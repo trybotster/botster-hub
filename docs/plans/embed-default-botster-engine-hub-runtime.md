@@ -4,8 +4,9 @@ Ticket: `ticket_1780276002_456394`
 
 ## Context Loaded
 
-- Project Pipelines context loaded for run `run_1780281590_760433`, current step `botster_plan`, gate `botster_plan_gate`, ticket `Embed botster-core DefaultBotsterEngine in hub runtime skeleton`, and Plan Review findings from `review_1780281989_176714`.
-- Run routing: proceed from `main`. The run has stale historical base fields in older events, but an orchestrator inbox message corrected this run to main-rooted with no stacked base run or ticket.
+- Project Pipelines context loaded for current run `run_1780357556_737356`, current run step `run_step_1780357556_181957`, current step `botster_plan`, gate `botster_plan_gate`, and ticket `ticket_1780276002_456394` / `Embed botster-core DefaultBotsterEngine in hub runtime skeleton`.
+- Current run has no prior artifacts, reviews, findings, open questions, question answers, or run checklists. Dependencies are closed: `ticket_1780276002_554468` / `Define botster-hub architecture and crate layout` and `ticket_1780276002_878022` / `Implement hub configuration model and explicit startup options`.
+- Run routing: current pipeline context reports `base_ref` `main`, base run `run_1780276015_619864`, and base ticket `ticket_1780276002_554468`. Worktree branch already contains prior plan and implementation commits for this ticket; this Plan artifact is refreshed for the current pipeline run before gate submission.
 - Required Plan playbooks loaded:
   - [[planner-playbook]]
   - [[botster-planner-playbook]]
@@ -36,8 +37,13 @@ Ticket: `ticket_1780276002_456394`
   - Locked `botster-core` exports default-on `local-runtime` items: `DefaultBotsterEngine`, `DefaultBotsterEngineError`, `LocalProcessRuntime`, and `LocalProcessRuntimeOptions`.
   - Locked `botster-core::DefaultBotsterEngine` exposes `spawn_session`, `attach_client`, `detach_client`, `write_bytes`, `resize`, `drain_runtime_once`, `classify_activity`, and `shutdown_session`.
 - Workflow checklist evidence:
-  - Initial Plan checklist creation hit a Project Pipelines SQLite write lock, so evidence was preserved in gate payload.
-  - Plan Review created run-level vault checklists and identified the prior lack of a repo-visible plan artifact as a blocker.
+  - Project Pipelines checklist instructions loaded for the current run.
+  - Current-run checklist listing returned no checklists.
+  - Current-run vault checklist creation hit the Project Pipelines SQLite write-lock path, so checklist evidence is preserved here and in the gate payload.
+  - Vault notes read: identity, goals, [[planner-playbook]], [[botster-planner-playbook]], [[botster-architecture]], [[cli-patterns]], [[spa-patterns]], [[project pipeline orchestration belongs in a device-level botster plugin]], [[project pipelines needs an operator workbench not more primitives]], [[project pipelines ui contract belongs in the plugin readme]], [[botster orchestration should spawn agents with explicit target ids]], [[botster orchestration prompts must bind agents to explicit worktrees]], [[botster engine command surface uses botsterengine as facade]], [[botster packages should enforce core hub cli plugin provider boundaries]], and [[botster is a local rust runtime that can optionally federate with cloud]].
+  - Convention conflicts: none. The plan keeps core mechanics in `botster-core`, hub policy in `botster-hub`, and Project Pipelines state in plugin-owned gate evidence.
+  - Plan-step verification evidence: repo files inspected with `rg --files`, `sed`, `git status --short`, and `git log --oneline --decorate -5`. Implementation verification commands are acceptance checks for later stages, not run in this Plan step.
+  - Durable knowledge capture: no new vault capture required before implementation; potential follow-up capture remains listed below if `HubRuntime` becomes the standing embedding pattern.
 
 ## Scope
 
