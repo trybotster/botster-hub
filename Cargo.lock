@@ -91,6 +91,8 @@ name = "botster-hub"
 version = "0.1.0"
 dependencies = [
  "botster-core",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

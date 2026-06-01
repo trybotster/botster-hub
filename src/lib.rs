@@ -23,6 +23,13 @@ pub mod providers;
 
 use providers::ProviderCapability;
 
+pub use config::{
+    CoreEngineOptions, CoreQueueCapacity, DataDirectoryOption, DirectoryList, HostIdentity,
+    HostIdentityOptions, HubConfig, HubConfigError, HubStartupOptions, LocalSocketBinding,
+    RuntimeEnvironment, SessionDefaults, SessionIoCoalescingOptions, TcpBinding, TransportBindings,
+    build_default_config_for_runtime,
+};
+
 /// Compile-checked description of the crate boundaries exposed by the hub.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ArchitectureSummary {
