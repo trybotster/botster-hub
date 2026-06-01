@@ -1,3 +1,9 @@
+//! Hub-owned configuration policy and explicit startup options.
+//!
+//! The hub resolves product-host policy around paths, transports, session
+//! defaults, and core engine knobs before handing requests to `botster-core`.
+//! This module intentionally does not load concrete config files yet.
+
 use std::env;
 use std::error::Error;
 use std::fmt;
@@ -15,6 +21,17 @@ const DEFAULT_COLS: u16 = 80;
 const DEFAULT_PLUGIN_DIRECTORY: &str = "plugins";
 const DEFAULT_PROVIDER_DIRECTORY: &str = "providers";
 const DEFAULT_LOCAL_SOCKET: &str = "botster-hub.sock";
+
+/// Configuration areas owned by the hub.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigArea {
+    /// Device or host-level hub identity and local policy.
+    Host,
+    /// Provider package enablement, pinning, and capability grants.
+    Providers,
+    /// Client admission and transport policy.
+    Clients,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HubStartupOptions {
