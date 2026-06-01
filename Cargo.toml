@@ -1,0 +1,10 @@
+[package]
+name = "botster-hub"
+version = "0.1.0"
+edition = "2024"
+description = "Botster product host built around botster-core"
+repository = "https://github.com/trybotster/botster-hub"
+license-file = "LICENSE"
+
+[dependencies]
+botster-core = { git = "https://github.com/trybotster/botster-core", branch = "main" }
