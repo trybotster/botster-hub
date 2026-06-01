@@ -1,3 +1,8 @@
 fn main() {
-    println!("botster-hub scaffold: product host for botster-core");
+    let summary = botster_hub::architecture_summary();
+    println!(
+        "botster-hub scaffold: {} roles, {} provider capability contracts",
+        summary.responsibilities().len(),
+        summary.provider_capabilities().len()
+    );
 }
