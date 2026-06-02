@@ -7,6 +7,11 @@ provider itself; cloud federation, signaling relays, browser shells, and API
 integrations belong in installable providers behind hub-owned capability
 contracts.
 
+The accepted boundary model is documented in
+[`docs/adr/hub-as-host-profile-over-core.md`](docs/adr/hub-as-host-profile-over-core.md):
+the hub is a first-party host profile/plugin bundle over `botster-core`, not a
+thick wrapper.
+
 ## Responsibility split
 
 | Layer | Owns |
