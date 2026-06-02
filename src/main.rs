@@ -1,6 +1,6 @@
 use std::process;
 
-use botster_hub::{HubRuntime, RuntimeEnvironment, build_default_config_for_runtime};
+use botster_hub::{HubRuntime, RuntimeEnvironment, build_default_config_for_runtime, host_profile};
 
 fn main() {
     let environment = RuntimeEnvironment::from_current_process();
@@ -8,11 +8,13 @@ fn main() {
     match build_default_config_for_runtime(&environment) {
         Ok(config) => {
             let runtime = HubRuntime::new(config);
-            let summary = botster_hub::architecture_summary();
+            let profile = host_profile();
             println!(
-                "botster-hub runtime ready for {}: {} responsibility roles over botster-core",
+                "{} first-party host profile ready for {}: {} roles, {} core capability surfaces",
+                profile.id,
                 runtime.config().host.id,
-                summary.responsibilities().len()
+                profile.responsibilities().len(),
+                profile.capability_surfaces().len()
             );
         }
         Err(error) => {

@@ -1,8 +1,8 @@
-//! Hub-owned configuration policy and explicit startup options.
+//! Profile-owned configuration policy and explicit startup options.
 //!
-//! The hub resolves product-host policy around paths, transports, session
-//! defaults, and core engine knobs before handing requests to `botster-core`.
-//! This module intentionally does not load concrete config files yet.
+//! The host profile resolves policy around paths, transports, session defaults,
+//! and core engine knobs before handing requests to `botster-core`. This module
+//! intentionally does not load concrete config files yet.
 
 use std::env;
 use std::error::Error;
