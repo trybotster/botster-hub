@@ -9,9 +9,12 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use botster_core::{
-    ClientId, CoreSessionMetadata, DefaultBotsterEngine, RequestId, ResizePayload, SessionId,
-    SessionSpawnRequest, SpawnEnvironment, SpawnWorkingDirectory, SubscriptionId, TransportEgress,
+    ClientId, CoreSessionMetadata, RequestId, ResizePayload, SessionId, SessionSpawnRequest,
+    SpawnEnvironment, SpawnWorkingDirectory, SubscriptionId, TransportEgress,
 };
+
+use crate::config::HubConfig;
+use crate::runtime::HubRuntime;
 
 /// Hub-facing role for the embedded core dependency.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,18 +40,21 @@ pub struct RunOneSmokeReport {
     pub shutdown: bool,
 }
 
-pub fn run_one_smoke(request: RunOneSmokeRequest) -> Result<RunOneSmokeReport, String> {
-    let mut engine = DefaultBotsterEngine::new();
+pub fn run_one_smoke(
+    config: HubConfig,
+    request: RunOneSmokeRequest,
+) -> Result<RunOneSmokeReport, String> {
+    let mut runtime = HubRuntime::new(config);
     let spawn_request = build_run_one_spawn_request(request);
     let session_id = spawn_request.session_id.clone();
     let client_id = ClientId("hub-cli-smoke-client".to_string());
     let subscription_id = SubscriptionId("hub-cli-smoke-subscription".to_string());
     let mut logical_clock = 1;
 
-    engine
+    runtime
         .spawn_session(spawn_request, CoreSessionMetadata::new())
         .map_err(|error| error.to_string())?;
-    engine
+    runtime
         .attach_client(
             client_id,
             session_id.clone(),
@@ -56,14 +62,15 @@ pub fn run_one_smoke(request: RunOneSmokeRequest) -> Result<RunOneSmokeReport, S
             logical_clock,
         )
         .map_err(|error| {
-            let _ = engine.shutdown_session(session_id.clone(), "attach failed", logical_clock + 1);
+            let _ =
+                runtime.shutdown_session(session_id.clone(), "attach failed", logical_clock + 1);
             error.to_string()
         })?;
     logical_clock += 1;
 
-    let drained_bytes = drain_available_bytes(&mut engine, &session_id, &mut logical_clock)?;
+    let drained_bytes = drain_available_bytes(&mut runtime, &session_id, &mut logical_clock)?;
 
-    let shutdown = engine
+    let shutdown = runtime
         .shutdown_session(session_id, "run-one smoke complete", logical_clock)
         .map(|_| true)
         .or_else(|error| {
@@ -98,7 +105,7 @@ fn build_run_one_spawn_request(request: RunOneSmokeRequest) -> SessionSpawnReque
 }
 
 fn drain_available_bytes(
-    engine: &mut DefaultBotsterEngine,
+    runtime: &mut HubRuntime,
     session_id: &SessionId,
     logical_clock: &mut u64,
 ) -> Result<usize, String> {
@@ -106,7 +113,7 @@ fn drain_available_bytes(
     let mut drained_bytes = 0;
 
     while Instant::now() < deadline {
-        let outcome = engine
+        let outcome = runtime
             .drain_runtime_once(session_id, *logical_clock)
             .or_else(|error| {
                 if is_session_not_found(&error.to_string()) {
@@ -147,6 +154,18 @@ fn is_session_not_found(message: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{DataDirectoryOption, HubStartupOptions, RuntimeEnvironment};
+
+    fn explicit_test_config() -> HubConfig {
+        HubStartupOptions {
+            data_directory: DataDirectoryOption::Explicit(
+                "target/botster-hub-test-data/core".into(),
+            ),
+            ..HubStartupOptions::default()
+        }
+        .build_config_for_environment(&RuntimeEnvironment::from_values(None, None, None))
+        .expect("explicit config")
+    }
 
     #[test]
     fn run_one_spawn_environment_is_empty_default() {
@@ -163,11 +182,14 @@ mod tests {
 
     #[test]
     fn run_one_uses_real_core_engine() {
-        let report = run_one_smoke(RunOneSmokeRequest {
-            working_directory: PathBuf::from("."),
-            executable: "sh".to_string(),
-            arguments: vec!["-c".to_string(), "printf hub-smoke; sleep 1".to_string()],
-        })
+        let report = run_one_smoke(
+            explicit_test_config(),
+            RunOneSmokeRequest {
+                working_directory: PathBuf::from("."),
+                executable: "sh".to_string(),
+                arguments: vec!["-c".to_string(), "printf hub-smoke; sleep 1".to_string()],
+            },
+        )
         .expect("run real core smoke");
 
         assert!(report.spawned);
