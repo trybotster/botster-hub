@@ -196,15 +196,19 @@ fn run_one(
         ..HubStartupOptions::default()
     };
 
-    if let Err(error) = options.build_config_for_environment(environment) {
-        return CliOutput::failure(format!("botster-hub config error: {error}\n"));
-    }
+    let config = match options.build_config_for_environment(environment) {
+        Ok(config) => config,
+        Err(error) => return CliOutput::failure(format!("botster-hub config error: {error}\n")),
+    };
 
-    match run_one_smoke(RunOneSmokeRequest {
-        working_directory,
-        executable,
-        arguments,
-    }) {
+    match run_one_smoke(
+        config,
+        RunOneSmokeRequest {
+            working_directory,
+            executable,
+            arguments,
+        },
+    ) {
         Ok(report) => CliOutput::success(format!(
             "botster-hub run-one ok: spawned={} attached={} drained_bytes={} shutdown={}\n",
             report.spawned, report.attached, report.drained_bytes, report.shutdown
