@@ -1,29 +1,36 @@
 # botster-hub
 
-`botster-hub` is the first-party Botster host profile over `botster-core`.
+`botster-hub` is Botster's trusted first-party host profile over
+`botster-core`.
 
-The hub owns trusted startup composition, product policy, and host integration.
-It does not fork or replace core runtime mechanics, and it does not implement
-every provider itself. Cloud federation, signaling relays, browser shells, and
-API integrations belong in installable providers behind hub-owned capability
+The profile owns trusted startup composition, policy, and host integration. It
+does not fork or replace core runtime mechanics, and it does not implement every
+provider itself; cloud federation, signaling relays, browser shells, and API
+integrations belong in installable providers behind profile-governed capability
 contracts.
+
+The accepted boundary model is documented in
+[`docs/adr/hub-as-host-profile-over-core.md`](docs/adr/hub-as-host-profile-over-core.md):
+the hub is a first-party host profile/plugin bundle over `botster-core`, not a
+thick wrapper.
 
 ## Responsibility split
 
 | Layer | Owns |
 | --- | --- |
-| `botster-core` | Reusable local engine mechanics and transport-neutral primitives: session spawning, PTY/process mechanics, lifecycle, activity, fanout, `TransportIngress`/`TransportEgress`, `SessionIo`, client stream contracts, notifications, plugin worker primitives, capability surfaces, and reusable crypto/identity mechanisms. |
-| `botster-hub` | First-party host profile policy: config locations, persistence policy, auth hooks, provider capability contracts, client admission/enforcement, package install/enable/pin/update policy, lifecycle ordering, timeout/failure policy, and audit hooks. |
-| CLI | Thin operator entrypoints that start, discover, or attach to a hub without owning product policy. |
+| `botster-core` | Policy-free reusable local engine mechanics and transport-neutral primitives: session spawning, PTY/process mechanics, lifecycle, activity, fanout, `TransportIngress`/`TransportEgress`, `SessionIo`, client stream contracts, notifications, plugin worker primitives, package manifest/capability surfaces, and reusable crypto/identity mechanisms. |
+| `botster-hub` | Trusted first-party host profile policy: config locations, persistence policy, auth hooks, provider capability contracts, startup composition, admission/enforcement, package install/enable/pin/update policy, lifecycle ordering, timeout/failure policy, and audit hooks. |
+| CLI | Thin operator entrypoints that start, discover, or attach to a hub without owning profile policy. |
 | Clients | Browser, TUI, socket, and custom renderers that consume hub contracts. Clients do not own provider behavior. |
 | Plugins/providers | Installable behavior packages that declare capabilities, compatibility, entrypoints, provenance, checksums, enabled state, and update policy. |
 | External provider implementations | Cloud federation, signaling relay, browser shell, API, and other privileged integrations implemented outside the hub crate. |
 
-The hub embeds `DefaultBotsterEngine` for the reusable tmux-like local engine:
-session spawning, PTY/process mechanics, session lifecycle and activity,
-subscription fanout, notifications, plugin worker primitives, and consumer
-conformance behavior. `HubRuntime` is a hub-owned adapter and policy facade over
-that engine, not a separate runtime engine.
+The host profile embeds `botster-core` through the default local-runtime-backed
+engine facade for the reusable tmux-like local engine: session spawning,
+PTY/process mechanics, session lifecycle and activity, subscription fanout,
+notifications, plugin worker primitives, and consumer conformance behavior.
+`HubRuntime` is a hub-owned adapter and policy facade over that engine, not a
+separate runtime engine.
 
 ## HubRuntime facade audit
 
@@ -48,14 +55,15 @@ surfaces, and transport contracts in `botster-core`.
 ## Crate layout
 
 ```text
-src/lib.rs                 public facade and architecture summary
-src/main.rs                thin binary smoke path through the facade
+src/lib.rs                 public facade over runtime and profile metadata
+src/profile.rs             first-party host profile manifest and policy metadata
+src/main.rs                thin binary smoke path through the profile facade
 src/core.rs                boundary docs for embedded botster-core mechanisms
-src/config.rs              hub-owned startup policy for core-owned knobs
-src/persistence.rs         hub-owned persistence policy seam
-src/auth.rs                hub-owned auth hook seam
+src/config.rs              profile-owned startup policy for core-owned knobs
+src/persistence.rs         profile-owned persistence policy seam
+src/auth.rs                profile-owned auth hook seam
 src/packages.rs            plugin/provider package policy seam
-src/providers.rs           provider capability vocabulary
+src/providers.rs           provider capability policy seam
 src/adapters/mod.rs        host adapter contract namespace
 src/adapters/clients.rs    client admission taxonomy
 src/adapters/cloud.rs      cloud provider contract seam
@@ -74,11 +82,23 @@ signaling servers, browser shells, API clients, OAuth/device-code flows,
 provider processes, persistence databases, plugin runtimes, marketplace fetches,
 package installers, or client transports.
 
-`botster-core` is currently sourced from the `main` branch in `Cargo.toml` with
-default features enabled so `DefaultBotsterEngine` and the default local runtime
-remain available. Development follows current core `main` through the checked-in
-`Cargo.lock` revision. Release builds should move to a deliberate tag or
-revision pin before shipping.
+## Dependency policy
+
+During development, this scaffold tracks `botster-core` from the `main` branch
+declared in `Cargo.toml`, with the resolved git revision committed in
+`Cargo.lock` for reproducibility. Refresh the lockfile intentionally when hub
+work needs current core behavior; stale lock drift is not a separate pinning
+policy.
+
+Release builds should move to a deliberate `botster-core` tag or revision pin
+before shipping. Local `path` overrides are not the repo default and should stay
+outside committed dependency policy unless the repo grows an explicit override
+workflow.
+
+The hub runtime embeds `botster-core`'s default local engine path via
+`DefaultBotsterEngine`. Keep core default features enabled so the `local-runtime`
+feature remains active unless the hub intentionally replaces that runtime
+contract.
 
 This repo is intentionally greenfield. The existing `trybotster` monolith is
 evidence only, not source to copy.

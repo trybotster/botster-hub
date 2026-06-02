@@ -1,8 +1,9 @@
 //! Plugin and provider package policy seam.
 //!
-//! The hub owns install, enable, disable, pin, update, capability grant, and
-//! provenance policy. Package managers and provider packages implement behavior
-//! behind those contracts; this module does not fetch or install anything.
+//! The first-party host profile owns install, enable, disable, pin, update,
+//! capability grant, and provenance policy. Package managers and provider
+//! packages implement behavior behind those contracts; this module does not
+//! fetch or install anything.
 
 use crate::providers::ProviderCapability;
 
@@ -22,7 +23,7 @@ pub enum PackagePolicy {
 }
 
 /// Declared capability grant for a package.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CapabilityGrant {
     /// Capability requested by a provider or plugin package.
     pub capability: ProviderCapability,
