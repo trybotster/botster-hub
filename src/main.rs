@@ -10,10 +10,9 @@ fn main() {
             let runtime = HubRuntime::new(config);
             let summary = botster_hub::architecture_summary();
             println!(
-                "botster-hub runtime ready for {}: {} roles, {} provider capability contracts",
+                "botster-hub runtime ready for {}: {} responsibility roles over botster-core",
                 runtime.config().host.id,
-                summary.responsibilities().len(),
-                summary.provider_capabilities().len()
+                summary.responsibilities().len()
             );
         }
         Err(error) => {

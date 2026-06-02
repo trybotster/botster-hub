@@ -4,23 +4,25 @@
 
 The hub owns product policy and host integration. It does not implement every
 provider itself; cloud federation, signaling relays, browser shells, and API
-integrations belong in installable providers behind hub-owned capability
-contracts.
+integrations belong in installable providers that declare capabilities through
+`botster-core` package contracts.
 
 ## Responsibility split
 
 | Layer | Owns |
 | --- | --- |
-| `botster-core` | Reusable local engine mechanics and transport-neutral primitives: session spawning, PTY/process mechanics, lifecycle, activity, fanout, notifications, plugin worker primitives, and reusable crypto/identity mechanisms. |
-| `botster-hub` | Product host policy: config locations, persistence policy, auth hooks, provider capability contracts, admission/enforcement, package install/enable/pin/update policy, lifecycle ordering, timeout/failure policy, and audit hooks. |
+| `botster-core` | Reusable local engine mechanics and transport-neutral primitives: session spawning, PTY/process mechanics, lifecycle, activity, fanout, notifications, plugin worker primitives, reusable crypto/identity mechanisms, package manifests, `Capability`, `CapabilitySurface`, host-profile admission contracts, and capability runtime primitives. |
+| `botster-hub` | Product host policy over core contracts: config locations, persistence policy, auth hooks, admission/enforcement, package install/enable/pin/update policy, lifecycle ordering, timeout/failure policy, and audit hooks. |
 | CLI | Thin operator entrypoints that start, discover, or attach to a hub without owning product policy. |
 | Clients | Browser, TUI, socket, and custom renderers that consume hub contracts. Clients do not own provider behavior. |
 | Plugins/providers | Installable behavior packages that declare capabilities, compatibility, entrypoints, provenance, checksums, enabled state, and update policy. |
 | External provider implementations | Cloud federation, signaling relay, browser shell, API, and other privileged integrations implemented outside the hub crate. |
 
-The hub should embed `botster-core` for the reusable tmux-like local engine:
-session spawning, PTY/process mechanics, session lifecycle and activity,
-subscription fanout, notifications, plugin worker primitives, and consumer
+The hub should embed `botster-core` for the reusable tmux-like local engine and
+shared package/capability contracts: session spawning, PTY/process mechanics,
+session lifecycle and activity, subscription fanout, notifications, plugin
+worker primitives, package manifests, `Capability`, `CapabilitySurface`,
+host-profile admission contracts, capability runtime primitives, and consumer
 conformance behavior.
 
 ## Crate layout
@@ -28,17 +30,11 @@ conformance behavior.
 ```text
 src/lib.rs                 public facade and architecture summary
 src/main.rs                thin binary smoke path through the facade
-src/core.rs                boundary docs for embedded botster-core mechanisms
 src/config.rs              hub-owned config policy seam
 src/persistence.rs         hub-owned persistence policy seam
 src/auth.rs                hub-owned auth hook seam
-src/packages.rs            plugin/provider package policy seam
-src/providers.rs           provider capability vocabulary
-src/adapters/mod.rs        host adapter contract namespace
-src/adapters/clients.rs    client transport adapter seam
-src/adapters/cloud.rs      cloud provider contract seam
-src/adapters/signaling.rs  signaling relay contract seam
-src/adapters/api.rs        external API provider contract seam
+src/packages.rs            hub package policy over core package contracts
+src/runtime.rs             hub runtime facade over botster-core
 ```
 
 This scaffold is intentionally shallow. The module tree makes the intended

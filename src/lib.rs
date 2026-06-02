@@ -8,21 +8,17 @@
 //! ```
 //! let summary = botster_hub::architecture_summary();
 //! assert!(summary.role_labels().contains(&"botster-core"));
-//! assert!(summary.provider_capabilities().contains(
-//!     &botster_hub::providers::ProviderCapability::SignalingRelay,
-//! ));
+//! assert!(summary
+//!     .responsibilities()
+//!     .iter()
+//!     .any(|role| role.owns.contains("PackageManifest")));
 //! ```
 
-pub mod adapters;
 pub mod auth;
 pub mod config;
-pub mod core;
 pub mod packages;
 pub mod persistence;
-pub mod providers;
 pub mod runtime;
-
-use providers::ProviderCapability;
 
 pub use config::{
     CoreEngineOptions, CoreQueueCapacity, DataDirectoryOption, DirectoryList, HostIdentity,
@@ -38,18 +34,12 @@ pub use runtime::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ArchitectureSummary {
     roles: &'static [Responsibility],
-    provider_capabilities: &'static [ProviderCapability],
 }
 
 impl ArchitectureSummary {
     /// Stable role labels used by docs, tests, and the binary smoke path.
     pub fn role_labels(&self) -> Vec<&'static str> {
         self.roles.iter().map(Responsibility::label).collect()
-    }
-
-    /// Hub-owned provider capability vocabulary.
-    pub fn provider_capabilities(&self) -> &'static [ProviderCapability] {
-        self.provider_capabilities
     }
 
     /// Responsibility rows for README-aligned callers.
@@ -81,11 +71,11 @@ impl Responsibility {
 const RESPONSIBILITIES: &[Responsibility] = &[
     Responsibility::new(
         "botster-core",
-        "reusable local engine mechanics and transport-neutral primitives",
+        "reusable local engine mechanics, PackageManifest, Capability, CapabilitySurface, host-profile admission contracts, and capability runtime primitives",
     ),
     Responsibility::new(
         "botster-hub",
-        "product host policy, capability contracts, admission, lifecycle, and audit hooks",
+        "product host policy over core contracts: config, persistence, auth, package enablement, lifecycle, and audit hooks",
     ),
     Responsibility::new(
         "CLI",
@@ -97,7 +87,7 @@ const RESPONSIBILITIES: &[Responsibility] = &[
     ),
     Responsibility::new(
         "plugins/providers",
-        "installable behavior packages that declare capabilities and provenance",
+        "installable behavior packages that declare core capabilities and provenance",
     ),
     Responsibility::new(
         "external providers",
@@ -105,22 +95,10 @@ const RESPONSIBILITIES: &[Responsibility] = &[
     ),
 ];
 
-const PROVIDER_CAPABILITIES: &[ProviderCapability] = &[
-    ProviderCapability::ClientAdmission,
-    ProviderCapability::PairingInvites,
-    ProviderCapability::SignalingRelay,
-    ProviderCapability::HubPresence,
-    ProviderCapability::BrowserShell,
-    ProviderCapability::Secrets,
-    ProviderCapability::CryptoEnvelope,
-    ProviderCapability::ExternalApi,
-];
-
 /// Return the public architecture summary used by the binary smoke path.
 pub fn architecture_summary() -> ArchitectureSummary {
     ArchitectureSummary {
         roles: RESPONSIBILITIES,
-        provider_capabilities: PROVIDER_CAPABILITIES,
     }
 }
 
@@ -129,7 +107,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn architecture_summary_names_required_roles_and_capabilities() {
+    fn architecture_summary_names_required_roles_and_core_owned_contracts() {
         let summary = architecture_summary();
 
         assert_eq!(
@@ -143,15 +121,27 @@ mod tests {
                 "external providers"
             ]
         );
+
+        let core_role = summary
+            .responsibilities()
+            .iter()
+            .find(|role| role.label() == "botster-core")
+            .expect("summary should include botster-core ownership");
+        assert!(core_role.owns.contains("PackageManifest"));
+        assert!(core_role.owns.contains("Capability"));
+        assert!(core_role.owns.contains("CapabilitySurface"));
+        assert!(core_role.owns.contains("host-profile admission contracts"));
+        assert!(core_role.owns.contains("capability runtime primitives"));
+
+        let hub_role = summary
+            .responsibilities()
+            .iter()
+            .find(|role| role.label() == "botster-hub")
+            .expect("summary should include botster-hub ownership");
         assert!(
-            summary
-                .provider_capabilities()
-                .contains(&ProviderCapability::SignalingRelay)
-        );
-        assert!(
-            summary
-                .provider_capabilities()
-                .contains(&ProviderCapability::BrowserShell)
+            hub_role
+                .owns
+                .contains("product host policy over core contracts")
         );
     }
 }
