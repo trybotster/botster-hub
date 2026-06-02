@@ -1,20 +1,22 @@
-//! Public architecture facade for the `botster-hub` product host.
+//! Public architecture facade for the `botster-hub` first-party host profile.
 //!
-//! `botster-hub` owns product host policy around reusable `botster-core`
-//! mechanics. This crate defines hub boundary contracts and a minimal runtime
-//! facade over `botster-core`; provider, cloud, Rails, WebRTC, and client
-//! transport implementations intentionally live outside this scaffold.
+//! `botster-hub` is a trusted profile over reusable `botster-core` mechanics.
+//! This crate defines profile-owned policy seams and a minimal runtime facade
+//! over `botster-core`; provider, cloud, Rails, WebRTC, and client transport
+//! implementations intentionally live outside this scaffold.
 //!
 //! ```
+//! let profile = botster_hub::host_profile();
+//! assert_eq!(profile.id, "botster-hub");
+//! assert!(profile.capability_surfaces().contains(
+//!     &botster_core::CapabilitySurface::SignalingRelay,
+//! ));
+//!
 //! let summary = botster_hub::architecture_summary();
-//! assert!(summary.role_labels().contains(&"botster-core"));
 //! assert!(summary.facade_decisions().iter().any(|decision| {
 //!     decision.core_operation() == "execute_command(DefaultEngineCommand)"
 //!         && decision.exposure() == botster_hub::HubFacadeExposure::Hidden
 //! }));
-//! assert!(summary.provider_capabilities().contains(
-//!     &botster_hub::providers::ProviderCapability::SignalingRelay,
-//! ));
 //! ```
 
 pub mod adapters;
@@ -23,10 +25,11 @@ pub mod config;
 pub mod core;
 pub mod packages;
 pub mod persistence;
+pub mod profile;
 pub mod providers;
 pub mod runtime;
 
-use providers::ProviderCapability;
+use botster_core::CapabilitySurface;
 
 pub use config::{
     CoreEngineOptions, CoreQueueCapacity, DataDirectoryOption, DirectoryList, HostIdentity,
@@ -34,57 +37,44 @@ pub use config::{
     RuntimeEnvironment, SessionDefaults, SessionIoCoalescingOptions, TcpBinding, TransportBindings,
     build_default_config_for_runtime,
 };
+pub use profile::{
+    CoreRuntimeRole, HostProfileManifest, HostProfileTrust, PolicyArea, Responsibility,
+    host_profile,
+};
 pub use runtime::{
     HubRuntime, HubRuntimeError, HubRuntimeObservation, HubRuntimeOutput, HubRuntimeSpawnOutcome,
 };
 
-/// Compile-checked description of the crate boundaries exposed by the hub.
+/// Compile-checked description of the profile plus the audited `HubRuntime` facade.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ArchitectureSummary {
-    roles: &'static [Responsibility],
+    profile: &'static HostProfileManifest,
     facade_decisions: &'static [HubFacadeDecision],
-    provider_capabilities: &'static [ProviderCapability],
 }
 
 impl ArchitectureSummary {
     /// Stable role labels used by docs, tests, and the binary smoke path.
+    #[must_use]
     pub fn role_labels(&self) -> Vec<&'static str> {
-        self.roles.iter().map(Responsibility::label).collect()
+        self.profile.role_labels()
     }
 
-    /// Hub-owned provider capability vocabulary.
-    pub fn provider_capabilities(&self) -> &'static [ProviderCapability] {
-        self.provider_capabilities
+    /// Capability surfaces governed by the first-party host profile.
+    #[must_use]
+    pub const fn capability_surfaces(&self) -> &'static [CapabilitySurface] {
+        self.profile.capability_surfaces()
     }
 
     /// Responsibility rows for README-aligned callers.
-    pub fn responsibilities(&self) -> &'static [Responsibility] {
-        self.roles
+    #[must_use]
+    pub const fn responsibilities(&self) -> &'static [Responsibility] {
+        self.profile.responsibilities()
     }
 
     /// README-aligned audit of current core operations exposed or hidden by `HubRuntime`.
-    pub fn facade_decisions(&self) -> &'static [HubFacadeDecision] {
+    #[must_use]
+    pub const fn facade_decisions(&self) -> &'static [HubFacadeDecision] {
         self.facade_decisions
-    }
-}
-
-/// Named ownership boundary in the Botster package layout.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Responsibility {
-    /// Stable short label.
-    pub label: &'static str,
-    /// One-sentence ownership boundary.
-    pub owns: &'static str,
-}
-
-impl Responsibility {
-    const fn new(label: &'static str, owns: &'static str) -> Self {
-        Self { label, owns }
-    }
-
-    /// Return the stable short label.
-    pub fn label(&self) -> &'static str {
-        self.label
     }
 }
 
@@ -119,47 +109,23 @@ impl HubFacadeDecision {
     }
 
     /// Core operation audited for the hub facade.
-    pub fn core_operation(&self) -> &'static str {
+    #[must_use]
+    pub const fn core_operation(&self) -> &'static str {
         self.core_operation
     }
 
     /// Hub facade exposure decision.
+    #[must_use]
     pub const fn exposure(&self) -> HubFacadeExposure {
         self.exposure
     }
 
     /// Short reason for the hub facade decision.
-    pub fn reason(&self) -> &'static str {
+    #[must_use]
+    pub const fn reason(&self) -> &'static str {
         self.reason
     }
 }
-
-const RESPONSIBILITIES: &[Responsibility] = &[
-    Responsibility::new(
-        "botster-core",
-        "reusable local engine mechanics and transport-neutral primitives",
-    ),
-    Responsibility::new(
-        "botster-hub",
-        "product host policy, capability contracts, admission, lifecycle, and audit hooks",
-    ),
-    Responsibility::new(
-        "CLI",
-        "thin operator entrypoints that start or attach to a hub",
-    ),
-    Responsibility::new(
-        "clients",
-        "browser, TUI, socket, and custom renderers consuming hub contracts",
-    ),
-    Responsibility::new(
-        "plugins/providers",
-        "installable behavior packages that declare capabilities and provenance",
-    ),
-    Responsibility::new(
-        "external providers",
-        "cloud federation, signaling relay, browser shell, and API implementations",
-    ),
-];
 
 const HUB_FACADE_DECISIONS: &[HubFacadeDecision] = &[
     HubFacadeDecision::new(
@@ -214,23 +180,12 @@ const HUB_FACADE_DECISIONS: &[HubFacadeDecision] = &[
     ),
 ];
 
-const PROVIDER_CAPABILITIES: &[ProviderCapability] = &[
-    ProviderCapability::ClientAdmission,
-    ProviderCapability::PairingInvites,
-    ProviderCapability::SignalingRelay,
-    ProviderCapability::HubPresence,
-    ProviderCapability::BrowserShell,
-    ProviderCapability::Secrets,
-    ProviderCapability::CryptoEnvelope,
-    ProviderCapability::ExternalApi,
-];
-
-/// Return the public architecture summary used by the binary smoke path.
-pub fn architecture_summary() -> ArchitectureSummary {
+/// Return the public architecture summary used by docs and tests.
+#[must_use]
+pub const fn architecture_summary() -> ArchitectureSummary {
     ArchitectureSummary {
-        roles: RESPONSIBILITIES,
+        profile: host_profile(),
         facade_decisions: HUB_FACADE_DECISIONS,
-        provider_capabilities: PROVIDER_CAPABILITIES,
     }
 }
 
@@ -239,7 +194,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn architecture_summary_names_required_roles_and_capabilities() {
+    fn architecture_summary_names_profile_roles_and_capabilities() {
         let summary = architecture_summary();
 
         assert_eq!(
@@ -255,13 +210,13 @@ mod tests {
         );
         assert!(
             summary
-                .provider_capabilities()
-                .contains(&ProviderCapability::SignalingRelay)
+                .capability_surfaces()
+                .contains(&CapabilitySurface::SignalingRelay)
         );
         assert!(
             summary
-                .provider_capabilities()
-                .contains(&ProviderCapability::BrowserShell)
+                .capability_surfaces()
+                .contains(&CapabilitySurface::BrowserShell)
         );
     }
 

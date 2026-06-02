@@ -1,8 +1,8 @@
 //! Client transport adapter seam.
 //!
-//! Browser, TUI, socket, and custom clients consume hub-owned admission
-//! contracts. This module classifies clients at the hub boundary; it does not
-//! replace core `TransportIngress`, `TransportEgress`, `SessionIo`, or
+//! Browser, TUI, socket, and custom clients consume profile-owned admission
+//! contracts. This module classifies clients at the host-profile boundary; it
+//! does not replace core `TransportIngress`, `TransportEgress`, `SessionIo`, or
 //! client-stream contracts.
 
 /// Client admission categories recognized by the hub.
