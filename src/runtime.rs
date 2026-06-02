@@ -1,8 +1,9 @@
-//! Hub-owned runtime facade over the default `botster-core` engine.
+//! Profile-owned runtime facade over the default `botster-core` engine.
 //!
-//! The hub owns explicit configuration and admission policy. Session process
-//! mechanics, terminal byte routing, activity accounting, and shutdown stay in
-//! `botster-core` through `DefaultBotsterEngine`.
+//! The first-party host profile owns explicit configuration and admission
+//! policy. Session process mechanics, terminal byte routing, activity
+//! accounting, and shutdown stay in `botster-core` through
+//! `DefaultBotsterEngine`.
 
 use botster_core::{
     BotsterEngineObservation, BotsterEngineOutput, BotsterSpawnOutcome, ClientId,
