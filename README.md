@@ -6,8 +6,8 @@
 The profile owns trusted startup composition, policy, and host integration. It
 does not fork or replace core runtime mechanics, and it does not implement every
 provider itself; cloud federation, signaling relays, browser shells, and API
-integrations belong in installable providers behind profile-governed capability
-contracts.
+integrations belong in installable providers that declare capabilities through
+`botster-core` package contracts.
 
 The accepted boundary model is documented in
 [`docs/adr/hub-as-host-profile-over-core.md`](docs/adr/hub-as-host-profile-over-core.md):
@@ -18,19 +18,21 @@ thick wrapper.
 
 | Layer | Owns |
 | --- | --- |
-| `botster-core` | Policy-free reusable local engine mechanics and transport-neutral primitives: session spawning, PTY/process mechanics, lifecycle, activity, fanout, `TransportIngress`/`TransportEgress`, `SessionIo`, client stream contracts, notifications, plugin worker primitives, package manifest/capability surfaces, and reusable crypto/identity mechanisms. |
-| `botster-hub` | Trusted first-party host profile policy: config locations, persistence policy, auth hooks, provider capability contracts, startup composition, admission/enforcement, package install/enable/pin/update policy, lifecycle ordering, timeout/failure policy, and audit hooks. |
+| `botster-core` | Policy-free reusable local engine mechanics and transport-neutral primitives: session spawning, PTY/process mechanics, lifecycle, activity, fanout, `TransportIngress`/`TransportEgress`, `SessionIo`, client stream contracts, notifications, plugin worker primitives, reusable crypto/identity mechanisms, package manifests, `Capability`, `CapabilitySurface`, host-profile admission contracts, and capability runtime primitives. |
+| `botster-hub` | Trusted first-party host profile policy over core contracts: config locations, persistence policy, auth hooks, startup composition, admission/enforcement, package install/enable/pin/update policy, lifecycle ordering, timeout/failure policy, and audit hooks. |
 | CLI | Thin operator entrypoints that start, discover, or attach to a hub without owning profile policy. |
 | Clients | Browser, TUI, socket, and custom renderers that consume hub contracts. Clients do not own provider behavior. |
 | Plugins/providers | Installable behavior packages that declare capabilities, compatibility, entrypoints, provenance, checksums, enabled state, and update policy. |
 | External provider implementations | Cloud federation, signaling relay, browser shell, API, and other privileged integrations implemented outside the hub crate. |
 
 The host profile embeds `botster-core` through the default local-runtime-backed
-engine facade for the reusable tmux-like local engine: session spawning,
-PTY/process mechanics, session lifecycle and activity, subscription fanout,
-notifications, plugin worker primitives, and consumer conformance behavior.
-`HubRuntime` is a hub-owned adapter and policy facade over that engine, not a
-separate runtime engine.
+engine facade for the reusable tmux-like local engine and shared package
+contracts: session spawning, PTY/process mechanics, session lifecycle and
+activity, subscription fanout, notifications, plugin worker primitives, package
+manifests, `Capability`, `CapabilitySurface`, host-profile admission contracts,
+capability runtime primitives, and consumer conformance behavior. `HubRuntime`
+is a hub-owned adapter and policy facade over that engine, not a separate
+runtime engine.
 
 ## HubRuntime facade audit
 
@@ -38,6 +40,9 @@ The hub exposes explicit methods where the operation is host-policy,
 admission, scheduling, or visibility adjacent. It hides generic core routers and
 keeps byte routing, PTY/session mechanics, fanout, plugin workers, capability
 surfaces, and transport contracts in `botster-core`.
+Client admission is host-profile policy over core admission and transport
+contracts, not a hub replacement for `TransportIngress`, `TransportEgress`,
+`SessionIo`, or client stream contracts.
 
 | Core operation | HubRuntime decision | Reason |
 | --- | --- | --- |
@@ -58,17 +63,11 @@ surfaces, and transport contracts in `botster-core`.
 src/lib.rs                 public facade over runtime and profile metadata
 src/profile.rs             first-party host profile manifest and policy metadata
 src/main.rs                thin binary smoke path through the profile facade
-src/core.rs                boundary docs for embedded botster-core mechanisms
-src/config.rs              profile-owned startup policy for core-owned knobs
-src/persistence.rs         profile-owned persistence policy seam
-src/auth.rs                profile-owned auth hook seam
-src/packages.rs            plugin/provider package policy seam
-src/providers.rs           provider capability policy seam
-src/adapters/mod.rs        host adapter contract namespace
-src/adapters/clients.rs    client admission taxonomy
-src/adapters/cloud.rs      cloud provider contract seam
-src/adapters/signaling.rs  signaling relay contract seam
-src/adapters/api.rs        external API provider contract seam
+src/config.rs              hub-owned config policy seam
+src/persistence.rs         hub-owned persistence policy seam
+src/auth.rs                hub-owned auth hook seam
+src/packages.rs            hub package policy over core package contracts
+src/runtime.rs             hub runtime facade over botster-core
 ```
 
 This scaffold is intentionally shallow. The module tree makes the intended
