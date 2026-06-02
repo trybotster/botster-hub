@@ -1,17 +1,19 @@
 //! Client transport adapter seam.
 //!
-//! Browser, TUI, socket, and custom clients consume hub-owned contracts. This
-//! module names the transport categories without implementing a transport.
+//! Browser, TUI, socket, and custom clients consume hub-owned admission
+//! contracts. This module classifies clients at the hub boundary; it does not
+//! replace core `TransportIngress`, `TransportEgress`, `SessionIo`, or
+//! client-stream contracts.
 
-/// Client transport categories the hub can admit.
+/// Client admission categories recognized by the hub.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClientTransport {
-    /// Browser client transport.
+    /// Browser client admitted through browser-facing host policy.
     Browser,
-    /// Terminal UI client transport.
+    /// Terminal UI client admitted through local operator policy.
     Tui,
-    /// Local socket client transport.
+    /// Local socket client admitted through local IPC policy.
     Socket,
-    /// Custom client transport using the same hub contracts.
+    /// Custom client admitted through the same hub policy vocabulary.
     Custom,
 }
