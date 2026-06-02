@@ -1,7 +1,8 @@
-//! Hub-owned authentication hook seam.
+//! Profile-owned authentication hook seam.
 //!
-//! The hub owns admission and auth policy hooks. Concrete OAuth, device-code,
-//! cloud, or provider-specific flows are intentionally out of scope.
+//! The first-party host profile owns admission and auth policy hooks. Concrete
+//! OAuth, device-code, cloud, or provider-specific flows are intentionally out
+//! of scope.
 
 /// Auth hook points exposed by the hub.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -1,7 +1,8 @@
 //! External API provider contract seam.
 //!
-//! The hub owns admission, audit, timeout, and capability policy for external
-//! APIs. Concrete API clients live in provider packages outside this crate.
+//! The host profile owns admission, audit, timeout, and capability policy for
+//! external APIs. Concrete API clients live in provider packages outside this
+//! crate.
 
 /// External API contract categories governed by the hub.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
