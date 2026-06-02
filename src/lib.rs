@@ -19,14 +19,11 @@
 //! }));
 //! ```
 
-pub mod adapters;
 pub mod auth;
 pub mod config;
-pub mod core;
 pub mod packages;
 pub mod persistence;
 pub mod profile;
-pub mod providers;
 pub mod runtime;
 
 use botster_core::CapabilitySurface;
