@@ -59,9 +59,23 @@ signaling servers, browser shells, API clients, OAuth/device-code flows,
 provider processes, persistence databases, plugin runtimes, marketplace fetches,
 package installers, or client transports.
 
-`botster-core` is currently sourced from the `main` branch in `Cargo.toml`;
-source reproducibility relies on `Cargo.lock` until the dependency policy is
-made stricter.
+## Dependency policy
+
+During development, this scaffold tracks `botster-core` from the `main` branch
+declared in `Cargo.toml`, with the resolved git revision committed in
+`Cargo.lock` for reproducibility. Refresh the lockfile intentionally when hub
+work needs current core behavior; stale lock drift is not a separate pinning
+policy.
+
+Release builds should move to a deliberate `botster-core` tag or revision pin
+before shipping. Local `path` overrides are not the repo default and should stay
+outside committed dependency policy unless the repo grows an explicit override
+workflow.
+
+The hub runtime embeds `botster-core`'s default local engine path via
+`DefaultBotsterEngine`. Keep core default features enabled so the `local-runtime`
+feature remains active unless the hub intentionally replaces that runtime
+contract.
 
 This repo is intentionally greenfield. The existing `trybotster` monolith is
 evidence only, not source to copy.
