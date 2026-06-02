@@ -4,13 +4,14 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use botster_core::{
-    BotsterEngineObservation, ClientId, CoreSessionMetadata, RequestId, ResizePayload,
-    SessionActivityStatus, SessionId, SessionLifecycleState, SessionSpawnRequest, SpawnEnvironment,
-    SpawnWorkingDirectory, SubscriptionId, TransportEgress,
+    BotsterEngineObservation, ClientId, CoreSessionMetadata, MailboxSendFailureReason,
+    PreparedSnapshotRequest, QueueSource, RequestId, ResizePayload, SessionActivityStatus,
+    SessionId, SessionLifecycleState, SessionSpawnRequest, SpawnEnvironment, SpawnWorkingDirectory,
+    SubscriptionId, TransportEgress,
 };
 use botster_hub::{
-    DataDirectoryOption, HostIdentityOptions, HubRuntime, HubStartupOptions, RuntimeEnvironment,
-    SessionDefaults, TransportBindings,
+    DataDirectoryOption, HostIdentityOptions, HubRuntime, HubRuntimeError, HubRuntimeOutput,
+    HubStartupOptions, RuntimeEnvironment, SessionDefaults, TransportBindings,
 };
 
 fn explicit_config() -> botster_hub::HubConfig {
@@ -120,6 +121,7 @@ fn hub_runtime_spawns_attaches_writes_reads_classifies_and_shuts_down_through_co
     assert_eq!(spawn.handle.session_id, session_id);
     assert_eq!(spawn.session.lifecycle, SessionLifecycleState::Running);
     assert!(runtime.session(&session_id).is_some());
+    assert_eq!(runtime.list_sessions().len(), 1);
 
     runtime
         .attach_client(
@@ -130,6 +132,17 @@ fn hub_runtime_spawns_attaches_writes_reads_classifies_and_shuts_down_through_co
         )
         .expect("attach fake client through core");
     logical_clock += 1;
+
+    let pressure = runtime
+        .report_backpressure(
+            client_id.clone(),
+            session_id.clone(),
+            QueueSource::ClientWorker,
+            16,
+            12,
+        )
+        .expect("report pressure evidence through core");
+    assert!(!pressure.observations.is_empty());
 
     let ready = drain_until(&mut runtime, &session_id, b"ready", &mut logical_clock);
     assert!(
@@ -162,6 +175,16 @@ fn hub_runtime_spawns_attaches_writes_reads_classifies_and_shuts_down_through_co
             .expect("classify activity through core"),
         SessionActivityStatus::Active
     );
+    assert_eq!(
+        runtime
+            .inspect_session(&session_id, logical_clock, 5)
+            .expect("inspect session through core")
+            .activity_status,
+        SessionActivityStatus::Active
+    );
+    runtime
+        .drain_runtime_all_once(logical_clock)
+        .expect("drain all sessions through core");
 
     let shutdown = runtime
         .shutdown_session(session_id.clone(), "test complete", logical_clock)
@@ -179,4 +202,58 @@ fn hub_runtime_spawns_attaches_writes_reads_classifies_and_shuts_down_through_co
             .map(|session| &session.lifecycle),
         Some(SessionLifecycleState::Stopping)
     ));
+}
+
+#[test]
+fn hub_runtime_public_facade_includes_audited_core_visibility_and_reporting_methods() {
+    type InspectSession = fn(
+        &HubRuntime,
+        &SessionId,
+        u64,
+        u64,
+    ) -> Result<botster_core::EngineSessionInspection, HubRuntimeError>;
+    type ReadScreen =
+        fn(&mut HubRuntime, RequestId, SessionId, u64) -> Result<HubRuntimeOutput, HubRuntimeError>;
+    type ReplaySnapshot = fn(
+        &mut HubRuntime,
+        PreparedSnapshotRequest,
+        u64,
+    ) -> Result<HubRuntimeOutput, HubRuntimeError>;
+    type ReportBackpressure = fn(
+        &mut HubRuntime,
+        ClientId,
+        SessionId,
+        QueueSource,
+        usize,
+        usize,
+    ) -> Result<HubRuntimeOutput, HubRuntimeError>;
+    type ReportDeliveryLag = fn(
+        &mut HubRuntime,
+        ClientId,
+        SessionId,
+        SubscriptionId,
+        QueueSource,
+        usize,
+        usize,
+    ) -> Result<HubRuntimeOutput, HubRuntimeError>;
+    type ReportDeliveryFailure = fn(
+        &mut HubRuntime,
+        ClientId,
+        SessionId,
+        SubscriptionId,
+        QueueSource,
+        MailboxSendFailureReason,
+    ) -> Result<HubRuntimeOutput, HubRuntimeError>;
+
+    let _list_sessions: fn(&HubRuntime) -> Vec<botster_core::CoreSession> =
+        HubRuntime::list_sessions;
+    let _inspect_session: InspectSession = HubRuntime::inspect_session;
+    let _read_screen: ReadScreen = HubRuntime::read_screen;
+    let _capture_snapshot: ReadScreen = HubRuntime::capture_snapshot;
+    let _replay_snapshot: ReplaySnapshot = HubRuntime::replay_snapshot;
+    let _drain_all: fn(&mut HubRuntime, u64) -> Result<HubRuntimeOutput, HubRuntimeError> =
+        HubRuntime::drain_runtime_all_once;
+    let _report_backpressure: ReportBackpressure = HubRuntime::report_backpressure;
+    let _report_delivery_lag: ReportDeliveryLag = HubRuntime::report_delivery_lag;
+    let _report_delivery_failure: ReportDeliveryFailure = HubRuntime::report_delivery_failure;
 }
