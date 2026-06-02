@@ -1,15 +1,17 @@
 use std::process;
 
-use botster_hub::{RuntimeEnvironment, build_default_config_for_runtime};
+use botster_hub::{HubRuntime, RuntimeEnvironment, build_default_config_for_runtime};
 
 fn main() {
     let environment = RuntimeEnvironment::from_current_process();
 
     match build_default_config_for_runtime(&environment) {
-        Ok(_config) => {
+        Ok(config) => {
+            let runtime = HubRuntime::new(config);
             let summary = botster_hub::architecture_summary();
             println!(
-                "botster-hub config ready: {} roles, {} provider capability contracts",
+                "botster-hub runtime ready for {}: {} roles, {} provider capability contracts",
+                runtime.config().host.id,
                 summary.responsibilities().len(),
                 summary.provider_capabilities().len()
             );

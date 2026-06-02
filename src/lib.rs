@@ -1,9 +1,9 @@
 //! Public architecture facade for the `botster-hub` product host.
 //!
 //! `botster-hub` owns product host policy around reusable `botster-core`
-//! mechanics. This crate currently defines boundary contracts only; provider,
-//! cloud, Rails, WebRTC, and client transport implementations intentionally
-//! live outside this scaffold.
+//! mechanics. This crate defines hub boundary contracts and a minimal runtime
+//! facade over `botster-core`; provider, cloud, Rails, WebRTC, and client
+//! transport implementations intentionally live outside this scaffold.
 //!
 //! ```
 //! let summary = botster_hub::architecture_summary();
@@ -20,6 +20,7 @@ pub mod core;
 pub mod packages;
 pub mod persistence;
 pub mod providers;
+pub mod runtime;
 
 use providers::ProviderCapability;
 
@@ -28,6 +29,9 @@ pub use config::{
     HostIdentityOptions, HubConfig, HubConfigError, HubStartupOptions, LocalSocketBinding,
     RuntimeEnvironment, SessionDefaults, SessionIoCoalescingOptions, TcpBinding, TransportBindings,
     build_default_config_for_runtime,
+};
+pub use runtime::{
+    HubRuntime, HubRuntimeError, HubRuntimeObservation, HubRuntimeOutput, HubRuntimeSpawnOutcome,
 };
 
 /// Compile-checked description of the crate boundaries exposed by the hub.
