@@ -14,7 +14,9 @@ use botster_core::{
 };
 
 use crate::config::HubConfig;
-use crate::lifecycle::{HubLifecycleResult, HubPluginLifecycle, HubPluginRuntimeBundle};
+use crate::lifecycle::{
+    HubLifecycleResult, HubPluginLifecycle, HubPluginLifecycleStatus, HubPluginRuntimeBundle,
+};
 use crate::packages::PackageRegistry;
 
 /// Hub-owned adapter and policy facade over the default local core engine.
@@ -86,6 +88,15 @@ impl HubRuntime {
             .unload_package(request_id, package_name)
     }
 
+    /// Return read-only plugin lifecycle status derived from hub package records and load state.
+    #[must_use]
+    pub fn plugin_lifecycle_status(
+        &self,
+        registry: &PackageRegistry,
+    ) -> Vec<HubPluginLifecycleStatus> {
+        self.plugin_lifecycle.status(registry)
+    }
+
     /// Return a recorded core session.
     #[must_use]
     pub fn session(&self, session_id: &SessionId) -> Option<&botster_core::CoreSession> {
@@ -119,6 +130,18 @@ impl HubRuntime {
             .attach_client(client_id, session_id, subscription_id, now_seconds)
     }
 
+    /// Detach a client subscription from a session through core.
+    pub fn detach_client(
+        &mut self,
+        client_id: ClientId,
+        session_id: SessionId,
+        subscription_id: SubscriptionId,
+        now_seconds: u64,
+    ) -> Result<BotsterEngineOutput, DefaultBotsterEngineError> {
+        self.engine
+            .detach_client(client_id, session_id, subscription_id, now_seconds)
+    }
+
     /// Write terminal bytes into a session through core.
     pub fn write_bytes(
         &mut self,
@@ -129,6 +152,19 @@ impl HubRuntime {
     ) -> Result<BotsterEngineOutput, DefaultBotsterEngineError> {
         self.engine
             .write_bytes(client_id, session_id, data, now_seconds)
+    }
+
+    /// Resize a session terminal through the explicit hub facade.
+    pub fn resize(
+        &mut self,
+        client_id: ClientId,
+        session_id: SessionId,
+        rows: u16,
+        cols: u16,
+        now_seconds: u64,
+    ) -> Result<BotsterEngineOutput, DefaultBotsterEngineError> {
+        self.engine
+            .resize(client_id, session_id, rows, cols, now_seconds)
     }
 
     /// Drain available local runtime output through core's subscription path.

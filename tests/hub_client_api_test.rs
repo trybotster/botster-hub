@@ -1,0 +1,389 @@
+#![cfg(unix)]
+
+use std::thread;
+use std::time::{Duration, Instant};
+
+use botster_core::{
+    Capability, CapabilitySurface, ExtensionEntrypoint, ExtensionKind, ExtensionRuntime, RequestId,
+    SessionId, SessionLifecycleState, SubscriptionId,
+};
+use botster_hub::{
+    DataDirectoryOption, HostIdentityOptions, HubClientAdmission, HubClientApi, HubClientError,
+    HubClientEvent, HubClientIdentity, HubClientOperation, HubClientPackageClassification,
+    HubClientPackageState, HubClientRequest, HubClientResponseBody, HubClientRole, HubRuntime,
+    HubStartupOptions, PackageProvenance, PackageRegistry, RuntimeEnvironment, SessionDefaults,
+    TransportBindings,
+};
+
+fn explicit_runtime() -> HubRuntime {
+    let config = HubStartupOptions {
+        host: HostIdentityOptions {
+            id: "hub-client-api-test".to_string(),
+            display_name: "Hub Client API Test".to_string(),
+            fingerprint: None,
+        },
+        data_directory: DataDirectoryOption::Explicit(
+            "target/botster-hub-test-data/client-api".into(),
+        ),
+        session_defaults: SessionDefaults {
+            shell: "/bin/sh".to_string(),
+            working_directory: Some(".".into()),
+            initial_rows: 24,
+            initial_cols: 80,
+        },
+        transports: TransportBindings {
+            local_socket: None,
+            tcp: Vec::new(),
+        },
+        ..HubStartupOptions::default()
+    }
+    .build_config_for_environment(&RuntimeEnvironment::from_values(None, None, None))
+    .expect("explicit runtime config should build");
+
+    HubRuntime::new(config)
+}
+
+fn request_id(value: &str) -> RequestId {
+    RequestId(value.to_string())
+}
+
+fn session_id() -> SessionId {
+    SessionId("hub-client-api-session".to_string())
+}
+
+fn subscription_id() -> SubscriptionId {
+    SubscriptionId("hub-client-api-subscription".to_string())
+}
+
+fn empty_registry() -> PackageRegistry {
+    PackageRegistry::new(Vec::<Capability>::new().into_iter().collect())
+}
+
+fn capability(surface: CapabilitySurface, scope: Option<&str>) -> Capability {
+    Capability {
+        surface,
+        scope: scope.map(ToString::to_string),
+    }
+}
+
+fn plugin_manifest(name: &str, capabilities: Vec<Capability>) -> botster_core::PackageManifest {
+    botster_core::PackageManifest {
+        name: name.to_string(),
+        version: "1.0.0".to_string(),
+        kind: ExtensionKind::Plugin,
+        botster: ">=0.1.0".to_string(),
+        source: Some(botster_core::PackageSource::Git {
+            repo: "https://example.invalid/botster/plugin.git".to_string(),
+            reference: "v1.0.0".to_string(),
+        }),
+        capabilities,
+        entrypoints: vec![ExtensionEntrypoint {
+            runtime: ExtensionRuntime::Lua,
+            path: "plugin.lua".to_string(),
+            bootstrap: false,
+        }],
+        host_profile: None,
+    }
+}
+
+fn provenance() -> PackageProvenance {
+    PackageProvenance {
+        source: "local-private-source".to_string(),
+        checksum: Some("sha256:test".to_string()),
+    }
+}
+
+fn drain_until(
+    api: &HubClientApi,
+    runtime: &mut HubRuntime,
+    packages: &PackageRegistry,
+    session_id: &SessionId,
+    needle: &[u8],
+    logical_clock: &mut u64,
+) -> Vec<u8> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut observed = Vec::new();
+
+    while Instant::now() < deadline {
+        let response = api
+            .handle_request(
+                runtime,
+                packages,
+                HubClientRequest::DrainRuntime {
+                    request_id: request_id("drain"),
+                    session_id: session_id.clone(),
+                    last_output_at: *logical_clock,
+                },
+            )
+            .expect("drain through client api");
+        *logical_clock += 1;
+
+        let HubClientResponseBody::Events(events) = response.body else {
+            panic!("drain should return events");
+        };
+        for event in events {
+            if let HubClientEvent::TerminalOutput { data, .. } = event {
+                observed.extend(data);
+            }
+        }
+
+        if observed
+            .windows(needle.len())
+            .any(|window| window == needle)
+        {
+            return observed;
+        }
+
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    panic!(
+        "timed out waiting for {:?} in {:?}",
+        String::from_utf8_lossy(needle),
+        String::from_utf8_lossy(&observed)
+    );
+}
+
+#[test]
+fn local_client_api_exercises_status_spawn_attach_input_resize_detach_and_events() {
+    let api = HubClientApi::local_operator("local-client-api-test");
+    let packages = empty_registry();
+    let mut runtime = explicit_runtime();
+    let session_id = session_id();
+    let subscription_id = subscription_id();
+    let mut logical_clock = 100;
+
+    let status = api
+        .handle_request(
+            &mut runtime,
+            &packages,
+            HubClientRequest::Status {
+                request_id: request_id("status"),
+            },
+        )
+        .expect("status through client api");
+    let HubClientResponseBody::Status(status) = status.body else {
+        panic!("status response expected");
+    };
+    assert_eq!(status.profile_id, "botster-hub");
+    assert_eq!(status.session_count, 0);
+
+    let sessions = api
+        .handle_request(
+            &mut runtime,
+            &packages,
+            HubClientRequest::ListSessions {
+                request_id: request_id("list-empty"),
+            },
+        )
+        .expect("list through client api");
+    assert!(
+        matches!(sessions.body, HubClientResponseBody::Sessions(sessions) if sessions.is_empty())
+    );
+
+    let spawn = api
+        .handle_request(
+            &mut runtime,
+            &packages,
+            HubClientRequest::Spawn {
+                request_id: request_id("spawn"),
+                session_id: session_id.clone(),
+                command: "printf 'ready\\n'; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done".to_string(),
+            },
+        )
+        .expect("spawn through client api");
+    let HubClientResponseBody::Spawned(spawned) = spawn.body else {
+        panic!("spawned response expected");
+    };
+    assert_eq!(spawned.session.session_id, session_id);
+    assert_eq!(spawned.session.lifecycle, SessionLifecycleState::Running);
+    assert!(spawned.events.iter().any(|event| {
+        matches!(
+            event,
+            HubClientEvent::SessionLifecycle {
+                session_id: observed,
+                state: SessionLifecycleState::Running
+            } if observed == &session_id
+        )
+    }));
+
+    let attach = api
+        .handle_request(
+            &mut runtime,
+            &packages,
+            HubClientRequest::Attach {
+                request_id: request_id("attach"),
+                session_id: session_id.clone(),
+                subscription_id: subscription_id.clone(),
+                now_seconds: logical_clock,
+            },
+        )
+        .expect("attach through client api");
+    logical_clock += 1;
+    assert!(matches!(attach.body, HubClientResponseBody::Events(_)));
+
+    drain_until(
+        &api,
+        &mut runtime,
+        &packages,
+        &session_id,
+        b"ready",
+        &mut logical_clock,
+    );
+
+    api.handle_request(
+        &mut runtime,
+        &packages,
+        HubClientRequest::Resize {
+            request_id: request_id("resize"),
+            session_id: session_id.clone(),
+            rows: 30,
+            cols: 100,
+            now_seconds: logical_clock,
+        },
+    )
+    .expect("resize through client api");
+    logical_clock += 1;
+
+    api.handle_request(
+        &mut runtime,
+        &packages,
+        HubClientRequest::Input {
+            request_id: request_id("input"),
+            session_id: session_id.clone(),
+            data: b"ping-hub\n".to_vec(),
+            now_seconds: logical_clock,
+        },
+    )
+    .expect("input through client api");
+    logical_clock += 1;
+
+    let echo = drain_until(
+        &api,
+        &mut runtime,
+        &packages,
+        &session_id,
+        b"echo:ping-hub",
+        &mut logical_clock,
+    );
+    assert!(
+        echo.windows(b"echo:ping-hub".len())
+            .any(|window| window == b"echo:ping-hub")
+    );
+
+    api.handle_request(
+        &mut runtime,
+        &packages,
+        HubClientRequest::Detach {
+            request_id: request_id("detach"),
+            session_id: session_id.clone(),
+            subscription_id,
+            now_seconds: logical_clock,
+        },
+    )
+    .expect("detach through client api");
+}
+
+#[test]
+fn package_and_lifecycle_queries_are_sanitized_and_explicitly_pulled() {
+    let api = HubClientApi::local_operator("local-client-api-test");
+    let mut runtime = explicit_runtime();
+    let surface = capability(CapabilitySurface::Surfaces, None);
+    let mut packages = PackageRegistry::new(vec![surface.clone()].into_iter().collect());
+    packages
+        .install(
+            plugin_manifest("workflow.plugin", vec![surface]),
+            provenance(),
+            "install package",
+        )
+        .expect("install package");
+    packages
+        .enable("workflow.plugin", "enable package")
+        .expect("enable package");
+
+    api.handle_request(
+        &mut runtime,
+        &packages,
+        HubClientRequest::Attach {
+            request_id: request_id("attach-missing-session"),
+            session_id: session_id(),
+            subscription_id: subscription_id(),
+            now_seconds: 1,
+        },
+    )
+    .expect_err("attach is a transport handshake and should not hydrate packages");
+
+    let response = api
+        .handle_request(
+            &mut runtime,
+            &packages,
+            HubClientRequest::ListPackages {
+                request_id: request_id("packages"),
+            },
+        )
+        .expect("package query through client api");
+    let HubClientResponseBody::Packages(records) = response.body else {
+        panic!("packages response expected");
+    };
+    assert_eq!(records.len(), 1);
+    let record = &records[0];
+    assert_eq!(record.package_name, "workflow.plugin");
+    assert_eq!(
+        record.classification,
+        HubClientPackageClassification::Plugin
+    );
+    assert_eq!(record.state, HubClientPackageState::Enabled);
+    assert!(
+        !format!("{record:?}").contains("local-private-source"),
+        "package client response must not expose provenance"
+    );
+
+    let response = api
+        .handle_request(
+            &mut runtime,
+            &packages,
+            HubClientRequest::PluginLifecycleStatus {
+                request_id: request_id("plugin-lifecycle"),
+            },
+        )
+        .expect("plugin lifecycle status through client api");
+    let HubClientResponseBody::PluginLifecycle(records) = response.body else {
+        panic!("plugin lifecycle response expected");
+    };
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].package_name, "workflow.plugin");
+    assert_eq!(records[0].state, HubClientPackageState::Enabled);
+    assert!(!records[0].loaded);
+}
+
+#[test]
+fn denied_client_request_returns_typed_admission_error() {
+    let api = HubClientApi::new(
+        HubClientIdentity {
+            client_id: botster_core::ClientId("denied-client".to_string()),
+            role: HubClientRole::Unadmitted,
+        },
+        HubClientAdmission::deny_all(),
+    );
+    let mut runtime = explicit_runtime();
+    let packages = empty_registry();
+
+    let error = api
+        .handle_request(
+            &mut runtime,
+            &packages,
+            HubClientRequest::Status {
+                request_id: request_id("denied-status"),
+            },
+        )
+        .expect_err("denied client should fail");
+
+    assert_eq!(
+        error,
+        HubClientError::AdmissionDenied {
+            request_id: request_id("denied-status"),
+            operation: HubClientOperation::Status,
+            role: HubClientRole::Unadmitted,
+        }
+    );
+}
