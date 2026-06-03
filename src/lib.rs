@@ -29,6 +29,7 @@
 //! ```
 
 pub mod auth;
+pub mod capabilities;
 pub mod config;
 pub mod lifecycle;
 pub mod packages;
@@ -38,6 +39,7 @@ pub mod runtime;
 
 use botster_core::CapabilitySurface;
 
+pub use capabilities::HubCapabilityRuntime;
 pub use config::{
     CoreEngineOptions, CoreQueueCapacity, DataDirectoryOption, DirectoryList, HostIdentity,
     HostIdentityOptions, HubConfig, HubConfigError, HubStartupOptions, LocalSocketBinding,
@@ -163,6 +165,21 @@ const HUB_FACADE_DECISIONS: &[HubFacadeDecision] = &[
         "PluginWorkerEngine::unload_plugin",
         HubFacadeExposure::Exposed,
         "plugin unload cleanup stays scoped by core worker ownership",
+    ),
+    HubFacadeDecision::new(
+        "PluginCapabilityRuntime::submit",
+        HubFacadeExposure::Exposed,
+        "hub owns concrete local capability policy and submits through core request contracts",
+    ),
+    HubFacadeDecision::new(
+        "PluginCapabilityRuntime::drain_events",
+        HubFacadeExposure::Exposed,
+        "plugin capability completions and timer events are drained through a hub-owned path",
+    ),
+    HubFacadeDecision::new(
+        "PluginCapabilityRuntime::cleanup_plugin",
+        HubFacadeExposure::Exposed,
+        "capability resources are released during hub plugin reload and unload",
     ),
     HubFacadeDecision::new(
         "execute_command(DefaultEngineCommand)",
