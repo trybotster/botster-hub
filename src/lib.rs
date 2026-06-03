@@ -52,10 +52,11 @@ pub use lifecycle::{
     HubLifecycleError, HubLifecycleResult, HubPluginLifecycle, HubPluginRuntimeBundle,
 };
 pub use packages::{
-    PackageAction, PackageAdmissionPolicy, PackageAdmissionReason, PackageClassification,
-    PackageDecision, PackagePin, PackageProvenance, PackageRecord, PackageRegistry,
-    PackageRegistryError, PackageRegistryResult, PackageRegistrySnapshot,
-    PackageRegistrySnapshotError, PackageState, PackageUpdatePolicy, default_package_policy,
+    LOCAL_PACKAGE_MANIFEST_FILE, PackageAction, PackageAdmissionPolicy, PackageAdmissionReason,
+    PackageClassification, PackageDecision, PackagePin, PackageProvenance, PackageRecord,
+    PackageRegistry, PackageRegistryError, PackageRegistryResult, PackageRegistrySnapshot,
+    PackageRegistrySnapshotError, PackageState, PackageUpdatePolicy, PreparedLocalPackage,
+    default_package_policy,
 };
 pub use persistence::{
     CapabilityGrantRecord, FileHubStateStore, HubAuditEntry, HubState, HubStateError,
