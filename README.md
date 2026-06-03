@@ -99,6 +99,21 @@ The hub runtime embeds `botster-core`'s default local engine path via
 feature remains active unless the hub intentionally replaces that runtime
 contract.
 
+## Runtime smoke proof
+
+The production binary includes a deliberately thin smoke entrypoint:
+
+```sh
+cargo run -- run-one --data-dir target/botster-hub-smoke-data -- /bin/sh -c "printf 'botster-hub-smoke-ok\n'"
+```
+
+`run-one` requires an explicit `--data-dir`, builds hub config without falling
+back to user paths, then crosses `HubRuntime -> DefaultBotsterEngine` through
+spawn, attach, drain, marker observation, and shutdown. Its output is scrubbed
+to profile, host, session, marker, byte-count, and shutdown-observation facts so
+pipeline artifacts do not need local paths, environment dumps, keys, or
+fingerprints.
+
 ## Package registry policy
 
 `PackageRegistry` is the first concrete hub-owned package policy surface. It
@@ -108,7 +123,8 @@ metadata placeholders, classifies providers from `botster_core::ExtensionKind`,
 and validates enable decisions against a hub-owned `CapabilitySet`.
 
 The registry deliberately uses core package contracts instead of defining a hub
-manifest or capability vocabulary. Provider host-profile packages are admitted
+manifest or capability vocabulary. Provider packages must carry host-profile
+metadata before they can be enabled; provider host-profile packages are admitted
 through `botster_core::admit_host_profile`, so core still owns the narrow
 manifest/admission preconditions while hub owns install, enable, disable, pin,
 grant, provenance, update, and audit policy.

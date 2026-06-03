@@ -66,7 +66,6 @@ impl PackageRegistry {
             ));
         }
 
-        let package_name = manifest.name.clone();
         let classification = PackageClassification::from_kind(&manifest.kind);
         let record = PackageRecord {
             manifest,
@@ -122,16 +121,36 @@ impl PackageRegistry {
             ));
         }
 
-        let admitted_host_profile = if record.manifest.host_profile.is_some() {
-            Some(admit_host_profile(&record.manifest, true).map_err(|error| {
-                PackageRegistryError::new(
+        let admitted_host_profile = match record.classification {
+            PackageClassification::Plugin => {
+                if record.manifest.host_profile.is_some() {
+                    Some(admit_host_profile(&record.manifest, true).map_err(|error| {
+                        PackageRegistryError::new(
+                            package_name,
+                            PackageAction::Enable,
+                            PackagePolicyReason::HostProfileAdmission(error),
+                        )
+                    })?)
+                } else {
+                    None
+                }
+            }
+            PackageClassification::Provider if record.manifest.host_profile.is_none() => {
+                return Err(PackageRegistryError::new(
                     package_name,
                     PackageAction::Enable,
-                    PackagePolicyReason::HostProfileAdmission(error),
-                )
-            })?)
-        } else {
-            None
+                    PackagePolicyReason::ProviderMissingHostProfile,
+                ));
+            }
+            PackageClassification::Provider => {
+                Some(admit_host_profile(&record.manifest, true).map_err(|error| {
+                    PackageRegistryError::new(
+                        package_name,
+                        PackageAction::Enable,
+                        PackagePolicyReason::HostProfileAdmission(error),
+                    )
+                })?)
+            }
         };
 
         let record = self
@@ -391,6 +410,8 @@ pub enum PackagePolicyReason {
     UngovernedCapabilitySurface(CapabilitySurface),
     /// Manifest requested a capability not present in the hub-owned grant set.
     UngrantedCapability(Capability),
+    /// Provider-classified packages must carry host-profile metadata before enablement.
+    ProviderMissingHostProfile,
     /// Core host-profile admission rejected the provider package.
     HostProfileAdmission(HostProfileAdmissionError),
 }
@@ -628,6 +649,26 @@ mod tests {
             .expect("install provider");
 
         assert_eq!(record.classification, PackageClassification::Provider);
+    }
+
+    #[test]
+    fn provider_without_host_profile_metadata_is_denied_before_enable() {
+        let capability = capability(CapabilitySurface::ClientAdmission, None);
+        let mut manifest = provider_manifest("metadata-missing.provider", vec![capability.clone()]);
+        manifest.host_profile = None;
+        let mut registry = PackageRegistry::new(grants(vec![capability]));
+        registry
+            .install(manifest, provenance(), "install provider")
+            .expect("install provider");
+
+        let error = registry
+            .enable("metadata-missing.provider", "enable provider")
+            .expect_err("provider without host profile metadata should deny");
+
+        assert_eq!(
+            error.reason,
+            PackagePolicyReason::ProviderMissingHostProfile
+        );
     }
 
     #[test]
