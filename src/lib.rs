@@ -30,6 +30,7 @@
 
 pub mod auth;
 pub mod capabilities;
+pub mod client_api;
 pub mod config;
 pub mod daemon;
 pub mod lifecycle;
@@ -41,6 +42,13 @@ pub mod runtime;
 use botster_core::CapabilitySurface;
 
 pub use capabilities::HubCapabilityRuntime;
+pub use client_api::{
+    HubClientAdmission, HubClientApi, HubClientCapability, HubClientError, HubClientEvent,
+    HubClientIdentity, HubClientObservationKind, HubClientOperation, HubClientPackage,
+    HubClientPackageClassification, HubClientPackageState, HubClientPluginLifecycle,
+    HubClientRequest, HubClientResponse, HubClientResponseBody, HubClientResult, HubClientRole,
+    HubClientSession, HubClientSpawned, HubClientStatus,
+};
 pub use config::{
     CoreEngineOptions, CoreQueueCapacity, DataDirectoryOption, DirectoryList, HostIdentity,
     HostIdentityOptions, HubConfig, HubConfigError, HubStartupOptions, LocalSocketBinding,
@@ -51,7 +59,8 @@ pub use daemon::{
     HubDaemon, HubDaemonError, HubDaemonResult, HubDaemonState, HubDaemonStatus, HubStateLoadSource,
 };
 pub use lifecycle::{
-    HubLifecycleError, HubLifecycleResult, HubPluginLifecycle, HubPluginRuntimeBundle,
+    HubLifecycleError, HubLifecycleResult, HubPluginLifecycle, HubPluginLifecycleStatus,
+    HubPluginRuntimeBundle,
 };
 pub use packages::{
     LOCAL_PACKAGE_MANIFEST_FILE, PackageAction, PackageAdmissionPolicy, PackageAdmissionReason,
@@ -202,6 +211,31 @@ const HUB_FACADE_DECISIONS: &[HubFacadeDecision] = &[
         "host visibility over core-recorded sessions",
     ),
     HubFacadeDecision::new(
+        "spawn_session",
+        HubFacadeExposure::Exposed,
+        "host-admitted local session creation through core mechanics",
+    ),
+    HubFacadeDecision::new(
+        "attach_client",
+        HubFacadeExposure::Exposed,
+        "explicit client subscription handshake without global state hydration",
+    ),
+    HubFacadeDecision::new(
+        "detach_client",
+        HubFacadeExposure::Exposed,
+        "explicit client subscription teardown through core mechanics",
+    ),
+    HubFacadeDecision::new(
+        "write_bytes",
+        HubFacadeExposure::Exposed,
+        "explicit client terminal input path through core mechanics",
+    ),
+    HubFacadeDecision::new(
+        "resize",
+        HubFacadeExposure::Exposed,
+        "explicit client terminal resize path through core mechanics",
+    ),
+    HubFacadeDecision::new(
         "inspect_session",
         HubFacadeExposure::Exposed,
         "host visibility over lifecycle and activity",
@@ -294,7 +328,15 @@ mod tests {
             .map(HubFacadeDecision::core_operation)
             .collect();
 
+        assert!(exposed.contains(&"PluginCapabilityRuntime::submit"));
+        assert!(exposed.contains(&"PluginCapabilityRuntime::drain_events"));
+        assert!(exposed.contains(&"PluginCapabilityRuntime::cleanup_plugin"));
         assert!(exposed.contains(&"list_sessions"));
+        assert!(exposed.contains(&"spawn_session"));
+        assert!(exposed.contains(&"attach_client"));
+        assert!(exposed.contains(&"detach_client"));
+        assert!(exposed.contains(&"write_bytes"));
+        assert!(exposed.contains(&"resize"));
         assert!(exposed.contains(&"inspect_session"));
         assert!(exposed.contains(&"read_screen"));
         assert!(exposed.contains(&"capture_snapshot"));

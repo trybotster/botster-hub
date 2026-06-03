@@ -303,6 +303,11 @@ fn hub_runtime_loads_and_invokes_enabled_plugin_package_through_core_worker() {
         .expect("load through hub runtime");
 
     assert_eq!(loaded, plugin_key(package_name));
+    let status = hub.plugin_lifecycle_status(&registry);
+    assert_eq!(status.len(), 1);
+    assert_eq!(status[0].package_name, package_name);
+    assert!(status[0].loaded);
+
     let outcome = hub.invoke_plugin(invocation("invoke-plugin", command.clone()));
     assert!(matches!(
         outcome.result,
