@@ -30,6 +30,7 @@
 
 pub mod auth;
 pub mod config;
+pub mod daemon;
 pub mod lifecycle;
 pub mod packages;
 pub mod persistence;
@@ -43,6 +44,9 @@ pub use config::{
     HostIdentityOptions, HubConfig, HubConfigError, HubStartupOptions, LocalSocketBinding,
     RuntimeEnvironment, SessionDefaults, SessionIoCoalescingOptions, TcpBinding, TransportBindings,
     build_default_config_for_runtime,
+};
+pub use daemon::{
+    HubDaemon, HubDaemonError, HubDaemonResult, HubDaemonState, HubDaemonStatus, HubStateLoadSource,
 };
 pub use lifecycle::{
     HubLifecycleError, HubLifecycleResult, HubPluginLifecycle, HubPluginRuntimeBundle,
