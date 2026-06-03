@@ -8,11 +8,14 @@
 use botster_core::{
     BotsterEngineObservation, BotsterEngineOutput, BotsterSpawnOutcome, ClientId, CoreSession,
     CoreSessionMetadata, DefaultBotsterEngine, DefaultBotsterEngineError, EngineSessionInspection,
-    MailboxSendFailureReason, PreparedSnapshotRequest, QueueSource, RequestId,
+    MailboxSendFailureReason, PluginCleanupResult, PluginInvocationOutcome,
+    PluginInvocationRequest, PluginKey, PreparedSnapshotRequest, QueueSource, RequestId,
     SessionActivityStatus, SessionId, SessionSpawnRequest, SubscriptionId,
 };
 
 use crate::config::HubConfig;
+use crate::lifecycle::{HubLifecycleResult, HubPluginLifecycle, HubPluginRuntimeBundle};
+use crate::packages::PackageRegistry;
 
 /// Hub-owned adapter and policy facade over the default local core engine.
 ///
@@ -23,6 +26,7 @@ use crate::config::HubConfig;
 pub struct HubRuntime {
     config: HubConfig,
     engine: DefaultBotsterEngine,
+    plugin_lifecycle: HubPluginLifecycle,
 }
 
 impl HubRuntime {
@@ -32,6 +36,7 @@ impl HubRuntime {
         Self {
             config,
             engine: DefaultBotsterEngine::new(),
+            plugin_lifecycle: HubPluginLifecycle::new(),
         }
     }
 
@@ -39,6 +44,46 @@ impl HubRuntime {
     #[must_use]
     pub const fn config(&self) -> &HubConfig {
         &self.config
+    }
+
+    /// Load an enabled package through core plugin worker mechanics.
+    pub fn load_plugin_package(
+        &mut self,
+        registry: &PackageRegistry,
+        package_name: &str,
+        bundle: HubPluginRuntimeBundle,
+    ) -> HubLifecycleResult<PluginKey> {
+        self.plugin_lifecycle
+            .load_package(registry, package_name, bundle)
+    }
+
+    /// Invoke a plugin handler through core plugin worker mechanics.
+    #[must_use]
+    pub fn invoke_plugin(&self, request: PluginInvocationRequest) -> PluginInvocationOutcome {
+        self.plugin_lifecycle.invoke(request)
+    }
+
+    /// Reload an enabled package through core plugin worker cleanup and replacement.
+    pub fn reload_plugin_package(
+        &mut self,
+        request_id: RequestId,
+        registry: &PackageRegistry,
+        package_name: &str,
+        bundle: HubPluginRuntimeBundle,
+    ) -> HubLifecycleResult<PluginCleanupResult> {
+        self.plugin_lifecycle
+            .reload_package(request_id, registry, package_name, bundle)
+    }
+
+    /// Unload a plugin package through core plugin worker cleanup mechanics.
+    #[must_use]
+    pub fn unload_plugin_package(
+        &mut self,
+        request_id: RequestId,
+        package_name: &str,
+    ) -> PluginCleanupResult {
+        self.plugin_lifecycle
+            .unload_package(request_id, package_name)
     }
 
     /// Return a recorded core session.

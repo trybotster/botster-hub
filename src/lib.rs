@@ -24,6 +24,7 @@
 
 pub mod auth;
 pub mod config;
+pub mod lifecycle;
 pub mod packages;
 pub mod persistence;
 pub mod profile;
@@ -36,6 +37,9 @@ pub use config::{
     HostIdentityOptions, HubConfig, HubConfigError, HubStartupOptions, LocalSocketBinding,
     RuntimeEnvironment, SessionDefaults, SessionIoCoalescingOptions, TcpBinding, TransportBindings,
     build_default_config_for_runtime,
+};
+pub use lifecycle::{
+    HubLifecycleError, HubLifecycleResult, HubPluginLifecycle, HubPluginRuntimeBundle,
 };
 pub use packages::{
     PackageAction, PackageClassification, PackageDecision, PackagePin, PackagePolicyReason,
@@ -133,6 +137,26 @@ impl HubFacadeDecision {
 }
 
 const HUB_FACADE_DECISIONS: &[HubFacadeDecision] = &[
+    HubFacadeDecision::new(
+        "PluginWorkerEngine::load_plugin",
+        HubFacadeExposure::Exposed,
+        "enabled hub package records are registered through core worker lifecycle",
+    ),
+    HubFacadeDecision::new(
+        "PluginWorkerEngine::invoke",
+        HubFacadeExposure::Exposed,
+        "plugin handlers dispatch through core worker capability and timeout enforcement",
+    ),
+    HubFacadeDecision::new(
+        "PluginWorkerEngine::reload_plugin",
+        HubFacadeExposure::Exposed,
+        "plugin reload cleanup and replacement stay in core worker mechanics",
+    ),
+    HubFacadeDecision::new(
+        "PluginWorkerEngine::unload_plugin",
+        HubFacadeExposure::Exposed,
+        "plugin unload cleanup stays scoped by core worker ownership",
+    ),
     HubFacadeDecision::new(
         "execute_command(DefaultEngineCommand)",
         HubFacadeExposure::Hidden,

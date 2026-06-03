@@ -67,6 +67,7 @@ src/config.rs              hub-owned config policy seam
 src/persistence.rs         hub-owned persistence policy seam
 src/auth.rs                hub-owned auth hook seam
 src/packages.rs            hub package policy over core package contracts
+src/lifecycle.rs           hub package lifecycle adapter over core plugin workers
 src/runtime.rs             hub runtime facade over botster-core
 ```
 
@@ -130,10 +131,12 @@ manifest/admission preconditions while hub owns install, enable, disable, pin,
 grant, provenance, update, and audit policy.
 
 This is the policy gate future package lifecycle loading should call before
-starting plugin/provider execution through core APIs. It is intentionally
-in-memory in this ticket: persistence belongs under `PersistenceBucket::PackageState`,
-and marketplace browsing, git cloning/fetching, network download, lockfile file
-formats, and lifecycle load/unload wiring remain excluded.
+starting plugin/provider execution through core APIs. The hub runtime now loads,
+invokes, reloads, and unloads enabled in-memory package records through
+`botster-core` plugin worker mechanics, with host-supplied deterministic runtime
+bundles. Persistence belongs under `PersistenceBucket::PackageState`, and
+marketplace browsing, git cloning/fetching, network download, lockfile file
+formats, and concrete plugin/provider runtime implementations remain excluded.
 
 This repo is intentionally greenfield. The existing `trybotster` monolith is
 evidence only, not source to copy.
