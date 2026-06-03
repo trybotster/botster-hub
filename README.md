@@ -64,6 +64,7 @@ src/lib.rs                 public facade over runtime and profile metadata
 src/profile.rs             first-party host profile manifest and policy metadata
 src/main.rs                thin binary smoke path through the profile facade
 src/config.rs              hub-owned config policy seam
+src/daemon.rs              deterministic local daemon lifecycle over runtime/state
 src/persistence.rs         hub-owned persistence policy seam
 src/auth.rs                hub-owned auth hook seam
 src/packages.rs            hub package policy over core package contracts
@@ -93,13 +94,27 @@ capability grants, package admission decisions, enabled/disabled/pinned state,
 provenance/checksum/update policy fields, local runtime settings, and audit
 history.
 
-The production binary boot path and `run-one` smoke path both build
-`HubRuntime` through `HubRuntime::load`, so runtime construction crosses the
-storage boundary before core engine operations start. `HubRuntime::new` remains
-available for tests and explicit in-memory construction. V1 production wiring
-loads or initializes local state; registry/grant/admission mutation saves are
-covered by storage-boundary tests and await the operator/package-manager
-commands that will call `HubStateStore::update`.
+The durable local startup path is explicit:
+
+```sh
+cargo run -- start --data-dir target/botster-hub-daemon-smoke-data
+```
+
+`start --data-dir` constructs `HubDaemon`, loads or initializes
+`hub-state.json`, restores package/provider policy records through
+`PackageRegistrySnapshot` admission, initializes `HubRuntime` through the
+default core engine facade, prints deterministic scrubbed status, and stops
+cleanly. Future transports, provider runtimes, sockets, and supervisors should
+attach after this lifecycle object has started; they should not recreate config
+or durable state ownership.
+
+The no-arg binary path is a side-effect-light host-profile summary. It builds
+resolved config and an in-memory `HubRuntime::new` summary only; it does not
+load or save `hub-state.json` through HOME/XDG fallback paths. `run-one` remains
+an explicit-data-dir runtime smoke path through `HubRuntime::load`. Registry,
+grant, and admission mutation saves are covered by storage-boundary tests and
+await the operator/package-manager commands that will call
+`HubStateStore::update`.
 
 Schema and consistency posture are documented in
 [`docs/adr/durable-hub-state-v1.md`](docs/adr/durable-hub-state-v1.md).
