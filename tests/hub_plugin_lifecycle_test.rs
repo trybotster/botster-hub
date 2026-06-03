@@ -1,3 +1,5 @@
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use botster_core::{
@@ -10,8 +12,9 @@ use botster_core::{
     PluginResourceKind, PluginResourceRef, PluginRuntime, RequestId,
 };
 use botster_hub::{
-    DataDirectoryOption, HostIdentityOptions, HubLifecycleError, HubPluginRuntimeBundle,
-    HubRuntime, HubStartupOptions, PackageProvenance, PackageRegistry, RuntimeEnvironment,
+    DataDirectoryOption, FileHubStateStore, HostIdentityOptions, HubLifecycleError,
+    HubPluginRuntimeBundle, HubRuntime, HubStartupOptions, HubStateStore,
+    LOCAL_PACKAGE_MANIFEST_FILE, PackageProvenance, PackageRegistry, RuntimeEnvironment,
     SessionDefaults, TransportBindings,
 };
 
@@ -138,6 +141,12 @@ fn plugin_manifest(name: &str, capabilities: Vec<Capability>) -> PackageManifest
     }
 }
 
+fn local_plugin_manifest(name: &str, capabilities: Vec<Capability>) -> PackageManifest {
+    let mut manifest = plugin_manifest(name, capabilities);
+    manifest.source = None;
+    manifest
+}
+
 fn provider_manifest(name: &str, capabilities: Vec<Capability>) -> PackageManifest {
     PackageManifest {
         name: name.to_string(),
@@ -239,6 +248,26 @@ fn invocation(request_id: &str, handler: PluginHandlerRef) -> PluginInvocationRe
     }
 }
 
+fn test_root(name: &str) -> PathBuf {
+    let root = PathBuf::from("target")
+        .join("botster-hub-test-data")
+        .join(name);
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).expect("create integration test root");
+    root.canonicalize()
+        .expect("canonical integration test root")
+}
+
+fn write_local_manifest(package_root: &Path, manifest: &PackageManifest) -> PathBuf {
+    let manifest_path = package_root.join(LOCAL_PACKAGE_MANIFEST_FILE);
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(manifest).expect("serialize local manifest"),
+    )
+    .expect("write local manifest");
+    manifest_path
+}
+
 #[test]
 fn hub_runtime_loads_and_invokes_enabled_plugin_package_through_core_worker() {
     let package_name = "workflow.plugin";
@@ -280,6 +309,88 @@ fn hub_runtime_loads_and_invokes_enabled_plugin_package_through_core_worker() {
     assert!(status[0].loaded);
 
     let outcome = hub.invoke_plugin(invocation("invoke-plugin", command.clone()));
+    assert!(matches!(
+        outcome.result,
+        PluginInvocationResult::Completed(PluginInvocationSuccess { handler, .. }) if handler == command
+    ));
+    assert_eq!(runtime.invocations().len(), 1);
+}
+
+#[test]
+fn local_package_install_persist_enable_prepare_and_load_crosses_core_worker() {
+    let package_name = "local.workflow.plugin";
+    let surface = capability(CapabilitySurface::Surfaces, None);
+    let root = test_root("local-package-runtime-path");
+    let data_root = root.join("data");
+    let package_root = root.join("package");
+    fs::create_dir_all(&package_root).expect("create package root");
+    fs::write(package_root.join("plugin.lua"), "-- synthetic plugin").expect("write plugin");
+    write_local_manifest(
+        &package_root,
+        &local_plugin_manifest(package_name, vec![surface.clone()]),
+    );
+    let mut installed_registry = registry_with_grants(vec![surface.clone()]);
+    installed_registry
+        .install_local_path(&package_root, "install local package")
+        .expect("install local package");
+    let config = HubStartupOptions {
+        data_directory: DataDirectoryOption::Explicit(data_root),
+        ..HubStartupOptions::default()
+    }
+    .build_config_for_environment(&RuntimeEnvironment::from_values(None, None, None))
+    .expect("explicit state config should build");
+    let store = FileHubStateStore::for_data_directory(&config.data_directory);
+    let state = store
+        .update(&config, |state| {
+            state.package_registry = installed_registry.snapshot();
+        })
+        .expect("save local package registry through hub state");
+    let mut registry = PackageRegistry::from_snapshot(state.package_registry)
+        .expect("load local package registry from hub state");
+    registry
+        .enable(package_name, "enable local package")
+        .expect("enable local package");
+    let prepared = registry
+        .prepare_local_package(package_name, "prepare local package")
+        .expect("prepare local package");
+    assert_eq!(prepared.package_name, package_name);
+    assert_eq!(prepared.selected_entrypoint.path, "plugin.lua");
+    assert_eq!(
+        prepared.selected_entrypoint_path,
+        package_root
+            .join("plugin.lua")
+            .canonicalize()
+            .expect("canonical plugin")
+    );
+    let command = handler(package_name, "advance");
+    let runtime = FakeRuntime::new("local-ok");
+    let mut hub = explicit_runtime();
+
+    let loaded = hub
+        .load_plugin_package(
+            &registry,
+            package_name,
+            HubPluginRuntimeBundle {
+                entrypoint: Some(
+                    prepared
+                        .selected_entrypoint_path
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+                ..bundle(
+                    package_name,
+                    runtime.clone(),
+                    command.clone(),
+                    Some(surface),
+                    "advance",
+                    "mcp-tool",
+                )
+            },
+        )
+        .expect("load prepared local package through hub runtime");
+
+    assert_eq!(loaded, plugin_key(package_name));
+    let outcome = hub.invoke_plugin(invocation("invoke-local-plugin", command.clone()));
     assert!(matches!(
         outcome.result,
         PluginInvocationResult::Completed(PluginInvocationSuccess { handler, .. }) if handler == command
