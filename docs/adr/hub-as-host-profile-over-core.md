@@ -55,6 +55,15 @@ first-party does not mean core. First-party packages should still declare
 capabilities and provenance so they can later be pinned, audited, disabled,
 updated, or replaced through the same package policy as user-installed packages.
 
+`PackageRegistry` is the concrete hub-owned policy gate for that package layer
+in the current scaffold. It stores records around `botster_core::PackageManifest`
+values, keeps hub-owned enabled/disabled/pin/provenance/update metadata, compares
+requested `Capability` values against hub-owned grants, and delegates privileged
+provider host-profile admission to `botster_core::admit_host_profile`. Future
+package lifecycle loading should call this registry before executing plugin or
+provider code; this ADR does not make the registry a marketplace fetcher,
+lockfile persistence layer, or lifecycle runtime.
+
 ## Startup Ownership
 
 Startup proceeds in this order:
