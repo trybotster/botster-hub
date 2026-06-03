@@ -20,6 +20,12 @@
 //!
 //! let registry = botster_hub::PackageRegistry::new(botster_core::CapabilitySet::new());
 //! assert!(registry.packages().is_empty());
+//!
+//! let policy = botster_hub::default_package_policy();
+//! assert_eq!(
+//!     policy.registry().granted_capabilities().len(),
+//!     profile.default_capability_grants().len()
+//! );
 //! ```
 
 pub mod auth;
@@ -38,9 +44,10 @@ pub use config::{
     build_default_config_for_runtime,
 };
 pub use packages::{
-    PackageAction, PackageClassification, PackageDecision, PackagePin, PackagePolicyReason,
-    PackageProvenance, PackageRecord, PackageRegistry, PackageRegistryError, PackageRegistryResult,
-    PackageState, PackageUpdatePolicy,
+    PackageAction, PackageAdmissionPolicy, PackageAdmissionReason, PackageClassification,
+    PackageDecision, PackagePin, PackageProvenance, PackageRecord, PackageRegistry,
+    PackageRegistryError, PackageRegistryResult, PackageState, PackageUpdatePolicy,
+    default_package_policy,
 };
 pub use profile::{
     CoreRuntimeRole, HostProfileManifest, HostProfileTrust, PolicyArea, Responsibility,
