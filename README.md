@@ -187,11 +187,11 @@ This is the policy gate future package lifecycle loading should call before
 starting plugin/provider execution through core APIs. The hub runtime now loads,
 invokes, reloads, and unloads enabled in-memory package records through
 `botster-core` plugin worker mechanics, with host-supplied deterministic runtime
-bundles. Package records persist under `PersistenceBucket::PackageState` as
-`package-state.json` below the configured hub data directory. Marketplace
-browsing, git cloning/fetching, network download, lockfile formats, binary/CLI
-package-install commands, and concrete plugin/provider runtime implementations
-remain excluded.
+bundles. Package records persist through the canonical `HubState.package_registry`
+snapshot inside `hub-state.json`; there is no separate package-state file for the
+registry. Marketplace browsing, git cloning/fetching, network download, lockfile
+formats, binary/CLI package-install commands, and concrete plugin/provider
+runtime implementations remain excluded.
 
 This repo is intentionally greenfield. The existing `trybotster` monolith is
 evidence only, not source to copy.

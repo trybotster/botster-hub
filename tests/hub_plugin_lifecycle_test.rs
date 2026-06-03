@@ -12,9 +12,10 @@ use botster_core::{
     PluginResourceKind, PluginResourceRef, PluginRuntime, RequestId,
 };
 use botster_hub::{
-    DataDirectoryOption, HostIdentityOptions, HubLifecycleError, HubPluginRuntimeBundle,
-    HubRuntime, HubStartupOptions, LOCAL_PACKAGE_MANIFEST_FILE, PackageProvenance, PackageRegistry,
-    RuntimeEnvironment, SessionDefaults, TransportBindings,
+    DataDirectoryOption, FileHubStateStore, HostIdentityOptions, HubLifecycleError,
+    HubPluginRuntimeBundle, HubRuntime, HubStartupOptions, HubStateStore,
+    LOCAL_PACKAGE_MANIFEST_FILE, PackageProvenance, PackageRegistry, RuntimeEnvironment,
+    SessionDefaults, TransportBindings,
 };
 
 #[derive(Clone)]
@@ -327,13 +328,20 @@ fn local_package_install_persist_enable_prepare_and_load_crosses_core_worker() {
     installed_registry
         .install_local_path(&package_root, "install local package")
         .expect("install local package");
-    installed_registry
-        .save_to_data_directory(&data_root)
-        .expect("save local package registry");
-    let mut registry = registry_with_grants(vec![surface.clone()]);
-    registry
-        .load_from_data_directory(&data_root, "load local package registry")
-        .expect("load local package registry");
+    let config = HubStartupOptions {
+        data_directory: DataDirectoryOption::Explicit(data_root),
+        ..HubStartupOptions::default()
+    }
+    .build_config_for_environment(&RuntimeEnvironment::from_values(None, None, None))
+    .expect("explicit state config should build");
+    let store = FileHubStateStore::for_data_directory(&config.data_directory);
+    let state = store
+        .update(&config, |state| {
+            state.package_registry = installed_registry.snapshot();
+        })
+        .expect("save local package registry through hub state");
+    let mut registry = PackageRegistry::from_snapshot(state.package_registry)
+        .expect("load local package registry from hub state");
     registry
         .enable(package_name, "enable local package")
         .expect("enable local package");

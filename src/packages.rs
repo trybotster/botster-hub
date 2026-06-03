@@ -16,7 +16,6 @@ use botster_core::{
 use serde::{Deserialize, Serialize};
 
 use crate::host_profile;
-use crate::persistence::PersistenceBucket;
 
 /// Conventional manifest filename used when installing a local package directory.
 pub const LOCAL_PACKAGE_MANIFEST_FILE: &str = "botster-package.json";
@@ -79,21 +78,6 @@ impl PackageAdmissionPolicy {
         audit_reason: impl Into<String>,
     ) -> PackageRegistryResult<PackageDecision> {
         self.registry.enable(package_name, audit_reason)
-    }
-
-    /// Persist package registry state under this hub data directory.
-    pub fn save_to_data_directory(&self, data_directory: &Path) -> PackageRegistryResult<()> {
-        self.registry.save_to_data_directory(data_directory)
-    }
-
-    /// Replace in-memory records from package registry state under this hub data directory.
-    pub fn load_from_data_directory(
-        &mut self,
-        data_directory: &Path,
-        audit_reason: impl Into<String>,
-    ) -> PackageRegistryResult<()> {
-        self.registry
-            .load_from_data_directory(data_directory, audit_reason)
     }
 }
 
@@ -366,79 +350,6 @@ impl PackageRegistry {
         })
     }
 
-    /// Persist package registry records under the hub data directory.
-    pub fn save_to_data_directory(&self, data_directory: &Path) -> PackageRegistryResult<()> {
-        let path = PersistenceBucket::PackageState.path_under(data_directory);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|error| {
-                PackageRegistryError::persistence(
-                    PackageAction::Persist,
-                    PackageAdmissionReason::PersistenceWrite(error.to_string()),
-                    "save package state",
-                )
-            })?;
-        }
-
-        let state = self.snapshot();
-        let json = serde_json::to_vec_pretty(&state).map_err(|error| {
-            PackageRegistryError::persistence(
-                PackageAction::Persist,
-                PackageAdmissionReason::PersistenceWrite(error.to_string()),
-                "serialize package state",
-            )
-        })?;
-        fs::write(path, json).map_err(|error| {
-            PackageRegistryError::persistence(
-                PackageAction::Persist,
-                PackageAdmissionReason::PersistenceWrite(error.to_string()),
-                "write package state",
-            )
-        })
-    }
-
-    /// Replace package records from package registry state under the hub data directory.
-    ///
-    /// Loading is all-or-nothing and fail-closed: if any persisted record can no
-    /// longer reconstruct its admitted host profile, no records are replaced.
-    /// Per-record recovery or quarantine is intentionally deferred to the
-    /// operator-facing lifecycle wiring that will report those decisions.
-    pub fn load_from_data_directory(
-        &mut self,
-        data_directory: &Path,
-        audit_reason: impl Into<String>,
-    ) -> PackageRegistryResult<()> {
-        let audit_reason = audit_reason.into();
-        let path = PersistenceBucket::PackageState.path_under(data_directory);
-        if !path.exists() {
-            self.records.clear();
-            return Ok(());
-        }
-
-        let json = fs::read(path).map_err(|error| {
-            PackageRegistryError::persistence(
-                PackageAction::Persist,
-                PackageAdmissionReason::PersistenceRead(error.to_string()),
-                audit_reason.clone(),
-            )
-        })?;
-        let snapshot: PackageRegistrySnapshot = serde_json::from_slice(&json).map_err(|error| {
-            PackageRegistryError::persistence(
-                PackageAction::Persist,
-                PackageAdmissionReason::PersistenceRead(error.to_string()),
-                audit_reason.clone(),
-            )
-        })?;
-
-        *self = Self::from_snapshot(snapshot).map_err(|error| {
-            PackageRegistryError::persistence(
-                PackageAction::Persist,
-                PackageAdmissionReason::InvalidSnapshot(error),
-                audit_reason,
-            )
-        })?;
-        Ok(())
-    }
-
     /// Prepare enabled local packages for core lifecycle wiring.
     pub fn prepare_enabled_local_packages(
         &self,
@@ -653,7 +564,6 @@ pub enum PackageAction {
     Enable,
     Disable,
     Pin,
-    Persist,
     Prepare,
 }
 
@@ -771,12 +681,6 @@ pub enum PackageAdmissionReason {
     InvalidLocalManifest(String),
     /// Local package entrypoint was absent or unsafe.
     UnsafeEntrypoint(String),
-    /// Durable package state could not be read.
-    PersistenceRead(String),
-    /// Durable package state could not be written.
-    PersistenceWrite(String),
-    /// Durable package state was internally inconsistent or no longer admits.
-    InvalidSnapshot(PackageRegistrySnapshotError),
     /// Capability surface is not governed by the current host profile.
     UngovernedCapabilitySurface(CapabilitySurface),
     /// Manifest requested a capability not present in the hub-owned grant set.
@@ -785,16 +689,6 @@ pub enum PackageAdmissionReason {
     ProviderMissingHostProfile,
     /// Core host-profile admission rejected the provider package.
     HostProfileAdmission(HostProfileAdmissionError),
-}
-
-impl PackageRegistryError {
-    fn persistence(
-        action: PackageAction,
-        reason: PackageAdmissionReason,
-        audit_reason: impl Into<String>,
-    ) -> Self {
-        Self::without_record("<package-state>", action, reason, audit_reason.into())
-    }
 }
 
 fn admit_enabled_host_profile(
@@ -1061,6 +955,9 @@ mod tests {
     };
     use std::fs;
     use std::path::{Path, PathBuf};
+
+    use crate::config::{DataDirectoryOption, HubStartupOptions, RuntimeEnvironment};
+    use crate::persistence::{FileHubStateStore, HubStateStore};
 
     fn capability(surface: CapabilitySurface, scope: Option<&str>) -> Capability {
         Capability {
@@ -1566,13 +1463,20 @@ mod tests {
             .profile_id
             .clone();
 
-        registry
-            .save_to_data_directory(&data_root)
-            .expect("save package state");
-        let mut loaded = PackageRegistry::new(registry.granted_capabilities().clone());
-        loaded
-            .load_from_data_directory(&data_root, "load package state")
-            .expect("load package state");
+        let config = HubStartupOptions {
+            data_directory: DataDirectoryOption::Explicit(data_root),
+            ..HubStartupOptions::default()
+        }
+        .build_config_for_environment(&RuntimeEnvironment::from_values(None, None, None))
+        .expect("explicit state config should build");
+        let store = FileHubStateStore::for_data_directory(&config.data_directory);
+        let state = store
+            .update(&config, |state| {
+                state.package_registry = registry.snapshot();
+            })
+            .expect("save package state through hub state");
+        let loaded = PackageRegistry::from_snapshot(state.package_registry)
+            .expect("load package state from hub state");
 
         let local_record = loaded.package("durable.plugin").expect("local record");
         assert_eq!(local_record.state, PackageState::Enabled);
