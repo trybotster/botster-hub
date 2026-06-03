@@ -50,8 +50,13 @@ pub use lifecycle::{
 pub use packages::{
     PackageAction, PackageAdmissionPolicy, PackageAdmissionReason, PackageClassification,
     PackageDecision, PackagePin, PackageProvenance, PackageRecord, PackageRegistry,
-    PackageRegistryError, PackageRegistryResult, PackageState, PackageUpdatePolicy,
-    default_package_policy,
+    PackageRegistryError, PackageRegistryResult, PackageRegistrySnapshot,
+    PackageRegistrySnapshotError, PackageState, PackageUpdatePolicy, default_package_policy,
+};
+pub use persistence::{
+    CapabilityGrantRecord, FileHubStateStore, HubAuditEntry, HubState, HubStateError,
+    HubStateResult, HubStateStore, HubStateStoreError, HubStateStoreResult, LocalRuntimeSettings,
+    PackageAdmissionDecision, SchemaMetadata,
 };
 pub use profile::{
     CoreRuntimeRole, HostProfileManifest, HostProfileTrust, PolicyArea, Responsibility,
