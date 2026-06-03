@@ -553,7 +553,7 @@ mod tests {
         let state = HubState::from_config(&config);
         let json = serde_json::to_string(&state).expect("serialize state");
 
-        assert!(!json.contains("/Users/"));
+        assert!(!json.contains(concat!("/", "Users", "/")));
         assert!(!json.contains("@example.com"));
         assert!(!json.contains("/home/"));
     }

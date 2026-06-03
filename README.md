@@ -56,6 +56,33 @@ contracts, not a hub replacement for `TransportIngress`, `TransportEgress`,
 | `report_backpressure` | Exposed | Typed pressure evidence without hub-owned retry policy. |
 | `report_delivery_lag` | Exposed | Typed slow-delivery evidence without hub-owned retry policy. |
 | `report_delivery_failure` | Exposed | Typed failed-delivery evidence without hub-owned retry policy. |
+| `PluginCapabilityRuntime::submit` | Exposed | Hub owns concrete local capability policy and submits through core request contracts. |
+| `PluginCapabilityRuntime::drain_events` | Exposed | Plugin capability completions and timer events are drained through a hub-owned path. |
+| `PluginCapabilityRuntime::cleanup_plugin` | Exposed | Capability resources are released during hub plugin reload and unload. |
+
+## Local capability runtimes
+
+`HubRuntime` owns the local concrete capability adapter for dogfood plugins. It
+accepts `botster-core` `CapabilityRuntimeRequest` values through
+`submit_capability_request`, returns core `CapabilityRuntimeHandle` values, and
+drains core `CapabilityRuntimeEvent` values through `drain_capability_events`.
+The hub adapter implements scoped filesystem operations, plugin JSON store
+operations, logical timers, bounded HTTP stubs, and core's in-memory WebSocket
+runtime. It does not add product cloud, public WebRTC, webhook, OAuth, Rails, or
+external API behavior.
+
+Filesystem access is rooted under the explicit hub data directory at
+`capability-scopes/workspace`. Plugin store data is rooted under
+`plugin-data/<plugin>/`, with `project-pipelines` as the first dogfood namespace
+grant. Runtime data must not be written under plugin source directories.
+Capability grants are scoped to match core request requirements exactly:
+`Network:http`, `Network:websocket`, `Filesystem:workspace`,
+`PluginDb:project-pipelines`, and `Timers:callbacks`.
+
+Filesystem and plugin-store work is accepted through the hub capability path and
+completed on runtime-owned worker threads. Plugin unload and reload call
+capability cleanup in addition to core plugin worker cleanup so timer and network
+resources do not survive replacement.
 
 ## Crate layout
 
@@ -69,6 +96,7 @@ src/persistence.rs         hub-owned persistence policy seam
 src/auth.rs                hub-owned auth hook seam
 src/packages.rs            hub package policy over core package contracts
 src/lifecycle.rs           hub package lifecycle adapter over core plugin workers
+src/capabilities.rs        hub-owned local capability runtime policy
 src/runtime.rs             hub runtime facade over botster-core
 ```
 
