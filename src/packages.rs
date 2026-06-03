@@ -584,7 +584,7 @@ impl PackageRegistrySnapshot {
     #[must_use]
     pub fn empty() -> Self {
         Self {
-            granted_capabilities: Vec::new(),
+            granted_capabilities: host_profile().default_capability_grants().to_vec(),
             governed_surfaces: host_profile().capability_surfaces().to_vec(),
             records: Vec::new(),
         }
