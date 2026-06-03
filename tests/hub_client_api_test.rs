@@ -199,6 +199,42 @@ fn drain_events_until(
     );
 }
 
+fn drain_events_for(
+    api: &HubClientApi,
+    runtime: &mut HubRuntime,
+    packages: &PackageRegistry,
+    session_id: &SessionId,
+    logical_clock: &mut u64,
+    duration: Duration,
+) -> Vec<HubClientEvent> {
+    let deadline = Instant::now() + duration;
+    let mut observed = Vec::new();
+
+    while Instant::now() < deadline {
+        let response = api
+            .handle_request(
+                runtime,
+                packages,
+                HubClientRequest::DrainRuntime {
+                    request_id: request_id("drain-extra"),
+                    session_id: session_id.clone(),
+                    last_output_at: *logical_clock,
+                },
+            )
+            .expect("extra drain through client api");
+        *logical_clock += 1;
+
+        let HubClientResponseBody::Events(events) = response.body else {
+            panic!("drain should return events");
+        };
+        observed.extend(events);
+
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    observed
+}
+
 #[test]
 fn local_client_api_exercises_status_spawn_attach_input_resize_detach_shutdown_and_events() {
     let api = HubClientApi::local_operator("local-client-api-test");
@@ -403,21 +439,32 @@ fn local_client_api_exercises_status_spawn_attach_input_resize_detach_shutdown_a
         b"echo:after-detach",
         &mut logical_clock,
     );
+    let extra_after_detach_events = drain_events_for(
+        &second_api,
+        &mut runtime,
+        &packages,
+        &session_id,
+        &mut logical_clock,
+        Duration::from_millis(200),
+    );
     assert!(
-        after_detach_events.iter().all(|event| {
-            !matches!(
-                event,
-                HubClientEvent::TerminalOutput {
-                    subscription_id: observed_subscription_id,
-                    data,
-                    ..
-                } if observed_subscription_id == &subscription_id
-                    && data
-                        .windows(b"echo:after-detach".len())
-                        .any(|window| window == b"echo:after-detach")
-            )
-        }),
-        "detached subscription should not receive later output"
+        after_detach_events
+            .iter()
+            .chain(extra_after_detach_events.iter())
+            .all(|event| {
+                !matches!(
+                    event,
+                    HubClientEvent::TerminalOutput {
+                        subscription_id: observed_subscription_id,
+                        data,
+                        ..
+                    } if observed_subscription_id == &subscription_id
+                        && data
+                            .windows(b"echo:after-detach".len())
+                            .any(|window| window == b"echo:after-detach")
+                )
+            }),
+        "detached subscription should not receive later output, including after an extra drain window"
     );
 
     let shutdown = second_api
@@ -545,6 +592,28 @@ fn denied_client_request_returns_typed_admission_error() {
         HubClientError::AdmissionDenied {
             request_id: request_id("denied-status"),
             operation: HubClientOperation::Status,
+            role: HubClientRole::Unadmitted,
+        }
+    );
+
+    let error = api
+        .handle_request(
+            &mut runtime,
+            &packages,
+            HubClientRequest::Shutdown {
+                request_id: request_id("denied-shutdown"),
+                session_id: session_id(),
+                reason: "denied".to_string(),
+                now_seconds: 1,
+            },
+        )
+        .expect_err("denied client should not shut down sessions");
+
+    assert_eq!(
+        error,
+        HubClientError::AdmissionDenied {
+            request_id: request_id("denied-shutdown"),
+            operation: HubClientOperation::Shutdown,
             role: HubClientRole::Unadmitted,
         }
     );
