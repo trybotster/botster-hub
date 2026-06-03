@@ -5,9 +5,9 @@ use std::time::{Duration, Instant};
 
 use botster_core::{
     BotsterEngineObservation, ClientId, CoreSessionMetadata, MailboxSendFailureReason,
-    PreparedSnapshotRequest, QueueSource, RequestId, ResizePayload, SessionActivityStatus,
-    SessionId, SessionLifecycleState, SessionSpawnRequest, SpawnEnvironment, SpawnWorkingDirectory,
-    SubscriptionId, TransportEgress,
+    ManagedSessionRuntimeError, PreparedSnapshotRequest, QueueSource, RequestId, ResizePayload,
+    SessionActivityStatus, SessionId, SessionLifecycleState, SessionRuntimeErrorKind,
+    SessionSpawnRequest, SpawnEnvironment, SpawnWorkingDirectory, SubscriptionId, TransportEgress,
 };
 use botster_hub::{
     DataDirectoryOption, FileHubStateStore, HostIdentityOptions, HubRuntime, HubRuntimeError,
@@ -131,6 +131,31 @@ fn drain_until(
     );
 }
 
+fn assert_live_handle_removed(
+    runtime: &mut HubRuntime,
+    session_id: &SessionId,
+    logical_clock: &mut u64,
+) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+
+    while Instant::now() < deadline {
+        match runtime.drain_runtime_once(session_id, *logical_clock) {
+            Err(ManagedSessionRuntimeError::Runtime(error))
+                if error.kind == SessionRuntimeErrorKind::SessionNotFound =>
+            {
+                return;
+            }
+            Ok(_) => {
+                *logical_clock += 1;
+                thread::sleep(Duration::from_millis(20));
+            }
+            other => panic!("expected SessionNotFound live-handle cleanup signal, got {other:?}"),
+        }
+    }
+
+    panic!("timed out waiting for SessionNotFound live-handle cleanup signal");
+}
+
 #[test]
 fn hub_runtime_spawns_attaches_writes_reads_classifies_and_shuts_down_through_core() {
     let config = explicit_config();
@@ -228,6 +253,7 @@ fn hub_runtime_spawns_attaches_writes_reads_classifies_and_shuts_down_through_co
             .map(|session| &session.lifecycle),
         Some(SessionLifecycleState::Stopping)
     ));
+    assert_live_handle_removed(&mut runtime, &session_id, &mut logical_clock);
 }
 
 #[test]

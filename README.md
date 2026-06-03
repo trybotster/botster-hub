@@ -188,10 +188,16 @@ cargo run -- run-one --data-dir target/botster-hub-smoke-data -- /bin/sh -c "pri
 
 `run-one` requires an explicit `--data-dir`, builds hub config without falling
 back to user paths, then crosses `HubRuntime -> DefaultBotsterEngine` through
-spawn, attach, drain, marker observation, and shutdown. Its output is scrubbed
-to profile, host, session, marker, byte-count, and shutdown-observation facts so
-pipeline artifacts do not need local paths, environment dumps, keys, or
-fingerprints.
+spawn, attach, resize, drain, marker observation, detach, and shutdown. Its
+output is scrubbed to profile, host, session, marker, byte-count, detach, and
+shutdown-observation facts so pipeline artifacts do not need local paths,
+environment dumps, keys, or fingerprints.
+
+The in-process `HubClientApi` local dogfood workflow supports status, session
+list, spawn, attach, input, resize, drain/output events, shutdown, package
+queries, and plugin lifecycle status. Browser, TUI, socket, WebRTC, cloud, and
+daemon-supervised transports remain future adapters over this same local API;
+they are not implemented by the smoke command.
 
 ## Package registry policy
 
