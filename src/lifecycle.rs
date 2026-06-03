@@ -4,7 +4,8 @@
 //! adapter only refuses packages that are not currently enabled, then delegates
 //! load, invoke, reload, unload, and cleanup mechanics to `botster-core`.
 
-use std::sync::Arc;
+use std::collections::BTreeSet;
+use std::sync::{Arc, Mutex};
 
 use botster_core::{
     BoundaryJson, PluginCleanupResult, PluginCleanupScope, PluginHandlerRegistration,
@@ -13,12 +14,13 @@ use botster_core::{
     PluginWorkerEngine, PluginWorkerRegistration, RequestId,
 };
 
-use crate::packages::{PackageRecord, PackageRegistry};
+use crate::packages::{PackageClassification, PackageRecord, PackageRegistry, PackageState};
 
 /// Hub-owned lifecycle adapter around core plugin worker mechanics.
 #[derive(Clone, Default)]
 pub struct HubPluginLifecycle {
     engine: PluginWorkerEngine,
+    loaded: Arc<Mutex<BTreeSet<String>>>,
 }
 
 impl HubPluginLifecycle {
@@ -27,6 +29,7 @@ impl HubPluginLifecycle {
     pub fn new() -> Self {
         Self {
             engine: PluginWorkerEngine::new(),
+            loaded: Arc::new(Mutex::new(BTreeSet::new())),
         }
     }
 
@@ -42,6 +45,10 @@ impl HubPluginLifecycle {
         let registration = registration_for(record, plugin_key.clone(), bundle)?;
 
         self.engine.load_plugin(registration);
+        self.loaded
+            .lock()
+            .expect("hub plugin lifecycle loaded set lock")
+            .insert(plugin_key.0.clone());
 
         Ok(plugin_key)
     }
@@ -72,6 +79,10 @@ impl HubPluginLifecycle {
             },
             registration,
         );
+        self.loaded
+            .lock()
+            .expect("hub plugin lifecycle loaded set lock")
+            .insert(package_name.to_string());
 
         Ok(cleanup)
     }
@@ -80,12 +91,49 @@ impl HubPluginLifecycle {
     #[must_use]
     pub fn unload_package(&self, request_id: RequestId, package_name: &str) -> PluginCleanupResult {
         let plugin_key = PluginKey(package_name.to_string());
-        self.engine.unload_plugin(PluginUnloadSpec {
+        let cleanup = self.engine.unload_plugin(PluginUnloadSpec {
             request_id,
             plugin_key,
             cleanup: PluginCleanupScope::DescriptorsAndResources,
-        })
+        });
+        self.loaded
+            .lock()
+            .expect("hub plugin lifecycle loaded set lock")
+            .remove(package_name);
+        cleanup
     }
+
+    /// Return package-level lifecycle status without exposing core worker internals.
+    #[must_use]
+    pub fn status(&self, registry: &PackageRegistry) -> Vec<HubPluginLifecycleStatus> {
+        let loaded = self
+            .loaded
+            .lock()
+            .expect("hub plugin lifecycle loaded set lock")
+            .clone();
+
+        registry
+            .packages()
+            .into_iter()
+            .filter(|record| record.classification == PackageClassification::Plugin)
+            .map(|record| HubPluginLifecycleStatus {
+                package_name: record.manifest.name.clone(),
+                state: record.state,
+                loaded: loaded.contains(&record.manifest.name),
+            })
+            .collect()
+    }
+}
+
+/// Read-only plugin package lifecycle status visible to local clients.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HubPluginLifecycleStatus {
+    /// Package name from the hub package registry.
+    pub package_name: String,
+    /// Hub package policy state.
+    pub state: PackageState,
+    /// Whether this lifecycle adapter has loaded the package into a core worker.
+    pub loaded: bool,
 }
 
 /// Host-supplied executable runtime state for one package load.
