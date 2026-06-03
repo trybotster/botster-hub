@@ -36,15 +36,6 @@ pub enum PersistenceBucket {
     ProviderState,
 }
 
-impl PersistenceBucket {
-    /// Resolve the canonical aggregate file used by the hub state store.
-    #[must_use]
-    pub fn path_under(self, data_directory: &Path) -> PathBuf {
-        let _bucket = self;
-        data_directory.join(HUB_STATE_FILE_NAME)
-    }
-}
-
 /// Versioned durable hub state aggregate.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HubState {

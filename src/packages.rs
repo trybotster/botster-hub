@@ -398,7 +398,9 @@ impl PackageRegistry {
                     HostProfileAdmissionError::MissingMetadata
                 }
                 PackageAdmissionReason::HostProfileAdmission(error) => error,
-                _ => HostProfileAdmissionError::MissingMetadata,
+                other => unreachable!(
+                    "admit_enabled_host_profile returned unexpected package admission reason: {other:?}"
+                ),
             };
             PackageRegistrySnapshotError::HostProfileAdmission {
                 package_name: record.manifest.name.clone(),
