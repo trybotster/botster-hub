@@ -31,6 +31,7 @@
 pub mod auth;
 pub mod capabilities;
 pub mod config;
+pub mod daemon;
 pub mod lifecycle;
 pub mod packages;
 pub mod persistence;
@@ -46,14 +47,22 @@ pub use config::{
     RuntimeEnvironment, SessionDefaults, SessionIoCoalescingOptions, TcpBinding, TransportBindings,
     build_default_config_for_runtime,
 };
+pub use daemon::{
+    HubDaemon, HubDaemonError, HubDaemonResult, HubDaemonState, HubDaemonStatus, HubStateLoadSource,
+};
 pub use lifecycle::{
     HubLifecycleError, HubLifecycleResult, HubPluginLifecycle, HubPluginRuntimeBundle,
 };
 pub use packages::{
     PackageAction, PackageAdmissionPolicy, PackageAdmissionReason, PackageClassification,
     PackageDecision, PackagePin, PackageProvenance, PackageRecord, PackageRegistry,
-    PackageRegistryError, PackageRegistryResult, PackageState, PackageUpdatePolicy,
-    default_package_policy,
+    PackageRegistryError, PackageRegistryResult, PackageRegistrySnapshot,
+    PackageRegistrySnapshotError, PackageState, PackageUpdatePolicy, default_package_policy,
+};
+pub use persistence::{
+    CapabilityGrantRecord, FileHubStateStore, HubAuditEntry, HubState, HubStateError,
+    HubStateResult, HubStateStore, HubStateStoreError, HubStateStoreResult, LocalRuntimeSettings,
+    PackageAdmissionDecision, SchemaMetadata,
 };
 pub use profile::{
     CoreRuntimeRole, HostProfileManifest, HostProfileTrust, PolicyArea, Responsibility,

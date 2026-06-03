@@ -91,6 +91,7 @@ src/lib.rs                 public facade over runtime and profile metadata
 src/profile.rs             first-party host profile manifest and policy metadata
 src/main.rs                thin binary smoke path through the profile facade
 src/config.rs              hub-owned config policy seam
+src/daemon.rs              deterministic local daemon lifecycle over runtime/state
 src/persistence.rs         hub-owned persistence policy seam
 src/auth.rs                hub-owned auth hook seam
 src/packages.rs            hub package policy over core package contracts
@@ -108,7 +109,43 @@ not add a physical multi-crate split.
 This repo does not yet implement Rails, TryBotster Cloud, ActionCable, WebRTC,
 signaling servers, browser shells, API clients, OAuth/device-code flows,
 provider processes, persistence databases, plugin runtimes, marketplace fetches,
-package installers, or client transports.
+package installers, or client transports. The hub does include local file-backed
+durable state for dogfood; database-backed persistence and cloud sync remain
+excluded.
+
+## Durable hub state
+
+`FileHubStateStore` persists versioned local state at
+`<HubConfig.data_directory>/hub-state.json`. The v1 state model records host
+identity, config/schema metadata, package/provider registry snapshots,
+capability grants, package admission decisions, enabled/disabled/pinned state,
+provenance/checksum/update policy fields, local runtime settings, and audit
+history.
+
+The durable local startup path is explicit:
+
+```sh
+cargo run -- start --data-dir target/botster-hub-daemon-smoke-data
+```
+
+`start --data-dir` constructs `HubDaemon`, loads or initializes
+`hub-state.json`, restores package/provider policy records through
+`PackageRegistrySnapshot` admission, initializes `HubRuntime` through the
+default core engine facade, prints deterministic scrubbed status, and stops
+cleanly. Future transports, provider runtimes, sockets, and supervisors should
+attach after this lifecycle object has started; they should not recreate config
+or durable state ownership.
+
+The no-arg binary path is a side-effect-light host-profile summary. It builds
+resolved config and an in-memory `HubRuntime::new` summary only; it does not
+load or save `hub-state.json` through HOME/XDG fallback paths. `run-one` remains
+an explicit-data-dir runtime smoke path through `HubRuntime::load`. Registry,
+grant, and admission mutation saves are covered by storage-boundary tests and
+await the operator/package-manager commands that will call
+`HubStateStore::update`.
+
+Schema and consistency posture are documented in
+[`docs/adr/durable-hub-state-v1.md`](docs/adr/durable-hub-state-v1.md).
 
 ## Dependency policy
 
