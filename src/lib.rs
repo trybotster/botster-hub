@@ -20,10 +20,17 @@
 //!
 //! let registry = botster_hub::PackageRegistry::new(botster_core::CapabilitySet::new());
 //! assert!(registry.packages().is_empty());
+//!
+//! let policy = botster_hub::default_package_policy();
+//! assert_eq!(
+//!     policy.registry().granted_capabilities().len(),
+//!     profile.default_capability_grants().len()
+//! );
 //! ```
 
 pub mod auth;
 pub mod config;
+pub mod lifecycle;
 pub mod packages;
 pub mod persistence;
 pub mod profile;
@@ -37,10 +44,14 @@ pub use config::{
     RuntimeEnvironment, SessionDefaults, SessionIoCoalescingOptions, TcpBinding, TransportBindings,
     build_default_config_for_runtime,
 };
+pub use lifecycle::{
+    HubLifecycleError, HubLifecycleResult, HubPluginLifecycle, HubPluginRuntimeBundle,
+};
 pub use packages::{
-    PackageAction, PackageClassification, PackageDecision, PackagePin, PackagePolicyReason,
-    PackageProvenance, PackageRecord, PackageRegistry, PackageRegistryError, PackageRegistryResult,
-    PackageRegistrySnapshot, PackageRegistrySnapshotError, PackageState, PackageUpdatePolicy,
+    PackageAction, PackageAdmissionPolicy, PackageAdmissionReason, PackageClassification,
+    PackageDecision, PackagePin, PackageProvenance, PackageRecord, PackageRegistry,
+    PackageRegistryError, PackageRegistryResult, PackageRegistrySnapshot,
+    PackageRegistrySnapshotError, PackageState, PackageUpdatePolicy, default_package_policy,
 };
 pub use persistence::{
     CapabilityGrantRecord, FileHubStateStore, HubAuditEntry, HubState, HubStateError,
@@ -138,6 +149,26 @@ impl HubFacadeDecision {
 }
 
 const HUB_FACADE_DECISIONS: &[HubFacadeDecision] = &[
+    HubFacadeDecision::new(
+        "PluginWorkerEngine::load_plugin",
+        HubFacadeExposure::Exposed,
+        "enabled hub package records are registered through core worker lifecycle",
+    ),
+    HubFacadeDecision::new(
+        "PluginWorkerEngine::invoke",
+        HubFacadeExposure::Exposed,
+        "plugin handlers dispatch through core worker capability and timeout enforcement",
+    ),
+    HubFacadeDecision::new(
+        "PluginWorkerEngine::reload_plugin",
+        HubFacadeExposure::Exposed,
+        "plugin reload cleanup and replacement stay in core worker mechanics",
+    ),
+    HubFacadeDecision::new(
+        "PluginWorkerEngine::unload_plugin",
+        HubFacadeExposure::Exposed,
+        "plugin unload cleanup stays scoped by core worker ownership",
+    ),
     HubFacadeDecision::new(
         "execute_command(DefaultEngineCommand)",
         HubFacadeExposure::Hidden,

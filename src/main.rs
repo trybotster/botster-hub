@@ -11,7 +11,7 @@ use botster_core::{
 };
 use botster_hub::{
     DataDirectoryOption, HubRuntime, HubStartupOptions, RuntimeEnvironment, SessionDefaults,
-    TransportBindings, build_default_config_for_runtime, host_profile,
+    TransportBindings, build_default_config_for_runtime, default_package_policy, host_profile,
 };
 
 const SMOKE_MARKER: &str = "botster-hub-smoke-ok";
@@ -29,12 +29,14 @@ fn main() {
     match boot_runtime() {
         Ok(runtime) => {
             let profile = host_profile();
+            let package_policy = default_package_policy();
             println!(
-                "{} first-party host profile ready for {}: {} roles, {} core capability surfaces",
+                "{} first-party host profile ready for {}: {} roles, {} core capability surfaces, {} package grants",
                 profile.id,
                 runtime.config().host.id,
                 profile.responsibilities().len(),
-                profile.capability_surfaces().len()
+                profile.capability_surfaces().len(),
+                package_policy.registry().granted_capabilities().len()
             );
         }
         Err(error) => {
