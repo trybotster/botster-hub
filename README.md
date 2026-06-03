@@ -99,5 +99,20 @@ The hub runtime embeds `botster-core`'s default local engine path via
 feature remains active unless the hub intentionally replaces that runtime
 contract.
 
+## Runtime smoke proof
+
+The production binary includes a deliberately thin smoke entrypoint:
+
+```sh
+cargo run -- run-one --data-dir target/botster-hub-smoke-data -- /bin/sh -c "printf 'botster-hub-smoke-ok\n'"
+```
+
+`run-one` requires an explicit `--data-dir`, builds hub config without falling
+back to user paths, then crosses `HubRuntime -> DefaultBotsterEngine` through
+spawn, attach, drain, marker observation, and shutdown. Its output is scrubbed
+to profile, host, session, marker, byte-count, and shutdown-observation facts so
+pipeline artifacts do not need local paths, environment dumps, keys, or
+fingerprints.
+
 This repo is intentionally greenfield. The existing `trybotster` monolith is
 evidence only, not source to copy.
