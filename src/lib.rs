@@ -11,6 +11,12 @@
 //! assert!(profile.capability_surfaces().contains(
 //!     &botster_core::CapabilitySurface::SignalingRelay,
 //! ));
+//!
+//! let summary = botster_hub::architecture_summary();
+//! assert!(summary.facade_decisions().iter().any(|decision| {
+//!     decision.core_operation() == "execute_command(DefaultEngineCommand)"
+//!         && decision.exposure() == botster_hub::HubFacadeExposure::Hidden
+//! }));
 //! ```
 
 pub mod auth;
@@ -19,6 +25,8 @@ pub mod packages;
 pub mod persistence;
 pub mod profile;
 pub mod runtime;
+
+use botster_core::CapabilitySurface;
 
 pub use config::{
     CoreEngineOptions, CoreQueueCapacity, DataDirectoryOption, DirectoryList, HostIdentity,
@@ -33,3 +41,206 @@ pub use profile::{
 pub use runtime::{
     HubRuntime, HubRuntimeError, HubRuntimeObservation, HubRuntimeOutput, HubRuntimeSpawnOutcome,
 };
+
+/// Compile-checked description of the profile plus the audited `HubRuntime` facade.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArchitectureSummary {
+    profile: &'static HostProfileManifest,
+    facade_decisions: &'static [HubFacadeDecision],
+}
+
+impl ArchitectureSummary {
+    /// Stable role labels used by docs, tests, and the binary smoke path.
+    #[must_use]
+    pub fn role_labels(&self) -> Vec<&'static str> {
+        self.profile.role_labels()
+    }
+
+    /// Capability surfaces governed by the first-party host profile.
+    #[must_use]
+    pub const fn capability_surfaces(&self) -> &'static [CapabilitySurface] {
+        self.profile.capability_surfaces()
+    }
+
+    /// Responsibility rows for README-aligned callers.
+    #[must_use]
+    pub const fn responsibilities(&self) -> &'static [Responsibility] {
+        self.profile.responsibilities()
+    }
+
+    /// README-aligned audit of current core operations exposed or hidden by `HubRuntime`.
+    #[must_use]
+    pub const fn facade_decisions(&self) -> &'static [HubFacadeDecision] {
+        self.facade_decisions
+    }
+}
+
+/// Whether a current core operation is part of the public hub runtime facade.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HubFacadeExposure {
+    /// Exposed as an explicit hub method because it is policy or visibility adjacent.
+    Exposed,
+    /// Intentionally hidden because exposing it would collapse hub policy into core mechanics.
+    Hidden,
+}
+
+/// One audited core operation and the hub facade decision for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HubFacadeDecision {
+    core_operation: &'static str,
+    exposure: HubFacadeExposure,
+    reason: &'static str,
+}
+
+impl HubFacadeDecision {
+    const fn new(
+        core_operation: &'static str,
+        exposure: HubFacadeExposure,
+        reason: &'static str,
+    ) -> Self {
+        Self {
+            core_operation,
+            exposure,
+            reason,
+        }
+    }
+
+    /// Core operation audited for the hub facade.
+    #[must_use]
+    pub const fn core_operation(&self) -> &'static str {
+        self.core_operation
+    }
+
+    /// Hub facade exposure decision.
+    #[must_use]
+    pub const fn exposure(&self) -> HubFacadeExposure {
+        self.exposure
+    }
+
+    /// Short reason for the hub facade decision.
+    #[must_use]
+    pub const fn reason(&self) -> &'static str {
+        self.reason
+    }
+}
+
+const HUB_FACADE_DECISIONS: &[HubFacadeDecision] = &[
+    HubFacadeDecision::new(
+        "execute_command(DefaultEngineCommand)",
+        HubFacadeExposure::Hidden,
+        "generic core router would obscure hub admission and policy boundaries",
+    ),
+    HubFacadeDecision::new(
+        "list_sessions",
+        HubFacadeExposure::Exposed,
+        "host visibility over core-recorded sessions",
+    ),
+    HubFacadeDecision::new(
+        "inspect_session",
+        HubFacadeExposure::Exposed,
+        "host visibility over lifecycle and activity",
+    ),
+    HubFacadeDecision::new(
+        "read_screen",
+        HubFacadeExposure::Exposed,
+        "explicit host request for core-owned session screen state",
+    ),
+    HubFacadeDecision::new(
+        "capture_snapshot",
+        HubFacadeExposure::Exposed,
+        "explicit host request for core-owned snapshot mechanics",
+    ),
+    HubFacadeDecision::new(
+        "replay_snapshot",
+        HubFacadeExposure::Exposed,
+        "explicit host request for core-owned snapshot replay mechanics",
+    ),
+    HubFacadeDecision::new(
+        "drain_runtime_all_once",
+        HubFacadeExposure::Exposed,
+        "host scheduler drain hook over live core sessions",
+    ),
+    HubFacadeDecision::new(
+        "report_backpressure",
+        HubFacadeExposure::Exposed,
+        "typed pressure evidence without hub-owned retry policy",
+    ),
+    HubFacadeDecision::new(
+        "report_delivery_lag",
+        HubFacadeExposure::Exposed,
+        "typed slow-delivery evidence without hub-owned retry policy",
+    ),
+    HubFacadeDecision::new(
+        "report_delivery_failure",
+        HubFacadeExposure::Exposed,
+        "typed failed-delivery evidence without hub-owned retry policy",
+    ),
+];
+
+/// Return the public architecture summary used by docs and tests.
+#[must_use]
+pub const fn architecture_summary() -> ArchitectureSummary {
+    ArchitectureSummary {
+        profile: host_profile(),
+        facade_decisions: HUB_FACADE_DECISIONS,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn architecture_summary_names_profile_roles_and_capabilities() {
+        let summary = architecture_summary();
+
+        assert_eq!(
+            summary.role_labels(),
+            vec![
+                "botster-core",
+                "botster-hub",
+                "CLI",
+                "clients",
+                "plugins/providers",
+                "external providers"
+            ]
+        );
+        assert!(
+            summary
+                .capability_surfaces()
+                .contains(&CapabilitySurface::SignalingRelay)
+        );
+        assert!(
+            summary
+                .capability_surfaces()
+                .contains(&CapabilitySurface::BrowserShell)
+        );
+    }
+
+    #[test]
+    fn architecture_summary_records_hub_runtime_facade_audit() {
+        let summary = architecture_summary();
+
+        let exposed: Vec<_> = summary
+            .facade_decisions()
+            .iter()
+            .filter(|decision| decision.exposure() == HubFacadeExposure::Exposed)
+            .map(HubFacadeDecision::core_operation)
+            .collect();
+
+        assert!(exposed.contains(&"list_sessions"));
+        assert!(exposed.contains(&"inspect_session"));
+        assert!(exposed.contains(&"read_screen"));
+        assert!(exposed.contains(&"capture_snapshot"));
+        assert!(exposed.contains(&"replay_snapshot"));
+        assert!(exposed.contains(&"drain_runtime_all_once"));
+        assert!(exposed.contains(&"report_backpressure"));
+        assert!(exposed.contains(&"report_delivery_lag"));
+        assert!(exposed.contains(&"report_delivery_failure"));
+        assert!(summary.facade_decisions().iter().any(|decision| {
+            decision.core_operation() == "execute_command(DefaultEngineCommand)"
+                && decision.exposure() == HubFacadeExposure::Hidden
+                && decision.reason().contains("generic core router")
+        }));
+    }
+}

@@ -1,8 +1,9 @@
 //! Profile-owned configuration policy and explicit startup options.
 //!
 //! The host profile resolves policy around paths, transports, session defaults,
-//! and core engine knobs before handing requests to `botster-core`. This module
-//! intentionally does not load concrete config files yet.
+//! and profile-owned policy for core engine knobs before handing requests to
+//! `botster-core`. This module intentionally does not load concrete config
+//! files yet.
 
 use std::env;
 use std::error::Error;
@@ -308,10 +309,18 @@ pub struct TcpBinding {
     pub port: u16,
 }
 
+/// Hub startup policy for core-owned runtime knobs.
+///
+/// The hub records queue, session I/O coalescing, and plugin-worker tuning here
+/// so startup policy is explicit. The underlying queues, session I/O worker,
+/// plugin worker engine, and delivery mechanics remain owned by `botster-core`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CoreEngineOptions {
+    /// Queue capacity choices keyed by core queue source name.
     pub queue_capacities: Vec<CoreQueueCapacity>,
+    /// Session I/O coalescing policy passed to core-owned session workers.
     pub session_io_coalescing: SessionIoCoalescingOptions,
+    /// Per-plugin worker queue capacity passed to core plugin worker primitives.
     pub plugin_worker_capacity: usize,
 }
 

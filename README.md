@@ -4,9 +4,10 @@
 `botster-core`.
 
 The profile owns trusted startup composition, policy, and host integration. It
-does not implement every provider itself; cloud federation, signaling relays,
-browser shells, and API integrations belong in installable providers that
-declare capabilities through `botster-core` package contracts.
+does not fork or replace core runtime mechanics, and it does not implement every
+provider itself; cloud federation, signaling relays, browser shells, and API
+integrations belong in installable providers that declare capabilities through
+`botster-core` package contracts.
 
 The accepted boundary model is documented in
 [`docs/adr/hub-as-host-profile-over-core.md`](docs/adr/hub-as-host-profile-over-core.md):
@@ -17,7 +18,7 @@ thick wrapper.
 
 | Layer | Owns |
 | --- | --- |
-| `botster-core` | Policy-free reusable local engine mechanics and transport-neutral primitives: session spawning, PTY/process mechanics, lifecycle, activity, fanout, notifications, plugin worker primitives, reusable crypto/identity mechanisms, package manifests, `Capability`, `CapabilitySurface`, host-profile admission contracts, and capability runtime primitives. |
+| `botster-core` | Policy-free reusable local engine mechanics and transport-neutral primitives: session spawning, PTY/process mechanics, lifecycle, activity, fanout, `TransportIngress`/`TransportEgress`, `SessionIo`, client stream contracts, notifications, plugin worker primitives, reusable crypto/identity mechanisms, package manifests, `Capability`, `CapabilitySurface`, host-profile admission contracts, and capability runtime primitives. |
 | `botster-hub` | Trusted first-party host profile policy over core contracts: config locations, persistence policy, auth hooks, startup composition, admission/enforcement, package install/enable/pin/update policy, lifecycle ordering, timeout/failure policy, and audit hooks. |
 | CLI | Thin operator entrypoints that start, discover, or attach to a hub without owning profile policy. |
 | Clients | Browser, TUI, socket, and custom renderers that consume hub contracts. Clients do not own provider behavior. |
@@ -29,7 +30,32 @@ engine facade for the reusable tmux-like local engine and shared package
 contracts: session spawning, PTY/process mechanics, session lifecycle and
 activity, subscription fanout, notifications, plugin worker primitives, package
 manifests, `Capability`, `CapabilitySurface`, host-profile admission contracts,
-capability runtime primitives, and consumer conformance behavior.
+capability runtime primitives, and consumer conformance behavior. `HubRuntime`
+is a hub-owned adapter and policy facade over that engine, not a separate
+runtime engine.
+
+## HubRuntime facade audit
+
+The hub exposes explicit methods where the operation is host-policy,
+admission, scheduling, or visibility adjacent. It hides generic core routers and
+keeps byte routing, PTY/session mechanics, fanout, plugin workers, capability
+surfaces, and transport contracts in `botster-core`.
+Client admission is host-profile policy over core admission and transport
+contracts, not a hub replacement for `TransportIngress`, `TransportEgress`,
+`SessionIo`, or client stream contracts.
+
+| Core operation | HubRuntime decision | Reason |
+| --- | --- | --- |
+| `execute_command(DefaultEngineCommand)` | Hidden | A generic command router would obscure hub admission and policy boundaries. |
+| `list_sessions` | Exposed | Host visibility over core-recorded sessions. |
+| `inspect_session` | Exposed | Host visibility over lifecycle and activity. |
+| `read_screen` | Exposed | Explicit host request for core-owned session screen state. |
+| `capture_snapshot` | Exposed | Explicit host request for core-owned snapshot mechanics. |
+| `replay_snapshot` | Exposed | Explicit host request for core-owned snapshot replay mechanics. |
+| `drain_runtime_all_once` | Exposed | Host scheduler drain hook over live core sessions. |
+| `report_backpressure` | Exposed | Typed pressure evidence without hub-owned retry policy. |
+| `report_delivery_lag` | Exposed | Typed slow-delivery evidence without hub-owned retry policy. |
+| `report_delivery_failure` | Exposed | Typed failed-delivery evidence without hub-owned retry policy. |
 
 ## Crate layout
 
