@@ -55,16 +55,19 @@ first-party does not mean core. First-party packages should still declare
 capabilities and provenance so they can later be pinned, audited, disabled,
 updated, or replaced through the same package policy as user-installed packages.
 
-`PackageRegistry` is the concrete hub-owned policy gate for that package layer
-in the current scaffold. It stores records around `botster_core::PackageManifest`
-values, keeps hub-owned enabled/disabled/pin/provenance/update metadata, compares
-requested `Capability` values against hub-owned grants, and delegates privileged
-provider host-profile admission to `botster_core::admit_host_profile`. Provider
-packages without host-profile metadata are denied before enablement so provider
-authority cannot bypass core admission. Future package lifecycle loading should
-call this registry before executing plugin or provider code; this ADR does not
-make the registry a marketplace fetcher, lockfile persistence layer, or lifecycle
-runtime.
+`default_package_policy()` is the concrete hub-owned policy gate for that
+package layer in the current scaffold. It derives the grant set from
+`host_profile()` default capability grants, then uses `PackageRegistry` to store
+records around `botster_core::PackageManifest` values, keep hub-owned
+enabled/disabled/pin/provenance/update metadata, compare requested `Capability`
+values against profile-owned grants, and delegate privileged provider
+host-profile admission to `botster_core::admit_host_profile`. Provider packages
+without host-profile metadata are denied before enablement so provider authority
+cannot bypass core admission. Accepted and denied decisions carry audit reasons
+and deterministic package/action/state/classification context for operator
+review. Future package lifecycle loading should call this policy before
+executing plugin or provider code; this ADR does not make it a marketplace
+fetcher, lockfile persistence layer, or lifecycle runtime.
 
 ## Startup Ownership
 
