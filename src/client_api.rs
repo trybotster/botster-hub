@@ -194,6 +194,20 @@ impl HubClientApi {
                     })?;
                 HubClientResponseBody::Events(events_from_output(output))
             }
+            HubClientRequest::Shutdown {
+                session_id,
+                reason,
+                now_seconds,
+                ..
+            } => {
+                let output = runtime
+                    .shutdown_session(session_id, reason, now_seconds)
+                    .map_err(|_| HubClientError::Runtime {
+                        request_id: request_id.clone(),
+                        operation,
+                    })?;
+                HubClientResponseBody::Events(events_from_output(output))
+            }
             HubClientRequest::ReadScreen {
                 session_id,
                 now_seconds,
@@ -301,6 +315,7 @@ impl HubClientAdmission {
             | HubClientOperation::Input
             | HubClientOperation::Resize
             | HubClientOperation::DrainRuntime
+            | HubClientOperation::Shutdown
             | HubClientOperation::ReadScreen
             | HubClientOperation::CaptureSnapshot => self.allow_runtime,
             HubClientOperation::ListPackages => self.allow_packages,
@@ -357,6 +372,13 @@ pub enum HubClientRequest {
         session_id: SessionId,
         last_output_at: u64,
     },
+    /// Shut down one session through the hub runtime.
+    Shutdown {
+        request_id: RequestId,
+        session_id: SessionId,
+        reason: String,
+        now_seconds: u64,
+    },
     /// Request a screen read where core supports it.
     ReadScreen {
         request_id: RequestId,
@@ -386,6 +408,7 @@ impl HubClientRequest {
             | Self::Input { request_id, .. }
             | Self::Resize { request_id, .. }
             | Self::DrainRuntime { request_id, .. }
+            | Self::Shutdown { request_id, .. }
             | Self::ReadScreen { request_id, .. }
             | Self::CaptureSnapshot { request_id, .. }
             | Self::ListPackages { request_id }
@@ -403,6 +426,7 @@ impl HubClientRequest {
             Self::Input { .. } => HubClientOperation::Input,
             Self::Resize { .. } => HubClientOperation::Resize,
             Self::DrainRuntime { .. } => HubClientOperation::DrainRuntime,
+            Self::Shutdown { .. } => HubClientOperation::Shutdown,
             Self::ReadScreen { .. } => HubClientOperation::ReadScreen,
             Self::CaptureSnapshot { .. } => HubClientOperation::CaptureSnapshot,
             Self::ListPackages { .. } => HubClientOperation::ListPackages,
@@ -422,6 +446,7 @@ pub enum HubClientOperation {
     Input,
     Resize,
     DrainRuntime,
+    Shutdown,
     ReadScreen,
     CaptureSnapshot,
     ListPackages,
