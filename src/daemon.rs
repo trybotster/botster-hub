@@ -107,6 +107,17 @@ impl HubDaemon {
         self.runtime.as_mut()
     }
 
+    /// Return the package registry restored for this daemon lifecycle.
+    #[must_use]
+    pub const fn package_registry(&self) -> &PackageRegistry {
+        &self.package_registry
+    }
+
+    /// Return the mutable package registry restored for this daemon lifecycle.
+    pub const fn package_registry_mut(&mut self) -> &mut PackageRegistry {
+        &mut self.package_registry
+    }
+
     /// Return deterministic lifecycle status without exposing local paths.
     #[must_use]
     pub fn status(&self) -> HubDaemonStatus {
