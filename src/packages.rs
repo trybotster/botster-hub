@@ -14,6 +14,64 @@ use botster_core::{
 
 use crate::host_profile;
 
+/// Hub-owned package admission policy backed by the first-party host profile.
+#[derive(Debug, Clone)]
+pub struct PackageAdmissionPolicy {
+    registry: PackageRegistry,
+}
+
+impl PackageAdmissionPolicy {
+    /// Build the package policy from the first-party host profile grant set.
+    #[must_use]
+    pub fn from_host_profile() -> Self {
+        Self {
+            registry: PackageRegistry::new(
+                host_profile()
+                    .default_capability_grants()
+                    .iter()
+                    .cloned()
+                    .collect(),
+            ),
+        }
+    }
+
+    /// Return the registry that enforces package admission.
+    #[must_use]
+    pub const fn registry(&self) -> &PackageRegistry {
+        &self.registry
+    }
+
+    /// Return the mutable registry for package install/enable/disable/pin actions.
+    pub const fn registry_mut(&mut self) -> &mut PackageRegistry {
+        &mut self.registry
+    }
+
+    /// Install a package manifest as disabled until hub policy enables it.
+    pub fn install(
+        &mut self,
+        manifest: PackageManifest,
+        provenance: PackageProvenance,
+        audit_reason: impl Into<String>,
+    ) -> PackageRegistryResult<&PackageRecord> {
+        self.registry.install(manifest, provenance, audit_reason)
+    }
+
+    /// Enable an installed package when current host-profile grants admit it.
+    pub fn enable(
+        &mut self,
+        package_name: &str,
+        audit_reason: impl Into<String>,
+    ) -> PackageRegistryResult<PackageDecision> {
+        self.registry.enable(package_name, audit_reason)
+    }
+}
+
+/// Build the production package policy from the first-party host profile.
+#[must_use]
+pub fn default_package_policy() -> PackageAdmissionPolicy {
+    PackageAdmissionPolicy::from_host_profile()
+}
+
 /// In-memory hub package registry.
 #[derive(Debug, Clone)]
 pub struct PackageRegistry {
@@ -40,29 +98,33 @@ impl PackageRegistry {
         provenance: PackageProvenance,
         audit_reason: impl Into<String>,
     ) -> PackageRegistryResult<&PackageRecord> {
+        let audit_reason = audit_reason.into();
         let package_name = manifest.name.clone();
 
         if self.records.contains_key(&package_name) {
-            return Err(PackageRegistryError::new(
+            return Err(PackageRegistryError::without_record(
                 package_name,
                 PackageAction::Install,
-                PackagePolicyReason::AlreadyInstalled,
+                PackageAdmissionReason::AlreadyInstalled,
+                audit_reason,
             ));
         }
 
         if manifest.source.is_none() {
-            return Err(PackageRegistryError::new(
+            return Err(PackageRegistryError::without_record(
                 package_name,
                 PackageAction::Install,
-                PackagePolicyReason::MissingSource,
+                PackageAdmissionReason::MissingSource,
+                audit_reason,
             ));
         }
 
         if provenance.source.is_empty() {
-            return Err(PackageRegistryError::new(
+            return Err(PackageRegistryError::without_record(
                 package_name,
                 PackageAction::Install,
-                PackagePolicyReason::MissingProvenance,
+                PackageAdmissionReason::MissingProvenance,
+                audit_reason,
             ));
         }
 
@@ -74,7 +136,7 @@ impl PackageRegistry {
             provenance,
             pin: None,
             update_policy: PackageUpdatePolicy::Manual,
-            last_audit_reason: audit_reason.into(),
+            last_audit_reason: audit_reason,
             admitted_host_profile: None,
         };
 
@@ -91,7 +153,10 @@ impl PackageRegistry {
         package_name: &str,
         audit_reason: impl Into<String>,
     ) -> PackageRegistryResult<PackageDecision> {
-        let record = self.record(package_name, PackageAction::Enable)?;
+        let audit_reason = audit_reason.into();
+        let record = self.record(package_name, PackageAction::Enable, audit_reason.clone())?;
+        let classification = record.classification;
+        let state = record.state;
 
         let ungoverned_surface = record
             .manifest
@@ -100,10 +165,13 @@ impl PackageRegistry {
             .find(|capability| !self.governed_surfaces.contains(&capability.surface))
             .cloned();
         if let Some(capability) = ungoverned_surface {
-            return Err(PackageRegistryError::new(
+            return Err(PackageRegistryError::with_record(
                 package_name,
                 PackageAction::Enable,
-                PackagePolicyReason::UngovernedCapabilitySurface(capability.surface),
+                PackageAdmissionReason::UngovernedCapabilitySurface(capability.surface),
+                state,
+                classification,
+                audit_reason,
             ));
         }
 
@@ -114,10 +182,13 @@ impl PackageRegistry {
             .find(|capability| !self.granted_capabilities.contains(capability))
             .cloned();
         if let Some(capability) = ungranted_capability {
-            return Err(PackageRegistryError::new(
+            return Err(PackageRegistryError::with_record(
                 package_name,
                 PackageAction::Enable,
-                PackagePolicyReason::UngrantedCapability(capability),
+                PackageAdmissionReason::UngrantedCapability(capability),
+                state,
+                classification,
+                audit_reason,
             ));
         }
 
@@ -125,10 +196,13 @@ impl PackageRegistry {
             PackageClassification::Plugin => {
                 if record.manifest.host_profile.is_some() {
                     Some(admit_host_profile(&record.manifest, true).map_err(|error| {
-                        PackageRegistryError::new(
+                        PackageRegistryError::with_record(
                             package_name,
                             PackageAction::Enable,
-                            PackagePolicyReason::HostProfileAdmission(error),
+                            PackageAdmissionReason::HostProfileAdmission(error),
+                            state,
+                            classification,
+                            audit_reason.clone(),
                         )
                     })?)
                 } else {
@@ -136,18 +210,24 @@ impl PackageRegistry {
                 }
             }
             PackageClassification::Provider if record.manifest.host_profile.is_none() => {
-                return Err(PackageRegistryError::new(
+                return Err(PackageRegistryError::with_record(
                     package_name,
                     PackageAction::Enable,
-                    PackagePolicyReason::ProviderMissingHostProfile,
+                    PackageAdmissionReason::ProviderMissingHostProfile,
+                    state,
+                    classification,
+                    audit_reason,
                 ));
             }
             PackageClassification::Provider => {
                 Some(admit_host_profile(&record.manifest, true).map_err(|error| {
-                    PackageRegistryError::new(
+                    PackageRegistryError::with_record(
                         package_name,
                         PackageAction::Enable,
-                        PackagePolicyReason::HostProfileAdmission(error),
+                        PackageAdmissionReason::HostProfileAdmission(error),
+                        state,
+                        classification,
+                        audit_reason.clone(),
                     )
                 })?)
             }
@@ -158,7 +238,7 @@ impl PackageRegistry {
             .get_mut(package_name)
             .expect("record existence checked before enable");
         record.state = PackageState::Enabled;
-        record.last_audit_reason = audit_reason.into();
+        record.last_audit_reason = audit_reason.clone();
         record.admitted_host_profile = admitted_host_profile.clone();
 
         Ok(PackageDecision {
@@ -167,6 +247,7 @@ impl PackageRegistry {
             state: record.state,
             classification: record.classification,
             admitted_host_profile,
+            audit_reason,
         })
     }
 
@@ -176,9 +257,10 @@ impl PackageRegistry {
         package_name: &str,
         audit_reason: impl Into<String>,
     ) -> PackageRegistryResult<PackageDecision> {
-        let record = self.record_mut(package_name, PackageAction::Disable)?;
+        let audit_reason = audit_reason.into();
+        let record = self.record_mut(package_name, PackageAction::Disable, audit_reason.clone())?;
         record.state = PackageState::Disabled;
-        record.last_audit_reason = audit_reason.into();
+        record.last_audit_reason = audit_reason.clone();
         record.admitted_host_profile = None;
 
         Ok(PackageDecision {
@@ -187,6 +269,7 @@ impl PackageRegistry {
             state: record.state,
             classification: record.classification,
             admitted_host_profile: None,
+            audit_reason,
         })
     }
 
@@ -197,18 +280,20 @@ impl PackageRegistry {
         pin: PackagePin,
         audit_reason: impl Into<String>,
     ) -> PackageRegistryResult<&PackageRecord> {
+        let audit_reason = audit_reason.into();
         if pin.revision.is_empty() {
-            return Err(PackageRegistryError::new(
+            return Err(PackageRegistryError::without_record(
                 package_name,
                 PackageAction::Pin,
-                PackagePolicyReason::MissingPinRevision,
+                PackageAdmissionReason::MissingPinRevision,
+                audit_reason,
             ));
         }
 
-        let record = self.record_mut(package_name, PackageAction::Pin)?;
+        let record = self.record_mut(package_name, PackageAction::Pin, audit_reason.clone())?;
         record.update_policy = pin.update_policy;
         record.pin = Some(pin);
-        record.last_audit_reason = audit_reason.into();
+        record.last_audit_reason = audit_reason;
 
         Ok(record)
     }
@@ -225,16 +310,24 @@ impl PackageRegistry {
         self.records.values().collect()
     }
 
+    /// Return the hub-owned grants used for package admission.
+    #[must_use]
+    pub const fn granted_capabilities(&self) -> &CapabilitySet {
+        &self.granted_capabilities
+    }
+
     fn record(
         &self,
         package_name: &str,
         action: PackageAction,
+        audit_reason: String,
     ) -> PackageRegistryResult<&PackageRecord> {
         self.records.get(package_name).ok_or_else(|| {
-            PackageRegistryError::new(
+            PackageRegistryError::without_record(
                 package_name,
                 action,
-                PackagePolicyReason::PackageNotInstalled,
+                PackageAdmissionReason::PackageNotInstalled,
+                audit_reason,
             )
         })
     }
@@ -243,12 +336,14 @@ impl PackageRegistry {
         &mut self,
         package_name: &str,
         action: PackageAction,
+        audit_reason: String,
     ) -> PackageRegistryResult<&mut PackageRecord> {
         self.records.get_mut(package_name).ok_or_else(|| {
-            PackageRegistryError::new(
+            PackageRegistryError::without_record(
                 package_name,
                 action,
-                PackagePolicyReason::PackageNotInstalled,
+                PackageAdmissionReason::PackageNotInstalled,
+                audit_reason,
             )
         })
     }
@@ -354,6 +449,8 @@ pub struct PackageDecision {
     pub classification: PackageClassification,
     /// Admitted host-profile metadata when enabling a provider host profile.
     pub admitted_host_profile: Option<AdmittedHostProfile>,
+    /// Operator/audit reason for this accepted decision.
+    pub audit_reason: String,
 }
 
 /// Registry action used in audit-friendly decisions and errors.
@@ -373,19 +470,47 @@ pub struct PackageRegistryError {
     /// Action that was denied.
     pub action: PackageAction,
     /// Typed denial reason.
-    pub reason: PackagePolicyReason,
+    pub reason: PackageAdmissionReason,
+    /// Package state before the denied action, when a record exists.
+    pub state: Option<PackageState>,
+    /// Package classification, when a record exists.
+    pub classification: Option<PackageClassification>,
+    /// Operator/audit reason attached to the denied action.
+    pub audit_reason: String,
 }
 
 impl PackageRegistryError {
-    fn new(
+    fn without_record(
         package_name: impl Into<String>,
         action: PackageAction,
-        reason: PackagePolicyReason,
+        reason: PackageAdmissionReason,
+        audit_reason: String,
     ) -> Self {
         Self {
             package_name: package_name.into(),
             action,
             reason,
+            state: None,
+            classification: None,
+            audit_reason,
+        }
+    }
+
+    fn with_record(
+        package_name: impl Into<String>,
+        action: PackageAction,
+        reason: PackageAdmissionReason,
+        state: PackageState,
+        classification: PackageClassification,
+        audit_reason: String,
+    ) -> Self {
+        Self {
+            package_name: package_name.into(),
+            action,
+            reason,
+            state: Some(state),
+            classification: Some(classification),
+            audit_reason,
         }
     }
 }
@@ -395,7 +520,7 @@ pub type PackageRegistryResult<T> = Result<T, PackageRegistryError>;
 
 /// Typed denial reasons for package policy.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PackagePolicyReason {
+pub enum PackageAdmissionReason {
     /// Package has already been installed in this in-memory registry.
     AlreadyInstalled,
     /// Package is not installed.
@@ -525,6 +650,7 @@ mod tests {
             .expect("enable granted package");
 
         assert_eq!(decision.state, PackageState::Enabled);
+        assert_eq!(decision.audit_reason, "operator enabled package");
         assert_eq!(
             registry.package("mcp.plugin").expect("record").state,
             PackageState::Enabled
@@ -554,8 +680,11 @@ mod tests {
         assert_eq!(error.action, PackageAction::Enable);
         assert_eq!(
             error.reason,
-            PackagePolicyReason::UngrantedCapability(requested)
+            PackageAdmissionReason::UngrantedCapability(requested)
         );
+        assert_eq!(error.state, Some(PackageState::Installed));
+        assert_eq!(error.classification, Some(PackageClassification::Plugin));
+        assert_eq!(error.audit_reason, "operator enabled package");
     }
 
     #[test]
@@ -576,7 +705,7 @@ mod tests {
 
         assert_eq!(
             error.reason,
-            PackagePolicyReason::UngovernedCapabilitySurface(CapabilitySurface::Timers)
+            PackageAdmissionReason::UngovernedCapabilitySurface(CapabilitySurface::Timers)
         );
     }
 
@@ -667,7 +796,7 @@ mod tests {
 
         assert_eq!(
             error.reason,
-            PackagePolicyReason::ProviderMissingHostProfile
+            PackageAdmissionReason::ProviderMissingHostProfile
         );
     }
 
@@ -688,6 +817,7 @@ mod tests {
             .expect("admit provider");
 
         assert_eq!(decision.classification, PackageClassification::Provider);
+        assert_eq!(decision.audit_reason, "enable provider");
         assert_eq!(
             decision
                 .admitted_host_profile
@@ -722,7 +852,7 @@ mod tests {
 
         assert_eq!(
             error.reason,
-            PackagePolicyReason::HostProfileAdmission(HostProfileAdmissionError::NotProvider)
+            PackageAdmissionReason::HostProfileAdmission(HostProfileAdmissionError::NotProvider)
         );
     }
 
@@ -743,7 +873,7 @@ mod tests {
 
         assert_eq!(
             error.reason,
-            PackagePolicyReason::HostProfileAdmission(
+            PackageAdmissionReason::HostProfileAdmission(
                 HostProfileAdmissionError::MissingBootstrapEntrypoint
             )
         );
@@ -758,7 +888,7 @@ mod tests {
         let error = registry
             .install(manifest, provenance(), "install")
             .expect_err("missing source should deny");
-        assert_eq!(error.reason, PackagePolicyReason::MissingSource);
+        assert_eq!(error.reason, PackageAdmissionReason::MissingSource);
 
         let error = registry
             .install(
@@ -770,6 +900,61 @@ mod tests {
                 "install",
             )
             .expect_err("missing provenance should deny");
-        assert_eq!(error.reason, PackagePolicyReason::MissingProvenance);
+        assert_eq!(error.reason, PackageAdmissionReason::MissingProvenance);
+    }
+
+    #[test]
+    fn default_package_policy_derives_grants_from_host_profile() {
+        let capability = capability(CapabilitySurface::Surfaces, None);
+        let mut policy = default_package_policy();
+
+        assert_eq!(
+            policy.registry().granted_capabilities().len(),
+            host_profile().default_capability_grants().len()
+        );
+
+        policy
+            .install(
+                plugin_manifest("surface.plugin", vec![capability]),
+                provenance(),
+                "install through profile policy",
+            )
+            .expect("install through default package policy");
+
+        let decision = policy
+            .enable("surface.plugin", "enable through profile policy")
+            .expect("enable through default package policy");
+
+        assert_eq!(decision.state, PackageState::Enabled);
+        assert_eq!(decision.audit_reason, "enable through profile policy");
+    }
+
+    #[test]
+    fn package_records_are_returned_in_stable_name_order() {
+        let mut policy = default_package_policy();
+
+        policy
+            .install(
+                plugin_manifest("zeta.plugin", Vec::new()),
+                provenance(),
+                "install zeta",
+            )
+            .expect("install zeta");
+        policy
+            .install(
+                plugin_manifest("alpha.plugin", Vec::new()),
+                provenance(),
+                "install alpha",
+            )
+            .expect("install alpha");
+
+        let names: Vec<_> = policy
+            .registry()
+            .packages()
+            .iter()
+            .map(|record| record.manifest.name.as_str())
+            .collect();
+
+        assert_eq!(names, vec!["alpha.plugin", "zeta.plugin"]);
     }
 }
