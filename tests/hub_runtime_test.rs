@@ -270,9 +270,26 @@ fn hub_runtime_public_facade_includes_audited_core_visibility_and_reporting_meth
         QueueSource,
         MailboxSendFailureReason,
     ) -> Result<HubRuntimeOutput, HubRuntimeError>;
+    type DetachClient = fn(
+        &mut HubRuntime,
+        ClientId,
+        SessionId,
+        SubscriptionId,
+        u64,
+    ) -> Result<HubRuntimeOutput, HubRuntimeError>;
+    type Resize = fn(
+        &mut HubRuntime,
+        ClientId,
+        SessionId,
+        u16,
+        u16,
+        u64,
+    ) -> Result<HubRuntimeOutput, HubRuntimeError>;
 
     let _list_sessions: fn(&HubRuntime) -> Vec<botster_core::CoreSession> =
         HubRuntime::list_sessions;
+    let _detach_client: DetachClient = HubRuntime::detach_client;
+    let _resize: Resize = HubRuntime::resize;
     let _inspect_session: InspectSession = HubRuntime::inspect_session;
     let _read_screen: ReadScreen = HubRuntime::read_screen;
     let _capture_snapshot: ReadScreen = HubRuntime::capture_snapshot;

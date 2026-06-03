@@ -93,7 +93,11 @@ Startup proceeds in this order:
    supplied outside core, as stated in `crates/botster-core/src/engine/plugin_worker.rs`.
 5. Clients subscribe or attach through transport-neutral contracts. Subscription
    opens a transport path; it does not hydrate all global application state.
-   Opened views and UI bindings drive route, entity, and surface pulls.
+   Opened views and UI bindings drive route, entity, and surface pulls. The
+   current scaffold exposes this for local dogfood clients through
+   `HubClientApi::handle_request`, an in-process request/response/event boundary
+   that routes status, session, package, lifecycle, and terminal control
+   requests through hub facades instead of raw core routers.
 
 The hub owns the control plane: topology, lifecycle, discovery, authorization,
 admission, routing decisions, recovery, cleanup, and provider/plugin

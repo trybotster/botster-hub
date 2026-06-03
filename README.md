@@ -44,10 +44,22 @@ Client admission is host-profile policy over core admission and transport
 contracts, not a hub replacement for `TransportIngress`, `TransportEgress`,
 `SessionIo`, or client stream contracts.
 
+`HubClientApi` is the stable local client API boundary over this facade. It is
+transport-neutral and currently exercised in-process; socket, CLI, TUI, or local
+browser bridge adapters should frame the same request/response/event contract
+instead of bypassing hub admission or calling core routers directly. Attach is a
+subscription handshake only, so clients still explicitly pull status, packages,
+lifecycle status, sessions, screens, or snapshots when they need them.
+
 | Core operation | HubRuntime decision | Reason |
 | --- | --- | --- |
 | `execute_command(DefaultEngineCommand)` | Hidden | A generic command router would obscure hub admission and policy boundaries. |
 | `list_sessions` | Exposed | Host visibility over core-recorded sessions. |
+| `spawn_session` | Exposed | Host-admitted local session creation through core mechanics. |
+| `attach_client` | Exposed | Explicit client subscription handshake without global state hydration. |
+| `detach_client` | Exposed | Explicit client subscription teardown through core mechanics. |
+| `write_bytes` | Exposed | Explicit client terminal input path through core mechanics. |
+| `resize` | Exposed | Explicit client terminal resize path through core mechanics. |
 | `inspect_session` | Exposed | Host visibility over lifecycle and activity. |
 | `read_screen` | Exposed | Explicit host request for core-owned session screen state. |
 | `capture_snapshot` | Exposed | Explicit host request for core-owned snapshot mechanics. |
@@ -88,6 +100,7 @@ resources do not survive replacement.
 
 ```text
 src/lib.rs                 public facade over runtime and profile metadata
+src/client_api.rs          transport-neutral local client request/response/event API
 src/profile.rs             first-party host profile manifest and policy metadata
 src/main.rs                thin binary smoke path through the profile facade
 src/config.rs              hub-owned config policy seam
