@@ -26,9 +26,8 @@ fn main() {
         return;
     }
 
-    match boot_summary() {
-        Ok(config) => {
-            let runtime = HubRuntime::new(config);
+    match boot_runtime() {
+        Ok(runtime) => {
             let profile = host_profile();
             println!(
                 "{} first-party host profile ready for {}: {} roles, {} core capability surfaces",
@@ -39,15 +38,16 @@ fn main() {
             );
         }
         Err(error) => {
-            eprintln!("botster-hub config error: {error}");
+            eprintln!("botster-hub boot error: {error}");
             process::exit(1);
         }
     }
 }
 
-fn boot_summary() -> Result<botster_hub::HubConfig, botster_hub::HubConfigError> {
+fn boot_runtime() -> Result<HubRuntime, BootError> {
     let environment = RuntimeEnvironment::from_current_process();
-    build_default_config_for_runtime(&environment)
+    let config = build_default_config_for_runtime(&environment).map_err(BootError::Config)?;
+    HubRuntime::load(config).map_err(BootError::State)
 }
 
 fn run_one(args: Vec<String>) -> Result<(), RunOneError> {
@@ -69,7 +69,7 @@ fn run_one(args: Vec<String>) -> Result<(), RunOneError> {
 
     let profile = host_profile();
     let host_id = config.host.id.clone();
-    let mut runtime = HubRuntime::new(config);
+    let mut runtime = HubRuntime::load(config)?;
     let request = SessionSpawnRequest {
         request_id: RequestId("botster-hub-smoke-spawn".to_string()),
         session_id: SessionId("botster-hub-smoke-session".to_string()),
@@ -197,7 +197,23 @@ enum RunOneError {
     Usage,
     Config(botster_hub::HubConfigError),
     Runtime(botster_hub::HubRuntimeError),
+    State(botster_hub::HubStateStoreError),
     TimedOut,
+}
+
+#[derive(Debug)]
+enum BootError {
+    Config(botster_hub::HubConfigError),
+    State(botster_hub::HubStateStoreError),
+}
+
+impl fmt::Display for BootError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Config(error) => write!(formatter, "{error}"),
+            Self::State(error) => write!(formatter, "{error}"),
+        }
+    }
 }
 
 impl fmt::Display for RunOneError {
@@ -209,6 +225,7 @@ impl fmt::Display for RunOneError {
             ),
             Self::Config(error) => write!(formatter, "{error}"),
             Self::Runtime(error) => write!(formatter, "{error}"),
+            Self::State(error) => write!(formatter, "{error}"),
             Self::TimedOut => write!(
                 formatter,
                 "timed out waiting for {SMOKE_MARKER}; command must print the smoke marker"
@@ -226,5 +243,11 @@ impl From<botster_hub::HubConfigError> for RunOneError {
 impl From<botster_hub::HubRuntimeError> for RunOneError {
     fn from(error: botster_hub::HubRuntimeError) -> Self {
         Self::Runtime(error)
+    }
+}
+
+impl From<botster_hub::HubStateStoreError> for RunOneError {
+    fn from(error: botster_hub::HubStateStoreError) -> Self {
+        Self::State(error)
     }
 }

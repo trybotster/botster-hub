@@ -40,7 +40,12 @@ pub use config::{
 pub use packages::{
     PackageAction, PackageClassification, PackageDecision, PackagePin, PackagePolicyReason,
     PackageProvenance, PackageRecord, PackageRegistry, PackageRegistryError, PackageRegistryResult,
-    PackageState, PackageUpdatePolicy,
+    PackageRegistrySnapshot, PackageRegistrySnapshotError, PackageState, PackageUpdatePolicy,
+};
+pub use persistence::{
+    CapabilityGrantRecord, FileHubStateStore, HubAuditEntry, HubState, HubStateError,
+    HubStateResult, HubStateStore, HubStateStoreError, HubStateStoreResult, LocalRuntimeSettings,
+    PackageAdmissionDecision, SchemaMetadata,
 };
 pub use profile::{
     CoreRuntimeRole, HostProfileManifest, HostProfileTrust, PolicyArea, Responsibility,

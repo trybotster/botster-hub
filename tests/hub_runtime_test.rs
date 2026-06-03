@@ -10,8 +10,8 @@ use botster_core::{
     SubscriptionId, TransportEgress,
 };
 use botster_hub::{
-    DataDirectoryOption, HostIdentityOptions, HubRuntime, HubRuntimeError, HubRuntimeOutput,
-    HubStartupOptions, RuntimeEnvironment, SessionDefaults, TransportBindings,
+    DataDirectoryOption, FileHubStateStore, HostIdentityOptions, HubRuntime, HubRuntimeError,
+    HubRuntimeOutput, HubStartupOptions, RuntimeEnvironment, SessionDefaults, TransportBindings,
 };
 
 fn explicit_config() -> botster_hub::HubConfig {
@@ -24,6 +24,32 @@ fn explicit_config() -> botster_hub::HubConfig {
         data_directory: DataDirectoryOption::Explicit(
             "target/botster-hub-test-data/runtime".into(),
         ),
+        session_defaults: SessionDefaults {
+            shell: "/bin/sh".to_string(),
+            working_directory: Some(".".into()),
+            initial_rows: 24,
+            initial_cols: 80,
+        },
+        transports: TransportBindings {
+            local_socket: None,
+            tcp: Vec::new(),
+        },
+        ..HubStartupOptions::default()
+    }
+    .build_config_for_environment(&RuntimeEnvironment::from_values(None, None, None))
+    .expect("explicit runtime config should build")
+}
+
+fn explicit_config_with_data_dir(
+    data_directory: impl Into<std::path::PathBuf>,
+) -> botster_hub::HubConfig {
+    HubStartupOptions {
+        host: HostIdentityOptions {
+            id: "hub-runtime-test".to_string(),
+            display_name: "Hub Runtime Test".to_string(),
+            fingerprint: None,
+        },
+        data_directory: DataDirectoryOption::Explicit(data_directory.into()),
         session_defaults: SessionDefaults {
             shell: "/bin/sh".to_string(),
             working_directory: Some(".".into()),
@@ -256,4 +282,19 @@ fn hub_runtime_public_facade_includes_audited_core_visibility_and_reporting_meth
     let _report_backpressure: ReportBackpressure = HubRuntime::report_backpressure;
     let _report_delivery_lag: ReportDeliveryLag = HubRuntime::report_delivery_lag;
     let _report_delivery_failure: ReportDeliveryFailure = HubRuntime::report_delivery_failure;
+}
+
+#[test]
+fn runtime_boot_loads_hub_state_from_configured_data_directory() {
+    let config = explicit_config_with_data_dir("target/botster-hub-test-data/runtime-load");
+    let store = FileHubStateStore::for_data_directory(&config.data_directory);
+
+    let runtime = HubRuntime::load(config.clone()).expect("load runtime through state store");
+
+    assert_eq!(runtime.state().host, config.host);
+    assert_eq!(
+        runtime.state().runtime_settings.data_directory,
+        config.data_directory
+    );
+    assert!(store.path().exists());
 }
