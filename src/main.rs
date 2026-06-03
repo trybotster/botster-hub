@@ -174,14 +174,30 @@ fn run_one(args: Vec<String>) -> Result<(), RunOneError> {
 
     let spawn = runtime.spawn_session(request, CoreSessionMetadata::new())?;
     runtime.attach_client(
+        client_id.clone(),
+        session_id.clone(),
+        subscription_id.clone(),
+        logical_clock,
+    )?;
+    logical_clock += 1;
+
+    runtime.resize(
+        client_id.clone(),
+        session_id.clone(),
+        30,
+        100,
+        logical_clock,
+    )?;
+    logical_clock += 1;
+
+    let observed = drain_until_marker(&mut runtime, &session_id, &mut logical_clock)?;
+    let detach = runtime.detach_client(
         client_id,
         session_id.clone(),
         subscription_id,
         logical_clock,
     )?;
     logical_clock += 1;
-
-    let observed = drain_until_marker(&mut runtime, &session_id, &mut logical_clock)?;
     let shutdown =
         runtime.shutdown_session(session_id.clone(), "run-one complete", logical_clock)?;
 
@@ -192,6 +208,7 @@ fn run_one(args: Vec<String>) -> Result<(), RunOneError> {
     println!("spawned_session={}", spawn.handle.session_id.0);
     println!("observed_marker={SMOKE_MARKER}");
     println!("observed_bytes={}", observed.len());
+    println!("detach_observations={}", detach.observations.len());
     println!("shutdown_observations={}", shutdown.observations.len());
 
     Ok(())
