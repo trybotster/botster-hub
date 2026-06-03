@@ -11,6 +11,7 @@ use botster_core::{
     AdmittedHostProfile, Capability, CapabilitySet, CapabilitySurface, ExtensionKind,
     HostProfileAdmissionError, PackageManifest, admit_host_profile,
 };
+use serde::{Deserialize, Serialize};
 
 use crate::host_profile;
 
@@ -310,6 +311,57 @@ impl PackageRegistry {
         self.records.values().collect()
     }
 
+    /// Export the trusted in-memory registry for durable hub state.
+    #[must_use]
+    pub fn snapshot(&self) -> PackageRegistrySnapshot {
+        PackageRegistrySnapshot {
+            granted_capabilities: self.granted_capabilities.iter().cloned().collect(),
+            governed_surfaces: self.governed_surfaces.clone(),
+            records: self.records.values().cloned().collect(),
+        }
+    }
+
+    /// Rebuild trusted persisted registry state and re-derive runtime admission metadata.
+    pub fn from_snapshot(
+        snapshot: PackageRegistrySnapshot,
+    ) -> Result<Self, PackageRegistrySnapshotError> {
+        let mut records = BTreeMap::new();
+
+        for mut record in snapshot.records {
+            let package_name = record.manifest.name.clone();
+            record.admitted_host_profile = Self::admitted_host_profile_from_snapshot(&record)?;
+            if records.insert(package_name.clone(), record).is_some() {
+                return Err(PackageRegistrySnapshotError::DuplicatePackage(package_name));
+            }
+        }
+
+        Ok(Self {
+            records,
+            granted_capabilities: snapshot.granted_capabilities.into_iter().collect(),
+            governed_surfaces: snapshot.governed_surfaces,
+        })
+    }
+
+    fn admitted_host_profile_from_snapshot(
+        record: &PackageRecord,
+    ) -> Result<Option<AdmittedHostProfile>, PackageRegistrySnapshotError> {
+        if !record.is_enabled() {
+            return Ok(None);
+        }
+
+        match record.classification {
+            PackageClassification::Plugin if record.manifest.host_profile.is_none() => Ok(None),
+            PackageClassification::Plugin | PackageClassification::Provider => {
+                admit_host_profile(&record.manifest, true)
+                    .map(Some)
+                    .map_err(|error| PackageRegistrySnapshotError::HostProfileAdmission {
+                        package_name: record.manifest.name.clone(),
+                        error,
+                    })
+            }
+        }
+    }
+
     /// Return the hub-owned grants used for package admission.
     #[must_use]
     pub const fn granted_capabilities(&self) -> &CapabilitySet {
@@ -350,7 +402,7 @@ impl PackageRegistry {
 }
 
 /// Stored package policy record.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PackageRecord {
     /// Core-owned package manifest.
     pub manifest: PackageManifest,
@@ -366,7 +418,11 @@ pub struct PackageRecord {
     pub update_policy: PackageUpdatePolicy,
     /// Operator/audit reason for the latest registry mutation.
     pub last_audit_reason: String,
-    /// Core-admitted host-profile metadata for enabled provider packages.
+    /// Runtime admission metadata re-derived from persisted manifests on reload.
+    ///
+    /// This field is skipped in durable JSON because `AdmittedHostProfile` is a
+    /// core runtime result, not a serde-stable storage contract.
+    #[serde(skip)]
     pub admitted_host_profile: Option<AdmittedHostProfile>,
 }
 
@@ -379,7 +435,8 @@ impl PackageRecord {
 }
 
 /// Hub-owned package state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PackageState {
     /// Installed but not active.
     Installed,
@@ -390,7 +447,8 @@ pub enum PackageState {
 }
 
 /// Hub package classification derived from `botster-core::ExtensionKind`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PackageClassification {
     /// Ordinary plugin package.
     Plugin,
@@ -408,7 +466,7 @@ impl PackageClassification {
 }
 
 /// Hub-owned provenance placeholder around a core manifest source.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PackageProvenance {
     /// Non-local source identifier suitable for audit displays.
     pub source: String,
@@ -417,7 +475,7 @@ pub struct PackageProvenance {
 }
 
 /// Hub-owned pin metadata.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PackagePin {
     /// Revision, tag, or version pinned by policy.
     pub revision: String,
@@ -428,7 +486,8 @@ pub struct PackagePin {
 }
 
 /// Hub-owned update policy placeholder.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PackageUpdatePolicy {
     /// Updates require an explicit operator/package-manager action.
     Manual,
@@ -460,6 +519,43 @@ pub enum PackageAction {
     Enable,
     Disable,
     Pin,
+}
+
+/// Trusted durable export of package records and hub-owned grants.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PackageRegistrySnapshot {
+    /// Capabilities granted by hub package policy.
+    pub granted_capabilities: Vec<Capability>,
+    /// Capability surfaces governed by the current host profile.
+    pub governed_surfaces: Vec<CapabilitySurface>,
+    /// Package records in deterministic package-name order.
+    pub records: Vec<PackageRecord>,
+}
+
+impl PackageRegistrySnapshot {
+    /// Empty snapshot governed by the current first-party host profile.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self {
+            granted_capabilities: Vec::new(),
+            governed_surfaces: host_profile().capability_surfaces().to_vec(),
+            records: Vec::new(),
+        }
+    }
+}
+
+/// Error returned when persisted registry state is internally inconsistent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PackageRegistrySnapshotError {
+    /// More than one persisted record used the same package manifest name.
+    DuplicatePackage(String),
+    /// Persisted enabled provider/plugin host-profile state no longer admits cleanly.
+    HostProfileAdmission {
+        /// Package whose persisted admission state could not be re-derived.
+        package_name: String,
+        /// Core admission error.
+        error: HostProfileAdmissionError,
+    },
 }
 
 /// Typed hub package policy error.
@@ -956,5 +1052,99 @@ mod tests {
             .collect();
 
         assert_eq!(names, vec!["alpha.plugin", "zeta.plugin"]);
+    }
+
+    #[test]
+    fn snapshot_round_trip_rehydrates_enabled_provider_admission() {
+        let capability = capability(CapabilitySurface::ClientAdmission, None);
+        let mut registry = PackageRegistry::new(grants(vec![capability.clone()]));
+        registry
+            .install(
+                provider_manifest("admission.provider", vec![capability]),
+                provenance(),
+                "install provider",
+            )
+            .expect("install provider");
+        registry
+            .enable("admission.provider", "enable provider")
+            .expect("enable provider");
+
+        let snapshot = registry.snapshot();
+        let restored = PackageRegistry::from_snapshot(snapshot).expect("restore snapshot");
+        let record = restored
+            .package("admission.provider")
+            .expect("restored provider");
+
+        assert_eq!(record.state, PackageState::Enabled);
+        assert_eq!(
+            record
+                .admitted_host_profile
+                .as_ref()
+                .expect("re-admitted provider")
+                .metadata
+                .profile_id,
+            "example-provider"
+        );
+    }
+
+    #[test]
+    fn from_snapshot_rejects_duplicate_package_records() {
+        let manifest = plugin_manifest("duplicate.plugin", Vec::new());
+        let record = PackageRecord {
+            manifest,
+            state: PackageState::Installed,
+            classification: PackageClassification::Plugin,
+            provenance: provenance(),
+            pin: None,
+            update_policy: PackageUpdatePolicy::Manual,
+            last_audit_reason: "install".to_string(),
+            admitted_host_profile: None,
+        };
+        let snapshot = PackageRegistrySnapshot {
+            granted_capabilities: Vec::new(),
+            governed_surfaces: host_profile().capability_surfaces().to_vec(),
+            records: vec![record.clone(), record],
+        };
+
+        let error =
+            PackageRegistry::from_snapshot(snapshot).expect_err("duplicate package should fail");
+
+        assert_eq!(
+            error,
+            PackageRegistrySnapshotError::DuplicatePackage("duplicate.plugin".to_string())
+        );
+    }
+
+    #[test]
+    fn from_snapshot_rejects_enabled_provider_that_no_longer_admits() {
+        let mut manifest = provider_manifest(
+            "broken.provider",
+            vec![capability(CapabilitySurface::ClientAdmission, None)],
+        );
+        manifest.entrypoints.clear();
+        let snapshot = PackageRegistrySnapshot {
+            granted_capabilities: Vec::new(),
+            governed_surfaces: host_profile().capability_surfaces().to_vec(),
+            records: vec![PackageRecord {
+                manifest,
+                state: PackageState::Enabled,
+                classification: PackageClassification::Provider,
+                provenance: provenance(),
+                pin: None,
+                update_policy: PackageUpdatePolicy::Manual,
+                last_audit_reason: "restore".to_string(),
+                admitted_host_profile: None,
+            }],
+        };
+
+        let error = PackageRegistry::from_snapshot(snapshot).expect_err("bad provider should fail");
+
+        assert_eq!(
+            error,
+            PackageRegistrySnapshotError::HostProfileAdmission {
+                package_name: "broken.provider".to_string(),
+                error: HostProfileAdmissionError::MissingBootstrapEntrypoint,
+            }
+        );
     }
 }

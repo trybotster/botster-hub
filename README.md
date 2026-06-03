@@ -80,7 +80,29 @@ not add a physical multi-crate split.
 This repo does not yet implement Rails, TryBotster Cloud, ActionCable, WebRTC,
 signaling servers, browser shells, API clients, OAuth/device-code flows,
 provider processes, persistence databases, plugin runtimes, marketplace fetches,
-package installers, or client transports.
+package installers, or client transports. The hub does include local file-backed
+durable state for dogfood; database-backed persistence and cloud sync remain
+excluded.
+
+## Durable hub state
+
+`FileHubStateStore` persists versioned local state at
+`<HubConfig.data_directory>/hub-state.json`. The v1 state model records host
+identity, config/schema metadata, package/provider registry snapshots,
+capability grants, package admission decisions, enabled/disabled/pinned state,
+provenance/checksum/update policy fields, local runtime settings, and audit
+history.
+
+The production binary boot path and `run-one` smoke path both build
+`HubRuntime` through `HubRuntime::load`, so runtime construction crosses the
+storage boundary before core engine operations start. `HubRuntime::new` remains
+available for tests and explicit in-memory construction. V1 production wiring
+loads or initializes local state; registry/grant/admission mutation saves are
+covered by storage-boundary tests and await the operator/package-manager
+commands that will call `HubStateStore::update`.
+
+Schema and consistency posture are documented in
+[`docs/adr/durable-hub-state-v1.md`](docs/adr/durable-hub-state-v1.md).
 
 ## Dependency policy
 

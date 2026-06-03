@@ -16,6 +16,7 @@ use botster_core::{
 use crate::config::HubConfig;
 use crate::lifecycle::{HubLifecycleResult, HubPluginLifecycle, HubPluginRuntimeBundle};
 use crate::packages::PackageRegistry;
+use crate::persistence::{FileHubStateStore, HubState, HubStateStore, HubStateStoreResult};
 
 /// Hub-owned adapter and policy facade over the default local core engine.
 ///
@@ -25,6 +26,7 @@ use crate::packages::PackageRegistry;
 /// admission and policy boundaries remain visible at the hub layer.
 pub struct HubRuntime {
     config: HubConfig,
+    state: HubState,
     engine: DefaultBotsterEngine,
     plugin_lifecycle: HubPluginLifecycle,
 }
@@ -33,17 +35,45 @@ impl HubRuntime {
     /// Build a hub runtime from explicit, already-validated hub config.
     #[must_use]
     pub fn new(config: HubConfig) -> Self {
+        let state = HubState::from_config(&config);
         Self {
             config,
+            state,
             engine: DefaultBotsterEngine::new(),
             plugin_lifecycle: HubPluginLifecycle::new(),
         }
+    }
+
+    /// Load durable hub state from the resolved data directory before building runtime.
+    pub fn load(config: HubConfig) -> HubStateStoreResult<Self> {
+        let store = FileHubStateStore::for_data_directory(&config.data_directory);
+        Self::load_from_store(config, &store)
+    }
+
+    /// Load durable hub state through an explicit storage boundary.
+    pub fn load_from_store(
+        config: HubConfig,
+        store: &impl HubStateStore,
+    ) -> HubStateStoreResult<Self> {
+        let state = store.load_or_initialize(&config)?;
+        Ok(Self {
+            config,
+            state,
+            engine: DefaultBotsterEngine::new(),
+            plugin_lifecycle: HubPluginLifecycle::new(),
+        })
     }
 
     /// Return the policy-resolved hub config that created this runtime.
     #[must_use]
     pub const fn config(&self) -> &HubConfig {
         &self.config
+    }
+
+    /// Return the durable hub state loaded for this runtime.
+    #[must_use]
+    pub const fn state(&self) -> &HubState {
+        &self.state
     }
 
     /// Load an enabled package through core plugin worker mechanics.
