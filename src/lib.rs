@@ -29,8 +29,10 @@
 //! ```
 
 pub mod auth;
+pub mod capabilities;
 pub mod client_api;
 pub mod config;
+pub mod daemon;
 pub mod lifecycle;
 pub mod packages;
 pub mod persistence;
@@ -39,6 +41,7 @@ pub mod runtime;
 
 use botster_core::CapabilitySurface;
 
+pub use capabilities::HubCapabilityRuntime;
 pub use client_api::{
     HubClientAdmission, HubClientApi, HubClientCapability, HubClientError, HubClientEvent,
     HubClientIdentity, HubClientObservationKind, HubClientOperation, HubClientPackage,
@@ -52,15 +55,24 @@ pub use config::{
     RuntimeEnvironment, SessionDefaults, SessionIoCoalescingOptions, TcpBinding, TransportBindings,
     build_default_config_for_runtime,
 };
+pub use daemon::{
+    HubDaemon, HubDaemonError, HubDaemonResult, HubDaemonState, HubDaemonStatus, HubStateLoadSource,
+};
 pub use lifecycle::{
     HubLifecycleError, HubLifecycleResult, HubPluginLifecycle, HubPluginLifecycleStatus,
     HubPluginRuntimeBundle,
 };
 pub use packages::{
-    PackageAction, PackageAdmissionPolicy, PackageAdmissionReason, PackageClassification,
-    PackageDecision, PackagePin, PackageProvenance, PackageRecord, PackageRegistry,
-    PackageRegistryError, PackageRegistryResult, PackageState, PackageUpdatePolicy,
+    LOCAL_PACKAGE_MANIFEST_FILE, PackageAction, PackageAdmissionPolicy, PackageAdmissionReason,
+    PackageClassification, PackageDecision, PackagePin, PackageProvenance, PackageRecord,
+    PackageRegistry, PackageRegistryError, PackageRegistryResult, PackageRegistrySnapshot,
+    PackageRegistrySnapshotError, PackageState, PackageUpdatePolicy, PreparedLocalPackage,
     default_package_policy,
+};
+pub use persistence::{
+    CapabilityGrantRecord, FileHubStateStore, HubAuditEntry, HubState, HubStateError,
+    HubStateResult, HubStateStore, HubStateStoreError, HubStateStoreResult, LocalRuntimeSettings,
+    PackageAdmissionDecision, SchemaMetadata,
 };
 pub use profile::{
     CoreRuntimeRole, HostProfileManifest, HostProfileTrust, PolicyArea, Responsibility,
@@ -172,6 +184,21 @@ const HUB_FACADE_DECISIONS: &[HubFacadeDecision] = &[
         "PluginWorkerEngine::unload_plugin",
         HubFacadeExposure::Exposed,
         "plugin unload cleanup stays scoped by core worker ownership",
+    ),
+    HubFacadeDecision::new(
+        "PluginCapabilityRuntime::submit",
+        HubFacadeExposure::Exposed,
+        "hub owns concrete local capability policy and submits through core request contracts",
+    ),
+    HubFacadeDecision::new(
+        "PluginCapabilityRuntime::drain_events",
+        HubFacadeExposure::Exposed,
+        "plugin capability completions and timer events are drained through a hub-owned path",
+    ),
+    HubFacadeDecision::new(
+        "PluginCapabilityRuntime::cleanup_plugin",
+        HubFacadeExposure::Exposed,
+        "capability resources are released during hub plugin reload and unload",
     ),
     HubFacadeDecision::new(
         "execute_command(DefaultEngineCommand)",
@@ -301,6 +328,9 @@ mod tests {
             .map(HubFacadeDecision::core_operation)
             .collect();
 
+        assert!(exposed.contains(&"PluginCapabilityRuntime::submit"));
+        assert!(exposed.contains(&"PluginCapabilityRuntime::drain_events"));
+        assert!(exposed.contains(&"PluginCapabilityRuntime::cleanup_plugin"));
         assert!(exposed.contains(&"list_sessions"));
         assert!(exposed.contains(&"spawn_session"));
         assert!(exposed.contains(&"attach_client"));

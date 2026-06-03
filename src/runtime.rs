@@ -8,16 +8,18 @@
 use botster_core::{
     BotsterEngineObservation, BotsterEngineOutput, BotsterSpawnOutcome, ClientId, CoreSession,
     CoreSessionMetadata, DefaultBotsterEngine, DefaultBotsterEngineError, EngineSessionInspection,
-    MailboxSendFailureReason, PluginCleanupResult, PluginInvocationOutcome,
-    PluginInvocationRequest, PluginKey, PreparedSnapshotRequest, QueueSource, RequestId,
-    SessionActivityStatus, SessionId, SessionSpawnRequest, SubscriptionId,
+    MailboxSendFailureReason, PluginCapabilityRuntime, PluginCleanupResult,
+    PluginInvocationOutcome, PluginInvocationRequest, PluginKey, PreparedSnapshotRequest,
+    QueueSource, RequestId, SessionActivityStatus, SessionId, SessionSpawnRequest, SubscriptionId,
 };
 
+use crate::capabilities::HubCapabilityRuntime;
 use crate::config::HubConfig;
 use crate::lifecycle::{
     HubLifecycleResult, HubPluginLifecycle, HubPluginLifecycleStatus, HubPluginRuntimeBundle,
 };
 use crate::packages::PackageRegistry;
+use crate::persistence::{FileHubStateStore, HubState, HubStateStore, HubStateStoreResult};
 
 /// Hub-owned adapter and policy facade over the default local core engine.
 ///
@@ -27,25 +29,66 @@ use crate::packages::PackageRegistry;
 /// admission and policy boundaries remain visible at the hub layer.
 pub struct HubRuntime {
     config: HubConfig,
+    state: HubState,
     engine: DefaultBotsterEngine,
     plugin_lifecycle: HubPluginLifecycle,
+    capability_runtime: HubCapabilityRuntime,
+    last_capability_cleanup: Option<PluginCleanupResult>,
 }
 
 impl HubRuntime {
     /// Build a hub runtime from explicit, already-validated hub config.
     #[must_use]
     pub fn new(config: HubConfig) -> Self {
+        let state = HubState::from_config(&config);
         Self {
+            capability_runtime: HubCapabilityRuntime::from_config(&config),
             config,
+            state,
             engine: DefaultBotsterEngine::new(),
             plugin_lifecycle: HubPluginLifecycle::new(),
+            last_capability_cleanup: None,
         }
+    }
+
+    /// Load durable hub state from the resolved data directory before building runtime.
+    pub fn load(config: HubConfig) -> HubStateStoreResult<Self> {
+        let store = FileHubStateStore::for_data_directory(&config.data_directory);
+        Self::load_from_store(config, &store)
+    }
+
+    /// Load durable hub state through an explicit storage boundary.
+    pub fn load_from_store(
+        config: HubConfig,
+        store: &impl HubStateStore,
+    ) -> HubStateStoreResult<Self> {
+        let state = store.load_or_initialize(&config)?;
+        Ok(Self {
+            capability_runtime: HubCapabilityRuntime::from_config(&config),
+            config,
+            state,
+            engine: DefaultBotsterEngine::new(),
+            plugin_lifecycle: HubPluginLifecycle::new(),
+            last_capability_cleanup: None,
+        })
     }
 
     /// Return the policy-resolved hub config that created this runtime.
     #[must_use]
     pub const fn config(&self) -> &HubConfig {
         &self.config
+    }
+
+    /// Return the concrete local capability runtime owned by this hub.
+    #[must_use]
+    pub const fn capability_runtime(&self) -> &HubCapabilityRuntime {
+        &self.capability_runtime
+    }
+
+    /// Return the durable hub state loaded for this runtime.
+    #[must_use]
+    pub const fn state(&self) -> &HubState {
+        &self.state
     }
 
     /// Load an enabled package through core plugin worker mechanics.
@@ -73,8 +116,18 @@ impl HubRuntime {
         package_name: &str,
         bundle: HubPluginRuntimeBundle,
     ) -> HubLifecycleResult<PluginCleanupResult> {
-        self.plugin_lifecycle
-            .reload_package(request_id, registry, package_name, bundle)
+        let plugin_key = PluginKey(package_name.to_string());
+        let capability_cleanup = self.cleanup_plugin_capabilities(&plugin_key).ok();
+        let mut lifecycle_cleanup =
+            self.plugin_lifecycle
+                .reload_package(request_id, registry, package_name, bundle)?;
+        if let Some(cleanup) = capability_cleanup {
+            lifecycle_cleanup
+                .removed_resources
+                .extend(cleanup.removed_resources.clone());
+            self.last_capability_cleanup = Some(cleanup);
+        }
+        Ok(lifecycle_cleanup)
     }
 
     /// Unload a plugin package through core plugin worker cleanup mechanics.
@@ -84,8 +137,78 @@ impl HubRuntime {
         request_id: RequestId,
         package_name: &str,
     ) -> PluginCleanupResult {
-        self.plugin_lifecycle
-            .unload_package(request_id, package_name)
+        let plugin_key = PluginKey(package_name.to_string());
+        let capability_cleanup = self.cleanup_plugin_capabilities(&plugin_key).ok();
+        let mut lifecycle_cleanup = self
+            .plugin_lifecycle
+            .unload_package(request_id, package_name);
+        if let Some(cleanup) = capability_cleanup {
+            lifecycle_cleanup
+                .removed_resources
+                .extend(cleanup.removed_resources.clone());
+            self.last_capability_cleanup = Some(cleanup);
+        }
+        lifecycle_cleanup
+    }
+
+    /// Submit a plugin capability request through the hub-owned concrete runtime.
+    pub fn submit_capability_request(
+        &mut self,
+        request: botster_core::CapabilityRuntimeRequest,
+    ) -> Result<botster_core::CapabilityRuntimeHandle, botster_core::CapabilityRuntimeError> {
+        self.capability_runtime.submit(request)
+    }
+
+    /// Cancel one plugin-owned capability operation.
+    pub fn cancel_capability_operation(
+        &mut self,
+        plugin_key: &PluginKey,
+        operation_id: &botster_core::CapabilityOperationId,
+    ) -> Result<(), botster_core::CapabilityRuntimeError> {
+        self.capability_runtime.cancel(plugin_key, operation_id)
+    }
+
+    /// Release one plugin-owned capability resource.
+    pub fn release_capability_resource(
+        &mut self,
+        resource: botster_core::PluginResourceRef,
+    ) -> Result<(), botster_core::CapabilityRuntimeError> {
+        self.capability_runtime.release_resource(resource)
+    }
+
+    /// Drain currently available capability events for one plugin.
+    pub fn drain_capability_events(
+        &mut self,
+        plugin_key: &PluginKey,
+    ) -> Result<Vec<botster_core::CapabilityRuntimeEvent>, botster_core::CapabilityRuntimeError>
+    {
+        self.capability_runtime.drain_events(plugin_key)
+    }
+
+    /// Drain capability events after advancing the local logical timer clock.
+    pub fn drain_capability_events_at(
+        &mut self,
+        plugin_key: &PluginKey,
+        now_ms: u64,
+    ) -> Result<Vec<botster_core::CapabilityRuntimeEvent>, botster_core::CapabilityRuntimeError>
+    {
+        self.capability_runtime.drain_events_at(plugin_key, now_ms)
+    }
+
+    /// Stop all capability runtime resources owned by one plugin.
+    pub fn cleanup_plugin_capabilities(
+        &mut self,
+        plugin_key: &PluginKey,
+    ) -> Result<PluginCleanupResult, botster_core::CapabilityRuntimeError> {
+        let cleanup = self.capability_runtime.cleanup_plugin(plugin_key)?;
+        self.last_capability_cleanup = Some(cleanup.clone());
+        Ok(cleanup)
+    }
+
+    /// Last capability cleanup produced by reload, unload, or explicit cleanup.
+    #[must_use]
+    pub const fn last_capability_cleanup(&self) -> Option<&PluginCleanupResult> {
+        self.last_capability_cleanup.as_ref()
     }
 
     /// Return read-only plugin lifecycle status derived from hub package records and load state.

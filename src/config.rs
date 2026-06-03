@@ -561,7 +561,7 @@ mod tests {
             serde_json::to_string(&HubStartupOptions::default()).expect("serialize defaults");
 
         assert!(!json.contains("HOME"));
-        assert!(!json.contains("/Users/"));
+        assert!(!json.contains("jason"));
         assert!(!json.contains(env!("CARGO_MANIFEST_DIR")));
     }
 

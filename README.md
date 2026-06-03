@@ -68,6 +68,33 @@ lifecycle status, sessions, screens, or snapshots when they need them.
 | `report_backpressure` | Exposed | Typed pressure evidence without hub-owned retry policy. |
 | `report_delivery_lag` | Exposed | Typed slow-delivery evidence without hub-owned retry policy. |
 | `report_delivery_failure` | Exposed | Typed failed-delivery evidence without hub-owned retry policy. |
+| `PluginCapabilityRuntime::submit` | Exposed | Hub owns concrete local capability policy and submits through core request contracts. |
+| `PluginCapabilityRuntime::drain_events` | Exposed | Plugin capability completions and timer events are drained through a hub-owned path. |
+| `PluginCapabilityRuntime::cleanup_plugin` | Exposed | Capability resources are released during hub plugin reload and unload. |
+
+## Local capability runtimes
+
+`HubRuntime` owns the local concrete capability adapter for dogfood plugins. It
+accepts `botster-core` `CapabilityRuntimeRequest` values through
+`submit_capability_request`, returns core `CapabilityRuntimeHandle` values, and
+drains core `CapabilityRuntimeEvent` values through `drain_capability_events`.
+The hub adapter implements scoped filesystem operations, plugin JSON store
+operations, logical timers, bounded HTTP stubs, and core's in-memory WebSocket
+runtime. It does not add product cloud, public WebRTC, webhook, OAuth, Rails, or
+external API behavior.
+
+Filesystem access is rooted under the explicit hub data directory at
+`capability-scopes/workspace`. Plugin store data is rooted under
+`plugin-data/<plugin>/`, with `project-pipelines` as the first dogfood namespace
+grant. Runtime data must not be written under plugin source directories.
+Capability grants are scoped to match core request requirements exactly:
+`Network:http`, `Network:websocket`, `Filesystem:workspace`,
+`PluginDb:project-pipelines`, and `Timers:callbacks`.
+
+Filesystem and plugin-store work is accepted through the hub capability path and
+completed on runtime-owned worker threads. Plugin unload and reload call
+capability cleanup in addition to core plugin worker cleanup so timer and network
+resources do not survive replacement.
 
 ## Crate layout
 
@@ -77,10 +104,12 @@ src/client_api.rs          transport-neutral local client request/response/event
 src/profile.rs             first-party host profile manifest and policy metadata
 src/main.rs                thin binary smoke path through the profile facade
 src/config.rs              hub-owned config policy seam
+src/daemon.rs              deterministic local daemon lifecycle over runtime/state
 src/persistence.rs         hub-owned persistence policy seam
 src/auth.rs                hub-owned auth hook seam
 src/packages.rs            hub package policy over core package contracts
 src/lifecycle.rs           hub package lifecycle adapter over core plugin workers
+src/capabilities.rs        hub-owned local capability runtime policy
 src/runtime.rs             hub runtime facade over botster-core
 ```
 
@@ -93,7 +122,43 @@ not add a physical multi-crate split.
 This repo does not yet implement Rails, TryBotster Cloud, ActionCable, WebRTC,
 signaling servers, browser shells, API clients, OAuth/device-code flows,
 provider processes, persistence databases, plugin runtimes, marketplace fetches,
-package installers, or client transports.
+package installers, or client transports. The hub does include local file-backed
+durable state for dogfood; database-backed persistence and cloud sync remain
+excluded.
+
+## Durable hub state
+
+`FileHubStateStore` persists versioned local state at
+`<HubConfig.data_directory>/hub-state.json`. The v1 state model records host
+identity, config/schema metadata, package/provider registry snapshots,
+capability grants, package admission decisions, enabled/disabled/pinned state,
+provenance/checksum/update policy fields, local runtime settings, and audit
+history.
+
+The durable local startup path is explicit:
+
+```sh
+cargo run -- start --data-dir target/botster-hub-daemon-smoke-data
+```
+
+`start --data-dir` constructs `HubDaemon`, loads or initializes
+`hub-state.json`, restores package/provider policy records through
+`PackageRegistrySnapshot` admission, initializes `HubRuntime` through the
+default core engine facade, prints deterministic scrubbed status, and stops
+cleanly. Future transports, provider runtimes, sockets, and supervisors should
+attach after this lifecycle object has started; they should not recreate config
+or durable state ownership.
+
+The no-arg binary path is a side-effect-light host-profile summary. It builds
+resolved config and an in-memory `HubRuntime::new` summary only; it does not
+load or save `hub-state.json` through HOME/XDG fallback paths. `run-one` remains
+an explicit-data-dir runtime smoke path through `HubRuntime::load`. Registry,
+grant, and admission mutation saves are covered by storage-boundary tests and
+await the operator/package-manager commands that will call
+`HubStateStore::update`.
+
+Schema and consistency posture are documented in
+[`docs/adr/durable-hub-state-v1.md`](docs/adr/durable-hub-state-v1.md).
 
 ## Dependency policy
 
@@ -145,6 +210,14 @@ through `botster_core::admit_host_profile`, so core still owns the narrow
 manifest/admission preconditions while hub owns install, enable, disable, pin,
 grant, provenance, update, and audit policy.
 
+Local dogfood installs accept either an explicit JSON manifest path or a package
+directory containing `botster-package.json`. The file is parsed as
+`botster_core::PackageManifest`; the hub rewrites the manifest source to
+`PackageSource::Path` with the canonical package root, records
+`local:<canonical-package-root>` provenance, and rejects absolute, traversing,
+or symlink-escaped entrypoints before registry mutation. Enabled local records
+can be prepared into canonical entrypoint paths for the core lifecycle adapter.
+
 Accepted and denied package decisions carry package name, action,
 classification when known, prior or resulting state when known, typed policy
 reason for denials, admitted host-profile metadata when present, and the audit
@@ -155,9 +228,11 @@ This is the policy gate future package lifecycle loading should call before
 starting plugin/provider execution through core APIs. The hub runtime now loads,
 invokes, reloads, and unloads enabled in-memory package records through
 `botster-core` plugin worker mechanics, with host-supplied deterministic runtime
-bundles. Persistence belongs under `PersistenceBucket::PackageState`, and
-marketplace browsing, git cloning/fetching, network download, lockfile file
-formats, and concrete plugin/provider runtime implementations remain excluded.
+bundles. Package records persist through the canonical `HubState.package_registry`
+snapshot inside `hub-state.json`; there is no separate package-state file for the
+registry. Marketplace browsing, git cloning/fetching, network download, lockfile
+formats, binary/CLI package-install commands, and concrete plugin/provider
+runtime implementations remain excluded.
 
 This repo is intentionally greenfield. The existing `trybotster` monolith is
 evidence only, not source to copy.

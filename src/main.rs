@@ -10,20 +10,31 @@ use botster_core::{
     SpawnEnvironment, SpawnWorkingDirectory, SubscriptionId, TransportEgress,
 };
 use botster_hub::{
-    DataDirectoryOption, HubRuntime, HubStartupOptions, RuntimeEnvironment, SessionDefaults,
-    TransportBindings, build_default_config_for_runtime, default_package_policy, host_profile,
+    DataDirectoryOption, HubDaemon, HubDaemonState, HubRuntime, HubStartupOptions,
+    HubStateLoadSource, RuntimeEnvironment, SessionDefaults, TransportBindings,
+    build_default_config_for_runtime, default_package_policy, host_profile,
 };
 
 const SMOKE_MARKER: &str = "botster-hub-smoke-ok";
 const SMOKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn main() {
-    if env::args().nth(1).as_deref() == Some("run-one") {
-        if let Err(error) = run_one(env::args().skip(2).collect()) {
-            eprintln!("botster-hub run-one error: {error}");
-            process::exit(1);
+    match env::args().nth(1).as_deref() {
+        Some("start") => {
+            if let Err(error) = start_daemon(env::args().skip(2).collect()) {
+                eprintln!("botster-hub start error: {error}");
+                process::exit(1);
+            }
+            return;
         }
-        return;
+        Some("run-one") => {
+            if let Err(error) = run_one(env::args().skip(2).collect()) {
+                eprintln!("botster-hub run-one error: {error}");
+                process::exit(1);
+            }
+            return;
+        }
+        _ => {}
     }
 
     match boot_summary() {
@@ -52,6 +63,79 @@ fn boot_summary() -> Result<botster_hub::HubConfig, botster_hub::HubConfigError>
     build_default_config_for_runtime(&environment)
 }
 
+fn start_daemon(args: Vec<String>) -> Result<(), StartError> {
+    let options = StartOptions::parse(args)?;
+    let config = HubStartupOptions {
+        data_directory: DataDirectoryOption::Explicit(options.data_directory),
+        session_defaults: SessionDefaults {
+            working_directory: Some(PathBuf::from(".")),
+            ..SessionDefaults::default()
+        },
+        transports: TransportBindings {
+            local_socket: None,
+            tcp: Vec::new(),
+        },
+        ..HubStartupOptions::default()
+    }
+    .build_config_for_environment(&RuntimeEnvironment::from_values(None, None, None))?;
+
+    let mut daemon = HubDaemon::start(config)?;
+    print_daemon_status("started", &daemon.status());
+    let stopped = daemon.stop();
+    print_daemon_status("stopped", &stopped);
+
+    Ok(())
+}
+
+fn print_daemon_status(label: &str, status: &botster_hub::HubDaemonStatus) {
+    println!("event={label}");
+    println!(
+        "lifecycle_state={}",
+        lifecycle_state_label(status.lifecycle_state)
+    );
+    println!("host_id={}", status.host_id);
+    println!("host_display_name={}", status.host_display_name);
+    println!("schema_version={}", status.schema_version);
+    println!("data_dir_configured={}", status.data_dir_configured);
+    println!("core_initialized={}", status.core_initialized);
+    println!("state_source={}", state_source_label(status.state_source));
+    println!("package_count={}", status.package_count);
+    println!("enabled_package_count={}", status.enabled_package_count);
+    println!("provider_count={}", status.provider_count);
+    println!("enabled_provider_count={}", status.enabled_provider_count);
+}
+
+fn lifecycle_state_label(state: HubDaemonState) -> &'static str {
+    match state {
+        HubDaemonState::Created => "created",
+        HubDaemonState::Running => "running",
+        HubDaemonState::Stopped => "stopped",
+    }
+}
+
+fn state_source_label(source: HubStateLoadSource) -> &'static str {
+    match source {
+        HubStateLoadSource::Loaded => "loaded",
+        HubStateLoadSource::Initialized => "initialized",
+    }
+}
+
+struct StartOptions {
+    data_directory: PathBuf,
+}
+
+impl StartOptions {
+    fn parse(args: Vec<String>) -> Result<Self, StartError> {
+        if args.len() != 2 || args.first().map(String::as_str) != Some("--data-dir") {
+            return Err(StartError::Usage);
+        }
+
+        Ok(Self {
+            data_directory: PathBuf::from(&args[1]),
+        })
+    }
+}
+
 fn run_one(args: Vec<String>) -> Result<(), RunOneError> {
     let options = RunOneOptions::parse(args)?;
     let command = options.command.clone();
@@ -71,7 +155,7 @@ fn run_one(args: Vec<String>) -> Result<(), RunOneError> {
 
     let profile = host_profile();
     let host_id = config.host.id.clone();
-    let mut runtime = HubRuntime::new(config);
+    let mut runtime = HubRuntime::load(config)?;
     let request = SessionSpawnRequest {
         request_id: RequestId("botster-hub-smoke-spawn".to_string()),
         session_id: SessionId("botster-hub-smoke-session".to_string()),
@@ -195,11 +279,29 @@ struct RunOneCommand {
 }
 
 #[derive(Debug)]
+enum StartError {
+    Usage,
+    Config(botster_hub::HubConfigError),
+    Daemon(botster_hub::HubDaemonError),
+}
+
+#[derive(Debug)]
 enum RunOneError {
     Usage,
     Config(botster_hub::HubConfigError),
     Runtime(botster_hub::HubRuntimeError),
+    State(botster_hub::HubStateStoreError),
     TimedOut,
+}
+
+impl fmt::Display for StartError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Usage => write!(formatter, "usage: botster-hub start --data-dir <path>"),
+            Self::Config(error) => write!(formatter, "{error}"),
+            Self::Daemon(error) => write!(formatter, "{error}"),
+        }
+    }
 }
 
 impl fmt::Display for RunOneError {
@@ -211,6 +313,7 @@ impl fmt::Display for RunOneError {
             ),
             Self::Config(error) => write!(formatter, "{error}"),
             Self::Runtime(error) => write!(formatter, "{error}"),
+            Self::State(error) => write!(formatter, "{error}"),
             Self::TimedOut => write!(
                 formatter,
                 "timed out waiting for {SMOKE_MARKER}; command must print the smoke marker"
@@ -225,8 +328,26 @@ impl From<botster_hub::HubConfigError> for RunOneError {
     }
 }
 
+impl From<botster_hub::HubConfigError> for StartError {
+    fn from(error: botster_hub::HubConfigError) -> Self {
+        Self::Config(error)
+    }
+}
+
+impl From<botster_hub::HubDaemonError> for StartError {
+    fn from(error: botster_hub::HubDaemonError) -> Self {
+        Self::Daemon(error)
+    }
+}
+
 impl From<botster_hub::HubRuntimeError> for RunOneError {
     fn from(error: botster_hub::HubRuntimeError) -> Self {
         Self::Runtime(error)
+    }
+}
+
+impl From<botster_hub::HubStateStoreError> for RunOneError {
+    fn from(error: botster_hub::HubStateStoreError) -> Self {
+        Self::State(error)
     }
 }
