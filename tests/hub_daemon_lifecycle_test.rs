@@ -118,6 +118,33 @@ fn provider_manifest() -> PackageManifest {
     }
 }
 
+fn write_local_plugin_package(root: &Path) {
+    fs::create_dir_all(root).expect("create local package root");
+    fs::write(
+        root.join("plugin.lua"),
+        "-- synthetic local dogfood plugin\n",
+    )
+    .expect("write plugin entrypoint");
+    fs::write(
+        root.join("botster-package.json"),
+        r#"{
+  "name": "dogfood.plugin",
+  "version": "1.0.0",
+  "kind": "plugin",
+  "botster": ">=0.1.0",
+  "source": { "type": "path", "path": "." },
+  "capabilities": [
+    { "surface": "surfaces" }
+  ],
+  "entrypoints": [
+    { "runtime": "lua", "path": "plugin.lua", "bootstrap": false }
+  ]
+}
+"#,
+    )
+    .expect("write local package manifest");
+}
+
 #[test]
 fn daemon_starts_empty_state_reports_status_uses_core_and_stops_idempotently() {
     let config = explicit_config(unique_test_dir("empty"));
@@ -229,6 +256,149 @@ fn cli_start_requires_explicit_data_dir_and_prints_scrubbed_lifecycle_status() {
     assert!(!stdout.contains(concat!("/", "Users", "/")));
     assert!(!stdout.contains("/home/"));
     assert!(data_dir.join("hub-state.json").exists());
+}
+
+#[test]
+fn cli_status_uses_daemon_status_path_without_local_paths() {
+    let data_dir = unique_test_dir("cli-status");
+    let output = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("status")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .output()
+        .expect("run botster-hub status");
+
+    assert!(
+        output.status.success(),
+        "status failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("stdout is utf8");
+    assert!(stdout.contains("event=status"));
+    assert!(stdout.contains("lifecycle_state=running"));
+    assert!(stdout.contains("schema_version=1"));
+    assert!(stdout.contains("core_initialized=true"));
+    assert!(!stdout.contains(data_dir.to_string_lossy().as_ref()));
+}
+
+#[test]
+fn cli_sessions_spawn_and_list_route_through_client_api() {
+    let data_dir = unique_test_dir("cli-sessions");
+    let spawn = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("sessions")
+        .arg("spawn")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("--session-id")
+        .arg("dogfood-session")
+        .arg("--")
+        .arg("printf 'dogfood-ok\\n'; sleep 1")
+        .output()
+        .expect("run botster-hub sessions spawn");
+
+    assert!(
+        spawn.status.success(),
+        "spawn failed: {}",
+        String::from_utf8_lossy(&spawn.stderr)
+    );
+    let stdout = String::from_utf8(spawn.stdout).expect("stdout is utf8");
+    assert!(stdout.contains("response=spawned"));
+    assert!(stdout.contains("session_id=dogfood-session"));
+    assert!(stdout.contains("lifecycle=running"));
+    assert!(stdout.contains("event=session_lifecycle"));
+    assert!(!stdout.contains(data_dir.to_string_lossy().as_ref()));
+
+    let list = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("sessions")
+        .arg("list")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .output()
+        .expect("run botster-hub sessions list");
+
+    assert!(
+        list.status.success(),
+        "list failed: {}",
+        String::from_utf8_lossy(&list.stderr)
+    );
+    let stdout = String::from_utf8(list.stdout).expect("stdout is utf8");
+    assert!(stdout.contains("response=sessions"));
+    assert!(stdout.contains("session_count=0"));
+    assert!(!stdout.contains(data_dir.to_string_lossy().as_ref()));
+}
+
+#[test]
+fn cli_inspect_reports_not_found_for_fresh_in_process_daemon() {
+    let data_dir = unique_test_dir("cli-inspect");
+    let output = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("inspect")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("dogfood-session")
+        .output()
+        .expect("run botster-hub inspect");
+
+    assert!(
+        output.status.success(),
+        "inspect failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("stdout is utf8");
+    assert!(stdout.contains("inspect=session"));
+    assert!(stdout.contains("session_id=dogfood-session"));
+    assert!(stdout.contains("found=false"));
+    assert!(!stdout.contains(data_dir.to_string_lossy().as_ref()));
+}
+
+#[test]
+fn cli_packages_enable_local_path_persists_and_lists_through_client_api() {
+    let data_dir = unique_test_dir("cli-packages");
+    let package_dir = unique_test_dir("local-package");
+    write_local_plugin_package(&package_dir);
+
+    let enable = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("packages")
+        .arg("enable")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("--path")
+        .arg(&package_dir)
+        .output()
+        .expect("run botster-hub packages enable");
+
+    assert!(
+        enable.status.success(),
+        "enable failed: {}",
+        String::from_utf8_lossy(&enable.stderr)
+    );
+    let stdout = String::from_utf8(enable.stdout).expect("stdout is utf8");
+    assert!(stdout.contains("decision=package"));
+    assert!(stdout.contains("package_name=dogfood.plugin"));
+    assert!(stdout.contains("action=enable"));
+    assert!(stdout.contains("response=packages"));
+    assert!(stdout.contains("package name=dogfood.plugin"));
+    assert!(stdout.contains("state=enabled"));
+    assert!(!stdout.contains(package_dir.to_string_lossy().as_ref()));
+
+    let list = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("packages")
+        .arg("list")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .output()
+        .expect("run botster-hub packages list");
+
+    assert!(
+        list.status.success(),
+        "packages list failed: {}",
+        String::from_utf8_lossy(&list.stderr)
+    );
+    let stdout = String::from_utf8(list.stdout).expect("stdout is utf8");
+    assert!(stdout.contains("response=packages"));
+    assert!(stdout.contains("package_count=1"));
+    assert!(stdout.contains("package name=dogfood.plugin"));
+    assert!(stdout.contains("state=enabled"));
+    assert!(!stdout.contains(package_dir.to_string_lossy().as_ref()));
 }
 
 #[test]
