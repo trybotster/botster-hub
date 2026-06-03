@@ -167,6 +167,25 @@ Package state persists through `hub-state.json`; live sessions are runtime-only
 and do not survive separate CLI invocations until a socket attach protocol
 exists.
 
+The end-to-end local dogfood proof is the Unix integration flow below:
+
+```sh
+./test.sh --test hub_local_dogfood_test local_dogfood_runs_daemon_package_lifecycle_session_and_clean_shutdown
+```
+
+That test is the documented proof path for the current scaffold. It starts an
+explicit `HubDaemon` with durable state, installs and enables the checked-in
+`examples/synthetic-plugin` fixture, persists and reloads `hub-state.json`,
+pulls status/package/lifecycle state through `HubClientApi`, resolves the
+package's Lua entrypoint path, loads the package, invokes a synthetic in-process
+plugin runtime through `HubRuntime`, spawns a local PTY session, attaches a
+client, sends input, drains the observed marker, and shuts down through the same
+local client API. The Lua fixture is not executed by a real Lua runtime in this
+proof. The PTY portion is Unix-only.
+
+The CLI commands below are illustrative wiring demos for the same local
+surfaces, not the verified end-to-end proof flow:
+
 ```sh
 cargo run -- start --data-dir target/botster-hub-dogfood-data
 cargo run -- status --data-dir target/botster-hub-dogfood-data
@@ -198,6 +217,15 @@ are wired through `HubClientApi` for future socket-backed continuity, but are
 not useful across separate invocations yet. `inspect` is intentionally scoped to
 sanitized session list data until the stable client API grows a dedicated
 inspection request.
+
+Dogfood-ready today: explicit local daemon lifecycle, file-backed hub/package
+state, local package admission from a manifest path, typed status/package reads,
+plugin lifecycle observation/invocation through the hub facade, and in-process
+PTY spawn/attach/input/drain/shutdown through `HubClientApi`.
+
+Feature parity still pending: cross-process live session continuity, a socket
+daemon protocol, provider process supervision, cloud/Rails/WebRTC/browser/TUI
+adapters, marketplace/package fetching, and durable PTY recovery.
 
 Schema and consistency posture are documented in
 [`docs/adr/durable-hub-state-v1.md`](docs/adr/durable-hub-state-v1.md).
