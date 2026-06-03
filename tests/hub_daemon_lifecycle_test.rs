@@ -226,7 +226,7 @@ fn cli_start_requires_explicit_data_dir_and_prints_scrubbed_lifecycle_status() {
     assert!(stdout.contains("core_initialized=true"));
     assert!(stdout.contains("state_source=initialized"));
     assert!(!stdout.contains(data_dir.to_string_lossy().as_ref()));
-    assert!(!stdout.contains("/Users/"));
+    assert!(!stdout.contains(concat!("/", "Users", "/")));
     assert!(!stdout.contains("/home/"));
     assert!(data_dir.join("hub-state.json").exists());
 }

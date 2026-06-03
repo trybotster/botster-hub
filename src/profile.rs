@@ -21,8 +21,6 @@ pub struct HostProfileManifest {
     pub policy_areas: &'static [PolicyArea],
     /// Capability surfaces governed by the profile and declared by packages.
     pub capability_surfaces: &'static [CapabilitySurface],
-    /// Hub-owned default grants for package admission.
-    pub default_capability_grants: &'static [Capability],
     /// README-aligned package responsibility rows.
     pub responsibilities: &'static [Responsibility],
 }
@@ -45,8 +43,8 @@ impl HostProfileManifest {
 
     /// Capability grants the first-party hub profile admits by default.
     #[must_use]
-    pub const fn default_capability_grants(&self) -> &'static [Capability] {
-        self.default_capability_grants
+    pub fn default_capability_grants(&self) -> Vec<Capability> {
+        default_capability_grants()
     }
 
     /// Responsibility rows for README-aligned callers.
@@ -139,62 +137,73 @@ const CAPABILITY_SURFACES: &[CapabilitySurface] = &[
     CapabilitySurface::Mcp,
     CapabilitySurface::PluginDb,
     CapabilitySurface::Filesystem,
+    CapabilitySurface::Timers,
 ];
 
-const DEFAULT_CAPABILITY_GRANTS: &[Capability] = &[
-    Capability {
-        surface: CapabilitySurface::ClientAdmission,
-        scope: None,
-    },
-    Capability {
-        surface: CapabilitySurface::PairingInvites,
-        scope: None,
-    },
-    Capability {
-        surface: CapabilitySurface::SignalingRelay,
-        scope: None,
-    },
-    Capability {
-        surface: CapabilitySurface::HubPresence,
-        scope: None,
-    },
-    Capability {
-        surface: CapabilitySurface::BrowserShell,
-        scope: None,
-    },
-    Capability {
-        surface: CapabilitySurface::Secrets,
-        scope: None,
-    },
-    Capability {
-        surface: CapabilitySurface::Crypto,
-        scope: None,
-    },
-    Capability {
-        surface: CapabilitySurface::Network,
-        scope: None,
-    },
-    Capability {
-        surface: CapabilitySurface::Surfaces,
-        scope: None,
-    },
-    Capability {
-        surface: CapabilitySurface::SessionActions,
-        scope: None,
-    },
-    Capability {
-        surface: CapabilitySurface::Mcp,
-        scope: None,
-    },
-    Capability {
-        surface: CapabilitySurface::PluginDb,
-        scope: None,
-    },
-    Capability {
-        surface: CapabilitySurface::Filesystem,
-        scope: None,
-    },
-];
+fn default_capability_grants() -> Vec<Capability> {
+    vec![
+        Capability {
+            surface: CapabilitySurface::ClientAdmission,
+            scope: None,
+        },
+        Capability {
+            surface: CapabilitySurface::PairingInvites,
+            scope: None,
+        },
+        Capability {
+            surface: CapabilitySurface::SignalingRelay,
+            scope: None,
+        },
+        Capability {
+            surface: CapabilitySurface::HubPresence,
+            scope: None,
+        },
+        Capability {
+            surface: CapabilitySurface::BrowserShell,
+            scope: None,
+        },
+        Capability {
+            surface: CapabilitySurface::Secrets,
+            scope: None,
+        },
+        Capability {
+            surface: CapabilitySurface::Crypto,
+            scope: None,
+        },
+        Capability {
+            surface: CapabilitySurface::Network,
+            scope: Some("http".to_string()),
+        },
+        Capability {
+            surface: CapabilitySurface::Network,
+            scope: Some("websocket".to_string()),
+        },
+        Capability {
+            surface: CapabilitySurface::Surfaces,
+            scope: None,
+        },
+        Capability {
+            surface: CapabilitySurface::SessionActions,
+            scope: None,
+        },
+        Capability {
+            surface: CapabilitySurface::Mcp,
+            scope: None,
+        },
+        Capability {
+            surface: CapabilitySurface::PluginDb,
+            scope: Some("project-pipelines".to_string()),
+        },
+        Capability {
+            surface: CapabilitySurface::Filesystem,
+            scope: Some("workspace".to_string()),
+        },
+        Capability {
+            surface: CapabilitySurface::Timers,
+            scope: Some("callbacks".to_string()),
+        },
+    ]
+}
 
 const RESPONSIBILITIES: &[Responsibility] = &[
     Responsibility::new(
@@ -230,7 +239,6 @@ const FIRST_PARTY_HOST_PROFILE: HostProfileManifest = HostProfileManifest {
     core_role: CORE_RUNTIME_ROLE,
     policy_areas: POLICY_AREAS,
     capability_surfaces: CAPABILITY_SURFACES,
-    default_capability_grants: DEFAULT_CAPABILITY_GRANTS,
     responsibilities: RESPONSIBILITIES,
 };
 
@@ -293,6 +301,10 @@ mod tests {
         assert!(profile.default_capability_grants().contains(&Capability {
             surface: CapabilitySurface::ClientAdmission,
             scope: None,
+        }));
+        assert!(profile.default_capability_grants().contains(&Capability {
+            surface: CapabilitySurface::Timers,
+            scope: Some("callbacks".to_string()),
         }));
         assert!(
             profile

@@ -34,8 +34,7 @@ impl PackageAdmissionPolicy {
             registry: PackageRegistry::new(
                 host_profile()
                     .default_capability_grants()
-                    .iter()
-                    .cloned()
+                    .into_iter()
                     .collect(),
             ),
         }
@@ -1131,7 +1130,7 @@ mod tests {
     }
 
     #[test]
-    fn enable_denies_capability_surface_outside_host_profile_policy() {
+    fn enable_admits_timer_capability_after_profile_governs_timers() {
         let requested = capability(CapabilitySurface::Timers, Some("callbacks"));
         let mut registry = PackageRegistry::new(grants(vec![requested.clone()]));
         registry
@@ -1142,14 +1141,11 @@ mod tests {
             )
             .expect("install package");
 
-        let error = registry
+        let decision = registry
             .enable("timer.plugin", "operator enabled package")
-            .expect_err("ungoverned host surface should deny");
+            .expect("governed timer surface should enable");
 
-        assert_eq!(
-            error.reason,
-            PackageAdmissionReason::UngovernedCapabilitySurface(CapabilitySurface::Timers)
-        );
+        assert_eq!(decision.state, PackageState::Enabled);
     }
 
     #[test]
