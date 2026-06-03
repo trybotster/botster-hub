@@ -144,13 +144,70 @@ fn drain_until(
     );
 }
 
+fn drain_events_until(
+    api: &HubClientApi,
+    runtime: &mut HubRuntime,
+    packages: &PackageRegistry,
+    session_id: &SessionId,
+    subscription_id: &SubscriptionId,
+    needle: &[u8],
+    logical_clock: &mut u64,
+) -> Vec<HubClientEvent> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut observed = Vec::new();
+
+    while Instant::now() < deadline {
+        let response = api
+            .handle_request(
+                runtime,
+                packages,
+                HubClientRequest::DrainRuntime {
+                    request_id: request_id("drain-events"),
+                    session_id: session_id.clone(),
+                    last_output_at: *logical_clock,
+                },
+            )
+            .expect("drain through client api");
+        *logical_clock += 1;
+
+        let HubClientResponseBody::Events(events) = response.body else {
+            panic!("drain should return events");
+        };
+        observed.extend(events);
+
+        if observed.iter().any(|event| {
+            matches!(
+                event,
+                HubClientEvent::TerminalOutput {
+                    subscription_id: observed_subscription_id,
+                    data,
+                    ..
+                } if observed_subscription_id == subscription_id
+                    && data.windows(needle.len()).any(|window| window == needle)
+            )
+        }) {
+            return observed;
+        }
+
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    panic!(
+        "timed out waiting for {:?} on {:?}",
+        String::from_utf8_lossy(needle),
+        subscription_id
+    );
+}
+
 #[test]
-fn local_client_api_exercises_status_spawn_attach_input_resize_detach_and_events() {
+fn local_client_api_exercises_status_spawn_attach_input_resize_detach_shutdown_and_events() {
     let api = HubClientApi::local_operator("local-client-api-test");
+    let second_api = HubClientApi::local_operator("local-client-api-test-two");
     let packages = empty_registry();
     let mut runtime = explicit_runtime();
     let session_id = session_id();
     let subscription_id = subscription_id();
+    let second_subscription_id = SubscriptionId("hub-client-api-subscription-two".to_string());
     let mut logical_clock = 100;
 
     let status = api
@@ -221,6 +278,19 @@ fn local_client_api_exercises_status_spawn_attach_input_resize_detach_and_events
         .expect("attach through client api");
     logical_clock += 1;
     assert!(matches!(attach.body, HubClientResponseBody::Events(_)));
+    second_api
+        .handle_request(
+            &mut runtime,
+            &packages,
+            HubClientRequest::Attach {
+                request_id: request_id("attach-two"),
+                session_id: session_id.clone(),
+                subscription_id: second_subscription_id.clone(),
+                now_seconds: logical_clock,
+            },
+        )
+        .expect("attach second client through client api");
+    logical_clock += 1;
 
     drain_until(
         &api,
@@ -258,17 +328,43 @@ fn local_client_api_exercises_status_spawn_attach_input_resize_detach_and_events
     .expect("input through client api");
     logical_clock += 1;
 
-    let echo = drain_until(
+    let echo_events = drain_events_until(
         &api,
         &mut runtime,
         &packages,
         &session_id,
+        &subscription_id,
         b"echo:ping-hub",
         &mut logical_clock,
     );
+    assert!(echo_events.iter().any(|event| {
+        matches!(
+            event,
+            HubClientEvent::TerminalOutput {
+                subscription_id: observed_subscription_id,
+                data,
+                ..
+            } if observed_subscription_id == &subscription_id
+                && data
+                    .windows(b"echo:ping-hub".len())
+                    .any(|window| window == b"echo:ping-hub")
+        )
+    }));
     assert!(
-        echo.windows(b"echo:ping-hub".len())
-            .any(|window| window == b"echo:ping-hub")
+        echo_events.iter().any(|event| {
+            matches!(
+                event,
+                HubClientEvent::TerminalOutput {
+                    subscription_id: observed_subscription_id,
+                    data,
+                    ..
+                } if observed_subscription_id == &second_subscription_id
+                    && data
+                        .windows(b"echo:ping-hub".len())
+                        .any(|window| window == b"echo:ping-hub")
+            )
+        }),
+        "both attached subscriptions should receive shared session output"
     );
 
     api.handle_request(
@@ -277,11 +373,77 @@ fn local_client_api_exercises_status_spawn_attach_input_resize_detach_and_events
         HubClientRequest::Detach {
             request_id: request_id("detach"),
             session_id: session_id.clone(),
-            subscription_id,
+            subscription_id: subscription_id.clone(),
             now_seconds: logical_clock,
         },
     )
     .expect("detach through client api");
+    logical_clock += 1;
+
+    second_api
+        .handle_request(
+            &mut runtime,
+            &packages,
+            HubClientRequest::Input {
+                request_id: request_id("input-after-detach"),
+                session_id: session_id.clone(),
+                data: b"after-detach\n".to_vec(),
+                now_seconds: logical_clock,
+            },
+        )
+        .expect("input from still-attached client through client api");
+    logical_clock += 1;
+
+    let after_detach_events = drain_events_until(
+        &second_api,
+        &mut runtime,
+        &packages,
+        &session_id,
+        &second_subscription_id,
+        b"echo:after-detach",
+        &mut logical_clock,
+    );
+    assert!(
+        after_detach_events.iter().all(|event| {
+            !matches!(
+                event,
+                HubClientEvent::TerminalOutput {
+                    subscription_id: observed_subscription_id,
+                    data,
+                    ..
+                } if observed_subscription_id == &subscription_id
+                    && data
+                        .windows(b"echo:after-detach".len())
+                        .any(|window| window == b"echo:after-detach")
+            )
+        }),
+        "detached subscription should not receive later output"
+    );
+
+    let shutdown = second_api
+        .handle_request(
+            &mut runtime,
+            &packages,
+            HubClientRequest::Shutdown {
+                request_id: request_id("shutdown"),
+                session_id: session_id.clone(),
+                reason: "client api test complete".to_string(),
+                now_seconds: logical_clock,
+            },
+        )
+        .expect("shutdown through client api");
+    let HubClientResponseBody::Events(events) = shutdown.body else {
+        panic!("shutdown should return events");
+    };
+    assert!(events.iter().any(|event| {
+        matches!(
+            event,
+            HubClientEvent::SessionLifecycle {
+                session_id: observed,
+                state: SessionLifecycleState::Stopping,
+            } if observed == &session_id
+        )
+    }));
 }
 
 #[test]
