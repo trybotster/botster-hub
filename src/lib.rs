@@ -17,6 +17,9 @@
 //!     decision.core_operation() == "execute_command(DefaultEngineCommand)"
 //!         && decision.exposure() == botster_hub::HubFacadeExposure::Hidden
 //! }));
+//!
+//! let registry = botster_hub::PackageRegistry::new(botster_core::CapabilitySet::new());
+//! assert!(registry.packages().is_empty());
 //! ```
 
 pub mod auth;
@@ -33,6 +36,11 @@ pub use config::{
     HostIdentityOptions, HubConfig, HubConfigError, HubStartupOptions, LocalSocketBinding,
     RuntimeEnvironment, SessionDefaults, SessionIoCoalescingOptions, TcpBinding, TransportBindings,
     build_default_config_for_runtime,
+};
+pub use packages::{
+    PackageAction, PackageClassification, PackageDecision, PackagePin, PackagePolicyReason,
+    PackageProvenance, PackageRecord, PackageRegistry, PackageRegistryError, PackageRegistryResult,
+    PackageState, PackageUpdatePolicy,
 };
 pub use profile::{
     CoreRuntimeRole, HostProfileManifest, HostProfileTrust, PolicyArea, Responsibility,

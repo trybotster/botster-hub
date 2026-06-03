@@ -114,5 +114,26 @@ to profile, host, session, marker, byte-count, and shutdown-observation facts so
 pipeline artifacts do not need local paths, environment dumps, keys, or
 fingerprints.
 
+## Package registry policy
+
+`PackageRegistry` is the first concrete hub-owned package policy surface. It
+stores in-memory package records around `botster_core::PackageManifest` values,
+keeps enabled/disabled state, records provenance/checksum and pin/update
+metadata placeholders, classifies providers from `botster_core::ExtensionKind`,
+and validates enable decisions against a hub-owned `CapabilitySet`.
+
+The registry deliberately uses core package contracts instead of defining a hub
+manifest or capability vocabulary. Provider packages must carry host-profile
+metadata before they can be enabled; provider host-profile packages are admitted
+through `botster_core::admit_host_profile`, so core still owns the narrow
+manifest/admission preconditions while hub owns install, enable, disable, pin,
+grant, provenance, update, and audit policy.
+
+This is the policy gate future package lifecycle loading should call before
+starting plugin/provider execution through core APIs. It is intentionally
+in-memory in this ticket: persistence belongs under `PersistenceBucket::PackageState`,
+and marketplace browsing, git cloning/fetching, network download, lockfile file
+formats, and lifecycle load/unload wiring remain excluded.
+
 This repo is intentionally greenfield. The existing `trybotster` monolith is
 evidence only, not source to copy.
