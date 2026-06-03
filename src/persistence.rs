@@ -36,6 +36,18 @@ pub enum PersistenceBucket {
     ProviderState,
 }
 
+impl PersistenceBucket {
+    /// Resolve the concrete file used by this scaffold under the hub data dir.
+    #[must_use]
+    pub fn path_under(self, data_directory: &Path) -> PathBuf {
+        match self {
+            Self::HostState => data_directory.join(HUB_STATE_FILE_NAME),
+            Self::PackageState => data_directory.join("package-state.json"),
+            Self::ProviderState => data_directory.join("provider-state.json"),
+        }
+    }
+}
+
 /// Versioned durable hub state aggregate.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HubState {
