@@ -169,6 +169,14 @@ through `botster_core::admit_host_profile`, so core still owns the narrow
 manifest/admission preconditions while hub owns install, enable, disable, pin,
 grant, provenance, update, and audit policy.
 
+Local dogfood installs accept either an explicit JSON manifest path or a package
+directory containing `botster-package.json`. The file is parsed as
+`botster_core::PackageManifest`; the hub rewrites the manifest source to
+`PackageSource::Path` with the canonical package root, records
+`local:<canonical-package-root>` provenance, and rejects absolute, traversing,
+or symlink-escaped entrypoints before registry mutation. Enabled local records
+can be prepared into canonical entrypoint paths for the core lifecycle adapter.
+
 Accepted and denied package decisions carry package name, action,
 classification when known, prior or resulting state when known, typed policy
 reason for denials, admitted host-profile metadata when present, and the audit
@@ -179,9 +187,11 @@ This is the policy gate future package lifecycle loading should call before
 starting plugin/provider execution through core APIs. The hub runtime now loads,
 invokes, reloads, and unloads enabled in-memory package records through
 `botster-core` plugin worker mechanics, with host-supplied deterministic runtime
-bundles. Persistence belongs under `PersistenceBucket::PackageState`, and
-marketplace browsing, git cloning/fetching, network download, lockfile file
-formats, and concrete plugin/provider runtime implementations remain excluded.
+bundles. Package records persist through the canonical `HubState.package_registry`
+snapshot inside `hub-state.json`; there is no separate package-state file for the
+registry. Marketplace browsing, git cloning/fetching, network download, lockfile
+formats, binary/CLI package-install commands, and concrete plugin/provider
+runtime implementations remain excluded.
 
 This repo is intentionally greenfield. The existing `trybotster` monolith is
 evidence only, not source to copy.

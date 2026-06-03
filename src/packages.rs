@@ -1,19 +1,24 @@
 //! Hub-owned package registry policy over `botster-core` manifests.
 //!
-//! This module stores in-memory package policy records and validates enable,
-//! disable, pin, and provider admission decisions against the current core
+//! This module stores package policy records and validates enable, disable,
+//! pin, local source, and provider admission decisions against the current core
 //! manifest, capability, and host-profile admission contracts. It intentionally
-//! does not fetch packages, persist records, or load plugin/provider lifecycles.
+//! does not fetch packages or load plugin/provider lifecycles.
 
 use std::collections::BTreeMap;
+use std::fs;
+use std::path::{Component, Path, PathBuf};
 
 use botster_core::{
-    AdmittedHostProfile, Capability, CapabilitySet, CapabilitySurface, ExtensionKind,
-    HostProfileAdmissionError, PackageManifest, admit_host_profile,
+    AdmittedHostProfile, Capability, CapabilitySet, CapabilitySurface, ExtensionEntrypoint,
+    ExtensionKind, HostProfileAdmissionError, PackageManifest, PackageSource, admit_host_profile,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::host_profile;
+
+/// Conventional manifest filename used when installing a local package directory.
+pub const LOCAL_PACKAGE_MANIFEST_FILE: &str = "botster-package.json";
 
 /// Hub-owned package admission policy backed by the first-party host profile.
 #[derive(Debug, Clone)]
@@ -55,6 +60,15 @@ impl PackageAdmissionPolicy {
         audit_reason: impl Into<String>,
     ) -> PackageRegistryResult<&PackageRecord> {
         self.registry.install(manifest, provenance, audit_reason)
+    }
+
+    /// Install a local package from an explicit manifest path or package directory.
+    pub fn install_local_path(
+        &mut self,
+        path: impl AsRef<Path>,
+        audit_reason: impl Into<String>,
+    ) -> PackageRegistryResult<&PackageRecord> {
+        self.registry.install_local_path(path, audit_reason)
     }
 
     /// Enable an installed package when current host-profile grants admit it.
@@ -148,6 +162,27 @@ impl PackageRegistry {
             .expect("inserted package record should be readable"))
     }
 
+    /// Install a local package from an explicit manifest path or package directory.
+    pub fn install_local_path(
+        &mut self,
+        path: impl AsRef<Path>,
+        audit_reason: impl Into<String>,
+    ) -> PackageRegistryResult<&PackageRecord> {
+        let audit_reason = audit_reason.into();
+        let local_source = LocalPackageSource::resolve(path.as_ref(), audit_reason.clone())?;
+        let mut manifest = local_source.read_manifest(audit_reason.clone())?;
+        local_source.validate_manifest_entrypoints(&manifest, audit_reason.clone())?;
+        manifest.source = Some(PackageSource::Path {
+            path: local_source.package_root.to_string_lossy().into_owned(),
+        });
+        let provenance = PackageProvenance {
+            source: format!("local:{}", local_source.package_root.to_string_lossy()),
+            checksum: None,
+        };
+
+        self.install(manifest, provenance, audit_reason)
+    }
+
     /// Enable an installed package when every requested capability is granted.
     pub fn enable(
         &mut self,
@@ -193,46 +228,19 @@ impl PackageRegistry {
             ));
         }
 
-        let admitted_host_profile = match record.classification {
-            PackageClassification::Plugin => {
-                if record.manifest.host_profile.is_some() {
-                    Some(admit_host_profile(&record.manifest, true).map_err(|error| {
-                        PackageRegistryError::with_record(
-                            package_name,
-                            PackageAction::Enable,
-                            PackageAdmissionReason::HostProfileAdmission(error),
-                            state,
-                            classification,
-                            audit_reason.clone(),
-                        )
-                    })?)
-                } else {
-                    None
-                }
-            }
-            PackageClassification::Provider if record.manifest.host_profile.is_none() => {
-                return Err(PackageRegistryError::with_record(
-                    package_name,
-                    PackageAction::Enable,
-                    PackageAdmissionReason::ProviderMissingHostProfile,
-                    state,
-                    classification,
-                    audit_reason,
-                ));
-            }
-            PackageClassification::Provider => {
-                Some(admit_host_profile(&record.manifest, true).map_err(|error| {
+        let admitted_host_profile =
+            admit_enabled_host_profile(&record.manifest, record.classification).map_err(
+                |reason| {
                     PackageRegistryError::with_record(
                         package_name,
                         PackageAction::Enable,
-                        PackageAdmissionReason::HostProfileAdmission(error),
+                        reason,
                         state,
                         classification,
                         audit_reason.clone(),
                     )
-                })?)
-            }
-        };
+                },
+            )?;
 
         let record = self
             .records
@@ -342,6 +350,41 @@ impl PackageRegistry {
         })
     }
 
+    /// Prepare enabled local packages for core lifecycle wiring.
+    pub fn prepare_enabled_local_packages(
+        &self,
+        audit_reason: impl Into<String>,
+    ) -> PackageRegistryResult<Vec<PreparedLocalPackage>> {
+        let audit_reason = audit_reason.into();
+        self.records
+            .values()
+            .filter(|record| record.is_enabled())
+            .filter(|record| matches!(record.manifest.source, Some(PackageSource::Path { .. })))
+            .map(|record| PreparedLocalPackage::from_record(record, audit_reason.clone()))
+            .collect()
+    }
+
+    /// Prepare one enabled local package for core lifecycle wiring.
+    pub fn prepare_local_package(
+        &self,
+        package_name: &str,
+        audit_reason: impl Into<String>,
+    ) -> PackageRegistryResult<PreparedLocalPackage> {
+        let audit_reason = audit_reason.into();
+        let record = self.record(package_name, PackageAction::Prepare, audit_reason.clone())?;
+        if !record.is_enabled() {
+            return Err(PackageRegistryError::with_record(
+                package_name,
+                PackageAction::Prepare,
+                PackageAdmissionReason::PackageNotEnabled,
+                record.state,
+                record.classification,
+                audit_reason,
+            ));
+        }
+        PreparedLocalPackage::from_record(record, audit_reason)
+    }
+
     fn admitted_host_profile_from_snapshot(
         record: &PackageRecord,
     ) -> Result<Option<AdmittedHostProfile>, PackageRegistrySnapshotError> {
@@ -349,17 +392,21 @@ impl PackageRegistry {
             return Ok(None);
         }
 
-        match record.classification {
-            PackageClassification::Plugin if record.manifest.host_profile.is_none() => Ok(None),
-            PackageClassification::Plugin | PackageClassification::Provider => {
-                admit_host_profile(&record.manifest, true)
-                    .map(Some)
-                    .map_err(|error| PackageRegistrySnapshotError::HostProfileAdmission {
-                        package_name: record.manifest.name.clone(),
-                        error,
-                    })
+        admit_enabled_host_profile(&record.manifest, record.classification).map_err(|reason| {
+            let error = match reason {
+                PackageAdmissionReason::ProviderMissingHostProfile => {
+                    HostProfileAdmissionError::MissingMetadata
+                }
+                PackageAdmissionReason::HostProfileAdmission(error) => error,
+                other => unreachable!(
+                    "admit_enabled_host_profile returned unexpected package admission reason: {other:?}"
+                ),
+            };
+            PackageRegistrySnapshotError::HostProfileAdmission {
+                package_name: record.manifest.name.clone(),
+                error,
             }
-        }
+        })
     }
 
     /// Return the hub-owned grants used for package admission.
@@ -468,7 +515,7 @@ impl PackageClassification {
 /// Hub-owned provenance placeholder around a core manifest source.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PackageProvenance {
-    /// Non-local source identifier suitable for audit displays.
+    /// Source identifier suitable for audit displays, including local package roots.
     pub source: String,
     /// Optional checksum recorded by future installer/lockfile paths.
     pub checksum: Option<String>,
@@ -519,6 +566,7 @@ pub enum PackageAction {
     Enable,
     Disable,
     Pin,
+    Prepare,
 }
 
 /// Trusted durable export of package records and hub-owned grants.
@@ -627,6 +675,14 @@ pub enum PackageAdmissionReason {
     MissingProvenance,
     /// Pin metadata did not identify a revision/tag/version.
     MissingPinRevision,
+    /// Enabled package must be active before preparation.
+    PackageNotEnabled,
+    /// Local path source was absent or unsafe.
+    UnsafeLocalPath(String),
+    /// Local package manifest could not be read or parsed.
+    InvalidLocalManifest(String),
+    /// Local package entrypoint was absent or unsafe.
+    UnsafeEntrypoint(String),
     /// Capability surface is not governed by the current host profile.
     UngovernedCapabilitySurface(CapabilitySurface),
     /// Manifest requested a capability not present in the hub-owned grant set.
@@ -637,6 +693,261 @@ pub enum PackageAdmissionReason {
     HostProfileAdmission(HostProfileAdmissionError),
 }
 
+fn admit_enabled_host_profile(
+    manifest: &PackageManifest,
+    classification: PackageClassification,
+) -> Result<Option<AdmittedHostProfile>, PackageAdmissionReason> {
+    match classification {
+        PackageClassification::Plugin if manifest.host_profile.is_none() => Ok(None),
+        PackageClassification::Plugin => admit_host_profile(manifest, true)
+            .map(Some)
+            .map_err(PackageAdmissionReason::HostProfileAdmission),
+        PackageClassification::Provider if manifest.host_profile.is_none() => {
+            Err(PackageAdmissionReason::ProviderMissingHostProfile)
+        }
+        PackageClassification::Provider => admit_host_profile(manifest, true)
+            .map(Some)
+            .map_err(PackageAdmissionReason::HostProfileAdmission),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedLocalPackage {
+    /// Installed package name.
+    pub package_name: String,
+    /// Canonical local package root.
+    pub package_root: PathBuf,
+    /// Manifest entrypoints preserved from the core package manifest.
+    pub entrypoints: Vec<ExtensionEntrypoint>,
+    /// Selected entrypoint from the manifest.
+    pub selected_entrypoint: ExtensionEntrypoint,
+    /// Canonical filesystem path for the selected entrypoint.
+    pub selected_entrypoint_path: PathBuf,
+}
+
+impl PreparedLocalPackage {
+    fn from_record(record: &PackageRecord, audit_reason: String) -> PackageRegistryResult<Self> {
+        let package_root = match &record.manifest.source {
+            Some(PackageSource::Path { path }) => canonical_package_root(
+                Path::new(path),
+                &record.manifest.name,
+                PackageAction::Prepare,
+                audit_reason.clone(),
+            )?,
+            _ => {
+                return Err(PackageRegistryError::with_record(
+                    record.manifest.name.clone(),
+                    PackageAction::Prepare,
+                    PackageAdmissionReason::UnsafeLocalPath(
+                        "package manifest source is not a local path".to_string(),
+                    ),
+                    record.state,
+                    record.classification,
+                    audit_reason,
+                ));
+            }
+        };
+
+        let Some(selected_entrypoint) = record.manifest.entrypoints.first().cloned() else {
+            return Err(PackageRegistryError::with_record(
+                record.manifest.name.clone(),
+                PackageAction::Prepare,
+                PackageAdmissionReason::UnsafeEntrypoint(
+                    "local package has no entrypoints".to_string(),
+                ),
+                record.state,
+                record.classification,
+                audit_reason,
+            ));
+        };
+        let selected_entrypoint_path = canonical_entrypoint_path(
+            &package_root,
+            &selected_entrypoint.path,
+            &record.manifest.name,
+            PackageAction::Prepare,
+            audit_reason.clone(),
+        )?;
+
+        Ok(Self {
+            package_name: record.manifest.name.clone(),
+            package_root,
+            entrypoints: record.manifest.entrypoints.clone(),
+            selected_entrypoint,
+            selected_entrypoint_path,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct LocalPackageSource {
+    package_root: PathBuf,
+    manifest_path: PathBuf,
+}
+
+impl LocalPackageSource {
+    fn resolve(path: &Path, audit_reason: String) -> PackageRegistryResult<Self> {
+        if path.as_os_str().is_empty() {
+            return Err(PackageRegistryError::without_record(
+                "<local-package>",
+                PackageAction::Install,
+                PackageAdmissionReason::UnsafeLocalPath("local package path is empty".to_string()),
+                audit_reason,
+            ));
+        }
+
+        let canonical = path.canonicalize().map_err(|error| {
+            PackageRegistryError::without_record(
+                path.to_string_lossy(),
+                PackageAction::Install,
+                PackageAdmissionReason::UnsafeLocalPath(error.to_string()),
+                audit_reason.clone(),
+            )
+        })?;
+
+        if canonical.is_dir() {
+            let manifest_path = canonical.join(LOCAL_PACKAGE_MANIFEST_FILE);
+            let manifest_path = manifest_path.canonicalize().map_err(|error| {
+                PackageRegistryError::without_record(
+                    canonical.to_string_lossy(),
+                    PackageAction::Install,
+                    PackageAdmissionReason::InvalidLocalManifest(error.to_string()),
+                    audit_reason.clone(),
+                )
+            })?;
+            if !manifest_path.starts_with(&canonical) {
+                return Err(PackageRegistryError::without_record(
+                    canonical.to_string_lossy(),
+                    PackageAction::Install,
+                    PackageAdmissionReason::UnsafeLocalPath(
+                        "directory manifest resolves outside package root".to_string(),
+                    ),
+                    audit_reason,
+                ));
+            }
+            Ok(Self {
+                package_root: canonical,
+                manifest_path,
+            })
+        } else {
+            let Some(package_root) = canonical.parent() else {
+                return Err(PackageRegistryError::without_record(
+                    canonical.to_string_lossy(),
+                    PackageAction::Install,
+                    PackageAdmissionReason::UnsafeLocalPath(
+                        "manifest path has no package directory".to_string(),
+                    ),
+                    audit_reason,
+                ));
+            };
+            Ok(Self {
+                package_root: package_root.to_path_buf(),
+                manifest_path: canonical,
+            })
+        }
+    }
+
+    fn read_manifest(&self, audit_reason: String) -> PackageRegistryResult<PackageManifest> {
+        let bytes = fs::read(&self.manifest_path).map_err(|error| {
+            PackageRegistryError::without_record(
+                self.manifest_path.to_string_lossy(),
+                PackageAction::Install,
+                PackageAdmissionReason::InvalidLocalManifest(error.to_string()),
+                audit_reason.clone(),
+            )
+        })?;
+        serde_json::from_slice(&bytes).map_err(|error| {
+            PackageRegistryError::without_record(
+                self.manifest_path.to_string_lossy(),
+                PackageAction::Install,
+                PackageAdmissionReason::InvalidLocalManifest(error.to_string()),
+                audit_reason,
+            )
+        })
+    }
+
+    fn validate_manifest_entrypoints(
+        &self,
+        manifest: &PackageManifest,
+        audit_reason: String,
+    ) -> PackageRegistryResult<()> {
+        for entrypoint in &manifest.entrypoints {
+            canonical_entrypoint_path(
+                &self.package_root,
+                &entrypoint.path,
+                &manifest.name,
+                PackageAction::Install,
+                audit_reason.clone(),
+            )?;
+        }
+        Ok(())
+    }
+}
+
+fn canonical_package_root(
+    path: &Path,
+    package_name: &str,
+    action: PackageAction,
+    audit_reason: String,
+) -> PackageRegistryResult<PathBuf> {
+    path.canonicalize().map_err(|error| {
+        PackageRegistryError::without_record(
+            package_name,
+            action,
+            PackageAdmissionReason::UnsafeLocalPath(error.to_string()),
+            audit_reason,
+        )
+    })
+}
+
+fn canonical_entrypoint_path(
+    package_root: &Path,
+    entrypoint: &str,
+    package_name: &str,
+    action: PackageAction,
+    audit_reason: String,
+) -> PackageRegistryResult<PathBuf> {
+    let relative = Path::new(entrypoint);
+    if entrypoint.is_empty()
+        || relative.is_absolute()
+        || relative.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        return Err(PackageRegistryError::without_record(
+            package_name,
+            action,
+            PackageAdmissionReason::UnsafeEntrypoint(entrypoint.to_string()),
+            audit_reason,
+        ));
+    }
+
+    let entrypoint_path = package_root
+        .join(relative)
+        .canonicalize()
+        .map_err(|error| {
+            PackageRegistryError::without_record(
+                package_name,
+                action,
+                PackageAdmissionReason::UnsafeEntrypoint(error.to_string()),
+                audit_reason.clone(),
+            )
+        })?;
+    if !entrypoint_path.starts_with(package_root) {
+        return Err(PackageRegistryError::without_record(
+            package_name,
+            action,
+            PackageAdmissionReason::UnsafeEntrypoint(
+                "entrypoint resolves outside package root".to_string(),
+            ),
+            audit_reason,
+        ));
+    }
+    Ok(entrypoint_path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -644,6 +955,11 @@ mod tests {
         ExtensionEntrypoint, ExtensionRuntime, HostProfileMetadata, HostProfilePolicySection,
         PackageSource,
     };
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    use crate::config::{DataDirectoryOption, HubStartupOptions, RuntimeEnvironment};
+    use crate::persistence::{FileHubStateStore, HubStateStore};
 
     fn capability(surface: CapabilitySurface, scope: Option<&str>) -> Capability {
         Capability {
@@ -708,6 +1024,37 @@ mod tests {
                 policy_sections: vec![HostProfilePolicySection::Providers],
             }),
         }
+    }
+
+    fn test_root(name: &str) -> PathBuf {
+        let root = PathBuf::from("target")
+            .join("botster-hub-package-tests")
+            .join(name);
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create package test root");
+        root.canonicalize().expect("canonical package test root")
+    }
+
+    fn write_manifest(package_root: &Path, manifest: &PackageManifest) -> PathBuf {
+        let manifest_path = package_root.join(LOCAL_PACKAGE_MANIFEST_FILE);
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(manifest).expect("serialize local package manifest"),
+        )
+        .expect("write local package manifest");
+        manifest_path
+    }
+
+    fn local_manifest(name: &str, entrypoint: &str) -> PackageManifest {
+        let mut manifest =
+            plugin_manifest(name, vec![capability(CapabilitySurface::Surfaces, None)]);
+        manifest.source = None;
+        manifest.entrypoints = vec![ExtensionEntrypoint {
+            runtime: ExtensionRuntime::Lua,
+            path: entrypoint.to_string(),
+            bootstrap: false,
+        }];
+        manifest
     }
 
     #[test]
@@ -1023,6 +1370,284 @@ mod tests {
 
         assert_eq!(decision.state, PackageState::Enabled);
         assert_eq!(decision.audit_reason, "enable through profile policy");
+    }
+
+    #[test]
+    fn explicit_local_manifest_installs_path_source_and_local_provenance() {
+        let root = test_root("explicit-local-manifest");
+        fs::write(root.join("plugin.lua"), "-- synthetic plugin").expect("write plugin");
+        let manifest_path = write_manifest(&root, &local_manifest("local.plugin", "plugin.lua"));
+        let mut registry =
+            PackageRegistry::new(grants(vec![capability(CapabilitySurface::Surfaces, None)]));
+
+        let record = registry
+            .install_local_path(&manifest_path, "install local manifest")
+            .expect("install local manifest");
+
+        assert_eq!(record.state, PackageState::Installed);
+        assert_eq!(
+            record.manifest.source,
+            Some(PackageSource::Path {
+                path: root.to_string_lossy().into_owned()
+            })
+        );
+        assert_eq!(
+            record.provenance.source,
+            format!("local:{}", root.to_string_lossy())
+        );
+    }
+
+    #[test]
+    fn local_package_directory_uses_conventional_manifest_filename() {
+        let root = test_root("directory-local-manifest");
+        fs::write(root.join("plugin.lua"), "-- synthetic plugin").expect("write plugin");
+        write_manifest(&root, &local_manifest("directory.plugin", "plugin.lua"));
+        let mut registry =
+            PackageRegistry::new(grants(vec![capability(CapabilitySurface::Surfaces, None)]));
+
+        registry
+            .install_local_path(&root, "install package directory")
+            .expect("install package directory");
+
+        assert!(registry.package("directory.plugin").is_some());
+    }
+
+    #[test]
+    fn durable_package_state_round_trips_local_metadata_and_provider_admission() {
+        let root = test_root("durable-local-state");
+        let data_root = root.join("data");
+        let plugin_root = root.join("package");
+        fs::create_dir_all(&plugin_root).expect("create local package");
+        fs::write(plugin_root.join("plugin.lua"), "-- synthetic plugin").expect("write plugin");
+        write_manifest(
+            &plugin_root,
+            &local_manifest("durable.plugin", "plugin.lua"),
+        );
+        let provider_capability = capability(CapabilitySurface::ClientAdmission, None);
+        let mut registry = PackageRegistry::new(grants(vec![
+            capability(CapabilitySurface::Surfaces, None),
+            provider_capability.clone(),
+        ]));
+        registry
+            .install_local_path(&plugin_root, "install local package")
+            .expect("install local package");
+        registry
+            .pin(
+                "durable.plugin",
+                PackagePin {
+                    revision: "local-dev".to_string(),
+                    checksum: Some("sha256:local-dev".to_string()),
+                    update_policy: PackageUpdatePolicy::TrackSource,
+                },
+                "pin local package",
+            )
+            .expect("pin local package");
+        registry
+            .enable("durable.plugin", "enable local package")
+            .expect("enable local package");
+        registry
+            .install(
+                provider_manifest("durable.provider", vec![provider_capability]),
+                provenance(),
+                "install provider",
+            )
+            .expect("install provider");
+        registry
+            .enable("durable.provider", "enable provider")
+            .expect("enable provider");
+        let live_provider_profile = registry
+            .package("durable.provider")
+            .expect("provider record before save")
+            .admitted_host_profile
+            .as_ref()
+            .expect("live provider admission")
+            .metadata
+            .profile_id
+            .clone();
+
+        let config = HubStartupOptions {
+            data_directory: DataDirectoryOption::Explicit(data_root),
+            ..HubStartupOptions::default()
+        }
+        .build_config_for_environment(&RuntimeEnvironment::from_values(None, None, None))
+        .expect("explicit state config should build");
+        let store = FileHubStateStore::for_data_directory(&config.data_directory);
+        let state = store
+            .update(&config, |state| {
+                state.package_registry = registry.snapshot();
+            })
+            .expect("save package state through hub state");
+        let loaded = PackageRegistry::from_snapshot(state.package_registry)
+            .expect("load package state from hub state");
+
+        let local_record = loaded.package("durable.plugin").expect("local record");
+        assert_eq!(local_record.state, PackageState::Enabled);
+        assert_eq!(
+            local_record.pin.as_ref().expect("pin").update_policy,
+            PackageUpdatePolicy::TrackSource
+        );
+        assert_eq!(
+            local_record.provenance.source,
+            format!(
+                "local:{}",
+                plugin_root.canonicalize().unwrap().to_string_lossy()
+            )
+        );
+        assert!(
+            loaded
+                .package("durable.provider")
+                .expect("provider record")
+                .admitted_host_profile
+                .is_some()
+        );
+        assert_eq!(
+            loaded
+                .package("durable.provider")
+                .expect("provider record")
+                .admitted_host_profile
+                .as_ref()
+                .expect("reloaded provider admission")
+                .metadata
+                .profile_id,
+            live_provider_profile
+        );
+    }
+
+    #[test]
+    fn unsafe_local_entrypoints_are_rejected_before_install() {
+        let root = test_root("unsafe-local-entrypoints");
+        fs::write(root.join("plugin.lua"), "-- synthetic plugin").expect("write plugin");
+        let mut registry =
+            PackageRegistry::new(grants(vec![capability(CapabilitySurface::Surfaces, None)]));
+
+        write_manifest(&root, &local_manifest("absolute.plugin", "/tmp/plugin.lua"));
+        let error = registry
+            .install_local_path(&root, "install absolute entrypoint")
+            .expect_err("absolute entrypoint should fail");
+        assert!(matches!(
+            error.reason,
+            PackageAdmissionReason::UnsafeEntrypoint(_)
+        ));
+
+        write_manifest(&root, &local_manifest("traverse.plugin", "../plugin.lua"));
+        let error = registry
+            .install_local_path(&root, "install traversing entrypoint")
+            .expect_err("traversing entrypoint should fail");
+        assert!(matches!(
+            error.reason,
+            PackageAdmissionReason::UnsafeEntrypoint(_)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_escaped_entrypoints_are_rejected_at_install_and_prepare() {
+        use std::os::unix::fs::symlink;
+
+        let root = test_root("symlink-escaped-entrypoint");
+        let outside = test_root("symlink-escaped-entrypoint-outside");
+        fs::write(outside.join("outside.lua"), "-- outside").expect("write outside plugin");
+        symlink(outside.join("outside.lua"), root.join("link.lua")).expect("create symlink");
+        write_manifest(&root, &local_manifest("symlink.plugin", "link.lua"));
+        let mut registry =
+            PackageRegistry::new(grants(vec![capability(CapabilitySurface::Surfaces, None)]));
+
+        let error = registry
+            .install_local_path(&root, "install symlink entrypoint")
+            .expect_err("symlink escape should fail");
+        assert!(matches!(
+            error.reason,
+            PackageAdmissionReason::UnsafeEntrypoint(_)
+        ));
+
+        fs::remove_file(root.join("link.lua")).expect("remove escaping symlink");
+        fs::write(root.join("link.lua"), "-- safe during install").expect("write safe file");
+        registry
+            .install_local_path(&root, "install safe local package")
+            .expect("install safe package");
+        registry
+            .enable("symlink.plugin", "enable safe local package")
+            .expect("enable safe package");
+        fs::remove_file(root.join("link.lua")).expect("remove safe file");
+        symlink(outside.join("outside.lua"), root.join("link.lua"))
+            .expect("create escaping symlink after install");
+
+        let error = registry
+            .prepare_local_package("symlink.plugin", "prepare local package")
+            .expect_err("prepare should revalidate entrypoint escape");
+        assert!(matches!(
+            error.reason,
+            PackageAdmissionReason::UnsafeEntrypoint(_)
+        ));
+    }
+
+    #[test]
+    fn prepare_enabled_local_packages_returns_only_enabled_local_records() {
+        let root = test_root("prepare-enabled-local-packages");
+        let alpha_root = root.join("alpha");
+        let beta_root = root.join("beta");
+        let disabled_root = root.join("disabled");
+        for package_root in [&alpha_root, &beta_root, &disabled_root] {
+            fs::create_dir_all(package_root).expect("create package root");
+            fs::write(package_root.join("plugin.lua"), "-- synthetic plugin")
+                .expect("write plugin");
+        }
+        write_manifest(&alpha_root, &local_manifest("alpha.local", "plugin.lua"));
+        write_manifest(&beta_root, &local_manifest("beta.local", "plugin.lua"));
+        write_manifest(
+            &disabled_root,
+            &local_manifest("disabled.local", "plugin.lua"),
+        );
+        let mut registry =
+            PackageRegistry::new(grants(vec![capability(CapabilitySurface::Surfaces, None)]));
+        registry
+            .install_local_path(&alpha_root, "install alpha")
+            .expect("install alpha");
+        registry
+            .install_local_path(&beta_root, "install beta")
+            .expect("install beta");
+        registry
+            .install_local_path(&disabled_root, "install disabled")
+            .expect("install disabled");
+        registry
+            .install(
+                plugin_manifest(
+                    "nonlocal.plugin",
+                    vec![capability(CapabilitySurface::Surfaces, None)],
+                ),
+                provenance(),
+                "install nonlocal",
+            )
+            .expect("install nonlocal");
+        for package_name in ["alpha.local", "beta.local", "nonlocal.plugin"] {
+            registry
+                .enable(package_name, "enable package")
+                .expect("enable package");
+        }
+
+        let prepared = registry
+            .prepare_enabled_local_packages("prepare local packages")
+            .expect("prepare enabled local packages");
+        let package_names: Vec<_> = prepared
+            .iter()
+            .map(|package| package.package_name.as_str())
+            .collect();
+
+        assert_eq!(package_names, vec!["alpha.local", "beta.local"]);
+        assert_eq!(
+            prepared[0].selected_entrypoint_path,
+            alpha_root
+                .join("plugin.lua")
+                .canonicalize()
+                .expect("canonical alpha entrypoint")
+        );
+        assert_eq!(
+            prepared[1].selected_entrypoint_path,
+            beta_root
+                .join("plugin.lua")
+                .canonicalize()
+                .expect("canonical beta entrypoint")
+        );
     }
 
     #[test]
