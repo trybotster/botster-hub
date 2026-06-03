@@ -153,9 +153,51 @@ The no-arg binary path is a side-effect-light host-profile summary. It builds
 resolved config and an in-memory `HubRuntime::new` summary only; it does not
 load or save `hub-state.json` through HOME/XDG fallback paths. `run-one` remains
 an explicit-data-dir runtime smoke path through `HubRuntime::load`. Registry,
-grant, and admission mutation saves are covered by storage-boundary tests and
-await the operator/package-manager commands that will call
-`HubStateStore::update`.
+grant, and admission mutation saves are now exercised by the local operator CLI
+package commands through `HubStateStore::update`.
+
+## Local dogfood operator CLI
+
+The `botster-hub` binary includes a deliberately thin local operator surface for
+dogfood. It starts an explicit local hub lifecycle with `HubDaemon`, then routes
+operator reads and session actions through `HubClientApi` instead of raw core
+routers. The current scaffold is in-process; it proves the daemon/runtime
+boundary without claiming a socket protocol for separate long-lived processes.
+Package state persists through `hub-state.json`; live sessions are runtime-only
+and do not survive separate CLI invocations until a socket attach protocol
+exists.
+
+```sh
+cargo run -- start --data-dir target/botster-hub-dogfood-data
+cargo run -- status --data-dir target/botster-hub-dogfood-data
+
+cargo run -- packages enable --data-dir target/botster-hub-dogfood-data \
+  --path examples/synthetic-plugin
+cargo run -- packages list --data-dir target/botster-hub-dogfood-data
+cargo run -- providers list --data-dir target/botster-hub-dogfood-data
+
+# Session commands prove the HubClientApi wiring for one ephemeral daemon
+# invocation. A later command starts a fresh daemon, so it will not see this
+# spawned session until cross-process socket attach exists.
+cargo run -- sessions spawn --data-dir target/botster-hub-dogfood-data \
+  --session-id dogfood-session -- "printf 'dogfood-ok\n'; sleep 1"
+cargo run -- sessions list --data-dir target/botster-hub-dogfood-data
+cargo run -- sessions attach --data-dir target/botster-hub-dogfood-data dogfood-session
+cargo run -- sessions send-input --data-dir target/botster-hub-dogfood-data \
+  dogfood-session -- "ping\n"
+cargo run -- inspect --data-dir target/botster-hub-dogfood-data dogfood-session
+```
+
+`packages enable --path` installs and enables a local package manifest through
+the existing hub package registry policy, persists the registry snapshot under
+`hub-state.json`, and then lists packages through `HubClientApi::ListPackages`.
+The session commands are wiring demonstrations in this scaffold: `spawn` crosses
+`HubClientApi::Spawn`, while a later `sessions list` or `inspect` command starts
+a new in-process daemon and reports no live session. `attach` and `send-input`
+are wired through `HubClientApi` for future socket-backed continuity, but are
+not useful across separate invocations yet. `inspect` is intentionally scoped to
+sanitized session list data until the stable client API grows a dedicated
+inspection request.
 
 Schema and consistency posture are documented in
 [`docs/adr/durable-hub-state-v1.md`](docs/adr/durable-hub-state-v1.md).
