@@ -25,14 +25,13 @@ thick wrapper.
 | Plugins/providers | Installable behavior packages that declare capabilities, compatibility, entrypoints, provenance, checksums, enabled state, and update policy. |
 | External provider implementations | Cloud federation, signaling relay, browser shell, API, and other privileged integrations implemented outside the hub crate. |
 
-The host profile embeds `botster-core` through the default local-runtime-backed
-engine facade for the reusable tmux-like local engine and shared package
-contracts: session spawning, PTY/process mechanics, session lifecycle and
-activity, subscription fanout, notifications, plugin worker primitives, package
-manifests, `Capability`, `CapabilitySurface`, host-profile admission contracts,
-capability runtime primitives, and consumer conformance behavior. `HubRuntime`
-is a hub-owned adapter and policy facade over that engine, not a separate
-runtime engine.
+The host profile consumes `botster-core` through the typed core daemon API for
+the production local session path. `botster-core-daemon` owns the durable
+session registry metadata, worker-backed session supervision, PTY/process
+mechanics, subscription fanout, readiness-gated writes, adoption primitives, and
+delivery-state transitions. `HubRuntime` is the hub-owned host-profile facade
+over that daemon plus hub package, lifecycle, and capability policy; it is not a
+replacement runtime engine and it does not own live production PTY handles.
 
 ## HubRuntime facade audit
 
@@ -49,27 +48,23 @@ transport-neutral and currently exercised in-process; socket, CLI, TUI, or local
 browser bridge adapters should frame the same request/response/event contract
 instead of bypassing hub admission or calling core routers directly. Attach is a
 subscription handshake only, so clients still explicitly pull status, packages,
-lifecycle status, or sessions when they need them. Screen and snapshot requests
-return a typed unsupported response until the daemon-backed core API exposes
-those operations.
+lifecycle status, or sessions when they need them. Hub code may start or embed
+the typed core daemon API; it must not shell out to the core daemon CLI or parse
+CLI output for session routing. Screen and snapshot requests return a typed
+unsupported response until the daemon-backed core API exposes those operations.
 
 | Core operation | HubRuntime decision | Reason |
 | --- | --- | --- |
 | `execute_command(DefaultEngineCommand)` | Hidden | A generic command router would obscure hub admission and policy boundaries. |
-| `list_sessions` | Exposed | Host visibility over core-recorded sessions. |
-| `spawn_session` | Exposed | Host-admitted local session creation through core mechanics. |
+| `list_sessions` | Exposed | Host visibility over daemon-recorded sessions. |
+| `spawn_session` | Exposed | Host-admitted local session creation through the core daemon. |
 | `attach_client` | Exposed | Explicit client subscription handshake without global state hydration. |
-| `detach_client` | Exposed | Explicit client subscription teardown through core mechanics. |
-| `write_bytes` | Exposed | Explicit client terminal input path through core mechanics. |
-| `resize` | Exposed | Explicit client terminal resize path through core mechanics. |
-| `inspect_session` | Exposed | Host visibility over lifecycle and activity. |
-| `read_screen` | Deferred | Daemon-backed core API does not expose screen reads yet. |
-| `capture_snapshot` | Deferred | Daemon-backed core API does not expose snapshot capture yet. |
-| `replay_snapshot` | Deferred | Daemon-backed core API does not expose snapshot replay yet. |
-| `drain_runtime_all_once` | Exposed | Host scheduler drain hook over live core sessions. |
-| `report_backpressure` | Deferred | Daemon-backed core API does not expose pressure reporting yet. |
-| `report_delivery_lag` | Deferred | Daemon-backed core API does not expose slow-delivery reporting yet. |
-| `report_delivery_failure` | Deferred | Daemon-backed core API does not expose failed-delivery reporting yet. |
+| `detach_client` | Exposed | Explicit client subscription teardown through the core daemon. |
+| `write_bytes` | Exposed | Explicit client terminal input path through the core daemon. |
+| `resize` | Exposed | Explicit client terminal resize path through the core daemon. |
+| `guarded_write` | Exposed | Hub admits the package/provider request, then core daemon owns readiness and delivery states. |
+| `release_sessions_for_restart` / `adoption_scan` / `adopt_session` | Exposed | Explicit daemon restart/adoption controls over worker-backed core sessions. |
+| `read_screen` / `capture_snapshot` / `report_delivery_*` | Deferred | Daemon-backed core API does not expose these embedded-engine-only helpers yet. |
 | `PluginCapabilityRuntime::submit` | Exposed | Hub owns concrete local capability policy and submits through core request contracts. |
 | `PluginCapabilityRuntime::drain_events` | Exposed | Plugin capability completions and timer events are drained through a hub-owned path. |
 | `PluginCapabilityRuntime::cleanup_plugin` | Exposed | Capability resources are released during hub plugin reload and unload. |
@@ -112,7 +107,7 @@ src/auth.rs                hub-owned auth hook seam
 src/packages.rs            hub package policy over core package contracts
 src/lifecycle.rs           hub package lifecycle adapter over core plugin workers
 src/capabilities.rs        hub-owned local capability runtime policy
-src/runtime.rs             hub runtime facade over botster-core
+src/runtime.rs             hub runtime facade over botster-core-daemon
 ```
 
 This scaffold is intentionally shallow. The module tree makes the intended
@@ -146,10 +141,10 @@ cargo run -- start --data-dir target/botster-hub-daemon-smoke-data
 `start --data-dir` constructs `HubDaemon`, loads or initializes
 `hub-state.json`, restores package/provider policy records through
 `PackageRegistrySnapshot` admission, initializes `HubRuntime` through the
-daemon-backed core/session-worker facade, prints deterministic scrubbed status, and stops
-cleanly. Future transports, provider runtimes, sockets, and supervisors should
-attach after this lifecycle object has started; they should not recreate config
-or durable state ownership.
+worker-backed core daemon facade, prints deterministic scrubbed status, and
+stops cleanly. Future transports, provider runtimes, sockets, and supervisors
+should attach after this lifecycle object has started; they should not recreate
+config or durable state ownership.
 
 The no-arg binary path is a side-effect-light host-profile summary. It builds
 resolved config and an in-memory `HubRuntime::new` summary only; it does not
@@ -163,11 +158,13 @@ package commands through `HubStateStore::update`.
 The `botster-hub` binary includes a deliberately thin local operator surface for
 dogfood. It starts an explicit local hub lifecycle with `HubDaemon`, then routes
 operator reads and session actions through `HubClientApi` instead of raw core
-routers. The session path is backed by `CoreDaemon` configured with the
-`botster-session-worker` executable, so an intentional hub lifecycle restart can
-release hub ownership, start a new hub over the same explicit data directory,
-adopt the live worker-backed session from the core daemon registry, and reattach
-through the same client API. Package state persists through `hub-state.json`.
+routers. The current scaffold embeds the typed daemon API in-process while core
+session workers own live PTYs; it proves the daemon/runtime boundary without
+claiming a socket protocol for separate long-lived hub processes. Package state
+persists through `hub-state.json`. Core registry metadata persists under the hub
+data directory, and live worker-backed sessions can be adopted after an
+intentional daemon restart; separate short-lived CLI invocations still do not
+share one long-lived hub process until a socket attach protocol exists.
 
 The end-to-end local dogfood proof is the Unix integration flow below:
 
@@ -197,7 +194,9 @@ cargo run -- packages enable --data-dir target/botster-hub-dogfood-data \
 cargo run -- packages list --data-dir target/botster-hub-dogfood-data
 cargo run -- providers list --data-dir target/botster-hub-dogfood-data
 
-# Session commands route through HubClientApi and the daemon-backed runtime.
+# Session commands prove the HubClientApi wiring for one ephemeral daemon
+# invocation. A later command starts a fresh daemon, so it will not see this
+# spawned session until cross-process socket attach exists.
 cargo run -- sessions spawn --data-dir target/botster-hub-dogfood-data \
   --session-id dogfood-session -- "printf 'dogfood-ok\n'; sleep 1"
 cargo run -- sessions list --data-dir target/botster-hub-dogfood-data
@@ -210,38 +209,37 @@ cargo run -- inspect --data-dir target/botster-hub-dogfood-data dogfood-session
 `packages enable --path` installs and enables a local package manifest through
 the existing hub package registry policy, persists the registry snapshot under
 `hub-state.json`, and then lists packages through `HubClientApi::ListPackages`.
-The session commands cross `HubClientApi` into the daemon-backed runtime. The
-restart proof lives in `hub_daemon_lifecycle_test`: it spawns a long-running
-worker-backed session, stops only the hub lifecycle, starts a new hub with the
-same explicit data directory, lists and reattaches the same session, sends input,
-drains output, and shuts down through the client API. `inspect` is intentionally
-scoped to sanitized session list data until the stable client API grows a
-dedicated inspection request.
+The session commands are wiring demonstrations in this scaffold: `spawn` crosses
+`HubClientApi::Spawn`, while a later `sessions list` or `inspect` command starts
+a new in-process daemon and reports no live session. `attach` and `send-input`
+are wired through `HubClientApi` for future socket-backed continuity, but are
+not useful across separate invocations yet. `inspect` is intentionally scoped to
+sanitized session list data until the stable client API grows a dedicated
+inspection request.
+
+Dogfood-ready today: explicit local daemon lifecycle, file-backed hub/package
+state, local package admission from a manifest path, typed status/package reads,
+plugin lifecycle observation/invocation through the hub facade, and in-process
+PTY spawn/attach/input/drain/shutdown through `HubClientApi`.
+
+The restart proof lives in `hub_daemon_lifecycle_test`: it spawns a long-running
+worker-backed session, stops only the hub lifecycle, starts a new hub over the
+same explicit data directory, recovers and lists the same session, reattaches,
+sends input, drains output, and shuts down through `HubClientApi`. Startup
+reconciliation is deterministic: registry records with missing protocol
+evidence, missing workers, unhealthy workers, or duplicate candidates are marked
+stale; terminal records remain terminal; and live worker-backed records absent
+from hub-owned state are recovered from core daemon/session-worker evidence.
 
 In the daemon-backed model, attach, detach, input, and resize requests are
 control-plane acknowledgements. Terminal egress is delivered by explicit
 `DrainRuntime` calls over the session-backed CoreDaemon path, not synchronously
 from those control operations.
 
-Hub startup reconciles session disagreement deterministically:
-
-- A hub/core registry record with missing protocol evidence, a missing worker,
-  an unhealthy worker, or duplicate worker candidates is marked stale.
-- A terminal registry record remains terminal.
-- A live worker-backed core daemon record that is absent from hub-owned state is
-  recovered by adopting the worker and surfacing sanitized core session metadata.
-- Recovery evidence comes from core daemon/session-worker protocol metadata, not
-  defaulted positive fields or path existence.
-
-Dogfood-ready today: explicit local daemon lifecycle, file-backed hub/package
-state, local package admission from a manifest path, typed status/package reads,
-plugin lifecycle observation/invocation through the hub facade, and
-daemon-backed worker PTY spawn/attach/input/drain/shutdown through
-`HubClientApi`.
-
-Feature parity still pending: a socket daemon protocol, provider process
-supervision, cloud/Rails/WebRTC/browser/TUI adapters, marketplace/package
-fetching, and broader terminal snapshot/read-screen support over the daemon API.
+Feature parity still pending: cross-process socket attach for separate CLI
+invocations, a socket daemon protocol, provider process supervision,
+cloud/Rails/WebRTC/browser/TUI adapters, marketplace/package fetching, and
+broader terminal snapshot/read-screen/reporting support over the daemon API.
 
 Schema and consistency posture are documented in
 [`docs/adr/durable-hub-state-v1.md`](docs/adr/durable-hub-state-v1.md).
@@ -259,9 +257,11 @@ before shipping. Local `path` overrides are not the repo default and should stay
 outside committed dependency policy unless the repo grows an explicit override
 workflow.
 
-The hub runtime embeds `botster-core-daemon` and configures it with the
-`botster-session-worker` executable. Keep core default features enabled so the
-`local-runtime` feature remains active for worker-backed local PTY execution.
+The production local session path uses `botster-core-daemon` through typed Rust
+APIs and configures the sibling `botster-session-worker` executable for
+worker-backed sessions. Keep core default features enabled so
+daemon/session-worker mechanics can use the local runtime contracts. Do not
+route hub session control through the thin core daemon CLI.
 
 ## Runtime smoke proof
 
@@ -272,17 +272,17 @@ cargo run -- run-one --data-dir target/botster-hub-smoke-data -- /bin/sh -c "pri
 ```
 
 `run-one` requires an explicit `--data-dir`, builds hub config without falling
-back to user paths, then crosses `HubRuntime -> CoreDaemon -> session-worker` through
-spawn, attach, resize, drain, marker observation, detach, and shutdown. Its
-output is scrubbed to profile, host, session, marker, byte-count, detach, and
-shutdown-observation facts so pipeline artifacts do not need local paths,
-environment dumps, keys, or fingerprints.
+back to user paths, then crosses `HubRuntime -> CoreDaemon -> botster-session-worker`
+through spawn, attach, resize, drain, marker observation, detach, and shutdown.
+Its output is scrubbed to profile, host, session, marker, byte-count, and
+daemon-path facts so pipeline artifacts do not need local paths, environment
+dumps, keys, or fingerprints.
 
 The in-process `HubClientApi` local dogfood workflow supports status, session
-list, spawn, attach, input, resize, drain/output events, shutdown, package
-queries, and plugin lifecycle status. Browser, TUI, socket, WebRTC, cloud, and
-daemon-supervised transports remain future adapters over this same local API;
-they are not implemented by the smoke command.
+list, spawn, attach, input, resize, drain/output events, shutdown, guarded
+notification write, package queries, and plugin lifecycle status. Browser, TUI,
+socket, WebRTC, and cloud transports remain future adapters over this same local
+API; they are not implemented by the smoke command.
 
 ## Package registry policy
 
