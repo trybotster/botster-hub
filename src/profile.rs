@@ -109,7 +109,7 @@ impl Responsibility {
 const CORE_RUNTIME_ROLE: CoreRuntimeRole = CoreRuntimeRole {
     facade: "botster_core_daemon::CoreDaemon",
     runtime_feature: "local-runtime",
-    owns: "policy-free worker-backed local PTY/process mechanics consumed through the hub runtime facade",
+    owns: "policy-free local PTY/process mechanics consumed through the typed core daemon facade",
 };
 
 const POLICY_AREAS: &[PolicyArea] = &[

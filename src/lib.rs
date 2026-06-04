@@ -79,7 +79,8 @@ pub use profile::{
     host_profile,
 };
 pub use runtime::{
-    HubRuntime, HubRuntimeError, HubRuntimeObservation, HubRuntimeOutput, HubRuntimeSpawnOutcome,
+    HubRuntime, HubRuntimeError, HubRuntimeObservation, HubRuntimeOutput,
+    daemon_session_to_core_session,
 };
 
 /// Compile-checked description of the profile plus the audited `HubRuntime` facade.
@@ -120,7 +121,7 @@ impl ArchitectureSummary {
 pub enum HubFacadeExposure {
     /// Exposed as an explicit hub method because it is policy or visibility adjacent.
     Exposed,
-    /// Public facade method exists, but the current daemon-backed core API does not support it yet.
+    /// Public facade or client request shape exists, but the current daemon API does not support it yet.
     Deferred,
     /// Intentionally hidden because exposing it would collapse hub policy into core mechanics.
     Hidden,
@@ -230,52 +231,27 @@ const HUB_FACADE_DECISIONS: &[HubFacadeDecision] = &[
     HubFacadeDecision::new(
         "write_bytes",
         HubFacadeExposure::Exposed,
-        "explicit client terminal input path through core mechanics",
+        "explicit client terminal input path through the core daemon",
     ),
     HubFacadeDecision::new(
         "resize",
         HubFacadeExposure::Exposed,
-        "explicit client terminal resize path through core mechanics",
+        "explicit client terminal resize path through the core daemon",
     ),
     HubFacadeDecision::new(
-        "inspect_session",
+        "guarded_write",
         HubFacadeExposure::Exposed,
-        "host visibility over lifecycle and activity",
+        "hub-admitted guarded notification write delegated to core daemon readiness and delivery states",
     ),
     HubFacadeDecision::new(
-        "read_screen",
-        HubFacadeExposure::Deferred,
-        "daemon-backed core API does not expose screen reads yet",
-    ),
-    HubFacadeDecision::new(
-        "capture_snapshot",
-        HubFacadeExposure::Deferred,
-        "daemon-backed core API does not expose snapshot capture yet",
-    ),
-    HubFacadeDecision::new(
-        "replay_snapshot",
-        HubFacadeExposure::Deferred,
-        "daemon-backed core API does not expose snapshot replay yet",
-    ),
-    HubFacadeDecision::new(
-        "drain_runtime_all_once",
+        "release_sessions_for_restart/adoption_scan/adopt_session",
         HubFacadeExposure::Exposed,
-        "host scheduler drain hook over live core sessions",
+        "explicit daemon restart/adoption control over worker-backed core sessions",
     ),
     HubFacadeDecision::new(
-        "report_backpressure",
+        "read_screen/capture_snapshot/report_delivery_*",
         HubFacadeExposure::Deferred,
-        "daemon-backed core API does not expose pressure reporting yet",
-    ),
-    HubFacadeDecision::new(
-        "report_delivery_lag",
-        HubFacadeExposure::Deferred,
-        "daemon-backed core API does not expose slow-delivery reporting yet",
-    ),
-    HubFacadeDecision::new(
-        "report_delivery_failure",
-        HubFacadeExposure::Deferred,
-        "daemon-backed core API does not expose failed-delivery reporting yet",
+        "daemon-backed core API does not expose these embedded-engine-only helpers yet",
     ),
 ];
 
@@ -339,26 +315,17 @@ mod tests {
         assert!(exposed.contains(&"detach_client"));
         assert!(exposed.contains(&"write_bytes"));
         assert!(exposed.contains(&"resize"));
-        assert!(exposed.contains(&"inspect_session"));
-        assert!(exposed.contains(&"drain_runtime_all_once"));
-        for deferred_operation in [
-            "read_screen",
-            "capture_snapshot",
-            "replay_snapshot",
-            "report_backpressure",
-            "report_delivery_lag",
-            "report_delivery_failure",
-        ] {
-            assert!(summary.facade_decisions().iter().any(|decision| {
-                decision.core_operation() == deferred_operation
-                    && decision.exposure() == HubFacadeExposure::Deferred
-                    && decision.reason().contains("daemon-backed core API")
-            }));
-        }
+        assert!(exposed.contains(&"guarded_write"));
+        assert!(exposed.contains(&"release_sessions_for_restart/adoption_scan/adopt_session"));
         assert!(summary.facade_decisions().iter().any(|decision| {
             decision.core_operation() == "execute_command(DefaultEngineCommand)"
                 && decision.exposure() == HubFacadeExposure::Hidden
                 && decision.reason().contains("generic core router")
+        }));
+        assert!(summary.facade_decisions().iter().any(|decision| {
+            decision.core_operation() == "read_screen/capture_snapshot/report_delivery_*"
+                && decision.exposure() == HubFacadeExposure::Deferred
+                && decision.reason().contains("daemon-backed core API")
         }));
     }
 }

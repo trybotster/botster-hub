@@ -21,6 +21,9 @@ use botster_hub::{
     PackageRegistry, RuntimeEnvironment, SessionDefaults, TransportBindings,
 };
 
+mod support;
+use support::ensure_session_worker_binary;
+
 const DOGFOOD_PACKAGE: &str = "dogfood.synthetic-plugin";
 const DOGFOOD_SESSION: &str = "dogfood-local-session";
 const DOGFOOD_SUBSCRIPTION: &str = "dogfood-local-subscription";
@@ -73,6 +76,7 @@ fn local_dogfood_runs_daemon_package_lifecycle_session_and_clean_shutdown() {
 }
 
 fn run_local_dogfood() {
+    ensure_session_worker_binary();
     let data_dir = unique_test_dir("dogfood");
     let config = explicit_config(&data_dir);
     let store = FileHubStateStore::for_data_directory(&config.data_directory);
@@ -211,7 +215,6 @@ fn run_local_dogfood() {
             HubClientRequest::Shutdown {
                 request_id: request_id("dogfood-cleanup-shutdown"),
                 session_id: session_id.clone(),
-                reason: "dogfood cleanup".to_string(),
                 now_seconds: logical_clock,
             },
         );
@@ -228,7 +231,6 @@ fn run_local_dogfood() {
             HubClientRequest::Shutdown {
                 request_id: request_id("dogfood-shutdown"),
                 session_id,
-                reason: "dogfood proof complete".to_string(),
                 now_seconds: logical_clock,
             },
         )
@@ -236,15 +238,7 @@ fn run_local_dogfood() {
     let HubClientResponseBody::Events(events) = shutdown.body else {
         panic!("shutdown should return events");
     };
-    assert!(events.iter().any(|event| {
-        matches!(
-            event,
-            HubClientEvent::SessionLifecycle {
-                state: SessionLifecycleState::Stopping,
-                ..
-            }
-        )
-    }));
+    assert!(events.is_empty());
 
     reloaded.stop();
 }
@@ -310,9 +304,11 @@ fn spawn_attach_input_and_drain(
                 request_id: request_id("dogfood-spawn"),
                 session_id: session_id.clone(),
                 command: "printf 'dogfood:ready\\n'; while IFS= read -r line; do printf 'dogfood:%s\\n' \"$line\"; done".to_string(),
+                now_seconds: *logical_clock,
             },
         )
         .expect("spawn through client api");
+    *logical_clock += 1;
     let HubClientResponseBody::Spawned(spawned) = spawn.body else {
         panic!("spawn response expected");
     };
