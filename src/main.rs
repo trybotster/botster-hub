@@ -1,5 +1,6 @@
 use std::env;
 use std::fmt;
+use std::io;
 use std::path::PathBuf;
 use std::process;
 use std::thread;
@@ -7,15 +8,15 @@ use std::time::{Duration, Instant};
 
 use botster_core::{
     ClientId, CoreSessionMetadata, RequestId, ResizePayload, SessionId, SessionLifecycleState,
-    SessionSpawnRequest, SpawnEnvironment, SpawnWorkingDirectory, SubscriptionId,
-    TerminalAttachState, TransportEgress,
+    SessionSpawnRequest, SpawnEnvironment, SpawnWorkingDirectory, SubscriptionId, TransportEgress,
 };
 use botster_hub::{
-    DataDirectoryOption, FileHubStateStore, HubClientApi, HubClientEvent, HubClientObservationKind,
-    HubClientPackageClassification, HubClientPackageState, HubClientRequest, HubClientResponseBody,
-    HubDaemon, HubDaemonState, HubRuntime, HubStartupOptions, HubStateLoadSource, HubStateStore,
-    PackageAction, RuntimeEnvironment, SessionDefaults, TransportBindings,
-    build_default_config_for_runtime, default_package_policy, host_profile,
+    DaemonEvent, DaemonRequest, DaemonResponse, DaemonResponseKind, DaemonSession, DaemonStatus,
+    DataDirectoryOption, FileHubStateStore, HubClientApi, HubClientPackageClassification,
+    HubClientPackageState, HubClientRequest, HubClientResponseBody, HubDaemon, HubDaemonState,
+    HubRuntime, HubStartupOptions, HubStateLoadSource, HubStateStore, PackageAction,
+    RuntimeEnvironment, SessionDefaults, TransportBindings, build_default_config_for_runtime,
+    daemon_transport_request, default_package_policy, host_profile, serve_daemon, stream_attach,
 };
 
 const SMOKE_MARKER: &str = "botster-hub-smoke-ok";
@@ -40,6 +41,13 @@ fn main() {
         Some("sessions") => {
             if let Err(error) = operator_sessions(env::args().skip(2).collect()) {
                 eprintln!("botster-hub sessions error: {error}");
+                process::exit(1);
+            }
+            return;
+        }
+        Some("shutdown") => {
+            if let Err(error) = operator_shutdown(env::args().skip(2).collect()) {
+                eprintln!("botster-hub shutdown error: {error}");
                 process::exit(1);
             }
             return;
@@ -105,10 +113,22 @@ fn start_daemon(args: Vec<String>) -> Result<(), StartError> {
     let options = DataDirOptions::parse(args, "start")?;
     let config = explicit_config(options.data_directory)?;
 
-    let mut daemon = HubDaemon::start(config)?;
-    print_daemon_status("started", &daemon.status());
-    let stopped = daemon.stop();
-    print_daemon_status("stopped", &stopped);
+    let stopped = serve_daemon(config)?;
+    let status = DaemonStatus {
+        lifecycle_state: lifecycle_state_label(stopped.lifecycle_state).to_string(),
+        host_id: stopped.host_id,
+        host_display_name: stopped.host_display_name,
+        schema_version: stopped.schema_version,
+        data_dir_configured: stopped.data_dir_configured,
+        core_initialized: stopped.core_initialized,
+        state_source: state_source_label(stopped.state_source).to_string(),
+        package_count: stopped.package_count,
+        enabled_package_count: stopped.enabled_package_count,
+        provider_count: stopped.provider_count,
+        enabled_provider_count: stopped.enabled_provider_count,
+        session_count: 0,
+    };
+    print_daemon_transport_status("stopped", &status);
 
     Ok(())
 }
@@ -116,80 +136,90 @@ fn start_daemon(args: Vec<String>) -> Result<(), StartError> {
 fn operator_status(args: Vec<String>) -> Result<(), OperatorError> {
     let options = DataDirOptions::parse(args, "status")?;
     let config = explicit_config(options.data_directory)?;
-    let mut daemon = HubDaemon::start(config)?;
-    print_daemon_status("status", &daemon.status());
-    daemon.stop();
+    let response = daemon_transport_request(&config, DaemonRequest::Status)?;
+    let Some(status) = response.status else {
+        return Err(OperatorError::UnexpectedResponse("status"));
+    };
+    print_daemon_transport_status("status", &status);
     Ok(())
 }
 
 fn operator_sessions(args: Vec<String>) -> Result<(), OperatorError> {
     let command = SessionCommand::parse(args)?;
-    let mut daemon = HubDaemon::start(explicit_config(command.data_directory)?)?;
-    let packages = daemon.package_registry().clone();
-    let api = HubClientApi::local_operator("botster-hub-cli");
-    let runtime = daemon
-        .runtime_mut()
-        .ok_or(OperatorError::DaemonNotRunning)?;
+    let config = explicit_config(command.data_directory)?;
 
     match command.action {
         SessionAction::List => {
-            let response = api.handle_request(
-                runtime,
-                &packages,
-                HubClientRequest::ListSessions {
-                    request_id: request_id("cli-sessions-list"),
-                },
-            )?;
-            print_client_response(response.body);
+            let response = daemon_transport_request(&config, DaemonRequest::ListSessions)?;
+            print_daemon_response(response);
         }
         SessionAction::Spawn {
             session_id,
             command,
         } => {
-            let response = api.handle_request(
-                runtime,
-                &packages,
-                HubClientRequest::Spawn {
-                    request_id: request_id("cli-sessions-spawn"),
-                    session_id,
+            let response = daemon_transport_request(
+                &config,
+                DaemonRequest::Spawn {
+                    session_id: session_id.0,
                     command,
-                    now_seconds: 1,
                 },
             )?;
-            print_client_response(response.body);
+            print_daemon_response(response);
         }
         SessionAction::Attach {
             session_id,
             subscription_id,
         } => {
-            let response = api.handle_request(
-                runtime,
-                &packages,
-                HubClientRequest::Attach {
-                    request_id: request_id("cli-sessions-attach"),
-                    session_id,
-                    subscription_id,
-                    now_seconds: 1,
-                },
-            )?;
-            print_client_response(response.body);
+            stream_attach(&config, session_id, subscription_id, &mut io::stdout())?;
         }
         SessionAction::SendInput { session_id, data } => {
-            let response = api.handle_request(
-                runtime,
-                &packages,
-                HubClientRequest::Input {
-                    request_id: request_id("cli-sessions-send-input"),
-                    session_id,
-                    data,
-                    now_seconds: 1,
+            let response = daemon_transport_request(
+                &config,
+                DaemonRequest::SendInput {
+                    session_id: session_id.0,
+                    data: String::from_utf8_lossy(&data).to_string(),
                 },
             )?;
-            print_client_response(response.body);
+            print_daemon_response(response);
+        }
+        SessionAction::Resize {
+            session_id,
+            rows,
+            cols,
+        } => {
+            let response = daemon_transport_request(
+                &config,
+                DaemonRequest::Resize {
+                    session_id: session_id.0,
+                    rows,
+                    cols,
+                },
+            )?;
+            print_daemon_response(response);
+        }
+        SessionAction::Detach {
+            session_id,
+            subscription_id,
+        } => {
+            let response = daemon_transport_request(
+                &config,
+                DaemonRequest::Detach {
+                    session_id: session_id.0,
+                    subscription_id: subscription_id.0,
+                },
+            )?;
+            print_daemon_response(response);
         }
     }
 
-    daemon.stop();
+    Ok(())
+}
+
+fn operator_shutdown(args: Vec<String>) -> Result<(), OperatorError> {
+    let options = DataDirOptions::parse(args, "shutdown")?;
+    let config = explicit_config(options.data_directory)?;
+    let response = daemon_transport_request(&config, DaemonRequest::DaemonShutdown)?;
+    print_daemon_response(response);
     Ok(())
 }
 
@@ -289,8 +319,7 @@ fn explicit_config(
             ..SessionDefaults::default()
         },
         transports: TransportBindings {
-            local_socket: None,
-            tcp: Vec::new(),
+            ..TransportBindings::default()
         },
         ..HubStartupOptions::default()
     }
@@ -308,22 +337,123 @@ fn persist_package_registry(daemon: &HubDaemon) -> Result<(), OperatorError> {
     Ok(())
 }
 
-fn print_daemon_status(label: &str, status: &botster_hub::HubDaemonStatus) {
+fn print_daemon_transport_status(label: &str, status: &DaemonStatus) {
     println!("event={label}");
-    println!(
-        "lifecycle_state={}",
-        lifecycle_state_label(status.lifecycle_state)
-    );
+    println!("lifecycle_state={}", status.lifecycle_state);
     println!("host_id={}", status.host_id);
     println!("host_display_name={}", status.host_display_name);
     println!("schema_version={}", status.schema_version);
     println!("data_dir_configured={}", status.data_dir_configured);
     println!("core_initialized={}", status.core_initialized);
-    println!("state_source={}", state_source_label(status.state_source));
+    println!("state_source={}", status.state_source);
     println!("package_count={}", status.package_count);
     println!("enabled_package_count={}", status.enabled_package_count);
     println!("provider_count={}", status.provider_count);
     println!("enabled_provider_count={}", status.enabled_provider_count);
+    println!("session_count={}", status.session_count);
+}
+
+fn print_daemon_response(response: DaemonResponse) {
+    match response.kind {
+        DaemonResponseKind::Status => {
+            if let Some(status) = response.status {
+                print_daemon_transport_status("status", &status);
+            }
+        }
+        DaemonResponseKind::Sessions => {
+            println!("response=sessions");
+            println!("session_count={}", response.sessions.len());
+            for session in response.sessions {
+                print_daemon_session(&session);
+            }
+        }
+        DaemonResponseKind::Spawned => {
+            println!("response=spawned");
+            if let Some(session) = response.sessions.first() {
+                println!("session_id={}", session.session_id);
+                println!("lifecycle={}", session.lifecycle);
+            }
+            print_daemon_events(&response.events);
+        }
+        DaemonResponseKind::Events => {
+            println!("response=events");
+            print_daemon_events(&response.events);
+        }
+        DaemonResponseKind::Shutdown => {
+            println!("response=shutdown");
+            if let Some(status) = response.status {
+                println!("lifecycle_state={}", status.lifecycle_state);
+            }
+        }
+    }
+}
+
+fn print_daemon_session(session: &DaemonSession) {
+    println!(
+        "session id={} lifecycle={}",
+        session.session_id, session.lifecycle
+    );
+}
+
+fn print_daemon_events(events: &[DaemonEvent]) {
+    println!("event_count={}", events.len());
+    for event in events {
+        match event {
+            DaemonEvent::SessionLifecycle { session_id, state } => {
+                println!("event=session_lifecycle session_id={session_id} state={state}");
+            }
+            DaemonEvent::TerminalOutput {
+                session_id,
+                subscription_id,
+                data,
+            } => {
+                println!(
+                    "event=terminal_output session_id={session_id} subscription_id={subscription_id} bytes={}",
+                    data.len()
+                );
+            }
+            DaemonEvent::Snapshot {
+                session_id,
+                subscription_id,
+                bytes,
+            } => {
+                println!(
+                    "event=snapshot session_id={session_id} subscription_id={subscription_id} bytes={bytes}"
+                );
+            }
+            DaemonEvent::Scrollback {
+                session_id,
+                subscription_id,
+                bytes,
+            } => {
+                println!(
+                    "event=scrollback session_id={session_id} subscription_id={subscription_id} bytes={bytes}"
+                );
+            }
+            DaemonEvent::ProcessExit {
+                session_id,
+                subscription_id,
+                code,
+            } => {
+                println!(
+                    "event=process_exit session_id={session_id} subscription_id={subscription_id} code={}",
+                    code.map_or_else(|| "none".to_string(), |code| code.to_string())
+                );
+            }
+            DaemonEvent::AttachState {
+                session_id,
+                subscription_id,
+                state,
+            } => {
+                println!(
+                    "event=attach_state session_id={session_id} subscription_id={subscription_id} state={state}"
+                );
+            }
+            DaemonEvent::RuntimeObservation { kind } => {
+                println!("event=runtime_observation kind={kind}");
+            }
+        }
+    }
 }
 
 fn lifecycle_state_label(state: HubDaemonState) -> &'static str {
@@ -338,62 +468,6 @@ fn state_source_label(source: HubStateLoadSource) -> &'static str {
     match source {
         HubStateLoadSource::Loaded => "loaded",
         HubStateLoadSource::Initialized => "initialized",
-    }
-}
-
-fn print_client_response(body: HubClientResponseBody) {
-    match body {
-        HubClientResponseBody::Status(status) => {
-            println!("response=status");
-            println!("profile_id={}", status.profile_id);
-            println!("host_id={}", status.host_id);
-            println!("session_count={}", status.session_count);
-            println!("package_count={}", status.package_count);
-        }
-        HubClientResponseBody::Sessions(sessions) => {
-            println!("response=sessions");
-            println!("session_count={}", sessions.len());
-            for session in sessions {
-                println!(
-                    "session id={} lifecycle={}",
-                    session.session_id.0,
-                    session_lifecycle_label(&session.lifecycle)
-                );
-            }
-        }
-        HubClientResponseBody::Spawned(spawned) => {
-            println!("response=spawned");
-            println!("session_id={}", spawned.session.session_id.0);
-            println!(
-                "lifecycle={}",
-                session_lifecycle_label(&spawned.session.lifecycle)
-            );
-            print_events(&spawned.events);
-        }
-        HubClientResponseBody::Events(events) => {
-            println!("response=events");
-            print_events(&events);
-        }
-        HubClientResponseBody::GuardedWrite(result) => {
-            println!("response=guarded_write");
-            println!("decision={:?}", result.decision);
-            println!("state_count={}", result.states.len());
-        }
-        HubClientResponseBody::Packages(_) => {
-            print_packages_response(body, false);
-        }
-        HubClientResponseBody::PluginLifecycle(records) => {
-            println!("response=plugin_lifecycle");
-            println!("package_count={}", records.len());
-            for record in records {
-                println!(
-                    "package name={} state={} loaded={}",
-                    record.package_name,
-                    package_state_label(record.state),
-                    record.loaded
-                );
-            }
-        }
     }
 }
 
@@ -433,83 +507,6 @@ fn print_packages_response(body: HubClientResponseBody, providers_only: bool) {
     }
 }
 
-fn print_events(events: &[HubClientEvent]) {
-    println!("event_count={}", events.len());
-    for event in events {
-        match event {
-            HubClientEvent::SessionLifecycle { session_id, state } => {
-                println!(
-                    "event=session_lifecycle session_id={} state={}",
-                    session_id.0,
-                    session_lifecycle_label(state)
-                );
-            }
-            HubClientEvent::TerminalOutput {
-                session_id,
-                subscription_id,
-                data,
-            } => {
-                println!(
-                    "event=terminal_output session_id={} subscription_id={} bytes={}",
-                    session_id.0,
-                    subscription_id.0,
-                    data.len()
-                );
-            }
-            HubClientEvent::Snapshot {
-                session_id,
-                subscription_id,
-                bytes,
-            } => {
-                println!(
-                    "event=snapshot session_id={} subscription_id={} bytes={bytes}",
-                    session_id.0, subscription_id.0
-                );
-            }
-            HubClientEvent::Scrollback {
-                session_id,
-                subscription_id,
-                bytes,
-            } => {
-                println!(
-                    "event=scrollback session_id={} subscription_id={} bytes={bytes}",
-                    session_id.0, subscription_id.0
-                );
-            }
-            HubClientEvent::ProcessExit {
-                session_id,
-                subscription_id,
-                code,
-            } => {
-                println!(
-                    "event=process_exit session_id={} subscription_id={} code={}",
-                    session_id.0,
-                    subscription_id.0,
-                    code.map_or_else(|| "none".to_string(), |code| code.to_string())
-                );
-            }
-            HubClientEvent::AttachState {
-                session_id,
-                subscription_id,
-                state,
-            } => {
-                println!(
-                    "event=attach_state session_id={} subscription_id={} state={}",
-                    session_id.0,
-                    subscription_id.0,
-                    attach_state_label(state)
-                );
-            }
-            HubClientEvent::RuntimeObservation { kind } => {
-                println!(
-                    "event=runtime_observation kind={}",
-                    observation_label(*kind)
-                );
-            }
-        }
-    }
-}
-
 fn print_package_decision(decision: &botster_hub::PackageDecision) {
     println!("decision=package");
     println!("package_name={}", decision.package_name);
@@ -532,22 +529,6 @@ fn session_lifecycle_label(state: &SessionLifecycleState) -> &'static str {
         SessionLifecycleState::Stopping => "stopping",
         SessionLifecycleState::Exited { .. } => "exited",
         SessionLifecycleState::Failed { .. } => "failed",
-    }
-}
-
-fn attach_state_label(state: &TerminalAttachState) -> &'static str {
-    match state {
-        TerminalAttachState::Attaching => "attaching",
-        TerminalAttachState::Attached => "attached",
-        TerminalAttachState::Detached => "detached",
-    }
-}
-
-fn observation_label(kind: HubClientObservationKind) -> &'static str {
-    match kind {
-        HubClientObservationKind::SessionActivity => "session_activity",
-        HubClientObservationKind::Subscription => "subscription",
-        HubClientObservationKind::Backpressure => "backpressure",
     }
 }
 
@@ -610,6 +591,15 @@ enum SessionAction {
     SendInput {
         session_id: SessionId,
         data: Vec<u8>,
+    },
+    Resize {
+        session_id: SessionId,
+        rows: u16,
+        cols: u16,
+    },
+    Detach {
+        session_id: SessionId,
+        subscription_id: SubscriptionId,
     },
 }
 
@@ -687,6 +677,48 @@ impl SessionCommand {
                     action: SessionAction::SendInput {
                         session_id: SessionId(args[3].clone()),
                         data: args[5..].join(" ").into_bytes(),
+                    },
+                })
+            }
+            "resize" => {
+                if args.len() != 6 {
+                    return Err(OperatorError::Usage("sessions resize"));
+                }
+                let options = DataDirOptions::parse(args[1..3].to_vec(), "sessions resize")?;
+                let rows = args[4]
+                    .parse::<u16>()
+                    .map_err(|_| OperatorError::Usage("sessions resize"))?;
+                let cols = args[5]
+                    .parse::<u16>()
+                    .map_err(|_| OperatorError::Usage("sessions resize"))?;
+                Ok(Self {
+                    data_directory: options.data_directory,
+                    action: SessionAction::Resize {
+                        session_id: SessionId(args[3].clone()),
+                        rows,
+                        cols,
+                    },
+                })
+            }
+            "detach" => {
+                if args.len() < 4 {
+                    return Err(OperatorError::Usage("sessions detach"));
+                }
+                let options = DataDirOptions::parse(args[1..3].to_vec(), "sessions detach")?;
+                let subscription_id =
+                    if args.get(4).map(String::as_str) == Some("--subscription-id") {
+                        let Some(value) = args.get(5) else {
+                            return Err(OperatorError::Usage("sessions detach"));
+                        };
+                        SubscriptionId(value.clone())
+                    } else {
+                        SubscriptionId("botster-hub-cli-subscription".to_string())
+                    };
+                Ok(Self {
+                    data_directory: options.data_directory,
+                    action: SessionAction::Detach {
+                        session_id: SessionId(args[3].clone()),
+                        subscription_id,
                     },
                 })
             }
@@ -945,6 +977,7 @@ enum StartError {
     Operator(OperatorError),
     Config(botster_hub::HubConfigError),
     Daemon(botster_hub::HubDaemonError),
+    Transport(botster_hub::DaemonTransportError),
 }
 
 #[derive(Debug)]
@@ -955,6 +988,7 @@ enum OperatorError {
     Config(botster_hub::HubConfigError),
     Client(botster_hub::HubClientError),
     Daemon(botster_hub::HubDaemonError),
+    Transport(botster_hub::DaemonTransportError),
     Package(botster_hub::PackageRegistryError),
     State(botster_hub::HubStateStoreError),
 }
@@ -974,6 +1008,7 @@ impl fmt::Display for StartError {
             Self::Operator(error) => write!(formatter, "{error}"),
             Self::Config(error) => write!(formatter, "{error}"),
             Self::Daemon(error) => write!(formatter, "{error}"),
+            Self::Transport(error) => write!(formatter, "{error}"),
         }
     }
 }
@@ -989,6 +1024,7 @@ impl fmt::Display for OperatorError {
             Self::Config(error) => write!(formatter, "{error}"),
             Self::Client(error) => write!(formatter, "client API error: {error:?}"),
             Self::Daemon(error) => write!(formatter, "{error}"),
+            Self::Transport(error) => write!(formatter, "{error}"),
             Self::Package(error) => write!(formatter, "package policy error: {error:?}"),
             Self::State(error) => write!(formatter, "{error}"),
         }
@@ -999,7 +1035,9 @@ fn usage_for(command: &str) -> &'static str {
     match command {
         "start" => "usage: botster-hub start --data-dir <path>",
         "status" => "usage: botster-hub status --data-dir <path>",
-        "sessions" => "usage: botster-hub sessions <list|spawn|attach|send-input> ...",
+        "sessions" => {
+            "usage: botster-hub sessions <list|spawn|attach|send-input|resize|detach> ..."
+        }
         "sessions list" => "usage: botster-hub sessions list --data-dir <path>",
         "sessions spawn" => {
             "usage: botster-hub sessions spawn --data-dir <path> [--session-id <id>] -- <command>"
@@ -1007,9 +1045,16 @@ fn usage_for(command: &str) -> &'static str {
         "sessions attach" => {
             "usage: botster-hub sessions attach --data-dir <path> <session-id> [--subscription-id <id>]"
         }
+        "sessions resize" => {
+            "usage: botster-hub sessions resize --data-dir <path> <session-id> <rows> <cols>"
+        }
+        "sessions detach" => {
+            "usage: botster-hub sessions detach --data-dir <path> <session-id> [--subscription-id <id>]"
+        }
         "sessions send-input" => {
             "usage: botster-hub sessions send-input --data-dir <path> <session-id> -- <bytes>"
         }
+        "shutdown" => "usage: botster-hub shutdown --data-dir <path>",
         "packages" => "usage: botster-hub packages <list|enable|disable> ...",
         "packages list" => "usage: botster-hub packages list --data-dir <path>",
         "packages enable" => {
@@ -1018,7 +1063,9 @@ fn usage_for(command: &str) -> &'static str {
         "packages disable" => "usage: botster-hub packages disable --data-dir <path> <name>",
         "providers" | "providers list" => "usage: botster-hub providers list --data-dir <path>",
         "inspect" => "usage: botster-hub inspect --data-dir <path> <session-id>",
-        _ => "usage: botster-hub <start|status|sessions|packages|providers|inspect|run-one>",
+        _ => {
+            "usage: botster-hub <start|status|sessions|shutdown|packages|providers|inspect|run-one>"
+        }
     }
 }
 
@@ -1058,6 +1105,12 @@ impl From<botster_hub::HubDaemonError> for StartError {
     }
 }
 
+impl From<botster_hub::DaemonTransportError> for StartError {
+    fn from(error: botster_hub::DaemonTransportError) -> Self {
+        Self::Transport(error)
+    }
+}
+
 impl From<OperatorError> for StartError {
     fn from(error: OperatorError) -> Self {
         Self::Operator(error)
@@ -1079,6 +1132,12 @@ impl From<botster_hub::HubClientError> for OperatorError {
 impl From<botster_hub::HubDaemonError> for OperatorError {
     fn from(error: botster_hub::HubDaemonError) -> Self {
         Self::Daemon(error)
+    }
+}
+
+impl From<botster_hub::DaemonTransportError> for OperatorError {
+    fn from(error: botster_hub::DaemonTransportError) -> Self {
+        Self::Transport(error)
     }
 }
 
