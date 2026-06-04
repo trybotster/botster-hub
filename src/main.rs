@@ -1100,6 +1100,12 @@ impl From<botster_hub::HubRuntimeError> for RunOneError {
     }
 }
 
+impl From<botster_core_daemon::CoreDaemonError> for RunOneError {
+    fn from(error: botster_core_daemon::CoreDaemonError) -> Self {
+        Self::Runtime(error.into())
+    }
+}
+
 impl From<botster_hub::HubStateStoreError> for RunOneError {
     fn from(error: botster_hub::HubStateStoreError) -> Self {
         Self::State(error)

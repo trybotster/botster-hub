@@ -50,7 +50,8 @@ instead of bypassing hub admission or calling core routers directly. Attach is a
 subscription handshake only, so clients still explicitly pull status, packages,
 lifecycle status, or sessions when they need them. Hub code may start or embed
 the typed core daemon API; it must not shell out to the core daemon CLI or parse
-CLI output for session routing.
+CLI output for session routing. Screen and snapshot requests return a typed
+unsupported response until the daemon-backed core API exposes those operations.
 
 | Core operation | HubRuntime decision | Reason |
 | --- | --- | --- |
@@ -63,7 +64,7 @@ CLI output for session routing.
 | `resize` | Exposed | Explicit client terminal resize path through the core daemon. |
 | `guarded_write` | Exposed | Hub admits the package/provider request, then core daemon owns readiness and delivery states. |
 | `release_sessions_for_restart` / `adoption_scan` / `adopt_session` | Exposed | Explicit daemon restart/adoption controls over worker-backed core sessions. |
-| `read_screen` / `capture_snapshot` / `report_delivery_*` | Hidden | Embedded-engine-only helpers are not part of the daemon-backed production session path. |
+| `read_screen` / `capture_snapshot` / `report_delivery_*` | Deferred | Daemon-backed core API does not expose these embedded-engine-only helpers yet. |
 | `PluginCapabilityRuntime::submit` | Exposed | Hub owns concrete local capability policy and submits through core request contracts. |
 | `PluginCapabilityRuntime::drain_events` | Exposed | Plugin capability completions and timer events are drained through a hub-owned path. |
 | `PluginCapabilityRuntime::cleanup_plugin` | Exposed | Capability resources are released during hub plugin reload and unload. |
@@ -221,9 +222,24 @@ state, local package admission from a manifest path, typed status/package reads,
 plugin lifecycle observation/invocation through the hub facade, and in-process
 PTY spawn/attach/input/drain/shutdown through `HubClientApi`.
 
-Feature parity still pending: cross-process live session continuity, a socket
-daemon protocol, provider process supervision, cloud/Rails/WebRTC/browser/TUI
-adapters, marketplace/package fetching, and durable PTY recovery.
+The restart proof lives in `hub_daemon_lifecycle_test`: it spawns a long-running
+worker-backed session, stops only the hub lifecycle, starts a new hub over the
+same explicit data directory, recovers and lists the same session, reattaches,
+sends input, drains output, and shuts down through `HubClientApi`. Startup
+reconciliation is deterministic: registry records with missing protocol
+evidence, missing workers, unhealthy workers, or duplicate candidates are marked
+stale; terminal records remain terminal; and live worker-backed records absent
+from hub-owned state are recovered from core daemon/session-worker evidence.
+
+In the daemon-backed model, attach, detach, input, and resize requests are
+control-plane acknowledgements. Terminal egress is delivered by explicit
+`DrainRuntime` calls over the session-backed CoreDaemon path, not synchronously
+from those control operations.
+
+Feature parity still pending: cross-process socket attach for separate CLI
+invocations, a socket daemon protocol, provider process supervision,
+cloud/Rails/WebRTC/browser/TUI adapters, marketplace/package fetching, and
+broader terminal snapshot/read-screen/reporting support over the daemon API.
 
 Schema and consistency posture are documented in
 [`docs/adr/durable-hub-state-v1.md`](docs/adr/durable-hub-state-v1.md).

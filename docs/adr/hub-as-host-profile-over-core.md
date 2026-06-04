@@ -79,6 +79,13 @@ Startup proceeds in this order:
    `botster_core_daemon::CoreDaemon` in `src/runtime.rs`, using the hub data
    directory for durable daemon registry metadata and the sibling
    `botster-session-worker` executable for worker-backed live sessions.
+   Storage-backed startup reconciles daemon registry disagreement
+   deterministically: adoptable worker-backed records are recovered into the
+   restarted hub; records with missing protocol evidence, missing workers,
+   unhealthy workers, or duplicate worker candidates are marked stale; terminal
+   records remain terminal. Recovery evidence comes from core
+   daemon/session-worker protocol metadata rather than defaulted positive
+   fields.
 3. The host enables privileged providers from pinned package metadata and
    explicit grants. Providers that affect trust, admission, reachability,
    pairing, signaling, registry publication, secrets, remote network access, or
