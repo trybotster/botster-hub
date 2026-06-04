@@ -8,6 +8,8 @@
 use std::error::Error;
 use std::fmt;
 
+use botster_core::SessionId;
+
 use crate::config::HubConfig;
 use crate::packages::{
     PackageClassification, PackageRegistry, PackageRegistrySnapshotError, PackageState,
@@ -60,6 +62,10 @@ pub struct HubDaemonStatus {
     pub provider_count: usize,
     /// Count of restored enabled provider policy records.
     pub enabled_provider_count: usize,
+    /// Worker-backed sessions adopted during startup reconciliation.
+    pub recovered_sessions: Vec<SessionId>,
+    /// Registry sessions marked stale during startup reconciliation.
+    pub stale_sessions: Vec<SessionId>,
 }
 
 /// Local daemon lifecycle around `HubRuntime` and durable hub state.
@@ -134,6 +140,16 @@ impl HubDaemon {
             })
             .count();
         let enabled_package_count = packages.iter().filter(|record| record.is_enabled()).count();
+        let (recovered_sessions, stale_sessions) = self
+            .runtime
+            .as_ref()
+            .map(|runtime| {
+                (
+                    runtime.reconciliation().recovered_sessions.clone(),
+                    runtime.reconciliation().stale_sessions.clone(),
+                )
+            })
+            .unwrap_or_default();
 
         HubDaemonStatus {
             lifecycle_state: self.lifecycle_state,
@@ -147,6 +163,8 @@ impl HubDaemon {
             enabled_package_count,
             provider_count,
             enabled_provider_count,
+            recovered_sessions,
+            stale_sessions,
         }
     }
 
