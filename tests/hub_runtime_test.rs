@@ -1,5 +1,6 @@
 #![cfg(unix)]
 
+use std::fs;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -10,12 +11,15 @@ use botster_core::{
 };
 use botster_core_daemon::{
     GuardedWriteDecision, GuardedWriteDeliveryState, GuardedWriteRequest, ReadinessEvidence,
-    RegistrySessionState,
+    RegistrySessionState, SessionAdoptionState,
 };
 use botster_hub::{
     DataDirectoryOption, FileHubStateStore, HostIdentityOptions, HubRuntime, HubStartupOptions,
     RuntimeEnvironment, SessionDefaults, TransportBindings,
 };
+
+mod support;
+use support::ensure_session_worker_binary;
 
 fn explicit_config() -> botster_hub::HubConfig {
     explicit_config_with_data_dir("target/botster-hub-test-data/runtime")
@@ -24,13 +28,16 @@ fn explicit_config() -> botster_hub::HubConfig {
 fn explicit_config_with_data_dir(
     data_directory: impl Into<std::path::PathBuf>,
 ) -> botster_hub::HubConfig {
+    ensure_session_worker_binary();
+    let data_directory = data_directory.into();
+    let _ = fs::remove_dir_all(&data_directory);
     HubStartupOptions {
         host: HostIdentityOptions {
             id: "hub-runtime-test".to_string(),
             display_name: "Hub Runtime Test".to_string(),
             fingerprint: None,
         },
-        data_directory: DataDirectoryOption::Explicit(data_directory.into()),
+        data_directory: DataDirectoryOption::Explicit(data_directory),
         session_defaults: SessionDefaults {
             shell: "/bin/sh".to_string(),
             working_directory: Some(".".into()),
@@ -186,6 +193,95 @@ fn hub_runtime_routes_production_session_verbs_through_core_daemon() {
         .shutdown_session(session_id.clone(), logical_clock)
         .expect("shutdown through core daemon");
     let listed = runtime.list_sessions().expect("daemon list after shutdown");
+    assert_eq!(listed[0].registry_state, RegistrySessionState::Exited);
+}
+
+#[test]
+fn hub_runtime_uses_worker_backed_sessions_and_adopts_after_daemon_restart() {
+    let config = explicit_config_with_data_dir("target/botster-hub-test-data/runtime-adoption");
+    let session_id = SessionId("hub-runtime-adoption-session".to_string());
+    let client_id = ClientId("adoption-client".to_string());
+    let subscription_id = SubscriptionId("adoption-subscription".to_string());
+    let mut logical_clock = 200;
+
+    {
+        let mut runtime = HubRuntime::new(config.clone());
+        let mut request = spawn_request(runtime.config());
+        request.session_id = session_id.clone();
+        runtime
+            .spawn_session(request, CoreSessionMetadata::new(), logical_clock)
+            .expect("hub runtime should spawn through worker-backed core daemon");
+        logical_clock += 1;
+
+        let listed = runtime.list_sessions().expect("daemon list");
+        assert_eq!(listed[0].session_id, session_id);
+        assert!(
+            listed[0]
+                .process
+                .as_ref()
+                .and_then(|process| process.pid)
+                .is_some(),
+            "worker-backed spawn should persist a child process identity"
+        );
+
+        let reports = runtime
+            .adoption_scan()
+            .expect("worker-backed hub runtime should scan adoption evidence");
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].state, SessionAdoptionState::Adoptable);
+        assert!(
+            reports[0]
+                .record
+                .recovery_identity
+                .as_ref()
+                .and_then(|identity| identity.get("worker_control_socket"))
+                .is_some(),
+            "hub-created session should carry worker control socket evidence"
+        );
+        runtime.release_sessions_for_restart();
+    }
+
+    let mut restarted = HubRuntime::new(config);
+    let reports = restarted
+        .adoption_scan()
+        .expect("fresh hub runtime should classify released worker");
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].state, SessionAdoptionState::Adoptable);
+    restarted
+        .adopt_session(&session_id, logical_clock)
+        .expect("fresh hub runtime should adopt live worker");
+    logical_clock += 1;
+
+    restarted
+        .attach_client(
+            client_id.clone(),
+            session_id.clone(),
+            subscription_id,
+            logical_clock,
+        )
+        .expect("attach through adopted worker");
+    logical_clock += 1;
+    restarted
+        .write_bytes(
+            client_id.clone(),
+            session_id.clone(),
+            b"after-adopt\n".to_vec(),
+            logical_clock,
+        )
+        .expect("input through adopted worker");
+    logical_clock += 1;
+    drain_until(
+        &mut restarted,
+        &session_id,
+        b"echo:after-adopt",
+        &mut logical_clock,
+    );
+    restarted
+        .shutdown_session(session_id.clone(), logical_clock)
+        .expect("shutdown adopted worker through hub runtime");
+    let listed = restarted
+        .list_sessions()
+        .expect("registry should list adopted shutdown");
     assert_eq!(listed[0].registry_state, RegistrySessionState::Exited);
 }
 

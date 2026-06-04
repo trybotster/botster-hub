@@ -12,8 +12,10 @@ use botster_core::{
 };
 use botster_core_daemon::{
     CoreDaemon, CoreDaemonConfig, CoreDaemonError, DaemonSession, DrainResult, GuardedWriteRequest,
-    GuardedWriteResult, RegistrySessionState, SpawnSessionRequest,
+    GuardedWriteResult, RegistrySessionState, SessionAdoptionReport, SpawnSessionRequest,
 };
+use std::env;
+use std::path::{Path, PathBuf};
 
 use crate::capabilities::HubCapabilityRuntime;
 use crate::config::HubConfig;
@@ -43,7 +45,7 @@ impl HubRuntime {
     #[must_use]
     pub fn new(config: HubConfig) -> Self {
         let state = HubState::from_config(&config);
-        let core_daemon = CoreDaemon::new(CoreDaemonConfig::new(&config.data_directory));
+        let core_daemon = CoreDaemon::new(core_daemon_config(&config.data_directory));
         Self {
             capability_runtime: HubCapabilityRuntime::from_config(&config),
             config,
@@ -66,7 +68,7 @@ impl HubRuntime {
         store: &impl HubStateStore,
     ) -> HubStateStoreResult<Self> {
         let state = store.load_or_initialize(&config)?;
-        let core_daemon = CoreDaemon::new(CoreDaemonConfig::new(&config.data_directory));
+        let core_daemon = CoreDaemon::new(core_daemon_config(&config.data_directory));
         Ok(Self {
             capability_runtime: HubCapabilityRuntime::from_config(&config),
             config,
@@ -319,6 +321,25 @@ impl HubRuntime {
         self.core_daemon.guarded_write(request)
     }
 
+    /// Release worker-backed sessions before an intentional daemon restart.
+    pub fn release_sessions_for_restart(&mut self) {
+        self.core_daemon.release_for_restart();
+    }
+
+    /// Scan daemon registry records for worker-backed restart/adoption evidence.
+    pub fn adoption_scan(&self) -> Result<Vec<SessionAdoptionReport>, CoreDaemonError> {
+        self.core_daemon.adoption_scan()
+    }
+
+    /// Reattach one live worker-backed session after daemon restart.
+    pub fn adopt_session(
+        &mut self,
+        session_id: &SessionId,
+        now_seconds: u64,
+    ) -> Result<CoreSession, CoreDaemonError> {
+        self.core_daemon.adopt_session(session_id, now_seconds)
+    }
+
     /// Shut down one daemon-owned session through core.
     pub fn shutdown_session(
         &mut self,
@@ -337,6 +358,30 @@ pub type HubRuntimeOutput = BotsterEngineOutput;
 
 /// Error emitted by the core daemon session supervisor.
 pub type HubRuntimeError = CoreDaemonError;
+
+fn core_daemon_config(data_directory: &Path) -> CoreDaemonConfig {
+    CoreDaemonConfig::new(data_directory).with_worker_path(session_worker_path())
+}
+
+fn session_worker_path() -> PathBuf {
+    let current = env::current_exe().unwrap_or_else(|_| PathBuf::from("botster-hub"));
+    let Some(dir) = current.parent() else {
+        return PathBuf::from("botster-session-worker");
+    };
+    let sibling = dir.join("botster-session-worker");
+    if sibling.exists() {
+        return sibling;
+    }
+    if dir.file_name().and_then(|name| name.to_str()) == Some("deps")
+        && let Some(debug_dir) = dir.parent()
+    {
+        let debug_sibling = debug_dir.join("botster-session-worker");
+        if debug_sibling.exists() {
+            return debug_sibling;
+        }
+    }
+    sibling
+}
 
 /// Convert daemon registry state into the client-facing core lifecycle summary.
 #[must_use]

@@ -18,7 +18,11 @@ use botster_hub::{
     SessionDefaults, TransportBindings,
 };
 
+mod support;
+use support::ensure_session_worker_binary;
+
 fn explicit_runtime(name: &str) -> HubRuntime {
+    ensure_session_worker_binary();
     let config = HubStartupOptions {
         host: HostIdentityOptions {
             id: format!("hub-capability-{name}"),

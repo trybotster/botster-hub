@@ -36,6 +36,9 @@ The public command surface for the hub production local session path is the
 typed core daemon API, not raw core routers and not the thin daemon CLI.
 `DefaultBotsterEngine` remains a core implementation detail behind daemon/local
 runtime mechanics; the hub consumes explicit daemon verbs through `HubRuntime`.
+The production constructors configure `CoreDaemon` with the sibling
+`botster-session-worker` executable so live PTY handles are owned by core worker
+processes, not by the hub process.
 
 ## Boundary Tiers
 
@@ -74,7 +77,8 @@ Startup proceeds in this order:
 2. The host profile initializes core mechanisms. For production local PTY
    execution, the current hub path constructs `HubRuntime` with
    `botster_core_daemon::CoreDaemon` in `src/runtime.rs`, using the hub data
-   directory for durable daemon registry state.
+   directory for durable daemon registry metadata and the sibling
+   `botster-session-worker` executable for worker-backed live sessions.
 3. The host enables privileged providers from pinned package metadata and
    explicit grants. Providers that affect trust, admission, reachability,
    pairing, signaling, registry publication, secrets, remote network access, or
@@ -143,6 +147,11 @@ payloads, scrollback, or per-client egress. Core already names `SessionIo` and
   become wrong for contract-only embedders. Mitigation: name the production hub
   path as the typed core daemon facade and keep lower-level engine helpers as
   core implementation details.
+- Durability over-claim: registry metadata durability is not the same as
+  preserving every byte during downtime. Mitigation: hub docs and tests claim
+  Unix worker-backed process survival, adoption, attach/input/drain/shutdown
+  after release/adopt, and no downtime scrollback continuity beyond core's
+  current guarantees.
 
 ## Migration Path For `botster-hub`
 
@@ -153,9 +162,10 @@ payloads, scrollback, or per-client egress. Core already names `SessionIo` and
 3. Audit current scaffold modules against this ADR:
    `src/runtime.rs`, `src/config.rs`, `src/auth.rs`, `src/persistence.rs`,
    `src/packages.rs`, `src/providers.rs`, and `src/adapters/*`.
-4. Keep runtime proof paths facade-backed. The current `HubRuntime` should use
-   typed core daemon verbs for local session execution rather than assembling
-   `MultiplexerEngine` directly or parsing core daemon CLI output.
+4. Keep runtime proof paths facade-backed. The current `HubRuntime` uses typed
+   core daemon verbs and worker-backed sessions for local session execution
+   rather than assembling `MultiplexerEngine` directly, owning PTY handles, or
+   parsing core daemon CLI output.
 5. Move product policy into host-profile/provider/plugin packages without
    widening core. Cloud federation, signaling relays, browser shell delivery,
    SSO, package indexes, marketplace UX, and workflow apps should compose core
@@ -173,6 +183,8 @@ payloads, scrollback, or per-client egress. Core already names `SessionIo` and
 9. Convert documented boundaries into compile-time/package/test enforcement
    only after the ADR, README, current scaffold, and locked core surfaces agree.
 
-This migration path is intentionally documentation-first. The ticket acceptance
-does not require runtime implementation beyond the current scaffold and public
-doc discovery path.
+This migration path is intentionally staged. The current scaffold now proves the
+production local session path through `HubRuntime -> CoreDaemon ->
+botster-session-worker`; later tickets can add socket transports, broader
+restart UX, and provider/client adapters without moving PTY ownership back into
+the hub.

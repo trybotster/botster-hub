@@ -100,11 +100,12 @@ impl HubClientApi {
             HubClientRequest::Spawn {
                 session_id,
                 command,
+                now_seconds,
                 ..
             } => {
                 let request = spawn_request(runtime, request_id.clone(), session_id, command);
                 let outcome = runtime
-                    .spawn_session(request, client_session_metadata(), 0)
+                    .spawn_session(request, client_session_metadata(), now_seconds)
                     .map_err(|_| HubClientError::Runtime {
                         request_id: request_id.clone(),
                         operation,
@@ -223,6 +224,7 @@ impl HubClientApi {
                 package_name,
                 data,
                 readiness,
+                now_seconds,
                 ..
             } => {
                 if !package_allows_guarded_write(packages, &package_name) {
@@ -238,7 +240,7 @@ impl HubClientApi {
                         client_id: self.identity.client_id.clone(),
                         data,
                         readiness,
-                        now_seconds: 0,
+                        now_seconds,
                     })
                     .map_err(|_| HubClientError::Runtime {
                         request_id: request_id.clone(),
@@ -347,6 +349,7 @@ pub enum HubClientRequest {
         request_id: RequestId,
         session_id: SessionId,
         command: String,
+        now_seconds: u64,
     },
     /// Attach to one session stream. This does not hydrate global state.
     Attach {
@@ -396,6 +399,7 @@ pub enum HubClientRequest {
         package_name: String,
         data: Vec<u8>,
         readiness: ReadinessEvidence,
+        now_seconds: u64,
     },
     /// Return sanitized package/provider records.
     ListPackages { request_id: RequestId },

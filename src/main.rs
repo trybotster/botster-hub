@@ -153,6 +153,7 @@ fn operator_sessions(args: Vec<String>) -> Result<(), OperatorError> {
                     request_id: request_id("cli-sessions-spawn"),
                     session_id,
                     command,
+                    now_seconds: 1,
                 },
             )?;
             print_client_response(response.body);
