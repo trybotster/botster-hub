@@ -141,10 +141,12 @@ cargo run -- start --data-dir target/botster-hub-daemon-smoke-data
 `start --data-dir` constructs `HubDaemon`, loads or initializes
 `hub-state.json`, restores package/provider policy records through
 `PackageRegistrySnapshot` admission, initializes `HubRuntime` through the
-worker-backed core daemon facade, prints deterministic scrubbed status, and
-stops cleanly. Future transports, provider runtimes, sockets, and supervisors
-should attach after this lifecycle object has started; they should not recreate
-config or durable state ownership.
+worker-backed core daemon facade, binds the configured local Unix socket, and
+stays running until `shutdown --data-dir` asks it to stop. Later operator CLI
+invocations connect to that socket with a `hello` / `hello_ack` protocol
+handshake before sending daemon requests. Future transports, provider runtimes,
+sockets, and supervisors should attach after this lifecycle object has started;
+they should not recreate config or durable state ownership.
 
 The no-arg binary path is a side-effect-light host-profile summary. It builds
 resolved config and an in-memory `HubRuntime::new` summary only; it does not
@@ -156,15 +158,15 @@ package commands through `HubStateStore::update`.
 ## Local dogfood operator CLI
 
 The `botster-hub` binary includes a deliberately thin local operator surface for
-dogfood. It starts an explicit local hub lifecycle with `HubDaemon`, then routes
-operator reads and session actions through `HubClientApi` instead of raw core
-routers. The current scaffold embeds the typed daemon API in-process while core
-session workers own live PTYs; it proves the daemon/runtime boundary without
-claiming a socket protocol for separate long-lived hub processes. Package state
-persists through `hub-state.json`. Core registry metadata persists under the hub
-data directory, and live worker-backed sessions can be adopted after an
-intentional daemon restart; separate short-lived CLI invocations still do not
-share one long-lived hub process until a socket attach protocol exists.
+dogfood. `start --data-dir` owns the daemon lifecycle and one `HubRuntime`;
+`status`, `sessions list`, `sessions spawn`, `sessions attach`,
+`sessions send-input`, `sessions resize`, `sessions detach`, and `shutdown`
+connect to that daemon over the resolved local socket. The CLI remains a thin
+adapter: daemon requests still route through `HubClientApi` instead of raw core
+routers, and the daemon stamps runtime clocks for separate stateless client
+invocations. Package state persists through `hub-state.json`, core registry
+metadata persists under the hub data directory, and live worker-backed sessions
+can be adopted after an intentional daemon restart.
 
 The end-to-end local dogfood proof is the Unix integration flow below:
 
@@ -182,11 +184,14 @@ client, sends input, drains the observed marker, and shuts down through the same
 local client API. The Lua fixture is not executed by a real Lua runtime in this
 proof. The PTY portion is Unix-only.
 
-The CLI commands below are illustrative wiring demos for the same local
-surfaces, not the verified end-to-end proof flow:
+The CLI commands below exercise the daemon-backed workflow across separate
+processes:
 
 ```sh
+# Terminal 1: leave the daemon running.
 cargo run -- start --data-dir target/botster-hub-dogfood-data
+
+# Other terminals:
 cargo run -- status --data-dir target/botster-hub-dogfood-data
 
 cargo run -- packages enable --data-dir target/botster-hub-dogfood-data \
@@ -194,33 +199,36 @@ cargo run -- packages enable --data-dir target/botster-hub-dogfood-data \
 cargo run -- packages list --data-dir target/botster-hub-dogfood-data
 cargo run -- providers list --data-dir target/botster-hub-dogfood-data
 
-# Session commands prove the HubClientApi wiring for one ephemeral daemon
-# invocation. A later command starts a fresh daemon, so it will not see this
-# spawned session until cross-process socket attach exists.
 cargo run -- sessions spawn --data-dir target/botster-hub-dogfood-data \
   --session-id dogfood-session -- "printf 'dogfood-ok\n'; sleep 1"
 cargo run -- sessions list --data-dir target/botster-hub-dogfood-data
 cargo run -- sessions attach --data-dir target/botster-hub-dogfood-data dogfood-session
 cargo run -- sessions send-input --data-dir target/botster-hub-dogfood-data \
-  dogfood-session -- "ping\n"
+  dogfood-session -- "ping\r"
+cargo run -- sessions resize --data-dir target/botster-hub-dogfood-data \
+  dogfood-session 30 100
+cargo run -- sessions detach --data-dir target/botster-hub-dogfood-data dogfood-session
 cargo run -- inspect --data-dir target/botster-hub-dogfood-data dogfood-session
+cargo run -- shutdown --data-dir target/botster-hub-dogfood-data
 ```
 
 `packages enable --path` installs and enables a local package manifest through
 the existing hub package registry policy, persists the registry snapshot under
 `hub-state.json`, and then lists packages through `HubClientApi::ListPackages`.
-The session commands are wiring demonstrations in this scaffold: `spawn` crosses
-`HubClientApi::Spawn`, while a later `sessions list` or `inspect` command starts
-a new in-process daemon and reports no live session. `attach` and `send-input`
-are wired through `HubClientApi` for future socket-backed continuity, but are
-not useful across separate invocations yet. `inspect` is intentionally scoped to
-sanitized session list data until the stable client API grows a dedicated
-inspection request.
+The session commands use the running daemon runtime, so a session created by
+one CLI process is visible to later `sessions list`, `sessions attach`,
+`sessions send-input`, `sessions resize`, and `sessions detach` invocations.
+`attach` streams terminal bytes and currently exits after an idle window if the
+core runtime does not provide a process-exit frame; persistent TUI-grade attach
+with explicit signal handling remains outside this scaffold. `inspect` is
+intentionally scoped to sanitized session list data until the stable client API
+grows a dedicated inspection request.
 
 Dogfood-ready today: explicit local daemon lifecycle, file-backed hub/package
 state, local package admission from a manifest path, typed status/package reads,
-plugin lifecycle observation/invocation through the hub facade, and in-process
-PTY spawn/attach/input/drain/shutdown through `HubClientApi`.
+plugin lifecycle observation/invocation through the hub facade, daemon-backed
+PTY spawn/list/attach/input/resize/detach/shutdown through `HubClientApi`, and
+an in-process dogfood proof for package/runtime mechanics.
 
 The restart proof lives in `hub_daemon_lifecycle_test`: it spawns a long-running
 worker-backed session, stops only the hub lifecycle, starts a new hub over the
@@ -236,10 +244,10 @@ control-plane acknowledgements. Terminal egress is delivered by explicit
 `DrainRuntime` calls over the session-backed CoreDaemon path, not synchronously
 from those control operations.
 
-Feature parity still pending: cross-process socket attach for separate CLI
-invocations, a socket daemon protocol, provider process supervision,
-cloud/Rails/WebRTC/browser/TUI adapters, marketplace/package fetching, and
-broader terminal snapshot/read-screen/reporting support over the daemon API.
+Feature parity still pending: durable PTY recovery after daemon exit, provider
+process supervision, cloud/Rails/WebRTC/browser/TUI adapters,
+marketplace/package fetching, missing-public-socket self-heal after the socket
+path is externally removed, and long-running attach signal handling.
 
 Schema and consistency posture are documented in
 [`docs/adr/durable-hub-state-v1.md`](docs/adr/durable-hub-state-v1.md).

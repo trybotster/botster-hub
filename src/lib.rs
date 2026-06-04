@@ -33,6 +33,7 @@ pub mod capabilities;
 pub mod client_api;
 pub mod config;
 pub mod daemon;
+pub mod daemon_transport;
 pub mod lifecycle;
 pub mod packages;
 pub mod persistence;
@@ -57,6 +58,11 @@ pub use config::{
 };
 pub use daemon::{
     HubDaemon, HubDaemonError, HubDaemonResult, HubDaemonState, HubDaemonStatus, HubStateLoadSource,
+};
+pub use daemon_transport::{
+    DaemonEvent, DaemonRequest, DaemonResponse, DaemonResponseKind, DaemonSession, DaemonStatus,
+    DaemonTransportError, DaemonTransportResult, request as daemon_transport_request, serve_daemon,
+    stream_attach,
 };
 pub use lifecycle::{
     HubLifecycleError, HubLifecycleResult, HubPluginLifecycle, HubPluginLifecycleStatus,
