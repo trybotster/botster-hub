@@ -144,7 +144,7 @@ cargo run -- start --data-dir target/botster-hub-daemon-smoke-data
 `start --data-dir` constructs `HubDaemon`, loads or initializes
 `hub-state.json`, restores package/provider policy records through
 `PackageRegistrySnapshot` admission, initializes `HubRuntime` through the
-default core engine facade, prints deterministic scrubbed status, and stops
+daemon-backed core/session-worker facade, prints deterministic scrubbed status, and stops
 cleanly. Future transports, provider runtimes, sockets, and supervisors should
 attach after this lifecycle object has started; they should not recreate config
 or durable state ownership.
@@ -161,11 +161,11 @@ package commands through `HubStateStore::update`.
 The `botster-hub` binary includes a deliberately thin local operator surface for
 dogfood. It starts an explicit local hub lifecycle with `HubDaemon`, then routes
 operator reads and session actions through `HubClientApi` instead of raw core
-routers. The current scaffold is in-process; it proves the daemon/runtime
-boundary without claiming a socket protocol for separate long-lived processes.
-Package state persists through `hub-state.json`; live sessions are runtime-only
-and do not survive separate CLI invocations until a socket attach protocol
-exists.
+routers. The session path is backed by `CoreDaemon` configured with the
+`botster-session-worker` executable, so an intentional hub lifecycle restart can
+release hub ownership, start a new hub over the same explicit data directory,
+adopt the live worker-backed session from the core daemon registry, and reattach
+through the same client API. Package state persists through `hub-state.json`.
 
 The end-to-end local dogfood proof is the Unix integration flow below:
 
@@ -195,9 +195,7 @@ cargo run -- packages enable --data-dir target/botster-hub-dogfood-data \
 cargo run -- packages list --data-dir target/botster-hub-dogfood-data
 cargo run -- providers list --data-dir target/botster-hub-dogfood-data
 
-# Session commands prove the HubClientApi wiring for one ephemeral daemon
-# invocation. A later command starts a fresh daemon, so it will not see this
-# spawned session until cross-process socket attach exists.
+# Session commands route through HubClientApi and the daemon-backed runtime.
 cargo run -- sessions spawn --data-dir target/botster-hub-dogfood-data \
   --session-id dogfood-session -- "printf 'dogfood-ok\n'; sleep 1"
 cargo run -- sessions list --data-dir target/botster-hub-dogfood-data
@@ -210,22 +208,33 @@ cargo run -- inspect --data-dir target/botster-hub-dogfood-data dogfood-session
 `packages enable --path` installs and enables a local package manifest through
 the existing hub package registry policy, persists the registry snapshot under
 `hub-state.json`, and then lists packages through `HubClientApi::ListPackages`.
-The session commands are wiring demonstrations in this scaffold: `spawn` crosses
-`HubClientApi::Spawn`, while a later `sessions list` or `inspect` command starts
-a new in-process daemon and reports no live session. `attach` and `send-input`
-are wired through `HubClientApi` for future socket-backed continuity, but are
-not useful across separate invocations yet. `inspect` is intentionally scoped to
-sanitized session list data until the stable client API grows a dedicated
-inspection request.
+The session commands cross `HubClientApi` into the daemon-backed runtime. The
+restart proof lives in `hub_daemon_lifecycle_test`: it spawns a long-running
+worker-backed session, stops only the hub lifecycle, starts a new hub with the
+same explicit data directory, lists and reattaches the same session, sends input,
+drains output, and shuts down through the client API. `inspect` is intentionally
+scoped to sanitized session list data until the stable client API grows a
+dedicated inspection request.
+
+Hub startup reconciles session disagreement deterministically:
+
+- A hub/core registry record with missing protocol evidence, a missing worker,
+  an unhealthy worker, or duplicate worker candidates is marked stale.
+- A terminal registry record remains terminal.
+- A live worker-backed core daemon record that is absent from hub-owned state is
+  recovered by adopting the worker and surfacing sanitized core session metadata.
+- Recovery evidence comes from core daemon/session-worker protocol metadata, not
+  defaulted positive fields or path existence.
 
 Dogfood-ready today: explicit local daemon lifecycle, file-backed hub/package
 state, local package admission from a manifest path, typed status/package reads,
-plugin lifecycle observation/invocation through the hub facade, and in-process
-PTY spawn/attach/input/drain/shutdown through `HubClientApi`.
+plugin lifecycle observation/invocation through the hub facade, and
+daemon-backed worker PTY spawn/attach/input/drain/shutdown through
+`HubClientApi`.
 
-Feature parity still pending: cross-process live session continuity, a socket
-daemon protocol, provider process supervision, cloud/Rails/WebRTC/browser/TUI
-adapters, marketplace/package fetching, and durable PTY recovery.
+Feature parity still pending: a socket daemon protocol, provider process
+supervision, cloud/Rails/WebRTC/browser/TUI adapters, marketplace/package
+fetching, and broader terminal snapshot/read-screen support over the daemon API.
 
 Schema and consistency posture are documented in
 [`docs/adr/durable-hub-state-v1.md`](docs/adr/durable-hub-state-v1.md).
@@ -243,10 +252,9 @@ before shipping. Local `path` overrides are not the repo default and should stay
 outside committed dependency policy unless the repo grows an explicit override
 workflow.
 
-The hub runtime embeds `botster-core`'s default local engine path via
-`DefaultBotsterEngine`. Keep core default features enabled so the `local-runtime`
-feature remains active unless the hub intentionally replaces that runtime
-contract.
+The hub runtime embeds `botster-core-daemon` and configures it with the
+`botster-session-worker` executable. Keep core default features enabled so the
+`local-runtime` feature remains active for worker-backed local PTY execution.
 
 ## Runtime smoke proof
 
@@ -257,7 +265,7 @@ cargo run -- run-one --data-dir target/botster-hub-smoke-data -- /bin/sh -c "pri
 ```
 
 `run-one` requires an explicit `--data-dir`, builds hub config without falling
-back to user paths, then crosses `HubRuntime -> DefaultBotsterEngine` through
+back to user paths, then crosses `HubRuntime -> CoreDaemon -> session-worker` through
 spawn, attach, resize, drain, marker observation, detach, and shutdown. Its
 output is scrubbed to profile, host, session, marker, byte-count, detach, and
 shutdown-observation facts so pipeline artifacts do not need local paths,
