@@ -211,7 +211,6 @@ fn run_local_dogfood() {
             HubClientRequest::Shutdown {
                 request_id: request_id("dogfood-cleanup-shutdown"),
                 session_id: session_id.clone(),
-                reason: "dogfood cleanup".to_string(),
                 now_seconds: logical_clock,
             },
         );
@@ -228,7 +227,6 @@ fn run_local_dogfood() {
             HubClientRequest::Shutdown {
                 request_id: request_id("dogfood-shutdown"),
                 session_id,
-                reason: "dogfood proof complete".to_string(),
                 now_seconds: logical_clock,
             },
         )
@@ -236,15 +234,7 @@ fn run_local_dogfood() {
     let HubClientResponseBody::Events(events) = shutdown.body else {
         panic!("shutdown should return events");
     };
-    assert!(events.iter().any(|event| {
-        matches!(
-            event,
-            HubClientEvent::SessionLifecycle {
-                state: SessionLifecycleState::Stopping,
-                ..
-            }
-        )
-    }));
+    assert!(events.is_empty());
 
     reloaded.stop();
 }

@@ -7,14 +7,18 @@
 use std::collections::BTreeMap;
 
 use botster_core::{
-    BotsterEngineObservation, ClientId, CoreSession, CoreSessionMetadata, RequestId, SessionId,
-    SessionLifecycleState, SessionSpawnRequest, SpawnEnvironment, SpawnWorkingDirectory,
-    SubscriptionId, TerminalAttachState, TransportEgress,
+    BotsterEngineObservation, CapabilitySurface, ClientId, CoreSession, CoreSessionMetadata,
+    RequestId, SessionId, SessionLifecycleState, SessionSpawnRequest, SpawnEnvironment,
+    SpawnWorkingDirectory, SubscriptionId, TerminalAttachState, TransportEgress,
+};
+use botster_core_daemon::{
+    GuardedWriteDecision, GuardedWriteDeliveryState, GuardedWriteRequest, GuardedWriteResult,
+    ReadinessEvidence,
 };
 
 use crate::lifecycle::HubPluginLifecycleStatus;
 use crate::packages::{PackageClassification, PackageRecord, PackageRegistry, PackageState};
-use crate::{HubRuntime, HubRuntimeError, host_profile};
+use crate::{HubRuntime, HubRuntimeError, daemon_session_to_core_session, host_profile};
 
 /// Transport-neutral local client API handler.
 #[derive(Debug, Clone)]
@@ -72,13 +76,24 @@ impl HubClientApi {
             HubClientRequest::Status { .. } => HubClientResponseBody::Status(HubClientStatus {
                 profile_id: host_profile().id.to_string(),
                 host_id: runtime.config().host.id.clone(),
-                session_count: runtime.list_sessions().len(),
+                session_count: runtime
+                    .list_sessions()
+                    .map_err(|_| HubClientError::Runtime {
+                        request_id: request_id.clone(),
+                        operation,
+                    })?
+                    .len(),
                 package_count: packages.packages().len(),
             }),
             HubClientRequest::ListSessions { .. } => HubClientResponseBody::Sessions(
                 runtime
                     .list_sessions()
+                    .map_err(|_| HubClientError::Runtime {
+                        request_id: request_id.clone(),
+                        operation,
+                    })?
                     .into_iter()
+                    .map(daemon_session_to_core_session)
                     .map(HubClientSession::from)
                     .collect(),
             ),
@@ -89,18 +104,14 @@ impl HubClientApi {
             } => {
                 let request = spawn_request(runtime, request_id.clone(), session_id, command);
                 let outcome = runtime
-                    .spawn_session(request, client_session_metadata())
+                    .spawn_session(request, client_session_metadata(), 0)
                     .map_err(|_| HubClientError::Runtime {
                         request_id: request_id.clone(),
                         operation,
                     })?;
                 HubClientResponseBody::Spawned(HubClientSpawned {
-                    session: HubClientSession::from(outcome.session),
-                    events: outcome
-                        .observations
-                        .into_iter()
-                        .map(HubClientEvent::from_observation)
-                        .collect(),
+                    session: HubClientSession::from(outcome),
+                    events: Vec::new(),
                 })
             }
             HubClientRequest::Attach {
@@ -109,7 +120,7 @@ impl HubClientApi {
                 now_seconds,
                 ..
             } => {
-                let output = runtime
+                runtime
                     .attach_client(
                         self.identity.client_id.clone(),
                         session_id,
@@ -120,7 +131,7 @@ impl HubClientApi {
                         request_id: request_id.clone(),
                         operation,
                     })?;
-                HubClientResponseBody::Events(events_from_output(output))
+                HubClientResponseBody::Events(Vec::new())
             }
             HubClientRequest::Detach {
                 session_id,
@@ -128,7 +139,7 @@ impl HubClientApi {
                 now_seconds,
                 ..
             } => {
-                let output = runtime
+                runtime
                     .detach_client(
                         self.identity.client_id.clone(),
                         session_id,
@@ -139,7 +150,7 @@ impl HubClientApi {
                         request_id: request_id.clone(),
                         operation,
                     })?;
-                HubClientResponseBody::Events(events_from_output(output))
+                HubClientResponseBody::Events(Vec::new())
             }
             HubClientRequest::Input {
                 session_id,
@@ -147,7 +158,7 @@ impl HubClientApi {
                 now_seconds,
                 ..
             } => {
-                let output = runtime
+                runtime
                     .write_bytes(
                         self.identity.client_id.clone(),
                         session_id,
@@ -158,7 +169,7 @@ impl HubClientApi {
                         request_id: request_id.clone(),
                         operation,
                     })?;
-                HubClientResponseBody::Events(events_from_output(output))
+                HubClientResponseBody::Events(Vec::new())
             }
             HubClientRequest::Resize {
                 session_id,
@@ -167,7 +178,7 @@ impl HubClientApi {
                 now_seconds,
                 ..
             } => {
-                let output = runtime
+                runtime
                     .resize(
                         self.identity.client_id.clone(),
                         session_id,
@@ -179,7 +190,7 @@ impl HubClientApi {
                         request_id: request_id.clone(),
                         operation,
                     })?;
-                HubClientResponseBody::Events(events_from_output(output))
+                HubClientResponseBody::Events(Vec::new())
             }
             HubClientRequest::DrainRuntime {
                 session_id,
@@ -192,47 +203,48 @@ impl HubClientApi {
                         request_id: request_id.clone(),
                         operation,
                     })?;
-                HubClientResponseBody::Events(events_from_output(output))
+                HubClientResponseBody::Events(events_from_drain(output))
             }
             HubClientRequest::Shutdown {
                 session_id,
-                reason,
                 now_seconds,
                 ..
             } => {
-                let output = runtime
-                    .shutdown_session(session_id, reason, now_seconds)
+                runtime
+                    .shutdown_session(session_id, now_seconds)
                     .map_err(|_| HubClientError::Runtime {
                         request_id: request_id.clone(),
                         operation,
                     })?;
-                HubClientResponseBody::Events(events_from_output(output))
+                HubClientResponseBody::Events(Vec::new())
             }
-            HubClientRequest::ReadScreen {
+            HubClientRequest::GuardedNotificationWrite {
                 session_id,
-                now_seconds,
+                package_name,
+                data,
+                readiness,
                 ..
             } => {
-                let output = runtime
-                    .read_screen(request_id.clone(), session_id, now_seconds)
+                if !package_allows_guarded_write(packages, &package_name) {
+                    return Err(HubClientError::PackageCapabilityDenied {
+                        request_id,
+                        operation,
+                        package_name,
+                    });
+                }
+                let result = runtime
+                    .guarded_write(GuardedWriteRequest {
+                        session_id,
+                        client_id: self.identity.client_id.clone(),
+                        data,
+                        readiness,
+                        now_seconds: 0,
+                    })
                     .map_err(|_| HubClientError::Runtime {
                         request_id: request_id.clone(),
                         operation,
                     })?;
-                HubClientResponseBody::Events(events_from_output(output))
-            }
-            HubClientRequest::CaptureSnapshot {
-                session_id,
-                now_seconds,
-                ..
-            } => {
-                let output = runtime
-                    .capture_snapshot(request_id.clone(), session_id, now_seconds)
-                    .map_err(|_| HubClientError::Runtime {
-                        request_id: request_id.clone(),
-                        operation,
-                    })?;
-                HubClientResponseBody::Events(events_from_output(output))
+                HubClientResponseBody::GuardedWrite(HubClientGuardedWrite::from(result))
             }
             HubClientRequest::ListPackages { .. } => HubClientResponseBody::Packages(
                 packages
@@ -316,8 +328,7 @@ impl HubClientAdmission {
             | HubClientOperation::Resize
             | HubClientOperation::DrainRuntime
             | HubClientOperation::Shutdown
-            | HubClientOperation::ReadScreen
-            | HubClientOperation::CaptureSnapshot => self.allow_runtime,
+            | HubClientOperation::GuardedNotificationWrite => self.allow_runtime,
             HubClientOperation::ListPackages => self.allow_packages,
             HubClientOperation::PluginLifecycleStatus => self.allow_lifecycle,
         }
@@ -376,20 +387,15 @@ pub enum HubClientRequest {
     Shutdown {
         request_id: RequestId,
         session_id: SessionId,
-        reason: String,
         now_seconds: u64,
     },
-    /// Request a screen read where core supports it.
-    ReadScreen {
+    /// Request a hub-admitted guarded notification write into one session.
+    GuardedNotificationWrite {
         request_id: RequestId,
         session_id: SessionId,
-        now_seconds: u64,
-    },
-    /// Request a snapshot where core supports it.
-    CaptureSnapshot {
-        request_id: RequestId,
-        session_id: SessionId,
-        now_seconds: u64,
+        package_name: String,
+        data: Vec<u8>,
+        readiness: ReadinessEvidence,
     },
     /// Return sanitized package/provider records.
     ListPackages { request_id: RequestId },
@@ -409,8 +415,7 @@ impl HubClientRequest {
             | Self::Resize { request_id, .. }
             | Self::DrainRuntime { request_id, .. }
             | Self::Shutdown { request_id, .. }
-            | Self::ReadScreen { request_id, .. }
-            | Self::CaptureSnapshot { request_id, .. }
+            | Self::GuardedNotificationWrite { request_id, .. }
             | Self::ListPackages { request_id }
             | Self::PluginLifecycleStatus { request_id } => request_id,
         }
@@ -427,8 +432,7 @@ impl HubClientRequest {
             Self::Resize { .. } => HubClientOperation::Resize,
             Self::DrainRuntime { .. } => HubClientOperation::DrainRuntime,
             Self::Shutdown { .. } => HubClientOperation::Shutdown,
-            Self::ReadScreen { .. } => HubClientOperation::ReadScreen,
-            Self::CaptureSnapshot { .. } => HubClientOperation::CaptureSnapshot,
+            Self::GuardedNotificationWrite { .. } => HubClientOperation::GuardedNotificationWrite,
             Self::ListPackages { .. } => HubClientOperation::ListPackages,
             Self::PluginLifecycleStatus { .. } => HubClientOperation::PluginLifecycleStatus,
         }
@@ -447,8 +451,7 @@ pub enum HubClientOperation {
     Resize,
     DrainRuntime,
     Shutdown,
-    ReadScreen,
-    CaptureSnapshot,
+    GuardedNotificationWrite,
     ListPackages,
     PluginLifecycleStatus,
 }
@@ -469,6 +472,7 @@ pub enum HubClientResponseBody {
     Sessions(Vec<HubClientSession>),
     Spawned(HubClientSpawned),
     Events(Vec<HubClientEvent>),
+    GuardedWrite(HubClientGuardedWrite),
     Packages(Vec<HubClientPackage>),
     PluginLifecycle(Vec<HubClientPluginLifecycle>),
 }
@@ -503,6 +507,22 @@ impl From<CoreSession> for HubClientSession {
 pub struct HubClientSpawned {
     pub session: HubClientSession,
     pub events: Vec<HubClientEvent>,
+}
+
+/// Client-facing guarded write result. Delivery states are produced by core.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HubClientGuardedWrite {
+    pub decision: GuardedWriteDecision,
+    pub states: Vec<GuardedWriteDeliveryState>,
+}
+
+impl From<GuardedWriteResult> for HubClientGuardedWrite {
+    fn from(result: GuardedWriteResult) -> Self {
+        Self {
+            decision: result.decision,
+            states: result.states,
+        }
+    }
 }
 
 /// Client event stream emitted from hub runtime output.
@@ -672,6 +692,11 @@ pub enum HubClientError {
         request_id: RequestId,
         operation: HubClientOperation,
     },
+    PackageCapabilityDenied {
+        request_id: RequestId,
+        operation: HubClientOperation,
+        package_name: String,
+    },
 }
 
 /// Result alias for client API requests.
@@ -712,7 +737,7 @@ fn client_session_metadata() -> CoreSessionMetadata {
     )]))
 }
 
-fn events_from_output(output: botster_core::BotsterEngineOutput) -> Vec<HubClientEvent> {
+fn events_from_drain(output: botster_core_daemon::DrainResult) -> Vec<HubClientEvent> {
     let mut events = Vec::new();
 
     events.extend(
@@ -785,3 +810,20 @@ fn events_from_output(output: botster_core::BotsterEngineOutput) -> Vec<HubClien
 
 #[allow(dead_code)]
 fn _runtime_error_type_is_not_public_payload(_: HubRuntimeError) {}
+
+fn package_allows_guarded_write(packages: &PackageRegistry, package_name: &str) -> bool {
+    let Some(record) = packages.package(package_name) else {
+        return false;
+    };
+    if !matches!(record.state, PackageState::Enabled) {
+        return false;
+    }
+
+    record.manifest.capabilities.iter().any(|capability| {
+        capability.surface == CapabilitySurface::SessionActions
+            && capability
+                .scope
+                .as_deref()
+                .is_none_or(|scope| scope == "guarded_session_notification_write")
+    })
+}

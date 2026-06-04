@@ -79,7 +79,8 @@ pub use profile::{
     host_profile,
 };
 pub use runtime::{
-    HubRuntime, HubRuntimeError, HubRuntimeObservation, HubRuntimeOutput, HubRuntimeSpawnOutcome,
+    HubRuntime, HubRuntimeError, HubRuntimeObservation, HubRuntimeOutput,
+    daemon_session_to_core_session,
 };
 
 /// Compile-checked description of the profile plus the audited `HubRuntime` facade.
@@ -228,52 +229,22 @@ const HUB_FACADE_DECISIONS: &[HubFacadeDecision] = &[
     HubFacadeDecision::new(
         "write_bytes",
         HubFacadeExposure::Exposed,
-        "explicit client terminal input path through core mechanics",
+        "explicit client terminal input path through the core daemon",
     ),
     HubFacadeDecision::new(
         "resize",
         HubFacadeExposure::Exposed,
-        "explicit client terminal resize path through core mechanics",
+        "explicit client terminal resize path through the core daemon",
     ),
     HubFacadeDecision::new(
-        "inspect_session",
+        "guarded_write",
         HubFacadeExposure::Exposed,
-        "host visibility over lifecycle and activity",
+        "hub-admitted guarded notification write delegated to core daemon readiness and delivery states",
     ),
     HubFacadeDecision::new(
-        "read_screen",
-        HubFacadeExposure::Exposed,
-        "explicit host request for core-owned session screen state",
-    ),
-    HubFacadeDecision::new(
-        "capture_snapshot",
-        HubFacadeExposure::Exposed,
-        "explicit host request for core-owned snapshot mechanics",
-    ),
-    HubFacadeDecision::new(
-        "replay_snapshot",
-        HubFacadeExposure::Exposed,
-        "explicit host request for core-owned snapshot replay mechanics",
-    ),
-    HubFacadeDecision::new(
-        "drain_runtime_all_once",
-        HubFacadeExposure::Exposed,
-        "host scheduler drain hook over live core sessions",
-    ),
-    HubFacadeDecision::new(
-        "report_backpressure",
-        HubFacadeExposure::Exposed,
-        "typed pressure evidence without hub-owned retry policy",
-    ),
-    HubFacadeDecision::new(
-        "report_delivery_lag",
-        HubFacadeExposure::Exposed,
-        "typed slow-delivery evidence without hub-owned retry policy",
-    ),
-    HubFacadeDecision::new(
-        "report_delivery_failure",
-        HubFacadeExposure::Exposed,
-        "typed failed-delivery evidence without hub-owned retry policy",
+        "read_screen/capture_snapshot/report_delivery_*",
+        HubFacadeExposure::Hidden,
+        "embedded-engine-only helpers are not part of the daemon-backed production session path",
     ),
 ];
 
@@ -337,18 +308,18 @@ mod tests {
         assert!(exposed.contains(&"detach_client"));
         assert!(exposed.contains(&"write_bytes"));
         assert!(exposed.contains(&"resize"));
-        assert!(exposed.contains(&"inspect_session"));
-        assert!(exposed.contains(&"read_screen"));
-        assert!(exposed.contains(&"capture_snapshot"));
-        assert!(exposed.contains(&"replay_snapshot"));
-        assert!(exposed.contains(&"drain_runtime_all_once"));
-        assert!(exposed.contains(&"report_backpressure"));
-        assert!(exposed.contains(&"report_delivery_lag"));
-        assert!(exposed.contains(&"report_delivery_failure"));
+        assert!(exposed.contains(&"guarded_write"));
         assert!(summary.facade_decisions().iter().any(|decision| {
             decision.core_operation() == "execute_command(DefaultEngineCommand)"
                 && decision.exposure() == HubFacadeExposure::Hidden
                 && decision.reason().contains("generic core router")
+        }));
+        assert!(summary.facade_decisions().iter().any(|decision| {
+            decision.core_operation() == "read_screen/capture_snapshot/report_delivery_*"
+                && decision.exposure() == HubFacadeExposure::Hidden
+                && decision
+                    .reason()
+                    .contains("daemon-backed production session path")
         }));
     }
 }

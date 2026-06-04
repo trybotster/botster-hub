@@ -373,6 +373,11 @@ fn print_client_response(body: HubClientResponseBody) {
             println!("response=events");
             print_events(&events);
         }
+        HubClientResponseBody::GuardedWrite(result) => {
+            println!("response=guarded_write");
+            println!("decision={:?}", result.decision);
+            println!("state_count={}", result.states.len());
+        }
         HubClientResponseBody::Packages(_) => {
             print_packages_response(body, false);
         }
@@ -812,7 +817,8 @@ fn run_one(args: Vec<String>) -> Result<(), RunOneError> {
     let subscription_id = SubscriptionId("botster-hub-smoke-subscription".to_string());
     let mut logical_clock = 1;
 
-    let spawn = runtime.spawn_session(request, CoreSessionMetadata::new())?;
+    let spawn = runtime.spawn_session(request, CoreSessionMetadata::new(), logical_clock)?;
+    logical_clock += 1;
     runtime.attach_client(
         client_id.clone(),
         session_id.clone(),
@@ -831,25 +837,23 @@ fn run_one(args: Vec<String>) -> Result<(), RunOneError> {
     logical_clock += 1;
 
     let observed = drain_until_marker(&mut runtime, &session_id, &mut logical_clock)?;
-    let detach = runtime.detach_client(
+    runtime.detach_client(
         client_id,
         session_id.clone(),
         subscription_id,
         logical_clock,
     )?;
     logical_clock += 1;
-    let shutdown =
-        runtime.shutdown_session(session_id.clone(), "run-one complete", logical_clock)?;
+    runtime.shutdown_session(session_id.clone(), logical_clock)?;
 
     println!(
-        "{} first-party host profile booted for {} through DefaultBotsterEngine",
+        "{} first-party host profile booted for {} through CoreDaemon",
         profile.id, host_id
     );
-    println!("spawned_session={}", spawn.handle.session_id.0);
+    println!("spawned_session={}", spawn.session_id.0);
     println!("observed_marker={SMOKE_MARKER}");
     println!("observed_bytes={}", observed.len());
-    println!("detach_observations={}", detach.observations.len());
-    println!("shutdown_observations={}", shutdown.observations.len());
+    println!("daemon_session_path=core_daemon");
 
     Ok(())
 }
