@@ -4,40 +4,21 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use botster_core::{
-    BotsterEngineObservation, ClientId, CoreSessionMetadata, MailboxSendFailureReason,
-    ManagedSessionRuntimeError, PreparedSnapshotRequest, QueueSource, RequestId, ResizePayload,
-    SessionActivityStatus, SessionId, SessionLifecycleState, SessionRuntimeErrorKind,
-    SessionSpawnRequest, SpawnEnvironment, SpawnWorkingDirectory, SubscriptionId, TransportEgress,
+    ClientId, CoreSessionMetadata, ModeFlags, RequestId, ResizePayload, SessionId,
+    SessionLifecycleState, SessionSpawnRequest, SpawnEnvironment, SpawnWorkingDirectory,
+    SubscriptionId, TransportEgress,
+};
+use botster_core_daemon::{
+    GuardedWriteDecision, GuardedWriteDeliveryState, GuardedWriteRequest, ReadinessEvidence,
+    RegistrySessionState,
 };
 use botster_hub::{
-    DataDirectoryOption, FileHubStateStore, HostIdentityOptions, HubRuntime, HubRuntimeError,
-    HubRuntimeOutput, HubStartupOptions, RuntimeEnvironment, SessionDefaults, TransportBindings,
+    DataDirectoryOption, FileHubStateStore, HostIdentityOptions, HubRuntime, HubStartupOptions,
+    RuntimeEnvironment, SessionDefaults, TransportBindings,
 };
 
 fn explicit_config() -> botster_hub::HubConfig {
-    HubStartupOptions {
-        host: HostIdentityOptions {
-            id: "hub-runtime-test".to_string(),
-            display_name: "Hub Runtime Test".to_string(),
-            fingerprint: None,
-        },
-        data_directory: DataDirectoryOption::Explicit(
-            "target/botster-hub-test-data/runtime".into(),
-        ),
-        session_defaults: SessionDefaults {
-            shell: "/bin/sh".to_string(),
-            working_directory: Some(".".into()),
-            initial_rows: 24,
-            initial_cols: 80,
-        },
-        transports: TransportBindings {
-            local_socket: None,
-            tcp: Vec::new(),
-        },
-        ..HubStartupOptions::default()
-    }
-    .build_config_for_environment(&RuntimeEnvironment::from_values(None, None, None))
-    .expect("explicit runtime config should build")
+    explicit_config_with_data_dir("target/botster-hub-test-data/runtime")
 }
 
 fn explicit_config_with_data_dir(
@@ -105,7 +86,7 @@ fn drain_until(
     while Instant::now() < deadline {
         let output = runtime
             .drain_runtime_once(session_id, *logical_clock)
-            .expect("drain runtime through core");
+            .expect("drain runtime through core daemon");
         *logical_clock += 1;
 
         for (_, frame) in output.client_egress {
@@ -131,33 +112,8 @@ fn drain_until(
     );
 }
 
-fn assert_live_handle_removed(
-    runtime: &mut HubRuntime,
-    session_id: &SessionId,
-    logical_clock: &mut u64,
-) {
-    let deadline = Instant::now() + Duration::from_secs(5);
-
-    while Instant::now() < deadline {
-        match runtime.drain_runtime_once(session_id, *logical_clock) {
-            Err(ManagedSessionRuntimeError::Runtime(error))
-                if error.kind == SessionRuntimeErrorKind::SessionNotFound =>
-            {
-                return;
-            }
-            Ok(_) => {
-                *logical_clock += 1;
-                thread::sleep(Duration::from_millis(20));
-            }
-            other => panic!("expected SessionNotFound live-handle cleanup signal, got {other:?}"),
-        }
-    }
-
-    panic!("timed out waiting for SessionNotFound live-handle cleanup signal");
-}
-
 #[test]
-fn hub_runtime_spawns_attaches_writes_reads_classifies_and_shuts_down_through_core() {
+fn hub_runtime_routes_production_session_verbs_through_core_daemon() {
     let config = explicit_config();
     let mut runtime = HubRuntime::new(config);
     let request = spawn_request(runtime.config());
@@ -167,41 +123,48 @@ fn hub_runtime_spawns_attaches_writes_reads_classifies_and_shuts_down_through_co
     let mut logical_clock = 20;
 
     let spawn = runtime
-        .spawn_session(request, CoreSessionMetadata::new())
-        .expect("spawn local command through core");
-    assert_eq!(spawn.handle.session_id, session_id);
-    assert_eq!(spawn.session.lifecycle, SessionLifecycleState::Running);
-    assert!(runtime.session(&session_id).is_some());
-    assert_eq!(runtime.list_sessions().len(), 1);
+        .spawn_session(request, CoreSessionMetadata::new(), logical_clock)
+        .expect("spawn local command through core daemon");
+    logical_clock += 1;
+    assert_eq!(spawn.session_id, session_id);
+    assert_eq!(spawn.lifecycle, SessionLifecycleState::Running);
+    assert!(
+        runtime
+            .session(&session_id)
+            .expect("daemon session lookup")
+            .is_some()
+    );
+    assert_eq!(
+        runtime.list_sessions().expect("daemon list").len(),
+        1,
+        "hub visibility should come from core daemon registry"
+    );
 
     runtime
         .attach_client(
             client_id.clone(),
             session_id.clone(),
-            subscription_id.clone(),
+            subscription_id,
             logical_clock,
         )
-        .expect("attach fake client through core");
+        .expect("attach fake client through core daemon");
     logical_clock += 1;
 
-    let pressure = runtime
-        .report_backpressure(
+    drain_until(&mut runtime, &session_id, b"ready", &mut logical_clock);
+
+    runtime
+        .resize(
             client_id.clone(),
             session_id.clone(),
-            QueueSource::ClientWorker,
-            16,
-            12,
+            30,
+            100,
+            logical_clock,
         )
-        .expect("report pressure evidence through core");
-    assert!(!pressure.observations.is_empty());
-
-    let ready = drain_until(&mut runtime, &session_id, b"ready", &mut logical_clock);
-    assert!(
-        ready
-            .windows(b"ready".len())
-            .any(|window| window == b"ready"),
-        "runtime should fan out local command startup output through core"
-    );
+        .expect("resize through core daemon");
+    logical_clock += 1;
+    let listed = runtime.list_sessions().expect("daemon list after resize");
+    assert_eq!(listed[0].size.rows, 30);
+    assert_eq!(listed[0].size.cols, 100);
 
     runtime
         .write_bytes(
@@ -210,9 +173,8 @@ fn hub_runtime_spawns_attaches_writes_reads_classifies_and_shuts_down_through_co
             b"ping-hub\n".to_vec(),
             logical_clock,
         )
-        .expect("write input through core");
+        .expect("write input through core daemon");
     logical_clock += 1;
-
     drain_until(
         &mut runtime,
         &session_id,
@@ -220,111 +182,87 @@ fn hub_runtime_spawns_attaches_writes_reads_classifies_and_shuts_down_through_co
         &mut logical_clock,
     );
 
-    assert_eq!(
-        runtime
-            .classify_activity(&session_id, logical_clock, 5)
-            .expect("classify activity through core"),
-        SessionActivityStatus::Active
-    );
-    assert_eq!(
-        runtime
-            .inspect_session(&session_id, logical_clock, 5)
-            .expect("inspect session through core")
-            .activity_status,
-        SessionActivityStatus::Active
-    );
     runtime
-        .drain_runtime_all_once(logical_clock)
-        .expect("drain all sessions through core");
-
-    let shutdown = runtime
-        .shutdown_session(session_id.clone(), "test complete", logical_clock)
-        .expect("shutdown through core");
-    assert!(shutdown.observations.iter().any(|observation| {
-        observation
-            == &BotsterEngineObservation::SessionLifecycle {
-                session_id: session_id.clone(),
-                state: SessionLifecycleState::Stopping,
-            }
-    }));
-    assert!(matches!(
-        runtime
-            .session(&session_id)
-            .map(|session| &session.lifecycle),
-        Some(SessionLifecycleState::Stopping)
-    ));
-    assert_live_handle_removed(&mut runtime, &session_id, &mut logical_clock);
+        .shutdown_session(session_id.clone(), logical_clock)
+        .expect("shutdown through core daemon");
+    let listed = runtime.list_sessions().expect("daemon list after shutdown");
+    assert_eq!(listed[0].registry_state, RegistrySessionState::Exited);
 }
 
 #[test]
-fn hub_runtime_public_facade_includes_audited_core_visibility_and_reporting_methods() {
-    type InspectSession = fn(
-        &HubRuntime,
-        &SessionId,
-        u64,
-        u64,
-    ) -> Result<botster_core::EngineSessionInspection, HubRuntimeError>;
-    type ReadScreen =
-        fn(&mut HubRuntime, RequestId, SessionId, u64) -> Result<HubRuntimeOutput, HubRuntimeError>;
-    type ReplaySnapshot = fn(
-        &mut HubRuntime,
-        PreparedSnapshotRequest,
-        u64,
-    ) -> Result<HubRuntimeOutput, HubRuntimeError>;
-    type ReportBackpressure = fn(
-        &mut HubRuntime,
-        ClientId,
-        SessionId,
-        QueueSource,
-        usize,
-        usize,
-    ) -> Result<HubRuntimeOutput, HubRuntimeError>;
-    type ReportDeliveryLag = fn(
-        &mut HubRuntime,
-        ClientId,
-        SessionId,
-        SubscriptionId,
-        QueueSource,
-        usize,
-        usize,
-    ) -> Result<HubRuntimeOutput, HubRuntimeError>;
-    type ReportDeliveryFailure = fn(
-        &mut HubRuntime,
-        ClientId,
-        SessionId,
-        SubscriptionId,
-        QueueSource,
-        MailboxSendFailureReason,
-    ) -> Result<HubRuntimeOutput, HubRuntimeError>;
-    type DetachClient = fn(
-        &mut HubRuntime,
-        ClientId,
-        SessionId,
-        SubscriptionId,
-        u64,
-    ) -> Result<HubRuntimeOutput, HubRuntimeError>;
-    type Resize = fn(
-        &mut HubRuntime,
-        ClientId,
-        SessionId,
-        u16,
-        u16,
-        u64,
-    ) -> Result<HubRuntimeOutput, HubRuntimeError>;
+fn hub_runtime_guarded_write_delegates_readiness_and_delivery_state_to_core_daemon() {
+    let config = explicit_config_with_data_dir("target/botster-hub-test-data/runtime-guarded");
+    let mut runtime = HubRuntime::new(config);
+    let request = spawn_request(runtime.config());
+    let session_id = request.session_id.clone();
+    let client_id = ClientId("guarded-client".to_string());
+    let subscription_id = SubscriptionId("guarded-subscription".to_string());
+    let mut logical_clock = 100;
 
-    let _list_sessions: fn(&HubRuntime) -> Vec<botster_core::CoreSession> =
-        HubRuntime::list_sessions;
-    let _detach_client: DetachClient = HubRuntime::detach_client;
-    let _resize: Resize = HubRuntime::resize;
-    let _inspect_session: InspectSession = HubRuntime::inspect_session;
-    let _read_screen: ReadScreen = HubRuntime::read_screen;
-    let _capture_snapshot: ReadScreen = HubRuntime::capture_snapshot;
-    let _replay_snapshot: ReplaySnapshot = HubRuntime::replay_snapshot;
-    let _drain_all: fn(&mut HubRuntime, u64) -> Result<HubRuntimeOutput, HubRuntimeError> =
-        HubRuntime::drain_runtime_all_once;
-    let _report_backpressure: ReportBackpressure = HubRuntime::report_backpressure;
-    let _report_delivery_lag: ReportDeliveryLag = HubRuntime::report_delivery_lag;
-    let _report_delivery_failure: ReportDeliveryFailure = HubRuntime::report_delivery_failure;
+    runtime
+        .spawn_session(request, CoreSessionMetadata::new(), logical_clock)
+        .expect("spawn for guarded write");
+    logical_clock += 1;
+    runtime
+        .attach_client(
+            client_id.clone(),
+            session_id.clone(),
+            subscription_id,
+            logical_clock,
+        )
+        .expect("attach for guarded write");
+    logical_clock += 1;
+
+    let mode_flags = ModeFlags {
+        cursor_visible: true,
+        ..ModeFlags::default()
+    };
+    let written = runtime
+        .guarded_write(GuardedWriteRequest {
+            session_id: session_id.clone(),
+            client_id: client_id.clone(),
+            data: b"guarded\n".to_vec(),
+            readiness: ReadinessEvidence::ready(mode_flags),
+            now_seconds: logical_clock,
+        })
+        .expect("ready guarded write should cross core daemon");
+    logical_clock += 1;
+    assert!(matches!(written.decision, GuardedWriteDecision::Write));
+    assert_eq!(
+        written.states,
+        vec![
+            GuardedWriteDeliveryState::Accepted,
+            GuardedWriteDeliveryState::Written
+        ],
+        "hub must not fabricate delivered or acknowledged states"
+    );
+    drain_until(
+        &mut runtime,
+        &session_id,
+        b"echo:guarded",
+        &mut logical_clock,
+    );
+
+    let deferred = runtime
+        .guarded_write(GuardedWriteRequest {
+            session_id: session_id.clone(),
+            client_id: client_id.clone(),
+            data: b"deferred\n".to_vec(),
+            readiness: ReadinessEvidence::default(),
+            now_seconds: logical_clock,
+        })
+        .expect("absent readiness evidence should be core-deferred");
+    assert!(matches!(
+        deferred.decision,
+        GuardedWriteDecision::Defer { .. }
+    ));
+    assert_eq!(
+        deferred.states,
+        vec![
+            GuardedWriteDeliveryState::Accepted,
+            GuardedWriteDeliveryState::Deferred
+        ]
+    );
 }
 
 #[test]

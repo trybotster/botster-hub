@@ -167,12 +167,12 @@ fn daemon_starts_empty_state_reports_status_uses_core_and_stops_idempotently() {
     let request = spawn_request(runtime.config());
     let session_id = request.session_id.clone();
     runtime
-        .spawn_session(request, CoreSessionMetadata::new())
-        .expect("spawn through embedded core runtime");
-    assert_eq!(runtime.list_sessions().len(), 1);
+        .spawn_session(request, CoreSessionMetadata::new(), 1)
+        .expect("spawn through core daemon runtime");
+    assert_eq!(runtime.list_sessions().expect("daemon list").len(), 1);
     runtime
-        .shutdown_session(session_id, "daemon test complete", 1)
-        .expect("shutdown through embedded core runtime");
+        .shutdown_session(session_id, 2)
+        .expect("shutdown through core daemon runtime");
 
     let stopped = daemon.stop();
     assert_eq!(stopped.lifecycle_state, HubDaemonState::Stopped);
@@ -305,7 +305,7 @@ fn cli_sessions_spawn_and_list_route_through_client_api() {
     assert!(stdout.contains("response=spawned"));
     assert!(stdout.contains("session_id=dogfood-session"));
     assert!(stdout.contains("lifecycle=running"));
-    assert!(stdout.contains("event=session_lifecycle"));
+    assert!(stdout.contains("event_count=0"));
     assert!(!stdout.contains(data_dir.to_string_lossy().as_ref()));
 
     let list = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
@@ -323,7 +323,8 @@ fn cli_sessions_spawn_and_list_route_through_client_api() {
     );
     let stdout = String::from_utf8(list.stdout).expect("stdout is utf8");
     assert!(stdout.contains("response=sessions"));
-    assert!(stdout.contains("session_count=0"));
+    assert!(stdout.contains("session_count=1"));
+    assert!(stdout.contains("session id=dogfood-session lifecycle=running"));
     assert!(!stdout.contains(data_dir.to_string_lossy().as_ref()));
 }
 

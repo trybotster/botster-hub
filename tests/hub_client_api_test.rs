@@ -1,12 +1,13 @@
 #![cfg(unix)]
 
-use std::thread;
 use std::time::{Duration, Instant};
+use std::{fs, thread};
 
 use botster_core::{
-    Capability, CapabilitySurface, ExtensionEntrypoint, ExtensionKind, ExtensionRuntime, RequestId,
-    SessionId, SessionLifecycleState, SubscriptionId,
+    Capability, CapabilitySurface, ExtensionEntrypoint, ExtensionKind, ExtensionRuntime, ModeFlags,
+    RequestId, SessionId, SessionLifecycleState, SubscriptionId,
 };
+use botster_core_daemon::{GuardedWriteDecision, GuardedWriteDeliveryState, ReadinessEvidence};
 use botster_hub::{
     DataDirectoryOption, HostIdentityOptions, HubClientAdmission, HubClientApi, HubClientError,
     HubClientEvent, HubClientIdentity, HubClientOperation, HubClientPackageClassification,
@@ -15,16 +16,16 @@ use botster_hub::{
     TransportBindings,
 };
 
-fn explicit_runtime() -> HubRuntime {
+fn explicit_runtime(name: &str) -> HubRuntime {
+    let data_directory = format!("target/botster-hub-test-data/client-api-{name}");
+    let _ = fs::remove_dir_all(&data_directory);
     let config = HubStartupOptions {
         host: HostIdentityOptions {
             id: "hub-client-api-test".to_string(),
             display_name: "Hub Client API Test".to_string(),
             fingerprint: None,
         },
-        data_directory: DataDirectoryOption::Explicit(
-            "target/botster-hub-test-data/client-api".into(),
-        ),
+        data_directory: DataDirectoryOption::Explicit(data_directory.into()),
         session_defaults: SessionDefaults {
             shell: "/bin/sh".to_string(),
             working_directory: Some(".".into()),
@@ -240,7 +241,7 @@ fn local_client_api_exercises_status_spawn_attach_input_resize_detach_shutdown_a
     let api = HubClientApi::local_operator("local-client-api-test");
     let second_api = HubClientApi::local_operator("local-client-api-test-two");
     let packages = empty_registry();
-    let mut runtime = explicit_runtime();
+    let mut runtime = explicit_runtime("session-flow");
     let session_id = session_id();
     let subscription_id = subscription_id();
     let second_subscription_id = SubscriptionId("hub-client-api-subscription-two".to_string());
@@ -290,15 +291,7 @@ fn local_client_api_exercises_status_spawn_attach_input_resize_detach_shutdown_a
     };
     assert_eq!(spawned.session.session_id, session_id);
     assert_eq!(spawned.session.lifecycle, SessionLifecycleState::Running);
-    assert!(spawned.events.iter().any(|event| {
-        matches!(
-            event,
-            HubClientEvent::SessionLifecycle {
-                session_id: observed,
-                state: SessionLifecycleState::Running
-            } if observed == &session_id
-        )
-    }));
+    assert!(spawned.events.is_empty());
 
     let attach = api
         .handle_request(
@@ -474,7 +467,6 @@ fn local_client_api_exercises_status_spawn_attach_input_resize_detach_shutdown_a
             HubClientRequest::Shutdown {
                 request_id: request_id("shutdown"),
                 session_id: session_id.clone(),
-                reason: "client api test complete".to_string(),
                 now_seconds: logical_clock,
             },
         )
@@ -482,21 +474,146 @@ fn local_client_api_exercises_status_spawn_attach_input_resize_detach_shutdown_a
     let HubClientResponseBody::Events(events) = shutdown.body else {
         panic!("shutdown should return events");
     };
-    assert!(events.iter().any(|event| {
-        matches!(
-            event,
-            HubClientEvent::SessionLifecycle {
-                session_id: observed,
-                state: SessionLifecycleState::Stopping,
-            } if observed == &session_id
+    assert!(events.is_empty());
+}
+
+#[test]
+fn guarded_notification_write_is_hub_admitted_and_core_delivered() {
+    let api = HubClientApi::local_operator("local-client-api-test");
+    let mut runtime = explicit_runtime("guarded-write");
+    let session_actions = capability(
+        CapabilitySurface::SessionActions,
+        Some("guarded_session_notification_write"),
+    );
+    let surfaces = capability(CapabilitySurface::Surfaces, None);
+    let mut packages = PackageRegistry::new(
+        vec![session_actions.clone(), surfaces.clone()]
+            .into_iter()
+            .collect(),
+    );
+    packages
+        .install(
+            plugin_manifest("workflow.plugin", vec![session_actions.clone()]),
+            provenance(),
+            "install package",
         )
-    }));
+        .expect("install allowed package");
+    packages
+        .enable("workflow.plugin", "enable package")
+        .expect("enable allowed package");
+    packages
+        .install(
+            plugin_manifest("blocked.plugin", vec![surfaces]),
+            provenance(),
+            "install blocked package",
+        )
+        .expect("install blocked package");
+    packages
+        .enable("blocked.plugin", "enable blocked package")
+        .expect("enable blocked package");
+
+    let session_id = SessionId("hub-client-api-guarded-session".to_string());
+    let subscription_id = SubscriptionId("hub-client-api-guarded-subscription".to_string());
+    let mut logical_clock = 200;
+    api.handle_request(
+        &mut runtime,
+        &packages,
+        HubClientRequest::Spawn {
+            request_id: request_id("guarded-spawn"),
+            session_id: session_id.clone(),
+            command:
+                "printf 'ready\\n'; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done"
+                    .to_string(),
+        },
+    )
+    .expect("spawn through client api");
+    api.handle_request(
+        &mut runtime,
+        &packages,
+        HubClientRequest::Attach {
+            request_id: request_id("guarded-attach"),
+            session_id: session_id.clone(),
+            subscription_id: subscription_id.clone(),
+            now_seconds: logical_clock,
+        },
+    )
+    .expect("attach through client api");
+    logical_clock += 1;
+
+    drain_until(
+        &api,
+        &mut runtime,
+        &packages,
+        &session_id,
+        b"ready",
+        &mut logical_clock,
+    );
+
+    let mode_flags = ModeFlags {
+        cursor_visible: true,
+        ..ModeFlags::default()
+    };
+    let response = api
+        .handle_request(
+            &mut runtime,
+            &packages,
+            HubClientRequest::GuardedNotificationWrite {
+                request_id: request_id("guarded-write"),
+                session_id: session_id.clone(),
+                package_name: "workflow.plugin".to_string(),
+                data: b"guarded-client\n".to_vec(),
+                readiness: ReadinessEvidence::ready(mode_flags.clone()),
+            },
+        )
+        .expect("allowed package should write through core daemon");
+    let HubClientResponseBody::GuardedWrite(result) = response.body else {
+        panic!("guarded write response expected");
+    };
+    assert!(matches!(result.decision, GuardedWriteDecision::Write));
+    assert_eq!(
+        result.states,
+        vec![
+            GuardedWriteDeliveryState::Accepted,
+            GuardedWriteDeliveryState::Written
+        ],
+        "core daemon owns guarded-write delivery states"
+    );
+    drain_until(
+        &api,
+        &mut runtime,
+        &packages,
+        &session_id,
+        b"echo:guarded-client",
+        &mut logical_clock,
+    );
+
+    let denied = api
+        .handle_request(
+            &mut runtime,
+            &packages,
+            HubClientRequest::GuardedNotificationWrite {
+                request_id: request_id("guarded-denied"),
+                session_id,
+                package_name: "blocked.plugin".to_string(),
+                data: b"blocked\n".to_vec(),
+                readiness: ReadinessEvidence::ready(mode_flags),
+            },
+        )
+        .expect_err("ungranted package should be denied by hub policy");
+    assert_eq!(
+        denied,
+        HubClientError::PackageCapabilityDenied {
+            request_id: request_id("guarded-denied"),
+            operation: HubClientOperation::GuardedNotificationWrite,
+            package_name: "blocked.plugin".to_string(),
+        }
+    );
 }
 
 #[test]
 fn package_and_lifecycle_queries_are_sanitized_and_explicitly_pulled() {
     let api = HubClientApi::local_operator("local-client-api-test");
-    let mut runtime = explicit_runtime();
+    let mut runtime = explicit_runtime("packages");
     let surface = capability(CapabilitySurface::Surfaces, None);
     let mut packages = PackageRegistry::new(vec![surface.clone()].into_iter().collect());
     packages
@@ -574,7 +691,7 @@ fn denied_client_request_returns_typed_admission_error() {
         },
         HubClientAdmission::deny_all(),
     );
-    let mut runtime = explicit_runtime();
+    let mut runtime = explicit_runtime("denied");
     let packages = empty_registry();
 
     let error = api
@@ -603,7 +720,6 @@ fn denied_client_request_returns_typed_admission_error() {
             HubClientRequest::Shutdown {
                 request_id: request_id("denied-shutdown"),
                 session_id: session_id(),
-                reason: "denied".to_string(),
                 now_seconds: 1,
             },
         )

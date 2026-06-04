@@ -453,8 +453,9 @@ fn capability_operations_do_not_block_session_hot_path() {
     let mut logical_clock = 100;
 
     runtime
-        .spawn_session(spawn, CoreSessionMetadata::new())
+        .spawn_session(spawn, CoreSessionMetadata::new(), logical_clock)
         .expect("spawn through core");
+    logical_clock += 1;
     runtime
         .attach_client(
             client_id.clone(),
