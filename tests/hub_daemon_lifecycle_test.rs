@@ -2,8 +2,10 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::process::{Child, Command, Output, Stdio};
+use std::sync::{Mutex, OnceLock};
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use botster_core::{
     Capability, CapabilitySurface, CoreSessionMetadata, ExtensionEntrypoint, ExtensionKind,
@@ -21,6 +23,8 @@ use botster_hub::{
 
 mod support;
 use support::ensure_session_worker_binary;
+
+static REAL_DAEMON_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 fn unique_test_dir(name: &str) -> PathBuf {
     let nanos = SystemTime::now()
@@ -50,8 +54,7 @@ fn explicit_config(data_directory: impl Into<PathBuf>) -> botster_hub::HubConfig
             initial_cols: 80,
         },
         transports: TransportBindings {
-            local_socket: None,
-            tcp: Vec::new(),
+            ..TransportBindings::default()
         },
         ..HubStartupOptions::default()
     }
@@ -199,6 +202,89 @@ fn write_local_plugin_package(root: &Path) {
 "#,
     )
     .expect("write local package manifest");
+}
+
+fn daemon_test_lock() -> &'static Mutex<()> {
+    REAL_DAEMON_TEST_LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn start_cli_daemon(data_dir: &Path) -> Child {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("start")
+        .arg("--data-dir")
+        .arg(data_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn botster-hub start");
+
+    wait_for_status(data_dir, &mut child);
+    child
+}
+
+fn wait_for_status(data_dir: &Path, child: &mut Child) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if let Some(status) = child.try_wait().expect("check daemon child") {
+            panic!("daemon exited before ready with {status}");
+        }
+        let output = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+            .arg("status")
+            .arg("--data-dir")
+            .arg(data_dir)
+            .output()
+            .expect("run botster-hub status");
+        if output.status.success() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    panic!("daemon did not become ready");
+}
+
+fn shutdown_cli_daemon(data_dir: &Path, child: Child) -> Output {
+    let shutdown = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("shutdown")
+        .arg("--data-dir")
+        .arg(data_dir)
+        .output()
+        .expect("run botster-hub shutdown");
+    assert!(
+        shutdown.status.success(),
+        "shutdown failed: {}",
+        String::from_utf8_lossy(&shutdown.stderr)
+    );
+    let output = child.wait_with_output().expect("wait for daemon child");
+    assert!(
+        output.status.success(),
+        "daemon failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output
+}
+
+fn run_command_with_timeout(mut command: Command, timeout: Duration) -> Output {
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn timed command");
+    let deadline = std::time::Instant::now() + timeout;
+
+    while std::time::Instant::now() < deadline {
+        if child.try_wait().expect("poll timed command").is_some() {
+            return child.wait_with_output().expect("collect timed command");
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    let _ = child.kill();
+    let output = child.wait_with_output().expect("collect timed out command");
+    panic!(
+        "command timed out after {timeout:?}: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]
@@ -460,36 +546,11 @@ fn daemon_restores_existing_provider_policy_records_through_snapshot_admission()
 
 #[test]
 fn cli_start_requires_explicit_data_dir_and_prints_scrubbed_lifecycle_status() {
+    let _guard = daemon_test_lock()
+        .lock()
+        .expect("serialize real daemon test");
     let data_dir = unique_test_dir("cli-start");
-    let output = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
-        .arg("start")
-        .arg("--data-dir")
-        .arg(&data_dir)
-        .output()
-        .expect("run botster-hub start");
-
-    assert!(
-        output.status.success(),
-        "start failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8(output.stdout).expect("stdout is utf8");
-    assert!(stdout.contains("event=started"));
-    assert!(stdout.contains("lifecycle_state=running"));
-    assert!(stdout.contains("event=stopped"));
-    assert!(stdout.contains("lifecycle_state=stopped"));
-    assert!(stdout.contains("schema_version=1"));
-    assert!(stdout.contains("core_initialized=true"));
-    assert!(stdout.contains("state_source=initialized"));
-    assert!(!stdout.contains(data_dir.to_string_lossy().as_ref()));
-    assert!(!stdout.contains(concat!("/", "Users", "/")));
-    assert!(!stdout.contains("/home/"));
-    assert!(data_dir.join("hub-state.json").exists());
-}
-
-#[test]
-fn cli_status_uses_daemon_status_path_without_local_paths() {
-    let data_dir = unique_test_dir("cli-status");
+    let child = start_cli_daemon(&data_dir);
     let output = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
         .arg("status")
         .arg("--data-dir")
@@ -507,12 +568,45 @@ fn cli_status_uses_daemon_status_path_without_local_paths() {
     assert!(stdout.contains("lifecycle_state=running"));
     assert!(stdout.contains("schema_version=1"));
     assert!(stdout.contains("core_initialized=true"));
+    assert!(stdout.contains("state_source=initialized"));
     assert!(!stdout.contains(data_dir.to_string_lossy().as_ref()));
+    assert!(!stdout.contains(concat!("/", "Users", "/")));
+    assert!(!stdout.contains("/home/"));
+    assert!(data_dir.join("hub-state.json").exists());
+
+    let output = shutdown_cli_daemon(&data_dir, child);
+    let stdout = String::from_utf8(output.stdout).expect("daemon stdout is utf8");
+    assert!(stdout.contains("event=stopped"));
+    assert!(stdout.contains("lifecycle_state=stopped"));
+}
+
+#[test]
+fn cli_status_uses_daemon_status_path_without_local_paths() {
+    let data_dir = unique_test_dir("cli-status");
+    let output = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("status")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .output()
+        .expect("run botster-hub status");
+
+    assert!(
+        !output.status.success(),
+        "status unexpectedly succeeded: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stderr = String::from_utf8(output.stderr).expect("stderr is utf8");
+    assert!(stderr.contains("daemon not running"));
+    assert!(!stderr.contains(data_dir.to_string_lossy().as_ref()));
 }
 
 #[test]
 fn cli_sessions_spawn_and_list_route_through_client_api() {
+    let _guard = daemon_test_lock()
+        .lock()
+        .expect("serialize real daemon test");
     let data_dir = unique_test_dir("cli-sessions");
+    let child = start_cli_daemon(&data_dir);
     let spawn = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
         .arg("sessions")
         .arg("spawn")
@@ -521,7 +615,7 @@ fn cli_sessions_spawn_and_list_route_through_client_api() {
         .arg("--session-id")
         .arg("dogfood-session")
         .arg("--")
-        .arg("printf 'dogfood-ok\\n'; sleep 1")
+        .arg("printf 'dogfood-ok\\n'; IFS= read -r line; printf 'dogfood:%s\\n' \"$line\"")
         .output()
         .expect("run botster-hub sessions spawn");
 
@@ -555,6 +649,266 @@ fn cli_sessions_spawn_and_list_route_through_client_api() {
     assert!(stdout.contains("session_count=1"));
     assert!(stdout.contains("session id=dogfood-session lifecycle=running"));
     assert!(!stdout.contains(data_dir.to_string_lossy().as_ref()));
+
+    let resize = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("sessions")
+        .arg("resize")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("dogfood-session")
+        .arg("30")
+        .arg("100")
+        .output()
+        .expect("run botster-hub sessions resize");
+    assert!(
+        resize.status.success(),
+        "resize failed: {}",
+        String::from_utf8_lossy(&resize.stderr)
+    );
+
+    let attach = botster_hub::daemon_transport_request(
+        &explicit_config(&data_dir),
+        botster_hub::DaemonRequest::Attach {
+            session_id: "dogfood-session".to_string(),
+            subscription_id: "botster-hub-cli-subscription".to_string(),
+        },
+    )
+    .expect("attach before explicit detach");
+    assert_eq!(attach.kind, botster_hub::DaemonResponseKind::Events);
+
+    let detach = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("sessions")
+        .arg("detach")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("dogfood-session")
+        .output()
+        .expect("run botster-hub sessions detach");
+    assert!(
+        detach.status.success(),
+        "detach failed: {}",
+        String::from_utf8_lossy(&detach.stderr)
+    );
+
+    let send = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("sessions")
+        .arg("send-input")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("dogfood-session")
+        .arg("--")
+        .arg("from-cli\r")
+        .output()
+        .expect("run botster-hub sessions send-input");
+    assert!(
+        send.status.success(),
+        "send-input failed: {}",
+        String::from_utf8_lossy(&send.stderr)
+    );
+
+    let attach = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("sessions")
+        .arg("attach")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("dogfood-session")
+        .output()
+        .expect("run botster-hub sessions attach");
+    assert!(
+        attach.status.success(),
+        "attach failed: {}",
+        String::from_utf8_lossy(&attach.stderr)
+    );
+    let stdout = String::from_utf8(attach.stdout).expect("attach stdout is utf8");
+    assert!(stdout.contains("dogfood-ok"));
+
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
+fn daemon_detaches_subscription_when_attach_connection_drops() {
+    let _guard = daemon_test_lock()
+        .lock()
+        .expect("serialize real daemon test");
+    let data_dir = unique_test_dir("cli-attach-eof");
+    let config = explicit_config(&data_dir);
+    let child = start_cli_daemon(&data_dir);
+
+    let spawn = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::Spawn {
+            session_id: "eof-session".to_string(),
+            command:
+                "printf 'ready\\n'; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done"
+                    .to_string(),
+        },
+    )
+    .expect("spawn eof test session");
+    assert_eq!(spawn.kind, botster_hub::DaemonResponseKind::Spawned);
+
+    let attach = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::Attach {
+            session_id: "eof-session".to_string(),
+            subscription_id: "dropped-subscription".to_string(),
+        },
+    )
+    .expect("attach dropped subscription");
+    assert_eq!(attach.kind, botster_hub::DaemonResponseKind::Events);
+
+    thread::sleep(Duration::from_millis(150));
+
+    botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::SendInput {
+            session_id: "eof-session".to_string(),
+            data: "after-eof\r".to_string(),
+        },
+    )
+    .expect("send input after dropped attach");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    let mut observed_events = Vec::new();
+    while std::time::Instant::now() < deadline {
+        let drain = botster_hub::daemon_transport_request(
+            &config,
+            botster_hub::DaemonRequest::Drain {
+                session_id: "eof-session".to_string(),
+            },
+        )
+        .expect("drain after dropped attach");
+        observed_events.extend(drain.events);
+        thread::sleep(Duration::from_millis(30));
+    }
+
+    assert!(
+        observed_events.iter().all(|event| {
+            !matches!(
+                event,
+                botster_hub::DaemonEvent::TerminalOutput {
+                    subscription_id,
+                    data,
+                    ..
+                } if subscription_id == "dropped-subscription" && data.contains("after-eof")
+            )
+        }),
+        "dropped attach subscription received later terminal output: {observed_events:?}"
+    );
+
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
+fn stalled_attach_stdout_does_not_block_other_daemon_commands() {
+    let _guard = daemon_test_lock()
+        .lock()
+        .expect("serialize real daemon test");
+    let data_dir = unique_test_dir("cli-stalled-attach");
+    let child = start_cli_daemon(&data_dir);
+
+    let mut spawn_command = Command::new(env!("CARGO_BIN_EXE_botster-hub"));
+    spawn_command
+        .arg("sessions")
+        .arg("spawn")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("--session-id")
+        .arg("slow-consumer")
+        .arg("--")
+        .arg(
+            "i=0; while [ \"$i\" -lt 50000 ]; do printf 'flood-line-%05d\\n' \"$i\"; i=$((i + 1)); done; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done",
+        );
+    let spawn = run_command_with_timeout(spawn_command, Duration::from_secs(3));
+    assert!(
+        spawn.status.success(),
+        "spawn failed: {}",
+        String::from_utf8_lossy(&spawn.stderr)
+    );
+
+    let mut attach_child = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("sessions")
+        .arg("attach")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("slow-consumer")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn stalled attach");
+    thread::sleep(Duration::from_millis(500));
+    assert!(
+        attach_child
+            .try_wait()
+            .expect("poll stalled attach")
+            .is_none(),
+        "attach exited before the slow-consumer check"
+    );
+
+    let mut list_command = Command::new(env!("CARGO_BIN_EXE_botster-hub"));
+    list_command
+        .arg("sessions")
+        .arg("list")
+        .arg("--data-dir")
+        .arg(&data_dir);
+    let list = run_command_with_timeout(list_command, Duration::from_secs(2));
+    assert!(
+        list.status.success(),
+        "list failed while attach stdout was blocked: {}",
+        String::from_utf8_lossy(&list.stderr)
+    );
+
+    let mut send_command = Command::new(env!("CARGO_BIN_EXE_botster-hub"));
+    send_command
+        .arg("sessions")
+        .arg("send-input")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("slow-consumer")
+        .arg("--")
+        .arg("still-responsive\r");
+    let send = run_command_with_timeout(send_command, Duration::from_secs(2));
+    assert!(
+        send.status.success(),
+        "send-input failed while attach stdout was blocked: {}",
+        String::from_utf8_lossy(&send.stderr)
+    );
+
+    let mut resize_command = Command::new(env!("CARGO_BIN_EXE_botster-hub"));
+    resize_command
+        .arg("sessions")
+        .arg("resize")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("slow-consumer")
+        .arg("32")
+        .arg("120");
+    let resize = run_command_with_timeout(resize_command, Duration::from_secs(2));
+    assert!(
+        resize.status.success(),
+        "resize failed while attach stdout was blocked: {}",
+        String::from_utf8_lossy(&resize.stderr)
+    );
+
+    let mut shutdown_command = Command::new(env!("CARGO_BIN_EXE_botster-hub"));
+    shutdown_command
+        .arg("shutdown")
+        .arg("--data-dir")
+        .arg(&data_dir);
+    let shutdown = run_command_with_timeout(shutdown_command, Duration::from_secs(2));
+    assert!(
+        shutdown.status.success(),
+        "shutdown failed while attach stdout was blocked: {}",
+        String::from_utf8_lossy(&shutdown.stderr)
+    );
+
+    let _ = attach_child.kill();
+    let _ = attach_child.wait_with_output();
+    let output = child.wait_with_output().expect("wait for daemon child");
+    assert!(
+        output.status.success(),
+        "daemon failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]
