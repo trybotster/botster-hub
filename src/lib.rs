@@ -242,6 +242,11 @@ const HUB_FACADE_DECISIONS: &[HubFacadeDecision] = &[
         "hub-admitted guarded notification write delegated to core daemon readiness and delivery states",
     ),
     HubFacadeDecision::new(
+        "release_sessions_for_restart/adoption_scan/adopt_session",
+        HubFacadeExposure::Exposed,
+        "explicit daemon restart/adoption control over worker-backed core sessions",
+    ),
+    HubFacadeDecision::new(
         "read_screen/capture_snapshot/report_delivery_*",
         HubFacadeExposure::Hidden,
         "embedded-engine-only helpers are not part of the daemon-backed production session path",
@@ -309,6 +314,7 @@ mod tests {
         assert!(exposed.contains(&"write_bytes"));
         assert!(exposed.contains(&"resize"));
         assert!(exposed.contains(&"guarded_write"));
+        assert!(exposed.contains(&"release_sessions_for_restart/adoption_scan/adopt_session"));
         assert!(summary.facade_decisions().iter().any(|decision| {
             decision.core_operation() == "execute_command(DefaultEngineCommand)"
                 && decision.exposure() == HubFacadeExposure::Hidden

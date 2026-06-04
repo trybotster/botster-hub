@@ -16,7 +16,11 @@ use botster_hub::{
     TransportBindings,
 };
 
+mod support;
+use support::ensure_session_worker_binary;
+
 fn explicit_runtime(name: &str) -> HubRuntime {
+    ensure_session_worker_binary();
     let data_directory = format!("target/botster-hub-test-data/client-api-{name}");
     let _ = fs::remove_dir_all(&data_directory);
     let config = HubStartupOptions {
@@ -283,9 +287,11 @@ fn local_client_api_exercises_status_spawn_attach_input_resize_detach_shutdown_a
                 request_id: request_id("spawn"),
                 session_id: session_id.clone(),
                 command: "printf 'ready\\n'; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done".to_string(),
+                now_seconds: logical_clock,
             },
         )
         .expect("spawn through client api");
+    logical_clock += 1;
     let HubClientResponseBody::Spawned(spawned) = spawn.body else {
         panic!("spawned response expected");
     };
@@ -512,8 +518,8 @@ fn guarded_notification_write_is_hub_admitted_and_core_delivered() {
         .enable("blocked.plugin", "enable blocked package")
         .expect("enable blocked package");
 
-    let session_id = SessionId("hub-client-api-guarded-session".to_string());
-    let subscription_id = SubscriptionId("hub-client-api-guarded-subscription".to_string());
+    let session_id = SessionId("client-guarded".to_string());
+    let subscription_id = SubscriptionId("client-guarded-subscription".to_string());
     let mut logical_clock = 200;
     api.handle_request(
         &mut runtime,
@@ -524,9 +530,11 @@ fn guarded_notification_write_is_hub_admitted_and_core_delivered() {
             command:
                 "printf 'ready\\n'; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done"
                     .to_string(),
+            now_seconds: logical_clock,
         },
     )
     .expect("spawn through client api");
+    logical_clock += 1;
     api.handle_request(
         &mut runtime,
         &packages,
@@ -563,9 +571,11 @@ fn guarded_notification_write_is_hub_admitted_and_core_delivered() {
                 package_name: "workflow.plugin".to_string(),
                 data: b"guarded-client\n".to_vec(),
                 readiness: ReadinessEvidence::ready(mode_flags.clone()),
+                now_seconds: logical_clock,
             },
         )
         .expect("allowed package should write through core daemon");
+    logical_clock += 1;
     let HubClientResponseBody::GuardedWrite(result) = response.body else {
         panic!("guarded write response expected");
     };
@@ -597,6 +607,7 @@ fn guarded_notification_write_is_hub_admitted_and_core_delivered() {
                 package_name: "blocked.plugin".to_string(),
                 data: b"blocked\n".to_vec(),
                 readiness: ReadinessEvidence::ready(mode_flags),
+                now_seconds: logical_clock,
             },
         )
         .expect_err("ungranted package should be denied by hub policy");

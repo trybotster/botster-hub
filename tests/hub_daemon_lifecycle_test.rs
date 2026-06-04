@@ -17,6 +17,9 @@ use botster_hub::{
     PackageProvenance, RuntimeEnvironment, SessionDefaults, TransportBindings,
 };
 
+mod support;
+use support::ensure_session_worker_binary;
+
 fn unique_test_dir(name: &str) -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -30,6 +33,7 @@ fn unique_test_dir(name: &str) -> PathBuf {
 }
 
 fn explicit_config(data_directory: impl Into<PathBuf>) -> botster_hub::HubConfig {
+    ensure_session_worker_binary();
     HubStartupOptions {
         host: HostIdentityOptions {
             id: "hub-daemon-test".to_string(),
