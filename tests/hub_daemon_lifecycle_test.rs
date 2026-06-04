@@ -726,6 +726,120 @@ fn cli_sessions_spawn_and_list_route_through_client_api() {
 }
 
 #[test]
+fn cli_daemon_restart_recovers_worker_backed_session_through_transport() {
+    let _guard = daemon_test_lock()
+        .lock()
+        .expect("serialize real daemon test");
+    let data_dir = unique_test_dir("cli-restart-recover");
+    let config = explicit_config(&data_dir);
+    let session_id = "cli-restart-session";
+
+    let child = start_cli_daemon(&data_dir);
+    let spawn = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::Spawn {
+            session_id: session_id.to_string(),
+            command: "printf 'restart-ready\\n'; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done".to_string(),
+        },
+    )
+    .expect("spawn restart recovery session through daemon transport");
+    assert_eq!(spawn.kind, botster_hub::DaemonResponseKind::Spawned);
+    assert!(
+        spawn
+            .sessions
+            .iter()
+            .any(|session| session.session_id == session_id && session.lifecycle == "running")
+    );
+
+    shutdown_cli_daemon(&data_dir, child);
+    let restarted_child = start_cli_daemon(&data_dir);
+
+    let status = botster_hub::daemon_transport_request(&config, botster_hub::DaemonRequest::Status)
+        .expect("status after daemon restart");
+    let status = status.status.expect("status response body");
+    assert_eq!(status.lifecycle_state, "running");
+    assert!(status.core_initialized);
+    assert!(
+        status
+            .recovered_sessions
+            .iter()
+            .any(|recovered| recovered == session_id),
+        "restarted daemon should report startup recovery for the live worker-backed session"
+    );
+    assert!(
+        !status
+            .stale_sessions
+            .iter()
+            .any(|stale| stale == session_id),
+        "worker-backed session with protocol evidence should not be marked stale"
+    );
+
+    let list =
+        botster_hub::daemon_transport_request(&config, botster_hub::DaemonRequest::ListSessions)
+            .expect("list recovered session through daemon transport");
+    assert!(
+        list.sessions
+            .iter()
+            .any(|session| session.session_id == session_id && session.lifecycle == "running")
+    );
+
+    let resize = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::Resize {
+            session_id: session_id.to_string(),
+            rows: 30,
+            cols: 100,
+        },
+    )
+    .expect("resize after daemon restart");
+    assert_eq!(resize.kind, botster_hub::DaemonResponseKind::Events);
+    let attach_config = config.clone();
+    let attach_session_id = SessionId(session_id.to_string());
+    let attach_handle = thread::spawn(move || {
+        let mut output = Vec::new();
+        botster_hub::stream_attach(
+            &attach_config,
+            attach_session_id,
+            SubscriptionId("cli-restart-subscription-after".to_string()),
+            &mut output,
+        )
+        .expect("stream attach after daemon restart");
+        output
+    });
+    thread::sleep(Duration::from_millis(100));
+    let send = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::SendInput {
+            session_id: session_id.to_string(),
+            data: "after-restart\n".to_string(),
+        },
+    )
+    .expect("send input after daemon restart");
+    assert_eq!(send.kind, botster_hub::DaemonResponseKind::Events);
+    let attached_output = attach_handle
+        .join()
+        .expect("stream attach thread should complete");
+    let attached_output = String::from_utf8_lossy(&attached_output);
+    assert!(
+        attached_output.contains("echo:after-restart"),
+        "stream attach should observe post-restart echo, got {attached_output:?}"
+    );
+
+    let shutdown_session = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::ShutdownSession {
+            session_id: session_id.to_string(),
+        },
+    )
+    .expect("shutdown recovered session through daemon transport");
+    assert_eq!(
+        shutdown_session.kind,
+        botster_hub::DaemonResponseKind::Events
+    );
+    shutdown_cli_daemon(&data_dir, restarted_child);
+}
+
+#[test]
 fn daemon_detaches_subscription_when_attach_connection_drops() {
     let _guard = daemon_test_lock()
         .lock()

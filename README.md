@@ -172,6 +172,7 @@ The end-to-end local dogfood proof is the Unix integration flow below:
 
 ```sh
 ./test.sh --test hub_local_dogfood_test local_dogfood_runs_daemon_package_lifecycle_session_and_clean_shutdown
+./test.sh --test hub_daemon_lifecycle_test cli_daemon_restart_recovers_worker_backed_session_through_transport
 ```
 
 That test is the documented proof path for the current scaffold. It starts an
@@ -208,6 +209,7 @@ cargo run -- sessions send-input --data-dir target/botster-hub-dogfood-data \
 cargo run -- sessions resize --data-dir target/botster-hub-dogfood-data \
   dogfood-session 30 100
 cargo run -- sessions detach --data-dir target/botster-hub-dogfood-data dogfood-session
+cargo run -- sessions shutdown --data-dir target/botster-hub-dogfood-data dogfood-session
 cargo run -- inspect --data-dir target/botster-hub-dogfood-data dogfood-session
 cargo run -- shutdown --data-dir target/botster-hub-dogfood-data
 ```
@@ -217,27 +219,41 @@ the existing hub package registry policy, persists the registry snapshot under
 `hub-state.json`, and then lists packages through `HubClientApi::ListPackages`.
 The session commands use the running daemon runtime, so a session created by
 one CLI process is visible to later `sessions list`, `sessions attach`,
-`sessions send-input`, `sessions resize`, and `sessions detach` invocations.
+`sessions send-input`, `sessions resize`, `sessions detach`, and
+`sessions shutdown` invocations.
 `attach` streams terminal bytes and currently exits after an idle window if the
 core runtime does not provide a process-exit frame; persistent TUI-grade attach
 with explicit signal handling remains outside this scaffold. `inspect` is
 intentionally scoped to sanitized session list data until the stable client API
 grows a dedicated inspection request.
 
+Package commands are a separate short-lived hub-policy path over the same
+durable state. They start a `HubDaemon`, mutate or read `hub-state.json`, route
+package/provider reads through `HubClientApi`, and stop; they do not attach to
+the long-running session daemon today.
+
 Dogfood-ready today: explicit local daemon lifecycle, file-backed hub/package
 state, local package admission from a manifest path, typed status/package reads,
 plugin lifecycle observation/invocation through the hub facade, daemon-backed
-PTY spawn/list/attach/input/resize/detach/shutdown through `HubClientApi`, and
-an in-process dogfood proof for package/runtime mechanics.
+PTY spawn/list/attach/input/resize/detach/session-shutdown through
+`HubClientApi`, and cross-process daemon transport proof for hub restart
+recovery.
 
-The restart proof lives in `hub_daemon_lifecycle_test`: it spawns a long-running
-worker-backed session, stops only the hub lifecycle, starts a new hub over the
-same explicit data directory, recovers and lists the same session, reattaches,
-sends input, drains output, and shuts down through `HubClientApi`. Startup
-reconciliation is deterministic: registry records with missing protocol
+The production-shaped restart proof lives in `hub_daemon_lifecycle_test`: it
+starts the `botster-hub` binary, spawns a long-running worker-backed session
+over daemon transport, stops the hub daemon process through `shutdown
+--data-dir`, starts the binary again over the same explicit data directory,
+observes startup `recovered_sessions`, lists the same session, reattaches,
+sends input, drains post-restart output, shuts down the session, and stops the
+daemon. The lower-level in-process restart test remains contract coverage for
+`HubClientApi`.
+
+Startup reconciliation is deterministic: registry records with missing protocol
 evidence, missing workers, unhealthy workers, or duplicate candidates are marked
 stale; terminal records remain terminal; and live worker-backed records absent
 from hub-owned state are recovered from core daemon/session-worker evidence.
+The readiness boundary is documented in
+[`docs/adr/local-runtime-dogfood-readiness.md`](docs/adr/local-runtime-dogfood-readiness.md).
 
 In the daemon-backed model, attach, detach, input, and resize requests are
 control-plane acknowledgements. Terminal egress is delivered by explicit

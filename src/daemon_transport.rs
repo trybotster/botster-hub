@@ -412,6 +412,19 @@ fn handle_control_request(
             )?;
             events_response(response.body)
         }
+        DaemonRequest::ShutdownSession { session_id } => {
+            let now = tick(logical_clock);
+            let response = api.handle_request(
+                runtime,
+                packages,
+                HubClientRequest::Shutdown {
+                    request_id: request_id("daemon-sessions-shutdown"),
+                    session_id: SessionId(session_id),
+                    now_seconds: now,
+                },
+            )?;
+            events_response(response.body)
+        }
         DaemonRequest::Drain { session_id } => {
             let cursor = drain_cursors
                 .entry(session_id.clone())
@@ -425,8 +438,11 @@ fn handle_control_request(
                     last_output_at: *cursor,
                 },
             )?;
-            *cursor = tick(logical_clock);
-            events_response(response.body)
+            let response = events_response(response.body)?;
+            if !response.events.is_empty() {
+                *cursor = tick(logical_clock);
+            }
+            Ok(response)
         }
         DaemonRequest::DaemonShutdown => Ok(DaemonResponse {
             kind: DaemonResponseKind::Shutdown,
@@ -652,6 +668,9 @@ pub enum DaemonRequest {
         rows: u16,
         cols: u16,
     },
+    ShutdownSession {
+        session_id: String,
+    },
     Drain {
         session_id: String,
     },
@@ -729,6 +748,8 @@ pub struct DaemonStatus {
     pub provider_count: usize,
     pub enabled_provider_count: usize,
     pub session_count: usize,
+    pub recovered_sessions: Vec<String>,
+    pub stale_sessions: Vec<String>,
 }
 
 impl DaemonStatus {
@@ -755,6 +776,16 @@ impl DaemonStatus {
             provider_count: status.provider_count,
             enabled_provider_count: status.enabled_provider_count,
             session_count,
+            recovered_sessions: status
+                .recovered_sessions
+                .iter()
+                .map(|session_id| session_id.0.clone())
+                .collect(),
+            stale_sessions: status
+                .stale_sessions
+                .iter()
+                .map(|session_id| session_id.0.clone())
+                .collect(),
         }
     }
 }

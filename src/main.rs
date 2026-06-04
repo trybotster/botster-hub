@@ -127,6 +127,16 @@ fn start_daemon(args: Vec<String>) -> Result<(), StartError> {
         provider_count: stopped.provider_count,
         enabled_provider_count: stopped.enabled_provider_count,
         session_count: 0,
+        recovered_sessions: stopped
+            .recovered_sessions
+            .iter()
+            .map(|session_id| session_id.0.clone())
+            .collect(),
+        stale_sessions: stopped
+            .stale_sessions
+            .iter()
+            .map(|session_id| session_id.0.clone())
+            .collect(),
     };
     print_daemon_transport_status("stopped", &status);
 
@@ -206,6 +216,15 @@ fn operator_sessions(args: Vec<String>) -> Result<(), OperatorError> {
                 DaemonRequest::Detach {
                     session_id: session_id.0,
                     subscription_id: subscription_id.0,
+                },
+            )?;
+            print_daemon_response(response);
+        }
+        SessionAction::Shutdown { session_id } => {
+            let response = daemon_transport_request(
+                &config,
+                DaemonRequest::ShutdownSession {
+                    session_id: session_id.0,
                 },
             )?;
             print_daemon_response(response);
@@ -351,6 +370,17 @@ fn print_daemon_transport_status(label: &str, status: &DaemonStatus) {
     println!("provider_count={}", status.provider_count);
     println!("enabled_provider_count={}", status.enabled_provider_count);
     println!("session_count={}", status.session_count);
+    println!(
+        "recovered_session_count={}",
+        status.recovered_sessions.len()
+    );
+    for session_id in &status.recovered_sessions {
+        println!("recovered_session id={session_id}");
+    }
+    println!("stale_session_count={}", status.stale_sessions.len());
+    for session_id in &status.stale_sessions {
+        println!("stale_session id={session_id}");
+    }
 }
 
 fn print_daemon_response(response: DaemonResponse) {
@@ -601,6 +631,9 @@ enum SessionAction {
         session_id: SessionId,
         subscription_id: SubscriptionId,
     },
+    Shutdown {
+        session_id: SessionId,
+    },
 }
 
 impl SessionCommand {
@@ -719,6 +752,18 @@ impl SessionCommand {
                     action: SessionAction::Detach {
                         session_id: SessionId(args[3].clone()),
                         subscription_id,
+                    },
+                })
+            }
+            "shutdown" => {
+                if args.len() != 4 {
+                    return Err(OperatorError::Usage("sessions shutdown"));
+                }
+                let options = DataDirOptions::parse(args[1..3].to_vec(), "sessions shutdown")?;
+                Ok(Self {
+                    data_directory: options.data_directory,
+                    action: SessionAction::Shutdown {
+                        session_id: SessionId(args[3].clone()),
                     },
                 })
             }
@@ -1036,7 +1081,7 @@ fn usage_for(command: &str) -> &'static str {
         "start" => "usage: botster-hub start --data-dir <path>",
         "status" => "usage: botster-hub status --data-dir <path>",
         "sessions" => {
-            "usage: botster-hub sessions <list|spawn|attach|send-input|resize|detach> ..."
+            "usage: botster-hub sessions <list|spawn|attach|send-input|resize|detach|shutdown> ..."
         }
         "sessions list" => "usage: botster-hub sessions list --data-dir <path>",
         "sessions spawn" => {
@@ -1053,6 +1098,9 @@ fn usage_for(command: &str) -> &'static str {
         }
         "sessions send-input" => {
             "usage: botster-hub sessions send-input --data-dir <path> <session-id> -- <bytes>"
+        }
+        "sessions shutdown" => {
+            "usage: botster-hub sessions shutdown --data-dir <path> <session-id>"
         }
         "shutdown" => "usage: botster-hub shutdown --data-dir <path>",
         "packages" => "usage: botster-hub packages <list|enable|disable> ...",
