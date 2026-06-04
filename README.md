@@ -49,7 +49,9 @@ transport-neutral and currently exercised in-process; socket, CLI, TUI, or local
 browser bridge adapters should frame the same request/response/event contract
 instead of bypassing hub admission or calling core routers directly. Attach is a
 subscription handshake only, so clients still explicitly pull status, packages,
-lifecycle status, sessions, screens, or snapshots when they need them.
+lifecycle status, or sessions when they need them. Screen and snapshot requests
+return a typed unsupported response until the daemon-backed core API exposes
+those operations.
 
 | Core operation | HubRuntime decision | Reason |
 | --- | --- | --- |
@@ -61,13 +63,13 @@ lifecycle status, sessions, screens, or snapshots when they need them.
 | `write_bytes` | Exposed | Explicit client terminal input path through core mechanics. |
 | `resize` | Exposed | Explicit client terminal resize path through core mechanics. |
 | `inspect_session` | Exposed | Host visibility over lifecycle and activity. |
-| `read_screen` | Exposed | Explicit host request for core-owned session screen state. |
-| `capture_snapshot` | Exposed | Explicit host request for core-owned snapshot mechanics. |
-| `replay_snapshot` | Exposed | Explicit host request for core-owned snapshot replay mechanics. |
+| `read_screen` | Deferred | Daemon-backed core API does not expose screen reads yet. |
+| `capture_snapshot` | Deferred | Daemon-backed core API does not expose snapshot capture yet. |
+| `replay_snapshot` | Deferred | Daemon-backed core API does not expose snapshot replay yet. |
 | `drain_runtime_all_once` | Exposed | Host scheduler drain hook over live core sessions. |
-| `report_backpressure` | Exposed | Typed pressure evidence without hub-owned retry policy. |
-| `report_delivery_lag` | Exposed | Typed slow-delivery evidence without hub-owned retry policy. |
-| `report_delivery_failure` | Exposed | Typed failed-delivery evidence without hub-owned retry policy. |
+| `report_backpressure` | Deferred | Daemon-backed core API does not expose pressure reporting yet. |
+| `report_delivery_lag` | Deferred | Daemon-backed core API does not expose slow-delivery reporting yet. |
+| `report_delivery_failure` | Deferred | Daemon-backed core API does not expose failed-delivery reporting yet. |
 | `PluginCapabilityRuntime::submit` | Exposed | Hub owns concrete local capability policy and submits through core request contracts. |
 | `PluginCapabilityRuntime::drain_events` | Exposed | Plugin capability completions and timer events are drained through a hub-owned path. |
 | `PluginCapabilityRuntime::cleanup_plugin` | Exposed | Capability resources are released during hub plugin reload and unload. |
@@ -215,6 +217,11 @@ same explicit data directory, lists and reattaches the same session, sends input
 drains output, and shuts down through the client API. `inspect` is intentionally
 scoped to sanitized session list data until the stable client API grows a
 dedicated inspection request.
+
+In the daemon-backed model, attach, detach, input, and resize requests are
+control-plane acknowledgements. Terminal egress is delivered by explicit
+`DrainRuntime` calls over the session-backed CoreDaemon path, not synchronously
+from those control operations.
 
 Hub startup reconciles session disagreement deterministically:
 

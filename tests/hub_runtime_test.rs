@@ -232,9 +232,20 @@ fn hub_runtime_spawns_attaches_writes_reads_classifies_and_shuts_down_through_co
         .spawn_session(request, CoreSessionMetadata::new())
         .expect("spawn local command through core");
     assert_eq!(spawn.handle.session_id, session_id);
+    assert!(
+        spawn.handle.process.pid.is_some(),
+        "worker-backed spawn handle should carry the core daemon worker pid"
+    );
     assert_eq!(spawn.session.lifecycle, SessionLifecycleState::Running);
     assert!(runtime.session(&session_id).is_some());
     assert_eq!(runtime.list_sessions().len(), 1);
+    assert_eq!(
+        runtime
+            .classify_activity(&session_id, logical_clock, 5)
+            .expect("classify no-activity session through core"),
+        SessionActivityStatus::Idle,
+        "new sessions with no observed byte activity should be idle"
+    );
 
     runtime
         .attach_client(
@@ -283,6 +294,13 @@ fn hub_runtime_spawns_attaches_writes_reads_classifies_and_shuts_down_through_co
             .expect("inspect session through core")
             .activity_status,
         SessionActivityStatus::Active
+    );
+    assert_eq!(
+        runtime
+            .classify_activity(&session_id, logical_clock + 6, 5)
+            .expect("classify stale activity through core"),
+        SessionActivityStatus::Idle,
+        "activity older than the threshold should be idle"
     );
     runtime
         .drain_runtime_all_once(logical_clock)

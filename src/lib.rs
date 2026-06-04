@@ -120,6 +120,8 @@ impl ArchitectureSummary {
 pub enum HubFacadeExposure {
     /// Exposed as an explicit hub method because it is policy or visibility adjacent.
     Exposed,
+    /// Public facade method exists, but the current daemon-backed core API does not support it yet.
+    Deferred,
     /// Intentionally hidden because exposing it would collapse hub policy into core mechanics.
     Hidden,
 }
@@ -242,18 +244,18 @@ const HUB_FACADE_DECISIONS: &[HubFacadeDecision] = &[
     ),
     HubFacadeDecision::new(
         "read_screen",
-        HubFacadeExposure::Exposed,
-        "explicit host request for core-owned session screen state",
+        HubFacadeExposure::Deferred,
+        "daemon-backed core API does not expose screen reads yet",
     ),
     HubFacadeDecision::new(
         "capture_snapshot",
-        HubFacadeExposure::Exposed,
-        "explicit host request for core-owned snapshot mechanics",
+        HubFacadeExposure::Deferred,
+        "daemon-backed core API does not expose snapshot capture yet",
     ),
     HubFacadeDecision::new(
         "replay_snapshot",
-        HubFacadeExposure::Exposed,
-        "explicit host request for core-owned snapshot replay mechanics",
+        HubFacadeExposure::Deferred,
+        "daemon-backed core API does not expose snapshot replay yet",
     ),
     HubFacadeDecision::new(
         "drain_runtime_all_once",
@@ -262,18 +264,18 @@ const HUB_FACADE_DECISIONS: &[HubFacadeDecision] = &[
     ),
     HubFacadeDecision::new(
         "report_backpressure",
-        HubFacadeExposure::Exposed,
-        "typed pressure evidence without hub-owned retry policy",
+        HubFacadeExposure::Deferred,
+        "daemon-backed core API does not expose pressure reporting yet",
     ),
     HubFacadeDecision::new(
         "report_delivery_lag",
-        HubFacadeExposure::Exposed,
-        "typed slow-delivery evidence without hub-owned retry policy",
+        HubFacadeExposure::Deferred,
+        "daemon-backed core API does not expose slow-delivery reporting yet",
     ),
     HubFacadeDecision::new(
         "report_delivery_failure",
-        HubFacadeExposure::Exposed,
-        "typed failed-delivery evidence without hub-owned retry policy",
+        HubFacadeExposure::Deferred,
+        "daemon-backed core API does not expose failed-delivery reporting yet",
     ),
 ];
 
@@ -338,13 +340,21 @@ mod tests {
         assert!(exposed.contains(&"write_bytes"));
         assert!(exposed.contains(&"resize"));
         assert!(exposed.contains(&"inspect_session"));
-        assert!(exposed.contains(&"read_screen"));
-        assert!(exposed.contains(&"capture_snapshot"));
-        assert!(exposed.contains(&"replay_snapshot"));
         assert!(exposed.contains(&"drain_runtime_all_once"));
-        assert!(exposed.contains(&"report_backpressure"));
-        assert!(exposed.contains(&"report_delivery_lag"));
-        assert!(exposed.contains(&"report_delivery_failure"));
+        for deferred_operation in [
+            "read_screen",
+            "capture_snapshot",
+            "replay_snapshot",
+            "report_backpressure",
+            "report_delivery_lag",
+            "report_delivery_failure",
+        ] {
+            assert!(summary.facade_decisions().iter().any(|decision| {
+                decision.core_operation() == deferred_operation
+                    && decision.exposure() == HubFacadeExposure::Deferred
+                    && decision.reason().contains("daemon-backed core API")
+            }));
+        }
         assert!(summary.facade_decisions().iter().any(|decision| {
             decision.core_operation() == "execute_command(DefaultEngineCommand)"
                 && decision.exposure() == HubFacadeExposure::Hidden

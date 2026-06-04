@@ -494,6 +494,53 @@ fn local_client_api_exercises_status_spawn_attach_input_resize_detach_shutdown_a
 }
 
 #[test]
+fn read_screen_and_snapshot_return_typed_unsupported_until_daemon_api_exists() {
+    let api = HubClientApi::local_operator("local-client-api-test");
+    let packages = empty_registry();
+    let mut runtime = explicit_runtime();
+
+    let read_screen = api
+        .handle_request(
+            &mut runtime,
+            &packages,
+            HubClientRequest::ReadScreen {
+                request_id: request_id("read-screen"),
+                session_id: session_id(),
+                now_seconds: 1,
+            },
+        )
+        .expect_err("daemon-backed read_screen should be typed unsupported");
+    assert_eq!(
+        read_screen,
+        HubClientError::UnsupportedDaemonOperation {
+            request_id: request_id("read-screen"),
+            operation: HubClientOperation::ReadScreen,
+            daemon_operation: "read_screen",
+        }
+    );
+
+    let capture_snapshot = api
+        .handle_request(
+            &mut runtime,
+            &packages,
+            HubClientRequest::CaptureSnapshot {
+                request_id: request_id("capture-snapshot"),
+                session_id: session_id(),
+                now_seconds: 1,
+            },
+        )
+        .expect_err("daemon-backed capture_snapshot should be typed unsupported");
+    assert_eq!(
+        capture_snapshot,
+        HubClientError::UnsupportedDaemonOperation {
+            request_id: request_id("capture-snapshot"),
+            operation: HubClientOperation::CaptureSnapshot,
+            daemon_operation: "capture_snapshot",
+        }
+    );
+}
+
+#[test]
 fn package_and_lifecycle_queries_are_sanitized_and_explicitly_pulled() {
     let api = HubClientApi::local_operator("local-client-api-test");
     let mut runtime = explicit_runtime();

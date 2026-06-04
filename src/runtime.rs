@@ -15,8 +15,9 @@ use botster_core::{
     CoreSessionMetadata, EngineSessionInspection, MailboxSendFailureReason,
     PluginCapabilityRuntime, PluginCleanupResult, PluginInvocationOutcome, PluginInvocationRequest,
     PluginKey, PreparedSnapshotRequest, ProcessIdentity, QueueSource, RequestId,
-    SessionActivityStatus, SessionId, SessionLifecycleState, SessionRuntimeHandle,
-    SessionSpawnRequest, SubscriptionId,
+    SessionActivityEvent, SessionActivityStatus, SessionId, SessionLifecycleState,
+    SessionRuntimeHandle, SessionSpawnRequest, SubscriptionId, apply_session_activity_event,
+    classify_session_activity,
 };
 use botster_core_daemon::{
     CoreDaemon, CoreDaemonConfig, CoreDaemonError, RegistrySessionState, SessionAdoptionState,
@@ -62,9 +63,7 @@ impl HubRuntime {
     #[must_use]
     pub fn new(config: HubConfig) -> Self {
         let state = HubState::from_config(&config);
-        let mut runtime = Self::from_state(config, state);
-        let _ = runtime.reconcile_sessions(0);
-        runtime
+        Self::from_state(config, state)
     }
 
     fn from_state(config: HubConfig, state: HubState) -> Self {
@@ -282,10 +281,17 @@ impl HubRuntime {
             },
             0,
         )?;
+        let process = self
+            .core_daemon
+            .registry()
+            .load(&session.session_id)
+            .map_err(CoreDaemonError::from)?
+            .and_then(|record| record.process)
+            .unwrap_or_else(|| fallback_process_identity(&session.session_id));
         self.sessions
             .insert(session.session_id.clone(), session.clone());
         Ok(BotsterSpawnOutcome {
-            handle: session_handle(&session.session_id, request_id),
+            handle: session_handle(&session.session_id, request_id, process),
             session: session.clone(),
             observations: vec![BotsterEngineObservation::SessionLifecycle {
                 session_id: session.session_id,
@@ -328,8 +334,19 @@ impl HubRuntime {
         data: impl Into<Vec<u8>>,
         now_seconds: u64,
     ) -> Result<BotsterEngineOutput, HubRuntimeError> {
+        let data = data.into();
+        let byte_count = data.len() as u64;
         self.core_daemon
-            .input(client_id, session_id, data, now_seconds)?;
+            .input(client_id, session_id.clone(), data, now_seconds)?;
+        if let Some(session) = self.sessions.get_mut(&session_id) {
+            apply_session_activity_event(
+                session,
+                SessionActivityEvent::InputBytes {
+                    at: now_seconds,
+                    bytes: byte_count,
+                },
+            );
+        }
         Ok(BotsterEngineOutput::empty())
     }
 
@@ -355,10 +372,26 @@ impl HubRuntime {
     ) -> Result<BotsterEngineOutput, HubRuntimeError> {
         let drained = self.core_daemon.drain(session_id, last_output_at)?;
         for observation in &drained.observations {
-            if let BotsterEngineObservation::SessionLifecycle { session_id, state } = observation
-                && let Some(session) = self.sessions.get_mut(session_id)
-            {
-                session.lifecycle = state.clone();
+            match observation {
+                BotsterEngineObservation::SessionLifecycle { session_id, state } => {
+                    if let Some(session) = self.sessions.get_mut(session_id) {
+                        session.lifecycle = state.clone();
+                    }
+                }
+                BotsterEngineObservation::SessionActivity {
+                    session_id,
+                    status: SessionActivityStatus::Active,
+                } => {
+                    if let Some(session) = self.sessions.get_mut(session_id) {
+                        apply_session_activity_event(
+                            session,
+                            SessionActivityEvent::DeclaredActivity { at: last_output_at },
+                        );
+                    }
+                }
+                BotsterEngineObservation::SessionActivity { .. }
+                | BotsterEngineObservation::Subscription(_)
+                | BotsterEngineObservation::Backpressure(_) => {}
             }
         }
         Ok(BotsterEngineOutput {
@@ -408,12 +441,8 @@ impl HubRuntime {
             .get(session_id)
             .cloned()
             .ok_or_else(|| HubRuntimeError::UnknownSession(session_id.clone()))?;
-        let latest = session.activity.latest_activity_at().unwrap_or(now_seconds);
-        let activity_status = if now_seconds.saturating_sub(latest) <= active_threshold_seconds {
-            SessionActivityStatus::Active
-        } else {
-            SessionActivityStatus::Idle
-        };
+        let activity_status =
+            classify_session_activity(&session.activity, now_seconds, active_threshold_seconds);
         Ok(EngineSessionInspection {
             session,
             activity_status,
@@ -652,13 +681,21 @@ fn session_worker_path(config: &HubConfig) -> PathBuf {
         })
 }
 
-fn session_handle(session_id: &SessionId, request_id: RequestId) -> SessionRuntimeHandle {
+fn session_handle(
+    session_id: &SessionId,
+    request_id: RequestId,
+    process: ProcessIdentity,
+) -> SessionRuntimeHandle {
     SessionRuntimeHandle {
         request_id,
         session_id: session_id.clone(),
-        process: ProcessIdentity {
-            pid: None,
-            runtime_id: Some(format!("{}-worker", session_id.0)),
-        },
+        process,
+    }
+}
+
+fn fallback_process_identity(session_id: &SessionId) -> ProcessIdentity {
+    ProcessIdentity {
+        pid: None,
+        runtime_id: Some(format!("{}-worker", session_id.0)),
     }
 }
