@@ -215,9 +215,8 @@ impl HubClientApi {
             } => {
                 let output = runtime
                     .read_screen(request_id.clone(), session_id, now_seconds)
-                    .map_err(|_| HubClientError::Runtime {
-                        request_id: request_id.clone(),
-                        operation,
+                    .map_err(|error| {
+                        hub_client_runtime_error(error, request_id.clone(), operation)
                     })?;
                 HubClientResponseBody::Events(events_from_output(output))
             }
@@ -228,9 +227,8 @@ impl HubClientApi {
             } => {
                 let output = runtime
                     .capture_snapshot(request_id.clone(), session_id, now_seconds)
-                    .map_err(|_| HubClientError::Runtime {
-                        request_id: request_id.clone(),
-                        operation,
+                    .map_err(|error| {
+                        hub_client_runtime_error(error, request_id.clone(), operation)
                     })?;
                 HubClientResponseBody::Events(events_from_output(output))
             }
@@ -668,6 +666,11 @@ pub enum HubClientError {
         operation: HubClientOperation,
         role: HubClientRole,
     },
+    UnsupportedDaemonOperation {
+        request_id: RequestId,
+        operation: HubClientOperation,
+        daemon_operation: &'static str,
+    },
     Runtime {
         request_id: RequestId,
         operation: HubClientOperation,
@@ -676,6 +679,28 @@ pub enum HubClientError {
 
 /// Result alias for client API requests.
 pub type HubClientResult<T> = Result<T, HubClientError>;
+
+fn hub_client_runtime_error(
+    error: HubRuntimeError,
+    request_id: RequestId,
+    operation: HubClientOperation,
+) -> HubClientError {
+    match error {
+        HubRuntimeError::UnsupportedDaemonOperation(daemon_operation) => {
+            HubClientError::UnsupportedDaemonOperation {
+                request_id,
+                operation,
+                daemon_operation,
+            }
+        }
+        HubRuntimeError::CoreDaemon(_)
+        | HubRuntimeError::State(_)
+        | HubRuntimeError::UnknownSession(_) => HubClientError::Runtime {
+            request_id,
+            operation,
+        },
+    }
+}
 
 fn spawn_request(
     runtime: &HubRuntime,
