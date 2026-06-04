@@ -263,6 +263,30 @@ fn shutdown_cli_daemon(data_dir: &Path, child: Child) -> Output {
     output
 }
 
+fn run_command_with_timeout(mut command: Command, timeout: Duration) -> Output {
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn timed command");
+    let deadline = std::time::Instant::now() + timeout;
+
+    while std::time::Instant::now() < deadline {
+        if child.try_wait().expect("poll timed command").is_some() {
+            return child.wait_with_output().expect("collect timed command");
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    let _ = child.kill();
+    let output = child.wait_with_output().expect("collect timed out command");
+    panic!(
+        "command timed out after {timeout:?}: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[test]
 fn daemon_starts_empty_state_reports_status_uses_core_and_stops_idempotently() {
     let config = explicit_config(unique_test_dir("empty"));
@@ -699,6 +723,192 @@ fn cli_sessions_spawn_and_list_route_through_client_api() {
     assert!(stdout.contains("dogfood-ok"));
 
     shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
+fn daemon_detaches_subscription_when_attach_connection_drops() {
+    let _guard = daemon_test_lock()
+        .lock()
+        .expect("serialize real daemon test");
+    let data_dir = unique_test_dir("cli-attach-eof");
+    let config = explicit_config(&data_dir);
+    let child = start_cli_daemon(&data_dir);
+
+    let spawn = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::Spawn {
+            session_id: "eof-session".to_string(),
+            command:
+                "printf 'ready\\n'; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done"
+                    .to_string(),
+        },
+    )
+    .expect("spawn eof test session");
+    assert_eq!(spawn.kind, botster_hub::DaemonResponseKind::Spawned);
+
+    let attach = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::Attach {
+            session_id: "eof-session".to_string(),
+            subscription_id: "dropped-subscription".to_string(),
+        },
+    )
+    .expect("attach dropped subscription");
+    assert_eq!(attach.kind, botster_hub::DaemonResponseKind::Events);
+
+    thread::sleep(Duration::from_millis(150));
+
+    botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::SendInput {
+            session_id: "eof-session".to_string(),
+            data: "after-eof\r".to_string(),
+        },
+    )
+    .expect("send input after dropped attach");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    let mut observed_events = Vec::new();
+    while std::time::Instant::now() < deadline {
+        let drain = botster_hub::daemon_transport_request(
+            &config,
+            botster_hub::DaemonRequest::Drain {
+                session_id: "eof-session".to_string(),
+            },
+        )
+        .expect("drain after dropped attach");
+        observed_events.extend(drain.events);
+        thread::sleep(Duration::from_millis(30));
+    }
+
+    assert!(
+        observed_events.iter().all(|event| {
+            !matches!(
+                event,
+                botster_hub::DaemonEvent::TerminalOutput {
+                    subscription_id,
+                    data,
+                    ..
+                } if subscription_id == "dropped-subscription" && data.contains("after-eof")
+            )
+        }),
+        "dropped attach subscription received later terminal output: {observed_events:?}"
+    );
+
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
+fn stalled_attach_stdout_does_not_block_other_daemon_commands() {
+    let _guard = daemon_test_lock()
+        .lock()
+        .expect("serialize real daemon test");
+    let data_dir = unique_test_dir("cli-stalled-attach");
+    let child = start_cli_daemon(&data_dir);
+
+    let mut spawn_command = Command::new(env!("CARGO_BIN_EXE_botster-hub"));
+    spawn_command
+        .arg("sessions")
+        .arg("spawn")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("--session-id")
+        .arg("slow-consumer")
+        .arg("--")
+        .arg(
+            "i=0; while [ \"$i\" -lt 50000 ]; do printf 'flood-line-%05d\\n' \"$i\"; i=$((i + 1)); done; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done",
+        );
+    let spawn = run_command_with_timeout(spawn_command, Duration::from_secs(3));
+    assert!(
+        spawn.status.success(),
+        "spawn failed: {}",
+        String::from_utf8_lossy(&spawn.stderr)
+    );
+
+    let mut attach_child = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("sessions")
+        .arg("attach")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("slow-consumer")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn stalled attach");
+    thread::sleep(Duration::from_millis(500));
+    assert!(
+        attach_child
+            .try_wait()
+            .expect("poll stalled attach")
+            .is_none(),
+        "attach exited before the slow-consumer check"
+    );
+
+    let mut list_command = Command::new(env!("CARGO_BIN_EXE_botster-hub"));
+    list_command
+        .arg("sessions")
+        .arg("list")
+        .arg("--data-dir")
+        .arg(&data_dir);
+    let list = run_command_with_timeout(list_command, Duration::from_secs(2));
+    assert!(
+        list.status.success(),
+        "list failed while attach stdout was blocked: {}",
+        String::from_utf8_lossy(&list.stderr)
+    );
+
+    let mut send_command = Command::new(env!("CARGO_BIN_EXE_botster-hub"));
+    send_command
+        .arg("sessions")
+        .arg("send-input")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("slow-consumer")
+        .arg("--")
+        .arg("still-responsive\r");
+    let send = run_command_with_timeout(send_command, Duration::from_secs(2));
+    assert!(
+        send.status.success(),
+        "send-input failed while attach stdout was blocked: {}",
+        String::from_utf8_lossy(&send.stderr)
+    );
+
+    let mut resize_command = Command::new(env!("CARGO_BIN_EXE_botster-hub"));
+    resize_command
+        .arg("sessions")
+        .arg("resize")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("slow-consumer")
+        .arg("32")
+        .arg("120");
+    let resize = run_command_with_timeout(resize_command, Duration::from_secs(2));
+    assert!(
+        resize.status.success(),
+        "resize failed while attach stdout was blocked: {}",
+        String::from_utf8_lossy(&resize.stderr)
+    );
+
+    let mut shutdown_command = Command::new(env!("CARGO_BIN_EXE_botster-hub"));
+    shutdown_command
+        .arg("shutdown")
+        .arg("--data-dir")
+        .arg(&data_dir);
+    let shutdown = run_command_with_timeout(shutdown_command, Duration::from_secs(2));
+    assert!(
+        shutdown.status.success(),
+        "shutdown failed while attach stdout was blocked: {}",
+        String::from_utf8_lossy(&shutdown.stderr)
+    );
+
+    let _ = attach_child.kill();
+    let _ = attach_child.wait_with_output();
+    let output = child.wait_with_output().expect("wait for daemon child");
+    assert!(
+        output.status.success(),
+        "daemon failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]
