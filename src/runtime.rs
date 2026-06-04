@@ -12,9 +12,12 @@ use botster_core::{
 };
 use botster_core_daemon::{
     CoreDaemon, CoreDaemonConfig, CoreDaemonError, DaemonSession, DrainResult, GuardedWriteRequest,
-    GuardedWriteResult, RegistrySessionState, SessionAdoptionReport, SpawnSessionRequest,
+    GuardedWriteResult, RegistrySessionState, SessionAdoptionReport, SessionAdoptionState,
+    SpawnSessionRequest,
 };
 use std::env;
+use std::error::Error;
+use std::fmt;
 use std::path::{Path, PathBuf};
 
 use crate::capabilities::HubCapabilityRuntime;
@@ -23,7 +26,7 @@ use crate::lifecycle::{
     HubLifecycleResult, HubPluginLifecycle, HubPluginLifecycleStatus, HubPluginRuntimeBundle,
 };
 use crate::packages::PackageRegistry;
-use crate::persistence::{FileHubStateStore, HubState, HubStateStore, HubStateStoreResult};
+use crate::persistence::{FileHubStateStore, HubState, HubStateStore, HubStateStoreError};
 
 /// Hub-owned adapter and policy facade over the default local core engine.
 ///
@@ -35,9 +38,19 @@ pub struct HubRuntime {
     config: HubConfig,
     state: HubState,
     core_daemon: CoreDaemon,
+    reconciliation: HubSessionReconciliation,
     plugin_lifecycle: HubPluginLifecycle,
     capability_runtime: HubCapabilityRuntime,
     last_capability_cleanup: Option<PluginCleanupResult>,
+}
+
+/// Deterministic session reconciliation summary from hub startup.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HubSessionReconciliation {
+    /// Registry-backed sessions that were adopted into the restarted hub.
+    pub recovered_sessions: Vec<SessionId>,
+    /// Registry-backed sessions that were marked stale by hub startup policy.
+    pub stale_sessions: Vec<SessionId>,
 }
 
 impl HubRuntime {
@@ -51,13 +64,14 @@ impl HubRuntime {
             config,
             state,
             core_daemon,
+            reconciliation: HubSessionReconciliation::default(),
             plugin_lifecycle: HubPluginLifecycle::new(),
             last_capability_cleanup: None,
         }
     }
 
     /// Load durable hub state from the resolved data directory before building runtime.
-    pub fn load(config: HubConfig) -> HubStateStoreResult<Self> {
+    pub fn load(config: HubConfig) -> HubRuntimeResult<Self> {
         let store = FileHubStateStore::for_data_directory(&config.data_directory);
         Self::load_from_store(config, &store)
     }
@@ -66,17 +80,20 @@ impl HubRuntime {
     pub fn load_from_store(
         config: HubConfig,
         store: &impl HubStateStore,
-    ) -> HubStateStoreResult<Self> {
+    ) -> HubRuntimeResult<Self> {
         let state = store.load_or_initialize(&config)?;
         let core_daemon = CoreDaemon::new(core_daemon_config(&config.data_directory));
-        Ok(Self {
+        let mut runtime = Self {
             capability_runtime: HubCapabilityRuntime::from_config(&config),
             config,
             state,
             core_daemon,
+            reconciliation: HubSessionReconciliation::default(),
             plugin_lifecycle: HubPluginLifecycle::new(),
             last_capability_cleanup: None,
-        })
+        };
+        runtime.reconcile_sessions(0)?;
+        Ok(runtime)
     }
 
     /// Return the policy-resolved hub config that created this runtime.
@@ -95,6 +112,12 @@ impl HubRuntime {
     #[must_use]
     pub const fn state(&self) -> &HubState {
         &self.state
+    }
+
+    /// Return the startup reconciliation decisions made against the core daemon registry.
+    #[must_use]
+    pub const fn reconciliation(&self) -> &HubSessionReconciliation {
+        &self.reconciliation
     }
 
     /// Load an enabled package through core plugin worker mechanics.
@@ -326,6 +349,11 @@ impl HubRuntime {
         self.core_daemon.release_for_restart();
     }
 
+    /// Release worker-backed sessions before an intentional hub restart.
+    pub fn release_for_restart(&mut self) {
+        self.release_sessions_for_restart();
+    }
+
     /// Scan daemon registry records for worker-backed restart/adoption evidence.
     pub fn adoption_scan(&self) -> Result<Vec<SessionAdoptionReport>, CoreDaemonError> {
         self.core_daemon.adoption_scan()
@@ -348,6 +376,42 @@ impl HubRuntime {
     ) -> Result<(), CoreDaemonError> {
         self.core_daemon.shutdown(Some(session_id), now_seconds)
     }
+
+    fn reconcile_sessions(&mut self, now_seconds: u64) -> Result<(), CoreDaemonError> {
+        self.reconciliation = HubSessionReconciliation::default();
+        for report in self.core_daemon.adoption_scan()? {
+            match report.state {
+                SessionAdoptionState::Adoptable => {
+                    let session = self
+                        .core_daemon
+                        .adopt_session(&report.record.session_id, now_seconds)?;
+                    self.reconciliation
+                        .recovered_sessions
+                        .push(session.session_id);
+                }
+                SessionAdoptionState::MissingProtocolEvidence
+                | SessionAdoptionState::StaleWorker { .. }
+                | SessionAdoptionState::UnhealthyWorker { .. }
+                | SessionAdoptionState::DuplicateWorker { .. } => {
+                    self.core_daemon
+                        .mark_stale(&report.record.session_id, now_seconds)?;
+                    self.reconciliation
+                        .stale_sessions
+                        .push(report.record.session_id);
+                }
+                SessionAdoptionState::Terminal => {
+                    if report.record.state == RegistrySessionState::Running {
+                        self.core_daemon
+                            .mark_stale(&report.record.session_id, now_seconds)?;
+                        self.reconciliation
+                            .stale_sessions
+                            .push(report.record.session_id);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Observation type emitted by the embedded core engine.
@@ -356,8 +420,47 @@ pub type HubRuntimeObservation = BotsterEngineObservation;
 /// Output batch emitted by the embedded core engine.
 pub type HubRuntimeOutput = BotsterEngineOutput;
 
-/// Error emitted by the core daemon session supervisor.
-pub type HubRuntimeError = CoreDaemonError;
+/// Error emitted by the daemon-backed hub runtime.
+#[derive(Debug)]
+pub enum HubRuntimeError {
+    /// Core daemon operation failed.
+    CoreDaemon(CoreDaemonError),
+    /// Durable hub state failed to load.
+    State(HubStateStoreError),
+}
+
+impl fmt::Display for HubRuntimeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CoreDaemon(error) => write!(formatter, "{error}"),
+            Self::State(error) => write!(formatter, "{error}"),
+        }
+    }
+}
+
+impl Error for HubRuntimeError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::CoreDaemon(error) => Some(error),
+            Self::State(error) => Some(error),
+        }
+    }
+}
+
+impl From<CoreDaemonError> for HubRuntimeError {
+    fn from(error: CoreDaemonError) -> Self {
+        Self::CoreDaemon(error)
+    }
+}
+
+impl From<HubStateStoreError> for HubRuntimeError {
+    fn from(error: HubStateStoreError) -> Self {
+        Self::State(error)
+    }
+}
+
+/// Hub runtime result alias.
+pub type HubRuntimeResult<T> = Result<T, HubRuntimeError>;
 
 fn core_daemon_config(data_directory: &Path) -> CoreDaemonConfig {
     CoreDaemonConfig::new(data_directory).with_worker_path(session_worker_path())

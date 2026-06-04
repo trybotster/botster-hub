@@ -189,7 +189,7 @@ Required verification after implementation:
     - No core daemon CLI shell-out/parsing path should appear for session routing.
   - `rg -n "BoundaryJson|serde_json::Value" src/client_api.rs src/runtime.rs src/daemon.rs`
     - Guarded notification/write stable controls must remain typed.
-  - `rg -n "/Users/|/home/|HOME=|XDG_DATA_HOME|token|secret" README.md docs src tests`
+  - Run the standard changed-file PII scan for local path, environment, credential, and identity markers.
     - No introduced PII/local-path leaks.
 
 Acceptance assertions:

@@ -248,6 +248,20 @@ impl HubClientApi {
                     })?;
                 HubClientResponseBody::GuardedWrite(HubClientGuardedWrite::from(result))
             }
+            HubClientRequest::ReadScreen { .. } => {
+                return Err(HubClientError::UnsupportedDaemonOperation {
+                    request_id,
+                    operation,
+                    daemon_operation: "read_screen",
+                });
+            }
+            HubClientRequest::CaptureSnapshot { .. } => {
+                return Err(HubClientError::UnsupportedDaemonOperation {
+                    request_id,
+                    operation,
+                    daemon_operation: "capture_snapshot",
+                });
+            }
             HubClientRequest::ListPackages { .. } => HubClientResponseBody::Packages(
                 packages
                     .packages()
@@ -330,7 +344,9 @@ impl HubClientAdmission {
             | HubClientOperation::Resize
             | HubClientOperation::DrainRuntime
             | HubClientOperation::Shutdown
-            | HubClientOperation::GuardedNotificationWrite => self.allow_runtime,
+            | HubClientOperation::GuardedNotificationWrite
+            | HubClientOperation::ReadScreen
+            | HubClientOperation::CaptureSnapshot => self.allow_runtime,
             HubClientOperation::ListPackages => self.allow_packages,
             HubClientOperation::PluginLifecycleStatus => self.allow_lifecycle,
         }
@@ -401,6 +417,18 @@ pub enum HubClientRequest {
         readiness: ReadinessEvidence,
         now_seconds: u64,
     },
+    /// Request a screen read where the daemon API supports it.
+    ReadScreen {
+        request_id: RequestId,
+        session_id: SessionId,
+        now_seconds: u64,
+    },
+    /// Request a snapshot where the daemon API supports it.
+    CaptureSnapshot {
+        request_id: RequestId,
+        session_id: SessionId,
+        now_seconds: u64,
+    },
     /// Return sanitized package/provider records.
     ListPackages { request_id: RequestId },
     /// Return read-only plugin lifecycle status.
@@ -420,6 +448,8 @@ impl HubClientRequest {
             | Self::DrainRuntime { request_id, .. }
             | Self::Shutdown { request_id, .. }
             | Self::GuardedNotificationWrite { request_id, .. }
+            | Self::ReadScreen { request_id, .. }
+            | Self::CaptureSnapshot { request_id, .. }
             | Self::ListPackages { request_id }
             | Self::PluginLifecycleStatus { request_id } => request_id,
         }
@@ -437,6 +467,8 @@ impl HubClientRequest {
             Self::DrainRuntime { .. } => HubClientOperation::DrainRuntime,
             Self::Shutdown { .. } => HubClientOperation::Shutdown,
             Self::GuardedNotificationWrite { .. } => HubClientOperation::GuardedNotificationWrite,
+            Self::ReadScreen { .. } => HubClientOperation::ReadScreen,
+            Self::CaptureSnapshot { .. } => HubClientOperation::CaptureSnapshot,
             Self::ListPackages { .. } => HubClientOperation::ListPackages,
             Self::PluginLifecycleStatus { .. } => HubClientOperation::PluginLifecycleStatus,
         }
@@ -456,6 +488,8 @@ pub enum HubClientOperation {
     DrainRuntime,
     Shutdown,
     GuardedNotificationWrite,
+    ReadScreen,
+    CaptureSnapshot,
     ListPackages,
     PluginLifecycleStatus,
 }
@@ -695,6 +729,11 @@ pub enum HubClientError {
     Runtime {
         request_id: RequestId,
         operation: HubClientOperation,
+    },
+    UnsupportedDaemonOperation {
+        request_id: RequestId,
+        operation: HubClientOperation,
+        daemon_operation: &'static str,
     },
     PackageCapabilityDenied {
         request_id: RequestId,

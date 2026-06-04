@@ -121,6 +121,8 @@ impl ArchitectureSummary {
 pub enum HubFacadeExposure {
     /// Exposed as an explicit hub method because it is policy or visibility adjacent.
     Exposed,
+    /// Public facade or client request shape exists, but the current daemon API does not support it yet.
+    Deferred,
     /// Intentionally hidden because exposing it would collapse hub policy into core mechanics.
     Hidden,
 }
@@ -248,8 +250,8 @@ const HUB_FACADE_DECISIONS: &[HubFacadeDecision] = &[
     ),
     HubFacadeDecision::new(
         "read_screen/capture_snapshot/report_delivery_*",
-        HubFacadeExposure::Hidden,
-        "embedded-engine-only helpers are not part of the daemon-backed production session path",
+        HubFacadeExposure::Deferred,
+        "daemon-backed core API does not expose these embedded-engine-only helpers yet",
     ),
 ];
 
@@ -322,10 +324,8 @@ mod tests {
         }));
         assert!(summary.facade_decisions().iter().any(|decision| {
             decision.core_operation() == "read_screen/capture_snapshot/report_delivery_*"
-                && decision.exposure() == HubFacadeExposure::Hidden
-                && decision
-                    .reason()
-                    .contains("daemon-backed production session path")
+                && decision.exposure() == HubFacadeExposure::Deferred
+                && decision.reason().contains("daemon-backed core API")
         }));
     }
 }
