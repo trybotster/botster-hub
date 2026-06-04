@@ -13,7 +13,7 @@ use crate::packages::{
     PackageClassification, PackageRegistry, PackageRegistrySnapshotError, PackageState,
 };
 use crate::persistence::{FileHubStateStore, HubState, HubStateStoreError};
-use crate::runtime::HubRuntime;
+use crate::runtime::{HubRuntime, HubRuntimeError};
 
 /// Local daemon lifecycle state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -152,6 +152,9 @@ impl HubDaemon {
 
     /// Stop the daemon lifecycle. This is idempotent.
     pub fn stop(&mut self) -> HubDaemonStatus {
+        if let Some(runtime) = self.runtime.as_mut() {
+            runtime.release_for_restart();
+        }
         self.runtime = None;
         self.lifecycle_state = HubDaemonState::Stopped;
         self.status()
@@ -163,6 +166,8 @@ impl HubDaemon {
 pub enum HubDaemonError {
     /// Durable state failed to load or initialize.
     State(HubStateStoreError),
+    /// Runtime failed to initialize or reconcile daemon-backed sessions.
+    Runtime(HubRuntimeError),
     /// Persisted package/provider policy records could not be restored.
     PackageRegistry(PackageRegistrySnapshotError),
 }
@@ -171,6 +176,7 @@ impl fmt::Display for HubDaemonError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::State(error) => write!(formatter, "{error}"),
+            Self::Runtime(error) => write!(formatter, "{error}"),
             Self::PackageRegistry(error) => {
                 write!(formatter, "hub package registry restore error: {error:?}")
             }
@@ -182,6 +188,7 @@ impl Error for HubDaemonError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::State(error) => Some(error),
+            Self::Runtime(error) => Some(error),
             Self::PackageRegistry(_) => None,
         }
     }
@@ -190,6 +197,12 @@ impl Error for HubDaemonError {
 impl From<HubStateStoreError> for HubDaemonError {
     fn from(error: HubStateStoreError) -> Self {
         Self::State(error)
+    }
+}
+
+impl From<HubRuntimeError> for HubDaemonError {
+    fn from(error: HubRuntimeError) -> Self {
+        Self::Runtime(error)
     }
 }
 

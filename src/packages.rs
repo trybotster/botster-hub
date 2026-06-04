@@ -698,15 +698,19 @@ fn admit_enabled_host_profile(
 ) -> Result<Option<AdmittedHostProfile>, PackageAdmissionReason> {
     match classification {
         PackageClassification::Plugin if manifest.host_profile.is_none() => Ok(None),
-        PackageClassification::Plugin => admit_host_profile(manifest, true)
-            .map(Some)
-            .map_err(PackageAdmissionReason::HostProfileAdmission),
+        PackageClassification::Plugin => {
+            admit_host_profile(manifest, true, env!("CARGO_PKG_VERSION"))
+                .map(Some)
+                .map_err(PackageAdmissionReason::HostProfileAdmission)
+        }
         PackageClassification::Provider if manifest.host_profile.is_none() => {
             Err(PackageAdmissionReason::ProviderMissingHostProfile)
         }
-        PackageClassification::Provider => admit_host_profile(manifest, true)
-            .map(Some)
-            .map_err(PackageAdmissionReason::HostProfileAdmission),
+        PackageClassification::Provider => {
+            admit_host_profile(manifest, true, env!("CARGO_PKG_VERSION"))
+                .map(Some)
+                .map_err(PackageAdmissionReason::HostProfileAdmission)
+        }
     }
 }
 

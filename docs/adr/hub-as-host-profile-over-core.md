@@ -11,7 +11,7 @@ bundle of default policy, provider enablement, startup ordering, package
 management, and first-party plugins over reusable core mechanisms.
 
 The source of truth for concrete core surfaces is the locked `botster-core`
-dependency at `a6b4a7a92a09028c9abe239ba8aab2385d7f8835`. The checked source
+dependency at `f03e82e59a77cfee938bb8807c31b2a260cbdc10`. The checked source
 exposes core contracts, identity, package, runtime, actor, entity, transport,
 UI, and engine modules from `crates/botster-core/src/lib.rs`. It also documents
 that the default feature set enables `local-runtime`, while contract-only
@@ -20,7 +20,7 @@ and transport contracts without the local process dependency. The matching
 feature definition is in `crates/botster-core/Cargo.toml`.
 
 This ADR treats the existing hub scaffold as useful evidence, not gospel. The
-scaffold currently embeds `DefaultBotsterEngine` in `src/runtime.rs` and exposes
+scaffold currently embeds `botster-core-daemon` in `src/runtime.rs` and exposes
 shallow seams for config, auth, persistence, packages, providers, and adapters.
 Those names are kept only where they line up with the accepted boundary model.
 
@@ -46,7 +46,7 @@ directly. This is derived from `crates/botster-core/src/engine/botster.rs`, wher
 
 | Tier | Owns | Does not own | Source evidence |
 | --- | --- | --- | --- |
-| Non-replaceable core mechanisms | `BotsterEngine`, `DefaultBotsterEngine` when `local-runtime` is enabled, `MultiplexerEngine`, session/runtime traits, transport ingress/egress frames, actor mailbox contracts, bounded queue metadata, session I/O requests/events, client worker messages, plugin worker engine contracts, package manifest/capability types, entity frames, UI contract types, reusable crypto/envelope operations, and public device identity/fingerprint helpers. | Product startup policy, provider selection, auth/admission decisions, package install/update policy, cloud federation policy, browser shell delivery, or workflow-specific plugin behavior. | `crates/botster-core/src/lib.rs`, `src/engine/botster.rs`, `src/contract/actor.rs`, `src/contract/transport.rs`, `src/package/manifest.rs`, `src/package/capability.rs`, `src/contract/entity.rs`, `src/identity/crypto.rs`, `src/identity/device.rs` at `botster-core@a6b4a7a`. |
+| Non-replaceable core mechanisms | `BotsterEngine`, `DefaultBotsterEngine` when `local-runtime` is enabled, `CoreDaemon`, `MultiplexerEngine`, session/runtime traits, transport ingress/egress frames, actor mailbox contracts, bounded queue metadata, session I/O requests/events, client worker messages, plugin worker engine contracts, package manifest/capability types, entity frames, UI contract types, reusable crypto/envelope operations, and public device identity/fingerprint helpers. | Product startup policy, provider selection, auth/admission decisions, package install/update policy, cloud federation policy, browser shell delivery, or workflow-specific plugin behavior. | `crates/botster-core/src/lib.rs`, `crates/botster-core-daemon/src/lib.rs`, `src/engine/botster.rs`, `src/contract/actor.rs`, `src/contract/transport.rs`, `src/package/manifest.rs`, `src/package/capability.rs`, `src/contract/entity.rs`, `src/identity/crypto.rs`, `src/identity/device.rs` at `botster-core@f03e82e5`. |
 | Trusted host profile privileges | Startup composition, runtime config, host identity policy, client admission, provider enablement, capability grants, package install/enable/disable/pin/update policy, persistence locations, audit hooks, lifecycle ordering, timeout/failure policy, and wiring the default local runtime when this host wants local PTY execution. | Reimplementing core engine/session/actor contracts, owning raw terminal byte delivery, treating cloud/Rails/browser shell providers as hardcoded hub internals, or executing ordinary plugin callbacks inline as hub policy. | Hub scaffold `src/config.rs`, `src/runtime.rs`, `src/packages.rs`, `src/providers.rs`; vault notes `botster packages should enforce core hub cli plugin provider boundaries`, `botster cloud should be an installable privileged provider not a hub dependency`, and `botster-core local process runtime is feature-gated from contract-only embeds`. |
 | Ordinary user-installed plugins/providers | Declared behavior through package manifests, entrypoints, descriptors, handlers, plugin-owned entity families, MCP/tools/resources, session actions, UI surfaces, provider implementations, and provider-specific readiness/probing. Privileged providers may request capabilities such as secrets, crypto, client admission, pairing invites, signaling relay, hub presence, or browser shell. | Implicit hub internals, unpinned privileged authority, package manager policy, raw private key material, direct ownership of client admission without a grant, terminal data-plane ownership, or global client hydration. | `PackageManifest` and `CapabilitySurface` in core; `PluginWorkerRegistration` in `src/engine/plugin_worker.rs`; `PluginHandlerRef`, `PluginOwnedDescriptor`, `PluginResourceRef`, and `PluginInvocationRequest` in `src/contract/actor.rs`; vault notes `botster package manifests and lockfiles should declare capabilities and provenance`, `botster plugin runtime uses supervisor plus per plugin workers`, and `botster plugin entities are canonical for plugin-owned dynamic state`. |
 
@@ -77,10 +77,10 @@ Startup proceeds in this order:
    directory, session defaults, plugin/provider directories, transport bindings,
    and core engine knobs. The current scaffold for this is `src/config.rs`.
 2. The host profile initializes core mechanisms. For local PTY execution, the
-   current hub path constructs `HubRuntime` with `DefaultBotsterEngine::new()`
-   in `src/runtime.rs`. That is a host-profile decision to use the default
-   `local-runtime` core adapter, not proof that every embedder must take the
-   local process dependency.
+   current hub path constructs `HubRuntime` with `botster-core-daemon` and an
+   explicit `botster-session-worker` executable in `src/runtime.rs`. That is a
+   host-profile decision to use the daemon-backed local runtime adapter so hub
+   restarts do not own or kill worker PTYs.
 3. The host enables privileged providers from pinned package metadata and
    explicit grants. Providers that affect trust, admission, reachability,
    pairing, signaling, registry publication, secrets, remote network access, or
@@ -98,6 +98,25 @@ Startup proceeds in this order:
    `HubClientApi::handle_request`, an in-process request/response/event boundary
    that routes status, session, package, lifecycle, and terminal control
    requests through hub facades instead of raw core routers.
+
+## Session Restart Reconciliation
+
+The hub owns reconciliation policy; the core daemon owns session routing and the
+session worker owns PTY state. On hub startup, `HubRuntime` reads durable hub
+state, scans the core daemon registry, and applies these deterministic rules:
+
+- Adoptable live worker-backed records are adopted and surfaced as recovered
+  sessions.
+- Records with missing protocol evidence, missing workers, unhealthy workers, or
+  duplicate worker candidates are explicitly marked stale.
+- Terminal records stay terminal.
+- A live core daemon record that is absent from hub-owned state is recovered with
+  sanitized core session metadata. The hub does not invent policy metadata or
+  expose raw worker paths.
+
+The adoption decision must come from core daemon/session-worker evidence such as
+restart-contract metadata and worker liveness. Path existence, registry shape, or
+defaulted positive fields are not sufficient recovery evidence.
 
 The hub owns the control plane: topology, lifecycle, discovery, authorization,
 admission, routing decisions, recovery, cleanup, and provider/plugin
@@ -145,10 +164,10 @@ payloads, scrollback, or per-client egress. Core already names `SessionIo` and
   long will make ownership unclear. Mitigation: when a boundary becomes
   enforceable, replace old names cold turkey unless a real deployment boundary
   requires temporary compatibility.
-- Feature-gated docs drift: references to `DefaultBotsterEngine` can become
-  wrong for contract-only embedders. Mitigation: call it the default
-  `local-runtime` instance and keep `BotsterEngine` as the always-available
-  facade.
+- Feature-gated docs drift: references to the old in-process
+  `DefaultBotsterEngine` path can become wrong for the hub. Mitigation: describe
+  the hub session path as daemon-backed and keep direct core-engine details in
+  the core repo.
 
 ## Migration Path For `botster-hub`
 
@@ -160,8 +179,9 @@ payloads, scrollback, or per-client egress. Core already names `SessionIo` and
    `src/runtime.rs`, `src/config.rs`, `src/auth.rs`, `src/persistence.rs`,
    `src/packages.rs`, `src/providers.rs`, and `src/adapters/*`.
 4. Keep runtime proof paths facade-backed. The current `HubRuntime` should
-   continue to use core's default local facade for local execution rather than
-   assembling `MultiplexerEngine` directly.
+   continue to route local execution through `CoreDaemon` with an explicit
+   session-worker path rather than assembling `MultiplexerEngine` directly or
+   bypassing the hub facade.
 5. Move product policy into host-profile/provider/plugin packages without
    widening core. Cloud federation, signaling relays, browser shell delivery,
    SSO, package indexes, marketplace UX, and workflow apps should compose core

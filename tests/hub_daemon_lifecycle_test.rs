@@ -3,18 +3,21 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Once;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use botster_core::{
     Capability, CapabilitySurface, CoreSessionMetadata, ExtensionEntrypoint, ExtensionKind,
     ExtensionRuntime, HostProfileMetadata, HostProfilePolicySection, PackageManifest,
-    PackageSource, RequestId, ResizePayload, SessionId, SessionSpawnRequest, SpawnEnvironment,
-    SpawnWorkingDirectory,
+    PackageSource, ProcessIdentity, RequestId, ResizePayload, SessionId, SessionSpawnRequest,
+    SpawnEnvironment, SpawnWorkingDirectory, SubscriptionId,
 };
+use botster_core_daemon::{RegistryRecord, SessionRegistry};
 use botster_hub::{
-    DataDirectoryOption, FileHubStateStore, HostIdentityOptions, HubDaemon, HubDaemonState,
+    CoreEngineOptions, DataDirectoryOption, FileHubStateStore, HostIdentityOptions, HubClientApi,
+    HubClientEvent, HubClientRequest, HubClientResponseBody, HubDaemon, HubDaemonState,
     HubStartupOptions, HubStateLoadSource, HubStateStore, PackageAdmissionPolicy,
-    PackageProvenance, RuntimeEnvironment, SessionDefaults, TransportBindings,
+    PackageProvenance, PackageRegistry, RuntimeEnvironment, SessionDefaults, TransportBindings,
 };
 
 fn unique_test_dir(name: &str) -> PathBuf {
@@ -47,10 +50,71 @@ fn explicit_config(data_directory: impl Into<PathBuf>) -> botster_hub::HubConfig
             local_socket: None,
             tcp: Vec::new(),
         },
+        core_engine: CoreEngineOptions {
+            session_worker_path: Some(worker_path()),
+            ..CoreEngineOptions::default()
+        },
         ..HubStartupOptions::default()
     }
     .build_config_for_environment(&RuntimeEnvironment::from_values(None, None, None))
     .expect("explicit daemon config should build")
+}
+
+fn empty_registry() -> PackageRegistry {
+    PackageRegistry::new(Vec::<Capability>::new().into_iter().collect())
+}
+
+fn worker_path() -> PathBuf {
+    static BUILD_WORKER: Once = Once::new();
+    BUILD_WORKER.call_once(|| {
+        let status = Command::new("cargo")
+            .args([
+                "build",
+                "--manifest-path",
+                core_manifest_path()
+                    .to_str()
+                    .expect("core manifest path should be utf8"),
+                "-p",
+                "botster-core",
+                "--bin",
+                "botster-session-worker",
+                "--target-dir",
+                "target",
+            ])
+            .status()
+            .expect("worker binary build command should run");
+        assert!(
+            status.success(),
+            "worker binary should build for hub daemon tests"
+        );
+    });
+
+    PathBuf::from("target/debug/botster-session-worker")
+}
+
+fn core_manifest_path() -> PathBuf {
+    let cargo_home = std::env::var_os("CARGO_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cargo")))
+        .expect("cargo home should resolve");
+    let checkouts = cargo_home.join("git").join("checkouts");
+    for checkout in std::fs::read_dir(&checkouts).expect("cargo git checkouts should be readable") {
+        let checkout = checkout.expect("checkout entry should read");
+        let name = checkout.file_name();
+        if !name.to_string_lossy().starts_with("botster-core-") {
+            continue;
+        }
+        for revision in
+            std::fs::read_dir(checkout.path()).expect("botster-core revisions should be readable")
+        {
+            let revision = revision.expect("revision entry should read");
+            let manifest = revision.path().join("Cargo.toml");
+            if manifest.exists() {
+                return manifest;
+            }
+        }
+    }
+    panic!("botster-core git checkout should exist after dependency resolution");
 }
 
 fn spawn_request(config: &botster_hub::HubConfig) -> SessionSpawnRequest {
@@ -77,6 +141,52 @@ fn spawn_request(config: &botster_hub::HubConfig) -> SessionSpawnRequest {
             cols: config.session_defaults.initial_cols,
         }),
     }
+}
+
+fn drain_until_client_output(
+    api: &HubClientApi,
+    runtime: &mut botster_hub::HubRuntime,
+    packages: &PackageRegistry,
+    session_id: &SessionId,
+    needle: &[u8],
+    logical_clock: &mut u64,
+) -> Vec<HubClientEvent> {
+    let mut observed = Vec::new();
+    for _ in 0..100 {
+        let response = api
+            .handle_request(
+                runtime,
+                packages,
+                HubClientRequest::DrainRuntime {
+                    request_id: RequestId("hub-daemon-drain".to_string()),
+                    session_id: session_id.clone(),
+                    last_output_at: *logical_clock,
+                },
+            )
+            .expect("drain through hub client api");
+        *logical_clock += 1;
+        let HubClientResponseBody::Events(events) = response.body else {
+            panic!("drain should return events");
+        };
+        observed.extend(events);
+
+        if observed.iter().any(|event| {
+            matches!(
+                event,
+                HubClientEvent::TerminalOutput { data, .. }
+                    if data.windows(needle.len()).any(|window| window == needle)
+            )
+        }) {
+            return observed;
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    panic!(
+        "timed out waiting for {:?} in client output",
+        String::from_utf8_lossy(needle)
+    );
 }
 
 fn package_provenance() -> PackageProvenance {
@@ -185,6 +295,177 @@ fn daemon_starts_empty_state_reports_status_uses_core_and_stops_idempotently() {
         .expect("reload committed daemon state");
     assert_eq!(reopened.schema_version, 1);
     assert_eq!(reopened.host.id, "hub-daemon-test");
+}
+
+#[test]
+fn daemon_restart_reconnects_worker_backed_session_through_client_api() {
+    let config = explicit_config(unique_test_dir("restart-reconnect"));
+    let packages = empty_registry();
+    let api = HubClientApi::local_operator("hub-daemon-restart-client");
+    let session_id = SessionId("hub-daemon-restart-session".to_string());
+    let subscription_id = SubscriptionId("hub-daemon-restart-subscription".to_string());
+    let mut logical_clock = 10;
+
+    let mut daemon = HubDaemon::start(config.clone()).expect("start first hub daemon");
+    api.handle_request(
+        daemon.runtime_mut().expect("runtime initialized"),
+        &packages,
+        HubClientRequest::Spawn {
+            request_id: RequestId("hub-daemon-restart-spawn".to_string()),
+            session_id: session_id.clone(),
+            command: "printf 'restart-ready\\n'; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done".to_string(),
+        },
+    )
+    .expect("spawn through hub client api");
+    api.handle_request(
+        daemon.runtime_mut().expect("runtime initialized"),
+        &packages,
+        HubClientRequest::Attach {
+            request_id: RequestId("hub-daemon-restart-attach".to_string()),
+            session_id: session_id.clone(),
+            subscription_id: subscription_id.clone(),
+            now_seconds: logical_clock,
+        },
+    )
+    .expect("attach before restart through client api");
+    logical_clock += 1;
+    drain_until_client_output(
+        &api,
+        daemon.runtime_mut().expect("runtime initialized"),
+        &packages,
+        &session_id,
+        b"restart-ready",
+        &mut logical_clock,
+    );
+    daemon.stop();
+
+    let mut restarted = HubDaemon::start(config).expect("restart hub daemon");
+    assert!(
+        restarted
+            .runtime()
+            .expect("runtime initialized")
+            .reconciliation()
+            .recovered_sessions
+            .contains(&session_id),
+        "restart should recover the live worker-backed session"
+    );
+    let listed = api
+        .handle_request(
+            restarted.runtime_mut().expect("runtime initialized"),
+            &packages,
+            HubClientRequest::ListSessions {
+                request_id: RequestId("hub-daemon-restart-list".to_string()),
+            },
+        )
+        .expect("list after restart through client api");
+    assert!(
+        matches!(listed.body, HubClientResponseBody::Sessions(sessions) if sessions.iter().any(|session| session.session_id == session_id))
+    );
+
+    api.handle_request(
+        restarted.runtime_mut().expect("runtime initialized"),
+        &packages,
+        HubClientRequest::Attach {
+            request_id: RequestId("hub-daemon-restart-reattach".to_string()),
+            session_id: session_id.clone(),
+            subscription_id: subscription_id.clone(),
+            now_seconds: logical_clock,
+        },
+    )
+    .expect("reattach after restart through client api");
+    logical_clock += 1;
+    api.handle_request(
+        restarted.runtime_mut().expect("runtime initialized"),
+        &packages,
+        HubClientRequest::Input {
+            request_id: RequestId("hub-daemon-restart-input".to_string()),
+            session_id: session_id.clone(),
+            data: b"after-restart\n".to_vec(),
+            now_seconds: logical_clock,
+        },
+    )
+    .expect("input after restart through client api");
+    logical_clock += 1;
+    drain_until_client_output(
+        &api,
+        restarted.runtime_mut().expect("runtime initialized"),
+        &packages,
+        &session_id,
+        b"echo:after-restart",
+        &mut logical_clock,
+    );
+    api.handle_request(
+        restarted.runtime_mut().expect("runtime initialized"),
+        &packages,
+        HubClientRequest::Shutdown {
+            request_id: RequestId("hub-daemon-restart-shutdown".to_string()),
+            session_id,
+            reason: "restart proof complete".to_string(),
+            now_seconds: logical_clock,
+        },
+    )
+    .expect("shutdown after restart through client api");
+}
+
+#[test]
+fn daemon_startup_reconciliation_marks_stale_and_recovers_missing_live_sessions() {
+    let stale_config = explicit_config(unique_test_dir("stale-reconcile"));
+    let stale_session_id = SessionId("hub-daemon-stale-session".to_string());
+    let registry = SessionRegistry::new(stale_config.data_directory.join("core-daemon"));
+    let mut stale_record = RegistryRecord::running(
+        stale_session_id.clone(),
+        Some(ProcessIdentity {
+            pid: Some(42),
+            runtime_id: Some("stale-runtime".to_string()),
+        }),
+        ResizePayload { rows: 24, cols: 80 },
+        "sh".to_string(),
+        1,
+    );
+    stale_record.observe_restart_contract(serde_json::json!({"session": "hub-daemon-stale"}), 2);
+    registry
+        .save(&stale_record)
+        .expect("stale registry fixture should save");
+
+    let stale_daemon = HubDaemon::start(stale_config).expect("start daemon with stale registry");
+    assert!(
+        stale_daemon
+            .runtime()
+            .expect("runtime initialized")
+            .reconciliation()
+            .stale_sessions
+            .contains(&stale_session_id),
+        "hub-known record without a live worker should become stale deterministically"
+    );
+
+    let recovered_config = explicit_config(unique_test_dir("recovered-reconcile"));
+    let packages = empty_registry();
+    let api = HubClientApi::local_operator("hub-daemon-recovered-client");
+    let recovered_session_id = SessionId("hub-daemon-recovered-session".to_string());
+    let mut first = HubDaemon::start(recovered_config.clone()).expect("start first daemon");
+    api.handle_request(
+        first.runtime_mut().expect("runtime initialized"),
+        &packages,
+        HubClientRequest::Spawn {
+            request_id: RequestId("hub-daemon-recovered-spawn".to_string()),
+            session_id: recovered_session_id.clone(),
+            command: "printf 'recovered-ready\\n'; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done".to_string(),
+        },
+    )
+    .expect("spawn recovered session through client api");
+    first.stop();
+
+    let recovered =
+        HubDaemon::start(recovered_config).expect("restart daemon with live core registry record");
+    assert!(
+        recovered
+            .runtime()
+            .expect("runtime initialized")
+            .reconciliation()
+            .recovered_sessions
+            .contains(&recovered_session_id),
+        "core-live worker-backed session absent from hub state should be recovered"
+    );
 }
 
 #[test]
@@ -323,12 +604,13 @@ fn cli_sessions_spawn_and_list_route_through_client_api() {
     );
     let stdout = String::from_utf8(list.stdout).expect("stdout is utf8");
     assert!(stdout.contains("response=sessions"));
-    assert!(stdout.contains("session_count=0"));
+    assert!(stdout.contains("session_count=1"));
+    assert!(stdout.contains("session id=dogfood-session"));
     assert!(!stdout.contains(data_dir.to_string_lossy().as_ref()));
 }
 
 #[test]
-fn cli_inspect_reports_not_found_for_fresh_in_process_daemon() {
+fn cli_inspect_reports_not_found_for_missing_session() {
     let data_dir = unique_test_dir("cli-inspect");
     let output = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
         .arg("inspect")

@@ -107,9 +107,9 @@ impl Responsibility {
 }
 
 const CORE_RUNTIME_ROLE: CoreRuntimeRole = CoreRuntimeRole {
-    facade: "botster_core::DefaultBotsterEngine",
+    facade: "botster_core_daemon::CoreDaemon",
     runtime_feature: "local-runtime",
-    owns: "policy-free local PTY/process mechanics consumed through the BotsterEngine facade",
+    owns: "policy-free worker-backed local PTY/process mechanics consumed through the hub runtime facade",
 };
 
 const POLICY_AREAS: &[PolicyArea] = &[
@@ -258,10 +258,7 @@ mod tests {
 
         assert_eq!(profile.id, "botster-hub");
         assert_eq!(profile.trust, HostProfileTrust::FirstPartyTrusted);
-        assert_eq!(
-            profile.core_role.facade,
-            "botster_core::DefaultBotsterEngine"
-        );
+        assert_eq!(profile.core_role.facade, "botster_core_daemon::CoreDaemon");
         assert_eq!(profile.core_role.runtime_feature, "local-runtime");
         assert!(profile.core_role.owns.contains("policy-free"));
     }

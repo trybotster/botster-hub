@@ -318,6 +318,9 @@ pub struct TcpBinding {
 pub struct CoreEngineOptions {
     /// Queue capacity choices keyed by core queue source name.
     pub queue_capacities: Vec<CoreQueueCapacity>,
+    /// Explicit worker executable used for restart-durable daemon-backed sessions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_worker_path: Option<PathBuf>,
     /// Session I/O coalescing policy passed to core-owned session workers.
     pub session_io_coalescing: SessionIoCoalescingOptions,
     /// Per-plugin worker queue capacity passed to core plugin worker primitives.
@@ -334,6 +337,7 @@ impl Default for CoreEngineOptions {
                     capacity: source.default_capacity(),
                 })
                 .collect(),
+            session_worker_path: None,
             session_io_coalescing: SessionIoCoalescingOptions::from(
                 SessionIoCoalescingPolicy::default(),
             ),
@@ -349,6 +353,9 @@ impl CoreEngineOptions {
             self.plugin_worker_capacity,
         )?;
         self.session_io_coalescing.validate()?;
+        if let Some(path) = &self.session_worker_path {
+            validate_non_empty_path("core_engine.session_worker_path", path)?;
+        }
 
         for queue in &self.queue_capacities {
             validate_non_empty_string("core_engine.queue_capacities.source", &queue.source)?;

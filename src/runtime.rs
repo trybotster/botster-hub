@@ -1,16 +1,26 @@
-//! Profile-owned runtime facade over the default `botster-core` engine.
+//! Profile-owned runtime facade over the daemon-backed `botster-core` engine.
 //!
 //! The first-party host profile owns explicit configuration and admission
 //! policy. Session process mechanics, terminal byte routing, activity
-//! accounting, and shutdown stay in `botster-core` through
-//! `DefaultBotsterEngine`.
+//! accounting, and shutdown stay in `botster-core` through `CoreDaemon` and
+//! the configured session-worker executable.
+
+use std::collections::HashMap;
+use std::error::Error;
+use std::fmt;
+use std::path::PathBuf;
 
 use botster_core::{
     BotsterEngineObservation, BotsterEngineOutput, BotsterSpawnOutcome, ClientId, CoreSession,
-    CoreSessionMetadata, DefaultBotsterEngine, DefaultBotsterEngineError, EngineSessionInspection,
-    MailboxSendFailureReason, PluginCapabilityRuntime, PluginCleanupResult,
-    PluginInvocationOutcome, PluginInvocationRequest, PluginKey, PreparedSnapshotRequest,
-    QueueSource, RequestId, SessionActivityStatus, SessionId, SessionSpawnRequest, SubscriptionId,
+    CoreSessionMetadata, EngineSessionInspection, MailboxSendFailureReason,
+    PluginCapabilityRuntime, PluginCleanupResult, PluginInvocationOutcome, PluginInvocationRequest,
+    PluginKey, PreparedSnapshotRequest, ProcessIdentity, QueueSource, RequestId,
+    SessionActivityStatus, SessionId, SessionLifecycleState, SessionRuntimeHandle,
+    SessionSpawnRequest, SubscriptionId,
+};
+use botster_core_daemon::{
+    CoreDaemon, CoreDaemonConfig, CoreDaemonError, RegistrySessionState, SessionAdoptionState,
+    SpawnSessionRequest,
 };
 
 use crate::capabilities::HubCapabilityRuntime;
@@ -19,7 +29,7 @@ use crate::lifecycle::{
     HubLifecycleResult, HubPluginLifecycle, HubPluginLifecycleStatus, HubPluginRuntimeBundle,
 };
 use crate::packages::PackageRegistry;
-use crate::persistence::{FileHubStateStore, HubState, HubStateStore, HubStateStoreResult};
+use crate::persistence::{FileHubStateStore, HubState, HubStateStore, HubStateStoreError};
 
 /// Hub-owned adapter and policy facade over the default local core engine.
 ///
@@ -30,10 +40,21 @@ use crate::persistence::{FileHubStateStore, HubState, HubStateStore, HubStateSto
 pub struct HubRuntime {
     config: HubConfig,
     state: HubState,
-    engine: DefaultBotsterEngine,
+    core_daemon: CoreDaemon,
+    sessions: HashMap<SessionId, CoreSession>,
+    reconciliation: HubSessionReconciliation,
     plugin_lifecycle: HubPluginLifecycle,
     capability_runtime: HubCapabilityRuntime,
     last_capability_cleanup: Option<PluginCleanupResult>,
+}
+
+/// Deterministic session reconciliation summary from hub startup.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HubSessionReconciliation {
+    /// Registry-backed sessions that were adopted into the restarted hub.
+    pub recovered_sessions: Vec<SessionId>,
+    /// Registry-backed sessions that were marked stale by hub startup policy.
+    pub stale_sessions: Vec<SessionId>,
 }
 
 impl HubRuntime {
@@ -41,18 +62,27 @@ impl HubRuntime {
     #[must_use]
     pub fn new(config: HubConfig) -> Self {
         let state = HubState::from_config(&config);
+        let mut runtime = Self::from_state(config, state);
+        let _ = runtime.reconcile_sessions(0);
+        runtime
+    }
+
+    fn from_state(config: HubConfig, state: HubState) -> Self {
+        let core_daemon = CoreDaemon::new(core_daemon_config(&config));
         Self {
             capability_runtime: HubCapabilityRuntime::from_config(&config),
             config,
             state,
-            engine: DefaultBotsterEngine::new(),
+            core_daemon,
+            sessions: HashMap::new(),
+            reconciliation: HubSessionReconciliation::default(),
             plugin_lifecycle: HubPluginLifecycle::new(),
             last_capability_cleanup: None,
         }
     }
 
     /// Load durable hub state from the resolved data directory before building runtime.
-    pub fn load(config: HubConfig) -> HubStateStoreResult<Self> {
+    pub fn load(config: HubConfig) -> HubRuntimeResult<Self> {
         let store = FileHubStateStore::for_data_directory(&config.data_directory);
         Self::load_from_store(config, &store)
     }
@@ -61,16 +91,11 @@ impl HubRuntime {
     pub fn load_from_store(
         config: HubConfig,
         store: &impl HubStateStore,
-    ) -> HubStateStoreResult<Self> {
+    ) -> HubRuntimeResult<Self> {
         let state = store.load_or_initialize(&config)?;
-        Ok(Self {
-            capability_runtime: HubCapabilityRuntime::from_config(&config),
-            config,
-            state,
-            engine: DefaultBotsterEngine::new(),
-            plugin_lifecycle: HubPluginLifecycle::new(),
-            last_capability_cleanup: None,
-        })
+        let mut runtime = Self::from_state(config, state);
+        runtime.reconcile_sessions(0)?;
+        Ok(runtime)
     }
 
     /// Return the policy-resolved hub config that created this runtime.
@@ -89,6 +114,17 @@ impl HubRuntime {
     #[must_use]
     pub const fn state(&self) -> &HubState {
         &self.state
+    }
+
+    /// Return the startup reconciliation decisions made against the core daemon registry.
+    #[must_use]
+    pub const fn reconciliation(&self) -> &HubSessionReconciliation {
+        &self.reconciliation
+    }
+
+    /// Release worker processes for an intentional hub restart.
+    pub fn release_for_restart(&mut self) {
+        self.core_daemon.release_for_restart();
     }
 
     /// Load an enabled package through core plugin worker mechanics.
@@ -223,13 +259,13 @@ impl HubRuntime {
     /// Return a recorded core session.
     #[must_use]
     pub fn session(&self, session_id: &SessionId) -> Option<&botster_core::CoreSession> {
-        self.engine.session(session_id)
+        self.sessions.get(session_id)
     }
 
     /// Return recorded sessions for host visibility without exposing core's command router.
     #[must_use]
     pub fn list_sessions(&self) -> Vec<CoreSession> {
-        self.engine.list_sessions()
+        self.sessions.values().cloned().collect()
     }
 
     /// Spawn a local PTY-backed session through core from a host-owned request.
@@ -237,8 +273,25 @@ impl HubRuntime {
         &mut self,
         request: SessionSpawnRequest,
         metadata: CoreSessionMetadata,
-    ) -> Result<BotsterSpawnOutcome, DefaultBotsterEngineError> {
-        self.engine.spawn_session(request, metadata)
+    ) -> Result<BotsterSpawnOutcome, HubRuntimeError> {
+        let request_id = request.request_id.clone();
+        let session = self.core_daemon.spawn(
+            SpawnSessionRequest {
+                request,
+                metadata: metadata.clone(),
+            },
+            0,
+        )?;
+        self.sessions
+            .insert(session.session_id.clone(), session.clone());
+        Ok(BotsterSpawnOutcome {
+            handle: session_handle(&session.session_id, request_id),
+            session: session.clone(),
+            observations: vec![BotsterEngineObservation::SessionLifecycle {
+                session_id: session.session_id,
+                state: SessionLifecycleState::Running,
+            }],
+        })
     }
 
     /// Attach a client subscription to a session through core.
@@ -248,9 +301,10 @@ impl HubRuntime {
         session_id: SessionId,
         subscription_id: SubscriptionId,
         now_seconds: u64,
-    ) -> Result<BotsterEngineOutput, DefaultBotsterEngineError> {
-        self.engine
-            .attach_client(client_id, session_id, subscription_id, now_seconds)
+    ) -> Result<BotsterEngineOutput, HubRuntimeError> {
+        self.core_daemon
+            .attach(client_id, session_id, subscription_id, now_seconds)?;
+        Ok(BotsterEngineOutput::empty())
     }
 
     /// Detach a client subscription from a session through core.
@@ -260,9 +314,10 @@ impl HubRuntime {
         session_id: SessionId,
         subscription_id: SubscriptionId,
         now_seconds: u64,
-    ) -> Result<BotsterEngineOutput, DefaultBotsterEngineError> {
-        self.engine
-            .detach_client(client_id, session_id, subscription_id, now_seconds)
+    ) -> Result<BotsterEngineOutput, HubRuntimeError> {
+        self.core_daemon
+            .detach(client_id, session_id, subscription_id, now_seconds)?;
+        Ok(BotsterEngineOutput::empty())
     }
 
     /// Write terminal bytes into a session through core.
@@ -272,9 +327,10 @@ impl HubRuntime {
         session_id: SessionId,
         data: impl Into<Vec<u8>>,
         now_seconds: u64,
-    ) -> Result<BotsterEngineOutput, DefaultBotsterEngineError> {
-        self.engine
-            .write_bytes(client_id, session_id, data, now_seconds)
+    ) -> Result<BotsterEngineOutput, HubRuntimeError> {
+        self.core_daemon
+            .input(client_id, session_id, data, now_seconds)?;
+        Ok(BotsterEngineOutput::empty())
     }
 
     /// Resize a session terminal through the explicit hub facade.
@@ -285,9 +341,10 @@ impl HubRuntime {
         rows: u16,
         cols: u16,
         now_seconds: u64,
-    ) -> Result<BotsterEngineOutput, DefaultBotsterEngineError> {
-        self.engine
-            .resize(client_id, session_id, rows, cols, now_seconds)
+    ) -> Result<BotsterEngineOutput, HubRuntimeError> {
+        self.core_daemon
+            .resize(client_id, session_id, rows, cols, now_seconds)?;
+        Ok(BotsterEngineOutput::empty())
     }
 
     /// Drain available local runtime output through core's subscription path.
@@ -295,16 +352,37 @@ impl HubRuntime {
         &mut self,
         session_id: &SessionId,
         last_output_at: u64,
-    ) -> Result<BotsterEngineOutput, DefaultBotsterEngineError> {
-        self.engine.drain_runtime_once(session_id, last_output_at)
+    ) -> Result<BotsterEngineOutput, HubRuntimeError> {
+        let drained = self.core_daemon.drain(session_id, last_output_at)?;
+        for observation in &drained.observations {
+            if let BotsterEngineObservation::SessionLifecycle { session_id, state } = observation
+                && let Some(session) = self.sessions.get_mut(session_id)
+            {
+                session.lifecycle = state.clone();
+            }
+        }
+        Ok(BotsterEngineOutput {
+            client_egress: drained.client_egress,
+            session_requests: Vec::new(),
+            client_control_frames: Vec::new(),
+            session_events: Vec::new(),
+            observations: drained.observations,
+        })
     }
 
     /// Drain available local runtime output once for every live session.
     pub fn drain_runtime_all_once(
         &mut self,
         last_output_at: u64,
-    ) -> Result<BotsterEngineOutput, DefaultBotsterEngineError> {
-        self.engine.drain_runtime_all_once(last_output_at)
+    ) -> Result<BotsterEngineOutput, HubRuntimeError> {
+        let mut output = BotsterEngineOutput::empty();
+        let session_ids: Vec<_> = self.sessions.keys().cloned().collect();
+        for session_id in session_ids {
+            let drained = self.drain_runtime_once(&session_id, last_output_at)?;
+            output.client_egress.extend(drained.client_egress);
+            output.observations.extend(drained.observations);
+        }
+        Ok(output)
     }
 
     /// Classify one session's activity through core.
@@ -313,9 +391,9 @@ impl HubRuntime {
         session_id: &SessionId,
         now_seconds: u64,
         active_threshold_seconds: u64,
-    ) -> Result<SessionActivityStatus, DefaultBotsterEngineError> {
-        self.engine
-            .classify_activity(session_id, now_seconds, active_threshold_seconds)
+    ) -> Result<SessionActivityStatus, HubRuntimeError> {
+        let inspection = self.inspect_session(session_id, now_seconds, active_threshold_seconds)?;
+        Ok(inspection.activity_status)
     }
 
     /// Inspect one session's lifecycle and activity through core.
@@ -324,9 +402,22 @@ impl HubRuntime {
         session_id: &SessionId,
         now_seconds: u64,
         active_threshold_seconds: u64,
-    ) -> Result<EngineSessionInspection, DefaultBotsterEngineError> {
-        self.engine
-            .inspect_session(session_id, now_seconds, active_threshold_seconds)
+    ) -> Result<EngineSessionInspection, HubRuntimeError> {
+        let session = self
+            .sessions
+            .get(session_id)
+            .cloned()
+            .ok_or_else(|| HubRuntimeError::UnknownSession(session_id.clone()))?;
+        let latest = session.activity.latest_activity_at().unwrap_or(now_seconds);
+        let activity_status = if now_seconds.saturating_sub(latest) <= active_threshold_seconds {
+            SessionActivityStatus::Active
+        } else {
+            SessionActivityStatus::Idle
+        };
+        Ok(EngineSessionInspection {
+            session,
+            activity_status,
+        })
     }
 
     /// Ask core to read a session screen where the runtime supports it.
@@ -335,8 +426,9 @@ impl HubRuntime {
         request_id: RequestId,
         session_id: SessionId,
         now_seconds: u64,
-    ) -> Result<BotsterEngineOutput, DefaultBotsterEngineError> {
-        self.engine.read_screen(request_id, session_id, now_seconds)
+    ) -> Result<BotsterEngineOutput, HubRuntimeError> {
+        let _ = (request_id, session_id, now_seconds);
+        Err(HubRuntimeError::UnsupportedDaemonOperation("read_screen"))
     }
 
     /// Ask core to capture a session snapshot where the runtime supports it.
@@ -345,9 +437,11 @@ impl HubRuntime {
         request_id: RequestId,
         session_id: SessionId,
         now_seconds: u64,
-    ) -> Result<BotsterEngineOutput, DefaultBotsterEngineError> {
-        self.engine
-            .capture_snapshot(request_id, session_id, now_seconds)
+    ) -> Result<BotsterEngineOutput, HubRuntimeError> {
+        let _ = (request_id, session_id, now_seconds);
+        Err(HubRuntimeError::UnsupportedDaemonOperation(
+            "capture_snapshot",
+        ))
     }
 
     /// Ask core to replay or prepare a session snapshot.
@@ -355,8 +449,11 @@ impl HubRuntime {
         &mut self,
         request: PreparedSnapshotRequest,
         now_seconds: u64,
-    ) -> Result<BotsterEngineOutput, DefaultBotsterEngineError> {
-        self.engine.replay_snapshot(request, now_seconds)
+    ) -> Result<BotsterEngineOutput, HubRuntimeError> {
+        let _ = (request, now_seconds);
+        Err(HubRuntimeError::UnsupportedDaemonOperation(
+            "replay_snapshot",
+        ))
     }
 
     /// Report client-side backpressure as typed core observation data.
@@ -367,9 +464,11 @@ impl HubRuntime {
         source: QueueSource,
         capacity: usize,
         depth: usize,
-    ) -> Result<BotsterEngineOutput, DefaultBotsterEngineError> {
-        self.engine
-            .report_backpressure(client_id, session_id, source, capacity, depth)
+    ) -> Result<BotsterEngineOutput, HubRuntimeError> {
+        let _ = (client_id, session_id, source, capacity, depth);
+        Err(HubRuntimeError::UnsupportedDaemonOperation(
+            "report_backpressure",
+        ))
     }
 
     /// Report accepted-but-slow delivery as typed core observation data.
@@ -381,15 +480,18 @@ impl HubRuntime {
         source: QueueSource,
         capacity: usize,
         depth: usize,
-    ) -> Result<BotsterEngineOutput, DefaultBotsterEngineError> {
-        self.engine.report_delivery_lag(
+    ) -> Result<BotsterEngineOutput, HubRuntimeError> {
+        let _ = (
             client_id,
             session_id,
             subscription_id,
             source,
             capacity,
             depth,
-        )
+        );
+        Err(HubRuntimeError::UnsupportedDaemonOperation(
+            "report_delivery_lag",
+        ))
     }
 
     /// Report a failed delivery attempt as typed core observation data.
@@ -400,9 +502,11 @@ impl HubRuntime {
         subscription_id: SubscriptionId,
         source: QueueSource,
         reason: MailboxSendFailureReason,
-    ) -> Result<BotsterEngineOutput, DefaultBotsterEngineError> {
-        self.engine
-            .report_delivery_failure(client_id, session_id, subscription_id, source, reason)
+    ) -> Result<BotsterEngineOutput, HubRuntimeError> {
+        let _ = (client_id, session_id, subscription_id, source, reason);
+        Err(HubRuntimeError::UnsupportedDaemonOperation(
+            "report_delivery_failure",
+        ))
     }
 
     /// Shut down one local PTY-backed session through core.
@@ -411,9 +515,57 @@ impl HubRuntime {
         session_id: SessionId,
         reason: impl Into<String>,
         now_seconds: u64,
-    ) -> Result<BotsterEngineOutput, DefaultBotsterEngineError> {
-        self.engine
-            .shutdown_session(session_id, reason, now_seconds)
+    ) -> Result<BotsterEngineOutput, HubRuntimeError> {
+        let _ = reason.into();
+        self.core_daemon
+            .shutdown(Some(session_id.clone()), now_seconds)?;
+        if let Some(session) = self.sessions.get_mut(&session_id) {
+            session.lifecycle = SessionLifecycleState::Stopping;
+        }
+        Ok(BotsterEngineOutput {
+            observations: vec![BotsterEngineObservation::SessionLifecycle {
+                session_id,
+                state: SessionLifecycleState::Stopping,
+            }],
+            ..BotsterEngineOutput::empty()
+        })
+    }
+
+    fn reconcile_sessions(&mut self, now_seconds: u64) -> Result<(), HubRuntimeError> {
+        self.reconciliation = HubSessionReconciliation::default();
+        for report in self.core_daemon.adoption_scan()? {
+            match report.state {
+                SessionAdoptionState::Adoptable => {
+                    let session = self
+                        .core_daemon
+                        .adopt_session(&report.record.session_id, now_seconds)?;
+                    self.reconciliation
+                        .recovered_sessions
+                        .push(session.session_id.clone());
+                    self.sessions.insert(session.session_id.clone(), session);
+                }
+                SessionAdoptionState::MissingProtocolEvidence
+                | SessionAdoptionState::StaleWorker { .. }
+                | SessionAdoptionState::UnhealthyWorker { .. }
+                | SessionAdoptionState::DuplicateWorker { .. } => {
+                    self.core_daemon
+                        .mark_stale(&report.record.session_id, now_seconds)?;
+                    self.reconciliation
+                        .stale_sessions
+                        .push(report.record.session_id);
+                }
+                SessionAdoptionState::Terminal => {
+                    if report.record.state == RegistrySessionState::Running {
+                        self.core_daemon
+                            .mark_stale(&report.record.session_id, now_seconds)?;
+                        self.reconciliation
+                            .stale_sessions
+                            .push(report.record.session_id);
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -426,5 +578,87 @@ pub type HubRuntimeOutput = BotsterEngineOutput;
 /// Spawn result emitted by the embedded core engine.
 pub type HubRuntimeSpawnOutcome = BotsterSpawnOutcome;
 
-/// Error emitted by the embedded default local core engine.
-pub type HubRuntimeError = DefaultBotsterEngineError;
+/// Error emitted by the daemon-backed hub runtime.
+#[derive(Debug)]
+pub enum HubRuntimeError {
+    /// Core daemon operation failed.
+    CoreDaemon(CoreDaemonError),
+    /// Durable hub state failed to load.
+    State(HubStateStoreError),
+    /// Session was not present in the daemon-backed hub session index.
+    UnknownSession(SessionId),
+    /// The current core daemon API does not expose this facade operation yet.
+    UnsupportedDaemonOperation(&'static str),
+}
+
+impl fmt::Display for HubRuntimeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CoreDaemon(error) => write!(formatter, "{error}"),
+            Self::State(error) => write!(formatter, "{error}"),
+            Self::UnknownSession(session_id) => {
+                write!(formatter, "unknown session: {session_id:?}")
+            }
+            Self::UnsupportedDaemonOperation(operation) => {
+                write!(formatter, "core daemon does not expose {operation}")
+            }
+        }
+    }
+}
+
+impl Error for HubRuntimeError {}
+
+impl From<CoreDaemonError> for HubRuntimeError {
+    fn from(error: CoreDaemonError) -> Self {
+        Self::CoreDaemon(error)
+    }
+}
+
+impl From<HubStateStoreError> for HubRuntimeError {
+    fn from(error: HubStateStoreError) -> Self {
+        Self::State(error)
+    }
+}
+
+/// Hub runtime result alias.
+pub type HubRuntimeResult<T> = Result<T, HubRuntimeError>;
+
+fn core_daemon_config(config: &HubConfig) -> CoreDaemonConfig {
+    CoreDaemonConfig::new(config.data_directory.join("core-daemon"))
+        .with_worker_path(session_worker_path(config))
+}
+
+fn session_worker_path(config: &HubConfig) -> PathBuf {
+    config
+        .core_engine
+        .session_worker_path
+        .clone()
+        .unwrap_or_else(|| {
+            std::env::current_exe()
+                .ok()
+                .and_then(|path| {
+                    path.parent().map(|parent| {
+                        if parent.file_name().and_then(|name| name.to_str()) == Some("deps") {
+                            parent
+                                .parent()
+                                .unwrap_or(parent)
+                                .join("botster-session-worker")
+                        } else {
+                            parent.join("botster-session-worker")
+                        }
+                    })
+                })
+                .unwrap_or_else(|| PathBuf::from("botster-session-worker"))
+        })
+}
+
+fn session_handle(session_id: &SessionId, request_id: RequestId) -> SessionRuntimeHandle {
+    SessionRuntimeHandle {
+        request_id,
+        session_id: session_id.clone(),
+        process: ProcessIdentity {
+            pid: None,
+            runtime_id: Some(format!("{}-worker", session_id.0)),
+        },
+    }
+}

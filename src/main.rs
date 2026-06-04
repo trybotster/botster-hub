@@ -842,7 +842,7 @@ fn run_one(args: Vec<String>) -> Result<(), RunOneError> {
         runtime.shutdown_session(session_id.clone(), "run-one complete", logical_clock)?;
 
     println!(
-        "{} first-party host profile booted for {} through DefaultBotsterEngine",
+        "{} first-party host profile booted for {} through CoreDaemon",
         profile.id, host_id
     );
     println!("spawned_session={}", spawn.handle.session_id.0);

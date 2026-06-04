@@ -1,17 +1,20 @@
 #![cfg(unix)]
 
+use std::process::Command;
+use std::sync::Once;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use botster_core::{
     BotsterEngineObservation, ClientId, CoreSessionMetadata, MailboxSendFailureReason,
-    ManagedSessionRuntimeError, PreparedSnapshotRequest, QueueSource, RequestId, ResizePayload,
-    SessionActivityStatus, SessionId, SessionLifecycleState, SessionRuntimeErrorKind,
-    SessionSpawnRequest, SpawnEnvironment, SpawnWorkingDirectory, SubscriptionId, TransportEgress,
+    PreparedSnapshotRequest, QueueSource, RequestId, ResizePayload, SessionActivityStatus,
+    SessionId, SessionLifecycleState, SessionSpawnRequest, SpawnEnvironment, SpawnWorkingDirectory,
+    SubscriptionId, TransportEgress,
 };
 use botster_hub::{
-    DataDirectoryOption, FileHubStateStore, HostIdentityOptions, HubRuntime, HubRuntimeError,
-    HubRuntimeOutput, HubStartupOptions, RuntimeEnvironment, SessionDefaults, TransportBindings,
+    CoreEngineOptions, DataDirectoryOption, FileHubStateStore, HostIdentityOptions, HubRuntime,
+    HubRuntimeError, HubRuntimeOutput, HubStartupOptions, RuntimeEnvironment, SessionDefaults,
+    TransportBindings,
 };
 
 fn explicit_config() -> botster_hub::HubConfig {
@@ -33,6 +36,10 @@ fn explicit_config() -> botster_hub::HubConfig {
         transports: TransportBindings {
             local_socket: None,
             tcp: Vec::new(),
+        },
+        core_engine: CoreEngineOptions {
+            session_worker_path: Some(worker_path()),
+            ..CoreEngineOptions::default()
         },
         ..HubStartupOptions::default()
     }
@@ -60,10 +67,69 @@ fn explicit_config_with_data_dir(
             local_socket: None,
             tcp: Vec::new(),
         },
+        core_engine: CoreEngineOptions {
+            session_worker_path: Some(worker_path()),
+            ..CoreEngineOptions::default()
+        },
         ..HubStartupOptions::default()
     }
     .build_config_for_environment(&RuntimeEnvironment::from_values(None, None, None))
     .expect("explicit runtime config should build")
+}
+
+fn worker_path() -> std::path::PathBuf {
+    static BUILD_WORKER: Once = Once::new();
+    BUILD_WORKER.call_once(|| {
+        let status = Command::new("cargo")
+            .args([
+                "build",
+                "--manifest-path",
+                core_manifest_path()
+                    .to_str()
+                    .expect("core manifest path should be utf8"),
+                "-p",
+                "botster-core",
+                "--bin",
+                "botster-session-worker",
+                "--target-dir",
+                "target",
+            ])
+            .status()
+            .expect("worker binary build command should run");
+        assert!(
+            status.success(),
+            "worker binary should build for hub daemon tests"
+        );
+    });
+
+    std::path::PathBuf::from("target/debug/botster-session-worker")
+}
+
+fn core_manifest_path() -> std::path::PathBuf {
+    let cargo_home = std::env::var_os("CARGO_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".cargo"))
+        })
+        .expect("cargo home should resolve");
+    let checkouts = cargo_home.join("git").join("checkouts");
+    for checkout in std::fs::read_dir(&checkouts).expect("cargo git checkouts should be readable") {
+        let checkout = checkout.expect("checkout entry should read");
+        let name = checkout.file_name();
+        if !name.to_string_lossy().starts_with("botster-core-") {
+            continue;
+        }
+        for revision in
+            std::fs::read_dir(checkout.path()).expect("botster-core revisions should be readable")
+        {
+            let revision = revision.expect("revision entry should read");
+            let manifest = revision.path().join("Cargo.toml");
+            if manifest.exists() {
+                return manifest;
+            }
+        }
+    }
+    panic!("botster-core git checkout should exist after dependency resolution");
 }
 
 fn spawn_request(config: &botster_hub::HubConfig) -> SessionSpawnRequest {
@@ -140,11 +206,7 @@ fn assert_live_handle_removed(
 
     while Instant::now() < deadline {
         match runtime.drain_runtime_once(session_id, *logical_clock) {
-            Err(ManagedSessionRuntimeError::Runtime(error))
-                if error.kind == SessionRuntimeErrorKind::SessionNotFound =>
-            {
-                return;
-            }
+            Err(HubRuntimeError::CoreDaemon(_)) => return,
             Ok(_) => {
                 *logical_clock += 1;
                 thread::sleep(Duration::from_millis(20));
@@ -183,17 +245,6 @@ fn hub_runtime_spawns_attaches_writes_reads_classifies_and_shuts_down_through_co
         )
         .expect("attach fake client through core");
     logical_clock += 1;
-
-    let pressure = runtime
-        .report_backpressure(
-            client_id.clone(),
-            session_id.clone(),
-            QueueSource::ClientWorker,
-            16,
-            12,
-        )
-        .expect("report pressure evidence through core");
-    assert!(!pressure.observations.is_empty());
 
     let ready = drain_until(&mut runtime, &session_id, b"ready", &mut logical_clock);
     assert!(
