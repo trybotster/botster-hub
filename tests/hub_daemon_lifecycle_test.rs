@@ -179,11 +179,8 @@ fn provider_manifest() -> PackageManifest {
 
 fn write_local_plugin_package(root: &Path) {
     fs::create_dir_all(root).expect("create local package root");
-    fs::write(
-        root.join("plugin.lua"),
-        "-- synthetic local dogfood plugin\n",
-    )
-    .expect("write plugin entrypoint");
+    fs::write(root.join("plugin.lua"), "return botster.register({})\n")
+        .expect("write plugin entrypoint");
     fs::write(
         root.join("botster-package.json"),
         r#"{
@@ -202,6 +199,29 @@ fn write_local_plugin_package(root: &Path) {
 "#,
     )
     .expect("write local package manifest");
+}
+
+fn write_local_process_plugin_package(root: &Path) {
+    fs::create_dir_all(root.join("bin")).expect("create process package root");
+    fs::write(root.join("bin").join("plugin"), "#!/bin/sh\n").expect("write process entrypoint");
+    fs::write(
+        root.join("botster-package.json"),
+        r#"{
+  "name": "dogfood.process-plugin",
+  "version": "1.0.0",
+  "kind": "plugin",
+  "botster": ">=0.1.0",
+  "source": { "type": "path", "path": "." },
+  "capabilities": [
+    { "surface": "surfaces" }
+  ],
+  "entrypoints": [
+    { "runtime": "process", "path": "bin/plugin", "bootstrap": false }
+  ]
+}
+"#,
+    )
+    .expect("write local process package manifest");
 }
 
 fn daemon_test_lock() -> &'static Mutex<()> {
@@ -1319,9 +1339,9 @@ fn cli_packages_enable_local_path_routes_through_running_daemon_and_persists() {
     );
     assert!(
         lifecycle.lifecycle.iter().any(|plugin| {
-            plugin.package_name == "dogfood.plugin" && plugin.state == "enabled" && !plugin.loaded
+            plugin.package_name == "dogfood.plugin" && plugin.state == "enabled" && plugin.loaded
         }),
-        "enabled package should be visible to daemon lifecycle without restart"
+        "enabled package should load into daemon lifecycle without restart"
     );
 
     let list = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
@@ -1382,6 +1402,45 @@ fn cli_packages_enable_local_path_routes_through_running_daemon_and_persists() {
     assert!(stdout.contains("state=enabled"));
 
     shutdown_cli_daemon(&data_dir, restarted);
+}
+
+#[test]
+fn cli_packages_enable_local_process_package_does_not_attempt_lua_load() {
+    let _guard = daemon_test_lock()
+        .lock()
+        .expect("serialize real daemon test");
+    let data_dir = unique_test_dir("cli-process-package");
+    let package_dir = unique_test_dir("local-process-package");
+    write_local_process_plugin_package(&package_dir);
+    let child = start_cli_daemon(&data_dir);
+
+    let enable = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("packages")
+        .arg("enable")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("--path")
+        .arg(&package_dir)
+        .output()
+        .expect("run botster-hub packages enable process package");
+
+    assert!(
+        enable.status.success(),
+        "enable process package failed: {}",
+        String::from_utf8_lossy(&enable.stderr)
+    );
+    let lifecycle = botster_hub::daemon_transport_request(
+        &explicit_config(&data_dir),
+        botster_hub::DaemonRequest::PluginLifecycleStatus,
+    )
+    .expect("daemon plugin lifecycle status");
+    assert!(lifecycle.lifecycle.iter().any(|plugin| {
+        plugin.package_name == "dogfood.process-plugin"
+            && plugin.state == "enabled"
+            && !plugin.loaded
+    }));
+
+    shutdown_cli_daemon(&data_dir, child);
 }
 
 #[test]

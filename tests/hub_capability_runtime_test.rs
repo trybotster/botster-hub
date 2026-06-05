@@ -354,6 +354,8 @@ fn hub_runtime_stores_plugin_json_under_plugin_data_and_enforces_namespace() {
     let plugin_key = PluginKey("project-pipelines".to_string());
     let store_root = runtime
         .capability_runtime()
+        .lock()
+        .expect("hub capability runtime lock")
         .plugin_store_root()
         .to_path_buf();
 

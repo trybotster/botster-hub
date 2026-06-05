@@ -5,7 +5,8 @@
   "botster": ">=0.1.0",
   "source": { "type": "path", "path": "." },
   "capabilities": [
-    { "surface": "surfaces" }
+    { "surface": "mcp" },
+    { "surface": "timers", "scope": "callbacks" }
   ],
   "entrypoints": [
     { "runtime": "lua", "path": "plugin.lua", "bootstrap": false }
