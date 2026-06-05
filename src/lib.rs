@@ -35,6 +35,7 @@ pub mod config;
 pub mod daemon;
 pub mod daemon_transport;
 pub mod lifecycle;
+pub mod lua_runtime;
 pub mod mcp;
 pub mod packages;
 pub mod persistence;
@@ -50,7 +51,8 @@ pub use client_api::{
     HubClientGuardedWrite, HubClientIdentity, HubClientObservationKind, HubClientOperation,
     HubClientPackage, HubClientPackageClassification, HubClientPackageState,
     HubClientPluginLifecycle, HubClientRequest, HubClientResponse, HubClientResponseBody,
-    HubClientResult, HubClientRole, HubClientRuntimeErrorKind, HubClientSession, HubClientSpawned,
+    HubClientResult, HubClientRole, HubClientRoutedEnvelopeAck, HubClientRoutedEnvelopeDrain,
+    HubClientRoutedEnvelopePublish, HubClientRuntimeErrorKind, HubClientSession, HubClientSpawned,
     HubClientStatus,
 };
 pub use config::{
@@ -63,18 +65,21 @@ pub use daemon::{
     HubDaemon, HubDaemonError, HubDaemonResult, HubDaemonState, HubDaemonStatus, HubStateLoadSource,
 };
 pub use daemon_transport::{
-    DaemonCapability, DaemonConnection, DaemonEvent, DaemonGuardedWrite, DaemonOperatorError,
-    DaemonPackage, DaemonPackageDecision, DaemonPluginLifecycle, DaemonRequest, DaemonResponse,
-    DaemonResponseKind, DaemonSession, DaemonSessionCleanup, DaemonStatus, DaemonTransportError,
-    DaemonTransportResult, request as daemon_transport_request, serve_daemon, stream_attach,
+    DaemonCapability, DaemonConnection, DaemonCoordination, DaemonEnvelope, DaemonEnvelopeAck,
+    DaemonEnvelopeDelivery, DaemonEnvelopePublish, DaemonEvent, DaemonIdentity, DaemonNotify,
+    DaemonOperatorError, DaemonPackage, DaemonPackageDecision, DaemonPluginLifecycle,
+    DaemonRequest, DaemonResponse, DaemonResponseKind, DaemonSession, DaemonSessionCleanup,
+    DaemonStatus, DaemonTransportError, DaemonTransportResult, request as daemon_transport_request,
+    serve_daemon, stream_attach,
 };
 pub use lifecycle::{
     HubLifecycleError, HubLifecycleResult, HubPluginLifecycle, HubPluginLifecycleStatus,
     HubPluginRuntimeBundle,
 };
+pub use lua_runtime::{LuaPluginRuntime, LuaPluginRuntimeError, SharedHubCapabilityRuntime};
 pub use mcp::{
     McpCallRequest, McpServeError, McpToolDescriptor, McpToolError, McpToolProvider,
-    McpToolRegistry, McpToolResult, NativeHubToolProvider, serve_mcp_stdio,
+    McpToolRegistry, McpToolResult, NativeHubToolProvider, PluginHubToolProvider, serve_mcp_stdio,
 };
 pub use packages::{
     LOCAL_PACKAGE_MANIFEST_FILE, PackageAction, PackageAdmissionPolicy, PackageAdmissionReason,
@@ -93,7 +98,7 @@ pub use profile::{
     host_profile,
 };
 pub use runtime::{
-    HubRuntime, HubRuntimeError, HubRuntimeObservation, HubRuntimeOutput,
+    HubLuaPluginLoadError, HubRuntime, HubRuntimeError, HubRuntimeObservation, HubRuntimeOutput,
     daemon_session_to_core_session,
 };
 pub use tui::{
@@ -261,6 +266,11 @@ const HUB_FACADE_DECISIONS: &[HubFacadeDecision] = &[
         "hub-admitted guarded notification write delegated to core daemon readiness and delivery states",
     ),
     HubFacadeDecision::new(
+        "publish/drain/acknowledge_routed_envelope",
+        HubFacadeExposure::Exposed,
+        "native coordination reference tools delegate queue, cursor, and ack semantics to the core daemon routed-envelope primitive",
+    ),
+    HubFacadeDecision::new(
         "release_sessions_for_restart/adoption_scan/adopt_session",
         HubFacadeExposure::Exposed,
         "explicit daemon restart/adoption control over worker-backed core sessions",
@@ -333,6 +343,7 @@ mod tests {
         assert!(exposed.contains(&"write_bytes"));
         assert!(exposed.contains(&"resize"));
         assert!(exposed.contains(&"guarded_write"));
+        assert!(exposed.contains(&"publish/drain/acknowledge_routed_envelope"));
         assert!(exposed.contains(&"release_sessions_for_restart/adoption_scan/adopt_session"));
         assert!(summary.facade_decisions().iter().any(|decision| {
             decision.core_operation() == "execute_command(DefaultEngineCommand)"

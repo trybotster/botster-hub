@@ -424,21 +424,34 @@ fn print_daemon_response(response: DaemonResponse) -> Result<(), OperatorError> 
                 );
             }
         }
-        DaemonResponseKind::GuardedWrite => {
-            println!("response=guarded_write");
-            if let Some(result) = response.guarded_write {
-                println!("decision={}", result.decision);
-                if let Some(reason) = result.reason {
-                    println!("reason={reason}");
-                }
-                println!("states={}", result.states.join(","));
+        DaemonResponseKind::PluginMcpTools => {
+            println!("response=plugin_mcp_tools");
+            println!("tool_count={}", response.plugin_tools.len());
+            for tool in response.plugin_tools {
+                println!("tool name={}", tool.name);
             }
+        }
+        DaemonResponseKind::PluginMcpToolResult => {
+            println!("response=plugin_mcp_tool_result");
+            println!("result={}", response.plugin_tool_result);
         }
         DaemonResponseKind::SessionCleanup => {
             println!("response=session_cleanup");
             if let Some(cleanup) = response.cleanup {
                 println!("session_id={}", cleanup.session_id);
                 println!("outcome={}", cleanup.outcome);
+            }
+        }
+        DaemonResponseKind::Identity
+        | DaemonResponseKind::MessagePosted
+        | DaemonResponseKind::Messages
+        | DaemonResponseKind::MessageAcked
+        | DaemonResponseKind::SessionNotified => {
+            println!("response=coordination");
+            if let Some(coordination) = response.coordination {
+                let json = serde_json::to_string(&coordination)
+                    .unwrap_or_else(|_| "{\"error\":\"unserializable\"}".to_string());
+                println!("coordination={json}");
             }
         }
         DaemonResponseKind::OperatorError => {
@@ -1044,7 +1057,7 @@ struct RunOneCommand {
 
 #[derive(Debug)]
 enum StartError {
-    Operator(OperatorError),
+    Operator(Box<OperatorError>),
     Config(botster_hub::HubConfigError),
     Daemon(botster_hub::HubDaemonError),
     Transport(botster_hub::DaemonTransportError),
@@ -1067,7 +1080,7 @@ enum OperatorError {
 
 #[derive(Debug)]
 enum McpCliError {
-    Usage(OperatorError),
+    Usage(Box<OperatorError>),
     Config(botster_hub::HubConfigError),
     Serve(botster_hub::McpServeError),
 }
@@ -1215,7 +1228,7 @@ impl From<botster_hub::DaemonTransportError> for StartError {
 
 impl From<OperatorError> for StartError {
     fn from(error: OperatorError) -> Self {
-        Self::Operator(error)
+        Self::Operator(Box::new(error))
     }
 }
 
@@ -1227,7 +1240,7 @@ impl From<botster_hub::HubConfigError> for OperatorError {
 
 impl From<OperatorError> for McpCliError {
     fn from(error: OperatorError) -> Self {
-        Self::Usage(error)
+        Self::Usage(Box::new(error))
     }
 }
 
