@@ -1,5 +1,78 @@
 # Port Project Pipelines as a Local Plugin
 
+## PR Review Merge-Conflict Addendum
+
+### Context Loaded
+
+- Pipeline context: the run returned to `botster_plan` after GitHub PR review `pullrequestreview-4440428794` on PR #34 requested: "Please fix merge conflicts."
+- PR context: PR #34 is `https://github.com/trybotster/botster-hub/pull/34`, head `project-pipelines/ticket_1780628470_952911`, base `main`, review decision `CHANGES_REQUESTED`, merge state `DIRTY`.
+- Local context: this worktree is detached at PR head `ce365f5`; `origin/main` is `b98bb88`; unrelated local files remain dirty/untracked (`.gitignore`, `.env`, `mise.local.toml`, `target/`) and must be ignored.
+- Conflict inspection: `git merge-tree HEAD origin/main` reports content conflicts in `src/daemon.rs`, `src/daemon_transport.rs`, `src/lib.rs`, `src/lifecycle.rs`, `src/main.rs`, `src/mcp.rs`, `src/runtime.rs`, and `tests/hub_mcp_test.rs`.
+- Mainline drift: `origin/main` now includes Lua plugin runtime work (`src/lua_runtime.rs`, `docs/lua-plugin-abi.md`, `tests/hub_lua_runtime_test.rs`) and no longer has the branch-only Project Pipelines plan/package/runtime files. The merge resolution must preserve main's Lua runtime and adapt Project Pipelines to it where needed.
+
+### Scope
+
+- Update the existing PR branch only; do not create a new run or a new PR.
+- Merge or rebase the PR branch with current `origin/main`, resolving conflicts surgically in the eight conflicting files named above.
+- Preserve the already-implemented Project Pipelines behavior from PR #34: daemon-backed plugin MCP tools, package enable/startup loading, plugin-data persistence, restart tool re-registration, disable/unload removal, persist-failed error reporting, docs/cutover posture, and existing targeted tests.
+- Preserve new mainline Lua runtime/API work rather than deleting it. If main's Lua runtime supersedes branch scaffold assumptions, integrate Project Pipelines with the new runtime boundary instead of keeping stale "Lua unavailable" wording.
+- Keep branch-only Project Pipelines package/docs/runtime artifacts where still required: `examples/project-pipelines/*`, `src/project_pipelines.rs` or its mainline-adapted successor, `docs/plans/port-project-pipelines-as-local-plugin.md`, and MCP tests.
+
+### Non-Scope
+
+- Do not broaden the PR beyond conflict resolution and required adaptation to main's new Lua runtime APIs.
+- Do not rework unrelated daemon, MCP, lifecycle, Lua ABI, or client API behavior from main unless the conflict requires it.
+- Do not remove or rewrite mainline `src/lua_runtime.rs`, `docs/lua-plugin-abi.md`, or `tests/hub_lua_runtime_test.rs`.
+- Do not touch unrelated local dirty files.
+
+### Assumptions And Unknowns
+
+- Assumption: the correct conflict posture is "main plus Project Pipelines," preserving current mainline Lua runtime additions and PR #34's Project Pipelines acceptance behavior.
+- Assumption: conflict resolution may need to replace earlier host-supplied Project Pipelines runtime scaffolding with real Lua runtime integration if `origin/main` now exposes the required adapter.
+- Unknown: whether Project Pipelines can immediately move all workflow policy into Lua on top of main's new runtime without expanding the ticket. If not, retain the smallest compatibility bridge and document the residual limitation accurately.
+- Unknown: whether Cargo dependency and lockfile updates from main require re-running broader test suites beyond the prior targeted MCP tests.
+
+### Affected Surfaces And Files
+
+- Definite conflict files: `src/daemon.rs`, `src/daemon_transport.rs`, `src/lib.rs`, `src/lifecycle.rs`, `src/main.rs`, `src/mcp.rs`, `src/runtime.rs`, `tests/hub_mcp_test.rs`.
+- Definite preservation/adaptation files: `src/lua_runtime.rs`, `docs/lua-plugin-abi.md`, `tests/hub_lua_runtime_test.rs`, `src/project_pipelines.rs`, `examples/project-pipelines/*`, `README.md`, `Cargo.toml`, `Cargo.lock`.
+- Plan/docs: this plan artifact may be updated only to reflect the conflict-resolution posture and any changed residual risks.
+
+### Risks
+
+- Accidentally resolving conflicts by deleting main's new Lua runtime would regress the dependency work this ticket was waiting on.
+- Accidentally resolving conflicts by deleting Project Pipelines branch files would satisfy merge mechanics but fail the ticket acceptance.
+- Prior residual-risk wording about "real Lua unavailable" may become false after mainline changes; stale docs are a review risk.
+- Cargo.lock/Cargo.toml drift can hide compile or clippy failures if only the old targeted MCP test is rerun.
+- Detached worktree and unrelated dirty files make it easy to commit local noise or push the wrong ref.
+
+### Acceptance Checks And Tests
+
+- `git status --short --branch` before and after resolution; final staged/committed changes must exclude `.gitignore`, `.env`, `mise.local.toml`, and `target/`.
+- Conflict resolution check: no conflict markers remain (`rg '<<<<<<<|=======|>>>>>>>'`).
+- `cargo fmt`
+- `cargo clippy --all-targets -- -D warnings`
+- Re-run prior Project Pipelines proofs:
+  - `./test.sh mcp_serve_lists_calls_and_reloads_project_pipelines_plugin_tools`
+  - `./test.sh mutating_handler_reports_persist_failed_when_state_write_fails`
+- Re-run or add Lua-runtime coverage from main:
+  - `./test.sh hub_lua_runtime` or the exact test-filter equivalent that actually executes `tests/hub_lua_runtime_test.rs`
+- Re-run the bounded merge-affected suites because main and the PR both touched daemon, MCP, lifecycle, runtime, package, and capability paths:
+  - `./test.sh --test hub_mcp_test`
+  - `./test.sh --test hub_capability_runtime_test`
+  - `./test.sh --test hub_daemon_lifecycle_test`
+  - `./test.sh --test hub_plugin_lifecycle_test`
+  - `./test.sh --test hub_local_dogfood_test`
+  - `./test.sh --test hub_runtime_test`
+  - `./test.sh --test hub_lua_runtime_test`
+- Re-read the Project Pipelines README, root README, and cutover/residual-risk wording against main's Lua runtime and plugin ABI docs. Correct stale claims, or record why each limitation still holds.
+- Push the resolved existing PR branch `project-pipelines/ticket_1780628470_952911` and verify PR #34 no longer reports `DIRTY`.
+
+### Vault Gaps Worth Capturing
+
+- If resolving this conflict requires a new rule for Project Pipelines moving from host-supplied Rust policy to main's Lua runtime adapter, capture that boundary after implementation.
+- If `./test.sh` filter semantics make `hub_lua_runtime` easy to run as zero tests, capture the exact working filter if not already documented.
+
 ## Context Loaded
 
 - Pipeline context: ticket `ticket_1780628470_952911`, run `run_1780688521_435653`, step `botster_plan`, gate `botster_plan_gate`.

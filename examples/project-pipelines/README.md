@@ -18,14 +18,15 @@ Unsupported monolith features:
 - Rails/cloud/WebRTC/browser marketplace surfaces
 - GitHub provider supervision and PR automation
 - broad compatibility with monolith SQLite state
-- full agent spawn/worktree orchestration from Lua
+- full agent spawn/worktree orchestration from Project Pipelines Lua policy
 
 Cutover posture: live monolith Project Pipelines data is not imported in this
 milestone. Cutover requires no in-flight monolith tickets, or a future explicit
 one-shot export/import tool before switching active work to this local plugin.
 
-Runtime note: this reduced hub crate does not yet execute Lua entrypoints. The
-package manifest and entrypoint are real local package inputs, and the hub
-currently supplies the Project Pipelines runtime bundle from the package load
-path so the production daemon/MCP/worker/storage path can be proved without a
-second `mcp-serve` runtime.
+Runtime note: the hub now has a real Lua plugin runtime for packages that
+register descriptors and handlers through the Lua ABI. This Project Pipelines
+entrypoint is still a stub, so the hub currently supplies the Project Pipelines
+runtime bundle from the package load path until the workflow policy is moved
+into Lua. The production daemon/MCP/worker/storage path is still proved without
+a second `mcp-serve` runtime.

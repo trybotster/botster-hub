@@ -8,10 +8,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 use botster_core::{
-    BoundaryJson, PluginCleanupResult, PluginCleanupScope, PluginHandlerRegistration,
-    PluginInvocationOutcome, PluginInvocationRequest, PluginKey, PluginLoadSpec,
-    PluginOwnedDescriptor, PluginReloadSpec, PluginResourceRef, PluginRuntime, PluginUnloadSpec,
-    PluginWorkerEngine, PluginWorkerRegistration, RequestId,
+    BoundaryJson, PluginCleanupResult, PluginCleanupScope, PluginDescriptorKind,
+    PluginHandlerRegistration, PluginInvocationOutcome, PluginInvocationRequest, PluginKey,
+    PluginLoadSpec, PluginOwnedDescriptor, PluginReloadSpec, PluginResourceRef, PluginRuntime,
+    PluginUnloadSpec, PluginWorkerEngine, PluginWorkerRegistration, RequestId,
 };
 
 use crate::packages::{PackageClassification, PackageRecord, PackageRegistry, PackageState};
@@ -81,7 +81,7 @@ impl HubPluginLifecycle {
         let cleanup = self.engine.reload_plugin(
             PluginReloadSpec {
                 request_id,
-                plugin_key,
+                plugin_key: plugin_key.clone(),
                 load: registration.load.clone(),
                 cleanup: PluginCleanupScope::DescriptorsAndResources,
             },
@@ -90,11 +90,11 @@ impl HubPluginLifecycle {
         self.loaded
             .lock()
             .expect("hub plugin lifecycle loaded set lock")
-            .insert(package_name.to_string());
+            .insert(plugin_key.0.clone());
         self.descriptors
             .lock()
             .expect("hub plugin lifecycle descriptors lock")
-            .insert(package_name.to_string(), descriptors);
+            .insert(plugin_key.0.clone(), descriptors);
 
         Ok(cleanup)
     }
@@ -119,19 +119,15 @@ impl HubPluginLifecycle {
         cleanup
     }
 
-    /// Return loaded descriptors for a plugin-owned descriptor family.
+    /// Return plugin-owned MCP tool descriptors with handler refs for daemon-backed MCP routing.
     #[must_use]
-    pub fn descriptors_by_kind(
-        &self,
-        kind: botster_core::PluginDescriptorKind,
-    ) -> Vec<PluginOwnedDescriptor> {
+    pub fn mcp_tool_descriptors(&self) -> Vec<PluginOwnedDescriptor> {
         self.descriptors
             .lock()
             .expect("hub plugin lifecycle descriptors lock")
             .values()
-            .flat_map(|descriptors| descriptors.iter())
-            .filter(|descriptor| descriptor.descriptor.kind == kind)
-            .cloned()
+            .flat_map(|descriptors| descriptors.iter().cloned())
+            .filter(|descriptor| descriptor.descriptor.kind == PluginDescriptorKind::McpTool)
             .collect()
     }
 
