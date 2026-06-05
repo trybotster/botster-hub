@@ -16,9 +16,11 @@ use std::thread;
 use std::time::Duration;
 
 use botster_core::{
-    RequestId, SessionId, SessionLifecycleState, SubscriptionId, TerminalAttachState,
+    ModeFlags, RequestId, SessionId, SessionLifecycleState, SubscriptionId, TerminalAttachState,
 };
-use botster_core_daemon::RegistrySessionState;
+use botster_core_daemon::{
+    GuardedWriteDecision, GuardedWriteDeliveryState, ReadinessEvidence, RegistrySessionState,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -86,6 +88,27 @@ pub fn request(
     let mut stream = connect_and_hello(config)?;
     write_frame(&mut stream, &request)?;
     read_frame(&mut stream)
+}
+
+/// Persistent daemon connection for clients that own attach subscription state.
+pub struct DaemonConnection {
+    stream: UnixStream,
+    reader: BufReader<UnixStream>,
+}
+
+impl DaemonConnection {
+    /// Connect to the daemon and complete the socket protocol handshake.
+    pub fn connect(config: &HubConfig) -> DaemonTransportResult<Self> {
+        let stream = connect_and_hello(config)?;
+        let reader = BufReader::new(stream.try_clone().map_err(DaemonTransportError::Io)?);
+        Ok(Self { stream, reader })
+    }
+
+    /// Send one request over this persistent connection.
+    pub fn request(&mut self, request: &DaemonRequest) -> DaemonTransportResult<DaemonResponse> {
+        write_frame(&mut self.stream, request)?;
+        read_frame_from_reader(&mut self.reader)
+    }
 }
 
 /// Attach and stream terminal bytes until the session exits or the connection closes.
@@ -460,6 +483,31 @@ fn handle_runtime_control_request(
             )?;
             events_response(response.body)
         }
+        DaemonRequest::GuardedNotificationWrite {
+            session_id,
+            package_name,
+            data,
+            cursor_visible,
+        } => {
+            let now = tick(logical_clock);
+            let mode_flags = ModeFlags {
+                cursor_visible,
+                ..ModeFlags::default()
+            };
+            let response = api.handle_request(
+                runtime,
+                &packages,
+                HubClientRequest::GuardedNotificationWrite {
+                    request_id: request_id("daemon-guarded-notification-write"),
+                    session_id: SessionId(session_id),
+                    package_name,
+                    data: data.into_bytes(),
+                    readiness: ReadinessEvidence::ready(mode_flags),
+                    now_seconds: now,
+                },
+            )?;
+            guarded_write_response(response.body)
+        }
         DaemonRequest::ShutdownSession { session_id } => {
             let now = tick(logical_clock);
             match classify_shutdown_session(runtime, &session_id)? {
@@ -536,6 +584,7 @@ fn handle_runtime_control_request(
             packages: Vec::new(),
             package_decision: None,
             lifecycle: Vec::new(),
+            guarded_write: None,
             events: Vec::new(),
             cleanup: None,
             error: None,
@@ -616,6 +665,13 @@ fn events_response(body: HubClientResponseBody) -> DaemonTransportResult<DaemonR
         return Err(DaemonTransportError::UnexpectedResponse);
     };
     Ok(DaemonResponse::events(events_from_client(events)))
+}
+
+fn guarded_write_response(body: HubClientResponseBody) -> DaemonTransportResult<DaemonResponse> {
+    let HubClientResponseBody::GuardedWrite(result) = body else {
+        return Err(DaemonTransportError::UnexpectedResponse);
+    };
+    Ok(DaemonResponse::guarded_write(result.into()))
 }
 
 enum ShutdownSessionClassification {
@@ -856,6 +912,12 @@ pub enum DaemonRequest {
         rows: u16,
         cols: u16,
     },
+    GuardedNotificationWrite {
+        session_id: String,
+        package_name: String,
+        data: String,
+        cursor_visible: bool,
+    },
     ShutdownSession {
         session_id: String,
     },
@@ -885,6 +947,7 @@ pub struct DaemonResponse {
     pub packages: Vec<DaemonPackage>,
     pub package_decision: Option<DaemonPackageDecision>,
     pub lifecycle: Vec<DaemonPluginLifecycle>,
+    pub guarded_write: Option<DaemonGuardedWrite>,
     pub events: Vec<DaemonEvent>,
     pub cleanup: Option<DaemonSessionCleanup>,
     pub error: Option<DaemonOperatorError>,
@@ -899,6 +962,7 @@ impl DaemonResponse {
             packages: Vec::new(),
             package_decision: None,
             lifecycle: Vec::new(),
+            guarded_write: None,
             events: Vec::new(),
             cleanup: None,
             error: None,
@@ -913,6 +977,7 @@ impl DaemonResponse {
             packages: Vec::new(),
             package_decision: None,
             lifecycle: Vec::new(),
+            guarded_write: None,
             events: Vec::new(),
             cleanup: None,
             error: None,
@@ -927,6 +992,7 @@ impl DaemonResponse {
             packages: Vec::new(),
             package_decision: None,
             lifecycle: Vec::new(),
+            guarded_write: None,
             events,
             cleanup: None,
             error: None,
@@ -941,6 +1007,7 @@ impl DaemonResponse {
             packages: Vec::new(),
             package_decision: None,
             lifecycle: Vec::new(),
+            guarded_write: None,
             events,
             cleanup: None,
             error: None,
@@ -955,6 +1022,7 @@ impl DaemonResponse {
             packages: packages.into_iter().map(Into::into).collect(),
             package_decision: None,
             lifecycle: Vec::new(),
+            guarded_write: None,
             events: Vec::new(),
             cleanup: None,
             error: None,
@@ -969,6 +1037,22 @@ impl DaemonResponse {
             packages: Vec::new(),
             package_decision: None,
             lifecycle: lifecycle.into_iter().map(Into::into).collect(),
+            guarded_write: None,
+            events: Vec::new(),
+            cleanup: None,
+            error: None,
+        }
+    }
+
+    fn guarded_write(guarded_write: DaemonGuardedWrite) -> Self {
+        Self {
+            kind: DaemonResponseKind::GuardedWrite,
+            status: None,
+            sessions: Vec::new(),
+            packages: Vec::new(),
+            package_decision: None,
+            lifecycle: Vec::new(),
+            guarded_write: Some(guarded_write),
             events: Vec::new(),
             cleanup: None,
             error: None,
@@ -983,6 +1067,7 @@ impl DaemonResponse {
             packages: Vec::new(),
             package_decision: None,
             lifecycle: Vec::new(),
+            guarded_write: None,
             events: Vec::new(),
             cleanup: Some(cleanup),
             error: None,
@@ -997,6 +1082,7 @@ impl DaemonResponse {
             packages: Vec::new(),
             package_decision: None,
             lifecycle: Vec::new(),
+            guarded_write: None,
             events: Vec::new(),
             cleanup: None,
             error: Some(DaemonOperatorError {
@@ -1016,6 +1102,7 @@ impl DaemonResponse {
             packages: Vec::new(),
             package_decision: None,
             lifecycle: Vec::new(),
+            guarded_write: None,
             events: Vec::new(),
             cleanup: None,
             error: Some(DaemonOperatorError::from_client_error(error)),
@@ -1030,6 +1117,7 @@ impl DaemonResponse {
             packages: Vec::new(),
             package_decision: None,
             lifecycle: Vec::new(),
+            guarded_write: None,
             events: Vec::new(),
             cleanup: None,
             error: Some(DaemonOperatorError::from_package_error(error)),
@@ -1044,6 +1132,7 @@ impl DaemonResponse {
             packages: Vec::new(),
             package_decision: None,
             lifecycle: Vec::new(),
+            guarded_write: None,
             events: Vec::new(),
             cleanup: None,
             error: Some(DaemonOperatorError::from_state_error(error)),
@@ -1061,6 +1150,7 @@ pub enum DaemonResponseKind {
     Packages,
     PackageDecision,
     PluginLifecycle,
+    GuardedWrite,
     SessionCleanup,
     OperatorError,
     Shutdown,
@@ -1135,6 +1225,33 @@ impl From<HubClientPluginLifecycle> for DaemonPluginLifecycle {
             package_name: lifecycle.package_name,
             state: package_state_label(lifecycle.state).to_string(),
             loaded: lifecycle.loaded,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonGuardedWrite {
+    pub decision: String,
+    pub reason: Option<String>,
+    pub states: Vec<String>,
+}
+
+impl From<crate::HubClientGuardedWrite> for DaemonGuardedWrite {
+    fn from(result: crate::HubClientGuardedWrite) -> Self {
+        let (decision, reason) = match result.decision {
+            GuardedWriteDecision::Write => ("write".to_string(), None),
+            GuardedWriteDecision::Defer { reason } => ("defer".to_string(), Some(reason)),
+            GuardedWriteDecision::Reject { reason } => ("reject".to_string(), Some(reason)),
+        };
+        Self {
+            decision,
+            reason,
+            states: result
+                .states
+                .into_iter()
+                .map(guarded_write_delivery_state_label)
+                .map(ToString::to_string)
+                .collect(),
         }
     }
 }
@@ -1344,6 +1461,17 @@ fn package_state_label(state: crate::HubClientPackageState) -> &'static str {
         crate::HubClientPackageState::Installed => "installed",
         crate::HubClientPackageState::Enabled => "enabled",
         crate::HubClientPackageState::Disabled => "disabled",
+    }
+}
+
+fn guarded_write_delivery_state_label(state: GuardedWriteDeliveryState) -> &'static str {
+    match state {
+        GuardedWriteDeliveryState::Accepted => "accepted",
+        GuardedWriteDeliveryState::Deferred => "deferred",
+        GuardedWriteDeliveryState::Rejected => "rejected",
+        GuardedWriteDeliveryState::Written => "written",
+        GuardedWriteDeliveryState::Delivered => "delivered",
+        GuardedWriteDeliveryState::Acknowledged => "acknowledged",
     }
 }
 

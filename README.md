@@ -233,10 +233,43 @@ the running daemon runtime, so a session created by one CLI process is visible
 to later `sessions list`, `sessions attach`, `sessions send-input`, `sessions
 resize`, `sessions detach`, and `sessions shutdown` invocations.
 `attach` streams terminal bytes and currently exits after an idle window if the
-core runtime does not provide a process-exit frame; persistent TUI-grade attach
-with explicit signal handling remains outside this scaffold. `inspect` is
-intentionally scoped to sanitized session list data until the stable client API
-grows a dedicated inspection request.
+core runtime does not provide a process-exit frame. `inspect` is intentionally
+scoped to sanitized session list data until the stable client API grows a
+dedicated inspection request.
+
+## Minimal local TUI
+
+`botster-hub tui --data-dir <path>` opens the first local terminal UI over the
+same daemon socket and `HubClientApi` path as the operator CLI. It does not
+start or embed a second `HubRuntime`; start the daemon first, then open the TUI
+from another terminal.
+
+```sh
+# Terminal 1: leave the daemon running.
+cargo run -- start --data-dir target/botster-hub-tui-dogfood-data
+
+# Terminal 2: create a session the TUI can attach to.
+cargo run -- sessions spawn --data-dir target/botster-hub-tui-dogfood-data \
+  --session-id dogfood-session -- "printf 'dogfood-ok\n'; while IFS= read -r line; do printf 'dogfood:%s\n' \"$line\"; done"
+
+# Terminal 3: operate the session from the TUI.
+cargo run -- tui --data-dir target/botster-hub-tui-dogfood-data
+```
+
+The TUI lists daemon sessions, attaches with a persistent socket subscription,
+sends ordinary typed input to the active PTY, forwards terminal resize events,
+detaches and reattaches with fresh subscription ids, shuts down sessions, and can
+request daemon shutdown. On daemon socket loss it shows a reconnecting state,
+reconnects to the daemon, refreshes the session list, drops the stale
+subscription id, and reattaches when the worker-backed session is recovered.
+When recovery is absent, it leaves the operator in the session/status view with
+a visible session-lost error.
+
+Guarded doorbell notifications use the daemon `GuardedNotificationWrite`
+request, which wraps `HubClientRequest::GuardedNotificationWrite` and returns
+the core guarded-write decision plus delivery states. The test fixture enables a
+package with `session_actions` before exercising this path; visible notification
+claims should assert a real `write` decision with `accepted,written` states.
 
 Package commands require the daemon socket for this local dogfood path. When
 the daemon is not running they fail with `daemon not running` instead of

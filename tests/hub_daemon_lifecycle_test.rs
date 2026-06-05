@@ -204,6 +204,50 @@ fn write_local_plugin_package(root: &Path) {
     .expect("write local package manifest");
 }
 
+fn write_guarded_notification_package(root: &Path) {
+    fs::create_dir_all(root).expect("create guarded package root");
+    fs::write(root.join("plugin.lua"), "-- guarded notification fixture\n")
+        .expect("write guarded plugin entrypoint");
+    fs::write(
+        root.join("botster-package.json"),
+        r#"{
+  "name": "workflow.plugin",
+  "version": "1.0.0",
+  "kind": "plugin",
+  "botster": ">=0.1.0",
+  "source": { "type": "path", "path": "." },
+  "capabilities": [
+    { "surface": "session_actions" }
+  ],
+  "entrypoints": [
+    { "runtime": "lua", "path": "plugin.lua", "bootstrap": false }
+  ]
+}
+"#,
+    )
+    .expect("write guarded package manifest");
+}
+
+fn enable_guarded_notification_package(data_dir: &Path, config: &botster_hub::HubConfig) {
+    let package_root = data_dir.join("workflow-plugin");
+    write_guarded_notification_package(&package_root);
+    let enable = botster_hub::daemon_transport_request(
+        config,
+        botster_hub::DaemonRequest::EnablePackageLocalPath { path: package_root },
+    )
+    .expect("enable guarded notification package through daemon");
+    assert_eq!(
+        enable.kind,
+        botster_hub::DaemonResponseKind::PackageDecision
+    );
+    assert!(
+        enable
+            .packages
+            .iter()
+            .any(|package| package.package_name == "workflow.plugin" && package.state == "enabled")
+    );
+}
+
 fn daemon_test_lock() -> &'static Mutex<()> {
     REAL_DAEMON_TEST_LOCK.get_or_init(|| Mutex::new(()))
 }
@@ -1121,6 +1165,150 @@ fn daemon_detaches_subscription_when_attach_connection_drops() {
     );
 
     shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
+fn daemon_guarded_notification_write_reports_real_write_decision_over_socket() {
+    let _guard = daemon_test_lock()
+        .lock()
+        .expect("serialize real daemon test");
+    let data_dir = unique_test_dir("daemon-guarded-write");
+    let config = explicit_config(&data_dir);
+    let child = start_cli_daemon(&data_dir);
+    enable_guarded_notification_package(&data_dir, &config);
+
+    let spawn = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::Spawn {
+            session_id: "guarded-socket-session".to_string(),
+            command:
+                "printf 'ready\\n'; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done"
+                    .to_string(),
+        },
+    )
+    .expect("spawn guarded socket session");
+    assert_eq!(spawn.kind, botster_hub::DaemonResponseKind::Spawned);
+
+    let mut connection =
+        botster_hub::DaemonConnection::connect(&config).expect("connect TUI-grade socket");
+    connection
+        .request(&botster_hub::DaemonRequest::Attach {
+            session_id: "guarded-socket-session".to_string(),
+            subscription_id: "guarded-socket-subscription".to_string(),
+        })
+        .expect("attach persistent socket subscription");
+
+    let write = connection
+        .request(&botster_hub::DaemonRequest::GuardedNotificationWrite {
+            session_id: "guarded-socket-session".to_string(),
+            package_name: "workflow.plugin".to_string(),
+            data: "guarded-socket\n".to_string(),
+            cursor_visible: true,
+        })
+        .expect("guarded notification write over daemon socket");
+    assert_eq!(write.kind, botster_hub::DaemonResponseKind::GuardedWrite);
+    let guarded = write.guarded_write.expect("guarded write response body");
+    assert_eq!(guarded.decision, "write");
+    assert_eq!(guarded.states, vec!["accepted", "written"]);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut observed = String::new();
+    while std::time::Instant::now() < deadline {
+        let drain = connection
+            .request(&botster_hub::DaemonRequest::Drain {
+                session_id: "guarded-socket-session".to_string(),
+            })
+            .expect("drain guarded socket session");
+        for event in drain.events {
+            if let botster_hub::DaemonEvent::TerminalOutput { data, .. } = event {
+                observed.push_str(&data);
+            }
+        }
+        if observed.contains("echo:guarded-socket") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(30));
+    }
+    assert!(
+        observed.contains("echo:guarded-socket"),
+        "guarded socket write should reach PTY input path, got {observed:?}"
+    );
+
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
+fn scripted_tui_uses_daemon_socket_for_attach_input_doorbell_resize_and_restart_reconnect() {
+    let _guard = daemon_test_lock()
+        .lock()
+        .expect("serialize real daemon test");
+    let data_dir = unique_test_dir("scripted-tui");
+    let config = explicit_config(&data_dir);
+    let child = start_cli_daemon(&data_dir);
+    enable_guarded_notification_package(&data_dir, &config);
+
+    let spawn = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::Spawn {
+            session_id: "scripted-tui-session".to_string(),
+            command:
+                "printf 'ready\\n'; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done"
+                    .to_string(),
+        },
+    )
+    .expect("spawn scripted TUI session");
+    assert_eq!(spawn.kind, botster_hub::DaemonResponseKind::Spawned);
+
+    let proof = botster_hub::run_scripted_probe(config.clone(), "scripted-tui-session")
+        .expect("scripted TUI probe should complete core workflow");
+    assert!(
+        proof
+            .rendered_sessions
+            .contains(&"scripted-tui-session".to_string())
+    );
+    assert!(proof.observed_output.contains("echo:from-tui"));
+    assert!(proof.observed_output.contains("echo:doorbell-from-tui"));
+    assert!(proof.observed_output.contains("echo:after-reattach"));
+    assert_eq!(proof.guarded_decision, "write");
+    assert_eq!(proof.guarded_states, vec!["accepted", "written"]);
+    assert_eq!(proof.resize_sent, Some((31, 101)));
+    assert_ne!(
+        proof.first_subscription_id, proof.second_subscription_id,
+        "TUI reattach should allocate a fresh subscription id"
+    );
+
+    let mut driver = botster_hub::ScriptedTuiDriver::connect(config.clone())
+        .expect("connect scripted TUI driver before restart");
+    driver
+        .select_session("scripted-tui-session")
+        .expect("select recovered session before restart");
+    let before_restart_subscription = driver
+        .attach_selected()
+        .expect("attach before daemon restart");
+    driver.send_input("before-restart\n");
+    driver
+        .drain_until("echo:before-restart", Duration::from_secs(5))
+        .expect("observe pre-restart output");
+
+    shutdown_cli_daemon(&data_dir, child);
+    let restarted_child = start_cli_daemon(&data_dir);
+    driver
+        .reconnect()
+        .expect("scripted TUI should reconnect after daemon restart");
+    let after_restart_subscription = driver
+        .subscription_id()
+        .expect("reconnect should reattach recovered session");
+    assert_ne!(
+        before_restart_subscription, after_restart_subscription,
+        "daemon restart reconnect must discard stale subscription id"
+    );
+    driver.send_input("after-restart\n");
+    driver
+        .drain_until("echo:after-restart", Duration::from_secs(5))
+        .expect("TUI should observe output after daemon restart reconnect");
+    assert!(driver.output().contains("echo:after-restart"));
+
+    shutdown_cli_daemon(&data_dir, restarted_child);
 }
 
 #[test]

@@ -40,16 +40,18 @@ pub mod packages;
 pub mod persistence;
 pub mod profile;
 pub mod runtime;
+pub mod tui;
 
 use botster_core::CapabilitySurface;
 
 pub use capabilities::HubCapabilityRuntime;
 pub use client_api::{
     HubClientAdmission, HubClientApi, HubClientCapability, HubClientError, HubClientEvent,
-    HubClientIdentity, HubClientObservationKind, HubClientOperation, HubClientPackage,
-    HubClientPackageClassification, HubClientPackageState, HubClientPluginLifecycle,
-    HubClientRequest, HubClientResponse, HubClientResponseBody, HubClientResult, HubClientRole,
-    HubClientRuntimeErrorKind, HubClientSession, HubClientSpawned, HubClientStatus,
+    HubClientGuardedWrite, HubClientIdentity, HubClientObservationKind, HubClientOperation,
+    HubClientPackage, HubClientPackageClassification, HubClientPackageState,
+    HubClientPluginLifecycle, HubClientRequest, HubClientResponse, HubClientResponseBody,
+    HubClientResult, HubClientRole, HubClientRuntimeErrorKind, HubClientSession, HubClientSpawned,
+    HubClientStatus,
 };
 pub use config::{
     CoreEngineOptions, CoreQueueCapacity, DataDirectoryOption, DirectoryList, HostIdentity,
@@ -61,10 +63,10 @@ pub use daemon::{
     HubDaemon, HubDaemonError, HubDaemonResult, HubDaemonState, HubDaemonStatus, HubStateLoadSource,
 };
 pub use daemon_transport::{
-    DaemonCapability, DaemonEvent, DaemonOperatorError, DaemonPackage, DaemonPackageDecision,
-    DaemonPluginLifecycle, DaemonRequest, DaemonResponse, DaemonResponseKind, DaemonSession,
-    DaemonSessionCleanup, DaemonStatus, DaemonTransportError, DaemonTransportResult,
-    request as daemon_transport_request, serve_daemon, stream_attach,
+    DaemonCapability, DaemonConnection, DaemonEvent, DaemonGuardedWrite, DaemonOperatorError,
+    DaemonPackage, DaemonPackageDecision, DaemonPluginLifecycle, DaemonRequest, DaemonResponse,
+    DaemonResponseKind, DaemonSession, DaemonSessionCleanup, DaemonStatus, DaemonTransportError,
+    DaemonTransportResult, request as daemon_transport_request, serve_daemon, stream_attach,
 };
 pub use lifecycle::{
     HubLifecycleError, HubLifecycleResult, HubPluginLifecycle, HubPluginLifecycleStatus,
@@ -93,6 +95,9 @@ pub use profile::{
 pub use runtime::{
     HubRuntime, HubRuntimeError, HubRuntimeObservation, HubRuntimeOutput,
     daemon_session_to_core_session,
+};
+pub use tui::{
+    ScriptedTuiDriver, ScriptedTuiProof, TuiError, TuiResult, run as run_tui, run_scripted_probe,
 };
 
 /// Compile-checked description of the profile plus the audited `HubRuntime` facade.
