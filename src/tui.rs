@@ -61,9 +61,10 @@ pub fn run_scripted_probe(config: HubConfig, session_id: &str) -> TuiResult<Scri
     driver.drain_until("echo:from-tui", Duration::from_secs(5))?;
     driver.resize(31, 101);
     let resize_sent = driver.resize_sent();
+    driver.send_input("size-check\n");
+    driver.drain_until("winsize:31 101", Duration::from_secs(5))?;
     let guarded =
         driver.guarded_notification(DEFAULT_NOTIFICATION_PACKAGE, "doorbell-from-tui\n")?;
-    driver.drain_until("echo:doorbell-from-tui", Duration::from_secs(5))?;
     driver.detach();
     let second_subscription_id = driver.attach_selected()?;
     driver.send_input("after-reattach\n");
@@ -145,6 +146,10 @@ impl ScriptedTuiDriver {
     pub fn subscription_id(&self) -> Option<String> {
         self.client.subscription_id.clone()
     }
+
+    pub fn errors(&self) -> Vec<String> {
+        self.client.errors.clone()
+    }
 }
 
 /// Test proof emitted by the scripted TUI client path.
@@ -200,11 +205,9 @@ impl TuiClient {
         self.reconnecting = false;
         self.refresh()?;
         if let Some(active_session_id) = self.active_session_id.clone() {
-            if self
-                .sessions
-                .iter()
-                .any(|session| session.session_id == active_session_id)
-            {
+            if self.sessions.iter().any(|session| {
+                session.session_id == active_session_id && session.lifecycle == "running"
+            }) {
                 self.attach_session(active_session_id)?;
             } else {
                 self.subscription_id = None;
@@ -363,7 +366,6 @@ impl TuiClient {
             session_id,
             package_name: package_name.to_string(),
             data: data.to_string(),
-            cursor_visible: true,
         })?;
         let Some(result) = response.guarded_write else {
             return Err(TuiError::UnexpectedResponse);
