@@ -11,12 +11,13 @@ use botster_core::{
     SessionSpawnRequest, SpawnEnvironment, SpawnWorkingDirectory, SubscriptionId, TransportEgress,
 };
 use botster_hub::{
-    DaemonEvent, DaemonRequest, DaemonResponse, DaemonResponseKind, DaemonSession, DaemonStatus,
-    DataDirectoryOption, FileHubStateStore, HubClientApi, HubClientPackageClassification,
-    HubClientPackageState, HubClientRequest, HubClientResponseBody, HubDaemon, HubDaemonState,
-    HubRuntime, HubStartupOptions, HubStateLoadSource, HubStateStore, PackageAction,
-    RuntimeEnvironment, SessionDefaults, TransportBindings, build_default_config_for_runtime,
-    daemon_transport_request, default_package_policy, host_profile, serve_daemon, stream_attach,
+    DaemonEvent, DaemonOperatorError, DaemonRequest, DaemonResponse, DaemonResponseKind,
+    DaemonSession, DaemonStatus, DataDirectoryOption, FileHubStateStore, HubClientApi,
+    HubClientPackageClassification, HubClientPackageState, HubClientRequest, HubClientResponseBody,
+    HubDaemon, HubDaemonState, HubRuntime, HubStartupOptions, HubStateLoadSource, HubStateStore,
+    PackageAction, RuntimeEnvironment, SessionDefaults, TransportBindings,
+    build_default_config_for_runtime, daemon_transport_request, default_package_policy,
+    host_profile, serve_daemon, stream_attach,
 };
 
 const SMOKE_MARKER: &str = "botster-hub-smoke-ok";
@@ -161,7 +162,7 @@ fn operator_sessions(args: Vec<String>) -> Result<(), OperatorError> {
     match command.action {
         SessionAction::List => {
             let response = daemon_transport_request(&config, DaemonRequest::ListSessions)?;
-            print_daemon_response(response);
+            print_daemon_response(response)?;
         }
         SessionAction::Spawn {
             session_id,
@@ -174,7 +175,7 @@ fn operator_sessions(args: Vec<String>) -> Result<(), OperatorError> {
                     command,
                 },
             )?;
-            print_daemon_response(response);
+            print_daemon_response(response)?;
         }
         SessionAction::Attach {
             session_id,
@@ -190,7 +191,7 @@ fn operator_sessions(args: Vec<String>) -> Result<(), OperatorError> {
                     data: String::from_utf8_lossy(&data).to_string(),
                 },
             )?;
-            print_daemon_response(response);
+            print_daemon_response(response)?;
         }
         SessionAction::Resize {
             session_id,
@@ -205,7 +206,7 @@ fn operator_sessions(args: Vec<String>) -> Result<(), OperatorError> {
                     cols,
                 },
             )?;
-            print_daemon_response(response);
+            print_daemon_response(response)?;
         }
         SessionAction::Detach {
             session_id,
@@ -218,7 +219,7 @@ fn operator_sessions(args: Vec<String>) -> Result<(), OperatorError> {
                     subscription_id: subscription_id.0,
                 },
             )?;
-            print_daemon_response(response);
+            print_daemon_response(response)?;
         }
         SessionAction::Shutdown { session_id } => {
             let response = daemon_transport_request(
@@ -227,7 +228,7 @@ fn operator_sessions(args: Vec<String>) -> Result<(), OperatorError> {
                     session_id: session_id.0,
                 },
             )?;
-            print_daemon_response(response);
+            print_daemon_response(response)?;
         }
     }
 
@@ -238,7 +239,7 @@ fn operator_shutdown(args: Vec<String>) -> Result<(), OperatorError> {
     let options = DataDirOptions::parse(args, "shutdown")?;
     let config = explicit_config(options.data_directory)?;
     let response = daemon_transport_request(&config, DaemonRequest::DaemonShutdown)?;
-    print_daemon_response(response);
+    print_daemon_response(response)?;
     Ok(())
 }
 
@@ -383,7 +384,8 @@ fn print_daemon_transport_status(label: &str, status: &DaemonStatus) {
     }
 }
 
-fn print_daemon_response(response: DaemonResponse) {
+fn print_daemon_response(response: DaemonResponse) -> Result<(), OperatorError> {
+    let mut operator_error = None;
     match response.kind {
         DaemonResponseKind::Status => {
             if let Some(status) = response.status {
@@ -409,6 +411,23 @@ fn print_daemon_response(response: DaemonResponse) {
             println!("response=events");
             print_daemon_events(&response.events);
         }
+        DaemonResponseKind::SessionCleanup => {
+            println!("response=session_cleanup");
+            if let Some(cleanup) = response.cleanup {
+                println!("session_id={}", cleanup.session_id);
+                println!("outcome={}", cleanup.outcome);
+            }
+        }
+        DaemonResponseKind::OperatorError => {
+            println!("response=operator_error");
+            if let Some(error) = response.error {
+                println!("error_code={}", error.code);
+                println!("request_id={}", error.request_id);
+                println!("operation={}", error.operation);
+                println!("message={}", error.message);
+                operator_error = Some(error);
+            }
+        }
         DaemonResponseKind::Shutdown => {
             println!("response=shutdown");
             if let Some(status) = response.status {
@@ -416,6 +435,12 @@ fn print_daemon_response(response: DaemonResponse) {
             }
         }
     }
+
+    if let Some(error) = operator_error {
+        return Err(OperatorError::DaemonOperator(error));
+    }
+
+    Ok(())
 }
 
 fn print_daemon_session(session: &DaemonSession) {
@@ -1032,6 +1057,7 @@ enum OperatorError {
     DaemonNotRunning,
     Config(botster_hub::HubConfigError),
     Client(botster_hub::HubClientError),
+    DaemonOperator(DaemonOperatorError),
     Daemon(botster_hub::HubDaemonError),
     Transport(botster_hub::DaemonTransportError),
     Package(botster_hub::PackageRegistryError),
@@ -1068,6 +1094,13 @@ impl fmt::Display for OperatorError {
             Self::DaemonNotRunning => write!(formatter, "hub daemon runtime is not running"),
             Self::Config(error) => write!(formatter, "{error}"),
             Self::Client(error) => write!(formatter, "client API error: {error:?}"),
+            Self::DaemonOperator(error) => {
+                write!(
+                    formatter,
+                    "operator error: {} {}",
+                    error.code, error.message
+                )
+            }
             Self::Daemon(error) => write!(formatter, "{error}"),
             Self::Transport(error) => write!(formatter, "{error}"),
             Self::Package(error) => write!(formatter, "package policy error: {error:?}"),
