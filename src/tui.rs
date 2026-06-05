@@ -25,7 +25,6 @@ use crate::{
 
 const DRAIN_INTERVAL: Duration = Duration::from_millis(50);
 const RECONNECT_INTERVAL: Duration = Duration::from_millis(250);
-const DEFAULT_NOTIFICATION_PACKAGE: &str = "workflow.plugin";
 
 /// Run the interactive terminal UI until the operator quits.
 pub fn run(config: HubConfig) -> TuiResult<()> {
@@ -63,8 +62,7 @@ pub fn run_scripted_probe(config: HubConfig, session_id: &str) -> TuiResult<Scri
     let resize_sent = driver.resize_sent();
     driver.send_input("size-check\n");
     driver.drain_until("winsize:31 101", Duration::from_secs(5))?;
-    let guarded =
-        driver.guarded_notification(DEFAULT_NOTIFICATION_PACKAGE, "doorbell-from-tui\n")?;
+    let guarded = driver.guarded_notification("doorbell-from-tui\n")?;
     driver.detach();
     let second_subscription_id = driver.attach_selected()?;
     driver.send_input("after-reattach\n");
@@ -127,12 +125,8 @@ impl ScriptedTuiDriver {
         self.client.resize_sent
     }
 
-    pub fn guarded_notification(
-        &mut self,
-        package_name: &str,
-        data: &str,
-    ) -> TuiResult<crate::DaemonGuardedWrite> {
-        self.client.guarded_notification(package_name, data)
+    pub fn guarded_notification(&mut self, data: &str) -> TuiResult<crate::DaemonNotify> {
+        self.client.guarded_notification(data)
     }
 
     pub fn drain_until(&mut self, needle: &str, timeout: Duration) -> TuiResult<()> {
@@ -354,20 +348,18 @@ impl TuiClient {
         }
     }
 
-    fn guarded_notification(
-        &mut self,
-        package_name: &str,
-        data: &str,
-    ) -> TuiResult<crate::DaemonGuardedWrite> {
+    fn guarded_notification(&mut self, data: &str) -> TuiResult<crate::DaemonNotify> {
         let Some(session_id) = self.active_session_id.clone() else {
             return Err(TuiError::NoAttachedSession);
         };
-        let response = self.request(DaemonRequest::GuardedNotificationWrite {
+        let response = self.request(DaemonRequest::NotifySession {
             session_id,
-            package_name: package_name.to_string(),
             data: data.to_string(),
         })?;
-        let Some(result) = response.guarded_write else {
+        let Some(result) = response
+            .coordination
+            .and_then(|coordination| coordination.notify)
+        else {
             return Err(TuiError::UnexpectedResponse);
         };
         self.notifications.push(format!(
@@ -490,9 +482,7 @@ fn handle_key(app: &mut TuiClient, key: KeyEvent) -> TuiResult<bool> {
         }
         (KeyModifiers::CONTROL, KeyCode::Char('r')) => app.refresh()?,
         (KeyModifiers::CONTROL, KeyCode::Char('n')) => {
-            if let Err(error) =
-                app.guarded_notification(DEFAULT_NOTIFICATION_PACKAGE, "botster-doorbell\n")
-            {
+            if let Err(error) = app.guarded_notification("botster-doorbell\n") {
                 app.errors.push(error.to_string());
             }
         }

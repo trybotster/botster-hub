@@ -7,26 +7,30 @@
 
 use botster_core::{
     BotsterEngineObservation, BotsterEngineOutput, ClientId, CoreSession, CoreSessionMetadata,
-    ManagedSessionRuntimeError, PluginCapabilityRuntime, PluginCleanupResult,
-    PluginInvocationOutcome, PluginInvocationRequest, PluginKey, RequestId, SessionId,
+    EnvelopeId, EnvelopeTarget, ManagedSessionRuntimeError, PluginCapabilityRuntime,
+    PluginCleanupResult, PluginInvocationOutcome, PluginInvocationRequest, PluginKey, RequestId,
+    RoutedEnvelope, RoutedEnvelopeDrainOutcome, RoutedEnvelopePublishOutcome, SessionId,
     SessionLifecycleState, SessionRuntimeErrorKind, SessionSpawnRequest, SubscriptionId,
 };
 use botster_core_daemon::{
-    CoreDaemon, CoreDaemonConfig, CoreDaemonError, DaemonSession, DrainResult, GuardedWriteRequest,
-    GuardedWriteResult, RegistrySessionState, SessionAdoptionReport, SessionAdoptionState,
-    SpawnSessionRequest,
+    AcknowledgeRoutedEnvelopeRequest, CoreDaemon, CoreDaemonConfig, CoreDaemonError, DaemonSession,
+    DrainResult, DrainRoutedEnvelopesRequest, GuardedWriteRequest, GuardedWriteResult,
+    PublishRoutedEnvelopeRequest, RegistrySessionState, RoutedEnvelopeDeliveryStateResult,
+    SessionAdoptionReport, SessionAdoptionState, SpawnSessionRequest,
 };
 use std::env;
 use std::error::Error;
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use crate::capabilities::HubCapabilityRuntime;
 use crate::config::HubConfig;
 use crate::lifecycle::{
     HubLifecycleResult, HubPluginLifecycle, HubPluginLifecycleStatus, HubPluginRuntimeBundle,
 };
-use crate::packages::PackageRegistry;
+use crate::lua_runtime::{LuaPluginRuntime, LuaPluginRuntimeError, SharedHubCapabilityRuntime};
+use crate::packages::{PackageRegistry, PackageRegistryError};
 use crate::persistence::{FileHubStateStore, HubState, HubStateStore, HubStateStoreError};
 
 /// Hub-owned adapter and policy facade over the default local core engine.
@@ -41,7 +45,7 @@ pub struct HubRuntime {
     core_daemon: CoreDaemon,
     reconciliation: HubSessionReconciliation,
     plugin_lifecycle: HubPluginLifecycle,
-    capability_runtime: HubCapabilityRuntime,
+    capability_runtime: SharedHubCapabilityRuntime,
     last_capability_cleanup: Option<PluginCleanupResult>,
 }
 
@@ -61,7 +65,7 @@ impl HubRuntime {
         let state = HubState::from_config(&config);
         let core_daemon = CoreDaemon::new(core_daemon_config(&config.data_directory));
         Self {
-            capability_runtime: HubCapabilityRuntime::from_config(&config),
+            capability_runtime: Arc::new(Mutex::new(HubCapabilityRuntime::from_config(&config))),
             config,
             state,
             core_daemon,
@@ -85,7 +89,7 @@ impl HubRuntime {
         let state = store.load_or_initialize(&config)?;
         let core_daemon = CoreDaemon::new(core_daemon_config(&config.data_directory));
         let mut runtime = Self {
-            capability_runtime: HubCapabilityRuntime::from_config(&config),
+            capability_runtime: Arc::new(Mutex::new(HubCapabilityRuntime::from_config(&config))),
             config,
             state,
             core_daemon,
@@ -105,8 +109,8 @@ impl HubRuntime {
 
     /// Return the concrete local capability runtime owned by this hub.
     #[must_use]
-    pub const fn capability_runtime(&self) -> &HubCapabilityRuntime {
-        &self.capability_runtime
+    pub fn capability_runtime(&self) -> SharedHubCapabilityRuntime {
+        self.capability_runtime.clone()
     }
 
     /// Return the durable hub state loaded for this runtime.
@@ -130,6 +134,21 @@ impl HubRuntime {
     ) -> HubLifecycleResult<PluginKey> {
         self.plugin_lifecycle
             .load_package(registry, package_name, bundle)
+    }
+
+    /// Prepare and load an enabled local Lua package through the real Lua runtime.
+    pub fn load_lua_plugin_package(
+        &mut self,
+        registry: &PackageRegistry,
+        package_name: &str,
+    ) -> Result<PluginKey, HubLuaPluginLoadError> {
+        let prepared = registry
+            .prepare_local_package(package_name, "load local lua plugin package")
+            .map_err(HubLuaPluginLoadError::Package)?;
+        let bundle = LuaPluginRuntime::load_prepared(&prepared, self.capability_runtime.clone())
+            .map_err(HubLuaPluginLoadError::Lua)?;
+        self.load_plugin_package(registry, package_name, bundle)
+            .map_err(HubLuaPluginLoadError::Lifecycle)
     }
 
     /// Invoke a plugin handler through core plugin worker mechanics.
@@ -186,7 +205,10 @@ impl HubRuntime {
         &mut self,
         request: botster_core::CapabilityRuntimeRequest,
     ) -> Result<botster_core::CapabilityRuntimeHandle, botster_core::CapabilityRuntimeError> {
-        self.capability_runtime.submit(request)
+        self.capability_runtime
+            .lock()
+            .expect("hub capability runtime lock")
+            .submit(request)
     }
 
     /// Cancel one plugin-owned capability operation.
@@ -195,7 +217,10 @@ impl HubRuntime {
         plugin_key: &PluginKey,
         operation_id: &botster_core::CapabilityOperationId,
     ) -> Result<(), botster_core::CapabilityRuntimeError> {
-        self.capability_runtime.cancel(plugin_key, operation_id)
+        self.capability_runtime
+            .lock()
+            .expect("hub capability runtime lock")
+            .cancel(plugin_key, operation_id)
     }
 
     /// Release one plugin-owned capability resource.
@@ -203,7 +228,10 @@ impl HubRuntime {
         &mut self,
         resource: botster_core::PluginResourceRef,
     ) -> Result<(), botster_core::CapabilityRuntimeError> {
-        self.capability_runtime.release_resource(resource)
+        self.capability_runtime
+            .lock()
+            .expect("hub capability runtime lock")
+            .release_resource(resource)
     }
 
     /// Drain currently available capability events for one plugin.
@@ -212,7 +240,10 @@ impl HubRuntime {
         plugin_key: &PluginKey,
     ) -> Result<Vec<botster_core::CapabilityRuntimeEvent>, botster_core::CapabilityRuntimeError>
     {
-        self.capability_runtime.drain_events(plugin_key)
+        self.capability_runtime
+            .lock()
+            .expect("hub capability runtime lock")
+            .drain_events(plugin_key)
     }
 
     /// Drain capability events after advancing the local logical timer clock.
@@ -222,7 +253,10 @@ impl HubRuntime {
         now_ms: u64,
     ) -> Result<Vec<botster_core::CapabilityRuntimeEvent>, botster_core::CapabilityRuntimeError>
     {
-        self.capability_runtime.drain_events_at(plugin_key, now_ms)
+        self.capability_runtime
+            .lock()
+            .expect("hub capability runtime lock")
+            .drain_events_at(plugin_key, now_ms)
     }
 
     /// Stop all capability runtime resources owned by one plugin.
@@ -230,9 +264,74 @@ impl HubRuntime {
         &mut self,
         plugin_key: &PluginKey,
     ) -> Result<PluginCleanupResult, botster_core::CapabilityRuntimeError> {
-        let cleanup = self.capability_runtime.cleanup_plugin(plugin_key)?;
+        let cleanup = self
+            .capability_runtime
+            .lock()
+            .expect("hub capability runtime lock")
+            .cleanup_plugin(plugin_key)?;
         self.last_capability_cleanup = Some(cleanup.clone());
         Ok(cleanup)
+    }
+
+    /// Return loaded plugin MCP tool descriptors.
+    #[must_use]
+    pub fn list_plugin_mcp_tools(&self) -> Vec<crate::McpToolDescriptor> {
+        self.plugin_lifecycle
+            .mcp_tool_descriptors()
+            .into_iter()
+            .filter_map(crate::mcp::mcp_descriptor_from_plugin)
+            .collect()
+    }
+
+    /// Invoke a loaded plugin MCP tool through the core worker path.
+    pub fn call_plugin_mcp_tool(
+        &self,
+        call: crate::McpCallRequest,
+    ) -> Result<serde_json::Value, crate::McpToolError> {
+        let descriptor = self
+            .plugin_lifecycle
+            .mcp_tool_descriptors()
+            .into_iter()
+            .find(|descriptor| {
+                descriptor
+                    .body
+                    .0
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(call.name.as_str())
+            })
+            .ok_or_else(|| {
+                crate::McpToolError::new(
+                    "unknown_tool",
+                    format!("unknown plugin MCP tool: {}", call.name),
+                )
+            })?;
+        let handler = descriptor.handler.ok_or_else(|| {
+            crate::McpToolError::new("plugin_tool_unavailable", "plugin MCP tool has no handler")
+        })?;
+        let outcome = self.invoke_plugin(PluginInvocationRequest {
+            request_id: RequestId(format!("mcp-tool-{}", call.name)),
+            handler,
+            timeout_ms: 1_000,
+            context: botster_core::PluginInvocationContext {
+                client_id: None,
+                session_id: None,
+                subscription_id: None,
+                surface_id: None,
+                origin: Some("mcp-serve".to_string()),
+                metadata: None,
+            },
+            payload: botster_core::BoundaryJson(call.arguments),
+        });
+        match outcome.result {
+            botster_core::PluginInvocationResult::Completed(success) => {
+                Ok(success.payload.map_or_else(json_null, |payload| payload.0))
+            }
+            botster_core::PluginInvocationResult::Failed(failure) => Err(crate::McpToolError::new(
+                "plugin_tool_failed",
+                failure.reason,
+            )),
+        }
     }
 
     /// Last capability cleanup produced by reload, unload, or explicit cleanup.
@@ -343,6 +442,43 @@ impl HubRuntime {
         request: GuardedWriteRequest,
     ) -> Result<GuardedWriteResult, CoreDaemonError> {
         self.core_daemon.guarded_write(request)
+    }
+
+    /// Publish one coordination envelope through the core daemon routed-envelope primitive.
+    pub fn publish_routed_envelope(
+        &mut self,
+        envelope: RoutedEnvelope,
+    ) -> Result<RoutedEnvelopePublishOutcome, CoreDaemonError> {
+        self.core_daemon
+            .publish_routed_envelope(PublishRoutedEnvelopeRequest { envelope })
+    }
+
+    /// Drain coordination envelopes for one routed target through core cursor semantics.
+    pub fn drain_routed_envelopes(
+        &mut self,
+        target: EnvelopeTarget,
+        after: Option<botster_core::EnvelopeCursor>,
+        limit: usize,
+    ) -> Result<RoutedEnvelopeDrainOutcome, CoreDaemonError> {
+        self.core_daemon
+            .drain_routed_envelopes(DrainRoutedEnvelopesRequest {
+                target,
+                after,
+                limit,
+            })
+    }
+
+    /// Acknowledge one routed envelope delivery through the core daemon.
+    pub fn acknowledge_routed_envelope(
+        &mut self,
+        target: EnvelopeTarget,
+        envelope_id: EnvelopeId,
+    ) -> Result<RoutedEnvelopeDeliveryStateResult, CoreDaemonError> {
+        self.core_daemon
+            .acknowledge_routed_envelope(AcknowledgeRoutedEnvelopeRequest {
+                target,
+                envelope_id,
+            })
     }
 
     /// Release worker-backed sessions before an intentional daemon restart.
@@ -486,6 +622,38 @@ impl From<HubStateStoreError> for HubRuntimeError {
 
 /// Hub runtime result alias.
 pub type HubRuntimeResult<T> = Result<T, HubRuntimeError>;
+
+/// Error emitted while preparing and loading a real Lua plugin package.
+#[derive(Debug)]
+pub enum HubLuaPluginLoadError {
+    Package(PackageRegistryError),
+    Lua(LuaPluginRuntimeError),
+    Lifecycle(crate::HubLifecycleError),
+}
+
+impl fmt::Display for HubLuaPluginLoadError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Package(error) => write!(formatter, "{error:?}"),
+            Self::Lua(error) => write!(formatter, "{error}"),
+            Self::Lifecycle(error) => write!(formatter, "{error:?}"),
+        }
+    }
+}
+
+impl Error for HubLuaPluginLoadError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Package(_) => None,
+            Self::Lua(error) => Some(error),
+            Self::Lifecycle(_) => None,
+        }
+    }
+}
+
+fn json_null() -> serde_json::Value {
+    serde_json::Value::Null
+}
 
 fn core_daemon_config(data_directory: &Path) -> CoreDaemonConfig {
     CoreDaemonConfig::new(data_directory).with_worker_path(session_worker_path())

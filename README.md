@@ -265,10 +265,8 @@ subscription id, and reattaches when the worker-backed session is recovered.
 When recovery is absent, it leaves the operator in the session/status view with
 a visible session-lost error.
 
-Guarded doorbell notifications use the daemon `GuardedNotificationWrite`
-request, which wraps `HubClientRequest::GuardedNotificationWrite` and returns
-the core guarded-write decision plus delivery states. The test fixture enables a
-package with `session_actions` before exercising this path. The current daemon
+Doorbell notifications use the daemon `NotifySession` request, the same native
+coordination path exposed through MCP as `notify_session`. The current daemon
 socket surface does not expose observed mode/screen readiness yet, so the
 production TUI fails closed and reports the deferred guarded-write decision
 rather than fabricating `SafeWriteIndicator::Safe`. A future delivered doorbell
@@ -295,18 +293,41 @@ line is one protocol message, and the command does not use `Content-Length`
 framing. Process diagnostics belong on stderr so agent clients can treat stdout
 as the protocol stream.
 
-The first native tools are read-only smoke tools:
+Native tools route through the running daemon, not directly into hub state:
 
 - `hub.status` returns sanitized daemon status through
   `daemon_transport_request -> serve_daemon -> HubClientApi -> HubRuntime`.
 - `hub.sessions.list` returns sanitized session ids and lifecycle labels through
   the same daemon/client path.
+- `whoami` reports the local MCP identity available to native tools. When
+  `BOTSTER_SESSION_UUID` is present it is reported as the caller session.
+- `post_message` and `post_envelope` publish a text payload as a core routed
+  envelope to one target session.
+- `receive_messages` and `receive_envelopes` drain only the caller session route
+  from `BOTSTER_SESSION_UUID`; they do not accept another session id or agent id.
+- `ack_message` and `ack_envelope` acknowledge one delivered caller-scoped
+  envelope.
+- `notify_session` is a guarded-write doorbell attempt. The current native MCP
+  surface does not yet gather terminal readiness evidence from attached clients,
+  so it reports core's guarded-write decision and can defer instead of injecting
+  bytes. That result is separate from routed-envelope inbox, cursor, and ack
+  semantics.
+
+The message/envelope tools use
+`daemon_transport_request -> serve_daemon -> HubClientApi -> HubRuntime ->
+CoreDaemon::{publish,drain,acknowledge}_routed_envelope`. Core assigns routed
+envelope cursors in memory; the current hub surface reports the cursor returned
+by core but does not claim restart-durable inbox state.
 
 Tool listing and calling both route through `McpToolRegistry`. Native hub tools
 are provided by `NativeHubToolProvider` today; future Lua plugin tools should add
 descriptors and owned call messages to that same registry path, with execution
 dispatched through the plugin worker/supervisor boundary instead of creating a
 second MCP server or direct in-process closure path.
+
+The local coordination path uses no Lua or plugin tool execution: `whoami`,
+`post_message`, `receive_messages`, `ack_message`, and `notify_session` are
+native hub tools even when the binary also has the Lua plugin runtime available.
 
 Dogfood-ready today: explicit local daemon lifecycle, file-backed hub/package
 state, local package admission from a manifest path, typed status/package reads,

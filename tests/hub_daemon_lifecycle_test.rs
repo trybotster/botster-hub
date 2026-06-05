@@ -179,11 +179,8 @@ fn provider_manifest() -> PackageManifest {
 
 fn write_local_plugin_package(root: &Path) {
     fs::create_dir_all(root).expect("create local package root");
-    fs::write(
-        root.join("plugin.lua"),
-        "-- synthetic local dogfood plugin\n",
-    )
-    .expect("write plugin entrypoint");
+    fs::write(root.join("plugin.lua"), "return botster.register({})\n")
+        .expect("write plugin entrypoint");
     fs::write(
         root.join("botster-package.json"),
         r#"{
@@ -204,48 +201,27 @@ fn write_local_plugin_package(root: &Path) {
     .expect("write local package manifest");
 }
 
-fn write_guarded_notification_package(root: &Path) {
-    fs::create_dir_all(root).expect("create guarded package root");
-    fs::write(root.join("plugin.lua"), "-- guarded notification fixture\n")
-        .expect("write guarded plugin entrypoint");
+fn write_local_process_plugin_package(root: &Path) {
+    fs::create_dir_all(root.join("bin")).expect("create process package root");
+    fs::write(root.join("bin").join("plugin"), "#!/bin/sh\n").expect("write process entrypoint");
     fs::write(
         root.join("botster-package.json"),
         r#"{
-  "name": "workflow.plugin",
+  "name": "dogfood.process-plugin",
   "version": "1.0.0",
   "kind": "plugin",
   "botster": ">=0.1.0",
   "source": { "type": "path", "path": "." },
   "capabilities": [
-    { "surface": "session_actions" }
+    { "surface": "surfaces" }
   ],
   "entrypoints": [
-    { "runtime": "lua", "path": "plugin.lua", "bootstrap": false }
+    { "runtime": "process", "path": "bin/plugin", "bootstrap": false }
   ]
 }
 "#,
     )
-    .expect("write guarded package manifest");
-}
-
-fn enable_guarded_notification_package(data_dir: &Path, config: &botster_hub::HubConfig) {
-    let package_root = data_dir.join("workflow-plugin");
-    write_guarded_notification_package(&package_root);
-    let enable = botster_hub::daemon_transport_request(
-        config,
-        botster_hub::DaemonRequest::EnablePackageLocalPath { path: package_root },
-    )
-    .expect("enable guarded notification package through daemon");
-    assert_eq!(
-        enable.kind,
-        botster_hub::DaemonResponseKind::PackageDecision
-    );
-    assert!(
-        enable
-            .packages
-            .iter()
-            .any(|package| package.package_name == "workflow.plugin" && package.state == "enabled")
-    );
+    .expect("write local process package manifest");
 }
 
 fn daemon_test_lock() -> &'static Mutex<()> {
@@ -1168,19 +1144,18 @@ fn daemon_detaches_subscription_when_attach_connection_drops() {
 }
 
 #[test]
-fn daemon_guarded_notification_write_defers_without_observed_readiness_over_socket() {
+fn daemon_notify_session_defers_without_observed_readiness_over_socket() {
     let _guard = daemon_test_lock()
         .lock()
         .expect("serialize real daemon test");
-    let data_dir = unique_test_dir("daemon-guarded-write");
+    let data_dir = unique_test_dir("daemon-notify-session");
     let config = explicit_config(&data_dir);
     let child = start_cli_daemon(&data_dir);
-    enable_guarded_notification_package(&data_dir, &config);
 
     let spawn = botster_hub::daemon_transport_request(
         &config,
         botster_hub::DaemonRequest::Spawn {
-            session_id: "guarded-socket-session".to_string(),
+            session_id: "notify-socket-session".to_string(),
             command:
                 "printf 'ready\\n'; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done"
                     .to_string(),
@@ -1193,29 +1168,31 @@ fn daemon_guarded_notification_write_defers_without_observed_readiness_over_sock
         botster_hub::DaemonConnection::connect(&config).expect("connect TUI-grade socket");
     connection
         .request(&botster_hub::DaemonRequest::Attach {
-            session_id: "guarded-socket-session".to_string(),
-            subscription_id: "guarded-socket-subscription".to_string(),
+            session_id: "notify-socket-session".to_string(),
+            subscription_id: "notify-socket-subscription".to_string(),
         })
         .expect("attach persistent socket subscription");
 
     let write = connection
-        .request(&botster_hub::DaemonRequest::GuardedNotificationWrite {
-            session_id: "guarded-socket-session".to_string(),
-            package_name: "workflow.plugin".to_string(),
-            data: "guarded-socket\n".to_string(),
+        .request(&botster_hub::DaemonRequest::NotifySession {
+            session_id: "notify-socket-session".to_string(),
+            data: "notify-socket\n".to_string(),
         })
-        .expect("guarded notification write over daemon socket");
-    assert_eq!(write.kind, botster_hub::DaemonResponseKind::GuardedWrite);
-    let guarded = write.guarded_write.expect("guarded write response body");
-    assert_eq!(guarded.decision, "defer");
-    assert_eq!(guarded.states, vec!["accepted", "deferred"]);
+        .expect("notify session over daemon socket");
+    assert_eq!(write.kind, botster_hub::DaemonResponseKind::SessionNotified);
+    let notify = write
+        .coordination
+        .and_then(|coordination| coordination.notify)
+        .expect("notify response body");
+    assert!(notify.decision.starts_with("Defer"));
+    assert_eq!(notify.states, vec!["accepted", "deferred"]);
 
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     let mut observed = String::new();
     while std::time::Instant::now() < deadline {
         let drain = connection
             .request(&botster_hub::DaemonRequest::Drain {
-                session_id: "guarded-socket-session".to_string(),
+                session_id: "notify-socket-session".to_string(),
             })
             .expect("drain guarded socket session");
         for event in drain.events {
@@ -1223,14 +1200,14 @@ fn daemon_guarded_notification_write_defers_without_observed_readiness_over_sock
                 observed.push_str(&data);
             }
         }
-        if observed.contains("echo:guarded-socket") {
+        if observed.contains("echo:notify-socket") {
             break;
         }
         thread::sleep(Duration::from_millis(30));
     }
     assert!(
-        !observed.contains("echo:guarded-socket"),
-        "guarded socket write without observed readiness should not reach PTY input path, got {observed:?}"
+        !observed.contains("echo:notify-socket"),
+        "notify session without observed readiness should not reach PTY input path, got {observed:?}"
     );
 
     shutdown_cli_daemon(&data_dir, child);
@@ -1244,7 +1221,6 @@ fn scripted_tui_uses_daemon_socket_for_attach_input_doorbell_resize_and_restart_
     let data_dir = unique_test_dir("scripted-tui");
     let config = explicit_config(&data_dir);
     let child = start_cli_daemon(&data_dir);
-    enable_guarded_notification_package(&data_dir, &config);
 
     let spawn = botster_hub::daemon_transport_request(
         &config,
@@ -1269,7 +1245,7 @@ fn scripted_tui_uses_daemon_socket_for_attach_input_doorbell_resize_and_restart_
     assert!(proof.observed_output.contains("winsize:31 101"));
     assert!(!proof.observed_output.contains("echo:doorbell-from-tui"));
     assert!(proof.observed_output.contains("echo:after-reattach"));
-    assert_eq!(proof.guarded_decision, "defer");
+    assert!(proof.guarded_decision.starts_with("Defer"));
     assert_eq!(proof.guarded_states, vec!["accepted", "deferred"]);
     assert_eq!(proof.resize_sent, Some((31, 101)));
     assert_ne!(
@@ -1574,9 +1550,9 @@ fn cli_packages_enable_local_path_routes_through_running_daemon_and_persists() {
     );
     assert!(
         lifecycle.lifecycle.iter().any(|plugin| {
-            plugin.package_name == "dogfood.plugin" && plugin.state == "enabled" && !plugin.loaded
+            plugin.package_name == "dogfood.plugin" && plugin.state == "enabled" && plugin.loaded
         }),
-        "enabled package should be visible to daemon lifecycle without restart"
+        "enabled package should load into daemon lifecycle without restart"
     );
 
     let list = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
@@ -1637,6 +1613,45 @@ fn cli_packages_enable_local_path_routes_through_running_daemon_and_persists() {
     assert!(stdout.contains("state=enabled"));
 
     shutdown_cli_daemon(&data_dir, restarted);
+}
+
+#[test]
+fn cli_packages_enable_local_process_package_does_not_attempt_lua_load() {
+    let _guard = daemon_test_lock()
+        .lock()
+        .expect("serialize real daemon test");
+    let data_dir = unique_test_dir("cli-process-package");
+    let package_dir = unique_test_dir("local-process-package");
+    write_local_process_plugin_package(&package_dir);
+    let child = start_cli_daemon(&data_dir);
+
+    let enable = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("packages")
+        .arg("enable")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("--path")
+        .arg(&package_dir)
+        .output()
+        .expect("run botster-hub packages enable process package");
+
+    assert!(
+        enable.status.success(),
+        "enable process package failed: {}",
+        String::from_utf8_lossy(&enable.stderr)
+    );
+    let lifecycle = botster_hub::daemon_transport_request(
+        &explicit_config(&data_dir),
+        botster_hub::DaemonRequest::PluginLifecycleStatus,
+    )
+    .expect("daemon plugin lifecycle status");
+    assert!(lifecycle.lifecycle.iter().any(|plugin| {
+        plugin.package_name == "dogfood.process-plugin"
+            && plugin.state == "enabled"
+            && !plugin.loaded
+    }));
+
+    shutdown_cli_daemon(&data_dir, child);
 }
 
 #[test]
