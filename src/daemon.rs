@@ -10,6 +10,7 @@ use std::fmt;
 
 use botster_core::SessionId;
 
+use crate::HubLuaPluginLoadError;
 use crate::config::HubConfig;
 use crate::packages::{
     PackageClassification, PackageRegistry, PackageRegistrySnapshotError, PackageState,
@@ -192,6 +193,8 @@ pub(crate) fn load_enabled_local_plugins(
         if let Some(bundle) = runtime_bundle_for_prepared_package(&package, &config.data_directory)
         {
             runtime.load_plugin_package(package_registry, &package.package_name, bundle)?;
+        } else if package.selected_entrypoint.runtime == botster_core::ExtensionRuntime::Lua {
+            runtime.load_lua_plugin_package(package_registry, &package.package_name)?;
         }
     }
     Ok(())
@@ -210,6 +213,8 @@ pub enum HubDaemonError {
     Package(crate::PackageRegistryError),
     /// Plugin lifecycle rejected a prepared package load.
     Lifecycle(crate::HubLifecycleError),
+    /// Enabled local Lua plugin failed to load during daemon startup.
+    LuaPlugin(HubLuaPluginLoadError),
 }
 
 impl fmt::Display for HubDaemonError {
@@ -222,6 +227,7 @@ impl fmt::Display for HubDaemonError {
             }
             Self::Package(error) => write!(formatter, "hub package policy error: {error:?}"),
             Self::Lifecycle(error) => write!(formatter, "hub plugin lifecycle error: {error:?}"),
+            Self::LuaPlugin(error) => write!(formatter, "hub lua plugin load error: {error}"),
         }
     }
 }
@@ -233,6 +239,7 @@ impl Error for HubDaemonError {
             Self::Runtime(error) => Some(error),
             Self::PackageRegistry(_) => None,
             Self::Package(_) | Self::Lifecycle(_) => None,
+            Self::LuaPlugin(error) => Some(error),
         }
     }
 }
@@ -264,6 +271,12 @@ impl From<crate::PackageRegistryError> for HubDaemonError {
 impl From<crate::HubLifecycleError> for HubDaemonError {
     fn from(error: crate::HubLifecycleError) -> Self {
         Self::Lifecycle(error)
+    }
+}
+
+impl From<HubLuaPluginLoadError> for HubDaemonError {
+    fn from(error: HubLuaPluginLoadError) -> Self {
+        Self::LuaPlugin(error)
     }
 }
 

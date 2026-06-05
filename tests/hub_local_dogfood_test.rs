@@ -3,22 +3,15 @@
 use std::fs;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use botster_core::{
-    BoundaryJson, Capability, CapabilitySurface, PluginCancellationToken, PluginDescriptorKind,
-    PluginDescriptorRef, PluginHandlerKind, PluginHandlerRef, PluginHandlerRegistration,
-    PluginInvocationContext, PluginInvocationRequest, PluginInvocationResult,
-    PluginInvocationSuccess, PluginKey, PluginOwnedDescriptor, PluginResourceKind,
-    PluginResourceRef, PluginRuntime, RequestId, SessionId, SessionLifecycleState, SubscriptionId,
-};
+use botster_core::{RequestId, SessionId, SessionLifecycleState, SubscriptionId};
 use botster_hub::{
     DataDirectoryOption, FileHubStateStore, HostIdentityOptions, HubClientApi, HubClientEvent,
     HubClientPackageClassification, HubClientPackageState, HubClientRequest, HubClientResponseBody,
-    HubDaemon, HubPluginRuntimeBundle, HubStartupOptions, HubStateLoadSource, HubStateStore,
-    PackageRegistry, RuntimeEnvironment, SessionDefaults, TransportBindings,
+    HubDaemon, HubStartupOptions, HubStateLoadSource, HubStateStore, PackageRegistry,
+    RuntimeEnvironment, SessionDefaults, TransportBindings,
 };
 
 mod support;
@@ -28,47 +21,6 @@ const DOGFOOD_PACKAGE: &str = "dogfood.synthetic-plugin";
 const DOGFOOD_SESSION: &str = "dogfood-local-session";
 const DOGFOOD_SUBSCRIPTION: &str = "dogfood-local-subscription";
 const INPUT_MARKER: &[u8] = b"dogfood:from-input";
-
-#[derive(Clone)]
-struct FakeDogfoodRuntime {
-    invocations: Arc<Mutex<Vec<PluginInvocationRequest>>>,
-}
-
-impl FakeDogfoodRuntime {
-    fn new() -> Self {
-        Self {
-            invocations: Arc::new(Mutex::new(Vec::new())),
-        }
-    }
-
-    fn invocations(&self) -> Vec<PluginInvocationRequest> {
-        self.invocations
-            .lock()
-            .expect("fake dogfood runtime invocations lock")
-            .clone()
-    }
-}
-
-impl PluginRuntime for FakeDogfoodRuntime {
-    fn invoke(
-        &self,
-        request: PluginInvocationRequest,
-        _cancellation: PluginCancellationToken,
-    ) -> PluginInvocationResult {
-        self.invocations
-            .lock()
-            .expect("fake dogfood runtime invocations lock")
-            .push(request.clone());
-
-        PluginInvocationResult::Completed(PluginInvocationSuccess {
-            request_id: request.request_id,
-            handler: request.handler,
-            payload: Some(BoundaryJson(serde_json::json!({ "dogfood": true }))),
-        })
-    }
-
-    fn stop(&self, _plugin_key: &PluginKey) {}
-}
 
 #[test]
 fn local_dogfood_runs_daemon_package_lifecycle_session_and_clean_shutdown() {
@@ -132,35 +84,6 @@ fn run_local_dogfood() {
         "prepared entrypoint should resolve to plugin.lua"
     );
 
-    let runtime = FakeDogfoodRuntime::new();
-    let command = handler("dogfood.invoke");
-    let loaded_registry = reloaded.package_registry().clone();
-    let loaded = reloaded
-        .runtime_mut()
-        .expect("runtime initialized after reload")
-        .load_plugin_package(
-            &loaded_registry,
-            DOGFOOD_PACKAGE,
-            HubPluginRuntimeBundle {
-                runtime: Arc::new(runtime.clone()),
-                handlers: vec![PluginHandlerRegistration {
-                    handler: command.clone(),
-                    required_capability: Some(capability(CapabilitySurface::Surfaces, None)),
-                }],
-                descriptors: vec![descriptor("dogfood-command", command.clone())],
-                resources: vec![resource("dogfood-resource")],
-                entrypoint: Some(
-                    prepared
-                        .selected_entrypoint_path
-                        .to_string_lossy()
-                        .into_owned(),
-                ),
-                metadata: None,
-            },
-        )
-        .expect("load synthetic plugin through hub lifecycle");
-    assert_eq!(loaded, PluginKey(DOGFOOD_PACKAGE.to_string()));
-
     let lifecycle_registry = reloaded.package_registry().clone();
     let lifecycle = api
         .handle_request(
@@ -178,15 +101,25 @@ fn run_local_dogfood() {
     assert_eq!(records[0].package_name, DOGFOOD_PACKAGE);
     assert!(records[0].loaded);
 
-    let outcome = reloaded
+    let tools = reloaded
+        .runtime()
+        .expect("runtime initialized")
+        .list_plugin_mcp_tools();
+    assert!(
+        tools
+            .iter()
+            .any(|tool| tool.name == "dogfood.synthetic.echo")
+    );
+    let result = reloaded
         .runtime_mut()
         .expect("runtime initialized")
-        .invoke_plugin(invocation(command.clone()));
-    assert!(matches!(
-        outcome.result,
-        PluginInvocationResult::Completed(PluginInvocationSuccess { handler, .. }) if handler == command
-    ));
-    assert_eq!(runtime.invocations().len(), 1);
+        .call_plugin_mcp_tool(botster_hub::McpCallRequest {
+            name: "dogfood.synthetic.echo".to_string(),
+            arguments: serde_json::json!({ "message": "dogfood" }),
+        })
+        .expect("call real synthetic Lua MCP tool");
+    assert_eq!(result["message"], "dogfood");
+    assert_eq!(result["ambient"]["os"], true);
 
     let mut session_started = false;
     let session_id = SessionId(DOGFOOD_SESSION.to_string());
@@ -449,58 +382,6 @@ fn persist_package_registry(daemon: &HubDaemon) {
             state.package_registry = snapshot;
         })
         .expect("persist dogfood package registry");
-}
-
-fn capability(surface: CapabilitySurface, scope: Option<&str>) -> Capability {
-    Capability {
-        surface,
-        scope: scope.map(ToString::to_string),
-    }
-}
-
-fn handler(handler_id: &str) -> PluginHandlerRef {
-    PluginHandlerRef {
-        plugin_key: PluginKey(DOGFOOD_PACKAGE.to_string()),
-        kind: PluginHandlerKind::Command,
-        handler_id: handler_id.to_string(),
-    }
-}
-
-fn descriptor(descriptor_id: &str, handler: PluginHandlerRef) -> PluginOwnedDescriptor {
-    PluginOwnedDescriptor {
-        descriptor: PluginDescriptorRef {
-            plugin_key: PluginKey(DOGFOOD_PACKAGE.to_string()),
-            kind: PluginDescriptorKind::Command,
-            descriptor_id: descriptor_id.to_string(),
-        },
-        handler: Some(handler),
-        body: BoundaryJson(serde_json::json!({ "id": descriptor_id })),
-    }
-}
-
-fn resource(resource_id: &str) -> PluginResourceRef {
-    PluginResourceRef {
-        plugin_key: PluginKey(DOGFOOD_PACKAGE.to_string()),
-        kind: PluginResourceKind::McpRegistration,
-        resource_id: resource_id.to_string(),
-    }
-}
-
-fn invocation(handler: PluginHandlerRef) -> PluginInvocationRequest {
-    PluginInvocationRequest {
-        request_id: request_id("dogfood-invoke"),
-        handler,
-        timeout_ms: 1_000,
-        context: PluginInvocationContext {
-            client_id: None,
-            session_id: None,
-            subscription_id: None,
-            surface_id: None,
-            origin: Some("hub-local-dogfood-test".to_string()),
-            metadata: None,
-        },
-        payload: BoundaryJson(serde_json::json!({ "dogfood": "invoke" })),
-    }
 }
 
 fn request_id(value: &str) -> RequestId {
