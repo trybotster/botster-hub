@@ -555,3 +555,33 @@ pub fn mcp_invocation_context() -> PluginInvocationContext {
         }))),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unique_test_path(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time after epoch")
+            .as_nanos();
+        std::env::temp_dir()
+            .join("botster-hub-project-pipelines")
+            .join(name)
+            .join(nanos.to_string())
+    }
+
+    #[test]
+    fn mutating_handler_reports_persist_failed_when_state_write_fails() {
+        let blocked_root = unique_test_path("persist-failed");
+        fs::create_dir_all(blocked_root.parent().expect("test path parent"))
+            .expect("create test parent");
+        fs::write(&blocked_root, b"not a directory").expect("create state root blocker");
+
+        let runtime = ProjectPipelinesRuntime::new(blocked_root);
+        let result = runtime.handle("create", json!({ "title": "Cannot persist" }));
+
+        assert_eq!(result["ok"], false);
+        assert_eq!(result["error"]["code"], "persist_failed");
+    }
+}
