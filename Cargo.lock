@@ -79,7 +79,7 @@ dependencies = [
 [[package]]
 name = "botster-core"
 version = "0.1.0"
-source = "git+https://github.com/trybotster/botster-core?branch=main#f03e82e59a77cfee938bb8807c31b2a260cbdc10"
+source = "git+https://github.com/trybotster/botster-core?branch=main#765ea865fc6672365ec60114c14f48581c8a75d8"
 dependencies = [
  "aes-gcm",
  "base64",
@@ -95,7 +95,7 @@ dependencies = [
 [[package]]
 name = "botster-core-daemon"
 version = "0.1.0"
-source = "git+https://github.com/trybotster/botster-core?branch=main#f03e82e59a77cfee938bb8807c31b2a260cbdc10"
+source = "git+https://github.com/trybotster/botster-core?branch=main#765ea865fc6672365ec60114c14f48581c8a75d8"
 dependencies = [
  "botster-core",
  "serde",
