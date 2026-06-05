@@ -231,6 +231,7 @@ impl ProjectPipelinesRuntime {
 
     fn handle(&self, handler_id: &str, arguments: Value) -> Value {
         let mut state = self.state.lock().expect("project pipelines state lock");
+        let mutates = !matches!(handler_id, "list" | "current_context");
         let result = match handler_id {
             "create" => state.create(arguments),
             "list" | "current_context" => state.snapshot(),
@@ -246,7 +247,18 @@ impl ProjectPipelinesRuntime {
                 }
             }),
         };
-        let _ = write_state(&self.state_path, &state);
+        if mutates
+            && result.get("ok").and_then(Value::as_bool) == Some(true)
+            && let Err(error) = write_state(&self.state_path, &state)
+        {
+            return json!({
+                "ok": false,
+                "error": {
+                    "code": "persist_failed",
+                    "message": format!("failed to persist Project Pipelines state: {error}")
+                }
+            });
+        }
         result
     }
 }

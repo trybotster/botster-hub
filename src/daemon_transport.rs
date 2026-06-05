@@ -676,7 +676,7 @@ fn plugin_mcp_call_tool_response(
             success
                 .payload
                 .map(|payload| payload.0)
-                .unwrap_or_else(|| json_empty()),
+                .unwrap_or_else(json_empty),
         )),
         PluginInvocationResult::Failed(failure) => Ok(DaemonResponse::mcp_call_error(
             format!("{:?}", failure.kind),

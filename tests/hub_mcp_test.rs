@@ -394,9 +394,22 @@ fn mcp_serve_lists_calls_and_reloads_project_pipelines_plugin_tools() {
                     "arguments": {}
                 }
             }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 9,
+                "method": "tools/call",
+                "params": {
+                    "name": "project_pipelines.start",
+                    "arguments": {
+                        "ticket_id": "ticket_local_missing",
+                        "target_id": "tgt_local_project",
+                        "worktree": "worktrees/project-pipelines-local"
+                    }
+                }
+            }),
         ],
     );
-    let messages = mcp_messages(output, 8);
+    let messages = mcp_messages(output, 9);
 
     let tool_names = messages[1]["result"]["tools"]
         .as_array()
@@ -428,6 +441,11 @@ fn mcp_serve_lists_calls_and_reloads_project_pipelines_plugin_tools() {
     assert_eq!(
         messages[7]["result"]["structuredContent"]["runs"][0]["status"],
         "ready_for_review"
+    );
+    assert_eq!(messages[8]["result"]["structuredContent"]["ok"], false);
+    assert_eq!(
+        messages[8]["result"]["structuredContent"]["error"]["code"],
+        "not_found"
     );
     assert!(
         data_dir
