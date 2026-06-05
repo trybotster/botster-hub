@@ -2,10 +2,11 @@
 //!
 //! Core owns request, event, handle, and error shapes. The hub owns concrete
 //! local policy: scope roots, plugin-data paths, exact grants, operation
-//! limits, bounded local network stubs, and plugin cleanup.
+//! limits, policy-gated HTTP execution, and plugin cleanup.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
+use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -20,7 +21,7 @@ use botster_core::{
     FilesystemCapabilityPermissions, FilesystemCapabilityRequest, FilesystemCapabilityResult,
     FilesystemEntry, FilesystemEntryKind, FilesystemMetadata, FilesystemOperation,
     HttpCapabilityEndpointPolicy, HttpCapabilityResponse, HttpCapabilityRuntime,
-    HttpCapabilityRuntimeConfig, HttpCapabilityTransport, HttpTransportRequest,
+    HttpCapabilityRuntimeConfig, HttpCapabilityTransport, HttpHeader, HttpTransportRequest,
     InMemoryWebSocketCapabilityRuntime, PluginCancellationToken, PluginCapabilityRuntime,
     PluginCleanupResult, PluginKey, PluginResourceKind, PluginResourceRef, PluginStoreBackend,
     PluginStoreCapabilityRequest, PluginStoreEntry, PluginStoreKey, PluginStoreLimits,
@@ -34,6 +35,7 @@ use crate::config::HubConfig;
 const DEFAULT_FILESYSTEM_SCOPE: &str = "workspace";
 const DEFAULT_CAPABILITY_EVENT_CAPACITY: usize = 256;
 const DEFAULT_CAPABILITY_OPERATION_CAPACITY: usize = 128;
+const DEFAULT_HTTP_TIMEOUT_MS: u64 = 5_000;
 
 /// Hub-owned concrete capability runtime.
 pub struct HubCapabilityRuntime {
@@ -80,15 +82,13 @@ impl HubCapabilityRuntime {
                 },
             },
         )]);
-        let endpoint_policy = HttpCapabilityEndpointPolicy::new(
-            ["http", "https"],
-            ["localhost", "127.0.0.1", "example.invalid"],
-        );
+        let endpoint_policy =
+            HttpCapabilityEndpointPolicy::new(["http", "https"], ["localhost", "127.0.0.1"]);
         let http = HttpCapabilityRuntime::new(
             grants.clone(),
             endpoint_policy,
             HttpCapabilityRuntimeConfig::default(),
-            Arc::new(LocalStubHttpTransport),
+            Arc::new(RealHttpTransport::default()),
         );
         let websocket = InMemoryWebSocketCapabilityRuntime::new(
             WebSocketCapabilityRuntimeConfig::new(grants.clone(), 256, 256, 256),
@@ -1070,25 +1070,78 @@ fn enforce_plugin_store_limits(
     Ok(())
 }
 
-struct LocalStubHttpTransport;
+struct RealHttpTransport {
+    agent: ureq::Agent,
+    policy: HubHttpTransportPolicy,
+}
 
-impl HttpCapabilityTransport for LocalStubHttpTransport {
+impl Default for RealHttpTransport {
+    fn default() -> Self {
+        let timeout = Duration::from_millis(DEFAULT_HTTP_TIMEOUT_MS);
+        let agent = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .max_redirects(0)
+            .proxy(None)
+            .timeout_global(Some(timeout))
+            .timeout_connect(Some(timeout))
+            .timeout_recv_response(Some(timeout))
+            .timeout_recv_body(Some(timeout))
+            .build()
+            .into();
+        Self {
+            agent,
+            policy: HubHttpTransportPolicy::default(),
+        }
+    }
+}
+
+impl HttpCapabilityTransport for RealHttpTransport {
     fn execute(
         &self,
         request: HttpTransportRequest,
         cancellation: PluginCancellationToken,
     ) -> Result<HttpCapabilityResponse, CapabilityRuntimeError> {
+        self.policy.validate_request(&request)?;
         if cancellation.is_cancelled() {
             return Err(CapabilityRuntimeError::new(
                 CapabilityRuntimeErrorKind::Cancelled,
                 "HTTP capability operation was cancelled",
             ));
         }
-        std::thread::sleep(Duration::from_millis(1));
+
+        let mut builder = ureq::http::Request::builder()
+            .method(request_method(&request)?)
+            .uri(request_endpoint(&request));
+        for header in request_headers(&request) {
+            builder = builder.header(&header.name, &header.value);
+        }
+        let http_request = builder.body(request_body(&request)).map_err(|_| {
+            CapabilityRuntimeError::new(
+                CapabilityRuntimeErrorKind::InvalidRequest,
+                "HTTP request could not be built from admitted capability input",
+            )
+        })?;
+
+        let mut response = self.agent.run(http_request).map_err(transport_error)?;
+        if cancellation.is_cancelled() {
+            return Err(CapabilityRuntimeError::new(
+                CapabilityRuntimeErrorKind::Cancelled,
+                "HTTP capability operation was cancelled",
+            ));
+        }
+
+        let status = response.status().as_u16();
+        let headers = response_headers(&response)?;
+        let body = response
+            .body_mut()
+            .with_config()
+            .limit(request.max_response_body_bytes.saturating_add(1) as u64)
+            .read_to_vec()
+            .map_err(transport_error)?;
         let response = HttpCapabilityResponse {
-            status: 204,
-            headers: Vec::new(),
-            body: Vec::new(),
+            status,
+            headers,
+            body,
         };
         HttpCapabilityRuntime::validate_response(
             &HttpCapabilityRuntimeConfig {
@@ -1101,6 +1154,156 @@ impl HttpCapabilityTransport for LocalStubHttpTransport {
             &response,
         )?;
         Ok(response)
+    }
+}
+
+struct HubHttpTransportPolicy {
+    allowed_methods: BTreeSet<&'static str>,
+    allowed_request_headers: BTreeSet<&'static str>,
+    denied_sensitive_headers: BTreeSet<&'static str>,
+}
+
+impl Default for HubHttpTransportPolicy {
+    fn default() -> Self {
+        Self {
+            allowed_methods: BTreeSet::from(["GET", "POST"]),
+            allowed_request_headers: BTreeSet::from(["accept", "content-type", "user-agent"]),
+            denied_sensitive_headers: BTreeSet::from([
+                "authorization",
+                "cookie",
+                "proxy-authorization",
+                "set-cookie",
+            ]),
+        }
+    }
+}
+
+impl HubHttpTransportPolicy {
+    fn validate_request(
+        &self,
+        request: &HttpTransportRequest,
+    ) -> Result<(), CapabilityRuntimeError> {
+        let method = request_method_text(request);
+        if !self.allowed_methods.contains(method.as_str()) {
+            return Err(CapabilityRuntimeError::new(
+                CapabilityRuntimeErrorKind::CapabilityDenied,
+                "HTTP method is not allowed by this hub",
+            ));
+        }
+
+        for header in request_headers(request) {
+            let name = header.name.to_ascii_lowercase();
+            if self.denied_sensitive_headers.contains(name.as_str()) {
+                return Err(CapabilityRuntimeError::new(
+                    CapabilityRuntimeErrorKind::CapabilityDenied,
+                    "HTTP request header is not allowed by this hub",
+                ));
+            }
+            if !self.allowed_request_headers.contains(name.as_str()) {
+                return Err(CapabilityRuntimeError::new(
+                    CapabilityRuntimeErrorKind::CapabilityDenied,
+                    "HTTP request header is not allowed by this hub",
+                ));
+            }
+        }
+
+        Ok(())
+    }
+}
+
+fn request_method(
+    request: &HttpTransportRequest,
+) -> Result<ureq::http::Method, CapabilityRuntimeError> {
+    request_method_text(request).parse().map_err(|_| {
+        CapabilityRuntimeError::new(
+            CapabilityRuntimeErrorKind::InvalidRequest,
+            "HTTP method could not be parsed after admission",
+        )
+    })
+}
+
+fn request_method_text(request: &HttpTransportRequest) -> String {
+    let CapabilityOperation::Http(http) = &request.runtime_request.operation else {
+        return String::new();
+    };
+    http.method.trim().to_ascii_uppercase()
+}
+
+fn request_endpoint(request: &HttpTransportRequest) -> &str {
+    let CapabilityOperation::Http(http) = &request.runtime_request.operation else {
+        return "";
+    };
+    http.endpoint.as_str()
+}
+
+fn request_headers(request: &HttpTransportRequest) -> &[HttpHeader] {
+    let CapabilityOperation::Http(http) = &request.runtime_request.operation else {
+        return &[];
+    };
+    http.headers.as_slice()
+}
+
+fn request_body(request: &HttpTransportRequest) -> Vec<u8> {
+    let CapabilityOperation::Http(http) = &request.runtime_request.operation else {
+        return Vec::new();
+    };
+    http.body.clone()
+}
+
+fn response_headers(
+    response: &ureq::http::Response<ureq::Body>,
+) -> Result<Vec<HttpHeader>, CapabilityRuntimeError> {
+    response
+        .headers()
+        .iter()
+        .map(|(name, value)| {
+            let value = value.to_str().map_err(|_| {
+                CapabilityRuntimeError::new(
+                    CapabilityRuntimeErrorKind::InvalidRequest,
+                    "HTTP response header value is not valid text",
+                )
+            })?;
+            Ok(HttpHeader {
+                name: name.as_str().to_string(),
+                value: value.to_string(),
+            })
+        })
+        .collect()
+}
+
+fn transport_error(error: ureq::Error) -> CapabilityRuntimeError {
+    let kind = match error {
+        ureq::Error::Timeout(_) => CapabilityRuntimeErrorKind::TimedOut,
+        ureq::Error::BodyExceedsLimit(_) => CapabilityRuntimeErrorKind::InvalidRequest,
+        _ => CapabilityRuntimeErrorKind::BackendFailed,
+    };
+    CapabilityRuntimeError::new(kind, sanitized_transport_error(error))
+}
+
+fn sanitized_transport_error(error: ureq::Error) -> String {
+    match error {
+        ureq::Error::Timeout(_) => "HTTP request timed out".to_string(),
+        ureq::Error::HostNotFound => "HTTP host could not be resolved".to_string(),
+        ureq::Error::ConnectionFailed => "HTTP connection failed".to_string(),
+        ureq::Error::BodyExceedsLimit(_) => {
+            "HTTP response body exceeds configured limit".to_string()
+        }
+        ureq::Error::Io(error) => sanitized_io_error(error),
+        _ => "HTTP transport failed".to_string(),
+    }
+}
+
+fn sanitized_io_error(error: io::Error) -> String {
+    match error.kind() {
+        io::ErrorKind::TimedOut => "HTTP request timed out".to_string(),
+        io::ErrorKind::ConnectionRefused => "HTTP connection refused".to_string(),
+        io::ErrorKind::ConnectionReset => "HTTP connection reset".to_string(),
+        io::ErrorKind::ConnectionAborted => "HTTP connection aborted".to_string(),
+        io::ErrorKind::NotConnected => "HTTP connection was not established".to_string(),
+        io::ErrorKind::UnexpectedEof => {
+            "HTTP connection closed before response completed".to_string()
+        }
+        _ => "HTTP transport I/O failed".to_string(),
     }
 }
 
