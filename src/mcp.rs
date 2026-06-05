@@ -221,12 +221,16 @@ pub trait McpToolProvider: Send + Sync {
 #[derive(Debug, Clone)]
 pub struct NativeHubToolProvider {
     config: HubConfig,
+    caller_session_id: Option<String>,
 }
 
 impl NativeHubToolProvider {
     #[must_use]
     pub fn new(config: HubConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            caller_session_id: std::env::var("BOTSTER_SESSION_UUID").ok(),
+        }
     }
 }
 
@@ -251,30 +255,159 @@ impl McpToolProvider for NativeHubToolProvider {
                     "additionalProperties": false,
                 }),
             ),
+            McpToolDescriptor::new(
+                "whoami",
+                "Report the native hub MCP identity available to coordination tools.",
+                json!({
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false,
+                }),
+            ),
+            McpToolDescriptor::new(
+                "post_message",
+                "Publish a routed coordination message to one target session.",
+                post_message_schema(),
+            ),
+            McpToolDescriptor::new(
+                "post_envelope",
+                "Alias of post_message for routed-envelope terminology.",
+                post_message_schema(),
+            ),
+            McpToolDescriptor::new(
+                "receive_messages",
+                "Drain routed coordination messages for the caller session only.",
+                receive_messages_schema(),
+            ),
+            McpToolDescriptor::new(
+                "receive_envelopes",
+                "Alias of receive_messages for routed-envelope terminology.",
+                receive_messages_schema(),
+            ),
+            McpToolDescriptor::new(
+                "ack_message",
+                "Acknowledge one delivered routed coordination message for the caller session.",
+                ack_message_schema(),
+            ),
+            McpToolDescriptor::new(
+                "ack_envelope",
+                "Alias of ack_message for routed-envelope terminology.",
+                ack_message_schema(),
+            ),
+            McpToolDescriptor::new(
+                "notify_session",
+                "Attempt a guarded-write doorbell into one session.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "session_id": { "type": "string" },
+                        "message": { "type": "string" }
+                    },
+                    "required": ["session_id", "message"],
+                    "additionalProperties": false,
+                }),
+            ),
         ]
     }
 
     fn call_tool(&self, call: McpCallRequest) -> Result<McpToolResult, McpToolError> {
-        if !call
-            .arguments
-            .as_object()
-            .is_some_and(serde_json::Map::is_empty)
-        {
-            return Err(McpToolError::new(
-                "invalid_arguments",
-                format!("{} does not accept arguments", call.name),
-            ));
-        }
-
         match call.name.as_str() {
-            "hub.status" => daemon_tool_result(
-                daemon_transport_request(&self.config, DaemonRequest::Status),
-                "status",
-            ),
-            "hub.sessions.list" => daemon_tool_result(
-                daemon_transport_request(&self.config, DaemonRequest::ListSessions),
-                "sessions",
-            ),
+            "hub.status" => {
+                require_no_arguments(&call)?;
+                daemon_tool_result(
+                    daemon_transport_request(&self.config, DaemonRequest::Status),
+                    "status",
+                )
+            }
+            "hub.sessions.list" => {
+                require_no_arguments(&call)?;
+                daemon_tool_result(
+                    daemon_transport_request(&self.config, DaemonRequest::ListSessions),
+                    "sessions",
+                )
+            }
+            "whoami" => {
+                require_no_arguments(&call)?;
+                daemon_tool_result(
+                    daemon_transport_request(
+                        &self.config,
+                        DaemonRequest::Whoami {
+                            caller_session_id: self.caller_session_id.clone(),
+                        },
+                    ),
+                    "identity",
+                )
+            }
+            "post_message" | "post_envelope" => {
+                let target_session_id = required_string(&call.arguments, "session_id")?;
+                let body = required_string(&call.arguments, "body")?;
+                let envelope_id = optional_string(&call.arguments, "envelope_id")?;
+                daemon_tool_result(
+                    daemon_transport_request(
+                        &self.config,
+                        DaemonRequest::PostMessage {
+                            caller_session_id: self.caller_session_id.clone(),
+                            target_session_id,
+                            envelope_id,
+                            body,
+                        },
+                    ),
+                    "message_posted",
+                )
+            }
+            "receive_messages" | "receive_envelopes" => {
+                reject_target_inbox_arguments(&call.arguments)?;
+                let Some(caller_session_id) = self.caller_session_id.clone() else {
+                    return Err(McpToolError::new(
+                        "identity_unavailable",
+                        "receive_messages requires BOTSTER_SESSION_UUID so the caller inbox is known",
+                    ));
+                };
+                let after = optional_u64(&call.arguments, "after")?;
+                let limit = optional_usize(&call.arguments, "limit")?.unwrap_or(32);
+                daemon_tool_result(
+                    daemon_transport_request(
+                        &self.config,
+                        DaemonRequest::ReceiveMessages {
+                            caller_session_id,
+                            after,
+                            limit,
+                        },
+                    ),
+                    "messages",
+                )
+            }
+            "ack_message" | "ack_envelope" => {
+                reject_target_inbox_arguments(&call.arguments)?;
+                let Some(caller_session_id) = self.caller_session_id.clone() else {
+                    return Err(McpToolError::new(
+                        "identity_unavailable",
+                        "ack_message requires BOTSTER_SESSION_UUID so the caller inbox is known",
+                    ));
+                };
+                let envelope_id = required_string(&call.arguments, "envelope_id")?;
+                daemon_tool_result(
+                    daemon_transport_request(
+                        &self.config,
+                        DaemonRequest::AckMessage {
+                            caller_session_id,
+                            envelope_id,
+                        },
+                    ),
+                    "message_acked",
+                )
+            }
+            "notify_session" => {
+                let session_id = required_string(&call.arguments, "session_id")?;
+                let data = required_string(&call.arguments, "message")?;
+                daemon_tool_result(
+                    daemon_transport_request(
+                        &self.config,
+                        DaemonRequest::NotifySession { session_id, data },
+                    ),
+                    "session_notified",
+                )
+            }
             _ => Err(McpToolError::new(
                 "unknown_tool",
                 format!("unknown native hub tool: {}", call.name),
@@ -283,8 +416,55 @@ impl McpToolProvider for NativeHubToolProvider {
     }
 
     fn provides_tool(&self, name: &str) -> bool {
-        matches!(name, "hub.status" | "hub.sessions.list")
+        matches!(
+            name,
+            "hub.status"
+                | "hub.sessions.list"
+                | "whoami"
+                | "post_message"
+                | "post_envelope"
+                | "receive_messages"
+                | "receive_envelopes"
+                | "ack_message"
+                | "ack_envelope"
+                | "notify_session"
+        )
     }
+}
+
+fn post_message_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "session_id": { "type": "string" },
+            "body": { "type": "string" },
+            "envelope_id": { "type": "string" }
+        },
+        "required": ["session_id", "body"],
+        "additionalProperties": false,
+    })
+}
+
+fn receive_messages_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "after": { "type": "integer", "minimum": 0 },
+            "limit": { "type": "integer", "minimum": 1, "maximum": 128 }
+        },
+        "additionalProperties": false,
+    })
+}
+
+fn ack_message_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "envelope_id": { "type": "string" }
+        },
+        "required": ["envelope_id"],
+        "additionalProperties": false,
+    })
 }
 
 fn daemon_tool_result(
@@ -331,10 +511,94 @@ fn daemon_tool_result(
                 })
             }).collect::<Vec<_>>(),
         }))),
+        ("identity", DaemonResponseKind::Identity)
+        | ("message_posted", DaemonResponseKind::MessagePosted)
+        | ("messages", DaemonResponseKind::Messages)
+        | ("message_acked", DaemonResponseKind::MessageAcked)
+        | ("session_notified", DaemonResponseKind::SessionNotified) => {
+            let coordination = response.coordination.ok_or_else(|| {
+                McpToolError::new(
+                    "daemon_response",
+                    "daemon coordination response missing body",
+                )
+            })?;
+            serde_json::to_value(coordination)
+                .map(McpToolResult::structured)
+                .map_err(|_| {
+                    McpToolError::new(
+                        "daemon_response",
+                        "coordination response was not serializable",
+                    )
+                })
+        }
         _ => Err(McpToolError::new(
             "daemon_response",
             "daemon returned an unexpected response kind",
         )),
+    }
+}
+
+fn require_no_arguments(call: &McpCallRequest) -> Result<(), McpToolError> {
+    if call
+        .arguments
+        .as_object()
+        .is_some_and(serde_json::Map::is_empty)
+    {
+        Ok(())
+    } else {
+        Err(McpToolError::new(
+            "invalid_arguments",
+            format!("{} does not accept arguments", call.name),
+        ))
+    }
+}
+
+fn required_string(arguments: &Value, name: &str) -> Result<String, McpToolError> {
+    arguments
+        .get(name)
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| McpToolError::new("invalid_arguments", format!("{name} must be a string")))
+}
+
+fn optional_string(arguments: &Value, name: &str) -> Result<Option<String>, McpToolError> {
+    match arguments.get(name) {
+        Some(value) => value.as_str().map(str::to_string).map(Some).ok_or_else(|| {
+            McpToolError::new("invalid_arguments", format!("{name} must be a string"))
+        }),
+        None => Ok(None),
+    }
+}
+
+fn optional_u64(arguments: &Value, name: &str) -> Result<Option<u64>, McpToolError> {
+    match arguments.get(name) {
+        Some(value) => value.as_u64().map(Some).ok_or_else(|| {
+            McpToolError::new(
+                "invalid_arguments",
+                format!("{name} must be an unsigned integer"),
+            )
+        }),
+        None => Ok(None),
+    }
+}
+
+fn optional_usize(arguments: &Value, name: &str) -> Result<Option<usize>, McpToolError> {
+    optional_u64(arguments, name).and_then(|value| {
+        value
+            .map(usize::try_from)
+            .transpose()
+            .map_err(|_| McpToolError::new("invalid_arguments", format!("{name} is too large")))
+    })
+}
+
+fn reject_target_inbox_arguments(arguments: &Value) -> Result<(), McpToolError> {
+    if arguments.get("session_id").is_some() || arguments.get("agent_id").is_some() {
+        Err(McpToolError::new(
+            "invalid_arguments",
+            "receive and ack tools are caller-scoped and do not accept session_id or agent_id",
+        ))
+    } else {
+        Ok(())
     }
 }
 

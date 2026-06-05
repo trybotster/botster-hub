@@ -8,8 +8,10 @@ use std::collections::BTreeMap;
 
 use botster_core::{
     BotsterEngineObservation, CapabilitySurface, ClientId, CoreSession, CoreSessionMetadata,
-    RequestId, SessionId, SessionLifecycleState, SessionRuntimeErrorKind, SessionSpawnRequest,
-    SpawnEnvironment, SpawnWorkingDirectory, SubscriptionId, TerminalAttachState, TransportEgress,
+    EnvelopeCursor, EnvelopeDeliveryState, EnvelopeId, EnvelopeTarget, RequestId, RoutedEnvelope,
+    RoutedEnvelopeDrainOutcome, RoutedEnvelopePublishOutcome, SessionId, SessionLifecycleState,
+    SessionRuntimeErrorKind, SessionSpawnRequest, SpawnEnvironment, SpawnWorkingDirectory,
+    SubscriptionId, TerminalAttachState, TransportEgress,
 };
 use botster_core_daemon::{
     GuardedWriteDecision, GuardedWriteDeliveryState, GuardedWriteRequest, GuardedWriteResult,
@@ -218,6 +220,56 @@ impl HubClientApi {
                     .map_err(|error| runtime_error(request_id.clone(), operation, error))?;
                 HubClientResponseBody::GuardedWrite(HubClientGuardedWrite::from(result))
             }
+            HubClientRequest::NotifySession {
+                session_id,
+                data,
+                readiness,
+                now_seconds,
+                ..
+            } => {
+                let result = runtime
+                    .guarded_write(GuardedWriteRequest {
+                        session_id,
+                        client_id: self.identity.client_id.clone(),
+                        data,
+                        readiness,
+                        now_seconds,
+                    })
+                    .map_err(|error| runtime_error(request_id.clone(), operation, error))?;
+                HubClientResponseBody::GuardedWrite(HubClientGuardedWrite::from(result))
+            }
+            HubClientRequest::PublishRoutedEnvelope { envelope, .. } => {
+                let outcome = runtime
+                    .publish_routed_envelope(envelope)
+                    .map_err(|error| runtime_error(request_id.clone(), operation, error))?;
+                HubClientResponseBody::RoutedEnvelopePublish(HubClientRoutedEnvelopePublish::from(
+                    outcome,
+                ))
+            }
+            HubClientRequest::DrainRoutedEnvelopes {
+                target,
+                after,
+                limit,
+                ..
+            } => {
+                let outcome = runtime
+                    .drain_routed_envelopes(target, after, limit)
+                    .map_err(|error| runtime_error(request_id.clone(), operation, error))?;
+                HubClientResponseBody::RoutedEnvelopeDrain(HubClientRoutedEnvelopeDrain::from(
+                    outcome,
+                ))
+            }
+            HubClientRequest::AcknowledgeRoutedEnvelope {
+                target,
+                envelope_id,
+                ..
+            } => {
+                let state = runtime
+                    .acknowledge_routed_envelope(target, envelope_id)
+                    .map_err(|error| runtime_error(request_id.clone(), operation, error))?
+                    .state;
+                HubClientResponseBody::RoutedEnvelopeAck(HubClientRoutedEnvelopeAck { state })
+            }
             HubClientRequest::ReadScreen { .. } => {
                 return Err(HubClientError::UnsupportedDaemonOperation {
                     request_id,
@@ -315,6 +367,10 @@ impl HubClientAdmission {
             | HubClientOperation::DrainRuntime
             | HubClientOperation::Shutdown
             | HubClientOperation::GuardedNotificationWrite
+            | HubClientOperation::NotifySession
+            | HubClientOperation::PublishRoutedEnvelope
+            | HubClientOperation::DrainRoutedEnvelopes
+            | HubClientOperation::AcknowledgeRoutedEnvelope
             | HubClientOperation::ReadScreen
             | HubClientOperation::CaptureSnapshot => self.allow_runtime,
             HubClientOperation::ListPackages => self.allow_packages,
@@ -387,6 +443,32 @@ pub enum HubClientRequest {
         readiness: ReadinessEvidence,
         now_seconds: u64,
     },
+    /// Request a native hub-owned guarded notification write into one session.
+    NotifySession {
+        request_id: RequestId,
+        session_id: SessionId,
+        data: Vec<u8>,
+        readiness: ReadinessEvidence,
+        now_seconds: u64,
+    },
+    /// Publish one routed envelope through core.
+    PublishRoutedEnvelope {
+        request_id: RequestId,
+        envelope: RoutedEnvelope,
+    },
+    /// Drain routed envelopes for one target through core cursor semantics.
+    DrainRoutedEnvelopes {
+        request_id: RequestId,
+        target: EnvelopeTarget,
+        after: Option<EnvelopeCursor>,
+        limit: usize,
+    },
+    /// Acknowledge one routed envelope target copy through core.
+    AcknowledgeRoutedEnvelope {
+        request_id: RequestId,
+        target: EnvelopeTarget,
+        envelope_id: EnvelopeId,
+    },
     /// Request a screen read where the daemon API supports it.
     ReadScreen {
         request_id: RequestId,
@@ -418,6 +500,10 @@ impl HubClientRequest {
             | Self::DrainRuntime { request_id, .. }
             | Self::Shutdown { request_id, .. }
             | Self::GuardedNotificationWrite { request_id, .. }
+            | Self::NotifySession { request_id, .. }
+            | Self::PublishRoutedEnvelope { request_id, .. }
+            | Self::DrainRoutedEnvelopes { request_id, .. }
+            | Self::AcknowledgeRoutedEnvelope { request_id, .. }
             | Self::ReadScreen { request_id, .. }
             | Self::CaptureSnapshot { request_id, .. }
             | Self::ListPackages { request_id }
@@ -437,6 +523,10 @@ impl HubClientRequest {
             Self::DrainRuntime { .. } => HubClientOperation::DrainRuntime,
             Self::Shutdown { .. } => HubClientOperation::Shutdown,
             Self::GuardedNotificationWrite { .. } => HubClientOperation::GuardedNotificationWrite,
+            Self::NotifySession { .. } => HubClientOperation::NotifySession,
+            Self::PublishRoutedEnvelope { .. } => HubClientOperation::PublishRoutedEnvelope,
+            Self::DrainRoutedEnvelopes { .. } => HubClientOperation::DrainRoutedEnvelopes,
+            Self::AcknowledgeRoutedEnvelope { .. } => HubClientOperation::AcknowledgeRoutedEnvelope,
             Self::ReadScreen { .. } => HubClientOperation::ReadScreen,
             Self::CaptureSnapshot { .. } => HubClientOperation::CaptureSnapshot,
             Self::ListPackages { .. } => HubClientOperation::ListPackages,
@@ -458,6 +548,10 @@ pub enum HubClientOperation {
     DrainRuntime,
     Shutdown,
     GuardedNotificationWrite,
+    NotifySession,
+    PublishRoutedEnvelope,
+    DrainRoutedEnvelopes,
+    AcknowledgeRoutedEnvelope,
     ReadScreen,
     CaptureSnapshot,
     ListPackages,
@@ -481,6 +575,9 @@ pub enum HubClientResponseBody {
     Spawned(HubClientSpawned),
     Events(Vec<HubClientEvent>),
     GuardedWrite(HubClientGuardedWrite),
+    RoutedEnvelopePublish(HubClientRoutedEnvelopePublish),
+    RoutedEnvelopeDrain(HubClientRoutedEnvelopeDrain),
+    RoutedEnvelopeAck(HubClientRoutedEnvelopeAck),
     Packages(Vec<HubClientPackage>),
     PluginLifecycle(Vec<HubClientPluginLifecycle>),
 }
@@ -531,6 +628,42 @@ impl From<GuardedWriteResult> for HubClientGuardedWrite {
             states: result.states,
         }
     }
+}
+
+/// Client-facing routed envelope publish outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HubClientRoutedEnvelopePublish {
+    pub deliveries: Vec<EnvelopeDeliveryState>,
+}
+
+impl From<RoutedEnvelopePublishOutcome> for HubClientRoutedEnvelopePublish {
+    fn from(outcome: RoutedEnvelopePublishOutcome) -> Self {
+        Self {
+            deliveries: outcome.deliveries,
+        }
+    }
+}
+
+/// Client-facing routed envelope drain outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HubClientRoutedEnvelopeDrain {
+    pub envelopes: Vec<RoutedEnvelope>,
+    pub next_cursor: Option<EnvelopeCursor>,
+}
+
+impl From<RoutedEnvelopeDrainOutcome> for HubClientRoutedEnvelopeDrain {
+    fn from(outcome: RoutedEnvelopeDrainOutcome) -> Self {
+        Self {
+            envelopes: outcome.envelopes,
+            next_cursor: outcome.next_cursor,
+        }
+    }
+}
+
+/// Client-facing routed envelope acknowledgement outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HubClientRoutedEnvelopeAck {
+    pub state: Option<EnvelopeDeliveryState>,
 }
 
 /// Client event stream emitted from hub runtime output.
@@ -585,6 +718,9 @@ impl HubClientEvent {
             BotsterEngineObservation::Backpressure(_) => Self::RuntimeObservation {
                 kind: HubClientObservationKind::Backpressure,
             },
+            BotsterEngineObservation::RoutedEnvelope(_) => Self::RuntimeObservation {
+                kind: HubClientObservationKind::RoutedEnvelope,
+            },
         }
     }
 }
@@ -595,6 +731,7 @@ pub enum HubClientObservationKind {
     SessionActivity,
     Subscription,
     Backpressure,
+    RoutedEnvelope,
 }
 
 /// Sanitized package/provider summary.

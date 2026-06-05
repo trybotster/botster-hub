@@ -417,6 +417,18 @@ fn print_daemon_response(response: DaemonResponse) -> Result<(), OperatorError> 
                 println!("outcome={}", cleanup.outcome);
             }
         }
+        DaemonResponseKind::Identity
+        | DaemonResponseKind::MessagePosted
+        | DaemonResponseKind::Messages
+        | DaemonResponseKind::MessageAcked
+        | DaemonResponseKind::SessionNotified => {
+            println!("response=coordination");
+            if let Some(coordination) = response.coordination {
+                let json = serde_json::to_string(&coordination)
+                    .unwrap_or_else(|_| "{\"error\":\"unserializable\"}".to_string());
+                println!("coordination={json}");
+            }
+        }
         DaemonResponseKind::OperatorError => {
             println!("response=operator_error");
             if let Some(error) = response.error {
