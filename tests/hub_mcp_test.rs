@@ -328,6 +328,11 @@ fn mcp_native_coordination_tools_route_messages_through_daemon_envelopes() {
             json!({
                 "jsonrpc": "2.0",
                 "id": 2,
+                "method": "tools/list"
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
                 "method": "tools/call",
                 "params": {
                     "name": "whoami",
@@ -336,7 +341,7 @@ fn mcp_native_coordination_tools_route_messages_through_daemon_envelopes() {
             }),
             json!({
                 "jsonrpc": "2.0",
-                "id": 3,
+                "id": 4,
                 "method": "tools/call",
                 "params": {
                     "name": "post_message",
@@ -349,7 +354,7 @@ fn mcp_native_coordination_tools_route_messages_through_daemon_envelopes() {
             }),
             json!({
                 "jsonrpc": "2.0",
-                "id": 4,
+                "id": 5,
                 "method": "tools/call",
                 "params": {
                     "name": "post_message",
@@ -362,7 +367,7 @@ fn mcp_native_coordination_tools_route_messages_through_daemon_envelopes() {
             }),
             json!({
                 "jsonrpc": "2.0",
-                "id": 5,
+                "id": 6,
                 "method": "tools/call",
                 "params": {
                     "name": "post_message",
@@ -376,16 +381,38 @@ fn mcp_native_coordination_tools_route_messages_through_daemon_envelopes() {
         ],
     );
     let post_messages = parse_mcp_output(post, "post");
+    let native_tool_names = post_messages[1]["result"]["tools"]
+        .as_array()
+        .expect("tools array")
+        .iter()
+        .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+        .collect::<Vec<_>>();
+    for native_name in [
+        "whoami",
+        "post_message",
+        "receive_messages",
+        "ack_message",
+        "notify_session",
+    ] {
+        assert_eq!(
+            native_tool_names
+                .iter()
+                .filter(|name| **name == native_name)
+                .count(),
+            1,
+            "{native_name} should be listed exactly once by the native MCP provider"
+        );
+    }
     assert_eq!(
-        post_messages[1]["result"]["structuredContent"]["identity"]["caller_session_id"],
+        post_messages[2]["result"]["structuredContent"]["identity"]["caller_session_id"],
         "session-alpha"
     );
     assert_eq!(
-        post_messages[2]["result"]["structuredContent"]["publish"]["deliveries"][0]["envelope_id"],
+        post_messages[3]["result"]["structuredContent"]["publish"]["deliveries"][0]["envelope_id"],
         "mcp-envelope-1"
     );
     assert_eq!(
-        post_messages[2]["result"]["structuredContent"]["publish"]["deliveries"][0]["status"],
+        post_messages[3]["result"]["structuredContent"]["publish"]["deliveries"][0]["status"],
         "queued"
     );
 

@@ -904,6 +904,11 @@ mod tests {
         failures: BTreeMap<String, McpToolError>,
     }
 
+    struct NamedProvider {
+        name: &'static str,
+        marker: &'static str,
+    }
+
     impl McpToolProvider for FakeProvider {
         fn list_tools(&self) -> Vec<McpToolDescriptor> {
             vec![McpToolDescriptor::new(
@@ -926,6 +931,26 @@ mod tests {
             Ok(McpToolResult::structured(json!({
                 "name": call.name,
                 "arguments": call.arguments,
+            })))
+        }
+    }
+
+    impl McpToolProvider for NamedProvider {
+        fn list_tools(&self) -> Vec<McpToolDescriptor> {
+            vec![McpToolDescriptor::new(
+                self.name,
+                "Named test tool.",
+                json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                }),
+            )]
+        }
+
+        fn call_tool(&self, call: McpCallRequest) -> Result<McpToolResult, McpToolError> {
+            Ok(McpToolResult::structured(json!({
+                "name": call.name,
+                "provider": self.marker,
             })))
         }
     }
@@ -954,6 +979,28 @@ mod tests {
             })
             .expect_err("unknown tool should fail");
         assert_eq!(error.code, "unknown_tool");
+    }
+
+    #[test]
+    fn registry_dispatches_duplicate_tool_names_to_first_registered_provider() {
+        let mut registry = McpToolRegistry::new();
+        registry.register_provider(NamedProvider {
+            name: "post_message",
+            marker: "native",
+        });
+        registry.register_provider(NamedProvider {
+            name: "post_message",
+            marker: "plugin",
+        });
+
+        let result = registry
+            .call_tool(McpCallRequest {
+                name: "post_message".to_string(),
+                arguments: json!({}),
+            })
+            .expect("first provider should handle duplicate tool name");
+
+        assert_eq!(result.structured_content["provider"], "native");
     }
 
     #[test]
