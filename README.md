@@ -233,6 +233,33 @@ the daemon is not running they fail with `daemon not running` instead of
 mutating `hub-state.json` out of band. That keeps package/provider state,
 daemon-backed status, and plugin lifecycle reads on one control plane.
 
+## Agent-facing MCP stdio
+
+Local agents can launch the daemon-backed MCP surface with an explicit data
+directory:
+
+```sh
+botster-hub mcp-serve --data-dir target/botster-hub-dogfood-data
+```
+
+`mcp-serve` speaks MCP over stdio as newline-delimited JSON-RPC: every stdout
+line is one protocol message, and the command does not use `Content-Length`
+framing. Process diagnostics belong on stderr so agent clients can treat stdout
+as the protocol stream.
+
+The first native tools are read-only smoke tools:
+
+- `hub.status` returns sanitized daemon status through
+  `daemon_transport_request -> serve_daemon -> HubClientApi -> HubRuntime`.
+- `hub.sessions.list` returns sanitized session ids and lifecycle labels through
+  the same daemon/client path.
+
+Tool listing and calling both route through `McpToolRegistry`. Native hub tools
+are provided by `NativeHubToolProvider` today; future Lua plugin tools should add
+descriptors and owned call messages to that same registry path, with execution
+dispatched through the plugin worker/supervisor boundary instead of creating a
+second MCP server or direct in-process closure path.
+
 Dogfood-ready today: explicit local daemon lifecycle, file-backed hub/package
 state, local package admission from a manifest path, typed status/package reads,
 plugin lifecycle observation/invocation through the hub facade, daemon-backed
