@@ -7,8 +7,9 @@
 
 use botster_core::{
     BotsterEngineObservation, BotsterEngineOutput, ClientId, CoreSession, CoreSessionMetadata,
-    PluginCapabilityRuntime, PluginCleanupResult, PluginInvocationOutcome, PluginInvocationRequest,
-    PluginKey, RequestId, SessionId, SessionLifecycleState, SessionSpawnRequest, SubscriptionId,
+    ManagedSessionRuntimeError, PluginCapabilityRuntime, PluginCleanupResult,
+    PluginInvocationOutcome, PluginInvocationRequest, PluginKey, RequestId, SessionId,
+    SessionLifecycleState, SessionRuntimeErrorKind, SessionSpawnRequest, SubscriptionId,
 };
 use botster_core_daemon::{
     CoreDaemon, CoreDaemonConfig, CoreDaemonError, DaemonSession, DrainResult, GuardedWriteRequest,
@@ -382,12 +383,24 @@ impl HubRuntime {
         for report in self.core_daemon.adoption_scan()? {
             match report.state {
                 SessionAdoptionState::Adoptable => {
-                    let session = self
+                    match self
                         .core_daemon
-                        .adopt_session(&report.record.session_id, now_seconds)?;
-                    self.reconciliation
-                        .recovered_sessions
-                        .push(session.session_id);
+                        .adopt_session(&report.record.session_id, now_seconds)
+                    {
+                        Ok(session) => {
+                            self.reconciliation
+                                .recovered_sessions
+                                .push(session.session_id);
+                        }
+                        Err(error) if is_stale_worker_control_socket_adoption_error(&error) => {
+                            self.core_daemon
+                                .mark_stale(&report.record.session_id, now_seconds)?;
+                            self.reconciliation
+                                .stale_sessions
+                                .push(report.record.session_id);
+                        }
+                        Err(error) => return Err(error),
+                    }
                 }
                 SessionAdoptionState::MissingProtocolEvidence
                 | SessionAdoptionState::StaleWorker { .. }
@@ -411,6 +424,18 @@ impl HubRuntime {
             }
         }
         Ok(())
+    }
+}
+
+fn is_stale_worker_control_socket_adoption_error(error: &CoreDaemonError) -> bool {
+    match error {
+        CoreDaemonError::Engine(ManagedSessionRuntimeError::Runtime(runtime_error)) => {
+            runtime_error.kind == SessionRuntimeErrorKind::SpawnFailed
+                && runtime_error
+                    .message
+                    .starts_with("connect worker control socket failed: ")
+        }
+        _ => false,
     }
 }
 
