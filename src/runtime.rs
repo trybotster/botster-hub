@@ -7,14 +7,16 @@
 
 use botster_core::{
     BotsterEngineObservation, BotsterEngineOutput, ClientId, CoreSession, CoreSessionMetadata,
-    ManagedSessionRuntimeError, PluginCapabilityRuntime, PluginCleanupResult,
-    PluginInvocationOutcome, PluginInvocationRequest, PluginKey, RequestId, SessionId,
+    EnvelopeId, EnvelopeTarget, ManagedSessionRuntimeError, PluginCapabilityRuntime,
+    PluginCleanupResult, PluginInvocationOutcome, PluginInvocationRequest, PluginKey, RequestId,
+    RoutedEnvelope, RoutedEnvelopeDrainOutcome, RoutedEnvelopePublishOutcome, SessionId,
     SessionLifecycleState, SessionRuntimeErrorKind, SessionSpawnRequest, SubscriptionId,
 };
 use botster_core_daemon::{
-    CoreDaemon, CoreDaemonConfig, CoreDaemonError, DaemonSession, DrainResult, GuardedWriteRequest,
-    GuardedWriteResult, RegistrySessionState, SessionAdoptionReport, SessionAdoptionState,
-    SpawnSessionRequest,
+    AcknowledgeRoutedEnvelopeRequest, CoreDaemon, CoreDaemonConfig, CoreDaemonError, DaemonSession,
+    DrainResult, DrainRoutedEnvelopesRequest, GuardedWriteRequest, GuardedWriteResult,
+    PublishRoutedEnvelopeRequest, RegistrySessionState, RoutedEnvelopeDeliveryStateResult,
+    SessionAdoptionReport, SessionAdoptionState, SpawnSessionRequest,
 };
 use std::env;
 use std::error::Error;
@@ -343,6 +345,43 @@ impl HubRuntime {
         request: GuardedWriteRequest,
     ) -> Result<GuardedWriteResult, CoreDaemonError> {
         self.core_daemon.guarded_write(request)
+    }
+
+    /// Publish one coordination envelope through the core daemon routed-envelope primitive.
+    pub fn publish_routed_envelope(
+        &mut self,
+        envelope: RoutedEnvelope,
+    ) -> Result<RoutedEnvelopePublishOutcome, CoreDaemonError> {
+        self.core_daemon
+            .publish_routed_envelope(PublishRoutedEnvelopeRequest { envelope })
+    }
+
+    /// Drain coordination envelopes for one routed target through core cursor semantics.
+    pub fn drain_routed_envelopes(
+        &mut self,
+        target: EnvelopeTarget,
+        after: Option<botster_core::EnvelopeCursor>,
+        limit: usize,
+    ) -> Result<RoutedEnvelopeDrainOutcome, CoreDaemonError> {
+        self.core_daemon
+            .drain_routed_envelopes(DrainRoutedEnvelopesRequest {
+                target,
+                after,
+                limit,
+            })
+    }
+
+    /// Acknowledge one routed envelope delivery through the core daemon.
+    pub fn acknowledge_routed_envelope(
+        &mut self,
+        target: EnvelopeTarget,
+        envelope_id: EnvelopeId,
+    ) -> Result<RoutedEnvelopeDeliveryStateResult, CoreDaemonError> {
+        self.core_daemon
+            .acknowledge_routed_envelope(AcknowledgeRoutedEnvelopeRequest {
+                target,
+                envelope_id,
+            })
     }
 
     /// Release worker-backed sessions before an intentional daemon restart.
