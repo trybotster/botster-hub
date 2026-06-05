@@ -214,18 +214,24 @@ cargo run -- inspect --data-dir target/botster-hub-dogfood-data dogfood-session
 cargo run -- shutdown --data-dir target/botster-hub-dogfood-data
 ```
 
-`packages enable --path` installs and enables a local package manifest through
-the existing hub package registry policy, persists the registry snapshot under
-`hub-state.json`, and then lists packages through `HubClientApi::ListPackages`.
-The session commands use the running daemon runtime, so a session created by
-one CLI process is visible to later `sessions list`, `sessions attach`,
-`sessions send-input`, `sessions resize`, `sessions detach`, and
-`sessions shutdown` invocations.
+`packages enable --path` connects to the running daemon, installs and enables a
+local package manifest through the existing hub package registry policy,
+persists the registry snapshot under `hub-state.json`, and then lists packages
+from the daemon's refreshed in-memory registry. `packages list` and `providers
+list` use the same daemon-backed registry view. The session commands also use
+the running daemon runtime, so a session created by one CLI process is visible
+to later `sessions list`, `sessions attach`, `sessions send-input`, `sessions
+resize`, `sessions detach`, and `sessions shutdown` invocations.
 `attach` streams terminal bytes and currently exits after an idle window if the
 core runtime does not provide a process-exit frame; persistent TUI-grade attach
 with explicit signal handling remains outside this scaffold. `inspect` is
 intentionally scoped to sanitized session list data until the stable client API
 grows a dedicated inspection request.
+
+Package commands require the daemon socket for this local dogfood path. When
+the daemon is not running they fail with `daemon not running` instead of
+mutating `hub-state.json` out of band. That keeps package/provider state,
+daemon-backed status, and plugin lifecycle reads on one control plane.
 
 ## Agent-facing MCP stdio
 
@@ -253,14 +259,6 @@ are provided by `NativeHubToolProvider` today; future Lua plugin tools should ad
 descriptors and owned call messages to that same registry path, with execution
 dispatched through the plugin worker/supervisor boundary instead of creating a
 second MCP server or direct in-process closure path.
-
-Package commands are a separate short-lived hub-policy path over the same
-durable state. They start a `HubDaemon`, mutate or read `hub-state.json`, route
-package/provider reads through `HubClientApi`, and stop; they do not attach to
-the long-running session daemon today. A daemon that is already running keeps
-the package registry snapshot it loaded at startup, so package enable/disable
-changes made from another CLI process become visible to daemon-backed session
-operations after restarting the daemon.
 
 Dogfood-ready today: explicit local daemon lifecycle, file-backed hub/package
 state, local package admission from a manifest path, typed status/package reads,
