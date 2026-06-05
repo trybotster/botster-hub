@@ -35,6 +35,7 @@ pub mod config;
 pub mod daemon;
 pub mod daemon_transport;
 pub mod lifecycle;
+pub mod mcp;
 pub mod packages;
 pub mod persistence;
 pub mod profile;
@@ -67,6 +68,10 @@ pub use daemon_transport::{
 pub use lifecycle::{
     HubLifecycleError, HubLifecycleResult, HubPluginLifecycle, HubPluginLifecycleStatus,
     HubPluginRuntimeBundle,
+};
+pub use mcp::{
+    McpCallRequest, McpServeError, McpToolDescriptor, McpToolError, McpToolProvider,
+    McpToolRegistry, McpToolResult, NativeHubToolProvider, serve_mcp_stdio,
 };
 pub use packages::{
     LOCAL_PACKAGE_MANIFEST_FILE, PackageAction, PackageAdmissionPolicy, PackageAdmissionReason,
