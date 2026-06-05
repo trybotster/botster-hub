@@ -39,6 +39,7 @@ pub mod mcp;
 pub mod packages;
 pub mod persistence;
 pub mod profile;
+pub mod project_pipelines;
 pub mod runtime;
 
 use botster_core::CapabilitySurface;
@@ -61,10 +62,11 @@ pub use daemon::{
     HubDaemon, HubDaemonError, HubDaemonResult, HubDaemonState, HubDaemonStatus, HubStateLoadSource,
 };
 pub use daemon_transport::{
-    DaemonCapability, DaemonEvent, DaemonOperatorError, DaemonPackage, DaemonPackageDecision,
-    DaemonPluginLifecycle, DaemonRequest, DaemonResponse, DaemonResponseKind, DaemonSession,
-    DaemonSessionCleanup, DaemonStatus, DaemonTransportError, DaemonTransportResult,
-    request as daemon_transport_request, serve_daemon, stream_attach,
+    DaemonCapability, DaemonEvent, DaemonMcpCallResult, DaemonMcpError, DaemonMcpTool,
+    DaemonOperatorError, DaemonPackage, DaemonPackageDecision, DaemonPluginLifecycle,
+    DaemonRequest, DaemonResponse, DaemonResponseKind, DaemonSession, DaemonSessionCleanup,
+    DaemonStatus, DaemonTransportError, DaemonTransportResult, request as daemon_transport_request,
+    serve_daemon, stream_attach,
 };
 pub use lifecycle::{
     HubLifecycleError, HubLifecycleResult, HubPluginLifecycle, HubPluginLifecycleStatus,
@@ -72,7 +74,7 @@ pub use lifecycle::{
 };
 pub use mcp::{
     McpCallRequest, McpServeError, McpToolDescriptor, McpToolError, McpToolProvider,
-    McpToolRegistry, McpToolResult, NativeHubToolProvider, serve_mcp_stdio,
+    McpToolRegistry, McpToolResult, NativeHubToolProvider, PluginMcpToolProvider, serve_mcp_stdio,
 };
 pub use packages::{
     LOCAL_PACKAGE_MANIFEST_FILE, PackageAction, PackageAdmissionPolicy, PackageAdmissionReason,

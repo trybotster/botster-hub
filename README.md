@@ -117,6 +117,7 @@ src/auth.rs                hub-owned auth hook seam
 src/packages.rs            hub package policy over core package contracts
 src/lifecycle.rs           hub package lifecycle adapter over core plugin workers
 src/capabilities.rs        hub-owned local capability runtime policy
+src/project_pipelines.rs   first Project Pipelines local plugin runtime bundle source
 src/runtime.rs             hub runtime facade over botster-core-daemon
 ```
 
@@ -132,6 +133,15 @@ provider processes, persistence databases, plugin runtimes, marketplace fetches,
 package installers, or client transports. The hub does include local file-backed
 durable state for dogfood; database-backed persistence and cloud sync remain
 excluded.
+
+The exception in this scaffold is the constrained `examples/project-pipelines`
+local plugin package. The daemon loads that package into `HubPluginLifecycle`
+through a host-supplied Project Pipelines runtime bundle because this reduced
+crate still does not execute Lua entrypoints. MCP tools are registered through
+the shared `mcp-serve` registry, dispatched over daemon transport to the owner
+thread, invoked through `PluginWorkerEngine`, and persisted under
+`plugin-data/project-pipelines/`. The plugin README names unsupported monolith
+features and the no-in-flight-monolith-ticket cutover posture.
 
 ## Durable hub state
 

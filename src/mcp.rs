@@ -24,7 +24,8 @@ where
     R: BufRead,
     W: Write,
 {
-    let registry = McpToolRegistry::from_provider(NativeHubToolProvider::new(config));
+    let mut registry = McpToolRegistry::from_provider(NativeHubToolProvider::new(config.clone()));
+    registry.register_provider(PluginMcpToolProvider::new(config));
     McpStdioServer::new(registry).serve(input, output)
 }
 
@@ -284,6 +285,72 @@ impl McpToolProvider for NativeHubToolProvider {
 
     fn provides_tool(&self, name: &str) -> bool {
         matches!(name, "hub.status" | "hub.sessions.list")
+    }
+}
+
+/// Plugin-backed MCP tools forwarded to the running daemon owner thread.
+#[derive(Debug, Clone)]
+pub struct PluginMcpToolProvider {
+    config: HubConfig,
+}
+
+impl PluginMcpToolProvider {
+    #[must_use]
+    pub fn new(config: HubConfig) -> Self {
+        Self { config }
+    }
+}
+
+impl McpToolProvider for PluginMcpToolProvider {
+    fn list_tools(&self) -> Vec<McpToolDescriptor> {
+        let Ok(response) =
+            daemon_transport_request(&self.config, DaemonRequest::PluginMcpListTools)
+        else {
+            return Vec::new();
+        };
+        if response.error.is_some() || response.kind != DaemonResponseKind::PluginMcpTools {
+            return Vec::new();
+        }
+        response
+            .mcp_tools
+            .into_iter()
+            .map(|tool| McpToolDescriptor::new(tool.name, tool.description, tool.input_schema))
+            .collect()
+    }
+
+    fn call_tool(&self, call: McpCallRequest) -> Result<McpToolResult, McpToolError> {
+        let response = daemon_transport_request(
+            &self.config,
+            DaemonRequest::PluginMcpCallTool {
+                name: call.name.clone(),
+                arguments: call.arguments,
+            },
+        )
+        .map_err(|error| {
+            McpToolError::new(
+                "daemon_unavailable",
+                format!("hub daemon plugin MCP request failed: {error}"),
+            )
+        })?;
+        if let Some(error) = response.error {
+            return Err(McpToolError::new(error.code, error.message));
+        }
+        if response.kind != DaemonResponseKind::PluginMcpCall {
+            return Err(McpToolError::new(
+                "daemon_response",
+                "daemon returned an unexpected plugin MCP response kind",
+            ));
+        }
+        let result = response.mcp_result.ok_or_else(|| {
+            McpToolError::new(
+                "daemon_response",
+                "daemon plugin MCP response missing result",
+            )
+        })?;
+        if let Some(error) = result.error {
+            return Err(McpToolError::new(error.code, error.message));
+        }
+        Ok(McpToolResult::structured(result.structured_content))
     }
 }
 

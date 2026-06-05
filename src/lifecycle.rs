@@ -4,7 +4,7 @@
 //! adapter only refuses packages that are not currently enabled, then delegates
 //! load, invoke, reload, unload, and cleanup mechanics to `botster-core`.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 use botster_core::{
@@ -21,6 +21,7 @@ use crate::packages::{PackageClassification, PackageRecord, PackageRegistry, Pac
 pub struct HubPluginLifecycle {
     engine: PluginWorkerEngine,
     loaded: Arc<Mutex<BTreeSet<String>>>,
+    descriptors: Arc<Mutex<BTreeMap<String, Vec<PluginOwnedDescriptor>>>>,
 }
 
 impl HubPluginLifecycle {
@@ -30,6 +31,7 @@ impl HubPluginLifecycle {
         Self {
             engine: PluginWorkerEngine::new(),
             loaded: Arc::new(Mutex::new(BTreeSet::new())),
+            descriptors: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -42,6 +44,7 @@ impl HubPluginLifecycle {
     ) -> HubLifecycleResult<PluginKey> {
         let record = enabled_record(registry, package_name)?;
         let plugin_key = plugin_key_for(record);
+        let descriptors = bundle.descriptors.clone();
         let registration = registration_for(record, plugin_key.clone(), bundle)?;
 
         self.engine.load_plugin(registration);
@@ -49,6 +52,10 @@ impl HubPluginLifecycle {
             .lock()
             .expect("hub plugin lifecycle loaded set lock")
             .insert(plugin_key.0.clone());
+        self.descriptors
+            .lock()
+            .expect("hub plugin lifecycle descriptors lock")
+            .insert(plugin_key.0.clone(), descriptors);
 
         Ok(plugin_key)
     }
@@ -69,6 +76,7 @@ impl HubPluginLifecycle {
     ) -> HubLifecycleResult<PluginCleanupResult> {
         let record = enabled_record(registry, package_name)?;
         let plugin_key = plugin_key_for(record);
+        let descriptors = bundle.descriptors.clone();
         let registration = registration_for(record, plugin_key.clone(), bundle)?;
         let cleanup = self.engine.reload_plugin(
             PluginReloadSpec {
@@ -83,6 +91,10 @@ impl HubPluginLifecycle {
             .lock()
             .expect("hub plugin lifecycle loaded set lock")
             .insert(package_name.to_string());
+        self.descriptors
+            .lock()
+            .expect("hub plugin lifecycle descriptors lock")
+            .insert(package_name.to_string(), descriptors);
 
         Ok(cleanup)
     }
@@ -100,7 +112,27 @@ impl HubPluginLifecycle {
             .lock()
             .expect("hub plugin lifecycle loaded set lock")
             .remove(package_name);
+        self.descriptors
+            .lock()
+            .expect("hub plugin lifecycle descriptors lock")
+            .remove(package_name);
         cleanup
+    }
+
+    /// Return loaded descriptors for a plugin-owned descriptor family.
+    #[must_use]
+    pub fn descriptors_by_kind(
+        &self,
+        kind: botster_core::PluginDescriptorKind,
+    ) -> Vec<PluginOwnedDescriptor> {
+        self.descriptors
+            .lock()
+            .expect("hub plugin lifecycle descriptors lock")
+            .values()
+            .flat_map(|descriptors| descriptors.iter())
+            .filter(|descriptor| descriptor.descriptor.kind == kind)
+            .cloned()
+            .collect()
     }
 
     /// Return package-level lifecycle status without exposing core worker internals.
