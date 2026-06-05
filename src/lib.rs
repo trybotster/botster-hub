@@ -41,17 +41,19 @@ pub mod packages;
 pub mod persistence;
 pub mod profile;
 pub mod runtime;
+pub mod tui;
 
 use botster_core::CapabilitySurface;
 
 pub use capabilities::HubCapabilityRuntime;
 pub use client_api::{
     HubClientAdmission, HubClientApi, HubClientCapability, HubClientError, HubClientEvent,
-    HubClientIdentity, HubClientObservationKind, HubClientOperation, HubClientPackage,
-    HubClientPackageClassification, HubClientPackageState, HubClientPluginLifecycle,
-    HubClientRequest, HubClientResponse, HubClientResponseBody, HubClientResult, HubClientRole,
-    HubClientRoutedEnvelopeAck, HubClientRoutedEnvelopeDrain, HubClientRoutedEnvelopePublish,
-    HubClientRuntimeErrorKind, HubClientSession, HubClientSpawned, HubClientStatus,
+    HubClientGuardedWrite, HubClientIdentity, HubClientObservationKind, HubClientOperation,
+    HubClientPackage, HubClientPackageClassification, HubClientPackageState,
+    HubClientPluginLifecycle, HubClientRequest, HubClientResponse, HubClientResponseBody,
+    HubClientResult, HubClientRole, HubClientRoutedEnvelopeAck, HubClientRoutedEnvelopeDrain,
+    HubClientRoutedEnvelopePublish, HubClientRuntimeErrorKind, HubClientSession, HubClientSpawned,
+    HubClientStatus,
 };
 pub use config::{
     CoreEngineOptions, CoreQueueCapacity, DataDirectoryOption, DirectoryList, HostIdentity,
@@ -63,7 +65,7 @@ pub use daemon::{
     HubDaemon, HubDaemonError, HubDaemonResult, HubDaemonState, HubDaemonStatus, HubStateLoadSource,
 };
 pub use daemon_transport::{
-    DaemonCapability, DaemonCoordination, DaemonEnvelope, DaemonEnvelopeAck,
+    DaemonCapability, DaemonConnection, DaemonCoordination, DaemonEnvelope, DaemonEnvelopeAck,
     DaemonEnvelopeDelivery, DaemonEnvelopePublish, DaemonEvent, DaemonIdentity, DaemonNotify,
     DaemonOperatorError, DaemonPackage, DaemonPackageDecision, DaemonPluginLifecycle,
     DaemonRequest, DaemonResponse, DaemonResponseKind, DaemonSession, DaemonSessionCleanup,
@@ -98,6 +100,9 @@ pub use profile::{
 pub use runtime::{
     HubLuaPluginLoadError, HubRuntime, HubRuntimeError, HubRuntimeObservation, HubRuntimeOutput,
     daemon_session_to_core_session,
+};
+pub use tui::{
+    ScriptedTuiDriver, ScriptedTuiProof, TuiError, TuiResult, run as run_tui, run_scripted_probe,
 };
 
 /// Compile-checked description of the profile plus the audited `HubRuntime` facade.

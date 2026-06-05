@@ -16,7 +16,7 @@ use botster_hub::{
     HubClientRequest, HubClientResponseBody, HubDaemon, HubDaemonState, HubRuntime,
     HubStartupOptions, HubStateLoadSource, RuntimeEnvironment, SessionDefaults, TransportBindings,
     build_default_config_for_runtime, daemon_transport_request, default_package_policy,
-    host_profile, serve_daemon, serve_mcp_stdio, stream_attach,
+    host_profile, run_tui, serve_daemon, serve_mcp_stdio, stream_attach,
 };
 
 const SMOKE_MARKER: &str = "botster-hub-smoke-ok";
@@ -55,6 +55,13 @@ fn main() {
         Some("mcp-serve") => {
             if let Err(error) = mcp_serve(env::args().skip(2).collect()) {
                 eprintln!("botster-hub mcp-serve error: {error}");
+                process::exit(1);
+            }
+            return;
+        }
+        Some("tui") => {
+            if let Err(error) = operator_tui(env::args().skip(2).collect()) {
+                eprintln!("botster-hub tui error: {error}");
                 process::exit(1);
             }
             return;
@@ -255,6 +262,13 @@ fn mcp_serve(args: Vec<String>) -> Result<(), McpCliError> {
     let stdin = io::stdin();
     let stdout = io::stdout();
     serve_mcp_stdio(config, BufReader::new(stdin.lock()), stdout.lock())?;
+    Ok(())
+}
+
+fn operator_tui(args: Vec<String>) -> Result<(), OperatorError> {
+    let options = DataDirOptions::parse(args, "tui")?;
+    let config = explicit_config(options.data_directory)?;
+    run_tui(config)?;
     Ok(())
 }
 
@@ -1043,7 +1057,7 @@ struct RunOneCommand {
 
 #[derive(Debug)]
 enum StartError {
-    Operator(OperatorError),
+    Operator(Box<OperatorError>),
     Config(botster_hub::HubConfigError),
     Daemon(botster_hub::HubDaemonError),
     Transport(botster_hub::DaemonTransportError),
@@ -1059,13 +1073,14 @@ enum OperatorError {
     DaemonOperator(DaemonOperatorError),
     Daemon(botster_hub::HubDaemonError),
     Transport(botster_hub::DaemonTransportError),
+    Tui(botster_hub::TuiError),
     Package(botster_hub::PackageRegistryError),
     State(botster_hub::HubStateStoreError),
 }
 
 #[derive(Debug)]
 enum McpCliError {
-    Usage(OperatorError),
+    Usage(Box<OperatorError>),
     Config(botster_hub::HubConfigError),
     Serve(botster_hub::McpServeError),
 }
@@ -1119,6 +1134,7 @@ impl fmt::Display for OperatorError {
             }
             Self::Daemon(error) => write!(formatter, "{error}"),
             Self::Transport(error) => write!(formatter, "{error}"),
+            Self::Tui(error) => write!(formatter, "{error}"),
             Self::Package(error) => write!(formatter, "package policy error: {error:?}"),
             Self::State(error) => write!(formatter, "{error}"),
         }
@@ -1153,6 +1169,7 @@ fn usage_for(command: &str) -> &'static str {
         }
         "shutdown" => "usage: botster-hub shutdown --data-dir <path>",
         "mcp-serve" => "usage: botster-hub mcp-serve --data-dir <path>",
+        "tui" => "usage: botster-hub tui --data-dir <path>",
         "packages" => "usage: botster-hub packages <list|enable|disable> ...",
         "packages list" => "usage: botster-hub packages list --data-dir <path>",
         "packages enable" => {
@@ -1162,7 +1179,7 @@ fn usage_for(command: &str) -> &'static str {
         "providers" | "providers list" => "usage: botster-hub providers list --data-dir <path>",
         "inspect" => "usage: botster-hub inspect --data-dir <path> <session-id>",
         _ => {
-            "usage: botster-hub <start|status|sessions|shutdown|mcp-serve|packages|providers|inspect|run-one>"
+            "usage: botster-hub <start|status|sessions|shutdown|mcp-serve|tui|packages|providers|inspect|run-one>"
         }
     }
 }
@@ -1211,7 +1228,7 @@ impl From<botster_hub::DaemonTransportError> for StartError {
 
 impl From<OperatorError> for StartError {
     fn from(error: OperatorError) -> Self {
-        Self::Operator(error)
+        Self::Operator(Box::new(error))
     }
 }
 
@@ -1223,7 +1240,7 @@ impl From<botster_hub::HubConfigError> for OperatorError {
 
 impl From<OperatorError> for McpCliError {
     fn from(error: OperatorError) -> Self {
-        Self::Usage(error)
+        Self::Usage(Box::new(error))
     }
 }
 
@@ -1254,6 +1271,12 @@ impl From<botster_hub::HubDaemonError> for OperatorError {
 impl From<botster_hub::DaemonTransportError> for OperatorError {
     fn from(error: botster_hub::DaemonTransportError) -> Self {
         Self::Transport(error)
+    }
+}
+
+impl From<botster_hub::TuiError> for OperatorError {
+    fn from(error: botster_hub::TuiError) -> Self {
+        Self::Tui(error)
     }
 }
 
