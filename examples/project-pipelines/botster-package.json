@@ -1,0 +1,14 @@
+{
+  "name": "project-pipelines",
+  "version": "1.0.0",
+  "kind": "plugin",
+  "botster": ">=0.1.0",
+  "source": { "type": "path", "path": "." },
+  "capabilities": [
+    { "surface": "mcp" },
+    { "surface": "plugin_db", "scope": "project-pipelines" }
+  ],
+  "entrypoints": [
+    { "runtime": "lua", "path": "plugin.lua", "bootstrap": false }
+  ]
+}

@@ -16,11 +16,14 @@ use std::thread;
 use std::time::Duration;
 
 use botster_core::{
-    RequestId, SessionId, SessionLifecycleState, SubscriptionId, TerminalAttachState,
+    BoundaryJson, PluginInvocationRequest, PluginInvocationResult, RequestId, SessionId,
+    SessionLifecycleState, SubscriptionId, TerminalAttachState,
 };
 use botster_core_daemon::RegistrySessionState;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
+use crate::project_pipelines::mcp_invocation_context;
 use crate::{
     FileHubStateStore, HubClientApi, HubClientEvent, HubClientPackage,
     HubClientPackageClassification, HubClientPluginLifecycle, HubClientRequest,
@@ -310,6 +313,7 @@ fn handle_control_request(
                 .package_registry_mut()
                 .enable(&package_name, "daemon socket enable local package")?;
             persist_package_registry(daemon)?;
+            load_package_after_enable(daemon, &package_name)?;
             package_decision_response(daemon, decision)
         }
         DaemonRequest::EnablePackage { package_name } => {
@@ -317,6 +321,7 @@ fn handle_control_request(
                 .package_registry_mut()
                 .enable(&package_name, "daemon socket enable package")?;
             persist_package_registry(daemon)?;
+            load_package_after_enable(daemon, &package_name)?;
             package_decision_response(daemon, decision)
         }
         DaemonRequest::DisablePackage { package_name } => {
@@ -356,6 +361,10 @@ fn handle_runtime_control_request(
                 return Err(DaemonTransportError::UnexpectedResponse);
             };
             Ok(DaemonResponse::status(status, client_status.session_count))
+        }
+        DaemonRequest::PluginMcpListTools => plugin_mcp_list_tools_response(runtime),
+        DaemonRequest::PluginMcpCallTool { name, arguments } => {
+            plugin_mcp_call_tool_response(runtime, name, arguments)
         }
         DaemonRequest::ListSessions => {
             let response = api.handle_request(
@@ -536,6 +545,8 @@ fn handle_runtime_control_request(
             packages: Vec::new(),
             package_decision: None,
             lifecycle: Vec::new(),
+            mcp_tools: Vec::new(),
+            mcp_result: None,
             events: Vec::new(),
             cleanup: None,
             error: None,
@@ -548,6 +559,32 @@ fn handle_runtime_control_request(
             unreachable!("package requests are handled before runtime borrow")
         }
     }
+}
+
+fn load_package_after_enable(
+    daemon: &mut HubDaemon,
+    package_name: &str,
+) -> DaemonTransportResult<()> {
+    let config = daemon
+        .runtime()
+        .ok_or(DaemonTransportError::DaemonNotRunning)?
+        .config()
+        .clone();
+    let package_registry = daemon.package_registry().clone();
+    let prepared = package_registry.prepare_local_package(
+        package_name,
+        "daemon socket load enabled local plugin package",
+    )?;
+    if let Some(bundle) = crate::project_pipelines::runtime_bundle_for_prepared_package(
+        &prepared,
+        &config.data_directory,
+    ) {
+        daemon
+            .runtime_mut()
+            .ok_or(DaemonTransportError::DaemonNotRunning)?
+            .load_plugin_package(&package_registry, package_name, bundle)?;
+    }
+    Ok(())
 }
 
 fn list_packages_response(daemon: &mut HubDaemon) -> DaemonTransportResult<DaemonResponse> {
@@ -586,6 +623,70 @@ fn plugin_lifecycle_response(daemon: &mut HubDaemon) -> DaemonTransportResult<Da
         return Err(DaemonTransportError::UnexpectedResponse);
     };
     Ok(DaemonResponse::plugin_lifecycle(lifecycle))
+}
+
+fn plugin_mcp_list_tools_response(
+    runtime: &crate::HubRuntime,
+) -> DaemonTransportResult<DaemonResponse> {
+    let tools = runtime
+        .plugin_mcp_tool_descriptors()
+        .into_iter()
+        .filter_map(DaemonMcpTool::from_plugin_descriptor)
+        .collect::<Vec<_>>();
+    Ok(DaemonResponse::mcp_tools(tools))
+}
+
+fn plugin_mcp_call_tool_response(
+    runtime: &crate::HubRuntime,
+    name: String,
+    arguments: Value,
+) -> DaemonTransportResult<DaemonResponse> {
+    let Some(descriptor) = runtime
+        .plugin_mcp_tool_descriptors()
+        .into_iter()
+        .find(|descriptor| {
+            descriptor
+                .body
+                .0
+                .get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|tool_name| tool_name == name)
+        })
+    else {
+        return Ok(DaemonResponse::mcp_call_error(
+            "unknown_tool",
+            format!("unknown plugin MCP tool: {name}"),
+        ));
+    };
+    let Some(handler) = descriptor.handler else {
+        return Ok(DaemonResponse::mcp_call_error(
+            "missing_handler",
+            format!("plugin MCP tool has no handler: {name}"),
+        ));
+    };
+    let outcome = runtime.invoke_plugin(PluginInvocationRequest {
+        request_id: request_id(&format!("daemon-mcp-{name}")),
+        handler,
+        timeout_ms: 2_000,
+        context: mcp_invocation_context(),
+        payload: BoundaryJson(arguments),
+    });
+    match outcome.result {
+        PluginInvocationResult::Completed(success) => Ok(DaemonResponse::mcp_call_result(
+            success
+                .payload
+                .map(|payload| payload.0)
+                .unwrap_or_else(|| json_empty()),
+        )),
+        PluginInvocationResult::Failed(failure) => Ok(DaemonResponse::mcp_call_error(
+            format!("{:?}", failure.kind),
+            failure.reason,
+        )),
+    }
+}
+
+fn json_empty() -> Value {
+    Value::Object(serde_json::Map::new())
 }
 
 fn package_decision_response(
@@ -830,7 +931,7 @@ struct DaemonHelloAck {
 }
 
 /// Client request variants for the local daemon protocol.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DaemonRequest {
     Status,
@@ -873,11 +974,16 @@ pub enum DaemonRequest {
         package_name: String,
     },
     PluginLifecycleStatus,
+    PluginMcpListTools,
+    PluginMcpCallTool {
+        name: String,
+        arguments: Value,
+    },
     DaemonShutdown,
 }
 
 /// Server response variants for one local daemon request.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DaemonResponse {
     pub kind: DaemonResponseKind,
     pub status: Option<DaemonStatus>,
@@ -885,6 +991,8 @@ pub struct DaemonResponse {
     pub packages: Vec<DaemonPackage>,
     pub package_decision: Option<DaemonPackageDecision>,
     pub lifecycle: Vec<DaemonPluginLifecycle>,
+    pub mcp_tools: Vec<DaemonMcpTool>,
+    pub mcp_result: Option<DaemonMcpCallResult>,
     pub events: Vec<DaemonEvent>,
     pub cleanup: Option<DaemonSessionCleanup>,
     pub error: Option<DaemonOperatorError>,
@@ -899,6 +1007,8 @@ impl DaemonResponse {
             packages: Vec::new(),
             package_decision: None,
             lifecycle: Vec::new(),
+            mcp_tools: Vec::new(),
+            mcp_result: None,
             events: Vec::new(),
             cleanup: None,
             error: None,
@@ -913,6 +1023,8 @@ impl DaemonResponse {
             packages: Vec::new(),
             package_decision: None,
             lifecycle: Vec::new(),
+            mcp_tools: Vec::new(),
+            mcp_result: None,
             events: Vec::new(),
             cleanup: None,
             error: None,
@@ -927,6 +1039,8 @@ impl DaemonResponse {
             packages: Vec::new(),
             package_decision: None,
             lifecycle: Vec::new(),
+            mcp_tools: Vec::new(),
+            mcp_result: None,
             events,
             cleanup: None,
             error: None,
@@ -941,6 +1055,8 @@ impl DaemonResponse {
             packages: Vec::new(),
             package_decision: None,
             lifecycle: Vec::new(),
+            mcp_tools: Vec::new(),
+            mcp_result: None,
             events,
             cleanup: None,
             error: None,
@@ -955,6 +1071,8 @@ impl DaemonResponse {
             packages: packages.into_iter().map(Into::into).collect(),
             package_decision: None,
             lifecycle: Vec::new(),
+            mcp_tools: Vec::new(),
+            mcp_result: None,
             events: Vec::new(),
             cleanup: None,
             error: None,
@@ -969,6 +1087,8 @@ impl DaemonResponse {
             packages: Vec::new(),
             package_decision: None,
             lifecycle: lifecycle.into_iter().map(Into::into).collect(),
+            mcp_tools: Vec::new(),
+            mcp_result: None,
             events: Vec::new(),
             cleanup: None,
             error: None,
@@ -983,6 +1103,8 @@ impl DaemonResponse {
             packages: Vec::new(),
             package_decision: None,
             lifecycle: Vec::new(),
+            mcp_tools: Vec::new(),
+            mcp_result: None,
             events: Vec::new(),
             cleanup: Some(cleanup),
             error: None,
@@ -997,6 +1119,8 @@ impl DaemonResponse {
             packages: Vec::new(),
             package_decision: None,
             lifecycle: Vec::new(),
+            mcp_tools: Vec::new(),
+            mcp_result: None,
             events: Vec::new(),
             cleanup: None,
             error: Some(DaemonOperatorError {
@@ -1016,6 +1140,8 @@ impl DaemonResponse {
             packages: Vec::new(),
             package_decision: None,
             lifecycle: Vec::new(),
+            mcp_tools: Vec::new(),
+            mcp_result: None,
             events: Vec::new(),
             cleanup: None,
             error: Some(DaemonOperatorError::from_client_error(error)),
@@ -1030,6 +1156,8 @@ impl DaemonResponse {
             packages: Vec::new(),
             package_decision: None,
             lifecycle: Vec::new(),
+            mcp_tools: Vec::new(),
+            mcp_result: None,
             events: Vec::new(),
             cleanup: None,
             error: Some(DaemonOperatorError::from_package_error(error)),
@@ -1044,9 +1172,68 @@ impl DaemonResponse {
             packages: Vec::new(),
             package_decision: None,
             lifecycle: Vec::new(),
+            mcp_tools: Vec::new(),
+            mcp_result: None,
             events: Vec::new(),
             cleanup: None,
             error: Some(DaemonOperatorError::from_state_error(error)),
+        }
+    }
+
+    fn mcp_tools(tools: Vec<DaemonMcpTool>) -> Self {
+        Self {
+            kind: DaemonResponseKind::PluginMcpTools,
+            status: None,
+            sessions: Vec::new(),
+            packages: Vec::new(),
+            package_decision: None,
+            lifecycle: Vec::new(),
+            mcp_tools: tools,
+            mcp_result: None,
+            events: Vec::new(),
+            cleanup: None,
+            error: None,
+        }
+    }
+
+    fn mcp_call_result(structured_content: Value) -> Self {
+        Self {
+            kind: DaemonResponseKind::PluginMcpCall,
+            status: None,
+            sessions: Vec::new(),
+            packages: Vec::new(),
+            package_decision: None,
+            lifecycle: Vec::new(),
+            mcp_tools: Vec::new(),
+            mcp_result: Some(DaemonMcpCallResult {
+                structured_content,
+                error: None,
+            }),
+            events: Vec::new(),
+            cleanup: None,
+            error: None,
+        }
+    }
+
+    fn mcp_call_error(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            kind: DaemonResponseKind::PluginMcpCall,
+            status: None,
+            sessions: Vec::new(),
+            packages: Vec::new(),
+            package_decision: None,
+            lifecycle: Vec::new(),
+            mcp_tools: Vec::new(),
+            mcp_result: Some(DaemonMcpCallResult {
+                structured_content: json_empty(),
+                error: Some(DaemonMcpError {
+                    code: code.into(),
+                    message: message.into(),
+                }),
+            }),
+            events: Vec::new(),
+            cleanup: None,
+            error: None,
         }
     }
 }
@@ -1061,6 +1248,8 @@ pub enum DaemonResponseKind {
     Packages,
     PackageDecision,
     PluginLifecycle,
+    PluginMcpTools,
+    PluginMcpCall,
     SessionCleanup,
     OperatorError,
     Shutdown,
@@ -1137,6 +1326,36 @@ impl From<HubClientPluginLifecycle> for DaemonPluginLifecycle {
             loaded: lifecycle.loaded,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DaemonMcpTool {
+    pub name: String,
+    pub description: String,
+    pub input_schema: Value,
+}
+
+impl DaemonMcpTool {
+    fn from_plugin_descriptor(descriptor: botster_core::PluginOwnedDescriptor) -> Option<Self> {
+        let body = descriptor.body.0;
+        Some(Self {
+            name: body.get("name")?.as_str()?.to_string(),
+            description: body.get("description")?.as_str()?.to_string(),
+            input_schema: body.get("input_schema")?.clone(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DaemonMcpCallResult {
+    pub structured_content: Value,
+    pub error: Option<DaemonMcpError>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonMcpError {
+    pub code: String,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1500,6 +1719,7 @@ pub enum DaemonTransportError {
     Package(crate::PackageRegistryError),
     State(crate::HubStateStoreError),
     Runtime(crate::HubRuntimeError),
+    Lifecycle(crate::HubLifecycleError),
 }
 
 impl fmt::Display for DaemonTransportError {
@@ -1520,6 +1740,7 @@ impl fmt::Display for DaemonTransportError {
             Self::Package(error) => write!(formatter, "{error:?}"),
             Self::State(error) => write!(formatter, "{error}"),
             Self::Runtime(error) => write!(formatter, "{error:?}"),
+            Self::Lifecycle(error) => write!(formatter, "{error:?}"),
         }
     }
 }
@@ -1563,6 +1784,12 @@ impl From<crate::HubStateStoreError> for DaemonTransportError {
 impl From<crate::HubRuntimeError> for DaemonTransportError {
     fn from(error: crate::HubRuntimeError) -> Self {
         Self::Runtime(error)
+    }
+}
+
+impl From<crate::HubLifecycleError> for DaemonTransportError {
+    fn from(error: crate::HubLifecycleError) -> Self {
+        Self::Lifecycle(error)
     }
 }
 

@@ -410,6 +410,19 @@ fn print_daemon_response(response: DaemonResponse) -> Result<(), OperatorError> 
                 );
             }
         }
+        DaemonResponseKind::PluginMcpTools => {
+            println!("response=plugin_mcp_tools");
+            println!("tool_count={}", response.mcp_tools.len());
+            for tool in response.mcp_tools {
+                println!("tool name={}", tool.name);
+            }
+        }
+        DaemonResponseKind::PluginMcpCall => {
+            println!("response=plugin_mcp_call");
+            if let Some(result) = response.mcp_result {
+                println!("is_error={}", result.error.is_some());
+            }
+        }
         DaemonResponseKind::SessionCleanup => {
             println!("response=session_cleanup");
             if let Some(cleanup) = response.cleanup {

@@ -7,9 +7,9 @@
 
 use botster_core::{
     BotsterEngineObservation, BotsterEngineOutput, ClientId, CoreSession, CoreSessionMetadata,
-    ManagedSessionRuntimeError, PluginCapabilityRuntime, PluginCleanupResult,
-    PluginInvocationOutcome, PluginInvocationRequest, PluginKey, RequestId, SessionId,
-    SessionLifecycleState, SessionRuntimeErrorKind, SessionSpawnRequest, SubscriptionId,
+    ManagedSessionRuntimeError, PluginCapabilityRuntime, PluginCleanupResult, PluginDescriptorKind,
+    PluginInvocationOutcome, PluginInvocationRequest, PluginKey, PluginOwnedDescriptor, RequestId,
+    SessionId, SessionLifecycleState, SessionRuntimeErrorKind, SessionSpawnRequest, SubscriptionId,
 };
 use botster_core_daemon::{
     CoreDaemon, CoreDaemonConfig, CoreDaemonError, DaemonSession, DrainResult, GuardedWriteRequest,
@@ -136,6 +136,13 @@ impl HubRuntime {
     #[must_use]
     pub fn invoke_plugin(&self, request: PluginInvocationRequest) -> PluginInvocationOutcome {
         self.plugin_lifecycle.invoke(request)
+    }
+
+    /// Return loaded plugin-owned MCP tool descriptors.
+    #[must_use]
+    pub fn plugin_mcp_tool_descriptors(&self) -> Vec<PluginOwnedDescriptor> {
+        self.plugin_lifecycle
+            .descriptors_by_kind(PluginDescriptorKind::McpTool)
     }
 
     /// Reload an enabled package through core plugin worker cleanup and replacement.
