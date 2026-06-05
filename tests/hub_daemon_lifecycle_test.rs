@@ -1144,6 +1144,217 @@ fn daemon_detaches_subscription_when_attach_connection_drops() {
 }
 
 #[test]
+fn daemon_notify_session_defers_without_observed_readiness_over_socket() {
+    let _guard = daemon_test_lock()
+        .lock()
+        .expect("serialize real daemon test");
+    let data_dir = unique_test_dir("daemon-notify-session");
+    let config = explicit_config(&data_dir);
+    let child = start_cli_daemon(&data_dir);
+
+    let spawn = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::Spawn {
+            session_id: "notify-socket-session".to_string(),
+            command:
+                "printf 'ready\\n'; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done"
+                    .to_string(),
+        },
+    )
+    .expect("spawn guarded socket session");
+    assert_eq!(spawn.kind, botster_hub::DaemonResponseKind::Spawned);
+
+    let mut connection =
+        botster_hub::DaemonConnection::connect(&config).expect("connect TUI-grade socket");
+    connection
+        .request(&botster_hub::DaemonRequest::Attach {
+            session_id: "notify-socket-session".to_string(),
+            subscription_id: "notify-socket-subscription".to_string(),
+        })
+        .expect("attach persistent socket subscription");
+
+    let write = connection
+        .request(&botster_hub::DaemonRequest::NotifySession {
+            session_id: "notify-socket-session".to_string(),
+            data: "notify-socket\n".to_string(),
+        })
+        .expect("notify session over daemon socket");
+    assert_eq!(write.kind, botster_hub::DaemonResponseKind::SessionNotified);
+    let notify = write
+        .coordination
+        .and_then(|coordination| coordination.notify)
+        .expect("notify response body");
+    assert!(notify.decision.starts_with("Defer"));
+    assert_eq!(notify.states, vec!["accepted", "deferred"]);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut observed = String::new();
+    while std::time::Instant::now() < deadline {
+        let drain = connection
+            .request(&botster_hub::DaemonRequest::Drain {
+                session_id: "notify-socket-session".to_string(),
+            })
+            .expect("drain guarded socket session");
+        for event in drain.events {
+            if let botster_hub::DaemonEvent::TerminalOutput { data, .. } = event {
+                observed.push_str(&data);
+            }
+        }
+        if observed.contains("echo:notify-socket") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(30));
+    }
+    assert!(
+        !observed.contains("echo:notify-socket"),
+        "notify session without observed readiness should not reach PTY input path, got {observed:?}"
+    );
+
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
+fn scripted_tui_uses_daemon_socket_for_attach_input_doorbell_resize_and_restart_reconnect() {
+    let _guard = daemon_test_lock()
+        .lock()
+        .expect("serialize real daemon test");
+    let data_dir = unique_test_dir("scripted-tui");
+    let config = explicit_config(&data_dir);
+    let child = start_cli_daemon(&data_dir);
+
+    let spawn = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::Spawn {
+            session_id: "scripted-tui-session".to_string(),
+            command:
+                "printf 'ready\\n'; while IFS= read -r line; do if [ \"$line\" = size-check ]; then printf 'winsize:%s\\n' \"$(stty size)\"; else printf 'echo:%s\\n' \"$line\"; fi; done"
+                    .to_string(),
+        },
+    )
+    .expect("spawn scripted TUI session");
+    assert_eq!(spawn.kind, botster_hub::DaemonResponseKind::Spawned);
+
+    let proof = botster_hub::run_scripted_probe(config.clone(), "scripted-tui-session")
+        .expect("scripted TUI probe should complete core workflow");
+    assert!(
+        proof
+            .rendered_sessions
+            .contains(&"scripted-tui-session".to_string())
+    );
+    assert!(proof.observed_output.contains("echo:from-tui"));
+    assert!(proof.observed_output.contains("winsize:31 101"));
+    assert!(!proof.observed_output.contains("echo:doorbell-from-tui"));
+    assert!(proof.observed_output.contains("echo:after-reattach"));
+    assert!(proof.guarded_decision.starts_with("Defer"));
+    assert_eq!(proof.guarded_states, vec!["accepted", "deferred"]);
+    assert_eq!(proof.resize_sent, Some((31, 101)));
+    assert_ne!(
+        proof.first_subscription_id, proof.second_subscription_id,
+        "TUI reattach should allocate a fresh subscription id"
+    );
+
+    let mut driver = botster_hub::ScriptedTuiDriver::connect(config.clone())
+        .expect("connect scripted TUI driver before restart");
+    driver
+        .select_session("scripted-tui-session")
+        .expect("select recovered session before restart");
+    let before_restart_subscription = driver
+        .attach_selected()
+        .expect("attach before daemon restart");
+    driver.send_input("before-restart\n");
+    driver
+        .drain_until("echo:before-restart", Duration::from_secs(5))
+        .expect("observe pre-restart output");
+
+    shutdown_cli_daemon(&data_dir, child);
+    let restarted_child = start_cli_daemon(&data_dir);
+    driver
+        .reconnect()
+        .expect("scripted TUI should reconnect after daemon restart");
+    let after_restart_subscription = driver
+        .subscription_id()
+        .expect("reconnect should reattach recovered session");
+    assert_ne!(
+        before_restart_subscription, after_restart_subscription,
+        "daemon restart reconnect must discard stale subscription id"
+    );
+    driver.send_input("after-restart\n");
+    driver
+        .drain_until("echo:after-restart", Duration::from_secs(5))
+        .expect("TUI should observe output after daemon restart reconnect");
+    assert!(driver.output().contains("echo:after-restart"));
+
+    shutdown_cli_daemon(&data_dir, restarted_child);
+}
+
+#[test]
+fn scripted_tui_surfaces_session_lost_when_restart_does_not_recover_attached_session() {
+    let _guard = daemon_test_lock()
+        .lock()
+        .expect("serialize real daemon test");
+    let data_dir = unique_test_dir("scripted-tui-session-lost");
+    let config = explicit_config(&data_dir);
+    let child = start_cli_daemon(&data_dir);
+
+    let spawn = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::Spawn {
+            session_id: "scripted-lost-session".to_string(),
+            command:
+                "printf 'ready\\n'; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done"
+                    .to_string(),
+        },
+    )
+    .expect("spawn scripted lost-session fixture");
+    assert_eq!(spawn.kind, botster_hub::DaemonResponseKind::Spawned);
+
+    let mut driver = botster_hub::ScriptedTuiDriver::connect(config.clone())
+        .expect("connect scripted TUI driver before lost-session restart");
+    driver
+        .select_session("scripted-lost-session")
+        .expect("select session before loss");
+    driver
+        .attach_selected()
+        .expect("attach before intentional session loss");
+    driver.send_input("before-loss\n");
+    driver
+        .drain_until("echo:before-loss", Duration::from_secs(5))
+        .expect("observe pre-loss output");
+
+    let shutdown_session = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::ShutdownSession {
+            session_id: "scripted-lost-session".to_string(),
+        },
+    )
+    .expect("shut down session before daemon restart");
+    assert_eq!(
+        shutdown_session.kind,
+        botster_hub::DaemonResponseKind::Events
+    );
+
+    shutdown_cli_daemon(&data_dir, child);
+    let restarted_child = start_cli_daemon(&data_dir);
+    driver
+        .reconnect()
+        .expect("TUI reconnect should keep operator in status/session view");
+    assert!(
+        driver.subscription_id().is_none(),
+        "unrecovered session should not keep or recreate a subscription"
+    );
+    assert!(
+        driver
+            .errors()
+            .iter()
+            .any(|error| error.contains("attached session was not recovered")),
+        "TUI should surface visible session-lost error, got {:?}",
+        driver.errors()
+    );
+
+    shutdown_cli_daemon(&data_dir, restarted_child);
+}
+
+#[test]
 fn stalled_attach_stdout_does_not_block_other_daemon_commands() {
     let _guard = daemon_test_lock()
         .lock()

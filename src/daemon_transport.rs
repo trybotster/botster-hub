@@ -94,6 +94,27 @@ pub fn request(
     read_frame(&mut stream)
 }
 
+/// Persistent daemon connection for clients that own attach subscription state.
+pub struct DaemonConnection {
+    stream: UnixStream,
+    reader: BufReader<UnixStream>,
+}
+
+impl DaemonConnection {
+    /// Connect to the daemon and complete the socket protocol handshake.
+    pub fn connect(config: &HubConfig) -> DaemonTransportResult<Self> {
+        let stream = connect_and_hello(config)?;
+        let reader = BufReader::new(stream.try_clone().map_err(DaemonTransportError::Io)?);
+        Ok(Self { stream, reader })
+    }
+
+    /// Send one request over this persistent connection.
+    pub fn request(&mut self, request: &DaemonRequest) -> DaemonTransportResult<DaemonResponse> {
+        write_frame(&mut self.stream, request)?;
+        read_frame_from_reader(&mut self.reader)
+    }
+}
+
 /// Attach and stream terminal bytes until the session exits or the connection closes.
 pub fn stream_attach(
     config: &HubConfig,
@@ -1436,6 +1457,11 @@ impl DaemonCoordination {
             notify: Some(DaemonNotify {
                 decision: format!("{decision:?}"),
                 state_count: states.len(),
+                states: states
+                    .into_iter()
+                    .map(guarded_write_delivery_state_label)
+                    .map(ToString::to_string)
+                    .collect(),
             }),
         }
     }
@@ -1529,6 +1555,7 @@ impl DaemonEnvelopeAck {
 pub struct DaemonNotify {
     pub decision: String,
     pub state_count: usize,
+    pub states: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1828,6 +1855,17 @@ fn package_state_label(state: crate::HubClientPackageState) -> &'static str {
         crate::HubClientPackageState::Installed => "installed",
         crate::HubClientPackageState::Enabled => "enabled",
         crate::HubClientPackageState::Disabled => "disabled",
+    }
+}
+
+fn guarded_write_delivery_state_label(state: GuardedWriteDeliveryState) -> &'static str {
+    match state {
+        GuardedWriteDeliveryState::Accepted => "accepted",
+        GuardedWriteDeliveryState::Deferred => "deferred",
+        GuardedWriteDeliveryState::Rejected => "rejected",
+        GuardedWriteDeliveryState::Written => "written",
+        GuardedWriteDeliveryState::Delivered => "delivered",
+        GuardedWriteDeliveryState::Acknowledged => "acknowledged",
     }
 }
 
