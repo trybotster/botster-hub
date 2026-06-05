@@ -22,8 +22,10 @@ use botster_core_daemon::RegistrySessionState;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    HubClientApi, HubClientEvent, HubClientRequest, HubClientResponseBody, HubClientSession,
-    HubConfig, HubDaemon, HubDaemonStatus, HubStateLoadSource, PackageRegistry,
+    FileHubStateStore, HubClientApi, HubClientEvent, HubClientPackage,
+    HubClientPackageClassification, HubClientPluginLifecycle, HubClientRequest,
+    HubClientResponseBody, HubClientSession, HubConfig, HubDaemon, HubDaemonStatus,
+    HubStateLoadSource, HubStateStore, PackageAction, PackageDecision,
 };
 
 const PROTOCOL: &str = "botster-hub-daemon-v1";
@@ -40,7 +42,6 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
 
     let (control_tx, control_rx) = mpsc::channel();
     let mut daemon = HubDaemon::start(config)?;
-    let packages = daemon.package_registry().clone();
     let mut logical_clock = 1;
     let mut drain_cursors = BTreeMap::<String, u64>::new();
 
@@ -58,7 +59,6 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
                 while let Ok(message) = control_rx.try_recv() {
                     if handle_control_message(
                         &mut daemon,
-                        &packages,
                         &mut logical_clock,
                         &mut drain_cursors,
                         message,
@@ -265,16 +265,19 @@ fn apply_attached_subscription_change(
 
 fn handle_control_message(
     daemon: &mut HubDaemon,
-    packages: &PackageRegistry,
     logical_clock: &mut u64,
     drain_cursors: &mut BTreeMap<String, u64>,
     message: ControlMessage,
 ) -> bool {
     let ControlMessage::Request { request, reply_tx } = message;
-    let response = handle_control_request(daemon, packages, logical_clock, drain_cursors, request)
-        .or_else(|error| match error {
-            DaemonTransportError::Client(error) => Ok(DaemonResponse::operator_error(error)),
-            error => Err(error),
+    let response =
+        handle_control_request(daemon, logical_clock, drain_cursors, request).or_else(|error| {
+            match error {
+                DaemonTransportError::Client(error) => Ok(DaemonResponse::operator_error(error)),
+                DaemonTransportError::Package(error) => Ok(DaemonResponse::package_error(error)),
+                DaemonTransportError::State(error) => Ok(DaemonResponse::state_error(error)),
+                error => Err(error),
+            }
         });
     let should_stop = matches!(
         response,
@@ -289,13 +292,53 @@ fn handle_control_message(
 
 fn handle_control_request(
     daemon: &mut HubDaemon,
-    packages: &PackageRegistry,
+    logical_clock: &mut u64,
+    drain_cursors: &mut BTreeMap<String, u64>,
+    request: DaemonRequest,
+) -> DaemonTransportResult<DaemonResponse> {
+    match request {
+        DaemonRequest::ListPackages => list_packages_response(daemon),
+        DaemonRequest::PluginLifecycleStatus => plugin_lifecycle_response(daemon),
+        DaemonRequest::EnablePackageLocalPath { path } => {
+            let package_name = {
+                let record = daemon
+                    .package_registry_mut()
+                    .install_local_path(path, "daemon socket enable local package")?;
+                record.manifest.name.clone()
+            };
+            let decision = daemon
+                .package_registry_mut()
+                .enable(&package_name, "daemon socket enable local package")?;
+            persist_package_registry(daemon)?;
+            package_decision_response(daemon, decision)
+        }
+        DaemonRequest::EnablePackage { package_name } => {
+            let decision = daemon
+                .package_registry_mut()
+                .enable(&package_name, "daemon socket enable package")?;
+            persist_package_registry(daemon)?;
+            package_decision_response(daemon, decision)
+        }
+        DaemonRequest::DisablePackage { package_name } => {
+            let decision = daemon
+                .package_registry_mut()
+                .disable(&package_name, "daemon socket disable package")?;
+            persist_package_registry(daemon)?;
+            package_decision_response(daemon, decision)
+        }
+        other => handle_runtime_control_request(daemon, logical_clock, drain_cursors, other),
+    }
+}
+
+fn handle_runtime_control_request(
+    daemon: &mut HubDaemon,
     logical_clock: &mut u64,
     drain_cursors: &mut BTreeMap<String, u64>,
     request: DaemonRequest,
 ) -> DaemonTransportResult<DaemonResponse> {
     let status = daemon.status();
     let api = HubClientApi::local_operator("botster-hub-daemon-socket");
+    let packages = daemon.package_registry().clone();
     let Some(runtime) = daemon.runtime_mut() else {
         return Err(DaemonTransportError::DaemonNotRunning);
     };
@@ -304,7 +347,7 @@ fn handle_control_request(
         DaemonRequest::Status => {
             let response = api.handle_request(
                 runtime,
-                packages,
+                &packages,
                 HubClientRequest::Status {
                     request_id: request_id("daemon-status"),
                 },
@@ -317,7 +360,7 @@ fn handle_control_request(
         DaemonRequest::ListSessions => {
             let response = api.handle_request(
                 runtime,
-                packages,
+                &packages,
                 HubClientRequest::ListSessions {
                     request_id: request_id("daemon-sessions-list"),
                 },
@@ -333,7 +376,7 @@ fn handle_control_request(
         } => {
             let response = api.handle_request(
                 runtime,
-                packages,
+                &packages,
                 HubClientRequest::Spawn {
                     request_id: request_id("daemon-sessions-spawn"),
                     session_id: SessionId(session_id),
@@ -357,7 +400,7 @@ fn handle_control_request(
             let now = tick(logical_clock);
             let response = api.handle_request(
                 runtime,
-                packages,
+                &packages,
                 HubClientRequest::Attach {
                     request_id: request_id("daemon-sessions-attach"),
                     session_id: SessionId(session_id),
@@ -374,7 +417,7 @@ fn handle_control_request(
             let now = tick(logical_clock);
             let response = api.handle_request(
                 runtime,
-                packages,
+                &packages,
                 HubClientRequest::Detach {
                     request_id: request_id("daemon-sessions-detach"),
                     session_id: SessionId(session_id),
@@ -388,7 +431,7 @@ fn handle_control_request(
             let now = tick(logical_clock);
             let response = api.handle_request(
                 runtime,
-                packages,
+                &packages,
                 HubClientRequest::Input {
                     request_id: request_id("daemon-sessions-send-input"),
                     session_id: SessionId(session_id),
@@ -406,7 +449,7 @@ fn handle_control_request(
             let now = tick(logical_clock);
             let response = api.handle_request(
                 runtime,
-                packages,
+                &packages,
                 HubClientRequest::Resize {
                     request_id: request_id("daemon-sessions-resize"),
                     session_id: SessionId(session_id),
@@ -431,7 +474,7 @@ fn handle_control_request(
             let shutdown_session_id = session_id.clone();
             let response = match api.handle_request(
                 runtime,
-                packages,
+                &packages,
                 HubClientRequest::Shutdown {
                     request_id: request_id("daemon-sessions-shutdown"),
                     session_id: SessionId(shutdown_session_id),
@@ -467,7 +510,7 @@ fn handle_control_request(
                 .or_insert_with(|| tick(logical_clock));
             let response = api.handle_request(
                 runtime,
-                packages,
+                &packages,
                 HubClientRequest::DrainRuntime {
                     request_id: request_id("daemon-sessions-drain"),
                     session_id: SessionId(session_id),
@@ -490,11 +533,82 @@ fn handle_control_request(
                     .len(),
             )),
             sessions: Vec::new(),
+            packages: Vec::new(),
+            package_decision: None,
+            lifecycle: Vec::new(),
             events: Vec::new(),
             cleanup: None,
             error: None,
         }),
+        DaemonRequest::ListPackages
+        | DaemonRequest::PluginLifecycleStatus
+        | DaemonRequest::EnablePackageLocalPath { .. }
+        | DaemonRequest::EnablePackage { .. }
+        | DaemonRequest::DisablePackage { .. } => {
+            unreachable!("package requests are handled before runtime borrow")
+        }
     }
+}
+
+fn list_packages_response(daemon: &mut HubDaemon) -> DaemonTransportResult<DaemonResponse> {
+    let packages = daemon.package_registry().clone();
+    let api = HubClientApi::local_operator("botster-hub-daemon-socket");
+    let Some(runtime) = daemon.runtime_mut() else {
+        return Err(DaemonTransportError::DaemonNotRunning);
+    };
+    let response = api.handle_request(
+        runtime,
+        &packages,
+        HubClientRequest::ListPackages {
+            request_id: request_id("daemon-packages-list"),
+        },
+    )?;
+    let HubClientResponseBody::Packages(packages) = response.body else {
+        return Err(DaemonTransportError::UnexpectedResponse);
+    };
+    Ok(DaemonResponse::packages(packages))
+}
+
+fn plugin_lifecycle_response(daemon: &mut HubDaemon) -> DaemonTransportResult<DaemonResponse> {
+    let packages = daemon.package_registry().clone();
+    let api = HubClientApi::local_operator("botster-hub-daemon-socket");
+    let Some(runtime) = daemon.runtime_mut() else {
+        return Err(DaemonTransportError::DaemonNotRunning);
+    };
+    let response = api.handle_request(
+        runtime,
+        &packages,
+        HubClientRequest::PluginLifecycleStatus {
+            request_id: request_id("daemon-plugin-lifecycle-status"),
+        },
+    )?;
+    let HubClientResponseBody::PluginLifecycle(lifecycle) = response.body else {
+        return Err(DaemonTransportError::UnexpectedResponse);
+    };
+    Ok(DaemonResponse::plugin_lifecycle(lifecycle))
+}
+
+fn package_decision_response(
+    daemon: &mut HubDaemon,
+    decision: PackageDecision,
+) -> DaemonTransportResult<DaemonResponse> {
+    let mut response = list_packages_response(daemon)?;
+    response.kind = DaemonResponseKind::PackageDecision;
+    response.package_decision = Some(DaemonPackageDecision::from(decision));
+    Ok(response)
+}
+
+fn persist_package_registry(daemon: &HubDaemon) -> DaemonTransportResult<()> {
+    let runtime = daemon
+        .runtime()
+        .ok_or(DaemonTransportError::DaemonNotRunning)?;
+    let config = runtime.config().clone();
+    let snapshot = daemon.package_registry().snapshot();
+    let store = FileHubStateStore::for_data_directory(&config.data_directory);
+    store.update(&config, |state| {
+        state.package_registry = snapshot;
+    })?;
+    Ok(())
 }
 
 fn events_response(body: HubClientResponseBody) -> DaemonTransportResult<DaemonResponse> {
@@ -748,6 +862,17 @@ pub enum DaemonRequest {
     Drain {
         session_id: String,
     },
+    ListPackages,
+    EnablePackageLocalPath {
+        path: PathBuf,
+    },
+    EnablePackage {
+        package_name: String,
+    },
+    DisablePackage {
+        package_name: String,
+    },
+    PluginLifecycleStatus,
     DaemonShutdown,
 }
 
@@ -757,6 +882,9 @@ pub struct DaemonResponse {
     pub kind: DaemonResponseKind,
     pub status: Option<DaemonStatus>,
     pub sessions: Vec<DaemonSession>,
+    pub packages: Vec<DaemonPackage>,
+    pub package_decision: Option<DaemonPackageDecision>,
+    pub lifecycle: Vec<DaemonPluginLifecycle>,
     pub events: Vec<DaemonEvent>,
     pub cleanup: Option<DaemonSessionCleanup>,
     pub error: Option<DaemonOperatorError>,
@@ -768,6 +896,9 @@ impl DaemonResponse {
             kind: DaemonResponseKind::Status,
             status: Some(DaemonStatus::from_status(&status, session_count)),
             sessions: Vec::new(),
+            packages: Vec::new(),
+            package_decision: None,
+            lifecycle: Vec::new(),
             events: Vec::new(),
             cleanup: None,
             error: None,
@@ -779,6 +910,9 @@ impl DaemonResponse {
             kind: DaemonResponseKind::Sessions,
             status: None,
             sessions: sessions.into_iter().map(Into::into).collect(),
+            packages: Vec::new(),
+            package_decision: None,
+            lifecycle: Vec::new(),
             events: Vec::new(),
             cleanup: None,
             error: None,
@@ -790,6 +924,9 @@ impl DaemonResponse {
             kind: DaemonResponseKind::Spawned,
             status: None,
             sessions: vec![session],
+            packages: Vec::new(),
+            package_decision: None,
+            lifecycle: Vec::new(),
             events,
             cleanup: None,
             error: None,
@@ -801,7 +938,38 @@ impl DaemonResponse {
             kind: DaemonResponseKind::Events,
             status: None,
             sessions: Vec::new(),
+            packages: Vec::new(),
+            package_decision: None,
+            lifecycle: Vec::new(),
             events,
+            cleanup: None,
+            error: None,
+        }
+    }
+
+    fn packages(packages: Vec<HubClientPackage>) -> Self {
+        Self {
+            kind: DaemonResponseKind::Packages,
+            status: None,
+            sessions: Vec::new(),
+            packages: packages.into_iter().map(Into::into).collect(),
+            package_decision: None,
+            lifecycle: Vec::new(),
+            events: Vec::new(),
+            cleanup: None,
+            error: None,
+        }
+    }
+
+    fn plugin_lifecycle(lifecycle: Vec<HubClientPluginLifecycle>) -> Self {
+        Self {
+            kind: DaemonResponseKind::PluginLifecycle,
+            status: None,
+            sessions: Vec::new(),
+            packages: Vec::new(),
+            package_decision: None,
+            lifecycle: lifecycle.into_iter().map(Into::into).collect(),
+            events: Vec::new(),
             cleanup: None,
             error: None,
         }
@@ -812,6 +980,9 @@ impl DaemonResponse {
             kind: DaemonResponseKind::SessionCleanup,
             status: None,
             sessions: Vec::new(),
+            packages: Vec::new(),
+            package_decision: None,
+            lifecycle: Vec::new(),
             events: Vec::new(),
             cleanup: Some(cleanup),
             error: None,
@@ -823,6 +994,9 @@ impl DaemonResponse {
             kind: DaemonResponseKind::OperatorError,
             status: None,
             sessions: Vec::new(),
+            packages: Vec::new(),
+            package_decision: None,
+            lifecycle: Vec::new(),
             events: Vec::new(),
             cleanup: None,
             error: Some(DaemonOperatorError {
@@ -839,9 +1013,40 @@ impl DaemonResponse {
             kind: DaemonResponseKind::OperatorError,
             status: None,
             sessions: Vec::new(),
+            packages: Vec::new(),
+            package_decision: None,
+            lifecycle: Vec::new(),
             events: Vec::new(),
             cleanup: None,
             error: Some(DaemonOperatorError::from_client_error(error)),
+        }
+    }
+
+    fn package_error(error: crate::PackageRegistryError) -> Self {
+        Self {
+            kind: DaemonResponseKind::OperatorError,
+            status: None,
+            sessions: Vec::new(),
+            packages: Vec::new(),
+            package_decision: None,
+            lifecycle: Vec::new(),
+            events: Vec::new(),
+            cleanup: None,
+            error: Some(DaemonOperatorError::from_package_error(error)),
+        }
+    }
+
+    fn state_error(error: crate::HubStateStoreError) -> Self {
+        Self {
+            kind: DaemonResponseKind::OperatorError,
+            status: None,
+            sessions: Vec::new(),
+            packages: Vec::new(),
+            package_decision: None,
+            lifecycle: Vec::new(),
+            events: Vec::new(),
+            cleanup: None,
+            error: Some(DaemonOperatorError::from_state_error(error)),
         }
     }
 }
@@ -853,9 +1058,85 @@ pub enum DaemonResponseKind {
     Sessions,
     Spawned,
     Events,
+    Packages,
+    PackageDecision,
+    PluginLifecycle,
     SessionCleanup,
     OperatorError,
     Shutdown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonPackage {
+    pub package_name: String,
+    pub version: String,
+    pub classification: String,
+    pub state: String,
+    pub requested_capabilities: Vec<DaemonCapability>,
+    pub provider_profile_admitted: bool,
+}
+
+impl From<HubClientPackage> for DaemonPackage {
+    fn from(package: HubClientPackage) -> Self {
+        Self {
+            package_name: package.package_name,
+            version: package.version,
+            classification: package_classification_label(package.classification).to_string(),
+            state: package_state_label(package.state).to_string(),
+            requested_capabilities: package
+                .requested_capabilities
+                .into_iter()
+                .map(|capability| DaemonCapability {
+                    surface: capability.surface,
+                    scope: capability.scope,
+                })
+                .collect(),
+            provider_profile_admitted: package.provider_profile_admitted,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonCapability {
+    pub surface: String,
+    pub scope: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonPackageDecision {
+    pub package_name: String,
+    pub action: String,
+    pub state: String,
+    pub classification: String,
+}
+
+impl From<PackageDecision> for DaemonPackageDecision {
+    fn from(decision: PackageDecision) -> Self {
+        Self {
+            package_name: decision.package_name,
+            action: package_action_label(decision.action).to_string(),
+            state: package_state_label(decision.state.into()).to_string(),
+            classification: package_classification_label(decision.classification.into())
+                .to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonPluginLifecycle {
+    pub package_name: String,
+    pub state: String,
+    pub loaded: bool,
+}
+
+impl From<HubClientPluginLifecycle> for DaemonPluginLifecycle {
+    fn from(lifecycle: HubClientPluginLifecycle) -> Self {
+        Self {
+            package_name: lifecycle.package_name,
+            state: package_state_label(lifecycle.state).to_string(),
+            loaded: lifecycle.loaded,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -988,6 +1269,29 @@ impl DaemonOperatorError {
             },
         }
     }
+
+    fn from_package_error(error: crate::PackageRegistryError) -> Self {
+        Self {
+            code: "package_policy_error".to_string(),
+            request_id: "daemon-package-mutation".to_string(),
+            operation: package_action_label(error.action).to_string(),
+            message: format!(
+                "package {} denied for {}: {:?}",
+                error.package_name,
+                package_action_label(error.action),
+                error.reason
+            ),
+        }
+    }
+
+    fn from_state_error(error: crate::HubStateStoreError) -> Self {
+        Self {
+            code: "hub_state_error".to_string(),
+            request_id: "daemon-package-mutation".to_string(),
+            operation: "persist_package_registry".to_string(),
+            message: format!("failed to persist package registry: {error}"),
+        }
+    }
 }
 
 fn shutdown_error_is_unknown_session(error: &crate::HubClientError) -> bool {
@@ -1025,6 +1329,31 @@ fn operation_label(operation: crate::HubClientOperation) -> &'static str {
         crate::HubClientOperation::CaptureSnapshot => "capture_snapshot",
         crate::HubClientOperation::ListPackages => "list_packages",
         crate::HubClientOperation::PluginLifecycleStatus => "plugin_lifecycle_status",
+    }
+}
+
+fn package_classification_label(classification: HubClientPackageClassification) -> &'static str {
+    match classification {
+        HubClientPackageClassification::Plugin => "plugin",
+        HubClientPackageClassification::Provider => "provider",
+    }
+}
+
+fn package_state_label(state: crate::HubClientPackageState) -> &'static str {
+    match state {
+        crate::HubClientPackageState::Installed => "installed",
+        crate::HubClientPackageState::Enabled => "enabled",
+        crate::HubClientPackageState::Disabled => "disabled",
+    }
+}
+
+fn package_action_label(action: PackageAction) -> &'static str {
+    match action {
+        PackageAction::Install => "install",
+        PackageAction::Enable => "enable",
+        PackageAction::Disable => "disable",
+        PackageAction::Pin => "pin",
+        PackageAction::Prepare => "prepare",
     }
 }
 
@@ -1168,6 +1497,8 @@ pub enum DaemonTransportError {
     Json(serde_json::Error),
     Daemon(crate::HubDaemonError),
     Client(crate::HubClientError),
+    Package(crate::PackageRegistryError),
+    State(crate::HubStateStoreError),
     Runtime(crate::HubRuntimeError),
 }
 
@@ -1186,6 +1517,8 @@ impl fmt::Display for DaemonTransportError {
             Self::Json(error) => write!(formatter, "{error}"),
             Self::Daemon(error) => write!(formatter, "{error}"),
             Self::Client(error) => write!(formatter, "{error:?}"),
+            Self::Package(error) => write!(formatter, "{error:?}"),
+            Self::State(error) => write!(formatter, "{error}"),
             Self::Runtime(error) => write!(formatter, "{error:?}"),
         }
     }
@@ -1197,6 +1530,7 @@ impl Error for DaemonTransportError {
             Self::Io(error) => Some(error),
             Self::Json(error) => Some(error),
             Self::Daemon(error) => Some(error),
+            Self::State(error) => Some(error),
             _ => None,
         }
     }
@@ -1211,6 +1545,18 @@ impl From<crate::HubDaemonError> for DaemonTransportError {
 impl From<crate::HubClientError> for DaemonTransportError {
     fn from(error: crate::HubClientError) -> Self {
         Self::Client(error)
+    }
+}
+
+impl From<crate::PackageRegistryError> for DaemonTransportError {
+    fn from(error: crate::PackageRegistryError) -> Self {
+        Self::Package(error)
+    }
+}
+
+impl From<crate::HubStateStoreError> for DaemonTransportError {
+    fn from(error: crate::HubStateStoreError) -> Self {
+        Self::State(error)
     }
 }
 
