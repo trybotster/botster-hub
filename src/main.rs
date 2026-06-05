@@ -11,11 +11,10 @@ use botster_core::{
     SessionSpawnRequest, SpawnEnvironment, SpawnWorkingDirectory, SubscriptionId, TransportEgress,
 };
 use botster_hub::{
-    DaemonEvent, DaemonOperatorError, DaemonRequest, DaemonResponse, DaemonResponseKind,
-    DaemonSession, DaemonStatus, DataDirectoryOption, FileHubStateStore, HubClientApi,
-    HubClientPackageClassification, HubClientPackageState, HubClientRequest, HubClientResponseBody,
-    HubDaemon, HubDaemonState, HubRuntime, HubStartupOptions, HubStateLoadSource, HubStateStore,
-    PackageAction, RuntimeEnvironment, SessionDefaults, TransportBindings,
+    DaemonEvent, DaemonOperatorError, DaemonPackage, DaemonRequest, DaemonResponse,
+    DaemonResponseKind, DaemonSession, DaemonStatus, DataDirectoryOption, HubClientApi,
+    HubClientRequest, HubClientResponseBody, HubDaemon, HubDaemonState, HubRuntime,
+    HubStartupOptions, HubStateLoadSource, RuntimeEnvironment, SessionDefaults, TransportBindings,
     build_default_config_for_runtime, daemon_transport_request, default_package_policy,
     host_profile, serve_daemon, stream_attach,
 };
@@ -245,53 +244,29 @@ fn operator_shutdown(args: Vec<String>) -> Result<(), OperatorError> {
 
 fn operator_packages(args: Vec<String>, providers_only: bool) -> Result<(), OperatorError> {
     let command = PackageCommand::parse(args, providers_only)?;
-    let mut daemon = HubDaemon::start(explicit_config(command.data_directory)?)?;
+    let config = explicit_config(command.data_directory)?;
 
     match command.action {
-        PackageActionCommand::List => {}
+        PackageActionCommand::List => {
+            let response = daemon_transport_request(&config, DaemonRequest::ListPackages)?;
+            print_packages_response(response, providers_only)?;
+        }
         PackageActionCommand::EnableLocalPath(path) => {
-            let package_name = {
-                let record = daemon
-                    .package_registry_mut()
-                    .install_local_path(path, "operator CLI enable local package")?;
-                record.manifest.name.clone()
-            };
-            let decision = daemon
-                .package_registry_mut()
-                .enable(&package_name, "operator CLI enable local package")?;
-            persist_package_registry(&daemon)?;
-            print_package_decision(&decision);
+            let response =
+                daemon_transport_request(&config, DaemonRequest::EnablePackageLocalPath { path })?;
+            print_packages_response(response, providers_only)?;
         }
         PackageActionCommand::EnableName(package_name) => {
-            let decision = daemon
-                .package_registry_mut()
-                .enable(&package_name, "operator CLI enable package")?;
-            persist_package_registry(&daemon)?;
-            print_package_decision(&decision);
+            let response =
+                daemon_transport_request(&config, DaemonRequest::EnablePackage { package_name })?;
+            print_packages_response(response, providers_only)?;
         }
         PackageActionCommand::Disable(package_name) => {
-            let decision = daemon
-                .package_registry_mut()
-                .disable(&package_name, "operator CLI disable package")?;
-            persist_package_registry(&daemon)?;
-            print_package_decision(&decision);
+            let response =
+                daemon_transport_request(&config, DaemonRequest::DisablePackage { package_name })?;
+            print_packages_response(response, providers_only)?;
         }
     }
-
-    let packages = daemon.package_registry().clone();
-    let api = HubClientApi::local_operator("botster-hub-cli");
-    let runtime = daemon
-        .runtime_mut()
-        .ok_or(OperatorError::DaemonNotRunning)?;
-    let response = api.handle_request(
-        runtime,
-        &packages,
-        HubClientRequest::ListPackages {
-            request_id: request_id("cli-packages-list"),
-        },
-    )?;
-    print_packages_response(response.body, providers_only);
-    daemon.stop();
     Ok(())
 }
 
@@ -344,17 +319,6 @@ fn explicit_config(
         ..HubStartupOptions::default()
     }
     .build_config_for_environment(&RuntimeEnvironment::from_values(None, None, None))
-}
-
-fn persist_package_registry(daemon: &HubDaemon) -> Result<(), OperatorError> {
-    let runtime = daemon.runtime().ok_or(OperatorError::DaemonNotRunning)?;
-    let config = runtime.config().clone();
-    let snapshot = daemon.package_registry().snapshot();
-    let store = FileHubStateStore::for_data_directory(&config.data_directory);
-    store.update(&config, |state| {
-        state.package_registry = snapshot;
-    })?;
-    Ok(())
 }
 
 fn print_daemon_transport_status(label: &str, status: &DaemonStatus) {
@@ -410,6 +374,25 @@ fn print_daemon_response(response: DaemonResponse) -> Result<(), OperatorError> 
         DaemonResponseKind::Events => {
             println!("response=events");
             print_daemon_events(&response.events);
+        }
+        DaemonResponseKind::Packages => {
+            print_packages(&response.packages, false);
+        }
+        DaemonResponseKind::PackageDecision => {
+            if let Some(decision) = response.package_decision {
+                print_package_decision(&decision);
+            }
+            print_packages(&response.packages, false);
+        }
+        DaemonResponseKind::PluginLifecycle => {
+            println!("response=plugin_lifecycle");
+            println!("plugin_count={}", response.lifecycle.len());
+            for lifecycle in response.lifecycle {
+                println!(
+                    "plugin package_name={} state={} loaded={}",
+                    lifecycle.package_name, lifecycle.state, lifecycle.loaded
+                );
+            }
         }
         DaemonResponseKind::SessionCleanup => {
             println!("response=session_cleanup");
@@ -526,19 +509,24 @@ fn state_source_label(source: HubStateLoadSource) -> &'static str {
     }
 }
 
-fn print_packages_response(body: HubClientResponseBody, providers_only: bool) {
-    let HubClientResponseBody::Packages(packages) = body else {
-        return;
-    };
+fn print_packages_response(
+    response: DaemonResponse,
+    providers_only: bool,
+) -> Result<(), OperatorError> {
+    if response.kind == DaemonResponseKind::OperatorError {
+        return print_daemon_response(response);
+    }
+    if let Some(decision) = response.package_decision.as_ref() {
+        print_package_decision(decision);
+    }
+    print_packages(&response.packages, providers_only);
+    Ok(())
+}
+
+fn print_packages(packages: &[DaemonPackage], providers_only: bool) {
     let packages: Vec<_> = packages
-        .into_iter()
-        .filter(|package| {
-            !providers_only
-                || matches!(
-                    package.classification,
-                    HubClientPackageClassification::Provider
-                )
-        })
+        .iter()
+        .filter(|package| !providers_only || package.classification == "provider")
         .collect();
     println!(
         "response={}",
@@ -554,23 +542,20 @@ fn print_packages_response(body: HubClientResponseBody, providers_only: bool) {
             "package name={} version={} classification={} state={} capabilities={} provider_profile_admitted={}",
             package.package_name,
             package.version,
-            package_classification_label(package.classification),
-            package_state_label(package.state),
+            package.classification,
+            package.state,
             package.requested_capabilities.len(),
             package.provider_profile_admitted
         );
     }
 }
 
-fn print_package_decision(decision: &botster_hub::PackageDecision) {
+fn print_package_decision(decision: &botster_hub::DaemonPackageDecision) {
     println!("decision=package");
     println!("package_name={}", decision.package_name);
-    println!("action={}", package_action_label(decision.action));
-    println!("state={}", package_state_label(decision.state.into()));
-    println!(
-        "classification={}",
-        package_classification_label(decision.classification.into())
-    );
+    println!("action={}", decision.action);
+    println!("state={}", decision.state);
+    println!("classification={}", decision.classification);
 }
 
 fn request_id(value: &str) -> RequestId {
@@ -584,31 +569,6 @@ fn session_lifecycle_label(state: &SessionLifecycleState) -> &'static str {
         SessionLifecycleState::Stopping => "stopping",
         SessionLifecycleState::Exited { .. } => "exited",
         SessionLifecycleState::Failed { .. } => "failed",
-    }
-}
-
-fn package_classification_label(classification: HubClientPackageClassification) -> &'static str {
-    match classification {
-        HubClientPackageClassification::Plugin => "plugin",
-        HubClientPackageClassification::Provider => "provider",
-    }
-}
-
-fn package_state_label(state: HubClientPackageState) -> &'static str {
-    match state {
-        HubClientPackageState::Installed => "installed",
-        HubClientPackageState::Enabled => "enabled",
-        HubClientPackageState::Disabled => "disabled",
-    }
-}
-
-fn package_action_label(action: PackageAction) -> &'static str {
-    match action {
-        PackageAction::Install => "install",
-        PackageAction::Enable => "enable",
-        PackageAction::Disable => "disable",
-        PackageAction::Pin => "pin",
-        PackageAction::Prepare => "prepare",
     }
 }
 

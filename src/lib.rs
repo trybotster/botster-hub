@@ -60,8 +60,9 @@ pub use daemon::{
     HubDaemon, HubDaemonError, HubDaemonResult, HubDaemonState, HubDaemonStatus, HubStateLoadSource,
 };
 pub use daemon_transport::{
-    DaemonEvent, DaemonOperatorError, DaemonRequest, DaemonResponse, DaemonResponseKind,
-    DaemonSession, DaemonSessionCleanup, DaemonStatus, DaemonTransportError, DaemonTransportResult,
+    DaemonCapability, DaemonEvent, DaemonOperatorError, DaemonPackage, DaemonPackageDecision,
+    DaemonPluginLifecycle, DaemonRequest, DaemonResponse, DaemonResponseKind, DaemonSession,
+    DaemonSessionCleanup, DaemonStatus, DaemonTransportError, DaemonTransportResult,
     request as daemon_transport_request, serve_daemon, stream_attach,
 };
 pub use lifecycle::{
