@@ -48,7 +48,7 @@ pub use client_api::{
     HubClientIdentity, HubClientObservationKind, HubClientOperation, HubClientPackage,
     HubClientPackageClassification, HubClientPackageState, HubClientPluginLifecycle,
     HubClientRequest, HubClientResponse, HubClientResponseBody, HubClientResult, HubClientRole,
-    HubClientSession, HubClientSpawned, HubClientStatus,
+    HubClientRuntimeErrorKind, HubClientSession, HubClientSpawned, HubClientStatus,
 };
 pub use config::{
     CoreEngineOptions, CoreQueueCapacity, DataDirectoryOption, DirectoryList, HostIdentity,
@@ -60,9 +60,9 @@ pub use daemon::{
     HubDaemon, HubDaemonError, HubDaemonResult, HubDaemonState, HubDaemonStatus, HubStateLoadSource,
 };
 pub use daemon_transport::{
-    DaemonEvent, DaemonRequest, DaemonResponse, DaemonResponseKind, DaemonSession, DaemonStatus,
-    DaemonTransportError, DaemonTransportResult, request as daemon_transport_request, serve_daemon,
-    stream_attach,
+    DaemonEvent, DaemonOperatorError, DaemonRequest, DaemonResponse, DaemonResponseKind,
+    DaemonSession, DaemonSessionCleanup, DaemonStatus, DaemonTransportError, DaemonTransportResult,
+    request as daemon_transport_request, serve_daemon, stream_attach,
 };
 pub use lifecycle::{
     HubLifecycleError, HubLifecycleResult, HubPluginLifecycle, HubPluginLifecycleStatus,
