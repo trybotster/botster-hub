@@ -209,6 +209,7 @@ fn daemon_test_lock() -> &'static Mutex<()> {
 }
 
 fn start_cli_daemon(data_dir: &Path) -> Child {
+    ensure_session_worker_binary();
     let mut child = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
         .arg("start")
         .arg("--data-dir")
@@ -721,6 +722,149 @@ fn cli_sessions_spawn_and_list_route_through_client_api() {
     );
     let stdout = String::from_utf8(attach.stdout).expect("attach stdout is utf8");
     assert!(stdout.contains("dogfood-ok"));
+
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
+fn cli_short_lived_session_shutdown_returns_structured_cleanup() {
+    let _guard = daemon_test_lock()
+        .lock()
+        .expect("serialize real daemon test");
+    let data_dir = unique_test_dir("cli-short-lived-shutdown");
+    let child = start_cli_daemon(&data_dir);
+
+    let spawn = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("sessions")
+        .arg("spawn")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("--session-id")
+        .arg("dogfood-session")
+        .arg("--")
+        .arg("printf 'dogfood-ok\\n'; IFS= read -r line; printf 'dogfood:%s\\n' \"$line\"")
+        .output()
+        .expect("run botster-hub sessions spawn");
+    assert!(
+        spawn.status.success(),
+        "spawn failed: {}",
+        String::from_utf8_lossy(&spawn.stderr)
+    );
+
+    let attach_child = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("sessions")
+        .arg("attach")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("dogfood-session")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("run botster-hub sessions attach");
+
+    thread::sleep(Duration::from_millis(150));
+    let send = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("sessions")
+        .arg("send-input")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("dogfood-session")
+        .arg("--")
+        .arg("done\r")
+        .output()
+        .expect("run botster-hub sessions send-input");
+    assert!(
+        send.status.success(),
+        "send-input failed: {}",
+        String::from_utf8_lossy(&send.stderr)
+    );
+
+    let attach = attach_child
+        .wait_with_output()
+        .expect("wait for attach child");
+    assert!(
+        attach.status.success(),
+        "attach failed: {}",
+        String::from_utf8_lossy(&attach.stderr)
+    );
+    let attach_stdout = String::from_utf8(attach.stdout).expect("attach stdout is utf8");
+    assert!(attach_stdout.contains("dogfood-ok"));
+    assert!(attach_stdout.contains("dogfood:done"));
+
+    let shutdown = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("sessions")
+        .arg("shutdown")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("dogfood-session")
+        .output()
+        .expect("run botster-hub sessions shutdown");
+    assert!(
+        shutdown.status.success(),
+        "shutdown failed: {}",
+        String::from_utf8_lossy(&shutdown.stderr)
+    );
+    let stdout = String::from_utf8(shutdown.stdout).expect("shutdown stdout is utf8");
+    let stderr = String::from_utf8(shutdown.stderr).expect("shutdown stderr is utf8");
+    assert!(stdout.contains("response=session_cleanup"));
+    assert!(stdout.contains("session_id=dogfood-session"));
+    assert!(stdout.contains("outcome=already_exited"));
+    assert!(!stdout.contains("client disconnected"));
+    assert!(!stderr.contains("client disconnected"));
+    assert!(!stdout.contains(data_dir.to_string_lossy().as_ref()));
+    assert!(!stderr.contains(data_dir.to_string_lossy().as_ref()));
+
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
+fn cli_request_level_runtime_error_returns_operator_frame_and_keeps_daemon_responsive() {
+    let _guard = daemon_test_lock()
+        .lock()
+        .expect("serialize real daemon test");
+    let data_dir = unique_test_dir("cli-operator-error");
+    let child = start_cli_daemon(&data_dir);
+
+    let send = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("sessions")
+        .arg("send-input")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("missing-session")
+        .arg("--")
+        .arg("input\r")
+        .output()
+        .expect("run botster-hub sessions send-input");
+    assert!(
+        !send.status.success(),
+        "missing-session send-input should fail with operator frame"
+    );
+    let stdout = String::from_utf8(send.stdout).expect("send stdout is utf8");
+    let stderr = String::from_utf8(send.stderr).expect("send stderr is utf8");
+    assert!(stdout.contains("response=operator_error"));
+    assert!(stdout.contains("error_code=unknown_session"));
+    assert!(stdout.contains("operation=input"));
+    assert!(stderr.contains("operator error: unknown_session"));
+    assert!(!stdout.contains("client disconnected"));
+    assert!(!stderr.contains("client disconnected"));
+    assert!(!stdout.contains(data_dir.to_string_lossy().as_ref()));
+    assert!(!stderr.contains(data_dir.to_string_lossy().as_ref()));
+
+    let status = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("status")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .output()
+        .expect("run botster-hub status after operator error");
+    assert!(
+        status.status.success(),
+        "status failed after operator error: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let stdout = String::from_utf8(status.stdout).expect("status stdout is utf8");
+    assert!(stdout.contains("event=status"));
+    assert!(stdout.contains("lifecycle_state=running"));
+    assert!(!stdout.contains(data_dir.to_string_lossy().as_ref()));
 
     shutdown_cli_daemon(&data_dir, child);
 }

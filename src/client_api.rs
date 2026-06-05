@@ -8,8 +8,8 @@ use std::collections::BTreeMap;
 
 use botster_core::{
     BotsterEngineObservation, CapabilitySurface, ClientId, CoreSession, CoreSessionMetadata,
-    RequestId, SessionId, SessionLifecycleState, SessionSpawnRequest, SpawnEnvironment,
-    SpawnWorkingDirectory, SubscriptionId, TerminalAttachState, TransportEgress,
+    RequestId, SessionId, SessionLifecycleState, SessionRuntimeErrorKind, SessionSpawnRequest,
+    SpawnEnvironment, SpawnWorkingDirectory, SubscriptionId, TerminalAttachState, TransportEgress,
 };
 use botster_core_daemon::{
     GuardedWriteDecision, GuardedWriteDeliveryState, GuardedWriteRequest, GuardedWriteResult,
@@ -78,20 +78,14 @@ impl HubClientApi {
                 host_id: runtime.config().host.id.clone(),
                 session_count: runtime
                     .list_sessions()
-                    .map_err(|_| HubClientError::Runtime {
-                        request_id: request_id.clone(),
-                        operation,
-                    })?
+                    .map_err(|error| runtime_error(request_id.clone(), operation, error))?
                     .len(),
                 package_count: packages.packages().len(),
             }),
             HubClientRequest::ListSessions { .. } => HubClientResponseBody::Sessions(
                 runtime
                     .list_sessions()
-                    .map_err(|_| HubClientError::Runtime {
-                        request_id: request_id.clone(),
-                        operation,
-                    })?
+                    .map_err(|error| runtime_error(request_id.clone(), operation, error))?
                     .into_iter()
                     .map(daemon_session_to_core_session)
                     .map(HubClientSession::from)
@@ -106,10 +100,7 @@ impl HubClientApi {
                 let request = spawn_request(runtime, request_id.clone(), session_id, command);
                 let outcome = runtime
                     .spawn_session(request, client_session_metadata(), now_seconds)
-                    .map_err(|_| HubClientError::Runtime {
-                        request_id: request_id.clone(),
-                        operation,
-                    })?;
+                    .map_err(|error| runtime_error(request_id.clone(), operation, error))?;
                 HubClientResponseBody::Spawned(HubClientSpawned {
                     session: HubClientSession::from(outcome),
                     events: Vec::new(),
@@ -128,10 +119,7 @@ impl HubClientApi {
                         subscription_id,
                         now_seconds,
                     )
-                    .map_err(|_| HubClientError::Runtime {
-                        request_id: request_id.clone(),
-                        operation,
-                    })?;
+                    .map_err(|error| runtime_error(request_id.clone(), operation, error))?;
                 HubClientResponseBody::Events(Vec::new())
             }
             HubClientRequest::Detach {
@@ -147,10 +135,7 @@ impl HubClientApi {
                         subscription_id,
                         now_seconds,
                     )
-                    .map_err(|_| HubClientError::Runtime {
-                        request_id: request_id.clone(),
-                        operation,
-                    })?;
+                    .map_err(|error| runtime_error(request_id.clone(), operation, error))?;
                 HubClientResponseBody::Events(Vec::new())
             }
             HubClientRequest::Input {
@@ -166,10 +151,7 @@ impl HubClientApi {
                         data,
                         now_seconds,
                     )
-                    .map_err(|_| HubClientError::Runtime {
-                        request_id: request_id.clone(),
-                        operation,
-                    })?;
+                    .map_err(|error| runtime_error(request_id.clone(), operation, error))?;
                 HubClientResponseBody::Events(Vec::new())
             }
             HubClientRequest::Resize {
@@ -187,10 +169,7 @@ impl HubClientApi {
                         cols,
                         now_seconds,
                     )
-                    .map_err(|_| HubClientError::Runtime {
-                        request_id: request_id.clone(),
-                        operation,
-                    })?;
+                    .map_err(|error| runtime_error(request_id.clone(), operation, error))?;
                 HubClientResponseBody::Events(Vec::new())
             }
             HubClientRequest::DrainRuntime {
@@ -200,10 +179,7 @@ impl HubClientApi {
             } => {
                 let output = runtime
                     .drain_runtime_once(&session_id, last_output_at)
-                    .map_err(|_| HubClientError::Runtime {
-                        request_id: request_id.clone(),
-                        operation,
-                    })?;
+                    .map_err(|error| runtime_error(request_id.clone(), operation, error))?;
                 HubClientResponseBody::Events(events_from_drain(output))
             }
             HubClientRequest::Shutdown {
@@ -213,10 +189,7 @@ impl HubClientApi {
             } => {
                 runtime
                     .shutdown_session(session_id, now_seconds)
-                    .map_err(|_| HubClientError::Runtime {
-                        request_id: request_id.clone(),
-                        operation,
-                    })?;
+                    .map_err(|error| runtime_error(request_id.clone(), operation, error))?;
                 HubClientResponseBody::Events(Vec::new())
             }
             HubClientRequest::GuardedNotificationWrite {
@@ -242,10 +215,7 @@ impl HubClientApi {
                         readiness,
                         now_seconds,
                     })
-                    .map_err(|_| HubClientError::Runtime {
-                        request_id: request_id.clone(),
-                        operation,
-                    })?;
+                    .map_err(|error| runtime_error(request_id.clone(), operation, error))?;
                 HubClientResponseBody::GuardedWrite(HubClientGuardedWrite::from(result))
             }
             HubClientRequest::ReadScreen { .. } => {
@@ -729,6 +699,7 @@ pub enum HubClientError {
     Runtime {
         request_id: RequestId,
         operation: HubClientOperation,
+        kind: HubClientRuntimeErrorKind,
     },
     UnsupportedDaemonOperation {
         request_id: RequestId,
@@ -744,6 +715,38 @@ pub enum HubClientError {
 
 /// Result alias for client API requests.
 pub type HubClientResult<T> = Result<T, HubClientError>;
+
+/// Stable runtime error categories safe to expose across client transports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HubClientRuntimeErrorKind {
+    UnknownSession,
+    Runtime,
+    State,
+}
+
+fn runtime_error(
+    request_id: RequestId,
+    operation: HubClientOperation,
+    error: impl Into<HubRuntimeError>,
+) -> HubClientError {
+    let kind = match error.into() {
+        HubRuntimeError::CoreDaemon(botster_core_daemon::CoreDaemonError::UnknownSession(_)) => {
+            HubClientRuntimeErrorKind::UnknownSession
+        }
+        HubRuntimeError::CoreDaemon(botster_core_daemon::CoreDaemonError::Engine(
+            botster_core::DefaultBotsterEngineError::Runtime(error),
+        )) if error.kind == SessionRuntimeErrorKind::SessionNotFound => {
+            HubClientRuntimeErrorKind::UnknownSession
+        }
+        HubRuntimeError::CoreDaemon(_) => HubClientRuntimeErrorKind::Runtime,
+        HubRuntimeError::State(_) => HubClientRuntimeErrorKind::State,
+    };
+    HubClientError::Runtime {
+        request_id,
+        operation,
+        kind,
+    }
+}
 
 fn spawn_request(
     runtime: &HubRuntime,

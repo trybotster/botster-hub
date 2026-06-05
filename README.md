@@ -230,7 +230,10 @@ grows a dedicated inspection request.
 Package commands are a separate short-lived hub-policy path over the same
 durable state. They start a `HubDaemon`, mutate or read `hub-state.json`, route
 package/provider reads through `HubClientApi`, and stop; they do not attach to
-the long-running session daemon today.
+the long-running session daemon today. A daemon that is already running keeps
+the package registry snapshot it loaded at startup, so package enable/disable
+changes made from another CLI process become visible to daemon-backed session
+operations after restarting the daemon.
 
 Dogfood-ready today: explicit local daemon lifecycle, file-backed hub/package
 state, local package admission from a manifest path, typed status/package reads,

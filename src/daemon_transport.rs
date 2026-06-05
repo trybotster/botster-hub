@@ -18,6 +18,7 @@ use std::time::Duration;
 use botster_core::{
     RequestId, SessionId, SessionLifecycleState, SubscriptionId, TerminalAttachState,
 };
+use botster_core_daemon::RegistrySessionState;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -270,7 +271,11 @@ fn handle_control_message(
     message: ControlMessage,
 ) -> bool {
     let ControlMessage::Request { request, reply_tx } = message;
-    let response = handle_control_request(daemon, packages, logical_clock, drain_cursors, request);
+    let response = handle_control_request(daemon, packages, logical_clock, drain_cursors, request)
+        .or_else(|error| match error {
+            DaemonTransportError::Client(error) => Ok(DaemonResponse::operator_error(error)),
+            error => Err(error),
+        });
     let should_stop = matches!(
         response,
         Ok(DaemonResponse {
@@ -414,15 +419,46 @@ fn handle_control_request(
         }
         DaemonRequest::ShutdownSession { session_id } => {
             let now = tick(logical_clock);
-            let response = api.handle_request(
+            match classify_shutdown_session(runtime, &session_id)? {
+                ShutdownSessionClassification::Active => {}
+                ShutdownSessionClassification::Cleanup(cleanup) => {
+                    return Ok(DaemonResponse::session_cleanup(cleanup));
+                }
+                ShutdownSessionClassification::Missing => {
+                    return Ok(DaemonResponse::unknown_session_cleanup(&session_id));
+                }
+            }
+            let shutdown_session_id = session_id.clone();
+            let response = match api.handle_request(
                 runtime,
                 packages,
                 HubClientRequest::Shutdown {
                     request_id: request_id("daemon-sessions-shutdown"),
-                    session_id: SessionId(session_id),
+                    session_id: SessionId(shutdown_session_id),
                     now_seconds: now,
                 },
-            )?;
+            ) {
+                Ok(response) => response,
+                Err(error) => {
+                    if shutdown_error_is_unknown_session(&error) {
+                        return Ok(DaemonResponse::session_cleanup(DaemonSessionCleanup {
+                            session_id: session_id.clone(),
+                            outcome: "already_exited".to_string(),
+                        }));
+                    }
+                    return match classify_shutdown_session(runtime, &session_id)? {
+                        ShutdownSessionClassification::Cleanup(cleanup) => {
+                            Ok(DaemonResponse::session_cleanup(cleanup))
+                        }
+                        ShutdownSessionClassification::Missing => {
+                            Ok(DaemonResponse::unknown_session_cleanup(&session_id))
+                        }
+                        ShutdownSessionClassification::Active => {
+                            Err(DaemonTransportError::Client(error))
+                        }
+                    };
+                }
+            };
             events_response(response.body)
         }
         DaemonRequest::Drain { session_id } => {
@@ -455,6 +491,8 @@ fn handle_control_request(
             )),
             sessions: Vec::new(),
             events: Vec::new(),
+            cleanup: None,
+            error: None,
         }),
     }
 }
@@ -464,6 +502,42 @@ fn events_response(body: HubClientResponseBody) -> DaemonTransportResult<DaemonR
         return Err(DaemonTransportError::UnexpectedResponse);
     };
     Ok(DaemonResponse::events(events_from_client(events)))
+}
+
+enum ShutdownSessionClassification {
+    Active,
+    Cleanup(DaemonSessionCleanup),
+    Missing,
+}
+
+fn classify_shutdown_session(
+    runtime: &mut crate::HubRuntime,
+    session_id: &str,
+) -> Result<ShutdownSessionClassification, crate::HubRuntimeError> {
+    let Some(session) = runtime
+        .list_sessions()
+        .map_err(crate::HubRuntimeError::from)?
+        .into_iter()
+        .find(|session| session.session_id.0 == session_id)
+    else {
+        return Ok(ShutdownSessionClassification::Missing);
+    };
+
+    match session.registry_state {
+        RegistrySessionState::Running => Ok(ShutdownSessionClassification::Active),
+        RegistrySessionState::Stopping | RegistrySessionState::Exited => Ok(
+            ShutdownSessionClassification::Cleanup(DaemonSessionCleanup {
+                session_id: session_id.to_string(),
+                outcome: "already_exited".to_string(),
+            }),
+        ),
+        RegistrySessionState::Stale => Ok(ShutdownSessionClassification::Cleanup(
+            DaemonSessionCleanup {
+                session_id: session_id.to_string(),
+                outcome: "stale_session".to_string(),
+            },
+        )),
+    }
 }
 
 fn request_id(value: &str) -> RequestId {
@@ -684,6 +758,8 @@ pub struct DaemonResponse {
     pub status: Option<DaemonStatus>,
     pub sessions: Vec<DaemonSession>,
     pub events: Vec<DaemonEvent>,
+    pub cleanup: Option<DaemonSessionCleanup>,
+    pub error: Option<DaemonOperatorError>,
 }
 
 impl DaemonResponse {
@@ -693,6 +769,8 @@ impl DaemonResponse {
             status: Some(DaemonStatus::from_status(&status, session_count)),
             sessions: Vec::new(),
             events: Vec::new(),
+            cleanup: None,
+            error: None,
         }
     }
 
@@ -702,6 +780,8 @@ impl DaemonResponse {
             status: None,
             sessions: sessions.into_iter().map(Into::into).collect(),
             events: Vec::new(),
+            cleanup: None,
+            error: None,
         }
     }
 
@@ -711,6 +791,8 @@ impl DaemonResponse {
             status: None,
             sessions: vec![session],
             events,
+            cleanup: None,
+            error: None,
         }
     }
 
@@ -720,6 +802,46 @@ impl DaemonResponse {
             status: None,
             sessions: Vec::new(),
             events,
+            cleanup: None,
+            error: None,
+        }
+    }
+
+    fn session_cleanup(cleanup: DaemonSessionCleanup) -> Self {
+        Self {
+            kind: DaemonResponseKind::SessionCleanup,
+            status: None,
+            sessions: Vec::new(),
+            events: Vec::new(),
+            cleanup: Some(cleanup),
+            error: None,
+        }
+    }
+
+    fn unknown_session_cleanup(session_id: &str) -> Self {
+        Self {
+            kind: DaemonResponseKind::OperatorError,
+            status: None,
+            sessions: Vec::new(),
+            events: Vec::new(),
+            cleanup: None,
+            error: Some(DaemonOperatorError {
+                code: "unknown_session".to_string(),
+                request_id: "daemon-sessions-shutdown".to_string(),
+                operation: "shutdown".to_string(),
+                message: format!("unknown session: {session_id}"),
+            }),
+        }
+    }
+
+    fn operator_error(error: crate::HubClientError) -> Self {
+        Self {
+            kind: DaemonResponseKind::OperatorError,
+            status: None,
+            sessions: Vec::new(),
+            events: Vec::new(),
+            cleanup: None,
+            error: Some(DaemonOperatorError::from_client_error(error)),
         }
     }
 }
@@ -731,6 +853,8 @@ pub enum DaemonResponseKind {
     Sessions,
     Spawned,
     Events,
+    SessionCleanup,
+    OperatorError,
     Shutdown,
 }
 
@@ -802,6 +926,105 @@ impl From<HubClientSession> for DaemonSession {
             session_id: session.session_id.0,
             lifecycle: lifecycle_label(&session.lifecycle).to_string(),
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonSessionCleanup {
+    pub session_id: String,
+    pub outcome: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonOperatorError {
+    pub code: String,
+    pub request_id: String,
+    pub operation: String,
+    pub message: String,
+}
+
+impl DaemonOperatorError {
+    fn from_client_error(error: crate::HubClientError) -> Self {
+        match error {
+            crate::HubClientError::AdmissionDenied {
+                request_id,
+                operation,
+                role,
+            } => Self {
+                code: "admission_denied".to_string(),
+                request_id: request_id.0,
+                operation: operation_label(operation).to_string(),
+                message: format!("{role:?} is not allowed to run {operation:?}"),
+            },
+            crate::HubClientError::Runtime {
+                request_id,
+                operation,
+                kind,
+            } => Self {
+                code: runtime_error_code(kind).to_string(),
+                request_id: request_id.0,
+                operation: operation_label(operation).to_string(),
+                message: format!("runtime failed while handling {operation:?}: {kind:?}"),
+            },
+            crate::HubClientError::UnsupportedDaemonOperation {
+                request_id,
+                operation,
+                daemon_operation,
+            } => Self {
+                code: "unsupported_daemon_operation".to_string(),
+                request_id: request_id.0,
+                operation: operation_label(operation).to_string(),
+                message: format!("{daemon_operation} is not supported by the daemon"),
+            },
+            crate::HubClientError::PackageCapabilityDenied {
+                request_id,
+                operation,
+                package_name,
+            } => Self {
+                code: "package_capability_denied".to_string(),
+                request_id: request_id.0,
+                operation: operation_label(operation).to_string(),
+                message: format!("{package_name} is not allowed to run {operation:?}"),
+            },
+        }
+    }
+}
+
+fn shutdown_error_is_unknown_session(error: &crate::HubClientError) -> bool {
+    matches!(
+        error,
+        crate::HubClientError::Runtime {
+            operation: crate::HubClientOperation::Shutdown,
+            kind: crate::HubClientRuntimeErrorKind::UnknownSession,
+            ..
+        }
+    )
+}
+
+fn runtime_error_code(kind: crate::HubClientRuntimeErrorKind) -> &'static str {
+    match kind {
+        crate::HubClientRuntimeErrorKind::UnknownSession => "unknown_session",
+        crate::HubClientRuntimeErrorKind::Runtime => "runtime_error",
+        crate::HubClientRuntimeErrorKind::State => "state_error",
+    }
+}
+
+fn operation_label(operation: crate::HubClientOperation) -> &'static str {
+    match operation {
+        crate::HubClientOperation::Status => "status",
+        crate::HubClientOperation::ListSessions => "list_sessions",
+        crate::HubClientOperation::Spawn => "spawn",
+        crate::HubClientOperation::Attach => "attach",
+        crate::HubClientOperation::Detach => "detach",
+        crate::HubClientOperation::Input => "input",
+        crate::HubClientOperation::Resize => "resize",
+        crate::HubClientOperation::DrainRuntime => "drain_runtime",
+        crate::HubClientOperation::Shutdown => "shutdown",
+        crate::HubClientOperation::GuardedNotificationWrite => "guarded_notification_write",
+        crate::HubClientOperation::ReadScreen => "read_screen",
+        crate::HubClientOperation::CaptureSnapshot => "capture_snapshot",
+        crate::HubClientOperation::ListPackages => "list_packages",
+        crate::HubClientOperation::PluginLifecycleStatus => "plugin_lifecycle_status",
     }
 }
 
