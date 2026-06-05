@@ -10,6 +10,7 @@ use std::fmt;
 
 use botster_core::SessionId;
 
+use crate::HubLuaPluginLoadError;
 use crate::config::HubConfig;
 use crate::packages::{
     PackageClassification, PackageRegistry, PackageRegistrySnapshotError, PackageState,
@@ -87,9 +88,10 @@ impl HubDaemon {
         } else {
             HubStateLoadSource::Initialized
         };
-        let runtime = HubRuntime::load_from_store(config.clone(), &store)?;
+        let mut runtime = HubRuntime::load_from_store(config.clone(), &store)?;
         let state = runtime.state().clone();
         let package_registry = PackageRegistry::from_snapshot(state.package_registry.clone())?;
+        load_enabled_local_lua_plugins(&mut runtime, &package_registry)?;
 
         Ok(Self {
             config,
@@ -188,6 +190,8 @@ pub enum HubDaemonError {
     Runtime(HubRuntimeError),
     /// Persisted package/provider policy records could not be restored.
     PackageRegistry(PackageRegistrySnapshotError),
+    /// Enabled local Lua plugin failed to load during daemon startup.
+    LuaPlugin(HubLuaPluginLoadError),
 }
 
 impl fmt::Display for HubDaemonError {
@@ -198,6 +202,7 @@ impl fmt::Display for HubDaemonError {
             Self::PackageRegistry(error) => {
                 write!(formatter, "hub package registry restore error: {error:?}")
             }
+            Self::LuaPlugin(error) => write!(formatter, "hub lua plugin load error: {error}"),
         }
     }
 }
@@ -208,6 +213,7 @@ impl Error for HubDaemonError {
             Self::State(error) => Some(error),
             Self::Runtime(error) => Some(error),
             Self::PackageRegistry(_) => None,
+            Self::LuaPlugin(error) => Some(error),
         }
     }
 }
@@ -230,5 +236,26 @@ impl From<PackageRegistrySnapshotError> for HubDaemonError {
     }
 }
 
+impl From<HubLuaPluginLoadError> for HubDaemonError {
+    fn from(error: HubLuaPluginLoadError) -> Self {
+        Self::LuaPlugin(error)
+    }
+}
+
 /// Daemon lifecycle result alias.
 pub type HubDaemonResult<T> = Result<T, HubDaemonError>;
+
+fn load_enabled_local_lua_plugins(
+    runtime: &mut HubRuntime,
+    registry: &PackageRegistry,
+) -> HubDaemonResult<()> {
+    for prepared in registry
+        .prepare_enabled_local_packages("daemon startup load lua plugins")
+        .map_err(|error| HubDaemonError::LuaPlugin(HubLuaPluginLoadError::Package(error)))?
+    {
+        if prepared.selected_entrypoint.runtime == botster_core::ExtensionRuntime::Lua {
+            runtime.load_lua_plugin_package(registry, &prepared.package_name)?;
+        }
+    }
+    Ok(())
+}

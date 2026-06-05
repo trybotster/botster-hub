@@ -150,6 +150,39 @@ fn initialize_request(id: u64) -> Value {
     })
 }
 
+fn enable_synthetic_package(data_dir: &Path) {
+    let output = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("packages")
+        .arg("enable")
+        .arg("--data-dir")
+        .arg(data_dir)
+        .arg("--path")
+        .arg("examples/synthetic-plugin")
+        .output()
+        .expect("run botster-hub packages enable --path");
+    assert!(
+        output.status.success(),
+        "enable package failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn enable_synthetic_package_by_name(data_dir: &Path) {
+    let output = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("packages")
+        .arg("enable")
+        .arg("--data-dir")
+        .arg(data_dir)
+        .arg("dogfood.synthetic-plugin")
+        .output()
+        .expect("run botster-hub packages enable by name");
+    assert!(
+        output.status.success(),
+        "enable package by name failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[test]
 fn mcp_serve_supports_initialize_list_and_native_status_over_stdio() {
     let _guard = mcp_daemon_test_lock().lock().expect("lock MCP daemon test");
@@ -210,6 +243,68 @@ fn mcp_serve_supports_initialize_list_and_native_status_over_stdio() {
     );
     assert_eq!(
         messages[2]["result"]["structuredContent"]["core_initialized"],
+        true
+    );
+    assert!(
+        String::from_utf8_lossy(&daemon_output.stdout).contains("event=stopped"),
+        "daemon should shut down cleanly"
+    );
+}
+
+#[test]
+fn mcp_serve_lists_and_calls_loaded_lua_plugin_tool_through_daemon_runtime() {
+    let _guard = mcp_daemon_test_lock().lock().expect("lock MCP daemon test");
+    let data_dir = unique_test_dir("lua-plugin-tool");
+    let _ = fs::remove_dir_all(&data_dir);
+    let daemon = start_cli_daemon(&data_dir);
+    enable_synthetic_package(&data_dir);
+    enable_synthetic_package_by_name(&data_dir);
+
+    let output = run_mcp_serve(
+        &data_dir,
+        &[
+            initialize_request(1),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/list"
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {
+                    "name": "dogfood.synthetic.echo",
+                    "arguments": { "message": "mcp-daemon" }
+                }
+            }),
+        ],
+    );
+    let messages = parse_mcp_output(output, "plugin tool");
+    let daemon_output = shutdown_cli_daemon(&data_dir, daemon);
+
+    let tool_names = messages[1]["result"]["tools"]
+        .as_array()
+        .expect("tools array")
+        .iter()
+        .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+        .collect::<Vec<_>>();
+    assert!(tool_names.contains(&"hub.status"));
+    assert!(tool_names.contains(&"dogfood.synthetic.echo"));
+    assert_eq!(
+        tool_names
+            .iter()
+            .filter(|name| **name == "dogfood.synthetic.echo")
+            .count(),
+        1
+    );
+    assert_eq!(messages[2]["result"]["isError"], false);
+    assert_eq!(
+        messages[2]["result"]["structuredContent"]["message"],
+        "mcp-daemon"
+    );
+    assert_eq!(
+        messages[2]["result"]["structuredContent"]["ambient"]["os"],
         true
     );
     assert!(

@@ -76,9 +76,9 @@ accepts `botster-core` `CapabilityRuntimeRequest` values through
 `submit_capability_request`, returns core `CapabilityRuntimeHandle` values, and
 drains core `CapabilityRuntimeEvent` values through `drain_capability_events`.
 The hub adapter implements scoped filesystem operations, plugin JSON store
-operations, logical timers, bounded HTTP stubs, and core's in-memory WebSocket
-runtime. It does not add product cloud, public WebRTC, webhook, OAuth, Rails, or
-external API behavior.
+operations, logical timers, policy-gated HTTP execution, and core's in-memory
+WebSocket runtime. It does not add product cloud, public WebRTC, webhook, OAuth,
+Rails, or provider-specific API behavior.
 
 Filesystem access is rooted under the explicit hub data directory at
 `capability-scopes/workspace`. Plugin store data is rooted under
@@ -88,8 +88,18 @@ Capability grants are scoped to match core request requirements exactly:
 `Network:http`, `Network:websocket`, `Filesystem:workspace`,
 `PluginDb:project-pipelines`, and `Timers:callbacks`.
 
-Filesystem and plugin-store work is accepted through the hub capability path and
-completed on runtime-owned worker threads. Plugin unload and reload call
+HTTP requests are admitted through the core capability runtime and then executed
+by the hub transport only when the URL scheme, host, method, headers, body size,
+response size, header limits, and timeout policy pass. The default policy allows
+loopback HTTP/HTTPS hosts for local dogfood plugins, `GET` and `POST`, and a
+small safe request-header allowlist. Sensitive request headers such as
+authorization and cookie headers are denied without echoing their values in
+capability failure events. Deterministic fake HTTP should be injected only by
+tests that explicitly configure a fake transport; the default `HubRuntime` path
+performs real admitted HTTP I/O.
+
+Filesystem, plugin-store, and HTTP work is accepted through the hub capability
+path and completed on runtime-owned worker threads. Plugin unload and reload call
 capability cleanup in addition to core plugin worker cleanup so timer and network
 resources do not survive replacement.
 

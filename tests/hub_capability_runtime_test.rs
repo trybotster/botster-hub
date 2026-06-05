@@ -1,5 +1,7 @@
 #![cfg(unix)]
 
+use std::io::{Read, Write};
+use std::net::TcpListener;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -8,7 +10,7 @@ use botster_core::{
     CapabilityRuntimeErrorKind, CapabilityRuntimeEvent, CapabilityRuntimeRequest,
     CapabilitySurface, ClientId, CoreSessionMetadata, FilesystemCapabilityLimits,
     FilesystemCapabilityRequest, FilesystemCapabilityResult, FilesystemOperation,
-    HttpCapabilityRequest, PluginKey, PluginStoreCapabilityRequest, PluginStoreKey,
+    HttpCapabilityRequest, HttpHeader, PluginKey, PluginStoreCapabilityRequest, PluginStoreKey,
     PluginStoreOperation, PluginStoreResult, RequestId, ResizePayload, ScopedRelativePath,
     SessionId, SessionSpawnRequest, SpawnEnvironment, SpawnWorkingDirectory, SubscriptionId,
     TimerCapabilityRequest, TransportEgress, WebSocketCapabilityRequest,
@@ -112,6 +114,78 @@ fn drain_until_failed(
     }
 
     panic!("timed out waiting for capability failure: {observed:?}");
+}
+
+fn drain_until_terminal(
+    runtime: &mut HubRuntime,
+    plugin_key: &PluginKey,
+) -> Vec<CapabilityRuntimeEvent> {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut observed = Vec::new();
+
+    while Instant::now() < deadline {
+        observed.extend(
+            runtime
+                .drain_capability_events(plugin_key)
+                .expect("drain capability events"),
+        );
+        if observed.iter().any(|event| {
+            matches!(
+                event,
+                CapabilityRuntimeEvent::Completed(_)
+                    | CapabilityRuntimeEvent::Failed(_)
+                    | CapabilityRuntimeEvent::TimedOut(_)
+                    | CapabilityRuntimeEvent::Cancelled(_)
+            )
+        }) {
+            return observed;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    panic!("timed out waiting for terminal capability event: {observed:?}");
+}
+
+struct LocalHttpServer {
+    endpoint: String,
+    join: thread::JoinHandle<Vec<u8>>,
+}
+
+impl LocalHttpServer {
+    fn start(response: impl Into<Vec<u8>>, delay: Duration) -> Self {
+        let response = response.into();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local HTTP server");
+        let endpoint = format!(
+            "http://127.0.0.1:{}/status",
+            listener.local_addr().expect("local address").port()
+        );
+        let join = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept local HTTP request");
+            let mut request = Vec::new();
+            let mut buffer = [0; 1024];
+            loop {
+                let bytes = stream.read(&mut buffer).expect("read request");
+                if bytes == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..bytes]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            if !delay.is_zero() {
+                thread::sleep(delay);
+            }
+            stream.write_all(&response).expect("write response");
+            request
+        });
+
+        Self { endpoint, join }
+    }
+
+    fn join(self) -> Vec<u8> {
+        self.join.join().expect("local HTTP server thread")
+    }
 }
 
 fn spawn_request(config: &botster_hub::HubConfig) -> SessionSpawnRequest {
@@ -280,6 +354,8 @@ fn hub_runtime_stores_plugin_json_under_plugin_data_and_enforces_namespace() {
     let plugin_key = PluginKey("project-pipelines".to_string());
     let store_root = runtime
         .capability_runtime()
+        .lock()
+        .expect("hub capability runtime lock")
         .plugin_store_root()
         .to_path_buf();
 
@@ -326,8 +402,12 @@ fn hub_runtime_stores_plugin_json_under_plugin_data_and_enforces_namespace() {
 }
 
 #[test]
-fn hub_runtime_serves_bounded_http_and_websocket_stubs_without_product_networking() {
-    let mut runtime = explicit_runtime("network-stubs");
+fn hub_runtime_executes_admitted_http_through_real_loopback_transport() {
+    let server = LocalHttpServer::start(
+        b"HTTP/1.1 201 Created\r\nContent-Type: text/plain\r\nX-Botster-Test: real\r\nContent-Length: 11\r\nConnection: close\r\n\r\nhello-world",
+        Duration::ZERO,
+    );
+    let mut runtime = explicit_runtime("http-real-loopback");
     let plugin_key = PluginKey("project-pipelines".to_string());
 
     let http_handle = runtime
@@ -336,12 +416,12 @@ fn hub_runtime_serves_bounded_http_and_websocket_stubs_without_product_networkin
             "http-probe",
             CapabilityOperation::Http(HttpCapabilityRequest {
                 method: "GET".to_string(),
-                endpoint: "https://example.invalid/status".to_string(),
+                endpoint: server.endpoint.clone(),
                 headers: Vec::new(),
                 body: Vec::new(),
             }),
         ))
-        .expect("allowed local HTTP stub should submit");
+        .expect("allowed local HTTP request should submit");
     assert_eq!(
         http_handle.required_capability,
         Capability {
@@ -355,9 +435,279 @@ fn hub_runtime_serves_bounded_http_and_websocket_stubs_without_product_networkin
         CapabilityRuntimeEvent::Completed(completed)
             if matches!(
                 &completed.result,
-                Some(CapabilityOperationResult::Http(response)) if response.status == 204
+                Some(CapabilityOperationResult::Http(response))
+                    if response.status == 201
+                        && response.body == b"hello-world"
+                        && response.headers.iter().any(|header| {
+                            header.name.eq_ignore_ascii_case("x-botster-test")
+                                && header.value == "real"
+                        })
             )
     )));
+    let observed_request = server.join();
+    assert!(String::from_utf8_lossy(&observed_request).starts_with("GET /status HTTP/1.1"));
+}
+
+#[test]
+fn hub_runtime_denies_http_hosts_methods_and_sensitive_headers() {
+    let mut runtime = explicit_runtime("http-policy-denials");
+    let plugin_key = PluginKey("project-pipelines".to_string());
+
+    let denied_host = runtime
+        .submit_capability_request(request(
+            &plugin_key.0,
+            "denied-host",
+            CapabilityOperation::Http(HttpCapabilityRequest {
+                method: "GET".to_string(),
+                endpoint: "https://example.invalid/status".to_string(),
+                headers: Vec::new(),
+                body: Vec::new(),
+            }),
+        ))
+        .expect_err("non-loopback host should be denied before transport");
+    assert_eq!(
+        denied_host.kind,
+        CapabilityRuntimeErrorKind::CapabilityDenied
+    );
+
+    runtime
+        .submit_capability_request(request(
+            &plugin_key.0,
+            "denied-method",
+            CapabilityOperation::Http(HttpCapabilityRequest {
+                method: "DELETE".to_string(),
+                endpoint: "http://127.0.0.1:9/status".to_string(),
+                headers: Vec::new(),
+                body: Vec::new(),
+            }),
+        ))
+        .expect("core admits loopback request before hub method policy");
+    let method_events = drain_until_failed(&mut runtime, &plugin_key);
+    assert!(method_events.iter().any(|event| matches!(
+        event,
+        CapabilityRuntimeEvent::Failed(failure)
+            if failure.operation_id.0 == "denied-method"
+                && failure.error_kind == CapabilityRuntimeErrorKind::CapabilityDenied
+                && failure.reason == "HTTP method is not allowed by this hub"
+    )));
+
+    runtime
+        .submit_capability_request(request(
+            &plugin_key.0,
+            "denied-sensitive-header",
+            CapabilityOperation::Http(HttpCapabilityRequest {
+                method: "GET".to_string(),
+                endpoint: "http://127.0.0.1:9/status".to_string(),
+                headers: vec![HttpHeader {
+                    name: "Authorization".to_string(),
+                    value: "sensitive-test-value".to_string(),
+                }],
+                body: Vec::new(),
+            }),
+        ))
+        .expect("core admits syntactically valid header before hub header policy");
+    let header_events = drain_until_failed(&mut runtime, &plugin_key);
+    assert!(header_events.iter().any(|event| matches!(
+        event,
+        CapabilityRuntimeEvent::Failed(failure)
+            if failure.operation_id.0 == "denied-sensitive-header"
+                && failure.error_kind == CapabilityRuntimeErrorKind::CapabilityDenied
+                && failure.reason == "HTTP request header is not allowed by this hub"
+    )));
+    assert!(
+        !format!("{header_events:?}").contains("sensitive-test-value"),
+        "failure events must not echo sensitive header values"
+    );
+}
+
+#[test]
+fn hub_runtime_enforces_http_body_limits() {
+    let mut response = b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: 4194305\r\nConnection: close\r\n\r\n".to_vec();
+    response.extend(vec![b'x'; 4 * 1024 * 1024 + 1]);
+    let server = LocalHttpServer::start(response, Duration::ZERO);
+    let mut runtime = explicit_runtime("http-body-limits");
+    let plugin_key = PluginKey("project-pipelines".to_string());
+
+    let oversized_request = runtime
+        .submit_capability_request(request(
+            &plugin_key.0,
+            "oversized-request",
+            CapabilityOperation::Http(HttpCapabilityRequest {
+                method: "POST".to_string(),
+                endpoint: "http://127.0.0.1:9/status".to_string(),
+                headers: Vec::new(),
+                body: vec![b'x'; 1024 * 1024 + 1],
+            }),
+        ))
+        .expect_err("oversized HTTP request body should fail before transport");
+    assert_eq!(
+        oversized_request.kind,
+        CapabilityRuntimeErrorKind::InvalidRequest
+    );
+
+    runtime
+        .submit_capability_request(request(
+            &plugin_key.0,
+            "oversized-response",
+            CapabilityOperation::Http(HttpCapabilityRequest {
+                method: "GET".to_string(),
+                endpoint: server.endpoint.clone(),
+                headers: Vec::new(),
+                body: Vec::new(),
+            }),
+        ))
+        .expect("loopback request should submit for response limit enforcement");
+    let response_events = drain_until_failed(&mut runtime, &plugin_key);
+    assert!(response_events.iter().any(|event| matches!(
+        event,
+        CapabilityRuntimeEvent::Failed(failure)
+            if failure.operation_id.0 == "oversized-response"
+                && failure.error_kind == CapabilityRuntimeErrorKind::InvalidRequest
+                && failure.reason == "HTTP response body exceeds configured limit"
+    )));
+    let _ = server.join();
+}
+
+#[test]
+fn hub_runtime_reports_bounded_http_failures_without_blocking_hot_path() {
+    let server = LocalHttpServer::start(
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 4\r\nConnection: close\r\n\r\nslow",
+        Duration::from_millis(500),
+    );
+    let mut runtime = explicit_runtime("http-hot-path");
+    let plugin_key = PluginKey("project-pipelines".to_string());
+    let spawn = spawn_request(runtime.config());
+    let session_id = spawn.session_id.clone();
+    let client_id = ClientId("capability-http-client".to_string());
+    let subscription_id = SubscriptionId("capability-http-subscription".to_string());
+    let mut logical_clock = 100;
+
+    runtime
+        .spawn_session(spawn, CoreSessionMetadata::new(), logical_clock)
+        .expect("spawn through core");
+    logical_clock += 1;
+    runtime
+        .attach_client(
+            client_id.clone(),
+            session_id.clone(),
+            subscription_id,
+            logical_clock,
+        )
+        .expect("attach through core");
+    logical_clock += 1;
+
+    runtime
+        .submit_capability_request(request(
+            &plugin_key.0,
+            "slow-http",
+            CapabilityOperation::Http(HttpCapabilityRequest {
+                method: "GET".to_string(),
+                endpoint: server.endpoint.clone(),
+                headers: Vec::new(),
+                body: Vec::new(),
+            }),
+        ))
+        .expect("slow loopback HTTP should submit");
+
+    drain_session_until(&mut runtime, &session_id, b"ready", &mut logical_clock);
+    runtime
+        .write_bytes(
+            client_id,
+            session_id.clone(),
+            b"ping-http-capability\n".to_vec(),
+            logical_clock,
+        )
+        .expect("write while HTTP work is pending");
+    logical_clock += 1;
+    drain_session_until(
+        &mut runtime,
+        &session_id,
+        b"echo:ping-http-capability",
+        &mut logical_clock,
+    );
+    let http_events = drain_until_terminal(&mut runtime, &plugin_key);
+    assert!(http_events.iter().any(|event| matches!(
+        event,
+        CapabilityRuntimeEvent::Completed(completed)
+            if completed.operation_id.0 == "slow-http"
+                && matches!(
+                    &completed.result,
+                    Some(CapabilityOperationResult::Http(response)) if response.status == 200
+                )
+    )));
+    let _ = server.join();
+}
+
+#[test]
+fn hub_runtime_keeps_session_hot_path_responsive_during_failing_http_transport() {
+    let server = LocalHttpServer::start(b"not an http response\r\n", Duration::from_millis(500));
+    let mut runtime = explicit_runtime("http-failure-hot-path");
+    let plugin_key = PluginKey("project-pipelines".to_string());
+    let spawn = spawn_request(runtime.config());
+    let session_id = spawn.session_id.clone();
+    let client_id = ClientId("capability-http-failure-client".to_string());
+    let subscription_id = SubscriptionId("capability-http-failure-subscription".to_string());
+    let mut logical_clock = 100;
+
+    runtime
+        .spawn_session(spawn, CoreSessionMetadata::new(), logical_clock)
+        .expect("spawn through core");
+    logical_clock += 1;
+    runtime
+        .attach_client(
+            client_id.clone(),
+            session_id.clone(),
+            subscription_id,
+            logical_clock,
+        )
+        .expect("attach through core");
+    logical_clock += 1;
+
+    runtime
+        .submit_capability_request(request(
+            &plugin_key.0,
+            "failing-http",
+            CapabilityOperation::Http(HttpCapabilityRequest {
+                method: "GET".to_string(),
+                endpoint: server.endpoint.clone(),
+                headers: Vec::new(),
+                body: Vec::new(),
+            }),
+        ))
+        .expect("malformed loopback HTTP request should submit before transport failure");
+
+    drain_session_until(&mut runtime, &session_id, b"ready", &mut logical_clock);
+    runtime
+        .write_bytes(
+            client_id,
+            session_id.clone(),
+            b"ping-http-failure-capability\n".to_vec(),
+            logical_clock,
+        )
+        .expect("write while failing HTTP work is pending");
+    logical_clock += 1;
+    drain_session_until(
+        &mut runtime,
+        &session_id,
+        b"echo:ping-http-failure-capability",
+        &mut logical_clock,
+    );
+
+    let http_events = drain_until_terminal(&mut runtime, &plugin_key);
+    assert!(http_events.iter().any(|event| matches!(
+        event,
+        CapabilityRuntimeEvent::Failed(failure)
+            if failure.operation_id.0 == "failing-http"
+                && failure.error_kind == CapabilityRuntimeErrorKind::BackendFailed
+                && failure.reason == "HTTP transport failed"
+    )));
+    let _ = server.join();
+}
+
+#[test]
+fn hub_runtime_preserves_in_memory_websocket_stub() {
+    let mut runtime = explicit_runtime("websocket-stub");
+    let plugin_key = PluginKey("project-pipelines".to_string());
 
     let websocket_handle = runtime
         .submit_capability_request(request(

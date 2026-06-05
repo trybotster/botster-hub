@@ -16,20 +16,21 @@ use std::thread;
 use std::time::Duration;
 
 use botster_core::{
-    EndpointId, EnvelopeCursor, EnvelopeDeliveryState, EnvelopeId, EnvelopeTarget, RequestId,
-    RoutedEnvelope, RoutedEnvelopePayload, SessionId, SessionLifecycleState, SubscriptionId,
-    TerminalAttachState,
+    EndpointId, EnvelopeCursor, EnvelopeDeliveryState, EnvelopeId, EnvelopeTarget,
+    ExtensionRuntime, RequestId, RoutedEnvelope, RoutedEnvelopePayload, SessionId,
+    SessionLifecycleState, SubscriptionId, TerminalAttachState,
 };
 use botster_core_daemon::{
     GuardedWriteDecision, GuardedWriteDeliveryState, ReadinessEvidence, RegistrySessionState,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::{
     FileHubStateStore, HubClientApi, HubClientEvent, HubClientPackage,
     HubClientPackageClassification, HubClientPluginLifecycle, HubClientRequest,
     HubClientResponseBody, HubClientSession, HubConfig, HubDaemon, HubDaemonStatus,
-    HubStateLoadSource, HubStateStore, PackageAction, PackageDecision,
+    HubStateLoadSource, HubStateStore, McpToolDescriptor, PackageAction, PackageDecision,
 };
 
 const PROTOCOL: &str = "botster-hub-daemon-v1";
@@ -314,6 +315,16 @@ fn handle_control_request(
             let decision = daemon
                 .package_registry_mut()
                 .enable(&package_name, "daemon socket enable local package")?;
+            let registry = daemon.package_registry().clone();
+            let prepared = registry
+                .prepare_local_package(&package_name, "daemon socket inspect local package")?;
+            if prepared.selected_entrypoint.runtime == ExtensionRuntime::Lua {
+                daemon
+                    .runtime_mut()
+                    .ok_or(DaemonTransportError::DaemonNotRunning)?
+                    .load_lua_plugin_package(&registry, &package_name)
+                    .map_err(crate::HubDaemonError::from)?;
+            }
             persist_package_registry(daemon)?;
             package_decision_response(daemon, decision)
         }
@@ -655,6 +666,15 @@ fn handle_runtime_control_request(
                 DaemonCoordination::notify(write.decision, write.states),
             ))
         }
+        DaemonRequest::PluginMcpListTools => Ok(DaemonResponse::plugin_tools(
+            runtime.list_plugin_mcp_tools(),
+        )),
+        DaemonRequest::PluginMcpCallTool { name, arguments } => {
+            match runtime.call_plugin_mcp_tool(crate::McpCallRequest { name, arguments }) {
+                Ok(result) => Ok(DaemonResponse::plugin_tool_result(result)),
+                Err(error) => Ok(DaemonResponse::plugin_tool_error(error)),
+            }
+        }
         DaemonRequest::DaemonShutdown => Ok(DaemonResponse {
             kind: DaemonResponseKind::Shutdown,
             status: Some(DaemonStatus::from_status(
@@ -668,6 +688,8 @@ fn handle_runtime_control_request(
             packages: Vec::new(),
             package_decision: None,
             lifecycle: Vec::new(),
+            plugin_tools: Vec::new(),
+            plugin_tool_result: Value::Null,
             events: Vec::new(),
             cleanup: None,
             coordination: None,
@@ -1028,11 +1050,16 @@ pub enum DaemonRequest {
         package_name: String,
     },
     PluginLifecycleStatus,
+    PluginMcpListTools,
+    PluginMcpCallTool {
+        name: String,
+        arguments: Value,
+    },
     DaemonShutdown,
 }
 
 /// Server response variants for one local daemon request.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DaemonResponse {
     pub kind: DaemonResponseKind,
     pub status: Option<DaemonStatus>,
@@ -1040,6 +1067,10 @@ pub struct DaemonResponse {
     pub packages: Vec<DaemonPackage>,
     pub package_decision: Option<DaemonPackageDecision>,
     pub lifecycle: Vec<DaemonPluginLifecycle>,
+    #[serde(default)]
+    pub plugin_tools: Vec<McpToolDescriptor>,
+    #[serde(default)]
+    pub plugin_tool_result: Value,
     pub events: Vec<DaemonEvent>,
     pub cleanup: Option<DaemonSessionCleanup>,
     pub coordination: Option<DaemonCoordination>,
@@ -1055,6 +1086,8 @@ impl DaemonResponse {
             packages: Vec::new(),
             package_decision: None,
             lifecycle: Vec::new(),
+            plugin_tools: Vec::new(),
+            plugin_tool_result: Value::Null,
             events: Vec::new(),
             cleanup: None,
             coordination: None,
@@ -1070,6 +1103,8 @@ impl DaemonResponse {
             packages: Vec::new(),
             package_decision: None,
             lifecycle: Vec::new(),
+            plugin_tools: Vec::new(),
+            plugin_tool_result: Value::Null,
             events: Vec::new(),
             cleanup: None,
             coordination: None,
@@ -1085,6 +1120,8 @@ impl DaemonResponse {
             packages: Vec::new(),
             package_decision: None,
             lifecycle: Vec::new(),
+            plugin_tools: Vec::new(),
+            plugin_tool_result: Value::Null,
             events,
             cleanup: None,
             coordination: None,
@@ -1100,6 +1137,8 @@ impl DaemonResponse {
             packages: Vec::new(),
             package_decision: None,
             lifecycle: Vec::new(),
+            plugin_tools: Vec::new(),
+            plugin_tool_result: Value::Null,
             events,
             cleanup: None,
             coordination: None,
@@ -1115,6 +1154,8 @@ impl DaemonResponse {
             packages: packages.into_iter().map(Into::into).collect(),
             package_decision: None,
             lifecycle: Vec::new(),
+            plugin_tools: Vec::new(),
+            plugin_tool_result: Value::Null,
             events: Vec::new(),
             cleanup: None,
             coordination: None,
@@ -1130,6 +1171,8 @@ impl DaemonResponse {
             packages: Vec::new(),
             package_decision: None,
             lifecycle: lifecycle.into_iter().map(Into::into).collect(),
+            plugin_tools: Vec::new(),
+            plugin_tool_result: Value::Null,
             events: Vec::new(),
             cleanup: None,
             coordination: None,
@@ -1145,6 +1188,8 @@ impl DaemonResponse {
             packages: Vec::new(),
             package_decision: None,
             lifecycle: Vec::new(),
+            plugin_tools: Vec::new(),
+            plugin_tool_result: Value::Null,
             events: Vec::new(),
             cleanup: Some(cleanup),
             coordination: None,
@@ -1160,6 +1205,8 @@ impl DaemonResponse {
             packages: Vec::new(),
             package_decision: None,
             lifecycle: Vec::new(),
+            plugin_tools: Vec::new(),
+            plugin_tool_result: Value::Null,
             events: Vec::new(),
             cleanup: None,
             coordination: None,
@@ -1180,6 +1227,8 @@ impl DaemonResponse {
             packages: Vec::new(),
             package_decision: None,
             lifecycle: Vec::new(),
+            plugin_tools: Vec::new(),
+            plugin_tool_result: Value::Null,
             events: Vec::new(),
             cleanup: None,
             coordination: None,
@@ -1195,6 +1244,8 @@ impl DaemonResponse {
             packages: Vec::new(),
             package_decision: None,
             lifecycle: Vec::new(),
+            plugin_tools: Vec::new(),
+            plugin_tool_result: Value::Null,
             events: Vec::new(),
             cleanup: None,
             coordination: None,
@@ -1210,6 +1261,8 @@ impl DaemonResponse {
             packages: Vec::new(),
             package_decision: None,
             lifecycle: Vec::new(),
+            plugin_tools: Vec::new(),
+            plugin_tool_result: Value::Null,
             events: Vec::new(),
             cleanup: None,
             coordination: None,
@@ -1225,10 +1278,68 @@ impl DaemonResponse {
             packages: Vec::new(),
             package_decision: None,
             lifecycle: Vec::new(),
+            plugin_tools: Vec::new(),
+            plugin_tool_result: Value::Null,
             events: Vec::new(),
             cleanup: None,
             coordination: Some(coordination),
             error: None,
+        }
+    }
+
+    fn plugin_tools(plugin_tools: Vec<McpToolDescriptor>) -> Self {
+        Self {
+            kind: DaemonResponseKind::PluginMcpTools,
+            status: None,
+            sessions: Vec::new(),
+            packages: Vec::new(),
+            package_decision: None,
+            lifecycle: Vec::new(),
+            plugin_tools,
+            plugin_tool_result: Value::Null,
+            events: Vec::new(),
+            cleanup: None,
+            coordination: None,
+            error: None,
+        }
+    }
+
+    fn plugin_tool_result(plugin_tool_result: Value) -> Self {
+        Self {
+            kind: DaemonResponseKind::PluginMcpToolResult,
+            status: None,
+            sessions: Vec::new(),
+            packages: Vec::new(),
+            package_decision: None,
+            lifecycle: Vec::new(),
+            plugin_tools: Vec::new(),
+            plugin_tool_result,
+            events: Vec::new(),
+            cleanup: None,
+            coordination: None,
+            error: None,
+        }
+    }
+
+    fn plugin_tool_error(error: crate::McpToolError) -> Self {
+        Self {
+            kind: DaemonResponseKind::OperatorError,
+            status: None,
+            sessions: Vec::new(),
+            packages: Vec::new(),
+            package_decision: None,
+            lifecycle: Vec::new(),
+            plugin_tools: Vec::new(),
+            plugin_tool_result: Value::Null,
+            events: Vec::new(),
+            cleanup: None,
+            coordination: None,
+            error: Some(DaemonOperatorError {
+                code: error.code,
+                request_id: "daemon-plugin-mcp-call".to_string(),
+                operation: "plugin_mcp_call".to_string(),
+                message: error.message,
+            }),
         }
     }
 }
@@ -1243,6 +1354,8 @@ pub enum DaemonResponseKind {
     Packages,
     PackageDecision,
     PluginLifecycle,
+    PluginMcpTools,
+    PluginMcpToolResult,
     SessionCleanup,
     Identity,
     MessagePosted,
