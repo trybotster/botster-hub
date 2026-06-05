@@ -1,6 +1,6 @@
 use std::env;
 use std::fmt;
-use std::io;
+use std::io::{self, BufReader};
 use std::path::PathBuf;
 use std::process;
 use std::thread;
@@ -16,7 +16,7 @@ use botster_hub::{
     HubClientRequest, HubClientResponseBody, HubDaemon, HubDaemonState, HubRuntime,
     HubStartupOptions, HubStateLoadSource, RuntimeEnvironment, SessionDefaults, TransportBindings,
     build_default_config_for_runtime, daemon_transport_request, default_package_policy,
-    host_profile, serve_daemon, stream_attach,
+    host_profile, serve_daemon, serve_mcp_stdio, stream_attach,
 };
 
 const SMOKE_MARKER: &str = "botster-hub-smoke-ok";
@@ -48,6 +48,13 @@ fn main() {
         Some("shutdown") => {
             if let Err(error) = operator_shutdown(env::args().skip(2).collect()) {
                 eprintln!("botster-hub shutdown error: {error}");
+                process::exit(1);
+            }
+            return;
+        }
+        Some("mcp-serve") => {
+            if let Err(error) = mcp_serve(env::args().skip(2).collect()) {
+                eprintln!("botster-hub mcp-serve error: {error}");
                 process::exit(1);
             }
             return;
@@ -239,6 +246,15 @@ fn operator_shutdown(args: Vec<String>) -> Result<(), OperatorError> {
     let config = explicit_config(options.data_directory)?;
     let response = daemon_transport_request(&config, DaemonRequest::DaemonShutdown)?;
     print_daemon_response(response)?;
+    Ok(())
+}
+
+fn mcp_serve(args: Vec<String>) -> Result<(), McpCliError> {
+    let options = DataDirOptions::parse(args, "mcp-serve")?;
+    let config = explicit_config(options.data_directory)?;
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    serve_mcp_stdio(config, BufReader::new(stdin.lock()), stdout.lock())?;
     Ok(())
 }
 
@@ -1025,12 +1041,29 @@ enum OperatorError {
 }
 
 #[derive(Debug)]
+enum McpCliError {
+    Usage(OperatorError),
+    Config(botster_hub::HubConfigError),
+    Serve(botster_hub::McpServeError),
+}
+
+#[derive(Debug)]
 enum RunOneError {
     Usage,
     Config(botster_hub::HubConfigError),
     Runtime(botster_hub::HubRuntimeError),
     State(botster_hub::HubStateStoreError),
     TimedOut,
+}
+
+impl fmt::Display for McpCliError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Usage(error) => write!(formatter, "{error}"),
+            Self::Config(error) => write!(formatter, "{error}"),
+            Self::Serve(error) => write!(formatter, "{error}"),
+        }
+    }
 }
 
 impl fmt::Display for StartError {
@@ -1096,6 +1129,7 @@ fn usage_for(command: &str) -> &'static str {
             "usage: botster-hub sessions shutdown --data-dir <path> <session-id>"
         }
         "shutdown" => "usage: botster-hub shutdown --data-dir <path>",
+        "mcp-serve" => "usage: botster-hub mcp-serve --data-dir <path>",
         "packages" => "usage: botster-hub packages <list|enable|disable> ...",
         "packages list" => "usage: botster-hub packages list --data-dir <path>",
         "packages enable" => {
@@ -1105,7 +1139,7 @@ fn usage_for(command: &str) -> &'static str {
         "providers" | "providers list" => "usage: botster-hub providers list --data-dir <path>",
         "inspect" => "usage: botster-hub inspect --data-dir <path> <session-id>",
         _ => {
-            "usage: botster-hub <start|status|sessions|shutdown|packages|providers|inspect|run-one>"
+            "usage: botster-hub <start|status|sessions|shutdown|mcp-serve|packages|providers|inspect|run-one>"
         }
     }
 }
@@ -1161,6 +1195,24 @@ impl From<OperatorError> for StartError {
 impl From<botster_hub::HubConfigError> for OperatorError {
     fn from(error: botster_hub::HubConfigError) -> Self {
         Self::Config(error)
+    }
+}
+
+impl From<OperatorError> for McpCliError {
+    fn from(error: OperatorError) -> Self {
+        Self::Usage(error)
+    }
+}
+
+impl From<botster_hub::HubConfigError> for McpCliError {
+    fn from(error: botster_hub::HubConfigError) -> Self {
+        Self::Config(error)
+    }
+}
+
+impl From<botster_hub::McpServeError> for McpCliError {
+    fn from(error: botster_hub::McpServeError) -> Self {
+        Self::Serve(error)
     }
 }
 
