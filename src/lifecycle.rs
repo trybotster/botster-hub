@@ -4,14 +4,14 @@
 //! adapter only refuses packages that are not currently enabled, then delegates
 //! load, invoke, reload, unload, and cleanup mechanics to `botster-core`.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 use botster_core::{
-    BoundaryJson, PluginCleanupResult, PluginCleanupScope, PluginHandlerRegistration,
-    PluginInvocationOutcome, PluginInvocationRequest, PluginKey, PluginLoadSpec,
-    PluginOwnedDescriptor, PluginReloadSpec, PluginResourceRef, PluginRuntime, PluginUnloadSpec,
-    PluginWorkerEngine, PluginWorkerRegistration, RequestId,
+    BoundaryJson, PluginCleanupResult, PluginCleanupScope, PluginDescriptorKind,
+    PluginHandlerRegistration, PluginInvocationOutcome, PluginInvocationRequest, PluginKey,
+    PluginLoadSpec, PluginOwnedDescriptor, PluginReloadSpec, PluginResourceRef, PluginRuntime,
+    PluginUnloadSpec, PluginWorkerEngine, PluginWorkerRegistration, RequestId,
 };
 
 use crate::packages::{PackageClassification, PackageRecord, PackageRegistry, PackageState};
@@ -21,6 +21,7 @@ use crate::packages::{PackageClassification, PackageRecord, PackageRegistry, Pac
 pub struct HubPluginLifecycle {
     engine: PluginWorkerEngine,
     loaded: Arc<Mutex<BTreeSet<String>>>,
+    descriptors: Arc<Mutex<BTreeMap<String, Vec<PluginOwnedDescriptor>>>>,
 }
 
 impl HubPluginLifecycle {
@@ -30,6 +31,7 @@ impl HubPluginLifecycle {
         Self {
             engine: PluginWorkerEngine::new(),
             loaded: Arc::new(Mutex::new(BTreeSet::new())),
+            descriptors: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -42,6 +44,7 @@ impl HubPluginLifecycle {
     ) -> HubLifecycleResult<PluginKey> {
         let record = enabled_record(registry, package_name)?;
         let plugin_key = plugin_key_for(record);
+        let descriptors = bundle.descriptors.clone();
         let registration = registration_for(record, plugin_key.clone(), bundle)?;
 
         self.engine.load_plugin(registration);
@@ -49,6 +52,10 @@ impl HubPluginLifecycle {
             .lock()
             .expect("hub plugin lifecycle loaded set lock")
             .insert(plugin_key.0.clone());
+        self.descriptors
+            .lock()
+            .expect("hub plugin lifecycle descriptors lock")
+            .insert(plugin_key.0.clone(), descriptors);
 
         Ok(plugin_key)
     }
@@ -69,11 +76,12 @@ impl HubPluginLifecycle {
     ) -> HubLifecycleResult<PluginCleanupResult> {
         let record = enabled_record(registry, package_name)?;
         let plugin_key = plugin_key_for(record);
+        let descriptors = bundle.descriptors.clone();
         let registration = registration_for(record, plugin_key.clone(), bundle)?;
         let cleanup = self.engine.reload_plugin(
             PluginReloadSpec {
                 request_id,
-                plugin_key,
+                plugin_key: plugin_key.clone(),
                 load: registration.load.clone(),
                 cleanup: PluginCleanupScope::DescriptorsAndResources,
             },
@@ -82,7 +90,11 @@ impl HubPluginLifecycle {
         self.loaded
             .lock()
             .expect("hub plugin lifecycle loaded set lock")
-            .insert(package_name.to_string());
+            .insert(plugin_key.0.clone());
+        self.descriptors
+            .lock()
+            .expect("hub plugin lifecycle descriptors lock")
+            .insert(plugin_key.0.clone(), descriptors);
 
         Ok(cleanup)
     }
@@ -100,7 +112,23 @@ impl HubPluginLifecycle {
             .lock()
             .expect("hub plugin lifecycle loaded set lock")
             .remove(package_name);
+        self.descriptors
+            .lock()
+            .expect("hub plugin lifecycle descriptors lock")
+            .remove(package_name);
         cleanup
+    }
+
+    /// Return plugin-owned MCP tool descriptors with handler refs for daemon-backed MCP routing.
+    #[must_use]
+    pub fn mcp_tool_descriptors(&self) -> Vec<PluginOwnedDescriptor> {
+        self.descriptors
+            .lock()
+            .expect("hub plugin lifecycle descriptors lock")
+            .values()
+            .flat_map(|descriptors| descriptors.iter().cloned())
+            .filter(|descriptor| descriptor.descriptor.kind == PluginDescriptorKind::McpTool)
+            .collect()
     }
 
     /// Return package-level lifecycle status without exposing core worker internals.

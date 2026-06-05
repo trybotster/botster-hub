@@ -13,6 +13,7 @@ use serde_json::{Value, json};
 use crate::{
     DaemonRequest, DaemonResponse, DaemonResponseKind, HubConfig, daemon_transport_request,
 };
+use botster_core::PluginOwnedDescriptor;
 
 const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 const SERVER_NAME: &str = "botster-hub";
@@ -24,7 +25,8 @@ where
     R: BufRead,
     W: Write,
 {
-    let registry = McpToolRegistry::from_provider(NativeHubToolProvider::new(config));
+    let mut registry = McpToolRegistry::from_provider(NativeHubToolProvider::new(config.clone()));
+    registry.register_provider(PluginHubToolProvider::new(config));
     McpStdioServer::new(registry).serve(input, output)
 }
 
@@ -285,6 +287,77 @@ impl McpToolProvider for NativeHubToolProvider {
     fn provides_tool(&self, name: &str) -> bool {
         matches!(name, "hub.status" | "hub.sessions.list")
     }
+}
+
+/// Plugin-backed MCP tools delegated to the running daemon-owned `HubRuntime`.
+#[derive(Debug, Clone)]
+pub struct PluginHubToolProvider {
+    config: HubConfig,
+}
+
+impl PluginHubToolProvider {
+    #[must_use]
+    pub fn new(config: HubConfig) -> Self {
+        Self { config }
+    }
+}
+
+impl McpToolProvider for PluginHubToolProvider {
+    fn list_tools(&self) -> Vec<McpToolDescriptor> {
+        match daemon_transport_request(&self.config, DaemonRequest::PluginMcpListTools) {
+            Ok(response) if response.error.is_none() => response.plugin_tools,
+            _ => Vec::new(),
+        }
+    }
+
+    fn call_tool(&self, call: McpCallRequest) -> Result<McpToolResult, McpToolError> {
+        let response = daemon_transport_request(
+            &self.config,
+            DaemonRequest::PluginMcpCallTool {
+                name: call.name,
+                arguments: call.arguments,
+            },
+        )
+        .map_err(|error| {
+            McpToolError::new(
+                "daemon_unavailable",
+                format!("hub daemon request failed: {error}"),
+            )
+        })?;
+        if let Some(error) = response.error {
+            return Err(McpToolError::new(error.code, error.message));
+        }
+        match response.kind {
+            DaemonResponseKind::PluginMcpToolResult => {
+                Ok(McpToolResult::structured(response.plugin_tool_result))
+            }
+            _ => Err(McpToolError::new(
+                "daemon_response",
+                "daemon returned an unexpected response kind",
+            )),
+        }
+    }
+}
+
+/// Convert a plugin-owned MCP descriptor body into an MCP tool descriptor.
+#[must_use]
+pub fn mcp_descriptor_from_plugin(descriptor: PluginOwnedDescriptor) -> Option<McpToolDescriptor> {
+    let name = descriptor.body.0.get("name")?.as_str()?.to_string();
+    let description = descriptor
+        .body
+        .0
+        .get("description")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let input_schema = descriptor
+        .body
+        .0
+        .get("input_schema")
+        .cloned()
+        .or_else(|| descriptor.body.0.get("inputSchema").cloned())
+        .unwrap_or_else(|| json!({ "type": "object", "additionalProperties": false }));
+    Some(McpToolDescriptor::new(name, description, input_schema))
 }
 
 fn daemon_tool_result(
