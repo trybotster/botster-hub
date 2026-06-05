@@ -105,6 +105,23 @@ fn enable_project_pipelines_package(data_dir: &Path) {
     );
 }
 
+fn disable_project_pipelines_package(data_dir: &Path) {
+    let output = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("packages")
+        .arg("disable")
+        .arg("--data-dir")
+        .arg(data_dir)
+        .arg("project-pipelines")
+        .output()
+        .expect("run botster-hub packages disable project-pipelines");
+    assert!(
+        output.status.success(),
+        "project pipelines package disable failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 fn run_mcp_serve(data_dir: &Path, requests: &[Value]) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
         .arg("mcp-serve")
@@ -501,6 +518,35 @@ fn mcp_serve_lists_calls_and_reloads_project_pipelines_plugin_tools() {
     assert_eq!(
         messages[2]["result"]["structuredContent"]["runs"][0]["coordination"]["request_id"],
         "project-pipelines:ticket_local_1:1"
+    );
+
+    disable_project_pipelines_package(&data_dir);
+    let output = run_mcp_serve(
+        &data_dir,
+        &[
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-06-18",
+                    "clientInfo": { "name": "botster-hub-test", "version": "0.0.0" },
+                    "capabilities": {}
+                }
+            }),
+            json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }),
+        ],
+    );
+    let messages = mcp_messages(output, 2);
+    let tool_names = messages[1]["result"]["tools"]
+        .as_array()
+        .expect("tools array after disable")
+        .iter()
+        .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+        .collect::<Vec<_>>();
+    assert!(
+        !tool_names.contains(&"project_pipelines.current_context"),
+        "Project Pipelines tools should be removed after package disable"
     );
     shutdown_cli_daemon(&data_dir, restarted);
 }
