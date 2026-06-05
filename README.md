@@ -289,6 +289,10 @@ descriptors and owned call messages to that same registry path, with execution
 dispatched through the plugin worker/supervisor boundary instead of creating a
 second MCP server or direct in-process closure path.
 
+The local coordination path uses no Lua or plugin tool execution: `whoami`,
+`post_message`, `receive_messages`, `ack_message`, and `notify_session` are
+native hub tools even when the binary also has the Lua plugin runtime available.
+
 Dogfood-ready today: explicit local daemon lifecycle, file-backed hub/package
 state, local package admission from a manifest path, typed status/package reads,
 plugin lifecycle observation/invocation through the hub facade, daemon-backed
