@@ -102,4 +102,3 @@
 - Convention-conflict checklist item evidence: no conflicts found; the plan does not add new primitives or bypass worker-backed architecture.
 - Verification checklist item evidence: `project_pipelines_current_context` loaded run/ticket/gate context; repo searches and file inspections identified `src/runtime.rs` as the likely change point and existing stale status surfaces.
 - Capture checklist item evidence: no durable vault capture is needed at plan time; implementation may capture a structured-error gap if it proves real.
-
