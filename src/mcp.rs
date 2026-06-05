@@ -75,14 +75,11 @@ impl McpStdioServer {
             }
         };
 
-        let id = request.id.clone();
-        if id.is_none() {
-            return None;
-        }
+        let id = request.id.clone()?;
 
         let Some(method) = request.method.as_deref() else {
             return Some(JsonRpcResponse::error(
-                id.unwrap_or(Value::Null),
+                id,
                 JsonRpcError::invalid_request("missing method"),
             ));
         };
@@ -90,27 +87,24 @@ impl McpStdioServer {
         match method {
             "initialize" => {
                 self.initialized = true;
-                Some(JsonRpcResponse::result(
-                    id.unwrap_or(Value::Null),
-                    initialize_result(request.params.as_ref()),
-                ))
+                Some(JsonRpcResponse::result(id, initialize_result()))
             }
             "tools/list" => {
                 if !self.initialized {
                     return Some(JsonRpcResponse::error(
-                        id.unwrap_or(Value::Null),
+                        id,
                         JsonRpcError::invalid_request("initialize must be called first"),
                     ));
                 }
                 Some(JsonRpcResponse::result(
-                    id.unwrap_or(Value::Null),
+                    id,
                     json!({ "tools": self.registry.list_tools() }),
                 ))
             }
             "tools/call" => {
                 if !self.initialized {
                     return Some(JsonRpcResponse::error(
-                        id.unwrap_or(Value::Null),
+                        id,
                         JsonRpcError::invalid_request("initialize must be called first"),
                     ));
                 }
@@ -118,18 +112,18 @@ impl McpStdioServer {
                     Ok(call) => call,
                     Err(error) => {
                         return Some(JsonRpcResponse::error(
-                            id.unwrap_or(Value::Null),
+                            id,
                             JsonRpcError::invalid_params(error),
                         ));
                     }
                 };
                 Some(JsonRpcResponse::result(
-                    id.unwrap_or(Value::Null),
+                    id,
                     tool_call_response(self.registry.call_tool(call)),
                 ))
             }
             _ => Some(JsonRpcResponse::error(
-                id.unwrap_or(Value::Null),
+                id,
                 JsonRpcError::method_not_found(method),
             )),
         }
@@ -143,11 +137,7 @@ fn tool_call_response(result: Result<McpToolResult, McpToolError>) -> Value {
     }
 }
 
-fn initialize_result(params: Option<&Value>) -> Value {
-    let _client_protocol_version = params
-        .and_then(|params| params.get("protocolVersion"))
-        .and_then(Value::as_str);
-
+fn initialize_result() -> Value {
     json!({
         "protocolVersion": MCP_PROTOCOL_VERSION,
         "serverInfo": {
@@ -290,6 +280,10 @@ impl McpToolProvider for NativeHubToolProvider {
                 format!("unknown native hub tool: {}", call.name),
             )),
         }
+    }
+
+    fn provides_tool(&self, name: &str) -> bool {
+        matches!(name, "hub.status" | "hub.sessions.list")
     }
 }
 
