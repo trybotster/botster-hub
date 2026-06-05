@@ -329,6 +329,7 @@ fn handle_control_request(
                 .package_registry_mut()
                 .disable(&package_name, "daemon socket disable package")?;
             persist_package_registry(daemon)?;
+            unload_package_after_disable(daemon, &package_name)?;
             package_decision_response(daemon, decision)
         }
         other => handle_runtime_control_request(daemon, logical_clock, drain_cursors, other),
@@ -584,6 +585,20 @@ fn load_package_after_enable(
             .ok_or(DaemonTransportError::DaemonNotRunning)?
             .load_plugin_package(&package_registry, package_name, bundle)?;
     }
+    Ok(())
+}
+
+fn unload_package_after_disable(
+    daemon: &mut HubDaemon,
+    package_name: &str,
+) -> DaemonTransportResult<()> {
+    let _ = daemon
+        .runtime_mut()
+        .ok_or(DaemonTransportError::DaemonNotRunning)?
+        .unload_plugin_package(
+            request_id(&format!("daemon-disable-{package_name}")),
+            package_name,
+        );
     Ok(())
 }
 
