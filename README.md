@@ -257,12 +257,31 @@ line is one protocol message, and the command does not use `Content-Length`
 framing. Process diagnostics belong on stderr so agent clients can treat stdout
 as the protocol stream.
 
-The first native tools are read-only smoke tools:
+Native tools route through the running daemon, not directly into hub state:
 
 - `hub.status` returns sanitized daemon status through
   `daemon_transport_request -> serve_daemon -> HubClientApi -> HubRuntime`.
 - `hub.sessions.list` returns sanitized session ids and lifecycle labels through
   the same daemon/client path.
+- `whoami` reports the local MCP identity available to native tools. When
+  `BOTSTER_SESSION_UUID` is present it is reported as the caller session.
+- `post_message` and `post_envelope` publish a text payload as a core routed
+  envelope to one target session.
+- `receive_messages` and `receive_envelopes` drain only the caller session route
+  from `BOTSTER_SESSION_UUID`; they do not accept another session id or agent id.
+- `ack_message` and `ack_envelope` acknowledge one delivered caller-scoped
+  envelope.
+- `notify_session` is a guarded-write doorbell attempt. The current native MCP
+  surface does not yet gather terminal readiness evidence from attached clients,
+  so it reports core's guarded-write decision and can defer instead of injecting
+  bytes. That result is separate from routed-envelope inbox, cursor, and ack
+  semantics.
+
+The message/envelope tools use
+`daemon_transport_request -> serve_daemon -> HubClientApi -> HubRuntime ->
+CoreDaemon::{publish,drain,acknowledge}_routed_envelope`. Core assigns routed
+envelope cursors in memory; the current hub surface reports the cursor returned
+by core but does not claim restart-durable inbox state.
 
 Tool listing and calling both route through `McpToolRegistry`. Native hub tools
 are provided by `NativeHubToolProvider` today; future Lua plugin tools should add
