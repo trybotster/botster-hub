@@ -35,6 +35,7 @@ pub mod config;
 pub mod daemon;
 pub mod daemon_transport;
 pub mod lifecycle;
+pub mod lua_runtime;
 pub mod mcp;
 pub mod packages;
 pub mod persistence;
@@ -73,9 +74,10 @@ pub use lifecycle::{
     HubLifecycleError, HubLifecycleResult, HubPluginLifecycle, HubPluginLifecycleStatus,
     HubPluginRuntimeBundle,
 };
+pub use lua_runtime::{LuaPluginRuntime, LuaPluginRuntimeError, SharedHubCapabilityRuntime};
 pub use mcp::{
     McpCallRequest, McpServeError, McpToolDescriptor, McpToolError, McpToolProvider,
-    McpToolRegistry, McpToolResult, NativeHubToolProvider, serve_mcp_stdio,
+    McpToolRegistry, McpToolResult, NativeHubToolProvider, PluginHubToolProvider, serve_mcp_stdio,
 };
 pub use packages::{
     LOCAL_PACKAGE_MANIFEST_FILE, PackageAction, PackageAdmissionPolicy, PackageAdmissionReason,
@@ -94,7 +96,7 @@ pub use profile::{
     host_profile,
 };
 pub use runtime::{
-    HubRuntime, HubRuntimeError, HubRuntimeObservation, HubRuntimeOutput,
+    HubLuaPluginLoadError, HubRuntime, HubRuntimeError, HubRuntimeObservation, HubRuntimeOutput,
     daemon_session_to_core_session,
 };
 
