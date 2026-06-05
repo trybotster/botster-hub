@@ -1168,7 +1168,7 @@ fn daemon_detaches_subscription_when_attach_connection_drops() {
 }
 
 #[test]
-fn daemon_guarded_notification_write_reports_real_write_decision_over_socket() {
+fn daemon_guarded_notification_write_defers_without_observed_readiness_over_socket() {
     let _guard = daemon_test_lock()
         .lock()
         .expect("serialize real daemon test");
@@ -1203,13 +1203,12 @@ fn daemon_guarded_notification_write_reports_real_write_decision_over_socket() {
             session_id: "guarded-socket-session".to_string(),
             package_name: "workflow.plugin".to_string(),
             data: "guarded-socket\n".to_string(),
-            cursor_visible: true,
         })
         .expect("guarded notification write over daemon socket");
     assert_eq!(write.kind, botster_hub::DaemonResponseKind::GuardedWrite);
     let guarded = write.guarded_write.expect("guarded write response body");
-    assert_eq!(guarded.decision, "write");
-    assert_eq!(guarded.states, vec!["accepted", "written"]);
+    assert_eq!(guarded.decision, "defer");
+    assert_eq!(guarded.states, vec!["accepted", "deferred"]);
 
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     let mut observed = String::new();
@@ -1230,8 +1229,8 @@ fn daemon_guarded_notification_write_reports_real_write_decision_over_socket() {
         thread::sleep(Duration::from_millis(30));
     }
     assert!(
-        observed.contains("echo:guarded-socket"),
-        "guarded socket write should reach PTY input path, got {observed:?}"
+        !observed.contains("echo:guarded-socket"),
+        "guarded socket write without observed readiness should not reach PTY input path, got {observed:?}"
     );
 
     shutdown_cli_daemon(&data_dir, child);
@@ -1252,7 +1251,7 @@ fn scripted_tui_uses_daemon_socket_for_attach_input_doorbell_resize_and_restart_
         botster_hub::DaemonRequest::Spawn {
             session_id: "scripted-tui-session".to_string(),
             command:
-                "printf 'ready\\n'; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done"
+                "printf 'ready\\n'; while IFS= read -r line; do if [ \"$line\" = size-check ]; then printf 'winsize:%s\\n' \"$(stty size)\"; else printf 'echo:%s\\n' \"$line\"; fi; done"
                     .to_string(),
         },
     )
@@ -1267,10 +1266,11 @@ fn scripted_tui_uses_daemon_socket_for_attach_input_doorbell_resize_and_restart_
             .contains(&"scripted-tui-session".to_string())
     );
     assert!(proof.observed_output.contains("echo:from-tui"));
-    assert!(proof.observed_output.contains("echo:doorbell-from-tui"));
+    assert!(proof.observed_output.contains("winsize:31 101"));
+    assert!(!proof.observed_output.contains("echo:doorbell-from-tui"));
     assert!(proof.observed_output.contains("echo:after-reattach"));
-    assert_eq!(proof.guarded_decision, "write");
-    assert_eq!(proof.guarded_states, vec!["accepted", "written"]);
+    assert_eq!(proof.guarded_decision, "defer");
+    assert_eq!(proof.guarded_states, vec!["accepted", "deferred"]);
     assert_eq!(proof.resize_sent, Some((31, 101)));
     assert_ne!(
         proof.first_subscription_id, proof.second_subscription_id,
@@ -1307,6 +1307,73 @@ fn scripted_tui_uses_daemon_socket_for_attach_input_doorbell_resize_and_restart_
         .drain_until("echo:after-restart", Duration::from_secs(5))
         .expect("TUI should observe output after daemon restart reconnect");
     assert!(driver.output().contains("echo:after-restart"));
+
+    shutdown_cli_daemon(&data_dir, restarted_child);
+}
+
+#[test]
+fn scripted_tui_surfaces_session_lost_when_restart_does_not_recover_attached_session() {
+    let _guard = daemon_test_lock()
+        .lock()
+        .expect("serialize real daemon test");
+    let data_dir = unique_test_dir("scripted-tui-session-lost");
+    let config = explicit_config(&data_dir);
+    let child = start_cli_daemon(&data_dir);
+
+    let spawn = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::Spawn {
+            session_id: "scripted-lost-session".to_string(),
+            command:
+                "printf 'ready\\n'; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done"
+                    .to_string(),
+        },
+    )
+    .expect("spawn scripted lost-session fixture");
+    assert_eq!(spawn.kind, botster_hub::DaemonResponseKind::Spawned);
+
+    let mut driver = botster_hub::ScriptedTuiDriver::connect(config.clone())
+        .expect("connect scripted TUI driver before lost-session restart");
+    driver
+        .select_session("scripted-lost-session")
+        .expect("select session before loss");
+    driver
+        .attach_selected()
+        .expect("attach before intentional session loss");
+    driver.send_input("before-loss\n");
+    driver
+        .drain_until("echo:before-loss", Duration::from_secs(5))
+        .expect("observe pre-loss output");
+
+    let shutdown_session = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::ShutdownSession {
+            session_id: "scripted-lost-session".to_string(),
+        },
+    )
+    .expect("shut down session before daemon restart");
+    assert_eq!(
+        shutdown_session.kind,
+        botster_hub::DaemonResponseKind::Events
+    );
+
+    shutdown_cli_daemon(&data_dir, child);
+    let restarted_child = start_cli_daemon(&data_dir);
+    driver
+        .reconnect()
+        .expect("TUI reconnect should keep operator in status/session view");
+    assert!(
+        driver.subscription_id().is_none(),
+        "unrecovered session should not keep or recreate a subscription"
+    );
+    assert!(
+        driver
+            .errors()
+            .iter()
+            .any(|error| error.contains("attached session was not recovered")),
+        "TUI should surface visible session-lost error, got {:?}",
+        driver.errors()
+    );
 
     shutdown_cli_daemon(&data_dir, restarted_child);
 }

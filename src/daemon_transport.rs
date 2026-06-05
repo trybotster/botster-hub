@@ -16,7 +16,7 @@ use std::thread;
 use std::time::Duration;
 
 use botster_core::{
-    ModeFlags, RequestId, SessionId, SessionLifecycleState, SubscriptionId, TerminalAttachState,
+    RequestId, SessionId, SessionLifecycleState, SubscriptionId, TerminalAttachState,
 };
 use botster_core_daemon::{
     GuardedWriteDecision, GuardedWriteDeliveryState, ReadinessEvidence, RegistrySessionState,
@@ -487,13 +487,8 @@ fn handle_runtime_control_request(
             session_id,
             package_name,
             data,
-            cursor_visible,
         } => {
             let now = tick(logical_clock);
-            let mode_flags = ModeFlags {
-                cursor_visible,
-                ..ModeFlags::default()
-            };
             let response = api.handle_request(
                 runtime,
                 &packages,
@@ -502,7 +497,7 @@ fn handle_runtime_control_request(
                     session_id: SessionId(session_id),
                     package_name,
                     data: data.into_bytes(),
-                    readiness: ReadinessEvidence::ready(mode_flags),
+                    readiness: ReadinessEvidence::default(),
                     now_seconds: now,
                 },
             )?;
@@ -916,7 +911,6 @@ pub enum DaemonRequest {
         session_id: String,
         package_name: String,
         data: String,
-        cursor_visible: bool,
     },
     ShutdownSession {
         session_id: String,

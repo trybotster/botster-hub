@@ -268,8 +268,13 @@ a visible session-lost error.
 Guarded doorbell notifications use the daemon `GuardedNotificationWrite`
 request, which wraps `HubClientRequest::GuardedNotificationWrite` and returns
 the core guarded-write decision plus delivery states. The test fixture enables a
-package with `session_actions` before exercising this path; visible notification
-claims should assert a real `write` decision with `accepted,written` states.
+package with `session_actions` before exercising this path. The current daemon
+socket surface does not expose observed mode/screen readiness yet, so the
+production TUI fails closed and reports the deferred guarded-write decision
+rather than fabricating `SafeWriteIndicator::Safe`. A future delivered doorbell
+must be driven by observed session readiness and should prove both a delivered
+case and a deferred/rejected unsafe case. The v1 activity row is a client-rendered
+guarded-write status row, not a separate routed notification event from core.
 
 Package commands require the daemon socket for this local dogfood path. When
 the daemon is not running they fail with `daemon not running` instead of
