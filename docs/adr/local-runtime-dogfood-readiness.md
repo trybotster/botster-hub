@@ -21,16 +21,16 @@ feature parity.
 
 ## Command Split
 
-Session commands use the long-running daemon transport. `status`, `sessions
-list`, `sessions spawn`, `sessions attach`, `sessions send-input`, `sessions
-resize`, `sessions detach`, `sessions shutdown`, and top-level `shutdown`
-connect to the daemon socket created by `start --data-dir`.
+Session and package commands use the long-running daemon transport. `status`,
+`sessions list`, `sessions spawn`, `sessions attach`, `sessions send-input`,
+`sessions resize`, `sessions detach`, `sessions shutdown`, `packages enable`,
+`packages list`, `providers list`, and top-level `shutdown` connect to the
+daemon socket created by `start --data-dir`.
 
-Package commands are intentionally short-lived hub-policy operations over the
-same durable state. `packages enable`, `packages list`, and `providers list`
-start a `HubDaemon`, mutate or read `hub-state.json`, route reads through
-`HubClientApi`, and stop. They do not attach to the long-running session daemon
-today.
+Package commands mutate the package registry on the daemon owner thread and
+persist the refreshed snapshot to `hub-state.json`. When the daemon is not
+running they fail with `daemon not running` instead of starting a short-lived
+hub that could silently diverge from live daemon state.
 
 ## Readiness Conclusion
 

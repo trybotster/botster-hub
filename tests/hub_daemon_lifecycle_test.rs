@@ -1260,10 +1260,14 @@ fn cli_inspect_reports_not_found_for_fresh_in_process_daemon() {
 }
 
 #[test]
-fn cli_packages_enable_local_path_persists_and_lists_through_client_api() {
+fn cli_packages_enable_local_path_routes_through_running_daemon_and_persists() {
+    let _guard = daemon_test_lock()
+        .lock()
+        .expect("serialize real daemon test");
     let data_dir = unique_test_dir("cli-packages");
     let package_dir = unique_test_dir("local-package");
     write_local_plugin_package(&package_dir);
+    let child = start_cli_daemon(&data_dir);
 
     let enable = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
         .arg("packages")
@@ -1289,6 +1293,37 @@ fn cli_packages_enable_local_path_persists_and_lists_through_client_api() {
     assert!(stdout.contains("state=enabled"));
     assert!(!stdout.contains(package_dir.to_string_lossy().as_ref()));
 
+    let status = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("status")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .output()
+        .expect("run botster-hub status after package enable");
+    assert!(
+        status.status.success(),
+        "status failed: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let stdout = String::from_utf8(status.stdout).expect("stdout is utf8");
+    assert!(stdout.contains("package_count=1"));
+    assert!(stdout.contains("enabled_package_count=1"));
+
+    let lifecycle = botster_hub::daemon_transport_request(
+        &explicit_config(&data_dir),
+        botster_hub::DaemonRequest::PluginLifecycleStatus,
+    )
+    .expect("daemon plugin lifecycle status");
+    assert_eq!(
+        lifecycle.kind,
+        botster_hub::DaemonResponseKind::PluginLifecycle
+    );
+    assert!(
+        lifecycle.lifecycle.iter().any(|plugin| {
+            plugin.package_name == "dogfood.plugin" && plugin.state == "enabled" && !plugin.loaded
+        }),
+        "enabled package should be visible to daemon lifecycle without restart"
+    );
+
     let list = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
         .arg("packages")
         .arg("list")
@@ -1308,6 +1343,74 @@ fn cli_packages_enable_local_path_persists_and_lists_through_client_api() {
     assert!(stdout.contains("package name=dogfood.plugin"));
     assert!(stdout.contains("state=enabled"));
     assert!(!stdout.contains(package_dir.to_string_lossy().as_ref()));
+
+    let providers = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("providers")
+        .arg("list")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .output()
+        .expect("run botster-hub providers list");
+    assert!(
+        providers.status.success(),
+        "providers list failed: {}",
+        String::from_utf8_lossy(&providers.stderr)
+    );
+    let stdout = String::from_utf8(providers.stdout).expect("stdout is utf8");
+    assert!(stdout.contains("response=providers"));
+    assert!(stdout.contains("package_count=0"));
+    assert!(!stdout.contains(package_dir.to_string_lossy().as_ref()));
+
+    shutdown_cli_daemon(&data_dir, child);
+
+    let restarted = start_cli_daemon(&data_dir);
+    let list_after_restart = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("packages")
+        .arg("list")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .output()
+        .expect("run botster-hub packages list after restart");
+    assert!(
+        list_after_restart.status.success(),
+        "packages list after restart failed: {}",
+        String::from_utf8_lossy(&list_after_restart.stderr)
+    );
+    let stdout = String::from_utf8(list_after_restart.stdout).expect("stdout is utf8");
+    assert!(stdout.contains("package_count=1"));
+    assert!(stdout.contains("package name=dogfood.plugin"));
+    assert!(stdout.contains("state=enabled"));
+
+    shutdown_cli_daemon(&data_dir, restarted);
+}
+
+#[test]
+fn cli_packages_enable_without_running_daemon_does_not_mutate_hub_state() {
+    let data_dir = unique_test_dir("cli-packages-offline");
+    let package_dir = unique_test_dir("local-package-offline");
+    write_local_plugin_package(&package_dir);
+
+    let enable = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("packages")
+        .arg("enable")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("--path")
+        .arg(&package_dir)
+        .output()
+        .expect("run botster-hub packages enable without daemon");
+
+    assert!(
+        !enable.status.success(),
+        "offline enable unexpectedly succeeded: {}",
+        String::from_utf8_lossy(&enable.stdout)
+    );
+    let stderr = String::from_utf8(enable.stderr).expect("stderr is utf8");
+    assert!(stderr.contains("daemon not running"));
+    assert!(
+        !data_dir.join("hub-state.json").exists(),
+        "offline package mutation should not create durable state"
+    );
 }
 
 #[test]
