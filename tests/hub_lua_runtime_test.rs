@@ -248,8 +248,12 @@ fn reload_replaces_lua_tool_descriptors_and_removes_stale_handlers() {
     let prepared = registry
         .prepare_local_package("reload.plugin", "prepare reload lua package")
         .expect("prepare reload package");
-    let bundle = LuaPluginRuntime::load_prepared(&prepared, hub.capability_runtime())
-        .expect("load new reload lua bundle");
+    let bundle = LuaPluginRuntime::load_prepared(
+        &prepared,
+        hub.capability_runtime(),
+        hub.routed_envelope_runtime(),
+    )
+    .expect("load new reload lua bundle");
     let cleanup = hub
         .reload_plugin_package(
             RequestId("reload-lua-runtime".to_string()),
