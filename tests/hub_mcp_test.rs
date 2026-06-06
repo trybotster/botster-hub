@@ -822,6 +822,24 @@ fn mcp_serve_lists_calls_and_reloads_project_pipelines_plugin_tools() {
         "project-pipelines"
     );
     assert_eq!(
+        messages[4]["result"]["structuredContent"]["run"]["coordination"]["publish_delivery_status"],
+        "queued"
+    );
+    assert_eq!(
+        messages[4]["result"]["structuredContent"]["run"]["coordination"]["ack_delivery_status"],
+        "acknowledged"
+    );
+    assert_eq!(
+        messages[4]["result"]["structuredContent"]["run"]["coordination"]["envelope_id"],
+        "project-pipelines-run:project-pipelines:ticket_local_1:1"
+    );
+    assert!(
+        messages[4]["result"]["structuredContent"]["run"]["coordination"]["drain_cursor"]
+            .as_u64()
+            .is_some(),
+        "coordination must include a cursor assigned by the routed-envelope primitive"
+    );
+    assert_eq!(
         messages[7]["result"]["structuredContent"]["runs"][0]["status"],
         "ready_for_review"
     );
@@ -834,9 +852,16 @@ fn mcp_serve_lists_calls_and_reloads_project_pipelines_plugin_tools() {
         data_dir
             .join("plugin-data")
             .join("project-pipelines")
+            .exists(),
+        "Project Pipelines state should live under plugin-data/project-pipelines through PluginDb"
+    );
+    assert!(
+        !data_dir
+            .join("plugin-data")
+            .join("project-pipelines")
             .join("state.json")
             .exists(),
-        "Project Pipelines state should live under plugin-data/project-pipelines"
+        "Project Pipelines must not persist through the removed host-bundle state file"
     );
 
     shutdown_cli_daemon(&data_dir, daemon);
@@ -884,6 +909,10 @@ fn mcp_serve_lists_calls_and_reloads_project_pipelines_plugin_tools() {
     assert_eq!(
         messages[2]["result"]["structuredContent"]["runs"][0]["coordination"]["request_id"],
         "project-pipelines:ticket_local_1:1"
+    );
+    assert_eq!(
+        messages[2]["result"]["structuredContent"]["runs"][0]["coordination"]["ack_delivery_status"],
+        "acknowledged"
     );
 
     disable_project_pipelines_package(&data_dir);

@@ -51,6 +51,40 @@ The initial capability helper is:
 - `botster.capabilities.timer_once(delay_ms)`: submits a timer capability
   request through the hub-owned `HubCapabilityRuntime` and returns structured
   handle/event metadata.
+- `botster.capabilities.plugin_db.get({ key = "..." })`: reads one JSON
+  record from the loaded plugin's namespace. Missing records raise a structured
+  runtime error that Lua code may handle with `pcall`.
+- `botster.capabilities.plugin_db.set({ key = "...", schema_version = 1,
+  payload = {...}, expected_revision = nil })`: writes one JSON record through
+  the declared `PluginDb` capability, drains the completion event, and returns
+  the typed plugin-store result.
+- `botster.capabilities.plugin_db.patch({ key = "...", patch = {...},
+  expected_revision = nil })`: applies a merge patch through the plugin-store
+  capability and waits for completion.
+- `botster.capabilities.plugin_db.delete({ key = "..." })`: deletes one
+  plugin-store record and waits for completion.
+- `botster.capabilities.plugin_db.list({ prefix = "..." })`: lists deterministic
+  plugin-store record metadata.
+
+`plugin_db` helpers always use the loaded plugin key as the namespace; Lua code
+cannot select another plugin's namespace. Mutating helpers submit to
+`HubCapabilityRuntime` and drain the matching completion before returning, so a
+handler can read its just-committed state deterministically.
+
+## Coordination Access
+
+Lua coordination helpers expose the generic routed-envelope primitive without
+embedding Project Pipelines policy in Rust:
+
+- `botster.coordination.publish({ id = "...", target = {...}, content_type =
+  "...", body = "...", extension = {...}, created_at = 0 })`: publishes one
+  envelope from the loaded plugin endpoint and returns
+  `RoutedEnvelopePublishOutcome`.
+- `botster.coordination.drain({ target = {...}, after = nil, limit = 16 })`:
+  drains a routed target queue and returns `RoutedEnvelopeDrainOutcome`,
+  including primitive-assigned cursors.
+- `botster.coordination.acknowledge({ target = {...}, envelope_id = "..." })`:
+  acknowledges one delivered target copy and returns its delivery state.
 
 Future capability helpers must continue to submit through hub/core capability
 contracts. They must not expose raw host filesystem, network, process, or C

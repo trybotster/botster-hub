@@ -16,7 +16,6 @@ use crate::packages::{
     PackageClassification, PackageRegistry, PackageRegistrySnapshotError, PackageState,
 };
 use crate::persistence::{FileHubStateStore, HubState, HubStateStoreError};
-use crate::project_pipelines::runtime_bundle_for_prepared_package;
 use crate::runtime::{HubRuntime, HubRuntimeError};
 
 /// Local daemon lifecycle state.
@@ -92,7 +91,7 @@ impl HubDaemon {
         let mut runtime = HubRuntime::load_from_store(config.clone(), &store)?;
         let state = runtime.state().clone();
         let package_registry = PackageRegistry::from_snapshot(state.package_registry.clone())?;
-        load_enabled_local_plugins(&mut runtime, &package_registry, &config)?;
+        load_enabled_local_plugins(&mut runtime, &package_registry)?;
 
         Ok(Self {
             config,
@@ -185,15 +184,11 @@ impl HubDaemon {
 pub(crate) fn load_enabled_local_plugins(
     runtime: &mut HubRuntime,
     package_registry: &PackageRegistry,
-    config: &HubConfig,
 ) -> HubDaemonResult<()> {
     let prepared = package_registry
         .prepare_enabled_local_packages("daemon startup load enabled local plugin packages")?;
     for package in prepared {
-        if let Some(bundle) = runtime_bundle_for_prepared_package(&package, &config.data_directory)
-        {
-            runtime.load_plugin_package(package_registry, &package.package_name, bundle)?;
-        } else if package.selected_entrypoint.runtime == botster_core::ExtensionRuntime::Lua {
+        if package.selected_entrypoint.runtime == botster_core::ExtensionRuntime::Lua {
             runtime.load_lua_plugin_package(package_registry, &package.package_name)?;
         }
     }

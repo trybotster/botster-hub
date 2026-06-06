@@ -117,8 +117,9 @@ src/auth.rs                hub-owned auth hook seam
 src/packages.rs            hub package policy over core package contracts
 src/lifecycle.rs           hub package lifecycle adapter over core plugin workers
 src/capabilities.rs        hub-owned local capability runtime policy
-src/project_pipelines.rs   first Project Pipelines local plugin runtime bundle source
 src/runtime.rs             hub runtime facade over botster-core-daemon
+examples/project-pipelines/plugin.lua
+                          first Project Pipelines Lua workflow plugin source
 ```
 
 This scaffold is intentionally shallow. The module tree makes the intended
@@ -135,15 +136,14 @@ durable state for dogfood; database-backed persistence and cloud sync remain
 excluded.
 
 The exception in this scaffold is the constrained `examples/project-pipelines`
-local plugin package. The daemon loads that package into `HubPluginLifecycle`
-through a host-supplied Project Pipelines runtime bundle even though the hub now
-has a real Lua plugin runtime, because this package's Lua entrypoint is still a
-stub and does not yet register Project Pipelines MCP descriptors or workflow
-handlers. MCP tools are registered through the shared `mcp-serve` registry,
-dispatched over daemon transport to the owner thread, invoked through
-`PluginWorkerEngine`, and persisted under `plugin-data/project-pipelines/`. The
-plugin README names unsupported monolith features and the
-no-in-flight-monolith-ticket cutover posture.
+local plugin package. The daemon loads that package through the real Lua plugin
+runtime; its entrypoint registers Project Pipelines MCP descriptors and workflow
+handlers with the Lua ABI. MCP tools are registered through the shared
+`mcp-serve` registry, dispatched over daemon transport to the owner thread,
+invoked through `PluginWorkerEngine`, and persisted through the PluginDb
+capability under `plugin-data/project-pipelines/`. The plugin README names
+unsupported monolith features and the no-in-flight-monolith-ticket cutover
+posture.
 
 ## Durable hub state
 
