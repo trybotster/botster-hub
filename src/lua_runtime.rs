@@ -8,14 +8,19 @@ use std::fmt;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 
 use botster_core::{
-    BoundaryJson, CapabilityOperation, CapabilityOperationId, CapabilityRuntimeRequest,
-    PluginCancellationToken, PluginCapabilityRuntime, PluginDescriptorKind, PluginDescriptorRef,
-    PluginHandlerKind, PluginHandlerRef, PluginHandlerRegistration, PluginInvocationFailure,
-    PluginInvocationFailureKind, PluginInvocationRequest, PluginInvocationResult,
-    PluginInvocationSuccess, PluginKey, PluginOwnedDescriptor, PluginResourceKind,
-    PluginResourceRef, PluginRuntime, TimerCapabilityRequest,
+    BoundaryJson, CapabilityOperation, CapabilityOperationId, CapabilityOperationResult,
+    CapabilityRuntimeEvent, CapabilityRuntimeRequest, EndpointId, EnvelopeCursor, EnvelopeId,
+    EnvelopeTarget, PluginCancellationToken, PluginCapabilityRuntime, PluginDescriptorKind,
+    PluginDescriptorRef, PluginHandlerKind, PluginHandlerRef, PluginHandlerRegistration,
+    PluginInvocationFailure, PluginInvocationFailureKind, PluginInvocationRequest,
+    PluginInvocationResult, PluginInvocationSuccess, PluginKey, PluginOwnedDescriptor,
+    PluginResourceKind, PluginResourceRef, PluginRuntime, PluginStoreCapabilityRequest,
+    PluginStoreKey, PluginStoreOperation, RoutedEnvelope, RoutedEnvelopePayload,
+    RoutedEnvelopeRouter, TimerCapabilityRequest,
 };
 use mlua::{Function, HookTriggers, Lua, LuaOptions, LuaSerdeExt, StdLib, Table, Value, VmState};
 use serde_json::json;
@@ -25,8 +30,12 @@ use crate::lifecycle::HubPluginRuntimeBundle;
 use crate::packages::PreparedLocalPackage;
 
 const DEFAULT_INSTRUCTION_BUDGET: u64 = 500_000;
+const PLUGIN_DB_TIMEOUT_MS: u64 = 1_000;
+static LUA_OPERATION_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 /// Shared host capability runtime used by Lua capability helpers.
 pub type SharedHubCapabilityRuntime = Arc<Mutex<HubCapabilityRuntime>>;
+/// Shared routed-envelope primitive used by Lua coordination helpers.
+pub type SharedRoutedEnvelopeRuntime = Arc<Mutex<RoutedEnvelopeRouter>>;
 
 /// Real Lua runtime for one loaded plugin package.
 pub struct LuaPluginRuntime {
@@ -41,12 +50,14 @@ impl LuaPluginRuntime {
     pub fn load_prepared(
         prepared: &PreparedLocalPackage,
         capabilities: SharedHubCapabilityRuntime,
+        routed_envelopes: SharedRoutedEnvelopeRuntime,
     ) -> Result<HubPluginRuntimeBundle, LuaPluginRuntimeError> {
         let plugin_key = PluginKey(prepared.package_name.clone());
         let loaded = LoadedLuaPlugin::load(
             plugin_key.clone(),
             &prepared.selected_entrypoint_path,
             capabilities,
+            routed_envelopes,
         )?;
         Ok(HubPluginRuntimeBundle {
             runtime: Arc::new(loaded.runtime),
@@ -70,6 +81,7 @@ impl LuaPluginRuntime {
         plugin_key: PluginKey,
         entrypoint: &Path,
         capabilities: SharedHubCapabilityRuntime,
+        routed_envelopes: SharedRoutedEnvelopeRuntime,
     ) -> Result<(Self, LuaRegistration), LuaPluginRuntimeError> {
         let lua = Lua::new_with(
             StdLib::TABLE | StdLib::STRING | StdLib::MATH | StdLib::UTF8,
@@ -89,7 +101,7 @@ impl LuaPluginRuntime {
                 Ok(VmState::Continue)
             },
         )?;
-        install_botster_api(&lua, plugin_key.clone(), capabilities)?;
+        install_botster_api(&lua, plugin_key.clone(), capabilities, routed_envelopes)?;
         let source = std::fs::read_to_string(entrypoint).map_err(|error| {
             LuaPluginRuntimeError::Load(format!("failed to read Lua entrypoint: {error}"))
         })?;
@@ -222,9 +234,14 @@ impl LoadedLuaPlugin {
         plugin_key: PluginKey,
         entrypoint: &Path,
         capabilities: SharedHubCapabilityRuntime,
+        routed_envelopes: SharedRoutedEnvelopeRuntime,
     ) -> Result<Self, LuaPluginRuntimeError> {
-        let (runtime, registration) =
-            LuaPluginRuntime::new(plugin_key.clone(), entrypoint, capabilities)?;
+        let (runtime, registration) = LuaPluginRuntime::new(
+            plugin_key.clone(),
+            entrypoint,
+            capabilities,
+            routed_envelopes,
+        )?;
         let mut handlers = Vec::new();
         let mut descriptors = Vec::new();
         let mut resources = Vec::new();
@@ -332,6 +349,7 @@ fn install_botster_api(
     lua: &Lua,
     plugin_key: PluginKey,
     capabilities: SharedHubCapabilityRuntime,
+    routed_envelopes: SharedRoutedEnvelopeRuntime,
 ) -> Result<(), LuaPluginRuntimeError> {
     let globals = lua.globals();
     globals.set("__botster_handlers", lua.create_table()?)?;
@@ -392,9 +410,288 @@ fn install_botster_api(
             }))
         })?,
     )?;
+    capabilities_table.set(
+        "plugin_db",
+        plugin_db_table(lua, plugin_key.clone(), capabilities.clone())?,
+    )?;
     botster.set("capabilities", capabilities_table)?;
+    botster.set(
+        "coordination",
+        coordination_table(lua, plugin_key, routed_envelopes)?,
+    )?;
     globals.set("botster", botster)?;
     Ok(())
+}
+
+fn plugin_db_table(
+    lua: &Lua,
+    plugin_key: PluginKey,
+    capabilities: SharedHubCapabilityRuntime,
+) -> Result<Table, mlua::Error> {
+    let plugin_db = lua.create_table()?;
+    for (name, action) in [
+        ("get", "get"),
+        ("set", "set"),
+        ("patch", "patch"),
+        ("delete", "delete"),
+        ("list", "list"),
+    ] {
+        let runtime = capabilities.clone();
+        let key = plugin_key.clone();
+        plugin_db.set(
+            name,
+            lua.create_function(move |lua, args: Value| {
+                let operation = plugin_store_operation_from_lua(lua, action, args)?;
+                submit_plugin_store_and_wait(lua, runtime.clone(), key.clone(), operation, action)
+            })?,
+        )?;
+    }
+    Ok(plugin_db)
+}
+
+fn plugin_store_operation_from_lua(
+    lua: &Lua,
+    action: &str,
+    args: Value,
+) -> Result<PluginStoreOperation, mlua::Error> {
+    let value = lua.from_value::<serde_json::Value>(args)?;
+    let key = value
+        .get("key")
+        .and_then(serde_json::Value::as_str)
+        .map(|key| PluginStoreKey(key.to_string()));
+    match action {
+        "get" => Ok(PluginStoreOperation::Get {
+            key: key
+                .ok_or_else(|| mlua::Error::RuntimeError("plugin_db.get requires key".into()))?,
+        }),
+        "set" => Ok(PluginStoreOperation::Set {
+            key: key
+                .ok_or_else(|| mlua::Error::RuntimeError("plugin_db.set requires key".into()))?,
+            schema_version: value
+                .get("schema_version")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(1),
+            payload: value.get("payload").cloned().ok_or_else(|| {
+                mlua::Error::RuntimeError("plugin_db.set requires payload".into())
+            })?,
+            expected_revision: value
+                .get("expected_revision")
+                .and_then(serde_json::Value::as_u64),
+        }),
+        "patch" => Ok(PluginStoreOperation::Patch {
+            key: key
+                .ok_or_else(|| mlua::Error::RuntimeError("plugin_db.patch requires key".into()))?,
+            patch: value.get("patch").cloned().ok_or_else(|| {
+                mlua::Error::RuntimeError("plugin_db.patch requires patch".into())
+            })?,
+            expected_revision: value
+                .get("expected_revision")
+                .and_then(serde_json::Value::as_u64),
+        }),
+        "delete" => Ok(PluginStoreOperation::Delete {
+            key: key
+                .ok_or_else(|| mlua::Error::RuntimeError("plugin_db.delete requires key".into()))?,
+        }),
+        "list" => Ok(PluginStoreOperation::List {
+            prefix: value
+                .get("prefix")
+                .and_then(serde_json::Value::as_str)
+                .map(ToString::to_string),
+        }),
+        _ => Err(mlua::Error::RuntimeError(
+            "unsupported plugin_db operation".to_string(),
+        )),
+    }
+}
+
+fn submit_plugin_store_and_wait(
+    lua: &Lua,
+    capabilities: SharedHubCapabilityRuntime,
+    plugin_key: PluginKey,
+    operation: PluginStoreOperation,
+    action: &str,
+) -> Result<Value, mlua::Error> {
+    let sequence = LUA_OPERATION_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let operation_id = CapabilityOperationId(format!("lua-plugin-db-{action}-{sequence}"));
+    let request = CapabilityRuntimeRequest {
+        plugin_key: plugin_key.clone(),
+        operation_id: operation_id.clone(),
+        operation: CapabilityOperation::PluginStore(PluginStoreCapabilityRequest {
+            namespace: plugin_key.0.clone(),
+            operation,
+        }),
+        timeout_ms: PLUGIN_DB_TIMEOUT_MS,
+        callback: None,
+    };
+    {
+        let mut runtime = capabilities.lock().map_err(|_| {
+            mlua::Error::RuntimeError("capability runtime lock poisoned".to_string())
+        })?;
+        runtime
+            .submit(request)
+            .map_err(|error| mlua::Error::RuntimeError(error.to_string()))?;
+    }
+
+    for _ in 0..PLUGIN_DB_TIMEOUT_MS {
+        let events = {
+            let mut runtime = capabilities.lock().map_err(|_| {
+                mlua::Error::RuntimeError("capability runtime lock poisoned".to_string())
+            })?;
+            runtime
+                .drain_events(&plugin_key)
+                .map_err(|error| mlua::Error::RuntimeError(error.to_string()))?
+        };
+        if let Some(value) = plugin_store_event_to_lua(lua, &operation_id, events)? {
+            return Ok(value);
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+
+    Err(mlua::Error::RuntimeError(
+        "plugin_db operation did not complete before timeout".to_string(),
+    ))
+}
+
+fn plugin_store_event_to_lua(
+    lua: &Lua,
+    operation_id: &CapabilityOperationId,
+    events: Vec<CapabilityRuntimeEvent>,
+) -> Result<Option<Value>, mlua::Error> {
+    for event in events {
+        match event {
+            CapabilityRuntimeEvent::Completed(completed)
+                if completed.operation_id == *operation_id =>
+            {
+                let Some(CapabilityOperationResult::PluginStore(result)) = completed.result else {
+                    return Err(mlua::Error::RuntimeError(
+                        "plugin_db operation returned unexpected capability result".to_string(),
+                    ));
+                };
+                return lua.to_value(&result).map(Some);
+            }
+            CapabilityRuntimeEvent::Failed(failure) if failure.operation_id == *operation_id => {
+                return Err(mlua::Error::RuntimeError(format!(
+                    "plugin_db operation failed: {}",
+                    failure.reason
+                )));
+            }
+            _ => {}
+        }
+    }
+    Ok(None)
+}
+
+fn coordination_table(
+    lua: &Lua,
+    plugin_key: PluginKey,
+    routed_envelopes: SharedRoutedEnvelopeRuntime,
+) -> Result<Table, mlua::Error> {
+    let coordination = lua.create_table()?;
+
+    let publish_runtime = routed_envelopes.clone();
+    let publish_plugin_key = plugin_key.clone();
+    coordination.set(
+        "publish",
+        lua.create_function(move |lua, args: Value| {
+            let envelope = routed_envelope_from_lua(lua, publish_plugin_key.clone(), args)?;
+            let mut runtime = publish_runtime.lock().map_err(|_| {
+                mlua::Error::RuntimeError("routed envelope runtime lock poisoned".to_string())
+            })?;
+            lua.to_value(&runtime.publish(envelope))
+        })?,
+    )?;
+
+    let drain_runtime = routed_envelopes.clone();
+    coordination.set(
+        "drain",
+        lua.create_function(move |lua, args: Value| {
+            let value = lua.from_value::<serde_json::Value>(args)?;
+            let target = target_from_json(value.get("target"))?;
+            let after = value
+                .get("after")
+                .and_then(serde_json::Value::as_u64)
+                .map(EnvelopeCursor);
+            let limit = value
+                .get("limit")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|limit| usize::try_from(limit).ok())
+                .unwrap_or(16);
+            let mut runtime = drain_runtime.lock().map_err(|_| {
+                mlua::Error::RuntimeError("routed envelope runtime lock poisoned".to_string())
+            })?;
+            lua.to_value(&runtime.drain(&target, after, limit))
+        })?,
+    )?;
+
+    let ack_runtime = routed_envelopes;
+    coordination.set(
+        "acknowledge",
+        lua.create_function(move |lua, args: Value| {
+            let value = lua.from_value::<serde_json::Value>(args)?;
+            let target = target_from_json(value.get("target"))?;
+            let envelope_id = value
+                .get("envelope_id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    mlua::Error::RuntimeError(
+                        "coordination.acknowledge requires envelope_id".to_string(),
+                    )
+                })?;
+            let mut runtime = ack_runtime.lock().map_err(|_| {
+                mlua::Error::RuntimeError("routed envelope runtime lock poisoned".to_string())
+            })?;
+            lua.to_value(&json!({
+                "state": runtime.acknowledge(&target, &EnvelopeId(envelope_id.to_string())),
+            }))
+        })?,
+    )?;
+
+    Ok(coordination)
+}
+
+fn routed_envelope_from_lua(
+    lua: &Lua,
+    plugin_key: PluginKey,
+    args: Value,
+) -> Result<RoutedEnvelope, mlua::Error> {
+    let value = lua.from_value::<serde_json::Value>(args)?;
+    let id = value
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| mlua::Error::RuntimeError("coordination.publish requires id".to_string()))?;
+    let target = target_from_json(value.get("target"))?;
+    let body = value
+        .get("body")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .as_bytes()
+        .to_vec();
+    Ok(RoutedEnvelope::new(
+        EnvelopeId(id.to_string()),
+        EndpointId(format!("plugin:{}", plugin_key.0)),
+        vec![target],
+        RoutedEnvelopePayload {
+            content_type: value
+                .get("content_type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("application/json")
+                .to_string(),
+            body,
+            extension: value.get("extension").cloned().map(BoundaryJson),
+        },
+        value
+            .get("created_at")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+    ))
+}
+
+fn target_from_json(value: Option<&serde_json::Value>) -> Result<EnvelopeTarget, mlua::Error> {
+    let value = value
+        .cloned()
+        .ok_or_else(|| mlua::Error::RuntimeError("coordination target is required".to_string()))?;
+    serde_json::from_value(value)
+        .map_err(|error| mlua::Error::RuntimeError(format!("invalid coordination target: {error}")))
 }
 
 fn registration_from_value(

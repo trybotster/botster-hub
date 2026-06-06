@@ -9,13 +9,12 @@ use botster_core::{
     BotsterEngineObservation, BotsterEngineOutput, ClientId, CoreSession, CoreSessionMetadata,
     EnvelopeId, EnvelopeTarget, ManagedSessionRuntimeError, PluginCapabilityRuntime,
     PluginCleanupResult, PluginInvocationOutcome, PluginInvocationRequest, PluginKey, RequestId,
-    RoutedEnvelope, RoutedEnvelopeDrainOutcome, RoutedEnvelopePublishOutcome, SessionId,
-    SessionLifecycleState, SessionRuntimeErrorKind, SessionSpawnRequest, SubscriptionId,
+    RoutedEnvelope, RoutedEnvelopeDrainOutcome, RoutedEnvelopePublishOutcome, RoutedEnvelopeRouter,
+    SessionId, SessionLifecycleState, SessionRuntimeErrorKind, SessionSpawnRequest, SubscriptionId,
 };
 use botster_core_daemon::{
-    AcknowledgeRoutedEnvelopeRequest, CoreDaemon, CoreDaemonConfig, CoreDaemonError, DaemonSession,
-    DrainResult, DrainRoutedEnvelopesRequest, GuardedWriteRequest, GuardedWriteResult,
-    PublishRoutedEnvelopeRequest, RegistrySessionState, RoutedEnvelopeDeliveryStateResult,
+    CoreDaemon, CoreDaemonConfig, CoreDaemonError, DaemonSession, DrainResult, GuardedWriteRequest,
+    GuardedWriteResult, RegistrySessionState, RoutedEnvelopeDeliveryStateResult,
     SessionAdoptionReport, SessionAdoptionState, SpawnSessionRequest,
 };
 use std::env;
@@ -29,7 +28,10 @@ use crate::config::HubConfig;
 use crate::lifecycle::{
     HubLifecycleResult, HubPluginLifecycle, HubPluginLifecycleStatus, HubPluginRuntimeBundle,
 };
-use crate::lua_runtime::{LuaPluginRuntime, LuaPluginRuntimeError, SharedHubCapabilityRuntime};
+use crate::lua_runtime::{
+    LuaPluginRuntime, LuaPluginRuntimeError, SharedHubCapabilityRuntime,
+    SharedRoutedEnvelopeRuntime,
+};
 use crate::packages::{PackageRegistry, PackageRegistryError};
 use crate::persistence::{FileHubStateStore, HubState, HubStateStore, HubStateStoreError};
 
@@ -46,6 +48,9 @@ pub struct HubRuntime {
     reconciliation: HubSessionReconciliation,
     plugin_lifecycle: HubPluginLifecycle,
     capability_runtime: SharedHubCapabilityRuntime,
+    // HubRuntime owns coordination routing so native MCP tools and Lua plugin
+    // helpers share one route table from the plugin invocation path.
+    routed_envelopes: SharedRoutedEnvelopeRuntime,
     last_capability_cleanup: Option<PluginCleanupResult>,
 }
 
@@ -63,9 +68,14 @@ impl HubRuntime {
     #[must_use]
     pub fn new(config: HubConfig) -> Self {
         let state = HubState::from_config(&config);
-        let core_daemon = CoreDaemon::new(core_daemon_config(&config.data_directory));
+        let core_config = core_daemon_config(&config.data_directory);
+        let routed_envelopes = Arc::new(Mutex::new(RoutedEnvelopeRouter::with_config(
+            core_config.routed_envelope_queue.clone(),
+        )));
+        let core_daemon = CoreDaemon::new(core_config);
         Self {
             capability_runtime: Arc::new(Mutex::new(HubCapabilityRuntime::from_config(&config))),
+            routed_envelopes,
             config,
             state,
             core_daemon,
@@ -87,9 +97,14 @@ impl HubRuntime {
         store: &impl HubStateStore,
     ) -> HubRuntimeResult<Self> {
         let state = store.load_or_initialize(&config)?;
-        let core_daemon = CoreDaemon::new(core_daemon_config(&config.data_directory));
+        let core_config = core_daemon_config(&config.data_directory);
+        let routed_envelopes = Arc::new(Mutex::new(RoutedEnvelopeRouter::with_config(
+            core_config.routed_envelope_queue.clone(),
+        )));
+        let core_daemon = CoreDaemon::new(core_config);
         let mut runtime = Self {
             capability_runtime: Arc::new(Mutex::new(HubCapabilityRuntime::from_config(&config))),
+            routed_envelopes,
             config,
             state,
             core_daemon,
@@ -111,6 +126,16 @@ impl HubRuntime {
     #[must_use]
     pub fn capability_runtime(&self) -> SharedHubCapabilityRuntime {
         self.capability_runtime.clone()
+    }
+
+    /// Return the shared routed-envelope primitive used by Lua coordination helpers.
+    ///
+    /// The hub owns this router for now because Lua plugin handlers are invoked
+    /// through `&self`; native MCP coordination commands and Lua helpers must
+    /// still observe the same route table.
+    #[must_use]
+    pub fn routed_envelope_runtime(&self) -> SharedRoutedEnvelopeRuntime {
+        self.routed_envelopes.clone()
     }
 
     /// Return the durable hub state loaded for this runtime.
@@ -145,8 +170,12 @@ impl HubRuntime {
         let prepared = registry
             .prepare_local_package(package_name, "load local lua plugin package")
             .map_err(HubLuaPluginLoadError::Package)?;
-        let bundle = LuaPluginRuntime::load_prepared(&prepared, self.capability_runtime.clone())
-            .map_err(HubLuaPluginLoadError::Lua)?;
+        let bundle = LuaPluginRuntime::load_prepared(
+            &prepared,
+            self.capability_runtime.clone(),
+            self.routed_envelopes.clone(),
+        )
+        .map_err(HubLuaPluginLoadError::Lua)?;
         self.load_plugin_package(registry, package_name, bundle)
             .map_err(HubLuaPluginLoadError::Lifecycle)
     }
@@ -444,41 +473,45 @@ impl HubRuntime {
         self.core_daemon.guarded_write(request)
     }
 
-    /// Publish one coordination envelope through the core daemon routed-envelope primitive.
+    /// Publish one coordination envelope through the hub-owned routed-envelope router.
     pub fn publish_routed_envelope(
         &mut self,
         envelope: RoutedEnvelope,
     ) -> Result<RoutedEnvelopePublishOutcome, CoreDaemonError> {
-        self.core_daemon
-            .publish_routed_envelope(PublishRoutedEnvelopeRequest { envelope })
+        Ok(self
+            .routed_envelopes
+            .lock()
+            .expect("routed envelope runtime lock")
+            .publish(envelope))
     }
 
-    /// Drain coordination envelopes for one routed target through core cursor semantics.
+    /// Drain coordination envelopes for one routed target through hub cursor semantics.
     pub fn drain_routed_envelopes(
         &mut self,
         target: EnvelopeTarget,
         after: Option<botster_core::EnvelopeCursor>,
         limit: usize,
     ) -> Result<RoutedEnvelopeDrainOutcome, CoreDaemonError> {
-        self.core_daemon
-            .drain_routed_envelopes(DrainRoutedEnvelopesRequest {
-                target,
-                after,
-                limit,
-            })
+        Ok(self
+            .routed_envelopes
+            .lock()
+            .expect("routed envelope runtime lock")
+            .drain(&target, after, limit))
     }
 
-    /// Acknowledge one routed envelope delivery through the core daemon.
+    /// Acknowledge one routed envelope delivery through the hub-owned router.
     pub fn acknowledge_routed_envelope(
         &mut self,
         target: EnvelopeTarget,
         envelope_id: EnvelopeId,
     ) -> Result<RoutedEnvelopeDeliveryStateResult, CoreDaemonError> {
-        self.core_daemon
-            .acknowledge_routed_envelope(AcknowledgeRoutedEnvelopeRequest {
-                target,
-                envelope_id,
-            })
+        Ok(RoutedEnvelopeDeliveryStateResult {
+            state: self
+                .routed_envelopes
+                .lock()
+                .expect("routed envelope runtime lock")
+                .acknowledge(&target, &envelope_id),
+        })
     }
 
     /// Release worker-backed sessions before an intentional daemon restart.

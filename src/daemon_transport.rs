@@ -723,25 +723,12 @@ fn load_package_after_enable(
     daemon: &mut HubDaemon,
     package_name: &str,
 ) -> DaemonTransportResult<()> {
-    let config = daemon
-        .runtime()
-        .ok_or(DaemonTransportError::DaemonNotRunning)?
-        .config()
-        .clone();
     let package_registry = daemon.package_registry().clone();
     let prepared = package_registry.prepare_local_package(
         package_name,
         "daemon socket load enabled local plugin package",
     )?;
-    if let Some(bundle) = crate::project_pipelines::runtime_bundle_for_prepared_package(
-        &prepared,
-        &config.data_directory,
-    ) {
-        daemon
-            .runtime_mut()
-            .ok_or(DaemonTransportError::DaemonNotRunning)?
-            .load_plugin_package(&package_registry, package_name, bundle)?;
-    } else if prepared.selected_entrypoint.runtime == ExtensionRuntime::Lua {
+    if prepared.selected_entrypoint.runtime == ExtensionRuntime::Lua {
         daemon
             .runtime_mut()
             .ok_or(DaemonTransportError::DaemonNotRunning)?
