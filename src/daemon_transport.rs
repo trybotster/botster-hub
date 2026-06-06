@@ -336,17 +336,8 @@ fn handle_control_request(
             let decision = daemon
                 .package_registry_mut()
                 .enable(&package_name, "daemon socket enable local package")?;
-            let registry = daemon.package_registry().clone();
-            let prepared = registry
-                .prepare_local_package(&package_name, "daemon socket inspect local package")?;
-            if prepared.selected_entrypoint.runtime == ExtensionRuntime::Lua {
-                daemon
-                    .runtime_mut()
-                    .ok_or(DaemonTransportError::DaemonNotRunning)?
-                    .load_lua_plugin_package(&registry, &package_name)
-                    .map_err(crate::HubDaemonError::from)?;
-            }
             persist_package_registry(daemon)?;
+            load_package_after_enable(daemon, &package_name)?;
             package_decision_response(daemon, decision)
         }
         DaemonRequest::EnablePackage { package_name } => {
@@ -354,6 +345,7 @@ fn handle_control_request(
                 .package_registry_mut()
                 .enable(&package_name, "daemon socket enable package")?;
             persist_package_registry(daemon)?;
+            load_package_after_enable(daemon, &package_name)?;
             package_decision_response(daemon, decision)
         }
         DaemonRequest::DisablePackage { package_name } => {
@@ -361,6 +353,7 @@ fn handle_control_request(
                 .package_registry_mut()
                 .disable(&package_name, "daemon socket disable package")?;
             persist_package_registry(daemon)?;
+            unload_package_after_disable(daemon, &package_name)?;
             package_decision_response(daemon, decision)
         }
         other => handle_runtime_control_request(daemon, logical_clock, drain_cursors, other),
@@ -726,6 +719,52 @@ fn handle_runtime_control_request(
     }
 }
 
+fn load_package_after_enable(
+    daemon: &mut HubDaemon,
+    package_name: &str,
+) -> DaemonTransportResult<()> {
+    let config = daemon
+        .runtime()
+        .ok_or(DaemonTransportError::DaemonNotRunning)?
+        .config()
+        .clone();
+    let package_registry = daemon.package_registry().clone();
+    let prepared = package_registry.prepare_local_package(
+        package_name,
+        "daemon socket load enabled local plugin package",
+    )?;
+    if let Some(bundle) = crate::project_pipelines::runtime_bundle_for_prepared_package(
+        &prepared,
+        &config.data_directory,
+    ) {
+        daemon
+            .runtime_mut()
+            .ok_or(DaemonTransportError::DaemonNotRunning)?
+            .load_plugin_package(&package_registry, package_name, bundle)?;
+    } else if prepared.selected_entrypoint.runtime == ExtensionRuntime::Lua {
+        daemon
+            .runtime_mut()
+            .ok_or(DaemonTransportError::DaemonNotRunning)?
+            .load_lua_plugin_package(&package_registry, package_name)
+            .map_err(crate::HubDaemonError::from)?;
+    }
+    Ok(())
+}
+
+fn unload_package_after_disable(
+    daemon: &mut HubDaemon,
+    package_name: &str,
+) -> DaemonTransportResult<()> {
+    let _ = daemon
+        .runtime_mut()
+        .ok_or(DaemonTransportError::DaemonNotRunning)?
+        .unload_plugin_package(
+            request_id(&format!("daemon-disable-{package_name}")),
+            package_name,
+        );
+    Ok(())
+}
+
 fn list_packages_response(daemon: &mut HubDaemon) -> DaemonTransportResult<DaemonResponse> {
     let packages = daemon.package_registry().clone();
     let api = HubClientApi::local_operator("botster-hub-daemon-socket");
@@ -1006,7 +1045,7 @@ struct DaemonHelloAck {
 }
 
 /// Client request variants for the local daemon protocol.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DaemonRequest {
     Status,
@@ -2023,6 +2062,7 @@ pub enum DaemonTransportError {
     Package(crate::PackageRegistryError),
     State(crate::HubStateStoreError),
     Runtime(crate::HubRuntimeError),
+    Lifecycle(crate::HubLifecycleError),
 }
 
 impl fmt::Display for DaemonTransportError {
@@ -2043,6 +2083,7 @@ impl fmt::Display for DaemonTransportError {
             Self::Package(error) => write!(formatter, "{error:?}"),
             Self::State(error) => write!(formatter, "{error}"),
             Self::Runtime(error) => write!(formatter, "{error:?}"),
+            Self::Lifecycle(error) => write!(formatter, "{error:?}"),
         }
     }
 }
@@ -2086,6 +2127,12 @@ impl From<crate::HubStateStoreError> for DaemonTransportError {
 impl From<crate::HubRuntimeError> for DaemonTransportError {
     fn from(error: crate::HubRuntimeError) -> Self {
         Self::Runtime(error)
+    }
+}
+
+impl From<crate::HubLifecycleError> for DaemonTransportError {
+    fn from(error: crate::HubLifecycleError) -> Self {
+        Self::Lifecycle(error)
     }
 }
 

@@ -40,6 +40,7 @@ pub mod mcp;
 pub mod packages;
 pub mod persistence;
 pub mod profile;
+pub mod project_pipelines;
 pub mod runtime;
 pub mod tui;
 
