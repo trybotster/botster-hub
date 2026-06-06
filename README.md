@@ -117,6 +117,7 @@ src/auth.rs                hub-owned auth hook seam
 src/packages.rs            hub package policy over core package contracts
 src/lifecycle.rs           hub package lifecycle adapter over core plugin workers
 src/capabilities.rs        hub-owned local capability runtime policy
+src/project_pipelines.rs   first Project Pipelines local plugin runtime bundle source
 src/runtime.rs             hub runtime facade over botster-core-daemon
 ```
 
@@ -128,10 +129,21 @@ not add a physical multi-crate split.
 
 This repo does not yet implement Rails, TryBotster Cloud, ActionCable, WebRTC,
 signaling servers, browser shells, API clients, OAuth/device-code flows,
-provider processes, persistence databases, plugin runtimes, marketplace fetches,
-package installers, or client transports. The hub does include local file-backed
+provider processes, persistence databases, marketplace fetches, package
+installers, or client transports. The hub does include local file-backed
 durable state for dogfood; database-backed persistence and cloud sync remain
 excluded.
+
+The exception in this scaffold is the constrained `examples/project-pipelines`
+local plugin package. The daemon loads that package into `HubPluginLifecycle`
+through a host-supplied Project Pipelines runtime bundle even though the hub now
+has a real Lua plugin runtime, because this package's Lua entrypoint is still a
+stub and does not yet register Project Pipelines MCP descriptors or workflow
+handlers. MCP tools are registered through the shared `mcp-serve` registry,
+dispatched over daemon transport to the owner thread, invoked through
+`PluginWorkerEngine`, and persisted under `plugin-data/project-pipelines/`. The
+plugin README names unsupported monolith features and the
+no-in-flight-monolith-ticket cutover posture.
 
 ## Durable hub state
 
@@ -192,8 +204,8 @@ pulls status/package/lifecycle state through `HubClientApi`, resolves the
 package's Lua entrypoint path, loads the package, invokes a synthetic in-process
 plugin runtime through `HubRuntime`, spawns a local PTY session, attaches a
 client, sends input, drains the observed marker, and shuts down through the same
-local client API. The Lua fixture is not executed by a real Lua runtime in this
-proof. The PTY portion is Unix-only.
+local client API. Separate Lua runtime tests cover real Lua entrypoint
+execution. The PTY portion is Unix-only.
 
 The CLI commands below exercise the daemon-backed workflow across separate
 processes:

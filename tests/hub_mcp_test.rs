@@ -83,6 +83,41 @@ fn shutdown_cli_daemon(data_dir: &Path, child: Child) -> Output {
     output
 }
 
+fn enable_project_pipelines_package(data_dir: &Path) {
+    let output = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("packages")
+        .arg("enable")
+        .arg("--data-dir")
+        .arg(data_dir)
+        .arg("--path")
+        .arg(Path::new("examples").join("project-pipelines"))
+        .output()
+        .expect("run botster-hub packages enable --path examples/project-pipelines");
+    assert!(
+        output.status.success(),
+        "project pipelines package enable failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn disable_project_pipelines_package(data_dir: &Path) {
+    let output = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("packages")
+        .arg("disable")
+        .arg("--data-dir")
+        .arg(data_dir)
+        .arg("project-pipelines")
+        .output()
+        .expect("run botster-hub packages disable project-pipelines");
+    assert!(
+        output.status.success(),
+        "project pipelines package disable failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 fn run_mcp_serve(data_dir: &Path, requests: &[Value]) -> Output {
     run_mcp_serve_with_session(data_dir, None, requests)
 }
@@ -132,6 +167,12 @@ fn parse_mcp_output(output: Output, label: &str) -> Vec<Value> {
         .lines()
         .map(|line| serde_json::from_str::<Value>(line).expect("stdout line is JSON-RPC"))
         .collect()
+}
+
+fn mcp_messages(output: Output, expected_count: usize) -> Vec<Value> {
+    let messages = parse_mcp_output(output, "project pipelines");
+    assert_eq!(messages.len(), expected_count);
+    messages
 }
 
 fn initialize_request(id: u64) -> Value {
@@ -641,4 +682,237 @@ fn mcp_serve_returns_structured_tool_error_when_daemon_is_unavailable() {
         call["result"]["structuredContent"]["error"]["code"],
         "daemon_unavailable"
     );
+}
+
+#[test]
+fn mcp_serve_lists_calls_and_reloads_project_pipelines_plugin_tools() {
+    let _guard = mcp_daemon_test_lock().lock().expect("lock MCP daemon test");
+    let data_dir = unique_test_dir("project-pipelines-plugin");
+    let _ = fs::remove_dir_all(&data_dir);
+    let daemon = start_cli_daemon(&data_dir);
+    enable_project_pipelines_package(&data_dir);
+
+    let output = run_mcp_serve(
+        &data_dir,
+        &[
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-06-18",
+                    "clientInfo": { "name": "botster-hub-test", "version": "0.0.0" },
+                    "capabilities": {}
+                }
+            }),
+            json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {
+                    "name": "project_pipelines.create",
+                    "arguments": { "title": "Local workflow parity" }
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tools/call",
+                "params": {
+                    "name": "project_pipelines.update",
+                    "arguments": {
+                        "ticket_id": "ticket_local_1",
+                        "status": "planned"
+                    }
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 5,
+                "method": "tools/call",
+                "params": {
+                    "name": "project_pipelines.start",
+                    "arguments": {
+                        "ticket_id": "ticket_local_1",
+                        "target_id": "tgt_local_project",
+                        "worktree": "worktrees/project-pipelines-local",
+                        "agent_name": "codex"
+                    }
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 6,
+                "method": "tools/call",
+                "params": {
+                    "name": "project_pipelines.submit_gate",
+                    "arguments": {
+                        "run_id": "run_local_1",
+                        "gate_id": "implement",
+                        "status": "passed",
+                        "summary": "local gate evidence",
+                        "evidence": { "command": "mcp e2e" }
+                    }
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 7,
+                "method": "tools/call",
+                "params": {
+                    "name": "project_pipelines.request_step_advance",
+                    "arguments": {
+                        "run_id": "run_local_1",
+                        "summary": "ready for review"
+                    }
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 8,
+                "method": "tools/call",
+                "params": {
+                    "name": "project_pipelines.current_context",
+                    "arguments": {}
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 9,
+                "method": "tools/call",
+                "params": {
+                    "name": "project_pipelines.start",
+                    "arguments": {
+                        "ticket_id": "ticket_local_missing",
+                        "target_id": "tgt_local_project",
+                        "worktree": "worktrees/project-pipelines-local"
+                    }
+                }
+            }),
+        ],
+    );
+    let messages = mcp_messages(output, 9);
+
+    let tool_names = messages[1]["result"]["tools"]
+        .as_array()
+        .expect("tools array")
+        .iter()
+        .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+        .collect::<Vec<_>>();
+    assert!(tool_names.contains(&"project_pipelines.create"));
+    assert!(tool_names.contains(&"project_pipelines.start"));
+
+    assert_eq!(messages[2]["result"]["isError"], false);
+    assert_eq!(
+        messages[2]["result"]["structuredContent"]["ticket"]["id"],
+        "ticket_local_1"
+    );
+    assert_eq!(messages[4]["result"]["isError"], false);
+    assert_eq!(
+        messages[4]["result"]["structuredContent"]["run"]["coordination"]["target_id"],
+        "tgt_local_project"
+    );
+    assert_eq!(
+        messages[4]["result"]["structuredContent"]["run"]["coordination"]["assigned_worktree"],
+        "worktrees/project-pipelines-local"
+    );
+    assert_eq!(
+        messages[4]["result"]["structuredContent"]["run"]["coordination"]["owner_plugin"],
+        "project-pipelines"
+    );
+    assert_eq!(
+        messages[7]["result"]["structuredContent"]["runs"][0]["status"],
+        "ready_for_review"
+    );
+    assert_eq!(messages[8]["result"]["structuredContent"]["ok"], false);
+    assert_eq!(
+        messages[8]["result"]["structuredContent"]["error"]["code"],
+        "not_found"
+    );
+    assert!(
+        data_dir
+            .join("plugin-data")
+            .join("project-pipelines")
+            .join("state.json")
+            .exists(),
+        "Project Pipelines state should live under plugin-data/project-pipelines"
+    );
+
+    shutdown_cli_daemon(&data_dir, daemon);
+    let restarted = start_cli_daemon(&data_dir);
+    let output = run_mcp_serve(
+        &data_dir,
+        &[
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-06-18",
+                    "clientInfo": { "name": "botster-hub-test", "version": "0.0.0" },
+                    "capabilities": {}
+                }
+            }),
+            json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {
+                    "name": "project_pipelines.current_context",
+                    "arguments": {}
+                }
+            }),
+        ],
+    );
+    let messages = mcp_messages(output, 3);
+    let tool_names = messages[1]["result"]["tools"]
+        .as_array()
+        .expect("tools array after restart")
+        .iter()
+        .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+        .collect::<Vec<_>>();
+    assert!(
+        tool_names.contains(&"project_pipelines.current_context"),
+        "Project Pipelines tools should be re-registered after daemon restart"
+    );
+    assert_eq!(
+        messages[2]["result"]["structuredContent"]["tickets"][0]["title"],
+        "Local workflow parity"
+    );
+    assert_eq!(
+        messages[2]["result"]["structuredContent"]["runs"][0]["coordination"]["request_id"],
+        "project-pipelines:ticket_local_1:1"
+    );
+
+    disable_project_pipelines_package(&data_dir);
+    let output = run_mcp_serve(
+        &data_dir,
+        &[
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-06-18",
+                    "clientInfo": { "name": "botster-hub-test", "version": "0.0.0" },
+                    "capabilities": {}
+                }
+            }),
+            json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }),
+        ],
+    );
+    let messages = mcp_messages(output, 2);
+    let tool_names = messages[1]["result"]["tools"]
+        .as_array()
+        .expect("tools array after disable")
+        .iter()
+        .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+        .collect::<Vec<_>>();
+    assert!(
+        !tool_names.contains(&"project_pipelines.current_context"),
+        "Project Pipelines tools should be removed after package disable"
+    );
+    shutdown_cli_daemon(&data_dir, restarted);
 }
