@@ -332,14 +332,53 @@ envelope cursors in memory; the current hub surface reports the cursor returned
 by core but does not claim restart-durable inbox state.
 
 Tool listing and calling both route through `McpToolRegistry`. Native hub tools
-are provided by `NativeHubToolProvider` today; future Lua plugin tools should add
-descriptors and owned call messages to that same registry path, with execution
-dispatched through the plugin worker/supervisor boundary instead of creating a
-second MCP server or direct in-process closure path.
+are provided by `NativeHubToolProvider`; Lua plugin tools use
+`PluginHubToolProvider` descriptors and owned daemon call messages on the same
+registry path. Plugin execution is dispatched through the plugin
+worker/supervisor boundary instead of creating a second MCP server or direct
+in-process closure path.
 
-The local coordination path uses no Lua or plugin tool execution: `whoami`,
-`post_message`, `receive_messages`, `ack_message`, and `notify_session` are
-native hub tools even when the binary also has the Lua plugin runtime available.
+The native local coordination path uses no Lua or plugin tool execution:
+`whoami`, `post_message`, `receive_messages`, `ack_message`, and
+`notify_session` are native hub tools even when the binary also has the Lua
+plugin runtime available. Project Pipelines separately composes the same
+routed-envelope primitives from `examples/project-pipelines/plugin.lua` through
+the Lua ABI.
+
+## Project Pipelines Local Readiness
+
+The checked-in `examples/project-pipelines` package is ready for constrained
+daily local coordination dogfood. Enable it through the running daemon and
+serve MCP from the same data directory:
+
+```sh
+cargo run -- packages enable --data-dir target/botster-hub-dogfood-data \
+  --path examples/project-pipelines
+cargo run -- mcp-serve --data-dir target/botster-hub-dogfood-data
+```
+
+`mcp-serve` lists and calls the plugin's Project Pipelines tools through
+`PluginHubToolProvider -> daemon request -> HubRuntime -> HubPluginLifecycle ->
+PluginWorkerEngine -> LuaPluginRuntime`. `project_pipelines.start` requires an
+explicit `target_id` and assigned worktree and records primitive-backed
+coordination evidence on the run: request id, agent name, owner plugin, routed
+envelope id, publish delivery status, drain cursor, and acknowledge delivery
+status. `session_uuid` is intentionally absent in this constrained local flow
+because the plugin records coordination before spawning an agent session.
+
+Project Pipelines state persists through PluginDb under
+`plugin-data/project-pipelines/`, not a host-supplied runtime bundle or plugin
+source directory. After an intentional daemon restart over the same data
+directory, package state reloads, Project Pipelines MCP tools re-register, and
+persisted tickets, runs, gates, and events remain visible through
+`project_pipelines.current_context`.
+
+Secrets are not imported or persisted by this readiness proof. Operators should
+re-enter any provider credentials needed by deferred provider integrations when
+those integrations land. Live monolith Project Pipelines data is not imported in
+this milestone; cutover requires no in-flight monolith tickets or a future
+explicit one-shot export/import before switching active work to the local
+plugin.
 
 Dogfood-ready today: explicit local daemon lifecycle, file-backed hub/package
 state, local package admission from a manifest path, typed status/package reads,
@@ -369,10 +408,17 @@ control-plane acknowledgements. Terminal egress is delivered by explicit
 `DrainRuntime` calls over the session-backed CoreDaemon path, not synchronously
 from those control operations.
 
+Ready for daily local use today: explicit daemon lifecycle, daemon-backed local
+PTY session operations, minimal daemon-backed TUI attach/reconnect, native MCP
+coordination tools, and constrained Project Pipelines MCP workflow tools over
+the Lua plugin runtime.
+
 Feature parity still pending: durable PTY recovery after daemon exit, provider
-process supervision, cloud/Rails/WebRTC/browser/TUI adapters,
-marketplace/package fetching, missing-public-socket self-heal after the socket
-path is externally removed, and long-running attach signal handling.
+process supervision, GitHub/PR automation, install/update packaging,
+cloud/Rails/WebRTC/browser/marketplace surfaces, broad migration compatibility
+from the monolith, missing-public-socket self-heal after the socket path is
+externally removed, long-running attach signal handling, and uncoordinated crash
+PTY recovery.
 
 Schema and consistency posture are documented in
 [`docs/adr/durable-hub-state-v1.md`](docs/adr/durable-hub-state-v1.md).
