@@ -4,6 +4,7 @@ use std::fmt;
 use std::io;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use botster_core::{UiActionResult, UiActionStatus, UiChild, UiNode, UiNodeId, UiNodeKind};
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
 };
@@ -14,9 +15,9 @@ use crossterm::terminal::{
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
-use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
+use ratatui::style::{Modifier, Style};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
+use serde_json::{Map, Value};
 
 use crate::{
     DaemonConnection, DaemonEvent, DaemonRequest, DaemonResponseKind, DaemonSession,
@@ -82,6 +83,7 @@ pub fn run_scripted_probe(config: HubConfig, session_id: &str) -> TuiResult<Scri
         guarded_decision: guarded.decision,
         guarded_states: guarded.states,
         resize_sent,
+        ui_regions: driver.client.rendered_ui_regions(),
     })
 }
 
@@ -173,6 +175,7 @@ pub struct ScriptedTuiProof {
     pub guarded_decision: String,
     pub guarded_states: Vec<String>,
     pub resize_sent: Option<(u16, u16)>,
+    pub ui_regions: Vec<String>,
 }
 
 struct TuiClient {
@@ -536,6 +539,107 @@ impl TuiClient {
             self.selected = (self.selected + 1).min(self.sessions.len() - 1);
         }
     }
+
+    fn ui_tree(&self) -> UiNode {
+        let status = panel_node(
+            "tui-status",
+            Some("botster-hub tui"),
+            vec![text_node("status-text", self.status.clone())],
+        );
+
+        let sessions = if self.sessions.is_empty() {
+            empty_state_node(
+                "sessions-empty",
+                "No sessions",
+                "Spawn a session before attaching.",
+            )
+        } else {
+            list_node(
+                "sessions-list",
+                self.sessions
+                    .iter()
+                    .enumerate()
+                    .map(|(index, session)| {
+                        let selected = index == self.selected;
+                        let attached = self.active_session_id.as_ref() == Some(&session.session_id);
+                        session_row_node(session, selected, attached)
+                    })
+                    .collect(),
+            )
+        };
+        let sessions = panel_node("sessions-panel", Some("Sessions"), vec![sessions]);
+
+        let active_session_id = self
+            .active_session_id
+            .clone()
+            .or_else(|| self.selected_session_id())
+            .unwrap_or_else(|| "no-session".to_string());
+        let terminal = panel_node(
+            "terminal-panel",
+            Some("Attached Output"),
+            vec![terminal_view_node("attached-terminal", active_session_id)],
+        );
+
+        let body = stack_node("body-stack", "horizontal", vec![sessions, terminal]);
+
+        let help = panel_node(
+            "keys-panel",
+            Some("Keys"),
+            vec![inline_node(
+                "keys-row",
+                vec![
+                    badge_node("key-enter", "Enter"),
+                    text_node("key-enter-text", "attach"),
+                    badge_node("key-type", "type"),
+                    text_node("key-type-text", "sends after attach"),
+                    badge_node("key-detach", "Esc/Ctrl-D"),
+                    text_node("key-detach-text", "detach"),
+                    badge_node("key-quit", "Ctrl-Q"),
+                    text_node("key-quit-text", "quit"),
+                    badge_node("key-notify", "Ctrl-N"),
+                    text_node("key-notify-text", "doorbell may defer"),
+                    badge_node("key-shutdown", "Ctrl-S/Ctrl-X"),
+                    text_node("key-shutdown-text", "shutdown"),
+                ],
+            )],
+        );
+
+        let notice_rows = self
+            .notifications
+            .iter()
+            .rev()
+            .take(3)
+            .enumerate()
+            .map(|(index, row)| activity_row_node("notice", index, row, "success"));
+        let error_rows = self
+            .errors
+            .iter()
+            .rev()
+            .take(3)
+            .enumerate()
+            .map(|(index, row)| activity_row_node("error", index, row, "danger"));
+        let activity_rows: Vec<UiNode> = notice_rows.chain(error_rows).collect();
+        let activity = panel_node(
+            "activity-panel",
+            Some("Activity"),
+            vec![if activity_rows.is_empty() {
+                empty_state_node(
+                    "activity-empty",
+                    "No activity",
+                    "Activity appears after TUI events.",
+                )
+            } else {
+                list_node("activity-list", activity_rows)
+            }],
+        );
+
+        stack_node("tui-root", "vertical", vec![status, body, help, activity])
+    }
+
+    fn rendered_ui_regions(&self) -> Vec<String> {
+        let renderer = TuiUiRenderer::new(TuiUiRenderContext::from_client(self));
+        renderer.region_ids(&self.ui_tree())
+    }
 }
 
 fn handle_key(app: &mut TuiClient, key: KeyEvent) -> TuiResult<bool> {
@@ -575,102 +679,955 @@ fn handle_key(app: &mut TuiClient, key: KeyEvent) -> TuiResult<bool> {
 }
 
 fn draw(frame: &mut ratatui::Frame<'_>, app: &TuiClient) {
-    let areas = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(8),
-            Constraint::Length(3),
-            Constraint::Length(7),
-        ])
-        .split(frame.area());
-    let body = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(32), Constraint::Min(20)])
-        .split(areas[1]);
+    let tree = app.ui_tree();
+    let renderer = TuiUiRenderer::new(TuiUiRenderContext::from_client(app));
+    renderer.render(frame, frame.area(), &tree);
+}
 
-    let title = Paragraph::new(Line::from(vec![
-        Span::styled("botster-hub tui", Style::default().fg(Color::Cyan)),
-        Span::raw("  "),
-        Span::raw(app.status.clone()),
-    ]))
-    .block(Block::default().borders(Borders::ALL));
-    frame.render_widget(title, areas[0]);
+#[derive(Debug, Clone, Default)]
+struct TuiUiRenderContext {
+    terminal_output: String,
+    action_results: Vec<UiActionResult>,
+}
 
-    let sessions: Vec<ListItem<'_>> = app
-        .sessions
-        .iter()
-        .enumerate()
-        .map(|(index, session)| {
-            let prefix = if index == app.selected { "> " } else { "  " };
-            let active = if app.active_session_id.as_ref() == Some(&session.session_id) {
-                " attached"
-            } else {
-                ""
-            };
-            ListItem::new(format!(
-                "{prefix}{} [{}]{}",
-                session.session_id, session.lifecycle, active
-            ))
+impl TuiUiRenderContext {
+    fn from_client(app: &TuiClient) -> Self {
+        Self {
+            terminal_output: app
+                .output
+                .iter()
+                .rev()
+                .take(200)
+                .rev()
+                .cloned()
+                .collect::<String>(),
+            action_results: Vec::new(),
+        }
+    }
+
+    fn failure_for(&self, node_id: Option<&UiNodeId>) -> Option<&str> {
+        let node_id = node_id?;
+        self.action_results.iter().rev().find_map(|result| {
+            (result.status == UiActionStatus::Failure && result.node_id.as_ref() == Some(node_id))
+                .then_some(result.error.as_deref())
+                .flatten()
         })
-        .collect();
-    let sessions = List::new(sessions)
-        .block(Block::default().title("Sessions").borders(Borders::ALL))
-        .highlight_style(Style::default().add_modifier(Modifier::BOLD));
-    frame.render_widget(sessions, body[0]);
+    }
+}
 
-    let output = app
-        .output
+struct TuiUiRenderer {
+    context: TuiUiRenderContext,
+}
+
+impl TuiUiRenderer {
+    fn new(context: TuiUiRenderContext) -> Self {
+        Self { context }
+    }
+
+    fn render(&self, frame: &mut ratatui::Frame<'_>, area: ratatui::layout::Rect, node: &UiNode) {
+        match node.kind {
+            UiNodeKind::Stack => self.render_stack(frame, area, node),
+            UiNodeKind::Inline => self.render_inline(frame, area, node),
+            UiNodeKind::Panel => self.render_panel(frame, area, node),
+            UiNodeKind::List => self.render_list(frame, area, node, None),
+            UiNodeKind::TerminalView => self.render_terminal(frame, area, node, None),
+            UiNodeKind::Form => self.render_form(frame, area, node, None),
+            UiNodeKind::Dialog => self.render_dialog(frame, area, node),
+            UiNodeKind::EmptyState => self.render_empty_state(frame, area, node, None),
+            _ => self.render_leaf(frame, area, node, None),
+        }
+    }
+
+    fn render_stack(
+        &self,
+        frame: &mut ratatui::Frame<'_>,
+        area: ratatui::layout::Rect,
+        node: &UiNode,
+    ) {
+        let children = node_children(node);
+        if children.is_empty() {
+            self.render_fallback(frame, area, node, None);
+            return;
+        }
+
+        if node.id.as_ref().is_some_and(|id| id.0 == "tui-root") && children.len() == 4 {
+            let areas = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(3),
+                    Constraint::Min(8),
+                    Constraint::Length(3),
+                    Constraint::Length(7),
+                ])
+                .split(area);
+            for (child, area) in children.iter().zip(areas.iter()) {
+                self.render(frame, *area, child);
+            }
+            return;
+        }
+
+        if node.id.as_ref().is_some_and(|id| id.0 == "body-stack") && children.len() == 2 {
+            let areas = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Length(32), Constraint::Min(20)])
+                .split(area);
+            for (child, area) in children.iter().zip(areas.iter()) {
+                self.render(frame, *area, child);
+            }
+            return;
+        }
+
+        let direction = match string_prop(node, "direction") {
+            Some("horizontal") => Direction::Horizontal,
+            _ => Direction::Vertical,
+        };
+        let constraints = vec![Constraint::Ratio(1, children.len() as u32); children.len()];
+        let areas = Layout::default()
+            .direction(direction)
+            .constraints(constraints)
+            .split(area);
+        for (child, area) in children.iter().zip(areas.iter()) {
+            self.render(frame, *area, child);
+        }
+    }
+
+    fn render_inline(
+        &self,
+        frame: &mut ratatui::Frame<'_>,
+        area: ratatui::layout::Rect,
+        node: &UiNode,
+    ) {
+        let line = self.node_lines(node).join("  ");
+        frame.render_widget(Paragraph::new(line).wrap(Wrap { trim: false }), area);
+    }
+
+    fn render_panel(
+        &self,
+        frame: &mut ratatui::Frame<'_>,
+        area: ratatui::layout::Rect,
+        node: &UiNode,
+    ) {
+        let block = Block::default()
+            .title(string_prop(node, "title").unwrap_or("Panel"))
+            .borders(Borders::ALL);
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        let children = node_children(node);
+        if children.len() == 1 {
+            self.render(frame, inner, children[0]);
+        } else {
+            frame.render_widget(
+                Paragraph::new(self.node_lines(node).join("\n")).wrap(Wrap { trim: false }),
+                inner,
+            );
+        }
+    }
+
+    fn render_list(
+        &self,
+        frame: &mut ratatui::Frame<'_>,
+        area: ratatui::layout::Rect,
+        node: &UiNode,
+        title: Option<&str>,
+    ) {
+        let items: Vec<ListItem<'_>> = node_children(node)
+            .into_iter()
+            .map(|child| ListItem::new(self.node_lines(child).join(" ")))
+            .collect();
+        let list = List::new(items)
+            .block(
+                Block::default()
+                    .title(title.unwrap_or("List"))
+                    .borders(Borders::NONE),
+            )
+            .highlight_style(Style::default().add_modifier(Modifier::BOLD));
+        frame.render_widget(list, area);
+    }
+
+    fn render_terminal(
+        &self,
+        frame: &mut ratatui::Frame<'_>,
+        area: ratatui::layout::Rect,
+        node: &UiNode,
+        title: Option<&str>,
+    ) {
+        let title = title
+            .or_else(|| string_prop(node, "title"))
+            .unwrap_or("Terminal");
+        let output = if self.context.terminal_output.is_empty() {
+            format!(
+                "terminal session {}",
+                string_prop(node, "session_id").unwrap_or("unknown")
+            )
+        } else {
+            self.context.terminal_output.clone()
+        };
+        frame.render_widget(
+            Paragraph::new(output)
+                .block(Block::default().title(title).borders(Borders::NONE))
+                .wrap(Wrap { trim: false }),
+            area,
+        );
+    }
+
+    fn render_form(
+        &self,
+        frame: &mut ratatui::Frame<'_>,
+        area: ratatui::layout::Rect,
+        node: &UiNode,
+        title: Option<&str>,
+    ) {
+        let mut rows = self.node_lines(node);
+        if let Some(error) = self.context.failure_for(node.id.as_ref()) {
+            rows.push(format!("error {error}"));
+        }
+        frame.render_widget(
+            Paragraph::new(rows.join("\n"))
+                .block(
+                    Block::default()
+                        .title(title.unwrap_or("Form"))
+                        .borders(Borders::NONE),
+                )
+                .wrap(Wrap { trim: false }),
+            area,
+        );
+    }
+
+    fn render_dialog(
+        &self,
+        frame: &mut ratatui::Frame<'_>,
+        area: ratatui::layout::Rect,
+        node: &UiNode,
+    ) {
+        frame.render_widget(
+            Paragraph::new(self.node_lines(node).join("\n"))
+                .block(
+                    Block::default()
+                        .title(string_prop(node, "title").unwrap_or("Dialog"))
+                        .borders(Borders::ALL),
+                )
+                .wrap(Wrap { trim: false }),
+            area,
+        );
+    }
+
+    fn render_empty_state(
+        &self,
+        frame: &mut ratatui::Frame<'_>,
+        area: ratatui::layout::Rect,
+        node: &UiNode,
+        title: Option<&str>,
+    ) {
+        frame.render_widget(
+            Paragraph::new(self.node_lines(node).join("\n"))
+                .block(
+                    Block::default()
+                        .title(title.unwrap_or("Empty"))
+                        .borders(Borders::NONE),
+                )
+                .wrap(Wrap { trim: false }),
+            area,
+        );
+    }
+
+    fn render_leaf(
+        &self,
+        frame: &mut ratatui::Frame<'_>,
+        area: ratatui::layout::Rect,
+        node: &UiNode,
+        title: Option<&str>,
+    ) {
+        frame.render_widget(
+            Paragraph::new(self.node_lines(node).join("\n"))
+                .block(
+                    Block::default()
+                        .title(title.unwrap_or(""))
+                        .borders(Borders::NONE),
+                )
+                .wrap(Wrap { trim: false }),
+            area,
+        );
+    }
+
+    fn render_fallback(
+        &self,
+        frame: &mut ratatui::Frame<'_>,
+        area: ratatui::layout::Rect,
+        node: &UiNode,
+        title: Option<&str>,
+    ) {
+        frame.render_widget(
+            Paragraph::new(format!("unsupported {:?}", node.kind)).block(
+                Block::default()
+                    .title(title.unwrap_or("Unsupported"))
+                    .borders(Borders::NONE),
+            ),
+            area,
+        );
+    }
+
+    fn node_lines(&self, node: &UiNode) -> Vec<String> {
+        let mut lines = match node.kind {
+            UiNodeKind::Text => vec![string_prop(node, "text").unwrap_or_default().to_string()],
+            UiNodeKind::Icon => vec![
+                string_prop(node, "label")
+                    .or_else(|| string_prop(node, "icon"))
+                    .unwrap_or_default()
+                    .to_string(),
+            ],
+            UiNodeKind::Badge => vec![format!(
+                "[{}]",
+                string_prop(node, "label").unwrap_or_default()
+            )],
+            UiNodeKind::StatusDot => {
+                vec![format!(
+                    "* {}",
+                    string_prop(node, "label").unwrap_or_default()
+                )]
+            }
+            UiNodeKind::Button | UiNodeKind::IconButton | UiNodeKind::MenuItem => {
+                vec![format!(
+                    "<{}>",
+                    string_prop(node, "label").unwrap_or("action")
+                )]
+            }
+            UiNodeKind::TextInput | UiNodeKind::Textarea => vec![format!(
+                "{}: {}",
+                string_prop(node, "label").unwrap_or("field"),
+                string_prop(node, "value")
+                    .or_else(|| string_prop(node, "placeholder"))
+                    .unwrap_or("")
+            )],
+            UiNodeKind::Checkbox => vec![format!(
+                "[{}] {}",
+                if bool_prop(node, "checked") { "x" } else { " " },
+                string_prop(node, "label").unwrap_or("field")
+            )],
+            UiNodeKind::Select => {
+                let value = string_prop(node, "value").unwrap_or("");
+                let mut select_lines = vec![format!(
+                    "{}: {value}",
+                    string_prop(node, "label").unwrap_or("select")
+                )];
+                if let Some(options) = node.slots.get("options") {
+                    select_lines.extend(options.iter().flat_map(|child| match child {
+                        UiChild::Node(node) => self.node_lines(node),
+                        _ => vec!["unsupported binding".to_string()],
+                    }));
+                }
+                select_lines
+            }
+            UiNodeKind::SelectOption => vec![format!(
+                "{} ({})",
+                string_prop(node, "label").unwrap_or("option"),
+                string_prop(node, "value").unwrap_or("")
+            )],
+            UiNodeKind::EmptyState => vec![
+                string_prop(node, "title").unwrap_or("Empty").to_string(),
+                string_prop(node, "description")
+                    .unwrap_or_default()
+                    .to_string(),
+            ],
+            UiNodeKind::TerminalView => vec![format!(
+                "terminal session {}",
+                string_prop(node, "session_id").unwrap_or("unknown")
+            )],
+            UiNodeKind::ListItem | UiNodeKind::TreeItem | UiNodeKind::Dialog => {
+                self.slot_lines(node)
+            }
+            UiNodeKind::Table | UiNodeKind::Menu | UiNodeKind::Tree | UiNodeKind::ScrollArea => {
+                vec![format!("unsupported {:?}", node.kind)]
+            }
+            _ => node_children(node)
+                .into_iter()
+                .flat_map(|child| self.node_lines(child))
+                .collect(),
+        };
+
+        if let Some(error) = self.context.failure_for(node.id.as_ref()) {
+            lines.push(format!("error {error}"));
+        }
+        lines.retain(|line| !line.is_empty());
+        lines
+    }
+
+    fn slot_lines(&self, node: &UiNode) -> Vec<String> {
+        ["title", "subtitle", "meta", "actions", "body"]
+            .into_iter()
+            .filter_map(|slot| node.slots.get(slot))
+            .flat_map(|children| {
+                children.iter().flat_map(|child| match child {
+                    UiChild::Node(node) => self.node_lines(node),
+                    _ => vec!["unsupported binding".to_string()],
+                })
+            })
+            .collect()
+    }
+
+    fn region_ids(&self, node: &UiNode) -> Vec<String> {
+        let mut ids = Vec::new();
+        self.collect_region_ids(node, &mut ids);
+        ids
+    }
+
+    fn collect_region_ids(&self, node: &UiNode, ids: &mut Vec<String>) {
+        if matches!(
+            node.kind,
+            UiNodeKind::Panel | UiNodeKind::List | UiNodeKind::TerminalView | UiNodeKind::Form
+        ) && let Some(id) = node.id.as_ref()
+        {
+            ids.push(id.0.clone());
+        }
+
+        for child in node_children(node) {
+            self.collect_region_ids(child, ids);
+        }
+        for children in node.slots.values() {
+            for child in children {
+                if let UiChild::Node(node) = child {
+                    self.collect_region_ids(node, ids);
+                }
+            }
+        }
+    }
+}
+
+fn node_children(node: &UiNode) -> Vec<&UiNode> {
+    node.children
         .iter()
-        .rev()
-        .take(200)
-        .rev()
-        .cloned()
-        .collect::<String>();
-    let terminal = Paragraph::new(output)
-        .block(
-            Block::default()
-                .title("Attached Output")
-                .borders(Borders::ALL),
-        )
-        .wrap(Wrap { trim: false });
-    frame.render_widget(terminal, body[1]);
+        .filter_map(|child| match child {
+            UiChild::Node(node) => Some(node.as_ref()),
+            _ => None,
+        })
+        .collect()
+}
 
-    let help = Paragraph::new(Line::from(vec![
-        Span::styled("Enter", Style::default().fg(Color::Cyan)),
-        Span::raw(" attach  "),
-        Span::styled("type", Style::default().fg(Color::Cyan)),
-        Span::raw(" sends after attach  "),
-        Span::styled("Esc/Ctrl-D", Style::default().fg(Color::Cyan)),
-        Span::raw(" detach  "),
-        Span::styled("Ctrl-Q", Style::default().fg(Color::Cyan)),
-        Span::raw(" quit  "),
-        Span::styled("Ctrl-N", Style::default().fg(Color::Cyan)),
-        Span::raw(" doorbell may defer  "),
-        Span::styled("Ctrl-S/Ctrl-X", Style::default().fg(Color::Red)),
-        Span::raw(" shutdown"),
-    ]))
-    .block(Block::default().title("Keys").borders(Borders::ALL))
-    .wrap(Wrap { trim: false });
-    frame.render_widget(help, areas[2]);
+fn string_prop<'a>(node: &'a UiNode, prop: &str) -> Option<&'a str> {
+    node.props.get(prop).and_then(Value::as_str)
+}
 
-    let mut rows = Vec::new();
-    rows.extend(app.notifications.iter().rev().take(3).map(|row| {
-        Line::from(vec![
-            Span::styled("notice ", Style::default().fg(Color::Green)),
-            Span::raw(row.clone()),
-        ])
-    }));
-    rows.extend(app.errors.iter().rev().take(3).map(|row| {
-        Line::from(vec![
-            Span::styled("error ", Style::default().fg(Color::Red)),
-            Span::raw(row.clone()),
-        ])
-    }));
-    let status = Paragraph::new(rows)
-        .block(Block::default().title("Activity").borders(Borders::ALL))
-        .wrap(Wrap { trim: false });
-    frame.render_widget(status, areas[3]);
+fn bool_prop(node: &UiNode, prop: &str) -> bool {
+    node.props
+        .get(prop)
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn stack_node(id: &str, direction: &str, children: Vec<UiNode>) -> UiNode {
+    node_with_props(
+        id,
+        UiNodeKind::Stack,
+        vec![("direction", Value::String(direction.to_string()))],
+        children,
+    )
+}
+
+fn inline_node(id: &str, children: Vec<UiNode>) -> UiNode {
+    node_with_props(id, UiNodeKind::Inline, Vec::new(), children)
+}
+
+fn panel_node(id: &str, title: Option<&str>, children: Vec<UiNode>) -> UiNode {
+    node_with_props(
+        id,
+        UiNodeKind::Panel,
+        title
+            .map(|title| vec![("title", Value::String(title.to_string()))])
+            .unwrap_or_default(),
+        children,
+    )
+}
+
+fn list_node(id: &str, children: Vec<UiNode>) -> UiNode {
+    node_with_props(id, UiNodeKind::List, Vec::new(), children)
+}
+
+fn text_node(id: &str, text: impl Into<String>) -> UiNode {
+    node_with_props(
+        id,
+        UiNodeKind::Text,
+        vec![("text", Value::String(text.into()))],
+        Vec::new(),
+    )
+}
+
+fn badge_node(id: &str, label: &str) -> UiNode {
+    node_with_props(
+        id,
+        UiNodeKind::Badge,
+        vec![("label", Value::String(label.to_string()))],
+        Vec::new(),
+    )
+}
+
+fn empty_state_node(id: &str, title: &str, description: &str) -> UiNode {
+    node_with_props(
+        id,
+        UiNodeKind::EmptyState,
+        vec![
+            ("title", Value::String(title.to_string())),
+            ("description", Value::String(description.to_string())),
+        ],
+        Vec::new(),
+    )
+}
+
+fn terminal_view_node(id: &str, session_id: String) -> UiNode {
+    node_with_props(
+        id,
+        UiNodeKind::TerminalView,
+        vec![
+            ("session_id", Value::String(session_id)),
+            ("title", Value::String("Attached Output".to_string())),
+        ],
+        Vec::new(),
+    )
+}
+
+fn session_row_node(session: &DaemonSession, selected: bool, attached: bool) -> UiNode {
+    let mut node = node_with_props(
+        &format!("session-row-{}", session.session_id),
+        UiNodeKind::ListItem,
+        vec![
+            ("value", Value::String(session.session_id.clone())),
+            ("selected", Value::Bool(selected)),
+        ],
+        Vec::new(),
+    );
+    node.slots.insert(
+        "title".to_string(),
+        vec![ui_child(text_node(
+            &format!("session-title-{}", session.session_id),
+            format!(
+                "{}{}",
+                if selected { "> " } else { "  " },
+                session.session_id
+            ),
+        ))],
+    );
+    node.slots.insert(
+        "subtitle".to_string(),
+        vec![ui_child(status_dot_node(
+            &format!("session-state-{}", session.session_id),
+            &session.lifecycle,
+            "success",
+        ))],
+    );
+    if attached {
+        node.slots.insert(
+            "meta".to_string(),
+            vec![ui_child(badge_node(
+                &format!("session-attached-{}", session.session_id),
+                "attached",
+            ))],
+        );
+    }
+    node
+}
+
+fn activity_row_node(kind: &str, index: usize, message: &str, tone: &str) -> UiNode {
+    let mut node = node_with_props(
+        &format!("activity-{kind}-{index}"),
+        UiNodeKind::ListItem,
+        vec![("value", Value::String(message.to_string()))],
+        Vec::new(),
+    );
+    node.slots.insert(
+        "title".to_string(),
+        vec![ui_child(status_dot_node(
+            &format!("activity-{kind}-{index}-status"),
+            kind,
+            tone,
+        ))],
+    );
+    node.slots.insert(
+        "subtitle".to_string(),
+        vec![ui_child(text_node(
+            &format!("activity-{kind}-{index}-message"),
+            message,
+        ))],
+    );
+    node
+}
+
+fn status_dot_node(id: &str, label: &str, tone: &str) -> UiNode {
+    node_with_props(
+        id,
+        UiNodeKind::StatusDot,
+        vec![
+            ("label", Value::String(label.to_string())),
+            ("tone", Value::String(tone.to_string())),
+        ],
+        Vec::new(),
+    )
+}
+
+fn node_with_props(
+    id: &str,
+    kind: UiNodeKind,
+    props: Vec<(&str, Value)>,
+    children: Vec<UiNode>,
+) -> UiNode {
+    UiNode {
+        kind,
+        id: Some(UiNodeId(id.to_string())),
+        props: props
+            .into_iter()
+            .map(|(key, value)| (key.to_string(), value))
+            .collect::<Map<String, Value>>(),
+        children: children.into_iter().map(ui_child).collect(),
+        slots: Default::default(),
+    }
+}
+
+fn ui_child(node: UiNode) -> UiChild {
+    UiChild::Node(Box::new(node))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    use botster_core::{RequestId, UiActionId};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    #[test]
+    fn tui_ui_renderer_renders_representative_core_primitives() {
+        let mut dialog = node_with_props(
+            "confirm-dialog",
+            UiNodeKind::Dialog,
+            vec![("title", Value::String("Confirm".to_string()))],
+            Vec::new(),
+        );
+        dialog.slots.insert(
+            "body".to_string(),
+            vec![ui_child(text_node("confirm-copy", "Dialog body"))],
+        );
+
+        let mut select = node_with_props(
+            "priority",
+            UiNodeKind::Select,
+            vec![
+                ("name", Value::String("priority".to_string())),
+                ("label", Value::String("Priority".to_string())),
+                ("value", Value::String("high".to_string())),
+            ],
+            Vec::new(),
+        );
+        select.slots.insert(
+            "options".to_string(),
+            vec![ui_child(node_with_props(
+                "priority-high",
+                UiNodeKind::SelectOption,
+                vec![
+                    ("value", Value::String("high".to_string())),
+                    ("label", Value::String("High".to_string())),
+                ],
+                Vec::new(),
+            ))],
+        );
+
+        let fixture = stack_node(
+            "fixture",
+            "vertical",
+            vec![
+                text_node("copy", "Hello UiNode"),
+                badge_node("badge", "ready"),
+                status_dot_node("state", "running", "success"),
+                list_node("items", vec![list_item_with_title("item-1", "First row")]),
+                node_with_props(
+                    "name",
+                    UiNodeKind::TextInput,
+                    vec![
+                        ("name", Value::String("name".to_string())),
+                        ("label", Value::String("Name".to_string())),
+                        ("value", Value::String("Botster".to_string())),
+                    ],
+                    Vec::new(),
+                ),
+                select,
+                node_with_props(
+                    "enabled",
+                    UiNodeKind::Checkbox,
+                    vec![
+                        ("name", Value::String("enabled".to_string())),
+                        ("label", Value::String("Enabled".to_string())),
+                        ("checked", Value::Bool(true)),
+                    ],
+                    Vec::new(),
+                ),
+                dialog,
+                empty_state_node("empty", "Nothing here", "Try another view."),
+                terminal_view_node("terminal", "session-1".to_string()),
+            ],
+        );
+
+        fixture
+            .validate()
+            .expect("fixture should satisfy core schema");
+        let rendered = render_text(&fixture, TuiUiRenderContext::default());
+        let frame = render_frame_text(&fixture, TuiUiRenderContext::default(), 80, 40);
+        let select_frame = render_frame_text(
+            node_children(&fixture)[5],
+            TuiUiRenderContext::default(),
+            40,
+            6,
+        );
+        assert!(rendered.contains("Hello UiNode"));
+        assert!(rendered.contains("[ready]"));
+        assert!(rendered.contains("* running"));
+        assert!(rendered.contains("First row"));
+        assert!(rendered.contains("Name: Botster"));
+        assert!(rendered.contains("Priority: high"));
+        assert!(rendered.contains("High (high)"));
+        assert!(rendered.contains("[x] Enabled"));
+        assert!(rendered.contains("Dialog body"));
+        assert!(rendered.contains("Nothing here"));
+        assert!(rendered.contains("terminal session session-1"));
+        assert!(frame.contains("Hello UiNode"));
+        assert!(frame.contains("First row"));
+        assert!(select_frame.contains("Priority: high"));
+        assert!(select_frame.contains("High"));
+        assert!(frame.contains("terminal session session-1"));
+    }
+
+    #[test]
+    fn tui_ui_renderer_renders_form_fields_and_action_failure_errors() {
+        let form = node_with_props(
+            "settings-form",
+            UiNodeKind::Form,
+            Vec::new(),
+            vec![
+                node_with_props(
+                    "project-name",
+                    UiNodeKind::TextInput,
+                    vec![
+                        ("name", Value::String("name".to_string())),
+                        ("label", Value::String("Name".to_string())),
+                        ("value", Value::String("".to_string())),
+                    ],
+                    Vec::new(),
+                ),
+                node_with_props(
+                    "notes",
+                    UiNodeKind::Textarea,
+                    vec![
+                        ("name", Value::String("notes".to_string())),
+                        ("label", Value::String("Notes".to_string())),
+                    ],
+                    Vec::new(),
+                ),
+                node_with_props(
+                    "notify",
+                    UiNodeKind::Checkbox,
+                    vec![
+                        ("name", Value::String("notify".to_string())),
+                        ("label", Value::String("Notify".to_string())),
+                        ("checked", Value::Bool(false)),
+                    ],
+                    Vec::new(),
+                ),
+            ],
+        );
+        let failure = UiActionResult {
+            request_id: RequestId("request-1".to_string()),
+            action_id: UiActionId("save-settings".to_string()),
+            node_id: Some(UiNodeId("project-name".to_string())),
+            status: UiActionStatus::Failure,
+            payload: None,
+            error: Some("Name is required".to_string()),
+        };
+
+        form.validate()
+            .expect("form fixture should satisfy core schema");
+        let rendered = render_text(
+            &form,
+            TuiUiRenderContext {
+                terminal_output: String::new(),
+                action_results: vec![failure],
+            },
+        );
+        let frame = render_frame_text(
+            &form,
+            TuiUiRenderContext {
+                terminal_output: String::new(),
+                action_results: vec![UiActionResult {
+                    request_id: RequestId("request-1".to_string()),
+                    action_id: UiActionId("save-settings".to_string()),
+                    node_id: Some(UiNodeId("project-name".to_string())),
+                    status: UiActionStatus::Failure,
+                    payload: None,
+                    error: Some("Name is required".to_string()),
+                }],
+            },
+            60,
+            12,
+        );
+        assert!(rendered.contains("Name:"));
+        assert!(rendered.contains("Notes:"));
+        assert!(rendered.contains("[ ] Notify"));
+        assert!(rendered.contains("error Name is required"));
+        assert!(frame.contains("Name:"));
+        assert!(frame.contains("error Name is required"));
+    }
+
+    #[test]
+    fn tui_ui_renderer_renders_action_rows() {
+        let mut row = list_item_with_title("session-row", "session-1");
+        row.slots.insert(
+            "actions".to_string(),
+            vec![ui_child(node_with_props(
+                "attach-button",
+                UiNodeKind::Button,
+                vec![
+                    ("label", Value::String("Attach".to_string())),
+                    ("action", Value::String("session.attach".to_string())),
+                ],
+                Vec::new(),
+            ))],
+        );
+        row.validate()
+            .expect("action row should satisfy core schema");
+        let rendered = render_text(&row, TuiUiRenderContext::default());
+        let frame = render_frame_text(&row, TuiUiRenderContext::default(), 40, 6);
+        assert!(rendered.contains("session-1"));
+        assert!(rendered.contains("<Attach>"));
+        assert!(frame.contains("session-1"));
+        assert!(frame.contains("<Attach>"));
+    }
+
+    #[test]
+    fn tui_ui_renderer_falls_back_for_unsupported_primitives() {
+        let table = node_with_props(
+            "table",
+            UiNodeKind::Table,
+            vec![("columns", Value::Array(Vec::new()))],
+            Vec::new(),
+        );
+        let rendered = render_text(&table, TuiUiRenderContext::default());
+        let frame = render_frame_text(&table, TuiUiRenderContext::default(), 40, 6);
+        assert!(rendered.contains("unsupported Table"));
+        assert!(frame.contains("unsupported Table"));
+    }
+
+    #[test]
+    fn tui_ui_renderer_renders_hub_authored_tui_tree_through_real_frame() {
+        let mut client = TuiClient::new(test_config());
+        client.sessions = vec![
+            DaemonSession {
+                session_id: "session-a".to_string(),
+                lifecycle: "running".to_string(),
+            },
+            DaemonSession {
+                session_id: "session-b".to_string(),
+                lifecycle: "exited".to_string(),
+            },
+        ];
+        client.selected = 1;
+        client.active_session_id = Some("session-a".to_string());
+        client.output.push("hello from terminal\n".to_string());
+        client.notifications.push("notice one".to_string());
+        client.notifications.push("notice two".to_string());
+        client.errors.push("error one".to_string());
+
+        let frame = render_frame_text(
+            &client.ui_tree(),
+            TuiUiRenderContext::from_client(&client),
+            100,
+            30,
+        );
+
+        assert!(frame.contains("botster-hub tui"));
+        assert!(frame.contains("session-a"));
+        assert!(frame.contains("session-b"));
+        assert!(frame.contains("hello from terminal"));
+        assert!(frame.contains("notice"));
+        assert!(frame.contains("error"));
+
+        let ids = all_node_ids(&client.ui_tree());
+        let mut sorted = ids.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(ids.len(), sorted.len(), "UiNode ids should be unique");
+    }
+
+    fn render_text(node: &UiNode, context: TuiUiRenderContext) -> String {
+        TuiUiRenderer::new(context).node_lines(node).join("\n")
+    }
+
+    fn test_config() -> HubConfig {
+        crate::HubStartupOptions::default()
+            .build_config_for_environment(&crate::RuntimeEnvironment::from_values(
+                Some(PathBuf::from("target/tui-renderer-test")),
+                None,
+                None,
+            ))
+            .expect("test config should build")
+    }
+
+    fn render_frame_text(
+        node: &UiNode,
+        context: TuiUiRenderContext,
+        width: u16,
+        height: u16,
+    ) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("test backend terminal should initialize");
+        let renderer = TuiUiRenderer::new(context);
+        terminal
+            .draw(|frame| renderer.render(frame, frame.area(), node))
+            .expect("renderer should draw into test backend");
+        buffer_text(terminal.backend().buffer())
+    }
+
+    fn buffer_text(buffer: &ratatui::buffer::Buffer) -> String {
+        let width = buffer.area.width as usize;
+        buffer
+            .content()
+            .chunks(width)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn all_node_ids(node: &UiNode) -> Vec<String> {
+        let mut ids = Vec::new();
+        collect_node_ids(node, &mut ids);
+        ids
+    }
+
+    fn collect_node_ids(node: &UiNode, ids: &mut Vec<String>) {
+        if let Some(id) = node.id.as_ref() {
+            ids.push(id.0.clone());
+        }
+        for child in &node.children {
+            if let UiChild::Node(node) = child {
+                collect_node_ids(node, ids);
+            }
+        }
+        for children in node.slots.values() {
+            for child in children {
+                if let UiChild::Node(node) = child {
+                    collect_node_ids(node, ids);
+                }
+            }
+        }
+    }
+
+    fn list_item_with_title(id: &str, title: &str) -> UiNode {
+        let mut node = node_with_props(
+            id,
+            UiNodeKind::ListItem,
+            vec![("value", Value::String(id.to_string()))],
+            Vec::new(),
+        );
+        node.slots.insert(
+            "title".to_string(),
+            vec![ui_child(text_node(&format!("{id}-title"), title))],
+        );
+        node
+    }
 }
 
 fn process_unique_seed() -> String {
