@@ -260,12 +260,22 @@ from another terminal.
 # Terminal 1: leave the daemon running.
 cargo run -- start --data-dir target/botster-hub-tui-dogfood-data
 
-# Terminal 2: create a session the TUI can attach to.
+# Terminal 2: create a deterministic echo-loop session for typed-input testing.
 cargo run -- sessions spawn --data-dir target/botster-hub-tui-dogfood-data \
   --session-id dogfood-session -- "printf 'dogfood-ok\n'; while IFS= read -r line; do printf 'dogfood:%s\n' \"$line\"; done"
 
 # Terminal 3: operate the session from the TUI.
 cargo run -- tui --data-dir target/botster-hub-tui-dogfood-data
+```
+
+The echo-loop fixture is intentionally not a shell: typing `hello` should produce
+`dogfood:hello`, while commands such as `ls` are just echoed back. For shell
+commands, spawn a separate long-lived shell session and attach to that session
+from the TUI:
+
+```sh
+cargo run -- sessions spawn --data-dir target/botster-hub-tui-dogfood-data \
+  --session-id dogfood-shell -- "/bin/sh -i"
 ```
 
 The TUI lists daemon sessions, attaches with a persistent socket subscription,
@@ -276,6 +286,11 @@ reconnects to the daemon, refreshes the session list, drops the stale
 subscription id, and reattaches when the worker-backed session is recovered.
 When recovery is absent, it leaves the operator in the session/status view with
 a visible session-lost error.
+
+Visible key hints are shown in the TUI: `Enter` attaches, typed input sends only
+after attach, `Esc`/`Ctrl-D` detaches, `Ctrl-Q` quits, `Ctrl-N` sends a doorbell
+that may defer, `Ctrl-S` shuts down the selected session, and `Ctrl-X` requests
+daemon shutdown.
 
 Doorbell notifications use the daemon `NotifySession` request, the same native
 coordination path exposed through MCP as `notify_session`. The current daemon

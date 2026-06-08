@@ -133,12 +133,28 @@ impl ScriptedTuiDriver {
         self.client.drain_until(needle, timeout)
     }
 
+    pub fn drain_once(&mut self) -> TuiResult<()> {
+        self.client.drain_or_reconnect()
+    }
+
     pub fn output(&self) -> String {
         self.client.output.join("")
     }
 
+    pub fn active_session_id(&self) -> Option<String> {
+        self.client.active_session_id.clone()
+    }
+
     pub fn subscription_id(&self) -> Option<String> {
         self.client.subscription_id.clone()
+    }
+
+    pub fn session_ids(&self) -> Vec<String> {
+        self.client
+            .sessions
+            .iter()
+            .map(|session| session.session_id.clone())
+            .collect()
     }
 
     pub fn errors(&self) -> Vec<String> {
@@ -378,9 +394,14 @@ impl TuiClient {
         let Some(session_id) = self.active_session_id.clone() else {
             return Ok(());
         };
-        match self.request(DaemonRequest::Drain { session_id }) {
+        match self.request_without_operator_error_row(DaemonRequest::Drain { session_id }) {
             Ok(response) => {
-                self.apply_events(response.events);
+                if Self::is_drain_unknown_session(&response) {
+                    self.clear_stale_attached_session();
+                } else {
+                    self.record_operator_error(&response);
+                    self.apply_events(response.events);
+                }
                 Ok(())
             }
             Err(error) => {
@@ -403,17 +424,60 @@ impl TuiClient {
     }
 
     fn request(&mut self, request: DaemonRequest) -> DaemonTransportResult<crate::DaemonResponse> {
+        self.request_with_operator_error_row(request, true)
+    }
+
+    fn request_without_operator_error_row(
+        &mut self,
+        request: DaemonRequest,
+    ) -> DaemonTransportResult<crate::DaemonResponse> {
+        self.request_with_operator_error_row(request, false)
+    }
+
+    fn request_with_operator_error_row(
+        &mut self,
+        request: DaemonRequest,
+        record_operator_error: bool,
+    ) -> DaemonTransportResult<crate::DaemonResponse> {
         let Some(connection) = self.connection.as_mut() else {
             return Err(DaemonTransportError::NotRunning);
         };
         let response = connection.request(&request)?;
+        if record_operator_error {
+            self.record_operator_error(&response);
+        }
+        Ok(response)
+    }
+
+    fn record_operator_error(&mut self, response: &crate::DaemonResponse) {
         if response.kind == DaemonResponseKind::OperatorError
             && let Some(error) = response.error.as_ref()
         {
             self.errors
                 .push(format!("{}: {}", error.code, error.message));
         }
-        Ok(response)
+    }
+
+    fn is_drain_unknown_session(response: &crate::DaemonResponse) -> bool {
+        response.kind == DaemonResponseKind::OperatorError
+            && response.error.as_ref().is_some_and(|error| {
+                error.code == "unknown_session" && error.operation == "drain_runtime"
+            })
+    }
+
+    fn clear_stale_attached_session(&mut self) {
+        self.active_session_id = None;
+        self.subscription_id = None;
+        self.errors
+            .push("attached session disappeared; detached and refreshed sessions".to_string());
+        if let Err(error) = self.refresh() {
+            match error {
+                TuiError::Daemon(error) => self.record_transport_error(error),
+                error => self
+                    .errors
+                    .push(format!("refresh failed after session loss: {error}")),
+            }
+        }
     }
 
     fn apply_events(&mut self, events: Vec<DaemonEvent>) {
@@ -516,6 +580,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &TuiClient) {
         .constraints([
             Constraint::Length(3),
             Constraint::Min(8),
+            Constraint::Length(3),
             Constraint::Length(7),
         ])
         .split(frame.area());
@@ -571,6 +636,24 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &TuiClient) {
         .wrap(Wrap { trim: false });
     frame.render_widget(terminal, body[1]);
 
+    let help = Paragraph::new(Line::from(vec![
+        Span::styled("Enter", Style::default().fg(Color::Cyan)),
+        Span::raw(" attach  "),
+        Span::styled("type", Style::default().fg(Color::Cyan)),
+        Span::raw(" sends after attach  "),
+        Span::styled("Esc/Ctrl-D", Style::default().fg(Color::Cyan)),
+        Span::raw(" detach  "),
+        Span::styled("Ctrl-Q", Style::default().fg(Color::Cyan)),
+        Span::raw(" quit  "),
+        Span::styled("Ctrl-N", Style::default().fg(Color::Cyan)),
+        Span::raw(" doorbell may defer  "),
+        Span::styled("Ctrl-S/Ctrl-X", Style::default().fg(Color::Red)),
+        Span::raw(" shutdown"),
+    ]))
+    .block(Block::default().title("Keys").borders(Borders::ALL))
+    .wrap(Wrap { trim: false });
+    frame.render_widget(help, areas[2]);
+
     let mut rows = Vec::new();
     rows.extend(app.notifications.iter().rev().take(3).map(|row| {
         Line::from(vec![
@@ -587,7 +670,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &TuiClient) {
     let status = Paragraph::new(rows)
         .block(Block::default().title("Activity").borders(Borders::ALL))
         .wrap(Wrap { trim: false });
-    frame.render_widget(status, areas[2]);
+    frame.render_widget(status, areas[3]);
 }
 
 fn process_unique_seed() -> String {
