@@ -1250,6 +1250,9 @@ fn scripted_tui_uses_daemon_socket_for_attach_input_doorbell_resize_and_restart_
             .rendered_sessions
             .contains(&"scripted-tui-session".to_string())
     );
+    assert!(proof.ui_regions.contains(&"sessions-panel".to_string()));
+    assert!(proof.ui_regions.contains(&"activity-panel".to_string()));
+    assert!(proof.ui_regions.contains(&"attached-terminal".to_string()));
     assert!(proof.observed_output.contains("echo:from-tui"));
     assert!(proof.observed_output.contains("winsize:31 101"));
     assert!(!proof.observed_output.contains("echo:doorbell-from-tui"));
