@@ -604,20 +604,21 @@ impl TuiClient {
             )],
         );
 
-        let activity_rows: Vec<UiNode> = self
+        let notice_rows = self
             .notifications
             .iter()
             .rev()
             .take(3)
-            .map(|row| activity_row_node("notice", row, "success"))
-            .chain(
-                self.errors
-                    .iter()
-                    .rev()
-                    .take(3)
-                    .map(|row| activity_row_node("error", row, "danger")),
-            )
-            .collect();
+            .enumerate()
+            .map(|(index, row)| activity_row_node("notice", index, row, "success"));
+        let error_rows = self
+            .errors
+            .iter()
+            .rev()
+            .take(3)
+            .enumerate()
+            .map(|(index, row)| activity_row_node("error", index, row, "danger"));
+        let activity_rows: Vec<UiNode> = notice_rows.chain(error_rows).collect();
         let activity = panel_node(
             "activity-panel",
             Some("Activity"),
@@ -1004,10 +1005,17 @@ impl TuiUiRenderer {
             )],
             UiNodeKind::Select => {
                 let value = string_prop(node, "value").unwrap_or("");
-                vec![format!(
+                let mut select_lines = vec![format!(
                     "{}: {value}",
                     string_prop(node, "label").unwrap_or("select")
-                )]
+                )];
+                if let Some(options) = node.slots.get("options") {
+                    select_lines.extend(options.iter().flat_map(|child| match child {
+                        UiChild::Node(node) => self.node_lines(node),
+                        _ => vec!["unsupported binding".to_string()],
+                    }));
+                }
+                select_lines
             }
             UiNodeKind::SelectOption => vec![format!(
                 "{} ({})",
@@ -1216,9 +1224,9 @@ fn session_row_node(session: &DaemonSession, selected: bool, attached: bool) -> 
     node
 }
 
-fn activity_row_node(kind: &str, message: &str, tone: &str) -> UiNode {
+fn activity_row_node(kind: &str, index: usize, message: &str, tone: &str) -> UiNode {
     let mut node = node_with_props(
-        &format!("activity-{kind}"),
+        &format!("activity-{kind}-{index}"),
         UiNodeKind::ListItem,
         vec![("value", Value::String(message.to_string()))],
         Vec::new(),
@@ -1226,7 +1234,7 @@ fn activity_row_node(kind: &str, message: &str, tone: &str) -> UiNode {
     node.slots.insert(
         "title".to_string(),
         vec![ui_child(status_dot_node(
-            &format!("activity-{kind}-status"),
+            &format!("activity-{kind}-{index}-status"),
             kind,
             tone,
         ))],
@@ -1234,7 +1242,7 @@ fn activity_row_node(kind: &str, message: &str, tone: &str) -> UiNode {
     node.slots.insert(
         "subtitle".to_string(),
         vec![ui_child(text_node(
-            &format!("activity-{kind}-message"),
+            &format!("activity-{kind}-{index}-message"),
             message,
         ))],
     );
@@ -1278,7 +1286,11 @@ fn ui_child(node: UiNode) -> UiChild {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+
     use botster_core::{RequestId, UiActionId};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
 
     #[test]
     fn tui_ui_renderer_renders_representative_core_primitives() {
@@ -1355,16 +1367,29 @@ mod tests {
             .validate()
             .expect("fixture should satisfy core schema");
         let rendered = render_text(&fixture, TuiUiRenderContext::default());
+        let frame = render_frame_text(&fixture, TuiUiRenderContext::default(), 80, 40);
+        let select_frame = render_frame_text(
+            node_children(&fixture)[5],
+            TuiUiRenderContext::default(),
+            40,
+            6,
+        );
         assert!(rendered.contains("Hello UiNode"));
         assert!(rendered.contains("[ready]"));
         assert!(rendered.contains("* running"));
         assert!(rendered.contains("First row"));
         assert!(rendered.contains("Name: Botster"));
         assert!(rendered.contains("Priority: high"));
+        assert!(rendered.contains("High (high)"));
         assert!(rendered.contains("[x] Enabled"));
         assert!(rendered.contains("Dialog body"));
         assert!(rendered.contains("Nothing here"));
         assert!(rendered.contains("terminal session session-1"));
+        assert!(frame.contains("Hello UiNode"));
+        assert!(frame.contains("First row"));
+        assert!(select_frame.contains("Priority: high"));
+        assert!(select_frame.contains("High"));
+        assert!(frame.contains("terminal session session-1"));
     }
 
     #[test]
@@ -1423,10 +1448,28 @@ mod tests {
                 action_results: vec![failure],
             },
         );
+        let frame = render_frame_text(
+            &form,
+            TuiUiRenderContext {
+                terminal_output: String::new(),
+                action_results: vec![UiActionResult {
+                    request_id: RequestId("request-1".to_string()),
+                    action_id: UiActionId("save-settings".to_string()),
+                    node_id: Some(UiNodeId("project-name".to_string())),
+                    status: UiActionStatus::Failure,
+                    payload: None,
+                    error: Some("Name is required".to_string()),
+                }],
+            },
+            60,
+            12,
+        );
         assert!(rendered.contains("Name:"));
         assert!(rendered.contains("Notes:"));
         assert!(rendered.contains("[ ] Notify"));
         assert!(rendered.contains("error Name is required"));
+        assert!(frame.contains("Name:"));
+        assert!(frame.contains("error Name is required"));
     }
 
     #[test]
@@ -1447,8 +1490,11 @@ mod tests {
         row.validate()
             .expect("action row should satisfy core schema");
         let rendered = render_text(&row, TuiUiRenderContext::default());
+        let frame = render_frame_text(&row, TuiUiRenderContext::default(), 40, 6);
         assert!(rendered.contains("session-1"));
         assert!(rendered.contains("<Attach>"));
+        assert!(frame.contains("session-1"));
+        assert!(frame.contains("<Attach>"));
     }
 
     #[test]
@@ -1460,11 +1506,113 @@ mod tests {
             Vec::new(),
         );
         let rendered = render_text(&table, TuiUiRenderContext::default());
+        let frame = render_frame_text(&table, TuiUiRenderContext::default(), 40, 6);
         assert!(rendered.contains("unsupported Table"));
+        assert!(frame.contains("unsupported Table"));
+    }
+
+    #[test]
+    fn tui_ui_renderer_renders_hub_authored_tui_tree_through_real_frame() {
+        let mut client = TuiClient::new(test_config());
+        client.sessions = vec![
+            DaemonSession {
+                session_id: "session-a".to_string(),
+                lifecycle: "running".to_string(),
+            },
+            DaemonSession {
+                session_id: "session-b".to_string(),
+                lifecycle: "exited".to_string(),
+            },
+        ];
+        client.selected = 1;
+        client.active_session_id = Some("session-a".to_string());
+        client.output.push("hello from terminal\n".to_string());
+        client.notifications.push("notice one".to_string());
+        client.notifications.push("notice two".to_string());
+        client.errors.push("error one".to_string());
+
+        let frame = render_frame_text(
+            &client.ui_tree(),
+            TuiUiRenderContext::from_client(&client),
+            100,
+            30,
+        );
+
+        assert!(frame.contains("botster-hub tui"));
+        assert!(frame.contains("session-a"));
+        assert!(frame.contains("session-b"));
+        assert!(frame.contains("hello from terminal"));
+        assert!(frame.contains("notice"));
+        assert!(frame.contains("error"));
+
+        let ids = all_node_ids(&client.ui_tree());
+        let mut sorted = ids.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(ids.len(), sorted.len(), "UiNode ids should be unique");
     }
 
     fn render_text(node: &UiNode, context: TuiUiRenderContext) -> String {
         TuiUiRenderer::new(context).node_lines(node).join("\n")
+    }
+
+    fn test_config() -> HubConfig {
+        crate::HubStartupOptions::default()
+            .build_config_for_environment(&crate::RuntimeEnvironment::from_values(
+                Some(PathBuf::from("target/tui-renderer-test")),
+                None,
+                None,
+            ))
+            .expect("test config should build")
+    }
+
+    fn render_frame_text(
+        node: &UiNode,
+        context: TuiUiRenderContext,
+        width: u16,
+        height: u16,
+    ) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("test backend terminal should initialize");
+        let renderer = TuiUiRenderer::new(context);
+        terminal
+            .draw(|frame| renderer.render(frame, frame.area(), node))
+            .expect("renderer should draw into test backend");
+        buffer_text(terminal.backend().buffer())
+    }
+
+    fn buffer_text(buffer: &ratatui::buffer::Buffer) -> String {
+        let width = buffer.area.width as usize;
+        buffer
+            .content()
+            .chunks(width)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn all_node_ids(node: &UiNode) -> Vec<String> {
+        let mut ids = Vec::new();
+        collect_node_ids(node, &mut ids);
+        ids
+    }
+
+    fn collect_node_ids(node: &UiNode, ids: &mut Vec<String>) {
+        if let Some(id) = node.id.as_ref() {
+            ids.push(id.0.clone());
+        }
+        for child in &node.children {
+            if let UiChild::Node(node) = child {
+                collect_node_ids(node, ids);
+            }
+        }
+        for children in node.slots.values() {
+            for child in children {
+                if let UiChild::Node(node) = child {
+                    collect_node_ids(node, ids);
+                }
+            }
+        }
     }
 
     fn list_item_with_title(id: &str, title: &str) -> UiNode {
