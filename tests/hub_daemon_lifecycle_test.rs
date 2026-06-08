@@ -1,6 +1,7 @@
 #![cfg(unix)]
 
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::{Mutex, OnceLock};
@@ -247,7 +248,15 @@ fn wait_for_status(data_dir: &Path, child: &mut Child) {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while std::time::Instant::now() < deadline {
         if let Some(status) = child.try_wait().expect("check daemon child") {
-            panic!("daemon exited before ready with {status}");
+            let mut stdout = String::new();
+            let mut stderr = String::new();
+            if let Some(mut pipe) = child.stdout.take() {
+                let _ = pipe.read_to_string(&mut stdout);
+            }
+            if let Some(mut pipe) = child.stderr.take() {
+                let _ = pipe.read_to_string(&mut stderr);
+            }
+            panic!("daemon exited before ready with {status}: stdout={stdout:?} stderr={stderr:?}");
         }
         let output = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
             .arg("status")
@@ -1352,6 +1361,117 @@ fn scripted_tui_surfaces_session_lost_when_restart_does_not_recover_attached_ses
     );
 
     shutdown_cli_daemon(&data_dir, restarted_child);
+}
+
+#[test]
+fn scripted_tui_detaches_and_refreshes_when_drain_reports_unknown_session() {
+    let _guard = daemon_test_lock()
+        .lock()
+        .expect("serialize real daemon test");
+    let data_dir = unique_test_dir("tui-drain-loss");
+    let config = explicit_config(&data_dir);
+    let child = start_cli_daemon(&data_dir);
+
+    let spawn = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::Spawn {
+            session_id: "scripted-drain-loss-session".to_string(),
+            command:
+                "printf 'ready\\n'; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done"
+                    .to_string(),
+        },
+    )
+    .expect("spawn scripted drain-loss fixture");
+    assert_eq!(spawn.kind, botster_hub::DaemonResponseKind::Spawned);
+
+    let mut driver = botster_hub::ScriptedTuiDriver::connect(config.clone())
+        .expect("connect scripted TUI driver before drain loss");
+    driver
+        .select_session("scripted-drain-loss-session")
+        .expect("select session before drain loss");
+    driver.attach_selected().expect("attach before drain loss");
+    driver.send_input("before-drain-loss\n");
+    driver
+        .drain_until("echo:before-drain-loss", Duration::from_secs(5))
+        .expect("observe pre-loss output");
+
+    let shutdown_session = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::ShutdownSession {
+            session_id: "scripted-drain-loss-session".to_string(),
+        },
+    )
+    .expect("shut down attached session before drain");
+    assert_eq!(
+        shutdown_session.kind,
+        botster_hub::DaemonResponseKind::Events
+    );
+
+    for _ in 0..3 {
+        driver
+            .drain_once()
+            .expect("drain after attached session disappeared");
+        thread::sleep(Duration::from_millis(30));
+    }
+
+    assert!(
+        driver.active_session_id().is_none(),
+        "drain-time UnknownSession should clear the active session"
+    );
+    assert!(
+        driver.subscription_id().is_none(),
+        "drain-time UnknownSession should clear the stale subscription"
+    );
+    let errors = driver.errors();
+    let session_lost_rows = errors
+        .iter()
+        .filter(|error| error.contains("attached session disappeared"))
+        .count();
+    assert_eq!(
+        session_lost_rows, 1,
+        "TUI should surface exactly one actionable session-loss row, got {errors:?}"
+    );
+    assert!(
+        !errors
+            .iter()
+            .any(|error| error.contains("unknown_session: runtime failed")),
+        "TUI should suppress the generic repeated drain error, got {errors:?}"
+    );
+
+    let replacement = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::Spawn {
+            session_id: "drain-replacement".to_string(),
+            command:
+                "printf 'replacement-ready\\n'; while IFS= read -r line; do printf 'replacement:%s\\n' \"$line\"; done"
+                    .to_string(),
+        },
+    )
+    .expect("spawn replacement session after drain loss");
+    assert_eq!(
+        replacement.kind,
+        botster_hub::DaemonResponseKind::Spawned,
+        "replacement spawn failed with {:?}",
+        replacement.error
+    );
+    driver
+        .select_session("drain-replacement")
+        .expect("select replacement session after drain loss");
+    assert!(
+        driver
+            .session_ids()
+            .contains(&"drain-replacement".to_string()),
+        "TUI should refresh sessions after drain loss"
+    );
+    driver
+        .attach_selected()
+        .expect("attach replacement session after drain loss");
+    driver.send_input("after-drain-loss\n");
+    driver
+        .drain_until("replacement:after-drain-loss", Duration::from_secs(5))
+        .expect("TUI should remain usable after drain loss");
+
+    shutdown_cli_daemon(&data_dir, child);
 }
 
 #[test]
