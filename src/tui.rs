@@ -1,5 +1,6 @@
 //! Minimal local TUI over the daemon socket client API.
 
+use std::cell::RefCell;
 use std::fmt;
 use std::io;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -7,6 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use botster_core::{UiActionResult, UiActionStatus, UiChild, UiNode, UiNodeId, UiNodeKind};
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
+    MouseButton, MouseEvent, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -37,13 +39,9 @@ pub fn run(config: HubConfig) -> TuiResult<()> {
     app.reconnect()?;
 
     loop {
-        terminal.draw(|frame| draw(frame, &app))?;
-        if event::poll(DRAIN_INTERVAL)? {
-            match event::read()? {
-                Event::Key(key) if handle_key(&mut app, key)? => break,
-                Event::Resize(cols, rows) => app.resize(rows, cols),
-                _ => {}
-            }
+        terminal.draw(|frame| draw(frame, &mut app))?;
+        if event::poll(DRAIN_INTERVAL)? && route_event(&mut app, event::read()?)? {
+            break;
         }
         app.drain_or_reconnect()?;
     }
@@ -187,11 +185,14 @@ struct TuiClient {
     subscription_id: Option<String>,
     subscription_generation: u64,
     output: Vec<String>,
+    sent_inputs: Vec<String>,
     notifications: Vec<String>,
     errors: Vec<String>,
     status: String,
     reconnecting: bool,
     resize_sent: Option<(u16, u16)>,
+    ui_regions: Vec<TuiHitRegion>,
+    focused_node_id: Option<UiNodeId>,
 }
 
 impl TuiClient {
@@ -205,11 +206,14 @@ impl TuiClient {
             subscription_id: None,
             subscription_generation: 0,
             output: Vec::new(),
+            sent_inputs: Vec::new(),
             notifications: Vec::new(),
             errors: Vec::new(),
             status: "starting".to_string(),
             reconnecting: false,
             resize_sent: None,
+            ui_regions: Vec::new(),
+            focused_node_id: None,
         }
     }
 
@@ -253,6 +257,10 @@ impl TuiClient {
 
     fn select_session(&mut self, session_id: &str) -> TuiResult<()> {
         self.refresh()?;
+        self.select_rendered_session(session_id)
+    }
+
+    fn select_rendered_session(&mut self, session_id: &str) -> TuiResult<()> {
         let Some(index) = self
             .sessions
             .iter()
@@ -315,6 +323,7 @@ impl TuiClient {
         let Some(session_id) = self.active_session_id.clone() else {
             return;
         };
+        self.sent_inputs.push(data.to_string());
         match self.request(DaemonRequest::SendInput {
             session_id,
             data: data.to_string(),
@@ -640,6 +649,55 @@ impl TuiClient {
         let renderer = TuiUiRenderer::new(TuiUiRenderContext::from_client(self));
         renderer.region_ids(&self.ui_tree())
     }
+
+    fn hit_region(&self, column: u16, row: u16) -> Option<&TuiHitRegion> {
+        self.ui_regions
+            .iter()
+            .filter(|region| region.contains(column, row))
+            .min_by_key(|region| u32::from(region.area.width) * u32::from(region.area.height))
+    }
+
+    fn activate_node(&mut self, node_id: &UiNodeId) -> TuiResult<()> {
+        if let Some(session_id) = node_id.0.strip_prefix("session-row-") {
+            self.select_rendered_session(session_id)?;
+            return self.attach_selected().map(|_| ());
+        }
+
+        match node_id.0.as_str() {
+            "attached-terminal" | "terminal-panel" => {
+                if self.active_session_id.is_none()
+                    && let Err(error) = self.attach_selected()
+                {
+                    self.errors.push(error.to_string());
+                }
+            }
+            "sessions-list" => {
+                if let Err(error) = self.attach_selected() {
+                    self.errors.push(error.to_string());
+                }
+            }
+            _ => self
+                .notifications
+                .push(format!("semantic action node {}", node_id.0)),
+        }
+        Ok(())
+    }
+
+    fn focus_node(&mut self, node_id: UiNodeId) {
+        self.focused_node_id = Some(node_id);
+    }
+}
+
+fn route_event(app: &mut TuiClient, event: Event) -> TuiResult<bool> {
+    match event {
+        Event::Key(key) => handle_key(app, key),
+        Event::Mouse(mouse) => route_mouse(app, mouse),
+        Event::Resize(cols, rows) => {
+            app.resize(rows, cols);
+            Ok(false)
+        }
+        _ => Ok(false),
+    }
 }
 
 fn handle_key(app: &mut TuiClient, key: KeyEvent) -> TuiResult<bool> {
@@ -673,15 +731,77 @@ fn handle_key(app: &mut TuiClient, key: KeyEvent) -> TuiResult<bool> {
         }
         (_, KeyCode::Enter) if app.active_session_id.is_some() => app.send_input("\r"),
         (_, KeyCode::Backspace) if app.active_session_id.is_some() => app.send_input("\u{7f}"),
+        (KeyModifiers::NONE, KeyCode::Enter) | (KeyModifiers::NONE, KeyCode::Char(' ')) => {
+            if let Some(node_id) = app.focused_node_id.clone() {
+                app.activate_node(&node_id)?;
+            }
+        }
         _ => {}
     }
     Ok(false)
 }
 
-fn draw(frame: &mut ratatui::Frame<'_>, app: &TuiClient) {
+fn route_mouse(app: &mut TuiClient, mouse: MouseEvent) -> TuiResult<bool> {
+    let Some(region) = app.hit_region(mouse.column, mouse.row).cloned() else {
+        return Ok(false);
+    };
+    let node_id = region.node_id.clone();
+
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            app.focus_node(node_id.clone());
+            match region.kind {
+                UiNodeKind::ListItem => {
+                    if let Some(session_id) = node_id.0.strip_prefix("session-row-") {
+                        let was_selected = app.selected_session_id().as_deref() == Some(session_id);
+                        app.select_rendered_session(session_id)?;
+                        if was_selected
+                            && app.active_session_id.is_none()
+                            && let Err(error) = app.attach_selected()
+                        {
+                            app.errors.push(error.to_string());
+                        }
+                    }
+                }
+                UiNodeKind::TerminalView => {
+                    if app.active_session_id.is_none()
+                        && let Err(error) = app.attach_selected()
+                    {
+                        app.errors.push(error.to_string());
+                    }
+                }
+                _ => app.activate_node(&node_id)?,
+            }
+        }
+        MouseEventKind::ScrollUp => {
+            if region.kind == UiNodeKind::TerminalView && app.active_session_id.is_some() {
+                app.send_input(&sgr_mouse_report(64, mouse.column, mouse.row));
+            } else {
+                app.previous_session();
+            }
+        }
+        MouseEventKind::ScrollDown => {
+            if region.kind == UiNodeKind::TerminalView && app.active_session_id.is_some() {
+                app.send_input(&sgr_mouse_report(65, mouse.column, mouse.row));
+            } else {
+                app.next_session();
+            }
+        }
+        _ => {}
+    }
+
+    Ok(false)
+}
+
+fn sgr_mouse_report(button: u16, column: u16, row: u16) -> String {
+    format!("\x1b[<{button};{};{}M", column + 1, row + 1)
+}
+
+fn draw(frame: &mut ratatui::Frame<'_>, app: &mut TuiClient) {
     let tree = app.ui_tree();
     let renderer = TuiUiRenderer::new(TuiUiRenderContext::from_client(app));
     renderer.render(frame, frame.area(), &tree);
+    app.ui_regions = renderer.into_regions();
 }
 
 #[derive(Debug, Clone, Default)]
@@ -717,14 +837,35 @@ impl TuiUiRenderContext {
 
 struct TuiUiRenderer {
     context: TuiUiRenderContext,
+    regions: RefCell<Vec<TuiHitRegion>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TuiHitRegion {
+    node_id: UiNodeId,
+    kind: UiNodeKind,
+    area: ratatui::layout::Rect,
+}
+
+impl TuiHitRegion {
+    fn contains(&self, column: u16, row: u16) -> bool {
+        column >= self.area.x
+            && row >= self.area.y
+            && column < self.area.x.saturating_add(self.area.width)
+            && row < self.area.y.saturating_add(self.area.height)
+    }
 }
 
 impl TuiUiRenderer {
     fn new(context: TuiUiRenderContext) -> Self {
-        Self { context }
+        Self {
+            context,
+            regions: RefCell::new(Vec::new()),
+        }
     }
 
     fn render(&self, frame: &mut ratatui::Frame<'_>, area: ratatui::layout::Rect, node: &UiNode) {
+        self.record_region(area, node);
         match node.kind {
             UiNodeKind::Stack => self.render_stack(frame, area, node),
             UiNodeKind::Inline => self.render_inline(frame, area, node),
@@ -735,6 +876,43 @@ impl TuiUiRenderer {
             UiNodeKind::Dialog => self.render_dialog(frame, area, node),
             UiNodeKind::EmptyState => self.render_empty_state(frame, area, node, None),
             _ => self.render_leaf(frame, area, node, None),
+        }
+    }
+
+    fn into_regions(self) -> Vec<TuiHitRegion> {
+        self.regions.into_inner()
+    }
+
+    fn record_region(&self, area: ratatui::layout::Rect, node: &UiNode) {
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        if let Some(node_id) = node.id.as_ref()
+            && matches!(
+                node.kind,
+                UiNodeKind::Panel
+                    | UiNodeKind::List
+                    | UiNodeKind::ListItem
+                    | UiNodeKind::Button
+                    | UiNodeKind::IconButton
+                    | UiNodeKind::Menu
+                    | UiNodeKind::MenuItem
+                    | UiNodeKind::Form
+                    | UiNodeKind::TextInput
+                    | UiNodeKind::Textarea
+                    | UiNodeKind::Checkbox
+                    | UiNodeKind::Select
+                    | UiNodeKind::SelectOption
+                    | UiNodeKind::Dialog
+                    | UiNodeKind::ScrollArea
+                    | UiNodeKind::TerminalView
+            )
+        {
+            self.regions.borrow_mut().push(TuiHitRegion {
+                node_id: node_id.clone(),
+                kind: node.kind,
+                area,
+            });
         }
     }
 
@@ -830,7 +1008,22 @@ impl TuiUiRenderer {
         node: &UiNode,
         title: Option<&str>,
     ) {
-        let items: Vec<ListItem<'_>> = node_children(node)
+        let children = node_children(node);
+        for (index, child) in children.iter().enumerate() {
+            if area.height <= index as u16 {
+                break;
+            }
+            self.record_region(
+                ratatui::layout::Rect {
+                    x: area.x,
+                    y: area.y + index as u16,
+                    width: area.width,
+                    height: 1,
+                },
+                child,
+            );
+        }
+        let items: Vec<ListItem<'_>> = children
             .into_iter()
             .map(|child| ListItem::new(self.node_lines(child).join(" ")))
             .collect();
@@ -877,6 +1070,20 @@ impl TuiUiRenderer {
         node: &UiNode,
         title: Option<&str>,
     ) {
+        for (index, child) in node_children(node).iter().enumerate() {
+            if area.height <= index as u16 {
+                break;
+            }
+            self.record_region(
+                ratatui::layout::Rect {
+                    x: area.x,
+                    y: area.y + index as u16,
+                    width: area.width,
+                    height: 1,
+                },
+                child,
+            );
+        }
         let mut rows = self.node_lines(node);
         if let Some(error) = self.context.failure_for(node.id.as_ref()) {
             rows.push(format!("error {error}"));
@@ -1552,6 +1759,70 @@ mod tests {
         assert_eq!(ids.len(), sorted.len(), "UiNode ids should be unique");
     }
 
+    #[test]
+    fn route_event_handles_key_and_mouse_selection_through_runtime_router() {
+        let mut client = TuiClient::new(test_config());
+        client.sessions = vec![
+            DaemonSession {
+                session_id: "session-a".to_string(),
+                lifecycle: "running".to_string(),
+            },
+            DaemonSession {
+                session_id: "session-b".to_string(),
+                lifecycle: "running".to_string(),
+            },
+        ];
+        draw_client(&mut client, 100, 30);
+
+        let should_quit = route_event(
+            &mut client,
+            Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+        )
+        .expect("key router should handle selection");
+        assert!(!should_quit);
+        assert_eq!(client.selected_session_id().as_deref(), Some("session-b"));
+
+        route_event(
+            &mut client,
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 2,
+                row: 4,
+                modifiers: KeyModifiers::NONE,
+            }),
+        )
+        .expect("mouse router should hit-test session row");
+        assert_eq!(client.selected_session_id().as_deref(), Some("session-a"));
+        assert_eq!(
+            client.focused_node_id.as_ref().map(|id| id.0.as_str()),
+            Some("session-row-session-a")
+        );
+    }
+
+    #[test]
+    fn route_event_forwards_terminal_owned_mouse_reports_as_raw_input() {
+        let mut client = TuiClient::new(test_config());
+        client.sessions = vec![DaemonSession {
+            session_id: "session-a".to_string(),
+            lifecycle: "running".to_string(),
+        }];
+        client.active_session_id = Some("session-a".to_string());
+        draw_client(&mut client, 100, 30);
+
+        route_event(
+            &mut client,
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 35,
+                row: 5,
+                modifiers: KeyModifiers::NONE,
+            }),
+        )
+        .expect("mouse router should forward terminal-owned wheel report");
+
+        assert_eq!(client.sent_inputs, vec!["\x1b[<65;36;6M".to_string()]);
+    }
+
     fn render_text(node: &UiNode, context: TuiUiRenderContext) -> String {
         TuiUiRenderer::new(context).node_lines(node).join("\n")
     }
@@ -1578,6 +1849,15 @@ mod tests {
         terminal
             .draw(|frame| renderer.render(frame, frame.area(), node))
             .expect("renderer should draw into test backend");
+        buffer_text(terminal.backend().buffer())
+    }
+
+    fn draw_client(client: &mut TuiClient, width: u16, height: u16) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("test backend terminal should initialize");
+        terminal
+            .draw(|frame| draw(frame, client))
+            .expect("TUI client should draw into test backend");
         buffer_text(terminal.backend().buffer())
     }
 
