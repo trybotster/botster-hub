@@ -124,8 +124,8 @@ fn boot_summary() -> Result<botster_hub::HubConfig, botster_hub::HubConfigError>
 }
 
 fn start_daemon(args: Vec<String>) -> Result<(), StartError> {
-    let options = DataDirOptions::parse(args, "start")?;
-    let config = explicit_config(options.data_directory)?;
+    let options = StartOptions::parse(args)?;
+    let config = explicit_config_with_worker(options.data_directory, options.session_worker_bin)?;
 
     let stopped = serve_daemon(config)?;
     let status = DaemonStatus {
@@ -337,11 +337,22 @@ fn operator_inspect(args: Vec<String>) -> Result<(), OperatorError> {
 fn explicit_config(
     data_directory: PathBuf,
 ) -> Result<botster_hub::HubConfig, botster_hub::HubConfigError> {
+    explicit_config_with_worker(data_directory, None)
+}
+
+fn explicit_config_with_worker(
+    data_directory: PathBuf,
+    session_worker_path: Option<PathBuf>,
+) -> Result<botster_hub::HubConfig, botster_hub::HubConfigError> {
     HubStartupOptions {
         data_directory: DataDirectoryOption::Explicit(data_directory),
         session_defaults: SessionDefaults {
             working_directory: Some(PathBuf::from(".")),
             ..SessionDefaults::default()
+        },
+        core_engine: botster_hub::CoreEngineOptions {
+            session_worker_path,
+            ..botster_hub::CoreEngineOptions::default()
         },
         transports: TransportBindings {
             ..TransportBindings::default()
@@ -657,6 +668,32 @@ impl DataDirOptions {
 
         Ok(Self {
             data_directory: PathBuf::from(&args[1]),
+        })
+    }
+}
+
+struct StartOptions {
+    data_directory: PathBuf,
+    session_worker_bin: Option<PathBuf>,
+}
+
+impl StartOptions {
+    fn parse(args: Vec<String>) -> Result<Self, OperatorError> {
+        if args.len() != 2 && args.len() != 4 {
+            return Err(OperatorError::Usage("start"));
+        }
+        if args.first().map(String::as_str) != Some("--data-dir") {
+            return Err(OperatorError::Usage("start"));
+        }
+        let session_worker_bin = match args.get(2).map(String::as_str) {
+            None => None,
+            Some("--session-worker-bin") => args.get(3).map(PathBuf::from),
+            Some(_) => return Err(OperatorError::Usage("start")),
+        };
+
+        Ok(Self {
+            data_directory: PathBuf::from(&args[1]),
+            session_worker_bin,
         })
     }
 }
@@ -1163,7 +1200,7 @@ impl fmt::Display for OperatorError {
 
 fn usage_for(command: &str) -> &'static str {
     match command {
-        "start" => "usage: botster-hub start --data-dir <path>",
+        "start" => "usage: botster-hub start --data-dir <path> [--session-worker-bin <path>]",
         "status" => "usage: botster-hub status --data-dir <path>",
         "sessions" => {
             "usage: botster-hub sessions <list|spawn|attach|send-input|resize|detach|shutdown> ..."

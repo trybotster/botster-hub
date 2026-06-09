@@ -19,10 +19,9 @@ use botster_core_daemon::{
     GuardedWriteResult, RegistrySessionState, RoutedEnvelopeDeliveryStateResult,
     SessionAdoptionReport, SessionAdoptionState, SpawnSessionRequest,
 };
-use std::env;
 use std::error::Error;
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use crate::capabilities::HubCapabilityRuntime;
@@ -70,7 +69,7 @@ impl HubRuntime {
     #[must_use]
     pub fn new(config: HubConfig) -> Self {
         let state = HubState::from_config(&config);
-        let core_config = core_daemon_config(&config.data_directory);
+        let core_config = core_daemon_config(&config);
         let routed_envelopes = Arc::new(Mutex::new(RoutedEnvelopeRouter::with_config(
             core_config.routed_envelope_queue.clone(),
         )));
@@ -99,7 +98,7 @@ impl HubRuntime {
         store: &impl HubStateStore,
     ) -> HubRuntimeResult<Self> {
         let state = store.load_or_initialize(&config)?;
-        let core_config = core_daemon_config(&config.data_directory);
+        let core_config = core_daemon_config(&config);
         let routed_envelopes = Arc::new(Mutex::new(RoutedEnvelopeRouter::with_config(
             core_config.routed_envelope_queue.clone(),
         )));
@@ -807,12 +806,16 @@ fn json_null() -> serde_json::Value {
     serde_json::Value::Null
 }
 
-fn core_daemon_config(data_directory: &Path) -> CoreDaemonConfig {
-    CoreDaemonConfig::new(data_directory).with_worker_path(session_worker_path())
+fn core_daemon_config(config: &HubConfig) -> CoreDaemonConfig {
+    CoreDaemonConfig::new(&config.data_directory).with_worker_path(session_worker_path(config))
 }
 
-fn session_worker_path() -> PathBuf {
-    let current = env::current_exe().unwrap_or_else(|_| PathBuf::from("botster-hub"));
+fn session_worker_path(config: &HubConfig) -> PathBuf {
+    if let Some(path) = &config.core_engine.session_worker_path {
+        return path.clone();
+    }
+
+    let current = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("botster-hub"));
     let Some(dir) = current.parent() else {
         return PathBuf::from("botster-session-worker");
     };

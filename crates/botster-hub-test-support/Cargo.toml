@@ -1,0 +1,10 @@
+[package]
+name = "botster-hub-test-support"
+version = "0.1.0"
+edition = "2024"
+description = "External-client test harness for isolated botster-hub daemon tests"
+repository = "https://github.com/trybotster/botster-hub"
+license-file = "../../LICENSE"
+
+[dependencies]
+botster-hub-client = { path = "../botster-hub-client" }
