@@ -485,7 +485,11 @@ impl PluginHubToolProvider {
 impl McpToolProvider for PluginHubToolProvider {
     fn list_tools(&self) -> Vec<McpToolDescriptor> {
         match daemon_transport_request(&self.config, DaemonRequest::PluginMcpListTools) {
-            Ok(response) if response.error.is_none() => response.plugin_tools,
+            Ok(response) if response.error.is_none() => response
+                .plugin_tools
+                .into_iter()
+                .filter_map(|tool| serde_json::from_value(tool).ok())
+                .collect(),
             _ => Vec::new(),
         }
     }
