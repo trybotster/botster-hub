@@ -292,7 +292,9 @@ impl TuiClient {
             });
         match response {
             Ok(response) if response.kind == DaemonResponseKind::PluginSurface => {
-                self.plugin_surface = response.plugin_surface;
+                self.plugin_surface = response
+                    .plugin_surface
+                    .and_then(|surface| serde_json::from_value(surface).ok());
                 if let Some(surface) = self.plugin_surface.clone() {
                     self.seed_form_values(&surface);
                 }
@@ -785,7 +787,10 @@ impl TuiClient {
         });
         match response {
             Ok(response) if response.kind == DaemonResponseKind::PluginActionResult => {
-                if let Some(result) = response.plugin_action_result {
+                if let Some(result) = response
+                    .plugin_action_result
+                    .and_then(|result| serde_json::from_value::<UiActionResult>(result).ok())
+                {
                     if result.status == UiActionStatus::Success {
                         self.notifications
                             .push("plugin action succeeded".to_string());
