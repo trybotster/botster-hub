@@ -428,7 +428,11 @@ fn print_daemon_response(response: DaemonResponse) -> Result<(), OperatorError> 
             println!("response=plugin_mcp_tools");
             println!("tool_count={}", response.plugin_tools.len());
             for tool in response.plugin_tools {
-                println!("tool name={}", tool.name);
+                let name = tool
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("<unknown>");
+                println!("tool name={name}");
             }
         }
         DaemonResponseKind::PluginMcpToolResult => {

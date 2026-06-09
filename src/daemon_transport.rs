@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Sender};
@@ -23,7 +23,15 @@ use botster_core::{
 use botster_core_daemon::{
     GuardedWriteDecision, GuardedWriteDeliveryState, ReadinessEvidence, RegistrySessionState,
 };
-use serde::{Deserialize, Serialize};
+use botster_hub_client::DaemonTransportError as ClientDaemonTransportError;
+pub use botster_hub_client::{
+    DaemonCapability, DaemonConnection as ClientDaemonConnection, DaemonCoordination,
+    DaemonEndpoint, DaemonEnvelope, DaemonEnvelopeAck, DaemonEnvelopeDelivery,
+    DaemonEnvelopePublish, DaemonEvent, DaemonHello, DaemonHelloAck, DaemonIdentity, DaemonNotify,
+    DaemonOperatorError, DaemonPackage, DaemonPackageDecision, DaemonPluginLifecycle,
+    DaemonRequest, DaemonResponse, DaemonResponseKind, DaemonSession, DaemonSessionCleanup,
+    DaemonStatus, PROTOCOL, read_frame, read_frame_from_reader, write_frame,
+};
 use serde_json::Value;
 
 use crate::{
@@ -33,8 +41,6 @@ use crate::{
     HubStateLoadSource, HubStateStore, McpToolDescriptor, PackageAction, PackageDecision,
 };
 
-const PROTOCOL: &str = "botster-hub-daemon-v1";
-const ATTACH_DRAIN_INTERVAL: Duration = Duration::from_millis(25);
 const MESSAGE_CONTENT_TYPE: &str = "application/vnd.botster.coordination.message+text";
 
 /// Run the local daemon socket until a shutdown request is received.
@@ -89,29 +95,29 @@ pub fn request(
     config: &HubConfig,
     request: DaemonRequest,
 ) -> DaemonTransportResult<DaemonResponse> {
-    let mut stream = connect_and_hello(config)?;
-    write_frame(&mut stream, &request)?;
-    read_frame(&mut stream)
+    let endpoint = daemon_endpoint(config)?;
+    botster_hub_client::request(&endpoint, request).map_err(DaemonTransportError::from)
 }
 
 /// Persistent daemon connection for clients that own attach subscription state.
 pub struct DaemonConnection {
-    stream: UnixStream,
-    reader: BufReader<UnixStream>,
+    inner: ClientDaemonConnection,
 }
 
 impl DaemonConnection {
     /// Connect to the daemon and complete the socket protocol handshake.
     pub fn connect(config: &HubConfig) -> DaemonTransportResult<Self> {
-        let stream = connect_and_hello(config)?;
-        let reader = BufReader::new(stream.try_clone().map_err(DaemonTransportError::Io)?);
-        Ok(Self { stream, reader })
+        let endpoint = daemon_endpoint(config)?;
+        let inner =
+            ClientDaemonConnection::connect(&endpoint).map_err(DaemonTransportError::from)?;
+        Ok(Self { inner })
     }
 
     /// Send one request over this persistent connection.
     pub fn request(&mut self, request: &DaemonRequest) -> DaemonTransportResult<DaemonResponse> {
-        write_frame(&mut self.stream, request)?;
-        read_frame_from_reader(&mut self.reader)
+        self.inner
+            .request(request)
+            .map_err(DaemonTransportError::from)
     }
 }
 
@@ -122,84 +128,9 @@ pub fn stream_attach(
     subscription_id: SubscriptionId,
     output: &mut impl Write,
 ) -> DaemonTransportResult<()> {
-    let mut stream = connect_and_hello(config)?;
-    let session_id_value = session_id.0.clone();
-    let subscription_id_value = subscription_id.0.clone();
-    let result = stream_attach_connected(
-        &mut stream,
-        &session_id_value,
-        &subscription_id_value,
-        output,
-    );
-    detach_stream_subscription(&mut stream, &session_id_value, &subscription_id_value);
-    result
-}
-
-fn stream_attach_connected(
-    stream: &mut UnixStream,
-    session_id: &str,
-    subscription_id: &str,
-    output: &mut impl Write,
-) -> DaemonTransportResult<()> {
-    write_frame(
-        stream,
-        &DaemonRequest::Attach {
-            session_id: session_id.to_string(),
-            subscription_id: subscription_id.to_string(),
-        },
-    )?;
-    let response: DaemonResponse = read_frame(stream)?;
-    write_terminal_events(&response.events, output)?;
-    if response.events.iter().any(DaemonEvent::is_process_exit) {
-        return Ok(());
-    }
-    let mut idle_drains = 0;
-
-    loop {
-        thread::sleep(ATTACH_DRAIN_INTERVAL);
-        write_frame(
-            stream,
-            &DaemonRequest::Drain {
-                session_id: session_id.to_string(),
-            },
-        )?;
-        let response: DaemonResponse = read_frame(stream)?;
-        if response.events.is_empty() {
-            idle_drains += 1;
-        } else {
-            idle_drains = 0;
-        }
-        write_terminal_events(&response.events, output)?;
-        if response.events.iter().any(DaemonEvent::is_process_exit) {
-            return Ok(());
-        }
-        if idle_drains >= 20 {
-            write_frame(stream, &DaemonRequest::ListSessions)?;
-            let response: DaemonResponse = read_frame(stream)?;
-            if response
-                .sessions
-                .iter()
-                .any(|session| session.session_id == session_id && session.lifecycle == "exited")
-            {
-                return Ok(());
-            }
-            return Ok(());
-        }
-    }
-}
-
-fn detach_stream_subscription(stream: &mut UnixStream, session_id: &str, subscription_id: &str) {
-    if write_frame(
-        stream,
-        &DaemonRequest::Detach {
-            session_id: session_id.to_string(),
-            subscription_id: subscription_id.to_string(),
-        },
-    )
-    .is_ok()
-    {
-        let _ = read_frame::<DaemonResponse>(stream);
-    }
+    let endpoint = daemon_endpoint(config)?;
+    botster_hub_client::stream_attach(&endpoint, &session_id.0, &subscription_id.0, output)
+        .map_err(DaemonTransportError::from)
 }
 
 fn handle_connection(
@@ -225,11 +156,11 @@ fn handle_connection(
     loop {
         let request = match read_frame_from_reader::<DaemonRequest>(&mut reader) {
             Ok(request) => request,
-            Err(DaemonTransportError::ClientDisconnected) => {
+            Err(ClientDaemonTransportError::ClientDisconnected) => {
                 detach_connection_subscriptions(&control_tx, &attached_subscriptions);
                 return Ok(());
             }
-            Err(error) => return Err(error),
+            Err(error) => return Err(error.into()),
         };
         let (reply_tx, reply_rx) = mpsc::channel();
         let close_after_response = matches!(request, DaemonRequest::DaemonShutdown);
@@ -243,7 +174,7 @@ fn handle_connection(
         apply_attached_subscription_change(&mut attached_subscriptions, active_change);
         if let Err(error) = write_frame(&mut stream, &response) {
             detach_connection_subscriptions(&control_tx, &attached_subscriptions);
-            return Err(error);
+            return Err(error.into());
         }
         if close_after_response {
             detach_connection_subscriptions(&control_tx, &attached_subscriptions);
@@ -300,9 +231,9 @@ fn handle_control_message(
     let response =
         handle_control_request(daemon, logical_clock, drain_cursors, request).or_else(|error| {
             match error {
-                DaemonTransportError::Client(error) => Ok(DaemonResponse::operator_error(error)),
-                DaemonTransportError::Package(error) => Ok(DaemonResponse::package_error(error)),
-                DaemonTransportError::State(error) => Ok(DaemonResponse::state_error(error)),
+                DaemonTransportError::Client(error) => Ok(daemon_operator_error(error)),
+                DaemonTransportError::Package(error) => Ok(daemon_package_error(error)),
+                DaemonTransportError::State(error) => Ok(daemon_state_error(error)),
                 error => Err(error),
             }
         });
@@ -385,7 +316,7 @@ fn handle_runtime_control_request(
             let HubClientResponseBody::Status(client_status) = response.body else {
                 return Err(DaemonTransportError::UnexpectedResponse);
             };
-            Ok(DaemonResponse::status(status, client_status.session_count))
+            Ok(daemon_status(status, client_status.session_count))
         }
         DaemonRequest::ListSessions => {
             let response = api.handle_request(
@@ -398,7 +329,7 @@ fn handle_runtime_control_request(
             let HubClientResponseBody::Sessions(sessions) = response.body else {
                 return Err(DaemonTransportError::UnexpectedResponse);
             };
-            Ok(DaemonResponse::sessions(sessions))
+            Ok(daemon_sessions(sessions))
         }
         DaemonRequest::Spawn {
             session_id,
@@ -418,8 +349,8 @@ fn handle_runtime_control_request(
                 return Err(DaemonTransportError::UnexpectedResponse);
             };
             drain_cursors.insert(spawned.session.session_id.0.clone(), *logical_clock);
-            Ok(DaemonResponse::spawned(
-                spawned.session.into(),
+            Ok(daemon_spawned(
+                daemon_session_from_client(spawned.session),
                 events_from_client(spawned.events),
             ))
         }
@@ -495,10 +426,10 @@ fn handle_runtime_control_request(
             match classify_shutdown_session(runtime, &session_id)? {
                 ShutdownSessionClassification::Active => {}
                 ShutdownSessionClassification::Cleanup(cleanup) => {
-                    return Ok(DaemonResponse::session_cleanup(cleanup));
+                    return Ok(daemon_session_cleanup(cleanup));
                 }
                 ShutdownSessionClassification::Missing => {
-                    return Ok(DaemonResponse::unknown_session_cleanup(&session_id));
+                    return Ok(daemon_unknown_session_cleanup(&session_id));
                 }
             }
             let shutdown_session_id = session_id.clone();
@@ -514,17 +445,17 @@ fn handle_runtime_control_request(
                 Ok(response) => response,
                 Err(error) => {
                     if shutdown_error_is_unknown_session(&error) {
-                        return Ok(DaemonResponse::session_cleanup(DaemonSessionCleanup {
+                        return Ok(daemon_session_cleanup(DaemonSessionCleanup {
                             session_id: session_id.clone(),
                             outcome: "already_exited".to_string(),
                         }));
                     }
                     return match classify_shutdown_session(runtime, &session_id)? {
                         ShutdownSessionClassification::Cleanup(cleanup) => {
-                            Ok(DaemonResponse::session_cleanup(cleanup))
+                            Ok(daemon_session_cleanup(cleanup))
                         }
                         ShutdownSessionClassification::Missing => {
-                            Ok(DaemonResponse::unknown_session_cleanup(&session_id))
+                            Ok(daemon_unknown_session_cleanup(&session_id))
                         }
                         ShutdownSessionClassification::Active => {
                             Err(DaemonTransportError::Client(error))
@@ -553,9 +484,9 @@ fn handle_runtime_control_request(
             }
             Ok(response)
         }
-        DaemonRequest::Whoami { caller_session_id } => Ok(DaemonResponse::coordination(
+        DaemonRequest::Whoami { caller_session_id } => Ok(daemon_coordination(
             DaemonResponseKind::Identity,
-            DaemonCoordination::identity(DaemonIdentity {
+            daemon_coordination_identity(DaemonIdentity {
                 client_id: "botster-hub-daemon-socket".to_string(),
                 role: "local_operator".to_string(),
                 identity_source: if caller_session_id.is_some() {
@@ -606,9 +537,9 @@ fn handle_runtime_control_request(
             let HubClientResponseBody::RoutedEnvelopePublish(publish) = response.body else {
                 return Err(DaemonTransportError::UnexpectedResponse);
             };
-            Ok(DaemonResponse::coordination(
+            Ok(daemon_coordination(
                 DaemonResponseKind::MessagePosted,
-                DaemonCoordination::publish(publish.deliveries),
+                daemon_coordination_publish(publish.deliveries),
             ))
         }
         DaemonRequest::ReceiveMessages {
@@ -631,9 +562,9 @@ fn handle_runtime_control_request(
             let HubClientResponseBody::RoutedEnvelopeDrain(drain) = response.body else {
                 return Err(DaemonTransportError::UnexpectedResponse);
             };
-            Ok(DaemonResponse::coordination(
+            Ok(daemon_coordination(
                 DaemonResponseKind::Messages,
-                DaemonCoordination::messages(drain.envelopes, drain.next_cursor),
+                daemon_coordination_messages(drain.envelopes, drain.next_cursor),
             ))
         }
         DaemonRequest::AckMessage {
@@ -654,9 +585,9 @@ fn handle_runtime_control_request(
             let HubClientResponseBody::RoutedEnvelopeAck(ack) = response.body else {
                 return Err(DaemonTransportError::UnexpectedResponse);
             };
-            Ok(DaemonResponse::coordination(
+            Ok(daemon_coordination(
                 DaemonResponseKind::MessageAcked,
-                DaemonCoordination::ack(ack.state),
+                daemon_coordination_ack(ack.state),
             ))
         }
         DaemonRequest::NotifySession { session_id, data } => {
@@ -675,18 +606,18 @@ fn handle_runtime_control_request(
             let HubClientResponseBody::GuardedWrite(write) = response.body else {
                 return Err(DaemonTransportError::UnexpectedResponse);
             };
-            Ok(DaemonResponse::coordination(
+            Ok(daemon_coordination(
                 DaemonResponseKind::SessionNotified,
-                DaemonCoordination::notify(write.decision, write.states),
+                daemon_coordination_notify(write.decision, write.states),
             ))
         }
-        DaemonRequest::PluginMcpListTools => Ok(DaemonResponse::plugin_tools(
-            runtime.list_plugin_mcp_tools(),
-        )),
+        DaemonRequest::PluginMcpListTools => {
+            Ok(daemon_plugin_tools(runtime.list_plugin_mcp_tools()))
+        }
         DaemonRequest::PluginMcpCallTool { name, arguments } => {
             match runtime.call_plugin_mcp_tool(crate::McpCallRequest { name, arguments }) {
-                Ok(result) => Ok(DaemonResponse::plugin_tool_result(result)),
-                Err(error) => Ok(DaemonResponse::plugin_tool_error(error)),
+                Ok(result) => Ok(daemon_plugin_tool_result(result)),
+                Err(error) => Ok(daemon_plugin_tool_error(error)),
             }
         }
         DaemonRequest::PluginSurfaceRender {
@@ -707,7 +638,7 @@ fn handle_runtime_control_request(
             let HubClientResponseBody::PluginSurface(surface) = response.body else {
                 return Err(DaemonTransportError::UnexpectedResponse);
             };
-            Ok(DaemonResponse::plugin_surface(surface))
+            Ok(daemon_plugin_surface(surface))
         }
         DaemonRequest::PluginSurfaceAction {
             package_name,
@@ -729,11 +660,11 @@ fn handle_runtime_control_request(
             let HubClientResponseBody::PluginActionResult(result) = response.body else {
                 return Err(DaemonTransportError::UnexpectedResponse);
             };
-            Ok(DaemonResponse::plugin_action_result(result))
+            Ok(daemon_plugin_action_result(result))
         }
         DaemonRequest::DaemonShutdown => Ok(DaemonResponse {
             kind: DaemonResponseKind::Shutdown,
-            status: Some(DaemonStatus::from_status(
+            status: Some(daemon_status_from_status(
                 &status,
                 runtime
                     .list_sessions()
@@ -812,7 +743,7 @@ fn list_packages_response(daemon: &mut HubDaemon) -> DaemonTransportResult<Daemo
     let HubClientResponseBody::Packages(packages) = response.body else {
         return Err(DaemonTransportError::UnexpectedResponse);
     };
-    Ok(DaemonResponse::packages(packages))
+    Ok(daemon_packages(packages))
 }
 
 fn plugin_lifecycle_response(daemon: &mut HubDaemon) -> DaemonTransportResult<DaemonResponse> {
@@ -831,7 +762,7 @@ fn plugin_lifecycle_response(daemon: &mut HubDaemon) -> DaemonTransportResult<Da
     let HubClientResponseBody::PluginLifecycle(lifecycle) = response.body else {
         return Err(DaemonTransportError::UnexpectedResponse);
     };
-    Ok(DaemonResponse::plugin_lifecycle(lifecycle))
+    Ok(daemon_plugin_lifecycle(lifecycle))
 }
 
 fn package_decision_response(
@@ -840,7 +771,7 @@ fn package_decision_response(
 ) -> DaemonTransportResult<DaemonResponse> {
     let mut response = list_packages_response(daemon)?;
     response.kind = DaemonResponseKind::PackageDecision;
-    response.package_decision = Some(DaemonPackageDecision::from(decision));
+    response.package_decision = Some(daemon_package_decision_from_policy(decision));
     Ok(response)
 }
 
@@ -861,7 +792,7 @@ fn events_response(body: HubClientResponseBody) -> DaemonTransportResult<DaemonR
     let HubClientResponseBody::Events(events) = body else {
         return Err(DaemonTransportError::UnexpectedResponse);
     };
-    Ok(DaemonResponse::events(events_from_client(events)))
+    Ok(daemon_events(events_from_client(events)))
 }
 
 enum ShutdownSessionClassification {
@@ -919,6 +850,10 @@ fn socket_path(config: &HubConfig) -> DaemonTransportResult<PathBuf> {
         .ok_or(DaemonTransportError::MissingSocketBinding)
 }
 
+fn daemon_endpoint(config: &HubConfig) -> DaemonTransportResult<DaemonEndpoint> {
+    socket_path(config).map(DaemonEndpoint::new)
+}
+
 fn prepare_socket_path(path: &PathBuf) -> DaemonTransportResult<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(DaemonTransportError::Io)?;
@@ -955,73 +890,8 @@ fn cleanup_socket_path(path: &PathBuf) {
     let _ = fs::remove_file(path);
 }
 
-fn connect_and_hello(config: &HubConfig) -> DaemonTransportResult<UnixStream> {
-    let path = socket_path(config)?;
-    let mut stream = UnixStream::connect(path).map_err(|error| {
-        if matches!(
-            error.kind(),
-            std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
-        ) {
-            DaemonTransportError::NotRunning
-        } else {
-            DaemonTransportError::Io(error)
-        }
-    })?;
-    write_frame(
-        &mut stream,
-        &DaemonHello {
-            protocol: PROTOCOL.to_string(),
-        },
-    )?;
-    let ack: DaemonHelloAck = read_frame(&mut stream)?;
-    if ack.protocol == PROTOCOL {
-        Ok(stream)
-    } else {
-        Err(DaemonTransportError::NotRunning)
-    }
-}
-
-fn write_frame<T: Serialize>(stream: &mut UnixStream, frame: &T) -> DaemonTransportResult<()> {
-    let bytes = serde_json::to_vec(frame).map_err(DaemonTransportError::Json)?;
-    stream.write_all(&bytes).map_err(DaemonTransportError::Io)?;
-    stream.write_all(b"\n").map_err(DaemonTransportError::Io)
-}
-
-fn read_frame<T: for<'de> Deserialize<'de>>(stream: &mut UnixStream) -> DaemonTransportResult<T> {
-    let mut reader = BufReader::new(stream.try_clone().map_err(DaemonTransportError::Io)?);
-    read_frame_from_reader(&mut reader)
-}
-
-fn read_frame_from_reader<T: for<'de> Deserialize<'de>>(
-    reader: &mut BufReader<UnixStream>,
-) -> DaemonTransportResult<T> {
-    let mut line = String::new();
-    let bytes = reader
-        .read_line(&mut line)
-        .map_err(DaemonTransportError::Io)?;
-    if bytes == 0 {
-        return Err(DaemonTransportError::ClientDisconnected);
-    }
-    serde_json::from_str(&line).map_err(DaemonTransportError::Json)
-}
-
-fn write_terminal_events(
-    events: &[DaemonEvent],
-    output: &mut impl Write,
-) -> DaemonTransportResult<()> {
-    for event in events {
-        if let DaemonEvent::TerminalOutput { data, .. } = event {
-            output
-                .write_all(data.as_bytes())
-                .map_err(DaemonTransportError::Io)?;
-            output.flush().map_err(DaemonTransportError::Io)?;
-        }
-    }
-    Ok(())
-}
-
 fn events_from_client(events: Vec<HubClientEvent>) -> Vec<DaemonEvent> {
-    events.into_iter().map(DaemonEvent::from).collect()
+    events.into_iter().map(daemon_event_from_client).collect()
 }
 
 #[derive(Debug)]
@@ -1065,890 +935,487 @@ impl AttachedSubscriptionChange {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct DaemonHello {
-    protocol: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct DaemonHelloAck {
-    protocol: String,
-}
-
-/// Client request variants for the local daemon protocol.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum DaemonRequest {
-    Status,
-    ListSessions,
-    Whoami {
-        caller_session_id: Option<String>,
-    },
-    PostMessage {
-        caller_session_id: Option<String>,
-        target_session_id: String,
-        envelope_id: Option<String>,
-        body: String,
-    },
-    ReceiveMessages {
-        caller_session_id: String,
-        after: Option<u64>,
-        limit: usize,
-    },
-    AckMessage {
-        caller_session_id: String,
-        envelope_id: String,
-    },
-    NotifySession {
-        session_id: String,
-        data: String,
-    },
-    Spawn {
-        session_id: String,
-        command: String,
-    },
-    Attach {
-        session_id: String,
-        subscription_id: String,
-    },
-    Detach {
-        session_id: String,
-        subscription_id: String,
-    },
-    SendInput {
-        session_id: String,
-        data: String,
-    },
-    Resize {
-        session_id: String,
-        rows: u16,
-        cols: u16,
-    },
-    ShutdownSession {
-        session_id: String,
-    },
-    Drain {
-        session_id: String,
-    },
-    ListPackages,
-    EnablePackageLocalPath {
-        path: PathBuf,
-    },
-    EnablePackage {
-        package_name: String,
-    },
-    DisablePackage {
-        package_name: String,
-    },
-    PluginLifecycleStatus,
-    PluginMcpListTools,
-    PluginMcpCallTool {
-        name: String,
-        arguments: Value,
-    },
-    PluginSurfaceRender {
-        package_name: String,
-        surface_id: String,
-        payload: Value,
-    },
-    PluginSurfaceAction {
-        package_name: String,
-        surface_id: String,
-        action_id: String,
-        payload: Value,
-    },
-    DaemonShutdown,
-}
-
-/// Server response variants for one local daemon request.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct DaemonResponse {
-    pub kind: DaemonResponseKind,
-    pub status: Option<DaemonStatus>,
-    pub sessions: Vec<DaemonSession>,
-    pub packages: Vec<DaemonPackage>,
-    pub package_decision: Option<DaemonPackageDecision>,
-    pub lifecycle: Vec<DaemonPluginLifecycle>,
-    #[serde(default)]
-    pub plugin_tools: Vec<McpToolDescriptor>,
-    #[serde(default)]
-    pub plugin_tool_result: Value,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub plugin_surface: Option<UiNode>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub plugin_action_result: Option<UiActionResult>,
-    pub events: Vec<DaemonEvent>,
-    pub cleanup: Option<DaemonSessionCleanup>,
-    pub coordination: Option<DaemonCoordination>,
-    pub error: Option<DaemonOperatorError>,
-}
-
-impl DaemonResponse {
-    fn status(status: HubDaemonStatus, session_count: usize) -> Self {
-        Self {
-            kind: DaemonResponseKind::Status,
-            status: Some(DaemonStatus::from_status(&status, session_count)),
-            sessions: Vec::new(),
-            packages: Vec::new(),
-            package_decision: None,
-            lifecycle: Vec::new(),
-            plugin_tools: Vec::new(),
-            plugin_tool_result: Value::Null,
-            plugin_surface: None,
-            plugin_action_result: None,
-            events: Vec::new(),
-            cleanup: None,
-            coordination: None,
-            error: None,
-        }
-    }
-
-    fn sessions(sessions: Vec<HubClientSession>) -> Self {
-        Self {
-            kind: DaemonResponseKind::Sessions,
-            status: None,
-            sessions: sessions.into_iter().map(Into::into).collect(),
-            packages: Vec::new(),
-            package_decision: None,
-            lifecycle: Vec::new(),
-            plugin_tools: Vec::new(),
-            plugin_tool_result: Value::Null,
-            plugin_surface: None,
-            plugin_action_result: None,
-            events: Vec::new(),
-            cleanup: None,
-            coordination: None,
-            error: None,
-        }
-    }
-
-    fn spawned(session: DaemonSession, events: Vec<DaemonEvent>) -> Self {
-        Self {
-            kind: DaemonResponseKind::Spawned,
-            status: None,
-            sessions: vec![session],
-            packages: Vec::new(),
-            package_decision: None,
-            lifecycle: Vec::new(),
-            plugin_tools: Vec::new(),
-            plugin_tool_result: Value::Null,
-            plugin_surface: None,
-            plugin_action_result: None,
-            events,
-            cleanup: None,
-            coordination: None,
-            error: None,
-        }
-    }
-
-    fn events(events: Vec<DaemonEvent>) -> Self {
-        Self {
-            kind: DaemonResponseKind::Events,
-            status: None,
-            sessions: Vec::new(),
-            packages: Vec::new(),
-            package_decision: None,
-            lifecycle: Vec::new(),
-            plugin_tools: Vec::new(),
-            plugin_tool_result: Value::Null,
-            plugin_surface: None,
-            plugin_action_result: None,
-            events,
-            cleanup: None,
-            coordination: None,
-            error: None,
-        }
-    }
-
-    fn packages(packages: Vec<HubClientPackage>) -> Self {
-        Self {
-            kind: DaemonResponseKind::Packages,
-            status: None,
-            sessions: Vec::new(),
-            packages: packages.into_iter().map(Into::into).collect(),
-            package_decision: None,
-            lifecycle: Vec::new(),
-            plugin_tools: Vec::new(),
-            plugin_tool_result: Value::Null,
-            plugin_surface: None,
-            plugin_action_result: None,
-            events: Vec::new(),
-            cleanup: None,
-            coordination: None,
-            error: None,
-        }
-    }
-
-    fn plugin_lifecycle(lifecycle: Vec<HubClientPluginLifecycle>) -> Self {
-        Self {
-            kind: DaemonResponseKind::PluginLifecycle,
-            status: None,
-            sessions: Vec::new(),
-            packages: Vec::new(),
-            package_decision: None,
-            lifecycle: lifecycle.into_iter().map(Into::into).collect(),
-            plugin_tools: Vec::new(),
-            plugin_tool_result: Value::Null,
-            plugin_surface: None,
-            plugin_action_result: None,
-            events: Vec::new(),
-            cleanup: None,
-            coordination: None,
-            error: None,
-        }
-    }
-
-    fn session_cleanup(cleanup: DaemonSessionCleanup) -> Self {
-        Self {
-            kind: DaemonResponseKind::SessionCleanup,
-            status: None,
-            sessions: Vec::new(),
-            packages: Vec::new(),
-            package_decision: None,
-            lifecycle: Vec::new(),
-            plugin_tools: Vec::new(),
-            plugin_tool_result: Value::Null,
-            plugin_surface: None,
-            plugin_action_result: None,
-            events: Vec::new(),
-            cleanup: Some(cleanup),
-            coordination: None,
-            error: None,
-        }
-    }
-
-    fn unknown_session_cleanup(session_id: &str) -> Self {
-        Self {
-            kind: DaemonResponseKind::OperatorError,
-            status: None,
-            sessions: Vec::new(),
-            packages: Vec::new(),
-            package_decision: None,
-            lifecycle: Vec::new(),
-            plugin_tools: Vec::new(),
-            plugin_tool_result: Value::Null,
-            plugin_surface: None,
-            plugin_action_result: None,
-            events: Vec::new(),
-            cleanup: None,
-            coordination: None,
-            error: Some(DaemonOperatorError {
-                code: "unknown_session".to_string(),
-                request_id: "daemon-sessions-shutdown".to_string(),
-                operation: "shutdown".to_string(),
-                message: format!("unknown session: {session_id}"),
-            }),
-        }
-    }
-
-    fn operator_error(error: crate::HubClientError) -> Self {
-        Self {
-            kind: DaemonResponseKind::OperatorError,
-            status: None,
-            sessions: Vec::new(),
-            packages: Vec::new(),
-            package_decision: None,
-            lifecycle: Vec::new(),
-            plugin_tools: Vec::new(),
-            plugin_tool_result: Value::Null,
-            plugin_surface: None,
-            plugin_action_result: None,
-            events: Vec::new(),
-            cleanup: None,
-            coordination: None,
-            error: Some(DaemonOperatorError::from_client_error(error)),
-        }
-    }
-
-    fn package_error(error: crate::PackageRegistryError) -> Self {
-        Self {
-            kind: DaemonResponseKind::OperatorError,
-            status: None,
-            sessions: Vec::new(),
-            packages: Vec::new(),
-            package_decision: None,
-            lifecycle: Vec::new(),
-            plugin_tools: Vec::new(),
-            plugin_tool_result: Value::Null,
-            plugin_surface: None,
-            plugin_action_result: None,
-            events: Vec::new(),
-            cleanup: None,
-            coordination: None,
-            error: Some(DaemonOperatorError::from_package_error(error)),
-        }
-    }
-
-    fn state_error(error: crate::HubStateStoreError) -> Self {
-        Self {
-            kind: DaemonResponseKind::OperatorError,
-            status: None,
-            sessions: Vec::new(),
-            packages: Vec::new(),
-            package_decision: None,
-            lifecycle: Vec::new(),
-            plugin_tools: Vec::new(),
-            plugin_tool_result: Value::Null,
-            plugin_surface: None,
-            plugin_action_result: None,
-            events: Vec::new(),
-            cleanup: None,
-            coordination: None,
-            error: Some(DaemonOperatorError::from_state_error(error)),
-        }
-    }
-
-    fn coordination(kind: DaemonResponseKind, coordination: DaemonCoordination) -> Self {
-        Self {
-            kind,
-            status: None,
-            sessions: Vec::new(),
-            packages: Vec::new(),
-            package_decision: None,
-            lifecycle: Vec::new(),
-            plugin_tools: Vec::new(),
-            plugin_tool_result: Value::Null,
-            plugin_surface: None,
-            plugin_action_result: None,
-            events: Vec::new(),
-            cleanup: None,
-            coordination: Some(coordination),
-            error: None,
-        }
-    }
-
-    fn plugin_tools(plugin_tools: Vec<McpToolDescriptor>) -> Self {
-        Self {
-            kind: DaemonResponseKind::PluginMcpTools,
-            status: None,
-            sessions: Vec::new(),
-            packages: Vec::new(),
-            package_decision: None,
-            lifecycle: Vec::new(),
-            plugin_tools,
-            plugin_tool_result: Value::Null,
-            plugin_surface: None,
-            plugin_action_result: None,
-            events: Vec::new(),
-            cleanup: None,
-            coordination: None,
-            error: None,
-        }
-    }
-
-    fn plugin_tool_result(plugin_tool_result: Value) -> Self {
-        Self {
-            kind: DaemonResponseKind::PluginMcpToolResult,
-            status: None,
-            sessions: Vec::new(),
-            packages: Vec::new(),
-            package_decision: None,
-            lifecycle: Vec::new(),
-            plugin_tools: Vec::new(),
-            plugin_tool_result,
-            plugin_surface: None,
-            plugin_action_result: None,
-            events: Vec::new(),
-            cleanup: None,
-            coordination: None,
-            error: None,
-        }
-    }
-
-    fn plugin_surface(plugin_surface: UiNode) -> Self {
-        Self {
-            kind: DaemonResponseKind::PluginSurface,
-            status: None,
-            sessions: Vec::new(),
-            packages: Vec::new(),
-            package_decision: None,
-            lifecycle: Vec::new(),
-            plugin_tools: Vec::new(),
-            plugin_tool_result: Value::Null,
-            plugin_surface: Some(plugin_surface),
-            plugin_action_result: None,
-            events: Vec::new(),
-            cleanup: None,
-            coordination: None,
-            error: None,
-        }
-    }
-
-    fn plugin_action_result(plugin_action_result: UiActionResult) -> Self {
-        Self {
-            kind: DaemonResponseKind::PluginActionResult,
-            status: None,
-            sessions: Vec::new(),
-            packages: Vec::new(),
-            package_decision: None,
-            lifecycle: Vec::new(),
-            plugin_tools: Vec::new(),
-            plugin_tool_result: Value::Null,
-            plugin_surface: None,
-            plugin_action_result: Some(plugin_action_result),
-            events: Vec::new(),
-            cleanup: None,
-            coordination: None,
-            error: None,
-        }
-    }
-
-    fn plugin_tool_error(error: crate::McpToolError) -> Self {
-        Self {
-            kind: DaemonResponseKind::OperatorError,
-            status: None,
-            sessions: Vec::new(),
-            packages: Vec::new(),
-            package_decision: None,
-            lifecycle: Vec::new(),
-            plugin_tools: Vec::new(),
-            plugin_tool_result: Value::Null,
-            plugin_surface: None,
-            plugin_action_result: None,
-            events: Vec::new(),
-            cleanup: None,
-            coordination: None,
-            error: Some(DaemonOperatorError {
-                code: error.code,
-                request_id: "daemon-plugin-mcp-call".to_string(),
-                operation: "plugin_mcp_call".to_string(),
-                message: error.message,
-            }),
-        }
+fn daemon_response_base(kind: DaemonResponseKind) -> DaemonResponse {
+    DaemonResponse {
+        kind,
+        status: None,
+        sessions: Vec::new(),
+        packages: Vec::new(),
+        package_decision: None,
+        lifecycle: Vec::new(),
+        plugin_tools: Vec::new(),
+        plugin_tool_result: Value::Null,
+        plugin_surface: None,
+        plugin_action_result: None,
+        events: Vec::new(),
+        cleanup: None,
+        coordination: None,
+        error: None,
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DaemonResponseKind {
-    Status,
-    Sessions,
-    Spawned,
-    Events,
-    Packages,
-    PackageDecision,
-    PluginLifecycle,
-    PluginMcpTools,
-    PluginMcpToolResult,
-    PluginSurface,
-    PluginActionResult,
-    SessionCleanup,
-    Identity,
-    MessagePosted,
-    Messages,
-    MessageAcked,
-    SessionNotified,
-    OperatorError,
-    Shutdown,
+fn daemon_status(status: HubDaemonStatus, session_count: usize) -> DaemonResponse {
+    let mut response = daemon_response_base(DaemonResponseKind::Status);
+    response.status = Some(daemon_status_from_status(&status, session_count));
+    response
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DaemonCoordination {
-    pub identity: Option<DaemonIdentity>,
-    pub publish: Option<DaemonEnvelopePublish>,
-    pub messages: Vec<DaemonEnvelope>,
-    pub next_cursor: Option<u64>,
-    pub ack: Option<DaemonEnvelopeAck>,
-    pub notify: Option<DaemonNotify>,
+fn daemon_sessions(sessions: Vec<HubClientSession>) -> DaemonResponse {
+    let mut response = daemon_response_base(DaemonResponseKind::Sessions);
+    response.sessions = sessions
+        .into_iter()
+        .map(daemon_session_from_client)
+        .collect();
+    response
 }
 
-impl DaemonCoordination {
-    fn identity(identity: DaemonIdentity) -> Self {
-        Self {
-            identity: Some(identity),
-            publish: None,
-            messages: Vec::new(),
-            next_cursor: None,
-            ack: None,
-            notify: None,
-        }
-    }
-
-    fn publish(deliveries: Vec<EnvelopeDeliveryState>) -> Self {
-        Self {
-            identity: None,
-            publish: Some(DaemonEnvelopePublish {
-                deliveries: deliveries
-                    .into_iter()
-                    .map(DaemonEnvelopeDelivery::from)
-                    .collect(),
-            }),
-            messages: Vec::new(),
-            next_cursor: None,
-            ack: None,
-            notify: None,
-        }
-    }
-
-    fn messages(envelopes: Vec<RoutedEnvelope>, next_cursor: Option<EnvelopeCursor>) -> Self {
-        Self {
-            identity: None,
-            publish: None,
-            messages: envelopes.into_iter().map(DaemonEnvelope::from).collect(),
-            next_cursor: next_cursor.map(|cursor| cursor.0),
-            ack: None,
-            notify: None,
-        }
-    }
-
-    fn ack(state: Option<EnvelopeDeliveryState>) -> Self {
-        Self {
-            identity: None,
-            publish: None,
-            messages: Vec::new(),
-            next_cursor: None,
-            ack: Some(DaemonEnvelopeAck::from_state(state)),
-            notify: None,
-        }
-    }
-
-    fn notify(decision: GuardedWriteDecision, states: Vec<GuardedWriteDeliveryState>) -> Self {
-        Self {
-            identity: None,
-            publish: None,
-            messages: Vec::new(),
-            next_cursor: None,
-            ack: None,
-            notify: Some(DaemonNotify {
-                decision: format!("{decision:?}"),
-                state_count: states.len(),
-                states: states
-                    .into_iter()
-                    .map(guarded_write_delivery_state_label)
-                    .map(ToString::to_string)
-                    .collect(),
-            }),
-        }
-    }
+fn daemon_spawned(session: DaemonSession, events: Vec<DaemonEvent>) -> DaemonResponse {
+    let mut response = daemon_response_base(DaemonResponseKind::Spawned);
+    response.sessions = vec![session];
+    response.events = events;
+    response
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DaemonIdentity {
-    pub client_id: String,
-    pub role: String,
-    pub identity_source: String,
-    pub caller_session_id: Option<String>,
-    pub host_id: String,
-    pub host_display_name: String,
+fn daemon_events(events: Vec<DaemonEvent>) -> DaemonResponse {
+    let mut response = daemon_response_base(DaemonResponseKind::Events);
+    response.events = events;
+    response
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DaemonEnvelopePublish {
-    pub deliveries: Vec<DaemonEnvelopeDelivery>,
+fn daemon_packages(packages: Vec<HubClientPackage>) -> DaemonResponse {
+    let mut response = daemon_response_base(DaemonResponseKind::Packages);
+    response.packages = packages
+        .into_iter()
+        .map(daemon_package_from_client)
+        .collect();
+    response
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DaemonEnvelopeDelivery {
-    pub envelope_id: String,
-    pub target: String,
-    pub cursor: u64,
-    pub status: String,
+fn daemon_plugin_lifecycle(lifecycle: Vec<HubClientPluginLifecycle>) -> DaemonResponse {
+    let mut response = daemon_response_base(DaemonResponseKind::PluginLifecycle);
+    response.lifecycle = lifecycle
+        .into_iter()
+        .map(daemon_plugin_lifecycle_from_client)
+        .collect();
+    response
 }
 
-impl From<EnvelopeDeliveryState> for DaemonEnvelopeDelivery {
-    fn from(state: EnvelopeDeliveryState) -> Self {
-        Self {
-            envelope_id: state.envelope_id.0,
-            target: envelope_target_label(&state.target),
-            cursor: state.cursor.0,
-            status: format!("{:?}", state.status).to_ascii_lowercase(),
-        }
-    }
+fn daemon_session_cleanup(cleanup: DaemonSessionCleanup) -> DaemonResponse {
+    let mut response = daemon_response_base(DaemonResponseKind::SessionCleanup);
+    response.cleanup = Some(cleanup);
+    response
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DaemonEnvelope {
-    pub envelope_id: String,
-    pub source: String,
-    pub content_type: String,
-    pub body: String,
-    pub created_at: u64,
-    pub cursor: Option<u64>,
+fn daemon_unknown_session_cleanup(session_id: &str) -> DaemonResponse {
+    let mut response = daemon_response_base(DaemonResponseKind::OperatorError);
+    response.error = Some(DaemonOperatorError {
+        code: "unknown_session".to_string(),
+        request_id: "daemon-sessions-shutdown".to_string(),
+        operation: "shutdown".to_string(),
+        message: format!("unknown session: {session_id}"),
+    });
+    response
 }
 
-impl From<RoutedEnvelope> for DaemonEnvelope {
-    fn from(envelope: RoutedEnvelope) -> Self {
-        Self {
-            envelope_id: envelope.id.0,
-            source: envelope.source.0,
-            content_type: envelope.payload.content_type,
-            body: String::from_utf8_lossy(&envelope.payload.body).to_string(),
-            created_at: envelope.created_at,
-            cursor: envelope.cursor.map(|cursor| cursor.0),
-        }
+fn daemon_operator_error(error: crate::HubClientError) -> DaemonResponse {
+    let mut response = daemon_response_base(DaemonResponseKind::OperatorError);
+    response.error = Some(daemon_operator_error_from_client(error));
+    response
+}
+
+fn daemon_package_error(error: crate::PackageRegistryError) -> DaemonResponse {
+    let mut response = daemon_response_base(DaemonResponseKind::OperatorError);
+    response.error = Some(daemon_operator_error_from_package(error));
+    response
+}
+
+fn daemon_state_error(error: crate::HubStateStoreError) -> DaemonResponse {
+    let mut response = daemon_response_base(DaemonResponseKind::OperatorError);
+    response.error = Some(daemon_operator_error_from_state(error));
+    response
+}
+
+fn daemon_coordination(
+    kind: DaemonResponseKind,
+    coordination: DaemonCoordination,
+) -> DaemonResponse {
+    let mut response = daemon_response_base(kind);
+    response.coordination = Some(coordination);
+    response
+}
+
+fn daemon_plugin_tools(plugin_tools: Vec<McpToolDescriptor>) -> DaemonResponse {
+    let mut response = daemon_response_base(DaemonResponseKind::PluginMcpTools);
+    response.plugin_tools = plugin_tools
+        .into_iter()
+        .map(|tool| serde_json::to_value(tool).unwrap_or(Value::Null))
+        .collect();
+    response
+}
+
+fn daemon_plugin_tool_result(plugin_tool_result: Value) -> DaemonResponse {
+    let mut response = daemon_response_base(DaemonResponseKind::PluginMcpToolResult);
+    response.plugin_tool_result = plugin_tool_result;
+    response
+}
+
+fn daemon_plugin_surface(plugin_surface: UiNode) -> DaemonResponse {
+    let mut response = daemon_response_base(DaemonResponseKind::PluginSurface);
+    response.plugin_surface = Some(serde_json::to_value(plugin_surface).unwrap_or(Value::Null));
+    response
+}
+
+fn daemon_plugin_action_result(plugin_action_result: UiActionResult) -> DaemonResponse {
+    let mut response = daemon_response_base(DaemonResponseKind::PluginActionResult);
+    response.plugin_action_result =
+        Some(serde_json::to_value(plugin_action_result).unwrap_or(Value::Null));
+    response
+}
+
+fn daemon_plugin_tool_error(error: crate::McpToolError) -> DaemonResponse {
+    let mut response = daemon_response_base(DaemonResponseKind::OperatorError);
+    response.error = Some(DaemonOperatorError {
+        code: error.code,
+        request_id: "daemon-plugin-mcp-call".to_string(),
+        operation: "plugin_mcp_call".to_string(),
+        message: error.message,
+    });
+    response
+}
+
+fn daemon_coordination_identity(identity: DaemonIdentity) -> DaemonCoordination {
+    DaemonCoordination {
+        identity: Some(identity),
+        publish: None,
+        messages: Vec::new(),
+        next_cursor: None,
+        ack: None,
+        notify: None,
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DaemonEnvelopeAck {
-    pub envelope_id: Option<String>,
-    pub target: Option<String>,
-    pub cursor: Option<u64>,
-    pub status: String,
-}
-
-impl DaemonEnvelopeAck {
-    fn from_state(state: Option<EnvelopeDeliveryState>) -> Self {
-        match state {
-            Some(state) => Self {
-                envelope_id: Some(state.envelope_id.0),
-                target: Some(envelope_target_label(&state.target)),
-                cursor: Some(state.cursor.0),
-                status: format!("{:?}", state.status).to_ascii_lowercase(),
-            },
-            None => Self {
-                envelope_id: None,
-                target: None,
-                cursor: None,
-                status: "unknown".to_string(),
-            },
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DaemonNotify {
-    pub decision: String,
-    pub state_count: usize,
-    pub states: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DaemonPackage {
-    pub package_name: String,
-    pub version: String,
-    pub classification: String,
-    pub state: String,
-    pub requested_capabilities: Vec<DaemonCapability>,
-    pub provider_profile_admitted: bool,
-}
-
-impl From<HubClientPackage> for DaemonPackage {
-    fn from(package: HubClientPackage) -> Self {
-        Self {
-            package_name: package.package_name,
-            version: package.version,
-            classification: package_classification_label(package.classification).to_string(),
-            state: package_state_label(package.state).to_string(),
-            requested_capabilities: package
-                .requested_capabilities
+fn daemon_coordination_publish(deliveries: Vec<EnvelopeDeliveryState>) -> DaemonCoordination {
+    DaemonCoordination {
+        identity: None,
+        publish: Some(DaemonEnvelopePublish {
+            deliveries: deliveries
                 .into_iter()
-                .map(|capability| DaemonCapability {
-                    surface: capability.surface,
-                    scope: capability.scope,
-                })
+                .map(daemon_envelope_delivery_from_state)
                 .collect(),
-            provider_profile_admitted: package.provider_profile_admitted,
-        }
+        }),
+        messages: Vec::new(),
+        next_cursor: None,
+        ack: None,
+        notify: None,
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DaemonCapability {
-    pub surface: String,
-    pub scope: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DaemonPackageDecision {
-    pub package_name: String,
-    pub action: String,
-    pub state: String,
-    pub classification: String,
-}
-
-impl From<PackageDecision> for DaemonPackageDecision {
-    fn from(decision: PackageDecision) -> Self {
-        Self {
-            package_name: decision.package_name,
-            action: package_action_label(decision.action).to_string(),
-            state: package_state_label(decision.state.into()).to_string(),
-            classification: package_classification_label(decision.classification.into())
-                .to_string(),
-        }
+fn daemon_coordination_messages(
+    envelopes: Vec<RoutedEnvelope>,
+    next_cursor: Option<EnvelopeCursor>,
+) -> DaemonCoordination {
+    DaemonCoordination {
+        identity: None,
+        publish: None,
+        messages: envelopes
+            .into_iter()
+            .map(daemon_envelope_from_routed)
+            .collect(),
+        next_cursor: next_cursor.map(|cursor| cursor.0),
+        ack: None,
+        notify: None,
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DaemonPluginLifecycle {
-    pub package_name: String,
-    pub state: String,
-    pub loaded: bool,
-}
-
-impl From<HubClientPluginLifecycle> for DaemonPluginLifecycle {
-    fn from(lifecycle: HubClientPluginLifecycle) -> Self {
-        Self {
-            package_name: lifecycle.package_name,
-            state: package_state_label(lifecycle.state).to_string(),
-            loaded: lifecycle.loaded,
-        }
+fn daemon_coordination_ack(state: Option<EnvelopeDeliveryState>) -> DaemonCoordination {
+    DaemonCoordination {
+        identity: None,
+        publish: None,
+        messages: Vec::new(),
+        next_cursor: None,
+        ack: Some(daemon_envelope_ack_from_state(state)),
+        notify: None,
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DaemonStatus {
-    pub lifecycle_state: String,
-    pub host_id: String,
-    pub host_display_name: String,
-    pub schema_version: u16,
-    pub data_dir_configured: bool,
-    pub core_initialized: bool,
-    pub state_source: String,
-    pub package_count: usize,
-    pub enabled_package_count: usize,
-    pub provider_count: usize,
-    pub enabled_provider_count: usize,
-    pub session_count: usize,
-    pub recovered_sessions: Vec<String>,
-    pub stale_sessions: Vec<String>,
+fn daemon_coordination_notify(
+    decision: GuardedWriteDecision,
+    states: Vec<GuardedWriteDeliveryState>,
+) -> DaemonCoordination {
+    DaemonCoordination {
+        identity: None,
+        publish: None,
+        messages: Vec::new(),
+        next_cursor: None,
+        ack: None,
+        notify: Some(DaemonNotify {
+            decision: format!("{decision:?}"),
+            state_count: states.len(),
+            states: states
+                .into_iter()
+                .map(guarded_write_delivery_state_label)
+                .map(ToString::to_string)
+                .collect(),
+        }),
+    }
 }
 
-impl DaemonStatus {
-    fn from_status(status: &HubDaemonStatus, session_count: usize) -> Self {
-        Self {
-            lifecycle_state: match status.lifecycle_state {
-                crate::HubDaemonState::Created => "created",
-                crate::HubDaemonState::Running => "running",
-                crate::HubDaemonState::Stopped => "stopped",
+fn daemon_envelope_delivery_from_state(state: EnvelopeDeliveryState) -> DaemonEnvelopeDelivery {
+    DaemonEnvelopeDelivery {
+        envelope_id: state.envelope_id.0,
+        target: envelope_target_label(&state.target),
+        cursor: state.cursor.0,
+        status: format!("{:?}", state.status).to_ascii_lowercase(),
+    }
+}
+
+fn daemon_envelope_from_routed(envelope: RoutedEnvelope) -> DaemonEnvelope {
+    DaemonEnvelope {
+        envelope_id: envelope.id.0,
+        source: envelope.source.0,
+        content_type: envelope.payload.content_type,
+        body: String::from_utf8_lossy(&envelope.payload.body).to_string(),
+        created_at: envelope.created_at,
+        cursor: envelope.cursor.map(|cursor| cursor.0),
+    }
+}
+
+fn daemon_envelope_ack_from_state(state: Option<EnvelopeDeliveryState>) -> DaemonEnvelopeAck {
+    match state {
+        Some(state) => DaemonEnvelopeAck {
+            envelope_id: Some(state.envelope_id.0),
+            target: Some(envelope_target_label(&state.target)),
+            cursor: Some(state.cursor.0),
+            status: format!("{:?}", state.status).to_ascii_lowercase(),
+        },
+        None => DaemonEnvelopeAck {
+            envelope_id: None,
+            target: None,
+            cursor: None,
+            status: "unknown".to_string(),
+        },
+    }
+}
+
+fn daemon_package_from_client(package: HubClientPackage) -> DaemonPackage {
+    DaemonPackage {
+        package_name: package.package_name,
+        version: package.version,
+        classification: package_classification_label(package.classification).to_string(),
+        state: package_state_label(package.state).to_string(),
+        requested_capabilities: package
+            .requested_capabilities
+            .into_iter()
+            .map(|capability| DaemonCapability {
+                surface: capability.surface,
+                scope: capability.scope,
+            })
+            .collect(),
+        provider_profile_admitted: package.provider_profile_admitted,
+    }
+}
+
+fn daemon_package_decision_from_policy(decision: PackageDecision) -> DaemonPackageDecision {
+    DaemonPackageDecision {
+        package_name: decision.package_name,
+        action: package_action_label(decision.action).to_string(),
+        state: package_state_label(decision.state.into()).to_string(),
+        classification: package_classification_label(decision.classification.into()).to_string(),
+    }
+}
+
+fn daemon_plugin_lifecycle_from_client(
+    lifecycle: HubClientPluginLifecycle,
+) -> DaemonPluginLifecycle {
+    DaemonPluginLifecycle {
+        package_name: lifecycle.package_name,
+        state: package_state_label(lifecycle.state).to_string(),
+        loaded: lifecycle.loaded,
+    }
+}
+
+fn daemon_status_from_status(status: &HubDaemonStatus, session_count: usize) -> DaemonStatus {
+    DaemonStatus {
+        lifecycle_state: match status.lifecycle_state {
+            crate::HubDaemonState::Created => "created",
+            crate::HubDaemonState::Running => "running",
+            crate::HubDaemonState::Stopped => "stopped",
+        }
+        .to_string(),
+        host_id: status.host_id.clone(),
+        host_display_name: status.host_display_name.clone(),
+        schema_version: status.schema_version,
+        data_dir_configured: status.data_dir_configured,
+        core_initialized: status.core_initialized,
+        state_source: match status.state_source {
+            HubStateLoadSource::Loaded => "loaded",
+            HubStateLoadSource::Initialized => "initialized",
+        }
+        .to_string(),
+        package_count: status.package_count,
+        enabled_package_count: status.enabled_package_count,
+        provider_count: status.provider_count,
+        enabled_provider_count: status.enabled_provider_count,
+        session_count,
+        recovered_sessions: status
+            .recovered_sessions
+            .iter()
+            .map(|session_id| session_id.0.clone())
+            .collect(),
+        stale_sessions: status
+            .stale_sessions
+            .iter()
+            .map(|session_id| session_id.0.clone())
+            .collect(),
+    }
+}
+
+fn daemon_session_from_client(session: HubClientSession) -> DaemonSession {
+    DaemonSession {
+        session_id: session.session_id.0,
+        lifecycle: lifecycle_label(&session.lifecycle).to_string(),
+    }
+}
+
+fn daemon_operator_error_from_client(error: crate::HubClientError) -> DaemonOperatorError {
+    match error {
+        crate::HubClientError::AdmissionDenied {
+            request_id,
+            operation,
+            role,
+        } => DaemonOperatorError {
+            code: "admission_denied".to_string(),
+            request_id: request_id.0,
+            operation: operation_label(operation).to_string(),
+            message: format!("{role:?} is not allowed to run {operation:?}"),
+        },
+        crate::HubClientError::Runtime {
+            request_id,
+            operation,
+            kind,
+        } => DaemonOperatorError {
+            code: runtime_error_code(kind).to_string(),
+            request_id: request_id.0,
+            operation: operation_label(operation).to_string(),
+            message: format!("runtime failed while handling {operation:?}: {kind:?}"),
+        },
+        crate::HubClientError::UnsupportedDaemonOperation {
+            request_id,
+            operation,
+            daemon_operation,
+        } => DaemonOperatorError {
+            code: "unsupported_daemon_operation".to_string(),
+            request_id: request_id.0,
+            operation: operation_label(operation).to_string(),
+            message: format!("{daemon_operation} is not supported by the daemon"),
+        },
+        crate::HubClientError::PackageCapabilityDenied {
+            request_id,
+            operation,
+            package_name,
+        } => DaemonOperatorError {
+            code: "package_capability_denied".to_string(),
+            request_id: request_id.0,
+            operation: operation_label(operation).to_string(),
+            message: format!("{package_name} is not allowed to run {operation:?}"),
+        },
+        crate::HubClientError::Plugin {
+            request_id,
+            operation,
+            code,
+            message,
+        } => DaemonOperatorError {
+            code,
+            request_id: request_id.0,
+            operation: operation_label(operation).to_string(),
+            message,
+        },
+    }
+}
+
+fn daemon_operator_error_from_package(error: crate::PackageRegistryError) -> DaemonOperatorError {
+    DaemonOperatorError {
+        code: "package_policy_error".to_string(),
+        request_id: "daemon-package-mutation".to_string(),
+        operation: package_action_label(error.action).to_string(),
+        message: format!(
+            "package {} denied for {}: {:?}",
+            error.package_name,
+            package_action_label(error.action),
+            error.reason
+        ),
+    }
+}
+
+fn daemon_operator_error_from_state(error: crate::HubStateStoreError) -> DaemonOperatorError {
+    DaemonOperatorError {
+        code: "hub_state_error".to_string(),
+        request_id: "daemon-package-mutation".to_string(),
+        operation: "persist_package_registry".to_string(),
+        message: format!("failed to persist package registry: {error}"),
+    }
+}
+
+fn daemon_event_from_client(event: HubClientEvent) -> DaemonEvent {
+    match event {
+        HubClientEvent::SessionLifecycle { session_id, state } => DaemonEvent::SessionLifecycle {
+            session_id: session_id.0,
+            state: lifecycle_label(&state).to_string(),
+        },
+        HubClientEvent::TerminalOutput {
+            session_id,
+            subscription_id,
+            data,
+        } => DaemonEvent::TerminalOutput {
+            session_id: session_id.0,
+            subscription_id: subscription_id.0,
+            data: String::from_utf8_lossy(&data).to_string(),
+        },
+        HubClientEvent::Snapshot {
+            session_id,
+            subscription_id,
+            bytes,
+        } => DaemonEvent::Snapshot {
+            session_id: session_id.0,
+            subscription_id: subscription_id.0,
+            bytes,
+        },
+        HubClientEvent::Scrollback {
+            session_id,
+            subscription_id,
+            bytes,
+        } => DaemonEvent::Scrollback {
+            session_id: session_id.0,
+            subscription_id: subscription_id.0,
+            bytes,
+        },
+        HubClientEvent::ProcessExit {
+            session_id,
+            subscription_id,
+            code,
+        } => DaemonEvent::ProcessExit {
+            session_id: session_id.0,
+            subscription_id: subscription_id.0,
+            code,
+        },
+        HubClientEvent::AttachState {
+            session_id,
+            subscription_id,
+            state,
+        } => DaemonEvent::AttachState {
+            session_id: session_id.0,
+            subscription_id: subscription_id.0,
+            state: attach_state_label(&state).to_string(),
+        },
+        HubClientEvent::RuntimeObservation { kind } => DaemonEvent::RuntimeObservation {
+            kind: match kind {
+                crate::HubClientObservationKind::SessionActivity => "session_activity",
+                crate::HubClientObservationKind::Subscription => "subscription",
+                crate::HubClientObservationKind::Backpressure => "backpressure",
+                crate::HubClientObservationKind::RoutedEnvelope => "routed_envelope",
             }
             .to_string(),
-            host_id: status.host_id.clone(),
-            host_display_name: status.host_display_name.clone(),
-            schema_version: status.schema_version,
-            data_dir_configured: status.data_dir_configured,
-            core_initialized: status.core_initialized,
-            state_source: match status.state_source {
-                HubStateLoadSource::Loaded => "loaded",
-                HubStateLoadSource::Initialized => "initialized",
-            }
-            .to_string(),
-            package_count: status.package_count,
-            enabled_package_count: status.enabled_package_count,
-            provider_count: status.provider_count,
-            enabled_provider_count: status.enabled_provider_count,
-            session_count,
-            recovered_sessions: status
-                .recovered_sessions
-                .iter()
-                .map(|session_id| session_id.0.clone())
-                .collect(),
-            stale_sessions: status
-                .stale_sessions
-                .iter()
-                .map(|session_id| session_id.0.clone())
-                .collect(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DaemonSession {
-    pub session_id: String,
-    pub lifecycle: String,
-}
-
-impl From<HubClientSession> for DaemonSession {
-    fn from(session: HubClientSession) -> Self {
-        Self {
-            session_id: session.session_id.0,
-            lifecycle: lifecycle_label(&session.lifecycle).to_string(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DaemonSessionCleanup {
-    pub session_id: String,
-    pub outcome: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DaemonOperatorError {
-    pub code: String,
-    pub request_id: String,
-    pub operation: String,
-    pub message: String,
-}
-
-impl DaemonOperatorError {
-    fn from_client_error(error: crate::HubClientError) -> Self {
-        match error {
-            crate::HubClientError::AdmissionDenied {
-                request_id,
-                operation,
-                role,
-            } => Self {
-                code: "admission_denied".to_string(),
-                request_id: request_id.0,
-                operation: operation_label(operation).to_string(),
-                message: format!("{role:?} is not allowed to run {operation:?}"),
-            },
-            crate::HubClientError::Runtime {
-                request_id,
-                operation,
-                kind,
-            } => Self {
-                code: runtime_error_code(kind).to_string(),
-                request_id: request_id.0,
-                operation: operation_label(operation).to_string(),
-                message: format!("runtime failed while handling {operation:?}: {kind:?}"),
-            },
-            crate::HubClientError::UnsupportedDaemonOperation {
-                request_id,
-                operation,
-                daemon_operation,
-            } => Self {
-                code: "unsupported_daemon_operation".to_string(),
-                request_id: request_id.0,
-                operation: operation_label(operation).to_string(),
-                message: format!("{daemon_operation} is not supported by the daemon"),
-            },
-            crate::HubClientError::PackageCapabilityDenied {
-                request_id,
-                operation,
-                package_name,
-            } => Self {
-                code: "package_capability_denied".to_string(),
-                request_id: request_id.0,
-                operation: operation_label(operation).to_string(),
-                message: format!("{package_name} is not allowed to run {operation:?}"),
-            },
-            crate::HubClientError::Plugin {
-                request_id,
-                operation,
-                code,
-                message,
-            } => Self {
-                code,
-                request_id: request_id.0,
-                operation: operation_label(operation).to_string(),
-                message,
-            },
-        }
-    }
-
-    fn from_package_error(error: crate::PackageRegistryError) -> Self {
-        Self {
-            code: "package_policy_error".to_string(),
-            request_id: "daemon-package-mutation".to_string(),
-            operation: package_action_label(error.action).to_string(),
-            message: format!(
-                "package {} denied for {}: {:?}",
-                error.package_name,
-                package_action_label(error.action),
-                error.reason
-            ),
-        }
-    }
-
-    fn from_state_error(error: crate::HubStateStoreError) -> Self {
-        Self {
-            code: "hub_state_error".to_string(),
-            request_id: "daemon-package-mutation".to_string(),
-            operation: "persist_package_registry".to_string(),
-            message: format!("failed to persist package registry: {error}"),
-        }
+        },
     }
 }
 
@@ -2047,114 +1514,6 @@ fn package_action_label(action: PackageAction) -> &'static str {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum DaemonEvent {
-    SessionLifecycle {
-        session_id: String,
-        state: String,
-    },
-    TerminalOutput {
-        session_id: String,
-        subscription_id: String,
-        data: String,
-    },
-    Snapshot {
-        session_id: String,
-        subscription_id: String,
-        bytes: usize,
-    },
-    Scrollback {
-        session_id: String,
-        subscription_id: String,
-        bytes: usize,
-    },
-    ProcessExit {
-        session_id: String,
-        subscription_id: String,
-        code: Option<i32>,
-    },
-    AttachState {
-        session_id: String,
-        subscription_id: String,
-        state: String,
-    },
-    RuntimeObservation {
-        kind: String,
-    },
-}
-
-impl DaemonEvent {
-    fn is_process_exit(&self) -> bool {
-        matches!(self, Self::ProcessExit { .. })
-    }
-}
-
-impl From<HubClientEvent> for DaemonEvent {
-    fn from(event: HubClientEvent) -> Self {
-        match event {
-            HubClientEvent::SessionLifecycle { session_id, state } => Self::SessionLifecycle {
-                session_id: session_id.0,
-                state: lifecycle_label(&state).to_string(),
-            },
-            HubClientEvent::TerminalOutput {
-                session_id,
-                subscription_id,
-                data,
-            } => Self::TerminalOutput {
-                session_id: session_id.0,
-                subscription_id: subscription_id.0,
-                data: String::from_utf8_lossy(&data).to_string(),
-            },
-            HubClientEvent::Snapshot {
-                session_id,
-                subscription_id,
-                bytes,
-            } => Self::Snapshot {
-                session_id: session_id.0,
-                subscription_id: subscription_id.0,
-                bytes,
-            },
-            HubClientEvent::Scrollback {
-                session_id,
-                subscription_id,
-                bytes,
-            } => Self::Scrollback {
-                session_id: session_id.0,
-                subscription_id: subscription_id.0,
-                bytes,
-            },
-            HubClientEvent::ProcessExit {
-                session_id,
-                subscription_id,
-                code,
-            } => Self::ProcessExit {
-                session_id: session_id.0,
-                subscription_id: subscription_id.0,
-                code,
-            },
-            HubClientEvent::AttachState {
-                session_id,
-                subscription_id,
-                state,
-            } => Self::AttachState {
-                session_id: session_id.0,
-                subscription_id: subscription_id.0,
-                state: attach_state_label(&state).to_string(),
-            },
-            HubClientEvent::RuntimeObservation { kind } => Self::RuntimeObservation {
-                kind: match kind {
-                    crate::HubClientObservationKind::SessionActivity => "session_activity",
-                    crate::HubClientObservationKind::Subscription => "subscription",
-                    crate::HubClientObservationKind::Backpressure => "backpressure",
-                    crate::HubClientObservationKind::RoutedEnvelope => "routed_envelope",
-                }
-                .to_string(),
-            },
-        }
-    }
-}
-
 fn lifecycle_label(state: &SessionLifecycleState) -> &'static str {
     match state {
         SessionLifecycleState::Starting => "starting",
@@ -2232,6 +1591,21 @@ impl Error for DaemonTransportError {
 impl From<crate::HubDaemonError> for DaemonTransportError {
     fn from(error: crate::HubDaemonError) -> Self {
         Self::Daemon(error)
+    }
+}
+
+impl From<ClientDaemonTransportError> for DaemonTransportError {
+    fn from(error: ClientDaemonTransportError) -> Self {
+        match error {
+            ClientDaemonTransportError::Io(error) => Self::Io(error),
+            ClientDaemonTransportError::Json(error) => Self::Json(error),
+            ClientDaemonTransportError::MissingSocketBinding => Self::MissingSocketBinding,
+            ClientDaemonTransportError::AlreadyRunning => Self::AlreadyRunning,
+            ClientDaemonTransportError::NotRunning => Self::NotRunning,
+            ClientDaemonTransportError::ClientDisconnected => Self::ClientDisconnected,
+            ClientDaemonTransportError::Protocol(message) => Self::Protocol(message),
+            ClientDaemonTransportError::ControlThreadStopped => Self::ControlThreadStopped,
+        }
     }
 }
 
