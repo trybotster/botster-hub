@@ -125,6 +125,7 @@ dependencies = [
  "botster-core",
  "botster-core-daemon",
  "botster-hub-client",
+ "botster-hub-test-support",
  "crossterm",
  "mlua",
  "ratatui",
@@ -139,6 +140,13 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "botster-hub-test-support"
+version = "0.1.0"
+dependencies = [
+ "botster-hub-client",
 ]
 
 [[package]]
