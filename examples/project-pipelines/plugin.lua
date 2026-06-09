@@ -84,6 +84,14 @@ local function validation_failure(field_errors, form_errors)
   }
 end
 
+local function ui_field_errors(field_errors)
+  local typed_errors = {}
+  for field, message in pairs(field_errors or {}) do
+    typed_errors[field] = { message }
+  end
+  return typed_errors
+end
+
 local function normalized_ticket_input(arguments)
   local title = trim(arguments.title)
   local pipeline_id = trim(arguments.pipeline_id) or "local_pipeline"
@@ -208,30 +216,31 @@ end
 local function create_ticket_action(arguments)
   local result = create(arguments)
   if not result.ok then
+    local validation_error = result.error.code == "validation_failed"
     return {
       request_id = arguments.request_id or "project-pipelines-create-ticket",
+      surface_id = "project-pipelines.create-ticket",
       action_id = "project_pipelines.create_ticket",
       node_id = "project-pipelines-create-form",
-      status = "failure",
+      state = validation_error and "rejected" or "error",
+      field_errors = validation_error and ui_field_errors(result.field_errors) or {},
+      form_errors = validation_error and (result.form_errors or { result.error.message }) or {},
       error = result.error.message,
-      payload = {
-        field_errors = result.field_errors or {},
-        form_errors = result.form_errors or { result.error.message },
-      },
     }
   end
   return {
     request_id = arguments.request_id or "project-pipelines-create-ticket",
+    surface_id = "project-pipelines.create-ticket",
     action_id = "project_pipelines.create_ticket",
     node_id = "project-pipelines-create-form",
-    status = "success",
+    state = "accepted",
+    normalized_values = {
+      title = result.ticket.title,
+      pipeline_id = result.ticket.pipeline_id,
+    },
     payload = {
       message = "Ticket created",
       ticket = result.ticket,
-      normalized = {
-        title = result.ticket.title,
-        pipeline_id = result.ticket.pipeline_id,
-      },
     },
   }
 end
