@@ -2,6 +2,7 @@
 
 use std::fs;
 use std::io::Read;
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::{Mutex, OnceLock};
@@ -1217,6 +1218,97 @@ fn external_hub_client_crate_drives_real_daemon_socket_protocol() {
 }
 
 #[test]
+fn external_hub_client_reports_compatibility_descriptor_and_mismatch_diagnostics() {
+    let _guard = daemon_test_lock()
+        .lock()
+        .expect("serialize real daemon test");
+    let data_dir = unique_test_dir("compat");
+    let config = explicit_config(&data_dir);
+    let socket_path = config
+        .transports
+        .local_socket
+        .as_ref()
+        .expect("test config has local socket")
+        .path
+        .clone();
+    let endpoint = botster_hub_client::DaemonEndpoint::new(socket_path.clone());
+    let child = start_cli_daemon(&data_dir);
+
+    let mut stream = UnixStream::connect(&socket_path).expect("connect raw compatibility socket");
+    botster_hub_client::write_frame(
+        &mut stream,
+        &botster_hub_client::DaemonHello {
+            protocol: botster_hub_client::PROTOCOL.to_string(),
+            compatibility: botster_hub_client::DaemonCompatibilityRequirement::current(),
+        },
+    )
+    .expect("write hello");
+    let ack: botster_hub_client::DaemonHelloAck =
+        botster_hub_client::read_frame(&mut stream).expect("read hello ack");
+    assert_eq!(ack.protocol, botster_hub_client::PROTOCOL);
+    assert_eq!(ack.compatibility.protocol, botster_hub_client::PROTOCOL);
+    assert_eq!(
+        ack.compatibility.protocol_version,
+        botster_hub_client::PROTOCOL_VERSION
+    );
+    assert!(
+        ack.compatibility
+            .supports_feature(botster_hub_client::FEATURE_SESSIONS)
+    );
+    assert!(
+        ack.compatibility
+            .supports_feature(botster_hub_client::FEATURE_TERMINAL_STREAMING)
+    );
+    assert!(
+        ack.compatibility
+            .supports_feature(botster_hub_client::FEATURE_RESIZE)
+    );
+    assert!(
+        ack.compatibility
+            .supports_feature(botster_hub_client::FEATURE_PLUGIN_SURFACE_RENDER)
+    );
+    assert!(
+        ack.compatibility
+            .supports_feature(botster_hub_client::FEATURE_PLUGIN_SURFACE_ACTION)
+    );
+    assert_eq!(
+        ack.compatibility.conformance_fixture_revision,
+        botster_hub_client::CONFORMANCE_FIXTURE_REVISION
+    );
+
+    let status = botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status)
+        .expect("external client status request");
+    let status = status.status.expect("status response body");
+    assert_eq!(status.compatibility, ack.compatibility);
+
+    let mut version_requirement = botster_hub_client::DaemonCompatibilityRequirement::current();
+    version_requirement.client_name = "future-version-client".to_string();
+    version_requirement.minimum_protocol_version = botster_hub_client::PROTOCOL_VERSION + 1;
+    let version_error =
+        botster_hub_client::connect_and_hello_with_requirement(&endpoint, &version_requirement)
+            .expect_err("future protocol version should fail compatibility");
+    let version_message = version_error.to_string();
+    assert!(version_message.contains("future-version-client"));
+    assert!(version_message.contains("unsupported protocol version"));
+    assert!(!version_message.contains(&data_dir.to_string_lossy().to_string()));
+
+    let mut feature_requirement = botster_hub_client::DaemonCompatibilityRequirement::current();
+    feature_requirement.client_name = "future-feature-client".to_string();
+    feature_requirement
+        .required_features
+        .push("future_feature".to_string());
+    let feature_error =
+        botster_hub_client::connect_and_hello_with_requirement(&endpoint, &feature_requirement)
+            .expect_err("future feature should fail compatibility");
+    let feature_message = feature_error.to_string();
+    assert!(feature_message.contains("future-feature-client"));
+    assert!(feature_message.contains("missing required feature(s): future_feature"));
+    assert!(!feature_message.contains(&data_dir.to_string_lossy().to_string()));
+
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
 fn external_hub_test_support_drives_isolated_daemon_socket_protocol() {
     let _guard = daemon_test_lock()
         .lock()
@@ -1238,6 +1330,23 @@ fn external_hub_test_support_drives_isolated_daemon_socket_protocol() {
     assert!(first_report.stream_contains_ready);
     assert!(first_report.stream_contains_echo);
     assert!(first_report.stream_contains_resize);
+    assert_eq!(
+        first_report.compatibility_protocol,
+        botster_hub_client::PROTOCOL
+    );
+    assert_eq!(
+        first_report.compatibility_protocol_version,
+        botster_hub_client::PROTOCOL_VERSION
+    );
+    assert!(
+        first_report
+            .compatibility_features
+            .contains(&botster_hub_client::FEATURE_SESSIONS.to_string())
+    );
+    assert_eq!(
+        first_report.compatibility_conformance_fixture_revision,
+        botster_hub_client::CONFORMANCE_FIXTURE_REVISION
+    );
     assert_eq!(first_report.validation_error_operation, "drain_runtime");
 
     let plugin_report = botster_hub_test_support::run_project_pipelines_conformance(

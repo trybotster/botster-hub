@@ -11,9 +11,9 @@ use botster_core::{
     SessionSpawnRequest, SpawnEnvironment, SpawnWorkingDirectory, SubscriptionId, TransportEgress,
 };
 use botster_hub::{
-    DaemonEvent, DaemonOperatorError, DaemonPackage, DaemonRequest, DaemonResponse,
-    DaemonResponseKind, DaemonSession, DaemonStatus, DataDirectoryOption, HubClientApi,
-    HubClientRequest, HubClientResponseBody, HubDaemon, HubDaemonState, HubRuntime,
+    DaemonCompatibility, DaemonEvent, DaemonOperatorError, DaemonPackage, DaemonRequest,
+    DaemonResponse, DaemonResponseKind, DaemonSession, DaemonStatus, DataDirectoryOption,
+    HubClientApi, HubClientRequest, HubClientResponseBody, HubDaemon, HubDaemonState, HubRuntime,
     HubStartupOptions, HubStateLoadSource, RuntimeEnvironment, SessionDefaults, TransportBindings,
     build_default_config_for_runtime, daemon_transport_request, default_package_policy,
     host_profile, run_tui, serve_daemon, serve_mcp_stdio, stream_attach,
@@ -130,6 +130,7 @@ fn start_daemon(args: Vec<String>) -> Result<(), StartError> {
     let stopped = serve_daemon(config)?;
     let status = DaemonStatus {
         lifecycle_state: lifecycle_state_label(stopped.lifecycle_state).to_string(),
+        compatibility: DaemonCompatibility::current(),
         host_id: stopped.host_id,
         host_display_name: stopped.host_display_name,
         schema_version: stopped.schema_version,
@@ -365,6 +366,13 @@ fn explicit_config_with_worker(
 fn print_daemon_transport_status(label: &str, status: &DaemonStatus) {
     println!("event={label}");
     println!("lifecycle_state={}", status.lifecycle_state);
+    println!("protocol={}", status.compatibility.protocol);
+    println!("protocol_version={}", status.compatibility.protocol_version);
+    println!(
+        "conformance_fixture_revision={}",
+        status.compatibility.conformance_fixture_revision
+    );
+    println!("features={}", status.compatibility.features.join(","));
     println!("host_id={}", status.host_id);
     println!("host_display_name={}", status.host_display_name);
     println!("schema_version={}", status.schema_version);
