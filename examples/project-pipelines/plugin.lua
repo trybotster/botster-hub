@@ -226,6 +226,7 @@ local function create_ticket_action(arguments)
     node_id = "project-pipelines-create-form",
     status = "success",
     payload = {
+      message = "Ticket created",
       ticket = result.ticket,
       normalized = {
         title = result.ticket.title,

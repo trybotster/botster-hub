@@ -770,9 +770,6 @@ fn descriptor_kind_for_handler_kind(kind: PluginHandlerKind) -> Option<PluginDes
     match kind {
         PluginHandlerKind::SurfaceRoute => Some(PluginDescriptorKind::SurfaceRoute),
         PluginHandlerKind::UiAction => Some(PluginDescriptorKind::UiAction),
-        PluginHandlerKind::Command => Some(PluginDescriptorKind::Command),
-        PluginHandlerKind::Hook => Some(PluginDescriptorKind::Hook),
-        PluginHandlerKind::SessionAction => Some(PluginDescriptorKind::SessionAction),
         _ => None,
     }
 }
