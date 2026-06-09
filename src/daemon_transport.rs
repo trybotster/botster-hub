@@ -1296,7 +1296,7 @@ fn daemon_status_from_status(status: &HubDaemonStatus, session_count: usize) -> 
             .iter()
             .map(|session_id| session_id.0.clone())
             .collect(),
-        diagnostics: vec![DaemonDiagnostic::connected("status")],
+        diagnostics: Vec::new(),
     }
 }
 

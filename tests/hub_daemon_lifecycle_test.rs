@@ -294,6 +294,26 @@ fn shutdown_cli_daemon(data_dir: &Path, child: Child) -> Output {
     output
 }
 
+fn has_diagnostic_kind(
+    diagnostics: &[botster_hub_client::DaemonDiagnostic],
+    kind: botster_hub_client::DaemonDiagnosticKind,
+) -> bool {
+    diagnostics.iter().any(|diagnostic| diagnostic.kind == kind)
+}
+
+fn has_failure_diagnostic(diagnostics: &[botster_hub_client::DaemonDiagnostic]) -> bool {
+    diagnostics.iter().any(|diagnostic| {
+        matches!(
+            diagnostic.kind,
+            botster_hub_client::DaemonDiagnosticKind::CompatibilityMismatch
+                | botster_hub_client::DaemonDiagnosticKind::UnsupportedFeature
+                | botster_hub_client::DaemonDiagnosticKind::TerminalStreamUnavailable
+                | botster_hub_client::DaemonDiagnosticKind::ActionFailure
+                | botster_hub_client::DaemonDiagnosticKind::DaemonStartupFailure
+        )
+    })
+}
+
 fn session_worker_binary_path() -> PathBuf {
     ensure_session_worker_binary();
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1109,6 +1129,7 @@ fn external_hub_client_crate_drives_real_daemon_socket_protocol() {
         diagnostic.kind == botster_hub_client::DaemonDiagnosticKind::Connected
             && diagnostic.operation.as_deref() == Some("status")
     }));
+    assert!(!has_failure_diagnostic(&status.diagnostics));
     assert_eq!(
         status
             .status
@@ -1212,6 +1233,10 @@ fn external_hub_client_crate_drives_real_daemon_socket_protocol() {
             && diagnostic.operation.as_deref() == Some("drain_runtime")
             && diagnostic.feature.as_deref() == Some(botster_hub_client::FEATURE_TERMINAL_STREAMING)
     }));
+    assert!(!has_diagnostic_kind(
+        &terminal_unavailable.diagnostics,
+        botster_hub_client::DaemonDiagnosticKind::Connected
+    ));
     let terminal_debug = format!("{:?}", terminal_unavailable.diagnostics);
     assert!(!terminal_debug.contains(&data_dir.to_string_lossy().to_string()));
     assert!(!terminal_debug.contains(concat!("/", "Users", "/")));
@@ -1268,6 +1293,7 @@ fn external_hub_client_reports_compatibility_descriptor_and_mismatch_diagnostics
         diagnostic.kind == botster_hub_client::DaemonDiagnosticKind::Connected
             && diagnostic.operation.as_deref() == Some("hello")
     }));
+    assert!(!has_failure_diagnostic(&ack.diagnostics));
     assert_eq!(ack.compatibility.protocol, botster_hub_client::PROTOCOL);
     assert_eq!(
         ack.compatibility.protocol_version,
@@ -1299,12 +1325,10 @@ fn external_hub_client_reports_compatibility_descriptor_and_mismatch_diagnostics
         diagnostic.kind == botster_hub_client::DaemonDiagnosticKind::Connected
             && diagnostic.operation.as_deref() == Some("status")
     }));
+    assert!(!has_failure_diagnostic(&status.diagnostics));
     let status = status.status.expect("status response body");
     assert_eq!(status.compatibility, ack.compatibility);
-    assert!(status.diagnostics.iter().any(|diagnostic| {
-        diagnostic.kind == botster_hub_client::DaemonDiagnosticKind::Connected
-            && diagnostic.operation.as_deref() == Some("status")
-    }));
+    assert!(status.diagnostics.is_empty());
 
     let mut version_requirement = botster_hub_client::DaemonCompatibilityRequirement::current();
     version_requirement.client_name = "future-version-client".to_string();
@@ -1327,6 +1351,14 @@ fn external_hub_client_reports_compatibility_descriptor_and_mismatch_diagnostics
                 .as_deref()
                 .is_some_and(|message| message.contains("unsupported protocol version"))
     }));
+    assert!(!has_diagnostic_kind(
+        &version_error.diagnostics,
+        botster_hub_client::DaemonDiagnosticKind::Connected
+    ));
+    assert!(!has_diagnostic_kind(
+        &version_error.diagnostics,
+        botster_hub_client::DaemonDiagnosticKind::ActionFailure
+    ));
 
     let mut feature_requirement = botster_hub_client::DaemonCompatibilityRequirement::current();
     feature_requirement.client_name = "future-feature-client".to_string();
@@ -1348,6 +1380,14 @@ fn external_hub_client_reports_compatibility_descriptor_and_mismatch_diagnostics
         diagnostic.kind == botster_hub_client::DaemonDiagnosticKind::UnsupportedFeature
             && diagnostic.feature.as_deref() == Some("future_feature")
     }));
+    assert!(!has_diagnostic_kind(
+        &feature_error.diagnostics,
+        botster_hub_client::DaemonDiagnosticKind::Connected
+    ));
+    assert!(!has_diagnostic_kind(
+        &feature_error.diagnostics,
+        botster_hub_client::DaemonDiagnosticKind::ActionFailure
+    ));
 
     shutdown_cli_daemon(&data_dir, child);
 }
