@@ -435,6 +435,22 @@ fn print_daemon_response(response: DaemonResponse) -> Result<(), OperatorError> 
             println!("response=plugin_mcp_tool_result");
             println!("result={}", response.plugin_tool_result);
         }
+        DaemonResponseKind::PluginSurface => {
+            println!("response=plugin_surface");
+            if let Some(surface) = response.plugin_surface {
+                let json = serde_json::to_string(&surface)
+                    .unwrap_or_else(|_| "{\"error\":\"unserializable\"}".to_string());
+                println!("surface={json}");
+            }
+        }
+        DaemonResponseKind::PluginActionResult => {
+            println!("response=plugin_action_result");
+            if let Some(result) = response.plugin_action_result {
+                let json = serde_json::to_string(&result)
+                    .unwrap_or_else(|_| "{\"error\":\"unserializable\"}".to_string());
+                println!("result={json}");
+            }
+        }
         DaemonResponseKind::SessionCleanup => {
             println!("response=session_cleanup");
             if let Some(cleanup) = response.cleanup {

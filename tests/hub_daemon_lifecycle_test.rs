@@ -12,7 +12,7 @@ use botster_core::{
     Capability, CapabilitySurface, CoreSessionMetadata, ExtensionEntrypoint, ExtensionKind,
     ExtensionRuntime, HostProfileMetadata, HostProfilePolicySection, PackageManifest,
     PackageSource, ProcessIdentity, RequestId, ResizePayload, SessionId, SessionSpawnRequest,
-    SpawnEnvironment, SpawnWorkingDirectory, SubscriptionId,
+    SpawnEnvironment, SpawnWorkingDirectory, SubscriptionId, UiActionStatus,
 };
 use botster_core_daemon::{RegistryRecord, SessionRegistry};
 use botster_hub::{
@@ -1217,6 +1217,68 @@ fn daemon_notify_session_defers_without_observed_readiness_over_socket() {
     assert!(
         !observed.contains("echo:notify-socket"),
         "notify session without observed readiness should not reach PTY input path, got {observed:?}"
+    );
+
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
+fn daemon_tui_project_pipelines_surface_action_round_trip_uses_plugin_result() {
+    let _guard = daemon_test_lock()
+        .lock()
+        .expect("serialize real daemon test");
+    let data_dir = unique_test_dir("daemon-tui-project-pipelines");
+    let config = explicit_config(&data_dir);
+    let child = start_cli_daemon(&data_dir);
+
+    let enabled = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::EnablePackageLocalPath {
+            path: PathBuf::from("examples/project-pipelines"),
+        },
+    )
+    .expect("enable project pipelines plugin over daemon socket");
+    assert_eq!(
+        enabled.kind,
+        botster_hub::DaemonResponseKind::PackageDecision
+    );
+
+    let mut driver =
+        botster_hub::tui::ScriptedTuiDriver::connect(config.clone()).expect("connect scripted TUI");
+    driver.set_project_pipelines_form("   ", "local_pipeline");
+    let invalid_results = driver.submit_project_pipelines_form();
+    let invalid = invalid_results.last().expect("invalid action result");
+    assert_eq!(invalid.status, UiActionStatus::Failure);
+    assert_eq!(
+        invalid
+            .payload
+            .as_ref()
+            .and_then(|payload| payload.get("field_errors"))
+            .and_then(|errors| errors.get("project-pipelines-create-title"))
+            .and_then(serde_json::Value::as_str),
+        Some("Title is required")
+    );
+
+    driver.set_project_pipelines_form("  TUI dogfood ticket  ", "local.pipeline");
+    let valid_results = driver.submit_project_pipelines_form();
+    let valid = valid_results.last().expect("valid action result");
+    assert_eq!(valid.status, UiActionStatus::Success);
+    assert_eq!(
+        valid.payload.as_ref().unwrap()["normalized"]["title"],
+        "TUI dogfood ticket"
+    );
+
+    let context = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::PluginMcpCallTool {
+            name: "project_pipelines.current_context".to_string(),
+            arguments: serde_json::json!({}),
+        },
+    )
+    .expect("read project pipelines current context over daemon socket");
+    assert_eq!(
+        context.plugin_tool_result["tickets"][0]["title"],
+        "TUI dogfood ticket"
     );
 
     shutdown_cli_daemon(&data_dir, child);

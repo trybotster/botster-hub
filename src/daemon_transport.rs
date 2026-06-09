@@ -18,7 +18,7 @@ use std::time::Duration;
 use botster_core::{
     EndpointId, EnvelopeCursor, EnvelopeDeliveryState, EnvelopeId, EnvelopeTarget,
     ExtensionRuntime, RequestId, RoutedEnvelope, RoutedEnvelopePayload, SessionId,
-    SessionLifecycleState, SubscriptionId, TerminalAttachState,
+    SessionLifecycleState, SubscriptionId, TerminalAttachState, UiActionResult, UiNode,
 };
 use botster_core_daemon::{
     GuardedWriteDecision, GuardedWriteDeliveryState, ReadinessEvidence, RegistrySessionState,
@@ -689,6 +689,48 @@ fn handle_runtime_control_request(
                 Err(error) => Ok(DaemonResponse::plugin_tool_error(error)),
             }
         }
+        DaemonRequest::PluginSurfaceRender {
+            package_name,
+            surface_id,
+            payload,
+        } => {
+            let response = api.handle_request(
+                runtime,
+                &packages,
+                HubClientRequest::PluginSurfaceRender {
+                    request_id: request_id("daemon-plugin-surface-render"),
+                    package_name,
+                    surface_id,
+                    payload,
+                },
+            )?;
+            let HubClientResponseBody::PluginSurface(surface) = response.body else {
+                return Err(DaemonTransportError::UnexpectedResponse);
+            };
+            Ok(DaemonResponse::plugin_surface(surface))
+        }
+        DaemonRequest::PluginSurfaceAction {
+            package_name,
+            surface_id,
+            action_id,
+            payload,
+        } => {
+            let response = api.handle_request(
+                runtime,
+                &packages,
+                HubClientRequest::PluginSurfaceAction {
+                    request_id: request_id("daemon-plugin-surface-action"),
+                    package_name,
+                    surface_id,
+                    action_id,
+                    payload,
+                },
+            )?;
+            let HubClientResponseBody::PluginActionResult(result) = response.body else {
+                return Err(DaemonTransportError::UnexpectedResponse);
+            };
+            Ok(DaemonResponse::plugin_action_result(result))
+        }
         DaemonRequest::DaemonShutdown => Ok(DaemonResponse {
             kind: DaemonResponseKind::Shutdown,
             status: Some(DaemonStatus::from_status(
@@ -704,6 +746,8 @@ fn handle_runtime_control_request(
             lifecycle: Vec::new(),
             plugin_tools: Vec::new(),
             plugin_tool_result: Value::Null,
+            plugin_surface: None,
+            plugin_action_result: None,
             events: Vec::new(),
             cleanup: None,
             coordination: None,
@@ -1102,6 +1146,17 @@ pub enum DaemonRequest {
         name: String,
         arguments: Value,
     },
+    PluginSurfaceRender {
+        package_name: String,
+        surface_id: String,
+        payload: Value,
+    },
+    PluginSurfaceAction {
+        package_name: String,
+        surface_id: String,
+        action_id: String,
+        payload: Value,
+    },
     DaemonShutdown,
 }
 
@@ -1118,6 +1173,10 @@ pub struct DaemonResponse {
     pub plugin_tools: Vec<McpToolDescriptor>,
     #[serde(default)]
     pub plugin_tool_result: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin_surface: Option<UiNode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin_action_result: Option<UiActionResult>,
     pub events: Vec<DaemonEvent>,
     pub cleanup: Option<DaemonSessionCleanup>,
     pub coordination: Option<DaemonCoordination>,
@@ -1135,6 +1194,8 @@ impl DaemonResponse {
             lifecycle: Vec::new(),
             plugin_tools: Vec::new(),
             plugin_tool_result: Value::Null,
+            plugin_surface: None,
+            plugin_action_result: None,
             events: Vec::new(),
             cleanup: None,
             coordination: None,
@@ -1152,6 +1213,8 @@ impl DaemonResponse {
             lifecycle: Vec::new(),
             plugin_tools: Vec::new(),
             plugin_tool_result: Value::Null,
+            plugin_surface: None,
+            plugin_action_result: None,
             events: Vec::new(),
             cleanup: None,
             coordination: None,
@@ -1169,6 +1232,8 @@ impl DaemonResponse {
             lifecycle: Vec::new(),
             plugin_tools: Vec::new(),
             plugin_tool_result: Value::Null,
+            plugin_surface: None,
+            plugin_action_result: None,
             events,
             cleanup: None,
             coordination: None,
@@ -1186,6 +1251,8 @@ impl DaemonResponse {
             lifecycle: Vec::new(),
             plugin_tools: Vec::new(),
             plugin_tool_result: Value::Null,
+            plugin_surface: None,
+            plugin_action_result: None,
             events,
             cleanup: None,
             coordination: None,
@@ -1203,6 +1270,8 @@ impl DaemonResponse {
             lifecycle: Vec::new(),
             plugin_tools: Vec::new(),
             plugin_tool_result: Value::Null,
+            plugin_surface: None,
+            plugin_action_result: None,
             events: Vec::new(),
             cleanup: None,
             coordination: None,
@@ -1220,6 +1289,8 @@ impl DaemonResponse {
             lifecycle: lifecycle.into_iter().map(Into::into).collect(),
             plugin_tools: Vec::new(),
             plugin_tool_result: Value::Null,
+            plugin_surface: None,
+            plugin_action_result: None,
             events: Vec::new(),
             cleanup: None,
             coordination: None,
@@ -1237,6 +1308,8 @@ impl DaemonResponse {
             lifecycle: Vec::new(),
             plugin_tools: Vec::new(),
             plugin_tool_result: Value::Null,
+            plugin_surface: None,
+            plugin_action_result: None,
             events: Vec::new(),
             cleanup: Some(cleanup),
             coordination: None,
@@ -1254,6 +1327,8 @@ impl DaemonResponse {
             lifecycle: Vec::new(),
             plugin_tools: Vec::new(),
             plugin_tool_result: Value::Null,
+            plugin_surface: None,
+            plugin_action_result: None,
             events: Vec::new(),
             cleanup: None,
             coordination: None,
@@ -1276,6 +1351,8 @@ impl DaemonResponse {
             lifecycle: Vec::new(),
             plugin_tools: Vec::new(),
             plugin_tool_result: Value::Null,
+            plugin_surface: None,
+            plugin_action_result: None,
             events: Vec::new(),
             cleanup: None,
             coordination: None,
@@ -1293,6 +1370,8 @@ impl DaemonResponse {
             lifecycle: Vec::new(),
             plugin_tools: Vec::new(),
             plugin_tool_result: Value::Null,
+            plugin_surface: None,
+            plugin_action_result: None,
             events: Vec::new(),
             cleanup: None,
             coordination: None,
@@ -1310,6 +1389,8 @@ impl DaemonResponse {
             lifecycle: Vec::new(),
             plugin_tools: Vec::new(),
             plugin_tool_result: Value::Null,
+            plugin_surface: None,
+            plugin_action_result: None,
             events: Vec::new(),
             cleanup: None,
             coordination: None,
@@ -1327,6 +1408,8 @@ impl DaemonResponse {
             lifecycle: Vec::new(),
             plugin_tools: Vec::new(),
             plugin_tool_result: Value::Null,
+            plugin_surface: None,
+            plugin_action_result: None,
             events: Vec::new(),
             cleanup: None,
             coordination: Some(coordination),
@@ -1344,6 +1427,8 @@ impl DaemonResponse {
             lifecycle: Vec::new(),
             plugin_tools,
             plugin_tool_result: Value::Null,
+            plugin_surface: None,
+            plugin_action_result: None,
             events: Vec::new(),
             cleanup: None,
             coordination: None,
@@ -1361,6 +1446,46 @@ impl DaemonResponse {
             lifecycle: Vec::new(),
             plugin_tools: Vec::new(),
             plugin_tool_result,
+            plugin_surface: None,
+            plugin_action_result: None,
+            events: Vec::new(),
+            cleanup: None,
+            coordination: None,
+            error: None,
+        }
+    }
+
+    fn plugin_surface(plugin_surface: UiNode) -> Self {
+        Self {
+            kind: DaemonResponseKind::PluginSurface,
+            status: None,
+            sessions: Vec::new(),
+            packages: Vec::new(),
+            package_decision: None,
+            lifecycle: Vec::new(),
+            plugin_tools: Vec::new(),
+            plugin_tool_result: Value::Null,
+            plugin_surface: Some(plugin_surface),
+            plugin_action_result: None,
+            events: Vec::new(),
+            cleanup: None,
+            coordination: None,
+            error: None,
+        }
+    }
+
+    fn plugin_action_result(plugin_action_result: UiActionResult) -> Self {
+        Self {
+            kind: DaemonResponseKind::PluginActionResult,
+            status: None,
+            sessions: Vec::new(),
+            packages: Vec::new(),
+            package_decision: None,
+            lifecycle: Vec::new(),
+            plugin_tools: Vec::new(),
+            plugin_tool_result: Value::Null,
+            plugin_surface: None,
+            plugin_action_result: Some(plugin_action_result),
             events: Vec::new(),
             cleanup: None,
             coordination: None,
@@ -1378,6 +1503,8 @@ impl DaemonResponse {
             lifecycle: Vec::new(),
             plugin_tools: Vec::new(),
             plugin_tool_result: Value::Null,
+            plugin_surface: None,
+            plugin_action_result: None,
             events: Vec::new(),
             cleanup: None,
             coordination: None,
@@ -1403,6 +1530,8 @@ pub enum DaemonResponseKind {
     PluginLifecycle,
     PluginMcpTools,
     PluginMcpToolResult,
+    PluginSurface,
+    PluginActionResult,
     SessionCleanup,
     Identity,
     MessagePosted,
@@ -1785,6 +1914,17 @@ impl DaemonOperatorError {
                 operation: operation_label(operation).to_string(),
                 message: format!("{package_name} is not allowed to run {operation:?}"),
             },
+            crate::HubClientError::Plugin {
+                request_id,
+                operation,
+                code,
+                message,
+            } => Self {
+                code,
+                request_id: request_id.0,
+                operation: operation_label(operation).to_string(),
+                message,
+            },
         }
     }
 
@@ -1851,6 +1991,8 @@ fn operation_label(operation: crate::HubClientOperation) -> &'static str {
         crate::HubClientOperation::CaptureSnapshot => "capture_snapshot",
         crate::HubClientOperation::ListPackages => "list_packages",
         crate::HubClientOperation::PluginLifecycleStatus => "plugin_lifecycle_status",
+        crate::HubClientOperation::PluginSurfaceRender => "plugin_surface_render",
+        crate::HubClientOperation::PluginSurfaceAction => "plugin_surface_action",
     }
 }
 
