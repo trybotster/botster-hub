@@ -796,6 +796,12 @@ impl DaemonDiagnostic {
         }
     }
 
+    /// Build a client-side diagnostic for a transport that disconnected after
+    /// the daemon protocol had already been established.
+    ///
+    /// The daemon does not emit this value as a response frame; clients produce
+    /// it locally when their own connection lifecycle proves a post-connect
+    /// disconnect.
     #[must_use]
     pub fn disconnected(message: impl Into<String>) -> Self {
         Self {
@@ -864,6 +870,9 @@ impl DaemonDiagnostic {
 #[serde(rename_all = "snake_case")]
 pub enum DaemonDiagnosticKind {
     Connected,
+    /// Client-side-only classification for post-connect transport loss.
+    ///
+    /// The daemon protocol does not emit this kind as a response frame.
     Disconnected,
     CompatibilityMismatch,
     UnsupportedFeature,
