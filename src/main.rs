@@ -11,12 +11,12 @@ use botster_core::{
     SessionSpawnRequest, SpawnEnvironment, SpawnWorkingDirectory, SubscriptionId, TransportEgress,
 };
 use botster_hub::{
-    DaemonCompatibility, DaemonEvent, DaemonOperatorError, DaemonPackage, DaemonRequest,
-    DaemonResponse, DaemonResponseKind, DaemonSession, DaemonStatus, DataDirectoryOption,
-    HubClientApi, HubClientRequest, HubClientResponseBody, HubDaemon, HubDaemonState, HubRuntime,
-    HubStartupOptions, HubStateLoadSource, RuntimeEnvironment, SessionDefaults, TransportBindings,
     build_default_config_for_runtime, daemon_transport_request, default_package_policy,
-    host_profile, run_tui, serve_daemon, serve_mcp_stdio, stream_attach,
+    host_profile, run_tui, serve_daemon, serve_mcp_stdio, stream_attach, DaemonCompatibility,
+    DaemonEvent, DaemonOperatorError, DaemonPackage, DaemonRequest, DaemonResponse,
+    DaemonResponseKind, DaemonSession, DaemonStatus, DataDirectoryOption, HubClientApi,
+    HubClientRequest, HubClientResponseBody, HubDaemon, HubDaemonState, HubRuntime,
+    HubStartupOptions, HubStateLoadSource, RuntimeEnvironment, SessionDefaults, TransportBindings,
 };
 
 const SMOKE_MARKER: &str = "botster-hub-smoke-ok";
@@ -152,6 +152,7 @@ fn start_daemon(args: Vec<String>) -> Result<(), StartError> {
             .iter()
             .map(|session_id| session_id.0.clone())
             .collect(),
+        diagnostics: Vec::new(),
     };
     print_daemon_transport_status("stopped", &status);
 
