@@ -61,6 +61,62 @@ connection error instead of continuing into session or terminal operations.
 before relying on sessions, terminal streaming, resize, or plugin surface/action
 dispatch, and show the diagnostic in the hub connection state.
 
+## Connection Diagnostics
+
+The daemon protocol exposes policy-free diagnostics through stable
+`DaemonDiagnostic` values. Clients should branch on `kind`, `operation`, and
+`feature`, and treat `message` as optional operator detail rather than a parsing
+contract.
+
+Diagnostics are additive fields on `DaemonHelloAck`, `DaemonStatus`,
+`DaemonResponse`, and `DaemonOperatorError`. Older responses that do not include
+diagnostics still deserialize with empty diagnostic lists.
+
+Current diagnostic kinds are:
+
+- `connected` for successful hello/status/shutdown lifecycle checks;
+- `compatibility_mismatch` for protocol, protocol-version, or conformance
+  descriptor mismatch;
+- `unsupported_feature` for missing handshake features or unsupported daemon
+  operations;
+- `terminal_stream_unavailable` when a terminal stream request has a distinct
+  runtime signal such as missing session on attach/drain;
+- `action_failure` when a plugin surface action returns a rejected or error
+  result;
+- `daemon_startup_failure` for startup failures reported by client/test-support
+  helpers before a daemon socket protocol response can exist;
+- `disconnected` for client-side transport disconnect classification.
+
+Downstream clients should prefer the structured fields over private string
+parsing:
+
+```rust
+let response = connection.request(&botster_hub_client::DaemonRequest::Status)?;
+if response.diagnostics.iter().any(|diagnostic| {
+    diagnostic.kind == botster_hub_client::DaemonDiagnosticKind::Connected
+}) {
+    // Render connected state.
+}
+```
+
+Compatibility errors also carry diagnostics:
+
+```rust
+match botster_hub_client::connect_and_hello_with_requirement(&endpoint, &requirement) {
+    Err(botster_hub_client::DaemonTransportError::Compatibility(error)) => {
+        for diagnostic in error.diagnostics {
+            // Render compatibility_mismatch or unsupported_feature.
+        }
+    }
+    other => other.map(drop)?,
+}
+```
+
+Diagnostic messages intentionally avoid local data directories, socket paths,
+raw worktree paths, and mutable Botster identity. First-party clients may add UI
+severity or remediation copy, but that policy belongs in the client renderer,
+not in the daemon protocol.
+
 The control-plane production route is:
 
 `botster_hub_client::DaemonConnection::request`
@@ -123,11 +179,12 @@ call `shutdown()` explicitly when they need teardown failures to be visible.
 `run_client_conformance` returns a stable report instead of raw event streams.
 It covers status, empty session list, spawn, terminal attach/drain through
 `stream_attach`, input echo, resize observation through `stty size`, a missing
-session validation error, and teardown. Downstream CI can run it twice against
-two fresh isolated hubs and compare the reports to prove deterministic fixture
-output.
+session validation error, connected diagnostics, terminal-unavailable
+diagnostics, and teardown. Downstream CI can run it twice against two fresh
+isolated hubs and compare the reports to prove deterministic fixture output.
 
 If a downstream client also wants to prove plugin surface/action dispatch
 against the first-party Project Pipelines example, provide a checkout path to
 the example package and call the optional `run_project_pipelines_conformance`
-helper.
+helper. Its report includes the rejected-action diagnostic for the invalid form
+submission path.

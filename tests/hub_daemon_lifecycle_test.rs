@@ -993,12 +993,10 @@ fn cli_daemon_restart_recovers_worker_backed_session_through_transport() {
     )
     .expect("spawn restart recovery session through daemon transport");
     assert_eq!(spawn.kind, botster_hub::DaemonResponseKind::Spawned);
-    assert!(
-        spawn
-            .sessions
-            .iter()
-            .any(|session| session.session_id == session_id && session.lifecycle == "running")
-    );
+    assert!(spawn
+        .sessions
+        .iter()
+        .any(|session| session.session_id == session_id && session.lifecycle == "running"));
 
     shutdown_cli_daemon(&data_dir, child);
     let restarted_child = start_cli_daemon(&data_dir);
@@ -1026,11 +1024,10 @@ fn cli_daemon_restart_recovers_worker_backed_session_through_transport() {
     let list =
         botster_hub::daemon_transport_request(&config, botster_hub::DaemonRequest::ListSessions)
             .expect("list recovered session through daemon transport");
-    assert!(
-        list.sessions
-            .iter()
-            .any(|session| session.session_id == session_id && session.lifecycle == "running")
-    );
+    assert!(list
+        .sessions
+        .iter()
+        .any(|session| session.session_id == session_id && session.lifecycle == "running"));
 
     let resize = botster_hub::daemon_transport_request(
         &config,
@@ -1108,6 +1105,10 @@ fn external_hub_client_crate_drives_real_daemon_socket_protocol() {
     let status = botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status)
         .expect("external client status request");
     assert_eq!(status.kind, botster_hub_client::DaemonResponseKind::Status);
+    assert!(status.diagnostics.iter().any(|diagnostic| {
+        diagnostic.kind == botster_hub_client::DaemonDiagnosticKind::Connected
+            && diagnostic.operation.as_deref() == Some("status")
+    }));
     assert_eq!(
         status
             .status
@@ -1133,13 +1134,11 @@ fn external_hub_client_crate_drives_real_daemon_socket_protocol() {
     )
     .expect("external client spawn request");
     assert_eq!(spawn.kind, botster_hub_client::DaemonResponseKind::Spawned);
-    assert!(
-        spawn
-            .sessions
-            .iter()
-            .any(|session| session.session_id == "external-client-session"
-                && session.lifecycle == "running")
-    );
+    assert!(spawn
+        .sessions
+        .iter()
+        .any(|session| session.session_id == "external-client-session"
+            && session.lifecycle == "running"));
 
     let mut connection =
         botster_hub_client::DaemonConnection::connect(&endpoint).expect("external connect");
@@ -1199,6 +1198,25 @@ fn external_hub_client_crate_drives_real_daemon_socket_protocol() {
         .expect("external detach request");
     assert_eq!(detach.kind, botster_hub_client::DaemonResponseKind::Events);
 
+    let terminal_unavailable = connection
+        .request(&botster_hub_client::DaemonRequest::Drain {
+            session_id: "missing-external-client-session".to_string(),
+        })
+        .expect("missing terminal drain returns operator response");
+    assert_eq!(
+        terminal_unavailable.kind,
+        botster_hub_client::DaemonResponseKind::OperatorError
+    );
+    assert!(terminal_unavailable.diagnostics.iter().any(|diagnostic| {
+        diagnostic.kind == botster_hub_client::DaemonDiagnosticKind::TerminalStreamUnavailable
+            && diagnostic.operation.as_deref() == Some("drain_runtime")
+            && diagnostic.feature.as_deref() == Some(botster_hub_client::FEATURE_TERMINAL_STREAMING)
+    }));
+    let terminal_debug = format!("{:?}", terminal_unavailable.diagnostics);
+    assert!(!terminal_debug.contains(&data_dir.to_string_lossy().to_string()));
+    assert!(!terminal_debug.contains(concat!("/", "Users", "/")));
+    assert!(!terminal_debug.contains("/home/"));
+
     let reconnect =
         botster_hub_client::DaemonConnection::connect(&endpoint).expect("external reconnect");
     drop(reconnect);
@@ -1246,31 +1264,30 @@ fn external_hub_client_reports_compatibility_descriptor_and_mismatch_diagnostics
     let ack: botster_hub_client::DaemonHelloAck =
         botster_hub_client::read_frame(&mut stream).expect("read hello ack");
     assert_eq!(ack.protocol, botster_hub_client::PROTOCOL);
+    assert!(ack.diagnostics.iter().any(|diagnostic| {
+        diagnostic.kind == botster_hub_client::DaemonDiagnosticKind::Connected
+            && diagnostic.operation.as_deref() == Some("hello")
+    }));
     assert_eq!(ack.compatibility.protocol, botster_hub_client::PROTOCOL);
     assert_eq!(
         ack.compatibility.protocol_version,
         botster_hub_client::PROTOCOL_VERSION
     );
-    assert!(
-        ack.compatibility
-            .supports_feature(botster_hub_client::FEATURE_SESSIONS)
-    );
-    assert!(
-        ack.compatibility
-            .supports_feature(botster_hub_client::FEATURE_TERMINAL_STREAMING)
-    );
-    assert!(
-        ack.compatibility
-            .supports_feature(botster_hub_client::FEATURE_RESIZE)
-    );
-    assert!(
-        ack.compatibility
-            .supports_feature(botster_hub_client::FEATURE_PLUGIN_SURFACE_RENDER)
-    );
-    assert!(
-        ack.compatibility
-            .supports_feature(botster_hub_client::FEATURE_PLUGIN_SURFACE_ACTION)
-    );
+    assert!(ack
+        .compatibility
+        .supports_feature(botster_hub_client::FEATURE_SESSIONS));
+    assert!(ack
+        .compatibility
+        .supports_feature(botster_hub_client::FEATURE_TERMINAL_STREAMING));
+    assert!(ack
+        .compatibility
+        .supports_feature(botster_hub_client::FEATURE_RESIZE));
+    assert!(ack
+        .compatibility
+        .supports_feature(botster_hub_client::FEATURE_PLUGIN_SURFACE_RENDER));
+    assert!(ack
+        .compatibility
+        .supports_feature(botster_hub_client::FEATURE_PLUGIN_SURFACE_ACTION));
     assert_eq!(
         ack.compatibility.conformance_fixture_revision,
         botster_hub_client::CONFORMANCE_FIXTURE_REVISION
@@ -1278,8 +1295,16 @@ fn external_hub_client_reports_compatibility_descriptor_and_mismatch_diagnostics
 
     let status = botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status)
         .expect("external client status request");
+    assert!(status.diagnostics.iter().any(|diagnostic| {
+        diagnostic.kind == botster_hub_client::DaemonDiagnosticKind::Connected
+            && diagnostic.operation.as_deref() == Some("status")
+    }));
     let status = status.status.expect("status response body");
     assert_eq!(status.compatibility, ack.compatibility);
+    assert!(status.diagnostics.iter().any(|diagnostic| {
+        diagnostic.kind == botster_hub_client::DaemonDiagnosticKind::Connected
+            && diagnostic.operation.as_deref() == Some("status")
+    }));
 
     let mut version_requirement = botster_hub_client::DaemonCompatibilityRequirement::current();
     version_requirement.client_name = "future-version-client".to_string();
@@ -1291,6 +1316,17 @@ fn external_hub_client_reports_compatibility_descriptor_and_mismatch_diagnostics
     assert!(version_message.contains("future-version-client"));
     assert!(version_message.contains("unsupported protocol version"));
     assert!(!version_message.contains(&data_dir.to_string_lossy().to_string()));
+    let botster_hub_client::DaemonTransportError::Compatibility(version_error) = version_error
+    else {
+        panic!("version mismatch should be a compatibility error");
+    };
+    assert!(version_error.diagnostics.iter().any(|diagnostic| {
+        diagnostic.kind == botster_hub_client::DaemonDiagnosticKind::CompatibilityMismatch
+            && diagnostic
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("unsupported protocol version"))
+    }));
 
     let mut feature_requirement = botster_hub_client::DaemonCompatibilityRequirement::current();
     feature_requirement.client_name = "future-feature-client".to_string();
@@ -1304,6 +1340,14 @@ fn external_hub_client_reports_compatibility_descriptor_and_mismatch_diagnostics
     assert!(feature_message.contains("future-feature-client"));
     assert!(feature_message.contains("missing required feature(s): future_feature"));
     assert!(!feature_message.contains(&data_dir.to_string_lossy().to_string()));
+    let botster_hub_client::DaemonTransportError::Compatibility(feature_error) = feature_error
+    else {
+        panic!("feature mismatch should be a compatibility error");
+    };
+    assert!(feature_error.diagnostics.iter().any(|diagnostic| {
+        diagnostic.kind == botster_hub_client::DaemonDiagnosticKind::UnsupportedFeature
+            && diagnostic.feature.as_deref() == Some("future_feature")
+    }));
 
     shutdown_cli_daemon(&data_dir, child);
 }
@@ -1338,16 +1382,19 @@ fn external_hub_test_support_drives_isolated_daemon_socket_protocol() {
         first_report.compatibility_protocol_version,
         botster_hub_client::PROTOCOL_VERSION
     );
-    assert!(
-        first_report
-            .compatibility_features
-            .contains(&botster_hub_client::FEATURE_SESSIONS.to_string())
-    );
+    assert!(first_report
+        .compatibility_features
+        .contains(&botster_hub_client::FEATURE_SESSIONS.to_string()));
     assert_eq!(
         first_report.compatibility_conformance_fixture_revision,
         botster_hub_client::CONFORMANCE_FIXTURE_REVISION
     );
+    assert_eq!(first_report.connected_diagnostic_operation, "status");
     assert_eq!(first_report.validation_error_operation, "drain_runtime");
+    assert_eq!(
+        first_report.validation_diagnostic_kind,
+        "terminal_stream_unavailable"
+    );
 
     let plugin_report = botster_hub_test_support::run_project_pipelines_conformance(
         &first,
@@ -1358,6 +1405,10 @@ fn external_hub_test_support_drives_isolated_daemon_socket_protocol() {
     assert_eq!(plugin_report.surface_kind, "panel");
     assert_eq!(plugin_report.surface_id, "project-pipelines-create-panel");
     assert_eq!(plugin_report.invalid_action_status, "failure");
+    assert_eq!(
+        plugin_report.invalid_action_diagnostic_kind,
+        "action_failure"
+    );
     assert_eq!(plugin_report.invalid_title_error, "Title is required");
     first.shutdown().expect("shutdown first isolated hub");
 
@@ -1604,11 +1655,9 @@ fn scripted_tui_uses_daemon_socket_for_attach_input_doorbell_resize_and_restart_
 
     let proof = botster_hub::run_scripted_probe(config.clone(), "scripted-tui-session")
         .expect("scripted TUI probe should complete core workflow");
-    assert!(
-        proof
-            .rendered_sessions
-            .contains(&"scripted-tui-session".to_string())
-    );
+    assert!(proof
+        .rendered_sessions
+        .contains(&"scripted-tui-session".to_string()));
     assert!(proof.ui_regions.contains(&"sessions-panel".to_string()));
     assert!(proof.ui_regions.contains(&"activity-panel".to_string()));
     assert!(proof.ui_regions.contains(&"attached-terminal".to_string()));
