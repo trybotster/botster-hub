@@ -15,7 +15,19 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use botster_hub_client::{DaemonEndpoint, DaemonRequest, DaemonResponseKind};
+use botster_hub_client::{
+    DaemonEndpoint, DaemonOperatorError, DaemonRequest, DaemonResponse, DaemonResponseKind,
+    DaemonTransportError,
+};
+
+const CONFORMANCE_SESSION_ID: &str = "botster-conformance-session";
+const CONFORMANCE_SUBSCRIPTION_ID: &str = "botster-conformance-subscription";
+const CONFORMANCE_READY: &str = "conformance-ready";
+const CONFORMANCE_ECHO: &str = "echo:from-conformance";
+const CONFORMANCE_WINSIZE_PREFIX: &str = "winsize:";
+const PROJECT_PIPELINES_PACKAGE: &str = "project-pipelines";
+const PROJECT_PIPELINES_SURFACE: &str = "project-pipelines.create-ticket";
+const PROJECT_PIPELINES_ACTION: &str = "project_pipelines.create_ticket";
 
 const DEFAULT_SOCKET_NAME: &str = "botster-hub.sock";
 const READY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -188,6 +200,428 @@ impl IsolatedHub {
                 stdout: String::from_utf8_lossy(&output.stdout).to_string(),
                 stderr: String::from_utf8_lossy(&output.stderr).to_string(),
             })
+        }
+    }
+}
+
+/// Stable observation returned by [`run_client_conformance`].
+///
+/// The report intentionally excludes raw event ordering and timing-dependent
+/// daemon details so downstream client CI can compare it across repeated runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientConformanceReport {
+    pub lifecycle_state: String,
+    pub initial_session_count: usize,
+    pub session_id: String,
+    pub spawned_lifecycle: String,
+    pub stream_contains_ready: bool,
+    pub stream_contains_echo: bool,
+    pub stream_contains_resize: bool,
+    pub validation_error_code: String,
+    pub validation_error_operation: String,
+}
+
+/// Stable observation returned by [`run_project_pipelines_conformance`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectPipelinesConformanceReport {
+    pub package_state: String,
+    pub surface_kind: String,
+    pub surface_id: String,
+    pub invalid_action_status: String,
+    pub invalid_title_error: String,
+}
+
+/// Run the hub-owned conformance flow for same-device external clients.
+///
+/// The flow starts from an already isolated hub, then exercises status, session
+/// list, spawn, attach/drain through `botster_hub_client::stream_attach`, input,
+/// resize, validation error handling, and session teardown using only public
+/// `botster-hub-client` calls.
+pub fn run_client_conformance(
+    hub: &IsolatedHub,
+) -> Result<ClientConformanceReport, ConformanceError> {
+    let status = request(hub.endpoint(), DaemonRequest::Status, "status")?;
+    expect_kind(&status, DaemonResponseKind::Status, "status")?;
+    let status = status.status.ok_or(ConformanceError::MissingBody {
+        operation: "status",
+        field: "status",
+    })?;
+
+    let list = request(hub.endpoint(), DaemonRequest::ListSessions, "list_sessions")?;
+    expect_kind(&list, DaemonResponseKind::Sessions, "list_sessions")?;
+    let initial_session_count = list.sessions.len();
+
+    let spawn = request(
+        hub.endpoint(),
+        DaemonRequest::Spawn {
+            session_id: CONFORMANCE_SESSION_ID.to_string(),
+            command: format!(
+                "printf '{CONFORMANCE_READY}\\n'; while IFS= read -r line; do if [ \"$line\" = size-check ]; then printf '{CONFORMANCE_WINSIZE_PREFIX}%s\\n' \"$(stty size)\"; elif [ \"$line\" = quit ]; then printf 'conformance-bye\\n'; exit 0; else printf 'echo:%s\\n' \"$line\"; fi; done"
+            ),
+        },
+        "spawn",
+    )?;
+    expect_kind(&spawn, DaemonResponseKind::Spawned, "spawn")?;
+    let spawned_lifecycle = spawn
+        .sessions
+        .iter()
+        .find(|session| session.session_id == CONFORMANCE_SESSION_ID)
+        .map(|session| session.lifecycle.clone())
+        .ok_or(ConformanceError::MissingSession {
+            session_id: CONFORMANCE_SESSION_ID.to_string(),
+        })?;
+
+    let endpoint = hub.endpoint().clone();
+    let attach_handle = thread::spawn(move || {
+        let mut output = Vec::new();
+        botster_hub_client::stream_attach(
+            &endpoint,
+            CONFORMANCE_SESSION_ID,
+            CONFORMANCE_SUBSCRIPTION_ID,
+            &mut output,
+        )?;
+        Ok::<_, DaemonTransportError>(output)
+    });
+    // `stream_attach` writes the initial attach events and then drains the
+    // session, so late-arriving output is still captured; this just gives the
+    // subscription a head start before we drive input.
+    thread::sleep(Duration::from_millis(100));
+
+    expect_kind(
+        &request(
+            hub.endpoint(),
+            DaemonRequest::Resize {
+                session_id: CONFORMANCE_SESSION_ID.to_string(),
+                rows: 33,
+                cols: 102,
+            },
+            "resize",
+        )?,
+        DaemonResponseKind::Events,
+        "resize",
+    )?;
+    expect_kind(
+        &request(
+            hub.endpoint(),
+            DaemonRequest::SendInput {
+                session_id: CONFORMANCE_SESSION_ID.to_string(),
+                data: "from-conformance\n".to_string(),
+            },
+            "send_input",
+        )?,
+        DaemonResponseKind::Events,
+        "send_input",
+    )?;
+    expect_kind(
+        &request(
+            hub.endpoint(),
+            DaemonRequest::SendInput {
+                session_id: CONFORMANCE_SESSION_ID.to_string(),
+                data: "size-check\n".to_string(),
+            },
+            "send_size_check",
+        )?,
+        DaemonResponseKind::Events,
+        "send_size_check",
+    )?;
+    expect_kind(
+        &request(
+            hub.endpoint(),
+            DaemonRequest::SendInput {
+                session_id: CONFORMANCE_SESSION_ID.to_string(),
+                data: "quit\n".to_string(),
+            },
+            "send_quit",
+        )?,
+        DaemonResponseKind::Events,
+        "send_quit",
+    )?;
+
+    let output = attach_handle
+        .join()
+        .map_err(|_| ConformanceError::AttachThreadPanicked)?
+        .map_err(|source| ConformanceError::Client {
+            operation: "stream_attach",
+            source,
+        })?;
+    let output = String::from_utf8_lossy(&output).to_string();
+    let stream_contains_ready = output.contains(CONFORMANCE_READY);
+    let stream_contains_echo = output.contains(CONFORMANCE_ECHO);
+    let resize_needle = format!("{CONFORMANCE_WINSIZE_PREFIX}33 102");
+    let stream_contains_resize = output.contains(&resize_needle);
+    if !stream_contains_ready {
+        return Err(ConformanceError::MissingOutput {
+            needle: CONFORMANCE_READY,
+            output,
+        });
+    }
+    if !stream_contains_echo {
+        return Err(ConformanceError::MissingOutput {
+            needle: CONFORMANCE_ECHO,
+            output,
+        });
+    }
+    if !stream_contains_resize {
+        return Err(ConformanceError::MissingOutput {
+            needle: "winsize:33 102",
+            output,
+        });
+    }
+
+    let validation = request(
+        hub.endpoint(),
+        DaemonRequest::Drain {
+            session_id: "missing-conformance-session".to_string(),
+        },
+        "validation_error",
+    )?;
+    expect_kind(
+        &validation,
+        DaemonResponseKind::OperatorError,
+        "validation_error",
+    )?;
+    let validation_error = validation.error.ok_or(ConformanceError::MissingBody {
+        operation: "validation_error",
+        field: "error",
+    })?;
+
+    let _ = request(
+        hub.endpoint(),
+        DaemonRequest::ShutdownSession {
+            session_id: CONFORMANCE_SESSION_ID.to_string(),
+        },
+        "shutdown_session",
+    );
+
+    Ok(ClientConformanceReport {
+        lifecycle_state: status.lifecycle_state,
+        initial_session_count,
+        session_id: CONFORMANCE_SESSION_ID.to_string(),
+        spawned_lifecycle,
+        stream_contains_ready,
+        stream_contains_echo,
+        stream_contains_resize,
+        validation_error_code: validation_error.code,
+        validation_error_operation: validation_error.operation,
+    })
+}
+
+/// Run the public Project Pipelines surface/action validation subflow.
+///
+/// Callers pass a package checkout path, usually `examples/project-pipelines`
+/// from this repository checkout. The helper enables the package through the
+/// daemon and exercises render/action dispatch without linking plugin internals.
+pub fn run_project_pipelines_conformance(
+    hub: &IsolatedHub,
+    package_path: impl Into<PathBuf>,
+) -> Result<ProjectPipelinesConformanceReport, ConformanceError> {
+    let enabled = request(
+        hub.endpoint(),
+        DaemonRequest::EnablePackageLocalPath {
+            path: package_path.into(),
+        },
+        "enable_project_pipelines",
+    )?;
+    expect_kind(
+        &enabled,
+        DaemonResponseKind::PackageDecision,
+        "enable_project_pipelines",
+    )?;
+    let package_state = enabled
+        .package_decision
+        .ok_or(ConformanceError::MissingBody {
+            operation: "enable_project_pipelines",
+            field: "package_decision",
+        })?
+        .state;
+
+    let surface = request(
+        hub.endpoint(),
+        DaemonRequest::PluginSurfaceRender {
+            package_name: PROJECT_PIPELINES_PACKAGE.to_string(),
+            surface_id: PROJECT_PIPELINES_SURFACE.to_string(),
+            payload: serde_json::json!({}),
+        },
+        "project_pipelines_surface",
+    )?;
+    expect_kind(
+        &surface,
+        DaemonResponseKind::PluginSurface,
+        "project_pipelines_surface",
+    )?;
+    let surface = surface
+        .plugin_surface
+        .ok_or(ConformanceError::MissingBody {
+            operation: "project_pipelines_surface",
+            field: "plugin_surface",
+        })?;
+    let surface_kind = value_string(&surface, "type", "project_pipelines_surface")?;
+    let surface_id = value_string(&surface, "id", "project_pipelines_surface")?;
+
+    let invalid = request(
+        hub.endpoint(),
+        DaemonRequest::PluginSurfaceAction {
+            package_name: PROJECT_PIPELINES_PACKAGE.to_string(),
+            surface_id: PROJECT_PIPELINES_SURFACE.to_string(),
+            action_id: PROJECT_PIPELINES_ACTION.to_string(),
+            payload: serde_json::json!({
+                "request_id": "invalid-project-pipelines-conformance",
+                "title": "   ",
+                "pipeline_id": "local_pipeline",
+            }),
+        },
+        "project_pipelines_invalid_action",
+    )?;
+    expect_kind(
+        &invalid,
+        DaemonResponseKind::PluginActionResult,
+        "project_pipelines_invalid_action",
+    )?;
+    let invalid = invalid
+        .plugin_action_result
+        .ok_or(ConformanceError::MissingBody {
+            operation: "project_pipelines_invalid_action",
+            field: "plugin_action_result",
+        })?;
+    let invalid_action_status =
+        value_string(&invalid, "status", "project_pipelines_invalid_action")?;
+    let invalid_title_error = invalid
+        .get("payload")
+        .and_then(|payload| payload.get("field_errors"))
+        .and_then(|errors| errors.get("project-pipelines-create-title"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or(ConformanceError::MissingJsonField {
+            operation: "project_pipelines_invalid_action",
+            field: "payload.field_errors.project-pipelines-create-title",
+        })?
+        .to_string();
+
+    Ok(ProjectPipelinesConformanceReport {
+        package_state,
+        surface_kind,
+        surface_id,
+        invalid_action_status,
+        invalid_title_error,
+    })
+}
+
+fn request(
+    endpoint: &DaemonEndpoint,
+    request: DaemonRequest,
+    operation: &'static str,
+) -> Result<DaemonResponse, ConformanceError> {
+    botster_hub_client::request(endpoint, request)
+        .map_err(|source| ConformanceError::Client { operation, source })
+}
+
+fn expect_kind(
+    response: &DaemonResponse,
+    expected: DaemonResponseKind,
+    operation: &'static str,
+) -> Result<(), ConformanceError> {
+    if response.kind == expected {
+        Ok(())
+    } else {
+        Err(ConformanceError::UnexpectedKind {
+            operation,
+            expected,
+            actual: response.kind,
+            error: response.error.clone(),
+        })
+    }
+}
+
+fn value_string(
+    value: &serde_json::Value,
+    field: &'static str,
+    operation: &'static str,
+) -> Result<String, ConformanceError> {
+    value
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .ok_or(ConformanceError::MissingJsonField { operation, field })
+}
+
+/// Errors returned by published conformance fixture flows.
+#[derive(Debug)]
+pub enum ConformanceError {
+    Client {
+        operation: &'static str,
+        source: DaemonTransportError,
+    },
+    UnexpectedKind {
+        operation: &'static str,
+        expected: DaemonResponseKind,
+        actual: DaemonResponseKind,
+        error: Option<DaemonOperatorError>,
+    },
+    MissingBody {
+        operation: &'static str,
+        field: &'static str,
+    },
+    MissingJsonField {
+        operation: &'static str,
+        field: &'static str,
+    },
+    MissingSession {
+        session_id: String,
+    },
+    MissingOutput {
+        needle: &'static str,
+        output: String,
+    },
+    AttachThreadPanicked,
+}
+
+impl fmt::Display for ConformanceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Client { operation, source } => {
+                write!(formatter, "{operation} request failed: {source}")
+            }
+            Self::UnexpectedKind {
+                operation,
+                expected,
+                actual,
+                error,
+            } => {
+                write!(
+                    formatter,
+                    "{operation} returned {actual:?}, expected {expected:?}"
+                )?;
+                if let Some(error) = error {
+                    write!(formatter, ": {} {}", error.code, error.message)?;
+                }
+                Ok(())
+            }
+            Self::MissingBody { operation, field } => {
+                write!(formatter, "{operation} response missing {field}")
+            }
+            Self::MissingJsonField { operation, field } => {
+                write!(formatter, "{operation} response missing JSON field {field}")
+            }
+            Self::MissingSession { session_id } => {
+                write!(formatter, "spawn response missing session {session_id}")
+            }
+            Self::MissingOutput { needle, output } => {
+                write!(formatter, "stream output missing {needle:?}: {output:?}")
+            }
+            Self::AttachThreadPanicked => write!(formatter, "stream attach thread panicked"),
+        }
+    }
+}
+
+impl Error for ConformanceError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Client { source, .. } => Some(source),
+            Self::UnexpectedKind { .. }
+            | Self::MissingBody { .. }
+            | Self::MissingJsonField { .. }
+            | Self::MissingSession { .. }
+            | Self::MissingOutput { .. }
+            | Self::AttachThreadPanicked => None,
         }
     }
 }
