@@ -16,6 +16,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub const PROTOCOL: &str = "botster-hub-daemon-v1";
+pub const PROTOCOL_VERSION: u16 = 1;
+pub const CONFORMANCE_FIXTURE_REVISION: u16 = 1;
+pub const FEATURE_SESSIONS: &str = "sessions";
+pub const FEATURE_TERMINAL_STREAMING: &str = "terminal_streaming";
+pub const FEATURE_RESIZE: &str = "resize";
+pub const FEATURE_PLUGIN_SURFACE_RENDER: &str = "plugin_surface_render";
+pub const FEATURE_PLUGIN_SURFACE_ACTION: &str = "plugin_surface_action";
 const ATTACH_DRAIN_INTERVAL: Duration = Duration::from_millis(25);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -144,6 +151,13 @@ fn detach_stream_subscription(stream: &mut UnixStream, session_id: &str, subscri
 }
 
 pub fn connect_and_hello(endpoint: &DaemonEndpoint) -> DaemonTransportResult<UnixStream> {
+    connect_and_hello_with_requirement(endpoint, &DaemonCompatibilityRequirement::current())
+}
+
+pub fn connect_and_hello_with_requirement(
+    endpoint: &DaemonEndpoint,
+    requirement: &DaemonCompatibilityRequirement,
+) -> DaemonTransportResult<UnixStream> {
     let mut stream = UnixStream::connect(&endpoint.socket_path).map_err(|error| {
         if matches!(
             error.kind(),
@@ -158,14 +172,18 @@ pub fn connect_and_hello(endpoint: &DaemonEndpoint) -> DaemonTransportResult<Uni
         &mut stream,
         &DaemonHello {
             protocol: PROTOCOL.to_string(),
+            compatibility: requirement.clone(),
         },
     )?;
     let ack: DaemonHelloAck = read_frame(&mut stream)?;
-    if ack.protocol == PROTOCOL {
-        Ok(stream)
-    } else {
-        Err(DaemonTransportError::NotRunning)
+    if ack.protocol != PROTOCOL {
+        return Err(DaemonTransportError::Protocol(
+            "unexpected hello ack protocol",
+        ));
     }
+    ensure_compatible(requirement, &ack.compatibility)
+        .map_err(DaemonTransportError::Compatibility)?;
+    Ok(stream)
 }
 
 pub fn write_frame<T: Serialize>(stream: &mut UnixStream, frame: &T) -> DaemonTransportResult<()> {
@@ -212,11 +230,174 @@ fn write_terminal_events(
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DaemonHello {
     pub protocol: String,
+    #[serde(default)]
+    pub compatibility: DaemonCompatibilityRequirement,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DaemonHelloAck {
     pub protocol: String,
+    pub compatibility: DaemonCompatibility,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonCompatibility {
+    pub protocol: String,
+    pub protocol_version: u16,
+    pub features: Vec<String>,
+    pub conformance_fixture_revision: u16,
+}
+
+impl DaemonCompatibility {
+    #[must_use]
+    pub fn current() -> Self {
+        Self {
+            protocol: PROTOCOL.to_string(),
+            protocol_version: PROTOCOL_VERSION,
+            features: current_feature_list()
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            conformance_fixture_revision: CONFORMANCE_FIXTURE_REVISION,
+        }
+    }
+
+    #[must_use]
+    pub fn supports_feature(&self, feature: &str) -> bool {
+        self.features.iter().any(|supported| supported == feature)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonCompatibilityRequirement {
+    pub protocol: String,
+    pub minimum_protocol_version: u16,
+    pub required_features: Vec<String>,
+    pub minimum_conformance_fixture_revision: u16,
+    pub client_name: String,
+}
+
+impl DaemonCompatibilityRequirement {
+    #[must_use]
+    pub fn current() -> Self {
+        Self {
+            protocol: PROTOCOL.to_string(),
+            minimum_protocol_version: PROTOCOL_VERSION,
+            required_features: current_feature_list()
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            minimum_conformance_fixture_revision: CONFORMANCE_FIXTURE_REVISION,
+            client_name: "botster-hub-client".to_string(),
+        }
+    }
+}
+
+impl Default for DaemonCompatibilityRequirement {
+    fn default() -> Self {
+        Self::current()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DaemonCompatibilityError {
+    pub diagnostic: String,
+}
+
+impl fmt::Display for DaemonCompatibilityError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.diagnostic)
+    }
+}
+
+impl Error for DaemonCompatibilityError {}
+
+pub fn ensure_compatible(
+    requirement: &DaemonCompatibilityRequirement,
+    compatibility: &DaemonCompatibility,
+) -> Result<(), DaemonCompatibilityError> {
+    if compatibility.protocol != requirement.protocol {
+        return Err(compatibility_error(
+            requirement,
+            compatibility,
+            format!(
+                "unsupported protocol {}; expected {}",
+                compatibility.protocol, requirement.protocol
+            ),
+        ));
+    }
+
+    if compatibility.protocol_version < requirement.minimum_protocol_version {
+        return Err(compatibility_error(
+            requirement,
+            compatibility,
+            format!(
+                "unsupported protocol version {}; requires at least {}",
+                compatibility.protocol_version, requirement.minimum_protocol_version
+            ),
+        ));
+    }
+
+    if compatibility.conformance_fixture_revision < requirement.minimum_conformance_fixture_revision
+    {
+        return Err(compatibility_error(
+            requirement,
+            compatibility,
+            format!(
+                "unsupported conformance fixture revision {}; requires at least {}",
+                compatibility.conformance_fixture_revision,
+                requirement.minimum_conformance_fixture_revision
+            ),
+        ));
+    }
+
+    let missing: Vec<&str> = requirement
+        .required_features
+        .iter()
+        .map(String::as_str)
+        .filter(|feature| !compatibility.supports_feature(feature))
+        .collect();
+    if !missing.is_empty() {
+        return Err(compatibility_error(
+            requirement,
+            compatibility,
+            format!("missing required feature(s): {}", missing.join(", ")),
+        ));
+    }
+
+    Ok(())
+}
+
+fn compatibility_error(
+    requirement: &DaemonCompatibilityRequirement,
+    compatibility: &DaemonCompatibility,
+    reason: String,
+) -> DaemonCompatibilityError {
+    DaemonCompatibilityError {
+        diagnostic: format!(
+            "{} is incompatible with running botster-hub: {}; required protocol={} min_version={} required_features=[{}] min_conformance_fixture_revision={}; running protocol={} version={} features=[{}] conformance_fixture_revision={}",
+            requirement.client_name,
+            reason,
+            requirement.protocol,
+            requirement.minimum_protocol_version,
+            requirement.required_features.join(","),
+            requirement.minimum_conformance_fixture_revision,
+            compatibility.protocol,
+            compatibility.protocol_version,
+            compatibility.features.join(","),
+            compatibility.conformance_fixture_revision
+        ),
+    }
+}
+
+fn current_feature_list() -> Vec<&'static str> {
+    vec![
+        FEATURE_SESSIONS,
+        FEATURE_TERMINAL_STREAMING,
+        FEATURE_RESIZE,
+        FEATURE_PLUGIN_SURFACE_RENDER,
+        FEATURE_PLUGIN_SURFACE_ACTION,
+    ]
 }
 
 /// Client request variants for the local daemon protocol.
@@ -443,6 +624,7 @@ pub struct DaemonPluginLifecycle {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DaemonStatus {
     pub lifecycle_state: String,
+    pub compatibility: DaemonCompatibility,
     pub host_id: String,
     pub host_display_name: String,
     pub schema_version: u16,
@@ -533,6 +715,7 @@ pub enum DaemonTransportError {
     NotRunning,
     ClientDisconnected,
     Protocol(&'static str),
+    Compatibility(DaemonCompatibilityError),
     ControlThreadStopped,
 }
 
@@ -548,6 +731,7 @@ impl fmt::Display for DaemonTransportError {
             Self::NotRunning => write!(formatter, "botster-hub daemon is not running"),
             Self::ClientDisconnected => write!(formatter, "daemon client disconnected"),
             Self::Protocol(message) => write!(formatter, "daemon protocol error: {message}"),
+            Self::Compatibility(error) => write!(formatter, "{error}"),
             Self::ControlThreadStopped => write!(formatter, "daemon control thread stopped"),
         }
     }
@@ -558,6 +742,7 @@ impl Error for DaemonTransportError {
         match self {
             Self::Io(error) => Some(error),
             Self::Json(error) => Some(error),
+            Self::Compatibility(error) => Some(error),
             Self::MissingSocketBinding
             | Self::AlreadyRunning
             | Self::NotRunning
@@ -565,5 +750,55 @@ impl Error for DaemonTransportError {
             | Self::Protocol(_)
             | Self::ControlThreadStopped => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compatibility_accepts_current_descriptor() {
+        ensure_compatible(
+            &DaemonCompatibilityRequirement::current(),
+            &DaemonCompatibility::current(),
+        )
+        .expect("current client and hub are compatible");
+    }
+
+    #[test]
+    fn compatibility_reports_unsupported_protocol_version() {
+        let mut requirement = DaemonCompatibilityRequirement::current();
+        requirement.minimum_protocol_version = PROTOCOL_VERSION + 1;
+        requirement.client_name = "version-test-client".to_string();
+
+        let error = ensure_compatible(&requirement, &DaemonCompatibility::current())
+            .expect_err("newer client requirement should fail against current hub");
+
+        assert!(error.diagnostic.contains("version-test-client"));
+        assert!(
+            error
+                .diagnostic
+                .contains("unsupported protocol version 1; requires at least 2")
+        );
+    }
+
+    #[test]
+    fn compatibility_reports_missing_required_feature() {
+        let mut requirement = DaemonCompatibilityRequirement::current();
+        requirement
+            .required_features
+            .push("future_feature".to_string());
+        requirement.client_name = "feature-test-client".to_string();
+
+        let error = ensure_compatible(&requirement, &DaemonCompatibility::current())
+            .expect_err("future feature should fail against current hub");
+
+        assert!(error.diagnostic.contains("feature-test-client"));
+        assert!(
+            error
+                .diagnostic
+                .contains("missing required feature(s): future_feature")
+        );
     }
 }

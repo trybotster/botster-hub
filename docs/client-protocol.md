@@ -9,6 +9,55 @@ Implementation baseline before this split: `9b39f1607144319138151cdf776e8909f35a
 
 External same-device clients should depend on the `botster-hub-client` crate and use `DaemonEndpoint`, `DaemonConnection`, `request`, or `stream_attach` to talk to a running `botster-hub` daemon socket. The crate owns the client-facing handshake, request, response, event, and JSON frame helpers.
 
+## Compatibility Handshake
+
+Clients should check hub compatibility before depending on request-specific
+behavior. `DaemonConnection::connect`, `request`, and `stream_attach` perform
+the current first-party compatibility check during the socket hello handshake.
+The running hub also returns the same descriptor on `DaemonRequest::Status` so
+operator UIs can show protocol diagnostics without opening a special endpoint.
+
+The current descriptor includes:
+
+- protocol name and version;
+- supported features: sessions, terminal streaming, resize, plugin surface
+  render, and plugin surface action dispatch;
+- conformance fixture revision.
+
+Downstream clients with the same requirements as the current crate can rely on
+the default connection helper:
+
+```rust
+let endpoint = botster_hub_client::DaemonEndpoint::new(socket_path);
+let mut connection = botster_hub_client::DaemonConnection::connect(&endpoint)
+    .map_err(|error| error.to_string())?;
+```
+
+Clients that need to declare stricter requirements should use the explicit
+handshake helper and display the returned diagnostic as a connection/status
+error:
+
+```rust
+let mut requirement = botster_hub_client::DaemonCompatibilityRequirement::current();
+requirement.client_name = "botster-tui".to_string();
+requirement
+    .required_features
+    .push("future_feature".to_string());
+
+let stream = botster_hub_client::connect_and_hello_with_requirement(
+    &endpoint,
+    &requirement,
+)
+.map_err(|error| error.to_string())?;
+```
+
+`botster-tui` should run this check as part of its daemon connect/reconnect
+path and render `DaemonTransportError::Compatibility` as the status panel
+connection error instead of continuing into session or terminal operations.
+`botster-web` should perform the same check in its local hub bridge/status path
+before relying on sessions, terminal streaming, resize, or plugin surface/action
+dispatch, and show the diagnostic in the hub connection state.
+
 The control-plane production route is:
 
 `botster_hub_client::DaemonConnection::request`
