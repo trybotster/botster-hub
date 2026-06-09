@@ -33,12 +33,37 @@ const DEFAULT_SOCKET_NAME: &str = "botster-hub.sock";
 const READY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Builder for one isolated local hub daemon test instance.
+///
+/// # Example
+///
+/// ```no_run
+/// use botster_hub_test_support::{run_client_conformance, IsolatedHubBuilder};
+///
+/// let hub = IsolatedHubBuilder::new()
+///     .hub_bin(std::env::var("BOTSTER_HUB_BIN").expect("BOTSTER_HUB_BIN"))
+///     .session_worker_bin(
+///         std::env::var("BOTSTER_SESSION_WORKER_BIN").expect("BOTSTER_SESSION_WORKER_BIN"),
+///     )
+///     .name("my-client-test")
+///     .start()
+///     .expect("isolated hub starts");
+///
+/// let report = run_client_conformance(&hub).expect("client conformance");
+/// assert_eq!(report.lifecycle_state, "running");
+/// assert_eq!(report.initial_session_count, 0);
+/// assert!(report.stream_contains_ready);
+/// assert!(report.stream_contains_echo);
+/// assert!(report.stream_contains_resize);
+/// assert_eq!(report.validation_error_operation, "drain_runtime");
+/// hub.shutdown().expect("shutdown isolated hub");
+/// ```
 #[derive(Debug, Clone)]
 pub struct IsolatedHubBuilder {
     hub_bin: Option<PathBuf>,
     session_worker_bin: Option<PathBuf>,
     root: Option<PathBuf>,
     name: String,
+    ready_timeout: Duration,
 }
 
 impl Default for IsolatedHubBuilder {
@@ -48,6 +73,7 @@ impl Default for IsolatedHubBuilder {
             session_worker_bin: None,
             root: None,
             name: "external-client".to_string(),
+            ready_timeout: READY_TIMEOUT,
         }
     }
 }
@@ -87,6 +113,12 @@ impl IsolatedHubBuilder {
         self
     }
 
+    #[cfg(test)]
+    fn ready_timeout(mut self, timeout: Duration) -> Self {
+        self.ready_timeout = timeout;
+        self
+    }
+
     /// Start the isolated daemon and wait for the real socket protocol to respond.
     pub fn start(self) -> Result<IsolatedHub, IsolatedHubError> {
         let data_dir = self.data_dir()?;
@@ -119,7 +151,10 @@ impl IsolatedHubBuilder {
             source,
         })?;
 
-        wait_for_ready(&endpoint, &mut child)?;
+        if let Err(error) = wait_for_ready(&endpoint, &mut child, self.ready_timeout) {
+            cleanup_child(&mut child);
+            return Err(error);
+        }
 
         Ok(IsolatedHub {
             hub_bin,
@@ -237,6 +272,26 @@ pub struct ProjectPipelinesConformanceReport {
 /// list, spawn, attach/drain through `botster_hub_client::stream_attach`, input,
 /// resize, validation error handling, and session teardown using only public
 /// `botster-hub-client` calls.
+///
+/// # Example
+///
+/// ```no_run
+/// use botster_hub_test_support::{run_client_conformance, IsolatedHubBuilder};
+///
+/// let hub = IsolatedHubBuilder::new()
+///     .hub_bin(std::env::var("BOTSTER_HUB_BIN").expect("BOTSTER_HUB_BIN"))
+///     .session_worker_bin(
+///         std::env::var("BOTSTER_SESSION_WORKER_BIN").expect("BOTSTER_SESSION_WORKER_BIN"),
+///     )
+///     .start()
+///     .expect("isolated hub starts");
+///
+/// let report = run_client_conformance(&hub).expect("client conformance");
+/// assert_eq!(report.lifecycle_state, "running");
+/// assert_eq!(report.validation_error_operation, "drain_runtime");
+/// assert!(report.stream_contains_resize);
+/// hub.shutdown().expect("shutdown isolated hub");
+/// ```
 pub fn run_client_conformance(
     hub: &IsolatedHub,
 ) -> Result<ClientConformanceReport, ConformanceError> {
@@ -411,6 +466,28 @@ pub fn run_client_conformance(
 /// Callers pass a package checkout path, usually `examples/project-pipelines`
 /// from this repository checkout. The helper enables the package through the
 /// daemon and exercises render/action dispatch without linking plugin internals.
+///
+/// # Example
+///
+/// ```no_run
+/// use botster_hub_test_support::{run_project_pipelines_conformance, IsolatedHubBuilder};
+///
+/// let hub = IsolatedHubBuilder::new()
+///     .hub_bin(std::env::var("BOTSTER_HUB_BIN").expect("BOTSTER_HUB_BIN"))
+///     .session_worker_bin(
+///         std::env::var("BOTSTER_SESSION_WORKER_BIN").expect("BOTSTER_SESSION_WORKER_BIN"),
+///     )
+///     .start()
+///     .expect("isolated hub starts");
+///
+/// let plugin_report = run_project_pipelines_conformance(&hub, "examples/project-pipelines")
+///     .expect("project pipelines conformance");
+/// assert_eq!(plugin_report.package_state, "enabled");
+/// assert_eq!(plugin_report.surface_id, "project-pipelines-create-panel");
+/// assert_eq!(plugin_report.invalid_action_status, "failure");
+/// assert_eq!(plugin_report.invalid_title_error, "Title is required");
+/// hub.shutdown().expect("shutdown isolated hub");
+/// ```
 pub fn run_project_pipelines_conformance(
     hub: &IsolatedHub,
     package_path: impl Into<PathBuf>,
@@ -483,18 +560,12 @@ pub fn run_project_pipelines_conformance(
             operation: "project_pipelines_invalid_action",
             field: "plugin_action_result",
         })?;
-    let invalid_action_status =
-        value_string(&invalid, "status", "project_pipelines_invalid_action")?;
-    let invalid_title_error = invalid
-        .get("payload")
-        .and_then(|payload| payload.get("field_errors"))
-        .and_then(|errors| errors.get("project-pipelines-create-title"))
-        .and_then(serde_json::Value::as_str)
-        .ok_or(ConformanceError::MissingJsonField {
-            operation: "project_pipelines_invalid_action",
-            field: "payload.field_errors.project-pipelines-create-title",
-        })?
-        .to_string();
+    let invalid_action_status = action_status_string(&invalid, "project_pipelines_invalid_action")?;
+    let invalid_title_error = field_error_string(
+        &invalid,
+        "project-pipelines-create-title",
+        "project_pipelines_invalid_action",
+    )?;
 
     Ok(ProjectPipelinesConformanceReport {
         package_state,
@@ -541,6 +612,57 @@ fn value_string(
         .and_then(serde_json::Value::as_str)
         .map(str::to_string)
         .ok_or(ConformanceError::MissingJsonField { operation, field })
+}
+
+fn action_status_string(
+    value: &serde_json::Value,
+    operation: &'static str,
+) -> Result<String, ConformanceError> {
+    if let Some(status) = value.get("status").and_then(serde_json::Value::as_str) {
+        return Ok(status.to_string());
+    }
+    match value.get("state").and_then(serde_json::Value::as_str) {
+        Some("accepted") => Ok("success".to_string()),
+        Some("rejected" | "error") => Ok("failure".to_string()),
+        Some(state) => Ok(state.to_string()),
+        None => Err(ConformanceError::MissingJsonField {
+            operation,
+            field: "status",
+        }),
+    }
+}
+
+fn field_error_string(
+    value: &serde_json::Value,
+    field_id: &'static str,
+    operation: &'static str,
+) -> Result<String, ConformanceError> {
+    let error = value
+        .get("payload")
+        .and_then(|payload| payload.get("field_errors"))
+        .and_then(|errors| errors.get(field_id))
+        .or_else(|| {
+            value
+                .get("field_errors")
+                .and_then(|errors| errors.get(field_id))
+        })
+        .ok_or(ConformanceError::MissingJsonField {
+            operation,
+            field: "field_errors",
+        })?;
+
+    if let Some(message) = error.as_str() {
+        return Ok(message.to_string());
+    }
+    error
+        .as_array()
+        .and_then(|messages| messages.first())
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .ok_or(ConformanceError::MissingJsonField {
+            operation,
+            field: "field_errors.message",
+        })
 }
 
 /// Errors returned by published conformance fixture flows.
@@ -760,8 +882,12 @@ fn ensure_file(label: &'static str, path: &Path) -> Result<(), IsolatedHubError>
     }
 }
 
-fn wait_for_ready(endpoint: &DaemonEndpoint, child: &mut Child) -> Result<(), IsolatedHubError> {
-    let deadline = Instant::now() + READY_TIMEOUT;
+fn wait_for_ready(
+    endpoint: &DaemonEndpoint,
+    child: &mut Child,
+    timeout: Duration,
+) -> Result<(), IsolatedHubError> {
+    let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         if let Some(status) = child
             .try_wait()
@@ -789,6 +915,14 @@ fn wait_for_ready(endpoint: &DaemonEndpoint, child: &mut Child) -> Result<(), Is
         stdout: String::new(),
         stderr: String::new(),
     })
+}
+
+fn cleanup_child(child: &mut Child) {
+    if child.try_wait().ok().flatten().is_some() {
+        return;
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 fn collect_child_output(child: &mut Child) -> (String, String) {
@@ -827,4 +961,222 @@ fn sanitize_segment(value: &str) -> String {
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[cfg(unix)]
+    use std::io::Write;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn explicit_path_reports_missing_hub_binary_env() {
+        let error = explicit_path(None, "__BOTSTER_HUB_TEST_MISSING_BIN")
+            .expect_err("missing hub env returns an error");
+
+        assert!(matches!(
+            error,
+            IsolatedHubError::MissingBinaryEnv {
+                variable: "__BOTSTER_HUB_TEST_MISSING_BIN"
+            }
+        ));
+    }
+
+    #[test]
+    fn explicit_path_reports_missing_session_worker_binary_env() {
+        let error = explicit_path(None, "__BOTSTER_SESSION_WORKER_TEST_MISSING_BIN")
+            .expect_err("missing worker env returns an error");
+
+        assert!(matches!(
+            error,
+            IsolatedHubError::MissingBinaryEnv {
+                variable: "__BOTSTER_SESSION_WORKER_TEST_MISSING_BIN"
+            }
+        ));
+    }
+
+    #[test]
+    fn start_reports_missing_hub_binary_path() {
+        let root = unique_root("missing-hub-path");
+        let worker = existing_file(&root, "botster-session-worker");
+        let missing_hub = root.join("missing-botster-hub");
+
+        let error = IsolatedHubBuilder::new()
+            .hub_bin(&missing_hub)
+            .session_worker_bin(worker)
+            .root(&root)
+            .start_error();
+
+        assert!(matches!(
+            error,
+            IsolatedHubError::MissingBinary {
+                label: "botster-hub binary",
+                path
+            } if path == missing_hub
+        ));
+    }
+
+    #[test]
+    fn start_reports_missing_session_worker_binary_path() {
+        let root = unique_root("missing-worker-path");
+        let hub = existing_file(&root, "botster-hub");
+        let missing_worker = root.join("missing-botster-session-worker");
+
+        let error = IsolatedHubBuilder::new()
+            .hub_bin(hub)
+            .session_worker_bin(&missing_worker)
+            .root(&root)
+            .start_error();
+
+        assert!(matches!(
+            error,
+            IsolatedHubError::MissingBinary {
+                label: "botster-session-worker binary",
+                path
+            } if path == missing_worker
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn start_reports_daemon_exit_before_readiness() {
+        let root = unique_root("daemon-exit");
+        let worker = existing_file(&root, "botster-session-worker");
+        let hub = executable_script(
+            &root,
+            "botster-hub",
+            r#"#!/bin/sh
+printf 'fake hub stdout\n'
+printf 'fake hub stderr\n' >&2
+exit 42
+"#,
+        );
+
+        let error = IsolatedHubBuilder::new()
+            .hub_bin(hub)
+            .session_worker_bin(worker)
+            .root(&root)
+            .ready_timeout(Duration::from_millis(500))
+            .start_error();
+
+        assert!(matches!(
+            error,
+            IsolatedHubError::DaemonExited {
+                status,
+                stdout,
+                stderr
+            } if status.contains("42")
+                && stdout.contains("fake hub stdout")
+                && stderr.contains("fake hub stderr")
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn start_timeout_cleans_up_unready_child() {
+        let root = unique_root("ready-timeout");
+        let worker = existing_file(&root, "botster-session-worker");
+        let pid_file = root.join("fake-hub.pid");
+        let script = format!(
+            r#"#!/bin/sh
+printf '%s\n' "$$" > '{}'
+while :; do
+  sleep 1
+done
+"#,
+            pid_file.display()
+        );
+        let hub = executable_script(&root, "botster-hub", &script);
+
+        let error = IsolatedHubBuilder::new()
+            .hub_bin(hub)
+            .session_worker_bin(worker)
+            .root(&root)
+            .ready_timeout(Duration::from_secs(1))
+            .start_error();
+
+        assert!(matches!(error, IsolatedHubError::ReadyTimeout { .. }));
+        let pid = read_fake_pid(&pid_file);
+        assert_process_exits(pid);
+    }
+
+    fn unique_root(name: &str) -> PathBuf {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after unix epoch")
+            .as_nanos();
+        let root = env::temp_dir()
+            .join("botster-hub-test-support")
+            .join(format!("{name}-{}-{now}", std::process::id()));
+        fs::create_dir_all(&root).expect("create unique test root");
+        root
+    }
+
+    trait StartErrorExt {
+        fn start_error(self) -> IsolatedHubError;
+    }
+
+    impl StartErrorExt for IsolatedHubBuilder {
+        fn start_error(self) -> IsolatedHubError {
+            match self.start() {
+                Ok(_) => panic!("isolated hub start unexpectedly succeeded"),
+                Err(error) => error,
+            }
+        }
+    }
+
+    fn existing_file(root: &Path, name: &str) -> PathBuf {
+        let path = root.join(name);
+        fs::write(&path, b"").expect("write fake binary placeholder");
+        path
+    }
+
+    #[cfg(unix)]
+    fn executable_script(root: &Path, name: &str, body: &str) -> PathBuf {
+        let path = root.join(name);
+        let mut file = fs::File::create(&path).expect("create fake executable");
+        file.write_all(body.as_bytes())
+            .expect("write fake executable");
+        let mut permissions = file
+            .metadata()
+            .expect("read fake executable metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&path, permissions).expect("mark fake executable executable");
+        path
+    }
+
+    #[cfg(unix)]
+    fn read_fake_pid(pid_file: &Path) -> u32 {
+        fs::read_to_string(pid_file)
+            .expect("read fake pid")
+            .trim()
+            .parse()
+            .expect("fake pid is numeric")
+    }
+
+    #[cfg(unix)]
+    fn assert_process_exits(pid: u32) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            if !process_exists(pid) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        panic!("process {pid} still exists after readiness timeout cleanup");
+    }
+
+    #[cfg(unix)]
+    fn process_exists(pid: u32) -> bool {
+        Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
 }
