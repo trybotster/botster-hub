@@ -1080,6 +1080,135 @@ fn cli_daemon_restart_recovers_worker_backed_session_through_transport() {
 }
 
 #[test]
+fn external_hub_client_crate_drives_real_daemon_socket_protocol() {
+    let _guard = daemon_test_lock()
+        .lock()
+        .expect("serialize real daemon test");
+    let data_dir = unique_test_dir("external-hub-client");
+    let config = explicit_config(&data_dir);
+    let socket_path = config
+        .transports
+        .local_socket
+        .as_ref()
+        .expect("test config has local socket")
+        .path
+        .clone();
+    let endpoint = botster_hub_client::DaemonEndpoint::new(socket_path);
+    let child = start_cli_daemon(&data_dir);
+
+    let status = botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status)
+        .expect("external client status request");
+    assert_eq!(status.kind, botster_hub_client::DaemonResponseKind::Status);
+    assert_eq!(
+        status
+            .status
+            .as_ref()
+            .expect("status response body")
+            .lifecycle_state,
+        "running"
+    );
+
+    let list =
+        botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::ListSessions)
+            .expect("external client list sessions request");
+    assert_eq!(list.kind, botster_hub_client::DaemonResponseKind::Sessions);
+
+    let spawn = botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::Spawn {
+            session_id: "external-client-session".to_string(),
+            command:
+                "printf 'external-ready\\n'; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done"
+                    .to_string(),
+        },
+    )
+    .expect("external client spawn request");
+    assert_eq!(spawn.kind, botster_hub_client::DaemonResponseKind::Spawned);
+    assert!(
+        spawn
+            .sessions
+            .iter()
+            .any(|session| session.session_id == "external-client-session"
+                && session.lifecycle == "running")
+    );
+
+    let mut connection =
+        botster_hub_client::DaemonConnection::connect(&endpoint).expect("external connect");
+    let attach = connection
+        .request(&botster_hub_client::DaemonRequest::Attach {
+            session_id: "external-client-session".to_string(),
+            subscription_id: "external-client-subscription".to_string(),
+        })
+        .expect("external attach request");
+    assert_eq!(attach.kind, botster_hub_client::DaemonResponseKind::Events);
+
+    let resize = connection
+        .request(&botster_hub_client::DaemonRequest::Resize {
+            session_id: "external-client-session".to_string(),
+            rows: 31,
+            cols: 101,
+        })
+        .expect("external resize request");
+    assert_eq!(resize.kind, botster_hub_client::DaemonResponseKind::Events);
+
+    let send = connection
+        .request(&botster_hub_client::DaemonRequest::SendInput {
+            session_id: "external-client-session".to_string(),
+            data: "external-input\n".to_string(),
+        })
+        .expect("external send input request");
+    assert_eq!(send.kind, botster_hub_client::DaemonResponseKind::Events);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut observed = String::new();
+    while std::time::Instant::now() < deadline {
+        let drain = connection
+            .request(&botster_hub_client::DaemonRequest::Drain {
+                session_id: "external-client-session".to_string(),
+            })
+            .expect("external drain request");
+        for event in drain.events {
+            if let botster_hub_client::DaemonEvent::TerminalOutput { data, .. } = event {
+                observed.push_str(&data);
+            }
+        }
+        if observed.contains("echo:external-input") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(30));
+    }
+    assert!(
+        observed.contains("echo:external-input"),
+        "external client should drain terminal output through the hub protocol, got {observed:?}"
+    );
+
+    let detach = connection
+        .request(&botster_hub_client::DaemonRequest::Detach {
+            session_id: "external-client-session".to_string(),
+            subscription_id: "external-client-subscription".to_string(),
+        })
+        .expect("external detach request");
+    assert_eq!(detach.kind, botster_hub_client::DaemonResponseKind::Events);
+
+    let reconnect =
+        botster_hub_client::DaemonConnection::connect(&endpoint).expect("external reconnect");
+    drop(reconnect);
+
+    let shutdown_session = botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::ShutdownSession {
+            session_id: "external-client-session".to_string(),
+        },
+    )
+    .expect("external shutdown session request");
+    assert_eq!(
+        shutdown_session.kind,
+        botster_hub_client::DaemonResponseKind::Events
+    );
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
 fn daemon_detaches_subscription_when_attach_connection_drops() {
     let _guard = daemon_test_lock()
         .lock()

@@ -1,3 +1,6 @@
+[workspace]
+members = [".", "crates/botster-hub-client"]
+
 [package]
 name = "botster-hub"
 version = "0.1.0"
@@ -7,6 +10,7 @@ repository = "https://github.com/trybotster/botster-hub"
 license-file = "LICENSE"
 
 [dependencies]
+botster-hub-client = { path = "crates/botster-hub-client" }
 botster-core = { git = "https://github.com/trybotster/botster-core", branch = "main" }
 botster-core-daemon = { git = "https://github.com/trybotster/botster-core", branch = "main" }
 crossterm = "0.29.0"
