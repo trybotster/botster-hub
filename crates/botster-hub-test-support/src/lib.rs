@@ -16,8 +16,9 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use botster_hub_client::{
-    DaemonCompatibilityRequirement, DaemonEndpoint, DaemonOperatorError, DaemonRequest,
-    DaemonResponse, DaemonResponseKind, DaemonTransportError, ensure_compatible,
+    ensure_compatible, DaemonCompatibilityRequirement, DaemonDiagnostic, DaemonDiagnosticKind,
+    DaemonEndpoint, DaemonOperatorError, DaemonRequest, DaemonResponse, DaemonResponseKind,
+    DaemonTransportError,
 };
 
 const CONFORMANCE_SESSION_ID: &str = "botster-conformance-session";
@@ -250,6 +251,7 @@ pub struct ClientConformanceReport {
     pub compatibility_protocol_version: u16,
     pub compatibility_features: Vec<String>,
     pub compatibility_conformance_fixture_revision: u16,
+    pub connected_diagnostic_operation: String,
     pub initial_session_count: usize,
     pub session_id: String,
     pub spawned_lifecycle: String,
@@ -258,6 +260,7 @@ pub struct ClientConformanceReport {
     pub stream_contains_resize: bool,
     pub validation_error_code: String,
     pub validation_error_operation: String,
+    pub validation_diagnostic_kind: String,
 }
 
 /// Stable observation returned by [`run_project_pipelines_conformance`].
@@ -267,6 +270,7 @@ pub struct ProjectPipelinesConformanceReport {
     pub surface_kind: String,
     pub surface_id: String,
     pub invalid_action_status: String,
+    pub invalid_action_diagnostic_kind: String,
     pub invalid_title_error: String,
 }
 
@@ -301,6 +305,8 @@ pub fn run_client_conformance(
 ) -> Result<ClientConformanceReport, ConformanceError> {
     let status = request(hub.endpoint(), DaemonRequest::Status, "status")?;
     expect_kind(&status, DaemonResponseKind::Status, "status")?;
+    let connected_diagnostic_operation =
+        diagnostic_operation(&status, DaemonDiagnosticKind::Connected, "status")?;
     let status = status.status.ok_or(ConformanceError::MissingBody {
         operation: "status",
         field: "status",
@@ -447,10 +453,18 @@ pub fn run_client_conformance(
         DaemonResponseKind::OperatorError,
         "validation_error",
     )?;
-    let validation_error = validation.error.ok_or(ConformanceError::MissingBody {
-        operation: "validation_error",
-        field: "error",
-    })?;
+    let validation_diagnostic_kind = diagnostic_kind(
+        &validation,
+        DaemonDiagnosticKind::TerminalStreamUnavailable,
+        "validation_error",
+    )?;
+    let validation_error = validation
+        .error
+        .as_ref()
+        .ok_or(ConformanceError::MissingBody {
+            operation: "validation_error",
+            field: "error",
+        })?;
 
     let _ = request(
         hub.endpoint(),
@@ -468,14 +482,16 @@ pub fn run_client_conformance(
         compatibility_conformance_fixture_revision: status
             .compatibility
             .conformance_fixture_revision,
+        connected_diagnostic_operation,
         initial_session_count,
         session_id: CONFORMANCE_SESSION_ID.to_string(),
         spawned_lifecycle,
         stream_contains_ready,
         stream_contains_echo,
         stream_contains_resize,
-        validation_error_code: validation_error.code,
-        validation_error_operation: validation_error.operation,
+        validation_error_code: validation_error.code.clone(),
+        validation_error_operation: validation_error.operation.clone(),
+        validation_diagnostic_kind,
     })
 }
 
@@ -572,6 +588,11 @@ pub fn run_project_pipelines_conformance(
         DaemonResponseKind::PluginActionResult,
         "project_pipelines_invalid_action",
     )?;
+    let invalid_action_diagnostic_kind = diagnostic_kind(
+        &invalid,
+        DaemonDiagnosticKind::ActionFailure,
+        "project_pipelines_invalid_action",
+    )?;
     let invalid = invalid
         .plugin_action_result
         .ok_or(ConformanceError::MissingBody {
@@ -590,6 +611,7 @@ pub fn run_project_pipelines_conformance(
         surface_kind,
         surface_id,
         invalid_action_status,
+        invalid_action_diagnostic_kind,
         invalid_title_error,
     })
 }
@@ -615,8 +637,46 @@ fn expect_kind(
             operation,
             expected,
             actual: response.kind,
-            error: response.error.clone(),
+            error: response.error.clone().map(Box::new),
         })
+    }
+}
+
+fn diagnostic_operation(
+    response: &DaemonResponse,
+    kind: DaemonDiagnosticKind,
+    operation: &'static str,
+) -> Result<String, ConformanceError> {
+    response
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.kind == kind)
+        .and_then(|diagnostic| diagnostic.operation.clone())
+        .ok_or(ConformanceError::MissingDiagnostic { operation, kind })
+}
+
+fn diagnostic_kind(
+    response: &DaemonResponse,
+    kind: DaemonDiagnosticKind,
+    operation: &'static str,
+) -> Result<String, ConformanceError> {
+    response
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.kind == kind)
+        .then(|| diagnostic_kind_label(kind).to_string())
+        .ok_or(ConformanceError::MissingDiagnostic { operation, kind })
+}
+
+fn diagnostic_kind_label(kind: DaemonDiagnosticKind) -> &'static str {
+    match kind {
+        DaemonDiagnosticKind::Connected => "connected",
+        DaemonDiagnosticKind::Disconnected => "disconnected",
+        DaemonDiagnosticKind::CompatibilityMismatch => "compatibility_mismatch",
+        DaemonDiagnosticKind::UnsupportedFeature => "unsupported_feature",
+        DaemonDiagnosticKind::TerminalStreamUnavailable => "terminal_stream_unavailable",
+        DaemonDiagnosticKind::ActionFailure => "action_failure",
+        DaemonDiagnosticKind::DaemonStartupFailure => "daemon_startup_failure",
     }
 }
 
@@ -694,7 +754,7 @@ pub enum ConformanceError {
         operation: &'static str,
         expected: DaemonResponseKind,
         actual: DaemonResponseKind,
-        error: Option<DaemonOperatorError>,
+        error: Option<Box<DaemonOperatorError>>,
     },
     MissingBody {
         operation: &'static str,
@@ -703,6 +763,10 @@ pub enum ConformanceError {
     MissingJsonField {
         operation: &'static str,
         field: &'static str,
+    },
+    MissingDiagnostic {
+        operation: &'static str,
+        kind: DaemonDiagnosticKind,
     },
     MissingSession {
         session_id: String,
@@ -741,6 +805,12 @@ impl fmt::Display for ConformanceError {
             Self::MissingJsonField { operation, field } => {
                 write!(formatter, "{operation} response missing JSON field {field}")
             }
+            Self::MissingDiagnostic { operation, kind } => {
+                write!(
+                    formatter,
+                    "{operation} response missing {kind:?} diagnostic"
+                )
+            }
             Self::MissingSession { session_id } => {
                 write!(formatter, "spawn response missing session {session_id}")
             }
@@ -759,6 +829,7 @@ impl Error for ConformanceError {
             Self::UnexpectedKind { .. }
             | Self::MissingBody { .. }
             | Self::MissingJsonField { .. }
+            | Self::MissingDiagnostic { .. }
             | Self::MissingSession { .. }
             | Self::MissingOutput { .. }
             | Self::AttachThreadPanicked => None,
@@ -860,6 +931,32 @@ impl fmt::Display for IsolatedHubError {
             Self::Wait { source } => write!(formatter, "failed to wait for daemon: {source}"),
             Self::Clock(source) => write!(formatter, "system clock error: {source}"),
         }
+    }
+}
+
+impl IsolatedHubError {
+    /// Return a path-neutral diagnostic for startup failures that occur before
+    /// the daemon socket protocol can emit a response.
+    #[must_use]
+    pub fn diagnostic(&self) -> DaemonDiagnostic {
+        let message = match self {
+            Self::MissingBinaryEnv { .. } => "required binary path is not configured",
+            Self::MissingBinary { label, .. } => {
+                return DaemonDiagnostic::daemon_startup_failure(format!(
+                    "{label} is not available"
+                ));
+            }
+            Self::CreateDataDir { .. } => "failed to create isolated daemon data directory",
+            Self::Spawn { .. } => "failed to spawn hub daemon",
+            Self::ReadyTimeout { .. } => "timed out waiting for hub daemon readiness",
+            Self::DaemonExited { .. } => "hub daemon exited before readiness",
+            Self::ShutdownCommand { .. } => "failed to run hub daemon shutdown command",
+            Self::ShutdownFailed { .. } => "hub daemon shutdown command failed",
+            Self::Wait { .. } => "failed to wait for hub daemon process",
+            Self::Clock(_) => "system clock error while preparing isolated daemon",
+        };
+
+        DaemonDiagnostic::daemon_startup_failure(message)
     }
 }
 
@@ -1028,12 +1125,19 @@ mod tests {
             .start_error();
 
         assert!(matches!(
-            error,
+            &error,
             IsolatedHubError::MissingBinary {
                 label: "botster-hub binary",
                 path
-            } if path == missing_hub
+            } if path == &missing_hub
         ));
+        let diagnostic = error.diagnostic();
+        assert_eq!(diagnostic.kind, DaemonDiagnosticKind::DaemonStartupFailure);
+        assert_eq!(
+            diagnostic.message.as_deref(),
+            Some("botster-hub binary is not available")
+        );
+        assert!(!format!("{diagnostic:?}").contains(&missing_hub.to_string_lossy().to_string()));
     }
 
     #[test]

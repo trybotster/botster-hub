@@ -18,19 +18,21 @@ use std::time::Duration;
 use botster_core::{
     EndpointId, EnvelopeCursor, EnvelopeDeliveryState, EnvelopeId, EnvelopeTarget,
     ExtensionRuntime, RequestId, RoutedEnvelope, RoutedEnvelopePayload, SessionId,
-    SessionLifecycleState, SubscriptionId, TerminalAttachState, UiActionResult, UiNode,
+    SessionLifecycleState, SubscriptionId, TerminalAttachState, UiActionResult,
+    UiActionResultState, UiNode,
 };
 use botster_core_daemon::{
     GuardedWriteDecision, GuardedWriteDeliveryState, ReadinessEvidence, RegistrySessionState,
 };
 use botster_hub_client::DaemonTransportError as ClientDaemonTransportError;
 pub use botster_hub_client::{
-    DaemonCapability, DaemonCompatibility, DaemonConnection as ClientDaemonConnection,
-    DaemonCoordination, DaemonEndpoint, DaemonEnvelope, DaemonEnvelopeAck, DaemonEnvelopeDelivery,
+    read_frame, read_frame_from_reader, write_frame, DaemonCapability, DaemonCompatibility,
+    DaemonConnection as ClientDaemonConnection, DaemonCoordination, DaemonDiagnostic,
+    DaemonEndpoint, DaemonEnvelope, DaemonEnvelopeAck, DaemonEnvelopeDelivery,
     DaemonEnvelopePublish, DaemonEvent, DaemonHello, DaemonHelloAck, DaemonIdentity, DaemonNotify,
     DaemonOperatorError, DaemonPackage, DaemonPackageDecision, DaemonPluginLifecycle,
     DaemonRequest, DaemonResponse, DaemonResponseKind, DaemonSession, DaemonSessionCleanup,
-    DaemonStatus, PROTOCOL, read_frame, read_frame_from_reader, write_frame,
+    DaemonStatus, PROTOCOL,
 };
 use serde_json::Value;
 
@@ -150,6 +152,7 @@ fn handle_connection(
         &DaemonHelloAck {
             protocol: PROTOCOL.to_string(),
             compatibility: DaemonCompatibility::current(),
+            diagnostics: vec![DaemonDiagnostic::connected("hello")],
         },
     )?;
     let mut attached_subscriptions = Vec::<AttachedSubscription>::new();
@@ -684,6 +687,7 @@ fn handle_runtime_control_request(
             cleanup: None,
             coordination: None,
             error: None,
+            diagnostics: vec![DaemonDiagnostic::connected("shutdown")],
         }),
         DaemonRequest::ListPackages
         | DaemonRequest::PluginLifecycleStatus
@@ -953,12 +957,14 @@ fn daemon_response_base(kind: DaemonResponseKind) -> DaemonResponse {
         cleanup: None,
         coordination: None,
         error: None,
+        diagnostics: Vec::new(),
     }
 }
 
 fn daemon_status(status: HubDaemonStatus, session_count: usize) -> DaemonResponse {
     let mut response = daemon_response_base(DaemonResponseKind::Status);
     response.status = Some(daemon_status_from_status(&status, session_count));
+    response.diagnostics = vec![DaemonDiagnostic::connected("status")];
     response
 }
 
@@ -1015,6 +1021,7 @@ fn daemon_unknown_session_cleanup(session_id: &str) -> DaemonResponse {
         request_id: "daemon-sessions-shutdown".to_string(),
         operation: "shutdown".to_string(),
         message: format!("unknown session: {session_id}"),
+        diagnostics: Vec::new(),
     });
     response
 }
@@ -1022,18 +1029,27 @@ fn daemon_unknown_session_cleanup(session_id: &str) -> DaemonResponse {
 fn daemon_operator_error(error: crate::HubClientError) -> DaemonResponse {
     let mut response = daemon_response_base(DaemonResponseKind::OperatorError);
     response.error = Some(daemon_operator_error_from_client(error));
+    if let Some(error) = &response.error {
+        response.diagnostics = error.diagnostics.clone();
+    }
     response
 }
 
 fn daemon_package_error(error: crate::PackageRegistryError) -> DaemonResponse {
     let mut response = daemon_response_base(DaemonResponseKind::OperatorError);
     response.error = Some(daemon_operator_error_from_package(error));
+    if let Some(error) = &response.error {
+        response.diagnostics = error.diagnostics.clone();
+    }
     response
 }
 
 fn daemon_state_error(error: crate::HubStateStoreError) -> DaemonResponse {
     let mut response = daemon_response_base(DaemonResponseKind::OperatorError);
     response.error = Some(daemon_operator_error_from_state(error));
+    if let Some(error) = &response.error {
+        response.diagnostics = error.diagnostics.clone();
+    }
     response
 }
 
@@ -1069,6 +1085,15 @@ fn daemon_plugin_surface(plugin_surface: UiNode) -> DaemonResponse {
 
 fn daemon_plugin_action_result(plugin_action_result: UiActionResult) -> DaemonResponse {
     let mut response = daemon_response_base(DaemonResponseKind::PluginActionResult);
+    if matches!(
+        plugin_action_result.state,
+        UiActionResultState::Rejected | UiActionResultState::Error
+    ) {
+        response.diagnostics = vec![DaemonDiagnostic::action_failure(
+            "plugin_surface_action",
+            "plugin surface action did not complete successfully",
+        )];
+    }
     response.plugin_action_result =
         Some(serde_json::to_value(plugin_action_result).unwrap_or(Value::Null));
     response
@@ -1081,6 +1106,7 @@ fn daemon_plugin_tool_error(error: crate::McpToolError) -> DaemonResponse {
         request_id: "daemon-plugin-mcp-call".to_string(),
         operation: "plugin_mcp_call".to_string(),
         message: error.message,
+        diagnostics: Vec::new(),
     });
     response
 }
@@ -1270,6 +1296,7 @@ fn daemon_status_from_status(status: &HubDaemonStatus, session_count: usize) -> 
             .iter()
             .map(|session_id| session_id.0.clone())
             .collect(),
+        diagnostics: Vec::new(),
     }
 }
 
@@ -1291,17 +1318,23 @@ fn daemon_operator_error_from_client(error: crate::HubClientError) -> DaemonOper
             request_id: request_id.0,
             operation: operation_label(operation).to_string(),
             message: format!("{role:?} is not allowed to run {operation:?}"),
+            diagnostics: Vec::new(),
         },
         crate::HubClientError::Runtime {
             request_id,
             operation,
             kind,
-        } => DaemonOperatorError {
-            code: runtime_error_code(kind).to_string(),
-            request_id: request_id.0,
-            operation: operation_label(operation).to_string(),
-            message: format!("runtime failed while handling {operation:?}: {kind:?}"),
-        },
+        } => {
+            let operation_label = operation_label(operation).to_string();
+            let message = format!("runtime failed while handling {operation:?}: {kind:?}");
+            DaemonOperatorError {
+                code: runtime_error_code(kind).to_string(),
+                request_id: request_id.0,
+                diagnostics: runtime_error_diagnostics(operation, kind, &message),
+                operation: operation_label,
+                message,
+            }
+        }
         crate::HubClientError::UnsupportedDaemonOperation {
             request_id,
             operation,
@@ -1311,6 +1344,7 @@ fn daemon_operator_error_from_client(error: crate::HubClientError) -> DaemonOper
             request_id: request_id.0,
             operation: operation_label(operation).to_string(),
             message: format!("{daemon_operation} is not supported by the daemon"),
+            diagnostics: vec![DaemonDiagnostic::unsupported_feature(daemon_operation)],
         },
         crate::HubClientError::PackageCapabilityDenied {
             request_id,
@@ -1321,6 +1355,7 @@ fn daemon_operator_error_from_client(error: crate::HubClientError) -> DaemonOper
             request_id: request_id.0,
             operation: operation_label(operation).to_string(),
             message: format!("{package_name} is not allowed to run {operation:?}"),
+            diagnostics: Vec::new(),
         },
         crate::HubClientError::Plugin {
             request_id,
@@ -1332,6 +1367,7 @@ fn daemon_operator_error_from_client(error: crate::HubClientError) -> DaemonOper
             request_id: request_id.0,
             operation: operation_label(operation).to_string(),
             message,
+            diagnostics: Vec::new(),
         },
     }
 }
@@ -1347,6 +1383,7 @@ fn daemon_operator_error_from_package(error: crate::PackageRegistryError) -> Dae
             package_action_label(error.action),
             error.reason
         ),
+        diagnostics: Vec::new(),
     }
 }
 
@@ -1356,6 +1393,7 @@ fn daemon_operator_error_from_state(error: crate::HubStateStoreError) -> DaemonO
         request_id: "daemon-package-mutation".to_string(),
         operation: "persist_package_registry".to_string(),
         message: format!("failed to persist package registry: {error}"),
+        diagnostics: Vec::new(),
     }
 }
 
@@ -1439,6 +1477,26 @@ fn runtime_error_code(kind: crate::HubClientRuntimeErrorKind) -> &'static str {
         crate::HubClientRuntimeErrorKind::Runtime => "runtime_error",
         crate::HubClientRuntimeErrorKind::State => "state_error",
     }
+}
+
+fn runtime_error_diagnostics(
+    operation: crate::HubClientOperation,
+    kind: crate::HubClientRuntimeErrorKind,
+    message: &str,
+) -> Vec<DaemonDiagnostic> {
+    if kind == crate::HubClientRuntimeErrorKind::UnknownSession
+        && matches!(
+            operation,
+            crate::HubClientOperation::Attach | crate::HubClientOperation::DrainRuntime
+        )
+    {
+        return vec![DaemonDiagnostic::terminal_stream_unavailable(
+            operation_label(operation),
+            message,
+        )];
+    }
+
+    Vec::new()
 }
 
 fn operation_label(operation: crate::HubClientOperation) -> &'static str {

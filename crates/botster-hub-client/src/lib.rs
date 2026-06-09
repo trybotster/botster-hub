@@ -285,6 +285,9 @@ fn status_missing_compatibility(value: &Value) -> bool {
 fn precompatibility_hub_error() -> DaemonTransportError {
     DaemonTransportError::Compatibility(DaemonCompatibilityError {
         diagnostic: "hub predates compatibility handshake".to_string(),
+        diagnostics: vec![DaemonDiagnostic::compatibility_mismatch(
+            "hub predates compatibility handshake",
+        )],
     })
 }
 
@@ -318,6 +321,8 @@ pub struct DaemonHello {
 pub struct DaemonHelloAck {
     pub protocol: String,
     pub compatibility: DaemonCompatibility,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<DaemonDiagnostic>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -396,6 +401,7 @@ impl Default for DaemonCompatibilityRequirement {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DaemonCompatibilityError {
     pub diagnostic: String,
+    pub diagnostics: Vec<DaemonDiagnostic>,
 }
 
 impl fmt::Display for DaemonCompatibilityError {
@@ -481,7 +487,18 @@ fn compatibility_error(
             compatibility.features.join(","),
             compatibility.conformance_fixture_revision
         ),
+        diagnostics: vec![compatibility_diagnostic(&reason)],
     }
+}
+
+fn compatibility_diagnostic(reason: &str) -> DaemonDiagnostic {
+    reason
+        .strip_prefix("missing required feature(s): ")
+        .and_then(|features| features.split(',').next())
+        .map(str::trim)
+        .filter(|feature| !feature.is_empty())
+        .map(DaemonDiagnostic::unsupported_feature)
+        .unwrap_or_else(|| DaemonDiagnostic::compatibility_mismatch(reason))
 }
 
 fn current_feature_list() -> Vec<&'static str> {
@@ -600,6 +617,8 @@ pub struct DaemonResponse {
     pub cleanup: Option<DaemonSessionCleanup>,
     pub coordination: Option<DaemonCoordination>,
     pub error: Option<DaemonOperatorError>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<DaemonDiagnostic>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -732,6 +751,8 @@ pub struct DaemonStatus {
     pub session_count: usize,
     pub recovered_sessions: Vec<String>,
     pub stale_sessions: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<DaemonDiagnostic>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -752,6 +773,112 @@ pub struct DaemonOperatorError {
     pub request_id: String,
     pub operation: String,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<DaemonDiagnostic>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonDiagnostic {
+    pub kind: DaemonDiagnosticKind,
+    pub operation: Option<String>,
+    pub feature: Option<String>,
+    pub message: Option<String>,
+}
+
+impl DaemonDiagnostic {
+    #[must_use]
+    pub fn connected(operation: impl Into<String>) -> Self {
+        Self {
+            kind: DaemonDiagnosticKind::Connected,
+            operation: Some(operation.into()),
+            feature: None,
+            message: None,
+        }
+    }
+
+    /// Build a client-side diagnostic for a transport that disconnected after
+    /// the daemon protocol had already been established.
+    ///
+    /// The daemon does not emit this value as a response frame; clients produce
+    /// it locally when their own connection lifecycle proves a post-connect
+    /// disconnect.
+    #[must_use]
+    pub fn disconnected(message: impl Into<String>) -> Self {
+        Self {
+            kind: DaemonDiagnosticKind::Disconnected,
+            operation: None,
+            feature: None,
+            message: Some(message.into()),
+        }
+    }
+
+    #[must_use]
+    pub fn compatibility_mismatch(message: impl Into<String>) -> Self {
+        Self {
+            kind: DaemonDiagnosticKind::CompatibilityMismatch,
+            operation: None,
+            feature: None,
+            message: Some(message.into()),
+        }
+    }
+
+    #[must_use]
+    pub fn unsupported_feature(feature: impl Into<String>) -> Self {
+        Self {
+            kind: DaemonDiagnosticKind::UnsupportedFeature,
+            operation: None,
+            feature: Some(feature.into()),
+            message: None,
+        }
+    }
+
+    #[must_use]
+    pub fn terminal_stream_unavailable(
+        operation: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind: DaemonDiagnosticKind::TerminalStreamUnavailable,
+            operation: Some(operation.into()),
+            feature: Some(FEATURE_TERMINAL_STREAMING.to_string()),
+            message: Some(message.into()),
+        }
+    }
+
+    #[must_use]
+    pub fn action_failure(operation: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            kind: DaemonDiagnosticKind::ActionFailure,
+            operation: Some(operation.into()),
+            feature: None,
+            message: Some(message.into()),
+        }
+    }
+
+    #[must_use]
+    pub fn daemon_startup_failure(message: impl Into<String>) -> Self {
+        Self {
+            kind: DaemonDiagnosticKind::DaemonStartupFailure,
+            operation: None,
+            feature: None,
+            message: Some(message.into()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DaemonDiagnosticKind {
+    Connected,
+    /// Client-side-only classification for post-connect transport loss.
+    ///
+    /// The daemon protocol does not emit this kind as a response frame.
+    Disconnected,
+    CompatibilityMismatch,
+    UnsupportedFeature,
+    TerminalStreamUnavailable,
+    ActionFailure,
+    DaemonStartupFailure,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -890,6 +1017,50 @@ mod tests {
         assert!(error
             .diagnostic
             .contains("missing required feature(s): future_feature"));
+        assert_eq!(
+            error.diagnostics,
+            vec![DaemonDiagnostic::unsupported_feature("future_feature")]
+        );
+    }
+
+    #[test]
+    fn response_diagnostics_default_when_missing_for_backward_compatibility() {
+        let response = serde_json::json!({
+            "kind": "status",
+            "status": {
+                "lifecycle_state": "running",
+                "compatibility": DaemonCompatibility::current(),
+                "host_id": "hub",
+                "host_display_name": "Hub",
+                "schema_version": 1,
+                "data_dir_configured": true,
+                "core_initialized": true,
+                "state_source": "initialized",
+                "package_count": 0,
+                "enabled_package_count": 0,
+                "provider_count": 0,
+                "enabled_provider_count": 0,
+                "session_count": 0,
+                "recovered_sessions": [],
+                "stale_sessions": []
+            },
+            "sessions": [],
+            "packages": [],
+            "package_decision": null,
+            "lifecycle": [],
+            "plugin_tools": [],
+            "plugin_tool_result": null,
+            "events": [],
+            "cleanup": null,
+            "coordination": null,
+            "error": null
+        });
+
+        let response: DaemonResponse =
+            serde_json::from_value(response).expect("missing diagnostics should default");
+
+        assert!(response.diagnostics.is_empty());
+        assert!(response.status.expect("status body").diagnostics.is_empty());
     }
 
     #[test]
