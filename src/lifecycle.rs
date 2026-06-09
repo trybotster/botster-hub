@@ -131,6 +131,30 @@ impl HubPluginLifecycle {
             .collect()
     }
 
+    /// Return plugin-owned surface route descriptors with handler refs.
+    #[must_use]
+    pub fn surface_route_descriptors(&self) -> Vec<PluginOwnedDescriptor> {
+        self.descriptors
+            .lock()
+            .expect("hub plugin lifecycle descriptors lock")
+            .values()
+            .flat_map(|descriptors| descriptors.iter().cloned())
+            .filter(|descriptor| descriptor.descriptor.kind == PluginDescriptorKind::SurfaceRoute)
+            .collect()
+    }
+
+    /// Return plugin-owned UI action descriptors with handler refs.
+    #[must_use]
+    pub fn ui_action_descriptors(&self) -> Vec<PluginOwnedDescriptor> {
+        self.descriptors
+            .lock()
+            .expect("hub plugin lifecycle descriptors lock")
+            .values()
+            .flat_map(|descriptors| descriptors.iter().cloned())
+            .filter(|descriptor| descriptor.descriptor.kind == PluginDescriptorKind::UiAction)
+            .collect()
+    }
+
     /// Return package-level lifecycle status without exposing core worker internals.
     #[must_use]
     pub fn status(&self, registry: &PackageRegistry) -> Vec<HubPluginLifecycleStatus> {

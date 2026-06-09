@@ -12,6 +12,12 @@ Supported in this milestone:
 - daemon-backed package enablement and restart reload
 - worker-backed MCP handler invocation with explicit target id, assigned
   worktree, request id, and plugin ownership metadata on started runs
+- a plugin-owned UiNode create-ticket surface at
+  `project-pipelines.create-ticket` plus UI action
+  `project_pipelines.create_ticket`
+- plugin-owned form validation for title and pipeline id, returning
+  `UiActionResult` failure payloads with `field_errors` keyed by stable UiNode
+  id and `form_errors` for form-level feedback
 - routed-envelope-backed start coordination with publish, drain, and
   acknowledge delivery evidence
 - intentionally absent `session_uuid` on `start` because this constrained local
@@ -33,3 +39,10 @@ Lua ABI. Project Pipelines workflow policy lives in `plugin.lua`; Rust exposes
 only reusable PluginDb and routed-envelope helpers needed by the plugin. The
 production daemon/MCP/worker/storage path is proved without a second
 `mcp-serve` runtime or a host-supplied Project Pipelines bundle.
+
+Manual dogfood path: enable this local package in a running hub, open the TUI,
+focus the Project Pipelines create-ticket fields, submit once with a blank title
+to see field/form validation, then submit with a nonblank title to create a
+local ticket. The TUI renders the plugin-authored UiNode tree and dispatches the
+semantic action through the daemon; it does not build a Project Pipelines form in
+Rust.

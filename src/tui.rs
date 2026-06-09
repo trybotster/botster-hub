@@ -1,6 +1,7 @@
 //! Minimal local TUI over the daemon socket client API.
 
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::fmt;
 use std::io;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -28,6 +29,9 @@ use crate::{
 
 const DRAIN_INTERVAL: Duration = Duration::from_millis(50);
 const RECONNECT_INTERVAL: Duration = Duration::from_millis(250);
+const DOGFOOD_PLUGIN: &str = "project-pipelines";
+const DOGFOOD_SURFACE: &str = "project-pipelines.create-ticket";
+const DOGFOOD_ACTION: &str = "project_pipelines.create_ticket";
 
 /// Run the interactive terminal UI until the operator quits.
 pub fn run(config: HubConfig) -> TuiResult<()> {
@@ -160,6 +164,22 @@ impl ScriptedTuiDriver {
     pub fn errors(&self) -> Vec<String> {
         self.client.errors.clone()
     }
+
+    pub fn set_project_pipelines_form(&mut self, title: &str, pipeline_id: &str) {
+        self.client.form_values.insert(
+            "project-pipelines-create-title".to_string(),
+            title.to_string(),
+        );
+        self.client.form_values.insert(
+            "project-pipelines-create-pipeline".to_string(),
+            pipeline_id.to_string(),
+        );
+    }
+
+    pub fn submit_project_pipelines_form(&mut self) -> Vec<UiActionResult> {
+        self.client.submit_plugin_action(DOGFOOD_ACTION);
+        self.client.action_results.clone()
+    }
 }
 
 /// Test proof emitted by the scripted TUI client path.
@@ -193,6 +213,9 @@ struct TuiClient {
     resize_sent: Option<(u16, u16)>,
     ui_regions: Vec<TuiHitRegion>,
     focused_node_id: Option<UiNodeId>,
+    plugin_surface: Option<UiNode>,
+    form_values: BTreeMap<String, String>,
+    action_results: Vec<UiActionResult>,
 }
 
 impl TuiClient {
@@ -214,6 +237,9 @@ impl TuiClient {
             resize_sent: None,
             ui_regions: Vec::new(),
             focused_node_id: None,
+            plugin_surface: None,
+            form_values: BTreeMap::new(),
+            action_results: Vec::new(),
         }
     }
 
@@ -232,6 +258,7 @@ impl TuiClient {
                     .push("attached session was not recovered after daemon reconnect".to_string());
             }
         }
+        self.load_dogfood_surface();
         Ok(())
     }
 
@@ -252,7 +279,51 @@ impl TuiClient {
         if self.selected >= self.sessions.len() {
             self.selected = self.sessions.len().saturating_sub(1);
         }
+        self.load_dogfood_surface();
         Ok(())
+    }
+
+    fn load_dogfood_surface(&mut self) {
+        let response =
+            self.request_without_operator_error_row(DaemonRequest::PluginSurfaceRender {
+                package_name: DOGFOOD_PLUGIN.to_string(),
+                surface_id: DOGFOOD_SURFACE.to_string(),
+                payload: serde_json::json!({}),
+            });
+        match response {
+            Ok(response) if response.kind == DaemonResponseKind::PluginSurface => {
+                self.plugin_surface = response.plugin_surface;
+                if let Some(surface) = self.plugin_surface.clone() {
+                    self.seed_form_values(&surface);
+                }
+            }
+            Ok(response) if response.kind == DaemonResponseKind::OperatorError => {
+                if let Some(error) = response.error.as_ref()
+                    && error.code != "unknown_surface"
+                {
+                    self.errors
+                        .push(format!("{}: {}", error.code, error.message));
+                }
+            }
+            Ok(_) => self
+                .errors
+                .push("plugin surface returned unexpected response".to_string()),
+            Err(DaemonTransportError::NotRunning) => {}
+            Err(error) => self.record_transport_error(error),
+        }
+    }
+
+    fn seed_form_values(&mut self, node: &UiNode) {
+        if let Some(node_id) = node.id.as_ref()
+            && matches!(node.kind, UiNodeKind::TextInput | UiNodeKind::Textarea)
+            && !self.form_values.contains_key(&node_id.0)
+        {
+            let value = string_prop(node, "value").unwrap_or_default().to_string();
+            self.form_values.insert(node_id.0.clone(), value);
+        }
+        for child in node_children(node) {
+            self.seed_form_values(child);
+        }
     }
 
     fn select_session(&mut self, session_id: &str) -> TuiResult<()> {
@@ -589,7 +660,15 @@ impl TuiClient {
             vec![terminal_view_node("attached-terminal", active_session_id)],
         );
 
-        let body = stack_node("body-stack", "horizontal", vec![sessions, terminal]);
+        let body = if let Some(surface) = self.plugin_surface.clone() {
+            stack_node(
+                "body-stack",
+                "horizontal",
+                vec![sessions, terminal, surface],
+            )
+        } else {
+            stack_node("body-stack", "horizontal", vec![sessions, terminal])
+        };
 
         let help = panel_node(
             "keys-panel",
@@ -663,6 +742,15 @@ impl TuiClient {
             return self.attach_selected().map(|_| ());
         }
 
+        let tree = self.ui_tree();
+        if let Some(action_id) = find_node(&tree, node_id)
+            .and_then(|node| string_prop(node, "action"))
+            .map(ToString::to_string)
+        {
+            self.submit_plugin_action(&action_id);
+            return Ok(());
+        }
+
         match node_id.0.as_str() {
             "attached-terminal" | "terminal-panel" => {
                 if self.active_session_id.is_none()
@@ -683,6 +771,66 @@ impl TuiClient {
         Ok(())
     }
 
+    fn submit_plugin_action(&mut self, action_id: &str) {
+        let mut payload = self.plugin_form_payload();
+        payload.insert(
+            "request_id".to_string(),
+            Value::String(format!("tui-{action_id}")),
+        );
+        let response = self.request(DaemonRequest::PluginSurfaceAction {
+            package_name: DOGFOOD_PLUGIN.to_string(),
+            surface_id: DOGFOOD_SURFACE.to_string(),
+            action_id: action_id.to_string(),
+            payload: Value::Object(payload),
+        });
+        match response {
+            Ok(response) if response.kind == DaemonResponseKind::PluginActionResult => {
+                if let Some(result) = response.plugin_action_result {
+                    if result.status == UiActionStatus::Success {
+                        self.notifications
+                            .push("plugin action succeeded".to_string());
+                    }
+                    self.action_results.push(result);
+                }
+            }
+            Ok(_) => self
+                .errors
+                .push("plugin action returned unexpected response".to_string()),
+            Err(error) => self.record_transport_error(error),
+        }
+    }
+
+    fn plugin_form_payload(&self) -> Map<String, Value> {
+        let mut payload = Map::new();
+        if let Some(surface) = self.plugin_surface.as_ref() {
+            collect_form_values(surface, &self.form_values, &mut payload);
+        }
+        payload
+    }
+
+    fn edit_focused_form_field(&mut self, key: KeyEvent) -> bool {
+        let Some(node_id) = self.focused_node_id.as_ref() else {
+            return false;
+        };
+        if !self.form_values.contains_key(&node_id.0) {
+            return false;
+        }
+        match key.code {
+            KeyCode::Char(value) => {
+                self.form_values
+                    .entry(node_id.0.clone())
+                    .or_default()
+                    .push(value);
+                true
+            }
+            KeyCode::Backspace => {
+                self.form_values.entry(node_id.0.clone()).or_default().pop();
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn focus_node(&mut self, node_id: UiNodeId) {
         self.focused_node_id = Some(node_id);
     }
@@ -701,6 +849,9 @@ fn route_event(app: &mut TuiClient, event: Event) -> TuiResult<bool> {
 }
 
 fn handle_key(app: &mut TuiClient, key: KeyEvent) -> TuiResult<bool> {
+    if app.active_session_id.is_none() && app.edit_focused_form_field(key) {
+        return Ok(false);
+    }
     match (key.modifiers, key.code) {
         (KeyModifiers::CONTROL, KeyCode::Char('q')) => return Ok(true),
         (KeyModifiers::CONTROL, KeyCode::Char('d')) | (KeyModifiers::NONE, KeyCode::Esc) => {
@@ -808,6 +959,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut TuiClient) {
 struct TuiUiRenderContext {
     terminal_output: String,
     action_results: Vec<UiActionResult>,
+    form_values: BTreeMap<String, String>,
 }
 
 impl TuiUiRenderContext {
@@ -821,16 +973,50 @@ impl TuiUiRenderContext {
                 .rev()
                 .cloned()
                 .collect::<String>(),
-            action_results: Vec::new(),
+            action_results: app.action_results.clone(),
+            form_values: app.form_values.clone(),
         }
     }
 
     fn failure_for(&self, node_id: Option<&UiNodeId>) -> Option<&str> {
         let node_id = node_id?;
         self.action_results.iter().rev().find_map(|result| {
-            (result.status == UiActionStatus::Failure && result.node_id.as_ref() == Some(node_id))
-                .then_some(result.error.as_deref())
-                .flatten()
+            if result.status != UiActionStatus::Failure {
+                return None;
+            }
+            if result.node_id.as_ref() == Some(node_id) {
+                return result.error.as_deref().or_else(|| {
+                    result
+                        .payload
+                        .as_ref()
+                        .and_then(|payload| payload.get("form_errors"))
+                        .and_then(Value::as_array)
+                        .and_then(|errors| errors.first())
+                        .and_then(Value::as_str)
+                });
+            }
+            result
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.get("field_errors"))
+                .and_then(|errors| errors.get(&node_id.0))
+                .and_then(Value::as_str)
+        })
+    }
+
+    fn success_for(&self, node_id: Option<&UiNodeId>) -> Option<&str> {
+        let node_id = node_id?;
+        self.action_results.iter().rev().find_map(|result| {
+            if result.status == UiActionStatus::Success && result.node_id.as_ref() == Some(node_id)
+            {
+                return result
+                    .payload
+                    .as_ref()
+                    .and_then(|payload| payload.get("message"))
+                    .and_then(Value::as_str)
+                    .or(Some("success"));
+            }
+            None
         })
     }
 }
@@ -1088,6 +1274,9 @@ impl TuiUiRenderer {
         if let Some(error) = self.context.failure_for(node.id.as_ref()) {
             rows.push(format!("error {error}"));
         }
+        if let Some(success) = self.context.success_for(node.id.as_ref()) {
+            rows.push(format!("success {success}"));
+        }
         frame.render_widget(
             Paragraph::new(rows.join("\n"))
                 .block(
@@ -1201,7 +1390,11 @@ impl TuiUiRenderer {
             UiNodeKind::TextInput | UiNodeKind::Textarea => vec![format!(
                 "{}: {}",
                 string_prop(node, "label").unwrap_or("field"),
-                string_prop(node, "value")
+                node.id
+                    .as_ref()
+                    .and_then(|id| self.context.form_values.get(&id.0))
+                    .map(String::as_str)
+                    .or_else(|| string_prop(node, "value"))
                     .or_else(|| string_prop(node, "placeholder"))
                     .unwrap_or("")
             )],
@@ -1253,6 +1446,9 @@ impl TuiUiRenderer {
 
         if let Some(error) = self.context.failure_for(node.id.as_ref()) {
             lines.push(format!("error {error}"));
+        }
+        if let Some(success) = self.context.success_for(node.id.as_ref()) {
+            lines.push(format!("success {success}"));
         }
         lines.retain(|line| !line.is_empty());
         lines
@@ -1307,6 +1503,52 @@ fn node_children(node: &UiNode) -> Vec<&UiNode> {
             _ => None,
         })
         .collect()
+}
+
+fn find_node<'a>(node: &'a UiNode, node_id: &UiNodeId) -> Option<&'a UiNode> {
+    if node.id.as_ref() == Some(node_id) {
+        return Some(node);
+    }
+    node.children
+        .iter()
+        .chain(node.slots.values().flat_map(|children| children.iter()))
+        .filter_map(|child| match child {
+            UiChild::Node(node) => Some(node.as_ref()),
+            _ => None,
+        })
+        .find_map(|child| find_node(child, node_id))
+}
+
+fn collect_form_values(
+    node: &UiNode,
+    values: &BTreeMap<String, String>,
+    payload: &mut Map<String, Value>,
+) {
+    if matches!(
+        node.kind,
+        UiNodeKind::TextInput | UiNodeKind::Textarea | UiNodeKind::Select
+    ) && let (Some(node_id), Some(name)) = (node.id.as_ref(), string_prop(node, "name"))
+    {
+        let value = values
+            .get(&node_id.0)
+            .cloned()
+            .or_else(|| string_prop(node, "value").map(ToString::to_string))
+            .unwrap_or_default();
+        payload.insert(name.to_string(), Value::String(value));
+    } else if node.kind == UiNodeKind::Checkbox
+        && let Some(name) = string_prop(node, "name")
+    {
+        payload.insert(name.to_string(), Value::Bool(bool_prop(node, "checked")));
+    }
+    for child in node
+        .children
+        .iter()
+        .chain(node.slots.values().flat_map(|children| children.iter()))
+    {
+        if let UiChild::Node(node) = child {
+            collect_form_values(node, values, payload);
+        }
+    }
 }
 
 fn string_prop<'a>(node: &'a UiNode, prop: &str) -> Option<&'a str> {
@@ -1653,6 +1895,7 @@ mod tests {
             TuiUiRenderContext {
                 terminal_output: String::new(),
                 action_results: vec![failure],
+                form_values: BTreeMap::new(),
             },
         );
         let frame = render_frame_text(
@@ -1667,6 +1910,7 @@ mod tests {
                     payload: None,
                     error: Some("Name is required".to_string()),
                 }],
+                form_values: BTreeMap::new(),
             },
             60,
             12,
@@ -1677,6 +1921,193 @@ mod tests {
         assert!(rendered.contains("error Name is required"));
         assert!(frame.contains("Name:"));
         assert!(frame.contains("error Name is required"));
+    }
+
+    #[test]
+    fn tui_ui_renderer_maps_structured_plugin_field_errors_and_success_payloads() {
+        let form = node_with_props(
+            "project-pipelines-create-form",
+            UiNodeKind::Form,
+            vec![(
+                "action",
+                Value::String("project_pipelines.create_ticket".to_string()),
+            )],
+            vec![
+                node_with_props(
+                    "project-pipelines-create-title",
+                    UiNodeKind::TextInput,
+                    vec![
+                        ("name", Value::String("title".to_string())),
+                        ("label", Value::String("Title".to_string())),
+                        ("placeholder", Value::String("Ticket title".to_string())),
+                    ],
+                    Vec::new(),
+                ),
+                node_with_props(
+                    "project-pipelines-create-submit",
+                    UiNodeKind::Button,
+                    vec![
+                        ("label", Value::String("Create ticket".to_string())),
+                        (
+                            "action",
+                            Value::String("project_pipelines.create_ticket".to_string()),
+                        ),
+                    ],
+                    Vec::new(),
+                ),
+            ],
+        );
+        let failure = UiActionResult {
+            request_id: RequestId("request-1".to_string()),
+            action_id: UiActionId("project_pipelines.create_ticket".to_string()),
+            node_id: Some(UiNodeId("project-pipelines-create-form".to_string())),
+            status: UiActionStatus::Failure,
+            payload: Some(serde_json::json!({
+                "field_errors": {
+                    "project-pipelines-create-title": "Title is required"
+                },
+                "form_errors": ["Title is required"]
+            })),
+            error: Some("Title is required".to_string()),
+        };
+        let success = UiActionResult {
+            request_id: RequestId("request-2".to_string()),
+            action_id: UiActionId("project_pipelines.create_ticket".to_string()),
+            node_id: Some(UiNodeId("project-pipelines-create-form".to_string())),
+            status: UiActionStatus::Success,
+            payload: Some(serde_json::json!({
+                "message": "Ticket created",
+                "ticket": { "id": "ticket_local_1", "title": "Dogfood ticket" }
+            })),
+            error: None,
+        };
+
+        form.validate()
+            .expect("project pipelines form should satisfy core schema");
+        let failure_frame = render_frame_text(
+            &form,
+            TuiUiRenderContext {
+                terminal_output: String::new(),
+                action_results: vec![failure],
+                form_values: BTreeMap::new(),
+            },
+            70,
+            10,
+        );
+        let success_frame = render_frame_text(
+            &form,
+            TuiUiRenderContext {
+                terminal_output: String::new(),
+                action_results: vec![success],
+                form_values: BTreeMap::from([(
+                    "project-pipelines-create-title".to_string(),
+                    "Dogfood ticket".to_string(),
+                )]),
+            },
+            70,
+            10,
+        );
+
+        assert!(failure_frame.contains("Title: Ticket title"));
+        assert!(failure_frame.contains("error Title is required"));
+        assert!(success_frame.contains("Title: Dogfood ticket"));
+        assert!(success_frame.contains("success Ticket created"));
+    }
+
+    #[test]
+    fn focused_form_field_typing_updates_submitted_value_without_placeholder() {
+        let mut client = TuiClient::new(test_config());
+        let surface = node_with_props(
+            "generic-form",
+            UiNodeKind::Form,
+            Vec::new(),
+            vec![node_with_props(
+                "generic-title",
+                UiNodeKind::TextInput,
+                vec![
+                    ("name", Value::String("title".to_string())),
+                    ("label", Value::String("Title".to_string())),
+                    ("placeholder", Value::String("Ticket title".to_string())),
+                ],
+                Vec::new(),
+            )],
+        );
+        client.seed_form_values(&surface);
+        client.plugin_surface = Some(surface);
+        client.focus_node(UiNodeId("generic-title".to_string()));
+
+        assert_eq!(
+            client.form_values.get("generic-title").map(String::as_str),
+            Some("")
+        );
+        assert!(
+            !handle_key(
+                &mut client,
+                KeyEvent::new(KeyCode::Char('A'), KeyModifiers::NONE)
+            )
+            .expect("typing into a focused field should route through handle_key")
+        );
+        assert!(
+            !handle_key(
+                &mut client,
+                KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE)
+            )
+            .expect("typing into a focused field should route through handle_key")
+        );
+        assert_eq!(
+            client.plugin_form_payload().get("title"),
+            Some(&Value::String("Ab".to_string()))
+        );
+    }
+
+    #[test]
+    fn click_on_node_action_prop_dispatches_plugin_action_without_hardcoded_id() {
+        let mut client = TuiClient::new(test_config());
+        client.plugin_surface = Some(node_with_props(
+            "generic-form",
+            UiNodeKind::Form,
+            Vec::new(),
+            vec![node_with_props(
+                "generic-submit",
+                UiNodeKind::Button,
+                vec![
+                    ("label", Value::String("Save".to_string())),
+                    (
+                        "action",
+                        Value::String("project_pipelines.create_ticket".to_string()),
+                    ),
+                ],
+                Vec::new(),
+            )],
+        ));
+        client.ui_regions = vec![TuiHitRegion {
+            node_id: UiNodeId("generic-submit".to_string()),
+            kind: UiNodeKind::Button,
+            area: ratatui::layout::Rect::new(1, 1, 10, 1),
+        }];
+
+        route_event(
+            &mut client,
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 2,
+                row: 1,
+                modifiers: KeyModifiers::NONE,
+            }),
+        )
+        .expect("mouse click should route through action-prop activation");
+
+        assert!(
+            client
+                .errors
+                .iter()
+                .any(|error| error.contains("not running")),
+            "click should attempt plugin action dispatch through the daemon"
+        );
+        assert!(
+            client.notifications.is_empty(),
+            "action-prop dispatch should not fall back to generic semantic notification"
+        );
     }
 
     #[test]
