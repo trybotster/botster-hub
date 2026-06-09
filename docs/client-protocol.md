@@ -25,7 +25,8 @@ The current descriptor includes:
 - conformance fixture revision.
 
 Downstream clients with the same requirements as the current crate can rely on
-the default connection helper:
+the default connection helper. The checked example for this path lives on
+`botster_hub_client::DaemonConnection`.
 
 ```rust
 let endpoint = botster_hub_client::DaemonEndpoint::new(socket_path);
@@ -35,7 +36,9 @@ let mut connection = botster_hub_client::DaemonConnection::connect(&endpoint)
 
 Clients that need to declare stricter requirements should use the explicit
 handshake helper and display the returned diagnostic as a connection/status
-error:
+error. The checked examples for this path live on
+`botster_hub_client::DaemonCompatibilityRequirement::current` and
+`botster_hub_client::connect_and_hello_with_requirement`.
 
 ```rust
 let mut requirement = botster_hub_client::DaemonCompatibilityRequirement::current();
