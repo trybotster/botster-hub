@@ -1221,146 +1221,48 @@ fn external_hub_test_support_drives_isolated_daemon_socket_protocol() {
     let _guard = daemon_test_lock()
         .lock()
         .expect("serialize real daemon test");
-    let harness = botster_hub_test_support::IsolatedHubBuilder::new()
+    let first = botster_hub_test_support::IsolatedHubBuilder::new()
         .hub_bin(env!("CARGO_BIN_EXE_botster-hub"))
         .session_worker_bin(session_worker_binary_path())
         .root(PathBuf::from("/tmp/bh-test-support"))
         .name("downstream-shape")
         .start()
         .expect("start isolated hub through public test-support harness");
-    assert!(harness.data_dir().starts_with("/tmp/bh-test-support"));
-    assert!(
-        harness
-            .endpoint()
-            .socket_path
-            .starts_with(harness.data_dir())
-    );
+    assert!(first.data_dir().starts_with("/tmp/bh-test-support"));
+    assert!(first.endpoint().socket_path.starts_with(first.data_dir()));
+    let first_report =
+        botster_hub_test_support::run_client_conformance(&first).expect("run client conformance");
+    assert_eq!(first_report.lifecycle_state, "running");
+    assert_eq!(first_report.initial_session_count, 0);
+    assert_eq!(first_report.spawned_lifecycle, "running");
+    assert!(first_report.stream_contains_ready);
+    assert!(first_report.stream_contains_echo);
+    assert!(first_report.stream_contains_resize);
+    assert_eq!(first_report.validation_error_operation, "drain_runtime");
 
-    let status = botster_hub_client::request(
-        harness.endpoint(),
-        botster_hub_client::DaemonRequest::Status,
+    let plugin_report = botster_hub_test_support::run_project_pipelines_conformance(
+        &first,
+        PathBuf::from("examples/project-pipelines"),
     )
-    .expect("test-support external status request");
-    assert_eq!(status.kind, botster_hub_client::DaemonResponseKind::Status);
-    let status = status.status.expect("status body");
-    assert_eq!(status.lifecycle_state, "running");
-    assert!(status.data_dir_configured);
-    assert_eq!(status.host_id, "local");
-    assert_eq!(status.host_display_name, "Botster Hub");
+    .expect("run project pipelines conformance");
+    assert_eq!(plugin_report.package_state, "enabled");
+    assert_eq!(plugin_report.surface_kind, "panel");
+    assert_eq!(plugin_report.surface_id, "project-pipelines-create-panel");
+    assert_eq!(plugin_report.invalid_action_status, "failure");
+    assert_eq!(plugin_report.invalid_title_error, "Title is required");
+    first.shutdown().expect("shutdown first isolated hub");
 
-    let list = botster_hub_client::request(
-        harness.endpoint(),
-        botster_hub_client::DaemonRequest::ListSessions,
-    )
-    .expect("test-support external list request");
-    assert_eq!(list.kind, botster_hub_client::DaemonResponseKind::Sessions);
-    assert!(list.sessions.is_empty());
-
-    let spawn = botster_hub_client::request(
-        harness.endpoint(),
-        botster_hub_client::DaemonRequest::Spawn {
-            session_id: "test-support-session".to_string(),
-            command:
-                "printf 'support-ready\\n'; while IFS= read -r line; do if [ \"$line\" = size-check ]; then printf 'winsize:%s\\n' \"$(stty size)\"; else printf 'echo:%s\\n' \"$line\"; fi; done"
-                    .to_string(),
-        },
-    )
-    .expect("test-support external spawn request");
-    assert_eq!(spawn.kind, botster_hub_client::DaemonResponseKind::Spawned);
-    assert!(
-        spawn
-            .sessions
-            .iter()
-            .any(|session| session.session_id == "test-support-session"
-                && session.lifecycle == "running")
-    );
-
-    let mut connection =
-        botster_hub_client::DaemonConnection::connect(harness.endpoint()).expect("connect");
-    let attach = connection
-        .request(&botster_hub_client::DaemonRequest::Attach {
-            session_id: "test-support-session".to_string(),
-            subscription_id: "test-support-subscription".to_string(),
-        })
-        .expect("test-support external attach request");
-    assert_eq!(attach.kind, botster_hub_client::DaemonResponseKind::Events);
-
-    let resize = connection
-        .request(&botster_hub_client::DaemonRequest::Resize {
-            session_id: "test-support-session".to_string(),
-            rows: 33,
-            cols: 102,
-        })
-        .expect("test-support external resize request");
-    assert_eq!(resize.kind, botster_hub_client::DaemonResponseKind::Events);
-
-    let send = connection
-        .request(&botster_hub_client::DaemonRequest::SendInput {
-            session_id: "test-support-session".to_string(),
-            data: "from-test-support\n".to_string(),
-        })
-        .expect("test-support external send input request");
-    assert_eq!(send.kind, botster_hub_client::DaemonResponseKind::Events);
-    drain_external_connection_until(
-        &mut connection,
-        "test-support-session",
-        "echo:from-test-support",
-    );
-
-    connection
-        .request(&botster_hub_client::DaemonRequest::SendInput {
-            session_id: "test-support-session".to_string(),
-            data: "size-check\n".to_string(),
-        })
-        .expect("test-support external size-check input request");
-    drain_external_connection_until(&mut connection, "test-support-session", "winsize:33 102");
-
-    let detach = connection
-        .request(&botster_hub_client::DaemonRequest::Detach {
-            session_id: "test-support-session".to_string(),
-            subscription_id: "test-support-subscription".to_string(),
-        })
-        .expect("test-support external detach request");
-    assert_eq!(detach.kind, botster_hub_client::DaemonResponseKind::Events);
-
-    let shutdown_session = botster_hub_client::request(
-        harness.endpoint(),
-        botster_hub_client::DaemonRequest::ShutdownSession {
-            session_id: "test-support-session".to_string(),
-        },
-    )
-    .expect("test-support external shutdown session request");
-    assert_eq!(
-        shutdown_session.kind,
-        botster_hub_client::DaemonResponseKind::Events
-    );
-    harness.shutdown().expect("shutdown isolated hub");
-}
-
-fn drain_external_connection_until(
-    connection: &mut botster_hub_client::DaemonConnection,
-    session_id: &str,
-    needle: &str,
-) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    let mut observed = String::new();
-    while std::time::Instant::now() < deadline {
-        let drain = connection
-            .request(&botster_hub_client::DaemonRequest::Drain {
-                session_id: session_id.to_string(),
-            })
-            .expect("external drain request");
-        for event in drain.events {
-            if let botster_hub_client::DaemonEvent::TerminalOutput { data, .. } = event {
-                observed.push_str(&data);
-            }
-        }
-        if observed.contains(needle) {
-            return;
-        }
-        thread::sleep(Duration::from_millis(30));
-    }
-    panic!("timed out waiting for {needle:?} in {observed:?}");
+    let second = botster_hub_test_support::IsolatedHubBuilder::new()
+        .hub_bin(env!("CARGO_BIN_EXE_botster-hub"))
+        .session_worker_bin(session_worker_binary_path())
+        .root(PathBuf::from("/tmp/bh-test-support"))
+        .name("downstream-shape-determinism")
+        .start()
+        .expect("start second isolated hub through public test-support harness");
+    let second_report =
+        botster_hub_test_support::run_client_conformance(&second).expect("rerun conformance");
+    assert_eq!(second_report, first_report);
+    second.shutdown().expect("shutdown second isolated hub");
 }
 
 #[test]
