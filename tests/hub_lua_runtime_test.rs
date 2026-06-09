@@ -3,27 +3,28 @@ use std::path::PathBuf;
 use botster_core::{
     BoundaryJson, PluginHandlerKind, PluginHandlerRef, PluginInvocationContext,
     PluginInvocationFailure, PluginInvocationFailureKind, PluginInvocationRequest,
-    PluginInvocationResult, PluginInvocationSuccess, PluginKey, RequestId,
+    PluginInvocationResult, PluginInvocationSuccess, PluginKey, RequestId, UiActionStatus,
+    UiNodeKind,
 };
 use botster_hub::{
-    DataDirectoryOption, HostIdentityOptions, HubRuntime, HubStartupOptions, LuaPluginRuntime,
-    PackageRegistry, RuntimeEnvironment, SessionDefaults, TransportBindings,
-    default_package_policy,
+    DataDirectoryOption, HostIdentityOptions, HubClientApi, HubClientRequest,
+    HubClientResponseBody, HubRuntime, HubStartupOptions, LuaPluginRuntime, PackageRegistry,
+    RuntimeEnvironment, SessionDefaults, TransportBindings, default_package_policy,
 };
 
 fn explicit_runtime(name: &str) -> HubRuntime {
+    let data_directory = PathBuf::from("target")
+        .join("botster-hub-test-data")
+        .join("lua-runtime")
+        .join(name);
+    let _ = std::fs::remove_dir_all(&data_directory);
     let config = HubStartupOptions {
         host: HostIdentityOptions {
             id: format!("hub-lua-runtime-test-{name}"),
             display_name: "Hub Lua Runtime Test".to_string(),
             fingerprint: None,
         },
-        data_directory: DataDirectoryOption::Explicit(
-            PathBuf::from("target")
-                .join("botster-hub-test-data")
-                .join("lua-runtime")
-                .join(name),
-        ),
+        data_directory: DataDirectoryOption::Explicit(data_directory),
         session_defaults: SessionDefaults {
             shell: "/bin/sh".to_string(),
             working_directory: Some(".".into()),
@@ -53,6 +54,20 @@ fn install_fixture_registry() -> PackageRegistry {
     policy
         .enable("dogfood.synthetic-plugin", "enable synthetic lua plugin")
         .expect("enable local lua package");
+    policy.registry().clone()
+}
+
+fn install_project_pipelines_registry() -> PackageRegistry {
+    let mut policy = default_package_policy();
+    policy
+        .install_local_path(
+            PathBuf::from("examples/project-pipelines"),
+            "install project pipelines lua plugin",
+        )
+        .expect("install project pipelines package");
+    policy
+        .enable("project-pipelines", "enable project pipelines package")
+        .expect("enable project pipelines package");
     policy.registry().clone()
 }
 
@@ -133,6 +148,102 @@ fn plugin_mcp_call_uses_loaded_runtime_and_returns_structured_payload() {
 
     assert_eq!(result["message"], "from-mcp");
     assert_eq!(result["ambient"]["os"], true);
+}
+
+#[test]
+fn project_pipelines_surface_action_round_trip_uses_client_api_and_plugin_worker() {
+    let registry = install_project_pipelines_registry();
+    let mut hub = explicit_runtime("project-pipelines-ui");
+    hub.load_lua_plugin_package(&registry, "project-pipelines")
+        .expect("load project pipelines plugin package");
+    let api = HubClientApi::local_operator("project-pipelines-ui-test");
+
+    let surface = api
+        .handle_request(
+            &mut hub,
+            &registry,
+            HubClientRequest::PluginSurfaceRender {
+                request_id: RequestId("render-project-pipelines-surface".to_string()),
+                package_name: "project-pipelines".to_string(),
+                surface_id: "project-pipelines.create-ticket".to_string(),
+                payload: serde_json::json!({}),
+            },
+        )
+        .expect("render project pipelines surface through client api");
+    let HubClientResponseBody::PluginSurface(surface) = surface.body else {
+        panic!("plugin surface response expected");
+    };
+    assert_eq!(surface.kind, UiNodeKind::Panel);
+    assert_eq!(
+        surface.id.as_ref().map(|id| id.0.as_str()),
+        Some("project-pipelines-create-panel")
+    );
+
+    let invalid = api
+        .handle_request(
+            &mut hub,
+            &registry,
+            HubClientRequest::PluginSurfaceAction {
+                request_id: RequestId("invalid-project-pipelines-action".to_string()),
+                package_name: "project-pipelines".to_string(),
+                surface_id: "project-pipelines.create-ticket".to_string(),
+                action_id: "project_pipelines.create_ticket".to_string(),
+                payload: serde_json::json!({
+                    "request_id": "invalid-project-pipelines-action",
+                    "title": "   ",
+                    "pipeline_id": "local_pipeline",
+                }),
+            },
+        )
+        .expect("submit invalid project pipelines action through client api");
+    let HubClientResponseBody::PluginActionResult(invalid) = invalid.body else {
+        panic!("plugin action response expected");
+    };
+    assert_eq!(invalid.status, UiActionStatus::Failure);
+    assert_eq!(
+        invalid
+            .payload
+            .as_ref()
+            .and_then(|payload| payload.get("field_errors"))
+            .and_then(|errors| errors.get("project-pipelines-create-title"))
+            .and_then(serde_json::Value::as_str),
+        Some("Title is required")
+    );
+
+    let valid = api
+        .handle_request(
+            &mut hub,
+            &registry,
+            HubClientRequest::PluginSurfaceAction {
+                request_id: RequestId("valid-project-pipelines-action".to_string()),
+                package_name: "project-pipelines".to_string(),
+                surface_id: "project-pipelines.create-ticket".to_string(),
+                action_id: "project_pipelines.create_ticket".to_string(),
+                payload: serde_json::json!({
+                    "request_id": "valid-project-pipelines-action",
+                    "title": "  Dogfood ticket  ",
+                    "pipeline_id": "local.pipeline",
+                }),
+            },
+        )
+        .expect("submit valid project pipelines action through client api");
+    let HubClientResponseBody::PluginActionResult(valid) = valid.body else {
+        panic!("plugin action response expected");
+    };
+    assert_eq!(valid.status, UiActionStatus::Success);
+    assert_eq!(
+        valid.payload.as_ref().unwrap()["normalized"]["title"],
+        "Dogfood ticket"
+    );
+
+    let context = hub
+        .call_plugin_mcp_tool(botster_hub::McpCallRequest {
+            name: "project_pipelines.current_context".to_string(),
+            arguments: serde_json::json!({}),
+        })
+        .expect("read current context after plugin action");
+    assert_eq!(context["tickets"].as_array().unwrap().len(), 1);
+    assert_eq!(context["tickets"][0]["title"], "Dogfood ticket");
 }
 
 #[test]

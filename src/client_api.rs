@@ -11,7 +11,7 @@ use botster_core::{
     EnvelopeCursor, EnvelopeDeliveryState, EnvelopeId, EnvelopeTarget, RequestId, RoutedEnvelope,
     RoutedEnvelopeDrainOutcome, RoutedEnvelopePublishOutcome, SessionId, SessionLifecycleState,
     SessionRuntimeErrorKind, SessionSpawnRequest, SpawnEnvironment, SpawnWorkingDirectory,
-    SubscriptionId, TerminalAttachState, TransportEgress,
+    SubscriptionId, TerminalAttachState, TransportEgress, UiActionResult, UiNode,
 };
 use botster_core_daemon::{
     GuardedWriteDecision, GuardedWriteDeliveryState, GuardedWriteRequest, GuardedWriteResult,
@@ -300,6 +300,27 @@ impl HubClientApi {
                         .collect(),
                 )
             }
+            HubClientRequest::PluginSurfaceRender {
+                package_name,
+                surface_id,
+                payload,
+                ..
+            } => HubClientResponseBody::PluginSurface(
+                runtime
+                    .render_plugin_surface(&package_name, &surface_id, payload)
+                    .map_err(|error| plugin_error(request_id.clone(), operation, error))?,
+            ),
+            HubClientRequest::PluginSurfaceAction {
+                package_name,
+                surface_id,
+                action_id,
+                payload,
+                ..
+            } => HubClientResponseBody::PluginActionResult(
+                runtime
+                    .dispatch_plugin_surface_action(&package_name, &surface_id, &action_id, payload)
+                    .map_err(|error| plugin_error(request_id.clone(), operation, error))?,
+            ),
         };
 
         Ok(HubClientResponse { request_id, body })
@@ -374,7 +395,9 @@ impl HubClientAdmission {
             | HubClientOperation::ReadScreen
             | HubClientOperation::CaptureSnapshot => self.allow_runtime,
             HubClientOperation::ListPackages => self.allow_packages,
-            HubClientOperation::PluginLifecycleStatus => self.allow_lifecycle,
+            HubClientOperation::PluginLifecycleStatus
+            | HubClientOperation::PluginSurfaceRender
+            | HubClientOperation::PluginSurfaceAction => self.allow_lifecycle,
         }
     }
 }
@@ -485,6 +508,21 @@ pub enum HubClientRequest {
     ListPackages { request_id: RequestId },
     /// Return read-only plugin lifecycle status.
     PluginLifecycleStatus { request_id: RequestId },
+    /// Render one plugin-owned surface through its worker-owned route handler.
+    PluginSurfaceRender {
+        request_id: RequestId,
+        package_name: String,
+        surface_id: String,
+        payload: serde_json::Value,
+    },
+    /// Dispatch one plugin-owned semantic UI action through its worker handler.
+    PluginSurfaceAction {
+        request_id: RequestId,
+        package_name: String,
+        surface_id: String,
+        action_id: String,
+        payload: serde_json::Value,
+    },
 }
 
 impl HubClientRequest {
@@ -507,7 +545,9 @@ impl HubClientRequest {
             | Self::ReadScreen { request_id, .. }
             | Self::CaptureSnapshot { request_id, .. }
             | Self::ListPackages { request_id }
-            | Self::PluginLifecycleStatus { request_id } => request_id,
+            | Self::PluginLifecycleStatus { request_id }
+            | Self::PluginSurfaceRender { request_id, .. }
+            | Self::PluginSurfaceAction { request_id, .. } => request_id,
         }
     }
 
@@ -531,6 +571,8 @@ impl HubClientRequest {
             Self::CaptureSnapshot { .. } => HubClientOperation::CaptureSnapshot,
             Self::ListPackages { .. } => HubClientOperation::ListPackages,
             Self::PluginLifecycleStatus { .. } => HubClientOperation::PluginLifecycleStatus,
+            Self::PluginSurfaceRender { .. } => HubClientOperation::PluginSurfaceRender,
+            Self::PluginSurfaceAction { .. } => HubClientOperation::PluginSurfaceAction,
         }
     }
 }
@@ -556,10 +598,12 @@ pub enum HubClientOperation {
     CaptureSnapshot,
     ListPackages,
     PluginLifecycleStatus,
+    PluginSurfaceRender,
+    PluginSurfaceAction,
 }
 
 /// Stable response envelope for one request.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct HubClientResponse {
     /// Request correlation id.
     pub request_id: RequestId,
@@ -568,7 +612,7 @@ pub struct HubClientResponse {
 }
 
 /// Stable response body variants.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum HubClientResponseBody {
     Status(HubClientStatus),
     Sessions(Vec<HubClientSession>),
@@ -580,6 +624,8 @@ pub enum HubClientResponseBody {
     RoutedEnvelopeAck(HubClientRoutedEnvelopeAck),
     Packages(Vec<HubClientPackage>),
     PluginLifecycle(Vec<HubClientPluginLifecycle>),
+    PluginSurface(UiNode),
+    PluginActionResult(UiActionResult),
 }
 
 /// Path-neutral hub status.
@@ -848,6 +894,12 @@ pub enum HubClientError {
         operation: HubClientOperation,
         package_name: String,
     },
+    Plugin {
+        request_id: RequestId,
+        operation: HubClientOperation,
+        code: String,
+        message: String,
+    },
 }
 
 /// Result alias for client API requests.
@@ -882,6 +934,19 @@ fn runtime_error(
         request_id,
         operation,
         kind,
+    }
+}
+
+fn plugin_error(
+    request_id: RequestId,
+    operation: HubClientOperation,
+    error: crate::McpToolError,
+) -> HubClientError {
+    HubClientError::Plugin {
+        request_id,
+        operation,
+        code: error.code,
+        message: error.message,
     }
 }
 

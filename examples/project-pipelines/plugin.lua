@@ -65,6 +65,50 @@ local function string_arg(arguments, key)
   return nil
 end
 
+local function trim(value)
+  if type(value) ~= "string" then
+    return nil
+  end
+  return (value:gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
+local function validation_failure(field_errors, form_errors)
+  return {
+    ok = false,
+    error = {
+      code = "validation_failed",
+      message = form_errors[1] or "ticket validation failed",
+    },
+    field_errors = field_errors,
+    form_errors = form_errors,
+  }
+end
+
+local function normalized_ticket_input(arguments)
+  local title = trim(arguments.title)
+  local pipeline_id = trim(arguments.pipeline_id) or "local_pipeline"
+  local field_errors = {}
+  local form_errors = {}
+  if not title or title == "" then
+    field_errors["project-pipelines-create-title"] = "Title is required"
+    table.insert(form_errors, "Title is required")
+  end
+  if pipeline_id == "" then
+    pipeline_id = "local_pipeline"
+  end
+  if not pipeline_id:match("^[%w_%-%.]+$") then
+    field_errors["project-pipelines-create-pipeline"] = "Pipeline id can only contain letters, numbers, dash, underscore, or dot"
+    table.insert(form_errors, "Pipeline id is invalid")
+  end
+  if next(field_errors) ~= nil then
+    return nil, validation_failure(field_errors, form_errors)
+  end
+  return {
+    title = title,
+    pipeline_id = pipeline_id,
+  }, nil
+end
+
 local function missing_arg(key)
   return {
     ok = false,
@@ -94,15 +138,17 @@ local function push_event(state, kind, payload)
 end
 
 local function create(arguments)
+  local input, validation_error = normalized_ticket_input(arguments)
+  if validation_error then
+    return validation_error
+  end
   local state = load_state()
-  local title = string_arg(arguments, "title") or "Untitled local ticket"
-  local pipeline_id = string_arg(arguments, "pipeline_id") or "local_pipeline"
   state.next_ticket = state.next_ticket + 1
   local ticket = {
     id = "ticket_local_" .. state.next_ticket,
-    title = title,
+    title = input.title,
     status = "open",
-    pipeline_id = pipeline_id,
+    pipeline_id = input.pipeline_id,
     created_at = 0,
   }
   push_event(state, "ticket.created", { ticket_id = ticket.id })
@@ -112,6 +158,81 @@ local function create(arguments)
     return error
   end
   return { ok = true, ticket = ticket }
+end
+
+local function create_ticket_surface(_arguments)
+  return {
+    type = "panel",
+    id = "project-pipelines-create-panel",
+    props = { title = "Create Project Pipelines ticket" },
+    children = {
+      {
+        type = "form",
+        id = "project-pipelines-create-form",
+        props = { action = "project_pipelines.create_ticket" },
+        children = {
+          {
+            type = "text_input",
+            id = "project-pipelines-create-title",
+            props = {
+              name = "title",
+              label = "Title",
+              placeholder = "Ticket title",
+              required = true,
+            },
+          },
+          {
+            type = "text_input",
+            id = "project-pipelines-create-pipeline",
+            props = {
+              name = "pipeline_id",
+              label = "Pipeline",
+              value = "local_pipeline",
+              required = true,
+            },
+          },
+          {
+            type = "button",
+            id = "project-pipelines-create-submit",
+            props = {
+              label = "Create ticket",
+              action = "project_pipelines.create_ticket",
+            },
+          },
+        },
+      },
+    },
+  }
+end
+
+local function create_ticket_action(arguments)
+  local result = create(arguments)
+  if not result.ok then
+    return {
+      request_id = arguments.request_id or "project-pipelines-create-ticket",
+      action_id = "project_pipelines.create_ticket",
+      node_id = "project-pipelines-create-form",
+      status = "failure",
+      error = result.error.message,
+      payload = {
+        field_errors = result.field_errors or {},
+        form_errors = result.form_errors or { result.error.message },
+      },
+    }
+  end
+  return {
+    request_id = arguments.request_id or "project-pipelines-create-ticket",
+    action_id = "project_pipelines.create_ticket",
+    node_id = "project-pipelines-create-form",
+    status = "success",
+    payload = {
+      ticket = result.ticket,
+      normalized = {
+        title = result.ticket.title,
+        pipeline_id = result.ticket.pipeline_id,
+      },
+    },
+  }
 end
 
 local function list()
@@ -315,6 +436,28 @@ local function request_step_advance(arguments)
 end
 
 return botster.register({
+  handlers = {
+    {
+      id = "create_ticket_surface",
+      kind = "surface_route",
+      descriptor_id = "project-pipelines.create-ticket",
+      descriptor = {
+        title = "Create Project Pipelines ticket",
+        surface_id = "project-pipelines.create-ticket",
+      },
+      call = create_ticket_surface,
+    },
+    {
+      id = "create_ticket_action",
+      kind = "ui_action",
+      descriptor_id = "project_pipelines.create_ticket",
+      descriptor = {
+        action_id = "project_pipelines.create_ticket",
+        surface_id = "project-pipelines.create-ticket",
+      },
+      call = create_ticket_action,
+    },
+  },
   tools = {
     {
       name = "project_pipelines.create",
