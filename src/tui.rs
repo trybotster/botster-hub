@@ -6,7 +6,9 @@ use std::fmt;
 use std::io;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use botster_core::{UiActionResult, UiActionStatus, UiChild, UiNode, UiNodeId, UiNodeKind};
+use botster_core::{
+    UiActionResult, UiActionResultState, UiChild, UiNode, UiNodeId, UiNodeKind,
+};
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
     MouseButton, MouseEvent, MouseEventKind,
@@ -791,7 +793,7 @@ impl TuiClient {
                     .plugin_action_result
                     .and_then(|result| serde_json::from_value::<UiActionResult>(result).ok())
                 {
-                    if result.status == UiActionStatus::Success {
+                    if result.state == UiActionResultState::Accepted {
                         self.notifications
                             .push("plugin action succeeded".to_string());
                     }
@@ -986,33 +988,30 @@ impl TuiUiRenderContext {
     fn failure_for(&self, node_id: Option<&UiNodeId>) -> Option<&str> {
         let node_id = node_id?;
         self.action_results.iter().rev().find_map(|result| {
-            if result.status != UiActionStatus::Failure {
+            if result.state != UiActionResultState::Rejected {
                 return None;
             }
             if result.node_id.as_ref() == Some(node_id) {
                 return result.error.as_deref().or_else(|| {
                     result
-                        .payload
-                        .as_ref()
-                        .and_then(|payload| payload.get("form_errors"))
-                        .and_then(Value::as_array)
-                        .and_then(|errors| errors.first())
-                        .and_then(Value::as_str)
+                        .form_errors
+                        .first()
+                        .map(std::string::String::as_str)
                 });
             }
             result
-                .payload
-                .as_ref()
-                .and_then(|payload| payload.get("field_errors"))
-                .and_then(|errors| errors.get(&node_id.0))
-                .and_then(Value::as_str)
+                .field_errors
+                .get(&node_id.0)
+                .and_then(|errors| errors.first())
+                .map(std::string::String::as_str)
         })
     }
 
     fn success_for(&self, node_id: Option<&UiNodeId>) -> Option<&str> {
         let node_id = node_id?;
         self.action_results.iter().rev().find_map(|result| {
-            if result.status == UiActionStatus::Success && result.node_id.as_ref() == Some(node_id)
+            if result.state == UiActionResultState::Accepted
+                && result.node_id.as_ref() == Some(node_id)
             {
                 return result
                     .payload
@@ -1742,7 +1741,7 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    use botster_core::{RequestId, UiActionId};
+    use botster_core::{RequestId, UiActionId, UiFieldErrors, UiFormValues, UiSurfaceId};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
@@ -1886,9 +1885,15 @@ mod tests {
         );
         let failure = UiActionResult {
             request_id: RequestId("request-1".to_string()),
+            surface_id: UiSurfaceId("fixture.surface".to_string()),
             action_id: UiActionId("save-settings".to_string()),
             node_id: Some(UiNodeId("project-name".to_string())),
-            status: UiActionStatus::Failure,
+            state: UiActionResultState::Rejected,
+            field_errors: UiFieldErrors::new(),
+            form_errors: Vec::new(),
+            warnings: Vec::new(),
+            normalized_values: None,
+            tree_update: None,
             payload: None,
             error: Some("Name is required".to_string()),
         };
@@ -1909,9 +1914,15 @@ mod tests {
                 terminal_output: String::new(),
                 action_results: vec![UiActionResult {
                     request_id: RequestId("request-1".to_string()),
+                    surface_id: UiSurfaceId("fixture.surface".to_string()),
                     action_id: UiActionId("save-settings".to_string()),
                     node_id: Some(UiNodeId("project-name".to_string())),
-                    status: UiActionStatus::Failure,
+                    state: UiActionResultState::Rejected,
+                    field_errors: UiFieldErrors::new(),
+                    form_errors: Vec::new(),
+                    warnings: Vec::new(),
+                    normalized_values: None,
+                    tree_update: None,
                     payload: None,
                     error: Some("Name is required".to_string()),
                 }],
@@ -1964,22 +1975,35 @@ mod tests {
         );
         let failure = UiActionResult {
             request_id: RequestId("request-1".to_string()),
+            surface_id: UiSurfaceId("project-pipelines.create-ticket".to_string()),
             action_id: UiActionId("project_pipelines.create_ticket".to_string()),
             node_id: Some(UiNodeId("project-pipelines-create-form".to_string())),
-            status: UiActionStatus::Failure,
-            payload: Some(serde_json::json!({
-                "field_errors": {
-                    "project-pipelines-create-title": "Title is required"
-                },
-                "form_errors": ["Title is required"]
-            })),
+            state: UiActionResultState::Rejected,
+            field_errors: UiFieldErrors::from_iter([(
+                "project-pipelines-create-title".to_string(),
+                vec!["Title is required".to_string()],
+            )]),
+            form_errors: vec!["Title is required".to_string()],
+            warnings: Vec::new(),
+            normalized_values: None,
+            tree_update: None,
+            payload: None,
             error: Some("Title is required".to_string()),
         };
         let success = UiActionResult {
             request_id: RequestId("request-2".to_string()),
+            surface_id: UiSurfaceId("project-pipelines.create-ticket".to_string()),
             action_id: UiActionId("project_pipelines.create_ticket".to_string()),
             node_id: Some(UiNodeId("project-pipelines-create-form".to_string())),
-            status: UiActionStatus::Success,
+            state: UiActionResultState::Accepted,
+            field_errors: UiFieldErrors::new(),
+            form_errors: Vec::new(),
+            warnings: Vec::new(),
+            normalized_values: Some(UiFormValues(Map::from_iter([(
+                "title".to_string(),
+                Value::String("Dogfood ticket".to_string()),
+            )]))),
+            tree_update: None,
             payload: Some(serde_json::json!({
                 "message": "Ticket created",
                 "ticket": { "id": "ticket_local_1", "title": "Dogfood ticket" }

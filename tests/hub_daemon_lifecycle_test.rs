@@ -12,7 +12,7 @@ use botster_core::{
     Capability, CapabilitySurface, CoreSessionMetadata, ExtensionEntrypoint, ExtensionKind,
     ExtensionRuntime, HostProfileMetadata, HostProfilePolicySection, PackageManifest,
     PackageSource, ProcessIdentity, RequestId, ResizePayload, SessionId, SessionSpawnRequest,
-    SpawnEnvironment, SpawnWorkingDirectory, SubscriptionId, UiActionStatus,
+    SpawnEnvironment, SpawnWorkingDirectory, SubscriptionId, UiActionResultState,
 };
 use botster_core_daemon::{RegistryRecord, SessionRegistry};
 use botster_hub::{
@@ -1434,23 +1434,25 @@ fn daemon_tui_project_pipelines_surface_action_round_trip_uses_plugin_result() {
     driver.set_project_pipelines_form("   ", "local_pipeline");
     let invalid_results = driver.submit_project_pipelines_form();
     let invalid = invalid_results.last().expect("invalid action result");
-    assert_eq!(invalid.status, UiActionStatus::Failure);
+    assert_eq!(invalid.state, UiActionResultState::Rejected);
+    assert_eq!(invalid.surface_id.0, "project-pipelines.create-ticket");
     assert_eq!(
         invalid
-            .payload
-            .as_ref()
-            .and_then(|payload| payload.get("field_errors"))
-            .and_then(|errors| errors.get("project-pipelines-create-title"))
-            .and_then(serde_json::Value::as_str),
+            .field_errors
+            .get("project-pipelines-create-title")
+            .and_then(|errors| errors.first())
+            .map(String::as_str),
         Some("Title is required")
     );
+    assert_eq!(invalid.form_errors, vec!["Title is required".to_string()]);
 
     driver.set_project_pipelines_form("  TUI dogfood ticket  ", "local.pipeline");
     let valid_results = driver.submit_project_pipelines_form();
     let valid = valid_results.last().expect("valid action result");
-    assert_eq!(valid.status, UiActionStatus::Success);
+    assert_eq!(valid.state, UiActionResultState::Accepted);
+    assert_eq!(valid.surface_id.0, "project-pipelines.create-ticket");
     assert_eq!(
-        valid.payload.as_ref().unwrap()["normalized"]["title"],
+        valid.normalized_values.as_ref().unwrap().0["title"],
         "TUI dogfood ticket"
     );
 
