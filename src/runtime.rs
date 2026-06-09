@@ -6,11 +6,13 @@
 //! through `botster-core-daemon`.
 
 use botster_core::{
-    BotsterEngineObservation, BotsterEngineOutput, ClientId, CoreSession, CoreSessionMetadata,
-    EnvelopeId, EnvelopeTarget, ManagedSessionRuntimeError, PluginCapabilityRuntime,
-    PluginCleanupResult, PluginInvocationOutcome, PluginInvocationRequest, PluginKey, RequestId,
-    RoutedEnvelope, RoutedEnvelopeDrainOutcome, RoutedEnvelopePublishOutcome, RoutedEnvelopeRouter,
-    SessionId, SessionLifecycleState, SessionRuntimeErrorKind, SessionSpawnRequest, SubscriptionId,
+    BotsterEngineObservation, BotsterEngineOutput, BoundaryJson, ClientId, CoreSession,
+    CoreSessionMetadata, EnvelopeId, EnvelopeTarget, ManagedSessionRuntimeError,
+    PluginCapabilityRuntime, PluginCleanupResult, PluginHandlerKind, PluginInvocationOutcome,
+    PluginInvocationRequest, PluginInvocationResult, PluginKey, RequestId, RoutedEnvelope,
+    RoutedEnvelopeDrainOutcome, RoutedEnvelopePublishOutcome, RoutedEnvelopeRouter, SessionId,
+    SessionLifecycleState, SessionRuntimeErrorKind, SessionSpawnRequest, SubscriptionId,
+    UiActionResult, UiNode,
 };
 use botster_core_daemon::{
     CoreDaemon, CoreDaemonConfig, CoreDaemonError, DaemonSession, DrainResult, GuardedWriteRequest,
@@ -363,6 +365,108 @@ impl HubRuntime {
         }
     }
 
+    /// Render a plugin-owned surface route through the plugin worker path.
+    pub fn render_plugin_surface(
+        &self,
+        package_name: &str,
+        surface_id: &str,
+        payload: serde_json::Value,
+    ) -> Result<UiNode, crate::McpToolError> {
+        let descriptor = self
+            .plugin_lifecycle
+            .surface_route_descriptors()
+            .into_iter()
+            .find(|descriptor| {
+                descriptor.descriptor.plugin_key.0 == package_name
+                    && descriptor.descriptor.descriptor_id == surface_id
+            })
+            .ok_or_else(|| {
+                crate::McpToolError::new(
+                    "unknown_surface",
+                    format!("unknown plugin surface: {package_name}/{surface_id}"),
+                )
+            })?;
+        let handler = descriptor.handler.ok_or_else(|| {
+            crate::McpToolError::new("surface_unavailable", "plugin surface has no handler")
+        })?;
+        let request_id = RequestId(format!("plugin-surface-render-{package_name}-{surface_id}"));
+        let outcome = self.invoke_plugin(PluginInvocationRequest {
+            request_id,
+            handler,
+            timeout_ms: 1_000,
+            context: botster_core::PluginInvocationContext {
+                client_id: None,
+                session_id: None,
+                subscription_id: None,
+                surface_id: Some(surface_id.to_string()),
+                origin: Some("local-client-api".to_string()),
+                metadata: None,
+            },
+            payload: BoundaryJson(payload),
+        });
+        let value = completed_plugin_payload(outcome.result, "plugin surface render")?;
+        let node: UiNode = serde_json::from_value(value).map_err(|error| {
+            crate::McpToolError::new("invalid_surface", format!("invalid plugin UiNode: {error}"))
+        })?;
+        node.validate().map_err(|error| {
+            crate::McpToolError::new("invalid_surface", format!("invalid plugin UiNode: {error}"))
+        })?;
+        Ok(node)
+    }
+
+    /// Dispatch a plugin-owned semantic UI action through the plugin worker path.
+    pub fn dispatch_plugin_surface_action(
+        &self,
+        package_name: &str,
+        surface_id: &str,
+        action_id: &str,
+        payload: serde_json::Value,
+    ) -> Result<UiActionResult, crate::McpToolError> {
+        let descriptor = self
+            .plugin_lifecycle
+            .ui_action_descriptors()
+            .into_iter()
+            .find(|descriptor| {
+                descriptor.descriptor.plugin_key.0 == package_name
+                    && descriptor.descriptor.descriptor_id == action_id
+            })
+            .ok_or_else(|| {
+                crate::McpToolError::new(
+                    "unknown_action",
+                    format!("unknown plugin UI action: {package_name}/{action_id}"),
+                )
+            })?;
+        let handler = descriptor.handler.ok_or_else(|| {
+            crate::McpToolError::new("action_unavailable", "plugin UI action has no handler")
+        })?;
+        let outcome = self.invoke_plugin(PluginInvocationRequest {
+            request_id: RequestId(format!(
+                "plugin-surface-action-{package_name}-{surface_id}-{action_id}"
+            )),
+            handler: botster_core::PluginHandlerRef {
+                kind: PluginHandlerKind::UiAction,
+                ..handler
+            },
+            timeout_ms: 1_000,
+            context: botster_core::PluginInvocationContext {
+                client_id: None,
+                session_id: None,
+                subscription_id: None,
+                surface_id: Some(surface_id.to_string()),
+                origin: Some("local-client-api".to_string()),
+                metadata: None,
+            },
+            payload: BoundaryJson(payload),
+        });
+        let value = completed_plugin_payload(outcome.result, "plugin surface action")?;
+        serde_json::from_value(value).map_err(|error| {
+            crate::McpToolError::new(
+                "invalid_action_result",
+                format!("invalid plugin UiActionResult: {error}"),
+            )
+        })
+    }
+
     /// Last capability cleanup produced by reload, unload, or explicit cleanup.
     #[must_use]
     pub const fn last_capability_cleanup(&self) -> Option<&PluginCleanupResult> {
@@ -593,6 +697,21 @@ impl HubRuntime {
             }
         }
         Ok(())
+    }
+}
+
+fn completed_plugin_payload(
+    result: PluginInvocationResult,
+    operation: &str,
+) -> Result<serde_json::Value, crate::McpToolError> {
+    match result {
+        PluginInvocationResult::Completed(success) => Ok(success
+            .payload
+            .map_or_else(|| serde_json::Value::Null, |payload| payload.0)),
+        PluginInvocationResult::Failed(failure) => Err(crate::McpToolError::new(
+            "plugin_invocation_failed",
+            format!("{operation} failed: {}", failure.reason),
+        )),
     }
 }
 

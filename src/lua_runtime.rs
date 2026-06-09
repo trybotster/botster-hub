@@ -277,14 +277,27 @@ impl LoadedLuaPlugin {
         }
 
         for handler in registration.handlers {
+            let descriptor_kind = descriptor_kind_for_handler_kind(handler.kind.clone());
+            let handler_ref = PluginHandlerRef {
+                plugin_key: plugin_key.clone(),
+                kind: handler.kind.clone(),
+                handler_id: handler.id.clone(),
+            };
             handlers.push(PluginHandlerRegistration {
-                handler: PluginHandlerRef {
-                    plugin_key: plugin_key.clone(),
-                    kind: handler.kind,
-                    handler_id: handler.id,
-                },
+                handler: handler_ref.clone(),
                 required_capability: None,
             });
+            if let Some(kind) = descriptor_kind {
+                descriptors.push(PluginOwnedDescriptor {
+                    descriptor: PluginDescriptorRef {
+                        plugin_key: plugin_key.clone(),
+                        kind,
+                        descriptor_id: handler.descriptor_id.clone(),
+                    },
+                    handler: Some(handler_ref),
+                    body: BoundaryJson(handler.body),
+                });
+            }
         }
 
         Ok(Self {
@@ -336,6 +349,8 @@ struct LuaToolRegistration {
 struct LuaHandlerRegistration {
     id: String,
     kind: PluginHandlerKind,
+    descriptor_id: String,
+    body: serde_json::Value,
 }
 
 fn empty_object() -> serde_json::Value {
@@ -735,14 +750,34 @@ fn registration_from_value(
             handlers.push(LuaHandlerRegistration {
                 id: handler.get("id").map_err(LuaPluginRuntimeError::from)?,
                 kind: handler_kind_from_lua(&kind)?,
+                descriptor_id: handler
+                    .get("descriptor_id")
+                    .or_else(|_| handler.get("id"))
+                    .map_err(LuaPluginRuntimeError::from)?,
+                body: match handler.get::<Value>("descriptor") {
+                    Ok(value) => lua
+                        .from_value::<serde_json::Value>(value)
+                        .map_err(LuaPluginRuntimeError::from)?,
+                    Err(_) => serde_json::Value::Null,
+                },
             });
         }
     }
     Ok(LuaRegistration { tools, handlers })
 }
 
+fn descriptor_kind_for_handler_kind(kind: PluginHandlerKind) -> Option<PluginDescriptorKind> {
+    match kind {
+        PluginHandlerKind::SurfaceRoute => Some(PluginDescriptorKind::SurfaceRoute),
+        PluginHandlerKind::UiAction => Some(PluginDescriptorKind::UiAction),
+        _ => None,
+    }
+}
+
 fn handler_kind_from_lua(kind: &str) -> Result<PluginHandlerKind, LuaPluginRuntimeError> {
     match kind {
+        "ui_action" => Ok(PluginHandlerKind::UiAction),
+        "session_action" => Ok(PluginHandlerKind::SessionAction),
         "command" => Ok(PluginHandlerKind::Command),
         "mcp_tool" => Ok(PluginHandlerKind::McpTool),
         "event" => Ok(PluginHandlerKind::Event),
