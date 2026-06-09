@@ -46,10 +46,17 @@ pub fn request(
 ) -> DaemonTransportResult<DaemonResponse> {
     let mut stream = connect_and_hello(endpoint)?;
     write_frame(&mut stream, &request)?;
-    read_frame(&mut stream)
+    read_daemon_response(&mut stream)
 }
 
 /// Persistent daemon connection for clients that own attach subscription state.
+///
+/// ```no_run
+/// let endpoint = botster_hub_client::DaemonEndpoint::new("/tmp/botster-hub.sock");
+/// let mut connection = botster_hub_client::DaemonConnection::connect(&endpoint)?;
+/// let response = connection.request(&botster_hub_client::DaemonRequest::Status)?;
+/// # Ok::<(), botster_hub_client::DaemonTransportError>(())
+/// ```
 pub struct DaemonConnection {
     stream: UnixStream,
     reader: BufReader<UnixStream>,
@@ -66,7 +73,7 @@ impl DaemonConnection {
     /// Send one request over this persistent connection.
     pub fn request(&mut self, request: &DaemonRequest) -> DaemonTransportResult<DaemonResponse> {
         write_frame(&mut self.stream, request)?;
-        read_frame_from_reader(&mut self.reader)
+        read_daemon_response_from_reader(&mut self.reader)
     }
 }
 
@@ -150,10 +157,24 @@ fn detach_stream_subscription(stream: &mut UnixStream, session_id: &str, subscri
     }
 }
 
+/// Connect to the daemon with the current first-party compatibility requirement.
 pub fn connect_and_hello(endpoint: &DaemonEndpoint) -> DaemonTransportResult<UnixStream> {
     connect_and_hello_with_requirement(endpoint, &DaemonCompatibilityRequirement::current())
 }
 
+/// Connect to the daemon and validate the running hub against an explicit requirement.
+///
+/// ```no_run
+/// let endpoint = botster_hub_client::DaemonEndpoint::new("/tmp/botster-hub.sock");
+/// let mut requirement = botster_hub_client::DaemonCompatibilityRequirement::current();
+/// requirement.client_name = "example-client".to_string();
+///
+/// let _stream = botster_hub_client::connect_and_hello_with_requirement(
+///     &endpoint,
+///     &requirement,
+/// )?;
+/// # Ok::<(), botster_hub_client::DaemonTransportError>(())
+/// ```
 pub fn connect_and_hello_with_requirement(
     endpoint: &DaemonEndpoint,
     requirement: &DaemonCompatibilityRequirement,
@@ -175,7 +196,7 @@ pub fn connect_and_hello_with_requirement(
             compatibility: requirement.clone(),
         },
     )?;
-    let ack: DaemonHelloAck = read_frame(&mut stream)?;
+    let ack = read_hello_ack(&mut stream)?;
     if ack.protocol != PROTOCOL {
         return Err(DaemonTransportError::Protocol(
             "unexpected hello ack protocol",
@@ -202,6 +223,11 @@ pub fn read_frame<T: for<'de> Deserialize<'de>>(
 pub fn read_frame_from_reader<T: for<'de> Deserialize<'de>>(
     reader: &mut BufReader<UnixStream>,
 ) -> DaemonTransportResult<T> {
+    let line = read_frame_line(reader)?;
+    serde_json::from_str(&line).map_err(DaemonTransportError::Json)
+}
+
+fn read_frame_line(reader: &mut BufReader<UnixStream>) -> DaemonTransportResult<String> {
     let mut line = String::new();
     let bytes = reader
         .read_line(&mut line)
@@ -209,7 +235,57 @@ pub fn read_frame_from_reader<T: for<'de> Deserialize<'de>>(
     if bytes == 0 {
         return Err(DaemonTransportError::ClientDisconnected);
     }
+    Ok(line)
+}
+
+fn read_value_frame_from_reader(
+    reader: &mut BufReader<UnixStream>,
+) -> DaemonTransportResult<Value> {
+    let line = read_frame_line(reader)?;
     serde_json::from_str(&line).map_err(DaemonTransportError::Json)
+}
+
+fn read_hello_ack(stream: &mut UnixStream) -> DaemonTransportResult<DaemonHelloAck> {
+    let mut reader = BufReader::new(stream.try_clone().map_err(DaemonTransportError::Io)?);
+    let value = read_value_frame_from_reader(&mut reader)?;
+    if hello_ack_missing_compatibility(&value) {
+        return Err(precompatibility_hub_error());
+    }
+    serde_json::from_value(value).map_err(DaemonTransportError::Json)
+}
+
+fn read_daemon_response(stream: &mut UnixStream) -> DaemonTransportResult<DaemonResponse> {
+    let mut reader = BufReader::new(stream.try_clone().map_err(DaemonTransportError::Io)?);
+    read_daemon_response_from_reader(&mut reader)
+}
+
+fn read_daemon_response_from_reader(
+    reader: &mut BufReader<UnixStream>,
+) -> DaemonTransportResult<DaemonResponse> {
+    let value = read_value_frame_from_reader(reader)?;
+    if status_missing_compatibility(&value) {
+        return Err(precompatibility_hub_error());
+    }
+    serde_json::from_value(value).map_err(DaemonTransportError::Json)
+}
+
+fn hello_ack_missing_compatibility(value: &Value) -> bool {
+    value.as_object().is_some_and(|object| {
+        object.contains_key("protocol") && !object.contains_key("compatibility")
+    })
+}
+
+fn status_missing_compatibility(value: &Value) -> bool {
+    value
+        .get("status")
+        .and_then(Value::as_object)
+        .is_some_and(|status| !status.contains_key("compatibility"))
+}
+
+fn precompatibility_hub_error() -> DaemonTransportError {
+    DaemonTransportError::Compatibility(DaemonCompatibilityError {
+        diagnostic: "hub predates compatibility handshake".to_string(),
+    })
 }
 
 fn write_terminal_events(
@@ -230,6 +306,10 @@ fn write_terminal_events(
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DaemonHello {
     pub protocol: String,
+    /// Reserved for future client-admission policy.
+    ///
+    /// Current hubs deserialize this field but intentionally ignore it; clients
+    /// validate hub compatibility from `DaemonHelloAck` and `DaemonStatus`.
     #[serde(default)]
     pub compatibility: DaemonCompatibilityRequirement,
 }
@@ -278,6 +358,20 @@ pub struct DaemonCompatibilityRequirement {
 }
 
 impl DaemonCompatibilityRequirement {
+    /// Build the current first-party daemon compatibility requirement.
+    ///
+    /// ```
+    /// let mut requirement = botster_hub_client::DaemonCompatibilityRequirement::current();
+    /// requirement.client_name = "botster-tui".to_string();
+    /// requirement
+    ///     .required_features
+    ///     .push(botster_hub_client::FEATURE_TERMINAL_STREAMING.to_string());
+    ///
+    /// assert_eq!(requirement.protocol, botster_hub_client::PROTOCOL);
+    /// assert!(requirement
+    ///     .required_features
+    ///     .contains(&botster_hub_client::FEATURE_TERMINAL_STREAMING.to_string()));
+    /// ```
     #[must_use]
     pub fn current() -> Self {
         Self {
@@ -776,11 +870,9 @@ mod tests {
             .expect_err("newer client requirement should fail against current hub");
 
         assert!(error.diagnostic.contains("version-test-client"));
-        assert!(
-            error
-                .diagnostic
-                .contains("unsupported protocol version 1; requires at least 2")
-        );
+        assert!(error
+            .diagnostic
+            .contains("unsupported protocol version 1; requires at least 2"));
     }
 
     #[test]
@@ -795,10 +887,66 @@ mod tests {
             .expect_err("future feature should fail against current hub");
 
         assert!(error.diagnostic.contains("feature-test-client"));
-        assert!(
-            error
-                .diagnostic
-                .contains("missing required feature(s): future_feature")
-        );
+        assert!(error
+            .diagnostic
+            .contains("missing required feature(s): future_feature"));
+    }
+
+    #[test]
+    fn hello_ack_missing_compatibility_reports_precompatibility_hub() {
+        let (mut server, mut client) = UnixStream::pair().expect("pair unix streams");
+        server
+            .write_all(br#"{"protocol":"botster-hub-daemon-v1"}"#)
+            .expect("write old hello ack");
+        server.write_all(b"\n").expect("write newline");
+
+        let error = read_hello_ack(&mut client).expect_err("old hello ack should fail");
+
+        assert!(matches!(error, DaemonTransportError::Compatibility(_)));
+        assert_eq!(error.to_string(), "hub predates compatibility handshake");
+    }
+
+    #[test]
+    fn status_missing_compatibility_reports_precompatibility_hub() {
+        let (mut server, mut client) = UnixStream::pair().expect("pair unix streams");
+        server
+            .write_all(
+                br#"{"kind":"status","status":{"lifecycle_state":"running","host_id":"hub","host_display_name":"Hub","schema_version":1,"data_dir_configured":true,"core_initialized":true,"state_source":"initialized","package_count":0,"enabled_package_count":0,"provider_count":0,"enabled_provider_count":0,"session_count":0,"recovered_sessions":[],"stale_sessions":[]},"sessions":[],"packages":[],"lifecycle":[],"events":[],"package_decision":null,"cleanup":null,"coordination":null,"error":null}"#,
+            )
+            .expect("write old status response");
+        server.write_all(b"\n").expect("write newline");
+
+        let error = read_daemon_response(&mut client).expect_err("old status response should fail");
+
+        assert!(matches!(error, DaemonTransportError::Compatibility(_)));
+        assert_eq!(error.to_string(), "hub predates compatibility handshake");
+    }
+
+    #[test]
+    fn malformed_hello_ack_still_reports_json_error() {
+        let (mut server, mut client) = UnixStream::pair().expect("pair unix streams");
+        server
+            .write_all(br#"{"protocol":"botster-hub-daemon-v1","compatibility":"wrong"}"#)
+            .expect("write malformed hello ack");
+        server.write_all(b"\n").expect("write newline");
+
+        let error = read_hello_ack(&mut client).expect_err("malformed ack should fail");
+
+        assert!(matches!(error, DaemonTransportError::Json(_)));
+    }
+
+    #[test]
+    fn malformed_status_still_reports_json_error() {
+        let (mut server, mut client) = UnixStream::pair().expect("pair unix streams");
+        server
+            .write_all(
+                br#"{"kind":"status","status":{"compatibility":"wrong"},"sessions":[],"packages":[],"lifecycle":[],"events":[],"package_decision":null,"cleanup":null,"coordination":null,"error":null}"#,
+            )
+            .expect("write malformed status response");
+        server.write_all(b"\n").expect("write newline");
+
+        let error = read_daemon_response(&mut client).expect_err("malformed status should fail");
+
+        assert!(matches!(error, DaemonTransportError::Json(_)));
     }
 }
