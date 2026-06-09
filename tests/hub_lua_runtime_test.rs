@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use botster_core::{
     BoundaryJson, PluginHandlerKind, PluginHandlerRef, PluginInvocationContext,
     PluginInvocationFailure, PluginInvocationFailureKind, PluginInvocationRequest,
-    PluginInvocationResult, PluginInvocationSuccess, PluginKey, RequestId, UiActionStatus,
+    PluginInvocationResult, PluginInvocationSuccess, PluginKey, RequestId, UiActionResultState,
     UiNodeKind,
 };
 use botster_hub::{
@@ -199,16 +199,17 @@ fn project_pipelines_surface_action_round_trip_uses_client_api_and_plugin_worker
     let HubClientResponseBody::PluginActionResult(invalid) = invalid.body else {
         panic!("plugin action response expected");
     };
-    assert_eq!(invalid.status, UiActionStatus::Failure);
+    assert_eq!(invalid.state, UiActionResultState::Rejected);
+    assert_eq!(invalid.surface_id.0, "project-pipelines.create-ticket");
     assert_eq!(
         invalid
-            .payload
-            .as_ref()
-            .and_then(|payload| payload.get("field_errors"))
-            .and_then(|errors| errors.get("project-pipelines-create-title"))
-            .and_then(serde_json::Value::as_str),
+            .field_errors
+            .get("project-pipelines-create-title")
+            .and_then(|errors| errors.first())
+            .map(String::as_str),
         Some("Title is required")
     );
+    assert_eq!(invalid.form_errors, vec!["Title is required".to_string()]);
 
     let valid = api
         .handle_request(
@@ -230,9 +231,10 @@ fn project_pipelines_surface_action_round_trip_uses_client_api_and_plugin_worker
     let HubClientResponseBody::PluginActionResult(valid) = valid.body else {
         panic!("plugin action response expected");
     };
-    assert_eq!(valid.status, UiActionStatus::Success);
+    assert_eq!(valid.state, UiActionResultState::Accepted);
+    assert_eq!(valid.surface_id.0, "project-pipelines.create-ticket");
     assert_eq!(
-        valid.payload.as_ref().unwrap()["normalized"]["title"],
+        valid.normalized_values.as_ref().unwrap().0["title"],
         "Dogfood ticket"
     );
 
