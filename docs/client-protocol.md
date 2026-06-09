@@ -29,7 +29,9 @@ External clients that need a true live-hub integration test should depend on the
 client protocol crate plus the test-support crate, not on the full `botster-hub`
 library. Until these crates are published to crates.io, the supported
 out-of-repo dependency shape is a git dependency pinned to the same repository
-revision for both crates:
+revision for both crates. Use one exact commit SHA for every Botster crate in
+the downstream test so the client protocol crate, test harness crate, hub
+binary, and session-worker binary all come from the same protocol revision:
 
 ```toml
 [dev-dependencies]
@@ -44,7 +46,9 @@ or plugin internals into the downstream client.
 Build or otherwise provide both binaries before running the downstream test. The
 fixture does not provision binaries itself; third-party CI should either build
 them from the same checkout/revision or download a release artifact that matches
-the crate revision under test.
+the crate revision under test. Use `--locked` when building from source so the
+hub's committed lockfile preserves the `botster-core` revision paired with that
+hub checkout.
 
 ```bash
 BOTSTER_ENV=test cargo build --locked --bin botster-hub
@@ -54,29 +58,10 @@ BOTSTER_ENV=test cargo build --locked -p botster-core --bin botster-session-work
 Then pass explicit paths into the harness. Environment variables are accepted as
 a convenience, but the library never relies on `CARGO_BIN_EXE_botster-hub`
 internally because Cargo only injects that variable for the package that owns the
-binary.
-
-```rust
-use botster_hub_test_support::{run_client_conformance, IsolatedHubBuilder};
-
-let hub = IsolatedHubBuilder::new()
-    .hub_bin(std::env::var("BOTSTER_HUB_BIN").expect("BOTSTER_HUB_BIN"))
-    .session_worker_bin(
-        std::env::var("BOTSTER_SESSION_WORKER_BIN").expect("BOTSTER_SESSION_WORKER_BIN"),
-    )
-    .name("my-client-test")
-    .start()
-    .expect("isolated hub starts");
-
-let report = run_client_conformance(&hub).expect("client conformance");
-assert_eq!(report.lifecycle_state, "running");
-assert_eq!(report.initial_session_count, 0);
-assert!(report.stream_contains_ready);
-assert!(report.stream_contains_echo);
-assert!(report.stream_contains_resize);
-assert_eq!(report.validation_error_operation, "drain_runtime");
-hub.shutdown().expect("shutdown isolated hub");
-```
+binary. The compile-checked usage examples live on
+`botster_hub_test_support::IsolatedHubBuilder`,
+`botster_hub_test_support::run_client_conformance`, and
+`botster_hub_test_support::run_project_pipelines_conformance`.
 
 Each harness instance creates a disposable data directory and socket path under
 the configured test root, uses synthetic default hub identity, and attempts a
@@ -92,16 +77,5 @@ output.
 
 If a downstream client also wants to prove plugin surface/action dispatch
 against the first-party Project Pipelines example, provide a checkout path to
-the example package and call the optional helper:
-
-```rust
-let plugin_report = botster_hub_test_support::run_project_pipelines_conformance(
-    &hub,
-    "examples/project-pipelines",
-)
-.expect("project pipelines conformance");
-assert_eq!(plugin_report.package_state, "enabled");
-assert_eq!(plugin_report.surface_id, "project-pipelines-create-panel");
-assert_eq!(plugin_report.invalid_action_status, "failure");
-assert_eq!(plugin_report.invalid_title_error, "Title is required");
-```
+the example package and call the optional `run_project_pipelines_conformance`
+helper.
