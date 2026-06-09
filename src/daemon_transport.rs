@@ -25,8 +25,8 @@ use botster_core_daemon::{
 };
 use botster_hub_client::DaemonTransportError as ClientDaemonTransportError;
 pub use botster_hub_client::{
-    DaemonCapability, DaemonConnection as ClientDaemonConnection, DaemonCoordination,
-    DaemonEndpoint, DaemonEnvelope, DaemonEnvelopeAck, DaemonEnvelopeDelivery,
+    DaemonCapability, DaemonCompatibility, DaemonConnection as ClientDaemonConnection,
+    DaemonCoordination, DaemonEndpoint, DaemonEnvelope, DaemonEnvelopeAck, DaemonEnvelopeDelivery,
     DaemonEnvelopePublish, DaemonEvent, DaemonHello, DaemonHelloAck, DaemonIdentity, DaemonNotify,
     DaemonOperatorError, DaemonPackage, DaemonPackageDecision, DaemonPluginLifecycle,
     DaemonRequest, DaemonResponse, DaemonResponseKind, DaemonSession, DaemonSessionCleanup,
@@ -149,6 +149,7 @@ fn handle_connection(
         &mut stream,
         &DaemonHelloAck {
             protocol: PROTOCOL.to_string(),
+            compatibility: DaemonCompatibility::current(),
         },
     )?;
     let mut attached_subscriptions = Vec::<AttachedSubscription>::new();
@@ -864,6 +865,7 @@ fn prepare_socket_path(path: &PathBuf) -> DaemonTransportResult<()> {
                 &mut stream,
                 &DaemonHello {
                     protocol: PROTOCOL.to_string(),
+                    compatibility: botster_hub_client::DaemonCompatibilityRequirement::current(),
                 },
             )?;
             let ack = read_frame::<DaemonHelloAck>(&mut stream);
@@ -1242,6 +1244,7 @@ fn daemon_status_from_status(status: &HubDaemonStatus, session_count: usize) -> 
             crate::HubDaemonState::Stopped => "stopped",
         }
         .to_string(),
+        compatibility: DaemonCompatibility::current(),
         host_id: status.host_id.clone(),
         host_display_name: status.host_display_name.clone(),
         schema_version: status.schema_version,
@@ -1540,6 +1543,7 @@ pub enum DaemonTransportError {
     AlreadyRunning,
     ClientDisconnected,
     Protocol(&'static str),
+    Compatibility(botster_hub_client::DaemonCompatibilityError),
     UnexpectedResponse,
     DaemonNotRunning,
     ControlThreadStopped,
@@ -1561,6 +1565,7 @@ impl fmt::Display for DaemonTransportError {
             Self::AlreadyRunning => write!(formatter, "daemon already running"),
             Self::ClientDisconnected => write!(formatter, "client disconnected"),
             Self::Protocol(message) => write!(formatter, "daemon protocol error: {message}"),
+            Self::Compatibility(error) => write!(formatter, "{error}"),
             Self::UnexpectedResponse => write!(formatter, "unexpected daemon response"),
             Self::DaemonNotRunning => write!(formatter, "daemon runtime is not running"),
             Self::ControlThreadStopped => write!(formatter, "daemon control thread stopped"),
@@ -1581,6 +1586,7 @@ impl Error for DaemonTransportError {
         match self {
             Self::Io(error) => Some(error),
             Self::Json(error) => Some(error),
+            Self::Compatibility(error) => Some(error),
             Self::Daemon(error) => Some(error),
             Self::State(error) => Some(error),
             _ => None,
@@ -1604,6 +1610,7 @@ impl From<ClientDaemonTransportError> for DaemonTransportError {
             ClientDaemonTransportError::NotRunning => Self::NotRunning,
             ClientDaemonTransportError::ClientDisconnected => Self::ClientDisconnected,
             ClientDaemonTransportError::Protocol(message) => Self::Protocol(message),
+            ClientDaemonTransportError::Compatibility(error) => Self::Compatibility(error),
             ClientDaemonTransportError::ControlThreadStopped => Self::ControlThreadStopped,
         }
     }

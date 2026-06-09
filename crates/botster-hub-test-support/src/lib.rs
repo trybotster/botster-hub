@@ -16,8 +16,8 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use botster_hub_client::{
-    DaemonEndpoint, DaemonOperatorError, DaemonRequest, DaemonResponse, DaemonResponseKind,
-    DaemonTransportError,
+    DaemonCompatibilityRequirement, DaemonEndpoint, DaemonOperatorError, DaemonRequest,
+    DaemonResponse, DaemonResponseKind, DaemonTransportError, ensure_compatible,
 };
 
 const CONFORMANCE_SESSION_ID: &str = "botster-conformance-session";
@@ -246,6 +246,10 @@ impl IsolatedHub {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientConformanceReport {
     pub lifecycle_state: String,
+    pub compatibility_protocol: String,
+    pub compatibility_protocol_version: u16,
+    pub compatibility_features: Vec<String>,
+    pub compatibility_conformance_fixture_revision: u16,
     pub initial_session_count: usize,
     pub session_id: String,
     pub spawned_lifecycle: String,
@@ -300,6 +304,14 @@ pub fn run_client_conformance(
     let status = status.status.ok_or(ConformanceError::MissingBody {
         operation: "status",
         field: "status",
+    })?;
+    ensure_compatible(
+        &DaemonCompatibilityRequirement::current(),
+        &status.compatibility,
+    )
+    .map_err(|source| ConformanceError::Client {
+        operation: "compatibility",
+        source: DaemonTransportError::Compatibility(source),
     })?;
 
     let list = request(hub.endpoint(), DaemonRequest::ListSessions, "list_sessions")?;
@@ -450,6 +462,12 @@ pub fn run_client_conformance(
 
     Ok(ClientConformanceReport {
         lifecycle_state: status.lifecycle_state,
+        compatibility_protocol: status.compatibility.protocol,
+        compatibility_protocol_version: status.compatibility.protocol_version,
+        compatibility_features: status.compatibility.features,
+        compatibility_conformance_fixture_revision: status
+            .compatibility
+            .conformance_fixture_revision,
         initial_session_count,
         session_id: CONFORMANCE_SESSION_ID.to_string(),
         spawned_lifecycle,

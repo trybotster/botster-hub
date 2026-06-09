@@ -564,6 +564,12 @@ fn daemon_tool_result(
             })?;
             Ok(McpToolResult::structured(json!({
                 "lifecycle_state": status.lifecycle_state,
+                "compatibility": {
+                    "protocol": status.compatibility.protocol,
+                    "protocol_version": status.compatibility.protocol_version,
+                    "features": status.compatibility.features,
+                    "conformance_fixture_revision": status.compatibility.conformance_fixture_revision,
+                },
                 "host_id": status.host_id,
                 "host_display_name": status.host_display_name,
                 "schema_version": status.schema_version,
