@@ -1406,35 +1406,62 @@ fn external_hub_test_support_drives_isolated_daemon_socket_protocol() {
         .expect("start isolated hub through public test-support harness");
     assert!(first.data_dir().starts_with("/tmp/bh-test-support"));
     assert!(first.endpoint().socket_path.starts_with(first.data_dir()));
+    let support_matrix = botster_hub_test_support::first_party_client_support_matrix();
     let first_report =
         botster_hub_test_support::run_client_conformance(&first).expect("run client conformance");
     assert_eq!(first_report.lifecycle_state, "running");
     assert_eq!(first_report.initial_session_count, 0);
     assert_eq!(first_report.spawned_lifecycle, "running");
+    assert_eq!(
+        support_matrix.session_actions,
+        vec![
+            "status",
+            "list_sessions",
+            "spawn",
+            "attach",
+            "drain",
+            "send_input",
+            "resize",
+            "shutdown_session",
+        ]
+    );
     assert!(first_report.stream_contains_ready);
     assert!(first_report.stream_contains_echo);
     assert!(first_report.stream_contains_resize);
-    assert_eq!(
-        first_report.compatibility_protocol,
-        botster_hub_client::PROTOCOL
-    );
+    assert_eq!(first_report.compatibility_protocol, support_matrix.protocol);
     assert_eq!(
         first_report.compatibility_protocol_version,
-        botster_hub_client::PROTOCOL_VERSION
+        support_matrix.protocol_version
     );
-    assert!(first_report
-        .compatibility_features
-        .contains(&botster_hub_client::FEATURE_SESSIONS.to_string()));
+    assert_eq!(
+        first_report.compatibility_features,
+        support_matrix.supported_features
+    );
     assert_eq!(
         first_report.compatibility_conformance_fixture_revision,
-        botster_hub_client::CONFORMANCE_FIXTURE_REVISION
+        support_matrix.conformance_fixture_revision
     );
     assert_eq!(first_report.connected_diagnostic_operation, "status");
     assert_eq!(first_report.validation_error_operation, "drain_runtime");
     assert_eq!(
         first_report.validation_diagnostic_kind,
-        "terminal_stream_unavailable"
+        support_matrix
+            .terminal_streaming
+            .missing_session_diagnostic_kind
     );
+    assert!(support_matrix.terminal_streaming.supported);
+    assert!(support_matrix.terminal_streaming.held_open_stream);
+    assert_eq!(
+        support_matrix.terminal_streaming.conformance_ready_output,
+        "conformance-ready"
+    );
+    assert_eq!(
+        support_matrix.terminal_streaming.conformance_echo_output,
+        "echo:from-conformance"
+    );
+    assert!(support_matrix.resize.supported);
+    assert_eq!(support_matrix.resize.action, "resize");
+    assert_eq!(support_matrix.resize.conformance_output_prefix, "winsize:");
 
     let plugin_report = botster_hub_test_support::run_project_pipelines_conformance(
         &first,
@@ -1442,12 +1469,22 @@ fn external_hub_test_support_drives_isolated_daemon_socket_protocol() {
     )
     .expect("run project pipelines conformance");
     assert_eq!(plugin_report.package_state, "enabled");
-    assert_eq!(plugin_report.surface_kind, "panel");
-    assert_eq!(plugin_report.surface_id, "project-pipelines-create-panel");
+    assert!(support_matrix.plugin_surfaces.render_supported);
+    assert!(support_matrix.plugin_surfaces.action_supported);
+    assert_eq!(
+        plugin_report.surface_kind,
+        support_matrix.plugin_surfaces.rendered_surface_kind
+    );
+    assert_eq!(
+        plugin_report.surface_id,
+        support_matrix.plugin_surfaces.rendered_surface_node_id
+    );
     assert_eq!(plugin_report.invalid_action_status, "failure");
     assert_eq!(
         plugin_report.invalid_action_diagnostic_kind,
-        "action_failure"
+        support_matrix
+            .plugin_surfaces
+            .invalid_action_diagnostic_kind
     );
     assert_eq!(plugin_report.invalid_title_error, "Title is required");
     first.shutdown().expect("shutdown first isolated hub");
