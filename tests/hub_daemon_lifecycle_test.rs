@@ -279,10 +279,11 @@ http.createServer((request, response) => {
     return;
   }
   response.writeHead(200, { 'content-type': 'application/json' });
-  response.end(JSON.stringify({
+    response.end(JSON.stringify({
     ok: mode === 'existing_hub' && source === 'socket' && socketExists && !mixedOwnership,
     mode,
     source,
+    port,
     socketExists,
     mixedOwnership,
   }));
@@ -321,6 +322,48 @@ http.createServer((request, response) => {
         serde_json::to_string_pretty(&manifest).expect("serialize botster-web manifest"),
     )
     .expect("write botster-web manifest");
+}
+
+fn write_failing_botster_web_package(root: &Path) {
+    fs::create_dir_all(root.join("scripts")).expect("create failing botster-web package root");
+    fs::write(root.join("plugin.lua"), "return botster.register({})\n")
+        .expect("write failing botster-web core entrypoint");
+    fs::write(
+        root.join("scripts").join("real-hub-dogfood-bridge.mjs"),
+        "console.error('bridge bind failed: fixture'); process.exit(42);\n",
+    )
+    .expect("write failing botster-web bridge script");
+    let manifest = serde_json::json!({
+        "name": "botster-web",
+        "version": "1.0.0",
+        "kind": "plugin",
+        "botster": ">=0.1.0",
+        "source": { "type": "path", "path": "." },
+        "capabilities": [{ "surface": "surfaces" }],
+        "entrypoints": [
+            { "runtime": "lua", "path": "plugin.lua", "bootstrap": false }
+        ],
+        "runnable_entrypoints": [{
+            "id": "web-client",
+            "kind": "web",
+            "command": "node",
+            "args": ["scripts/real-hub-dogfood-bridge.mjs"],
+            "working_directory": { "policy": "package_root" },
+            "environment": [
+                { "name": "BOTSTER_HUB_SOCKET", "required": false },
+                { "name": "BOTSTER_HUB_DATA_DIR", "required": false },
+                { "name": "BOTSTER_WEB_DOGFOOD_BRIDGE_PORT", "required": false, "default": "41739" }
+            ],
+            "mode": "dev",
+            "capabilities": [{ "surface": "network", "scope": "localhost" }],
+            "may_supervise": true
+        }]
+    });
+    fs::write(
+        root.join("botster-package.json"),
+        serde_json::to_string_pretty(&manifest).expect("serialize failing botster-web manifest"),
+    )
+    .expect("write failing botster-web manifest");
 }
 
 fn enable_supervised_package(data_dir: &Path, package_dir: &Path) {
@@ -620,19 +663,23 @@ fn run_command_with_timeout(mut command: Command, timeout: Duration) -> Output {
 }
 
 fn spawn_dogfood_launcher(
-    data_dir: &Path,
+    data_dir: Option<&Path>,
     web_package_path: &Path,
-    web_bridge_port: u16,
+    web_bridge_port: Option<u16>,
 ) -> (Child, mpsc::Receiver<String>) {
     ensure_session_worker_binary();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
-        .arg("dogfood")
-        .arg("--data-dir")
-        .arg(data_dir)
-        .arg("--web-package-path")
-        .arg(web_package_path)
-        .arg("--web-bridge-port")
-        .arg(web_bridge_port.to_string())
+    let mut command = Command::new(env!("CARGO_BIN_EXE_botster-hub"));
+    command.arg("dogfood");
+    if let Some(data_dir) = data_dir {
+        command.arg("--data-dir").arg(data_dir);
+    }
+    command.arg("--web-package-path").arg(web_package_path);
+    if let Some(web_bridge_port) = web_bridge_port {
+        command
+            .arg("--web-bridge-port")
+            .arg(web_bridge_port.to_string());
+    }
+    let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -652,6 +699,36 @@ fn spawn_dogfood_launcher(
     });
 
     (child, rx)
+}
+
+fn collect_dogfood_ready_output(child: &mut Child, rx: &mpsc::Receiver<String>) -> Vec<String> {
+    let mut lines = wait_for_dogfood_output(child, rx, "dogfood=ready");
+    lines.extend(wait_for_dogfood_output(
+        child,
+        rx,
+        "bridge=http://127.0.0.1:",
+    ));
+    lines.extend(wait_for_dogfood_output(child, rx, "web=unavailable"));
+    lines.extend(wait_for_dogfood_output(child, rx, "shutdown="));
+    lines
+}
+
+fn dogfood_output_value(lines: &[String], prefix: &str) -> String {
+    lines
+        .iter()
+        .find_map(|line| line.strip_prefix(prefix).map(str::to_string))
+        .unwrap_or_else(|| panic!("missing dogfood output line with prefix {prefix:?}: {lines:?}"))
+}
+
+fn dogfood_bridge_port(lines: &[String]) -> u16 {
+    dogfood_output_value(lines, "bridge=http://127.0.0.1:")
+        .parse()
+        .expect("dogfood bridge port is numeric")
+}
+
+fn dogfood_data_dir(lines: &[String]) -> PathBuf {
+    let value = dogfood_output_value(lines, "data_dir=");
+    PathBuf::from(value.strip_prefix("isolated:").unwrap_or(&value))
 }
 
 fn wait_for_dogfood_output(
@@ -708,25 +785,20 @@ fn cli_dogfood_launcher_starts_botster_web_in_existing_hub_mode_and_shuts_down()
     let web_package_dir = unique_test_dir("cli-dogfood-botster-web-package");
     write_botster_web_package(&web_package_dir);
     let web_bridge_port = unused_loopback_port();
-    let (mut child, rx) = spawn_dogfood_launcher(&data_dir, &web_package_dir, web_bridge_port);
-    let lines = wait_for_dogfood_output(&mut child, &rx, "dogfood=ready");
-    let mut lines = {
-        let mut collected = lines;
-        collected.extend(wait_for_dogfood_output(
-            &mut child,
-            &rx,
-            &format!("web=http://127.0.0.1:{web_bridge_port}"),
-        ));
-        collected.extend(wait_for_dogfood_output(&mut child, &rx, "shutdown="));
-        collected
-    };
+    let (mut child, rx) =
+        spawn_dogfood_launcher(Some(&data_dir), &web_package_dir, Some(web_bridge_port));
+    let mut lines = collect_dogfood_ready_output(&mut child, &rx);
     lines.sort();
     let text = lines.join("\n");
 
     assert!(text.contains("dogfood=ready"));
     assert!(text.contains("package name=project-pipelines state=enabled"));
     assert!(text.contains("package name=botster-web state=enabled"));
-    assert!(text.contains(&format!("web=http://127.0.0.1:{web_bridge_port}")));
+    assert!(text.contains(&format!("bridge=http://127.0.0.1:{web_bridge_port}")));
+    assert!(
+        text.contains("web=unavailable reason=botster-web-ui-server-not-supervised-by-dogfood")
+    );
+    assert!(!text.contains(&format!("web=http://127.0.0.1:{web_bridge_port}")));
     assert!(text.contains("tui=botster-hub tui --data-dir"));
     assert!(text.contains("mcp=botster-hub mcp-serve --data-dir"));
     assert!(text.contains("status=botster-hub status --data-dir"));
@@ -820,6 +892,113 @@ fn cli_dogfood_launcher_starts_botster_web_in_existing_hub_mode_and_shuts_down()
 
     shutdown_cli_daemon(&data_dir, child);
     wait_for_process_exit(web_pid);
+}
+
+#[test]
+fn cli_dogfood_launcher_uses_generated_data_dir_and_dynamic_bridge_port() {
+    let _guard = daemon_test_lock()
+        .lock()
+        .expect("serialize real daemon test");
+    let web_package_dir = unique_test_dir("cli-dogfood-default-botster-web-package");
+    write_botster_web_package(&web_package_dir);
+    let (mut child, rx) = spawn_dogfood_launcher(None, &web_package_dir, None);
+    let lines = collect_dogfood_ready_output(&mut child, &rx);
+    let text = lines.join("\n");
+    let data_dir = dogfood_data_dir(&lines);
+    let web_bridge_port = dogfood_bridge_port(&lines);
+
+    assert!(text.contains("dogfood=ready"));
+    assert!(text.contains("data_dir=isolated:"));
+    assert!(data_dir.is_absolute());
+    assert!(data_dir.starts_with(Path::new("/tmp").join("botster-hub-dogfood")));
+    assert_ne!(web_bridge_port, 0);
+
+    let health = read_json_health(&format!("http://127.0.0.1:{web_bridge_port}"));
+    assert_eq!(health["ok"], true);
+    assert_eq!(health["mode"], "existing_hub");
+    assert_eq!(health["source"], "socket");
+    assert_eq!(health["port"], web_bridge_port);
+
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
+fn cli_dogfood_launcher_reruns_against_existing_explicit_data_dir() {
+    let _guard = daemon_test_lock()
+        .lock()
+        .expect("serialize real daemon test");
+    let data_dir = unique_test_dir("cli-dogfood-rerun");
+    let web_package_dir = unique_test_dir("cli-dogfood-rerun-botster-web-package");
+    write_botster_web_package(&web_package_dir);
+
+    let first_port = unused_loopback_port();
+    let (mut first_child, first_rx) =
+        spawn_dogfood_launcher(Some(&data_dir), &web_package_dir, Some(first_port));
+    let first_lines = collect_dogfood_ready_output(&mut first_child, &first_rx);
+    assert_eq!(dogfood_bridge_port(&first_lines), first_port);
+    shutdown_cli_daemon(&data_dir, first_child);
+
+    let second_port = unused_loopback_port();
+    let (mut second_child, second_rx) =
+        spawn_dogfood_launcher(Some(&data_dir), &web_package_dir, Some(second_port));
+    let second_lines = collect_dogfood_ready_output(&mut second_child, &second_rx);
+    let second_text = second_lines.join("\n");
+
+    assert_eq!(dogfood_bridge_port(&second_lines), second_port);
+    assert!(second_text.contains("package name=project-pipelines state=enabled"));
+    assert!(second_text.contains("package name=botster-web state=enabled"));
+    let health = read_json_health(&format!("http://127.0.0.1:{second_port}"));
+    assert_eq!(health["ok"], true);
+    assert_eq!(health["source"], "socket");
+
+    shutdown_cli_daemon(&data_dir, second_child);
+}
+
+#[test]
+fn cli_dogfood_launcher_reports_failed_web_entrypoint_diagnostics() {
+    let _guard = daemon_test_lock()
+        .lock()
+        .expect("serialize real daemon test");
+    let data_dir = unique_test_dir("dogfood-web-fail");
+    let web_package_dir = unique_test_dir("dogfood-web-fail-package");
+    write_failing_botster_web_package(&web_package_dir);
+    let web_bridge_port = unused_loopback_port();
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_botster-hub"));
+    command
+        .arg("dogfood")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("--web-package-path")
+        .arg(&web_package_dir)
+        .arg("--web-bridge-port")
+        .arg(web_bridge_port.to_string());
+    let output = run_command_with_timeout(command, Duration::from_secs(30));
+
+    assert!(!output.status.success());
+    let text = command_output_text(&output);
+    assert!(
+        text.contains("start botster-web web-client entrypoint"),
+        "{text}"
+    );
+    assert!(text.contains("process state failed"), "{text}");
+    assert!(
+        text.contains("stderr: bridge bind failed: fixture"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("verify botster-web existing-hub health"),
+        "{text}"
+    );
+    assert!(
+        !text.contains(
+            std::env::current_dir()
+                .expect("current dir")
+                .to_string_lossy()
+                .as_ref()
+        )
+    );
+    assert!(!text.contains(web_package_dir.to_string_lossy().as_ref()));
 }
 
 #[test]
