@@ -276,6 +276,7 @@ fn verify_dogfood_session_worker(config: &botster_hub::HubConfig) -> Result<(), 
 
 struct DogfoodWebLaunch {
     bridge_url: String,
+    web_url: String,
     package_state: String,
 }
 
@@ -376,9 +377,12 @@ fn start_botster_web_dogfood(
     }
 
     let bridge_url = format!("http://127.0.0.1:{bridge_port}");
+    let web_url = format!("{bridge_url}/?dogfood=real-hub");
     wait_for_botster_web_health(config, &bridge_url)?;
+    wait_for_botster_web_ui(config, &web_url)?;
     Ok(DogfoodWebLaunch {
         bridge_url,
+        web_url,
         package_state,
     })
 }
@@ -446,6 +450,28 @@ fn wait_for_botster_web_health(
     })))
 }
 
+fn wait_for_botster_web_ui(
+    config: &botster_hub::HubConfig,
+    web_url: &str,
+) -> Result<(), DogfoodError> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut last_error = None;
+    while Instant::now() < deadline {
+        match read_botster_web_ui(web_url) {
+            Ok(()) => return Ok(()),
+            Err(error) => last_error = Some(error),
+        }
+        if let Some(message) = failed_web_entrypoint_status(config)? {
+            return Err(DogfoodError::WebEntrypointStart(message));
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    Err(DogfoodError::WebUi(last_error.unwrap_or_else(|| {
+        "timed out waiting for botster-web packaged UI".to_string()
+    })))
+}
+
 fn failed_web_entrypoint_status(
     config: &botster_hub::HubConfig,
 ) -> Result<Option<String>, DogfoodError> {
@@ -484,29 +510,62 @@ fn failed_web_entrypoint_status(
 }
 
 fn read_botster_web_health(bridge_url: &str) -> Result<serde_json::Value, String> {
-    let port = bridge_url
-        .strip_prefix("http://127.0.0.1:")
-        .ok_or_else(|| "unsupported botster-web bridge URL".to_string())?
-        .parse::<u16>()
-        .map_err(|_| "invalid botster-web bridge port".to_string())?;
-    let mut stream = TcpStream::connect(("127.0.0.1", port))
-        .map_err(|error| format!("connect botster-web health: {error}"))?;
-    stream
-        .set_read_timeout(Some(Duration::from_secs(1)))
-        .map_err(|error| format!("set botster-web health read timeout: {error}"))?;
-    stream
-        .write_all(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
-        .map_err(|error| format!("write botster-web health request: {error}"))?;
-    let mut response = String::new();
-    stream
-        .read_to_string(&mut response)
-        .map_err(|error| format!("read botster-web health response: {error}"))?;
-    let Some((headers, body)) = response.split_once("\r\n\r\n") else {
-        return Err("malformed botster-web health response".to_string());
-    };
+    let (headers, body) = read_botster_web_http(bridge_url, "/health", "health")?;
     if !headers.starts_with("HTTP/1.1 200") && !headers.starts_with("HTTP/1.0 200") {
         return Err("botster-web health returned non-200 status".to_string());
     }
+    serde_json::from_str(body.trim())
+        .map_err(|error| format!("parse botster-web health JSON: {error}"))
+}
+
+fn read_botster_web_ui(web_url: &str) -> Result<(), String> {
+    let bridge_url = web_url
+        .strip_suffix("/?dogfood=real-hub")
+        .ok_or_else(|| "unsupported botster-web UI URL".to_string())?;
+    let (headers, body) = read_botster_web_http(bridge_url, "/?dogfood=real-hub", "UI")?;
+    if !headers.starts_with("HTTP/1.1 200") && !headers.starts_with("HTTP/1.0 200") {
+        return Err("botster-web UI returned non-200 status".to_string());
+    }
+    let normalized_headers = headers.to_ascii_lowercase();
+    if !normalized_headers.contains("content-type: text/html") {
+        return Err("botster-web UI did not return HTML content type".to_string());
+    }
+    let normalized_body = body.to_ascii_lowercase();
+    if !normalized_body.contains("<!doctype html") && !normalized_body.contains("<html") {
+        return Err("botster-web UI response was not an HTML document".to_string());
+    }
+    if normalized_body.contains(r#""error":"not_found""#) || normalized_body.trim() == "not found" {
+        return Err("botster-web UI returned not_found".to_string());
+    }
+    Ok(())
+}
+
+fn read_botster_web_http(
+    bridge_url: &str,
+    path: &str,
+    label: &str,
+) -> Result<(String, String), String> {
+    let port = bridge_url
+        .strip_prefix("http://127.0.0.1:")
+        .ok_or_else(|| format!("unsupported botster-web {label} URL"))?
+        .parse::<u16>()
+        .map_err(|_| format!("invalid botster-web {label} port"))?;
+    let mut stream = TcpStream::connect(("127.0.0.1", port))
+        .map_err(|error| format!("connect botster-web {label}: {error}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .map_err(|error| format!("set botster-web {label} read timeout: {error}"))?;
+    let request = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|error| format!("write botster-web {label} request: {error}"))?;
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .map_err(|error| format!("read botster-web {label} response: {error}"))?;
+    let Some((headers, body)) = response.split_once("\r\n\r\n") else {
+        return Err(format!("malformed botster-web {label} response"));
+    };
     let body = if headers
         .to_ascii_lowercase()
         .contains("transfer-encoding: chunked")
@@ -515,8 +574,7 @@ fn read_botster_web_health(bridge_url: &str) -> Result<serde_json::Value, String
     } else {
         body.to_string()
     };
-    serde_json::from_str(body.trim())
-        .map_err(|error| format!("parse botster-web health JSON: {error}"))
+    Ok((headers.to_string(), body))
 }
 
 fn botster_web_health_is_existing_hub_socket(health: &serde_json::Value) -> bool {
@@ -607,7 +665,7 @@ fn print_dogfood_ready(
     println!("package name=project-pipelines state={project_pipelines_state}");
     println!("package name=botster-web state={}", web.package_state);
     println!("bridge={}", web.bridge_url);
-    println!("web=unavailable reason=botster-web-ui-server-not-supervised-by-dogfood");
+    println!("web={}", web.web_url);
     println!("tui=botster-hub tui --data-dir {dir}");
     println!("mcp=botster-hub mcp-serve --data-dir {dir}");
     println!("status=botster-hub status --data-dir {dir}");
@@ -1960,6 +2018,7 @@ enum DogfoodError {
     WebPackageEnable(String),
     WebEntrypointStart(String),
     WebHealth(String),
+    WebUi(String),
     WaitDaemon(io::Error),
     DaemonExited(String),
 }
@@ -2114,6 +2173,9 @@ impl fmt::Display for DogfoodError {
                     formatter,
                     "verify botster-web existing-hub health: {message}"
                 )
+            }
+            Self::WebUi(message) => {
+                write!(formatter, "verify botster-web packaged UI: {message}")
             }
             Self::WaitDaemon(error) => write!(formatter, "wait for dogfood daemon: {error}"),
             Self::DaemonExited(status) => write!(formatter, "dogfood daemon exited with {status}"),
