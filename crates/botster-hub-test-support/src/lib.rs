@@ -16,10 +16,11 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use botster_hub_client::{
-    ensure_compatible, DaemonCompatibilityRequirement, DaemonDiagnostic, DaemonDiagnosticKind,
+    DaemonCompatibility, DaemonCompatibilityRequirement, DaemonDiagnostic, DaemonDiagnosticKind,
     DaemonEndpoint, DaemonOperatorError, DaemonRequest, DaemonResponse, DaemonResponseKind,
-    DaemonTransportError,
+    DaemonTransportError, ensure_compatible,
 };
+use serde::{Deserialize, Serialize};
 
 const CONFORMANCE_SESSION_ID: &str = "botster-conformance-session";
 const CONFORMANCE_SUBSCRIPTION_ID: &str = "botster-conformance-subscription";
@@ -29,9 +30,142 @@ const CONFORMANCE_WINSIZE_PREFIX: &str = "winsize:";
 const PROJECT_PIPELINES_PACKAGE: &str = "project-pipelines";
 const PROJECT_PIPELINES_SURFACE: &str = "project-pipelines.create-ticket";
 const PROJECT_PIPELINES_ACTION: &str = "project_pipelines.create_ticket";
+const SUPPORTED_PLUGIN_SURFACE_JSON_ACTIONS: &str = "plugin_surface_json_actions";
+const UNSUPPORTED_PLUGIN_ENTITY_FRAMES: &str = "plugin_entity_frames";
 
 const DEFAULT_SOCKET_NAME: &str = "botster-hub.sock";
 const READY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Hub-owned support matrix for first-party same-device clients.
+///
+/// The matrix is intentionally published from test support instead of the hub
+/// daemon runtime. Downstream TUI/browser tests can serialize this value to a
+/// stable JSON fixture while production clients continue to rely on the daemon
+/// compatibility descriptor and conformance flows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FirstPartyClientSupportMatrix {
+    pub protocol: String,
+    pub protocol_version: u16,
+    pub conformance_fixture_revision: u16,
+    pub required_features: Vec<String>,
+    pub supported_features: Vec<String>,
+    pub diagnostic_kinds: Vec<String>,
+    pub session_actions: Vec<String>,
+    pub terminal_streaming: TerminalStreamingSupport,
+    pub resize: ResizeSupport,
+    pub plugin_surfaces: PluginSurfaceSupport,
+    pub entity_actions: EntityActionSupport,
+    pub known_limitations: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalStreamingSupport {
+    pub supported: bool,
+    pub feature: String,
+    pub helper: String,
+    pub held_open_stream: bool,
+    pub conformance_ready_output: String,
+    pub conformance_echo_output: String,
+    pub missing_session_diagnostic_kind: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResizeSupport {
+    pub supported: bool,
+    pub feature: String,
+    pub action: String,
+    pub conformance_output_prefix: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginSurfaceSupport {
+    pub render_supported: bool,
+    pub render_feature: String,
+    pub action_supported: bool,
+    pub action_feature: String,
+    pub package_name: String,
+    pub surface_id: String,
+    pub rendered_surface_kind: String,
+    pub rendered_surface_node_id: String,
+    pub invalid_action_diagnostic_kind: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EntityActionSupport {
+    pub supported_capabilities: Vec<String>,
+    pub unsupported_capabilities: Vec<String>,
+}
+
+/// Return the current first-party support matrix for downstream client tests.
+#[must_use]
+pub fn first_party_client_support_matrix() -> FirstPartyClientSupportMatrix {
+    let compatibility = DaemonCompatibility::current();
+    let requirement = DaemonCompatibilityRequirement::current();
+
+    FirstPartyClientSupportMatrix {
+        protocol: compatibility.protocol,
+        protocol_version: compatibility.protocol_version,
+        conformance_fixture_revision: compatibility.conformance_fixture_revision,
+        required_features: requirement.required_features,
+        supported_features: compatibility.features,
+        diagnostic_kinds: daemon_diagnostic_kind_labels()
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        session_actions: vec![
+            "status".to_string(),
+            "list_sessions".to_string(),
+            "spawn".to_string(),
+            "attach".to_string(),
+            "drain".to_string(),
+            "send_input".to_string(),
+            "resize".to_string(),
+            "shutdown_session".to_string(),
+        ],
+        terminal_streaming: TerminalStreamingSupport {
+            supported: true,
+            feature: botster_hub_client::FEATURE_TERMINAL_STREAMING.to_string(),
+            helper: "botster_hub_client::stream_attach".to_string(),
+            held_open_stream: true,
+            conformance_ready_output: CONFORMANCE_READY.to_string(),
+            conformance_echo_output: CONFORMANCE_ECHO.to_string(),
+            missing_session_diagnostic_kind: diagnostic_kind_label(
+                DaemonDiagnosticKind::TerminalStreamUnavailable,
+            )
+            .to_string(),
+        },
+        resize: ResizeSupport {
+            supported: true,
+            feature: botster_hub_client::FEATURE_RESIZE.to_string(),
+            action: "resize".to_string(),
+            conformance_output_prefix: CONFORMANCE_WINSIZE_PREFIX.to_string(),
+        },
+        plugin_surfaces: PluginSurfaceSupport {
+            render_supported: true,
+            render_feature: botster_hub_client::FEATURE_PLUGIN_SURFACE_RENDER.to_string(),
+            action_supported: true,
+            action_feature: botster_hub_client::FEATURE_PLUGIN_SURFACE_ACTION.to_string(),
+            package_name: PROJECT_PIPELINES_PACKAGE.to_string(),
+            surface_id: PROJECT_PIPELINES_SURFACE.to_string(),
+            rendered_surface_kind: "panel".to_string(),
+            rendered_surface_node_id: "project-pipelines-create-panel".to_string(),
+            invalid_action_diagnostic_kind: diagnostic_kind_label(
+                DaemonDiagnosticKind::ActionFailure,
+            )
+            .to_string(),
+        },
+        entity_actions: EntityActionSupport {
+            supported_capabilities: vec![SUPPORTED_PLUGIN_SURFACE_JSON_ACTIONS.to_string()],
+            unsupported_capabilities: vec![UNSUPPORTED_PLUGIN_ENTITY_FRAMES.to_string()],
+        },
+        known_limitations: vec![
+            "The matrix is a test/docs contract, not a daemon runtime endpoint.".to_string(),
+            "Full plugin entity-frame hydration is intentionally outside this conformance fixture."
+                .to_string(),
+            "Clients own renderer-specific presentation policy for diagnostics.".to_string(),
+        ],
+    }
+}
 
 /// Builder for one isolated local hub daemon test instance.
 ///
@@ -680,6 +814,18 @@ fn diagnostic_kind_label(kind: DaemonDiagnosticKind) -> &'static str {
     }
 }
 
+fn daemon_diagnostic_kind_labels() -> Vec<&'static str> {
+    vec![
+        diagnostic_kind_label(DaemonDiagnosticKind::Connected),
+        diagnostic_kind_label(DaemonDiagnosticKind::Disconnected),
+        diagnostic_kind_label(DaemonDiagnosticKind::CompatibilityMismatch),
+        diagnostic_kind_label(DaemonDiagnosticKind::UnsupportedFeature),
+        diagnostic_kind_label(DaemonDiagnosticKind::TerminalStreamUnavailable),
+        diagnostic_kind_label(DaemonDiagnosticKind::ActionFailure),
+        diagnostic_kind_label(DaemonDiagnosticKind::DaemonStartupFailure),
+    ]
+}
+
 fn value_string(
     value: &serde_json::Value,
     field: &'static str,
@@ -1085,6 +1231,163 @@ mod tests {
     use std::io::Write;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn support_matrix_matches_current_compatibility_descriptor() {
+        let matrix = first_party_client_support_matrix();
+        let compatibility = DaemonCompatibility::current();
+        let requirement = DaemonCompatibilityRequirement::current();
+
+        assert_eq!(matrix.protocol, compatibility.protocol);
+        assert_eq!(matrix.protocol_version, compatibility.protocol_version);
+        assert_eq!(
+            matrix.conformance_fixture_revision,
+            compatibility.conformance_fixture_revision
+        );
+        assert_eq!(matrix.supported_features, compatibility.features);
+        assert_eq!(matrix.required_features, requirement.required_features);
+        assert!(
+            matrix
+                .supported_features
+                .contains(&botster_hub_client::FEATURE_SESSIONS.to_string())
+        );
+        assert!(
+            matrix
+                .supported_features
+                .contains(&matrix.terminal_streaming.feature)
+        );
+        assert!(matrix.supported_features.contains(&matrix.resize.feature));
+        assert!(
+            matrix
+                .supported_features
+                .contains(&matrix.plugin_surfaces.render_feature)
+        );
+        assert!(
+            matrix
+                .supported_features
+                .contains(&matrix.plugin_surfaces.action_feature)
+        );
+    }
+
+    #[test]
+    fn support_matrix_diagnostic_kinds_are_exhaustive() {
+        let matrix = first_party_client_support_matrix();
+
+        assert_eq!(
+            matrix.diagnostic_kinds,
+            daemon_diagnostic_kind_labels()
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn support_matrix_entity_capabilities_are_disjoint_and_complete() {
+        let matrix = first_party_client_support_matrix();
+        let mut declared = matrix.entity_actions.supported_capabilities.clone();
+        declared.extend(matrix.entity_actions.unsupported_capabilities.clone());
+        declared.sort();
+
+        let mut known = vec![
+            SUPPORTED_PLUGIN_SURFACE_JSON_ACTIONS.to_string(),
+            UNSUPPORTED_PLUGIN_ENTITY_FRAMES.to_string(),
+        ];
+        known.sort();
+
+        assert_eq!(declared, known);
+        for supported in &matrix.entity_actions.supported_capabilities {
+            assert!(
+                !matrix
+                    .entity_actions
+                    .unsupported_capabilities
+                    .contains(supported)
+            );
+        }
+    }
+
+    #[test]
+    fn support_matrix_serializes_to_stable_json_shape() {
+        let matrix = first_party_client_support_matrix();
+        let value = serde_json::to_value(&matrix).expect("matrix serializes to JSON");
+
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "protocol": botster_hub_client::PROTOCOL,
+                "protocol_version": botster_hub_client::PROTOCOL_VERSION,
+                "conformance_fixture_revision": botster_hub_client::CONFORMANCE_FIXTURE_REVISION,
+                "required_features": [
+                    botster_hub_client::FEATURE_SESSIONS,
+                    botster_hub_client::FEATURE_TERMINAL_STREAMING,
+                    botster_hub_client::FEATURE_RESIZE,
+                    botster_hub_client::FEATURE_PLUGIN_SURFACE_RENDER,
+                    botster_hub_client::FEATURE_PLUGIN_SURFACE_ACTION,
+                ],
+                "supported_features": [
+                    botster_hub_client::FEATURE_SESSIONS,
+                    botster_hub_client::FEATURE_TERMINAL_STREAMING,
+                    botster_hub_client::FEATURE_RESIZE,
+                    botster_hub_client::FEATURE_PLUGIN_SURFACE_RENDER,
+                    botster_hub_client::FEATURE_PLUGIN_SURFACE_ACTION,
+                ],
+                "diagnostic_kinds": [
+                    "connected",
+                    "disconnected",
+                    "compatibility_mismatch",
+                    "unsupported_feature",
+                    "terminal_stream_unavailable",
+                    "action_failure",
+                    "daemon_startup_failure",
+                ],
+                "session_actions": [
+                    "status",
+                    "list_sessions",
+                    "spawn",
+                    "attach",
+                    "drain",
+                    "send_input",
+                    "resize",
+                    "shutdown_session",
+                ],
+                "terminal_streaming": {
+                    "supported": true,
+                    "feature": botster_hub_client::FEATURE_TERMINAL_STREAMING,
+                    "helper": "botster_hub_client::stream_attach",
+                    "held_open_stream": true,
+                    "conformance_ready_output": CONFORMANCE_READY,
+                    "conformance_echo_output": CONFORMANCE_ECHO,
+                    "missing_session_diagnostic_kind": "terminal_stream_unavailable",
+                },
+                "resize": {
+                    "supported": true,
+                    "feature": botster_hub_client::FEATURE_RESIZE,
+                    "action": "resize",
+                    "conformance_output_prefix": CONFORMANCE_WINSIZE_PREFIX,
+                },
+                "plugin_surfaces": {
+                    "render_supported": true,
+                    "render_feature": botster_hub_client::FEATURE_PLUGIN_SURFACE_RENDER,
+                    "action_supported": true,
+                    "action_feature": botster_hub_client::FEATURE_PLUGIN_SURFACE_ACTION,
+                    "package_name": PROJECT_PIPELINES_PACKAGE,
+                    "surface_id": PROJECT_PIPELINES_SURFACE,
+                    "rendered_surface_kind": "panel",
+                    "rendered_surface_node_id": "project-pipelines-create-panel",
+                    "invalid_action_diagnostic_kind": "action_failure",
+                },
+                "entity_actions": {
+                    "supported_capabilities": [SUPPORTED_PLUGIN_SURFACE_JSON_ACTIONS],
+                    "unsupported_capabilities": [UNSUPPORTED_PLUGIN_ENTITY_FRAMES],
+                },
+                "known_limitations": [
+                    "The matrix is a test/docs contract, not a daemon runtime endpoint.",
+                    "Full plugin entity-frame hydration is intentionally outside this conformance fixture.",
+                    "Clients own renderer-specific presentation policy for diagnostics.",
+                ],
+            })
+        );
+    }
 
     #[test]
     fn explicit_path_reports_missing_hub_binary_env() {

@@ -24,6 +24,14 @@ The current descriptor includes:
   render, and plugin surface action dispatch;
 - conformance fixture revision.
 
+The hub-owned first-party support matrix lives in
+`botster_hub_test_support::first_party_client_support_matrix`. It is a
+serde-serializable test/docs contract that expands the compatibility descriptor
+into the exact first-party client surface covered today: diagnostic kinds,
+session actions, held-open terminal streaming, resize, Project Pipelines
+surface/action dispatch, and known limitations. It is not a daemon runtime
+endpoint.
+
 Downstream clients with the same requirements as the current crate can rely on
 the default connection helper. The checked example for this path lives on
 `botster_hub_client::DaemonConnection`.
@@ -183,8 +191,22 @@ session validation error, connected diagnostics, terminal-unavailable
 diagnostics, and teardown. Downstream CI can run it twice against two fresh
 isolated hubs and compare the reports to prove deterministic fixture output.
 
+Downstream `botster-tui` tests should import
+`botster_hub_test_support::first_party_client_support_matrix` directly and
+compare it to `run_client_conformance` for the local client paths they exercise.
+Downstream `botster-web` tests should consume the matrix as serialized JSON,
+for example with `serde_json::to_value(first_party_client_support_matrix())`
+from a Rust fixture or repo sync step, rather than mirroring the matrix by hand
+in TypeScript.
+
 If a downstream client also wants to prove plugin surface/action dispatch
 against the first-party Project Pipelines example, provide a checkout path to
 the example package and call the optional `run_project_pipelines_conformance`
 helper. Its report includes the rejected-action diagnostic for the invalid form
 submission path.
+
+The matrix currently marks JSON plugin surface render/action dispatch as
+supported and full plugin entity-frame hydration as intentionally unsupported by
+this conformance fixture. Clients that render plugin entity stores should prove
+that path with their own entity-frame tests until the hub publishes a dedicated
+entity conformance fixture.
