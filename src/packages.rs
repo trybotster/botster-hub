@@ -896,7 +896,7 @@ pub struct PackageRegistryError {
 }
 
 impl PackageRegistryError {
-    fn without_record(
+    pub(crate) fn without_record(
         package_name: impl Into<String>,
         action: PackageAction,
         reason: PackageAdmissionReason,
