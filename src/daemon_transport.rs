@@ -329,11 +329,15 @@ fn handle_control_request(
         DaemonRequest::StartPackageEntrypoint {
             package_name,
             entrypoint_id,
+            environment_overrides,
         } => {
             let packages = daemon.package_registry().clone();
-            daemon
-                .entrypoint_supervisor()
-                .start(&packages, &package_name, &entrypoint_id)?;
+            daemon.entrypoint_supervisor().start(
+                &packages,
+                &package_name,
+                &entrypoint_id,
+                &environment_overrides,
+            )?;
             show_package_response(daemon, &package_name)
         }
         DaemonRequest::StopPackageEntrypoint {
@@ -350,9 +354,12 @@ fn handle_control_request(
             entrypoint_id,
         } => {
             let packages = daemon.package_registry().clone();
-            daemon
-                .entrypoint_supervisor()
-                .restart(&packages, &package_name, &entrypoint_id)?;
+            daemon.entrypoint_supervisor().restart(
+                &packages,
+                &package_name,
+                &entrypoint_id,
+                &BTreeMap::new(),
+            )?;
             show_package_response(daemon, &package_name)
         }
         DaemonRequest::PackageEntrypointStatus {

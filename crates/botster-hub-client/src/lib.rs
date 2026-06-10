@@ -4,6 +4,7 @@
 //! handshake, and connection helpers. It intentionally contains no hub runtime,
 //! TUI, Lua, or daemon-to-session-worker protocol dependencies.
 
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 use std::io::{BufRead, BufReader, Write};
@@ -588,6 +589,8 @@ pub enum DaemonRequest {
     StartPackageEntrypoint {
         package_name: String,
         entrypoint_id: String,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        environment_overrides: BTreeMap<String, String>,
     },
     StopPackageEntrypoint {
         package_name: String,
@@ -1211,14 +1214,44 @@ mod tests {
         let request = DaemonRequest::StartPackageEntrypoint {
             package_name: "workflow.plugin".to_string(),
             entrypoint_id: "web".to_string(),
+            environment_overrides: BTreeMap::new(),
         };
-        let value = serde_json::to_value(request).expect("serialize request");
+        let value = serde_json::to_value(&request).expect("serialize request");
         assert_eq!(
             value,
             serde_json::json!({
                 "type": "start_package_entrypoint",
                 "package_name": "workflow.plugin",
                 "entrypoint_id": "web"
+            })
+        );
+
+        let old_request: DaemonRequest = serde_json::from_value(serde_json::json!({
+            "type": "start_package_entrypoint",
+            "package_name": "workflow.plugin",
+            "entrypoint_id": "web"
+        }))
+        .expect("deserialize old start entrypoint request");
+        assert_eq!(old_request, request);
+
+        let request = DaemonRequest::StartPackageEntrypoint {
+            package_name: "workflow.plugin".to_string(),
+            entrypoint_id: "web".to_string(),
+            environment_overrides: BTreeMap::from([(
+                "BOTSTER_HUB_SOCKET".to_string(),
+                "/tmp/botster-hub.sock".to_string(),
+            )]),
+        };
+        let value = serde_json::to_value(request).expect("serialize request with env");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "type": "start_package_entrypoint",
+                "package_name": "workflow.plugin",
+                "entrypoint_id": "web",
+                "environment_overrides": {
+                    "BOTSTER_HUB_SOCKET": "/tmp/botster-hub.sock"
+                }
             })
         );
     }
