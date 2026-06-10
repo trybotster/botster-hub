@@ -125,6 +125,27 @@ raw worktree paths, and mutable Botster identity. First-party clients may add UI
 severity or remediation copy, but that policy belongs in the client renderer,
 not in the daemon protocol.
 
+## Package Runnable Entrypoints
+
+`DaemonPackage` rows include `runnable_entrypoints` for hub-owned local/dev
+process contracts declared by installed packages. These rows are discovery
+contracts only: the hub does not spawn or supervise them in this slice, and each
+entrypoint reports process state `not_started` unless a future runtime owner
+updates the state contract.
+
+Each entrypoint exposes sanitized manifest declarations: `id`, `kind`,
+`command`, `args`, `working_directory`, declarative `environment`
+requirements, `mode`, capability needs, `may_supervise`, and process
+diagnostics. The daemon response must not expose the local package root,
+provenance path, socket path, or host-resolved environment values. Environment
+defaults are manifest-provided literals, not snapshots from the operator's
+machine.
+
+The runnable contract is intentionally adjacent to core package `entrypoints`.
+Core `entrypoints` remain the plugin/provider code-load ABI, while
+`runnable_entrypoints` is the package discovery shape for clients and future
+launchers.
+
 The control-plane production route is:
 
 `botster_hub_client::DaemonConnection::request`

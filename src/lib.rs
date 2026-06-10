@@ -49,7 +49,9 @@ pub use capabilities::HubCapabilityRuntime;
 pub use client_api::{
     HubClientAdmission, HubClientApi, HubClientCapability, HubClientError, HubClientEvent,
     HubClientGuardedWrite, HubClientIdentity, HubClientObservationKind, HubClientOperation,
-    HubClientPackage, HubClientPackageClassification, HubClientPackageState,
+    HubClientPackage, HubClientPackageClassification, HubClientPackageDiagnostic,
+    HubClientPackageEnvironmentRequirement, HubClientPackageProcess,
+    HubClientPackageRunnableEntrypoint, HubClientPackageState, HubClientPackageWorkingDirectory,
     HubClientPluginLifecycle, HubClientRequest, HubClientResponse, HubClientResponseBody,
     HubClientResult, HubClientRole, HubClientRoutedEnvelopeAck, HubClientRoutedEnvelopeDrain,
     HubClientRoutedEnvelopePublish, HubClientRuntimeErrorKind, HubClientSession, HubClientSpawned,
@@ -67,7 +69,9 @@ pub use daemon::{
 pub use daemon_transport::{
     DaemonCapability, DaemonCompatibility, DaemonConnection, DaemonCoordination, DaemonEnvelope,
     DaemonEnvelopeAck, DaemonEnvelopeDelivery, DaemonEnvelopePublish, DaemonEvent, DaemonIdentity,
-    DaemonNotify, DaemonOperatorError, DaemonPackage, DaemonPackageDecision, DaemonPluginLifecycle,
+    DaemonNotify, DaemonOperatorError, DaemonPackage, DaemonPackageDecision,
+    DaemonPackageDiagnostic, DaemonPackageEnvironmentRequirement, DaemonPackageProcess,
+    DaemonPackageRunnableEntrypoint, DaemonPackageWorkingDirectory, DaemonPluginLifecycle,
     DaemonRequest, DaemonResponse, DaemonResponseKind, DaemonSession, DaemonSessionCleanup,
     DaemonStatus, DaemonTransportError, DaemonTransportResult, request as daemon_transport_request,
     serve_daemon, stream_attach,
@@ -84,10 +88,12 @@ pub use mcp::{
 pub use packages::{
     LOCAL_PACKAGE_MANIFEST_FILE, PackageAction, PackageAdmissionPolicy, PackageAdmissionReason,
     PackageClassification, PackageCompatibility, PackageCompatibilityResult, PackageDecision,
-    PackagePin, PackageProvenance, PackageRecord, PackageRegistry, PackageRegistryError,
-    PackageRegistryResult, PackageRegistrySnapshot, PackageRegistrySnapshotError, PackageState,
-    PackageTrust, PackageTrustClassification, PackageUpdatePolicy, PreparedLocalPackage,
-    default_package_policy,
+    PackageEnvironmentRequirement, PackagePin, PackageProvenance, PackageRecord, PackageRegistry,
+    PackageRegistryError, PackageRegistryResult, PackageRegistrySnapshot,
+    PackageRegistrySnapshotError, PackageRunnableDiagnostic, PackageRunnableEntrypoint,
+    PackageRunnableEntrypointKind, PackageRunnableMode, PackageRunnableProcess,
+    PackageRunnableProcessState, PackageRunnableWorkingDirectory, PackageState, PackageTrust,
+    PackageTrustClassification, PackageUpdatePolicy, PreparedLocalPackage, default_package_policy,
 };
 pub use persistence::{
     CapabilityGrantRecord, FileHubStateStore, HubAuditEntry, HubState, HubStateError,
