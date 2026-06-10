@@ -42,6 +42,14 @@ fn unique_test_dir(name: &str) -> PathBuf {
         .join(nanos.to_string())
 }
 
+fn unique_short_test_dir(name: &str) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time after epoch")
+        .as_nanos();
+    PathBuf::from("/tmp").join(format!("bh-{name}-{nanos}"))
+}
+
 fn explicit_config(data_directory: impl Into<PathBuf>) -> botster_hub::HubConfig {
     ensure_session_worker_binary();
     HubStartupOptions {
@@ -653,6 +661,22 @@ fn start_cli_daemon(data_dir: &Path) -> Child {
         .arg("start")
         .arg("--data-dir")
         .arg(data_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn botster-hub start");
+
+    wait_for_status(data_dir, &mut child);
+    child
+}
+
+fn start_cli_daemon_with_session_worker(data_dir: &Path, session_worker_bin: &Path) -> Child {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("start")
+        .arg("--data-dir")
+        .arg(data_dir)
+        .arg("--session-worker-bin")
+        .arg(session_worker_bin)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -2110,6 +2134,293 @@ fn external_hub_client_crate_drives_real_daemon_socket_protocol() {
         shutdown_session.kind,
         botster_hub_client::DaemonResponseKind::Events
     );
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
+fn external_hub_client_spawns_botster_web_dogfood_session_request_shape() {
+    let _guard = daemon_test_lock()
+        .lock()
+        .expect("serialize real daemon test");
+    let data_dir = unique_short_test_dir("web-spawn");
+    let config = explicit_config(&data_dir);
+    let socket_path = config
+        .transports
+        .local_socket
+        .as_ref()
+        .expect("test config has local socket")
+        .path
+        .clone();
+    let endpoint = botster_hub_client::DaemonEndpoint::new(socket_path);
+    let child = start_cli_daemon(&data_dir);
+
+    let mut connection =
+        botster_hub_client::DaemonConnection::connect(&endpoint).expect("external connect");
+    let spawn = connection
+        .request(&botster_hub_client::DaemonRequest::Spawn {
+            session_id: "botster-web-dogfood-session".to_string(),
+            command:
+                "printf 'botster-web-dogfood-ready\\n'; while IFS= read -r line; do printf 'web:%s\\n' \"$line\"; done"
+                    .to_string(),
+        })
+        .expect("botster-web dogfood spawn request");
+    assert_eq!(spawn.kind, botster_hub_client::DaemonResponseKind::Spawned);
+    assert!(spawn.sessions.iter().any(|session| session.session_id
+        == "botster-web-dogfood-session"
+        && session.lifecycle == "running"));
+
+    let list = connection
+        .request(&botster_hub_client::DaemonRequest::ListSessions)
+        .expect("list sessions after botster-web dogfood spawn");
+    assert_eq!(list.kind, botster_hub_client::DaemonResponseKind::Sessions);
+    assert!(list.sessions.iter().any(|session| session.session_id
+        == "botster-web-dogfood-session"
+        && session.lifecycle == "running"));
+
+    let packages = connection
+        .request(&botster_hub_client::DaemonRequest::ListPackages)
+        .expect("list packages remains observable after botster-web dogfood spawn");
+    assert_eq!(
+        packages.kind,
+        botster_hub_client::DaemonResponseKind::Packages
+    );
+
+    let attach = connection
+        .request(&botster_hub_client::DaemonRequest::Attach {
+            session_id: "botster-web-dogfood-session".to_string(),
+            subscription_id: "botster-web-dogfood-subscription".to_string(),
+        })
+        .expect("attach botster-web dogfood session");
+    assert_eq!(attach.kind, botster_hub_client::DaemonResponseKind::Events);
+
+    let send = connection
+        .request(&botster_hub_client::DaemonRequest::SendInput {
+            session_id: "botster-web-dogfood-session".to_string(),
+            data: "from-web-action\n".to_string(),
+        })
+        .expect("send input to botster-web dogfood session");
+    assert_eq!(send.kind, botster_hub_client::DaemonResponseKind::Events);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut observed = String::new();
+    while std::time::Instant::now() < deadline {
+        let drain = connection
+            .request(&botster_hub_client::DaemonRequest::Drain {
+                session_id: "botster-web-dogfood-session".to_string(),
+            })
+            .expect("drain botster-web dogfood session");
+        for event in drain.events {
+            if let botster_hub_client::DaemonEvent::TerminalOutput { data, .. } = event {
+                observed.push_str(&data);
+            }
+        }
+        if observed.contains("web:from-web-action") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(30));
+    }
+    assert!(
+        observed.contains("web:from-web-action"),
+        "botster-web dogfood request shape should attach and drain output, got {observed:?}"
+    );
+
+    let shutdown_session = connection
+        .request(&botster_hub_client::DaemonRequest::ShutdownSession {
+            session_id: "botster-web-dogfood-session".to_string(),
+        })
+        .expect("shutdown botster-web dogfood session");
+    assert_eq!(
+        shutdown_session.kind,
+        botster_hub_client::DaemonResponseKind::Events
+    );
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
+fn external_hub_client_duplicate_botster_web_dogfood_spawn_is_rejected_without_cleanup() {
+    let _guard = daemon_test_lock()
+        .lock()
+        .expect("serialize real daemon test");
+    let data_dir = unique_short_test_dir("web-duplicate");
+    let config = explicit_config(&data_dir);
+    let socket_path = config
+        .transports
+        .local_socket
+        .as_ref()
+        .expect("test config has local socket")
+        .path
+        .clone();
+    let endpoint = botster_hub_client::DaemonEndpoint::new(socket_path);
+    let child = start_cli_daemon(&data_dir);
+
+    let mut connection =
+        botster_hub_client::DaemonConnection::connect(&endpoint).expect("external connect");
+    let first_spawn = connection
+        .request(&botster_hub_client::DaemonRequest::Spawn {
+            session_id: "botster-web-dogfood-session".to_string(),
+            command:
+                "printf 'botster-web-dogfood-ready\\n'; while IFS= read -r line; do printf 'web:%s\\n' \"$line\"; done"
+                    .to_string(),
+        })
+        .expect("first botster-web dogfood spawn request");
+    assert_eq!(
+        first_spawn.kind,
+        botster_hub_client::DaemonResponseKind::Spawned
+    );
+
+    let duplicate = connection
+        .request(&botster_hub_client::DaemonRequest::Spawn {
+            session_id: "botster-web-dogfood-session".to_string(),
+            command: "printf 'replacement-should-not-start\\n'".to_string(),
+        })
+        .expect("duplicate botster-web dogfood spawn should return operator frame");
+    assert_eq!(
+        duplicate.kind,
+        botster_hub_client::DaemonResponseKind::OperatorError
+    );
+    let error = duplicate.error.as_ref().expect("operator error body");
+    assert_eq!(
+        error.code, "session_already_exists",
+        "unexpected duplicate spawn operator error: {error:?} diagnostics={:?}",
+        duplicate.diagnostics
+    );
+    assert_eq!(error.operation, "spawn");
+    assert!(
+        duplicate.diagnostics.iter().any(|diagnostic| {
+            diagnostic.kind == botster_hub_client::DaemonDiagnosticKind::ActionFailure
+                && diagnostic.operation.as_deref() == Some("spawn")
+                && diagnostic
+                    .message
+                    .as_deref()
+                    .is_some_and(|message| message.contains("already exists"))
+        }),
+        "duplicate spawn should carry a session_already_exists diagnostic row, got {:?}",
+        duplicate.diagnostics
+    );
+
+    let attach = connection
+        .request(&botster_hub_client::DaemonRequest::Attach {
+            session_id: "botster-web-dogfood-session".to_string(),
+            subscription_id: "botster-web-dogfood-duplicate-subscription".to_string(),
+        })
+        .expect("attach original botster-web dogfood session after duplicate rejection");
+    assert_eq!(attach.kind, botster_hub_client::DaemonResponseKind::Events);
+
+    let send = connection
+        .request(&botster_hub_client::DaemonRequest::SendInput {
+            session_id: "botster-web-dogfood-session".to_string(),
+            data: "after-duplicate\n".to_string(),
+        })
+        .expect("existing session remains writable after duplicate rejection");
+    assert_eq!(send.kind, botster_hub_client::DaemonResponseKind::Events);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut observed = String::new();
+    while std::time::Instant::now() < deadline {
+        let drain = connection
+            .request(&botster_hub_client::DaemonRequest::Drain {
+                session_id: "botster-web-dogfood-session".to_string(),
+            })
+            .expect("drain original botster-web dogfood session after duplicate rejection");
+        for event in drain.events {
+            if let botster_hub_client::DaemonEvent::TerminalOutput { data, .. } = event {
+                observed.push_str(&data);
+            }
+        }
+        if observed.contains("web:after-duplicate") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(30));
+    }
+    assert!(
+        observed.contains("web:after-duplicate"),
+        "duplicate rejection must not clean up or replace the existing session, got {observed:?}"
+    );
+    assert!(
+        !observed.contains("replacement-should-not-start"),
+        "duplicate rejected spawn command must not start, got {observed:?}"
+    );
+
+    let debug = format!("{error:?} {:?}", duplicate.diagnostics);
+    assert!(!debug.contains(&data_dir.to_string_lossy().to_string()));
+    assert!(!debug.contains(concat!("/", "Users", "/")));
+    assert!(!debug.contains("/home/"));
+
+    let shutdown_session = connection
+        .request(&botster_hub_client::DaemonRequest::ShutdownSession {
+            session_id: "botster-web-dogfood-session".to_string(),
+        })
+        .expect("shutdown botster-web dogfood session");
+    assert_eq!(
+        shutdown_session.kind,
+        botster_hub_client::DaemonResponseKind::Events
+    );
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
+fn external_hub_client_spawn_failure_returns_actionable_diagnostics() {
+    let _guard = daemon_test_lock()
+        .lock()
+        .expect("serialize real daemon test");
+    let data_dir = unique_short_test_dir("spawn-fail");
+    let bad_worker = data_dir.join("missing-botster-session-worker");
+    let config = explicit_config(&data_dir);
+    let socket_path = config
+        .transports
+        .local_socket
+        .as_ref()
+        .expect("test config has local socket")
+        .path
+        .clone();
+    let endpoint = botster_hub_client::DaemonEndpoint::new(socket_path);
+    let child = start_cli_daemon_with_session_worker(&data_dir, &bad_worker);
+
+    let mut connection =
+        botster_hub_client::DaemonConnection::connect(&endpoint).expect("external connect");
+    let spawn = connection
+        .request(&botster_hub_client::DaemonRequest::Spawn {
+            session_id: "botster-web-dogfood-session".to_string(),
+            command: "printf 'should-not-start\\n'".to_string(),
+        })
+        .expect("spawn failure should return operator frame");
+    assert_eq!(
+        spawn.kind,
+        botster_hub_client::DaemonResponseKind::OperatorError
+    );
+    let error = spawn.error.as_ref().expect("operator error body");
+    assert_eq!(
+        error.code, "spawn_failed",
+        "unexpected spawn operator error: {error:?} diagnostics={:?}",
+        spawn.diagnostics
+    );
+    assert_eq!(error.operation, "spawn");
+    assert!(
+        spawn.diagnostics.iter().any(|diagnostic| {
+            diagnostic.kind == botster_hub_client::DaemonDiagnosticKind::ActionFailure
+                && diagnostic.operation.as_deref() == Some("spawn")
+                && diagnostic
+                    .message
+                    .as_deref()
+                    .is_some_and(|message| message.contains("session worker"))
+        }),
+        "spawn failure should carry an actionable diagnostic row, got {:?}",
+        spawn.diagnostics
+    );
+    assert!(!has_diagnostic_kind(
+        &spawn.diagnostics,
+        botster_hub_client::DaemonDiagnosticKind::Connected
+    ));
+    let debug = format!("{error:?} {:?}", spawn.diagnostics);
+    assert!(!debug.contains(&data_dir.to_string_lossy().to_string()));
+    assert!(!debug.contains(&bad_worker.to_string_lossy().to_string()));
+    assert!(!debug.contains(concat!("/", "Users", "/")));
+    assert!(!debug.contains("/home/"));
+
+    let status = connection
+        .request(&botster_hub_client::DaemonRequest::Status)
+        .expect("daemon remains responsive after spawn failure");
+    assert_eq!(status.kind, botster_hub_client::DaemonResponseKind::Status);
     shutdown_cli_daemon(&data_dir, child);
 }
 
