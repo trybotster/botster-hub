@@ -273,6 +273,11 @@ const mode = socket || dataDir ? 'existing_hub' : 'spawned_hub';
 const socketExists = socket ? fs.existsSync(socket) : false;
 
 http.createServer((request, response) => {
+  if (request.url === '/?dogfood=real-hub') {
+    response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+    response.end('<!doctype html><html><head><title>Botster Web</title></head><body><main id="root">botster-web packaged UI</main><script type="module" src="/assets/index.js"></script></body></html>');
+    return;
+  }
   if (request.url !== '/health') {
     response.writeHead(404);
     response.end('not found');
@@ -322,6 +327,75 @@ http.createServer((request, response) => {
         serde_json::to_string_pretty(&manifest).expect("serialize botster-web manifest"),
     )
     .expect("write botster-web manifest");
+}
+
+fn write_health_only_botster_web_package(root: &Path) {
+    fs::create_dir_all(root.join("scripts")).expect("create health-only botster-web package root");
+    fs::write(root.join("plugin.lua"), "return botster.register({})\n")
+        .expect("write health-only botster-web core entrypoint");
+    fs::write(
+        root.join("scripts").join("real-hub-dogfood-bridge.mjs"),
+        r#"
+import fs from 'fs';
+import http from 'http';
+
+const port = Number(process.env.BOTSTER_WEB_DOGFOOD_BRIDGE_PORT || '41739');
+const socket = process.env.BOTSTER_HUB_SOCKET;
+const dataDir = process.env.BOTSTER_HUB_DATA_DIR;
+const source = socket ? 'socket' : (dataDir ? 'data_dir' : 'spawned');
+const mode = socket || dataDir ? 'existing_hub' : 'spawned_hub';
+const socketExists = socket ? fs.existsSync(socket) : false;
+
+http.createServer((request, response) => {
+  if (request.url !== '/health') {
+    response.writeHead(404, { 'content-type': 'application/json' });
+    response.end(JSON.stringify({ error: 'not_found' }));
+    return;
+  }
+  response.writeHead(200, { 'content-type': 'application/json' });
+  response.end(JSON.stringify({
+    ok: mode === 'existing_hub' && source === 'socket' && socketExists,
+    mode,
+    source,
+    port,
+    socketExists,
+  }));
+}).listen(port, '127.0.0.1');
+"#,
+    )
+    .expect("write health-only botster-web bridge script");
+    let manifest = serde_json::json!({
+        "name": "botster-web",
+        "version": "1.0.0",
+        "kind": "plugin",
+        "botster": ">=0.1.0",
+        "source": { "type": "path", "path": "." },
+        "capabilities": [{ "surface": "surfaces" }],
+        "entrypoints": [
+            { "runtime": "lua", "path": "plugin.lua", "bootstrap": false }
+        ],
+        "runnable_entrypoints": [{
+            "id": "web-client",
+            "kind": "web",
+            "command": "node",
+            "args": ["scripts/real-hub-dogfood-bridge.mjs"],
+            "working_directory": { "policy": "package_root" },
+            "environment": [
+                { "name": "BOTSTER_HUB_SOCKET", "required": false },
+                { "name": "BOTSTER_HUB_DATA_DIR", "required": false },
+                { "name": "BOTSTER_WEB_DOGFOOD_BRIDGE_PORT", "required": false, "default": "41739" }
+            ],
+            "mode": "dev",
+            "capabilities": [{ "surface": "network", "scope": "localhost" }],
+            "may_supervise": true
+        }]
+    });
+    fs::write(
+        root.join("botster-package.json"),
+        serde_json::to_string_pretty(&manifest)
+            .expect("serialize health-only botster-web manifest"),
+    )
+    .expect("write health-only botster-web manifest");
 }
 
 fn write_failing_botster_web_package(root: &Path) {
@@ -410,19 +484,46 @@ fn wait_for_process_exit(pid: u32) {
 }
 
 fn read_json_health(url: &str) -> serde_json::Value {
+    let (_, body) = read_http_path(url, "/health");
+    serde_json::from_str(body.trim()).expect("health JSON")
+}
+
+fn read_web_html(url: &str) -> String {
+    let bridge_url = url
+        .strip_suffix("/?dogfood=real-hub")
+        .expect("web URL path");
+    let (headers, body) = read_http_path(bridge_url, "/?dogfood=real-hub");
+    assert!(
+        headers.starts_with("HTTP/1.1 200") || headers.starts_with("HTTP/1.0 200"),
+        "web URL returned non-200: {headers}"
+    );
+    assert!(
+        headers
+            .to_ascii_lowercase()
+            .contains("content-type: text/html"),
+        "web URL did not return HTML: {headers}"
+    );
+    assert!(body.contains("<!doctype html>") || body.contains("<html"));
+    assert!(!body.contains(r#""error":"not_found""#));
+    assert_ne!(body.trim(), "not found");
+    body
+}
+
+fn read_http_path(url: &str, path: &str) -> (String, String) {
     let port = url
         .strip_prefix("http://127.0.0.1:")
-        .expect("local health URL")
+        .expect("local HTTP URL")
         .parse::<u16>()
-        .expect("health port");
-    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect health endpoint");
+        .expect("HTTP port");
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect HTTP endpoint");
+    let request = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
     stream
-        .write_all(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
-        .expect("write health request");
+        .write_all(request.as_bytes())
+        .expect("write HTTP request");
     let mut response = String::new();
     stream
         .read_to_string(&mut response)
-        .expect("read health response");
+        .expect("read HTTP response");
     let (headers, body) = response.split_once("\r\n\r\n").expect("HTTP response body");
     let body = if headers
         .to_ascii_lowercase()
@@ -432,7 +533,7 @@ fn read_json_health(url: &str) -> serde_json::Value {
     } else {
         body.to_string()
     };
-    serde_json::from_str(body.trim()).expect("health JSON")
+    (headers.to_string(), body)
 }
 
 fn unused_loopback_port() -> u16 {
@@ -708,7 +809,7 @@ fn collect_dogfood_ready_output(child: &mut Child, rx: &mpsc::Receiver<String>) 
         rx,
         "bridge=http://127.0.0.1:",
     ));
-    lines.extend(wait_for_dogfood_output(child, rx, "web=unavailable"));
+    lines.extend(wait_for_dogfood_output(child, rx, "web=http://127.0.0.1:"));
     lines.extend(wait_for_dogfood_output(child, rx, "shutdown="));
     lines
 }
@@ -724,6 +825,10 @@ fn dogfood_bridge_port(lines: &[String]) -> u16 {
     dogfood_output_value(lines, "bridge=http://127.0.0.1:")
         .parse()
         .expect("dogfood bridge port is numeric")
+}
+
+fn dogfood_web_url(lines: &[String]) -> String {
+    dogfood_output_value(lines, "web=")
 }
 
 fn dogfood_data_dir(lines: &[String]) -> PathBuf {
@@ -790,15 +895,16 @@ fn cli_dogfood_launcher_starts_botster_web_in_existing_hub_mode_and_shuts_down()
     let mut lines = collect_dogfood_ready_output(&mut child, &rx);
     lines.sort();
     let text = lines.join("\n");
+    let web_url = dogfood_web_url(&lines);
 
     assert!(text.contains("dogfood=ready"));
     assert!(text.contains("package name=project-pipelines state=enabled"));
     assert!(text.contains("package name=botster-web state=enabled"));
     assert!(text.contains(&format!("bridge=http://127.0.0.1:{web_bridge_port}")));
-    assert!(
-        text.contains("web=unavailable reason=botster-web-ui-server-not-supervised-by-dogfood")
+    assert_eq!(
+        web_url,
+        format!("http://127.0.0.1:{web_bridge_port}/?dogfood=real-hub")
     );
-    assert!(!text.contains(&format!("web=http://127.0.0.1:{web_bridge_port}")));
     assert!(text.contains("tui=botster-hub tui --data-dir"));
     assert!(text.contains("mcp=botster-hub mcp-serve --data-dir"));
     assert!(text.contains("status=botster-hub status --data-dir"));
@@ -820,6 +926,8 @@ fn cli_dogfood_launcher_starts_botster_web_in_existing_hub_mode_and_shuts_down()
     assert_eq!(health["source"], "socket");
     assert_eq!(health["socketExists"], true);
     assert_eq!(health["mixedOwnership"], false);
+    let html = read_web_html(&web_url);
+    assert!(html.contains("botster-web packaged UI"));
 
     let status = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
         .arg("status")
@@ -906,18 +1014,25 @@ fn cli_dogfood_launcher_uses_generated_data_dir_and_dynamic_bridge_port() {
     let text = lines.join("\n");
     let data_dir = dogfood_data_dir(&lines);
     let web_bridge_port = dogfood_bridge_port(&lines);
+    let web_url = dogfood_web_url(&lines);
 
     assert!(text.contains("dogfood=ready"));
     assert!(text.contains("data_dir=isolated:"));
     assert!(data_dir.is_absolute());
     assert!(data_dir.starts_with(Path::new("/tmp").join("botster-hub-dogfood")));
     assert_ne!(web_bridge_port, 0);
+    assert_eq!(
+        web_url,
+        format!("http://127.0.0.1:{web_bridge_port}/?dogfood=real-hub")
+    );
 
     let health = read_json_health(&format!("http://127.0.0.1:{web_bridge_port}"));
     assert_eq!(health["ok"], true);
     assert_eq!(health["mode"], "existing_hub");
     assert_eq!(health["source"], "socket");
     assert_eq!(health["port"], web_bridge_port);
+    let html = read_web_html(&web_url);
+    assert!(html.contains("botster-web packaged UI"));
 
     shutdown_cli_daemon(&data_dir, child);
 }
@@ -936,6 +1051,10 @@ fn cli_dogfood_launcher_reruns_against_existing_explicit_data_dir() {
         spawn_dogfood_launcher(Some(&data_dir), &web_package_dir, Some(first_port));
     let first_lines = collect_dogfood_ready_output(&mut first_child, &first_rx);
     assert_eq!(dogfood_bridge_port(&first_lines), first_port);
+    assert_eq!(
+        dogfood_web_url(&first_lines),
+        format!("http://127.0.0.1:{first_port}/?dogfood=real-hub")
+    );
     shutdown_cli_daemon(&data_dir, first_child);
 
     let second_port = unused_loopback_port();
@@ -945,11 +1064,17 @@ fn cli_dogfood_launcher_reruns_against_existing_explicit_data_dir() {
     let second_text = second_lines.join("\n");
 
     assert_eq!(dogfood_bridge_port(&second_lines), second_port);
+    assert_eq!(
+        dogfood_web_url(&second_lines),
+        format!("http://127.0.0.1:{second_port}/?dogfood=real-hub")
+    );
     assert!(second_text.contains("package name=project-pipelines state=enabled"));
     assert!(second_text.contains("package name=botster-web state=enabled"));
     let health = read_json_health(&format!("http://127.0.0.1:{second_port}"));
     assert_eq!(health["ok"], true);
     assert_eq!(health["source"], "socket");
+    let html = read_web_html(&dogfood_web_url(&second_lines));
+    assert!(html.contains("botster-web packaged UI"));
 
     shutdown_cli_daemon(&data_dir, second_child);
 }
@@ -990,6 +1115,50 @@ fn cli_dogfood_launcher_reports_failed_web_entrypoint_diagnostics() {
         !text.contains("verify botster-web existing-hub health"),
         "{text}"
     );
+    assert!(
+        !text.contains(
+            std::env::current_dir()
+                .expect("current dir")
+                .to_string_lossy()
+                .as_ref()
+        )
+    );
+    assert!(!text.contains(web_package_dir.to_string_lossy().as_ref()));
+}
+
+#[test]
+fn cli_dogfood_launcher_rejects_health_only_web_entrypoint() {
+    let _guard = daemon_test_lock()
+        .lock()
+        .expect("serialize real daemon test");
+    let data_dir = unique_test_dir("dogfood-web-health-only");
+    let web_package_dir = unique_test_dir("dogfood-web-health-only-package");
+    write_health_only_botster_web_package(&web_package_dir);
+    let web_bridge_port = unused_loopback_port();
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_botster-hub"));
+    command
+        .arg("dogfood")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("--web-package-path")
+        .arg(&web_package_dir)
+        .arg("--web-bridge-port")
+        .arg(web_bridge_port.to_string());
+    let output = run_command_with_timeout(command, Duration::from_secs(30));
+
+    assert!(!output.status.success());
+    let text = command_output_text(&output);
+    assert!(text.contains("verify botster-web packaged UI"), "{text}");
+    assert!(
+        text.contains("botster-web UI returned non-200 status"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("verify botster-web existing-hub health"),
+        "{text}"
+    );
+    assert!(!text.contains("dogfood=ready"), "{text}");
     assert!(
         !text.contains(
             std::env::current_dir()
