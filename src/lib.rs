@@ -83,9 +83,10 @@ pub use mcp::{
 };
 pub use packages::{
     LOCAL_PACKAGE_MANIFEST_FILE, PackageAction, PackageAdmissionPolicy, PackageAdmissionReason,
-    PackageClassification, PackageDecision, PackagePin, PackageProvenance, PackageRecord,
-    PackageRegistry, PackageRegistryError, PackageRegistryResult, PackageRegistrySnapshot,
-    PackageRegistrySnapshotError, PackageState, PackageUpdatePolicy, PreparedLocalPackage,
+    PackageClassification, PackageCompatibility, PackageCompatibilityResult, PackageDecision,
+    PackagePin, PackageProvenance, PackageRecord, PackageRegistry, PackageRegistryError,
+    PackageRegistryResult, PackageRegistrySnapshot, PackageRegistrySnapshotError, PackageState,
+    PackageTrust, PackageTrustClassification, PackageUpdatePolicy, PreparedLocalPackage,
     default_package_policy,
 };
 pub use persistence::{

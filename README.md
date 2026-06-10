@@ -481,12 +481,14 @@ API; they are not implemented by the smoke command.
 ## Package registry policy
 
 `default_package_policy()` is the production-facing hub-owned package policy
-surface. It builds a `PackageAdmissionPolicy` from `host_profile()` default capability
-grants, then stores in-memory package records around
+surface. It builds a `PackageAdmissionPolicy` from `host_profile()` default
+capability grants, then stores in-memory package records around
 `botster_core::PackageManifest` values through `PackageRegistry`. The registry
 keeps enabled/disabled state, records provenance/checksum and pin/update
-metadata placeholders, classifies providers from `botster_core::ExtensionKind`,
-and validates enable decisions against the profile-derived hub grant set.
+metadata, classifies providers from `botster_core::ExtensionKind`, persists a
+hub-owned trust marker, records admitted capabilities after enablement, records
+the narrow Botster compatibility result/diagnostics, and validates enable
+decisions against the profile-derived hub grant set.
 
 The registry deliberately uses core package contracts instead of defining a hub
 manifest or capability vocabulary. Provider packages must carry host-profile
@@ -499,9 +501,54 @@ Local dogfood installs accept either an explicit JSON manifest path or a package
 directory containing `botster-package.json`. The file is parsed as
 `botster_core::PackageManifest`; the hub rewrites the manifest source to
 `PackageSource::Path` with the canonical package root, records
-`local:<canonical-package-root>` provenance, and rejects absolute, traversing,
-or symlink-escaped entrypoints before registry mutation. Enabled local records
-can be prepared into canonical entrypoint paths for the core lifecycle adapter.
+`local:<canonical-package-root>` provenance, marks the record as
+`local_development` trust, and rejects absolute, traversing, or symlink-escaped
+entrypoints before registry mutation. Enabled local records can be prepared into
+canonical entrypoint paths for the core lifecycle adapter.
+
+Local path manifest example:
+
+```json
+{
+  "name": "dogfood.synthetic-plugin",
+  "version": "1.0.0",
+  "kind": "plugin",
+  "botster": ">=0.1.0",
+  "source": { "type": "path", "path": "." },
+  "capabilities": [
+    { "surface": "mcp" },
+    { "surface": "timers", "scope": "callbacks" }
+  ],
+  "entrypoints": [
+    { "runtime": "lua", "path": "plugin.lua", "bootstrap": false }
+  ]
+}
+```
+
+Git-source manifests use the same core shape. The registry can persist the Git
+URL/reference, provenance, pin revision/checksum, compatibility result, trust
+classification, and enabled/admitted-capability state, but this ticket does not
+clone, fetch, update, or resolve network Git sources:
+
+```json
+{
+  "name": "example.workflow-plugin",
+  "version": "1.0.0",
+  "kind": "plugin",
+  "botster": ">=0.1.0",
+  "source": {
+    "type": "git",
+    "repo": "https://example.invalid/botster/workflow-plugin.git",
+    "reference": "v1.0.0"
+  },
+  "capabilities": [
+    { "surface": "surfaces" }
+  ],
+  "entrypoints": [
+    { "runtime": "lua", "path": "plugin.lua", "bootstrap": false }
+  ]
+}
+```
 
 Accepted and denied package decisions carry package name, action,
 classification when known, prior or resulting state when known, typed policy
@@ -515,9 +562,27 @@ invokes, reloads, and unloads enabled in-memory package records through
 `botster-core` plugin worker mechanics, with host-supplied deterministic runtime
 bundles. Package records persist through the canonical `HubState.package_registry`
 snapshot inside `hub-state.json`; there is no separate package-state file for the
-registry. Marketplace browsing, git cloning/fetching, network download, lockfile
-formats, binary/CLI package-install commands, and concrete plugin/provider
-runtime implementations remain excluded.
+registry. The snapshot is the local lock state: installed source, provenance,
+pin revision/checksum, update policy, trust classification, enabled state,
+admitted capabilities, compatibility result/diagnostics, optional install/update
+timestamps, and the latest audit reason.
+
+Compatibility remains deliberately narrow in this slice. The manifest `botster`
+field accepts only exact `MAJOR.MINOR.PATCH` or lower-bound
+`>=MAJOR.MINOR.PATCH` requirements for the current hub binary. Broader semver
+ranges, separate hub/core/client protocol windows, compatibility channels,
+hosted registry indexes, signing, dependency solving, auto-update daemons,
+publishing portals, network Git clone/fetch/update behavior, and binary/CLI
+package-install commands remain excluded.
+
+Compatibility and enabled capability admission fail closed. An incompatible or
+invalid `botster` requirement is rejected at install; if a persisted package no
+longer satisfies the current hub version or grant/surface policy during
+`PackageRegistry::from_snapshot`, the registry load returns a typed error rather
+than silently quarantining that single record. The persisted
+`PackageCompatibility` value on accepted records is therefore the last accepted
+compatible result; incompatible and invalid results are operator diagnostics on
+the rejected install/reload path until package quarantine behavior exists.
 
 This repo is intentionally greenfield. The existing `trybotster` monolith is
 evidence only, not source to copy.
