@@ -800,14 +800,31 @@ fn print_packages(packages: &[DaemonPackage], providers_only: bool) {
     println!("package_count={}", packages.len());
     for package in packages {
         println!(
-            "package name={} version={} classification={} state={} capabilities={} provider_profile_admitted={}",
+            "package name={} version={} classification={} state={} capabilities={} runnable_entrypoints={} provider_profile_admitted={}",
             package.package_name,
             package.version,
             package.classification,
             package.state,
             package.requested_capabilities.len(),
+            package.runnable_entrypoints.len(),
             package.provider_profile_admitted
         );
+        for entrypoint in &package.runnable_entrypoints {
+            println!(
+                "package_entrypoint package={} id={} kind={} mode={} command={} args={} working_directory={} environment={} capabilities={} may_supervise={} process_state={}",
+                package.package_name,
+                entrypoint.id,
+                entrypoint.kind,
+                entrypoint.mode,
+                entrypoint.command,
+                entrypoint.args.len(),
+                entrypoint.working_directory.policy,
+                entrypoint.environment.len(),
+                entrypoint.capabilities.len(),
+                entrypoint.may_supervise,
+                entrypoint.process.state
+            );
+        }
     }
 }
 

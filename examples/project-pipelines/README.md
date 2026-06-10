@@ -45,5 +45,7 @@ the printed TUI command. Focus the Project Pipelines create-ticket fields, submi
 once with a blank title to see field/form validation, then submit with a
 nonblank title to create a local ticket. The TUI renders the plugin-authored
 UiNode tree and dispatches the semantic action through the daemon; it does not
-build a Project Pipelines form in Rust. This repo has no local web command today;
-use the printed TUI or MCP entrypoints for local dogfood.
+build a Project Pipelines form in Rust. The package manifest includes a
+`runnable_entrypoints` web-client declaration shaped for a future local
+`botster-web` dev server, but this milestone still treats it as a static
+contract; use the printed TUI or MCP entrypoints for local dogfood.

@@ -719,6 +719,8 @@ pub struct DaemonPackage {
     pub classification: String,
     pub state: String,
     pub requested_capabilities: Vec<DaemonCapability>,
+    #[serde(default)]
+    pub runnable_entrypoints: Vec<DaemonPackageRunnableEntrypoint>,
     pub provider_profile_admitted: bool,
 }
 
@@ -726,6 +728,50 @@ pub struct DaemonPackage {
 pub struct DaemonCapability {
     pub surface: String,
     pub scope: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonPackageRunnableEntrypoint {
+    pub id: String,
+    pub kind: String,
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    pub working_directory: DaemonPackageWorkingDirectory,
+    #[serde(default)]
+    pub environment: Vec<DaemonPackageEnvironmentRequirement>,
+    pub mode: String,
+    #[serde(default)]
+    pub capabilities: Vec<DaemonCapability>,
+    pub may_supervise: bool,
+    pub process: DaemonPackageProcess,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonPackageWorkingDirectory {
+    pub policy: String,
+    pub path: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonPackageEnvironmentRequirement {
+    pub name: String,
+    pub required: bool,
+    pub default: Option<String>,
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonPackageProcess {
+    pub state: String,
+    #[serde(default)]
+    pub diagnostics: Vec<DaemonPackageDiagnostic>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonPackageDiagnostic {
+    pub kind: String,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1006,9 +1052,11 @@ mod tests {
             .expect_err("newer client requirement should fail against current hub");
 
         assert!(error.diagnostic.contains("version-test-client"));
-        assert!(error
-            .diagnostic
-            .contains("unsupported protocol version 1; requires at least 2"));
+        assert!(
+            error
+                .diagnostic
+                .contains("unsupported protocol version 1; requires at least 2")
+        );
     }
 
     #[test]
@@ -1023,9 +1071,11 @@ mod tests {
             .expect_err("future feature should fail against current hub");
 
         assert!(error.diagnostic.contains("feature-test-client"));
-        assert!(error
-            .diagnostic
-            .contains("missing required feature(s): future_feature"));
+        assert!(
+            error
+                .diagnostic
+                .contains("missing required feature(s): future_feature")
+        );
         assert_eq!(
             error.diagnostics,
             vec![DaemonDiagnostic::unsupported_feature("future_feature")]
@@ -1070,6 +1120,56 @@ mod tests {
 
         assert!(response.diagnostics.is_empty());
         assert!(response.status.expect("status body").diagnostics.is_empty());
+    }
+
+    #[test]
+    fn daemon_package_runnable_entrypoints_are_serde_stable() {
+        let legacy = serde_json::json!({
+            "package_name": "legacy.plugin",
+            "version": "1.0.0",
+            "classification": "plugin",
+            "state": "enabled",
+            "requested_capabilities": [],
+            "provider_profile_admitted": false
+        });
+        let package: DaemonPackage =
+            serde_json::from_value(legacy).expect("legacy package should deserialize");
+        assert!(package.runnable_entrypoints.is_empty());
+
+        let current = serde_json::json!({
+            "package_name": "workflow.plugin",
+            "version": "1.0.0",
+            "classification": "plugin",
+            "state": "enabled",
+            "requested_capabilities": [],
+            "runnable_entrypoints": [{
+                "id": "web",
+                "kind": "web",
+                "command": "bin/botster-web",
+                "args": ["--host", "127.0.0.1"],
+                "working_directory": { "policy": "package_root", "path": null },
+                "environment": [{
+                    "name": "BOTSTER_WEB_PORT",
+                    "required": false,
+                    "default": "5173",
+                    "description": "Local web client port"
+                }],
+                "mode": "dev",
+                "capabilities": [{ "surface": "Network", "scope": "localhost" }],
+                "may_supervise": true,
+                "process": { "state": "not_started", "diagnostics": [] }
+            }],
+            "provider_profile_admitted": false
+        });
+        let package: DaemonPackage =
+            serde_json::from_value(current).expect("current package should deserialize");
+        let entrypoint = &package.runnable_entrypoints[0];
+
+        assert_eq!(entrypoint.id, "web");
+        assert_eq!(entrypoint.args, ["--host", "127.0.0.1"]);
+        assert_eq!(entrypoint.environment[0].default.as_deref(), Some("5173"));
+        assert!(entrypoint.may_supervise);
+        assert_eq!(entrypoint.process.state, "not_started");
     }
 
     #[test]
