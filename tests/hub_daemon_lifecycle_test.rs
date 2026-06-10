@@ -2078,6 +2078,109 @@ fn scripted_tui_surfaces_session_lost_when_restart_does_not_recover_attached_ses
 }
 
 #[test]
+fn scripted_tui_does_not_attach_exited_dogfood_smoke_session() {
+    let _guard = daemon_test_lock()
+        .lock()
+        .expect("serialize real daemon test");
+    let data_dir = unique_test_dir("tui-exited-dogfood-smoke");
+    let config = explicit_config(&data_dir);
+    let child = start_cli_daemon(&data_dir);
+
+    let spawn = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::Spawn {
+            session_id: "dogfood-worker-smoke".to_string(),
+            command: "printf 'dogfood-worker-ok\\n'; sleep 1".to_string(),
+        },
+    )
+    .expect("spawn exited dogfood smoke fixture");
+    assert_eq!(spawn.kind, botster_hub::DaemonResponseKind::Spawned);
+
+    let shutdown = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::ShutdownSession {
+            session_id: "dogfood-worker-smoke".to_string(),
+        },
+    )
+    .expect("shut down dogfood smoke fixture");
+    assert_eq!(shutdown.kind, botster_hub::DaemonResponseKind::Events);
+
+    let mut driver = botster_hub::ScriptedTuiDriver::connect(config.clone())
+        .expect("connect scripted TUI driver after dogfood smoke exit");
+    driver
+        .select_session("dogfood-worker-smoke")
+        .expect("exited smoke session should remain visible in TUI session list");
+
+    let attach = driver.attach_selected();
+    assert!(
+        attach
+            .as_ref()
+            .is_err_and(|error| error.to_string().contains("exited - cannot attach")),
+        "exited smoke attach should fail with actionable diagnostic, got {attach:?}"
+    );
+    assert!(
+        driver.active_session_id().is_none(),
+        "exited smoke attach must not set active session"
+    );
+    assert!(
+        driver.subscription_id().is_none(),
+        "exited smoke attach must not create subscription"
+    );
+
+    let second_attach = driver.attach_selected();
+    assert!(
+        second_attach
+            .as_ref()
+            .is_err_and(|error| error.to_string().contains("exited - cannot attach")),
+        "repeated exited smoke attach should keep returning actionable diagnostic, got {second_attach:?}"
+    );
+    let errors = driver.errors();
+    let exited_rows = errors
+        .iter()
+        .filter(|error| error.contains("dogfood-worker-smoke exited - cannot attach"))
+        .count();
+    assert_eq!(
+        exited_rows, 1,
+        "repeated exited attach attempts should not duplicate diagnostics, got {errors:?}"
+    );
+    assert!(
+        !errors
+            .iter()
+            .any(|error| error.contains("attached session disappeared")),
+        "guarded exited attach should not reach UnknownSession recovery path, got {errors:?}"
+    );
+
+    let replacement = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::Spawn {
+            session_id: "dogfood-running-replacement".to_string(),
+            command:
+                "printf 'replacement-ready\\n'; while IFS= read -r line; do printf 'replacement:%s\\n' \"$line\"; done"
+                    .to_string(),
+        },
+    )
+    .expect("spawn running replacement after exited smoke attach guard");
+    assert_eq!(
+        replacement.kind,
+        botster_hub::DaemonResponseKind::Spawned,
+        "replacement spawn failed with {:?}",
+        replacement.error
+    );
+    driver
+        .select_session("dogfood-running-replacement")
+        .expect("select running replacement after exited smoke guard");
+    driver
+        .attach_selected()
+        .expect("running replacement should remain attachable");
+    driver.send_input("after-exited-guard\n");
+    driver
+        .drain_until("replacement:after-exited-guard", Duration::from_secs(5))
+        .expect("TUI should remain usable after exited smoke guard");
+
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
 fn scripted_tui_detaches_and_refreshes_when_drain_reports_unknown_session() {
     let _guard = daemon_test_lock()
         .lock()
