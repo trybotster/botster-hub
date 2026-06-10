@@ -112,6 +112,22 @@ impl PackageRegistry {
         provenance: PackageProvenance,
         audit_reason: impl Into<String>,
     ) -> PackageRegistryResult<&PackageRecord> {
+        self.install_with_trust(
+            manifest,
+            provenance,
+            PackageTrust::third_party(),
+            audit_reason,
+        )
+    }
+
+    /// Install a package manifest with an explicit hub-owned trust marker.
+    pub fn install_with_trust(
+        &mut self,
+        manifest: PackageManifest,
+        provenance: PackageProvenance,
+        trust: PackageTrust,
+        audit_reason: impl Into<String>,
+    ) -> PackageRegistryResult<&PackageRecord> {
         let audit_reason = audit_reason.into();
         let package_name = manifest.name.clone();
 
@@ -142,14 +158,29 @@ impl PackageRegistry {
             ));
         }
 
+        let compatibility = PackageCompatibility::for_manifest(&manifest);
+        if !compatibility.is_compatible() {
+            return Err(PackageRegistryError::without_record(
+                package_name,
+                PackageAction::Install,
+                PackageAdmissionReason::BotsterCompatibility(compatibility.diagnostics.clone()),
+                audit_reason,
+            ));
+        }
+
         let classification = PackageClassification::from_kind(&manifest.kind);
         let record = PackageRecord {
             manifest,
             state: PackageState::Installed,
             classification,
+            trust,
             provenance,
             pin: None,
             update_policy: PackageUpdatePolicy::Manual,
+            admitted_capabilities: Vec::new(),
+            compatibility,
+            installed_at: None,
+            updated_at: None,
             last_audit_reason: audit_reason,
             admitted_host_profile: None,
         };
@@ -179,7 +210,12 @@ impl PackageRegistry {
             checksum: None,
         };
 
-        self.install(manifest, provenance, audit_reason)
+        self.install_with_trust(
+            manifest,
+            provenance,
+            PackageTrust::local_development(),
+            audit_reason,
+        )
     }
 
     /// Enable an installed package when every requested capability is granted.
@@ -246,6 +282,7 @@ impl PackageRegistry {
             .get_mut(package_name)
             .expect("record existence checked before enable");
         record.state = PackageState::Enabled;
+        record.admitted_capabilities = record.manifest.capabilities.clone();
         record.last_audit_reason = audit_reason.clone();
         record.admitted_host_profile = admitted_host_profile.clone();
 
@@ -268,6 +305,7 @@ impl PackageRegistry {
         let audit_reason = audit_reason.into();
         let record = self.record_mut(package_name, PackageAction::Disable, audit_reason.clone())?;
         record.state = PackageState::Disabled;
+        record.admitted_capabilities.clear();
         record.last_audit_reason = audit_reason.clone();
         record.admitted_host_profile = None;
 
@@ -333,10 +371,24 @@ impl PackageRegistry {
         snapshot: PackageRegistrySnapshot,
     ) -> Result<Self, PackageRegistrySnapshotError> {
         let mut records = BTreeMap::new();
+        let granted_capabilities: CapabilitySet =
+            snapshot.granted_capabilities.iter().cloned().collect();
 
         for mut record in snapshot.records {
             let package_name = record.manifest.name.clone();
+            record.compatibility = PackageCompatibility::for_manifest(&record.manifest);
+            if !record.compatibility.is_compatible() {
+                return Err(PackageRegistrySnapshotError::BotsterCompatibility {
+                    package_name,
+                    diagnostics: record.compatibility.diagnostics.clone(),
+                });
+            }
             record.admitted_host_profile = Self::admitted_host_profile_from_snapshot(&record)?;
+            record.admitted_capabilities = Self::admitted_capabilities_from_snapshot(
+                &record,
+                &granted_capabilities,
+                &snapshot.governed_surfaces,
+            )?;
             if records.insert(package_name.clone(), record).is_some() {
                 return Err(PackageRegistrySnapshotError::DuplicatePackage(package_name));
             }
@@ -408,6 +460,44 @@ impl PackageRegistry {
         })
     }
 
+    fn admitted_capabilities_from_snapshot(
+        record: &PackageRecord,
+        granted_capabilities: &CapabilitySet,
+        governed_surfaces: &[CapabilitySurface],
+    ) -> Result<Vec<Capability>, PackageRegistrySnapshotError> {
+        if !record.is_enabled() {
+            return Ok(Vec::new());
+        }
+
+        if let Some(capability) = record
+            .manifest
+            .capabilities
+            .iter()
+            .find(|capability| !governed_surfaces.contains(&capability.surface))
+        {
+            return Err(PackageRegistrySnapshotError::CapabilityAdmission {
+                package_name: record.manifest.name.clone(),
+                reason: PackageAdmissionReason::UngovernedCapabilitySurface(
+                    capability.surface.clone(),
+                ),
+            });
+        }
+
+        if let Some(capability) = record
+            .manifest
+            .capabilities
+            .iter()
+            .find(|capability| !granted_capabilities.contains(capability))
+        {
+            return Err(PackageRegistrySnapshotError::CapabilityAdmission {
+                package_name: record.manifest.name.clone(),
+                reason: PackageAdmissionReason::UngrantedCapability(capability.clone()),
+            });
+        }
+
+        Ok(record.manifest.capabilities.clone())
+    }
+
     /// Return the hub-owned grants used for package admission.
     #[must_use]
     pub const fn granted_capabilities(&self) -> &CapabilitySet {
@@ -456,12 +546,27 @@ pub struct PackageRecord {
     pub state: PackageState,
     /// Hub classification derived from the core extension kind.
     pub classification: PackageClassification,
+    /// Hub-owned trust marker for first-party/local/third-party package policy.
+    #[serde(default)]
+    pub trust: PackageTrust,
     /// Hub-owned provenance placeholder.
     pub provenance: PackageProvenance,
     /// Optional hub-owned pin metadata.
     pub pin: Option<PackagePin>,
     /// Hub-owned update policy placeholder.
     pub update_policy: PackageUpdatePolicy,
+    /// Capabilities admitted by the hub grant set for the current enabled record.
+    #[serde(default)]
+    pub admitted_capabilities: Vec<Capability>,
+    /// Narrow Botster compatibility result derived from the core manifest.
+    #[serde(default)]
+    pub compatibility: PackageCompatibility,
+    /// Optional install timestamp supplied by future installer paths.
+    #[serde(default)]
+    pub installed_at: Option<String>,
+    /// Optional latest update timestamp supplied by future installer paths.
+    #[serde(default)]
+    pub updated_at: Option<String>,
     /// Operator/audit reason for the latest registry mutation.
     pub last_audit_reason: String,
     /// Runtime admission metadata re-derived from persisted manifests on reload.
@@ -478,6 +583,132 @@ impl PackageRecord {
     pub const fn is_enabled(&self) -> bool {
         matches!(self.state, PackageState::Enabled)
     }
+}
+
+/// Hub-owned package trust marker.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PackageTrust {
+    /// Coarse trust classification used by hub package policy.
+    pub classification: PackageTrustClassification,
+    /// Explicit first-party marker for trusted Botster-owned packages.
+    pub first_party: bool,
+}
+
+impl PackageTrust {
+    /// First-party package owned by the hub/profile operator.
+    #[must_use]
+    pub const fn first_party() -> Self {
+        Self {
+            classification: PackageTrustClassification::FirstParty,
+            first_party: true,
+        }
+    }
+
+    /// Local development package whose authority comes from local operator action.
+    #[must_use]
+    pub const fn local_development() -> Self {
+        Self {
+            classification: PackageTrustClassification::LocalDevelopment,
+            first_party: false,
+        }
+    }
+
+    /// Third-party package until an installer/operator marks it otherwise.
+    #[must_use]
+    pub const fn third_party() -> Self {
+        Self {
+            classification: PackageTrustClassification::ThirdParty,
+            first_party: false,
+        }
+    }
+}
+
+impl Default for PackageTrust {
+    fn default() -> Self {
+        Self::third_party()
+    }
+}
+
+/// Durable package trust classes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PackageTrustClassification {
+    /// Botster-owned or operator-designated first-party package.
+    FirstParty,
+    /// Local development package installed from an explicit path.
+    LocalDevelopment,
+    /// Package without first-party trust.
+    ThirdParty,
+}
+
+/// Persisted narrow compatibility result for the current hub binary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PackageCompatibility {
+    /// Manifest field evaluated by hub policy.
+    pub botster_requirement: String,
+    /// Hub version used for the evaluation.
+    pub hub_version: String,
+    /// Result of the narrow compatibility check.
+    pub result: PackageCompatibilityResult,
+    /// Operator-facing diagnostics without local paths or secrets.
+    pub diagnostics: Vec<String>,
+}
+
+impl PackageCompatibility {
+    fn for_manifest(manifest: &PackageManifest) -> Self {
+        Self::evaluate(&manifest.botster, env!("CARGO_PKG_VERSION"))
+    }
+
+    fn evaluate(requirement: &str, hub_version: &str) -> Self {
+        let mut diagnostics = Vec::new();
+        let result = match compatibility_requirement_satisfied(requirement, hub_version) {
+            Ok(true) => {
+                diagnostics.push(format!(
+                    "botster requirement {requirement} is satisfied by hub {hub_version}"
+                ));
+                PackageCompatibilityResult::Compatible
+            }
+            Ok(false) => {
+                diagnostics.push(format!(
+                    "botster requirement {requirement} is not satisfied by hub {hub_version}"
+                ));
+                PackageCompatibilityResult::Incompatible
+            }
+            Err(message) => {
+                diagnostics.push(message);
+                PackageCompatibilityResult::InvalidRequirement
+            }
+        };
+
+        Self {
+            botster_requirement: requirement.to_string(),
+            hub_version: hub_version.to_string(),
+            result,
+            diagnostics,
+        }
+    }
+
+    fn is_compatible(&self) -> bool {
+        matches!(self.result, PackageCompatibilityResult::Compatible)
+    }
+}
+
+impl Default for PackageCompatibility {
+    fn default() -> Self {
+        Self::evaluate(">=0.0.0", env!("CARGO_PKG_VERSION"))
+    }
+}
+
+/// Narrow persisted compatibility outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PackageCompatibilityResult {
+    /// Current hub version satisfies the manifest requirement.
+    Compatible,
+    /// Current hub version does not satisfy the manifest requirement.
+    Incompatible,
+    /// Manifest requirement syntax is outside the supported narrow contract.
+    InvalidRequirement,
 }
 
 /// Hub-owned package state.
@@ -596,6 +827,20 @@ impl PackageRegistrySnapshot {
 pub enum PackageRegistrySnapshotError {
     /// More than one persisted record used the same package manifest name.
     DuplicatePackage(String),
+    /// Persisted package compatibility no longer admits under the current hub.
+    BotsterCompatibility {
+        /// Package whose persisted compatibility state could not be re-derived.
+        package_name: String,
+        /// Compatibility diagnostics.
+        diagnostics: Vec<String>,
+    },
+    /// Persisted enabled package capabilities no longer admit under current grants.
+    CapabilityAdmission {
+        /// Package whose capabilities no longer admit.
+        package_name: String,
+        /// Typed admission reason.
+        reason: PackageAdmissionReason,
+    },
     /// Persisted enabled provider/plugin host-profile state no longer admits cleanly.
     HostProfileAdmission {
         /// Package whose persisted admission state could not be re-derived.
@@ -690,6 +935,45 @@ pub enum PackageAdmissionReason {
     ProviderMissingHostProfile,
     /// Core host-profile admission rejected the provider package.
     HostProfileAdmission(HostProfileAdmissionError),
+    /// Manifest Botster compatibility requirement is unsupported or unsatisfied.
+    BotsterCompatibility(Vec<String>),
+}
+
+fn compatibility_requirement_satisfied(
+    requirement: &str,
+    hub_version: &str,
+) -> Result<bool, String> {
+    if requirement.is_empty() {
+        return Err("botster requirement is empty".to_string());
+    }
+
+    let (operator, required_version) = requirement
+        .strip_prefix(">=")
+        .map_or(("=", requirement), |version| (">=", version));
+    let required = parse_point_version(required_version).ok_or_else(|| {
+        format!(
+            "botster requirement {requirement} must be MAJOR.MINOR.PATCH or >=MAJOR.MINOR.PATCH"
+        )
+    })?;
+    let current = parse_point_version(hub_version)
+        .ok_or_else(|| format!("hub version {hub_version} is not MAJOR.MINOR.PATCH"))?;
+
+    Ok(match operator {
+        ">=" => current >= required,
+        "=" => current == required,
+        _ => unreachable!("compatibility operator is derived above"),
+    })
+}
+
+fn parse_point_version(version: &str) -> Option<(u64, u64, u64)> {
+    let mut parts = version.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((major, minor, patch))
 }
 
 fn admit_enabled_host_profile(
@@ -1060,6 +1344,25 @@ mod tests {
         manifest
     }
 
+    fn package_record(manifest: PackageManifest, state: PackageState) -> PackageRecord {
+        let classification = PackageClassification::from_kind(&manifest.kind);
+        PackageRecord {
+            compatibility: PackageCompatibility::for_manifest(&manifest),
+            manifest,
+            state,
+            classification,
+            trust: PackageTrust::third_party(),
+            provenance: provenance(),
+            pin: None,
+            update_policy: PackageUpdatePolicy::Manual,
+            admitted_capabilities: Vec::new(),
+            installed_at: None,
+            updated_at: None,
+            last_audit_reason: "test fixture".to_string(),
+            admitted_host_profile: None,
+        }
+    }
+
     #[test]
     fn install_stores_plugin_manifest_disabled() {
         let manifest = plugin_manifest(
@@ -1075,6 +1378,11 @@ mod tests {
 
         assert_eq!(record.state, PackageState::Installed);
         assert_eq!(record.classification, PackageClassification::Plugin);
+        assert_eq!(record.trust, PackageTrust::third_party());
+        assert_eq!(
+            record.compatibility.result,
+            PackageCompatibilityResult::Compatible
+        );
         assert!(!record.is_enabled());
         assert_eq!(registry.packages().len(), 1);
     }
@@ -1205,6 +1513,72 @@ mod tests {
             record.pin.as_ref().expect("pin").checksum.as_deref(),
             Some("sha256:pinned")
         );
+    }
+
+    #[test]
+    fn first_party_git_package_persists_trust_pin_and_compatibility_contract() {
+        let capability = capability(CapabilitySurface::Surfaces, None);
+        let mut registry = PackageRegistry::new(grants(vec![capability.clone()]));
+        registry
+            .install_with_trust(
+                plugin_manifest("first-party.plugin", vec![capability]),
+                PackageProvenance {
+                    source: "git:https://example.invalid/botster/first-party-plugin.git"
+                        .to_string(),
+                    checksum: Some("sha256:first-party".to_string()),
+                },
+                PackageTrust::first_party(),
+                "install first-party git package",
+            )
+            .expect("install first-party package");
+        registry
+            .pin(
+                "first-party.plugin",
+                PackagePin {
+                    revision: "8f2f4ac".to_string(),
+                    checksum: Some("sha256:first-party-pin".to_string()),
+                    update_policy: PackageUpdatePolicy::Manual,
+                },
+                "pin first-party package",
+            )
+            .expect("pin first-party package");
+        registry
+            .enable("first-party.plugin", "enable first-party package")
+            .expect("enable first-party package");
+
+        let json = serde_json::to_string_pretty(&registry.snapshot()).expect("serialize snapshot");
+        assert!(json.contains("\"first_party\": true"));
+        assert!(json.contains("\"classification\": \"first_party\""));
+        assert!(json.contains("\"revision\": \"8f2f4ac\""));
+        assert!(json.contains("\"result\": \"compatible\""));
+        assert!(!json.contains("/Users/"));
+        assert!(!json.contains("jason"));
+        assert!(!json.contains('@'));
+    }
+
+    #[test]
+    fn incompatible_botster_requirements_are_rejected_at_install() {
+        let mut registry = PackageRegistry::new(CapabilitySet::new());
+        let mut incompatible = plugin_manifest("future.plugin", Vec::new());
+        incompatible.botster = "999.0.0".to_string();
+
+        let error = registry
+            .install(incompatible, provenance(), "install incompatible package")
+            .expect_err("future exact requirement should fail");
+        assert!(matches!(
+            error.reason,
+            PackageAdmissionReason::BotsterCompatibility(_)
+        ));
+
+        let mut invalid = plugin_manifest("invalid.plugin", Vec::new());
+        invalid.botster = "^1.0".to_string();
+        let error = registry
+            .install(invalid, provenance(), "install invalid package")
+            .expect_err("unsupported semver range should fail");
+        assert!(matches!(
+            error.reason,
+            PackageAdmissionReason::BotsterCompatibility(_)
+        ));
     }
 
     #[test]
@@ -1395,6 +1769,7 @@ mod tests {
             record.provenance.source,
             format!("local:{}", root.to_string_lossy())
         );
+        assert_eq!(record.trust, PackageTrust::local_development());
     }
 
     #[test]
@@ -1701,6 +2076,7 @@ mod tests {
             .expect("restored provider");
 
         assert_eq!(record.state, PackageState::Enabled);
+        assert_eq!(record.admitted_capabilities, record.manifest.capabilities);
         assert_eq!(
             record
                 .admitted_host_profile
@@ -1713,18 +2089,84 @@ mod tests {
     }
 
     #[test]
+    fn from_snapshot_rejects_record_with_now_incompatible_botster_requirement() {
+        let mut manifest = plugin_manifest("future.plugin", Vec::new());
+        manifest.botster = "999.0.0".to_string();
+        let snapshot = PackageRegistrySnapshot {
+            granted_capabilities: Vec::new(),
+            governed_surfaces: host_profile().capability_surfaces().to_vec(),
+            records: vec![package_record(manifest, PackageState::Installed)],
+        };
+
+        let error =
+            PackageRegistry::from_snapshot(snapshot).expect_err("incompatible package should fail");
+
+        assert!(matches!(
+            error,
+            PackageRegistrySnapshotError::BotsterCompatibility {
+                package_name,
+                diagnostics
+            } if package_name == "future.plugin"
+                && diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.contains("not satisfied"))
+        ));
+    }
+
+    #[test]
+    fn from_snapshot_rejects_enabled_record_with_ungranted_capability() {
+        let requested = capability(CapabilitySurface::Network, Some("websocket"));
+        let snapshot = PackageRegistrySnapshot {
+            granted_capabilities: vec![capability(CapabilitySurface::Network, Some("http"))],
+            governed_surfaces: host_profile().capability_surfaces().to_vec(),
+            records: vec![package_record(
+                plugin_manifest("ungranted.plugin", vec![requested.clone()]),
+                PackageState::Enabled,
+            )],
+        };
+
+        let error =
+            PackageRegistry::from_snapshot(snapshot).expect_err("ungranted capability should fail");
+
+        assert_eq!(
+            error,
+            PackageRegistrySnapshotError::CapabilityAdmission {
+                package_name: "ungranted.plugin".to_string(),
+                reason: PackageAdmissionReason::UngrantedCapability(requested),
+            }
+        );
+    }
+
+    #[test]
+    fn from_snapshot_rejects_enabled_record_with_ungoverned_capability_surface() {
+        let requested = capability(CapabilitySurface::Timers, Some("callbacks"));
+        let snapshot = PackageRegistrySnapshot {
+            granted_capabilities: vec![requested.clone()],
+            governed_surfaces: vec![CapabilitySurface::Surfaces],
+            records: vec![package_record(
+                plugin_manifest("ungoverned.plugin", vec![requested]),
+                PackageState::Enabled,
+            )],
+        };
+
+        let error = PackageRegistry::from_snapshot(snapshot)
+            .expect_err("ungoverned capability surface should fail");
+
+        assert_eq!(
+            error,
+            PackageRegistrySnapshotError::CapabilityAdmission {
+                package_name: "ungoverned.plugin".to_string(),
+                reason: PackageAdmissionReason::UngovernedCapabilitySurface(
+                    CapabilitySurface::Timers
+                ),
+            }
+        );
+    }
+
+    #[test]
     fn from_snapshot_rejects_duplicate_package_records() {
         let manifest = plugin_manifest("duplicate.plugin", Vec::new());
-        let record = PackageRecord {
-            manifest,
-            state: PackageState::Installed,
-            classification: PackageClassification::Plugin,
-            provenance: provenance(),
-            pin: None,
-            update_policy: PackageUpdatePolicy::Manual,
-            last_audit_reason: "install".to_string(),
-            admitted_host_profile: None,
-        };
+        let record = package_record(manifest, PackageState::Installed);
         let snapshot = PackageRegistrySnapshot {
             granted_capabilities: Vec::new(),
             governed_surfaces: host_profile().capability_surfaces().to_vec(),
@@ -1750,16 +2192,7 @@ mod tests {
         let snapshot = PackageRegistrySnapshot {
             granted_capabilities: Vec::new(),
             governed_surfaces: host_profile().capability_surfaces().to_vec(),
-            records: vec![PackageRecord {
-                manifest,
-                state: PackageState::Enabled,
-                classification: PackageClassification::Provider,
-                provenance: provenance(),
-                pin: None,
-                update_policy: PackageUpdatePolicy::Manual,
-                last_audit_reason: "restore".to_string(),
-                admitted_host_profile: None,
-            }],
+            records: vec![package_record(manifest, PackageState::Enabled)],
         };
 
         let error = PackageRegistry::from_snapshot(snapshot).expect_err("bad provider should fail");
