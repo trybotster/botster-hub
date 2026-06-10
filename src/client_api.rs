@@ -1053,6 +1053,8 @@ pub type HubClientResult<T> = Result<T, HubClientError>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HubClientRuntimeErrorKind {
     UnknownSession,
+    SessionAlreadyExists,
+    SpawnFailed,
     Runtime,
     State,
 }
@@ -1071,6 +1073,19 @@ fn runtime_error(
         )) if error.kind == SessionRuntimeErrorKind::SessionNotFound => {
             HubClientRuntimeErrorKind::UnknownSession
         }
+        HubRuntimeError::CoreDaemon(botster_core_daemon::CoreDaemonError::Engine(
+            botster_core::DefaultBotsterEngineError::Runtime(error),
+        )) if error.kind == SessionRuntimeErrorKind::SpawnFailed => {
+            HubClientRuntimeErrorKind::SpawnFailed
+        }
+        HubRuntimeError::CoreDaemon(botster_core_daemon::CoreDaemonError::Engine(
+            botster_core::DefaultBotsterEngineError::TerminalBackendConstruction { .. },
+        )) => HubClientRuntimeErrorKind::SpawnFailed,
+        HubRuntimeError::CoreDaemon(botster_core_daemon::CoreDaemonError::Engine(
+            botster_core::DefaultBotsterEngineError::Multiplexer(
+                botster_core::MultiplexerEngineError::SessionAlreadyExists { .. },
+            ),
+        )) => HubClientRuntimeErrorKind::SessionAlreadyExists,
         HubRuntimeError::CoreDaemon(_) => HubClientRuntimeErrorKind::Runtime,
         HubRuntimeError::State(_) => HubClientRuntimeErrorKind::State,
     };
