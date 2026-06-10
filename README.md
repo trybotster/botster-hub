@@ -575,5 +575,14 @@ hosted registry indexes, signing, dependency solving, auto-update daemons,
 publishing portals, network Git clone/fetch/update behavior, and binary/CLI
 package-install commands remain excluded.
 
+Compatibility and enabled capability admission fail closed. An incompatible or
+invalid `botster` requirement is rejected at install; if a persisted package no
+longer satisfies the current hub version or grant/surface policy during
+`PackageRegistry::from_snapshot`, the registry load returns a typed error rather
+than silently quarantining that single record. The persisted
+`PackageCompatibility` value on accepted records is therefore the last accepted
+compatible result; incompatible and invalid results are operator diagnostics on
+the rejected install/reload path until package quarantine behavior exists.
+
 This repo is intentionally greenfield. The existing `trybotster` monolith is
 evidence only, not source to copy.

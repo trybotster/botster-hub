@@ -283,8 +283,6 @@ impl PackageRegistry {
             .expect("record existence checked before enable");
         record.state = PackageState::Enabled;
         record.admitted_capabilities = record.manifest.capabilities.clone();
-        record.compatibility = PackageCompatibility::for_manifest(&record.manifest);
-        record.updated_at = None;
         record.last_audit_reason = audit_reason.clone();
         record.admitted_host_profile = admitted_host_profile.clone();
 
@@ -308,7 +306,6 @@ impl PackageRegistry {
         let record = self.record_mut(package_name, PackageAction::Disable, audit_reason.clone())?;
         record.state = PackageState::Disabled;
         record.admitted_capabilities.clear();
-        record.updated_at = None;
         record.last_audit_reason = audit_reason.clone();
         record.admitted_host_profile = None;
 
@@ -342,7 +339,6 @@ impl PackageRegistry {
         let record = self.record_mut(package_name, PackageAction::Pin, audit_reason.clone())?;
         record.update_policy = pin.update_policy;
         record.pin = Some(pin);
-        record.updated_at = None;
         record.last_audit_reason = audit_reason;
 
         Ok(record)
@@ -393,7 +389,6 @@ impl PackageRegistry {
                 &granted_capabilities,
                 &snapshot.governed_surfaces,
             )?;
-            let package_name = record.manifest.name.clone();
             if records.insert(package_name.clone(), record).is_some() {
                 return Err(PackageRegistrySnapshotError::DuplicatePackage(package_name));
             }
@@ -2081,6 +2076,7 @@ mod tests {
             .expect("restored provider");
 
         assert_eq!(record.state, PackageState::Enabled);
+        assert_eq!(record.admitted_capabilities, record.manifest.capabilities);
         assert_eq!(
             record
                 .admitted_host_profile
@@ -2089,6 +2085,81 @@ mod tests {
                 .metadata
                 .profile_id,
             "example-provider"
+        );
+    }
+
+    #[test]
+    fn from_snapshot_rejects_record_with_now_incompatible_botster_requirement() {
+        let mut manifest = plugin_manifest("future.plugin", Vec::new());
+        manifest.botster = "999.0.0".to_string();
+        let snapshot = PackageRegistrySnapshot {
+            granted_capabilities: Vec::new(),
+            governed_surfaces: host_profile().capability_surfaces().to_vec(),
+            records: vec![package_record(manifest, PackageState::Installed)],
+        };
+
+        let error =
+            PackageRegistry::from_snapshot(snapshot).expect_err("incompatible package should fail");
+
+        assert!(matches!(
+            error,
+            PackageRegistrySnapshotError::BotsterCompatibility {
+                package_name,
+                diagnostics
+            } if package_name == "future.plugin"
+                && diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.contains("not satisfied"))
+        ));
+    }
+
+    #[test]
+    fn from_snapshot_rejects_enabled_record_with_ungranted_capability() {
+        let requested = capability(CapabilitySurface::Network, Some("websocket"));
+        let snapshot = PackageRegistrySnapshot {
+            granted_capabilities: vec![capability(CapabilitySurface::Network, Some("http"))],
+            governed_surfaces: host_profile().capability_surfaces().to_vec(),
+            records: vec![package_record(
+                plugin_manifest("ungranted.plugin", vec![requested.clone()]),
+                PackageState::Enabled,
+            )],
+        };
+
+        let error =
+            PackageRegistry::from_snapshot(snapshot).expect_err("ungranted capability should fail");
+
+        assert_eq!(
+            error,
+            PackageRegistrySnapshotError::CapabilityAdmission {
+                package_name: "ungranted.plugin".to_string(),
+                reason: PackageAdmissionReason::UngrantedCapability(requested),
+            }
+        );
+    }
+
+    #[test]
+    fn from_snapshot_rejects_enabled_record_with_ungoverned_capability_surface() {
+        let requested = capability(CapabilitySurface::Timers, Some("callbacks"));
+        let snapshot = PackageRegistrySnapshot {
+            granted_capabilities: vec![requested.clone()],
+            governed_surfaces: vec![CapabilitySurface::Surfaces],
+            records: vec![package_record(
+                plugin_manifest("ungoverned.plugin", vec![requested]),
+                PackageState::Enabled,
+            )],
+        };
+
+        let error = PackageRegistry::from_snapshot(snapshot)
+            .expect_err("ungoverned capability surface should fail");
+
+        assert_eq!(
+            error,
+            PackageRegistrySnapshotError::CapabilityAdmission {
+                package_name: "ungoverned.plugin".to_string(),
+                reason: PackageAdmissionReason::UngovernedCapabilitySurface(
+                    CapabilitySurface::Timers
+                ),
+            }
         );
     }
 
