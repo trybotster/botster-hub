@@ -353,10 +353,24 @@ impl TuiClient {
             .map(|session| session.session_id.clone())
     }
 
-    fn attach_selected(&mut self) -> TuiResult<String> {
-        let Some(session_id) = self.selected_session_id() else {
+    fn selected_attachable_session_id(&mut self) -> TuiResult<String> {
+        let Some(session) = self.sessions.get(self.selected) else {
             return Err(TuiError::NoSessions);
         };
+        if session.lifecycle == "running" {
+            Ok(session.session_id.clone())
+        } else {
+            let error = format!(
+                "{} {} - cannot attach",
+                session.session_id, session.lifecycle
+            );
+            self.push_unique_error(error.clone());
+            Err(TuiError::SessionNotAttachable(error))
+        }
+    }
+
+    fn attach_selected(&mut self) -> TuiResult<String> {
+        let session_id = self.selected_attachable_session_id()?;
         self.attach_session(session_id)
     }
 
@@ -555,8 +569,7 @@ impl TuiClient {
     fn clear_stale_attached_session(&mut self) {
         self.active_session_id = None;
         self.subscription_id = None;
-        self.errors
-            .push("attached session disappeared; detached and refreshed sessions".to_string());
+        self.push_unique_error("attached session disappeared; detached and refreshed sessions");
         if let Err(error) = self.refresh() {
             match error {
                 TuiError::Daemon(error) => self.record_transport_error(error),
@@ -564,6 +577,13 @@ impl TuiClient {
                     .errors
                     .push(format!("refresh failed after session loss: {error}")),
             }
+        }
+    }
+
+    fn push_unique_error(&mut self, error: impl Into<String>) {
+        let error = error.into();
+        if !self.errors.iter().any(|existing| existing == &error) {
+            self.errors.push(error);
         }
     }
 
@@ -1637,6 +1657,7 @@ fn terminal_view_node(id: &str, session_id: String) -> UiNode {
 }
 
 fn session_row_node(session: &DaemonSession, selected: bool, attached: bool) -> UiNode {
+    let attachable = session.lifecycle == "running";
     let mut node = node_with_props(
         &format!("session-row-{}", session.session_id),
         UiNodeKind::ListItem,
@@ -1657,12 +1678,17 @@ fn session_row_node(session: &DaemonSession, selected: bool, attached: bool) -> 
             ),
         ))],
     );
+    let subtitle = if attachable {
+        session.lifecycle.clone()
+    } else {
+        format!("{} - cannot attach", session.lifecycle)
+    };
     node.slots.insert(
         "subtitle".to_string(),
         vec![ui_child(status_dot_node(
             &format!("session-state-{}", session.session_id),
-            &session.lifecycle,
-            "success",
+            &subtitle,
+            if attachable { "success" } else { "warning" },
         ))],
     );
     if attached {
@@ -2198,6 +2224,7 @@ mod tests {
         client.notifications.push("notice two".to_string());
         client.errors.push("error one".to_string());
 
+        let rendered = render_text(&client.ui_tree(), TuiUiRenderContext::from_client(&client));
         let frame = render_frame_text(
             &client.ui_tree(),
             TuiUiRenderContext::from_client(&client),
@@ -2208,6 +2235,7 @@ mod tests {
         assert!(frame.contains("botster-hub tui"));
         assert!(frame.contains("session-a"));
         assert!(frame.contains("session-b"));
+        assert!(rendered.contains("exited - cannot attach"));
         assert!(frame.contains("hello from terminal"));
         assert!(frame.contains("notice"));
         assert!(frame.contains("error"));
@@ -2217,6 +2245,34 @@ mod tests {
         sorted.sort();
         sorted.dedup();
         assert_eq!(ids.len(), sorted.len(), "UiNode ids should be unique");
+    }
+
+    #[test]
+    fn attach_selected_rejects_exited_selected_session_without_detaching_active_session() {
+        let mut client = TuiClient::new(test_config());
+        client.sessions = vec![DaemonSession {
+            session_id: "dogfood-worker-smoke".to_string(),
+            lifecycle: "exited".to_string(),
+        }];
+
+        let result = client.attach_selected();
+
+        assert!(matches!(result, Err(TuiError::SessionNotAttachable(_))));
+        assert!(client.active_session_id.is_none());
+        assert!(client.subscription_id.is_none());
+        assert_eq!(
+            client.errors,
+            vec!["dogfood-worker-smoke exited - cannot attach".to_string()]
+        );
+
+        let result = client.attach_selected();
+
+        assert!(matches!(result, Err(TuiError::SessionNotAttachable(_))));
+        assert_eq!(
+            client.errors,
+            vec!["dogfood-worker-smoke exited - cannot attach".to_string()],
+            "repeated attach attempts should not duplicate the diagnostic"
+        );
     }
 
     #[test]
@@ -2403,6 +2459,7 @@ pub enum TuiError {
     NoSessions,
     NoAttachedSession,
     SessionMissing(String),
+    SessionNotAttachable(String),
     UnexpectedResponse,
     TimedOut(String),
 }
@@ -2417,6 +2474,7 @@ impl fmt::Display for TuiError {
             Self::SessionMissing(session_id) => {
                 write!(formatter, "session not found: {session_id}")
             }
+            Self::SessionNotAttachable(message) => write!(formatter, "{message}"),
             Self::UnexpectedResponse => write!(formatter, "unexpected daemon response"),
             Self::TimedOut(needle) => write!(formatter, "timed out waiting for {needle:?}"),
         }
