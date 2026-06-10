@@ -226,6 +226,68 @@ fn write_local_process_plugin_package(root: &Path) {
     .expect("write local process package manifest");
 }
 
+fn write_invalid_local_package(root: &Path) {
+    fs::create_dir_all(root).expect("create invalid package root");
+    fs::write(root.join("botster-package.json"), "{ invalid json\n")
+        .expect("write invalid manifest");
+}
+
+fn write_incompatible_local_package(root: &Path) {
+    fs::create_dir_all(root).expect("create incompatible package root");
+    fs::write(root.join("plugin.lua"), "return botster.register({})\n")
+        .expect("write plugin entrypoint");
+    fs::write(
+        root.join("botster-package.json"),
+        r#"{
+  "name": "dogfood.incompatible-plugin",
+  "version": "1.0.0",
+  "kind": "plugin",
+  "botster": ">=999.0.0",
+  "source": { "type": "path", "path": "." },
+  "capabilities": [
+    { "surface": "surfaces" }
+  ],
+  "entrypoints": [
+    { "runtime": "lua", "path": "plugin.lua", "bootstrap": false }
+  ]
+}
+"#,
+    )
+    .expect("write incompatible package manifest");
+}
+
+fn write_denied_capability_local_package(root: &Path) {
+    fs::create_dir_all(root).expect("create denied capability package root");
+    fs::write(root.join("plugin.lua"), "return botster.register({})\n")
+        .expect("write plugin entrypoint");
+    fs::write(
+        root.join("botster-package.json"),
+        r#"{
+  "name": "dogfood.denied-plugin",
+  "version": "1.0.0",
+  "kind": "plugin",
+  "botster": ">=0.1.0",
+  "source": { "type": "path", "path": "." },
+  "capabilities": [
+    { "surface": "filesystem", "scope": "home" }
+  ],
+  "entrypoints": [
+    { "runtime": "lua", "path": "plugin.lua", "bootstrap": false }
+  ]
+}
+"#,
+    )
+    .expect("write denied capability package manifest");
+}
+
+fn command_output_text(output: &Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
+
 fn daemon_test_lock() -> &'static Mutex<()> {
     REAL_DAEMON_TEST_LOCK.get_or_init(|| Mutex::new(()))
 }
@@ -2221,6 +2283,297 @@ fn cli_packages_enable_local_path_routes_through_running_daemon_and_persists() {
     assert!(stdout.contains("state=enabled"));
 
     shutdown_cli_daemon(&data_dir, restarted);
+}
+
+#[test]
+fn cli_packages_local_path_install_enable_disable_remove_flow() {
+    let _guard = daemon_test_lock()
+        .lock()
+        .expect("serialize real daemon test");
+    let data_dir = unique_test_dir("cli-packages-flow");
+    let package_dir = unique_test_dir("local-package-flow");
+    write_local_plugin_package(&package_dir);
+    let child = start_cli_daemon(&data_dir);
+
+    let install = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("packages")
+        .arg("install")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("--path")
+        .arg(&package_dir)
+        .output()
+        .expect("run botster-hub packages install");
+    assert!(
+        install.status.success(),
+        "install failed: {}",
+        String::from_utf8_lossy(&install.stderr)
+    );
+    let stdout = String::from_utf8(install.stdout).expect("stdout is utf8");
+    assert!(stdout.contains("decision=package"));
+    assert!(stdout.contains("package_name=dogfood.plugin"));
+    assert!(stdout.contains("action=install"));
+    assert!(stdout.contains("package_count=1"));
+    assert!(stdout.contains("state=installed"));
+    assert!(!stdout.contains(package_dir.to_string_lossy().as_ref()));
+    assert!(!stdout.contains(data_dir.to_string_lossy().as_ref()));
+
+    let show = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("packages")
+        .arg("show")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("dogfood.plugin")
+        .output()
+        .expect("run botster-hub packages show");
+    assert!(
+        show.status.success(),
+        "show failed: {}",
+        String::from_utf8_lossy(&show.stderr)
+    );
+    let stdout = String::from_utf8(show.stdout).expect("stdout is utf8");
+    assert!(stdout.contains("package_count=1"));
+    assert!(stdout.contains("package name=dogfood.plugin"));
+    assert!(stdout.contains("state=installed"));
+    assert!(!stdout.contains(package_dir.to_string_lossy().as_ref()));
+    assert!(!stdout.contains(data_dir.to_string_lossy().as_ref()));
+
+    let enable = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("packages")
+        .arg("enable")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("dogfood.plugin")
+        .output()
+        .expect("run botster-hub packages enable");
+    assert!(
+        enable.status.success(),
+        "enable failed: {}",
+        String::from_utf8_lossy(&enable.stderr)
+    );
+    let stdout = String::from_utf8(enable.stdout).expect("stdout is utf8");
+    assert!(stdout.contains("action=enable"));
+    assert!(stdout.contains("state=enabled"));
+    assert!(!stdout.contains(package_dir.to_string_lossy().as_ref()));
+    assert!(!stdout.contains(data_dir.to_string_lossy().as_ref()));
+
+    let lifecycle = botster_hub::daemon_transport_request(
+        &explicit_config(&data_dir),
+        botster_hub::DaemonRequest::PluginLifecycleStatus,
+    )
+    .expect("daemon plugin lifecycle status after enable");
+    assert!(lifecycle.lifecycle.iter().any(|plugin| {
+        plugin.package_name == "dogfood.plugin" && plugin.state == "enabled" && plugin.loaded
+    }));
+
+    let disable = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("packages")
+        .arg("disable")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("dogfood.plugin")
+        .output()
+        .expect("run botster-hub packages disable");
+    assert!(
+        disable.status.success(),
+        "disable failed: {}",
+        String::from_utf8_lossy(&disable.stderr)
+    );
+    let stdout = String::from_utf8(disable.stdout).expect("stdout is utf8");
+    assert!(stdout.contains("action=disable"));
+    assert!(stdout.contains("state=disabled"));
+
+    let lifecycle = botster_hub::daemon_transport_request(
+        &explicit_config(&data_dir),
+        botster_hub::DaemonRequest::PluginLifecycleStatus,
+    )
+    .expect("daemon plugin lifecycle status after disable");
+    assert!(lifecycle.lifecycle.iter().any(|plugin| {
+        plugin.package_name == "dogfood.plugin" && plugin.state == "disabled" && !plugin.loaded
+    }));
+
+    let remove = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("packages")
+        .arg("remove")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("dogfood.plugin")
+        .output()
+        .expect("run botster-hub packages remove");
+    assert!(
+        remove.status.success(),
+        "remove failed: {}",
+        String::from_utf8_lossy(&remove.stderr)
+    );
+    let stdout = String::from_utf8(remove.stdout).expect("stdout is utf8");
+    assert!(stdout.contains("action=remove"));
+    assert!(stdout.contains("package_count=0"));
+    assert!(!stdout.contains(package_dir.to_string_lossy().as_ref()));
+    assert!(!stdout.contains(data_dir.to_string_lossy().as_ref()));
+
+    shutdown_cli_daemon(&data_dir, child);
+
+    let restarted = start_cli_daemon(&data_dir);
+    let list_after_restart = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("packages")
+        .arg("list")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .output()
+        .expect("run botster-hub packages list after remove restart");
+    assert!(
+        list_after_restart.status.success(),
+        "packages list after remove restart failed: {}",
+        String::from_utf8_lossy(&list_after_restart.stderr)
+    );
+    let stdout = String::from_utf8(list_after_restart.stdout).expect("stdout is utf8");
+    assert!(stdout.contains("package_count=0"));
+
+    shutdown_cli_daemon(&data_dir, restarted);
+}
+
+#[test]
+fn cli_packages_local_path_diagnostics_are_actionable() {
+    let _guard = daemon_test_lock()
+        .lock()
+        .expect("serialize real daemon test");
+    let data_dir = unique_test_dir("cli-packages-diagnostics");
+    let invalid_dir = unique_test_dir("local-package-invalid");
+    let incompatible_dir = unique_test_dir("local-package-incompatible");
+    let duplicate_dir = unique_test_dir("local-package-duplicate");
+    let denied_dir = unique_test_dir("local-package-denied");
+    write_invalid_local_package(&invalid_dir);
+    write_incompatible_local_package(&incompatible_dir);
+    write_local_plugin_package(&duplicate_dir);
+    write_denied_capability_local_package(&denied_dir);
+    let child = start_cli_daemon(&data_dir);
+
+    let invalid = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("packages")
+        .arg("install")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("--path")
+        .arg(&invalid_dir)
+        .output()
+        .expect("run invalid package install");
+    assert!(!invalid.status.success());
+    let text = command_output_text(&invalid);
+    assert!(text.contains("response=operator_error"));
+    assert!(text.contains("operation=install"));
+    assert!(text.contains("InvalidLocalManifest"));
+    assert!(!text.contains(invalid_dir.to_string_lossy().as_ref()));
+    assert!(!text.contains(data_dir.to_string_lossy().as_ref()));
+
+    let incompatible = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("packages")
+        .arg("install")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("--path")
+        .arg(&incompatible_dir)
+        .output()
+        .expect("run incompatible package install");
+    assert!(!incompatible.status.success());
+    let text = command_output_text(&incompatible);
+    assert!(text.contains("response=operator_error"));
+    assert!(text.contains("operation=install"));
+    assert!(text.contains("BotsterCompatibility"));
+    assert!(!text.contains(incompatible_dir.to_string_lossy().as_ref()));
+    assert!(!text.contains(data_dir.to_string_lossy().as_ref()));
+
+    let first_install = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("packages")
+        .arg("install")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("--path")
+        .arg(&duplicate_dir)
+        .output()
+        .expect("run first duplicate package install");
+    assert!(
+        first_install.status.success(),
+        "first duplicate install failed: {}",
+        String::from_utf8_lossy(&first_install.stderr)
+    );
+    let duplicate = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("packages")
+        .arg("install")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("--path")
+        .arg(&duplicate_dir)
+        .output()
+        .expect("run duplicate package install");
+    assert!(!duplicate.status.success());
+    let text = command_output_text(&duplicate);
+    assert!(text.contains("response=operator_error"));
+    assert!(text.contains("operation=install"));
+    assert!(text.contains("AlreadyInstalled"));
+    assert!(!text.contains(duplicate_dir.to_string_lossy().as_ref()));
+    assert!(!text.contains(data_dir.to_string_lossy().as_ref()));
+
+    let denied_install = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("packages")
+        .arg("install")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("--path")
+        .arg(&denied_dir)
+        .output()
+        .expect("run denied package install");
+    assert!(
+        denied_install.status.success(),
+        "denied package install failed before enable: {}",
+        String::from_utf8_lossy(&denied_install.stderr)
+    );
+    let denied_enable = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("packages")
+        .arg("enable")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("dogfood.denied-plugin")
+        .output()
+        .expect("run denied package enable");
+    assert!(!denied_enable.status.success());
+    let text = command_output_text(&denied_enable);
+    assert!(text.contains("response=operator_error"));
+    assert!(text.contains("operation=enable"));
+    assert!(text.contains("UngrantedCapability"));
+
+    let missing_show = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("packages")
+        .arg("show")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("dogfood.missing-plugin")
+        .output()
+        .expect("run missing package show");
+    assert!(!missing_show.status.success());
+    let text = command_output_text(&missing_show);
+    assert!(text.contains("response=operator_error"));
+    assert!(text.contains("operation=show"));
+    assert!(text.contains("PackageNotInstalled"));
+    assert!(text.contains("dogfood.missing-plugin"));
+    assert!(!text.contains(data_dir.to_string_lossy().as_ref()));
+
+    let missing_remove = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("packages")
+        .arg("remove")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("dogfood.missing-plugin")
+        .output()
+        .expect("run missing package remove");
+    assert!(!missing_remove.status.success());
+    let text = command_output_text(&missing_remove);
+    assert!(text.contains("response=operator_error"));
+    assert!(text.contains("operation=remove"));
+    assert!(text.contains("PackageNotInstalled"));
+    assert!(text.contains("dogfood.missing-plugin"));
+    assert!(!text.contains(data_dir.to_string_lossy().as_ref()));
+
+    shutdown_cli_daemon(&data_dir, child);
 }
 
 #[test]

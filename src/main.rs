@@ -11,12 +11,12 @@ use botster_core::{
     SessionSpawnRequest, SpawnEnvironment, SpawnWorkingDirectory, SubscriptionId, TransportEgress,
 };
 use botster_hub::{
-    build_default_config_for_runtime, daemon_transport_request, default_package_policy,
-    host_profile, run_tui, serve_daemon, serve_mcp_stdio, stream_attach, DaemonCompatibility,
-    DaemonEvent, DaemonOperatorError, DaemonPackage, DaemonRequest, DaemonResponse,
-    DaemonResponseKind, DaemonSession, DaemonStatus, DataDirectoryOption, HubClientApi,
-    HubClientRequest, HubClientResponseBody, HubDaemon, HubDaemonState, HubRuntime,
+    DaemonCompatibility, DaemonEvent, DaemonOperatorError, DaemonPackage, DaemonRequest,
+    DaemonResponse, DaemonResponseKind, DaemonSession, DaemonStatus, DataDirectoryOption,
+    HubClientApi, HubClientRequest, HubClientResponseBody, HubDaemon, HubDaemonState, HubRuntime,
     HubStartupOptions, HubStateLoadSource, RuntimeEnvironment, SessionDefaults, TransportBindings,
+    build_default_config_for_runtime, daemon_transport_request, default_package_policy,
+    host_profile, run_tui, serve_daemon, serve_mcp_stdio, stream_attach,
 };
 
 const SMOKE_MARKER: &str = "botster-hub-smoke-ok";
@@ -283,6 +283,16 @@ fn operator_packages(args: Vec<String>, providers_only: bool) -> Result<(), Oper
             let response = daemon_transport_request(&config, DaemonRequest::ListPackages)?;
             print_packages_response(response, providers_only)?;
         }
+        PackageActionCommand::InstallLocalPath(path) => {
+            let response =
+                daemon_transport_request(&config, DaemonRequest::InstallPackageLocalPath { path })?;
+            print_packages_response(response, providers_only)?;
+        }
+        PackageActionCommand::Show(package_name) => {
+            let response =
+                daemon_transport_request(&config, DaemonRequest::ShowPackage { package_name })?;
+            print_packages_response(response, providers_only)?;
+        }
         PackageActionCommand::EnableLocalPath(path) => {
             let response =
                 daemon_transport_request(&config, DaemonRequest::EnablePackageLocalPath { path })?;
@@ -296,6 +306,11 @@ fn operator_packages(args: Vec<String>, providers_only: bool) -> Result<(), Oper
         PackageActionCommand::Disable(package_name) => {
             let response =
                 daemon_transport_request(&config, DaemonRequest::DisablePackage { package_name })?;
+            print_packages_response(response, providers_only)?;
+        }
+        PackageActionCommand::Remove(package_name) => {
+            let response =
+                daemon_transport_request(&config, DaemonRequest::RemovePackage { package_name })?;
             print_packages_response(response, providers_only)?;
         }
     }
@@ -883,9 +898,12 @@ struct PackageCommand {
 
 enum PackageActionCommand {
     List,
+    InstallLocalPath(PathBuf),
+    Show(String),
     EnableLocalPath(PathBuf),
     EnableName(String),
     Disable(String),
+    Remove(String),
 }
 
 impl PackageCommand {
@@ -904,6 +922,26 @@ impl PackageCommand {
                 Ok(Self {
                     data_directory: options.data_directory,
                     action: PackageActionCommand::List,
+                })
+            }
+            "install" if !providers_only => {
+                if args.len() != 5 || args.get(3).map(String::as_str) != Some("--path") {
+                    return Err(OperatorError::Usage("packages install"));
+                }
+                let options = DataDirOptions::parse(args[1..3].to_vec(), "packages install")?;
+                Ok(Self {
+                    data_directory: options.data_directory,
+                    action: PackageActionCommand::InstallLocalPath(PathBuf::from(&args[4])),
+                })
+            }
+            "show" if !providers_only => {
+                if args.len() != 4 {
+                    return Err(OperatorError::Usage("packages show"));
+                }
+                let options = DataDirOptions::parse(args[1..3].to_vec(), "packages show")?;
+                Ok(Self {
+                    data_directory: options.data_directory,
+                    action: PackageActionCommand::Show(args[3].clone()),
                 })
             }
             "enable" if !providers_only => {
@@ -934,6 +972,16 @@ impl PackageCommand {
                 Ok(Self {
                     data_directory: options.data_directory,
                     action: PackageActionCommand::Disable(args[3].clone()),
+                })
+            }
+            "remove" if !providers_only => {
+                if args.len() != 4 {
+                    return Err(OperatorError::Usage("packages remove"));
+                }
+                let options = DataDirOptions::parse(args[1..3].to_vec(), "packages remove")?;
+                Ok(Self {
+                    data_directory: options.data_directory,
+                    action: PackageActionCommand::Remove(args[3].clone()),
                 })
             }
             _ => Err(OperatorError::Usage(if providers_only {
@@ -1236,12 +1284,17 @@ fn usage_for(command: &str) -> &'static str {
         "shutdown" => "usage: botster-hub shutdown --data-dir <path>",
         "mcp-serve" => "usage: botster-hub mcp-serve --data-dir <path>",
         "tui" => "usage: botster-hub tui --data-dir <path>",
-        "packages" => "usage: botster-hub packages <list|enable|disable> ...",
+        "packages" => "usage: botster-hub packages <install|list|show|enable|disable|remove> ...",
+        "packages install" => {
+            "usage: botster-hub packages install --data-dir <path> --path <package-dir-or-manifest>"
+        }
         "packages list" => "usage: botster-hub packages list --data-dir <path>",
+        "packages show" => "usage: botster-hub packages show --data-dir <path> <name>",
         "packages enable" => {
             "usage: botster-hub packages enable --data-dir <path> (--path <package-dir-or-manifest>|<name>)"
         }
         "packages disable" => "usage: botster-hub packages disable --data-dir <path> <name>",
+        "packages remove" => "usage: botster-hub packages remove --data-dir <path> <name>",
         "providers" | "providers list" => "usage: botster-hub providers list --data-dir <path>",
         "inspect" => "usage: botster-hub inspect --data-dir <path> <session-id>",
         _ => {
