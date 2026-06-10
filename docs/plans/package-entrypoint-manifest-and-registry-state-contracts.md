@@ -125,7 +125,7 @@ No Lua plugin policy, Project Pipelines workflow policy, TUI UI, React SPA, Rail
 
 ## Worktree and target assumptions
 
-- Assigned worktree: `/Users/jasonconigliari/botster-sessions/trybotster-botster-hub-project-pipelines-ticket_1781065269_190384`.
+- Assigned worktree: the pipeline-provided ticket worktree for `ticket_1781065269_190384`.
 - Run target: `tgt_7e208a0c76a44980a83b63af976b1f22`.
 - Agents must operate in the assigned worktree, not an ambient checkout.
 
