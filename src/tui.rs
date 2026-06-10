@@ -780,12 +780,12 @@ impl TuiClient {
                 if self.active_session_id.is_none()
                     && let Err(error) = self.attach_selected()
                 {
-                    self.errors.push(error.to_string());
+                    self.push_unique_error(error.to_string());
                 }
             }
             "sessions-list" => {
                 if let Err(error) = self.attach_selected() {
-                    self.errors.push(error.to_string());
+                    self.push_unique_error(error.to_string());
                 }
             }
             _ => self
@@ -900,7 +900,7 @@ fn handle_key(app: &mut TuiClient, key: KeyEvent) -> TuiResult<bool> {
         }
         (KeyModifiers::NONE, KeyCode::Enter) if app.active_session_id.is_none() => {
             if let Err(error) = app.attach_selected() {
-                app.errors.push(error.to_string());
+                app.push_unique_error(error.to_string());
             }
         }
         (_, KeyCode::Char(value)) if app.active_session_id.is_some() => {
@@ -937,7 +937,7 @@ fn route_mouse(app: &mut TuiClient, mouse: MouseEvent) -> TuiResult<bool> {
                             && app.active_session_id.is_none()
                             && let Err(error) = app.attach_selected()
                         {
-                            app.errors.push(error.to_string());
+                            app.push_unique_error(error.to_string());
                         }
                     }
                 }
@@ -945,7 +945,7 @@ fn route_mouse(app: &mut TuiClient, mouse: MouseEvent) -> TuiResult<bool> {
                     if app.active_session_id.is_none()
                         && let Err(error) = app.attach_selected()
                     {
-                        app.errors.push(error.to_string());
+                        app.push_unique_error(error.to_string());
                     }
                 }
                 _ => app.activate_node(&node_id)?,
@@ -2272,6 +2272,46 @@ mod tests {
             client.errors,
             vec!["dogfood-worker-smoke exited - cannot attach".to_string()],
             "repeated attach attempts should not duplicate the diagnostic"
+        );
+    }
+
+    #[test]
+    fn key_and_mouse_attach_handlers_deduplicate_exited_session_diagnostic() {
+        let mut client = TuiClient::new(test_config());
+        client.sessions = vec![DaemonSession {
+            session_id: "dogfood-worker-smoke".to_string(),
+            lifecycle: "exited".to_string(),
+        }];
+
+        for _ in 0..2 {
+            let should_quit = handle_key(
+                &mut client,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            )
+            .expect("enter attach handler should return normally");
+            assert!(!should_quit);
+        }
+
+        draw_client(&mut client, 100, 30);
+        for _ in 0..2 {
+            route_event(
+                &mut client,
+                Event::Mouse(MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: 35,
+                    row: 5,
+                    modifiers: KeyModifiers::NONE,
+                }),
+            )
+            .expect("mouse attach handler should return normally");
+        }
+
+        assert!(client.active_session_id.is_none());
+        assert!(client.subscription_id.is_none());
+        assert_eq!(
+            client.errors,
+            vec!["dogfood-worker-smoke exited - cannot attach".to_string()],
+            "real key and mouse attach paths should not duplicate diagnostics"
         );
     }
 
