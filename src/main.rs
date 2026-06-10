@@ -1,10 +1,10 @@
 use std::env;
 use std::fmt;
 use std::io::{self, BufReader};
-use std::path::PathBuf;
-use std::process;
+use std::path::{Path, PathBuf};
+use std::process::{self, Child, Command, Stdio};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use botster_core::{
     ClientId, CoreSessionMetadata, RequestId, ResizePayload, SessionId, SessionLifecycleState,
@@ -27,6 +27,13 @@ fn main() {
         Some("start") => {
             if let Err(error) = start_daemon(env::args().skip(2).collect()) {
                 eprintln!("botster-hub start error: {error}");
+                process::exit(1);
+            }
+            return;
+        }
+        Some("dogfood") => {
+            if let Err(error) = dogfood(env::args().skip(2).collect()) {
+                eprintln!("botster-hub dogfood error: {error}");
                 process::exit(1);
             }
             return;
@@ -157,6 +164,152 @@ fn start_daemon(args: Vec<String>) -> Result<(), StartError> {
     print_daemon_transport_status("stopped", &status);
 
     Ok(())
+}
+
+fn dogfood(args: Vec<String>) -> Result<(), DogfoodError> {
+    let options = DogfoodOptions::parse(args)?;
+    let data_directory = options.data_directory()?;
+    std::fs::create_dir_all(&data_directory).map_err(|source| DogfoodError::CreateDataDir {
+        path: data_directory.clone(),
+        source,
+    })?;
+
+    let hub_bin = env::current_exe().map_err(DogfoodError::CurrentExe)?;
+    let mut child = spawn_dogfood_daemon(&hub_bin, &data_directory, &options)?;
+
+    if let Err(error) = wait_for_dogfood_ready(&data_directory, &mut child) {
+        cleanup_dogfood_child(&mut child);
+        return Err(error);
+    }
+
+    let config = explicit_config(data_directory.clone())?;
+    if let Err(error) = verify_dogfood_session_worker(&config) {
+        let _ = daemon_transport_request(&config, DaemonRequest::DaemonShutdown);
+        cleanup_dogfood_child(&mut child);
+        return Err(error);
+    }
+
+    let response = daemon_transport_request(
+        &config,
+        DaemonRequest::EnablePackageLocalPath {
+            path: options.package_path(),
+        },
+    )?;
+    if response.kind == DaemonResponseKind::OperatorError {
+        let _ = daemon_transport_request(&config, DaemonRequest::DaemonShutdown);
+        cleanup_dogfood_child(&mut child);
+        return Err(DogfoodError::PackageEnable(
+            response
+                .error
+                .map(|error| error.message)
+                .unwrap_or_else(|| "package enable failed".to_string()),
+        ));
+    }
+
+    let package_state = response
+        .package_decision
+        .as_ref()
+        .map(|decision| decision.state.as_str())
+        .unwrap_or("enabled");
+
+    print_dogfood_ready(&data_directory, options.default_data_dir, package_state);
+
+    let status = child.wait().map_err(DogfoodError::WaitDaemon)?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(DogfoodError::DaemonExited(status.to_string()))
+    }
+}
+
+fn verify_dogfood_session_worker(config: &botster_hub::HubConfig) -> Result<(), DogfoodError> {
+    let response = daemon_transport_request(
+        config,
+        DaemonRequest::Spawn {
+            session_id: "dogfood-worker-smoke".to_string(),
+            command: "printf 'dogfood-worker-ok\\n'; sleep 1".to_string(),
+        },
+    )?;
+    if response.kind == DaemonResponseKind::OperatorError {
+        return Err(DogfoodError::SessionWorker(
+            response
+                .error
+                .map(|error| error.message)
+                .unwrap_or_else(|| "session worker smoke failed".to_string()),
+        ));
+    }
+
+    let _ = daemon_transport_request(
+        config,
+        DaemonRequest::ShutdownSession {
+            session_id: "dogfood-worker-smoke".to_string(),
+        },
+    );
+    Ok(())
+}
+
+fn spawn_dogfood_daemon(
+    hub_bin: &Path,
+    data_directory: &Path,
+    options: &DogfoodOptions,
+) -> Result<Child, DogfoodError> {
+    if !hub_bin.is_file() {
+        return Err(DogfoodError::MissingHubBinary(hub_bin.to_path_buf()));
+    }
+    let session_worker_bin = options.session_worker_bin(hub_bin)?;
+
+    let mut command = Command::new(hub_bin);
+    command
+        .arg("start")
+        .arg("--data-dir")
+        .arg(data_directory)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    command.arg("--session-worker-bin").arg(&session_worker_bin);
+
+    command.spawn().map_err(|source| DogfoodError::SpawnDaemon {
+        path: hub_bin.to_path_buf(),
+        source,
+    })
+}
+
+fn wait_for_dogfood_ready(data_directory: &Path, child: &mut Child) -> Result<(), DogfoodError> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let config = explicit_config(data_directory.to_path_buf())?;
+    while Instant::now() < deadline {
+        if let Some(status) = child.try_wait().map_err(DogfoodError::PollDaemon)? {
+            return Err(DogfoodError::DaemonExited(status.to_string()));
+        }
+        if daemon_transport_request(&config, DaemonRequest::Status).is_ok() {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    Err(DogfoodError::ReadinessTimeout)
+}
+
+fn cleanup_dogfood_child(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn print_dogfood_ready(data_directory: &Path, default_data_dir: bool, package_state: &str) {
+    let dir = data_directory.display();
+    println!("dogfood=ready");
+    if default_data_dir {
+        println!("data_dir=isolated:{dir}");
+    } else {
+        println!("data_dir={dir}");
+    }
+    println!("package name=project-pipelines state={package_state}");
+    println!("tui=botster-hub tui --data-dir {dir}");
+    println!("mcp=botster-hub mcp-serve --data-dir {dir}");
+    println!("status=botster-hub status --data-dir {dir}");
+    println!(
+        "shutdown=run botster-hub shutdown --data-dir {dir} from another terminal for graceful shutdown; Ctrl-C hard-stops the foreground launcher"
+    );
+    println!("web=local web entrypoint unavailable in this repo; use TUI or MCP for local dogfood");
 }
 
 fn operator_status(args: Vec<String>) -> Result<(), OperatorError> {
@@ -722,6 +875,94 @@ impl StartOptions {
     }
 }
 
+struct DogfoodOptions {
+    data_directory: Option<PathBuf>,
+    session_worker_bin: Option<PathBuf>,
+    default_data_dir: bool,
+}
+
+impl DogfoodOptions {
+    fn parse(args: Vec<String>) -> Result<Self, DogfoodError> {
+        let mut data_directory = None;
+        let mut session_worker_bin = None;
+        let mut cursor = 0;
+
+        while cursor < args.len() {
+            match args[cursor].as_str() {
+                "--data-dir" => {
+                    let Some(value) = args.get(cursor + 1) else {
+                        return Err(DogfoodError::Usage);
+                    };
+                    data_directory = Some(PathBuf::from(value));
+                    cursor += 2;
+                }
+                "--session-worker-bin" => {
+                    let Some(value) = args.get(cursor + 1) else {
+                        return Err(DogfoodError::Usage);
+                    };
+                    session_worker_bin = Some(PathBuf::from(value));
+                    cursor += 2;
+                }
+                _ => return Err(DogfoodError::Usage),
+            }
+        }
+
+        Ok(Self {
+            default_data_dir: data_directory.is_none(),
+            data_directory,
+            session_worker_bin,
+        })
+    }
+
+    fn package_path(&self) -> PathBuf {
+        PathBuf::from("examples/project-pipelines")
+    }
+
+    fn session_worker_bin(&self, hub_bin: &Path) -> Result<PathBuf, DogfoodError> {
+        if let Some(path) = self.session_worker_bin.as_ref() {
+            if path.is_file() {
+                return Ok(path.clone());
+            }
+            return Err(DogfoodError::MissingSessionWorkerBinary(path.clone()));
+        }
+
+        let Some(bin_dir) = hub_bin.parent() else {
+            return Err(DogfoodError::MissingSessionWorkerBinary(PathBuf::from(
+                "botster-session-worker",
+            )));
+        };
+        let path = bin_dir.join("botster-session-worker");
+        if path.is_file() {
+            Ok(path)
+        } else if bin_dir.file_name().and_then(|name| name.to_str()) == Some("deps")
+            && let Some(debug_dir) = bin_dir.parent()
+        {
+            let debug_path = debug_dir.join("botster-session-worker");
+            if debug_path.is_file() {
+                Ok(debug_path)
+            } else {
+                Err(DogfoodError::MissingSessionWorkerBinary(debug_path))
+            }
+        } else {
+            Err(DogfoodError::MissingSessionWorkerBinary(path))
+        }
+    }
+
+    fn data_directory(&self) -> Result<PathBuf, DogfoodError> {
+        if let Some(path) = self.data_directory.as_ref() {
+            return Ok(path.clone());
+        }
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(DogfoodError::Clock)?
+            .as_nanos();
+        Ok(PathBuf::from("target")
+            .join("botster-hub-dogfood")
+            .join(format!("{}-{nanos}", process::id())))
+    }
+}
+
 struct SessionCommand {
     data_directory: PathBuf,
     action: SessionAction,
@@ -1178,6 +1419,25 @@ enum StartError {
 }
 
 #[derive(Debug)]
+enum DogfoodError {
+    Usage,
+    Clock(std::time::SystemTimeError),
+    CurrentExe(io::Error),
+    CreateDataDir { path: PathBuf, source: io::Error },
+    MissingHubBinary(PathBuf),
+    MissingSessionWorkerBinary(PathBuf),
+    SpawnDaemon { path: PathBuf, source: io::Error },
+    PollDaemon(io::Error),
+    ReadinessTimeout,
+    Config(botster_hub::HubConfigError),
+    Transport(botster_hub::DaemonTransportError),
+    SessionWorker(String),
+    PackageEnable(String),
+    WaitDaemon(io::Error),
+    DaemonExited(String),
+}
+
+#[derive(Debug)]
 enum OperatorError {
     Usage(&'static str),
     UnexpectedResponse(&'static str),
@@ -1229,6 +1489,58 @@ impl fmt::Display for StartError {
     }
 }
 
+impl fmt::Display for DogfoodError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Usage => write!(formatter, "{}", usage_for("dogfood")),
+            Self::Clock(error) => write!(formatter, "{error}"),
+            Self::CurrentExe(error) => {
+                write!(formatter, "resolve current botster-hub binary: {error}")
+            }
+            Self::CreateDataDir { path, source } => {
+                write!(
+                    formatter,
+                    "create dogfood data dir {}: {source}",
+                    path.display()
+                )
+            }
+            Self::MissingHubBinary(path) => {
+                write!(
+                    formatter,
+                    "missing botster-hub binary at {}",
+                    path.display()
+                )
+            }
+            Self::MissingSessionWorkerBinary(path) => write!(
+                formatter,
+                "missing botster-session-worker binary at {}; pass --session-worker-bin <path>",
+                path.display()
+            ),
+            Self::SpawnDaemon { path, source } => {
+                write!(
+                    formatter,
+                    "spawn dogfood daemon {}: {source}",
+                    path.display()
+                )
+            }
+            Self::PollDaemon(error) => write!(formatter, "poll dogfood daemon: {error}"),
+            Self::ReadinessTimeout => {
+                write!(formatter, "timed out waiting for dogfood daemon readiness")
+            }
+            Self::Config(error) => write!(formatter, "{error}"),
+            Self::Transport(error) => write!(formatter, "{error}"),
+            Self::SessionWorker(message) => {
+                write!(formatter, "verify botster-session-worker: {message}")
+            }
+            Self::PackageEnable(message) => {
+                write!(formatter, "enable project-pipelines package: {message}")
+            }
+            Self::WaitDaemon(error) => write!(formatter, "wait for dogfood daemon: {error}"),
+            Self::DaemonExited(status) => write!(formatter, "dogfood daemon exited with {status}"),
+        }
+    }
+}
+
 impl fmt::Display for OperatorError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -1258,6 +1570,7 @@ impl fmt::Display for OperatorError {
 fn usage_for(command: &str) -> &'static str {
     match command {
         "start" => "usage: botster-hub start --data-dir <path> [--session-worker-bin <path>]",
+        "dogfood" => "usage: botster-hub dogfood [--data-dir <path>] [--session-worker-bin <path>]",
         "status" => "usage: botster-hub status --data-dir <path>",
         "sessions" => {
             "usage: botster-hub sessions <list|spawn|attach|send-input|resize|detach|shutdown> ..."
@@ -1298,7 +1611,7 @@ fn usage_for(command: &str) -> &'static str {
         "providers" | "providers list" => "usage: botster-hub providers list --data-dir <path>",
         "inspect" => "usage: botster-hub inspect --data-dir <path> <session-id>",
         _ => {
-            "usage: botster-hub <start|status|sessions|shutdown|mcp-serve|tui|packages|providers|inspect|run-one>"
+            "usage: botster-hub <start|dogfood|status|sessions|shutdown|mcp-serve|tui|packages|providers|inspect|run-one>"
         }
     }
 }
@@ -1348,6 +1661,18 @@ impl From<botster_hub::DaemonTransportError> for StartError {
 impl From<OperatorError> for StartError {
     fn from(error: OperatorError) -> Self {
         Self::Operator(Box::new(error))
+    }
+}
+
+impl From<botster_hub::HubConfigError> for DogfoodError {
+    fn from(error: botster_hub::HubConfigError) -> Self {
+        Self::Config(error)
+    }
+}
+
+impl From<botster_hub::DaemonTransportError> for DogfoodError {
+    fn from(error: botster_hub::DaemonTransportError) -> Self {
+        Self::Transport(error)
     }
 }
 

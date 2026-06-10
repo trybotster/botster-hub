@@ -1,11 +1,11 @@
 #![cfg(unix)]
 
 use std::fs;
-use std::io::Read;
+use std::io::{BufRead, BufReader, Read};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -405,6 +405,170 @@ fn run_command_with_timeout(mut command: Command, timeout: Duration) -> Output {
         "command timed out after {timeout:?}: stdout={} stderr={}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn spawn_dogfood_launcher(data_dir: &Path) -> (Child, mpsc::Receiver<String>) {
+    ensure_session_worker_binary();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("dogfood")
+        .arg("--data-dir")
+        .arg(data_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn botster-hub dogfood");
+
+    let stdout = child.stdout.take().expect("dogfood stdout pipe");
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            let Ok(line) = line else {
+                break;
+            };
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+
+    (child, rx)
+}
+
+fn wait_for_dogfood_output(
+    child: &mut Child,
+    rx: &mpsc::Receiver<String>,
+    needle: &str,
+) -> Vec<String> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut lines = Vec::new();
+    while std::time::Instant::now() < deadline {
+        if let Some(status) = child.try_wait().expect("poll dogfood launcher") {
+            let mut stderr = String::new();
+            if let Some(mut pipe) = child.stderr.take() {
+                let _ = pipe.read_to_string(&mut stderr);
+            }
+            panic!(
+                "dogfood exited before {needle:?} with {status}: lines={lines:?} stderr={stderr:?}"
+            );
+        }
+
+        match rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(line) => {
+                let found = line.contains(needle);
+                lines.push(line);
+                if found {
+                    return lines;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("dogfood stdout closed before {needle:?}: lines={lines:?}");
+            }
+        }
+    }
+
+    panic!("timed out waiting for {needle:?}: lines={lines:?}");
+}
+
+#[test]
+fn cli_dogfood_launcher_starts_isolated_hub_enables_project_pipelines_and_shuts_down() {
+    let _guard = daemon_test_lock()
+        .lock()
+        .expect("serialize real daemon test");
+    let data_dir = unique_test_dir("cli-dogfood-launcher");
+    let (mut child, rx) = spawn_dogfood_launcher(&data_dir);
+    let lines = wait_for_dogfood_output(&mut child, &rx, "dogfood=ready");
+    let mut lines = {
+        let mut collected = lines;
+        collected.extend(wait_for_dogfood_output(
+            &mut child,
+            &rx,
+            "web=local web entrypoint unavailable",
+        ));
+        collected
+    };
+    lines.sort();
+    let text = lines.join("\n");
+
+    assert!(text.contains("dogfood=ready"));
+    assert!(text.contains("package name=project-pipelines state=enabled"));
+    assert!(text.contains("tui=botster-hub tui --data-dir"));
+    assert!(text.contains("mcp=botster-hub mcp-serve --data-dir"));
+    assert!(text.contains("status=botster-hub status --data-dir"));
+    assert!(text.contains("shutdown=run botster-hub shutdown --data-dir"));
+    assert!(text.contains("Ctrl-C hard-stops the foreground launcher"));
+    assert!(text.contains("web=local web entrypoint unavailable in this repo"));
+    assert!(
+        !text.contains("examples/project-pipelines"),
+        "launcher output should not leak the local package source path"
+    );
+
+    let status = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("status")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .output()
+        .expect("run botster-hub status after dogfood readiness");
+    assert!(
+        status.status.success(),
+        "status failed: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let stdout = String::from_utf8(status.stdout).expect("stdout is utf8");
+    assert!(stdout.contains("lifecycle_state=running"));
+    assert!(stdout.contains("enabled_package_count=1"));
+
+    let packages = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("packages")
+        .arg("list")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .output()
+        .expect("run botster-hub packages list after dogfood readiness");
+    assert!(
+        packages.status.success(),
+        "packages list failed: {}",
+        String::from_utf8_lossy(&packages.stderr)
+    );
+    let stdout = String::from_utf8(packages.stdout).expect("stdout is utf8");
+    assert!(stdout.contains("package name=project-pipelines"));
+    assert!(stdout.contains("state=enabled"));
+    assert!(!stdout.contains("examples/project-pipelines"));
+
+    let lifecycle = botster_hub::daemon_transport_request(
+        &explicit_config(&data_dir),
+        botster_hub::DaemonRequest::PluginLifecycleStatus,
+    )
+    .expect("daemon plugin lifecycle status after dogfood enable");
+    assert!(lifecycle.lifecycle.iter().any(|plugin| {
+        plugin.package_name == "project-pipelines" && plugin.state == "enabled" && plugin.loaded
+    }));
+
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
+fn cli_dogfood_launcher_reports_missing_session_worker_without_mutating_state() {
+    let data_dir = unique_test_dir("cli-dogfood-missing-worker");
+    let missing_worker = data_dir.join("missing-botster-session-worker");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("dogfood")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("--session-worker-bin")
+        .arg(&missing_worker)
+        .output()
+        .expect("run botster-hub dogfood with missing worker");
+
+    assert!(!output.status.success());
+    let text = command_output_text(&output);
+    assert!(text.contains("missing botster-session-worker binary"));
+    assert!(text.contains("--session-worker-bin <path>"));
+    assert!(
+        !data_dir.join("hub-state.json").exists(),
+        "missing worker should fail before package or hub state mutation"
     );
 }
 

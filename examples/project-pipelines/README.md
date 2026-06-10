@@ -40,9 +40,10 @@ only reusable PluginDb and routed-envelope helpers needed by the plugin. The
 production daemon/MCP/worker/storage path is proved without a second
 `mcp-serve` runtime or a host-supplied Project Pipelines bundle.
 
-Manual dogfood path: enable this local package in a running hub, open the TUI,
-focus the Project Pipelines create-ticket fields, submit once with a blank title
-to see field/form validation, then submit with a nonblank title to create a
-local ticket. The TUI renders the plugin-authored UiNode tree and dispatches the
-semantic action through the daemon; it does not build a Project Pipelines form in
-Rust.
+Manual dogfood path: run `botster-hub dogfood` from the hub checkout, then open
+the printed TUI command. Focus the Project Pipelines create-ticket fields, submit
+once with a blank title to see field/form validation, then submit with a
+nonblank title to create a local ticket. The TUI renders the plugin-authored
+UiNode tree and dispatches the semantic action through the daemon; it does not
+build a Project Pipelines form in Rust. This repo has no local web command today;
+use the printed TUI or MCP entrypoints for local dogfood.

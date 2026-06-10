@@ -193,11 +193,17 @@ can be adopted after an intentional daemon restart.
 The end-to-end local dogfood proof is the Unix integration flow below:
 
 ```sh
+./test.sh --test hub_daemon_lifecycle_test cli_dogfood_launcher_starts_isolated_hub_enables_project_pipelines_and_shuts_down
 ./test.sh --test hub_local_dogfood_test local_dogfood_runs_daemon_package_lifecycle_session_and_clean_shutdown
 ./test.sh --test hub_daemon_lifecycle_test cli_daemon_restart_recovers_worker_backed_session_through_transport
 ```
 
-That test is the documented proof path for the current scaffold. It starts an
+The first test proves the production `botster-hub dogfood` entrypoint: it starts
+an isolated daemon/session-worker subprocess, enables the checked-in
+`examples/project-pipelines` package through the daemon-owned package registry,
+prints TUI/MCP/status/shutdown next steps, reports that local web is unavailable
+in this repo, and shuts down through the daemon socket. The library-level test is
+the documented proof path for the lower scaffold. It starts an
 explicit `HubDaemon` with durable state, installs and enables the checked-in
 `examples/synthetic-plugin` fixture, persists and reloads `hub-state.json`,
 pulls status/package/lifecycle state through `HubClientApi`, resolves the
@@ -206,6 +212,31 @@ plugin runtime through `HubRuntime`, spawns a local PTY session, attaches a
 client, sends input, drains the observed marker, and shuts down through the same
 local client API. Separate Lua runtime tests cover real Lua entrypoint
 execution. The PTY portion is Unix-only.
+
+For daily first-party plugin dogfood, use the single-command launcher:
+
+```sh
+cargo run -- dogfood
+```
+
+The launcher uses an isolated data directory under `target/` by default. Pass
+`--data-dir <path>` when you want state to survive across runs. It locates a
+co-located `botster-session-worker` next to the current `botster-hub` binary, or
+you can pass `--session-worker-bin <path>` explicitly. After readiness it prints
+the exact commands for the current data directory:
+
+```sh
+botster-hub tui --data-dir <path>
+botster-hub mcp-serve --data-dir <path>
+botster-hub status --data-dir <path>
+botster-hub shutdown --data-dir <path>
+```
+
+Keep the launcher running in the foreground. For graceful shutdown, run the
+printed shutdown command from another terminal; `Ctrl-C` hard-stops the
+foreground launcher. This repository does not yet have a local web command or
+browser bridge/dev-mode entrypoint; use TUI or MCP for local dogfood until that
+surface lands.
 
 The CLI commands below exercise the daemon-backed workflow across separate
 processes:
@@ -370,8 +401,14 @@ the Lua ABI.
 ## Project Pipelines Local Readiness
 
 The checked-in `examples/project-pipelines` package is ready for constrained
-daily local coordination dogfood. Enable it through the running daemon and
-serve MCP from the same data directory:
+daily local coordination dogfood. Prefer the single-command launcher:
+
+```sh
+cargo run -- dogfood
+```
+
+For lower-level diagnostics, enable it through a running daemon and serve MCP
+from the same data directory:
 
 ```sh
 cargo run -- packages install --data-dir target/botster-hub-dogfood-data \
