@@ -19,7 +19,11 @@ use botster_core_daemon::{
 };
 
 use crate::lifecycle::HubPluginLifecycleStatus;
-use crate::packages::{PackageClassification, PackageRecord, PackageRegistry, PackageState};
+use crate::packages::{
+    PackageClassification, PackageRecord, PackageRegistry, PackageRunnableEntrypointKind,
+    PackageRunnableMode, PackageRunnableProcessState, PackageRunnableWorkingDirectory,
+    PackageState,
+};
 use crate::{HubRuntime, HubRuntimeError, daemon_session_to_core_session, host_profile};
 
 /// Transport-neutral local client API handler.
@@ -788,6 +792,7 @@ pub struct HubClientPackage {
     pub classification: HubClientPackageClassification,
     pub state: HubClientPackageState,
     pub requested_capabilities: Vec<HubClientCapability>,
+    pub runnable_entrypoints: Vec<HubClientPackageRunnableEntrypoint>,
     pub provider_profile_admitted: bool,
 }
 
@@ -807,9 +812,112 @@ impl From<&PackageRecord> for HubClientPackage {
                     scope: capability.scope.clone(),
                 })
                 .collect(),
+            runnable_entrypoints: record
+                .runnable_entrypoints
+                .iter()
+                .map(|entrypoint| HubClientPackageRunnableEntrypoint {
+                    id: entrypoint.id.clone(),
+                    kind: runnable_entrypoint_kind_label(entrypoint.kind).to_string(),
+                    command: entrypoint.command.clone(),
+                    args: entrypoint.args.clone(),
+                    working_directory: match &entrypoint.working_directory {
+                        PackageRunnableWorkingDirectory::PackageRoot => {
+                            HubClientPackageWorkingDirectory {
+                                policy: "package_root".to_string(),
+                                path: None,
+                            }
+                        }
+                        PackageRunnableWorkingDirectory::EntrypointDir => {
+                            HubClientPackageWorkingDirectory {
+                                policy: "entrypoint_dir".to_string(),
+                                path: None,
+                            }
+                        }
+                        PackageRunnableWorkingDirectory::Relative { path } => {
+                            HubClientPackageWorkingDirectory {
+                                policy: "relative".to_string(),
+                                path: Some(path.clone()),
+                            }
+                        }
+                    },
+                    environment: entrypoint
+                        .environment
+                        .iter()
+                        .map(|requirement| HubClientPackageEnvironmentRequirement {
+                            name: requirement.name.clone(),
+                            required: requirement.required,
+                            default: requirement.default.clone(),
+                            description: requirement.description.clone(),
+                        })
+                        .collect(),
+                    mode: runnable_mode_label(entrypoint.mode).to_string(),
+                    capabilities: entrypoint
+                        .capabilities
+                        .iter()
+                        .map(|capability| HubClientCapability {
+                            surface: format!("{:?}", capability.surface),
+                            scope: capability.scope.clone(),
+                        })
+                        .collect(),
+                    may_supervise: entrypoint.may_supervise,
+                    process: HubClientPackageProcess {
+                        state: runnable_process_state_label(entrypoint.process.state).to_string(),
+                        diagnostics: entrypoint
+                            .process
+                            .diagnostics
+                            .iter()
+                            .map(|diagnostic| HubClientPackageDiagnostic {
+                                kind: diagnostic.kind.clone(),
+                                message: diagnostic.message.clone(),
+                            })
+                            .collect(),
+                    },
+                })
+                .collect(),
             provider_profile_admitted: record.admitted_host_profile.is_some(),
         }
     }
+}
+
+/// Sanitized runnable entrypoint summary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HubClientPackageRunnableEntrypoint {
+    pub id: String,
+    pub kind: String,
+    pub command: String,
+    pub args: Vec<String>,
+    pub working_directory: HubClientPackageWorkingDirectory,
+    pub environment: Vec<HubClientPackageEnvironmentRequirement>,
+    pub mode: String,
+    pub capabilities: Vec<HubClientCapability>,
+    pub may_supervise: bool,
+    pub process: HubClientPackageProcess,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HubClientPackageWorkingDirectory {
+    pub policy: String,
+    pub path: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HubClientPackageEnvironmentRequirement {
+    pub name: String,
+    pub required: bool,
+    pub default: Option<String>,
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HubClientPackageProcess {
+    pub state: String,
+    pub diagnostics: Vec<HubClientPackageDiagnostic>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HubClientPackageDiagnostic {
+    pub kind: String,
+    pub message: String,
 }
 
 /// Package classification in client API vocabulary.
@@ -843,6 +951,34 @@ impl From<PackageState> for HubClientPackageState {
             PackageState::Enabled => Self::Enabled,
             PackageState::Disabled => Self::Disabled,
         }
+    }
+}
+
+fn runnable_entrypoint_kind_label(kind: PackageRunnableEntrypointKind) -> &'static str {
+    match kind {
+        PackageRunnableEntrypointKind::Client => "client",
+        PackageRunnableEntrypointKind::Web => "web",
+        PackageRunnableEntrypointKind::Mcp => "mcp",
+        PackageRunnableEntrypointKind::Daemon => "daemon",
+        PackageRunnableEntrypointKind::Provider => "provider",
+    }
+}
+
+fn runnable_mode_label(mode: PackageRunnableMode) -> &'static str {
+    match mode {
+        PackageRunnableMode::Dev => "dev",
+        PackageRunnableMode::Local => "local",
+    }
+}
+
+fn runnable_process_state_label(state: PackageRunnableProcessState) -> &'static str {
+    match state {
+        PackageRunnableProcessState::NotStarted => "not_started",
+        PackageRunnableProcessState::Starting => "starting",
+        PackageRunnableProcessState::Running => "running",
+        PackageRunnableProcessState::Exited => "exited",
+        PackageRunnableProcessState::Failed => "failed",
+        PackageRunnableProcessState::Stopped => "stopped",
     }
 }
 

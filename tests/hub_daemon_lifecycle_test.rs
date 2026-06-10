@@ -196,6 +196,23 @@ fn write_local_plugin_package(root: &Path) {
   ],
   "entrypoints": [
     { "runtime": "lua", "path": "plugin.lua", "bootstrap": false }
+  ],
+  "runnable_entrypoints": [
+    {
+      "id": "web",
+      "kind": "web",
+      "command": "bin/botster-web",
+      "args": ["--host", "127.0.0.1"],
+      "working_directory": { "policy": "package_root" },
+      "environment": [
+        { "name": "BOTSTER_WEB_PORT", "required": false, "default": "5173" }
+      ],
+      "mode": "dev",
+      "capabilities": [
+        { "surface": "network", "scope": "localhost" }
+      ],
+      "may_supervise": true
+    }
   ]
 }
 "#,
@@ -1239,10 +1256,12 @@ fn cli_daemon_restart_recovers_worker_backed_session_through_transport() {
     )
     .expect("spawn restart recovery session through daemon transport");
     assert_eq!(spawn.kind, botster_hub::DaemonResponseKind::Spawned);
-    assert!(spawn
-        .sessions
-        .iter()
-        .any(|session| session.session_id == session_id && session.lifecycle == "running"));
+    assert!(
+        spawn
+            .sessions
+            .iter()
+            .any(|session| session.session_id == session_id && session.lifecycle == "running")
+    );
 
     shutdown_cli_daemon(&data_dir, child);
     let restarted_child = start_cli_daemon(&data_dir);
@@ -1270,10 +1289,11 @@ fn cli_daemon_restart_recovers_worker_backed_session_through_transport() {
     let list =
         botster_hub::daemon_transport_request(&config, botster_hub::DaemonRequest::ListSessions)
             .expect("list recovered session through daemon transport");
-    assert!(list
-        .sessions
-        .iter()
-        .any(|session| session.session_id == session_id && session.lifecycle == "running"));
+    assert!(
+        list.sessions
+            .iter()
+            .any(|session| session.session_id == session_id && session.lifecycle == "running")
+    );
 
     let resize = botster_hub::daemon_transport_request(
         &config,
@@ -1381,11 +1401,13 @@ fn external_hub_client_crate_drives_real_daemon_socket_protocol() {
     )
     .expect("external client spawn request");
     assert_eq!(spawn.kind, botster_hub_client::DaemonResponseKind::Spawned);
-    assert!(spawn
-        .sessions
-        .iter()
-        .any(|session| session.session_id == "external-client-session"
-            && session.lifecycle == "running"));
+    assert!(
+        spawn
+            .sessions
+            .iter()
+            .any(|session| session.session_id == "external-client-session"
+                && session.lifecycle == "running")
+    );
 
     let mut connection =
         botster_hub_client::DaemonConnection::connect(&endpoint).expect("external connect");
@@ -1525,21 +1547,26 @@ fn external_hub_client_reports_compatibility_descriptor_and_mismatch_diagnostics
         ack.compatibility.protocol_version,
         botster_hub_client::PROTOCOL_VERSION
     );
-    assert!(ack
-        .compatibility
-        .supports_feature(botster_hub_client::FEATURE_SESSIONS));
-    assert!(ack
-        .compatibility
-        .supports_feature(botster_hub_client::FEATURE_TERMINAL_STREAMING));
-    assert!(ack
-        .compatibility
-        .supports_feature(botster_hub_client::FEATURE_RESIZE));
-    assert!(ack
-        .compatibility
-        .supports_feature(botster_hub_client::FEATURE_PLUGIN_SURFACE_RENDER));
-    assert!(ack
-        .compatibility
-        .supports_feature(botster_hub_client::FEATURE_PLUGIN_SURFACE_ACTION));
+    assert!(
+        ack.compatibility
+            .supports_feature(botster_hub_client::FEATURE_SESSIONS)
+    );
+    assert!(
+        ack.compatibility
+            .supports_feature(botster_hub_client::FEATURE_TERMINAL_STREAMING)
+    );
+    assert!(
+        ack.compatibility
+            .supports_feature(botster_hub_client::FEATURE_RESIZE)
+    );
+    assert!(
+        ack.compatibility
+            .supports_feature(botster_hub_client::FEATURE_PLUGIN_SURFACE_RENDER)
+    );
+    assert!(
+        ack.compatibility
+            .supports_feature(botster_hub_client::FEATURE_PLUGIN_SURFACE_ACTION)
+    );
     assert_eq!(
         ack.compatibility.conformance_fixture_revision,
         botster_hub_client::CONFORMANCE_FIXTURE_REVISION
@@ -1958,9 +1985,11 @@ fn scripted_tui_uses_daemon_socket_for_attach_input_doorbell_resize_and_restart_
 
     let proof = botster_hub::run_scripted_probe(config.clone(), "scripted-tui-session")
         .expect("scripted TUI probe should complete core workflow");
-    assert!(proof
-        .rendered_sessions
-        .contains(&"scripted-tui-session".to_string()));
+    assert!(
+        proof
+            .rendered_sessions
+            .contains(&"scripted-tui-session".to_string())
+    );
     assert!(proof.ui_regions.contains(&"sessions-panel".to_string()));
     assert!(proof.ui_regions.contains(&"activity-panel".to_string()));
     assert!(proof.ui_regions.contains(&"attached-terminal".to_string()));
@@ -2356,6 +2385,8 @@ fn cli_packages_enable_local_path_routes_through_running_daemon_and_persists() {
     assert!(stdout.contains("response=packages"));
     assert!(stdout.contains("package name=dogfood.plugin"));
     assert!(stdout.contains("state=enabled"));
+    assert!(stdout.contains("runnable_entrypoints=1"));
+    assert!(stdout.contains("package_entrypoint package=dogfood.plugin id=web kind=web mode=dev command=bin/botster-web args=2 working_directory=package_root environment=1 capabilities=1 may_supervise=true process_state=not_started"));
     assert!(!stdout.contains(package_dir.to_string_lossy().as_ref()));
 
     let status = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
@@ -2407,6 +2438,8 @@ fn cli_packages_enable_local_path_routes_through_running_daemon_and_persists() {
     assert!(stdout.contains("package_count=1"));
     assert!(stdout.contains("package name=dogfood.plugin"));
     assert!(stdout.contains("state=enabled"));
+    assert!(stdout.contains("runnable_entrypoints=1"));
+    assert!(stdout.contains("process_state=not_started"));
     assert!(!stdout.contains(package_dir.to_string_lossy().as_ref()));
 
     let providers = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
@@ -2445,6 +2478,9 @@ fn cli_packages_enable_local_path_routes_through_running_daemon_and_persists() {
     assert!(stdout.contains("package_count=1"));
     assert!(stdout.contains("package name=dogfood.plugin"));
     assert!(stdout.contains("state=enabled"));
+    assert!(stdout.contains("runnable_entrypoints=1"));
+    assert!(stdout.contains("package_entrypoint package=dogfood.plugin id=web kind=web mode=dev command=bin/botster-web args=2 working_directory=package_root environment=1 capabilities=1 may_supervise=true process_state=not_started"));
+    assert!(!stdout.contains(package_dir.to_string_lossy().as_ref()));
 
     shutdown_cli_daemon(&data_dir, restarted);
 }

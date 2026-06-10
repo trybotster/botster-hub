@@ -544,12 +544,23 @@ grant, provenance, update, and audit policy.
 
 Local dogfood installs accept either an explicit JSON manifest path or a package
 directory containing `botster-package.json`. The file is parsed as
-`botster_core::PackageManifest`; the hub rewrites the manifest source to
-`PackageSource::Path` with the canonical package root, records
+`botster_core::PackageManifest` plus the hub-owned `runnable_entrypoints`
+extension; the hub rewrites the manifest source to `PackageSource::Path` with
+the canonical package root, records
 `local:<canonical-package-root>` provenance, marks the record as
 `local_development` trust, and rejects absolute, traversing, or symlink-escaped
 entrypoints before registry mutation. Enabled local records can be prepared into
 canonical entrypoint paths for the core lifecycle adapter.
+
+`entrypoints` remains the core plugin/provider code-load contract. Runnable
+local/dev process declarations live under `runnable_entrypoints` so clients,
+launchers, and future marketplace tooling share one discovery shape without
+changing plugin loading semantics. Each runnable entrypoint declares a stable
+`id`, `kind` (`client`, `web`, `mcp`, `daemon`, or `provider`), `command`,
+`args`, `working_directory`, declarative `environment` requirements, `mode`
+(`dev` or `local`), capability needs, `may_supervise`, and a static process DTO.
+Current process state is always `not_started`; this slice does not spawn,
+supervise, restart, or health-check runnable entrypoints.
 
 Local path manifest example:
 
@@ -566,6 +577,28 @@ Local path manifest example:
   ],
   "entrypoints": [
     { "runtime": "lua", "path": "plugin.lua", "bootstrap": false }
+  ],
+  "runnable_entrypoints": [
+    {
+      "id": "web-client",
+      "kind": "web",
+      "command": "bin/botster-web",
+      "args": ["--host", "127.0.0.1"],
+      "working_directory": { "policy": "package_root" },
+      "environment": [
+        {
+          "name": "BOTSTER_WEB_PORT",
+          "required": false,
+          "default": "5173",
+          "description": "Local botster-web dev server port"
+        }
+      ],
+      "mode": "dev",
+      "capabilities": [
+        { "surface": "network", "scope": "localhost" }
+      ],
+      "may_supervise": true
+    }
   ]
 }
 ```
@@ -609,8 +642,12 @@ bundles. Package records persist through the canonical `HubState.package_registr
 snapshot inside `hub-state.json`; there is no separate package-state file for the
 registry. The snapshot is the local lock state: installed source, provenance,
 pin revision/checksum, update policy, trust classification, enabled state,
-admitted capabilities, compatibility result/diagnostics, optional install/update
-timestamps, and the latest audit reason.
+admitted capabilities, compatibility result/diagnostics, runnable entrypoint
+contracts, optional install/update timestamps, and the latest audit reason.
+
+Deferred production concerns remain outside this contract slice: signing,
+sandboxing, dependency solving, installer-managed binaries, hosted marketplace
+resolution, and production WebRTC launch paths.
 
 Compatibility remains deliberately narrow in this slice. The manifest `botster`
 field accepts only exact `MAJOR.MINOR.PATCH` or lower-bound

@@ -5,7 +5,7 @@
 //! manifest, capability, and host-profile admission contracts. It intentionally
 //! does not fetch packages or load plugin/provider lifecycles.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
@@ -128,6 +128,17 @@ impl PackageRegistry {
         trust: PackageTrust,
         audit_reason: impl Into<String>,
     ) -> PackageRegistryResult<&PackageRecord> {
+        self.install_with_trust_and_runnable(manifest, provenance, trust, Vec::new(), audit_reason)
+    }
+
+    fn install_with_trust_and_runnable(
+        &mut self,
+        manifest: PackageManifest,
+        provenance: PackageProvenance,
+        trust: PackageTrust,
+        runnable_entrypoints: Vec<PackageRunnableEntrypoint>,
+        audit_reason: impl Into<String>,
+    ) -> PackageRegistryResult<&PackageRecord> {
         let audit_reason = audit_reason.into();
         let package_name = manifest.name.clone();
 
@@ -179,6 +190,7 @@ impl PackageRegistry {
             update_policy: PackageUpdatePolicy::Manual,
             admitted_capabilities: Vec::new(),
             compatibility,
+            runnable_entrypoints,
             installed_at: None,
             updated_at: None,
             last_audit_reason: audit_reason,
@@ -200,8 +212,15 @@ impl PackageRegistry {
     ) -> PackageRegistryResult<&PackageRecord> {
         let audit_reason = audit_reason.into();
         let local_source = LocalPackageSource::resolve(path.as_ref(), audit_reason.clone())?;
-        let mut manifest = local_source.read_manifest(audit_reason.clone())?;
+        let local_manifest = local_source.read_manifest(audit_reason.clone())?;
+        let mut manifest = local_manifest.manifest;
         local_source.validate_manifest_entrypoints(&manifest, audit_reason.clone())?;
+        validate_runnable_entrypoints(
+            &manifest.name,
+            &local_manifest.runnable_entrypoints,
+            PackageAction::Install,
+            audit_reason.clone(),
+        )?;
         manifest.source = Some(PackageSource::Path {
             path: local_source.package_root.to_string_lossy().into_owned(),
         });
@@ -210,10 +229,11 @@ impl PackageRegistry {
             checksum: None,
         };
 
-        self.install_with_trust(
+        self.install_with_trust_and_runnable(
             manifest,
             provenance,
             PackageTrust::local_development(),
+            local_manifest.runnable_entrypoints,
             audit_reason,
         )
     }
@@ -409,6 +429,10 @@ impl PackageRegistry {
                     diagnostics: record.compatibility.diagnostics.clone(),
                 });
             }
+            validate_runnable_entrypoints_for_snapshot(
+                &package_name,
+                &record.runnable_entrypoints,
+            )?;
             record.admitted_host_profile = Self::admitted_host_profile_from_snapshot(&record)?;
             record.admitted_capabilities = Self::admitted_capabilities_from_snapshot(
                 &record,
@@ -587,6 +611,9 @@ pub struct PackageRecord {
     /// Narrow Botster compatibility result derived from the core manifest.
     #[serde(default)]
     pub compatibility: PackageCompatibility,
+    /// Hub-owned local/dev runnable entrypoint declarations.
+    #[serde(default)]
+    pub runnable_entrypoints: Vec<PackageRunnableEntrypoint>,
     /// Optional install timestamp supplied by future installer paths.
     #[serde(default)]
     pub installed_at: Option<String>,
@@ -609,6 +636,138 @@ impl PackageRecord {
     pub const fn is_enabled(&self) -> bool {
         matches!(self.state, PackageState::Enabled)
     }
+}
+
+/// Hub-owned package entrypoint declaration for local/dev runnable processes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PackageRunnableEntrypoint {
+    /// Stable manifest-local entrypoint id.
+    pub id: String,
+    /// Marketplace-shaped entrypoint kind.
+    pub kind: PackageRunnableEntrypointKind,
+    /// Command name or package-relative command path.
+    pub command: String,
+    /// Command arguments. These are declarative and are not shell-expanded by this contract.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Working-directory policy for future process spawning.
+    #[serde(default)]
+    pub working_directory: PackageRunnableWorkingDirectory,
+    /// Declarative environment requirements. Values are optional defaults, not host snapshots.
+    #[serde(default)]
+    pub environment: Vec<PackageEnvironmentRequirement>,
+    /// Local/dev execution mode.
+    #[serde(default)]
+    pub mode: PackageRunnableMode,
+    /// Capability declarations needed by this entrypoint.
+    #[serde(default)]
+    pub capabilities: Vec<Capability>,
+    /// Static policy declaring whether the hub may supervise this entrypoint later.
+    #[serde(default)]
+    pub may_supervise: bool,
+    /// Static process-state DTO. This ticket does not spawn processes, so it defaults to not_started.
+    #[serde(default)]
+    pub process: PackageRunnableProcess,
+}
+
+/// Supported runnable entrypoint kinds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PackageRunnableEntrypointKind {
+    Client,
+    Web,
+    Mcp,
+    Daemon,
+    Provider,
+}
+
+/// Working-directory policy for a runnable package entrypoint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "policy", rename_all = "snake_case")]
+pub enum PackageRunnableWorkingDirectory {
+    PackageRoot,
+    EntrypointDir,
+    Relative { path: String },
+}
+
+impl Default for PackageRunnableWorkingDirectory {
+    fn default() -> Self {
+        Self::PackageRoot
+    }
+}
+
+/// Declarative environment requirement for a runnable package entrypoint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PackageEnvironmentRequirement {
+    /// Environment variable name.
+    pub name: String,
+    /// Whether the variable must be present when a future launcher resolves it.
+    #[serde(default = "default_required_environment")]
+    pub required: bool,
+    /// Optional manifest-supplied default. This is not a host-resolved secret value.
+    #[serde(default)]
+    pub default: Option<String>,
+    /// Optional operator-facing description.
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+fn default_required_environment() -> bool {
+    true
+}
+
+/// Local/dev runnable entrypoint mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PackageRunnableMode {
+    Dev,
+    Local,
+}
+
+impl Default for PackageRunnableMode {
+    fn default() -> Self {
+        Self::Local
+    }
+}
+
+/// Static process-state DTO for package runnable entrypoints.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PackageRunnableProcess {
+    /// Current static state.
+    pub state: PackageRunnableProcessState,
+    /// Operator-facing diagnostics.
+    #[serde(default)]
+    pub diagnostics: Vec<PackageRunnableDiagnostic>,
+}
+
+impl Default for PackageRunnableProcess {
+    fn default() -> Self {
+        Self {
+            state: PackageRunnableProcessState::NotStarted,
+            diagnostics: Vec::new(),
+        }
+    }
+}
+
+/// Stable process states exposed before runtime spawning exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PackageRunnableProcessState {
+    NotStarted,
+    Starting,
+    Running,
+    Exited,
+    Failed,
+    Stopped,
+}
+
+/// Operator-facing process diagnostic row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PackageRunnableDiagnostic {
+    /// Diagnostic classifier.
+    pub kind: String,
+    /// Sanitized diagnostic message.
+    pub message: String,
 }
 
 /// Hub-owned package trust marker.
@@ -876,6 +1035,13 @@ pub enum PackageRegistrySnapshotError {
         /// Core admission error.
         error: HostProfileAdmissionError,
     },
+    /// Persisted runnable entrypoint declarations no longer validate.
+    RunnableEntrypoint {
+        /// Package whose persisted runnable entrypoints could not be re-derived.
+        package_name: String,
+        /// Sanitized validation reason.
+        reason: String,
+    },
 }
 
 /// Typed hub package policy error.
@@ -1093,6 +1259,14 @@ impl PreparedLocalPackage {
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct LocalPackageManifest {
+    #[serde(flatten)]
+    manifest: PackageManifest,
+    #[serde(default)]
+    runnable_entrypoints: Vec<PackageRunnableEntrypoint>,
+}
+
 #[derive(Debug, Clone)]
 struct LocalPackageSource {
     package_root: PathBuf,
@@ -1161,7 +1335,7 @@ impl LocalPackageSource {
         }
     }
 
-    fn read_manifest(&self, audit_reason: String) -> PackageRegistryResult<PackageManifest> {
+    fn read_manifest(&self, audit_reason: String) -> PackageRegistryResult<LocalPackageManifest> {
         let bytes = fs::read(&self.manifest_path).map_err(|error| {
             PackageRegistryError::without_record(
                 self.manifest_path.to_string_lossy(),
@@ -1263,6 +1437,86 @@ fn canonical_entrypoint_path(
     Ok(entrypoint_path)
 }
 
+fn validate_runnable_entrypoints(
+    package_name: &str,
+    entrypoints: &[PackageRunnableEntrypoint],
+    action: PackageAction,
+    audit_reason: String,
+) -> PackageRegistryResult<()> {
+    validate_runnable_entrypoint_contract(entrypoints).map_err(|reason| {
+        PackageRegistryError::without_record(
+            package_name,
+            action,
+            PackageAdmissionReason::UnsafeEntrypoint(reason),
+            audit_reason,
+        )
+    })
+}
+
+fn validate_runnable_entrypoints_for_snapshot(
+    package_name: &str,
+    entrypoints: &[PackageRunnableEntrypoint],
+) -> Result<(), PackageRegistrySnapshotError> {
+    validate_runnable_entrypoint_contract(entrypoints).map_err(|reason| {
+        PackageRegistrySnapshotError::RunnableEntrypoint {
+            package_name: package_name.to_string(),
+            reason,
+        }
+    })
+}
+
+fn validate_runnable_entrypoint_contract(
+    entrypoints: &[PackageRunnableEntrypoint],
+) -> Result<(), String> {
+    let mut ids = BTreeSet::new();
+    for entrypoint in entrypoints {
+        if entrypoint.id.trim().is_empty() {
+            return Err("runnable entrypoint id is empty".to_string());
+        }
+        if !ids.insert(entrypoint.id.as_str()) {
+            return Err(format!(
+                "duplicate runnable entrypoint id {}",
+                entrypoint.id
+            ));
+        }
+        validate_runnable_command(&entrypoint.command)?;
+        if let PackageRunnableWorkingDirectory::Relative { path } = &entrypoint.working_directory {
+            validate_relative_manifest_path(path, "working directory")?;
+        }
+        for requirement in &entrypoint.environment {
+            if requirement.name.trim().is_empty() {
+                return Err(format!(
+                    "runnable entrypoint {} has empty environment requirement name",
+                    entrypoint.id
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_runnable_command(command: &str) -> Result<(), String> {
+    if command.trim().is_empty() {
+        return Err("runnable entrypoint command is empty".to_string());
+    }
+    validate_relative_manifest_path(command, "command")
+}
+
+fn validate_relative_manifest_path(value: &str, label: &str) -> Result<(), String> {
+    let relative = Path::new(value);
+    if relative.is_absolute()
+        || relative.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        return Err(format!("runnable entrypoint {label} is unsafe: {value}"));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1360,6 +1614,12 @@ mod tests {
         manifest_path
     }
 
+    fn write_manifest_json(package_root: &Path, json: &str) -> PathBuf {
+        let manifest_path = package_root.join(LOCAL_PACKAGE_MANIFEST_FILE);
+        fs::write(&manifest_path, json).expect("write local package manifest json");
+        manifest_path
+    }
+
     fn local_manifest(name: &str, entrypoint: &str) -> PackageManifest {
         let mut manifest =
             plugin_manifest(name, vec![capability(CapabilitySurface::Surfaces, None)]);
@@ -1384,6 +1644,7 @@ mod tests {
             pin: None,
             update_policy: PackageUpdatePolicy::Manual,
             admitted_capabilities: Vec::new(),
+            runnable_entrypoints: Vec::new(),
             installed_at: None,
             updated_at: None,
             last_audit_reason: "test fixture".to_string(),
@@ -1813,6 +2074,177 @@ mod tests {
             .expect("install package directory");
 
         assert!(registry.package("directory.plugin").is_some());
+    }
+
+    #[test]
+    fn local_manifest_installs_runnable_entrypoint_contract() {
+        let root = test_root("runnable-entrypoint-contract");
+        fs::create_dir_all(root.join("web")).expect("create web directory");
+        fs::write(root.join("plugin.lua"), "-- synthetic plugin").expect("write plugin");
+        fs::write(root.join("web").join("dev-server"), "#!/bin/sh\n")
+            .expect("write runnable command");
+        write_manifest_json(
+            &root,
+            r#"{
+  "name": "runnable.plugin",
+  "version": "1.0.0",
+  "kind": "plugin",
+  "botster": ">=0.1.0",
+  "source": { "type": "path", "path": "." },
+  "capabilities": [{ "surface": "surfaces" }],
+  "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }],
+  "runnable_entrypoints": [{
+    "id": "web",
+    "kind": "web",
+    "command": "web/dev-server",
+    "args": ["--host", "127.0.0.1"],
+    "working_directory": { "policy": "relative", "path": "web" },
+    "environment": [{
+      "name": "BOTSTER_WEB_PORT",
+      "required": false,
+      "default": "5173",
+      "description": "Local web client port"
+    }],
+    "mode": "dev",
+    "capabilities": [{ "surface": "network", "scope": "localhost" }],
+    "may_supervise": true
+  }]
+}
+"#,
+        );
+        let mut registry = PackageRegistry::new(grants(vec![
+            capability(CapabilitySurface::Surfaces, None),
+            capability(CapabilitySurface::Network, Some("localhost")),
+        ]));
+
+        let record = registry
+            .install_local_path(&root, "install runnable package")
+            .expect("install runnable package");
+
+        assert_eq!(record.runnable_entrypoints.len(), 1);
+        let entrypoint = &record.runnable_entrypoints[0];
+        assert_eq!(entrypoint.id, "web");
+        assert_eq!(entrypoint.kind, PackageRunnableEntrypointKind::Web);
+        assert_eq!(entrypoint.command, "web/dev-server");
+        assert_eq!(entrypoint.args, ["--host", "127.0.0.1"]);
+        assert_eq!(
+            entrypoint.working_directory,
+            PackageRunnableWorkingDirectory::Relative {
+                path: "web".to_string()
+            }
+        );
+        assert_eq!(entrypoint.environment[0].name, "BOTSTER_WEB_PORT");
+        assert_eq!(entrypoint.environment[0].default.as_deref(), Some("5173"));
+        assert_eq!(entrypoint.mode, PackageRunnableMode::Dev);
+        assert_eq!(
+            entrypoint.capabilities[0].surface,
+            CapabilitySurface::Network
+        );
+        assert!(entrypoint.may_supervise);
+        assert_eq!(
+            entrypoint.process.state,
+            PackageRunnableProcessState::NotStarted
+        );
+
+        let json = serde_json::to_string_pretty(&registry.snapshot()).expect("serialize snapshot");
+        assert!(json.contains("\"runnable_entrypoints\""));
+        assert!(json.contains("\"may_supervise\": true"));
+        assert!(json.contains("\"state\": \"not_started\""));
+
+        let restored =
+            PackageRegistry::from_snapshot(registry.snapshot()).expect("restore snapshot");
+        assert_eq!(
+            restored
+                .package("runnable.plugin")
+                .expect("restored record")
+                .runnable_entrypoints[0]
+                .args,
+            ["--host", "127.0.0.1"]
+        );
+    }
+
+    #[test]
+    fn invalid_runnable_entrypoint_contracts_are_rejected() {
+        let root = test_root("invalid-runnable-entrypoints");
+        fs::write(root.join("plugin.lua"), "-- synthetic plugin").expect("write plugin");
+        let mut registry =
+            PackageRegistry::new(grants(vec![capability(CapabilitySurface::Surfaces, None)]));
+
+        for (name, entrypoints) in [
+            (
+                "duplicate",
+                r#"[
+                  { "id": "web", "kind": "web", "command": "bin/web" },
+                  { "id": "web", "kind": "client", "command": "bin/client" }
+                ]"#,
+            ),
+            (
+                "missing-command",
+                r#"[{ "id": "web", "kind": "web", "command": "" }]"#,
+            ),
+            (
+                "absolute-command",
+                r#"[{ "id": "web", "kind": "web", "command": "/bin/web" }]"#,
+            ),
+            (
+                "traversing-command",
+                r#"[{ "id": "web", "kind": "web", "command": "../bin/web" }]"#,
+            ),
+            (
+                "traversing-working-directory",
+                r#"[{
+                  "id": "web",
+                  "kind": "web",
+                  "command": "bin/web",
+                  "working_directory": { "policy": "relative", "path": "../web" }
+                }]"#,
+            ),
+        ] {
+            write_manifest_json(
+                &root,
+                &format!(
+                    r#"{{
+  "name": "{name}.plugin",
+  "version": "1.0.0",
+  "kind": "plugin",
+  "botster": ">=0.1.0",
+  "source": {{ "type": "path", "path": "." }},
+  "capabilities": [{{ "surface": "surfaces" }}],
+  "entrypoints": [{{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }}],
+  "runnable_entrypoints": {entrypoints}
+}}"#
+                ),
+            );
+            let error = registry
+                .install_local_path(&root, format!("install {name}"))
+                .expect_err("invalid runnable entrypoint should fail");
+            assert!(matches!(
+                error.reason,
+                PackageAdmissionReason::UnsafeEntrypoint(_)
+            ));
+        }
+
+        write_manifest_json(
+            &root,
+            r#"{
+  "name": "unsupported-kind.plugin",
+  "version": "1.0.0",
+  "kind": "plugin",
+  "botster": ">=0.1.0",
+  "source": { "type": "path", "path": "." },
+  "capabilities": [{ "surface": "surfaces" }],
+  "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }],
+  "runnable_entrypoints": [{ "id": "bad", "kind": "sidecar", "command": "bin/sidecar" }]
+}
+"#,
+        );
+        let error = registry
+            .install_local_path(&root, "install unsupported kind")
+            .expect_err("unsupported kind should fail");
+        assert!(matches!(
+            error.reason,
+            PackageAdmissionReason::InvalidLocalManifest(_)
+        ));
     }
 
     #[test]
