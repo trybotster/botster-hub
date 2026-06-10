@@ -217,9 +217,13 @@ cargo run -- start --data-dir target/botster-hub-dogfood-data
 # Other terminals:
 cargo run -- status --data-dir target/botster-hub-dogfood-data
 
-cargo run -- packages enable --data-dir target/botster-hub-dogfood-data \
+cargo run -- packages install --data-dir target/botster-hub-dogfood-data \
   --path examples/synthetic-plugin
 cargo run -- packages list --data-dir target/botster-hub-dogfood-data
+cargo run -- packages show --data-dir target/botster-hub-dogfood-data dogfood.synthetic-plugin
+cargo run -- packages enable --data-dir target/botster-hub-dogfood-data dogfood.synthetic-plugin
+cargo run -- packages disable --data-dir target/botster-hub-dogfood-data dogfood.synthetic-plugin
+cargo run -- packages remove --data-dir target/botster-hub-dogfood-data dogfood.synthetic-plugin
 cargo run -- providers list --data-dir target/botster-hub-dogfood-data
 
 cargo run -- sessions spawn --data-dir target/botster-hub-dogfood-data \
@@ -236,14 +240,17 @@ cargo run -- inspect --data-dir target/botster-hub-dogfood-data dogfood-session
 cargo run -- shutdown --data-dir target/botster-hub-dogfood-data
 ```
 
-`packages enable --path` connects to the running daemon, installs and enables a
-local package manifest through the existing hub package registry policy,
-persists the registry snapshot under `hub-state.json`, and then lists packages
-from the daemon's refreshed in-memory registry. `packages list` and `providers
-list` use the same daemon-backed registry view. The session commands also use
-the running daemon runtime, so a session created by one CLI process is visible
-to later `sessions list`, `sessions attach`, `sessions send-input`, `sessions
-resize`, `sessions detach`, and `sessions shutdown` invocations.
+`packages install --path` connects to the running daemon, validates the local
+package manifest through the existing hub package registry policy, persists it
+as installed but disabled under `hub-state.json`, and then lists packages from
+the daemon's refreshed in-memory registry. `packages show`, `packages enable`,
+`packages disable`, `packages remove`, `packages list`, and `providers list` use
+the same daemon-backed registry view. `packages enable --path` remains available
+as a convenience that installs and enables in one daemon-owned mutation. The
+session commands also use the running daemon runtime, so a session created by
+one CLI process is visible to later `sessions list`, `sessions attach`,
+`sessions send-input`, `sessions resize`, `sessions detach`, and `sessions
+shutdown` invocations.
 `attach` streams terminal bytes and currently exits after an idle window if the
 core runtime does not provide a process-exit frame. `inspect` is intentionally
 scoped to sanitized session list data until the stable client API grows a
@@ -367,8 +374,9 @@ daily local coordination dogfood. Enable it through the running daemon and
 serve MCP from the same data directory:
 
 ```sh
-cargo run -- packages enable --data-dir target/botster-hub-dogfood-data \
+cargo run -- packages install --data-dir target/botster-hub-dogfood-data \
   --path examples/project-pipelines
+cargo run -- packages enable --data-dir target/botster-hub-dogfood-data project-pipelines
 cargo run -- mcp-serve --data-dir target/botster-hub-dogfood-data
 ```
 
