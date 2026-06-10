@@ -567,6 +567,12 @@ pub enum DaemonRequest {
         session_id: String,
     },
     ListPackages,
+    InstallPackageLocalPath {
+        path: PathBuf,
+    },
+    ShowPackage {
+        package_name: String,
+    },
     EnablePackageLocalPath {
         path: PathBuf,
     },
@@ -574,6 +580,9 @@ pub enum DaemonRequest {
         package_name: String,
     },
     DisablePackage {
+        package_name: String,
+    },
+    RemovePackage {
         package_name: String,
     },
     PluginLifecycleStatus,
