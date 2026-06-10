@@ -1,7 +1,9 @@
 #![cfg(unix)]
 
+use std::collections::BTreeMap;
 use std::fs;
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
@@ -252,6 +254,75 @@ fn write_supervised_package(root: &Path, package_name: &str, command: &str, args
     .expect("write supervised package manifest");
 }
 
+fn write_botster_web_package(root: &Path) {
+    fs::create_dir_all(root.join("scripts")).expect("create botster-web package root");
+    fs::write(root.join("plugin.lua"), "return botster.register({})\n")
+        .expect("write botster-web core entrypoint");
+    fs::write(
+        root.join("scripts").join("real-hub-dogfood-bridge.mjs"),
+        r#"
+import fs from 'fs';
+import http from 'http';
+
+const port = Number(process.env.BOTSTER_WEB_DOGFOOD_BRIDGE_PORT || '41739');
+const socket = process.env.BOTSTER_HUB_SOCKET;
+const dataDir = process.env.BOTSTER_HUB_DATA_DIR;
+const mixedOwnership = Boolean(process.env.BOTSTER_WEB_DOGFOOD_DATA_DIR && (socket || dataDir));
+const source = socket ? 'socket' : (dataDir ? 'data_dir' : 'spawned');
+const mode = socket || dataDir ? 'existing_hub' : 'spawned_hub';
+const socketExists = socket ? fs.existsSync(socket) : false;
+
+http.createServer((request, response) => {
+  if (request.url !== '/health') {
+    response.writeHead(404);
+    response.end('not found');
+    return;
+  }
+  response.writeHead(200, { 'content-type': 'application/json' });
+  response.end(JSON.stringify({
+    ok: mode === 'existing_hub' && source === 'socket' && socketExists && !mixedOwnership,
+    mode,
+    source,
+    socketExists,
+    mixedOwnership,
+  }));
+}).listen(port, '127.0.0.1');
+"#,
+    )
+    .expect("write botster-web bridge script");
+    let manifest = serde_json::json!({
+        "name": "botster-web",
+        "version": "1.0.0",
+        "kind": "plugin",
+        "botster": ">=0.1.0",
+        "source": { "type": "path", "path": "." },
+        "capabilities": [{ "surface": "surfaces" }],
+        "entrypoints": [
+            { "runtime": "lua", "path": "plugin.lua", "bootstrap": false }
+        ],
+        "runnable_entrypoints": [{
+            "id": "web-client",
+            "kind": "web",
+            "command": "node",
+            "args": ["scripts/real-hub-dogfood-bridge.mjs"],
+            "working_directory": { "policy": "package_root" },
+            "environment": [
+                { "name": "BOTSTER_HUB_SOCKET", "required": false },
+                { "name": "BOTSTER_HUB_DATA_DIR", "required": false },
+                { "name": "BOTSTER_WEB_DOGFOOD_BRIDGE_PORT", "required": false, "default": "41739" }
+            ],
+            "mode": "dev",
+            "capabilities": [{ "surface": "network", "scope": "localhost" }],
+            "may_supervise": true
+        }]
+    });
+    fs::write(
+        root.join("botster-package.json"),
+        serde_json::to_string_pretty(&manifest).expect("serialize botster-web manifest"),
+    )
+    .expect("write botster-web manifest");
+}
+
 fn enable_supervised_package(data_dir: &Path, package_dir: &Path) {
     let response = botster_hub::daemon_transport_request(
         &explicit_config(data_dir),
@@ -293,6 +364,54 @@ fn wait_for_process_exit(pid: u32) {
         thread::sleep(Duration::from_millis(20));
     }
     panic!("process {pid} still exists");
+}
+
+fn read_json_health(url: &str) -> serde_json::Value {
+    let port = url
+        .strip_prefix("http://127.0.0.1:")
+        .expect("local health URL")
+        .parse::<u16>()
+        .expect("health port");
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect health endpoint");
+    stream
+        .write_all(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+        .expect("write health request");
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .expect("read health response");
+    let (headers, body) = response.split_once("\r\n\r\n").expect("HTTP response body");
+    let body = if headers
+        .to_ascii_lowercase()
+        .contains("transfer-encoding: chunked")
+    {
+        decode_chunked_http_body(body)
+    } else {
+        body.to_string()
+    };
+    serde_json::from_str(body.trim()).expect("health JSON")
+}
+
+fn unused_loopback_port() -> u16 {
+    TcpListener::bind(("127.0.0.1", 0))
+        .expect("bind unused loopback port")
+        .local_addr()
+        .expect("local addr")
+        .port()
+}
+
+fn decode_chunked_http_body(body: &str) -> String {
+    let mut rest = body;
+    let mut decoded = String::new();
+    loop {
+        let (size_line, after_size) = rest.split_once("\r\n").expect("chunk size");
+        let size = usize::from_str_radix(size_line.trim(), 16).expect("hex chunk size");
+        if size == 0 {
+            return decoded;
+        }
+        decoded.push_str(&after_size[..size]);
+        rest = &after_size[size + 2..];
+    }
 }
 
 fn write_local_process_plugin_package(root: &Path) {
@@ -500,12 +619,20 @@ fn run_command_with_timeout(mut command: Command, timeout: Duration) -> Output {
     );
 }
 
-fn spawn_dogfood_launcher(data_dir: &Path) -> (Child, mpsc::Receiver<String>) {
+fn spawn_dogfood_launcher(
+    data_dir: &Path,
+    web_package_path: &Path,
+    web_bridge_port: u16,
+) -> (Child, mpsc::Receiver<String>) {
     ensure_session_worker_binary();
     let mut child = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
         .arg("dogfood")
         .arg("--data-dir")
         .arg(data_dir)
+        .arg("--web-package-path")
+        .arg(web_package_path)
+        .arg("--web-bridge-port")
+        .arg(web_bridge_port.to_string())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -532,7 +659,7 @@ fn wait_for_dogfood_output(
     rx: &mpsc::Receiver<String>,
     needle: &str,
 ) -> Vec<String> {
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
     let mut lines = Vec::new();
     while std::time::Instant::now() < deadline {
         if let Some(status) = child.try_wait().expect("poll dogfood launcher") {
@@ -555,7 +682,16 @@ fn wait_for_dogfood_output(
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                panic!("dogfood stdout closed before {needle:?}: lines={lines:?}");
+                let status = child
+                    .try_wait()
+                    .expect("poll dogfood launcher after stdout close");
+                let mut stderr = String::new();
+                if let Some(mut pipe) = child.stderr.take() {
+                    let _ = pipe.read_to_string(&mut stderr);
+                }
+                panic!(
+                    "dogfood stdout closed before {needle:?}: status={status:?} lines={lines:?} stderr={stderr:?}"
+                );
             }
         }
     }
@@ -564,20 +700,24 @@ fn wait_for_dogfood_output(
 }
 
 #[test]
-fn cli_dogfood_launcher_starts_isolated_hub_enables_project_pipelines_and_shuts_down() {
+fn cli_dogfood_launcher_starts_botster_web_in_existing_hub_mode_and_shuts_down() {
     let _guard = daemon_test_lock()
         .lock()
         .expect("serialize real daemon test");
     let data_dir = unique_test_dir("cli-dogfood-launcher");
-    let (mut child, rx) = spawn_dogfood_launcher(&data_dir);
+    let web_package_dir = unique_test_dir("cli-dogfood-botster-web-package");
+    write_botster_web_package(&web_package_dir);
+    let web_bridge_port = unused_loopback_port();
+    let (mut child, rx) = spawn_dogfood_launcher(&data_dir, &web_package_dir, web_bridge_port);
     let lines = wait_for_dogfood_output(&mut child, &rx, "dogfood=ready");
     let mut lines = {
         let mut collected = lines;
         collected.extend(wait_for_dogfood_output(
             &mut child,
             &rx,
-            "web=local web entrypoint unavailable",
+            &format!("web=http://127.0.0.1:{web_bridge_port}"),
         ));
+        collected.extend(wait_for_dogfood_output(&mut child, &rx, "shutdown="));
         collected
     };
     lines.sort();
@@ -585,16 +725,29 @@ fn cli_dogfood_launcher_starts_isolated_hub_enables_project_pipelines_and_shuts_
 
     assert!(text.contains("dogfood=ready"));
     assert!(text.contains("package name=project-pipelines state=enabled"));
+    assert!(text.contains("package name=botster-web state=enabled"));
+    assert!(text.contains(&format!("web=http://127.0.0.1:{web_bridge_port}")));
     assert!(text.contains("tui=botster-hub tui --data-dir"));
     assert!(text.contains("mcp=botster-hub mcp-serve --data-dir"));
     assert!(text.contains("status=botster-hub status --data-dir"));
     assert!(text.contains("shutdown=run botster-hub shutdown --data-dir"));
     assert!(text.contains("Ctrl-C hard-stops the foreground launcher"));
-    assert!(text.contains("web=local web entrypoint unavailable in this repo"));
+    assert!(!text.contains("local web entrypoint unavailable"));
     assert!(
         !text.contains("examples/project-pipelines"),
         "launcher output should not leak the local package source path"
     );
+    assert!(
+        !text.contains(web_package_dir.to_string_lossy().as_ref()),
+        "launcher output should not leak the botster-web package source path"
+    );
+
+    let health = read_json_health(&format!("http://127.0.0.1:{web_bridge_port}"));
+    assert_eq!(health["ok"], true);
+    assert_eq!(health["mode"], "existing_hub");
+    assert_eq!(health["source"], "socket");
+    assert_eq!(health["socketExists"], true);
+    assert_eq!(health["mixedOwnership"], false);
 
     let status = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
         .arg("status")
@@ -609,7 +762,7 @@ fn cli_dogfood_launcher_starts_isolated_hub_enables_project_pipelines_and_shuts_
     );
     let stdout = String::from_utf8(status.stdout).expect("stdout is utf8");
     assert!(stdout.contains("lifecycle_state=running"));
-    assert!(stdout.contains("enabled_package_count=1"));
+    assert!(stdout.contains("enabled_package_count=2"));
 
     let packages = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
         .arg("packages")
@@ -625,8 +778,14 @@ fn cli_dogfood_launcher_starts_isolated_hub_enables_project_pipelines_and_shuts_
     );
     let stdout = String::from_utf8(packages.stdout).expect("stdout is utf8");
     assert!(stdout.contains("package name=project-pipelines"));
+    assert!(stdout.contains("package name=botster-web"));
     assert!(stdout.contains("state=enabled"));
+    assert!(stdout.contains(
+        "package_entrypoint package=botster-web id=web-client kind=web mode=dev command=node"
+    ));
+    assert!(stdout.contains("process_state=running"));
     assert!(!stdout.contains("examples/project-pipelines"));
+    assert!(!stdout.contains(web_package_dir.to_string_lossy().as_ref()));
 
     let lifecycle = botster_hub::daemon_transport_request(
         &explicit_config(&data_dir),
@@ -636,8 +795,31 @@ fn cli_dogfood_launcher_starts_isolated_hub_enables_project_pipelines_and_shuts_
     assert!(lifecycle.lifecycle.iter().any(|plugin| {
         plugin.package_name == "project-pipelines" && plugin.state == "enabled" && plugin.loaded
     }));
+    assert!(lifecycle.lifecycle.iter().any(|plugin| {
+        plugin.package_name == "botster-web" && plugin.state == "enabled" && plugin.loaded
+    }));
+
+    let list = botster_hub::daemon_transport_request(
+        &explicit_config(&data_dir),
+        botster_hub::DaemonRequest::ListPackages,
+    )
+    .expect("list packages after botster-web entrypoint start");
+    let web_entrypoint = list
+        .packages
+        .iter()
+        .find(|package| package.package_name == "botster-web")
+        .and_then(|package| {
+            package
+                .runnable_entrypoints
+                .iter()
+                .find(|entrypoint| entrypoint.id == "web-client")
+        })
+        .expect("botster-web web-client entrypoint");
+    assert_eq!(web_entrypoint.process.state, "running");
+    let web_pid = web_entrypoint.process.pid.expect("botster-web pid");
 
     shutdown_cli_daemon(&data_dir, child);
+    wait_for_process_exit(web_pid);
 }
 
 #[test]
@@ -2687,6 +2869,7 @@ fn package_entrypoint_supervision_starts_and_reports_running() {
         botster_hub::DaemonRequest::StartPackageEntrypoint {
             package_name: "dogfood.supervised".to_string(),
             entrypoint_id: "web".to_string(),
+            environment_overrides: BTreeMap::new(),
         },
     )
     .expect("start supervised entrypoint");
@@ -2727,6 +2910,60 @@ fn package_entrypoint_supervision_starts_and_reports_running() {
 }
 
 #[test]
+fn package_entrypoint_supervision_passes_environment_overrides() {
+    let _guard = daemon_test_lock()
+        .lock()
+        .expect("serialize real daemon test");
+    let data_dir = unique_test_dir("entrypoint-env");
+    let package_dir = unique_test_dir("entrypoint-env-package");
+    let output_path = std::env::current_dir()
+        .expect("current dir")
+        .join(data_dir.join("entrypoint-env.txt"));
+    write_supervised_package(
+        &package_dir,
+        "dogfood.env",
+        "sh",
+        &[
+            "-c",
+            &format!(
+                "printf '%s' \"$BOTSTER_TEST_ENV_OVERRIDE\" > {}; while true; do sleep 1; done",
+                output_path.display()
+            ),
+        ],
+    );
+    let child = start_cli_daemon(&data_dir);
+    enable_supervised_package(&data_dir, &package_dir);
+
+    let start = botster_hub::daemon_transport_request(
+        &explicit_config(&data_dir),
+        botster_hub::DaemonRequest::StartPackageEntrypoint {
+            package_name: "dogfood.env".to_string(),
+            entrypoint_id: "web".to_string(),
+            environment_overrides: BTreeMap::from([(
+                "BOTSTER_TEST_ENV_OVERRIDE".to_string(),
+                "override-reached-child".to_string(),
+            )]),
+        },
+    )
+    .expect("start supervised entrypoint with env");
+    let entrypoint = package_entrypoint(&start, "dogfood.env");
+    assert_eq!(entrypoint.process.state, "running");
+
+    for _ in 0..100 {
+        if output_path.exists() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        fs::read_to_string(&output_path).expect("read env output"),
+        "override-reached-child"
+    );
+
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
 fn package_entrypoint_supervision_reports_missing_command() {
     let _guard = daemon_test_lock()
         .lock()
@@ -2747,6 +2984,7 @@ fn package_entrypoint_supervision_reports_missing_command() {
         botster_hub::DaemonRequest::StartPackageEntrypoint {
             package_name: "dogfood.missing-command".to_string(),
             entrypoint_id: "web".to_string(),
+            environment_overrides: BTreeMap::new(),
         },
     )
     .expect("start missing supervised entrypoint");
@@ -2786,6 +3024,7 @@ fn package_entrypoint_supervision_reports_failed_command() {
         botster_hub::DaemonRequest::StartPackageEntrypoint {
             package_name: "dogfood.failed-command".to_string(),
             entrypoint_id: "web".to_string(),
+            environment_overrides: BTreeMap::new(),
         },
     )
     .expect("start failing supervised entrypoint");
@@ -2834,6 +3073,7 @@ fn package_entrypoint_supervision_stops_and_restarts() {
         botster_hub::DaemonRequest::StartPackageEntrypoint {
             package_name: "dogfood.restart".to_string(),
             entrypoint_id: "web".to_string(),
+            environment_overrides: BTreeMap::new(),
         },
     )
     .expect("start restart fixture");
@@ -2894,6 +3134,7 @@ fn package_entrypoint_supervision_cleans_up_on_disable_remove_and_shutdown() {
         botster_hub::DaemonRequest::StartPackageEntrypoint {
             package_name: "dogfood.cleanup".to_string(),
             entrypoint_id: "web".to_string(),
+            environment_overrides: BTreeMap::new(),
         },
     )
     .expect("start cleanup fixture");
@@ -2922,6 +3163,7 @@ fn package_entrypoint_supervision_cleans_up_on_disable_remove_and_shutdown() {
         botster_hub::DaemonRequest::StartPackageEntrypoint {
             package_name: "dogfood.cleanup".to_string(),
             entrypoint_id: "web".to_string(),
+            environment_overrides: BTreeMap::new(),
         },
     )
     .expect("restart cleanup fixture");
@@ -2955,6 +3197,7 @@ fn package_entrypoint_supervision_cleans_up_on_daemon_signal() {
         botster_hub::DaemonRequest::StartPackageEntrypoint {
             package_name: "dogfood.signal".to_string(),
             entrypoint_id: "web".to_string(),
+            environment_overrides: BTreeMap::new(),
         },
     )
     .expect("start signal fixture");

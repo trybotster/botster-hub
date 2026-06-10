@@ -10,27 +10,5 @@
   ],
   "entrypoints": [
     { "runtime": "lua", "path": "plugin.lua", "bootstrap": false }
-  ],
-  "runnable_entrypoints": [
-    {
-      "id": "web-client",
-      "kind": "web",
-      "command": "bin/botster-web",
-      "args": ["--host", "127.0.0.1"],
-      "working_directory": { "policy": "package_root" },
-      "environment": [
-        {
-          "name": "BOTSTER_WEB_PORT",
-          "required": false,
-          "default": "5173",
-          "description": "Local botster-web dev server port"
-        }
-      ],
-      "mode": "dev",
-      "capabilities": [
-        { "surface": "network", "scope": "localhost" }
-      ],
-      "may_supervise": true
-    }
   ]
 }
