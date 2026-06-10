@@ -585,6 +585,22 @@ pub enum DaemonRequest {
     RemovePackage {
         package_name: String,
     },
+    StartPackageEntrypoint {
+        package_name: String,
+        entrypoint_id: String,
+    },
+    StopPackageEntrypoint {
+        package_name: String,
+        entrypoint_id: String,
+    },
+    RestartPackageEntrypoint {
+        package_name: String,
+        entrypoint_id: String,
+    },
+    PackageEntrypointStatus {
+        package_name: String,
+        entrypoint_id: String,
+    },
     PluginLifecycleStatus,
     PluginMcpListTools,
     PluginMcpCallTool {
@@ -764,6 +780,14 @@ pub struct DaemonPackageEnvironmentRequirement {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DaemonPackageProcess {
     pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exited_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_status: Option<String>,
     #[serde(default)]
     pub diagnostics: Vec<DaemonPackageDiagnostic>,
 }
@@ -1157,7 +1181,13 @@ mod tests {
                 "mode": "dev",
                 "capabilities": [{ "surface": "Network", "scope": "localhost" }],
                 "may_supervise": true,
-                "process": { "state": "not_started", "diagnostics": [] }
+                "process": {
+                    "state": "running",
+                    "pid": 1234,
+                    "started_at": 1781060000,
+                    "exit_status": "none",
+                    "diagnostics": []
+                }
             }],
             "provider_profile_admitted": false
         });
@@ -1169,7 +1199,28 @@ mod tests {
         assert_eq!(entrypoint.args, ["--host", "127.0.0.1"]);
         assert_eq!(entrypoint.environment[0].default.as_deref(), Some("5173"));
         assert!(entrypoint.may_supervise);
-        assert_eq!(entrypoint.process.state, "not_started");
+        assert_eq!(entrypoint.process.state, "running");
+        assert_eq!(entrypoint.process.pid, Some(1234));
+        assert_eq!(entrypoint.process.started_at, Some(1781060000));
+        assert_eq!(entrypoint.process.exited_at, None);
+        assert_eq!(entrypoint.process.exit_status.as_deref(), Some("none"));
+    }
+
+    #[test]
+    fn package_entrypoint_lifecycle_request_is_serde_stable() {
+        let request = DaemonRequest::StartPackageEntrypoint {
+            package_name: "workflow.plugin".to_string(),
+            entrypoint_id: "web".to_string(),
+        };
+        let value = serde_json::to_value(request).expect("serialize request");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "type": "start_package_entrypoint",
+                "package_name": "workflow.plugin",
+                "entrypoint_id": "web"
+            })
+        );
     }
 
     #[test]

@@ -36,7 +36,10 @@ pub use botster_hub_client::{
     DaemonStatus, PROTOCOL, read_frame, read_frame_from_reader, write_frame,
 };
 use serde_json::Value;
+use signal_hook::consts::signal::{SIGINT, SIGTERM};
+use signal_hook::iterator::Signals;
 
+use crate::{EntrypointProcessSnapshot, EntrypointSupervisorError};
 use crate::{
     FileHubStateStore, HubClientApi, HubClientEvent, HubClientPackage,
     HubClientPackageClassification, HubClientPluginLifecycle, HubClientRequest,
@@ -57,6 +60,7 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
         .map_err(DaemonTransportError::Io)?;
 
     let (control_tx, control_rx) = mpsc::channel();
+    install_signal_forwarder(control_tx.clone())?;
     let mut daemon = HubDaemon::start(config)?;
     let mut logical_clock = 1;
     let mut drain_cursors = BTreeMap::<String, u64>::new();
@@ -240,6 +244,7 @@ fn handle_control_message(
                 DaemonTransportError::Client(error) => Ok(daemon_operator_error(error)),
                 DaemonTransportError::Package(error) => Ok(daemon_package_error(error)),
                 DaemonTransportError::State(error) => Ok(daemon_state_error(error)),
+                DaemonTransportError::Entrypoint(error) => Ok(daemon_entrypoint_error(error)),
                 error => Err(error),
             }
         });
@@ -304,6 +309,7 @@ fn handle_control_request(
             package_decision_response(daemon, decision)
         }
         DaemonRequest::DisablePackage { package_name } => {
+            daemon.entrypoint_supervisor().stop_package(&package_name);
             let decision = daemon
                 .package_registry_mut()
                 .disable(&package_name, "daemon socket disable package")?;
@@ -312,12 +318,51 @@ fn handle_control_request(
             package_decision_response(daemon, decision)
         }
         DaemonRequest::RemovePackage { package_name } => {
+            daemon.entrypoint_supervisor().stop_package(&package_name);
             unload_package_after_disable(daemon, &package_name)?;
             let decision = daemon
                 .package_registry_mut()
                 .remove(&package_name, "daemon socket remove package")?;
             persist_package_registry(daemon)?;
             package_decision_response(daemon, decision)
+        }
+        DaemonRequest::StartPackageEntrypoint {
+            package_name,
+            entrypoint_id,
+        } => {
+            let packages = daemon.package_registry().clone();
+            daemon
+                .entrypoint_supervisor()
+                .start(&packages, &package_name, &entrypoint_id)?;
+            show_package_response(daemon, &package_name)
+        }
+        DaemonRequest::StopPackageEntrypoint {
+            package_name,
+            entrypoint_id,
+        } => {
+            daemon
+                .entrypoint_supervisor()
+                .stop(&package_name, &entrypoint_id);
+            show_package_response(daemon, &package_name)
+        }
+        DaemonRequest::RestartPackageEntrypoint {
+            package_name,
+            entrypoint_id,
+        } => {
+            let packages = daemon.package_registry().clone();
+            daemon
+                .entrypoint_supervisor()
+                .restart(&packages, &package_name, &entrypoint_id)?;
+            show_package_response(daemon, &package_name)
+        }
+        DaemonRequest::PackageEntrypointStatus {
+            package_name,
+            entrypoint_id,
+        } => {
+            daemon
+                .entrypoint_supervisor()
+                .status(&package_name, &entrypoint_id);
+            show_package_response(daemon, &package_name)
         }
         other => handle_runtime_control_request(daemon, logical_clock, drain_cursors, other),
     }
@@ -724,7 +769,11 @@ fn handle_runtime_control_request(
         | DaemonRequest::EnablePackageLocalPath { .. }
         | DaemonRequest::EnablePackage { .. }
         | DaemonRequest::DisablePackage { .. }
-        | DaemonRequest::RemovePackage { .. } => {
+        | DaemonRequest::RemovePackage { .. }
+        | DaemonRequest::StartPackageEntrypoint { .. }
+        | DaemonRequest::StopPackageEntrypoint { .. }
+        | DaemonRequest::RestartPackageEntrypoint { .. }
+        | DaemonRequest::PackageEntrypointStatus { .. } => {
             unreachable!("package requests are handled before runtime borrow")
         }
     }
@@ -776,17 +825,19 @@ fn list_packages_response(daemon: &mut HubDaemon) -> DaemonTransportResult<Daemo
             request_id: request_id("daemon-packages-list"),
         },
     )?;
-    let HubClientResponseBody::Packages(packages) = response.body else {
+    let HubClientResponseBody::Packages(mut packages) = response.body else {
         return Err(DaemonTransportError::UnexpectedResponse);
     };
+    let snapshots = daemon.entrypoint_supervisor().snapshots();
+    apply_entrypoint_snapshots(&mut packages, snapshots);
     Ok(daemon_packages(packages))
 }
 
 fn show_package_response(
-    daemon: &HubDaemon,
+    daemon: &mut HubDaemon,
     package_name: &str,
 ) -> DaemonTransportResult<DaemonResponse> {
-    let package = daemon
+    let mut package = daemon
         .package_registry()
         .package(package_name)
         .map(HubClientPackage::from)
@@ -798,6 +849,8 @@ fn show_package_response(
                 "daemon socket show package".to_string(),
             )
         })?;
+    let snapshots = daemon.entrypoint_supervisor().snapshots();
+    apply_entrypoint_snapshots(std::slice::from_mut(&mut package), snapshots);
     Ok(daemon_packages(vec![package]))
 }
 
@@ -828,6 +881,40 @@ fn package_decision_response(
     response.kind = DaemonResponseKind::PackageDecision;
     response.package_decision = Some(daemon_package_decision_from_policy(decision));
     Ok(response)
+}
+
+fn apply_entrypoint_snapshots(
+    packages: &mut [HubClientPackage],
+    snapshots: Vec<EntrypointProcessSnapshot>,
+) {
+    for snapshot in snapshots {
+        let Some(package) = packages
+            .iter_mut()
+            .find(|package| package.package_name == snapshot.package_name)
+        else {
+            continue;
+        };
+        let Some(entrypoint) = package
+            .runnable_entrypoints
+            .iter_mut()
+            .find(|entrypoint| entrypoint.id == snapshot.entrypoint_id)
+        else {
+            continue;
+        };
+        entrypoint.process.state = snapshot.state;
+        entrypoint.process.pid = snapshot.pid;
+        entrypoint.process.started_at = snapshot.started_at;
+        entrypoint.process.exited_at = snapshot.exited_at;
+        entrypoint.process.exit_status = snapshot.exit_status;
+        entrypoint.process.diagnostics = snapshot
+            .diagnostics
+            .into_iter()
+            .map(|diagnostic| crate::HubClientPackageDiagnostic {
+                kind: diagnostic.kind,
+                message: diagnostic.message,
+            })
+            .collect();
+    }
 }
 
 fn persist_package_registry(daemon: &HubDaemon) -> DaemonTransportResult<()> {
@@ -907,6 +994,20 @@ fn socket_path(config: &HubConfig) -> DaemonTransportResult<PathBuf> {
 
 fn daemon_endpoint(config: &HubConfig) -> DaemonTransportResult<DaemonEndpoint> {
     socket_path(config).map(DaemonEndpoint::new)
+}
+
+fn install_signal_forwarder(control_tx: Sender<ControlMessage>) -> DaemonTransportResult<()> {
+    let mut signals = Signals::new([SIGINT, SIGTERM]).map_err(DaemonTransportError::Io)?;
+    thread::spawn(move || {
+        if signals.forever().next().is_some() {
+            let (reply_tx, _reply_rx) = mpsc::channel();
+            let _ = control_tx.send(ControlMessage::Request {
+                request: DaemonRequest::DaemonShutdown,
+                reply_tx,
+            });
+        }
+    });
+    Ok(())
 }
 
 fn prepare_socket_path(path: &PathBuf) -> DaemonTransportResult<()> {
@@ -1097,6 +1198,15 @@ fn daemon_package_error(error: crate::PackageRegistryError) -> DaemonResponse {
 fn daemon_state_error(error: crate::HubStateStoreError) -> DaemonResponse {
     let mut response = daemon_response_base(DaemonResponseKind::OperatorError);
     response.error = Some(daemon_operator_error_from_state(error));
+    if let Some(error) = &response.error {
+        response.diagnostics = error.diagnostics.clone();
+    }
+    response
+}
+
+fn daemon_entrypoint_error(error: EntrypointSupervisorError) -> DaemonResponse {
+    let mut response = daemon_response_base(DaemonResponseKind::OperatorError);
+    response.error = Some(daemon_operator_error_from_entrypoint(error));
     if let Some(error) = &response.error {
         response.diagnostics = error.diagnostics.clone();
     }
@@ -1323,6 +1433,10 @@ fn daemon_package_from_client(package: HubClientPackage) -> DaemonPackage {
                 may_supervise: entrypoint.may_supervise,
                 process: DaemonPackageProcess {
                     state: entrypoint.process.state,
+                    pid: entrypoint.process.pid,
+                    started_at: entrypoint.process.started_at,
+                    exited_at: entrypoint.process.exited_at,
+                    exit_status: entrypoint.process.exit_status,
                     diagnostics: entrypoint
                         .process
                         .diagnostics
@@ -1498,6 +1612,48 @@ fn daemon_operator_error_from_state(error: crate::HubStateStoreError) -> DaemonO
         request_id: "daemon-package-mutation".to_string(),
         operation: "persist_package_registry".to_string(),
         message: format!("failed to persist package registry: {error}"),
+        diagnostics: Vec::new(),
+    }
+}
+
+fn daemon_operator_error_from_entrypoint(error: EntrypointSupervisorError) -> DaemonOperatorError {
+    let (code, message) = match error {
+        EntrypointSupervisorError::PackageNotInstalled(package_name) => (
+            "package_not_installed",
+            format!("package {package_name} is not installed"),
+        ),
+        EntrypointSupervisorError::PackageDisabled(package_name) => (
+            "package_disabled",
+            format!("package {package_name} is not enabled"),
+        ),
+        EntrypointSupervisorError::PackageNotLocal(package_name) => (
+            "package_not_local",
+            format!("package {package_name} is not a local package"),
+        ),
+        EntrypointSupervisorError::EntrypointNotFound {
+            package_name,
+            entrypoint_id,
+        } => (
+            "entrypoint_not_found",
+            format!("package {package_name} has no runnable entrypoint {entrypoint_id}"),
+        ),
+        EntrypointSupervisorError::EntrypointNotSupervisable {
+            package_name,
+            entrypoint_id,
+        } => (
+            "entrypoint_not_supervisable",
+            format!("package {package_name} entrypoint {entrypoint_id} is not marked supervisable"),
+        ),
+        EntrypointSupervisorError::Io(error) => (
+            "entrypoint_io_error",
+            format!("entrypoint process error: {error}"),
+        ),
+    };
+    DaemonOperatorError {
+        code: code.to_string(),
+        request_id: "daemon-package-entrypoint".to_string(),
+        operation: "package_entrypoint".to_string(),
+        message,
         diagnostics: Vec::new(),
     }
 }
@@ -1718,6 +1874,7 @@ pub enum DaemonTransportError {
     Client(crate::HubClientError),
     Package(crate::PackageRegistryError),
     State(crate::HubStateStoreError),
+    Entrypoint(EntrypointSupervisorError),
     Runtime(crate::HubRuntimeError),
     Lifecycle(crate::HubLifecycleError),
 }
@@ -1740,6 +1897,7 @@ impl fmt::Display for DaemonTransportError {
             Self::Client(error) => write!(formatter, "{error:?}"),
             Self::Package(error) => write!(formatter, "{error:?}"),
             Self::State(error) => write!(formatter, "{error}"),
+            Self::Entrypoint(error) => write!(formatter, "{error:?}"),
             Self::Runtime(error) => write!(formatter, "{error:?}"),
             Self::Lifecycle(error) => write!(formatter, "{error:?}"),
         }
@@ -1796,6 +1954,12 @@ impl From<crate::PackageRegistryError> for DaemonTransportError {
 impl From<crate::HubStateStoreError> for DaemonTransportError {
     fn from(error: crate::HubStateStoreError) -> Self {
         Self::State(error)
+    }
+}
+
+impl From<EntrypointSupervisorError> for DaemonTransportError {
+    fn from(error: EntrypointSupervisorError) -> Self {
+        Self::Entrypoint(error)
     }
 }
 

@@ -862,6 +862,10 @@ impl From<&PackageRecord> for HubClientPackage {
                     may_supervise: entrypoint.may_supervise,
                     process: HubClientPackageProcess {
                         state: runnable_process_state_label(entrypoint.process.state).to_string(),
+                        pid: None,
+                        started_at: None,
+                        exited_at: None,
+                        exit_status: None,
                         diagnostics: entrypoint
                             .process
                             .diagnostics
@@ -911,6 +915,10 @@ pub struct HubClientPackageEnvironmentRequirement {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HubClientPackageProcess {
     pub state: String,
+    pub pid: Option<u32>,
+    pub started_at: Option<u64>,
+    pub exited_at: Option<u64>,
+    pub exit_status: Option<String>,
     pub diagnostics: Vec<HubClientPackageDiagnostic>,
 }
 
