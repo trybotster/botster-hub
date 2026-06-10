@@ -360,7 +360,9 @@ mod tests {
     use super::*;
     use crate::{
         DataDirectoryOption, HostIdentityOptions, HubStartupOptions, PackageProvenance,
-        PackageRegistry, RuntimeEnvironment,
+        PackageRegistry, PackageRunnableEntrypoint, PackageRunnableEntrypointKind,
+        PackageRunnableMode, PackageRunnableProcessState, PackageRunnableWorkingDirectory,
+        RuntimeEnvironment,
     };
 
     fn test_config(name: &str) -> HubConfig {
@@ -481,6 +483,52 @@ mod tests {
                 surface: CapabilitySurface::Surfaces,
                 scope: None,
             }]
+        );
+    }
+
+    #[test]
+    fn file_store_persists_runnable_entrypoints_in_package_registry() {
+        let config = test_config("registry-runnable-entrypoints");
+        let store = FileHubStateStore::for_data_directory(&config.data_directory);
+        let grant = Capability {
+            surface: CapabilitySurface::Surfaces,
+            scope: None,
+        };
+        let mut registry = PackageRegistry::new(vec![grant].into_iter().collect());
+        registry
+            .install(plugin_manifest(), provenance(), "install synthetic package")
+            .expect("install package");
+        let mut snapshot = registry.snapshot();
+        snapshot.records[0].runnable_entrypoints = vec![PackageRunnableEntrypoint {
+            id: "web".to_string(),
+            kind: PackageRunnableEntrypointKind::Web,
+            command: "bin/botster-web".to_string(),
+            args: vec!["--host".to_string(), "127.0.0.1".to_string()],
+            working_directory: PackageRunnableWorkingDirectory::PackageRoot,
+            environment: Vec::new(),
+            mode: PackageRunnableMode::Dev,
+            capabilities: Vec::new(),
+            may_supervise: true,
+            process: Default::default(),
+        }];
+
+        store
+            .update(&config, |state| {
+                state.package_registry = snapshot;
+            })
+            .expect("persist runnable entrypoint state");
+
+        let reopened = FileHubStateStore::for_data_directory(&config.data_directory)
+            .load_or_initialize(&config)
+            .expect("load runnable entrypoint state");
+        let entrypoint = &reopened.package_registry.records[0].runnable_entrypoints[0];
+
+        assert_eq!(entrypoint.id, "web");
+        assert_eq!(entrypoint.args, ["--host", "127.0.0.1"]);
+        assert!(entrypoint.may_supervise);
+        assert_eq!(
+            entrypoint.process.state,
+            PackageRunnableProcessState::NotStarted
         );
     }
 

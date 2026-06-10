@@ -673,13 +673,41 @@ fn package_and_lifecycle_queries_are_sanitized_and_explicitly_pulled() {
     let api = HubClientApi::local_operator("local-client-api-test");
     let mut runtime = explicit_runtime("packages");
     let surface = capability(CapabilitySurface::Surfaces, None);
-    let mut packages = PackageRegistry::new(vec![surface.clone()].into_iter().collect());
+    let network = capability(CapabilitySurface::Network, Some("localhost"));
+    let package_root = "target/botster-hub-test-data/client-api-package-runnable";
+    let _ = fs::remove_dir_all(package_root);
+    fs::create_dir_all(format!("{package_root}/web")).expect("create package directories");
+    fs::write(format!("{package_root}/plugin.lua"), "-- synthetic plugin").expect("write plugin");
+    fs::write(format!("{package_root}/web/dev-server"), "#!/bin/sh\n")
+        .expect("write runnable command");
+    fs::write(
+        format!("{package_root}/botster-package.json"),
+        r#"{
+  "name": "workflow.plugin",
+  "version": "1.0.0",
+  "kind": "plugin",
+  "botster": ">=0.1.0",
+  "source": { "type": "path", "path": "." },
+  "capabilities": [{ "surface": "surfaces" }],
+  "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }],
+  "runnable_entrypoints": [{
+    "id": "web",
+    "kind": "web",
+    "command": "web/dev-server",
+    "args": ["--host", "127.0.0.1"],
+    "working_directory": { "policy": "relative", "path": "web" },
+    "environment": [{ "name": "BOTSTER_WEB_PORT", "required": false, "default": "5173" }],
+    "mode": "dev",
+    "capabilities": [{ "surface": "network", "scope": "localhost" }],
+    "may_supervise": true
+  }]
+}
+"#,
+    )
+    .expect("write package manifest");
+    let mut packages = PackageRegistry::new(vec![surface.clone(), network].into_iter().collect());
     packages
-        .install(
-            plugin_manifest("workflow.plugin", vec![surface]),
-            provenance(),
-            "install package",
-        )
+        .install_local_path(package_root, "install package")
         .expect("install package");
     packages
         .enable("workflow.plugin", "enable package")
@@ -717,9 +745,27 @@ fn package_and_lifecycle_queries_are_sanitized_and_explicitly_pulled() {
         HubClientPackageClassification::Plugin
     );
     assert_eq!(record.state, HubClientPackageState::Enabled);
+    assert_eq!(record.runnable_entrypoints.len(), 1);
+    let entrypoint = &record.runnable_entrypoints[0];
+    assert_eq!(entrypoint.id, "web");
+    assert_eq!(entrypoint.kind, "web");
+    assert_eq!(entrypoint.command, "web/dev-server");
+    assert_eq!(entrypoint.args, ["--host", "127.0.0.1"]);
+    assert_eq!(entrypoint.working_directory.policy, "relative");
+    assert_eq!(entrypoint.working_directory.path.as_deref(), Some("web"));
+    assert_eq!(entrypoint.environment[0].name, "BOTSTER_WEB_PORT");
+    assert_eq!(entrypoint.environment[0].default.as_deref(), Some("5173"));
+    assert_eq!(entrypoint.mode, "dev");
+    assert_eq!(entrypoint.capabilities[0].surface, "Network");
+    assert!(entrypoint.may_supervise);
+    assert_eq!(entrypoint.process.state, "not_started");
     assert!(
         !format!("{record:?}").contains("local-private-source"),
         "package client response must not expose provenance"
+    );
+    assert!(
+        !format!("{record:?}").contains(package_root),
+        "package client response must not expose local package root"
     );
 
     let response = api

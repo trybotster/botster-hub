@@ -30,8 +30,10 @@ pub use botster_hub_client::{
     DaemonCoordination, DaemonDiagnostic, DaemonEndpoint, DaemonEnvelope, DaemonEnvelopeAck,
     DaemonEnvelopeDelivery, DaemonEnvelopePublish, DaemonEvent, DaemonHello, DaemonHelloAck,
     DaemonIdentity, DaemonNotify, DaemonOperatorError, DaemonPackage, DaemonPackageDecision,
-    DaemonPluginLifecycle, DaemonRequest, DaemonResponse, DaemonResponseKind, DaemonSession,
-    DaemonSessionCleanup, DaemonStatus, PROTOCOL, read_frame, read_frame_from_reader, write_frame,
+    DaemonPackageDiagnostic, DaemonPackageEnvironmentRequirement, DaemonPackageProcess,
+    DaemonPackageRunnableEntrypoint, DaemonPackageWorkingDirectory, DaemonPluginLifecycle,
+    DaemonRequest, DaemonResponse, DaemonResponseKind, DaemonSession, DaemonSessionCleanup,
+    DaemonStatus, PROTOCOL, read_frame, read_frame_from_reader, write_frame,
 };
 use serde_json::Value;
 
@@ -1285,6 +1287,52 @@ fn daemon_package_from_client(package: HubClientPackage) -> DaemonPackage {
             .map(|capability| DaemonCapability {
                 surface: capability.surface,
                 scope: capability.scope,
+            })
+            .collect(),
+        runnable_entrypoints: package
+            .runnable_entrypoints
+            .into_iter()
+            .map(|entrypoint| DaemonPackageRunnableEntrypoint {
+                id: entrypoint.id,
+                kind: entrypoint.kind,
+                command: entrypoint.command,
+                args: entrypoint.args,
+                working_directory: DaemonPackageWorkingDirectory {
+                    policy: entrypoint.working_directory.policy,
+                    path: entrypoint.working_directory.path,
+                },
+                environment: entrypoint
+                    .environment
+                    .into_iter()
+                    .map(|requirement| DaemonPackageEnvironmentRequirement {
+                        name: requirement.name,
+                        required: requirement.required,
+                        default: requirement.default,
+                        description: requirement.description,
+                    })
+                    .collect(),
+                mode: entrypoint.mode,
+                capabilities: entrypoint
+                    .capabilities
+                    .into_iter()
+                    .map(|capability| DaemonCapability {
+                        surface: capability.surface,
+                        scope: capability.scope,
+                    })
+                    .collect(),
+                may_supervise: entrypoint.may_supervise,
+                process: DaemonPackageProcess {
+                    state: entrypoint.process.state,
+                    diagnostics: entrypoint
+                        .process
+                        .diagnostics
+                        .into_iter()
+                        .map(|diagnostic| DaemonPackageDiagnostic {
+                            kind: diagnostic.kind,
+                            message: diagnostic.message,
+                        })
+                        .collect(),
+                },
             })
             .collect(),
         provider_profile_admitted: package.provider_profile_admitted,
