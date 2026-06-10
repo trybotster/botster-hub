@@ -1543,9 +1543,9 @@ fn daemon_operator_error_from_client(error: crate::HubClientError) -> DaemonOper
             kind,
         } => {
             let operation_label = operation_label(operation).to_string();
-            let message = format!("runtime failed while handling {operation:?}: {kind:?}");
+            let message = runtime_error_message(operation, kind);
             DaemonOperatorError {
-                code: runtime_error_code(kind).to_string(),
+                code: runtime_error_code(operation, kind).to_string(),
                 request_id: request_id.0,
                 diagnostics: runtime_error_diagnostics(operation, kind, &message),
                 operation: operation_label,
@@ -1739,11 +1739,36 @@ fn shutdown_error_is_unknown_session(error: &crate::HubClientError) -> bool {
     )
 }
 
-fn runtime_error_code(kind: crate::HubClientRuntimeErrorKind) -> &'static str {
-    match kind {
-        crate::HubClientRuntimeErrorKind::UnknownSession => "unknown_session",
-        crate::HubClientRuntimeErrorKind::Runtime => "runtime_error",
-        crate::HubClientRuntimeErrorKind::State => "state_error",
+fn runtime_error_code(
+    operation: crate::HubClientOperation,
+    kind: crate::HubClientRuntimeErrorKind,
+) -> &'static str {
+    match (operation, kind) {
+        (_, crate::HubClientRuntimeErrorKind::UnknownSession) => "unknown_session",
+        (_, crate::HubClientRuntimeErrorKind::SessionAlreadyExists) => "session_already_exists",
+        (_, crate::HubClientRuntimeErrorKind::SpawnFailed)
+        | (crate::HubClientOperation::Spawn, crate::HubClientRuntimeErrorKind::Runtime) => {
+            "spawn_failed"
+        }
+        (_, crate::HubClientRuntimeErrorKind::Runtime) => "runtime_error",
+        (_, crate::HubClientRuntimeErrorKind::State) => "state_error",
+    }
+}
+
+fn runtime_error_message(
+    operation: crate::HubClientOperation,
+    kind: crate::HubClientRuntimeErrorKind,
+) -> String {
+    match (operation, kind) {
+        (crate::HubClientOperation::Spawn, crate::HubClientRuntimeErrorKind::SessionAlreadyExists) => {
+            "spawn rejected because a session with that id already exists".to_string()
+        }
+        (crate::HubClientOperation::Spawn, crate::HubClientRuntimeErrorKind::SpawnFailed)
+        | (crate::HubClientOperation::Spawn, crate::HubClientRuntimeErrorKind::Runtime) => {
+            "spawn failed before the session started; verify the configured session worker and command"
+                .to_string()
+        }
+        _ => format!("runtime failed while handling {operation:?}: {kind:?}"),
     }
 }
 
@@ -1752,6 +1777,30 @@ fn runtime_error_diagnostics(
     kind: crate::HubClientRuntimeErrorKind,
     message: &str,
 ) -> Vec<DaemonDiagnostic> {
+    if matches!(operation, crate::HubClientOperation::Spawn) {
+        match kind {
+            crate::HubClientRuntimeErrorKind::SessionAlreadyExists => {
+                return vec![DaemonDiagnostic::action_failure(
+                    operation_label(operation),
+                    "spawn rejected because a session with that id already exists",
+                )];
+            }
+            crate::HubClientRuntimeErrorKind::SpawnFailed => {
+                return vec![DaemonDiagnostic::action_failure(
+                    operation_label(operation),
+                    "spawn failed before the session started; verify the configured session worker and command",
+                )];
+            }
+            crate::HubClientRuntimeErrorKind::Runtime => {
+                return vec![DaemonDiagnostic::action_failure(
+                    operation_label(operation),
+                    "spawn failed before the session started; verify the configured session worker and command",
+                )];
+            }
+            _ => {}
+        }
+    }
+
     if kind == crate::HubClientRuntimeErrorKind::UnknownSession
         && matches!(
             operation,
