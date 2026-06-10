@@ -73,6 +73,7 @@ impl EntrypointSupervisor {
         registry: &PackageRegistry,
         package_name: &str,
         entrypoint_id: &str,
+        environment_overrides: &BTreeMap<String, String>,
     ) -> EntrypointSupervisorResult<EntrypointProcessSnapshot> {
         self.refresh();
         let (record, entrypoint, package_root) =
@@ -92,6 +93,9 @@ impl EntrypointSupervisor {
         let mut command = Command::new(command_path);
         command.args(&entrypoint.args);
         command.current_dir(working_directory);
+        for (name, value) in environment_overrides {
+            command.env(name, value);
+        }
         command.stdout(Stdio::piped());
         command.stderr(Stdio::piped());
         unsafe {
@@ -151,9 +155,10 @@ impl EntrypointSupervisor {
         registry: &PackageRegistry,
         package_name: &str,
         entrypoint_id: &str,
+        environment_overrides: &BTreeMap<String, String>,
     ) -> EntrypointSupervisorResult<EntrypointProcessSnapshot> {
         let _ = self.stop(package_name, entrypoint_id);
-        self.start(registry, package_name, entrypoint_id)
+        self.start(registry, package_name, entrypoint_id, environment_overrides)
     }
 
     pub fn status(&mut self, package_name: &str, entrypoint_id: &str) -> EntrypointProcessSnapshot {

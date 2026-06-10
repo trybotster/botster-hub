@@ -1,6 +1,8 @@
+use std::collections::BTreeMap;
 use std::env;
 use std::fmt;
-use std::io::{self, BufReader};
+use std::io::{self, BufReader, Read, Write};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{self, Child, Command, Stdio};
 use std::thread;
@@ -189,30 +191,57 @@ fn dogfood(args: Vec<String>) -> Result<(), DogfoodError> {
         return Err(error);
     }
 
-    let response = daemon_transport_request(
+    let project_pipelines = daemon_transport_request(
         &config,
         DaemonRequest::EnablePackageLocalPath {
             path: options.package_path(),
         },
     )?;
-    if response.kind == DaemonResponseKind::OperatorError {
+    if project_pipelines.kind == DaemonResponseKind::OperatorError {
         let _ = daemon_transport_request(&config, DaemonRequest::DaemonShutdown);
         cleanup_dogfood_child(&mut child);
         return Err(DogfoodError::PackageEnable(
-            response
+            project_pipelines
                 .error
                 .map(|error| error.message)
                 .unwrap_or_else(|| "package enable failed".to_string()),
         ));
     }
 
-    let package_state = response
+    let package_state = project_pipelines
         .package_decision
         .as_ref()
         .map(|decision| decision.state.as_str())
         .unwrap_or("enabled");
 
-    print_dogfood_ready(&data_directory, options.default_data_dir, package_state);
+    let web_package_path = match options.web_package_path.as_ref() {
+        Some(path) => path,
+        None => {
+            let _ = daemon_transport_request(&config, DaemonRequest::DaemonShutdown);
+            cleanup_dogfood_child(&mut child);
+            return Err(DogfoodError::MissingWebPackagePath);
+        }
+    };
+    let web = match start_botster_web_dogfood(
+        &config,
+        &data_directory,
+        web_package_path,
+        options.web_bridge_port,
+    ) {
+        Ok(web) => web,
+        Err(error) => {
+            let _ = daemon_transport_request(&config, DaemonRequest::DaemonShutdown);
+            cleanup_dogfood_child(&mut child);
+            return Err(error);
+        }
+    };
+
+    print_dogfood_ready(
+        &data_directory,
+        options.default_data_dir,
+        package_state,
+        &web,
+    );
 
     let status = child.wait().map_err(DogfoodError::WaitDaemon)?;
     if status.success() {
@@ -246,6 +275,211 @@ fn verify_dogfood_session_worker(config: &botster_hub::HubConfig) -> Result<(), 
         },
     );
     Ok(())
+}
+
+struct DogfoodWebLaunch {
+    bridge_url: String,
+    package_state: String,
+}
+
+fn start_botster_web_dogfood(
+    config: &botster_hub::HubConfig,
+    data_directory: &Path,
+    package_path: &Path,
+    bridge_port: u16,
+) -> Result<DogfoodWebLaunch, DogfoodError> {
+    if !package_path.join("botster-package.json").is_file() {
+        return Err(DogfoodError::MissingWebPackage(package_path.to_path_buf()));
+    }
+
+    let response = daemon_transport_request(
+        config,
+        DaemonRequest::EnablePackageLocalPath {
+            path: package_path.to_path_buf(),
+        },
+    )?;
+    if response.kind == DaemonResponseKind::OperatorError {
+        return Err(DogfoodError::WebPackageEnable(
+            response
+                .error
+                .map(|error| error.message)
+                .unwrap_or_else(|| "botster-web package enable failed".to_string()),
+        ));
+    }
+
+    let web_package = response
+        .packages
+        .iter()
+        .find(|package| package.package_name == "botster-web")
+        .ok_or(DogfoodError::WrongWebPackage)?;
+    if !web_package
+        .runnable_entrypoints
+        .iter()
+        .any(|entrypoint| entrypoint.id == "web-client")
+    {
+        return Err(DogfoodError::MissingWebEntrypoint);
+    }
+    let package_state = response
+        .package_decision
+        .as_ref()
+        .map(|decision| decision.state.clone())
+        .unwrap_or_else(|| web_package.state.clone());
+
+    let socket_path = config
+        .transports
+        .local_socket
+        .as_ref()
+        .map(|binding| binding.path.clone())
+        .ok_or(DogfoodError::MissingLocalSocket)?;
+    let socket_path = absolutize_path(&socket_path)?;
+    let data_directory = absolutize_path(data_directory)?;
+    let mut environment_overrides = BTreeMap::new();
+    environment_overrides.insert(
+        "BOTSTER_HUB_SOCKET".to_string(),
+        socket_path.display().to_string(),
+    );
+    environment_overrides.insert(
+        "BOTSTER_HUB_DATA_DIR".to_string(),
+        data_directory.display().to_string(),
+    );
+    environment_overrides.insert(
+        "BOTSTER_WEB_DOGFOOD_BRIDGE_PORT".to_string(),
+        bridge_port.to_string(),
+    );
+
+    let response = daemon_transport_request(
+        config,
+        DaemonRequest::StartPackageEntrypoint {
+            package_name: "botster-web".to_string(),
+            entrypoint_id: "web-client".to_string(),
+            environment_overrides,
+        },
+    )?;
+    if response.kind == DaemonResponseKind::OperatorError {
+        return Err(DogfoodError::WebEntrypointStart(
+            response
+                .error
+                .map(|error| error.message)
+                .unwrap_or_else(|| "botster-web entrypoint start failed".to_string()),
+        ));
+    }
+    let Some(entrypoint) = response
+        .packages
+        .iter()
+        .find(|package| package.package_name == "botster-web")
+        .and_then(|package| {
+            package
+                .runnable_entrypoints
+                .iter()
+                .find(|entrypoint| entrypoint.id == "web-client")
+        })
+    else {
+        return Err(DogfoodError::MissingWebEntrypoint);
+    };
+    if entrypoint.process.state != "running" {
+        return Err(DogfoodError::WebEntrypointStart(format!(
+            "process state {}",
+            entrypoint.process.state
+        )));
+    }
+
+    let bridge_url = format!("http://127.0.0.1:{bridge_port}");
+    wait_for_botster_web_health(&bridge_url)?;
+    Ok(DogfoodWebLaunch {
+        bridge_url,
+        package_state,
+    })
+}
+
+fn absolutize_path(path: &Path) -> Result<PathBuf, DogfoodError> {
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        env::current_dir()
+            .map(|current_dir| current_dir.join(path))
+            .map_err(DogfoodError::CurrentDir)
+    }
+}
+
+fn wait_for_botster_web_health(bridge_url: &str) -> Result<(), DogfoodError> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut last_error = None;
+    while Instant::now() < deadline {
+        match read_botster_web_health(bridge_url) {
+            Ok(health) if botster_web_health_is_existing_hub_socket(&health) => return Ok(()),
+            Ok(health) => {
+                last_error = Some(format!("unexpected health response {health}"));
+            }
+            Err(error) => last_error = Some(error),
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    Err(DogfoodError::WebHealth(last_error.unwrap_or_else(|| {
+        "timed out waiting for botster-web health".to_string()
+    })))
+}
+
+fn read_botster_web_health(bridge_url: &str) -> Result<serde_json::Value, String> {
+    let port = bridge_url
+        .strip_prefix("http://127.0.0.1:")
+        .ok_or_else(|| "unsupported botster-web bridge URL".to_string())?
+        .parse::<u16>()
+        .map_err(|_| "invalid botster-web bridge port".to_string())?;
+    let mut stream = TcpStream::connect(("127.0.0.1", port))
+        .map_err(|error| format!("connect botster-web health: {error}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .map_err(|error| format!("set botster-web health read timeout: {error}"))?;
+    stream
+        .write_all(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+        .map_err(|error| format!("write botster-web health request: {error}"))?;
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .map_err(|error| format!("read botster-web health response: {error}"))?;
+    let Some((headers, body)) = response.split_once("\r\n\r\n") else {
+        return Err("malformed botster-web health response".to_string());
+    };
+    if !headers.starts_with("HTTP/1.1 200") && !headers.starts_with("HTTP/1.0 200") {
+        return Err("botster-web health returned non-200 status".to_string());
+    }
+    let body = if headers
+        .to_ascii_lowercase()
+        .contains("transfer-encoding: chunked")
+    {
+        decode_chunked_http_body(body)?
+    } else {
+        body.to_string()
+    };
+    serde_json::from_str(body.trim())
+        .map_err(|error| format!("parse botster-web health JSON: {error}"))
+}
+
+fn botster_web_health_is_existing_hub_socket(health: &serde_json::Value) -> bool {
+    health.get("ok").and_then(serde_json::Value::as_bool) == Some(true)
+        && health.get("mode").and_then(serde_json::Value::as_str) == Some("existing_hub")
+        && health.get("source").and_then(serde_json::Value::as_str) == Some("socket")
+}
+
+fn decode_chunked_http_body(body: &str) -> Result<String, String> {
+    let mut rest = body;
+    let mut decoded = String::new();
+    loop {
+        let Some((size_line, after_size)) = rest.split_once("\r\n") else {
+            return Err("malformed chunked botster-web health body".to_string());
+        };
+        let size = usize::from_str_radix(size_line.trim(), 16)
+            .map_err(|_| "invalid chunked botster-web health size".to_string())?;
+        if size == 0 {
+            return Ok(decoded);
+        }
+        if after_size.len() < size + 2 {
+            return Err("truncated chunked botster-web health body".to_string());
+        }
+        decoded.push_str(&after_size[..size]);
+        rest = &after_size[size + 2..];
+    }
 }
 
 fn spawn_dogfood_daemon(
@@ -294,7 +528,12 @@ fn cleanup_dogfood_child(child: &mut Child) {
     let _ = child.wait();
 }
 
-fn print_dogfood_ready(data_directory: &Path, default_data_dir: bool, package_state: &str) {
+fn print_dogfood_ready(
+    data_directory: &Path,
+    default_data_dir: bool,
+    project_pipelines_state: &str,
+    web: &DogfoodWebLaunch,
+) {
     let dir = data_directory.display();
     println!("dogfood=ready");
     if default_data_dir {
@@ -302,14 +541,15 @@ fn print_dogfood_ready(data_directory: &Path, default_data_dir: bool, package_st
     } else {
         println!("data_dir={dir}");
     }
-    println!("package name=project-pipelines state={package_state}");
+    println!("package name=project-pipelines state={project_pipelines_state}");
+    println!("package name=botster-web state={}", web.package_state);
+    println!("web={}", web.bridge_url);
     println!("tui=botster-hub tui --data-dir {dir}");
     println!("mcp=botster-hub mcp-serve --data-dir {dir}");
     println!("status=botster-hub status --data-dir {dir}");
     println!(
         "shutdown=run botster-hub shutdown --data-dir {dir} from another terminal for graceful shutdown; Ctrl-C hard-stops the foreground launcher"
     );
-    println!("web=local web entrypoint unavailable in this repo; use TUI or MCP for local dogfood");
 }
 
 fn operator_status(args: Vec<String>) -> Result<(), OperatorError> {
@@ -475,6 +715,7 @@ fn operator_packages(args: Vec<String>, providers_only: bool) -> Result<(), Oper
                 DaemonRequest::StartPackageEntrypoint {
                     package_name,
                     entrypoint_id,
+                    environment_overrides: BTreeMap::new(),
                 },
             )?;
             print_packages_response(response, providers_only)?;
@@ -981,6 +1222,8 @@ impl StartOptions {
 struct DogfoodOptions {
     data_directory: Option<PathBuf>,
     session_worker_bin: Option<PathBuf>,
+    web_package_path: Option<PathBuf>,
+    web_bridge_port: u16,
     default_data_dir: bool,
 }
 
@@ -988,6 +1231,8 @@ impl DogfoodOptions {
     fn parse(args: Vec<String>) -> Result<Self, DogfoodError> {
         let mut data_directory = None;
         let mut session_worker_bin = None;
+        let mut web_package_path = None;
+        let mut web_bridge_port = 41739;
         let mut cursor = 0;
 
         while cursor < args.len() {
@@ -1006,6 +1251,20 @@ impl DogfoodOptions {
                     session_worker_bin = Some(PathBuf::from(value));
                     cursor += 2;
                 }
+                "--web-package-path" => {
+                    let Some(value) = args.get(cursor + 1) else {
+                        return Err(DogfoodError::Usage);
+                    };
+                    web_package_path = Some(PathBuf::from(value));
+                    cursor += 2;
+                }
+                "--web-bridge-port" => {
+                    let Some(value) = args.get(cursor + 1) else {
+                        return Err(DogfoodError::Usage);
+                    };
+                    web_bridge_port = value.parse::<u16>().map_err(|_| DogfoodError::Usage)?;
+                    cursor += 2;
+                }
                 _ => return Err(DogfoodError::Usage),
             }
         }
@@ -1014,6 +1273,8 @@ impl DogfoodOptions {
             default_data_dir: data_directory.is_none(),
             data_directory,
             session_worker_bin,
+            web_package_path,
+            web_bridge_port,
         })
     }
 
@@ -1597,6 +1858,7 @@ enum DogfoodError {
     Usage,
     Clock(std::time::SystemTimeError),
     CurrentExe(io::Error),
+    CurrentDir(io::Error),
     CreateDataDir { path: PathBuf, source: io::Error },
     MissingHubBinary(PathBuf),
     MissingSessionWorkerBinary(PathBuf),
@@ -1607,6 +1869,14 @@ enum DogfoodError {
     Transport(botster_hub::DaemonTransportError),
     SessionWorker(String),
     PackageEnable(String),
+    MissingWebPackagePath,
+    MissingWebPackage(PathBuf),
+    WrongWebPackage,
+    MissingWebEntrypoint,
+    MissingLocalSocket,
+    WebPackageEnable(String),
+    WebEntrypointStart(String),
+    WebHealth(String),
     WaitDaemon(io::Error),
     DaemonExited(String),
 }
@@ -1671,6 +1941,7 @@ impl fmt::Display for DogfoodError {
             Self::CurrentExe(error) => {
                 write!(formatter, "resolve current botster-hub binary: {error}")
             }
+            Self::CurrentDir(error) => write!(formatter, "resolve current directory: {error}"),
             Self::CreateDataDir { path, source } => {
                 write!(
                     formatter,
@@ -1709,6 +1980,52 @@ impl fmt::Display for DogfoodError {
             Self::PackageEnable(message) => {
                 write!(formatter, "enable project-pipelines package: {message}")
             }
+            Self::MissingWebPackagePath => {
+                write!(
+                    formatter,
+                    "pass --web-package-path <path> for the botster-web package"
+                )
+            }
+            Self::MissingWebPackage(path) => {
+                write!(
+                    formatter,
+                    "missing botster-web package at {}",
+                    path.display()
+                )
+            }
+            Self::WrongWebPackage => {
+                write!(
+                    formatter,
+                    "--web-package-path must enable package botster-web"
+                )
+            }
+            Self::MissingWebEntrypoint => {
+                write!(
+                    formatter,
+                    "botster-web package must declare runnable entrypoint web-client"
+                )
+            }
+            Self::MissingLocalSocket => {
+                write!(
+                    formatter,
+                    "dogfood daemon has no local socket transport for botster-web attach mode"
+                )
+            }
+            Self::WebPackageEnable(message) => {
+                write!(formatter, "enable botster-web package: {message}")
+            }
+            Self::WebEntrypointStart(message) => {
+                write!(
+                    formatter,
+                    "start botster-web web-client entrypoint: {message}"
+                )
+            }
+            Self::WebHealth(message) => {
+                write!(
+                    formatter,
+                    "verify botster-web existing-hub health: {message}"
+                )
+            }
             Self::WaitDaemon(error) => write!(formatter, "wait for dogfood daemon: {error}"),
             Self::DaemonExited(status) => write!(formatter, "dogfood daemon exited with {status}"),
         }
@@ -1744,7 +2061,9 @@ impl fmt::Display for OperatorError {
 fn usage_for(command: &str) -> &'static str {
     match command {
         "start" => "usage: botster-hub start --data-dir <path> [--session-worker-bin <path>]",
-        "dogfood" => "usage: botster-hub dogfood [--data-dir <path>] [--session-worker-bin <path>]",
+        "dogfood" => {
+            "usage: botster-hub dogfood [--data-dir <path>] [--session-worker-bin <path>] --web-package-path <path> [--web-bridge-port <port>]"
+        }
         "status" => "usage: botster-hub status --data-dir <path>",
         "sessions" => {
             "usage: botster-hub sessions <list|spawn|attach|send-input|resize|detach|shutdown> ..."
