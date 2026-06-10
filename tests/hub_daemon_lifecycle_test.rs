@@ -2462,6 +2462,8 @@ fn cli_packages_local_path_diagnostics_are_actionable() {
     assert!(text.contains("response=operator_error"));
     assert!(text.contains("operation=install"));
     assert!(text.contains("InvalidLocalManifest"));
+    assert!(!text.contains(invalid_dir.to_string_lossy().as_ref()));
+    assert!(!text.contains(data_dir.to_string_lossy().as_ref()));
 
     let incompatible = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
         .arg("packages")
@@ -2477,6 +2479,8 @@ fn cli_packages_local_path_diagnostics_are_actionable() {
     assert!(text.contains("response=operator_error"));
     assert!(text.contains("operation=install"));
     assert!(text.contains("BotsterCompatibility"));
+    assert!(!text.contains(incompatible_dir.to_string_lossy().as_ref()));
+    assert!(!text.contains(data_dir.to_string_lossy().as_ref()));
 
     let first_install = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
         .arg("packages")
@@ -2506,6 +2510,8 @@ fn cli_packages_local_path_diagnostics_are_actionable() {
     assert!(text.contains("response=operator_error"));
     assert!(text.contains("operation=install"));
     assert!(text.contains("AlreadyInstalled"));
+    assert!(!text.contains(duplicate_dir.to_string_lossy().as_ref()));
+    assert!(!text.contains(data_dir.to_string_lossy().as_ref()));
 
     let denied_install = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
         .arg("packages")
@@ -2534,6 +2540,38 @@ fn cli_packages_local_path_diagnostics_are_actionable() {
     assert!(text.contains("response=operator_error"));
     assert!(text.contains("operation=enable"));
     assert!(text.contains("UngrantedCapability"));
+
+    let missing_show = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("packages")
+        .arg("show")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("dogfood.missing-plugin")
+        .output()
+        .expect("run missing package show");
+    assert!(!missing_show.status.success());
+    let text = command_output_text(&missing_show);
+    assert!(text.contains("response=operator_error"));
+    assert!(text.contains("operation=show"));
+    assert!(text.contains("PackageNotInstalled"));
+    assert!(text.contains("dogfood.missing-plugin"));
+    assert!(!text.contains(data_dir.to_string_lossy().as_ref()));
+
+    let missing_remove = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("packages")
+        .arg("remove")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("dogfood.missing-plugin")
+        .output()
+        .expect("run missing package remove");
+    assert!(!missing_remove.status.success());
+    let text = command_output_text(&missing_remove);
+    assert!(text.contains("response=operator_error"));
+    assert!(text.contains("operation=remove"));
+    assert!(text.contains("PackageNotInstalled"));
+    assert!(text.contains("dogfood.missing-plugin"));
+    assert!(!text.contains(data_dir.to_string_lossy().as_ref()));
 
     shutdown_cli_daemon(&data_dir, child);
 }

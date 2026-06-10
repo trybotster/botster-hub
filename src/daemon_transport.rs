@@ -39,7 +39,8 @@ use crate::{
     FileHubStateStore, HubClientApi, HubClientEvent, HubClientPackage,
     HubClientPackageClassification, HubClientPluginLifecycle, HubClientRequest,
     HubClientResponseBody, HubClientSession, HubConfig, HubDaemon, HubDaemonStatus,
-    HubStateLoadSource, HubStateStore, McpToolDescriptor, PackageAction, PackageDecision,
+    HubStateLoadSource, HubStateStore, McpToolDescriptor, PackageAction, PackageAdmissionReason,
+    PackageDecision, PackageRegistryError,
 };
 
 const MESSAGE_CONTENT_TYPE: &str = "application/vnd.botster.coordination.message+text";
@@ -787,13 +788,13 @@ fn show_package_response(
         .package_registry()
         .package(package_name)
         .map(HubClientPackage::from)
-        .ok_or_else(|| crate::PackageRegistryError {
-            package_name: package_name.to_string(),
-            action: PackageAction::Show,
-            reason: crate::PackageAdmissionReason::PackageNotInstalled,
-            state: None,
-            classification: None,
-            audit_reason: "daemon socket show package".to_string(),
+        .ok_or_else(|| {
+            PackageRegistryError::without_record(
+                package_name,
+                PackageAction::Show,
+                PackageAdmissionReason::PackageNotInstalled,
+                "daemon socket show package".to_string(),
+            )
         })?;
     Ok(daemon_packages(vec![package]))
 }
@@ -1420,17 +1421,26 @@ fn daemon_operator_error_from_client(error: crate::HubClientError) -> DaemonOper
 }
 
 fn daemon_operator_error_from_package(error: crate::PackageRegistryError) -> DaemonOperatorError {
+    let package_name = package_error_display_name(&error);
     DaemonOperatorError {
         code: "package_policy_error".to_string(),
         request_id: "daemon-package-mutation".to_string(),
         operation: package_action_label(error.action).to_string(),
         message: format!(
             "package {} denied for {}: {:?}",
-            error.package_name,
+            package_name,
             package_action_label(error.action),
             error.reason
         ),
         diagnostics: Vec::new(),
+    }
+}
+
+fn package_error_display_name(error: &crate::PackageRegistryError) -> &str {
+    match error.reason {
+        PackageAdmissionReason::InvalidLocalManifest(_)
+        | PackageAdmissionReason::UnsafeLocalPath(_) => "<local-package>",
+        _ => &error.package_name,
     }
 }
 

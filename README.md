@@ -220,10 +220,10 @@ cargo run -- status --data-dir target/botster-hub-dogfood-data
 cargo run -- packages install --data-dir target/botster-hub-dogfood-data \
   --path examples/synthetic-plugin
 cargo run -- packages list --data-dir target/botster-hub-dogfood-data
-cargo run -- packages show --data-dir target/botster-hub-dogfood-data dogfood.plugin
-cargo run -- packages enable --data-dir target/botster-hub-dogfood-data dogfood.plugin
-cargo run -- packages disable --data-dir target/botster-hub-dogfood-data dogfood.plugin
-cargo run -- packages remove --data-dir target/botster-hub-dogfood-data dogfood.plugin
+cargo run -- packages show --data-dir target/botster-hub-dogfood-data dogfood.synthetic-plugin
+cargo run -- packages enable --data-dir target/botster-hub-dogfood-data dogfood.synthetic-plugin
+cargo run -- packages disable --data-dir target/botster-hub-dogfood-data dogfood.synthetic-plugin
+cargo run -- packages remove --data-dir target/botster-hub-dogfood-data dogfood.synthetic-plugin
 cargo run -- providers list --data-dir target/botster-hub-dogfood-data
 
 cargo run -- sessions spawn --data-dir target/botster-hub-dogfood-data \
