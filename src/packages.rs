@@ -319,6 +319,32 @@ impl PackageRegistry {
         })
     }
 
+    /// Remove a package record after daemon runtime cleanup has been attempted.
+    pub fn remove(
+        &mut self,
+        package_name: &str,
+        audit_reason: impl Into<String>,
+    ) -> PackageRegistryResult<PackageDecision> {
+        let audit_reason = audit_reason.into();
+        let record = self.records.remove(package_name).ok_or_else(|| {
+            PackageRegistryError::without_record(
+                package_name,
+                PackageAction::Remove,
+                PackageAdmissionReason::PackageNotInstalled,
+                audit_reason.clone(),
+            )
+        })?;
+
+        Ok(PackageDecision {
+            package_name: package_name.to_string(),
+            action: PackageAction::Remove,
+            state: record.state,
+            classification: record.classification,
+            admitted_host_profile: None,
+            audit_reason,
+        })
+    }
+
     /// Record hub-owned pin and update metadata without fetching anything.
     pub fn pin(
         &mut self,
@@ -793,8 +819,10 @@ pub struct PackageDecision {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PackageAction {
     Install,
+    Show,
     Enable,
     Disable,
+    Remove,
     Pin,
     Prepare,
 }

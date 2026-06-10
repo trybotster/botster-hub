@@ -26,13 +26,12 @@ use botster_core_daemon::{
 };
 use botster_hub_client::DaemonTransportError as ClientDaemonTransportError;
 pub use botster_hub_client::{
-    read_frame, read_frame_from_reader, write_frame, DaemonCapability, DaemonCompatibility,
-    DaemonConnection as ClientDaemonConnection, DaemonCoordination, DaemonDiagnostic,
-    DaemonEndpoint, DaemonEnvelope, DaemonEnvelopeAck, DaemonEnvelopeDelivery,
-    DaemonEnvelopePublish, DaemonEvent, DaemonHello, DaemonHelloAck, DaemonIdentity, DaemonNotify,
-    DaemonOperatorError, DaemonPackage, DaemonPackageDecision, DaemonPluginLifecycle,
-    DaemonRequest, DaemonResponse, DaemonResponseKind, DaemonSession, DaemonSessionCleanup,
-    DaemonStatus, PROTOCOL,
+    DaemonCapability, DaemonCompatibility, DaemonConnection as ClientDaemonConnection,
+    DaemonCoordination, DaemonDiagnostic, DaemonEndpoint, DaemonEnvelope, DaemonEnvelopeAck,
+    DaemonEnvelopeDelivery, DaemonEnvelopePublish, DaemonEvent, DaemonHello, DaemonHelloAck,
+    DaemonIdentity, DaemonNotify, DaemonOperatorError, DaemonPackage, DaemonPackageDecision,
+    DaemonPluginLifecycle, DaemonRequest, DaemonResponse, DaemonResponseKind, DaemonSession,
+    DaemonSessionCleanup, DaemonStatus, PROTOCOL, read_frame, read_frame_from_reader, write_frame,
 };
 use serde_json::Value;
 
@@ -261,6 +260,24 @@ fn handle_control_request(
     match request {
         DaemonRequest::ListPackages => list_packages_response(daemon),
         DaemonRequest::PluginLifecycleStatus => plugin_lifecycle_response(daemon),
+        DaemonRequest::InstallPackageLocalPath { path } => {
+            let decision = {
+                let record = daemon
+                    .package_registry_mut()
+                    .install_local_path(path, "daemon socket install local package")?;
+                PackageDecision {
+                    package_name: record.manifest.name.clone(),
+                    action: PackageAction::Install,
+                    state: record.state,
+                    classification: record.classification,
+                    admitted_host_profile: None,
+                    audit_reason: record.last_audit_reason.clone(),
+                }
+            };
+            persist_package_registry(daemon)?;
+            package_decision_response(daemon, decision)
+        }
+        DaemonRequest::ShowPackage { package_name } => show_package_response(daemon, &package_name),
         DaemonRequest::EnablePackageLocalPath { path } => {
             let package_name = {
                 let record = daemon
@@ -289,6 +306,14 @@ fn handle_control_request(
                 .disable(&package_name, "daemon socket disable package")?;
             persist_package_registry(daemon)?;
             unload_package_after_disable(daemon, &package_name)?;
+            package_decision_response(daemon, decision)
+        }
+        DaemonRequest::RemovePackage { package_name } => {
+            unload_package_after_disable(daemon, &package_name)?;
+            let decision = daemon
+                .package_registry_mut()
+                .remove(&package_name, "daemon socket remove package")?;
+            persist_package_registry(daemon)?;
             package_decision_response(daemon, decision)
         }
         other => handle_runtime_control_request(daemon, logical_clock, drain_cursors, other),
@@ -690,10 +715,13 @@ fn handle_runtime_control_request(
             diagnostics: vec![DaemonDiagnostic::connected("shutdown")],
         }),
         DaemonRequest::ListPackages
+        | DaemonRequest::InstallPackageLocalPath { .. }
+        | DaemonRequest::ShowPackage { .. }
         | DaemonRequest::PluginLifecycleStatus
         | DaemonRequest::EnablePackageLocalPath { .. }
         | DaemonRequest::EnablePackage { .. }
-        | DaemonRequest::DisablePackage { .. } => {
+        | DaemonRequest::DisablePackage { .. }
+        | DaemonRequest::RemovePackage { .. } => {
             unreachable!("package requests are handled before runtime borrow")
         }
     }
@@ -749,6 +777,25 @@ fn list_packages_response(daemon: &mut HubDaemon) -> DaemonTransportResult<Daemo
         return Err(DaemonTransportError::UnexpectedResponse);
     };
     Ok(daemon_packages(packages))
+}
+
+fn show_package_response(
+    daemon: &HubDaemon,
+    package_name: &str,
+) -> DaemonTransportResult<DaemonResponse> {
+    let package = daemon
+        .package_registry()
+        .package(package_name)
+        .map(HubClientPackage::from)
+        .ok_or_else(|| crate::PackageRegistryError {
+            package_name: package_name.to_string(),
+            action: PackageAction::Show,
+            reason: crate::PackageAdmissionReason::PackageNotInstalled,
+            state: None,
+            classification: None,
+            audit_reason: "daemon socket show package".to_string(),
+        })?;
+    Ok(daemon_packages(vec![package]))
 }
 
 fn plugin_lifecycle_response(daemon: &mut HubDaemon) -> DaemonTransportResult<DaemonResponse> {
@@ -1568,8 +1615,10 @@ fn guarded_write_delivery_state_label(state: GuardedWriteDeliveryState) -> &'sta
 fn package_action_label(action: PackageAction) -> &'static str {
     match action {
         PackageAction::Install => "install",
+        PackageAction::Show => "show",
         PackageAction::Enable => "enable",
         PackageAction::Disable => "disable",
+        PackageAction::Remove => "remove",
         PackageAction::Pin => "pin",
         PackageAction::Prepare => "prepare",
     }
