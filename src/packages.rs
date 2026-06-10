@@ -682,18 +682,15 @@ pub enum PackageRunnableEntrypointKind {
 }
 
 /// Working-directory policy for a runnable package entrypoint.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "policy", rename_all = "snake_case")]
 pub enum PackageRunnableWorkingDirectory {
+    #[default]
     PackageRoot,
     EntrypointDir,
-    Relative { path: String },
-}
-
-impl Default for PackageRunnableWorkingDirectory {
-    fn default() -> Self {
-        Self::PackageRoot
-    }
+    Relative {
+        path: String,
+    },
 }
 
 /// Declarative environment requirement for a runnable package entrypoint.
@@ -717,17 +714,12 @@ fn default_required_environment() -> bool {
 }
 
 /// Local/dev runnable entrypoint mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PackageRunnableMode {
     Dev,
+    #[default]
     Local,
-}
-
-impl Default for PackageRunnableMode {
-    fn default() -> Self {
-        Self::Local
-    }
 }
 
 /// Static process-state DTO for package runnable entrypoints.
