@@ -3,7 +3,7 @@
 //! The daemon owns startup ordering for the first-party host profile: explicit
 //! config, durable state load, package/provider policy restoration, core
 //! runtime initialization, status, and clean stop. It does not own terminal I/O,
-//! transports, provider execution, signal handling, sockets, or supervisors.
+//! transports, provider execution, signal handling, or sockets.
 
 use std::error::Error;
 use std::fmt;
@@ -12,6 +12,7 @@ use botster_core::SessionId;
 
 use crate::HubLuaPluginLoadError;
 use crate::config::HubConfig;
+use crate::entrypoint_supervisor::EntrypointSupervisor;
 use crate::packages::{
     PackageClassification, PackageRegistry, PackageRegistrySnapshotError, PackageState,
 };
@@ -75,6 +76,7 @@ pub struct HubDaemon {
     state: HubState,
     state_source: HubStateLoadSource,
     package_registry: PackageRegistry,
+    entrypoint_supervisor: EntrypointSupervisor,
     runtime: Option<HubRuntime>,
     lifecycle_state: HubDaemonState,
 }
@@ -98,6 +100,7 @@ impl HubDaemon {
             state,
             state_source,
             package_registry,
+            entrypoint_supervisor: EntrypointSupervisor::default(),
             runtime: Some(runtime),
             lifecycle_state: HubDaemonState::Running,
         })
@@ -124,6 +127,11 @@ impl HubDaemon {
     /// Return the mutable package registry restored for this daemon lifecycle.
     pub const fn package_registry_mut(&mut self) -> &mut PackageRegistry {
         &mut self.package_registry
+    }
+
+    /// Return the local package entrypoint supervisor.
+    pub const fn entrypoint_supervisor(&mut self) -> &mut EntrypointSupervisor {
+        &mut self.entrypoint_supervisor
     }
 
     /// Return deterministic lifecycle status without exposing local paths.
@@ -172,6 +180,7 @@ impl HubDaemon {
 
     /// Stop the daemon lifecycle. This is idempotent.
     pub fn stop(&mut self) -> HubDaemonStatus {
+        self.entrypoint_supervisor.stop_all();
         if let Some(runtime) = self.runtime.as_mut() {
             runtime.release_for_restart();
         }

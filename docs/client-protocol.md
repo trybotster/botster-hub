@@ -128,18 +128,25 @@ not in the daemon protocol.
 ## Package Runnable Entrypoints
 
 `DaemonPackage` rows include `runnable_entrypoints` for hub-owned local/dev
-process contracts declared by installed packages. These rows are discovery
-contracts only: the hub does not spawn or supervise them in this slice, and each
-entrypoint reports process state `not_started` unless a future runtime owner
-updates the state contract.
+process contracts declared by installed packages. Entrypoints marked
+`may_supervise` can be started, stopped, restarted, and inspected with
+`StartPackageEntrypoint`, `StopPackageEntrypoint`,
+`RestartPackageEntrypoint`, and `PackageEntrypointStatus` daemon requests.
+Runtime process state is owned by the running hub daemon and is not persisted
+into package registry state.
 
 Each entrypoint exposes sanitized manifest declarations: `id`, `kind`,
 `command`, `args`, `working_directory`, declarative `environment`
 requirements, `mode`, capability needs, `may_supervise`, and process
-diagnostics. The daemon response must not expose the local package root,
-provenance path, socket path, or host-resolved environment values. Environment
-defaults are manifest-provided literals, not snapshots from the operator's
-machine.
+diagnostics. Runtime process fields are additive: `pid`, `started_at`,
+`exited_at`, and `exit_status` may be omitted when no supervised process state
+exists. The daemon response must not expose the local package root, provenance
+path, socket path, or host-resolved environment values. Environment defaults
+are manifest-provided literals, not snapshots from the operator's machine.
+
+Supervised entrypoints are local development processes, not a production
+installer or sandbox. The daemon stops them on explicit stop/restart, package
+disable/remove, `DaemonShutdown`, and daemon SIGINT/SIGTERM cleanup.
 
 The runnable contract is intentionally adjacent to core package `entrypoints`.
 Core `entrypoints` remain the plugin/provider code-load ABI, while

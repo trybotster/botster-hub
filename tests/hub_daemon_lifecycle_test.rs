@@ -220,6 +220,81 @@ fn write_local_plugin_package(root: &Path) {
     .expect("write local package manifest");
 }
 
+fn write_supervised_package(root: &Path, package_name: &str, command: &str, args: &[&str]) {
+    fs::create_dir_all(root).expect("create supervised package root");
+    fs::write(root.join("plugin.lua"), "return botster.register({})\n")
+        .expect("write plugin entrypoint");
+    let manifest = serde_json::json!({
+        "name": package_name,
+        "version": "1.0.0",
+        "kind": "plugin",
+        "botster": ">=0.1.0",
+        "source": { "type": "path", "path": "." },
+        "capabilities": [{ "surface": "surfaces" }],
+        "entrypoints": [
+            { "runtime": "lua", "path": "plugin.lua", "bootstrap": false }
+        ],
+        "runnable_entrypoints": [{
+            "id": "web",
+            "kind": "web",
+            "command": command,
+            "args": args,
+            "working_directory": { "policy": "package_root" },
+            "mode": "dev",
+            "capabilities": [{ "surface": "network", "scope": "localhost" }],
+            "may_supervise": true
+        }]
+    });
+    fs::write(
+        root.join("botster-package.json"),
+        serde_json::to_string_pretty(&manifest).expect("serialize supervised manifest"),
+    )
+    .expect("write supervised package manifest");
+}
+
+fn enable_supervised_package(data_dir: &Path, package_dir: &Path) {
+    let response = botster_hub::daemon_transport_request(
+        &explicit_config(data_dir),
+        botster_hub::DaemonRequest::EnablePackageLocalPath {
+            path: package_dir.to_path_buf(),
+        },
+    )
+    .expect("enable supervised package");
+    assert_eq!(
+        response.kind,
+        botster_hub::DaemonResponseKind::PackageDecision
+    );
+}
+
+fn package_entrypoint<'a>(
+    response: &'a botster_hub::DaemonResponse,
+    package_name: &str,
+) -> &'a botster_hub::DaemonPackageRunnableEntrypoint {
+    response
+        .packages
+        .iter()
+        .find(|package| package.package_name == package_name)
+        .expect("response includes package")
+        .runnable_entrypoints
+        .iter()
+        .find(|entrypoint| entrypoint.id == "web")
+        .expect("response includes web entrypoint")
+}
+
+fn process_exists(pid: u32) -> bool {
+    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+}
+
+fn wait_for_process_exit(pid: u32) {
+    for _ in 0..100 {
+        if !process_exists(pid) {
+            return;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    panic!("process {pid} still exists");
+}
+
 fn write_local_process_plugin_package(root: &Path) {
     fs::create_dir_all(root.join("bin")).expect("create process package root");
     fs::write(root.join("bin").join("plugin"), "#!/bin/sh\n").expect("write process entrypoint");
@@ -2586,6 +2661,318 @@ fn cli_packages_enable_local_path_routes_through_running_daemon_and_persists() {
     assert!(!stdout.contains(package_dir.to_string_lossy().as_ref()));
 
     shutdown_cli_daemon(&data_dir, restarted);
+}
+
+#[test]
+fn package_entrypoint_supervision_starts_and_reports_running() {
+    let _guard = daemon_test_lock()
+        .lock()
+        .expect("serialize real daemon test");
+    let data_dir = unique_test_dir("entrypoint-start");
+    let package_dir = unique_test_dir("entrypoint-start-package");
+    write_supervised_package(
+        &package_dir,
+        "dogfood.supervised",
+        "sh",
+        &[
+            "-c",
+            "printf 'entrypoint-ready\\n'; while true; do sleep 1; done",
+        ],
+    );
+    let child = start_cli_daemon(&data_dir);
+    enable_supervised_package(&data_dir, &package_dir);
+
+    let start = botster_hub::daemon_transport_request(
+        &explicit_config(&data_dir),
+        botster_hub::DaemonRequest::StartPackageEntrypoint {
+            package_name: "dogfood.supervised".to_string(),
+            entrypoint_id: "web".to_string(),
+        },
+    )
+    .expect("start supervised entrypoint");
+    let entrypoint = package_entrypoint(&start, "dogfood.supervised");
+    assert_eq!(entrypoint.process.state, "running");
+    assert!(entrypoint.process.pid.is_some());
+    assert!(entrypoint.process.started_at.is_some());
+
+    let list = botster_hub::daemon_transport_request(
+        &explicit_config(&data_dir),
+        botster_hub::DaemonRequest::ListPackages,
+    )
+    .expect("list packages after supervised start");
+    let entrypoint = package_entrypoint(&list, "dogfood.supervised");
+    assert_eq!(entrypoint.process.state, "running");
+    assert!(entrypoint.process.pid.is_some());
+
+    let cli_status = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("packages")
+        .arg("entrypoint-status")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("dogfood.supervised")
+        .arg("web")
+        .output()
+        .expect("run botster-hub packages entrypoint-status");
+    assert!(
+        cli_status.status.success(),
+        "entrypoint-status failed: {}",
+        String::from_utf8_lossy(&cli_status.stderr)
+    );
+    let stdout = String::from_utf8(cli_status.stdout).expect("stdout is utf8");
+    assert!(stdout.contains("response=packages"));
+    assert!(stdout.contains("process_state=running"));
+    assert!(stdout.contains("package_entrypoint_process package=dogfood.supervised id=web"));
+
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
+fn package_entrypoint_supervision_reports_missing_command() {
+    let _guard = daemon_test_lock()
+        .lock()
+        .expect("serialize real daemon test");
+    let data_dir = unique_test_dir("entrypoint-missing-command");
+    let package_dir = unique_test_dir("entrypoint-missing-command-package");
+    write_supervised_package(
+        &package_dir,
+        "dogfood.missing-command",
+        "definitely-missing-botster-command",
+        &[],
+    );
+    let child = start_cli_daemon(&data_dir);
+    enable_supervised_package(&data_dir, &package_dir);
+
+    let start = botster_hub::daemon_transport_request(
+        &explicit_config(&data_dir),
+        botster_hub::DaemonRequest::StartPackageEntrypoint {
+            package_name: "dogfood.missing-command".to_string(),
+            entrypoint_id: "web".to_string(),
+        },
+    )
+    .expect("start missing supervised entrypoint");
+    let entrypoint = package_entrypoint(&start, "dogfood.missing-command");
+    assert_eq!(entrypoint.process.state, "failed");
+    assert!(entrypoint.process.pid.is_none());
+    assert!(
+        entrypoint
+            .process
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.kind == "spawn_error")
+    );
+    assert!(!format!("{start:?}").contains(package_dir.to_string_lossy().as_ref()));
+
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
+fn package_entrypoint_supervision_reports_failed_command() {
+    let _guard = daemon_test_lock()
+        .lock()
+        .expect("serialize real daemon test");
+    let data_dir = unique_test_dir("entrypoint-failed-command");
+    let package_dir = unique_test_dir("entrypoint-failed-command-package");
+    write_supervised_package(
+        &package_dir,
+        "dogfood.failed-command",
+        "sh",
+        &["-c", "printf 'fixture failure\\n' >&2; exit 42"],
+    );
+    let child = start_cli_daemon(&data_dir);
+    enable_supervised_package(&data_dir, &package_dir);
+
+    let _ = botster_hub::daemon_transport_request(
+        &explicit_config(&data_dir),
+        botster_hub::DaemonRequest::StartPackageEntrypoint {
+            package_name: "dogfood.failed-command".to_string(),
+            entrypoint_id: "web".to_string(),
+        },
+    )
+    .expect("start failing supervised entrypoint");
+    thread::sleep(Duration::from_millis(100));
+    let status = botster_hub::daemon_transport_request(
+        &explicit_config(&data_dir),
+        botster_hub::DaemonRequest::PackageEntrypointStatus {
+            package_name: "dogfood.failed-command".to_string(),
+            entrypoint_id: "web".to_string(),
+        },
+    )
+    .expect("status failing supervised entrypoint");
+    let entrypoint = package_entrypoint(&status, "dogfood.failed-command");
+    assert_eq!(entrypoint.process.state, "failed");
+    assert_eq!(entrypoint.process.exit_status.as_deref(), Some("exit:42"));
+    assert!(
+        entrypoint
+            .process
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.kind == "stderr"
+                && diagnostic.message.contains("fixture failure"))
+    );
+
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
+fn package_entrypoint_supervision_stops_and_restarts() {
+    let _guard = daemon_test_lock()
+        .lock()
+        .expect("serialize real daemon test");
+    let data_dir = unique_test_dir("entrypoint-restart");
+    let package_dir = unique_test_dir("entrypoint-restart-package");
+    write_supervised_package(
+        &package_dir,
+        "dogfood.restart",
+        "sh",
+        &["-c", "while true; do sleep 1; done"],
+    );
+    let child = start_cli_daemon(&data_dir);
+    enable_supervised_package(&data_dir, &package_dir);
+
+    let start = botster_hub::daemon_transport_request(
+        &explicit_config(&data_dir),
+        botster_hub::DaemonRequest::StartPackageEntrypoint {
+            package_name: "dogfood.restart".to_string(),
+            entrypoint_id: "web".to_string(),
+        },
+    )
+    .expect("start restart fixture");
+    let first_pid = package_entrypoint(&start, "dogfood.restart")
+        .process
+        .pid
+        .expect("first pid");
+
+    let stop = botster_hub::daemon_transport_request(
+        &explicit_config(&data_dir),
+        botster_hub::DaemonRequest::StopPackageEntrypoint {
+            package_name: "dogfood.restart".to_string(),
+            entrypoint_id: "web".to_string(),
+        },
+    )
+    .expect("stop restart fixture");
+    assert_eq!(
+        package_entrypoint(&stop, "dogfood.restart").process.state,
+        "stopped"
+    );
+    wait_for_process_exit(first_pid);
+
+    let restart = botster_hub::daemon_transport_request(
+        &explicit_config(&data_dir),
+        botster_hub::DaemonRequest::RestartPackageEntrypoint {
+            package_name: "dogfood.restart".to_string(),
+            entrypoint_id: "web".to_string(),
+        },
+    )
+    .expect("restart fixture");
+    let second_pid = package_entrypoint(&restart, "dogfood.restart")
+        .process
+        .pid
+        .expect("second pid");
+    assert_ne!(first_pid, second_pid);
+
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
+fn package_entrypoint_supervision_cleans_up_on_disable_remove_and_shutdown() {
+    let _guard = daemon_test_lock()
+        .lock()
+        .expect("serialize real daemon test");
+    let data_dir = unique_test_dir("entrypoint-cleanup");
+    let package_dir = unique_test_dir("entrypoint-cleanup-package");
+    write_supervised_package(
+        &package_dir,
+        "dogfood.cleanup",
+        "sh",
+        &["-c", "while true; do sleep 1; done"],
+    );
+    let child = start_cli_daemon(&data_dir);
+    enable_supervised_package(&data_dir, &package_dir);
+
+    let start = botster_hub::daemon_transport_request(
+        &explicit_config(&data_dir),
+        botster_hub::DaemonRequest::StartPackageEntrypoint {
+            package_name: "dogfood.cleanup".to_string(),
+            entrypoint_id: "web".to_string(),
+        },
+    )
+    .expect("start cleanup fixture");
+    let disable_pid = package_entrypoint(&start, "dogfood.cleanup")
+        .process
+        .pid
+        .expect("disable pid");
+    let _ = botster_hub::daemon_transport_request(
+        &explicit_config(&data_dir),
+        botster_hub::DaemonRequest::DisablePackage {
+            package_name: "dogfood.cleanup".to_string(),
+        },
+    )
+    .expect("disable cleanup package");
+    wait_for_process_exit(disable_pid);
+
+    let _ = botster_hub::daemon_transport_request(
+        &explicit_config(&data_dir),
+        botster_hub::DaemonRequest::EnablePackage {
+            package_name: "dogfood.cleanup".to_string(),
+        },
+    )
+    .expect("re-enable cleanup package");
+    let restart = botster_hub::daemon_transport_request(
+        &explicit_config(&data_dir),
+        botster_hub::DaemonRequest::StartPackageEntrypoint {
+            package_name: "dogfood.cleanup".to_string(),
+            entrypoint_id: "web".to_string(),
+        },
+    )
+    .expect("restart cleanup fixture");
+    let shutdown_pid = package_entrypoint(&restart, "dogfood.cleanup")
+        .process
+        .pid
+        .expect("shutdown pid");
+
+    shutdown_cli_daemon(&data_dir, child);
+    wait_for_process_exit(shutdown_pid);
+}
+
+#[test]
+fn package_entrypoint_supervision_cleans_up_on_daemon_signal() {
+    let _guard = daemon_test_lock()
+        .lock()
+        .expect("serialize real daemon test");
+    let data_dir = unique_test_dir("entrypoint-signal");
+    let package_dir = unique_test_dir("entrypoint-signal-package");
+    write_supervised_package(
+        &package_dir,
+        "dogfood.signal",
+        "sh",
+        &["-c", "while true; do sleep 1; done"],
+    );
+    let child = start_cli_daemon(&data_dir);
+    enable_supervised_package(&data_dir, &package_dir);
+
+    let start = botster_hub::daemon_transport_request(
+        &explicit_config(&data_dir),
+        botster_hub::DaemonRequest::StartPackageEntrypoint {
+            package_name: "dogfood.signal".to_string(),
+            entrypoint_id: "web".to_string(),
+        },
+    )
+    .expect("start signal fixture");
+    let pid = package_entrypoint(&start, "dogfood.signal")
+        .process
+        .pid
+        .expect("signal pid");
+
+    unsafe {
+        libc::kill(child.id() as libc::pid_t, libc::SIGTERM);
+    }
+    let output = child.wait_with_output().expect("wait for signaled daemon");
+    assert!(
+        output.status.success(),
+        "daemon signal shutdown failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    wait_for_process_exit(pid);
 }
 
 #[test]

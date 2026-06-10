@@ -466,6 +466,58 @@ fn operator_packages(args: Vec<String>, providers_only: bool) -> Result<(), Oper
                 daemon_transport_request(&config, DaemonRequest::RemovePackage { package_name })?;
             print_packages_response(response, providers_only)?;
         }
+        PackageActionCommand::StartEntrypoint {
+            package_name,
+            entrypoint_id,
+        } => {
+            let response = daemon_transport_request(
+                &config,
+                DaemonRequest::StartPackageEntrypoint {
+                    package_name,
+                    entrypoint_id,
+                },
+            )?;
+            print_packages_response(response, providers_only)?;
+        }
+        PackageActionCommand::StopEntrypoint {
+            package_name,
+            entrypoint_id,
+        } => {
+            let response = daemon_transport_request(
+                &config,
+                DaemonRequest::StopPackageEntrypoint {
+                    package_name,
+                    entrypoint_id,
+                },
+            )?;
+            print_packages_response(response, providers_only)?;
+        }
+        PackageActionCommand::RestartEntrypoint {
+            package_name,
+            entrypoint_id,
+        } => {
+            let response = daemon_transport_request(
+                &config,
+                DaemonRequest::RestartPackageEntrypoint {
+                    package_name,
+                    entrypoint_id,
+                },
+            )?;
+            print_packages_response(response, providers_only)?;
+        }
+        PackageActionCommand::EntrypointStatus {
+            package_name,
+            entrypoint_id,
+        } => {
+            let response = daemon_transport_request(
+                &config,
+                DaemonRequest::PackageEntrypointStatus {
+                    package_name,
+                    entrypoint_id,
+                },
+            )?;
+            print_packages_response(response, providers_only)?;
+        }
     }
     Ok(())
 }
@@ -824,6 +876,40 @@ fn print_packages(packages: &[DaemonPackage], providers_only: bool) {
                 entrypoint.may_supervise,
                 entrypoint.process.state
             );
+            if entrypoint.process.pid.is_some()
+                || entrypoint.process.started_at.is_some()
+                || entrypoint.process.exited_at.is_some()
+                || entrypoint.process.exit_status.is_some()
+            {
+                println!(
+                    "package_entrypoint_process package={} id={} pid={} started_at={} exited_at={} exit_status={}",
+                    package.package_name,
+                    entrypoint.id,
+                    entrypoint
+                        .process
+                        .pid
+                        .map_or_else(|| "none".to_string(), |value| value.to_string()),
+                    entrypoint
+                        .process
+                        .started_at
+                        .map_or_else(|| "none".to_string(), |value| value.to_string()),
+                    entrypoint
+                        .process
+                        .exited_at
+                        .map_or_else(|| "none".to_string(), |value| value.to_string()),
+                    entrypoint
+                        .process
+                        .exit_status
+                        .clone()
+                        .unwrap_or_else(|| "none".to_string())
+                );
+            }
+            for diagnostic in &entrypoint.process.diagnostics {
+                println!(
+                    "package_entrypoint_diagnostic package={} id={} kind={} message={}",
+                    package.package_name, entrypoint.id, diagnostic.kind, diagnostic.message
+                );
+            }
         }
     }
 }
@@ -1162,6 +1248,22 @@ enum PackageActionCommand {
     EnableName(String),
     Disable(String),
     Remove(String),
+    StartEntrypoint {
+        package_name: String,
+        entrypoint_id: String,
+    },
+    StopEntrypoint {
+        package_name: String,
+        entrypoint_id: String,
+    },
+    RestartEntrypoint {
+        package_name: String,
+        entrypoint_id: String,
+    },
+    EntrypointStatus {
+        package_name: String,
+        entrypoint_id: String,
+    },
 }
 
 impl PackageCommand {
@@ -1242,6 +1344,50 @@ impl PackageCommand {
                     action: PackageActionCommand::Remove(args[3].clone()),
                 })
             }
+            "start-entrypoint" if !providers_only => {
+                parse_package_entrypoint_command(args, "packages start-entrypoint").map(
+                    |(options, package_name, entrypoint_id)| Self {
+                        data_directory: options.data_directory,
+                        action: PackageActionCommand::StartEntrypoint {
+                            package_name,
+                            entrypoint_id,
+                        },
+                    },
+                )
+            }
+            "stop-entrypoint" if !providers_only => {
+                parse_package_entrypoint_command(args, "packages stop-entrypoint").map(
+                    |(options, package_name, entrypoint_id)| Self {
+                        data_directory: options.data_directory,
+                        action: PackageActionCommand::StopEntrypoint {
+                            package_name,
+                            entrypoint_id,
+                        },
+                    },
+                )
+            }
+            "restart-entrypoint" if !providers_only => {
+                parse_package_entrypoint_command(args, "packages restart-entrypoint").map(
+                    |(options, package_name, entrypoint_id)| Self {
+                        data_directory: options.data_directory,
+                        action: PackageActionCommand::RestartEntrypoint {
+                            package_name,
+                            entrypoint_id,
+                        },
+                    },
+                )
+            }
+            "entrypoint-status" if !providers_only => {
+                parse_package_entrypoint_command(args, "packages entrypoint-status").map(
+                    |(options, package_name, entrypoint_id)| Self {
+                        data_directory: options.data_directory,
+                        action: PackageActionCommand::EntrypointStatus {
+                            package_name,
+                            entrypoint_id,
+                        },
+                    },
+                )
+            }
             _ => Err(OperatorError::Usage(if providers_only {
                 "providers list"
             } else {
@@ -1249,6 +1395,17 @@ impl PackageCommand {
             })),
         }
     }
+}
+
+fn parse_package_entrypoint_command(
+    args: Vec<String>,
+    usage: &'static str,
+) -> Result<(DataDirOptions, String, String), OperatorError> {
+    if args.len() != 5 {
+        return Err(OperatorError::Usage(usage));
+    }
+    let options = DataDirOptions::parse(args[1..3].to_vec(), usage)?;
+    Ok((options, args[3].clone(), args[4].clone()))
 }
 
 struct InspectCommand {
@@ -1614,7 +1771,9 @@ fn usage_for(command: &str) -> &'static str {
         "shutdown" => "usage: botster-hub shutdown --data-dir <path>",
         "mcp-serve" => "usage: botster-hub mcp-serve --data-dir <path>",
         "tui" => "usage: botster-hub tui --data-dir <path>",
-        "packages" => "usage: botster-hub packages <install|list|show|enable|disable|remove> ...",
+        "packages" => {
+            "usage: botster-hub packages <install|list|show|enable|disable|remove|start-entrypoint|stop-entrypoint|restart-entrypoint|entrypoint-status> ..."
+        }
         "packages install" => {
             "usage: botster-hub packages install --data-dir <path> --path <package-dir-or-manifest>"
         }
@@ -1625,6 +1784,18 @@ fn usage_for(command: &str) -> &'static str {
         }
         "packages disable" => "usage: botster-hub packages disable --data-dir <path> <name>",
         "packages remove" => "usage: botster-hub packages remove --data-dir <path> <name>",
+        "packages start-entrypoint" => {
+            "usage: botster-hub packages start-entrypoint --data-dir <path> <package> <entrypoint>"
+        }
+        "packages stop-entrypoint" => {
+            "usage: botster-hub packages stop-entrypoint --data-dir <path> <package> <entrypoint>"
+        }
+        "packages restart-entrypoint" => {
+            "usage: botster-hub packages restart-entrypoint --data-dir <path> <package> <entrypoint>"
+        }
+        "packages entrypoint-status" => {
+            "usage: botster-hub packages entrypoint-status --data-dir <path> <package> <entrypoint>"
+        }
         "providers" | "providers list" => "usage: botster-hub providers list --data-dir <path>",
         "inspect" => "usage: botster-hub inspect --data-dir <path> <session-id>",
         _ => {

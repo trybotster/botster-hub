@@ -34,6 +34,7 @@ pub mod client_api;
 pub mod config;
 pub mod daemon;
 pub mod daemon_transport;
+pub mod entrypoint_supervisor;
 pub mod lifecycle;
 pub mod lua_runtime;
 pub mod mcp;
@@ -75,6 +76,10 @@ pub use daemon_transport::{
     DaemonRequest, DaemonResponse, DaemonResponseKind, DaemonSession, DaemonSessionCleanup,
     DaemonStatus, DaemonTransportError, DaemonTransportResult, request as daemon_transport_request,
     serve_daemon, stream_attach,
+};
+pub use entrypoint_supervisor::{
+    EntrypointDiagnostic, EntrypointProcessSnapshot, EntrypointSupervisor,
+    EntrypointSupervisorError, EntrypointSupervisorResult,
 };
 pub use lifecycle::{
     HubLifecycleError, HubLifecycleResult, HubPluginLifecycle, HubPluginLifecycleStatus,
