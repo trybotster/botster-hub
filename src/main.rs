@@ -1130,6 +1130,7 @@ fn print_daemon_events(events: &[DaemonEvent]) {
                 session_id,
                 subscription_id,
                 bytes,
+                ..
             } => {
                 println!(
                     "event=snapshot session_id={session_id} subscription_id={subscription_id} bytes={bytes}"
@@ -1139,6 +1140,7 @@ fn print_daemon_events(events: &[DaemonEvent]) {
                 session_id,
                 subscription_id,
                 bytes,
+                ..
             } => {
                 println!(
                     "event=scrollback session_id={session_id} subscription_id={subscription_id} bytes={bytes}"

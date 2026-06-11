@@ -163,6 +163,26 @@ That helper still connects through the daemon socket, but terminal bytes are
 delivered by the hub-owned client/session actor data plane rather than by a
 private session-worker frame contract.
 
+`DaemonEvent::TerminalOutput`, `DaemonEvent::Snapshot`, and
+`DaemonEvent::Scrollback` expose renderable terminal data as a `data` string.
+The daemon converts raw terminal bytes with the same lossy UTF-8 decoding for
+all three event kinds. `Snapshot` and `Scrollback` also include `bytes`, which is
+the raw byte length before decoding, so clients can preserve existing size/count
+logic without deriving a possibly different decoded string length.
+
+The attach/drain ordering contract is that initial `snapshot` or `scrollback`
+history for a subscription is delivered before later live `terminal_output` for
+that subscription. Clients should render the restored history payload first,
+then append subsequent live output. `stream_attach` writes only terminal output
+bytes into its output writer; clients that need event kind, history payload, or
+ordering metadata should use `DaemonConnection` with `Attach` and `Drain`.
+
+The addition of required renderable `data` fields on `snapshot` and `scrollback`
+increments `CONFORMANCE_FIXTURE_REVISION`. `PROTOCOL_VERSION` remains unchanged
+because the daemon framing and request/response protocol are the same; clients
+that depend on renderable history should require the current conformance fixture
+revision during the hello handshake.
+
 Do not reuse `botster_core::contract` session-worker protocol, session frame magic, `DefaultEngineCommand`, `TransportIngress`, or `BoundaryJson` for external clients. Those are not the client-to-hub protocol. The client crate also intentionally excludes hub runtime, embedded TUI, Lua/plugin runtime, `ratatui`, `crossterm`, `mlua`, and core UI action/node types.
 
 Plugin surface and action responses cross the daemon boundary as JSON values. Hub-owned code may deserialize them into local core UI types, but external clients are not required to compile those internal UI/runtime dependencies.
