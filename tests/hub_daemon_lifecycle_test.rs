@@ -271,6 +271,7 @@ fn write_botster_web_package(root: &Path) {
         r#"
 import fs from 'fs';
 import http from 'http';
+import net from 'net';
 
 const port = Number(process.env.BOTSTER_WEB_DOGFOOD_BRIDGE_PORT || '41739');
 const socket = process.env.BOTSTER_HUB_SOCKET;
@@ -279,11 +280,139 @@ const mixedOwnership = Boolean(process.env.BOTSTER_WEB_DOGFOOD_DATA_DIR && (sock
 const source = socket ? 'socket' : (dataDir ? 'data_dir' : 'spawned');
 const mode = socket || dataDir ? 'existing_hub' : 'spawned_hub';
 const socketExists = socket ? fs.existsSync(socket) : false;
+const connections = new Map();
 
-http.createServer((request, response) => {
+function currentRequirement() {
+  return {
+    protocol: 'botster-hub-daemon-v1',
+    minimum_protocol_version: 1,
+    required_features: [
+      'sessions',
+      'terminal_streaming',
+      'resize',
+      'plugin_surface_render',
+      'plugin_surface_action',
+    ],
+    minimum_conformance_fixture_revision: 1,
+    client_name: 'botster-web-dogfood-bridge-fixture',
+  };
+}
+
+function readLine(connection) {
+  const newline = connection.buffer.indexOf('\n');
+  if (newline >= 0) {
+    const line = connection.buffer.slice(0, newline);
+    connection.buffer = connection.buffer.slice(newline + 1);
+    return Promise.resolve(line);
+  }
+
+  return new Promise((resolve, reject) => {
+    const onData = (chunk) => {
+      connection.buffer += chunk.toString('utf8');
+      const newline = connection.buffer.indexOf('\n');
+      if (newline < 0) {
+        return;
+      }
+      cleanup();
+      const line = connection.buffer.slice(0, newline);
+      connection.buffer = connection.buffer.slice(newline + 1);
+      resolve(line);
+    };
+    const onError = (error) => {
+      cleanup();
+      reject(error);
+    };
+    const cleanup = () => {
+      connection.stream.off('data', onData);
+      connection.stream.off('error', onError);
+    };
+    connection.stream.on('data', onData);
+    connection.stream.once('error', onError);
+  });
+}
+
+async function connectDaemon() {
+  if (!socket) {
+    throw new Error('BOTSTER_HUB_SOCKET is not set');
+  }
+  const stream = net.createConnection(socket);
+  const connection = { stream, buffer: '' };
+  await new Promise((resolve, reject) => {
+    stream.once('connect', resolve);
+    stream.once('error', reject);
+  });
+  stream.write(JSON.stringify({
+    protocol: 'botster-hub-daemon-v1',
+    compatibility: currentRequirement(),
+  }) + '\n');
+  await readLine(connection);
+  return connection;
+}
+
+async function daemonRequest(payload) {
+  const connectionId = payload.connection_id || null;
+  let connection = connectionId ? connections.get(connectionId) : null;
+  if (!connection) {
+    connection = await connectDaemon();
+    if (connectionId) {
+      connections.set(connectionId, connection);
+    }
+  }
+
+  connection.stream.write(JSON.stringify(payload.request) + '\n');
+  const response = JSON.parse(await readLine(connection));
+
+  if (!connectionId || payload.close === true) {
+    connection.stream.end();
+    if (connectionId) {
+      connections.delete(connectionId);
+    }
+  }
+
+  return response;
+}
+
+function readBody(request) {
+  return new Promise((resolve, reject) => {
+    let body = '';
+    request.on('data', (chunk) => {
+      body += chunk.toString('utf8');
+    });
+    request.on('end', () => resolve(body));
+    request.on('error', reject);
+  });
+}
+
+http.createServer(async (request, response) => {
   if (request.url === '/?dogfood=real-hub') {
     response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
     response.end('<!doctype html><html><head><title>Botster Web</title></head><body><main id="root">botster-web packaged UI</main><script type="module" src="/assets/index.js"></script></body></html>');
+    return;
+  }
+  if (request.url === '/bridge' && request.method === 'POST') {
+    try {
+      const payload = JSON.parse(await readBody(request));
+      const daemonResponse = await daemonRequest(payload);
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({
+        ok: true,
+        mode,
+        source,
+        dataDir,
+        socketExists,
+        response: daemonResponse,
+      }));
+    } catch (error) {
+      response.writeHead(502, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({
+        ok: false,
+        mode,
+        source,
+        dataDir,
+        socketExists,
+        error: String(error && error.message ? error.message : error),
+      }));
+    }
     return;
   }
   if (request.url !== '/health') {
@@ -542,6 +671,59 @@ fn read_http_path(url: &str, path: &str) -> (String, String) {
         body.to_string()
     };
     (headers.to_string(), body)
+}
+
+fn post_http_json(url: &str, path: &str, body: &str) -> (String, String) {
+    let port = url
+        .strip_prefix("http://127.0.0.1:")
+        .expect("local HTTP URL")
+        .parse::<u16>()
+        .expect("HTTP port");
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect HTTP endpoint");
+    let request = format!(
+        "POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream
+        .write_all(request.as_bytes())
+        .expect("write HTTP request");
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .expect("read HTTP response");
+    let (headers, body) = response.split_once("\r\n\r\n").expect("HTTP response body");
+    let body = if headers
+        .to_ascii_lowercase()
+        .contains("transfer-encoding: chunked")
+    {
+        decode_chunked_http_body(body)
+    } else {
+        body.to_string()
+    };
+    (headers.to_string(), body)
+}
+
+fn dogfood_bridge_request(
+    bridge_url: &str,
+    connection_id: Option<&str>,
+    request: &botster_hub_client::DaemonRequest,
+) -> botster_hub_client::DaemonResponse {
+    let mut payload = serde_json::json!({ "request": request });
+    if let Some(connection_id) = connection_id {
+        payload["connection_id"] = serde_json::Value::String(connection_id.to_string());
+    }
+    let body = serde_json::to_string(&payload).expect("serialize bridge request");
+    let (headers, body) = post_http_json(bridge_url, "/bridge", &body);
+    assert!(
+        headers.starts_with("HTTP/1.1 200") || headers.starts_with("HTTP/1.0 200"),
+        "bridge request returned non-200: {headers} body={body}"
+    );
+    let envelope: serde_json::Value = serde_json::from_str(body.trim()).expect("bridge JSON");
+    assert_eq!(envelope["ok"], true, "bridge envelope: {envelope}");
+    assert_eq!(envelope["mode"], "existing_hub");
+    assert_eq!(envelope["source"], "socket");
+    assert_eq!(envelope["socketExists"], true);
+    serde_json::from_value(envelope["response"].clone()).expect("daemon response JSON")
 }
 
 fn unused_loopback_port() -> u16 {
@@ -1024,6 +1206,227 @@ fn cli_dogfood_launcher_starts_botster_web_in_existing_hub_mode_and_shuts_down()
 
     shutdown_cli_daemon(&data_dir, child);
     wait_for_process_exit(web_pid);
+}
+
+#[test]
+fn cli_dogfood_launcher_bridge_request_endpoint_uses_same_daemon_state() {
+    let _guard = daemon_test_lock()
+        .lock()
+        .expect("serialize real daemon test");
+    let data_dir = unique_short_test_dir("dogfood-bridge");
+    let web_package_dir = unique_test_dir("cli-dogfood-bridge-botster-web-package");
+    write_botster_web_package(&web_package_dir);
+    let web_bridge_port = unused_loopback_port();
+    let (mut child, rx) =
+        spawn_dogfood_launcher(Some(&data_dir), &web_package_dir, Some(web_bridge_port));
+    let mut lines = collect_dogfood_ready_output(&mut child, &rx);
+    lines.sort();
+    let text = lines.join("\n");
+    let bridge_url = format!("http://127.0.0.1:{web_bridge_port}");
+    let connection_id = "dogfood-bridge-consistency";
+
+    assert!(text.contains("dogfood=ready"));
+    assert!(text.contains("package name=project-pipelines state=enabled"));
+    assert!(text.contains("package name=botster-web state=enabled"));
+    assert_eq!(dogfood_data_dir(&lines), data_dir);
+    assert_eq!(
+        dogfood_web_url(&lines),
+        format!("{bridge_url}/?dogfood=real-hub")
+    );
+
+    let status = dogfood_bridge_request(
+        &bridge_url,
+        Some(connection_id),
+        &botster_hub_client::DaemonRequest::Status,
+    );
+    assert_eq!(status.kind, botster_hub_client::DaemonResponseKind::Status);
+    let status_body = status.status.expect("bridge status body");
+    assert_eq!(status_body.lifecycle_state, "running");
+    assert!(status_body.core_initialized);
+    assert_eq!(status_body.enabled_package_count, 2);
+
+    let packages = dogfood_bridge_request(
+        &bridge_url,
+        Some(connection_id),
+        &botster_hub_client::DaemonRequest::ListPackages,
+    );
+    assert_eq!(
+        packages.kind,
+        botster_hub_client::DaemonResponseKind::Packages
+    );
+    assert!(packages.packages.iter().any(|package| {
+        package.package_name == "project-pipelines" && package.state == "enabled"
+    }));
+    let web_package = packages
+        .packages
+        .iter()
+        .find(|package| package.package_name == "botster-web" && package.state == "enabled")
+        .expect("bridge lists enabled botster-web package");
+    let web_entrypoint = web_package
+        .runnable_entrypoints
+        .iter()
+        .find(|entrypoint| entrypoint.id == "web-client")
+        .expect("bridge lists botster-web web-client entrypoint");
+    assert_eq!(web_entrypoint.process.state, "running");
+
+    let empty_sessions = dogfood_bridge_request(
+        &bridge_url,
+        Some(connection_id),
+        &botster_hub_client::DaemonRequest::ListSessions,
+    );
+    assert_eq!(
+        empty_sessions.kind,
+        botster_hub_client::DaemonResponseKind::Sessions
+    );
+
+    let spawn = dogfood_bridge_request(
+        &bridge_url,
+        Some(connection_id),
+        &botster_hub_client::DaemonRequest::Spawn {
+            session_id: "bridge-dogfood-session".to_string(),
+            command: "printf 'bridge-ready\\n'; while IFS= read -r line; do printf 'bridge:%s\\n' \"$line\"; done".to_string(),
+        },
+    );
+    assert_eq!(spawn.kind, botster_hub_client::DaemonResponseKind::Spawned);
+    assert!(spawn.sessions.iter().any(|session| {
+        session.session_id == "bridge-dogfood-session" && session.lifecycle == "running"
+    }));
+
+    let bridge_sessions = dogfood_bridge_request(
+        &bridge_url,
+        Some(connection_id),
+        &botster_hub_client::DaemonRequest::ListSessions,
+    );
+    assert!(bridge_sessions.sessions.iter().any(|session| {
+        session.session_id == "bridge-dogfood-session" && session.lifecycle == "running"
+    }));
+    let daemon_sessions = botster_hub::daemon_transport_request(
+        &explicit_config(&data_dir),
+        botster_hub::DaemonRequest::ListSessions,
+    )
+    .expect("direct daemon list sessions after bridge spawn");
+    assert!(daemon_sessions.sessions.iter().any(|session| {
+        session.session_id == "bridge-dogfood-session" && session.lifecycle == "running"
+    }));
+
+    let attach = dogfood_bridge_request(
+        &bridge_url,
+        Some(connection_id),
+        &botster_hub_client::DaemonRequest::Attach {
+            session_id: "bridge-dogfood-session".to_string(),
+            subscription_id: "bridge-dogfood-subscription".to_string(),
+        },
+    );
+    assert_eq!(attach.kind, botster_hub_client::DaemonResponseKind::Events);
+
+    let resize = dogfood_bridge_request(
+        &bridge_url,
+        Some(connection_id),
+        &botster_hub_client::DaemonRequest::Resize {
+            session_id: "bridge-dogfood-session".to_string(),
+            rows: 33,
+            cols: 111,
+        },
+    );
+    assert_eq!(resize.kind, botster_hub_client::DaemonResponseKind::Events);
+
+    let send = dogfood_bridge_request(
+        &bridge_url,
+        Some(connection_id),
+        &botster_hub_client::DaemonRequest::SendInput {
+            session_id: "bridge-dogfood-session".to_string(),
+            data: "from-bridge\n".to_string(),
+        },
+    );
+    assert_eq!(send.kind, botster_hub_client::DaemonResponseKind::Events);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut observed = String::new();
+    while std::time::Instant::now() < deadline {
+        let drain = dogfood_bridge_request(
+            &bridge_url,
+            Some(connection_id),
+            &botster_hub_client::DaemonRequest::Drain {
+                session_id: "bridge-dogfood-session".to_string(),
+            },
+        );
+        for event in drain.events {
+            if let botster_hub_client::DaemonEvent::TerminalOutput { data, .. } = event {
+                observed.push_str(&data);
+            }
+        }
+        if observed.contains("bridge:from-bridge") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(30));
+    }
+    assert!(
+        observed.contains("bridge:from-bridge"),
+        "bridge should attach and drain terminal output through the dogfood daemon, got {observed:?}"
+    );
+
+    let shutdown_session = dogfood_bridge_request(
+        &bridge_url,
+        Some(connection_id),
+        &botster_hub_client::DaemonRequest::ShutdownSession {
+            session_id: "bridge-dogfood-session".to_string(),
+        },
+    );
+    assert_eq!(
+        shutdown_session.kind,
+        botster_hub_client::DaemonResponseKind::Events
+    );
+
+    let missing_session = dogfood_bridge_request(
+        &bridge_url,
+        Some(connection_id),
+        &botster_hub_client::DaemonRequest::Drain {
+            session_id: "missing-bridge-dogfood-session".to_string(),
+        },
+    );
+    assert_eq!(
+        missing_session.kind,
+        botster_hub_client::DaemonResponseKind::OperatorError
+    );
+    let error = missing_session.error.expect("operator error body");
+    assert_eq!(error.code, "unknown_session");
+    assert_eq!(error.operation, "drain_runtime");
+    assert!(error.message.contains("UnknownSession"), "{error:?}");
+    assert!(error.diagnostics.iter().any(|diagnostic| {
+        diagnostic.kind == botster_hub_client::DaemonDiagnosticKind::TerminalStreamUnavailable
+            && diagnostic.operation.as_deref() == Some("drain_runtime")
+            && diagnostic.feature.as_deref() == Some(botster_hub_client::FEATURE_TERMINAL_STREAMING)
+            && diagnostic
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("UnknownSession"))
+    }));
+    for diagnostic in &error.diagnostics {
+        let diagnostic = serde_json::to_value(diagnostic).expect("serialize diagnostic");
+        assert_ne!(
+            diagnostic["kind"], "runtime",
+            "diagnostic kind should use bounded DaemonDiagnosticKind variants"
+        );
+    }
+
+    let after_shutdown = dogfood_bridge_request(
+        &bridge_url,
+        Some(connection_id),
+        &botster_hub_client::DaemonRequest::ListSessions,
+    );
+    assert!(after_shutdown.sessions.iter().any(|session| {
+        session.session_id == "bridge-dogfood-session" && session.lifecycle == "exited"
+    }));
+    let direct_after_shutdown = botster_hub::daemon_transport_request(
+        &explicit_config(&data_dir),
+        botster_hub::DaemonRequest::ListSessions,
+    )
+    .expect("direct daemon list sessions after bridge shutdown");
+    assert!(direct_after_shutdown.sessions.iter().any(|session| {
+        session.session_id == "bridge-dogfood-session" && session.lifecycle == "exited"
+    }));
+
+    shutdown_cli_daemon(&data_dir, child);
 }
 
 #[test]
