@@ -1683,20 +1683,22 @@ fn daemon_event_from_client(event: HubClientEvent) -> DaemonEvent {
         HubClientEvent::Snapshot {
             session_id,
             subscription_id,
-            bytes,
+            data,
         } => DaemonEvent::Snapshot {
             session_id: session_id.0,
             subscription_id: subscription_id.0,
-            bytes,
+            bytes: data.len(),
+            data: String::from_utf8_lossy(&data).to_string(),
         },
         HubClientEvent::Scrollback {
             session_id,
             subscription_id,
-            bytes,
+            data,
         } => DaemonEvent::Scrollback {
             session_id: session_id.0,
             subscription_id: subscription_id.0,
-            bytes,
+            bytes: data.len(),
+            data: String::from_utf8_lossy(&data).to_string(),
         },
         HubClientEvent::ProcessExit {
             session_id,
@@ -2033,3 +2035,43 @@ impl From<crate::HubLifecycleError> for DaemonTransportError {
 
 /// Result alias for daemon socket transport operations.
 pub type DaemonTransportResult<T> = Result<T, DaemonTransportError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn daemon_event_projection_decodes_history_data_and_keeps_raw_byte_counts() {
+        let session_id = SessionId("daemon-projection-session".to_string());
+        let subscription_id = SubscriptionId("daemon-projection-subscription".to_string());
+        let snapshot = daemon_event_from_client(HubClientEvent::Snapshot {
+            session_id: session_id.clone(),
+            subscription_id: subscription_id.clone(),
+            data: vec![b's', b'n', b'a', b'p', 0xff],
+        });
+        let scrollback = daemon_event_from_client(HubClientEvent::Scrollback {
+            session_id,
+            subscription_id,
+            data: b"scrollback".to_vec(),
+        });
+
+        assert_eq!(
+            snapshot,
+            DaemonEvent::Snapshot {
+                session_id: "daemon-projection-session".to_string(),
+                subscription_id: "daemon-projection-subscription".to_string(),
+                data: String::from_utf8_lossy(&[b's', b'n', b'a', b'p', 0xff]).to_string(),
+                bytes: 5,
+            }
+        );
+        assert_eq!(
+            scrollback,
+            DaemonEvent::Scrollback {
+                session_id: "daemon-projection-session".to_string(),
+                subscription_id: "daemon-projection-subscription".to_string(),
+                data: "scrollback".to_string(),
+                bytes: 10,
+            }
+        );
+    }
+}

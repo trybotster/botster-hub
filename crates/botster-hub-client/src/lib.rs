@@ -18,7 +18,7 @@ use serde_json::Value;
 
 pub const PROTOCOL: &str = "botster-hub-daemon-v1";
 pub const PROTOCOL_VERSION: u16 = 1;
-pub const CONFORMANCE_FIXTURE_REVISION: u16 = 1;
+pub const CONFORMANCE_FIXTURE_REVISION: u16 = 2;
 pub const FEATURE_SESSIONS: &str = "sessions";
 pub const FEATURE_TERMINAL_STREAMING: &str = "terminal_streaming";
 pub const FEATURE_RESIZE: &str = "resize";
@@ -978,11 +978,13 @@ pub enum DaemonEvent {
     Snapshot {
         session_id: String,
         subscription_id: String,
+        data: String,
         bytes: usize,
     },
     Scrollback {
         session_id: String,
         subscription_id: String,
+        data: String,
         bytes: usize,
     },
     ProcessExit {
@@ -1147,6 +1149,50 @@ mod tests {
 
         assert!(response.diagnostics.is_empty());
         assert!(response.status.expect("status body").diagnostics.is_empty());
+    }
+
+    #[test]
+    fn snapshot_and_scrollback_events_carry_renderable_data() {
+        let events = vec![
+            DaemonEvent::Snapshot {
+                session_id: "session".to_string(),
+                subscription_id: "subscription".to_string(),
+                data: "snapshot-data".to_string(),
+                bytes: 13,
+            },
+            DaemonEvent::Scrollback {
+                session_id: "session".to_string(),
+                subscription_id: "subscription".to_string(),
+                data: "scrollback-data".to_string(),
+                bytes: 15,
+            },
+        ];
+
+        let value = serde_json::to_value(&events).expect("events serialize");
+
+        assert_eq!(
+            value,
+            serde_json::json!([
+                {
+                    "type": "snapshot",
+                    "session_id": "session",
+                    "subscription_id": "subscription",
+                    "data": "snapshot-data",
+                    "bytes": 13
+                },
+                {
+                    "type": "scrollback",
+                    "session_id": "session",
+                    "subscription_id": "subscription",
+                    "data": "scrollback-data",
+                    "bytes": 15
+                }
+            ])
+        );
+
+        let round_tripped: Vec<DaemonEvent> =
+            serde_json::from_value(value).expect("events deserialize");
+        assert_eq!(round_tripped, events);
     }
 
     #[test]
