@@ -731,12 +731,12 @@ pub enum HubClientEvent {
     Snapshot {
         session_id: SessionId,
         subscription_id: SubscriptionId,
-        bytes: usize,
+        data: Vec<u8>,
     },
     Scrollback {
         session_id: SessionId,
         subscription_id: SubscriptionId,
-        bytes: usize,
+        data: Vec<u8>,
     },
     ProcessExit {
         session_id: SessionId,
@@ -1175,7 +1175,7 @@ fn events_from_drain(output: botster_core_daemon::DrainResult) -> Vec<HubClientE
                 } => Some(HubClientEvent::Snapshot {
                     session_id,
                     subscription_id,
-                    bytes: data.len(),
+                    data,
                 }),
                 TransportEgress::Scrollback {
                     session_id,
@@ -1184,7 +1184,7 @@ fn events_from_drain(output: botster_core_daemon::DrainResult) -> Vec<HubClientE
                 } => Some(HubClientEvent::Scrollback {
                     session_id,
                     subscription_id,
-                    bytes: data.len(),
+                    data,
                 }),
                 TransportEgress::ProcessExit {
                     session_id,
@@ -1233,4 +1233,67 @@ fn package_allows_guarded_write(packages: &PackageRegistry, package_name: &str) 
                 .as_deref()
                 .is_none_or(|scope| scope == "guarded_session_notification_write")
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn drain_projection_preserves_snapshot_and_scrollback_payloads_before_live_output() {
+        let session_id = SessionId("projection-session".to_string());
+        let subscription_id = SubscriptionId("projection-subscription".to_string());
+        let client_id = ClientId("projection-client".to_string());
+        let events = events_from_drain(botster_core_daemon::DrainResult {
+            client_egress: vec![
+                (
+                    client_id.clone(),
+                    TransportEgress::Snapshot {
+                        session_id: session_id.clone(),
+                        subscription_id: subscription_id.clone(),
+                        data: b"snapshot-history".to_vec(),
+                    },
+                ),
+                (
+                    client_id.clone(),
+                    TransportEgress::Scrollback {
+                        session_id: session_id.clone(),
+                        subscription_id: subscription_id.clone(),
+                        data: b"scrollback-history".to_vec(),
+                    },
+                ),
+                (
+                    client_id,
+                    TransportEgress::TerminalOutput {
+                        session_id: session_id.clone(),
+                        subscription_id: subscription_id.clone(),
+                        data: b"live-output".to_vec(),
+                    },
+                ),
+            ],
+            observations: Vec::new(),
+            backpressure: Vec::new(),
+        });
+
+        assert_eq!(
+            events,
+            vec![
+                HubClientEvent::Snapshot {
+                    session_id: session_id.clone(),
+                    subscription_id: subscription_id.clone(),
+                    data: b"snapshot-history".to_vec(),
+                },
+                HubClientEvent::Scrollback {
+                    session_id: session_id.clone(),
+                    subscription_id: subscription_id.clone(),
+                    data: b"scrollback-history".to_vec(),
+                },
+                HubClientEvent::TerminalOutput {
+                    session_id,
+                    subscription_id,
+                    data: b"live-output".to_vec(),
+                },
+            ]
+        );
+    }
 }
