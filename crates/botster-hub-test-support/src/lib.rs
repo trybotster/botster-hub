@@ -17,8 +17,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use botster_hub_client::{
     DaemonCompatibility, DaemonCompatibilityRequirement, DaemonDiagnostic, DaemonDiagnosticKind,
-    DaemonEndpoint, DaemonOperatorError, DaemonRequest, DaemonResponse, DaemonResponseKind,
-    DaemonTransportError, ensure_compatible,
+    DaemonEndpoint, DaemonEvent, DaemonOperatorError, DaemonRequest, DaemonResponse,
+    DaemonResponseKind, DaemonTransportError, ensure_compatible,
 };
 use serde::{Deserialize, Serialize};
 
@@ -27,6 +27,13 @@ const CONFORMANCE_SUBSCRIPTION_ID: &str = "botster-conformance-subscription";
 const CONFORMANCE_READY: &str = "conformance-ready";
 const CONFORMANCE_ECHO: &str = "echo:from-conformance";
 const CONFORMANCE_WINSIZE_PREFIX: &str = "winsize:";
+const LATE_ATTACH_HISTORY_SESSION_ID: &str = "late-attach-history-fixture-session";
+const LATE_ATTACH_HISTORY_SUBSCRIPTION_ID: &str = "late-attach-history-fixture-subscription";
+const LATE_ATTACH_NO_HISTORY_SESSION_ID: &str = "late-attach-no-history-fixture-session";
+const LATE_ATTACH_NO_HISTORY_SUBSCRIPTION_ID: &str = "late-attach-no-history-fixture-subscription";
+const LATE_ATTACH_HISTORY_DATA: &str = "history-before-live\r\n";
+const LATE_ATTACH_LIVE_DATA: &str = "live-after-attach\r\n";
+const LATE_ATTACH_NO_HISTORY_LIVE_DATA: &str = "live-without-history\r\n";
 const PROJECT_PIPELINES_PACKAGE: &str = "project-pipelines";
 const PROJECT_PIPELINES_SURFACE: &str = "project-pipelines.create-ticket";
 const PROJECT_PIPELINES_ACTION: &str = "project_pipelines.create_ticket";
@@ -55,6 +62,7 @@ pub struct FirstPartyClientSupportMatrix {
     pub resize: ResizeSupport,
     pub plugin_surfaces: PluginSurfaceSupport,
     pub entity_actions: EntityActionSupport,
+    pub late_attach_history: LateAttachHistorySupport,
     pub known_limitations: Vec<String>,
 }
 
@@ -94,6 +102,31 @@ pub struct PluginSurfaceSupport {
 pub struct EntityActionSupport {
     pub supported_capabilities: Vec<String>,
     pub unsupported_capabilities: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LateAttachHistorySupport {
+    pub supported: bool,
+    pub fixture_path: String,
+    pub json_helper: String,
+    pub event_type: String,
+    pub runtime_regression: String,
+}
+
+/// Public client-shaped scenario for late terminal attach history rendering.
+///
+/// The events use [`botster_hub_client::DaemonEvent`] values only, so
+/// downstream web/TUI tests can either consume this struct in Rust test code or
+/// mirror the serde JSON emitted by [`late_attach_history_conformance_fixture_json`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LateAttachHistoryConformanceScenario {
+    pub conformance_fixture_revision: u16,
+    pub session_id: String,
+    pub subscription_id: String,
+    pub no_history_session_id: String,
+    pub no_history_subscription_id: String,
+    pub history_then_live: Vec<DaemonEvent>,
+    pub no_history_then_live: Vec<DaemonEvent>,
 }
 
 /// Return the current first-party support matrix for downstream client tests.
@@ -158,6 +191,17 @@ pub fn first_party_client_support_matrix() -> FirstPartyClientSupportMatrix {
             supported_capabilities: vec![SUPPORTED_PLUGIN_SURFACE_JSON_ACTIONS.to_string()],
             unsupported_capabilities: vec![UNSUPPORTED_PLUGIN_ENTITY_FRAMES.to_string()],
         },
+        late_attach_history: LateAttachHistorySupport {
+            supported: true,
+            fixture_path: "botster_hub_test_support::late_attach_history_conformance_scenario"
+                .to_string(),
+            json_helper: "botster_hub_test_support::late_attach_history_conformance_fixture_json"
+                .to_string(),
+            event_type: "botster_hub_client::DaemonEvent".to_string(),
+            runtime_regression:
+                "external_daemon_attach_replays_prior_history_with_renderable_byte_count"
+                    .to_string(),
+        },
         known_limitations: vec![
             "The matrix is a test/docs contract, not a daemon runtime endpoint.".to_string(),
             "Full plugin entity-frame hydration is intentionally outside this conformance fixture."
@@ -165,6 +209,80 @@ pub fn first_party_client_support_matrix() -> FirstPartyClientSupportMatrix {
             "Clients own renderer-specific presentation policy for diagnostics.".to_string(),
         ],
     }
+}
+
+/// Return the typed late-attach history fixture for first-party client tests.
+#[must_use]
+pub fn late_attach_history_conformance_scenario() -> LateAttachHistoryConformanceScenario {
+    LateAttachHistoryConformanceScenario {
+        conformance_fixture_revision: botster_hub_client::CONFORMANCE_FIXTURE_REVISION,
+        session_id: LATE_ATTACH_HISTORY_SESSION_ID.to_string(),
+        subscription_id: LATE_ATTACH_HISTORY_SUBSCRIPTION_ID.to_string(),
+        no_history_session_id: LATE_ATTACH_NO_HISTORY_SESSION_ID.to_string(),
+        no_history_subscription_id: LATE_ATTACH_NO_HISTORY_SUBSCRIPTION_ID.to_string(),
+        history_then_live: late_attach_history_events(),
+        no_history_then_live: late_attach_no_history_events(),
+    }
+}
+
+/// Return the positive late-attach sequence: metadata, restored history, live bytes, exit.
+#[must_use]
+pub fn late_attach_history_events() -> Vec<DaemonEvent> {
+    vec![
+        DaemonEvent::AttachState {
+            session_id: LATE_ATTACH_HISTORY_SESSION_ID.to_string(),
+            subscription_id: LATE_ATTACH_HISTORY_SUBSCRIPTION_ID.to_string(),
+            state: "attached".to_string(),
+        },
+        DaemonEvent::Snapshot {
+            session_id: LATE_ATTACH_HISTORY_SESSION_ID.to_string(),
+            subscription_id: LATE_ATTACH_HISTORY_SUBSCRIPTION_ID.to_string(),
+            data: LATE_ATTACH_HISTORY_DATA.to_string(),
+            bytes: LATE_ATTACH_HISTORY_DATA.len(),
+        },
+        DaemonEvent::TerminalOutput {
+            session_id: LATE_ATTACH_HISTORY_SESSION_ID.to_string(),
+            subscription_id: LATE_ATTACH_HISTORY_SUBSCRIPTION_ID.to_string(),
+            data: LATE_ATTACH_LIVE_DATA.to_string(),
+        },
+        DaemonEvent::ProcessExit {
+            session_id: LATE_ATTACH_HISTORY_SESSION_ID.to_string(),
+            subscription_id: LATE_ATTACH_HISTORY_SUBSCRIPTION_ID.to_string(),
+            code: Some(0),
+        },
+    ]
+}
+
+/// Return a late attach sequence where no restored history is fabricated.
+#[must_use]
+pub fn late_attach_no_history_events() -> Vec<DaemonEvent> {
+    vec![
+        DaemonEvent::AttachState {
+            session_id: LATE_ATTACH_NO_HISTORY_SESSION_ID.to_string(),
+            subscription_id: LATE_ATTACH_NO_HISTORY_SUBSCRIPTION_ID.to_string(),
+            state: "attached".to_string(),
+        },
+        DaemonEvent::TerminalOutput {
+            session_id: LATE_ATTACH_NO_HISTORY_SESSION_ID.to_string(),
+            subscription_id: LATE_ATTACH_NO_HISTORY_SUBSCRIPTION_ID.to_string(),
+            data: LATE_ATTACH_NO_HISTORY_LIVE_DATA.to_string(),
+        },
+        DaemonEvent::ProcessExit {
+            session_id: LATE_ATTACH_NO_HISTORY_SESSION_ID.to_string(),
+            subscription_id: LATE_ATTACH_NO_HISTORY_SUBSCRIPTION_ID.to_string(),
+            code: Some(0),
+        },
+    ]
+}
+
+/// Return stable serde JSON for downstream clients that mirror the fixture.
+///
+/// Browser-side tests should mirror this JSON shape rather than inventing
+/// TypeScript-only event fields.
+#[must_use]
+pub fn late_attach_history_conformance_fixture_json() -> serde_json::Value {
+    serde_json::to_value(late_attach_history_conformance_scenario())
+        .expect("late attach history conformance fixture serializes")
 }
 
 /// Builder for one isolated local hub daemon test instance.
@@ -1380,10 +1498,217 @@ mod tests {
                     "supported_capabilities": [SUPPORTED_PLUGIN_SURFACE_JSON_ACTIONS],
                     "unsupported_capabilities": [UNSUPPORTED_PLUGIN_ENTITY_FRAMES],
                 },
+                "late_attach_history": {
+                    "supported": true,
+                    "fixture_path": "botster_hub_test_support::late_attach_history_conformance_scenario",
+                    "json_helper": "botster_hub_test_support::late_attach_history_conformance_fixture_json",
+                    "event_type": "botster_hub_client::DaemonEvent",
+                    "runtime_regression": "external_daemon_attach_replays_prior_history_with_renderable_byte_count",
+                },
                 "known_limitations": [
                     "The matrix is a test/docs contract, not a daemon runtime endpoint.",
                     "Full plugin entity-frame hydration is intentionally outside this conformance fixture.",
                     "Clients own renderer-specific presentation policy for diagnostics.",
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn late_attach_history_fixture_is_referenced_from_support_matrix() {
+        let matrix = first_party_client_support_matrix();
+
+        assert!(matrix.late_attach_history.supported);
+        assert_eq!(
+            matrix.late_attach_history.fixture_path,
+            "botster_hub_test_support::late_attach_history_conformance_scenario"
+        );
+        assert_eq!(
+            matrix.late_attach_history.json_helper,
+            "botster_hub_test_support::late_attach_history_conformance_fixture_json"
+        );
+        assert_eq!(
+            matrix.late_attach_history.event_type,
+            "botster_hub_client::DaemonEvent"
+        );
+    }
+
+    #[test]
+    fn late_attach_history_fixture_orders_history_before_live_output() {
+        let scenario = late_attach_history_conformance_scenario();
+
+        let history_index = scenario
+            .history_then_live
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    DaemonEvent::Snapshot { data, .. } | DaemonEvent::Scrollback { data, .. }
+                        if data.contains("history-before-live")
+                )
+            })
+            .expect("fixture includes restored history");
+        let live_index = scenario
+            .history_then_live
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    DaemonEvent::TerminalOutput { data, .. }
+                        if data.contains("live-after-attach")
+                )
+            })
+            .expect("fixture includes later live output");
+
+        assert!(
+            history_index < live_index,
+            "restored history must precede later live output"
+        );
+    }
+
+    #[test]
+    fn late_attach_history_fixture_does_not_fabricate_no_history_events() {
+        let scenario = late_attach_history_conformance_scenario();
+
+        assert!(
+            !scenario.no_history_then_live.iter().any(|event| {
+                matches!(
+                    event,
+                    DaemonEvent::Snapshot { data, .. } | DaemonEvent::Scrollback { data, .. }
+                        if !data.is_empty()
+                )
+            }),
+            "no-history fixture must not contain non-empty snapshot or scrollback events"
+        );
+        assert!(
+            scenario.no_history_then_live.iter().any(|event| {
+                matches!(
+                    event,
+                    DaemonEvent::TerminalOutput { data, .. }
+                        if data.contains("live-without-history")
+                )
+            }),
+            "no-history fixture should still include later live terminal output"
+        );
+    }
+
+    #[test]
+    fn late_attach_history_fixture_byte_counts_match_renderable_data() {
+        let scenario = late_attach_history_conformance_scenario();
+
+        for event in scenario
+            .history_then_live
+            .iter()
+            .chain(scenario.no_history_then_live.iter())
+        {
+            match event {
+                DaemonEvent::Snapshot { data, bytes, .. }
+                | DaemonEvent::Scrollback { data, bytes, .. } => {
+                    assert_eq!(*bytes, data.len());
+                    assert!(!data.is_empty());
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn late_attach_history_fixture_keeps_control_events_distinct_from_terminal_bytes() {
+        let scenario = late_attach_history_conformance_scenario();
+        let all_events = scenario
+            .history_then_live
+            .iter()
+            .chain(scenario.no_history_then_live.iter())
+            .collect::<Vec<_>>();
+
+        assert!(all_events.iter().any(|event| {
+            matches!(
+                event,
+                DaemonEvent::AttachState {
+                    state,
+                    ..
+                } if state == "attached"
+            )
+        }));
+        assert!(
+            all_events
+                .iter()
+                .any(|event| matches!(event, DaemonEvent::ProcessExit { code: Some(0), .. }))
+        );
+        assert!(
+            all_events.iter().all(|event| {
+                !matches!(
+                    event,
+                    DaemonEvent::AttachState { .. } | DaemonEvent::ProcessExit { .. }
+                ) || !matches!(
+                    event,
+                    DaemonEvent::TerminalOutput { .. }
+                        | DaemonEvent::Snapshot { .. }
+                        | DaemonEvent::Scrollback { .. }
+                )
+            }),
+            "control events must stay separate from terminal byte events"
+        );
+    }
+
+    #[test]
+    fn late_attach_history_fixture_serializes_to_stable_client_json() {
+        let value = late_attach_history_conformance_fixture_json();
+
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "conformance_fixture_revision": botster_hub_client::CONFORMANCE_FIXTURE_REVISION,
+                "session_id": LATE_ATTACH_HISTORY_SESSION_ID,
+                "subscription_id": LATE_ATTACH_HISTORY_SUBSCRIPTION_ID,
+                "no_history_session_id": LATE_ATTACH_NO_HISTORY_SESSION_ID,
+                "no_history_subscription_id": LATE_ATTACH_NO_HISTORY_SUBSCRIPTION_ID,
+                "history_then_live": [
+                    {
+                        "type": "attach_state",
+                        "session_id": LATE_ATTACH_HISTORY_SESSION_ID,
+                        "subscription_id": LATE_ATTACH_HISTORY_SUBSCRIPTION_ID,
+                        "state": "attached",
+                    },
+                    {
+                        "type": "snapshot",
+                        "session_id": LATE_ATTACH_HISTORY_SESSION_ID,
+                        "subscription_id": LATE_ATTACH_HISTORY_SUBSCRIPTION_ID,
+                        "data": LATE_ATTACH_HISTORY_DATA,
+                        "bytes": LATE_ATTACH_HISTORY_DATA.len(),
+                    },
+                    {
+                        "type": "terminal_output",
+                        "session_id": LATE_ATTACH_HISTORY_SESSION_ID,
+                        "subscription_id": LATE_ATTACH_HISTORY_SUBSCRIPTION_ID,
+                        "data": LATE_ATTACH_LIVE_DATA,
+                    },
+                    {
+                        "type": "process_exit",
+                        "session_id": LATE_ATTACH_HISTORY_SESSION_ID,
+                        "subscription_id": LATE_ATTACH_HISTORY_SUBSCRIPTION_ID,
+                        "code": 0,
+                    },
+                ],
+                "no_history_then_live": [
+                    {
+                        "type": "attach_state",
+                        "session_id": LATE_ATTACH_NO_HISTORY_SESSION_ID,
+                        "subscription_id": LATE_ATTACH_NO_HISTORY_SUBSCRIPTION_ID,
+                        "state": "attached",
+                    },
+                    {
+                        "type": "terminal_output",
+                        "session_id": LATE_ATTACH_NO_HISTORY_SESSION_ID,
+                        "subscription_id": LATE_ATTACH_NO_HISTORY_SUBSCRIPTION_ID,
+                        "data": LATE_ATTACH_NO_HISTORY_LIVE_DATA,
+                    },
+                    {
+                        "type": "process_exit",
+                        "session_id": LATE_ATTACH_NO_HISTORY_SESSION_ID,
+                        "subscription_id": LATE_ATTACH_NO_HISTORY_SUBSCRIPTION_ID,
+                        "code": 0,
+                    },
                 ],
             })
         );

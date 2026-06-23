@@ -181,6 +181,29 @@ output bytes into its output writer; clients that need event kind, history
 payload, or ordering metadata should use `DaemonConnection` with `Attach` and
 `Drain`.
 
+The reusable first-party fixture for this rendering contract lives in
+`botster_hub_test_support::late_attach_history_conformance_scenario`. It returns
+public `botster_hub_client::DaemonEvent` values only:
+
+- `history_then_live` includes attach metadata, non-empty `snapshot` or
+  `scrollback` history with `bytes == data.len()`, later `terminal_output`, and
+  process-exit metadata;
+- `no_history_then_live` includes attach metadata, later live terminal output,
+  and process-exit metadata without fabricating non-empty `snapshot` or
+  `scrollback` history.
+
+Rust downstream tests can consume the typed scenario directly. Browser/TUI
+tests that cannot depend on the Rust crate should mirror the stable JSON from
+`botster_hub_test_support::late_attach_history_conformance_fixture_json` and
+assert the same event ordering and classification. `AttachState` and
+`ProcessExit` are metadata/control events, not terminal bytes to render.
+
+The fixture is a client conformance contract, not a replacement daemon harness.
+The live runtime path remains covered by
+`external_daemon_attach_replays_prior_history_with_renderable_byte_count`, which
+proves the daemon socket path emits matching public event semantics for restored
+history before later live output and for the no-history case.
+
 The addition of required renderable `data` fields on `snapshot` and `scrollback`
 increments `CONFORMANCE_FIXTURE_REVISION`. `PROTOCOL_VERSION` remains unchanged
 because the daemon framing and request/response protocol are the same; clients
@@ -246,10 +269,12 @@ isolated hubs and compare the reports to prove deterministic fixture output.
 Downstream `botster-tui` tests should import
 `botster_hub_test_support::first_party_client_support_matrix` directly and
 compare it to `run_client_conformance` for the local client paths they exercise.
-Downstream `botster-web` tests should consume the matrix as serialized JSON,
-for example with `serde_json::to_value(first_party_client_support_matrix())`
-from a Rust fixture or repo sync step, rather than mirroring the matrix by hand
-in TypeScript.
+Downstream `botster-web` tests should consume the matrix and late-attach history
+scenario as serialized JSON, for example with
+`serde_json::to_value(first_party_client_support_matrix())` and
+`late_attach_history_conformance_fixture_json()` from a Rust fixture or repo sync
+step, rather than mirroring the matrix or daemon event fields by hand in
+TypeScript.
 
 If a downstream client also wants to prove plugin surface/action dispatch
 against the first-party Project Pipelines example, provide a checkout path to
