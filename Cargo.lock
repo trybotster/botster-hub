@@ -94,7 +94,7 @@ dependencies = [
 [[package]]
 name = "botster-core"
 version = "0.1.0"
-source = "git+https://github.com/trybotster/botster-core?branch=main#8f2f4acf7e9b73f4ff777151bfb55284871f8bdd"
+source = "git+https://github.com/trybotster/botster-core?branch=main#1548c0cbc4c93a92c44c7ed1f0018ddfb75592b5"
 dependencies = [
  "aes-gcm",
  "base64",
@@ -110,7 +110,7 @@ dependencies = [
 [[package]]
 name = "botster-core-daemon"
 version = "0.1.0"
-source = "git+https://github.com/trybotster/botster-core?branch=main#8f2f4acf7e9b73f4ff777151bfb55284871f8bdd"
+source = "git+https://github.com/trybotster/botster-core?branch=main#1548c0cbc4c93a92c44c7ed1f0018ddfb75592b5"
 dependencies = [
  "botster-core",
  "serde",
@@ -446,7 +446,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1171,7 +1171,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
