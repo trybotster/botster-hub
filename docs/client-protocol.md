@@ -170,12 +170,16 @@ all three event kinds. `Snapshot` and `Scrollback` also include `bytes`, which i
 the raw byte length before decoding, so clients can preserve existing size/count
 logic without deriving a possibly different decoded string length.
 
-The attach/drain ordering contract is that initial `snapshot` or `scrollback`
-history for a subscription is delivered before later live `terminal_output` for
-that subscription. Clients should render the restored history payload first,
-then append subsequent live output. `stream_attach` writes only terminal output
-bytes into its output writer; clients that need event kind, history payload, or
-ordering metadata should use `DaemonConnection` with `Attach` and `Drain`.
+The attach/drain ordering contract is that explicit `Attach` enters the
+core-owned SessionIo/ClientWorker subscription path and requests initial
+terminal history for that subscription. Initial `snapshot` or `scrollback`
+history is delivered before later live `terminal_output` for that subscription.
+Clients should render the restored history payload first, then append subsequent
+live output. Empty core snapshots do not fabricate history, and the daemon does
+not maintain a separate scrollback cache. `stream_attach` writes only terminal
+output bytes into its output writer; clients that need event kind, history
+payload, or ordering metadata should use `DaemonConnection` with `Attach` and
+`Drain`.
 
 The addition of required renderable `data` fields on `snapshot` and `scrollback`
 increments `CONFORMANCE_FIXTURE_REVISION`. `PROTOCOL_VERSION` remains unchanged

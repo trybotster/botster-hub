@@ -3075,6 +3075,255 @@ fn external_hub_test_support_drives_isolated_daemon_socket_protocol() {
 }
 
 #[test]
+fn external_daemon_attach_replays_prior_history_with_renderable_byte_count() {
+    let _guard = daemon_test_lock()
+        .lock()
+        .expect("serialize real daemon test");
+    let data_dir = unique_short_test_dir("late-history");
+    let config = explicit_config(&data_dir);
+    let child = start_cli_daemon(&data_dir);
+    let mut connection =
+        botster_hub::DaemonConnection::connect(&config).expect("connect daemon socket");
+
+    let spawn = connection
+        .request(&botster_hub::DaemonRequest::Spawn {
+            session_id: "late-history-session".to_string(),
+            command: "printf 'before-late\\n'; while IFS= read -r line; do printf 'after:%s\\n' \"$line\"; done".to_string(),
+        })
+        .expect("spawn late-history session");
+    assert_eq!(spawn.kind, botster_hub::DaemonResponseKind::Spawned);
+
+    let first_attach = connection
+        .request(&botster_hub::DaemonRequest::Attach {
+            session_id: "late-history-session".to_string(),
+            subscription_id: "late-history-first-subscription".to_string(),
+        })
+        .expect("attach first subscription");
+    assert_eq!(first_attach.kind, botster_hub::DaemonResponseKind::Events);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut first_observed = String::new();
+    while std::time::Instant::now() < deadline {
+        let drain = connection
+            .request(&botster_hub::DaemonRequest::Drain {
+                session_id: "late-history-session".to_string(),
+            })
+            .expect("drain first subscription output");
+        for event in drain.events {
+            if let botster_hub::DaemonEvent::TerminalOutput {
+                subscription_id,
+                data,
+                ..
+            } = event
+                && subscription_id == "late-history-first-subscription"
+            {
+                first_observed.push_str(&data);
+            }
+        }
+        if first_observed.contains("before-late") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(30));
+    }
+    assert!(
+        first_observed.contains("before-late"),
+        "first subscription should observe initial output before late attach, got {first_observed:?}"
+    );
+
+    let late_attach = connection
+        .request(&botster_hub::DaemonRequest::Attach {
+            session_id: "late-history-session".to_string(),
+            subscription_id: "late-history-late-subscription".to_string(),
+        })
+        .expect("attach late subscription");
+    assert_eq!(late_attach.kind, botster_hub::DaemonResponseKind::Events);
+
+    let send = connection
+        .request(&botster_hub::DaemonRequest::SendInput {
+            session_id: "late-history-session".to_string(),
+            data: "live-after-late\n".to_string(),
+        })
+        .expect("send later live output");
+    assert_eq!(send.kind, botster_hub::DaemonResponseKind::Events);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut observed_events = Vec::new();
+    while std::time::Instant::now() < deadline {
+        let drain = connection
+            .request(&botster_hub::DaemonRequest::Drain {
+                session_id: "late-history-session".to_string(),
+            })
+            .expect("drain late subscription output");
+        observed_events.extend(drain.events);
+        let saw_live = observed_events.iter().any(|event| {
+            matches!(
+                event,
+                botster_hub::DaemonEvent::TerminalOutput {
+                    subscription_id,
+                    data,
+                    ..
+                } if subscription_id == "late-history-late-subscription"
+                    && data.contains("after:live-after-late")
+            )
+        });
+        if saw_live {
+            break;
+        }
+        thread::sleep(Duration::from_millis(30));
+    }
+
+    let history_index = observed_events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                botster_hub::DaemonEvent::Snapshot {
+                    subscription_id,
+                    data,
+                    bytes,
+                    ..
+                }
+                | botster_hub::DaemonEvent::Scrollback {
+                    subscription_id,
+                    data,
+                    bytes,
+                    ..
+                } if subscription_id == "late-history-late-subscription"
+                    && data.contains("before-late")
+                    && *bytes == data.len()
+            )
+        })
+        .expect("late subscription should receive prior output history with bytes == data.len()");
+    let live_index = observed_events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                botster_hub::DaemonEvent::TerminalOutput {
+                    subscription_id,
+                    data,
+                    ..
+                } if subscription_id == "late-history-late-subscription"
+                    && data.contains("after:live-after-late")
+            )
+        })
+        .expect("late subscription should receive later live output");
+    assert!(
+        history_index < live_index,
+        "late history should precede later live output, got {observed_events:?}"
+    );
+
+    let no_history_spawn = connection
+        .request(&botster_hub::DaemonRequest::Spawn {
+            session_id: "no-history-session".to_string(),
+            command: "while IFS= read -r line; do printf 'after:%s\\n' \"$line\"; done".to_string(),
+        })
+        .expect("spawn no-history session");
+    assert_eq!(
+        no_history_spawn.kind,
+        botster_hub::DaemonResponseKind::Spawned
+    );
+
+    let first_no_history_attach = connection
+        .request(&botster_hub::DaemonRequest::Attach {
+            session_id: "no-history-session".to_string(),
+            subscription_id: "no-history-first-subscription".to_string(),
+        })
+        .expect("attach first no-history subscription");
+    assert_eq!(
+        first_no_history_attach.kind,
+        botster_hub::DaemonResponseKind::Events
+    );
+
+    let late_no_history_attach = connection
+        .request(&botster_hub::DaemonRequest::Attach {
+            session_id: "no-history-session".to_string(),
+            subscription_id: "no-history-late-subscription".to_string(),
+        })
+        .expect("attach late no-history subscription");
+    assert_eq!(
+        late_no_history_attach.kind,
+        botster_hub::DaemonResponseKind::Events
+    );
+
+    let no_history_send = connection
+        .request(&botster_hub::DaemonRequest::SendInput {
+            session_id: "no-history-session".to_string(),
+            data: "live-only\n".to_string(),
+        })
+        .expect("send no-history live output");
+    assert_eq!(
+        no_history_send.kind,
+        botster_hub::DaemonResponseKind::Events
+    );
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut no_history_events = Vec::new();
+    while std::time::Instant::now() < deadline {
+        let drain = connection
+            .request(&botster_hub::DaemonRequest::Drain {
+                session_id: "no-history-session".to_string(),
+            })
+            .expect("drain no-history live output");
+        no_history_events.extend(drain.events);
+        let saw_live = no_history_events.iter().any(|event| {
+            matches!(
+                event,
+                botster_hub::DaemonEvent::TerminalOutput {
+                    subscription_id,
+                    data,
+                    ..
+                } if subscription_id == "no-history-late-subscription"
+                    && data.contains("after:live-only")
+            )
+        });
+        if saw_live {
+            break;
+        }
+        thread::sleep(Duration::from_millis(30));
+    }
+
+    assert!(
+        !no_history_events.iter().any(|event| {
+            matches!(
+                event,
+                botster_hub::DaemonEvent::Snapshot {
+                    subscription_id,
+                    data,
+                    ..
+                }
+                | botster_hub::DaemonEvent::Scrollback {
+                    subscription_id,
+                    data,
+                    ..
+                } if subscription_id == "no-history-late-subscription" && !data.is_empty()
+            )
+        }),
+        "late no-history subscription should not receive fabricated history, got {no_history_events:?}"
+    );
+
+    let shutdown_session = connection
+        .request(&botster_hub::DaemonRequest::ShutdownSession {
+            session_id: "late-history-session".to_string(),
+        })
+        .expect("shutdown late-history session");
+    assert_eq!(
+        shutdown_session.kind,
+        botster_hub::DaemonResponseKind::Events
+    );
+    let shutdown_no_history_session = connection
+        .request(&botster_hub::DaemonRequest::ShutdownSession {
+            session_id: "no-history-session".to_string(),
+        })
+        .expect("shutdown no-history session");
+    assert_eq!(
+        shutdown_no_history_session.kind,
+        botster_hub::DaemonResponseKind::Events
+    );
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
 fn daemon_detaches_subscription_when_attach_connection_drops() {
     let _guard = daemon_test_lock()
         .lock()
