@@ -204,6 +204,22 @@ fn drain_events_until(
     );
 }
 
+fn history_data(event: &HubClientEvent) -> Option<(&SubscriptionId, &[u8])> {
+    match event {
+        HubClientEvent::Snapshot {
+            subscription_id,
+            data,
+            ..
+        }
+        | HubClientEvent::Scrollback {
+            subscription_id,
+            data,
+            ..
+        } => Some((subscription_id, data)),
+        _ => None,
+    }
+}
+
 fn drain_events_for(
     api: &HubClientApi,
     runtime: &mut HubRuntime,
@@ -238,6 +254,214 @@ fn drain_events_for(
     }
 
     observed
+}
+
+#[test]
+fn late_attach_receives_prior_terminal_history_before_later_live_output() {
+    let first_api = HubClientApi::local_operator("late-history-first-client");
+    let late_api = HubClientApi::local_operator("late-history-late-client");
+    let packages = empty_registry();
+    let mut runtime = explicit_runtime("late-history");
+    let session_id = SessionId("late-history-session".to_string());
+    let first_subscription = SubscriptionId("late-history-first-subscription".to_string());
+    let late_subscription = SubscriptionId("late-history-late-subscription".to_string());
+    let mut logical_clock = 100;
+
+    first_api
+        .handle_request(
+            &mut runtime,
+            &packages,
+            HubClientRequest::Spawn {
+                request_id: request_id("late-history-spawn"),
+                session_id: session_id.clone(),
+                command: "printf 'before-late\\n'; while IFS= read -r line; do printf 'after:%s\\n' \"$line\"; done".to_string(),
+                now_seconds: logical_clock,
+            },
+        )
+        .expect("spawn late-history session");
+    logical_clock += 1;
+
+    first_api
+        .handle_request(
+            &mut runtime,
+            &packages,
+            HubClientRequest::Attach {
+                request_id: request_id("late-history-first-attach"),
+                session_id: session_id.clone(),
+                subscription_id: first_subscription,
+                now_seconds: logical_clock,
+            },
+        )
+        .expect("attach first subscription");
+    logical_clock += 1;
+    drain_until(
+        &first_api,
+        &mut runtime,
+        &packages,
+        &session_id,
+        b"before-late",
+        &mut logical_clock,
+    );
+
+    late_api
+        .handle_request(
+            &mut runtime,
+            &packages,
+            HubClientRequest::Attach {
+                request_id: request_id("late-history-late-attach"),
+                session_id: session_id.clone(),
+                subscription_id: late_subscription.clone(),
+                now_seconds: logical_clock,
+            },
+        )
+        .expect("attach late subscription");
+    logical_clock += 1;
+
+    first_api
+        .handle_request(
+            &mut runtime,
+            &packages,
+            HubClientRequest::Input {
+                request_id: request_id("late-history-input"),
+                session_id: session_id.clone(),
+                data: b"live-after-late\n".to_vec(),
+                now_seconds: logical_clock,
+            },
+        )
+        .expect("send live output after late attach");
+    logical_clock += 1;
+
+    let events = drain_events_until(
+        &late_api,
+        &mut runtime,
+        &packages,
+        &session_id,
+        &late_subscription,
+        b"after:live-after-late",
+        &mut logical_clock,
+    );
+    let history_index = events
+        .iter()
+        .position(|event| {
+            history_data(event).is_some_and(|(subscription_id, data)| {
+                subscription_id == &late_subscription
+                    && data
+                        .windows(b"before-late".len())
+                        .any(|window| window == b"before-late")
+            })
+        })
+        .unwrap_or_else(|| {
+            panic!("late subscription should receive prior output as history, got {events:?}")
+        });
+    let live_index = events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                HubClientEvent::TerminalOutput {
+                    subscription_id,
+                    data,
+                    ..
+                } if subscription_id == &late_subscription
+                    && data
+                        .windows(b"after:live-after-late".len())
+                        .any(|window| window == b"after:live-after-late")
+            )
+        })
+        .expect("late subscription should receive later live output");
+
+    assert!(
+        history_index < live_index,
+        "late history should precede later live output, got {events:?}"
+    );
+}
+
+#[test]
+fn late_attach_without_prior_output_does_not_fabricate_history() {
+    let first_api = HubClientApi::local_operator("no-history-first-client");
+    let late_api = HubClientApi::local_operator("no-history-late-client");
+    let packages = empty_registry();
+    let mut runtime = explicit_runtime("no-history");
+    let session_id = SessionId("no-history-session".to_string());
+    let first_subscription = SubscriptionId("no-history-first-subscription".to_string());
+    let late_subscription = SubscriptionId("no-history-late-subscription".to_string());
+    let mut logical_clock = 100;
+
+    first_api
+        .handle_request(
+            &mut runtime,
+            &packages,
+            HubClientRequest::Spawn {
+                request_id: request_id("no-history-spawn"),
+                session_id: session_id.clone(),
+                command: "while IFS= read -r line; do printf 'after:%s\\n' \"$line\"; done"
+                    .to_string(),
+                now_seconds: logical_clock,
+            },
+        )
+        .expect("spawn no-history session");
+    logical_clock += 1;
+
+    first_api
+        .handle_request(
+            &mut runtime,
+            &packages,
+            HubClientRequest::Attach {
+                request_id: request_id("no-history-first-attach"),
+                session_id: session_id.clone(),
+                subscription_id: first_subscription,
+                now_seconds: logical_clock,
+            },
+        )
+        .expect("attach first no-history subscription");
+    logical_clock += 1;
+
+    late_api
+        .handle_request(
+            &mut runtime,
+            &packages,
+            HubClientRequest::Attach {
+                request_id: request_id("no-history-late-attach"),
+                session_id: session_id.clone(),
+                subscription_id: late_subscription.clone(),
+                now_seconds: logical_clock,
+            },
+        )
+        .expect("attach late no-history subscription");
+    logical_clock += 1;
+
+    first_api
+        .handle_request(
+            &mut runtime,
+            &packages,
+            HubClientRequest::Input {
+                request_id: request_id("no-history-input"),
+                session_id: session_id.clone(),
+                data: b"live-only\n".to_vec(),
+                now_seconds: logical_clock,
+            },
+        )
+        .expect("send live output after no-history late attach");
+    logical_clock += 1;
+
+    let events = drain_events_until(
+        &late_api,
+        &mut runtime,
+        &packages,
+        &session_id,
+        &late_subscription,
+        b"after:live-only",
+        &mut logical_clock,
+    );
+
+    assert!(
+        !events.iter().any(|event| {
+            history_data(event).is_some_and(|(subscription_id, data)| {
+                subscription_id == &late_subscription && !data.is_empty()
+            })
+        }),
+        "late no-history subscription should not receive fabricated history, got {events:?}"
+    );
 }
 
 #[test]
