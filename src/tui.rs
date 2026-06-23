@@ -6,9 +6,7 @@ use std::fmt;
 use std::io;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use botster_core::{
-    UiActionResult, UiActionResultState, UiChild, UiNode, UiNodeId, UiNodeKind,
-};
+use botster_core::{UiActionResult, UiActionResultState, UiChild, UiNode, UiNodeId, UiNodeKind};
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
     MouseButton, MouseEvent, MouseEventKind,
@@ -1012,12 +1010,10 @@ impl TuiUiRenderContext {
                 return None;
             }
             if result.node_id.as_ref() == Some(node_id) {
-                return result.error.as_deref().or_else(|| {
-                    result
-                        .form_errors
-                        .first()
-                        .map(std::string::String::as_str)
-                });
+                return result
+                    .error
+                    .as_deref()
+                    .or_else(|| result.form_errors.first().map(std::string::String::as_str));
             }
             result
                 .field_errors
