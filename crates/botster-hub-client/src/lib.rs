@@ -963,6 +963,33 @@ pub enum DaemonDiagnosticKind {
     DaemonStartupFailure,
 }
 
+/// Events returned by daemon attach and drain requests.
+///
+/// `Snapshot` and `Scrollback` are history events for a terminal
+/// subscription. Their `data` field is the renderable UTF-8 terminal history,
+/// and `bytes` is metadata describing the original raw byte count before the
+/// hub decoded that history for clients. Clients should render history events
+/// in the order received before appending later `TerminalOutput` for the same
+/// subscription.
+///
+/// ```
+/// let snapshot = botster_hub_client::DaemonEvent::Snapshot {
+///     session_id: "session".to_string(),
+///     subscription_id: "subscription".to_string(),
+///     data: "restored history\r\n".to_string(),
+///     bytes: 18,
+/// };
+///
+/// let live = botster_hub_client::DaemonEvent::TerminalOutput {
+///     session_id: "session".to_string(),
+///     subscription_id: "subscription".to_string(),
+///     data: "live output\r\n".to_string(),
+/// };
+///
+/// let events = vec![snapshot, live];
+/// assert!(matches!(events[0], botster_hub_client::DaemonEvent::Snapshot { .. }));
+/// assert!(matches!(events[1], botster_hub_client::DaemonEvent::TerminalOutput { .. }));
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DaemonEvent {
@@ -975,12 +1002,24 @@ pub enum DaemonEvent {
         subscription_id: String,
         data: String,
     },
+    /// Initial renderable terminal history for a subscription.
+    ///
+    /// `data` is the UTF-8 string clients render. `bytes` is the raw event data
+    /// length before decoding, not a second payload field. If an older hub or
+    /// unsupported history source reports a positive byte count without
+    /// renderable data, clients should surface an opaque-history/live-only
+    /// fallback instead of fabricating scrollback. The current DTO requires
+    /// `data`, so byte-only JSON does not deserialize as this variant.
     Snapshot {
         session_id: String,
         subscription_id: String,
         data: String,
         bytes: usize,
     },
+    /// Additional renderable terminal history for a subscription.
+    ///
+    /// Semantics match `Snapshot`: render `data` in event order before later
+    /// `TerminalOutput`, and treat `bytes` only as raw-length metadata.
     Scrollback {
         session_id: String,
         subscription_id: String,
@@ -1193,6 +1232,56 @@ mod tests {
         let round_tripped: Vec<DaemonEvent> =
             serde_json::from_value(value).expect("events deserialize");
         assert_eq!(round_tripped, events);
+    }
+
+    #[test]
+    fn history_events_deserialize_before_later_terminal_output() {
+        let value = serde_json::json!([
+            {
+                "type": "snapshot",
+                "session_id": "session",
+                "subscription_id": "subscription",
+                "data": "snapshot-data",
+                "bytes": 13
+            },
+            {
+                "type": "scrollback",
+                "session_id": "session",
+                "subscription_id": "subscription",
+                "data": "scrollback-data",
+                "bytes": 15
+            },
+            {
+                "type": "terminal_output",
+                "session_id": "session",
+                "subscription_id": "subscription",
+                "data": "live-data"
+            }
+        ]);
+
+        let events: Vec<DaemonEvent> =
+            serde_json::from_value(value).expect("ordered terminal events deserialize");
+
+        assert!(matches!(events[0], DaemonEvent::Snapshot { .. }));
+        assert!(matches!(events[1], DaemonEvent::Scrollback { .. }));
+        assert!(matches!(events[2], DaemonEvent::TerminalOutput { .. }));
+    }
+
+    #[test]
+    fn byte_only_history_json_is_not_current_dto_shape() {
+        let value = serde_json::json!({
+            "type": "snapshot",
+            "session_id": "session",
+            "subscription_id": "subscription",
+            "bytes": 13
+        });
+
+        let error = serde_json::from_value::<DaemonEvent>(value)
+            .expect_err("current history events require renderable data");
+        assert!(
+            error.to_string().contains("data"),
+            "missing data should fail loudly, got {error}"
+        );
     }
 
     #[test]
