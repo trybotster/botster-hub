@@ -137,8 +137,8 @@ fn plugin_manifest(name: &str, capabilities: Vec<Capability>) -> PackageManifest
             path: "plugin.lua".to_string(),
             bootstrap: false,
         }],
-        host_profile: None,
         configuration: None,
+        host_profile: None,
         surfaces: Vec::new(),
     }
 }

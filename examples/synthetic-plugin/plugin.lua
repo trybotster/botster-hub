@@ -14,9 +14,18 @@ return botster.register({
       handler = "echo",
       call = function(args)
         local timer = botster.capabilities.timer_once(1)
+        local config = botster.capabilities.config.get()
+        local cross_package_ok, cross_package_value = pcall(function()
+          return botster.capabilities.config.get("other.package")
+        end)
         return {
           message = args.message or "empty",
           capability = timer,
+          config = config,
+          cross_package_config_attempt = {
+            ok = cross_package_ok,
+            value = tostring(cross_package_value),
+          },
           ambient = {
             os = os == nil,
             io = io == nil,

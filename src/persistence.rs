@@ -350,11 +350,13 @@ pub type HubStateStoreResult<T> = Result<T, HubStateStoreError>;
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use botster_core::{
         Capability, CapabilitySurface, ExtensionEntrypoint, ExtensionKind, ExtensionRuntime,
-        PackageManifest, PackageSource,
+        PackageConfigurationField, PackageConfigurationFieldType, PackageConfigurationSchema,
+        PackageConfigurationSecretValue, PackageConfigurationValue, PackageManifest, PackageSource,
     };
 
     use super::*;
@@ -409,8 +411,8 @@ mod tests {
                 path: "plugin.lua".to_string(),
                 bootstrap: false,
             }],
-            host_profile: None,
             configuration: None,
+            host_profile: None,
             surfaces: Vec::new(),
         }
     }
@@ -420,6 +422,28 @@ mod tests {
             source: "https://example.invalid/botster/package-index".to_string(),
             checksum: Some("sha256:test-checksum".to_string()),
         }
+    }
+
+    fn configurable_plugin_manifest() -> PackageManifest {
+        let mut manifest = plugin_manifest();
+        manifest.configuration = Some(PackageConfigurationSchema {
+            groups: Vec::new(),
+            fields: vec![PackageConfigurationField {
+                key: "api_token".to_string(),
+                field_type: PackageConfigurationFieldType::Secret,
+                label: "API token".to_string(),
+                description: None,
+                required: true,
+                default: Some(PackageConfigurationValue::Secret {
+                    state: PackageConfigurationSecretValue::Unset,
+                }),
+                validation: None,
+                group: None,
+                order: None,
+                options: Vec::new(),
+            }],
+        });
+        manifest
     }
 
     #[test]
@@ -486,6 +510,61 @@ mod tests {
                 scope: None,
             }]
         );
+    }
+
+    #[test]
+    fn package_configuration_redacted_secret_marker_persists_without_raw_secret() {
+        let config = test_config("package-configuration-redaction");
+        let store = FileHubStateStore::for_data_directory(&config.data_directory);
+        let grant = Capability {
+            surface: CapabilitySurface::Surfaces,
+            scope: None,
+        };
+        let mut registry = PackageRegistry::new(vec![grant].into_iter().collect());
+        registry
+            .install(
+                configurable_plugin_manifest(),
+                provenance(),
+                "install configurable package",
+            )
+            .expect("install package");
+        registry
+            .set_configuration(
+                "workflow.plugin",
+                BTreeMap::from([(
+                    "api_token".to_string(),
+                    PackageConfigurationValue::Secret {
+                        state: PackageConfigurationSecretValue::WriteOnly,
+                    },
+                )]),
+                "set secret",
+            )
+            .expect("set package configuration");
+
+        store
+            .update(&config, |state| {
+                state.package_registry = registry.snapshot();
+            })
+            .expect("persist state");
+
+        let raw_state = fs::read_to_string(store.path()).expect("read hub state");
+        assert!(raw_state.contains("\"state\": \"redacted\""));
+        assert!(!raw_state.contains("write_only"));
+        assert!(!raw_state.contains("super-secret-token"));
+
+        let reopened = store.load_or_initialize(&config).expect("reopen state");
+        let restored =
+            PackageRegistry::from_snapshot(reopened.package_registry).expect("restore registry");
+        let view = restored
+            .package("workflow.plugin")
+            .expect("restored package")
+            .configuration_view();
+        assert!(matches!(
+            view.effective_values.get("api_token"),
+            Some(PackageConfigurationValue::Secret {
+                state: PackageConfigurationSecretValue::Redacted
+            })
+        ));
     }
 
     #[test]

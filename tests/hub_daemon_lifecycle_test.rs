@@ -232,6 +232,56 @@ fn write_local_plugin_package(root: &Path) {
     .expect("write local package manifest");
 }
 
+fn write_configurable_local_plugin_package(root: &Path) {
+    fs::create_dir_all(root).expect("create configurable package root");
+    fs::write(root.join("plugin.lua"), "return botster.register({})\n")
+        .expect("write plugin entrypoint");
+    fs::write(
+        root.join("botster-package.json"),
+        r#"{
+  "name": "configurable.plugin",
+  "version": "1.0.0",
+  "kind": "plugin",
+  "botster": ">=0.1.0",
+  "source": { "type": "path", "path": "." },
+  "capabilities": [
+    { "surface": "surfaces" }
+  ],
+  "entrypoints": [
+    { "runtime": "lua", "path": "plugin.lua", "bootstrap": false }
+  ],
+  "configuration": {
+    "fields": [
+      {
+        "key": "endpoint",
+        "type": "url",
+        "label": "Endpoint",
+        "required": true
+      },
+      {
+        "key": "mode",
+        "type": "select",
+        "label": "Mode",
+        "default": { "type": "select", "value": "read" },
+        "options": [
+          { "value": "read", "label": "Read" }
+        ]
+      },
+      {
+        "key": "api_token",
+        "type": "secret",
+        "label": "API token",
+        "required": true,
+        "default": { "type": "secret", "state": "unset" }
+      }
+    ]
+  }
+}
+"#,
+    )
+    .expect("write configurable package manifest");
+}
+
 fn write_supervised_package(root: &Path, package_name: &str, command: &str, args: &[&str]) {
     fs::create_dir_all(root).expect("create supervised package root");
     fs::write(root.join("plugin.lua"), "return botster.register({})\n")
@@ -4986,6 +5036,163 @@ fn cli_packages_local_path_diagnostics_are_actionable() {
     assert!(!text.contains(data_dir.to_string_lossy().as_ref()));
 
     shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
+fn package_configuration_daemon_set_show_list_reload_and_cli_are_redacted() {
+    let _guard = daemon_test_lock()
+        .lock()
+        .expect("serialize real daemon test");
+    let data_dir = unique_test_dir("package-configuration-daemon");
+    let package_dir = unique_test_dir("configurable-package");
+    write_configurable_local_plugin_package(&package_dir);
+    let config = explicit_config(&data_dir);
+    let child = start_cli_daemon(&data_dir);
+
+    let install = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::InstallPackageLocalPath {
+            path: package_dir.clone(),
+        },
+    )
+    .expect("install configurable package");
+    assert_eq!(
+        install.kind,
+        botster_hub::DaemonResponseKind::PackageDecision
+    );
+    let installed = install
+        .packages
+        .iter()
+        .find(|package| package.package_name == "configurable.plugin")
+        .expect("installed configurable package");
+    assert_eq!(
+        installed.configuration.missing_required,
+        vec!["endpoint".to_string(), "api_token".to_string()]
+    );
+
+    let missing_enable = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::EnablePackage {
+            package_name: "configurable.plugin".to_string(),
+        },
+    )
+    .expect("enable missing config returns operator error");
+    assert_eq!(
+        missing_enable.kind,
+        botster_hub::DaemonResponseKind::OperatorError
+    );
+    assert!(
+        missing_enable
+            .error
+            .as_ref()
+            .expect("operator error")
+            .message
+            .contains("MissingRequiredConfiguration")
+    );
+
+    let bad_config = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::SetPackageConfiguration {
+            package_name: "configurable.plugin".to_string(),
+            values: BTreeMap::from([(
+                "unknown".to_string(),
+                serde_json::json!({"type":"string","value":"nope"}),
+            )]),
+        },
+    )
+    .expect("bad config returns operator error");
+    assert_eq!(
+        bad_config.kind,
+        botster_hub::DaemonResponseKind::OperatorError
+    );
+
+    let configured = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::SetPackageConfiguration {
+            package_name: "configurable.plugin".to_string(),
+            values: BTreeMap::from([
+                (
+                    "endpoint".to_string(),
+                    serde_json::json!({"type":"url","value":"https://example.invalid/hook"}),
+                ),
+                (
+                    "api_token".to_string(),
+                    serde_json::json!({"type":"secret","state":"write_only"}),
+                ),
+            ]),
+        },
+    )
+    .expect("set config through daemon");
+    let configured_package = configured
+        .packages
+        .iter()
+        .find(|package| package.package_name == "configurable.plugin")
+        .expect("configured package");
+    assert!(configured_package.configuration.missing_required.is_empty());
+    assert_eq!(
+        configured_package.configuration.effective_values["api_token"],
+        serde_json::json!({"type":"secret","state":"redacted"})
+    );
+    assert_eq!(
+        configured_package.configuration.effective_values["mode"],
+        serde_json::json!({"type":"select","value":"read"})
+    );
+
+    let list =
+        botster_hub::daemon_transport_request(&config, botster_hub::DaemonRequest::ListPackages)
+            .expect("list after config mutation");
+    let listed = list
+        .packages
+        .iter()
+        .find(|package| package.package_name == "configurable.plugin")
+        .expect("listed configurable package");
+    assert!(listed.configuration.missing_required.is_empty());
+    assert_eq!(
+        listed.configuration.effective_values["api_token"],
+        serde_json::json!({"type":"secret","state":"redacted"})
+    );
+
+    let state_json =
+        fs::read_to_string(data_dir.join("hub-state.json")).expect("read hub state json");
+    assert!(state_json.contains("\"state\": \"redacted\""));
+    assert!(!state_json.contains("write_only"));
+    assert!(!state_json.contains("super-secret-token"));
+
+    let cli = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("packages")
+        .arg("config")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("configurable.plugin")
+        .output()
+        .expect("run packages config");
+    assert!(
+        cli.status.success(),
+        "packages config failed: {}",
+        String::from_utf8_lossy(&cli.stderr)
+    );
+    let stdout = String::from_utf8(cli.stdout).expect("stdout is utf8");
+    assert!(stdout.contains("package_config package=configurable.plugin schema_present=true"));
+    assert!(stdout.contains("\"state\":\"redacted\""));
+    assert!(!stdout.contains("write_only"));
+    assert!(!stdout.contains("super-secret-token"));
+
+    shutdown_cli_daemon(&data_dir, child);
+
+    let restarted = start_cli_daemon(&data_dir);
+    let reloaded =
+        botster_hub::daemon_transport_request(&config, botster_hub::DaemonRequest::ListPackages)
+            .expect("list after restart");
+    let package = reloaded
+        .packages
+        .iter()
+        .find(|package| package.package_name == "configurable.plugin")
+        .expect("reloaded package");
+    assert_eq!(
+        package.configuration.effective_values["api_token"],
+        serde_json::json!({"type":"secret","state":"redacted"})
+    );
+    shutdown_cli_daemon(&data_dir, restarted);
 }
 
 #[test]

@@ -808,6 +808,24 @@ fn operator_packages(args: Vec<String>, providers_only: bool) -> Result<(), Oper
                 daemon_transport_request(&config, DaemonRequest::ShowPackage { package_name })?;
             print_packages_response(response, providers_only)?;
         }
+        PackageActionCommand::Config(package_name) => {
+            let response =
+                daemon_transport_request(&config, DaemonRequest::ShowPackage { package_name })?;
+            print_packages_response(response, providers_only)?;
+        }
+        PackageActionCommand::SetConfig {
+            package_name,
+            values,
+        } => {
+            let response = daemon_transport_request(
+                &config,
+                DaemonRequest::SetPackageConfiguration {
+                    package_name,
+                    values,
+                },
+            )?;
+            print_packages_response(response, providers_only)?;
+        }
         PackageActionCommand::EnableLocalPath(path) => {
             let response =
                 daemon_transport_request(&config, DaemonRequest::EnablePackageLocalPath { path })?;
@@ -1226,6 +1244,32 @@ fn print_packages(packages: &[DaemonPackage], providers_only: bool) {
             package.runnable_entrypoints.len(),
             package.provider_profile_admitted
         );
+        println!(
+            "package_config package={} schema_present={} effective_values={} missing_required={} diagnostics={}",
+            package.package_name,
+            package.configuration.schema.is_some(),
+            package.configuration.effective_values.len(),
+            package.configuration.missing_required.len(),
+            package.configuration.diagnostics.len()
+        );
+        for key in &package.configuration.missing_required {
+            println!(
+                "package_config_missing package={} field={}",
+                package.package_name, key
+            );
+        }
+        for (key, value) in &package.configuration.effective_values {
+            println!(
+                "package_config_value package={} field={} value={}",
+                package.package_name, key, value
+            );
+        }
+        for diagnostic in &package.configuration.diagnostics {
+            println!(
+                "package_config_diagnostic package={} kind={} message={}",
+                package.package_name, diagnostic.kind, diagnostic.message
+            );
+        }
         for entrypoint in &package.runnable_entrypoints {
             println!(
                 "package_entrypoint package={} id={} kind={} mode={} command={} args={} working_directory={} environment={} capabilities={} may_supervise={} process_state={}",
@@ -1646,6 +1690,11 @@ enum PackageActionCommand {
     List,
     InstallLocalPath(PathBuf),
     Show(String),
+    Config(String),
+    SetConfig {
+        package_name: String,
+        values: BTreeMap<String, serde_json::Value>,
+    },
     EnableLocalPath(PathBuf),
     EnableName(String),
     Disable(String),
@@ -1705,6 +1754,34 @@ impl PackageCommand {
                     data_directory: options.data_directory,
                     action: PackageActionCommand::Show(args[3].clone()),
                 })
+            }
+            "config" if !providers_only => {
+                if args.get(1).map(String::as_str) == Some("set") {
+                    if args.len() != 6 {
+                        return Err(OperatorError::Usage("packages config set"));
+                    }
+                    let options =
+                        DataDirOptions::parse(args[2..4].to_vec(), "packages config set")?;
+                    let values =
+                        serde_json::from_str::<BTreeMap<String, serde_json::Value>>(&args[5])
+                            .map_err(|_| OperatorError::Usage("packages config set"))?;
+                    Ok(Self {
+                        data_directory: options.data_directory,
+                        action: PackageActionCommand::SetConfig {
+                            package_name: args[4].clone(),
+                            values,
+                        },
+                    })
+                } else {
+                    if args.len() != 4 {
+                        return Err(OperatorError::Usage("packages config"));
+                    }
+                    let options = DataDirOptions::parse(args[1..3].to_vec(), "packages config")?;
+                    Ok(Self {
+                        data_directory: options.data_directory,
+                        action: PackageActionCommand::Config(args[3].clone()),
+                    })
+                }
             }
             "enable" if !providers_only => {
                 if args.len() < 4 {
@@ -2244,13 +2321,17 @@ fn usage_for(command: &str) -> &'static str {
         "mcp-serve" => "usage: botster-hub mcp-serve --data-dir <path>",
         "tui" => "usage: botster-hub tui --data-dir <path>",
         "packages" => {
-            "usage: botster-hub packages <install|list|show|enable|disable|remove|start-entrypoint|stop-entrypoint|restart-entrypoint|entrypoint-status> ..."
+            "usage: botster-hub packages <install|list|show|config|enable|disable|remove|start-entrypoint|stop-entrypoint|restart-entrypoint|entrypoint-status> ..."
         }
         "packages install" => {
             "usage: botster-hub packages install --data-dir <path> --path <package-dir-or-manifest>"
         }
         "packages list" => "usage: botster-hub packages list --data-dir <path>",
         "packages show" => "usage: botster-hub packages show --data-dir <path> <name>",
+        "packages config" => "usage: botster-hub packages config --data-dir <path> <name>",
+        "packages config set" => {
+            "usage: botster-hub packages config set --data-dir <path> <name> '<json-object>'"
+        }
         "packages enable" => {
             "usage: botster-hub packages enable --data-dir <path> (--path <package-dir-or-manifest>|<name>)"
         }

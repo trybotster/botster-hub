@@ -576,6 +576,10 @@ pub enum DaemonRequest {
     ShowPackage {
         package_name: String,
     },
+    SetPackageConfiguration {
+        package_name: String,
+        values: BTreeMap<String, Value>,
+    },
     EnablePackageLocalPath {
         path: PathBuf,
     },
@@ -744,7 +748,21 @@ pub struct DaemonPackage {
     pub surfaces: Vec<DaemonPackageSurfaceDescriptor>,
     #[serde(default)]
     pub runnable_entrypoints: Vec<DaemonPackageRunnableEntrypoint>,
+    #[serde(default)]
+    pub configuration: DaemonPackageConfiguration,
     pub provider_profile_admitted: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonPackageConfiguration {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema: Option<Value>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub effective_values: BTreeMap<String, Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub missing_required: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<DaemonPackageDiagnostic>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1372,6 +1390,65 @@ mod tests {
     }
 
     #[test]
+    fn daemon_package_configuration_is_serde_stable_and_redacted() {
+        let request = DaemonRequest::SetPackageConfiguration {
+            package_name: "workflow.plugin".to_string(),
+            values: BTreeMap::from([
+                (
+                    "endpoint".to_string(),
+                    serde_json::json!({"type":"url","value":"https://example.invalid/hook"}),
+                ),
+                (
+                    "api_token".to_string(),
+                    serde_json::json!({"type":"secret","state":"write_only"}),
+                ),
+            ]),
+        };
+        assert_eq!(
+            serde_json::to_value(&request).expect("serialize set configuration request"),
+            serde_json::json!({
+                "type": "set_package_configuration",
+                "package_name": "workflow.plugin",
+                "values": {
+                    "api_token": { "type": "secret", "state": "write_only" },
+                    "endpoint": { "type": "url", "value": "https://example.invalid/hook" }
+                }
+            })
+        );
+
+        let package: DaemonPackage = serde_json::from_value(serde_json::json!({
+            "package_name": "workflow.plugin",
+            "version": "1.0.0",
+            "classification": "plugin",
+            "state": "installed",
+            "requested_capabilities": [],
+            "runnable_entrypoints": [],
+            "configuration": {
+                "schema": {
+                    "fields": [
+                        { "key": "api_token", "type": "secret", "label": "API token", "required": true }
+                    ]
+                },
+                "effective_values": {
+                    "api_token": { "type": "secret", "state": "redacted" }
+                },
+                "missing_required": [],
+                "diagnostics": []
+            },
+            "provider_profile_admitted": false
+        }))
+        .expect("package configuration row deserializes");
+
+        assert_eq!(
+            package.configuration.effective_values["api_token"],
+            serde_json::json!({"type":"secret","state":"redacted"})
+        );
+        let row_json = serde_json::to_string(&package).expect("serialize package row");
+        assert!(!row_json.contains("write_only"));
+        assert!(!row_json.contains("super-secret-token"));
+    }
+
+    #[test]
     fn package_entrypoint_lifecycle_request_is_serde_stable() {
         let request = DaemonRequest::StartPackageEntrypoint {
             package_name: "workflow.plugin".to_string(),
@@ -1659,6 +1736,13 @@ mod tests {
             DaemonRequest::ShowPackage {
                 package_name: "workflow.plugin".to_string(),
             },
+            DaemonRequest::SetPackageConfiguration {
+                package_name: "workflow.plugin".to_string(),
+                values: BTreeMap::from([(
+                    "endpoint".to_string(),
+                    serde_json::json!({"type":"url","value":"https://example.invalid/hook"}),
+                )]),
+            },
             DaemonRequest::EnablePackageLocalPath {
                 path: PathBuf::from("/tmp/plugin"),
             },
@@ -1731,6 +1815,7 @@ mod tests {
             DaemonRequest::ListPackages => "list_packages",
             DaemonRequest::InstallPackageLocalPath { .. } => "install_package_local_path",
             DaemonRequest::ShowPackage { .. } => "show_package",
+            DaemonRequest::SetPackageConfiguration { .. } => "set_package_configuration",
             DaemonRequest::EnablePackageLocalPath { .. } => "enable_package_local_path",
             DaemonRequest::EnablePackage { .. } => "enable_package",
             DaemonRequest::DisablePackage { .. } => "disable_package",
@@ -1832,6 +1917,7 @@ mod tests {
                 }],
                 surfaces: Vec::new(),
                 runnable_entrypoints: Vec::new(),
+                configuration: DaemonPackageConfiguration::default(),
                 provider_profile_admitted: false,
             }],
             package_decision: Some(DaemonPackageDecision {

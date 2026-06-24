@@ -10,5 +10,31 @@
   ],
   "entrypoints": [
     { "runtime": "lua", "path": "plugin.lua", "bootstrap": false }
-  ]
+  ],
+  "configuration": {
+    "fields": [
+      {
+        "key": "endpoint",
+        "type": "url",
+        "label": "Webhook endpoint",
+        "default": { "type": "url", "value": "https://example.invalid/hook" }
+      },
+      {
+        "key": "mode",
+        "type": "select",
+        "label": "Mode",
+        "default": { "type": "select", "value": "read" },
+        "options": [
+          { "value": "read", "label": "Read" },
+          { "value": "write", "label": "Write" }
+        ]
+      },
+      {
+        "key": "api_token",
+        "type": "secret",
+        "label": "API token",
+        "default": { "type": "secret", "state": "unset" }
+      }
+    ]
+  }
 }

@@ -17,8 +17,8 @@ use std::time::Duration;
 
 use botster_core::{
     EndpointId, EnvelopeCursor, EnvelopeDeliveryState, EnvelopeId, EnvelopeTarget,
-    ExtensionRuntime, RequestId, RoutedEnvelope, RoutedEnvelopePayload, SessionId,
-    SessionLifecycleState, SubscriptionId, TerminalAttachState, UiActionResult,
+    ExtensionRuntime, PackageConfigurationValue, RequestId, RoutedEnvelope, RoutedEnvelopePayload,
+    SessionId, SessionLifecycleState, SubscriptionId, TerminalAttachState, UiActionResult,
     UiActionResultState, UiNode,
 };
 use botster_core_daemon::{
@@ -29,12 +29,13 @@ pub use botster_hub_client::{
     DaemonCapability, DaemonCompatibility, DaemonConnection as ClientDaemonConnection,
     DaemonCoordination, DaemonDiagnostic, DaemonEndpoint, DaemonEnvelope, DaemonEnvelopeAck,
     DaemonEnvelopeDelivery, DaemonEnvelopePublish, DaemonEvent, DaemonHello, DaemonHelloAck,
-    DaemonIdentity, DaemonNotify, DaemonOperatorError, DaemonPackage, DaemonPackageDecision,
-    DaemonPackageDiagnostic, DaemonPackageEnvironmentRequirement, DaemonPackageProcess,
-    DaemonPackageRunnableEntrypoint, DaemonPackageSurfaceDescriptor, DaemonPackageWorkingDirectory,
-    DaemonPluginLifecycle, DaemonRequest, DaemonResponse, DaemonResponseKind, DaemonSession,
-    DaemonSessionCleanup, DaemonStatus, FEATURE_PLUGIN_SURFACE_ACTION,
-    FEATURE_PLUGIN_SURFACE_RENDER, PROTOCOL, read_frame, read_frame_from_reader, write_frame,
+    DaemonIdentity, DaemonNotify, DaemonOperatorError, DaemonPackage, DaemonPackageConfiguration,
+    DaemonPackageDecision, DaemonPackageDiagnostic, DaemonPackageEnvironmentRequirement,
+    DaemonPackageProcess, DaemonPackageRunnableEntrypoint, DaemonPackageSurfaceDescriptor,
+    DaemonPackageWorkingDirectory, DaemonPluginLifecycle, DaemonRequest, DaemonResponse,
+    DaemonResponseKind, DaemonSession, DaemonSessionCleanup, DaemonStatus,
+    FEATURE_PLUGIN_SURFACE_ACTION, FEATURE_PLUGIN_SURFACE_RENDER, PROTOCOL, read_frame,
+    read_frame_from_reader, write_frame,
 };
 use serde_json::Value;
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
@@ -287,6 +288,41 @@ fn handle_control_request(
             package_decision_response(daemon, decision)
         }
         DaemonRequest::ShowPackage { package_name } => show_package_response(daemon, &package_name),
+        DaemonRequest::SetPackageConfiguration {
+            package_name,
+            values,
+        } => {
+            let values = values
+                .into_iter()
+                .map(|(key, value)| {
+                    serde_json::from_value::<PackageConfigurationValue>(value)
+                        .map(|value| (key.clone(), value))
+                        .map_err(|error| {
+                            PackageRegistryError::without_record(
+                                package_name.clone(),
+                                PackageAction::Configure,
+                                PackageAdmissionReason::InvalidConfiguration(vec![
+                                    crate::PackageConfigurationDiagnostic {
+                                        kind: "value_decode_error".to_string(),
+                                        field: Some(key),
+                                        message: format!(
+                                            "configuration value is not a package configuration value: {error}"
+                                        ),
+                                    },
+                                ]),
+                                "daemon socket configure package".to_string(),
+                            )
+                        })
+                })
+                .collect::<Result<BTreeMap<_, _>, _>>()?;
+            daemon.package_registry_mut().set_configuration(
+                &package_name,
+                values,
+                "daemon socket configure package",
+            )?;
+            persist_package_registry(daemon)?;
+            show_package_response(daemon, &package_name)
+        }
         DaemonRequest::EnablePackageLocalPath { path } => {
             let package_name = {
                 let record = daemon
@@ -793,6 +829,7 @@ fn handle_runtime_control_request(
         DaemonRequest::ListPackages
         | DaemonRequest::InstallPackageLocalPath { .. }
         | DaemonRequest::ShowPackage { .. }
+        | DaemonRequest::SetPackageConfiguration { .. }
         | DaemonRequest::PluginLifecycleStatus
         | DaemonRequest::EnablePackageLocalPath { .. }
         | DaemonRequest::EnablePackage { .. }
@@ -1529,6 +1566,20 @@ fn daemon_package_from_client(package: HubClientPackage) -> DaemonPackage {
                 },
             })
             .collect(),
+        configuration: DaemonPackageConfiguration {
+            schema: package.configuration.schema,
+            effective_values: package.configuration.effective_values,
+            missing_required: package.configuration.missing_required,
+            diagnostics: package
+                .configuration
+                .diagnostics
+                .into_iter()
+                .map(|diagnostic| DaemonPackageDiagnostic {
+                    kind: diagnostic.kind,
+                    message: diagnostic.message,
+                })
+                .collect(),
+        },
         provider_profile_admitted: package.provider_profile_admitted,
     }
 }
@@ -1961,6 +2012,7 @@ fn package_action_label(action: PackageAction) -> &'static str {
     match action {
         PackageAction::Install => "install",
         PackageAction::Show => "show",
+        PackageAction::Configure => "configure",
         PackageAction::Enable => "enable",
         PackageAction::Disable => "disable",
         PackageAction::Remove => "remove",
