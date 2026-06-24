@@ -162,7 +162,7 @@ export interface DaemonPackage {
   requested_capabilities: DaemonCapability[];
   surfaces?: DaemonPackageSurfaceDescriptor[];
   runnable_entrypoints: DaemonPackageRunnableEntrypoint[];
-  configuration?: DaemonPackageConfiguration;
+  configuration: DaemonPackageConfiguration;
   provider_profile_admitted: boolean;
 }
 
