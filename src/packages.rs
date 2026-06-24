@@ -11,7 +11,9 @@ use std::path::{Component, Path, PathBuf};
 
 use botster_core::{
     AdmittedHostProfile, Capability, CapabilitySet, CapabilitySurface, ExtensionEntrypoint,
-    ExtensionKind, HostProfileAdmissionError, PackageManifest, PackageSource, admit_host_profile,
+    ExtensionKind, HostProfileAdmissionError, PackageConfigurationField,
+    PackageConfigurationFieldType, PackageConfigurationSchema, PackageConfigurationSecretValue,
+    PackageConfigurationValue, PackageManifest, PackageSource, admit_host_profile,
 };
 use serde::{Deserialize, Serialize};
 
@@ -191,6 +193,7 @@ impl PackageRegistry {
             admitted_capabilities: Vec::new(),
             compatibility,
             runnable_entrypoints,
+            configuration: PackageConfigurationState::default(),
             installed_at: None,
             updated_at: None,
             last_audit_reason: audit_reason,
@@ -248,6 +251,29 @@ impl PackageRegistry {
         let record = self.record(package_name, PackageAction::Enable, audit_reason.clone())?;
         let classification = record.classification;
         let state = record.state;
+        let configuration = record.configuration_view();
+        if !configuration.diagnostics.is_empty() {
+            return Err(PackageRegistryError::with_record(
+                package_name,
+                PackageAction::Enable,
+                PackageAdmissionReason::InvalidConfiguration(configuration.diagnostics),
+                state,
+                classification,
+                audit_reason,
+            ));
+        }
+        if !configuration.missing_required.is_empty() {
+            return Err(PackageRegistryError::with_record(
+                package_name,
+                PackageAction::Enable,
+                PackageAdmissionReason::MissingRequiredConfiguration(
+                    configuration.missing_required,
+                ),
+                state,
+                classification,
+                audit_reason,
+            ));
+        }
 
         let ungoverned_surface = record
             .manifest
@@ -388,6 +414,42 @@ impl PackageRegistry {
         record.last_audit_reason = audit_reason;
 
         Ok(record)
+    }
+
+    /// Persist validated configuration values for an installed package.
+    pub fn set_configuration(
+        &mut self,
+        package_name: &str,
+        values: BTreeMap<String, PackageConfigurationValue>,
+        audit_reason: impl Into<String>,
+    ) -> PackageRegistryResult<PackageConfigurationView> {
+        let audit_reason = audit_reason.into();
+        let record = self.record(package_name, PackageAction::Configure, audit_reason.clone())?;
+        let schema = configuration_schema(record)?;
+        validate_configuration_values(&record.manifest.name, schema, &values).map_err(
+            |reason| {
+                PackageRegistryError::with_record(
+                    package_name,
+                    PackageAction::Configure,
+                    reason,
+                    record.state,
+                    record.classification,
+                    audit_reason.clone(),
+                )
+            },
+        )?;
+
+        let record =
+            self.record_mut(package_name, PackageAction::Configure, audit_reason.clone())?;
+        for (key, value) in values {
+            record
+                .configuration
+                .values
+                .insert(key, stored_configuration_value(value));
+        }
+        record.last_audit_reason = audit_reason;
+
+        Ok(record.configuration_view())
     }
 
     /// Return a package record by package name.
@@ -614,6 +676,9 @@ pub struct PackageRecord {
     /// Hub-owned local/dev runnable entrypoint declarations.
     #[serde(default)]
     pub runnable_entrypoints: Vec<PackageRunnableEntrypoint>,
+    /// Hub-owned persisted package configuration values.
+    #[serde(default)]
+    pub configuration: PackageConfigurationState,
     /// Optional install timestamp supplied by future installer paths.
     #[serde(default)]
     pub installed_at: Option<String>,
@@ -636,6 +701,99 @@ impl PackageRecord {
     pub const fn is_enabled(&self) -> bool {
         matches!(self.state, PackageState::Enabled)
     }
+
+    /// Build the sanitized configuration view exposed to clients.
+    #[must_use]
+    pub fn configuration_view(&self) -> PackageConfigurationView {
+        PackageConfigurationView::from_record(self)
+    }
+}
+
+/// Hub-owned persisted configuration state for one package.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PackageConfigurationState {
+    /// Persisted non-secret values and redacted secret markers keyed by schema field.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub values: BTreeMap<String, PackageConfigurationValue>,
+}
+
+/// Sanitized effective configuration view for daemon/client DTOs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackageConfigurationView {
+    /// Manifest-declared schema.
+    pub schema: Option<PackageConfigurationSchema>,
+    /// Defaults plus stored values, with secrets redacted or unset.
+    pub effective_values: BTreeMap<String, PackageConfigurationValue>,
+    /// Required field keys still missing effective values.
+    pub missing_required: Vec<String>,
+    /// Schema/value diagnostics surfaced without raw secret material.
+    pub diagnostics: Vec<PackageConfigurationDiagnostic>,
+}
+
+impl PackageConfigurationView {
+    fn from_record(record: &PackageRecord) -> Self {
+        let Some(schema) = record.manifest.configuration.clone() else {
+            return Self {
+                schema: None,
+                effective_values: BTreeMap::new(),
+                missing_required: Vec::new(),
+                diagnostics: Vec::new(),
+            };
+        };
+
+        let mut effective_values = BTreeMap::new();
+        let mut missing_required = Vec::new();
+        let mut diagnostics = Vec::new();
+
+        for field in &schema.fields {
+            if let Err(PackageAdmissionReason::InvalidConfiguration(mut field_diagnostics)) =
+                validate_configuration_default(&record.manifest.name, field)
+            {
+                diagnostics.append(&mut field_diagnostics);
+            }
+
+            let value = record
+                .configuration
+                .values
+                .get(&field.key)
+                .cloned()
+                .or_else(|| field.default.clone())
+                .map(effective_configuration_value);
+            if let Some(value) = value
+                && !configuration_value_is_unset_secret(&value)
+            {
+                effective_values.insert(field.key.clone(), value);
+                continue;
+            }
+            if field.required {
+                missing_required.push(field.key.clone());
+            }
+        }
+
+        Self {
+            schema: Some(schema),
+            effective_values,
+            missing_required,
+            diagnostics,
+        }
+    }
+
+    /// Whether the view carries schema diagnostics.
+    #[must_use]
+    pub fn has_blocking_diagnostics(&self) -> bool {
+        !self.diagnostics.is_empty()
+    }
+}
+
+/// Sanitized package configuration diagnostic.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PackageConfigurationDiagnostic {
+    /// Stable diagnostic kind.
+    pub kind: String,
+    /// Optional field key.
+    pub field: Option<String>,
+    /// Path-neutral message.
+    pub message: String,
 }
 
 /// Hub-owned package entrypoint declaration for local/dev runnable processes.
@@ -971,6 +1129,7 @@ pub struct PackageDecision {
 pub enum PackageAction {
     Install,
     Show,
+    Configure,
     Enable,
     Disable,
     Remove,
@@ -1123,6 +1282,207 @@ pub enum PackageAdmissionReason {
     HostProfileAdmission(HostProfileAdmissionError),
     /// Manifest Botster compatibility requirement is unsupported or unsatisfied.
     BotsterCompatibility(Vec<String>),
+    /// Submitted or manifest default configuration did not match the schema.
+    InvalidConfiguration(Vec<PackageConfigurationDiagnostic>),
+    /// Required configuration keys are missing before enablement.
+    MissingRequiredConfiguration(Vec<String>),
+}
+
+fn configuration_schema(
+    record: &PackageRecord,
+) -> PackageRegistryResult<&PackageConfigurationSchema> {
+    record.manifest.configuration.as_ref().ok_or_else(|| {
+        PackageRegistryError::with_record(
+            record.manifest.name.clone(),
+            PackageAction::Configure,
+            PackageAdmissionReason::InvalidConfiguration(vec![PackageConfigurationDiagnostic {
+                kind: "schema_missing".to_string(),
+                field: None,
+                message: "package does not declare configuration schema".to_string(),
+            }]),
+            record.state,
+            record.classification,
+            "configure package".to_string(),
+        )
+    })
+}
+
+fn validate_configuration_values(
+    package_name: &str,
+    schema: &PackageConfigurationSchema,
+    values: &BTreeMap<String, PackageConfigurationValue>,
+) -> Result<(), PackageAdmissionReason> {
+    let mut diagnostics = Vec::new();
+    let fields: BTreeMap<_, _> = schema
+        .fields
+        .iter()
+        .map(|field| (field.key.as_str(), field))
+        .collect();
+
+    for field in &schema.fields {
+        if let Err(PackageAdmissionReason::InvalidConfiguration(mut field_diagnostics)) =
+            validate_configuration_default(package_name, field)
+        {
+            diagnostics.append(&mut field_diagnostics);
+        }
+    }
+
+    for (key, value) in values {
+        let Some(field) = fields.get(key.as_str()) else {
+            diagnostics.push(PackageConfigurationDiagnostic {
+                kind: "unknown_field".to_string(),
+                field: Some(key.clone()),
+                message: format!("package {package_name} has no configuration field {key}"),
+            });
+            continue;
+        };
+        if !configuration_value_matches_field_type(value, &field.field_type) {
+            diagnostics.push(PackageConfigurationDiagnostic {
+                kind: "value_type_mismatch".to_string(),
+                field: Some(key.clone()),
+                message: format!(
+                    "configuration field {key} expects {}",
+                    configuration_field_type_label(&field.field_type)
+                ),
+            });
+            continue;
+        }
+        if let PackageConfigurationValue::Select { value } = value
+            && !field.options.iter().any(|option| option.value == *value)
+        {
+            diagnostics.push(PackageConfigurationDiagnostic {
+                kind: "select_option_unknown".to_string(),
+                field: Some(key.clone()),
+                message: format!("configuration field {key} does not allow option {value}"),
+            });
+        }
+    }
+
+    if diagnostics.is_empty() {
+        Ok(())
+    } else {
+        Err(PackageAdmissionReason::InvalidConfiguration(diagnostics))
+    }
+}
+
+fn validate_configuration_default(
+    package_name: &str,
+    field: &PackageConfigurationField,
+) -> Result<(), PackageAdmissionReason> {
+    let Some(default) = field.default.as_ref() else {
+        return Ok(());
+    };
+    if !configuration_value_matches_field_type(default, &field.field_type) {
+        return Err(PackageAdmissionReason::InvalidConfiguration(vec![
+            PackageConfigurationDiagnostic {
+                kind: "default_type_mismatch".to_string(),
+                field: Some(field.key.clone()),
+                message: format!(
+                    "package {package_name} configuration field {} default does not match {}",
+                    field.key,
+                    configuration_field_type_label(&field.field_type)
+                ),
+            },
+        ]));
+    }
+    if let PackageConfigurationValue::Select { value } = default
+        && !field.options.iter().any(|option| option.value == *value)
+    {
+        return Err(PackageAdmissionReason::InvalidConfiguration(vec![
+            PackageConfigurationDiagnostic {
+                kind: "default_select_option_unknown".to_string(),
+                field: Some(field.key.clone()),
+                message: format!(
+                    "package {package_name} configuration field {} default does not allow option {value}",
+                    field.key
+                ),
+            },
+        ]));
+    }
+    Ok(())
+}
+
+fn configuration_value_matches_field_type(
+    value: &PackageConfigurationValue,
+    field_type: &PackageConfigurationFieldType,
+) -> bool {
+    matches!(
+        (value, field_type),
+        (
+            PackageConfigurationValue::String { .. },
+            PackageConfigurationFieldType::String
+        ) | (
+            PackageConfigurationValue::Number { .. },
+            PackageConfigurationFieldType::Number
+        ) | (
+            PackageConfigurationValue::Integer { .. },
+            PackageConfigurationFieldType::Integer
+        ) | (
+            PackageConfigurationValue::Boolean { .. },
+            PackageConfigurationFieldType::Boolean
+        ) | (
+            PackageConfigurationValue::Select { .. },
+            PackageConfigurationFieldType::Select
+        ) | (
+            PackageConfigurationValue::Path { .. },
+            PackageConfigurationFieldType::Path
+        ) | (
+            PackageConfigurationValue::Url { .. },
+            PackageConfigurationFieldType::Url
+        ) | (
+            PackageConfigurationValue::MultilineText { .. },
+            PackageConfigurationFieldType::MultilineText
+        ) | (
+            PackageConfigurationValue::Secret { .. },
+            PackageConfigurationFieldType::Secret
+        )
+    )
+}
+
+fn stored_configuration_value(value: PackageConfigurationValue) -> PackageConfigurationValue {
+    match value {
+        PackageConfigurationValue::Secret {
+            state:
+                PackageConfigurationSecretValue::WriteOnly | PackageConfigurationSecretValue::Redacted,
+        } => PackageConfigurationValue::Secret {
+            state: PackageConfigurationSecretValue::Redacted,
+        },
+        other => other,
+    }
+}
+
+fn effective_configuration_value(value: PackageConfigurationValue) -> PackageConfigurationValue {
+    match value {
+        PackageConfigurationValue::Secret {
+            state: PackageConfigurationSecretValue::WriteOnly,
+        } => PackageConfigurationValue::Secret {
+            state: PackageConfigurationSecretValue::Redacted,
+        },
+        other => other,
+    }
+}
+
+fn configuration_value_is_unset_secret(value: &PackageConfigurationValue) -> bool {
+    matches!(
+        value,
+        PackageConfigurationValue::Secret {
+            state: PackageConfigurationSecretValue::Unset
+        }
+    )
+}
+
+fn configuration_field_type_label(field_type: &PackageConfigurationFieldType) -> &'static str {
+    match field_type {
+        PackageConfigurationFieldType::String => "string",
+        PackageConfigurationFieldType::Number => "number",
+        PackageConfigurationFieldType::Integer => "integer",
+        PackageConfigurationFieldType::Boolean => "boolean",
+        PackageConfigurationFieldType::Select => "select",
+        PackageConfigurationFieldType::Path => "path",
+        PackageConfigurationFieldType::Url => "url",
+        PackageConfigurationFieldType::MultilineText => "multiline_text",
+        PackageConfigurationFieldType::Secret => "secret",
+    }
 }
 
 fn compatibility_requirement_satisfied(
@@ -1514,7 +1874,7 @@ mod tests {
     use super::*;
     use botster_core::{
         ExtensionEntrypoint, ExtensionRuntime, HostProfileMetadata, HostProfilePolicySection,
-        PackageSource,
+        PackageConfigurationOption, PackageSource,
     };
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -1556,8 +1916,8 @@ mod tests {
                 path: "plugin.lua".to_string(),
                 bootstrap: false,
             }],
-            host_profile: None,
             configuration: None,
+            host_profile: None,
             surfaces: Vec::new(),
         }
     }
@@ -1641,11 +2001,235 @@ mod tests {
             update_policy: PackageUpdatePolicy::Manual,
             admitted_capabilities: Vec::new(),
             runnable_entrypoints: Vec::new(),
+            configuration: PackageConfigurationState::default(),
             installed_at: None,
             updated_at: None,
             last_audit_reason: "test fixture".to_string(),
             admitted_host_profile: None,
         }
+    }
+
+    fn package_configuration_manifest() -> PackageManifest {
+        let mut manifest = plugin_manifest(
+            "configuration.plugin",
+            vec![capability(CapabilitySurface::Surfaces, None)],
+        );
+        manifest.configuration = Some(PackageConfigurationSchema {
+            groups: Vec::new(),
+            fields: vec![
+                PackageConfigurationField {
+                    key: "endpoint".to_string(),
+                    field_type: PackageConfigurationFieldType::Url,
+                    label: "Endpoint".to_string(),
+                    description: None,
+                    required: true,
+                    default: None,
+                    validation: None,
+                    group: None,
+                    order: None,
+                    options: Vec::new(),
+                },
+                PackageConfigurationField {
+                    key: "mode".to_string(),
+                    field_type: PackageConfigurationFieldType::Select,
+                    label: "Mode".to_string(),
+                    description: None,
+                    required: false,
+                    default: Some(PackageConfigurationValue::Select {
+                        value: "read".to_string(),
+                    }),
+                    validation: None,
+                    group: None,
+                    order: None,
+                    options: vec![PackageConfigurationOption {
+                        value: "read".to_string(),
+                        label: "Read".to_string(),
+                        description: None,
+                    }],
+                },
+                PackageConfigurationField {
+                    key: "api_token".to_string(),
+                    field_type: PackageConfigurationFieldType::Secret,
+                    label: "API token".to_string(),
+                    description: None,
+                    required: true,
+                    default: Some(PackageConfigurationValue::Secret {
+                        state: PackageConfigurationSecretValue::Unset,
+                    }),
+                    validation: None,
+                    group: None,
+                    order: None,
+                    options: Vec::new(),
+                },
+            ],
+        });
+        manifest
+    }
+
+    #[test]
+    fn package_configuration_validation_defaults_and_secret_redaction() {
+        let mut registry =
+            PackageRegistry::new(grants(vec![capability(CapabilitySurface::Surfaces, None)]));
+        registry
+            .install(
+                package_configuration_manifest(),
+                provenance(),
+                "install configurable package",
+            )
+            .expect("install configurable package");
+
+        let view = registry
+            .set_configuration(
+                "configuration.plugin",
+                BTreeMap::from([
+                    (
+                        "endpoint".to_string(),
+                        PackageConfigurationValue::Url {
+                            value: "https://example.invalid/hook".to_string(),
+                        },
+                    ),
+                    (
+                        "api_token".to_string(),
+                        PackageConfigurationValue::Secret {
+                            state: PackageConfigurationSecretValue::WriteOnly,
+                        },
+                    ),
+                ]),
+                "configure package",
+            )
+            .expect("set package configuration");
+
+        assert_eq!(view.missing_required, Vec::<String>::new());
+        assert!(matches!(
+            view.effective_values.get("api_token"),
+            Some(PackageConfigurationValue::Secret {
+                state: PackageConfigurationSecretValue::Redacted
+            })
+        ));
+        assert!(matches!(
+            view.effective_values.get("mode"),
+            Some(PackageConfigurationValue::Select { value }) if value == "read"
+        ));
+
+        let snapshot_json =
+            serde_json::to_string(&registry.snapshot()).expect("serialize registry snapshot");
+        assert!(snapshot_json.contains("\"state\":\"redacted\""));
+        assert!(!snapshot_json.contains("write_only"));
+        assert!(!snapshot_json.contains("super-secret-token"));
+    }
+
+    #[test]
+    fn package_configuration_rejects_unknown_field_and_type_mismatch() {
+        let mut registry =
+            PackageRegistry::new(grants(vec![capability(CapabilitySurface::Surfaces, None)]));
+        registry
+            .install(
+                package_configuration_manifest(),
+                provenance(),
+                "install configurable package",
+            )
+            .expect("install configurable package");
+
+        let error = registry
+            .set_configuration(
+                "configuration.plugin",
+                BTreeMap::from([(
+                    "missing".to_string(),
+                    PackageConfigurationValue::String {
+                        value: "value".to_string(),
+                    },
+                )]),
+                "configure package",
+            )
+            .expect_err("unknown field should fail");
+        assert!(matches!(
+            error.reason,
+            PackageAdmissionReason::InvalidConfiguration(ref diagnostics)
+                if diagnostics.iter().any(|diagnostic| diagnostic.kind == "unknown_field")
+        ));
+
+        let error = registry
+            .set_configuration(
+                "configuration.plugin",
+                BTreeMap::from([(
+                    "endpoint".to_string(),
+                    PackageConfigurationValue::String {
+                        value: "https://example.invalid".to_string(),
+                    },
+                )]),
+                "configure package",
+            )
+            .expect_err("type mismatch should fail");
+        assert!(matches!(
+            error.reason,
+            PackageAdmissionReason::InvalidConfiguration(ref diagnostics)
+                if diagnostics.iter().any(|diagnostic| diagnostic.kind == "value_type_mismatch")
+        ));
+    }
+
+    #[test]
+    fn package_configuration_rejects_select_default_outside_options() {
+        let mut manifest = package_configuration_manifest();
+        let schema = manifest
+            .configuration
+            .as_mut()
+            .expect("configuration schema");
+        let mode = schema
+            .fields
+            .iter_mut()
+            .find(|field| field.key == "mode")
+            .expect("mode field");
+        mode.default = Some(PackageConfigurationValue::Select {
+            value: "write".to_string(),
+        });
+
+        let mut registry =
+            PackageRegistry::new(grants(vec![capability(CapabilitySurface::Surfaces, None)]));
+        registry
+            .install(manifest, provenance(), "install configurable package")
+            .expect("install configurable package");
+
+        let view = registry
+            .package("configuration.plugin")
+            .expect("configuration package")
+            .configuration_view();
+        assert!(matches!(
+            view.diagnostics.as_slice(),
+            [PackageConfigurationDiagnostic { kind, field: Some(field), .. }]
+                if kind == "default_select_option_unknown" && field == "mode"
+        ));
+
+        let error = registry
+            .enable("configuration.plugin", "enable invalid default package")
+            .expect_err("invalid select default should block enable");
+        assert!(matches!(
+            error.reason,
+            PackageAdmissionReason::InvalidConfiguration(ref diagnostics)
+                if diagnostics.iter().any(|diagnostic| diagnostic.kind == "default_select_option_unknown")
+        ));
+    }
+
+    #[test]
+    fn package_configuration_missing_required_denies_enable_before_load() {
+        let mut registry =
+            PackageRegistry::new(grants(vec![capability(CapabilitySurface::Surfaces, None)]));
+        registry
+            .install(
+                package_configuration_manifest(),
+                provenance(),
+                "install configurable package",
+            )
+            .expect("install configurable package");
+
+        let error = registry
+            .enable("configuration.plugin", "enable without configuration")
+            .expect_err("missing required config should fail");
+
+        assert!(matches!(
+            error.reason,
+            PackageAdmissionReason::MissingRequiredConfiguration(ref fields)
+                if fields == &vec!["endpoint".to_string(), "api_token".to_string()]
+        ));
     }
 
     #[test]

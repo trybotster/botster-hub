@@ -1,10 +1,10 @@
 use std::path::PathBuf;
 
 use botster_core::{
-    BoundaryJson, PluginHandlerKind, PluginHandlerRef, PluginInvocationContext,
-    PluginInvocationFailure, PluginInvocationFailureKind, PluginInvocationRequest,
-    PluginInvocationResult, PluginInvocationSuccess, PluginKey, RequestId, UiActionResultState,
-    UiNodeKind,
+    BoundaryJson, PackageConfigurationSecretValue, PackageConfigurationValue, PluginHandlerKind,
+    PluginHandlerRef, PluginInvocationContext, PluginInvocationFailure,
+    PluginInvocationFailureKind, PluginInvocationRequest, PluginInvocationResult,
+    PluginInvocationSuccess, PluginKey, RequestId, UiActionResultState, UiNodeKind,
 };
 use botster_hub::{
     DataDirectoryOption, HostIdentityOptions, HubClientApi, HubClientRequest,
@@ -51,6 +51,43 @@ fn install_fixture_registry() -> PackageRegistry {
             "install synthetic lua plugin",
         )
         .expect("install local lua package");
+    policy
+        .enable("dogfood.synthetic-plugin", "enable synthetic lua plugin")
+        .expect("enable local lua package");
+    policy.registry().clone()
+}
+
+fn configured_fixture_registry() -> PackageRegistry {
+    let mut policy = default_package_policy();
+    policy
+        .install_local_path(
+            PathBuf::from("examples/synthetic-plugin"),
+            "install configured synthetic lua plugin",
+        )
+        .expect("install local lua package");
+    policy
+        .registry_mut()
+        .set_configuration(
+            "dogfood.synthetic-plugin",
+            [
+                (
+                    "endpoint".to_string(),
+                    PackageConfigurationValue::Url {
+                        value: "https://operator.example.invalid/hook".to_string(),
+                    },
+                ),
+                (
+                    "api_token".to_string(),
+                    PackageConfigurationValue::Secret {
+                        state: PackageConfigurationSecretValue::WriteOnly,
+                    },
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            "set synthetic lua plugin configuration",
+        )
+        .expect("set package configuration");
     policy
         .enable("dogfood.synthetic-plugin", "enable synthetic lua plugin")
         .expect("enable local lua package");
@@ -124,12 +161,58 @@ fn real_lua_plugin_loads_invokes_tool_and_uses_hub_capability_runtime() {
     assert_eq!(payload["ambient"]["os"], true);
     assert_eq!(payload["ambient"]["io"], true);
     assert_eq!(payload["ambient"]["package"], true);
+    assert_eq!(
+        payload["config"]["values"]["endpoint"]["value"],
+        "https://example.invalid/hook"
+    );
+    assert_eq!(payload["config"]["values"]["mode"]["value"], "read");
+    assert!(payload["config"]["values"].get("api_token").is_none());
+    assert_eq!(payload["cross_package_config_attempt"]["ok"], false);
     assert_eq!(payload["capability"]["event_count"], 2);
     assert!(
         payload["capability"]["resource_id"]
             .as_str()
             .is_some_and(|resource| resource.starts_with("timer-"))
     );
+}
+
+#[test]
+fn real_lua_plugin_reads_operator_config_and_redacted_secret_from_own_package_only() {
+    let registry = configured_fixture_registry();
+    let mut hub = explicit_runtime("configured-fixture");
+
+    let plugin_key = hub
+        .load_lua_plugin_package(&registry, "dogfood.synthetic-plugin")
+        .expect("load real lua plugin package");
+    let handler = PluginHandlerRef {
+        plugin_key,
+        kind: PluginHandlerKind::McpTool,
+        handler_id: "echo".to_string(),
+    };
+    let outcome = hub.invoke_plugin(invocation(
+        handler,
+        serde_json::json!({ "message": "configured" }),
+    ));
+
+    let PluginInvocationResult::Completed(PluginInvocationSuccess { payload, .. }) = outcome.result
+    else {
+        panic!("real lua invocation should complete");
+    };
+    let payload = payload.expect("lua response payload").0;
+    assert_eq!(
+        payload["config"]["values"]["endpoint"]["value"],
+        "https://operator.example.invalid/hook"
+    );
+    assert_eq!(payload["config"]["values"]["mode"]["value"], "read");
+    assert_eq!(
+        payload["config"]["values"]["api_token"]["state"],
+        "redacted"
+    );
+    assert_eq!(payload["config"]["missing_required"], serde_json::json!([]));
+    assert_eq!(payload["config"]["diagnostics"], serde_json::json!([]));
+    assert_eq!(payload["cross_package_config_attempt"]["ok"], false);
+    assert!(!payload.to_string().contains("WriteOnly"));
+    assert!(!payload.to_string().contains("operator-secret"));
 }
 
 #[test]
@@ -363,6 +446,10 @@ fn reload_replaces_lua_tool_descriptors_and_removes_stale_handlers() {
         .expect("prepare reload package");
     let bundle = LuaPluginRuntime::load_prepared(
         &prepared,
+        registry
+            .package("reload.plugin")
+            .expect("reload package")
+            .configuration_view(),
         hub.capability_runtime(),
         hub.routed_envelope_runtime(),
     )

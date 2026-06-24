@@ -48,6 +48,7 @@ export type DaemonRequest =
   | { type: "list_packages" }
   | { type: "install_package_local_path"; path: string }
   | { type: "show_package"; package_name: string }
+  | { type: "set_package_configuration"; package_name: string; values: Record<string, JsonValue> }
   | { type: "enable_package_local_path"; path: string }
   | { type: "enable_package"; package_name: string }
   | { type: "disable_package"; package_name: string }
@@ -161,6 +162,7 @@ export interface DaemonPackage {
   requested_capabilities: DaemonCapability[];
   surfaces?: DaemonPackageSurfaceDescriptor[];
   runnable_entrypoints: DaemonPackageRunnableEntrypoint[];
+  configuration?: DaemonPackageConfiguration;
   provider_profile_admitted: boolean;
 }
 
@@ -178,6 +180,13 @@ export interface DaemonPackageSurfaceDescriptor {
   order?: number | null;
   category?: string | null;
   supports?: string[];
+}
+
+export interface DaemonPackageConfiguration {
+  schema?: JsonValue | null;
+  effective_values?: Record<string, JsonValue>;
+  missing_required?: string[];
+  diagnostics?: DaemonPackageDiagnostic[];
 }
 
 export interface DaemonPackageRunnableEntrypoint {

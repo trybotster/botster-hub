@@ -1,11 +1,14 @@
 #![cfg(unix)]
 
+use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 use std::{fs, thread};
 
 use botster_core::{
     Capability, CapabilitySurface, ExtensionEntrypoint, ExtensionKind, ExtensionRuntime, ModeFlags,
-    RequestId, SessionId, SessionLifecycleState, SubscriptionId,
+    PackageConfigurationField, PackageConfigurationFieldType, PackageConfigurationSchema,
+    PackageConfigurationSecretValue, PackageConfigurationValue, RequestId, SessionId,
+    SessionLifecycleState, SubscriptionId,
 };
 use botster_core_daemon::{GuardedWriteDecision, GuardedWriteDeliveryState, ReadinessEvidence};
 use botster_hub::{
@@ -87,8 +90,8 @@ fn plugin_manifest(name: &str, capabilities: Vec<Capability>) -> botster_core::P
             path: "plugin.lua".to_string(),
             bootstrap: false,
         }],
-        host_profile: None,
         configuration: None,
+        host_profile: None,
         surfaces: Vec::new(),
     }
 }
@@ -98,6 +101,109 @@ fn provenance() -> PackageProvenance {
         source: "local-private-source".to_string(),
         checksum: Some("sha256:test".to_string()),
     }
+}
+
+fn configurable_plugin_manifest(
+    name: &str,
+    capabilities: Vec<Capability>,
+) -> botster_core::PackageManifest {
+    let mut manifest = plugin_manifest(name, capabilities);
+    manifest.configuration = Some(PackageConfigurationSchema {
+        groups: Vec::new(),
+        fields: vec![
+            PackageConfigurationField {
+                key: "endpoint".to_string(),
+                field_type: PackageConfigurationFieldType::Url,
+                label: "Endpoint".to_string(),
+                description: None,
+                required: true,
+                default: None,
+                validation: None,
+                group: None,
+                order: None,
+                options: Vec::new(),
+            },
+            PackageConfigurationField {
+                key: "api_token".to_string(),
+                field_type: PackageConfigurationFieldType::Secret,
+                label: "API token".to_string(),
+                description: None,
+                required: true,
+                default: Some(PackageConfigurationValue::Secret {
+                    state: PackageConfigurationSecretValue::Unset,
+                }),
+                validation: None,
+                group: None,
+                order: None,
+                options: Vec::new(),
+            },
+        ],
+    });
+    manifest
+}
+
+#[test]
+fn package_configuration_client_package_rows_are_sanitized() {
+    let api = HubClientApi::local_operator("package-configuration-client");
+    let capability = capability(CapabilitySurface::Surfaces, None);
+    let mut packages = PackageRegistry::new(vec![capability.clone()].into_iter().collect());
+    packages
+        .install(
+            configurable_plugin_manifest("configuration.plugin", vec![capability]),
+            provenance(),
+            "install configurable package",
+        )
+        .expect("install package");
+    packages
+        .set_configuration(
+            "configuration.plugin",
+            BTreeMap::from([
+                (
+                    "endpoint".to_string(),
+                    PackageConfigurationValue::Url {
+                        value: "https://example.invalid/hook".to_string(),
+                    },
+                ),
+                (
+                    "api_token".to_string(),
+                    PackageConfigurationValue::Secret {
+                        state: PackageConfigurationSecretValue::WriteOnly,
+                    },
+                ),
+            ]),
+            "set configuration",
+        )
+        .expect("set configuration");
+    let mut runtime = explicit_runtime("package-configuration-client");
+
+    let response = api
+        .handle_request(
+            &mut runtime,
+            &packages,
+            HubClientRequest::ListPackages {
+                request_id: request_id("list-package-configuration"),
+            },
+        )
+        .expect("list packages");
+    let HubClientResponseBody::Packages(rows) = response.body else {
+        panic!("packages response expected");
+    };
+    let row = rows
+        .into_iter()
+        .find(|row| row.package_name == "configuration.plugin")
+        .expect("configuration package row");
+
+    assert!(row.configuration.schema.is_some());
+    assert!(row.configuration.missing_required.is_empty());
+    assert!(row.configuration.diagnostics.is_empty());
+    assert_eq!(
+        row.configuration.effective_values["api_token"],
+        serde_json::json!({"type":"secret","state":"redacted"})
+    );
+    let row_json = serde_json::to_string(&row.configuration.effective_values)
+        .expect("serialize effective values");
+    assert!(!row_json.contains("write_only"));
+    assert!(!row_json.contains("super-secret-token"));
 }
 
 fn drain_until(

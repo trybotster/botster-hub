@@ -27,7 +27,7 @@ use serde_json::json;
 
 use crate::capabilities::HubCapabilityRuntime;
 use crate::lifecycle::HubPluginRuntimeBundle;
-use crate::packages::PreparedLocalPackage;
+use crate::packages::{PackageConfigurationView, PreparedLocalPackage};
 
 const DEFAULT_INSTRUCTION_BUDGET: u64 = 500_000;
 const PLUGIN_DB_TIMEOUT_MS: u64 = 1_000;
@@ -49,6 +49,7 @@ impl LuaPluginRuntime {
     /// Load a prepared local Lua package and return the core worker bundle.
     pub fn load_prepared(
         prepared: &PreparedLocalPackage,
+        configuration: PackageConfigurationView,
         capabilities: SharedHubCapabilityRuntime,
         routed_envelopes: SharedRoutedEnvelopeRuntime,
     ) -> Result<HubPluginRuntimeBundle, LuaPluginRuntimeError> {
@@ -56,6 +57,7 @@ impl LuaPluginRuntime {
         let loaded = LoadedLuaPlugin::load(
             plugin_key.clone(),
             &prepared.selected_entrypoint_path,
+            configuration,
             capabilities,
             routed_envelopes,
         )?;
@@ -80,6 +82,7 @@ impl LuaPluginRuntime {
     fn new(
         plugin_key: PluginKey,
         entrypoint: &Path,
+        configuration: PackageConfigurationView,
         capabilities: SharedHubCapabilityRuntime,
         routed_envelopes: SharedRoutedEnvelopeRuntime,
     ) -> Result<(Self, LuaRegistration), LuaPluginRuntimeError> {
@@ -101,7 +104,13 @@ impl LuaPluginRuntime {
                 Ok(VmState::Continue)
             },
         )?;
-        install_botster_api(&lua, plugin_key.clone(), capabilities, routed_envelopes)?;
+        install_botster_api(
+            &lua,
+            plugin_key.clone(),
+            configuration,
+            capabilities,
+            routed_envelopes,
+        )?;
         let source = std::fs::read_to_string(entrypoint).map_err(|error| {
             LuaPluginRuntimeError::Load(format!("failed to read Lua entrypoint: {error}"))
         })?;
@@ -233,12 +242,14 @@ impl LoadedLuaPlugin {
     fn load(
         plugin_key: PluginKey,
         entrypoint: &Path,
+        configuration: PackageConfigurationView,
         capabilities: SharedHubCapabilityRuntime,
         routed_envelopes: SharedRoutedEnvelopeRuntime,
     ) -> Result<Self, LuaPluginRuntimeError> {
         let (runtime, registration) = LuaPluginRuntime::new(
             plugin_key.clone(),
             entrypoint,
+            configuration,
             capabilities,
             routed_envelopes,
         )?;
@@ -363,6 +374,7 @@ fn empty_object() -> serde_json::Value {
 fn install_botster_api(
     lua: &Lua,
     plugin_key: PluginKey,
+    configuration: PackageConfigurationView,
     capabilities: SharedHubCapabilityRuntime,
     routed_envelopes: SharedRoutedEnvelopeRuntime,
 ) -> Result<(), LuaPluginRuntimeError> {
@@ -429,6 +441,7 @@ fn install_botster_api(
         "plugin_db",
         plugin_db_table(lua, plugin_key.clone(), capabilities.clone())?,
     )?;
+    capabilities_table.set("config", config_table(lua, configuration)?)?;
     botster.set("capabilities", capabilities_table)?;
     botster.set(
         "coordination",
@@ -436,6 +449,28 @@ fn install_botster_api(
     )?;
     globals.set("botster", botster)?;
     Ok(())
+}
+
+fn config_table(lua: &Lua, configuration: PackageConfigurationView) -> Result<Table, mlua::Error> {
+    let config = lua.create_table()?;
+    let payload = json!({
+        "values": configuration.effective_values,
+        "missing_required": configuration.missing_required,
+        "diagnostics": configuration.diagnostics,
+    });
+    config.set(
+        "get",
+        lua.create_function(move |lua, package_name: Value| {
+            if !matches!(package_name, Value::Nil) {
+                return Err(mlua::Error::RuntimeError(
+                    "config.get reads only the loaded plugin configuration and accepts no package name"
+                        .to_string(),
+                ));
+            }
+            lua.to_value(&payload)
+        })?,
+    )?;
+    Ok(config)
 }
 
 fn plugin_db_table(

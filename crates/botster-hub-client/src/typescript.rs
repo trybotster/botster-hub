@@ -116,6 +116,13 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             ("list_packages", &[]),
             ("install_package_local_path", &[("path", "string")]),
             ("show_package", &[("package_name", "string")]),
+            (
+                "set_package_configuration",
+                &[
+                    ("package_name", "string"),
+                    ("values", "Record<string, JsonValue>"),
+                ],
+            ),
             ("enable_package_local_path", &[("path", "string")]),
             ("enable_package", &[("package_name", "string")]),
             ("disable_package", &[("package_name", "string")]),
@@ -295,6 +302,7 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             ("requested_capabilities", "DaemonCapability[]"),
             ("surfaces?", "DaemonPackageSurfaceDescriptor[]"),
             ("runnable_entrypoints", "DaemonPackageRunnableEntrypoint[]"),
+            ("configuration?", "DaemonPackageConfiguration"),
             ("provider_profile_admitted", "boolean"),
         ],
     );
@@ -315,6 +323,16 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             ("order?", "number | null"),
             ("category?", "string | null"),
             ("supports?", "string[]"),
+        ],
+    );
+    emit_interface(
+        &mut output,
+        "DaemonPackageConfiguration",
+        &[
+            ("schema?", "JsonValue | null"),
+            ("effective_values?", "Record<string, JsonValue>"),
+            ("missing_required?", "string[]"),
+            ("diagnostics?", "DaemonPackageDiagnostic[]"),
         ],
     );
     emit_interface(
