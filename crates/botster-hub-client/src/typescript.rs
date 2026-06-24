@@ -293,6 +293,7 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             ("classification", "string"),
             ("state", "string"),
             ("requested_capabilities", "DaemonCapability[]"),
+            ("surfaces?", "DaemonPackageSurfaceDescriptor[]"),
             ("runnable_entrypoints", "DaemonPackageRunnableEntrypoint[]"),
             ("provider_profile_admitted", "boolean"),
         ],
@@ -301,6 +302,20 @@ pub(crate) fn daemon_protocol_typescript() -> String {
         &mut output,
         "DaemonCapability",
         &[("surface", "string"), ("scope", "string | null")],
+    );
+    emit_interface(
+        &mut output,
+        "DaemonPackageSurfaceDescriptor",
+        &[
+            ("id", "string"),
+            ("kind", "string"),
+            ("title", "string"),
+            ("description?", "string | null"),
+            ("icon?", "string | null"),
+            ("order?", "number | null"),
+            ("category?", "string | null"),
+            ("supports?", "string[]"),
+        ],
     );
     emit_interface(
         &mut output,

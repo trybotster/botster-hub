@@ -410,6 +410,8 @@ mod tests {
                 bootstrap: false,
             }],
             host_profile: None,
+            configuration: None,
+            surfaces: Vec::new(),
         }
     }
 
