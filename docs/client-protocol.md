@@ -138,6 +138,47 @@ raw worktree paths, and mutable Botster identity. First-party clients may add UI
 severity or remediation copy, but that policy belongs in the client renderer,
 not in the daemon protocol.
 
+## Package Registry Sources And Install Preview
+
+The hub exposes a local/static marketplace registry preview path through the
+daemon protocol. This is a hub-owned catalog contract for first-party fixtures
+and local package catalogs, not a hosted marketplace or remote installer.
+
+Current daemon requests:
+
+- `ListAvailablePackages { registry_path }` reads a local registry directory or
+  `botster-registry.json` file and returns sanitized `DaemonAvailablePackage`
+  rows.
+- `InspectAvailablePackage { registry_path, entry_id }` returns one available
+  row for inspect-before-install UI.
+- `PreviewPackageInstall { registry_path, entry_id }` returns a
+  `DaemonPackageInstallPlan` without mutating `HubState.package_registry`.
+- `InstallPackageRegistryEntry { registry_path, entry_id }` explicitly installs
+  one registry entry, persists source metadata and pins, and returns refreshed
+  installed package rows.
+
+Registry responses intentionally do not expose the local registry path or local
+package root. Local entries use path-neutral source labels such as
+`local:<entry_id>`. Git-shaped entries carry repo plus branch/tag/rev pin
+metadata for preview and persistence only; the daemon does not clone, fetch, or
+checkout remote content in this path.
+
+Install preview reports compatibility, requested capabilities, current
+installed-vs-available state, and effects such as adding a package record,
+recording source metadata, requiring a separate explicit enable, and not
+starting entrypoints. Explicit registry install leaves packages in the installed
+state. Clients must call existing enable/start requests separately if the
+operator wants activation or process supervision.
+
+CLI operators can inspect the same daemon path:
+
+```sh
+botster-hub packages available --data-dir <path> --registry <registry-dir-or-file>
+botster-hub packages inspect --data-dir <path> --registry <registry-dir-or-file> <entry-id>
+botster-hub packages preview-install --data-dir <path> --registry <registry-dir-or-file> <entry-id>
+botster-hub packages install --data-dir <path> --registry <registry-dir-or-file> <entry-id>
+```
+
 ## Package Runnable Entrypoints
 
 `DaemonPackage` rows include `runnable_entrypoints` for hub-owned local/dev
