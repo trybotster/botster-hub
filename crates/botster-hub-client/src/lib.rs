@@ -1412,6 +1412,50 @@ mod tests {
     }
 
     #[test]
+    fn generated_typescript_marks_vec_skip_diagnostics_fields_optional() {
+        let hello_ack = DaemonHelloAck {
+            protocol: PROTOCOL.to_string(),
+            compatibility: DaemonCompatibility::current(),
+            diagnostics: Vec::new(),
+        };
+        assert_serde_omits_empty_diagnostics(
+            "DaemonHelloAck",
+            serde_json::to_value(hello_ack).expect("hello ack serializes"),
+        );
+
+        let response = DaemonResponse {
+            diagnostics: Vec::new(),
+            ..daemon_response_example(DaemonResponseKind::Status)
+        };
+        assert_serde_omits_empty_diagnostics(
+            "DaemonResponse",
+            serde_json::to_value(response).expect("response serializes"),
+        );
+
+        let status = DaemonStatus {
+            diagnostics: Vec::new(),
+            ..daemon_response_example(DaemonResponseKind::Status)
+                .status
+                .expect("status example")
+        };
+        assert_serde_omits_empty_diagnostics(
+            "DaemonStatus",
+            serde_json::to_value(status).expect("status serializes"),
+        );
+
+        let operator_error = DaemonOperatorError {
+            diagnostics: Vec::new(),
+            ..daemon_response_example(DaemonResponseKind::OperatorError)
+                .error
+                .expect("operator error example")
+        };
+        assert_serde_omits_empty_diagnostics(
+            "DaemonOperatorError",
+            serde_json::to_value(operator_error).expect("operator error serializes"),
+        );
+    }
+
+    #[test]
     fn daemon_request_variants_are_serde_stable_and_generated() {
         for request in daemon_request_examples() {
             let expected_tag = daemon_request_tag(&request);
@@ -1464,6 +1508,29 @@ mod tests {
                 serde_json::from_value(value).expect("event deserializes");
             assert_eq!(round_tripped, event);
         }
+    }
+
+    fn assert_serde_omits_empty_diagnostics(type_name: &str, value: Value) {
+        assert!(
+            value.get("diagnostics").is_none(),
+            "{type_name} should omit empty diagnostics in serde JSON"
+        );
+        assert!(
+            generated_interface(type_name).contains("  diagnostics?: DaemonDiagnostic[];"),
+            "generated TypeScript should include {type_name}"
+        );
+    }
+
+    fn generated_interface(type_name: &str) -> String {
+        let generated = daemon_protocol_typescript();
+        let start = generated
+            .find(&format!("export interface {type_name} {{"))
+            .unwrap_or_else(|| panic!("generated TypeScript should include {type_name}"));
+        let rest = &generated[start..];
+        let end = rest
+            .find("\n}\n")
+            .unwrap_or_else(|| panic!("generated TypeScript interface should close {type_name}"));
+        rest[..end + 3].to_string()
     }
 
     fn daemon_request_examples() -> Vec<DaemonRequest> {

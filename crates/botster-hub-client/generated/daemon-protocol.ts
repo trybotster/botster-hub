@@ -12,7 +12,7 @@ export interface DaemonHello {
 export interface DaemonHelloAck {
   protocol: string;
   compatibility: DaemonCompatibility;
-  diagnostics: DaemonDiagnostic[];
+  diagnostics?: DaemonDiagnostic[];
 }
 
 export interface DaemonCompatibility {
@@ -78,7 +78,7 @@ export interface DaemonResponse {
   cleanup: DaemonSessionCleanup | null;
   coordination: DaemonCoordination | null;
   error: DaemonOperatorError | null;
-  diagnostics: DaemonDiagnostic[];
+  diagnostics?: DaemonDiagnostic[];
 }
 
 export type DaemonResponseKind =
@@ -236,7 +236,7 @@ export interface DaemonStatus {
   session_count: number;
   recovered_sessions: string[];
   stale_sessions: string[];
-  diagnostics: DaemonDiagnostic[];
+  diagnostics?: DaemonDiagnostic[];
 }
 
 export interface DaemonSession {
@@ -254,7 +254,7 @@ export interface DaemonOperatorError {
   request_id: string;
   operation: string;
   message: string;
-  diagnostics: DaemonDiagnostic[];
+  diagnostics?: DaemonDiagnostic[];
 }
 
 export interface DaemonDiagnostic {
