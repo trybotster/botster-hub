@@ -16,6 +16,8 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+mod typescript;
+
 pub const PROTOCOL: &str = "botster-hub-daemon-v1";
 pub const PROTOCOL_VERSION: u16 = 1;
 pub const CONFORMANCE_FIXTURE_REVISION: u16 = 2;
@@ -1050,6 +1052,12 @@ impl DaemonEvent {
 
 pub type DaemonTransportResult<T> = Result<T, DaemonTransportError>;
 
+/// Deterministic TypeScript definitions for the browser-visible daemon protocol.
+#[must_use]
+pub fn daemon_protocol_typescript() -> String {
+    typescript::daemon_protocol_typescript()
+}
+
 #[derive(Debug)]
 pub enum DaemonTransportError {
     Io(std::io::Error),
@@ -1389,6 +1397,427 @@ mod tests {
                 }
             })
         );
+    }
+
+    #[test]
+    fn generated_typescript_protocol_matches_checked_artifact() {
+        let generated = daemon_protocol_typescript();
+        let checked = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/generated/daemon-protocol.ts"
+        ))
+        .expect("checked generated protocol artifact is readable");
+
+        assert_eq!(generated, checked);
+    }
+
+    #[test]
+    fn daemon_request_variants_are_serde_stable_and_generated() {
+        for request in daemon_request_examples() {
+            let expected_tag = daemon_request_tag(&request);
+            let value = serde_json::to_value(&request).expect("request serializes");
+
+            assert_eq!(value["type"], expected_tag);
+            assert!(
+                daemon_protocol_typescript().contains(&format!("type: \"{expected_tag}\"")),
+                "generated TypeScript should include request variant {expected_tag}"
+            );
+
+            let round_tripped: DaemonRequest =
+                serde_json::from_value(value).expect("request deserializes");
+            assert_eq!(round_tripped, request);
+        }
+    }
+
+    #[test]
+    fn daemon_response_kinds_are_serde_stable_and_generated() {
+        for kind in daemon_response_kind_examples() {
+            let expected_kind = daemon_response_kind_tag(kind);
+            let response = daemon_response_example(kind);
+            let value = serde_json::to_value(&response).expect("response serializes");
+
+            assert_eq!(value["kind"], expected_kind);
+            assert!(
+                daemon_protocol_typescript().contains(&format!("\"{expected_kind}\"")),
+                "generated TypeScript should include response kind {expected_kind}"
+            );
+
+            let round_tripped: DaemonResponse =
+                serde_json::from_value(value).expect("response deserializes");
+            assert_eq!(round_tripped, response);
+        }
+    }
+
+    #[test]
+    fn daemon_event_variants_are_serde_stable_and_generated() {
+        for event in daemon_event_examples() {
+            let expected_tag = daemon_event_tag(&event);
+            let value = serde_json::to_value(&event).expect("event serializes");
+
+            assert_eq!(value["type"], expected_tag);
+            assert!(
+                daemon_protocol_typescript().contains(&format!("type: \"{expected_tag}\"")),
+                "generated TypeScript should include event variant {expected_tag}"
+            );
+
+            let round_tripped: DaemonEvent =
+                serde_json::from_value(value).expect("event deserializes");
+            assert_eq!(round_tripped, event);
+        }
+    }
+
+    fn daemon_request_examples() -> Vec<DaemonRequest> {
+        vec![
+            DaemonRequest::Status,
+            DaemonRequest::ListSessions,
+            DaemonRequest::Whoami {
+                caller_session_id: Some("caller".to_string()),
+            },
+            DaemonRequest::PostMessage {
+                caller_session_id: Some("caller".to_string()),
+                target_session_id: "target".to_string(),
+                envelope_id: Some("envelope".to_string()),
+                body: "hello".to_string(),
+            },
+            DaemonRequest::ReceiveMessages {
+                caller_session_id: "caller".to_string(),
+                after: Some(1),
+                limit: 10,
+            },
+            DaemonRequest::AckMessage {
+                caller_session_id: "caller".to_string(),
+                envelope_id: "envelope".to_string(),
+            },
+            DaemonRequest::NotifySession {
+                session_id: "session".to_string(),
+                data: "ready".to_string(),
+            },
+            DaemonRequest::Spawn {
+                session_id: "session".to_string(),
+                command: "echo hello".to_string(),
+            },
+            DaemonRequest::Attach {
+                session_id: "session".to_string(),
+                subscription_id: "subscription".to_string(),
+            },
+            DaemonRequest::Detach {
+                session_id: "session".to_string(),
+                subscription_id: "subscription".to_string(),
+            },
+            DaemonRequest::SendInput {
+                session_id: "session".to_string(),
+                data: "input".to_string(),
+            },
+            DaemonRequest::Resize {
+                session_id: "session".to_string(),
+                rows: 24,
+                cols: 80,
+            },
+            DaemonRequest::ShutdownSession {
+                session_id: "session".to_string(),
+            },
+            DaemonRequest::Drain {
+                session_id: "session".to_string(),
+            },
+            DaemonRequest::ListPackages,
+            DaemonRequest::InstallPackageLocalPath {
+                path: PathBuf::from("/tmp/plugin"),
+            },
+            DaemonRequest::ShowPackage {
+                package_name: "workflow.plugin".to_string(),
+            },
+            DaemonRequest::EnablePackageLocalPath {
+                path: PathBuf::from("/tmp/plugin"),
+            },
+            DaemonRequest::EnablePackage {
+                package_name: "workflow.plugin".to_string(),
+            },
+            DaemonRequest::DisablePackage {
+                package_name: "workflow.plugin".to_string(),
+            },
+            DaemonRequest::RemovePackage {
+                package_name: "workflow.plugin".to_string(),
+            },
+            DaemonRequest::StartPackageEntrypoint {
+                package_name: "workflow.plugin".to_string(),
+                entrypoint_id: "web".to_string(),
+                environment_overrides: BTreeMap::from([(
+                    "BOTSTER_HUB_SOCKET".to_string(),
+                    "/tmp/botster.sock".to_string(),
+                )]),
+            },
+            DaemonRequest::StopPackageEntrypoint {
+                package_name: "workflow.plugin".to_string(),
+                entrypoint_id: "web".to_string(),
+            },
+            DaemonRequest::RestartPackageEntrypoint {
+                package_name: "workflow.plugin".to_string(),
+                entrypoint_id: "web".to_string(),
+            },
+            DaemonRequest::PackageEntrypointStatus {
+                package_name: "workflow.plugin".to_string(),
+                entrypoint_id: "web".to_string(),
+            },
+            DaemonRequest::PluginLifecycleStatus,
+            DaemonRequest::PluginMcpListTools,
+            DaemonRequest::PluginMcpCallTool {
+                name: "tool".to_string(),
+                arguments: serde_json::json!({ "value": true }),
+            },
+            DaemonRequest::PluginSurfaceRender {
+                package_name: "workflow.plugin".to_string(),
+                surface_id: "home".to_string(),
+                payload: serde_json::json!({ "route": "/" }),
+            },
+            DaemonRequest::PluginSurfaceAction {
+                package_name: "workflow.plugin".to_string(),
+                surface_id: "home".to_string(),
+                action_id: "refresh".to_string(),
+                payload: serde_json::json!({ "id": "run" }),
+            },
+            DaemonRequest::DaemonShutdown,
+        ]
+    }
+
+    fn daemon_request_tag(request: &DaemonRequest) -> &'static str {
+        match request {
+            DaemonRequest::Status => "status",
+            DaemonRequest::ListSessions => "list_sessions",
+            DaemonRequest::Whoami { .. } => "whoami",
+            DaemonRequest::PostMessage { .. } => "post_message",
+            DaemonRequest::ReceiveMessages { .. } => "receive_messages",
+            DaemonRequest::AckMessage { .. } => "ack_message",
+            DaemonRequest::NotifySession { .. } => "notify_session",
+            DaemonRequest::Spawn { .. } => "spawn",
+            DaemonRequest::Attach { .. } => "attach",
+            DaemonRequest::Detach { .. } => "detach",
+            DaemonRequest::SendInput { .. } => "send_input",
+            DaemonRequest::Resize { .. } => "resize",
+            DaemonRequest::ShutdownSession { .. } => "shutdown_session",
+            DaemonRequest::Drain { .. } => "drain",
+            DaemonRequest::ListPackages => "list_packages",
+            DaemonRequest::InstallPackageLocalPath { .. } => "install_package_local_path",
+            DaemonRequest::ShowPackage { .. } => "show_package",
+            DaemonRequest::EnablePackageLocalPath { .. } => "enable_package_local_path",
+            DaemonRequest::EnablePackage { .. } => "enable_package",
+            DaemonRequest::DisablePackage { .. } => "disable_package",
+            DaemonRequest::RemovePackage { .. } => "remove_package",
+            DaemonRequest::StartPackageEntrypoint { .. } => "start_package_entrypoint",
+            DaemonRequest::StopPackageEntrypoint { .. } => "stop_package_entrypoint",
+            DaemonRequest::RestartPackageEntrypoint { .. } => "restart_package_entrypoint",
+            DaemonRequest::PackageEntrypointStatus { .. } => "package_entrypoint_status",
+            DaemonRequest::PluginLifecycleStatus => "plugin_lifecycle_status",
+            DaemonRequest::PluginMcpListTools => "plugin_mcp_list_tools",
+            DaemonRequest::PluginMcpCallTool { .. } => "plugin_mcp_call_tool",
+            DaemonRequest::PluginSurfaceRender { .. } => "plugin_surface_render",
+            DaemonRequest::PluginSurfaceAction { .. } => "plugin_surface_action",
+            DaemonRequest::DaemonShutdown => "daemon_shutdown",
+        }
+    }
+
+    fn daemon_response_kind_examples() -> Vec<DaemonResponseKind> {
+        vec![
+            DaemonResponseKind::Status,
+            DaemonResponseKind::Sessions,
+            DaemonResponseKind::Spawned,
+            DaemonResponseKind::Events,
+            DaemonResponseKind::Packages,
+            DaemonResponseKind::PackageDecision,
+            DaemonResponseKind::PluginLifecycle,
+            DaemonResponseKind::PluginMcpTools,
+            DaemonResponseKind::PluginMcpToolResult,
+            DaemonResponseKind::PluginSurface,
+            DaemonResponseKind::PluginActionResult,
+            DaemonResponseKind::SessionCleanup,
+            DaemonResponseKind::Identity,
+            DaemonResponseKind::MessagePosted,
+            DaemonResponseKind::Messages,
+            DaemonResponseKind::MessageAcked,
+            DaemonResponseKind::SessionNotified,
+            DaemonResponseKind::OperatorError,
+            DaemonResponseKind::Shutdown,
+        ]
+    }
+
+    fn daemon_response_kind_tag(kind: DaemonResponseKind) -> &'static str {
+        match kind {
+            DaemonResponseKind::Status => "status",
+            DaemonResponseKind::Sessions => "sessions",
+            DaemonResponseKind::Spawned => "spawned",
+            DaemonResponseKind::Events => "events",
+            DaemonResponseKind::Packages => "packages",
+            DaemonResponseKind::PackageDecision => "package_decision",
+            DaemonResponseKind::PluginLifecycle => "plugin_lifecycle",
+            DaemonResponseKind::PluginMcpTools => "plugin_mcp_tools",
+            DaemonResponseKind::PluginMcpToolResult => "plugin_mcp_tool_result",
+            DaemonResponseKind::PluginSurface => "plugin_surface",
+            DaemonResponseKind::PluginActionResult => "plugin_action_result",
+            DaemonResponseKind::SessionCleanup => "session_cleanup",
+            DaemonResponseKind::Identity => "identity",
+            DaemonResponseKind::MessagePosted => "message_posted",
+            DaemonResponseKind::Messages => "messages",
+            DaemonResponseKind::MessageAcked => "message_acked",
+            DaemonResponseKind::SessionNotified => "session_notified",
+            DaemonResponseKind::OperatorError => "operator_error",
+            DaemonResponseKind::Shutdown => "shutdown",
+        }
+    }
+
+    fn daemon_response_example(kind: DaemonResponseKind) -> DaemonResponse {
+        DaemonResponse {
+            kind,
+            status: Some(DaemonStatus {
+                lifecycle_state: "running".to_string(),
+                compatibility: DaemonCompatibility::current(),
+                host_id: "hub".to_string(),
+                host_display_name: "Hub".to_string(),
+                schema_version: 1,
+                data_dir_configured: true,
+                core_initialized: true,
+                state_source: "initialized".to_string(),
+                package_count: 1,
+                enabled_package_count: 1,
+                provider_count: 0,
+                enabled_provider_count: 0,
+                session_count: 1,
+                recovered_sessions: vec!["session".to_string()],
+                stale_sessions: Vec::new(),
+                diagnostics: vec![DaemonDiagnostic::connected("status")],
+            }),
+            sessions: vec![DaemonSession {
+                session_id: "session".to_string(),
+                lifecycle: "running".to_string(),
+            }],
+            packages: vec![DaemonPackage {
+                package_name: "workflow.plugin".to_string(),
+                version: "1.0.0".to_string(),
+                classification: "plugin".to_string(),
+                state: "enabled".to_string(),
+                requested_capabilities: vec![DaemonCapability {
+                    surface: "Network".to_string(),
+                    scope: Some("localhost".to_string()),
+                }],
+                runnable_entrypoints: Vec::new(),
+                provider_profile_admitted: false,
+            }],
+            package_decision: Some(DaemonPackageDecision {
+                package_name: "workflow.plugin".to_string(),
+                action: "enable".to_string(),
+                state: "enabled".to_string(),
+                classification: "plugin".to_string(),
+            }),
+            lifecycle: vec![DaemonPluginLifecycle {
+                package_name: "workflow.plugin".to_string(),
+                state: "loaded".to_string(),
+                loaded: true,
+            }],
+            plugin_tools: vec![serde_json::json!({ "name": "tool" })],
+            plugin_tool_result: serde_json::json!({ "content": [] }),
+            plugin_surface: Some(serde_json::json!({ "type": "text", "value": "surface" })),
+            plugin_action_result: Some(serde_json::json!({ "state": "accepted" })),
+            events: daemon_event_examples(),
+            cleanup: Some(DaemonSessionCleanup {
+                session_id: "session".to_string(),
+                outcome: "stopped".to_string(),
+            }),
+            coordination: Some(DaemonCoordination {
+                identity: Some(DaemonIdentity {
+                    client_id: "client".to_string(),
+                    role: "operator".to_string(),
+                    identity_source: "session".to_string(),
+                    caller_session_id: Some("caller".to_string()),
+                    host_id: "hub".to_string(),
+                    host_display_name: "Hub".to_string(),
+                }),
+                publish: Some(DaemonEnvelopePublish {
+                    deliveries: vec![DaemonEnvelopeDelivery {
+                        envelope_id: "envelope".to_string(),
+                        target: "target".to_string(),
+                        cursor: 1,
+                        status: "delivered".to_string(),
+                    }],
+                }),
+                messages: vec![DaemonEnvelope {
+                    envelope_id: "envelope".to_string(),
+                    source: "source".to_string(),
+                    content_type: "text/plain".to_string(),
+                    body: "hello".to_string(),
+                    created_at: 1,
+                    cursor: Some(1),
+                }],
+                next_cursor: Some(2),
+                ack: Some(DaemonEnvelopeAck {
+                    envelope_id: Some("envelope".to_string()),
+                    target: Some("target".to_string()),
+                    cursor: Some(1),
+                    status: "acked".to_string(),
+                }),
+                notify: Some(DaemonNotify {
+                    decision: "delivered".to_string(),
+                    state_count: 1,
+                    states: vec!["ready".to_string()],
+                }),
+            }),
+            error: Some(DaemonOperatorError {
+                code: "operator_error".to_string(),
+                request_id: "request".to_string(),
+                operation: "test".to_string(),
+                message: "failed".to_string(),
+                diagnostics: vec![DaemonDiagnostic::action_failure("test", "failed")],
+            }),
+            diagnostics: vec![DaemonDiagnostic::connected("test")],
+        }
+    }
+
+    fn daemon_event_examples() -> Vec<DaemonEvent> {
+        vec![
+            DaemonEvent::SessionLifecycle {
+                session_id: "session".to_string(),
+                state: "running".to_string(),
+            },
+            DaemonEvent::TerminalOutput {
+                session_id: "session".to_string(),
+                subscription_id: "subscription".to_string(),
+                data: "output".to_string(),
+            },
+            DaemonEvent::Snapshot {
+                session_id: "session".to_string(),
+                subscription_id: "subscription".to_string(),
+                data: "snapshot".to_string(),
+                bytes: 8,
+            },
+            DaemonEvent::Scrollback {
+                session_id: "session".to_string(),
+                subscription_id: "subscription".to_string(),
+                data: "scrollback".to_string(),
+                bytes: 10,
+            },
+            DaemonEvent::ProcessExit {
+                session_id: "session".to_string(),
+                subscription_id: "subscription".to_string(),
+                code: Some(0),
+            },
+            DaemonEvent::AttachState {
+                session_id: "session".to_string(),
+                subscription_id: "subscription".to_string(),
+                state: "attached".to_string(),
+            },
+            DaemonEvent::RuntimeObservation {
+                kind: "observation".to_string(),
+            },
+        ]
+    }
+
+    fn daemon_event_tag(event: &DaemonEvent) -> &'static str {
+        match event {
+            DaemonEvent::SessionLifecycle { .. } => "session_lifecycle",
+            DaemonEvent::TerminalOutput { .. } => "terminal_output",
+            DaemonEvent::Snapshot { .. } => "snapshot",
+            DaemonEvent::Scrollback { .. } => "scrollback",
+            DaemonEvent::ProcessExit { .. } => "process_exit",
+            DaemonEvent::AttachState { .. } => "attach_state",
+            DaemonEvent::RuntimeObservation { .. } => "runtime_observation",
+        }
     }
 
     #[test]

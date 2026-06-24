@@ -9,6 +9,19 @@ Implementation baseline before this split: `9b39f1607144319138151cdf776e8909f35a
 
 External same-device clients should depend on the `botster-hub-client` crate and use `DaemonEndpoint`, `DaemonConnection`, `request`, or `stream_attach` to talk to a running `botster-hub` daemon socket. The crate owns the client-facing handshake, request, response, event, and JSON frame helpers.
 
+Browser clients should import the checked generated TypeScript protocol artifact
+instead of maintaining handwritten DTO mirrors:
+
+- `crates/botster-hub-client/generated/daemon-protocol.ts`
+
+That artifact is generated from the Rust serde DTO surface in
+`crates/botster-hub-client` and is checked by the crate test suite. Rust serde
+remains canonical for the daemon wire shape; TypeScript consumers should treat
+the generated file as a downstream contract artifact, not as an independent
+source of truth. The artifact intentionally includes the hello/compatibility
+handshake DTOs as well as request, response, event, package, plugin lifecycle,
+plugin surface/action, diagnostics, coordination, and session DTO families.
+
 ## Compatibility Handshake
 
 Clients should check hub compatibility before depending on request-specific
