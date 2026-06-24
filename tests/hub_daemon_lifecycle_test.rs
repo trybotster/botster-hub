@@ -187,6 +187,7 @@ fn provider_manifest() -> PackageManifest {
             policy_sections: vec![HostProfilePolicySection::Providers],
         }),
         configuration: None,
+        surfaces: Vec::new(),
     }
 }
 
@@ -822,6 +823,48 @@ fn write_local_process_plugin_package(root: &Path) {
     .expect("write local process package manifest");
 }
 
+fn write_declared_surface_plugin_package(root: &Path) {
+    fs::create_dir_all(root).expect("create declared surface package root");
+    fs::write(root.join("plugin.lua"), "return botster.register({})\n")
+        .expect("write plugin entrypoint");
+    fs::write(
+        root.join("botster-package.json"),
+        r#"{
+  "name": "dogfood.surface-plugin",
+  "version": "1.0.0",
+  "kind": "plugin",
+  "botster": ">=0.1.0",
+  "source": { "type": "path", "path": "." },
+  "capabilities": [
+    { "surface": "surfaces" }
+  ],
+  "entrypoints": [
+    { "runtime": "lua", "path": "plugin.lua", "bootstrap": false }
+  ],
+  "surfaces": [
+    {
+      "id": "dogfood.surface.home",
+      "kind": "app",
+      "title": "Dogfood Surface",
+      "description": "Surface descriptor fixture",
+      "icon": "workflow",
+      "order": 20,
+      "category": "dogfood",
+      "supports": ["render", "action"]
+    },
+    {
+      "id": "dogfood.surface.settings",
+      "kind": "settings",
+      "title": "Dogfood Settings",
+      "supports": ["render"]
+    }
+  ]
+}
+"#,
+    )
+    .expect("write declared surface package manifest");
+}
+
 fn write_invalid_local_package(root: &Path) {
     fs::create_dir_all(root).expect("create invalid package root");
     fs::write(root.join("botster-package.json"), "{ invalid json\n")
@@ -1136,6 +1179,130 @@ fn wait_for_dogfood_output(
     }
 
     panic!("timed out waiting for {needle:?}: lines={lines:?}");
+}
+
+#[test]
+fn daemon_package_dtos_expose_declared_surfaces_and_validate_surface_ids() {
+    let _guard = daemon_test_lock()
+        .lock()
+        .expect("serialize real daemon test");
+    let data_dir = unique_short_test_dir("package-surfaces");
+    let surface_package_dir = unique_test_dir("daemon-declared-surface-package");
+    let legacy_package_dir = unique_test_dir("daemon-legacy-surface-package");
+    write_declared_surface_plugin_package(&surface_package_dir);
+    write_local_plugin_package(&legacy_package_dir);
+    let config = explicit_config(&data_dir);
+    let socket_path = config
+        .transports
+        .local_socket
+        .as_ref()
+        .expect("test config has local socket")
+        .path
+        .clone();
+    let endpoint = botster_hub_client::DaemonEndpoint::new(socket_path);
+    let child = start_cli_daemon(&data_dir);
+    let mut connection =
+        botster_hub_client::DaemonConnection::connect(&endpoint).expect("external connect");
+
+    let install_surface = connection
+        .request(
+            &botster_hub_client::DaemonRequest::InstallPackageLocalPath {
+                path: surface_package_dir.clone(),
+            },
+        )
+        .expect("install package with declared surfaces");
+    assert_eq!(
+        install_surface.kind,
+        botster_hub_client::DaemonResponseKind::PackageDecision
+    );
+    let install_legacy = connection
+        .request(
+            &botster_hub_client::DaemonRequest::InstallPackageLocalPath {
+                path: legacy_package_dir,
+            },
+        )
+        .expect("install legacy package without declared surfaces");
+    assert_eq!(
+        install_legacy.kind,
+        botster_hub_client::DaemonResponseKind::PackageDecision
+    );
+
+    let packages = connection
+        .request(&botster_hub_client::DaemonRequest::ListPackages)
+        .expect("list packages with declared surfaces");
+    let surface_package = packages
+        .packages
+        .iter()
+        .find(|package| package.package_name == "dogfood.surface-plugin")
+        .expect("surface package listed");
+    assert_eq!(surface_package.surfaces.len(), 2);
+    let surface = &surface_package.surfaces[0];
+    assert_eq!(surface.id, "dogfood.surface.home");
+    assert_eq!(surface.kind, "app");
+    assert_eq!(surface.title, "Dogfood Surface");
+    assert_eq!(
+        surface.description.as_deref(),
+        Some("Surface descriptor fixture")
+    );
+    assert_eq!(surface.icon.as_deref(), Some("workflow"));
+    assert_eq!(surface.order, Some(20));
+    assert_eq!(surface.category.as_deref(), Some("dogfood"));
+    assert_eq!(surface.supports, ["render", "action"]);
+
+    let show = connection
+        .request(&botster_hub_client::DaemonRequest::ShowPackage {
+            package_name: "dogfood.surface-plugin".to_string(),
+        })
+        .expect("show package with declared surfaces");
+    assert_eq!(show.packages.len(), 1);
+    assert_eq!(show.packages[0].surfaces, surface_package.surfaces);
+
+    let undeclared = connection
+        .request(&botster_hub_client::DaemonRequest::PluginSurfaceRender {
+            package_name: "dogfood.surface-plugin".to_string(),
+            surface_id: "dogfood.surface.missing".to_string(),
+            payload: serde_json::json!({}),
+        })
+        .expect("undeclared surface render returns operator frame");
+    assert_eq!(
+        undeclared.kind,
+        botster_hub_client::DaemonResponseKind::OperatorError
+    );
+    let error = undeclared.error.as_ref().expect("operator error body");
+    assert_eq!(error.code, "undeclared_plugin_surface");
+    assert_eq!(error.operation, "plugin_surface_render");
+    assert!(undeclared.diagnostics.iter().any(|diagnostic| {
+        diagnostic.kind == botster_hub_client::DaemonDiagnosticKind::UnsupportedFeature
+            && diagnostic.operation.as_deref() == Some("plugin_surface_render")
+            && diagnostic.feature.as_deref()
+                == Some(botster_hub_client::FEATURE_PLUGIN_SURFACE_RENDER)
+    }));
+
+    let legacy_passthrough = connection
+        .request(&botster_hub_client::DaemonRequest::PluginSurfaceRender {
+            package_name: "dogfood.plugin".to_string(),
+            surface_id: "legacy.dynamic.surface".to_string(),
+            payload: serde_json::json!({}),
+        })
+        .expect("legacy package render passes beyond descriptor guard");
+    assert_eq!(
+        legacy_passthrough.kind,
+        botster_hub_client::DaemonResponseKind::OperatorError
+    );
+    assert_ne!(
+        legacy_passthrough
+            .error
+            .as_ref()
+            .expect("legacy operator error")
+            .code,
+        "undeclared_plugin_surface"
+    );
+
+    let status = connection
+        .request(&botster_hub_client::DaemonRequest::Status)
+        .expect("daemon remains responsive after surface validation");
+    assert_eq!(status.kind, botster_hub_client::DaemonResponseKind::Status);
+    shutdown_cli_daemon(&data_dir, child);
 }
 
 #[test]

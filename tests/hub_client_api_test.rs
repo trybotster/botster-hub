@@ -92,6 +92,7 @@ fn plugin_manifest(name: &str, capabilities: Vec<Capability>) -> botster_core::P
         }],
         configuration: None,
         host_profile: None,
+        surfaces: Vec::new(),
     }
 }
 
@@ -1021,6 +1022,16 @@ fn package_and_lifecycle_queries_are_sanitized_and_explicitly_pulled() {
   "source": { "type": "path", "path": "." },
   "capabilities": [{ "surface": "surfaces" }],
   "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }],
+  "surfaces": [{
+    "id": "workflow.home",
+    "kind": "app",
+    "title": "Workflow Home",
+    "description": "Workflow dashboard",
+    "icon": "workflow",
+    "order": 10,
+    "category": "workflows",
+    "supports": ["render", "action"]
+  }],
   "runnable_entrypoints": [{
     "id": "web",
     "kind": "web",
@@ -1076,6 +1087,16 @@ fn package_and_lifecycle_queries_are_sanitized_and_explicitly_pulled() {
         HubClientPackageClassification::Plugin
     );
     assert_eq!(record.state, HubClientPackageState::Enabled);
+    assert_eq!(record.surfaces.len(), 1);
+    let surface = &record.surfaces[0];
+    assert_eq!(surface.id, "workflow.home");
+    assert_eq!(surface.kind, "app");
+    assert_eq!(surface.title, "Workflow Home");
+    assert_eq!(surface.description.as_deref(), Some("Workflow dashboard"));
+    assert_eq!(surface.icon.as_deref(), Some("workflow"));
+    assert_eq!(surface.order, Some(10));
+    assert_eq!(surface.category.as_deref(), Some("workflows"));
+    assert_eq!(surface.supports, ["render", "action"]);
     assert_eq!(record.runnable_entrypoints.len(), 1);
     let entrypoint = &record.runnable_entrypoints[0];
     assert_eq!(entrypoint.id, "web");

@@ -413,6 +413,7 @@ mod tests {
             }],
             configuration: None,
             host_profile: None,
+            surfaces: Vec::new(),
         }
     }
 

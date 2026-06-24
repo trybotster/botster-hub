@@ -139,6 +139,7 @@ fn plugin_manifest(name: &str, capabilities: Vec<Capability>) -> PackageManifest
         }],
         configuration: None,
         host_profile: None,
+        surfaces: Vec::new(),
     }
 }
 
@@ -173,6 +174,7 @@ fn provider_manifest(name: &str, capabilities: Vec<Capability>) -> PackageManife
             policy_sections: vec![HostProfilePolicySection::Providers],
         }),
         configuration: None,
+        surfaces: Vec::new(),
     }
 }
 
