@@ -302,7 +302,7 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             ("requested_capabilities", "DaemonCapability[]"),
             ("surfaces?", "DaemonPackageSurfaceDescriptor[]"),
             ("runnable_entrypoints", "DaemonPackageRunnableEntrypoint[]"),
-            ("configuration?", "DaemonPackageConfiguration"),
+            ("configuration", "DaemonPackageConfiguration"),
             ("provider_profile_admitted", "boolean"),
         ],
     );

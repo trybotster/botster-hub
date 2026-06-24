@@ -1599,6 +1599,85 @@ mod tests {
     }
 
     #[test]
+    fn generated_typescript_exposes_package_configuration_protocol() {
+        let generated = daemon_protocol_typescript();
+        let package = generated_interface("DaemonPackage");
+        let configuration = generated_interface("DaemonPackageConfiguration");
+
+        assert!(
+            generated.contains(
+                r#"| { type: "set_package_configuration"; package_name: string; values: Record<string, JsonValue> }"#
+            ),
+            "generated TypeScript should include set_package_configuration request"
+        );
+        assert!(
+            package.contains("  configuration: DaemonPackageConfiguration;"),
+            "DaemonPackage.configuration is serialized by Rust and should be generated as required"
+        );
+        assert!(
+            !package.contains("  configuration?: DaemonPackageConfiguration;"),
+            "DaemonPackage.configuration should not be generated as optional"
+        );
+        assert!(
+            configuration.contains("  schema?: JsonValue | null;"),
+            "optional schema should match serde skip_serializing_if"
+        );
+        assert!(
+            configuration.contains("  effective_values?: Record<string, JsonValue>;"),
+            "optional effective_values should match serde skip_serializing_if"
+        );
+        assert!(
+            configuration.contains("  missing_required?: string[];"),
+            "optional missing_required should match serde skip_serializing_if"
+        );
+        assert!(
+            configuration.contains("  diagnostics?: DaemonPackageDiagnostic[];"),
+            "optional diagnostics should match serde skip_serializing_if"
+        );
+    }
+
+    #[test]
+    fn daemon_package_configuration_optional_fields_match_serde_omission() {
+        let package = DaemonPackage {
+            package_name: "workflow.plugin".to_string(),
+            version: "1.0.0".to_string(),
+            classification: "plugin".to_string(),
+            state: "enabled".to_string(),
+            requested_capabilities: Vec::new(),
+            surfaces: Vec::new(),
+            runnable_entrypoints: Vec::new(),
+            configuration: DaemonPackageConfiguration::default(),
+            provider_profile_admitted: false,
+        };
+        let value = serde_json::to_value(package).expect("package serializes");
+
+        assert!(
+            value.get("configuration").is_some(),
+            "DaemonPackage should serialize configuration even when it is empty"
+        );
+        let configuration = value
+            .get("configuration")
+            .and_then(Value::as_object)
+            .expect("configuration serializes as an object");
+        assert!(
+            configuration.get("schema").is_none(),
+            "empty configuration should omit schema"
+        );
+        assert!(
+            configuration.get("effective_values").is_none(),
+            "empty configuration should omit effective_values"
+        );
+        assert!(
+            configuration.get("missing_required").is_none(),
+            "empty configuration should omit missing_required"
+        );
+        assert!(
+            configuration.get("diagnostics").is_none(),
+            "empty configuration should omit diagnostics"
+        );
+    }
+
+    #[test]
     fn daemon_request_variants_are_serde_stable_and_generated() {
         for request in daemon_request_examples() {
             let expected_tag = daemon_request_tag(&request);
