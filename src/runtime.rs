@@ -171,8 +171,13 @@ impl HubRuntime {
         let prepared = registry
             .prepare_local_package(package_name, "load local lua plugin package")
             .map_err(HubLuaPluginLoadError::Package)?;
+        let configuration = registry
+            .package(package_name)
+            .map(|record| record.configuration_view())
+            .expect("prepared local package must have a registry record");
         let bundle = LuaPluginRuntime::load_prepared(
             &prepared,
+            configuration,
             self.capability_runtime.clone(),
             self.routed_envelopes.clone(),
         )
