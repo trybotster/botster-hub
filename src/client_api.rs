@@ -20,9 +20,9 @@ use botster_core_daemon::{
 
 use crate::lifecycle::HubPluginLifecycleStatus;
 use crate::packages::{
-    PackageClassification, PackageRecord, PackageRegistry, PackageRunnableEntrypointKind,
-    PackageRunnableMode, PackageRunnableProcessState, PackageRunnableWorkingDirectory,
-    PackageState,
+    PackageClassification, PackageConfigurationView, PackageRecord, PackageRegistry,
+    PackageRunnableEntrypointKind, PackageRunnableMode, PackageRunnableProcessState,
+    PackageRunnableWorkingDirectory, PackageState,
 };
 use crate::{HubRuntime, HubRuntimeError, daemon_session_to_core_session, host_profile};
 
@@ -793,6 +793,7 @@ pub struct HubClientPackage {
     pub state: HubClientPackageState,
     pub requested_capabilities: Vec<HubClientCapability>,
     pub runnable_entrypoints: Vec<HubClientPackageRunnableEntrypoint>,
+    pub configuration: HubClientPackageConfiguration,
     pub provider_profile_admitted: bool,
 }
 
@@ -878,7 +879,49 @@ impl From<&PackageRecord> for HubClientPackage {
                     },
                 })
                 .collect(),
+            configuration: HubClientPackageConfiguration::from(record.configuration_view()),
             provider_profile_admitted: record.admitted_host_profile.is_some(),
+        }
+    }
+}
+
+/// Sanitized package configuration metadata and effective values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HubClientPackageConfiguration {
+    pub schema: Option<serde_json::Value>,
+    pub effective_values: BTreeMap<String, serde_json::Value>,
+    pub missing_required: Vec<String>,
+    pub diagnostics: Vec<HubClientPackageDiagnostic>,
+}
+
+impl From<PackageConfigurationView> for HubClientPackageConfiguration {
+    fn from(view: PackageConfigurationView) -> Self {
+        Self {
+            schema: view
+                .schema
+                .map(|schema| serde_json::to_value(schema).unwrap_or(serde_json::Value::Null)),
+            effective_values: view
+                .effective_values
+                .into_iter()
+                .map(|(key, value)| {
+                    (
+                        key,
+                        serde_json::to_value(value).unwrap_or(serde_json::Value::Null),
+                    )
+                })
+                .collect(),
+            missing_required: view.missing_required,
+            diagnostics: view
+                .diagnostics
+                .into_iter()
+                .map(|diagnostic| HubClientPackageDiagnostic {
+                    kind: diagnostic.kind,
+                    message: match diagnostic.field {
+                        Some(field) => format!("{}: {}", field, diagnostic.message),
+                        None => diagnostic.message,
+                    },
+                })
+                .collect(),
         }
     }
 }
