@@ -740,6 +740,8 @@ pub struct DaemonPackage {
     pub classification: String,
     pub state: String,
     pub requested_capabilities: Vec<DaemonCapability>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub surfaces: Vec<DaemonPackageSurfaceDescriptor>,
     #[serde(default)]
     pub runnable_entrypoints: Vec<DaemonPackageRunnableEntrypoint>,
     pub provider_profile_admitted: bool,
@@ -749,6 +751,23 @@ pub struct DaemonPackage {
 pub struct DaemonCapability {
     pub surface: String,
     pub scope: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonPackageSurfaceDescriptor {
+    pub id: String,
+    pub kind: String,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub supports: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1453,6 +1472,53 @@ mod tests {
             "DaemonOperatorError",
             serde_json::to_value(operator_error).expect("operator error serializes"),
         );
+
+        let package = DaemonPackage {
+            surfaces: Vec::new(),
+            ..daemon_response_example(DaemonResponseKind::Packages).packages[0].clone()
+        };
+        let value = serde_json::to_value(package).expect("package serializes");
+        assert!(
+            value.get("surfaces").is_none(),
+            "empty package surface descriptors should be omitted for legacy package JSON"
+        );
+    }
+
+    #[test]
+    fn daemon_package_surface_descriptors_use_core_manifest_field_names() {
+        let package = DaemonPackage {
+            surfaces: vec![DaemonPackageSurfaceDescriptor {
+                id: "project-pipelines.home".to_string(),
+                kind: "app".to_string(),
+                title: "Project Pipelines".to_string(),
+                description: Some("Pipeline workbench".to_string()),
+                icon: Some("workflow".to_string()),
+                order: Some(10),
+                category: Some("workflows".to_string()),
+                supports: vec!["render".to_string(), "action".to_string()],
+            }],
+            ..daemon_response_example(DaemonResponseKind::Packages).packages[0].clone()
+        };
+
+        let value = serde_json::to_value(package).expect("package serializes");
+        assert_eq!(
+            value["surfaces"][0],
+            serde_json::json!({
+                "id": "project-pipelines.home",
+                "kind": "app",
+                "title": "Project Pipelines",
+                "description": "Pipeline workbench",
+                "icon": "workflow",
+                "order": 10,
+                "category": "workflows",
+                "supports": ["render", "action"]
+            })
+        );
+
+        let generated = daemon_protocol_typescript();
+        assert!(generated.contains("surfaces?: DaemonPackageSurfaceDescriptor[];"));
+        assert!(generated.contains("export interface DaemonPackageSurfaceDescriptor"));
+        assert!(generated.contains("  supports?: string[];"));
     }
 
     #[test]
@@ -1764,6 +1830,7 @@ mod tests {
                     surface: "Network".to_string(),
                     scope: Some("localhost".to_string()),
                 }],
+                surfaces: Vec::new(),
                 runnable_entrypoints: Vec::new(),
                 provider_profile_admitted: false,
             }],

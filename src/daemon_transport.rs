@@ -31,9 +31,10 @@ pub use botster_hub_client::{
     DaemonEnvelopeDelivery, DaemonEnvelopePublish, DaemonEvent, DaemonHello, DaemonHelloAck,
     DaemonIdentity, DaemonNotify, DaemonOperatorError, DaemonPackage, DaemonPackageDecision,
     DaemonPackageDiagnostic, DaemonPackageEnvironmentRequirement, DaemonPackageProcess,
-    DaemonPackageRunnableEntrypoint, DaemonPackageWorkingDirectory, DaemonPluginLifecycle,
-    DaemonRequest, DaemonResponse, DaemonResponseKind, DaemonSession, DaemonSessionCleanup,
-    DaemonStatus, PROTOCOL, read_frame, read_frame_from_reader, write_frame,
+    DaemonPackageRunnableEntrypoint, DaemonPackageSurfaceDescriptor, DaemonPackageWorkingDirectory,
+    DaemonPluginLifecycle, DaemonRequest, DaemonResponse, DaemonResponseKind, DaemonSession,
+    DaemonSessionCleanup, DaemonStatus, FEATURE_PLUGIN_SURFACE_ACTION,
+    FEATURE_PLUGIN_SURFACE_RENDER, PROTOCOL, read_frame, read_frame_from_reader, write_frame,
 };
 use serde_json::Value;
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
@@ -45,7 +46,7 @@ use crate::{
     HubClientPackageClassification, HubClientPluginLifecycle, HubClientRequest,
     HubClientResponseBody, HubClientSession, HubConfig, HubDaemon, HubDaemonStatus,
     HubStateLoadSource, HubStateStore, McpToolDescriptor, PackageAction, PackageAdmissionReason,
-    PackageDecision, PackageRegistryError,
+    PackageDecision, PackageRegistry, PackageRegistryError,
 };
 
 const MESSAGE_CONTENT_TYPE: &str = "application/vnd.botster.coordination.message+text";
@@ -709,6 +710,16 @@ fn handle_runtime_control_request(
             surface_id,
             payload,
         } => {
+            if let Some(response) = undeclared_surface_response(
+                &packages,
+                &package_name,
+                &surface_id,
+                "daemon-plugin-surface-render",
+                "plugin_surface_render",
+                FEATURE_PLUGIN_SURFACE_RENDER,
+            ) {
+                return Ok(response);
+            }
             let response = api.handle_request(
                 runtime,
                 &packages,
@@ -730,6 +741,16 @@ fn handle_runtime_control_request(
             action_id,
             payload,
         } => {
+            if let Some(response) = undeclared_surface_response(
+                &packages,
+                &package_name,
+                &surface_id,
+                "daemon-plugin-surface-action",
+                "plugin_surface_action",
+                FEATURE_PLUGIN_SURFACE_ACTION,
+            ) {
+                return Ok(response);
+            }
             let response = api.handle_request(
                 runtime,
                 &packages,
@@ -1184,6 +1205,44 @@ fn daemon_unknown_session_cleanup(session_id: &str) -> DaemonResponse {
     response
 }
 
+fn undeclared_surface_response(
+    packages: &PackageRegistry,
+    package_name: &str,
+    surface_id: &str,
+    request_id: &str,
+    operation: &str,
+    feature: &str,
+) -> Option<DaemonResponse> {
+    let record = packages.package(package_name)?;
+    if record.manifest.surfaces.is_empty()
+        || record
+            .manifest
+            .surfaces
+            .iter()
+            .any(|surface| surface.id == surface_id)
+    {
+        return None;
+    }
+
+    let message = format!("{package_name} does not declare surface {surface_id}");
+    let diagnostic = DaemonDiagnostic {
+        kind: botster_hub_client::DaemonDiagnosticKind::UnsupportedFeature,
+        operation: Some(operation.to_string()),
+        feature: Some(feature.to_string()),
+        message: Some(message.clone()),
+    };
+    let mut response = daemon_response_base(DaemonResponseKind::OperatorError);
+    response.error = Some(DaemonOperatorError {
+        code: "undeclared_plugin_surface".to_string(),
+        request_id: request_id.to_string(),
+        operation: operation.to_string(),
+        message,
+        diagnostics: vec![diagnostic.clone()],
+    });
+    response.diagnostics = vec![diagnostic];
+    Some(response)
+}
+
 fn daemon_operator_error(error: crate::HubClientError) -> DaemonResponse {
     let mut response = daemon_response_base(DaemonResponseKind::OperatorError);
     response.error = Some(daemon_operator_error_from_client(error));
@@ -1404,6 +1463,20 @@ fn daemon_package_from_client(package: HubClientPackage) -> DaemonPackage {
             .map(|capability| DaemonCapability {
                 surface: capability.surface,
                 scope: capability.scope,
+            })
+            .collect(),
+        surfaces: package
+            .surfaces
+            .into_iter()
+            .map(|surface| DaemonPackageSurfaceDescriptor {
+                id: surface.id,
+                kind: surface.kind,
+                title: surface.title,
+                description: surface.description,
+                icon: surface.icon,
+                order: surface.order,
+                category: surface.category,
+                supports: surface.supports,
             })
             .collect(),
         runnable_entrypoints: package

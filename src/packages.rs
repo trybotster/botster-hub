@@ -1557,6 +1557,8 @@ mod tests {
                 bootstrap: false,
             }],
             host_profile: None,
+            configuration: None,
+            surfaces: Vec::new(),
         }
     }
 
@@ -1584,6 +1586,8 @@ mod tests {
                 required_capabilities: capabilities,
                 policy_sections: vec![HostProfilePolicySection::Providers],
             }),
+            configuration: None,
+            surfaces: Vec::new(),
         }
     }
 

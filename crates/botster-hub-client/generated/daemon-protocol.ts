@@ -159,6 +159,7 @@ export interface DaemonPackage {
   classification: string;
   state: string;
   requested_capabilities: DaemonCapability[];
+  surfaces?: DaemonPackageSurfaceDescriptor[];
   runnable_entrypoints: DaemonPackageRunnableEntrypoint[];
   provider_profile_admitted: boolean;
 }
@@ -166,6 +167,17 @@ export interface DaemonPackage {
 export interface DaemonCapability {
   surface: string;
   scope: string | null;
+}
+
+export interface DaemonPackageSurfaceDescriptor {
+  id: string;
+  kind: string;
+  title: string;
+  description?: string | null;
+  icon?: string | null;
+  order?: number | null;
+  category?: string | null;
+  supports?: string[];
 }
 
 export interface DaemonPackageRunnableEntrypoint {
