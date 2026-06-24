@@ -46,6 +46,10 @@ export type DaemonRequest =
   | { type: "shutdown_session"; session_id: string }
   | { type: "drain"; session_id: string }
   | { type: "list_packages" }
+  | { type: "list_available_packages"; registry_path: string }
+  | { type: "inspect_available_package"; registry_path: string; entry_id: string }
+  | { type: "preview_package_install"; registry_path: string; entry_id: string }
+  | { type: "install_package_registry_entry"; registry_path: string; entry_id: string }
   | { type: "install_package_local_path"; path: string }
   | { type: "show_package"; package_name: string }
   | { type: "set_package_configuration"; package_name: string; values: Record<string, JsonValue> }
@@ -69,6 +73,8 @@ export interface DaemonResponse {
   status: DaemonStatus | null;
   sessions: DaemonSession[];
   packages: DaemonPackage[];
+  available_packages?: DaemonAvailablePackage[];
+  install_plan?: DaemonPackageInstallPlan | null;
   package_decision: DaemonPackageDecision | null;
   lifecycle: DaemonPluginLifecycle[];
   plugin_tools: JsonValue[];
@@ -88,6 +94,8 @@ export type DaemonResponseKind =
   | "spawned"
   | "events"
   | "packages"
+  | "available_packages"
+  | "package_install_plan"
   | "package_decision"
   | "plugin_lifecycle"
   | "plugin_mcp_tools"
@@ -169,6 +177,49 @@ export interface DaemonPackage {
 export interface DaemonCapability {
   surface: string;
   scope: string | null;
+}
+
+export interface DaemonAvailablePackage {
+  entry_id: string;
+  package_name: string;
+  version: string;
+  classification: string;
+  source_kind: string;
+  source_label: string;
+  first_party: boolean;
+  state: string;
+  requested_capabilities: DaemonCapability[];
+  compatibility: DaemonPackageCompatibility;
+  pin?: DaemonPackagePin | null;
+}
+
+export interface DaemonPackageInstallPlan {
+  entry: DaemonAvailablePackage;
+  effects: DaemonPackageInstallEffect[];
+  diagnostics: DaemonPackageDiagnostic[];
+  mutates_registry: boolean;
+  starts_entrypoints: boolean;
+}
+
+export interface DaemonPackageInstallEffect {
+  kind: string;
+  message: string;
+}
+
+export interface DaemonPackageCompatibility {
+  botster_requirement: string;
+  hub_version: string;
+  result: string;
+  diagnostics: string[];
+}
+
+export interface DaemonPackagePin {
+  revision: string;
+  branch?: string | null;
+  tag?: string | null;
+  rev?: string | null;
+  checksum?: string | null;
+  update_policy: string;
 }
 
 export interface DaemonPackageSurfaceDescriptor {
