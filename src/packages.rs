@@ -746,13 +746,10 @@ impl PackageConfigurationView {
         let mut diagnostics = Vec::new();
 
         for field in &schema.fields {
-            match validate_configuration_default(&record.manifest.name, field) {
-                Ok(()) => {}
-                Err(reason) => diagnostics.push(PackageConfigurationDiagnostic {
-                    kind: "schema_default_type_mismatch".to_string(),
-                    field: Some(field.key.clone()),
-                    message: package_admission_reason_message(&reason),
-                }),
+            if let Err(PackageAdmissionReason::InvalidConfiguration(mut field_diagnostics)) =
+                validate_configuration_default(&record.manifest.name, field)
+            {
+                diagnostics.append(&mut field_diagnostics);
             }
 
             let value = record
@@ -762,11 +759,11 @@ impl PackageConfigurationView {
                 .cloned()
                 .or_else(|| field.default.clone())
                 .map(effective_configuration_value);
-            if let Some(value) = value {
-                if !configuration_value_is_unset_secret(&value) {
-                    effective_values.insert(field.key.clone(), value);
-                    continue;
-                }
+            if let Some(value) = value
+                && !configuration_value_is_unset_secret(&value)
+            {
+                effective_values.insert(field.key.clone(), value);
+                continue;
             }
             if field.required {
                 missing_required.push(field.key.clone());
@@ -1323,10 +1320,10 @@ fn validate_configuration_values(
         .collect();
 
     for field in &schema.fields {
-        if let Err(reason) = validate_configuration_default(package_name, field) {
-            if let PackageAdmissionReason::InvalidConfiguration(mut field_diagnostics) = reason {
-                diagnostics.append(&mut field_diagnostics);
-            }
+        if let Err(PackageAdmissionReason::InvalidConfiguration(mut field_diagnostics)) =
+            validate_configuration_default(package_name, field)
+        {
+            diagnostics.append(&mut field_diagnostics);
         }
     }
 
@@ -1375,20 +1372,34 @@ fn validate_configuration_default(
     let Some(default) = field.default.as_ref() else {
         return Ok(());
     };
-    if configuration_value_matches_field_type(default, &field.field_type) {
-        return Ok(());
+    if !configuration_value_matches_field_type(default, &field.field_type) {
+        return Err(PackageAdmissionReason::InvalidConfiguration(vec![
+            PackageConfigurationDiagnostic {
+                kind: "default_type_mismatch".to_string(),
+                field: Some(field.key.clone()),
+                message: format!(
+                    "package {package_name} configuration field {} default does not match {}",
+                    field.key,
+                    configuration_field_type_label(&field.field_type)
+                ),
+            },
+        ]));
     }
-    Err(PackageAdmissionReason::InvalidConfiguration(vec![
-        PackageConfigurationDiagnostic {
-            kind: "default_type_mismatch".to_string(),
-            field: Some(field.key.clone()),
-            message: format!(
-                "package {package_name} configuration field {} default does not match {}",
-                field.key,
-                configuration_field_type_label(&field.field_type)
-            ),
-        },
-    ]))
+    if let PackageConfigurationValue::Select { value } = default
+        && !field.options.iter().any(|option| option.value == *value)
+    {
+        return Err(PackageAdmissionReason::InvalidConfiguration(vec![
+            PackageConfigurationDiagnostic {
+                kind: "default_select_option_unknown".to_string(),
+                field: Some(field.key.clone()),
+                message: format!(
+                    "package {package_name} configuration field {} default does not allow option {value}",
+                    field.key
+                ),
+            },
+        ]));
+    }
+    Ok(())
 }
 
 fn configuration_value_matches_field_type(
@@ -1471,19 +1482,6 @@ fn configuration_field_type_label(field_type: &PackageConfigurationFieldType) ->
         PackageConfigurationFieldType::Url => "url",
         PackageConfigurationFieldType::MultilineText => "multiline_text",
         PackageConfigurationFieldType::Secret => "secret",
-    }
-}
-
-fn package_admission_reason_message(reason: &PackageAdmissionReason) -> String {
-    match reason {
-        PackageAdmissionReason::InvalidConfiguration(diagnostics) => diagnostics
-            .first()
-            .map(|diagnostic| diagnostic.message.clone())
-            .unwrap_or_else(|| "invalid package configuration".to_string()),
-        PackageAdmissionReason::MissingRequiredConfiguration(fields) => {
-            format!("missing required configuration: {}", fields.join(","))
-        }
-        other => format!("{other:?}"),
     }
 }
 
@@ -2164,6 +2162,48 @@ mod tests {
             error.reason,
             PackageAdmissionReason::InvalidConfiguration(ref diagnostics)
                 if diagnostics.iter().any(|diagnostic| diagnostic.kind == "value_type_mismatch")
+        ));
+    }
+
+    #[test]
+    fn package_configuration_rejects_select_default_outside_options() {
+        let mut manifest = package_configuration_manifest();
+        let schema = manifest
+            .configuration
+            .as_mut()
+            .expect("configuration schema");
+        let mode = schema
+            .fields
+            .iter_mut()
+            .find(|field| field.key == "mode")
+            .expect("mode field");
+        mode.default = Some(PackageConfigurationValue::Select {
+            value: "write".to_string(),
+        });
+
+        let mut registry =
+            PackageRegistry::new(grants(vec![capability(CapabilitySurface::Surfaces, None)]));
+        registry
+            .install(manifest, provenance(), "install configurable package")
+            .expect("install configurable package");
+
+        let view = registry
+            .package("configuration.plugin")
+            .expect("configuration package")
+            .configuration_view();
+        assert!(matches!(
+            view.diagnostics.as_slice(),
+            [PackageConfigurationDiagnostic { kind, field: Some(field), .. }]
+                if kind == "default_select_option_unknown" && field == "mode"
+        ));
+
+        let error = registry
+            .enable("configuration.plugin", "enable invalid default package")
+            .expect_err("invalid select default should block enable");
+        assert!(matches!(
+            error.reason,
+            PackageAdmissionReason::InvalidConfiguration(ref diagnostics)
+                if diagnostics.iter().any(|diagnostic| diagnostic.kind == "default_select_option_unknown")
         ));
     }
 
