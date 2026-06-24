@@ -33,7 +33,7 @@ pub(crate) fn daemon_protocol_typescript() -> String {
         &[
             ("protocol", "string"),
             ("compatibility", "DaemonCompatibility"),
-            ("diagnostics", "DaemonDiagnostic[]"),
+            ("diagnostics?", "DaemonDiagnostic[]"),
         ],
     );
     emit_interface(
@@ -185,7 +185,7 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             ("cleanup", "DaemonSessionCleanup | null"),
             ("coordination", "DaemonCoordination | null"),
             ("error", "DaemonOperatorError | null"),
-            ("diagnostics", "DaemonDiagnostic[]"),
+            ("diagnostics?", "DaemonDiagnostic[]"),
         ],
     );
     emit_string_union(
@@ -388,7 +388,7 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             ("session_count", "number"),
             ("recovered_sessions", "string[]"),
             ("stale_sessions", "string[]"),
-            ("diagnostics", "DaemonDiagnostic[]"),
+            ("diagnostics?", "DaemonDiagnostic[]"),
         ],
     );
     emit_interface(
@@ -409,7 +409,7 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             ("request_id", "string"),
             ("operation", "string"),
             ("message", "string"),
-            ("diagnostics", "DaemonDiagnostic[]"),
+            ("diagnostics?", "DaemonDiagnostic[]"),
         ],
     );
     emit_interface(
