@@ -8,10 +8,11 @@ use std::collections::BTreeMap;
 
 use botster_core::{
     BotsterEngineObservation, CapabilitySurface, ClientId, CoreSession, CoreSessionMetadata,
-    EnvelopeCursor, EnvelopeDeliveryState, EnvelopeId, EnvelopeTarget, RequestId, RoutedEnvelope,
-    RoutedEnvelopeDrainOutcome, RoutedEnvelopePublishOutcome, SessionId, SessionLifecycleState,
-    SessionRuntimeErrorKind, SessionSpawnRequest, SpawnEnvironment, SpawnWorkingDirectory,
-    SubscriptionId, TerminalAttachState, TransportEgress, UiActionResult, UiNode,
+    EnvelopeCursor, EnvelopeDeliveryState, EnvelopeId, EnvelopeTarget, PackageSurfaceKind,
+    PackageSurfaceOperation, RequestId, RoutedEnvelope, RoutedEnvelopeDrainOutcome,
+    RoutedEnvelopePublishOutcome, SessionId, SessionLifecycleState, SessionRuntimeErrorKind,
+    SessionSpawnRequest, SpawnEnvironment, SpawnWorkingDirectory, SubscriptionId,
+    TerminalAttachState, TransportEgress, UiActionResult, UiNode,
 };
 use botster_core_daemon::{
     GuardedWriteDecision, GuardedWriteDeliveryState, GuardedWriteRequest, GuardedWriteResult,
@@ -792,6 +793,7 @@ pub struct HubClientPackage {
     pub classification: HubClientPackageClassification,
     pub state: HubClientPackageState,
     pub requested_capabilities: Vec<HubClientCapability>,
+    pub surfaces: Vec<HubClientPackageSurfaceDescriptor>,
     pub runnable_entrypoints: Vec<HubClientPackageRunnableEntrypoint>,
     pub configuration: HubClientPackageConfiguration,
     pub provider_profile_admitted: bool,
@@ -811,6 +813,25 @@ impl From<&PackageRecord> for HubClientPackage {
                 .map(|capability| HubClientCapability {
                     surface: format!("{:?}", capability.surface),
                     scope: capability.scope.clone(),
+                })
+                .collect(),
+            surfaces: record
+                .manifest
+                .surfaces
+                .iter()
+                .map(|surface| HubClientPackageSurfaceDescriptor {
+                    id: surface.id.clone(),
+                    kind: package_surface_kind_label(&surface.kind).to_string(),
+                    title: surface.title.clone(),
+                    description: surface.description.clone(),
+                    icon: surface.icon.clone(),
+                    order: surface.order,
+                    category: surface.category.clone(),
+                    supports: surface
+                        .supports
+                        .iter()
+                        .map(|operation| package_surface_operation_label(operation).to_string())
+                        .collect(),
                 })
                 .collect(),
             runnable_entrypoints: record
@@ -883,6 +904,19 @@ impl From<&PackageRecord> for HubClientPackage {
             provider_profile_admitted: record.admitted_host_profile.is_some(),
         }
     }
+}
+
+/// Sanitized package UI surface descriptor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HubClientPackageSurfaceDescriptor {
+    pub id: String,
+    pub kind: String,
+    pub title: String,
+    pub description: Option<String>,
+    pub icon: Option<String>,
+    pub order: Option<i64>,
+    pub category: Option<String>,
+    pub supports: Vec<String>,
 }
 
 /// Sanitized package configuration metadata and effective values.
@@ -1030,6 +1064,22 @@ fn runnable_process_state_label(state: PackageRunnableProcessState) -> &'static 
         PackageRunnableProcessState::Exited => "exited",
         PackageRunnableProcessState::Failed => "failed",
         PackageRunnableProcessState::Stopped => "stopped",
+    }
+}
+
+fn package_surface_kind_label(kind: &PackageSurfaceKind) -> &'static str {
+    match kind {
+        PackageSurfaceKind::App => "app",
+        PackageSurfaceKind::Settings => "settings",
+        PackageSurfaceKind::DashboardWidget => "dashboard_widget",
+        PackageSurfaceKind::Diagnostics => "diagnostics",
+    }
+}
+
+fn package_surface_operation_label(operation: &PackageSurfaceOperation) -> &'static str {
+    match operation {
+        PackageSurfaceOperation::Render => "render",
+        PackageSurfaceOperation::Action => "action",
     }
 }
 

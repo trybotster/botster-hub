@@ -1918,6 +1918,7 @@ mod tests {
             }],
             configuration: None,
             host_profile: None,
+            surfaces: Vec::new(),
         }
     }
 
@@ -1946,6 +1947,7 @@ mod tests {
                 policy_sections: vec![HostProfilePolicySection::Providers],
             }),
             configuration: None,
+            surfaces: Vec::new(),
         }
     }
 
