@@ -786,7 +786,7 @@ impl PackageConfigurationView {
 }
 
 /// Sanitized package configuration diagnostic.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PackageConfigurationDiagnostic {
     /// Stable diagnostic kind.
     pub kind: String,
