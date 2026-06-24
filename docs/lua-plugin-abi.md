@@ -65,11 +65,21 @@ The initial capability helper is:
   plugin-store record and waits for completion.
 - `botster.capabilities.plugin_db.list({ prefix = "..." })`: lists deterministic
   plugin-store record metadata.
+- `botster.capabilities.config.get()`: returns the loaded plugin's own
+  sanitized effective package configuration as `{ values = {...},
+  missing_required = {...}, diagnostics = {...} }`. Values use the package
+  daemon DTO shape, including manifest defaults and operator-set non-secret
+  values. Secret values are absent when unset and redacted when set.
 
 `plugin_db` helpers always use the loaded plugin key as the namespace; Lua code
 cannot select another plugin's namespace. Mutating helpers submit to
 `HubCapabilityRuntime` and drain the matching completion before returning, so a
 handler can read its just-committed state deterministically.
+
+`config.get` follows the same loaded-plugin namespace rule. It accepts no
+package name and cannot read another package's configuration. Package
+configuration writes remain hub CLI/API responsibilities, not Lua plugin
+self-mutation.
 
 ## Coordination Access
 
