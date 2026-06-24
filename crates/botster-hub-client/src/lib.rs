@@ -570,6 +570,21 @@ pub enum DaemonRequest {
         session_id: String,
     },
     ListPackages,
+    ListAvailablePackages {
+        registry_path: PathBuf,
+    },
+    InspectAvailablePackage {
+        registry_path: PathBuf,
+        entry_id: String,
+    },
+    PreviewPackageInstall {
+        registry_path: PathBuf,
+        entry_id: String,
+    },
+    InstallPackageRegistryEntry {
+        registry_path: PathBuf,
+        entry_id: String,
+    },
     InstallPackageLocalPath {
         path: PathBuf,
     },
@@ -637,6 +652,10 @@ pub struct DaemonResponse {
     pub status: Option<DaemonStatus>,
     pub sessions: Vec<DaemonSession>,
     pub packages: Vec<DaemonPackage>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub available_packages: Vec<DaemonAvailablePackage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub install_plan: Option<DaemonPackageInstallPlan>,
     pub package_decision: Option<DaemonPackageDecision>,
     pub lifecycle: Vec<DaemonPluginLifecycle>,
     #[serde(default)]
@@ -663,6 +682,8 @@ pub enum DaemonResponseKind {
     Spawned,
     Events,
     Packages,
+    AvailablePackages,
+    PackageInstallPlan,
     PackageDecision,
     PluginLifecycle,
     PluginMcpTools,
@@ -751,6 +772,59 @@ pub struct DaemonPackage {
     #[serde(default)]
     pub configuration: DaemonPackageConfiguration,
     pub provider_profile_admitted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonAvailablePackage {
+    pub entry_id: String,
+    pub package_name: String,
+    pub version: String,
+    pub classification: String,
+    pub source_kind: String,
+    pub source_label: String,
+    pub first_party: bool,
+    pub state: String,
+    pub requested_capabilities: Vec<DaemonCapability>,
+    pub compatibility: DaemonPackageCompatibility,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pin: Option<DaemonPackagePin>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonPackageInstallPlan {
+    pub entry: DaemonAvailablePackage,
+    pub effects: Vec<DaemonPackageInstallEffect>,
+    pub diagnostics: Vec<DaemonPackageDiagnostic>,
+    pub mutates_registry: bool,
+    pub starts_entrypoints: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonPackageInstallEffect {
+    pub kind: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonPackageCompatibility {
+    pub botster_requirement: String,
+    pub hub_version: String,
+    pub result: String,
+    pub diagnostics: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonPackagePin {
+    pub revision: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tag: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rev: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checksum: Option<String>,
+    pub update_policy: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1809,6 +1883,21 @@ mod tests {
                 session_id: "session".to_string(),
             },
             DaemonRequest::ListPackages,
+            DaemonRequest::ListAvailablePackages {
+                registry_path: PathBuf::from("/tmp/registry"),
+            },
+            DaemonRequest::InspectAvailablePackage {
+                registry_path: PathBuf::from("/tmp/registry"),
+                entry_id: "workflow-plugin".to_string(),
+            },
+            DaemonRequest::PreviewPackageInstall {
+                registry_path: PathBuf::from("/tmp/registry"),
+                entry_id: "workflow-plugin".to_string(),
+            },
+            DaemonRequest::InstallPackageRegistryEntry {
+                registry_path: PathBuf::from("/tmp/registry"),
+                entry_id: "workflow-plugin".to_string(),
+            },
             DaemonRequest::InstallPackageLocalPath {
                 path: PathBuf::from("/tmp/plugin"),
             },
@@ -1892,6 +1981,10 @@ mod tests {
             DaemonRequest::ShutdownSession { .. } => "shutdown_session",
             DaemonRequest::Drain { .. } => "drain",
             DaemonRequest::ListPackages => "list_packages",
+            DaemonRequest::ListAvailablePackages { .. } => "list_available_packages",
+            DaemonRequest::InspectAvailablePackage { .. } => "inspect_available_package",
+            DaemonRequest::PreviewPackageInstall { .. } => "preview_package_install",
+            DaemonRequest::InstallPackageRegistryEntry { .. } => "install_package_registry_entry",
             DaemonRequest::InstallPackageLocalPath { .. } => "install_package_local_path",
             DaemonRequest::ShowPackage { .. } => "show_package",
             DaemonRequest::SetPackageConfiguration { .. } => "set_package_configuration",
@@ -1919,6 +2012,8 @@ mod tests {
             DaemonResponseKind::Spawned,
             DaemonResponseKind::Events,
             DaemonResponseKind::Packages,
+            DaemonResponseKind::AvailablePackages,
+            DaemonResponseKind::PackageInstallPlan,
             DaemonResponseKind::PackageDecision,
             DaemonResponseKind::PluginLifecycle,
             DaemonResponseKind::PluginMcpTools,
@@ -1943,6 +2038,8 @@ mod tests {
             DaemonResponseKind::Spawned => "spawned",
             DaemonResponseKind::Events => "events",
             DaemonResponseKind::Packages => "packages",
+            DaemonResponseKind::AvailablePackages => "available_packages",
+            DaemonResponseKind::PackageInstallPlan => "package_install_plan",
             DaemonResponseKind::PackageDecision => "package_decision",
             DaemonResponseKind::PluginLifecycle => "plugin_lifecycle",
             DaemonResponseKind::PluginMcpTools => "plugin_mcp_tools",
@@ -1999,6 +2096,58 @@ mod tests {
                 configuration: DaemonPackageConfiguration::default(),
                 provider_profile_admitted: false,
             }],
+            available_packages: vec![DaemonAvailablePackage {
+                entry_id: "workflow-plugin".to_string(),
+                package_name: "workflow.plugin".to_string(),
+                version: "1.0.0".to_string(),
+                classification: "plugin".to_string(),
+                source_kind: "git".to_string(),
+                source_label: "https://example.invalid/workflow.git".to_string(),
+                first_party: true,
+                state: "available".to_string(),
+                requested_capabilities: Vec::new(),
+                compatibility: DaemonPackageCompatibility {
+                    botster_requirement: ">=0.1.0".to_string(),
+                    hub_version: "0.1.0".to_string(),
+                    result: "compatible".to_string(),
+                    diagnostics: Vec::new(),
+                },
+                pin: Some(DaemonPackagePin {
+                    revision: "main".to_string(),
+                    branch: Some("main".to_string()),
+                    tag: None,
+                    rev: None,
+                    checksum: None,
+                    update_policy: "manual".to_string(),
+                }),
+            }],
+            install_plan: Some(DaemonPackageInstallPlan {
+                entry: DaemonAvailablePackage {
+                    entry_id: "workflow-plugin".to_string(),
+                    package_name: "workflow.plugin".to_string(),
+                    version: "1.0.0".to_string(),
+                    classification: "plugin".to_string(),
+                    source_kind: "git".to_string(),
+                    source_label: "https://example.invalid/workflow.git".to_string(),
+                    first_party: true,
+                    state: "available".to_string(),
+                    requested_capabilities: Vec::new(),
+                    compatibility: DaemonPackageCompatibility {
+                        botster_requirement: ">=0.1.0".to_string(),
+                        hub_version: "0.1.0".to_string(),
+                        result: "compatible".to_string(),
+                        diagnostics: Vec::new(),
+                    },
+                    pin: None,
+                },
+                effects: vec![DaemonPackageInstallEffect {
+                    kind: "add_package_record".to_string(),
+                    message: "would add package record".to_string(),
+                }],
+                diagnostics: Vec::new(),
+                mutates_registry: false,
+                starts_entrypoints: false,
+            }),
             package_decision: Some(DaemonPackageDecision {
                 package_name: "workflow.plugin".to_string(),
                 action: "enable".to_string(),

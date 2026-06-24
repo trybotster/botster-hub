@@ -4895,6 +4895,157 @@ fn cli_packages_local_path_install_enable_disable_remove_flow() {
 }
 
 #[test]
+fn daemon_packages_registry_fixture_preview_and_install_flow() {
+    let _guard = daemon_test_lock()
+        .lock()
+        .expect("serialize real daemon test");
+    let data_dir = unique_test_dir("daemon-registry-flow");
+    let registry_dir = unique_test_dir("daemon-package-registry");
+    let package_dir = registry_dir.join("packages").join("local");
+    write_local_plugin_package(&package_dir);
+    fs::write(
+        registry_dir.join(botster_hub::LOCAL_PACKAGE_REGISTRY_FILE),
+        r#"{
+  "source": { "id": "daemon-fixture", "kind": "local_path", "label": "Daemon Fixture" },
+  "entries": [
+    {
+      "id": "dogfood-local",
+      "first_party": true,
+      "source": { "type": "local_path", "path": "packages/local" }
+    },
+    {
+      "id": "dogfood-git",
+      "first_party": true,
+      "source": {
+        "type": "git",
+        "repo": "https://example.invalid/botster/dogfood.git",
+        "branch": "main",
+        "tag": "v1.0.0",
+        "rev": "abc123"
+      },
+      "manifest": {
+        "name": "dogfood.git",
+        "version": "1.0.0",
+        "kind": "plugin",
+        "botster": ">=0.1.0",
+        "capabilities": [
+          { "surface": "surfaces" }
+        ],
+        "entrypoints": [
+          { "runtime": "lua", "path": "plugin.lua", "bootstrap": false }
+        ]
+      }
+    }
+  ]
+}
+"#,
+    )
+    .expect("write package registry fixture");
+    let child = start_cli_daemon(&data_dir);
+    let config = explicit_config(&data_dir);
+
+    let available = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::ListAvailablePackages {
+            registry_path: registry_dir.clone(),
+        },
+    )
+    .expect("list available packages through daemon");
+    assert_eq!(
+        available.kind,
+        botster_hub::DaemonResponseKind::AvailablePackages
+    );
+    assert_eq!(available.available_packages.len(), 2);
+    assert!(available.available_packages.iter().all(|package| {
+        !package
+            .source_label
+            .contains(data_dir.to_string_lossy().as_ref())
+            && !package
+                .source_label
+                .contains(registry_dir.to_string_lossy().as_ref())
+    }));
+
+    let inspect = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::InspectAvailablePackage {
+            registry_path: registry_dir.clone(),
+            entry_id: "dogfood-git".to_string(),
+        },
+    )
+    .expect("inspect git-shaped entry through daemon");
+    let git_entry = inspect
+        .available_packages
+        .first()
+        .expect("inspected git entry");
+    assert_eq!(git_entry.source_kind, "git");
+    assert_eq!(
+        git_entry.pin.as_ref().expect("git pin").rev.as_deref(),
+        Some("abc123")
+    );
+
+    let preview = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::PreviewPackageInstall {
+            registry_path: registry_dir.clone(),
+            entry_id: "dogfood-local".to_string(),
+        },
+    )
+    .expect("preview install through daemon");
+    let plan = preview.install_plan.expect("install plan");
+    assert!(!plan.mutates_registry);
+    assert!(!plan.starts_entrypoints);
+    assert!(
+        plan.effects
+            .iter()
+            .any(|effect| effect.kind == "no_entrypoint_start")
+    );
+    let list_after_preview =
+        botster_hub::daemon_transport_request(&config, botster_hub::DaemonRequest::ListPackages)
+            .expect("list after preview");
+    assert!(list_after_preview.packages.is_empty());
+
+    let install = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::InstallPackageRegistryEntry {
+            registry_path: registry_dir.clone(),
+            entry_id: "dogfood-git".to_string(),
+        },
+    )
+    .expect("install git-shaped entry through daemon");
+    assert_eq!(
+        install.package_decision.expect("install decision").action,
+        "install"
+    );
+    let installed = install
+        .packages
+        .iter()
+        .find(|package| package.package_name == "dogfood.git")
+        .expect("installed package row");
+    assert_eq!(installed.state, "installed");
+
+    shutdown_cli_daemon(&data_dir, child);
+    let state = FileHubStateStore::for_data_directory(&data_dir)
+        .load_or_initialize(&explicit_config(&data_dir))
+        .expect("load persisted hub state after registry install");
+    let restored = PackageRegistry::from_snapshot(state.package_registry)
+        .expect("restore package registry snapshot");
+    let record = restored.package("dogfood.git").expect("restored package");
+    assert_eq!(record.state, botster_hub::PackageState::Installed);
+    assert_eq!(
+        record
+            .source_metadata
+            .as_ref()
+            .expect("source metadata")
+            .entry_id,
+        "dogfood-git"
+    );
+    assert_eq!(
+        record.pin.as_ref().expect("pin").rev.as_deref(),
+        Some("abc123")
+    );
+}
+
+#[test]
 fn cli_packages_local_path_diagnostics_are_actionable() {
     let _guard = daemon_test_lock()
         .lock()

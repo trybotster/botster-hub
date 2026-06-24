@@ -798,6 +798,52 @@ fn operator_packages(args: Vec<String>, providers_only: bool) -> Result<(), Oper
             let response = daemon_transport_request(&config, DaemonRequest::ListPackages)?;
             print_packages_response(response, providers_only)?;
         }
+        PackageActionCommand::Available(registry_path) => {
+            let response = daemon_transport_request(
+                &config,
+                DaemonRequest::ListAvailablePackages { registry_path },
+            )?;
+            print_packages_response(response, providers_only)?;
+        }
+        PackageActionCommand::InspectAvailable {
+            registry_path,
+            entry_id,
+        } => {
+            let response = daemon_transport_request(
+                &config,
+                DaemonRequest::InspectAvailablePackage {
+                    registry_path,
+                    entry_id,
+                },
+            )?;
+            print_packages_response(response, providers_only)?;
+        }
+        PackageActionCommand::PreviewInstall {
+            registry_path,
+            entry_id,
+        } => {
+            let response = daemon_transport_request(
+                &config,
+                DaemonRequest::PreviewPackageInstall {
+                    registry_path,
+                    entry_id,
+                },
+            )?;
+            print_packages_response(response, providers_only)?;
+        }
+        PackageActionCommand::InstallRegistryEntry {
+            registry_path,
+            entry_id,
+        } => {
+            let response = daemon_transport_request(
+                &config,
+                DaemonRequest::InstallPackageRegistryEntry {
+                    registry_path,
+                    entry_id,
+                },
+            )?;
+            print_packages_response(response, providers_only)?;
+        }
         PackageActionCommand::InstallLocalPath(path) => {
             let response =
                 daemon_transport_request(&config, DaemonRequest::InstallPackageLocalPath { path })?;
@@ -1029,6 +1075,14 @@ fn print_daemon_response(response: DaemonResponse) -> Result<(), OperatorError> 
         DaemonResponseKind::Packages => {
             print_packages(&response.packages, false);
         }
+        DaemonResponseKind::AvailablePackages => {
+            print_available_packages(&response.available_packages);
+        }
+        DaemonResponseKind::PackageInstallPlan => {
+            if let Some(plan) = response.install_plan.as_ref() {
+                print_package_install_plan(plan);
+            }
+        }
         DaemonResponseKind::PackageDecision => {
             if let Some(decision) = response.package_decision {
                 print_package_decision(&decision);
@@ -1215,8 +1269,69 @@ fn print_packages_response(
     if let Some(decision) = response.package_decision.as_ref() {
         print_package_decision(decision);
     }
+    if let Some(plan) = response.install_plan.as_ref() {
+        print_package_install_plan(plan);
+    }
+    if !response.available_packages.is_empty() {
+        print_available_packages(&response.available_packages);
+    }
     print_packages(&response.packages, providers_only);
     Ok(())
+}
+
+fn print_available_packages(packages: &[botster_hub::DaemonAvailablePackage]) {
+    println!("response=available_packages");
+    println!("available_package_count={}", packages.len());
+    for package in packages {
+        println!(
+            "available_package entry={} name={} version={} classification={} source_kind={} source={} first_party={} state={} capabilities={} compatibility={}",
+            package.entry_id,
+            package.package_name,
+            package.version,
+            package.classification,
+            package.source_kind,
+            package.source_label,
+            package.first_party,
+            package.state,
+            package.requested_capabilities.len(),
+            package.compatibility.result
+        );
+        if let Some(pin) = &package.pin {
+            println!(
+                "available_package_pin entry={} revision={} branch={} tag={} rev={} update_policy={}",
+                package.entry_id,
+                pin.revision,
+                pin.branch.as_deref().unwrap_or("none"),
+                pin.tag.as_deref().unwrap_or("none"),
+                pin.rev.as_deref().unwrap_or("none"),
+                pin.update_policy
+            );
+        }
+    }
+}
+
+fn print_package_install_plan(plan: &botster_hub::DaemonPackageInstallPlan) {
+    println!("response=package_install_plan");
+    println!(
+        "install_plan entry={} package={} state={} mutates_registry={} starts_entrypoints={}",
+        plan.entry.entry_id,
+        plan.entry.package_name,
+        plan.entry.state,
+        plan.mutates_registry,
+        plan.starts_entrypoints
+    );
+    for effect in &plan.effects {
+        println!(
+            "install_plan_effect kind={} message={}",
+            effect.kind, effect.message
+        );
+    }
+    for diagnostic in &plan.diagnostics {
+        println!(
+            "install_plan_diagnostic kind={} message={}",
+            diagnostic.kind, diagnostic.message
+        );
+    }
 }
 
 fn print_packages(packages: &[DaemonPackage], providers_only: bool) {
@@ -1688,6 +1803,19 @@ struct PackageCommand {
 
 enum PackageActionCommand {
     List,
+    Available(PathBuf),
+    InspectAvailable {
+        registry_path: PathBuf,
+        entry_id: String,
+    },
+    PreviewInstall {
+        registry_path: PathBuf,
+        entry_id: String,
+    },
+    InstallRegistryEntry {
+        registry_path: PathBuf,
+        entry_id: String,
+    },
     InstallLocalPath(PathBuf),
     Show(String),
     Config(String),
@@ -1735,15 +1863,62 @@ impl PackageCommand {
                     action: PackageActionCommand::List,
                 })
             }
+            "available" if !providers_only => {
+                if args.len() != 5 || args.get(3).map(String::as_str) != Some("--registry") {
+                    return Err(OperatorError::Usage("packages available"));
+                }
+                let options = DataDirOptions::parse(args[1..3].to_vec(), "packages available")?;
+                Ok(Self {
+                    data_directory: options.data_directory,
+                    action: PackageActionCommand::Available(PathBuf::from(&args[4])),
+                })
+            }
+            "inspect" if !providers_only => {
+                if args.len() != 6 || args.get(3).map(String::as_str) != Some("--registry") {
+                    return Err(OperatorError::Usage("packages inspect"));
+                }
+                let options = DataDirOptions::parse(args[1..3].to_vec(), "packages inspect")?;
+                Ok(Self {
+                    data_directory: options.data_directory,
+                    action: PackageActionCommand::InspectAvailable {
+                        registry_path: PathBuf::from(&args[4]),
+                        entry_id: args[5].clone(),
+                    },
+                })
+            }
+            "preview-install" if !providers_only => {
+                if args.len() != 6 || args.get(3).map(String::as_str) != Some("--registry") {
+                    return Err(OperatorError::Usage("packages preview-install"));
+                }
+                let options =
+                    DataDirOptions::parse(args[1..3].to_vec(), "packages preview-install")?;
+                Ok(Self {
+                    data_directory: options.data_directory,
+                    action: PackageActionCommand::PreviewInstall {
+                        registry_path: PathBuf::from(&args[4]),
+                        entry_id: args[5].clone(),
+                    },
+                })
+            }
             "install" if !providers_only => {
-                if args.len() != 5 || args.get(3).map(String::as_str) != Some("--path") {
+                if args.len() != 5 && args.len() != 6 {
                     return Err(OperatorError::Usage("packages install"));
                 }
                 let options = DataDirOptions::parse(args[1..3].to_vec(), "packages install")?;
-                Ok(Self {
-                    data_directory: options.data_directory,
-                    action: PackageActionCommand::InstallLocalPath(PathBuf::from(&args[4])),
-                })
+                match args.get(3).map(String::as_str) {
+                    Some("--path") if args.len() == 5 => Ok(Self {
+                        data_directory: options.data_directory,
+                        action: PackageActionCommand::InstallLocalPath(PathBuf::from(&args[4])),
+                    }),
+                    Some("--registry") if args.len() == 6 => Ok(Self {
+                        data_directory: options.data_directory,
+                        action: PackageActionCommand::InstallRegistryEntry {
+                            registry_path: PathBuf::from(&args[4]),
+                            entry_id: args[5].clone(),
+                        },
+                    }),
+                    _ => Err(OperatorError::Usage("packages install")),
+                }
             }
             "show" if !providers_only => {
                 if args.len() != 4 {
@@ -2321,10 +2496,19 @@ fn usage_for(command: &str) -> &'static str {
         "mcp-serve" => "usage: botster-hub mcp-serve --data-dir <path>",
         "tui" => "usage: botster-hub tui --data-dir <path>",
         "packages" => {
-            "usage: botster-hub packages <install|list|show|config|enable|disable|remove|start-entrypoint|stop-entrypoint|restart-entrypoint|entrypoint-status> ..."
+            "usage: botster-hub packages <available|inspect|preview-install|install|list|show|config|enable|disable|remove|start-entrypoint|stop-entrypoint|restart-entrypoint|entrypoint-status> ..."
         }
         "packages install" => {
-            "usage: botster-hub packages install --data-dir <path> --path <package-dir-or-manifest>"
+            "usage: botster-hub packages install --data-dir <path> (--path <package-dir-or-manifest>|--registry <registry-dir-or-file> <entry-id>)"
+        }
+        "packages available" => {
+            "usage: botster-hub packages available --data-dir <path> --registry <registry-dir-or-file>"
+        }
+        "packages inspect" => {
+            "usage: botster-hub packages inspect --data-dir <path> --registry <registry-dir-or-file> <entry-id>"
+        }
+        "packages preview-install" => {
+            "usage: botster-hub packages preview-install --data-dir <path> --registry <registry-dir-or-file> <entry-id>"
         }
         "packages list" => "usage: botster-hub packages list --data-dir <path>",
         "packages show" => "usage: botster-hub packages show --data-dir <path> <name>",

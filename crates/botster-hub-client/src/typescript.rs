@@ -114,6 +114,19 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             ("shutdown_session", &[("session_id", "string")]),
             ("drain", &[("session_id", "string")]),
             ("list_packages", &[]),
+            ("list_available_packages", &[("registry_path", "string")]),
+            (
+                "inspect_available_package",
+                &[("registry_path", "string"), ("entry_id", "string")],
+            ),
+            (
+                "preview_package_install",
+                &[("registry_path", "string"), ("entry_id", "string")],
+            ),
+            (
+                "install_package_registry_entry",
+                &[("registry_path", "string"), ("entry_id", "string")],
+            ),
             ("install_package_local_path", &[("path", "string")]),
             ("show_package", &[("package_name", "string")]),
             (
@@ -182,6 +195,8 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             ("status", "DaemonStatus | null"),
             ("sessions", "DaemonSession[]"),
             ("packages", "DaemonPackage[]"),
+            ("available_packages?", "DaemonAvailablePackage[]"),
+            ("install_plan?", "DaemonPackageInstallPlan | null"),
             ("package_decision", "DaemonPackageDecision | null"),
             ("lifecycle", "DaemonPluginLifecycle[]"),
             ("plugin_tools", "JsonValue[]"),
@@ -204,6 +219,8 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             "spawned",
             "events",
             "packages",
+            "available_packages",
+            "package_install_plan",
             "package_decision",
             "plugin_lifecycle",
             "plugin_mcp_tools",
@@ -310,6 +327,61 @@ pub(crate) fn daemon_protocol_typescript() -> String {
         &mut output,
         "DaemonCapability",
         &[("surface", "string"), ("scope", "string | null")],
+    );
+    emit_interface(
+        &mut output,
+        "DaemonAvailablePackage",
+        &[
+            ("entry_id", "string"),
+            ("package_name", "string"),
+            ("version", "string"),
+            ("classification", "string"),
+            ("source_kind", "string"),
+            ("source_label", "string"),
+            ("first_party", "boolean"),
+            ("state", "string"),
+            ("requested_capabilities", "DaemonCapability[]"),
+            ("compatibility", "DaemonPackageCompatibility"),
+            ("pin?", "DaemonPackagePin | null"),
+        ],
+    );
+    emit_interface(
+        &mut output,
+        "DaemonPackageInstallPlan",
+        &[
+            ("entry", "DaemonAvailablePackage"),
+            ("effects", "DaemonPackageInstallEffect[]"),
+            ("diagnostics", "DaemonPackageDiagnostic[]"),
+            ("mutates_registry", "boolean"),
+            ("starts_entrypoints", "boolean"),
+        ],
+    );
+    emit_interface(
+        &mut output,
+        "DaemonPackageInstallEffect",
+        &[("kind", "string"), ("message", "string")],
+    );
+    emit_interface(
+        &mut output,
+        "DaemonPackageCompatibility",
+        &[
+            ("botster_requirement", "string"),
+            ("hub_version", "string"),
+            ("result", "string"),
+            ("diagnostics", "string[]"),
+        ],
+    );
+    emit_interface(
+        &mut output,
+        "DaemonPackagePin",
+        &[
+            ("revision", "string"),
+            ("branch?", "string | null"),
+            ("tag?", "string | null"),
+            ("rev?", "string | null"),
+            ("checksum?", "string | null"),
+            ("update_policy", "string"),
+        ],
     );
     emit_interface(
         &mut output,
