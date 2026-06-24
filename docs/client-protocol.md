@@ -153,6 +153,39 @@ Core `entrypoints` remain the plugin/provider code-load ABI, while
 `runnable_entrypoints` is the package discovery shape for clients and future
 launchers.
 
+## Package Configuration
+
+Package manifests may declare a core-owned `configuration` schema. The hub owns
+policy for submitted values: it validates keys and value types against the
+manifest schema, applies manifest defaults to the effective view, blocks enable
+when required values are missing, and persists configuration under the package
+record in `HubState.package_registry`.
+
+`DaemonPackage` rows expose a sanitized `configuration` object:
+
+- `schema`: the manifest schema as JSON, or omitted for packages without config.
+- `effective_values`: defaults plus stored values, keyed by field.
+- `missing_required`: required field keys with no effective value.
+- `diagnostics`: schema/value diagnostics suitable for clients.
+
+Secrets are write-only. Clients may send a secret value marker through
+`SetPackageConfiguration` with `{ "type": "secret", "state": "write_only" }`.
+The hub persists and returns only `{ "type": "secret", "state": "redacted" }`
+or an unset marker; raw secret material is not part of the daemon protocol.
+
+CLI operators can inspect package configuration with:
+
+```sh
+botster-hub packages config --data-dir <path> <package>
+```
+
+They can update configuration with a JSON object whose values use the core
+configuration value shape:
+
+```sh
+botster-hub packages config set --data-dir <path> <package> '{"endpoint":{"type":"url","value":"https://example.invalid/hook"},"api_token":{"type":"secret","state":"write_only"}}'
+```
+
 The control-plane production route is:
 
 `botster_hub_client::DaemonConnection::request`
