@@ -137,6 +137,7 @@ fn plugin_manifest(name: &str, capabilities: Vec<Capability>) -> PackageManifest
             path: "plugin.lua".to_string(),
             bootstrap: false,
         }],
+        configuration: None,
         host_profile: None,
     }
 }
@@ -171,6 +172,7 @@ fn provider_manifest(name: &str, capabilities: Vec<Capability>) -> PackageManife
             required_capabilities: capabilities,
             policy_sections: vec![HostProfilePolicySection::Providers],
         }),
+        configuration: None,
     }
 }
 
