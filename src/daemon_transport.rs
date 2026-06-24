@@ -26,29 +26,31 @@ use botster_core_daemon::{
 };
 use botster_hub_client::DaemonTransportError as ClientDaemonTransportError;
 pub use botster_hub_client::{
-    DaemonCapability, DaemonCompatibility, DaemonConnection as ClientDaemonConnection,
-    DaemonCoordination, DaemonDiagnostic, DaemonEndpoint, DaemonEnvelope, DaemonEnvelopeAck,
-    DaemonEnvelopeDelivery, DaemonEnvelopePublish, DaemonEvent, DaemonHello, DaemonHelloAck,
-    DaemonIdentity, DaemonNotify, DaemonOperatorError, DaemonPackage, DaemonPackageConfiguration,
+    DaemonAvailablePackage, DaemonCapability, DaemonCompatibility,
+    DaemonConnection as ClientDaemonConnection, DaemonCoordination, DaemonDiagnostic,
+    DaemonEndpoint, DaemonEnvelope, DaemonEnvelopeAck, DaemonEnvelopeDelivery,
+    DaemonEnvelopePublish, DaemonEvent, DaemonHello, DaemonHelloAck, DaemonIdentity, DaemonNotify,
+    DaemonOperatorError, DaemonPackage, DaemonPackageCompatibility, DaemonPackageConfiguration,
     DaemonPackageDecision, DaemonPackageDiagnostic, DaemonPackageEnvironmentRequirement,
-    DaemonPackageProcess, DaemonPackageRunnableEntrypoint, DaemonPackageSurfaceDescriptor,
-    DaemonPackageWorkingDirectory, DaemonPluginLifecycle, DaemonRequest, DaemonResponse,
-    DaemonResponseKind, DaemonSession, DaemonSessionCleanup, DaemonStatus,
-    FEATURE_PLUGIN_SURFACE_ACTION, FEATURE_PLUGIN_SURFACE_RENDER, PROTOCOL, read_frame,
-    read_frame_from_reader, write_frame,
+    DaemonPackageInstallEffect, DaemonPackageInstallPlan, DaemonPackagePin, DaemonPackageProcess,
+    DaemonPackageRunnableEntrypoint, DaemonPackageSurfaceDescriptor, DaemonPackageWorkingDirectory,
+    DaemonPluginLifecycle, DaemonRequest, DaemonResponse, DaemonResponseKind, DaemonSession,
+    DaemonSessionCleanup, DaemonStatus, FEATURE_PLUGIN_SURFACE_ACTION,
+    FEATURE_PLUGIN_SURFACE_RENDER, PROTOCOL, read_frame, read_frame_from_reader, write_frame,
 };
 use serde_json::Value;
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
 
-use crate::{EntrypointProcessSnapshot, EntrypointSupervisorError};
 use crate::{
-    FileHubStateStore, HubClientApi, HubClientEvent, HubClientPackage,
-    HubClientPackageClassification, HubClientPluginLifecycle, HubClientRequest,
+    AvailablePackage, AvailablePackageState, FileHubStateStore, HubClientApi, HubClientEvent,
+    HubClientPackage, HubClientPackageClassification, HubClientPluginLifecycle, HubClientRequest,
     HubClientResponseBody, HubClientSession, HubConfig, HubDaemon, HubDaemonStatus,
     HubStateLoadSource, HubStateStore, McpToolDescriptor, PackageAction, PackageAdmissionReason,
-    PackageDecision, PackageRegistry, PackageRegistryError,
+    PackageCompatibilityResult, PackageDecision, PackageInstallPlan, PackagePin, PackageRegistry,
+    PackageRegistryEntrySourceKind, PackageRegistryError, PackageUpdatePolicy,
 };
+use crate::{EntrypointProcessSnapshot, EntrypointSupervisorError};
 
 const MESSAGE_CONTENT_TYPE: &str = "application/vnd.botster.coordination.message+text";
 
@@ -269,6 +271,39 @@ fn handle_control_request(
 ) -> DaemonTransportResult<DaemonResponse> {
     match request {
         DaemonRequest::ListPackages => list_packages_response(daemon),
+        DaemonRequest::ListAvailablePackages { registry_path } => {
+            available_packages_response(daemon, registry_path)
+        }
+        DaemonRequest::InspectAvailablePackage {
+            registry_path,
+            entry_id,
+        } => inspect_available_package_response(daemon, registry_path, &entry_id),
+        DaemonRequest::PreviewPackageInstall {
+            registry_path,
+            entry_id,
+        } => preview_package_install_response(daemon, registry_path, &entry_id),
+        DaemonRequest::InstallPackageRegistryEntry {
+            registry_path,
+            entry_id,
+        } => {
+            let decision = {
+                let record = daemon.package_registry_mut().install_registry_entry(
+                    registry_path,
+                    &entry_id,
+                    "daemon socket install registry package",
+                )?;
+                PackageDecision {
+                    package_name: record.manifest.name.clone(),
+                    action: PackageAction::Install,
+                    state: record.state,
+                    classification: record.classification,
+                    admitted_host_profile: None,
+                    audit_reason: record.last_audit_reason.clone(),
+                }
+            };
+            persist_package_registry(daemon)?;
+            package_decision_response(daemon, decision)
+        }
         DaemonRequest::PluginLifecycleStatus => plugin_lifecycle_response(daemon),
         DaemonRequest::InstallPackageLocalPath { path } => {
             let decision = {
@@ -814,6 +849,8 @@ fn handle_runtime_control_request(
             )),
             sessions: Vec::new(),
             packages: Vec::new(),
+            available_packages: Vec::new(),
+            install_plan: None,
             package_decision: None,
             lifecycle: Vec::new(),
             plugin_tools: Vec::new(),
@@ -827,6 +864,10 @@ fn handle_runtime_control_request(
             diagnostics: vec![DaemonDiagnostic::connected("shutdown")],
         }),
         DaemonRequest::ListPackages
+        | DaemonRequest::ListAvailablePackages { .. }
+        | DaemonRequest::InspectAvailablePackage { .. }
+        | DaemonRequest::PreviewPackageInstall { .. }
+        | DaemonRequest::InstallPackageRegistryEntry { .. }
         | DaemonRequest::InstallPackageLocalPath { .. }
         | DaemonRequest::ShowPackage { .. }
         | DaemonRequest::SetPackageConfiguration { .. }
@@ -896,6 +937,38 @@ fn list_packages_response(daemon: &mut HubDaemon) -> DaemonTransportResult<Daemo
     let snapshots = daemon.entrypoint_supervisor().snapshots();
     apply_entrypoint_snapshots(&mut packages, snapshots);
     Ok(daemon_packages(packages))
+}
+
+fn available_packages_response(
+    daemon: &mut HubDaemon,
+    registry_path: PathBuf,
+) -> DaemonTransportResult<DaemonResponse> {
+    let available = daemon
+        .package_registry()
+        .available_packages(registry_path)?;
+    Ok(daemon_available_packages(available))
+}
+
+fn inspect_available_package_response(
+    daemon: &mut HubDaemon,
+    registry_path: PathBuf,
+    entry_id: &str,
+) -> DaemonTransportResult<DaemonResponse> {
+    let available = daemon
+        .package_registry()
+        .inspect_available_package(registry_path, entry_id)?;
+    Ok(daemon_available_packages(vec![available]))
+}
+
+fn preview_package_install_response(
+    daemon: &mut HubDaemon,
+    registry_path: PathBuf,
+    entry_id: &str,
+) -> DaemonTransportResult<DaemonResponse> {
+    let plan = daemon
+        .package_registry()
+        .preview_registry_install(registry_path, entry_id)?;
+    Ok(daemon_package_install_plan(plan))
 }
 
 fn show_package_response(
@@ -1163,6 +1236,8 @@ fn daemon_response_base(kind: DaemonResponseKind) -> DaemonResponse {
         status: None,
         sessions: Vec::new(),
         packages: Vec::new(),
+        available_packages: Vec::new(),
+        install_plan: None,
         package_decision: None,
         lifecycle: Vec::new(),
         plugin_tools: Vec::new(),
@@ -1212,6 +1287,41 @@ fn daemon_packages(packages: Vec<HubClientPackage>) -> DaemonResponse {
         .into_iter()
         .map(daemon_package_from_client)
         .collect();
+    response
+}
+
+fn daemon_available_packages(packages: Vec<AvailablePackage>) -> DaemonResponse {
+    let mut response = daemon_response_base(DaemonResponseKind::AvailablePackages);
+    response.available_packages = packages
+        .into_iter()
+        .map(daemon_available_package_from_policy)
+        .collect();
+    response
+}
+
+fn daemon_package_install_plan(plan: PackageInstallPlan) -> DaemonResponse {
+    let mut response = daemon_response_base(DaemonResponseKind::PackageInstallPlan);
+    response.install_plan = Some(DaemonPackageInstallPlan {
+        entry: daemon_available_package_from_policy(plan.entry),
+        effects: plan
+            .effects
+            .into_iter()
+            .map(|effect| DaemonPackageInstallEffect {
+                kind: effect.kind,
+                message: effect.message,
+            })
+            .collect(),
+        diagnostics: plan
+            .diagnostics
+            .into_iter()
+            .map(|diagnostic| DaemonPackageDiagnostic {
+                kind: diagnostic.kind,
+                message: diagnostic.message,
+            })
+            .collect(),
+        mutates_registry: plan.mutates_registry,
+        starts_entrypoints: plan.starts_entrypoints,
+    });
     response
 }
 
@@ -1581,6 +1691,45 @@ fn daemon_package_from_client(package: HubClientPackage) -> DaemonPackage {
                 .collect(),
         },
         provider_profile_admitted: package.provider_profile_admitted,
+    }
+}
+
+fn daemon_available_package_from_policy(package: AvailablePackage) -> DaemonAvailablePackage {
+    DaemonAvailablePackage {
+        entry_id: package.entry_id,
+        package_name: package.package_name,
+        version: package.version,
+        classification: package_classification_label(package.classification.into()).to_string(),
+        source_kind: registry_source_kind_label(package.source_kind).to_string(),
+        source_label: package.source_label,
+        first_party: package.first_party,
+        state: available_package_state_label(package.state).to_string(),
+        requested_capabilities: package
+            .requested_capabilities
+            .into_iter()
+            .map(|capability| DaemonCapability {
+                surface: format!("{:?}", capability.surface),
+                scope: capability.scope,
+            })
+            .collect(),
+        compatibility: DaemonPackageCompatibility {
+            botster_requirement: package.compatibility.botster_requirement,
+            hub_version: package.compatibility.hub_version,
+            result: package_compatibility_label(package.compatibility.result).to_string(),
+            diagnostics: package.compatibility.diagnostics,
+        },
+        pin: package.pin.map(daemon_package_pin_from_policy),
+    }
+}
+
+fn daemon_package_pin_from_policy(pin: PackagePin) -> DaemonPackagePin {
+    DaemonPackagePin {
+        revision: pin.revision,
+        branch: pin.branch,
+        tag: pin.tag,
+        rev: pin.rev,
+        checksum: pin.checksum,
+        update_policy: package_update_policy_label(pin.update_policy).to_string(),
     }
 }
 
@@ -1994,6 +2143,37 @@ fn package_state_label(state: crate::HubClientPackageState) -> &'static str {
         crate::HubClientPackageState::Installed => "installed",
         crate::HubClientPackageState::Enabled => "enabled",
         crate::HubClientPackageState::Disabled => "disabled",
+    }
+}
+
+fn available_package_state_label(state: AvailablePackageState) -> &'static str {
+    match state {
+        AvailablePackageState::Available => "available",
+        AvailablePackageState::Installed => "installed",
+        AvailablePackageState::Enabled => "enabled",
+        AvailablePackageState::Disabled => "disabled",
+    }
+}
+
+fn registry_source_kind_label(kind: PackageRegistryEntrySourceKind) -> &'static str {
+    match kind {
+        PackageRegistryEntrySourceKind::LocalPath => "local_path",
+        PackageRegistryEntrySourceKind::Git => "git",
+    }
+}
+
+fn package_compatibility_label(result: PackageCompatibilityResult) -> &'static str {
+    match result {
+        PackageCompatibilityResult::Compatible => "compatible",
+        PackageCompatibilityResult::Incompatible => "incompatible",
+        PackageCompatibilityResult::InvalidRequirement => "invalid_requirement",
+    }
+}
+
+fn package_update_policy_label(policy: PackageUpdatePolicy) -> &'static str {
+    match policy {
+        PackageUpdatePolicy::Manual => "manual",
+        PackageUpdatePolicy::TrackSource => "track_source",
     }
 }
 

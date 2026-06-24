@@ -21,6 +21,8 @@ use crate::host_profile;
 
 /// Conventional manifest filename used when installing a local package directory.
 pub const LOCAL_PACKAGE_MANIFEST_FILE: &str = "botster-package.json";
+/// Conventional local marketplace registry filename.
+pub const LOCAL_PACKAGE_REGISTRY_FILE: &str = "botster-registry.json";
 
 /// Hub-owned package admission policy backed by the first-party host profile.
 #[derive(Debug, Clone)]
@@ -96,6 +98,16 @@ pub struct PackageRegistry {
     governed_surfaces: Vec<CapabilitySurface>,
 }
 
+struct PackageInstallOptions {
+    manifest: PackageManifest,
+    provenance: PackageProvenance,
+    trust: PackageTrust,
+    runnable_entrypoints: Vec<PackageRunnableEntrypoint>,
+    source_metadata: Option<PackageSourceMetadata>,
+    pin: Option<PackagePin>,
+    audit_reason: String,
+}
+
 impl PackageRegistry {
     /// Build a registry with a hub-owned grant set.
     #[must_use]
@@ -141,7 +153,30 @@ impl PackageRegistry {
         runnable_entrypoints: Vec<PackageRunnableEntrypoint>,
         audit_reason: impl Into<String>,
     ) -> PackageRegistryResult<&PackageRecord> {
-        let audit_reason = audit_reason.into();
+        self.install_with_options(PackageInstallOptions {
+            manifest,
+            provenance,
+            trust,
+            runnable_entrypoints,
+            source_metadata: None,
+            pin: None,
+            audit_reason: audit_reason.into(),
+        })
+    }
+
+    fn install_with_options(
+        &mut self,
+        options: PackageInstallOptions,
+    ) -> PackageRegistryResult<&PackageRecord> {
+        let PackageInstallOptions {
+            manifest,
+            provenance,
+            trust,
+            runnable_entrypoints,
+            source_metadata,
+            pin,
+            audit_reason,
+        } = options;
         let package_name = manifest.name.clone();
 
         if self.records.contains_key(&package_name) {
@@ -188,7 +223,8 @@ impl PackageRegistry {
             classification,
             trust,
             provenance,
-            pin: None,
+            source_metadata,
+            pin,
             update_policy: PackageUpdatePolicy::Manual,
             admitted_capabilities: Vec::new(),
             compatibility,
@@ -239,6 +275,72 @@ impl PackageRegistry {
             local_manifest.runnable_entrypoints,
             audit_reason,
         )
+    }
+
+    /// List packages from a hub-owned local/static marketplace registry.
+    pub fn available_packages(
+        &self,
+        registry_path: impl AsRef<Path>,
+    ) -> PackageRegistryResult<Vec<AvailablePackage>> {
+        let catalog = LocalRegistryCatalog::load(registry_path.as_ref())?;
+        catalog
+            .entries
+            .iter()
+            .map(|entry| self.available_package(&catalog, entry))
+            .collect()
+    }
+
+    /// Inspect one package entry from a hub-owned local/static marketplace registry.
+    pub fn inspect_available_package(
+        &self,
+        registry_path: impl AsRef<Path>,
+        entry_id: &str,
+    ) -> PackageRegistryResult<AvailablePackage> {
+        let catalog = LocalRegistryCatalog::load(registry_path.as_ref())?;
+        let entry = catalog.entry(entry_id)?;
+        self.available_package(&catalog, entry)
+    }
+
+    /// Preview an explicit package install from a registry entry without mutating state.
+    pub fn preview_registry_install(
+        &self,
+        registry_path: impl AsRef<Path>,
+        entry_id: &str,
+    ) -> PackageRegistryResult<PackageInstallPlan> {
+        let catalog = LocalRegistryCatalog::load(registry_path.as_ref())?;
+        let entry = catalog.entry(entry_id)?;
+        let prepared = PreparedRegistryEntry::from_catalog_entry(&catalog, entry)?;
+        Ok(self.install_plan(&catalog, entry, &prepared))
+    }
+
+    /// Explicitly install a package from a local/static registry entry.
+    ///
+    /// Git-shaped entries persist source and pin metadata only; this path never
+    /// fetches or clones remote content and never enables or starts entrypoints.
+    pub fn install_registry_entry(
+        &mut self,
+        registry_path: impl AsRef<Path>,
+        entry_id: &str,
+        audit_reason: impl Into<String>,
+    ) -> PackageRegistryResult<&PackageRecord> {
+        let catalog = LocalRegistryCatalog::load(registry_path.as_ref())?;
+        let entry = catalog.entry(entry_id)?;
+        let prepared = PreparedRegistryEntry::from_catalog_entry(&catalog, entry)?;
+        let source_metadata = PackageSourceMetadata::from_catalog_entry(&catalog, entry);
+        let trust = if entry.first_party {
+            PackageTrust::first_party()
+        } else {
+            PackageTrust::third_party()
+        };
+        self.install_with_options(PackageInstallOptions {
+            manifest: prepared.manifest,
+            provenance: prepared.provenance,
+            trust,
+            runnable_entrypoints: prepared.runnable_entrypoints,
+            source_metadata: Some(source_metadata),
+            pin: prepared.pin,
+            audit_reason: audit_reason.into(),
+        })
     }
 
     /// Enable an installed package when every requested capability is granted.
@@ -663,7 +765,11 @@ pub struct PackageRecord {
     pub trust: PackageTrust,
     /// Hub-owned provenance placeholder.
     pub provenance: PackageProvenance,
+    /// Sanitized hub-owned source metadata for registry-installed packages.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_metadata: Option<PackageSourceMetadata>,
     /// Optional hub-owned pin metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pin: Option<PackagePin>,
     /// Hub-owned update policy placeholder.
     pub update_policy: PackageUpdatePolicy,
@@ -1091,10 +1197,122 @@ pub struct PackageProvenance {
 pub struct PackagePin {
     /// Revision, tag, or version pinned by policy.
     pub revision: String,
+    /// Branch pin supplied by a git-shaped registry entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    /// Tag pin supplied by a git-shaped registry entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tag: Option<String>,
+    /// Commit/revision pin supplied by a git-shaped registry entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rev: Option<String>,
     /// Optional checksum paired with the pin.
     pub checksum: Option<String>,
     /// Update behavior while the package is pinned.
     pub update_policy: PackageUpdatePolicy,
+}
+
+/// Sanitized hub-owned metadata recording which registry entry installed a package.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PackageSourceMetadata {
+    /// Registry source identifier.
+    pub registry_id: String,
+    /// Registry source kind.
+    pub registry_kind: PackageRegistrySourceKind,
+    /// Registry entry identifier.
+    pub entry_id: String,
+    /// Package source kind.
+    pub source_kind: PackageRegistryEntrySourceKind,
+    /// Path-neutral source label for clients and audit displays.
+    pub source_label: String,
+    /// Git repo URL for git-shaped entries. Local path entries omit this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_repo: Option<String>,
+}
+
+impl PackageSourceMetadata {
+    fn from_catalog_entry(catalog: &LocalRegistryCatalog, entry: &PackageRegistryEntry) -> Self {
+        Self {
+            registry_id: catalog.source.id.clone(),
+            registry_kind: catalog.source.kind,
+            entry_id: entry.id.clone(),
+            source_kind: entry.source.kind(),
+            source_label: entry.source.label(&entry.id),
+            git_repo: match &entry.source {
+                PackageRegistryEntrySource::Git { repo, .. } => Some(repo.clone()),
+                PackageRegistryEntrySource::LocalPath { .. } => None,
+            },
+        }
+    }
+}
+
+/// Hub-owned marketplace registry source.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PackageRegistrySource {
+    /// Stable source id.
+    pub id: String,
+    /// Local/static registry source kind.
+    pub kind: PackageRegistrySourceKind,
+    /// Operator-facing label.
+    #[serde(default)]
+    pub label: String,
+}
+
+/// Supported hub marketplace registry source kinds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PackageRegistrySourceKind {
+    LocalPath,
+    StaticFirstParty,
+}
+
+/// Available package row from a local/static registry catalog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AvailablePackage {
+    pub entry_id: String,
+    pub package_name: String,
+    pub version: String,
+    pub classification: PackageClassification,
+    pub source_kind: PackageRegistryEntrySourceKind,
+    pub source_label: String,
+    pub first_party: bool,
+    pub requested_capabilities: Vec<Capability>,
+    pub compatibility: PackageCompatibility,
+    pub state: AvailablePackageState,
+    pub pin: Option<PackagePin>,
+}
+
+/// Installed-vs-available state for a catalog entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AvailablePackageState {
+    Available,
+    Installed,
+    Enabled,
+    Disabled,
+}
+
+/// Install preview returned before an explicit registry install.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackageInstallPlan {
+    pub entry: AvailablePackage,
+    pub effects: Vec<PackageInstallEffect>,
+    pub diagnostics: Vec<PackageInstallDiagnostic>,
+    pub mutates_registry: bool,
+    pub starts_entrypoints: bool,
+}
+
+/// Preview effect row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackageInstallEffect {
+    pub kind: String,
+    pub message: String,
+}
+
+/// Preview diagnostic row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackageInstallDiagnostic {
+    pub kind: String,
+    pub message: String,
 }
 
 /// Hub-owned update policy placeholder.
@@ -1542,6 +1760,408 @@ fn admit_enabled_host_profile(
                 .map_err(PackageAdmissionReason::HostProfileAdmission)
         }
     }
+}
+
+impl PackageRegistry {
+    fn available_package(
+        &self,
+        catalog: &LocalRegistryCatalog,
+        entry: &PackageRegistryEntry,
+    ) -> PackageRegistryResult<AvailablePackage> {
+        let prepared = PreparedRegistryEntry::from_catalog_entry(catalog, entry)?;
+        Ok(AvailablePackage {
+            entry_id: entry.id.clone(),
+            package_name: prepared.manifest.name.clone(),
+            version: prepared.manifest.version.clone(),
+            classification: PackageClassification::from_kind(&prepared.manifest.kind),
+            source_kind: entry.source.kind(),
+            source_label: entry.source.label(&entry.id),
+            first_party: entry.first_party,
+            requested_capabilities: prepared.manifest.capabilities.clone(),
+            compatibility: PackageCompatibility::for_manifest(&prepared.manifest),
+            state: self.available_state(&prepared.manifest.name),
+            pin: prepared.pin,
+        })
+    }
+
+    fn install_plan(
+        &self,
+        catalog: &LocalRegistryCatalog,
+        entry: &PackageRegistryEntry,
+        prepared: &PreparedRegistryEntry,
+    ) -> PackageInstallPlan {
+        let available = AvailablePackage {
+            entry_id: entry.id.clone(),
+            package_name: prepared.manifest.name.clone(),
+            version: prepared.manifest.version.clone(),
+            classification: PackageClassification::from_kind(&prepared.manifest.kind),
+            source_kind: entry.source.kind(),
+            source_label: entry.source.label(&entry.id),
+            first_party: entry.first_party,
+            requested_capabilities: prepared.manifest.capabilities.clone(),
+            compatibility: PackageCompatibility::for_manifest(&prepared.manifest),
+            state: self.available_state(&prepared.manifest.name),
+            pin: prepared.pin.clone(),
+        };
+        let mut effects = Vec::new();
+        let mut diagnostics = Vec::new();
+
+        if matches!(available.state, AvailablePackageState::Available) {
+            effects.push(PackageInstallEffect {
+                kind: "add_package_record".to_string(),
+                message: format!(
+                    "would add {} from {}",
+                    available.package_name, catalog.source.id
+                ),
+            });
+        } else {
+            effects.push(PackageInstallEffect {
+                kind: "already_installed".to_string(),
+                message: format!(
+                    "{} is already {}",
+                    available.package_name,
+                    available_state_label(available.state)
+                ),
+            });
+        }
+
+        effects.push(PackageInstallEffect {
+            kind: "record_source_metadata".to_string(),
+            message: "would persist registry source metadata and pin details".to_string(),
+        });
+        effects.push(PackageInstallEffect {
+            kind: "explicit_enable_required".to_string(),
+            message: "would remain installed until explicitly enabled".to_string(),
+        });
+        effects.push(PackageInstallEffect {
+            kind: "no_entrypoint_start".to_string(),
+            message: "would not start package entrypoints".to_string(),
+        });
+        if matches!(entry.source, PackageRegistryEntrySource::Git { .. }) {
+            effects.push(PackageInstallEffect {
+                kind: "no_network_fetch".to_string(),
+                message: "would record git metadata without clone or fetch".to_string(),
+            });
+        }
+
+        if !available.compatibility.is_compatible() {
+            diagnostics.extend(available.compatibility.diagnostics.iter().map(|message| {
+                PackageInstallDiagnostic {
+                    kind: "botster_compatibility".to_string(),
+                    message: message.clone(),
+                }
+            }));
+        }
+        for capability in &prepared.manifest.capabilities {
+            if !self.granted_capabilities.contains(capability) {
+                diagnostics.push(PackageInstallDiagnostic {
+                    kind: "ungranted_capability".to_string(),
+                    message: format!(
+                        "capability {} is not granted by the current hub profile",
+                        capability_label(capability)
+                    ),
+                });
+            }
+        }
+
+        PackageInstallPlan {
+            entry: available,
+            effects,
+            diagnostics,
+            mutates_registry: false,
+            starts_entrypoints: false,
+        }
+    }
+
+    fn available_state(&self, package_name: &str) -> AvailablePackageState {
+        match self.records.get(package_name).map(|record| record.state) {
+            Some(PackageState::Installed) => AvailablePackageState::Installed,
+            Some(PackageState::Enabled) => AvailablePackageState::Enabled,
+            Some(PackageState::Disabled) => AvailablePackageState::Disabled,
+            None => AvailablePackageState::Available,
+        }
+    }
+}
+
+fn available_state_label(state: AvailablePackageState) -> &'static str {
+    match state {
+        AvailablePackageState::Available => "available",
+        AvailablePackageState::Installed => "installed",
+        AvailablePackageState::Enabled => "enabled",
+        AvailablePackageState::Disabled => "disabled",
+    }
+}
+
+fn capability_label(capability: &Capability) -> String {
+    match &capability.scope {
+        Some(scope) => format!("{:?}:{scope}", capability.surface),
+        None => format!("{:?}", capability.surface),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct LocalRegistryCatalogFile {
+    source: PackageRegistrySource,
+    #[serde(default)]
+    entries: Vec<PackageRegistryEntry>,
+}
+
+#[derive(Debug)]
+struct LocalRegistryCatalog {
+    source: PackageRegistrySource,
+    entries: Vec<PackageRegistryEntry>,
+    root: PathBuf,
+}
+
+impl LocalRegistryCatalog {
+    fn load(path: &Path) -> PackageRegistryResult<Self> {
+        let source = if path.is_dir() {
+            path.join(LOCAL_PACKAGE_REGISTRY_FILE)
+        } else {
+            path.to_path_buf()
+        };
+        let canonical = source.canonicalize().map_err(|error| {
+            PackageRegistryError::without_record(
+                "<registry>",
+                PackageAction::Show,
+                PackageAdmissionReason::InvalidLocalManifest(error.to_string()),
+                "load package registry".to_string(),
+            )
+        })?;
+        let root = canonical.parent().map(Path::to_path_buf).ok_or_else(|| {
+            PackageRegistryError::without_record(
+                "<registry>",
+                PackageAction::Show,
+                PackageAdmissionReason::UnsafeLocalPath(
+                    "registry path has no parent directory".to_string(),
+                ),
+                "load package registry".to_string(),
+            )
+        })?;
+        let bytes = fs::read(&canonical).map_err(|error| {
+            PackageRegistryError::without_record(
+                "<registry>",
+                PackageAction::Show,
+                PackageAdmissionReason::InvalidLocalManifest(error.to_string()),
+                "load package registry".to_string(),
+            )
+        })?;
+        let catalog: LocalRegistryCatalogFile =
+            serde_json::from_slice(&bytes).map_err(|error| {
+                PackageRegistryError::without_record(
+                    "<registry>",
+                    PackageAction::Show,
+                    PackageAdmissionReason::InvalidLocalManifest(error.to_string()),
+                    "load package registry".to_string(),
+                )
+            })?;
+        Ok(Self {
+            source: catalog.source,
+            entries: catalog.entries,
+            root,
+        })
+    }
+
+    fn entry(&self, entry_id: &str) -> PackageRegistryResult<&PackageRegistryEntry> {
+        self.entries
+            .iter()
+            .find(|entry| entry.id == entry_id)
+            .ok_or_else(|| {
+                PackageRegistryError::without_record(
+                    entry_id,
+                    PackageAction::Show,
+                    PackageAdmissionReason::PackageNotInstalled,
+                    "inspect registry package".to_string(),
+                )
+            })
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PackageRegistryEntry {
+    id: String,
+    #[serde(default)]
+    first_party: bool,
+    source: PackageRegistryEntrySource,
+    #[serde(default)]
+    manifest: Option<PackageManifest>,
+    #[serde(default)]
+    runnable_entrypoints: Vec<PackageRunnableEntrypoint>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum PackageRegistryEntrySource {
+    LocalPath {
+        path: String,
+    },
+    Git {
+        repo: String,
+        #[serde(default)]
+        branch: Option<String>,
+        #[serde(default)]
+        tag: Option<String>,
+        #[serde(default)]
+        rev: Option<String>,
+    },
+}
+
+impl PackageRegistryEntrySource {
+    fn kind(&self) -> PackageRegistryEntrySourceKind {
+        match self {
+            Self::LocalPath { .. } => PackageRegistryEntrySourceKind::LocalPath,
+            Self::Git { .. } => PackageRegistryEntrySourceKind::Git,
+        }
+    }
+
+    fn label(&self, entry_id: &str) -> String {
+        match self {
+            Self::LocalPath { .. } => format!("local:{entry_id}"),
+            Self::Git { repo, .. } => repo.clone(),
+        }
+    }
+}
+
+/// Package source kind for registry entries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PackageRegistryEntrySourceKind {
+    LocalPath,
+    Git,
+}
+
+#[derive(Debug, Clone)]
+struct PreparedRegistryEntry {
+    manifest: PackageManifest,
+    provenance: PackageProvenance,
+    runnable_entrypoints: Vec<PackageRunnableEntrypoint>,
+    pin: Option<PackagePin>,
+}
+
+impl PreparedRegistryEntry {
+    fn from_catalog_entry(
+        catalog: &LocalRegistryCatalog,
+        entry: &PackageRegistryEntry,
+    ) -> PackageRegistryResult<Self> {
+        match &entry.source {
+            PackageRegistryEntrySource::LocalPath { path } => {
+                let absolute = safe_registry_relative_path(&catalog.root, path)?;
+                let local_source = LocalPackageSource::resolve(
+                    &absolute,
+                    "load registry local package".to_string(),
+                )?;
+                let local_manifest =
+                    local_source.read_manifest("load registry local package".to_string())?;
+                let mut manifest = local_manifest.manifest;
+                local_source.validate_manifest_entrypoints(
+                    &manifest,
+                    "load registry local package".to_string(),
+                )?;
+                let runnable_entrypoints = if entry.runnable_entrypoints.is_empty() {
+                    local_manifest.runnable_entrypoints
+                } else {
+                    entry.runnable_entrypoints.clone()
+                };
+                validate_runnable_entrypoints(
+                    &manifest.name,
+                    &runnable_entrypoints,
+                    PackageAction::Install,
+                    "load registry local package".to_string(),
+                )?;
+                manifest.source = Some(PackageSource::Path {
+                    path: local_source.package_root.to_string_lossy().into_owned(),
+                });
+                Ok(Self {
+                    manifest,
+                    provenance: PackageProvenance {
+                        source: format!("registry:{}:{}", catalog.source.id, entry.id),
+                        checksum: None,
+                    },
+                    runnable_entrypoints,
+                    pin: None,
+                })
+            }
+            PackageRegistryEntrySource::Git {
+                repo,
+                branch,
+                tag,
+                rev,
+            } => {
+                let mut manifest = entry.manifest.clone().ok_or_else(|| {
+                    PackageRegistryError::without_record(
+                        &entry.id,
+                        PackageAction::Show,
+                        PackageAdmissionReason::InvalidLocalManifest(
+                            "git registry entry must include an inline manifest".to_string(),
+                        ),
+                        "load registry git package".to_string(),
+                    )
+                })?;
+                let revision = git_pin_revision(branch, tag, rev)?;
+                manifest.source = Some(PackageSource::Git {
+                    repo: repo.clone(),
+                    reference: revision.clone(),
+                });
+                Ok(Self {
+                    manifest,
+                    provenance: PackageProvenance {
+                        source: format!("registry:{}:{}", catalog.source.id, entry.id),
+                        checksum: None,
+                    },
+                    runnable_entrypoints: entry.runnable_entrypoints.clone(),
+                    pin: Some(PackagePin {
+                        revision,
+                        branch: branch.clone(),
+                        tag: tag.clone(),
+                        rev: rev.clone(),
+                        checksum: None,
+                        update_policy: PackageUpdatePolicy::Manual,
+                    }),
+                })
+            }
+        }
+    }
+}
+
+fn safe_registry_relative_path(root: &Path, value: &str) -> PackageRegistryResult<PathBuf> {
+    let relative = Path::new(value);
+    if relative.is_absolute()
+        || relative.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        return Err(PackageRegistryError::without_record(
+            value,
+            PackageAction::Show,
+            PackageAdmissionReason::UnsafeLocalPath(
+                "registry entry path must stay inside registry directory".to_string(),
+            ),
+            "load package registry".to_string(),
+        ));
+    }
+    Ok(root.join(relative))
+}
+
+fn git_pin_revision(
+    branch: &Option<String>,
+    tag: &Option<String>,
+    rev: &Option<String>,
+) -> PackageRegistryResult<String> {
+    rev.as_ref()
+        .or(tag.as_ref())
+        .or(branch.as_ref())
+        .cloned()
+        .ok_or_else(|| {
+            PackageRegistryError::without_record(
+                "<git-registry-entry>",
+                PackageAction::Pin,
+                PackageAdmissionReason::MissingPinRevision,
+                "load registry git package".to_string(),
+            )
+        })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1997,6 +2617,7 @@ mod tests {
             classification,
             trust: PackageTrust::third_party(),
             provenance: provenance(),
+            source_metadata: None,
             pin: None,
             update_policy: PackageUpdatePolicy::Manual,
             admitted_capabilities: Vec::new(),
@@ -2370,6 +2991,9 @@ mod tests {
                 "pin.plugin",
                 PackagePin {
                     revision: "v1.0.0".to_string(),
+                    branch: None,
+                    tag: None,
+                    rev: None,
                     checksum: Some("sha256:pinned".to_string()),
                     update_policy: PackageUpdatePolicy::TrackSource,
                 },
@@ -2405,6 +3029,9 @@ mod tests {
                 "first-party.plugin",
                 PackagePin {
                     revision: "8f2f4ac".to_string(),
+                    branch: None,
+                    tag: None,
+                    rev: Some("8f2f4ac".to_string()),
                     checksum: Some("sha256:first-party-pin".to_string()),
                     update_policy: PackageUpdatePolicy::Manual,
                 },
@@ -2657,6 +3284,169 @@ mod tests {
     }
 
     #[test]
+    fn local_registry_lists_previews_and_installs_path_entry_without_path_leak_in_available_row() {
+        let root = test_root("local-registry-path-entry");
+        let package_root = root.join("packages").join("local");
+        fs::create_dir_all(&package_root).expect("create package root");
+        fs::write(package_root.join("plugin.lua"), "return {}\n").expect("write plugin");
+        write_manifest(
+            &package_root,
+            &local_manifest("catalog.local", "plugin.lua"),
+        );
+        fs::write(
+            root.join(LOCAL_PACKAGE_REGISTRY_FILE),
+            r#"{
+  "source": { "id": "first-party-fixture", "kind": "local_path", "label": "Fixture" },
+  "entries": [
+    {
+      "id": "catalog-local",
+      "first_party": true,
+      "source": { "type": "local_path", "path": "packages/local" }
+    }
+  ]
+}
+"#,
+        )
+        .expect("write registry");
+
+        let mut registry =
+            PackageRegistry::new(grants(vec![capability(CapabilitySurface::Surfaces, None)]));
+        let available = registry
+            .available_packages(&root)
+            .expect("list available packages");
+        assert_eq!(available.len(), 1);
+        assert_eq!(available[0].entry_id, "catalog-local");
+        assert_eq!(available[0].package_name, "catalog.local");
+        assert_eq!(available[0].source_label, "local:catalog-local");
+        assert!(
+            !available[0]
+                .source_label
+                .contains(root.to_str().expect("utf8 root"))
+        );
+        assert_eq!(available[0].state, AvailablePackageState::Available);
+
+        let plan = registry
+            .preview_registry_install(&root, "catalog-local")
+            .expect("preview registry install");
+        assert!(!plan.mutates_registry);
+        assert!(!plan.starts_entrypoints);
+        assert!(registry.package("catalog.local").is_none());
+
+        let record = registry
+            .install_registry_entry(&root, "catalog-local", "install fixture entry")
+            .expect("install registry entry");
+        assert_eq!(record.state, PackageState::Installed);
+        assert_eq!(record.trust, PackageTrust::first_party());
+        assert_eq!(
+            record
+                .source_metadata
+                .as_ref()
+                .expect("source metadata")
+                .entry_id,
+            "catalog-local"
+        );
+        assert_eq!(
+            registry
+                .inspect_available_package(&root, "catalog-local")
+                .expect("inspect after install")
+                .state,
+            AvailablePackageState::Installed
+        );
+    }
+
+    #[test]
+    fn git_shaped_registry_entry_persists_pin_and_source_metadata_without_network() {
+        let root = test_root("git-shaped-registry-entry");
+        fs::write(
+            root.join(LOCAL_PACKAGE_REGISTRY_FILE),
+            r#"{
+  "source": { "id": "static-first-party", "kind": "static_first_party", "label": "Fixture" },
+  "entries": [
+    {
+      "id": "catalog-git",
+      "first_party": true,
+      "source": {
+        "type": "git",
+        "repo": "https://example.invalid/botster/catalog-git.git",
+        "branch": "main",
+        "tag": "v1.2.3",
+        "rev": "abc123"
+      },
+      "manifest": {
+        "name": "catalog.git",
+        "version": "1.2.3",
+        "kind": "plugin",
+        "botster": ">=0.1.0",
+        "capabilities": [
+          { "surface": "surfaces" }
+        ],
+        "entrypoints": [
+          { "runtime": "lua", "path": "plugin.lua", "bootstrap": false }
+        ]
+      }
+    }
+  ]
+}
+"#,
+        )
+        .expect("write registry");
+
+        let mut registry =
+            PackageRegistry::new(grants(vec![capability(CapabilitySurface::Surfaces, None)]));
+        let available = registry
+            .inspect_available_package(&root, "catalog-git")
+            .expect("inspect git registry entry");
+        assert_eq!(available.source_kind, PackageRegistryEntrySourceKind::Git);
+        assert_eq!(
+            available.pin.as_ref().expect("pin").rev.as_deref(),
+            Some("abc123")
+        );
+
+        let plan = registry
+            .preview_registry_install(&root, "catalog-git")
+            .expect("preview git install");
+        assert!(
+            plan.effects
+                .iter()
+                .any(|effect| effect.kind == "no_network_fetch")
+        );
+        let record = registry
+            .install_registry_entry(&root, "catalog-git", "install git-shaped entry")
+            .expect("install git-shaped entry");
+        assert_eq!(record.state, PackageState::Installed);
+        assert_eq!(record.pin.as_ref().expect("record pin").revision, "abc123");
+        assert_eq!(
+            record
+                .source_metadata
+                .as_ref()
+                .expect("source metadata")
+                .git_repo
+                .as_deref(),
+            Some("https://example.invalid/botster/catalog-git.git")
+        );
+
+        let restored = PackageRegistry::from_snapshot(registry.snapshot()).expect("restore");
+        let restored_record = restored.package("catalog.git").expect("restored package");
+        assert_eq!(
+            restored_record
+                .source_metadata
+                .as_ref()
+                .expect("restored source metadata")
+                .entry_id,
+            "catalog-git"
+        );
+        assert_eq!(
+            restored_record
+                .pin
+                .as_ref()
+                .expect("restored pin")
+                .branch
+                .as_deref(),
+            Some("main")
+        );
+    }
+
+    #[test]
     fn local_manifest_installs_runnable_entrypoint_contract() {
         let root = test_root("runnable-entrypoint-contract");
         fs::create_dir_all(root.join("web")).expect("create web directory");
@@ -2851,6 +3641,9 @@ mod tests {
                 "durable.plugin",
                 PackagePin {
                     revision: "local-dev".to_string(),
+                    branch: None,
+                    tag: None,
+                    rev: None,
                     checksum: Some("sha256:local-dev".to_string()),
                     update_policy: PackageUpdatePolicy::TrackSource,
                 },
