@@ -6,9 +6,10 @@ use std::{fs, thread};
 
 use botster_core::{
     Capability, CapabilitySurface, ExtensionEntrypoint, ExtensionKind, ExtensionRuntime, ModeFlags,
-    PackageConfigurationField, PackageConfigurationFieldType, PackageConfigurationSchema,
-    PackageConfigurationSecretValue, PackageConfigurationValue, RequestId, SessionId,
-    SessionLifecycleState, SubscriptionId,
+    PackageBlockedReason, PackageConfigurationField, PackageConfigurationFieldType,
+    PackageConfigurationSchema, PackageConfigurationSecretValue, PackageConfigurationValue,
+    PackageDependency, PackageDependencyKind, PackageFeatureGate, PackageRequirement, RequestId,
+    SessionId, SessionLifecycleState, SubscriptionId,
 };
 use botster_core_daemon::{GuardedWriteDecision, GuardedWriteDeliveryState, ReadinessEvidence};
 use botster_hub::{
@@ -90,6 +91,8 @@ fn plugin_manifest(name: &str, capabilities: Vec<Capability>) -> botster_core::P
             path: "plugin.lua".to_string(),
             bootstrap: false,
         }],
+        dependencies: Vec::new(),
+        features: Vec::new(),
         configuration: None,
         host_profile: None,
         surfaces: Vec::new(),
@@ -139,6 +142,63 @@ fn configurable_plugin_manifest(
             },
         ],
     });
+    manifest
+}
+
+fn project_pipelines_manifest_with_github_feature() -> botster_core::PackageManifest {
+    let mut manifest = plugin_manifest(
+        "project-pipelines",
+        vec![capability(CapabilitySurface::Surfaces, None)],
+    );
+    manifest.dependencies = vec![PackageDependency {
+        id: "github-provider".to_string(),
+        package: "github-provider".to_string(),
+        kind: PackageDependencyKind::Optional,
+        feature: Some("github_pr_lifecycle".to_string()),
+        requirements: vec![PackageRequirement::Provider {
+            provider: "github-provider".to_string(),
+        }],
+    }];
+    manifest.features = vec![
+        PackageFeatureGate {
+            id: "local_pipelines".to_string(),
+            label: "Local pipelines".to_string(),
+            description: None,
+            dependencies: Vec::new(),
+            requirements: Vec::new(),
+        },
+        PackageFeatureGate {
+            id: "github_pr_lifecycle".to_string(),
+            label: "GitHub PR lifecycle".to_string(),
+            description: None,
+            dependencies: vec!["github-provider".to_string()],
+            requirements: vec![
+                PackageRequirement::Config {
+                    key: "endpoint".to_string(),
+                },
+                PackageRequirement::Auth {
+                    key: "api_token".to_string(),
+                },
+            ],
+        },
+    ];
+    manifest
+}
+
+fn capability_gated_plugin_manifest() -> botster_core::PackageManifest {
+    let mut manifest = plugin_manifest(
+        "capability-gated.plugin",
+        vec![capability(CapabilitySurface::Surfaces, None)],
+    );
+    manifest.features = vec![PackageFeatureGate {
+        id: "localhost_preview".to_string(),
+        label: "Localhost preview".to_string(),
+        description: None,
+        dependencies: Vec::new(),
+        requirements: vec![PackageRequirement::Capability {
+            capability: capability(CapabilitySurface::Network, Some("localhost")),
+        }],
+    }];
     manifest
 }
 
@@ -204,6 +264,282 @@ fn package_configuration_client_package_rows_are_sanitized() {
         .expect("serialize effective values");
     assert!(!row_json.contains("write_only"));
     assert!(!row_json.contains("super-secret-token"));
+}
+
+#[test]
+fn package_availability_projects_core_resolution_matrix_to_client_rows() {
+    let api = HubClientApi::local_operator("package-availability-client");
+    let surfaces = capability(CapabilitySurface::Surfaces, None);
+    let mut packages = PackageRegistry::new(vec![surfaces.clone()].into_iter().collect());
+    packages
+        .install(
+            project_pipelines_manifest_with_github_feature(),
+            provenance(),
+            "install project pipelines",
+        )
+        .expect("install project pipelines");
+    packages
+        .enable("project-pipelines", "enable project pipelines")
+        .expect("enable project pipelines");
+    let mut runtime = explicit_runtime("package-availability-client");
+
+    let response = api
+        .handle_request(
+            &mut runtime,
+            &packages,
+            HubClientRequest::ListPackages {
+                request_id: request_id("list-package-availability"),
+            },
+        )
+        .expect("list packages");
+    let HubClientResponseBody::Packages(rows) = response.body else {
+        panic!("packages response expected");
+    };
+    let row = rows
+        .into_iter()
+        .find(|row| row.package_name == "project-pipelines")
+        .expect("project pipelines package row");
+
+    assert_eq!(
+        row.availability.state,
+        botster_hub::HubClientPackageAvailabilityState::Available
+    );
+    assert!(row.availability.reasons.is_empty());
+
+    let local_feature = row
+        .feature_availability
+        .iter()
+        .find(|feature| feature.id == "local_pipelines")
+        .expect("local feature row");
+    assert_eq!(
+        local_feature.state,
+        botster_hub::HubClientPackageAvailabilityState::Available
+    );
+
+    let github_feature = row
+        .feature_availability
+        .iter()
+        .find(|feature| feature.id == "github_pr_lifecycle")
+        .expect("github feature row");
+    assert_eq!(
+        github_feature.state,
+        botster_hub::HubClientPackageAvailabilityState::Blocked
+    );
+    assert!(github_feature.reasons.iter().any(|reason| {
+        reason.reason == "missing_package"
+            && reason.action == "install_package"
+            && reason.package_name.as_deref() == Some("github-provider")
+    }));
+    assert!(github_feature.reasons.iter().any(|reason| {
+        reason.reason == "missing_auth"
+            && reason.action == "authenticate"
+            && reason.requirement.as_deref() == Some("api_token")
+    }));
+    assert!(format!("{:?}", github_feature.reasons).contains("github-provider"));
+}
+
+#[test]
+fn package_availability_reports_installed_but_disabled_dependency() {
+    let api = HubClientApi::local_operator("package-disabled-dependency-client");
+    let surfaces = capability(CapabilitySurface::Surfaces, None);
+    let mut packages = PackageRegistry::new(vec![surfaces.clone()].into_iter().collect());
+    packages
+        .install(
+            project_pipelines_manifest_with_github_feature(),
+            provenance(),
+            "install project pipelines",
+        )
+        .expect("install project pipelines");
+    packages
+        .enable("project-pipelines", "enable project pipelines")
+        .expect("enable project pipelines");
+    packages
+        .install(
+            plugin_manifest("github-provider", vec![surfaces]),
+            provenance(),
+            "install disabled github provider",
+        )
+        .expect("install github provider disabled");
+    let mut runtime = explicit_runtime("package-disabled-dependency-client");
+
+    let response = api
+        .handle_request(
+            &mut runtime,
+            &packages,
+            HubClientRequest::ListPackages {
+                request_id: request_id("list-disabled-dependency"),
+            },
+        )
+        .expect("list packages");
+    let HubClientResponseBody::Packages(rows) = response.body else {
+        panic!("packages response expected");
+    };
+    let row = rows
+        .into_iter()
+        .find(|row| row.package_name == "project-pipelines")
+        .expect("project pipelines package row");
+    let github_feature = row
+        .feature_availability
+        .iter()
+        .find(|feature| feature.id == "github_pr_lifecycle")
+        .expect("github feature row");
+
+    assert!(github_feature.reasons.iter().any(|reason| {
+        reason.reason == "disabled_package"
+            && reason.action == "enable_package"
+            && reason.package_name.as_deref() == Some("github-provider")
+    }));
+}
+
+#[test]
+fn package_availability_reports_capability_denial() {
+    let api = HubClientApi::local_operator("package-capability-denial-client");
+    let surfaces = capability(CapabilitySurface::Surfaces, None);
+    let mut packages = PackageRegistry::new(vec![surfaces.clone()].into_iter().collect());
+    packages
+        .install(
+            capability_gated_plugin_manifest(),
+            provenance(),
+            "install capability gated plugin",
+        )
+        .expect("install capability gated plugin");
+    packages
+        .enable("capability-gated.plugin", "enable capability gated plugin")
+        .expect("enable capability gated plugin");
+    let mut runtime = explicit_runtime("package-capability-denial-client");
+
+    let response = api
+        .handle_request(
+            &mut runtime,
+            &packages,
+            HubClientRequest::ListPackages {
+                request_id: request_id("list-capability-denial"),
+            },
+        )
+        .expect("list packages");
+    let HubClientResponseBody::Packages(rows) = response.body else {
+        panic!("packages response expected");
+    };
+    let row = rows
+        .into_iter()
+        .find(|row| row.package_name == "capability-gated.plugin")
+        .expect("capability gated package row");
+    let preview_feature = row
+        .feature_availability
+        .iter()
+        .find(|feature| feature.id == "localhost_preview")
+        .expect("localhost preview feature row");
+
+    assert_eq!(
+        preview_feature.state,
+        botster_hub::HubClientPackageAvailabilityState::Blocked
+    );
+    let reason = preview_feature
+        .reasons
+        .iter()
+        .find(|reason| reason.reason == "missing_capability")
+        .expect("missing capability reason");
+    assert_eq!(reason.action, "grant_capability");
+    assert_eq!(
+        reason.capability,
+        Some(botster_hub::HubClientCapability {
+            surface: "Network".to_string(),
+            scope: Some("localhost".to_string()),
+        })
+    );
+    assert!(reason.package_name.is_none());
+    assert!(reason.requirement.is_none());
+}
+
+#[test]
+fn package_availability_reason_vocabulary_is_stable_and_sanitized() {
+    let blocked_reasons = [
+        PackageBlockedReason::MissingPackage {
+            package: "github-provider".to_string(),
+        },
+        PackageBlockedReason::DisabledPackage {
+            package: "github-provider".to_string(),
+        },
+        PackageBlockedReason::MissingProvider {
+            provider: "github-provider".to_string(),
+        },
+        PackageBlockedReason::MissingCapability {
+            package: Some("capability-gated.plugin".to_string()),
+            capability: capability(CapabilitySurface::Network, Some("localhost")),
+        },
+        PackageBlockedReason::MissingAuth {
+            key: "github_token".to_string(),
+        },
+        PackageBlockedReason::MissingConfig {
+            key: "github_owner".to_string(),
+        },
+    ];
+    let rows = blocked_reasons
+        .iter()
+        .map(botster_hub::HubClientPackageAvailabilityReason::from)
+        .map(|reason| {
+            (
+                reason.reason,
+                reason.action,
+                reason.package_name,
+                reason.capability.map(|capability| {
+                    (
+                        capability.surface,
+                        capability.scope.unwrap_or_else(|| "<none>".to_string()),
+                    )
+                }),
+                reason.requirement,
+            )
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        rows,
+        vec![
+            (
+                "missing_package".to_string(),
+                "install_package".to_string(),
+                Some("github-provider".to_string()),
+                None,
+                None,
+            ),
+            (
+                "disabled_package".to_string(),
+                "enable_package".to_string(),
+                Some("github-provider".to_string()),
+                None,
+                None,
+            ),
+            (
+                "missing_provider".to_string(),
+                "install_provider".to_string(),
+                Some("github-provider".to_string()),
+                None,
+                None,
+            ),
+            (
+                "missing_capability".to_string(),
+                "grant_capability".to_string(),
+                Some("capability-gated.plugin".to_string()),
+                Some(("Network".to_string(), "localhost".to_string())),
+                None,
+            ),
+            (
+                "missing_auth".to_string(),
+                "authenticate".to_string(),
+                None,
+                None,
+                Some("github_token".to_string()),
+            ),
+            (
+                "missing_config".to_string(),
+                "configure_package".to_string(),
+                None,
+                None,
+                Some("github_owner".to_string()),
+            ),
+        ]
+    );
 }
 
 fn drain_until(

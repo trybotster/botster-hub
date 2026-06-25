@@ -207,6 +207,39 @@ Core `entrypoints` remain the plugin/provider code-load ABI, while
 `runnable_entrypoints` is the package discovery shape for clients and future
 launchers.
 
+## Package Availability
+
+`DaemonPackage` rows include resolved availability so clients do not infer
+dependency, feature, config, auth, or capability state from raw package fields.
+The hub assembles current registry/config/auth/capability state, calls the core
+`resolve_package_dependencies` contract, and projects the resulting matrix into
+sanitized daemon DTOs.
+
+Availability fields are additive and default to available for legacy rows:
+
+- `availability`: package-level state and reason/action rows.
+- `dependency_availability`: manifest dependency rows in core resolution order.
+- `feature_availability`: manifest feature rows in core resolution order.
+
+Reason/action strings are stable client vocabulary and do not expose core debug
+strings, local paths, provenance, token values, or auth identities. Current
+reason/action pairs are:
+
+- `missing_package` / `install_package`
+- `disabled_package` / `enable_package`
+- `missing_provider` / `install_provider`
+- `missing_capability` / `grant_capability`
+- `missing_config` / `configure_package`
+- `missing_auth` / `authenticate`
+- package-level `package_disabled` / `enable_package`
+- package-level invalid configuration diagnostics / `fix_configuration`
+
+Optional integrations should block only the features that declare them. For
+example, Project Pipelines local features remain available when no GitHub
+provider is installed, while GitHub PR lifecycle features are blocked until the
+provider package is installed, enabled, configured, authenticated, and
+capability-admitted.
+
 ## Package Configuration
 
 Package manifests may declare a core-owned `configuration` schema. The hub owns
