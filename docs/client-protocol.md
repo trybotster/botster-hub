@@ -156,6 +156,14 @@ Current daemon requests:
 - `InstallPackageRegistryEntry { registry_path, entry_id }` explicitly installs
   one registry entry, persists source metadata and pins, and returns refreshed
   installed package rows.
+- `CheckPackageUpdate { package_name }` returns `DaemonPackageUpdateStatus`
+  for the installed package without mutating state.
+- `PreviewPackageUpdate { package_name, pin }` returns
+  `DaemonPackageUpdateStatus` plus a `DaemonPackageInstallPlan`-shaped preview
+  that reuses `DaemonPackagePin` metadata and reports that no entrypoints start.
+- `ApplyPackageUpdate { package_name, pin }` records pinned source metadata and
+  update policy on the installed package, preserves configuration values, and
+  returns refreshed package rows.
 
 Registry responses intentionally do not expose the local registry path or local
 package root. Local entries use path-neutral source labels such as
@@ -177,7 +185,18 @@ botster-hub packages available --data-dir <path> --registry <registry-dir-or-fil
 botster-hub packages inspect --data-dir <path> --registry <registry-dir-or-file> <entry-id>
 botster-hub packages preview-install --data-dir <path> --registry <registry-dir-or-file> <entry-id>
 botster-hub packages install --data-dir <path> --registry <registry-dir-or-file> <entry-id>
+botster-hub packages check-update --data-dir <path> <package>
+botster-hub packages preview-update --data-dir <path> <package> --revision <revision> [--branch <branch>] [--tag <tag>] [--rev <rev>] [--checksum <checksum>] [--policy manual|track_source]
+botster-hub packages apply-update --data-dir <path> <package> --revision <revision> [--branch <branch>] [--tag <tag>] [--rev <rev>] [--checksum <checksum>] [--policy manual|track_source]
 ```
+
+Update lifecycle requests are production-shaped but deliberately do not fetch,
+clone, reload, or restart the hub. Unsupported source/update cases are reported
+as `DaemonPackageUpdateStatus.diagnostics` rows such as `update_unavailable`,
+`pin_required`, and `reload_unavailable`. If an enabled package or running
+entrypoint would need operator action after pin metadata changes, the daemon
+sets `reload_required` or `restart_required`; it does not invent a reload or hub
+restart path.
 
 ## Package Runnable Entrypoints
 

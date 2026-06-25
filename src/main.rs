@@ -13,13 +13,14 @@ use botster_core::{
     SessionSpawnRequest, SpawnEnvironment, SpawnWorkingDirectory, SubscriptionId, TransportEgress,
 };
 use botster_hub::{
-    DaemonCompatibility, DaemonEvent, DaemonOperatorError, DaemonPackage, DaemonRequest,
-    DaemonResponse, DaemonResponseKind, DaemonSession, DaemonStatus, DataDirectoryOption,
-    HubClientApi, HubClientRequest, HubClientResponseBody, HubDaemon, HubDaemonState, HubRuntime,
-    HubStartupOptions, HubStateLoadSource, RuntimeEnvironment, SessionDefaults, TransportBindings,
-    build_default_config_for_runtime, daemon_transport_request, default_package_policy,
-    host_profile, run_tui, serve_daemon, serve_mcp_stdio, stream_attach,
+    DaemonCompatibility, DaemonEvent, DaemonOperatorError, DaemonPackage, DaemonPackagePin,
+    DaemonRequest, DaemonResponse, DaemonResponseKind, DaemonSession, DaemonStatus,
+    DataDirectoryOption, HubClientApi, HubClientRequest, HubClientResponseBody, HubDaemon,
+    HubDaemonState, HubRuntime, HubStartupOptions, HubStateLoadSource, RuntimeEnvironment,
+    SessionDefaults, TransportBindings, build_default_config_for_runtime, daemon_transport_request,
+    default_package_policy, host_profile, run_tui, serve_daemon, serve_mcp_stdio, stream_attach,
 };
+use botster_hub_client::DaemonPackageUpdateStatus;
 
 const SMOKE_MARKER: &str = "botster-hub-smoke-ok";
 const SMOKE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -892,6 +893,27 @@ fn operator_packages(args: Vec<String>, providers_only: bool) -> Result<(), Oper
                 daemon_transport_request(&config, DaemonRequest::RemovePackage { package_name })?;
             print_packages_response(response, providers_only)?;
         }
+        PackageActionCommand::CheckUpdate(package_name) => {
+            let response = daemon_transport_request(
+                &config,
+                DaemonRequest::CheckPackageUpdate { package_name },
+            )?;
+            print_packages_response(response, providers_only)?;
+        }
+        PackageActionCommand::PreviewUpdate { package_name, pin } => {
+            let response = daemon_transport_request(
+                &config,
+                DaemonRequest::PreviewPackageUpdate { package_name, pin },
+            )?;
+            print_packages_response(response, providers_only)?;
+        }
+        PackageActionCommand::ApplyUpdate { package_name, pin } => {
+            let response = daemon_transport_request(
+                &config,
+                DaemonRequest::ApplyPackageUpdate { package_name, pin },
+            )?;
+            print_packages_response(response, providers_only)?;
+        }
         PackageActionCommand::StartEntrypoint {
             package_name,
             entrypoint_id,
@@ -1083,9 +1105,17 @@ fn print_daemon_response(response: DaemonResponse) -> Result<(), OperatorError> 
                 print_package_install_plan(plan);
             }
         }
+        DaemonResponseKind::PackageUpdateStatus => {
+            if let Some(status) = response.update_status.as_ref() {
+                print_package_update_status(status);
+            }
+        }
         DaemonResponseKind::PackageDecision => {
             if let Some(decision) = response.package_decision {
                 print_package_decision(&decision);
+            }
+            if let Some(status) = response.update_status.as_ref() {
+                print_package_update_status(status);
             }
             print_packages(&response.packages, false);
         }
@@ -1272,6 +1302,9 @@ fn print_packages_response(
     if let Some(plan) = response.install_plan.as_ref() {
         print_package_install_plan(plan);
     }
+    if let Some(status) = response.update_status.as_ref() {
+        print_package_update_status(status);
+    }
     if !response.available_packages.is_empty() {
         print_available_packages(&response.available_packages);
     }
@@ -1330,6 +1363,34 @@ fn print_package_install_plan(plan: &botster_hub::DaemonPackageInstallPlan) {
         println!(
             "install_plan_diagnostic kind={} message={}",
             diagnostic.kind, diagnostic.message
+        );
+    }
+}
+
+fn print_package_update_status(status: &DaemonPackageUpdateStatus) {
+    println!(
+        "package_update package={} update_available={} reload_required={} restart_required={}",
+        status.package_name,
+        status.update_available,
+        status.reload_required,
+        status.restart_required
+    );
+    if let Some(pin) = &status.pin {
+        println!(
+            "package_update_pin package={} revision={} branch={} tag={} rev={} checksum={} update_policy={}",
+            status.package_name,
+            pin.revision,
+            pin.branch.as_deref().unwrap_or("none"),
+            pin.tag.as_deref().unwrap_or("none"),
+            pin.rev.as_deref().unwrap_or("none"),
+            pin.checksum.as_deref().unwrap_or("none"),
+            pin.update_policy
+        );
+    }
+    for diagnostic in &status.diagnostics {
+        println!(
+            "package_update_diagnostic package={} kind={} message={}",
+            status.package_name, diagnostic.kind, diagnostic.message
         );
     }
 }
@@ -1827,6 +1888,15 @@ enum PackageActionCommand {
     EnableName(String),
     Disable(String),
     Remove(String),
+    CheckUpdate(String),
+    PreviewUpdate {
+        package_name: String,
+        pin: DaemonPackagePin,
+    },
+    ApplyUpdate {
+        package_name: String,
+        pin: DaemonPackagePin,
+    },
     StartEntrypoint {
         package_name: String,
         entrypoint_id: String,
@@ -1998,6 +2068,26 @@ impl PackageCommand {
                     action: PackageActionCommand::Remove(args[3].clone()),
                 })
             }
+            "check-update" if !providers_only => {
+                if args.len() != 4 {
+                    return Err(OperatorError::Usage("packages check-update"));
+                }
+                let options = DataDirOptions::parse(args[1..3].to_vec(), "packages check-update")?;
+                Ok(Self {
+                    data_directory: options.data_directory,
+                    action: PackageActionCommand::CheckUpdate(args[3].clone()),
+                })
+            }
+            "preview-update" if !providers_only => parse_package_update_command(
+                args,
+                "packages preview-update",
+                PackageUpdateCommandKind::Preview,
+            ),
+            "apply-update" if !providers_only => parse_package_update_command(
+                args,
+                "packages apply-update",
+                PackageUpdateCommandKind::Apply,
+            ),
             "start-entrypoint" if !providers_only => {
                 parse_package_entrypoint_command(args, "packages start-entrypoint").map(
                     |(options, package_name, entrypoint_id)| Self {
@@ -2049,6 +2139,72 @@ impl PackageCommand {
             })),
         }
     }
+}
+
+enum PackageUpdateCommandKind {
+    Preview,
+    Apply,
+}
+
+fn parse_package_update_command(
+    args: Vec<String>,
+    usage: &'static str,
+    kind: PackageUpdateCommandKind,
+) -> Result<PackageCommand, OperatorError> {
+    if args.len() < 6 {
+        return Err(OperatorError::Usage(usage));
+    }
+    let options = DataDirOptions::parse(args[1..3].to_vec(), usage)?;
+    let package_name = args[3].clone();
+    let pin = parse_daemon_package_pin(&args[4..], usage)?;
+    let action = match kind {
+        PackageUpdateCommandKind::Preview => {
+            PackageActionCommand::PreviewUpdate { package_name, pin }
+        }
+        PackageUpdateCommandKind::Apply => PackageActionCommand::ApplyUpdate { package_name, pin },
+    };
+    Ok(PackageCommand {
+        data_directory: options.data_directory,
+        action,
+    })
+}
+
+fn parse_daemon_package_pin(
+    args: &[String],
+    usage: &'static str,
+) -> Result<DaemonPackagePin, OperatorError> {
+    let mut revision = None;
+    let mut branch = None;
+    let mut tag = None;
+    let mut rev = None;
+    let mut checksum = None;
+    let mut update_policy = "manual".to_string();
+    let mut cursor = 0;
+    while cursor < args.len() {
+        let Some(value) = args.get(cursor + 1) else {
+            return Err(OperatorError::Usage(usage));
+        };
+        match args[cursor].as_str() {
+            "--revision" => revision = Some(value.clone()),
+            "--branch" => branch = Some(value.clone()),
+            "--tag" => tag = Some(value.clone()),
+            "--rev" => rev = Some(value.clone()),
+            "--checksum" => checksum = Some(value.clone()),
+            "--policy" if matches!(value.as_str(), "manual" | "track_source") => {
+                update_policy = value.clone();
+            }
+            _ => return Err(OperatorError::Usage(usage)),
+        }
+        cursor += 2;
+    }
+    Ok(DaemonPackagePin {
+        revision: revision.ok_or(OperatorError::Usage(usage))?,
+        branch,
+        tag,
+        rev,
+        checksum,
+        update_policy,
+    })
 }
 
 fn parse_package_entrypoint_command(
@@ -2521,6 +2677,15 @@ fn usage_for(command: &str) -> &'static str {
         }
         "packages disable" => "usage: botster-hub packages disable --data-dir <path> <name>",
         "packages remove" => "usage: botster-hub packages remove --data-dir <path> <name>",
+        "packages check-update" => {
+            "usage: botster-hub packages check-update --data-dir <path> <name>"
+        }
+        "packages preview-update" => {
+            "usage: botster-hub packages preview-update --data-dir <path> <name> --revision <revision> [--branch <branch>] [--tag <tag>] [--rev <rev>] [--checksum <checksum>] [--policy manual|track_source]"
+        }
+        "packages apply-update" => {
+            "usage: botster-hub packages apply-update --data-dir <path> <name> --revision <revision> [--branch <branch>] [--tag <tag>] [--rev <rev>] [--checksum <checksum>] [--policy manual|track_source]"
+        }
         "packages start-entrypoint" => {
             "usage: botster-hub packages start-entrypoint --data-dir <path> <package> <entrypoint>"
         }
