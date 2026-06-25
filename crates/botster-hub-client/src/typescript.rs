@@ -340,6 +340,7 @@ pub(crate) fn daemon_protocol_typescript() -> String {
                 "feature_availability?",
                 "DaemonPackageFeatureAvailability[]",
             ),
+            ("actions?", "DaemonPackageActionState[]"),
             ("provider_profile_admitted", "boolean"),
         ],
     );
@@ -406,6 +407,44 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             ("requested_capabilities", "DaemonCapability[]"),
             ("compatibility", "DaemonPackageCompatibility"),
             ("pin?", "DaemonPackagePin | null"),
+            ("actions?", "DaemonPackageActionState[]"),
+        ],
+    );
+    emit_interface(
+        &mut output,
+        "DaemonPackageActionState",
+        &[
+            ("action_id", "string"),
+            ("status", "DaemonPackageActionStatus"),
+            ("reason?", "string | null"),
+            ("diagnostics?", "DaemonPackageDiagnostic[]"),
+            (
+                "required_references?",
+                "DaemonPackageActionRequiredReference[]",
+            ),
+            ("request?", "DaemonPackageActionRequest | null"),
+        ],
+    );
+    emit_string_union(
+        &mut output,
+        "DaemonPackageActionStatus",
+        &["available", "blocked", "unavailable"],
+    );
+    emit_interface(
+        &mut output,
+        "DaemonPackageActionRequiredReference",
+        &[("kind", "string"), ("key", "string")],
+    );
+    emit_interface(
+        &mut output,
+        "DaemonPackageActionRequest",
+        &[
+            ("request_type", "string"),
+            ("pin?", "DaemonPackagePin | null"),
+            ("package_name?", "string | null"),
+            ("entry_id?", "string | null"),
+            ("entrypoint_id?", "string | null"),
+            ("registry_path?", "string | null"),
         ],
     );
     emit_interface(
@@ -434,6 +473,7 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             ("restart_required", "boolean"),
             ("pin?", "DaemonPackagePin | null"),
             ("diagnostics?", "DaemonPackageDiagnostic[]"),
+            ("actions?", "DaemonPackageActionState[]"),
         ],
     );
     emit_interface(
@@ -496,6 +536,7 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             ("capabilities", "DaemonCapability[]"),
             ("may_supervise", "boolean"),
             ("process", "DaemonPackageProcess"),
+            ("actions?", "DaemonPackageActionState[]"),
         ],
     );
     emit_interface(

@@ -179,6 +179,7 @@ export interface DaemonPackage {
   availability: DaemonPackageAvailability;
   dependency_availability?: DaemonPackageDependencyAvailability[];
   feature_availability?: DaemonPackageFeatureAvailability[];
+  actions?: DaemonPackageActionState[];
   provider_profile_admitted: boolean;
 }
 
@@ -229,6 +230,35 @@ export interface DaemonAvailablePackage {
   requested_capabilities: DaemonCapability[];
   compatibility: DaemonPackageCompatibility;
   pin?: DaemonPackagePin | null;
+  actions?: DaemonPackageActionState[];
+}
+
+export interface DaemonPackageActionState {
+  action_id: string;
+  status: DaemonPackageActionStatus;
+  reason?: string | null;
+  diagnostics?: DaemonPackageDiagnostic[];
+  required_references?: DaemonPackageActionRequiredReference[];
+  request?: DaemonPackageActionRequest | null;
+}
+
+export type DaemonPackageActionStatus =
+  | "available"
+  | "blocked"
+  | "unavailable";
+
+export interface DaemonPackageActionRequiredReference {
+  kind: string;
+  key: string;
+}
+
+export interface DaemonPackageActionRequest {
+  request_type: string;
+  pin?: DaemonPackagePin | null;
+  package_name?: string | null;
+  entry_id?: string | null;
+  entrypoint_id?: string | null;
+  registry_path?: string | null;
 }
 
 export interface DaemonPackageInstallPlan {
@@ -251,6 +281,7 @@ export interface DaemonPackageUpdateStatus {
   restart_required: boolean;
   pin?: DaemonPackagePin | null;
   diagnostics?: DaemonPackageDiagnostic[];
+  actions?: DaemonPackageActionState[];
 }
 
 export interface DaemonPackageCompatibility {
@@ -298,6 +329,7 @@ export interface DaemonPackageRunnableEntrypoint {
   capabilities: DaemonCapability[];
   may_supervise: boolean;
   process: DaemonPackageProcess;
+  actions?: DaemonPackageActionState[];
 }
 
 export interface DaemonPackageWorkingDirectory {

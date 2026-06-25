@@ -791,6 +791,8 @@ pub struct DaemonPackage {
     pub dependency_availability: Vec<DaemonPackageDependencyAvailability>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub feature_availability: Vec<DaemonPackageFeatureAvailability>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub actions: Vec<DaemonPackageActionState>,
     pub provider_profile_admitted: bool,
 }
 
@@ -860,6 +862,51 @@ pub struct DaemonAvailablePackage {
     pub compatibility: DaemonPackageCompatibility,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pin: Option<DaemonPackagePin>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub actions: Vec<DaemonPackageActionState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonPackageActionState {
+    pub action_id: String,
+    pub status: DaemonPackageActionStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<DaemonPackageDiagnostic>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_references: Vec<DaemonPackageActionRequiredReference>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request: Option<DaemonPackageActionRequest>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DaemonPackageActionStatus {
+    Available,
+    Blocked,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonPackageActionRequiredReference {
+    pub kind: String,
+    pub key: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonPackageActionRequest {
+    pub request_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pin: Option<DaemonPackagePin>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub package_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entrypoint_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registry_path: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -887,6 +934,8 @@ pub struct DaemonPackageUpdateStatus {
     pub pin: Option<DaemonPackagePin>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub diagnostics: Vec<DaemonPackageDiagnostic>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub actions: Vec<DaemonPackageActionState>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -961,6 +1010,8 @@ pub struct DaemonPackageRunnableEntrypoint {
     pub capabilities: Vec<DaemonCapability>,
     pub may_supervise: bool,
     pub process: DaemonPackageProcess,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub actions: Vec<DaemonPackageActionState>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1808,6 +1859,7 @@ mod tests {
             availability: DaemonPackageAvailability::default(),
             dependency_availability: Vec::new(),
             feature_availability: Vec::new(),
+            actions: Vec::new(),
             provider_profile_admitted: false,
         };
         let value = serde_json::to_value(package).expect("package serializes");
@@ -1835,6 +1887,10 @@ mod tests {
         assert!(
             configuration.get("diagnostics").is_none(),
             "empty configuration should omit diagnostics"
+        );
+        assert!(
+            value.get("actions").is_none(),
+            "empty package action descriptors should omit actions for additive compatibility"
         );
     }
 
@@ -2212,6 +2268,7 @@ mod tests {
                 availability: DaemonPackageAvailability::default(),
                 dependency_availability: Vec::new(),
                 feature_availability: Vec::new(),
+                actions: Vec::new(),
                 provider_profile_admitted: false,
             }],
             available_packages: vec![DaemonAvailablePackage {
@@ -2238,6 +2295,7 @@ mod tests {
                     checksum: None,
                     update_policy: "manual".to_string(),
                 }),
+                actions: Vec::new(),
             }],
             install_plan: Some(DaemonPackageInstallPlan {
                 entry: DaemonAvailablePackage {
@@ -2257,6 +2315,7 @@ mod tests {
                         diagnostics: Vec::new(),
                     },
                     pin: None,
+                    actions: Vec::new(),
                 },
                 effects: vec![DaemonPackageInstallEffect {
                     kind: "add_package_record".to_string(),
@@ -2276,6 +2335,7 @@ mod tests {
                     kind: "update_unavailable".to_string(),
                     message: "update resolution is unavailable for this package source".to_string(),
                 }],
+                actions: Vec::new(),
             }),
             package_decision: Some(DaemonPackageDecision {
                 package_name: "workflow.plugin".to_string(),
