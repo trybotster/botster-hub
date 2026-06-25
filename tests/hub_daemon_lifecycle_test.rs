@@ -1427,7 +1427,10 @@ fn cli_dogfood_launcher_starts_botster_web_in_existing_hub_mode_and_shuts_down()
         web_url,
         format!("http://127.0.0.1:{web_bridge_port}/?dogfood=real-hub")
     );
-    assert!(text.contains("tui=botster-tui --data-dir"));
+    assert!(text.contains(&format!(
+        "tui=botster-tui --data-dir {}",
+        data_dir.display()
+    )));
     assert!(text.contains("mcp=botster-hub mcp-serve --data-dir"));
     assert!(text.contains("status=botster-hub status --data-dir"));
     assert!(text.contains("shutdown=run botster-hub shutdown --data-dir"));
