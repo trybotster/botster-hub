@@ -171,7 +171,40 @@ export interface DaemonPackage {
   surfaces?: DaemonPackageSurfaceDescriptor[];
   runnable_entrypoints: DaemonPackageRunnableEntrypoint[];
   configuration: DaemonPackageConfiguration;
+  availability: DaemonPackageAvailability;
+  dependency_availability?: DaemonPackageDependencyAvailability[];
+  feature_availability?: DaemonPackageFeatureAvailability[];
   provider_profile_admitted: boolean;
+}
+
+export interface DaemonPackageAvailability {
+  state: DaemonPackageAvailabilityState;
+  reasons?: DaemonPackageAvailabilityReason[];
+}
+
+export type DaemonPackageAvailabilityState =
+  | "available"
+  | "blocked";
+
+export interface DaemonPackageAvailabilityReason {
+  reason: string;
+  action: string;
+  package_name?: string | null;
+  capability?: DaemonCapability | null;
+  requirement?: string | null;
+}
+
+export interface DaemonPackageDependencyAvailability {
+  id: string;
+  package_name: string;
+  state: DaemonPackageAvailabilityState;
+  reasons?: DaemonPackageAvailabilityReason[];
+}
+
+export interface DaemonPackageFeatureAvailability {
+  id: string;
+  state: DaemonPackageAvailabilityState;
+  reasons?: DaemonPackageAvailabilityReason[];
 }
 
 export interface DaemonCapability {

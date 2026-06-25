@@ -771,7 +771,65 @@ pub struct DaemonPackage {
     pub runnable_entrypoints: Vec<DaemonPackageRunnableEntrypoint>,
     #[serde(default)]
     pub configuration: DaemonPackageConfiguration,
+    #[serde(default)]
+    pub availability: DaemonPackageAvailability,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dependency_availability: Vec<DaemonPackageDependencyAvailability>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub feature_availability: Vec<DaemonPackageFeatureAvailability>,
     pub provider_profile_admitted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonPackageAvailability {
+    pub state: DaemonPackageAvailabilityState,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reasons: Vec<DaemonPackageAvailabilityReason>,
+}
+
+impl Default for DaemonPackageAvailability {
+    fn default() -> Self {
+        Self {
+            state: DaemonPackageAvailabilityState::Available,
+            reasons: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DaemonPackageAvailabilityState {
+    Available,
+    Blocked,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonPackageAvailabilityReason {
+    pub reason: String,
+    pub action: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub package_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability: Option<DaemonCapability>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requirement: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonPackageDependencyAvailability {
+    pub id: String,
+    pub package_name: String,
+    pub state: DaemonPackageAvailabilityState,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reasons: Vec<DaemonPackageAvailabilityReason>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonPackageFeatureAvailability {
+    pub id: String,
+    pub state: DaemonPackageAvailabilityState,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reasons: Vec<DaemonPackageAvailabilityReason>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1721,6 +1779,9 @@ mod tests {
             surfaces: Vec::new(),
             runnable_entrypoints: Vec::new(),
             configuration: DaemonPackageConfiguration::default(),
+            availability: DaemonPackageAvailability::default(),
+            dependency_availability: Vec::new(),
+            feature_availability: Vec::new(),
             provider_profile_admitted: false,
         };
         let value = serde_json::to_value(package).expect("package serializes");
@@ -1749,6 +1810,29 @@ mod tests {
             configuration.get("diagnostics").is_none(),
             "empty configuration should omit diagnostics"
         );
+    }
+
+    #[test]
+    fn daemon_package_availability_defaults_for_legacy_rows() {
+        let package: DaemonPackage = serde_json::from_value(serde_json::json!({
+            "package_name": "legacy.plugin",
+            "version": "1.0.0",
+            "classification": "plugin",
+            "state": "enabled",
+            "requested_capabilities": [],
+            "runnable_entrypoints": [],
+            "configuration": {},
+            "provider_profile_admitted": false
+        }))
+        .expect("legacy package row without availability should deserialize");
+
+        assert_eq!(
+            package.availability.state,
+            DaemonPackageAvailabilityState::Available
+        );
+        assert!(package.availability.reasons.is_empty());
+        assert!(package.dependency_availability.is_empty());
+        assert!(package.feature_availability.is_empty());
     }
 
     #[test]
@@ -2094,6 +2178,9 @@ mod tests {
                 surfaces: Vec::new(),
                 runnable_entrypoints: Vec::new(),
                 configuration: DaemonPackageConfiguration::default(),
+                availability: DaemonPackageAvailability::default(),
+                dependency_availability: Vec::new(),
+                feature_availability: Vec::new(),
                 provider_profile_admitted: false,
             }],
             available_packages: vec![DaemonAvailablePackage {

@@ -320,7 +320,59 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             ("surfaces?", "DaemonPackageSurfaceDescriptor[]"),
             ("runnable_entrypoints", "DaemonPackageRunnableEntrypoint[]"),
             ("configuration", "DaemonPackageConfiguration"),
+            ("availability", "DaemonPackageAvailability"),
+            (
+                "dependency_availability?",
+                "DaemonPackageDependencyAvailability[]",
+            ),
+            (
+                "feature_availability?",
+                "DaemonPackageFeatureAvailability[]",
+            ),
             ("provider_profile_admitted", "boolean"),
+        ],
+    );
+    emit_interface(
+        &mut output,
+        "DaemonPackageAvailability",
+        &[
+            ("state", "DaemonPackageAvailabilityState"),
+            ("reasons?", "DaemonPackageAvailabilityReason[]"),
+        ],
+    );
+    emit_string_union(
+        &mut output,
+        "DaemonPackageAvailabilityState",
+        &["available", "blocked"],
+    );
+    emit_interface(
+        &mut output,
+        "DaemonPackageAvailabilityReason",
+        &[
+            ("reason", "string"),
+            ("action", "string"),
+            ("package_name?", "string | null"),
+            ("capability?", "DaemonCapability | null"),
+            ("requirement?", "string | null"),
+        ],
+    );
+    emit_interface(
+        &mut output,
+        "DaemonPackageDependencyAvailability",
+        &[
+            ("id", "string"),
+            ("package_name", "string"),
+            ("state", "DaemonPackageAvailabilityState"),
+            ("reasons?", "DaemonPackageAvailabilityReason[]"),
+        ],
+    );
+    emit_interface(
+        &mut output,
+        "DaemonPackageFeatureAvailability",
+        &[
+            ("id", "string"),
+            ("state", "DaemonPackageAvailabilityState"),
+            ("reasons?", "DaemonPackageAvailabilityReason[]"),
         ],
     );
     emit_interface(

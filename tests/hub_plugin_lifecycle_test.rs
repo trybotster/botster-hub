@@ -137,6 +137,8 @@ fn plugin_manifest(name: &str, capabilities: Vec<Capability>) -> PackageManifest
             path: "plugin.lua".to_string(),
             bootstrap: false,
         }],
+        dependencies: Vec::new(),
+        features: Vec::new(),
         configuration: None,
         host_profile: None,
         surfaces: Vec::new(),
@@ -165,6 +167,8 @@ fn provider_manifest(name: &str, capabilities: Vec<Capability>) -> PackageManife
             path: "bin/provider".to_string(),
             bootstrap: true,
         }],
+        dependencies: Vec::new(),
+        features: Vec::new(),
         host_profile: Some(HostProfileMetadata {
             profile_id: "test-provider".to_string(),
             compatibility: ">=0.1.0".to_string(),

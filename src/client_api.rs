@@ -8,11 +8,12 @@ use std::collections::BTreeMap;
 
 use botster_core::{
     BotsterEngineObservation, CapabilitySurface, ClientId, CoreSession, CoreSessionMetadata,
-    EnvelopeCursor, EnvelopeDeliveryState, EnvelopeId, EnvelopeTarget, PackageSurfaceKind,
-    PackageSurfaceOperation, RequestId, RoutedEnvelope, RoutedEnvelopeDrainOutcome,
-    RoutedEnvelopePublishOutcome, SessionId, SessionLifecycleState, SessionRuntimeErrorKind,
-    SessionSpawnRequest, SpawnEnvironment, SpawnWorkingDirectory, SubscriptionId,
-    TerminalAttachState, TransportEgress, UiActionResult, UiNode,
+    EnvelopeCursor, EnvelopeDeliveryState, EnvelopeId, EnvelopeTarget, PackageBlockedReason,
+    PackageDependencyResolution, PackageFeatureResolution, PackageResolutionState,
+    PackageSurfaceKind, PackageSurfaceOperation, RequestId, RoutedEnvelope,
+    RoutedEnvelopeDrainOutcome, RoutedEnvelopePublishOutcome, SessionId, SessionLifecycleState,
+    SessionRuntimeErrorKind, SessionSpawnRequest, SpawnEnvironment, SpawnWorkingDirectory,
+    SubscriptionId, TerminalAttachState, TransportEgress, UiActionResult, UiNode,
 };
 use botster_core_daemon::{
     GuardedWriteDecision, GuardedWriteDeliveryState, GuardedWriteRequest, GuardedWriteResult,
@@ -293,7 +294,7 @@ impl HubClientApi {
                 packages
                     .packages()
                     .into_iter()
-                    .map(HubClientPackage::from)
+                    .map(|record| HubClientPackage::from_record(packages, record))
                     .collect(),
             ),
             HubClientRequest::PluginLifecycleStatus { .. } => {
@@ -796,11 +797,26 @@ pub struct HubClientPackage {
     pub surfaces: Vec<HubClientPackageSurfaceDescriptor>,
     pub runnable_entrypoints: Vec<HubClientPackageRunnableEntrypoint>,
     pub configuration: HubClientPackageConfiguration,
+    pub availability: HubClientPackageAvailability,
+    pub dependency_availability: Vec<HubClientPackageDependencyAvailability>,
+    pub feature_availability: Vec<HubClientPackageFeatureAvailability>,
     pub provider_profile_admitted: bool,
 }
 
-impl From<&PackageRecord> for HubClientPackage {
-    fn from(record: &PackageRecord) -> Self {
+impl HubClientPackage {
+    #[must_use]
+    pub fn from_record(registry: &PackageRegistry, record: &PackageRecord) -> Self {
+        let matrix = registry.resolution_matrix_for(record);
+        let dependency_availability = matrix
+            .dependencies
+            .iter()
+            .map(HubClientPackageDependencyAvailability::from)
+            .collect::<Vec<_>>();
+        let feature_availability = matrix
+            .features
+            .iter()
+            .map(HubClientPackageFeatureAvailability::from)
+            .collect::<Vec<_>>();
         Self {
             package_name: record.manifest.name.clone(),
             version: record.manifest.version.clone(),
@@ -811,7 +827,7 @@ impl From<&PackageRecord> for HubClientPackage {
                 .capabilities
                 .iter()
                 .map(|capability| HubClientCapability {
-                    surface: format!("{:?}", capability.surface),
+                    surface: capability_surface_label(&capability.surface).to_string(),
                     scope: capability.scope.clone(),
                 })
                 .collect(),
@@ -877,7 +893,7 @@ impl From<&PackageRecord> for HubClientPackage {
                         .capabilities
                         .iter()
                         .map(|capability| HubClientCapability {
-                            surface: format!("{:?}", capability.surface),
+                            surface: capability_surface_label(&capability.surface).to_string(),
                             scope: capability.scope.clone(),
                         })
                         .collect(),
@@ -901,7 +917,204 @@ impl From<&PackageRecord> for HubClientPackage {
                 })
                 .collect(),
             configuration: HubClientPackageConfiguration::from(record.configuration_view()),
+            availability: HubClientPackageAvailability::from_record(record, &matrix),
+            dependency_availability,
+            feature_availability,
             provider_profile_admitted: record.admitted_host_profile.is_some(),
+        }
+    }
+}
+
+/// Sanitized package-level availability projection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HubClientPackageAvailability {
+    pub state: HubClientPackageAvailabilityState,
+    pub reasons: Vec<HubClientPackageAvailabilityReason>,
+}
+
+impl HubClientPackageAvailability {
+    fn from_record(record: &PackageRecord, matrix: &botster_core::PackageResolutionMatrix) -> Self {
+        let mut reasons = Vec::new();
+
+        match record.state {
+            PackageState::Installed | PackageState::Disabled => {
+                reasons.push(HubClientPackageAvailabilityReason {
+                    reason: "package_disabled".to_string(),
+                    action: "enable_package".to_string(),
+                    package_name: Some(record.manifest.name.clone()),
+                    capability: None,
+                    requirement: None,
+                });
+            }
+            PackageState::Enabled => {}
+        }
+
+        let configuration = record.configuration_view();
+        for key in configuration.missing_required {
+            reasons.push(HubClientPackageAvailabilityReason {
+                reason: "missing_config".to_string(),
+                action: "configure_package".to_string(),
+                package_name: Some(record.manifest.name.clone()),
+                capability: None,
+                requirement: Some(key),
+            });
+        }
+        for diagnostic in configuration.diagnostics {
+            reasons.push(HubClientPackageAvailabilityReason {
+                reason: diagnostic.kind,
+                action: "fix_configuration".to_string(),
+                package_name: Some(record.manifest.name.clone()),
+                capability: None,
+                requirement: diagnostic.field,
+            });
+        }
+
+        reasons.extend(required_dependency_reasons(record, matrix));
+
+        Self {
+            state: availability_state_for_reasons(&reasons),
+            reasons,
+        }
+    }
+}
+
+fn required_dependency_reasons(
+    record: &PackageRecord,
+    matrix: &botster_core::PackageResolutionMatrix,
+) -> Vec<HubClientPackageAvailabilityReason> {
+    matrix
+        .dependencies
+        .iter()
+        .filter(|resolution| {
+            record.manifest.dependencies.iter().any(|dependency| {
+                dependency.id == resolution.id
+                    && matches!(
+                        dependency.kind,
+                        botster_core::PackageDependencyKind::Required
+                    )
+            })
+        })
+        .flat_map(|resolution| {
+            resolution
+                .blocked_reasons
+                .iter()
+                .map(HubClientPackageAvailabilityReason::from)
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HubClientPackageAvailabilityState {
+    Available,
+    Blocked,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HubClientPackageAvailabilityReason {
+    pub reason: String,
+    pub action: String,
+    pub package_name: Option<String>,
+    pub capability: Option<HubClientCapability>,
+    pub requirement: Option<String>,
+}
+
+impl From<&PackageBlockedReason> for HubClientPackageAvailabilityReason {
+    fn from(reason: &PackageBlockedReason) -> Self {
+        match reason {
+            PackageBlockedReason::MissingPackage { package } => Self {
+                reason: "missing_package".to_string(),
+                action: "install_package".to_string(),
+                package_name: Some(package.clone()),
+                capability: None,
+                requirement: None,
+            },
+            PackageBlockedReason::DisabledPackage { package } => Self {
+                reason: "disabled_package".to_string(),
+                action: "enable_package".to_string(),
+                package_name: Some(package.clone()),
+                capability: None,
+                requirement: None,
+            },
+            PackageBlockedReason::MissingProvider { provider } => Self {
+                reason: "missing_provider".to_string(),
+                action: "install_provider".to_string(),
+                package_name: Some(provider.clone()),
+                capability: None,
+                requirement: None,
+            },
+            PackageBlockedReason::MissingCapability {
+                package,
+                capability,
+            } => Self {
+                reason: "missing_capability".to_string(),
+                action: "grant_capability".to_string(),
+                package_name: package.clone(),
+                capability: Some(HubClientCapability {
+                    surface: capability_surface_label(&capability.surface).to_string(),
+                    scope: capability.scope.clone(),
+                }),
+                requirement: None,
+            },
+            PackageBlockedReason::MissingAuth { key } => Self {
+                reason: "missing_auth".to_string(),
+                action: "authenticate".to_string(),
+                package_name: None,
+                capability: None,
+                requirement: Some(key.clone()),
+            },
+            PackageBlockedReason::MissingConfig { key } => Self {
+                reason: "missing_config".to_string(),
+                action: "configure_package".to_string(),
+                package_name: None,
+                capability: None,
+                requirement: Some(key.clone()),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HubClientPackageDependencyAvailability {
+    pub id: String,
+    pub package_name: String,
+    pub state: HubClientPackageAvailabilityState,
+    pub reasons: Vec<HubClientPackageAvailabilityReason>,
+}
+
+impl From<&PackageDependencyResolution> for HubClientPackageDependencyAvailability {
+    fn from(resolution: &PackageDependencyResolution) -> Self {
+        let reasons = resolution
+            .blocked_reasons
+            .iter()
+            .map(HubClientPackageAvailabilityReason::from)
+            .collect::<Vec<_>>();
+        Self {
+            id: resolution.id.clone(),
+            package_name: resolution.package.clone(),
+            state: availability_state_from_core(resolution.state),
+            reasons,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HubClientPackageFeatureAvailability {
+    pub id: String,
+    pub state: HubClientPackageAvailabilityState,
+    pub reasons: Vec<HubClientPackageAvailabilityReason>,
+}
+
+impl From<&PackageFeatureResolution> for HubClientPackageFeatureAvailability {
+    fn from(resolution: &PackageFeatureResolution) -> Self {
+        let reasons = resolution
+            .blocked_reasons
+            .iter()
+            .map(HubClientPackageAvailabilityReason::from)
+            .collect::<Vec<_>>();
+        Self {
+            id: resolution.id.clone(),
+            state: availability_state_from_core(resolution.state),
+            reasons,
         }
     }
 }
@@ -1080,6 +1293,44 @@ fn package_surface_operation_label(operation: &PackageSurfaceOperation) -> &'sta
     match operation {
         PackageSurfaceOperation::Render => "render",
         PackageSurfaceOperation::Action => "action",
+    }
+}
+
+fn capability_surface_label(surface: &CapabilitySurface) -> &'static str {
+    match surface {
+        CapabilitySurface::ClientAdmission => "ClientAdmission",
+        CapabilitySurface::PairingInvites => "PairingInvites",
+        CapabilitySurface::SignalingRelay => "SignalingRelay",
+        CapabilitySurface::HubPresence => "HubPresence",
+        CapabilitySurface::BrowserShell => "BrowserShell",
+        CapabilitySurface::Secrets => "Secrets",
+        CapabilitySurface::Crypto => "Crypto",
+        CapabilitySurface::Network => "Network",
+        CapabilitySurface::Surfaces => "Surfaces",
+        CapabilitySurface::SessionActions => "SessionActions",
+        CapabilitySurface::Mcp => "Mcp",
+        CapabilitySurface::PluginDb => "PluginDb",
+        CapabilitySurface::Filesystem => "Filesystem",
+        CapabilitySurface::Timers => "Timers",
+    }
+}
+
+fn availability_state_from_core(
+    state: PackageResolutionState,
+) -> HubClientPackageAvailabilityState {
+    match state {
+        PackageResolutionState::Available => HubClientPackageAvailabilityState::Available,
+        PackageResolutionState::Blocked => HubClientPackageAvailabilityState::Blocked,
+    }
+}
+
+fn availability_state_for_reasons(
+    reasons: &[HubClientPackageAvailabilityReason],
+) -> HubClientPackageAvailabilityState {
+    if reasons.is_empty() {
+        HubClientPackageAvailabilityState::Available
+    } else {
+        HubClientPackageAvailabilityState::Blocked
     }
 }
 
