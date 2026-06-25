@@ -96,6 +96,7 @@ fn plugin_manifest(name: &str, capabilities: Vec<Capability>) -> botster_core::P
         configuration: None,
         host_profile: None,
         surfaces: Vec::new(),
+        runnable_entrypoints: Vec::new(),
     }
 }
 
@@ -1370,12 +1371,12 @@ fn package_and_lifecycle_queries_are_sanitized_and_explicitly_pulled() {
   }],
   "runnable_entrypoints": [{
     "id": "web",
-    "kind": "web",
+    "kind": "web_app",
     "command": "web/dev-server",
     "args": ["--host", "127.0.0.1"],
     "working_directory": { "policy": "relative", "path": "web" },
     "environment": [{ "name": "BOTSTER_WEB_PORT", "required": false, "default": "5173" }],
-    "mode": "dev",
+    "launch_mode": "background",
     "capabilities": [{ "surface": "network", "scope": "localhost" }],
     "may_supervise": true
   }]
@@ -1436,14 +1437,14 @@ fn package_and_lifecycle_queries_are_sanitized_and_explicitly_pulled() {
     assert_eq!(record.runnable_entrypoints.len(), 1);
     let entrypoint = &record.runnable_entrypoints[0];
     assert_eq!(entrypoint.id, "web");
-    assert_eq!(entrypoint.kind, "web");
+    assert_eq!(entrypoint.kind, "web_app");
     assert_eq!(entrypoint.command, "web/dev-server");
     assert_eq!(entrypoint.args, ["--host", "127.0.0.1"]);
     assert_eq!(entrypoint.working_directory.policy, "relative");
     assert_eq!(entrypoint.working_directory.path.as_deref(), Some("web"));
     assert_eq!(entrypoint.environment[0].name, "BOTSTER_WEB_PORT");
     assert_eq!(entrypoint.environment[0].default.as_deref(), Some("5173"));
-    assert_eq!(entrypoint.mode, "dev");
+    assert_eq!(entrypoint.launch_mode, "background");
     assert_eq!(entrypoint.capabilities[0].surface, "Network");
     assert!(entrypoint.may_supervise);
     assert_eq!(entrypoint.process.state, "not_started");

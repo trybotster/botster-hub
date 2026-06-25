@@ -11,9 +11,10 @@ use botster_core::{
     EnvelopeCursor, EnvelopeDeliveryState, EnvelopeId, EnvelopeTarget, PackageBlockedReason,
     PackageDependencyResolution, PackageFeatureResolution, PackageResolutionState,
     PackageSurfaceKind, PackageSurfaceOperation, RequestId, RoutedEnvelope,
-    RoutedEnvelopeDrainOutcome, RoutedEnvelopePublishOutcome, SessionId, SessionLifecycleState,
-    SessionRuntimeErrorKind, SessionSpawnRequest, SpawnEnvironment, SpawnWorkingDirectory,
-    SubscriptionId, TerminalAttachState, TransportEgress, UiActionResult, UiNode,
+    RoutedEnvelopeDrainOutcome, RoutedEnvelopePublishOutcome, RunnableEntrypointKind,
+    RunnableEntrypointLaunchMode, SessionId, SessionLifecycleState, SessionRuntimeErrorKind,
+    SessionSpawnRequest, SpawnEnvironment, SpawnWorkingDirectory, SubscriptionId,
+    TerminalAttachState, TransportEgress, UiActionResult, UiNode,
 };
 use botster_core_daemon::{
     GuardedWriteDecision, GuardedWriteDeliveryState, GuardedWriteRequest, GuardedWriteResult,
@@ -23,8 +24,7 @@ use botster_core_daemon::{
 use crate::lifecycle::HubPluginLifecycleStatus;
 use crate::packages::{
     PackageClassification, PackageConfigurationView, PackageRecord, PackageRegistry,
-    PackageRunnableEntrypointKind, PackageRunnableMode, PackageRunnableProcessState,
-    PackageRunnableWorkingDirectory, PackageState,
+    PackageRunnableProcessState, PackageRunnableWorkingDirectory, PackageState,
 };
 use crate::{HubRuntime, HubRuntimeError, daemon_session_to_core_session, host_profile};
 
@@ -855,7 +855,8 @@ impl HubClientPackage {
                 .iter()
                 .map(|entrypoint| HubClientPackageRunnableEntrypoint {
                     id: entrypoint.id.clone(),
-                    kind: runnable_entrypoint_kind_label(entrypoint.kind).to_string(),
+                    kind: runnable_entrypoint_kind_label(&entrypoint.kind).to_string(),
+                    launch_mode: runnable_launch_mode_label(&entrypoint.launch_mode).to_string(),
                     command: entrypoint.command.clone(),
                     args: entrypoint.args.clone(),
                     working_directory: match &entrypoint.working_directory {
@@ -888,7 +889,6 @@ impl HubClientPackage {
                             description: requirement.description.clone(),
                         })
                         .collect(),
-                    mode: runnable_mode_label(entrypoint.mode).to_string(),
                     capabilities: entrypoint
                         .capabilities
                         .iter()
@@ -1178,11 +1178,11 @@ impl From<PackageConfigurationView> for HubClientPackageConfiguration {
 pub struct HubClientPackageRunnableEntrypoint {
     pub id: String,
     pub kind: String,
+    pub launch_mode: String,
     pub command: String,
     pub args: Vec<String>,
     pub working_directory: HubClientPackageWorkingDirectory,
     pub environment: Vec<HubClientPackageEnvironmentRequirement>,
-    pub mode: String,
     pub capabilities: Vec<HubClientCapability>,
     pub may_supervise: bool,
     pub process: HubClientPackageProcess,
@@ -1252,20 +1252,17 @@ impl From<PackageState> for HubClientPackageState {
     }
 }
 
-fn runnable_entrypoint_kind_label(kind: PackageRunnableEntrypointKind) -> &'static str {
+fn runnable_entrypoint_kind_label(kind: &RunnableEntrypointKind) -> &'static str {
     match kind {
-        PackageRunnableEntrypointKind::Client => "client",
-        PackageRunnableEntrypointKind::Web => "web",
-        PackageRunnableEntrypointKind::Mcp => "mcp",
-        PackageRunnableEntrypointKind::Daemon => "daemon",
-        PackageRunnableEntrypointKind::Provider => "provider",
+        RunnableEntrypointKind::WebApp => "web_app",
+        RunnableEntrypointKind::TerminalApp => "terminal_app",
     }
 }
 
-fn runnable_mode_label(mode: PackageRunnableMode) -> &'static str {
+fn runnable_launch_mode_label(mode: &RunnableEntrypointLaunchMode) -> &'static str {
     match mode {
-        PackageRunnableMode::Dev => "dev",
-        PackageRunnableMode::Local => "local",
+        RunnableEntrypointLaunchMode::Background => "background",
+        RunnableEntrypointLaunchMode::ForegroundStdio => "foreground_stdio",
     }
 }
 

@@ -45,6 +45,7 @@ export type DaemonRequest =
   | { type: "resize"; session_id: string; rows: number; cols: number }
   | { type: "shutdown_session"; session_id: string }
   | { type: "drain"; session_id: string }
+  | { type: "list_apps" }
   | { type: "list_packages" }
   | { type: "list_available_packages"; registry_path: string }
   | { type: "inspect_available_package"; registry_path: string; entry_id: string }
@@ -75,6 +76,7 @@ export interface DaemonResponse {
   kind: DaemonResponseKind;
   status: DaemonStatus | null;
   sessions: DaemonSession[];
+  apps?: DaemonApp[];
   packages: DaemonPackage[];
   available_packages?: DaemonAvailablePackage[];
   install_plan?: DaemonPackageInstallPlan | null;
@@ -97,6 +99,7 @@ export type DaemonResponseKind =
   | "sessions"
   | "spawned"
   | "events"
+  | "apps"
   | "packages"
   | "available_packages"
   | "package_install_plan"
@@ -165,6 +168,24 @@ export interface DaemonNotify {
   decision: string;
   state_count: number;
   states: string[];
+}
+
+export interface DaemonApp {
+  package_name: string;
+  app_id: string;
+  entrypoint_id: string;
+  kind: string;
+  launch_mode: string;
+  lifecycle_state: string;
+  diagnostics?: DaemonPackageDiagnostic[];
+  actions?: DaemonPackageActionState[];
+  blocked_reasons?: string[];
+  launch_target: DaemonAppLaunchTarget;
+}
+
+export interface DaemonAppLaunchTarget {
+  kind: string;
+  local_url?: string | null;
 }
 
 export interface DaemonPackage {
@@ -321,11 +342,11 @@ export interface DaemonPackageConfiguration {
 export interface DaemonPackageRunnableEntrypoint {
   id: string;
   kind: string;
+  launch_mode: string;
   command: string;
   args: string[];
   working_directory: DaemonPackageWorkingDirectory;
   environment: DaemonPackageEnvironmentRequirement[];
-  mode: string;
   capabilities: DaemonCapability[];
   may_supervise: boolean;
   process: DaemonPackageProcess;

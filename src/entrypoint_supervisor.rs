@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
+use std::fs;
 use std::io::{BufReader, Read};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -10,14 +11,16 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use botster_core::PackageSource;
-
-use crate::{
-    PackageRecord, PackageRegistry, PackageRunnableEntrypoint, PackageRunnableMode, PackageState,
+use botster_core::{
+    PackageSource, RunnableEntrypointLaunchMode, RunnableEntrypointLaunchResult,
+    RunnableEntrypointProcessState, RunnableEntrypointResultField,
 };
+
+use crate::{PackageRecord, PackageRegistry, PackageRunnableEntrypoint, PackageState};
 
 const OUTPUT_LIMIT_BYTES: usize = 4096;
 const STOP_GRACE: Duration = Duration::from_millis(500);
+const LAUNCH_RESULT_ENV: &str = "BOTSTER_ENTRYPOINT_LAUNCH_RESULT";
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct EntrypointKey {
@@ -35,6 +38,7 @@ pub struct EntrypointProcessSnapshot {
     pub exited_at: Option<u64>,
     pub exit_status: Option<String>,
     pub diagnostics: Vec<EntrypointDiagnostic>,
+    pub launch_result: Option<RunnableEntrypointLaunchResult>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,6 +92,8 @@ impl EntrypointSupervisor {
             return Ok(process.snapshot(&key));
         }
 
+        let launch_result_path = entrypoint_declares_launch_result(entrypoint)
+            .then(|| launch_result_path(&key.package_name, &key.entrypoint_id, now_seconds()));
         let command_path = resolve_command(&package_root, entrypoint.command.as_str());
         let working_directory = resolve_working_directory(&package_root, entrypoint)?;
         let mut command = Command::new(command_path);
@@ -95,6 +101,10 @@ impl EntrypointSupervisor {
         command.current_dir(working_directory);
         for (name, value) in environment_overrides {
             command.env(name, value);
+        }
+        if let Some(path) = &launch_result_path {
+            let _ = fs::remove_file(path);
+            command.env(LAUNCH_RESULT_ENV, path);
         }
         command.stdout(Stdio::piped());
         command.stderr(Stdio::piped());
@@ -125,6 +135,12 @@ impl EntrypointSupervisor {
             stdout,
             stderr,
             diagnostics: Vec::new(),
+            launch_result: Some(RunnableEntrypointLaunchResult {
+                entrypoint_id: entrypoint_id.to_string(),
+                process_state: RunnableEntrypointProcessState::Running,
+                local_url: None,
+            }),
+            launch_result_path,
             state: ProcessState::Running,
         };
         let snapshot = process.snapshot(&key);
@@ -212,6 +228,8 @@ struct SupervisedProcess {
     stdout: Option<Receiver<Vec<u8>>>,
     stderr: Option<Receiver<Vec<u8>>>,
     diagnostics: Vec<EntrypointDiagnostic>,
+    launch_result: Option<RunnableEntrypointLaunchResult>,
+    launch_result_path: Option<PathBuf>,
     state: ProcessState,
 }
 
@@ -223,6 +241,7 @@ impl SupervisedProcess {
     fn refresh(&mut self) {
         drain_output("stdout", &mut self.stdout, &mut self.diagnostics);
         drain_output("stderr", &mut self.stderr, &mut self.diagnostics);
+        self.refresh_launch_result();
         if self.exited_at.is_none() {
             match self.child.try_wait() {
                 Ok(Some(status)) => self.mark_exit(status),
@@ -230,6 +249,9 @@ impl SupervisedProcess {
                 Err(error) => {
                     self.state = ProcessState::Failed;
                     self.exited_at = Some(now_seconds());
+                    if let Some(result) = &mut self.launch_result {
+                        result.process_state = RunnableEntrypointProcessState::Failed;
+                    }
                     self.diagnostics.push(EntrypointDiagnostic {
                         kind: "wait_error".to_string(),
                         message: bounded_message(error.to_string()),
@@ -237,6 +259,24 @@ impl SupervisedProcess {
                 }
             }
         }
+    }
+
+    fn refresh_launch_result(&mut self) {
+        let Some(path) = &self.launch_result_path else {
+            return;
+        };
+        let Ok(bytes) = fs::read(path) else {
+            return;
+        };
+        let Ok(result) = serde_json::from_slice::<RunnableEntrypointLaunchResult>(&bytes) else {
+            return;
+        };
+        if let Some(current) = &self.launch_result
+            && result.entrypoint_id != current.entrypoint_id
+        {
+            return;
+        }
+        self.launch_result = Some(result);
     }
 
     fn stop(&mut self) {
@@ -269,6 +309,13 @@ impl SupervisedProcess {
         } else {
             ProcessState::Failed
         };
+        if let Some(result) = &mut self.launch_result {
+            result.process_state = if status.success() {
+                RunnableEntrypointProcessState::Exited
+            } else {
+                RunnableEntrypointProcessState::Failed
+            };
+        }
     }
 
     fn snapshot(&self, key: &EntrypointKey) -> EntrypointProcessSnapshot {
@@ -281,6 +328,7 @@ impl SupervisedProcess {
             exited_at: self.exited_at,
             exit_status: self.exit_status.clone(),
             diagnostics: self.diagnostics.clone(),
+            launch_result: self.launch_result.clone(),
         }
     }
 }
@@ -329,8 +377,8 @@ fn find_supervisable_entrypoint<'a>(
     };
     if !entrypoint.may_supervise
         || !matches!(
-            entrypoint.mode,
-            PackageRunnableMode::Dev | PackageRunnableMode::Local
+            entrypoint.launch_mode,
+            RunnableEntrypointLaunchMode::Background
         )
     {
         return Err(EntrypointSupervisorError::EntrypointNotSupervisable {
@@ -372,6 +420,37 @@ fn resolve_working_directory(
         }
         crate::PackageRunnableWorkingDirectory::Relative { path } => Ok(package_root.join(path)),
     }
+}
+
+fn entrypoint_declares_launch_result(entrypoint: &PackageRunnableEntrypoint) -> bool {
+    entrypoint.readiness.as_ref().is_some_and(|readiness| {
+        readiness
+            .result_fields
+            .iter()
+            .any(|field| matches!(field, RunnableEntrypointResultField::LocalUrl))
+    })
+}
+
+fn launch_result_path(package_name: &str, entrypoint_id: &str, started_at: u64) -> PathBuf {
+    let file_name = format!(
+        "botster-launch-result-{}-{}-{started_at}.json",
+        sanitized_path_component(package_name),
+        sanitized_path_component(entrypoint_id)
+    );
+    std::env::temp_dir().join(file_name)
+}
+
+fn sanitized_path_component(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 fn spawn_reader(pipe: impl Read + Send + 'static) -> Receiver<Vec<u8>> {
@@ -469,6 +548,7 @@ fn stopped_snapshot(package_name: &str, entrypoint_id: &str) -> EntrypointProces
         exited_at: None,
         exit_status: None,
         diagnostics: Vec::new(),
+        launch_result: None,
     }
 }
 
@@ -489,5 +569,10 @@ fn failed_snapshot(
             kind: "spawn_error".to_string(),
             message: bounded_message(error.to_string()),
         }],
+        launch_result: Some(RunnableEntrypointLaunchResult {
+            entrypoint_id: entrypoint_id.to_string(),
+            process_state: RunnableEntrypointProcessState::Failed,
+            local_url: None,
+        }),
     }
 }
