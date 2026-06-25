@@ -220,7 +220,7 @@ into package registry state.
 
 Each entrypoint exposes sanitized manifest declarations: `id`, `kind`,
 `command`, `args`, `working_directory`, declarative `environment`
-requirements, `mode`, capability needs, `may_supervise`, and process
+requirements, `launch_mode`, capability needs, `may_supervise`, and process
 diagnostics. Runtime process fields are additive: `pid`, `started_at`,
 `exited_at`, and `exit_status` may be omitted when no supervised process state
 exists. The daemon response must not expose the local package root, provenance
@@ -228,6 +228,27 @@ path, socket path, or host-resolved environment values. Environment defaults
 are manifest-provided literals, not snapshots from the operator's machine.
 Entrypoint `actions` are derived after the daemon applies current supervisor
 snapshots, so start/stop/restart availability reflects live process state.
+
+`ListApps` exposes the installed app registry as first-class daemon DTOs. App
+rows are projected by the hub from installed package `runnable_entrypoints` plus
+the live `EntrypointSupervisor` snapshots, then returned as `DaemonResponse.apps`
+with response kind `apps`. Clients should consume those rows instead of
+inferring app state from package rows or parsing diagnostics.
+
+Each app row includes `package_name`, `app_id`, `entrypoint_id`, core
+`kind` (`web_app` or `terminal_app`), core `launch_mode` (`background` or
+`foreground_stdio`), `lifecycle_state`, `diagnostics`, `actions`,
+`blocked_reasons`, and a structured `launch_target`. Web apps may include
+`launch_target.local_url` only when the entrypoint readiness declares the
+`local_url` result field and the supervisor has a core
+`RunnableEntrypointLaunchResult.local_url` for that entrypoint.
+`launch_target.kind` mirrors the core app kind (`web_app` or `terminal_app`) so
+clients do not need a second kind vocabulary. Supervised runtimes can emit the
+structured launch result through the hub-provided
+`BOTSTER_ENTRYPOINT_LAUNCH_RESULT` file path. The hub must not derive
+`local_url` from stdout, stderr, diagnostics, command arguments, environment
+defaults, local package names, or known ports. Terminal apps use a terminal app
+launch target and do not expose fake background URLs.
 
 Supervised entrypoints are local development processes, not a production
 installer or sandbox. The daemon stops them on explicit stop/restart, package

@@ -18,17 +18,18 @@ use std::time::Duration;
 use botster_core::{
     EndpointId, EnvelopeCursor, EnvelopeDeliveryState, EnvelopeId, EnvelopeTarget,
     ExtensionRuntime, PackageConfigurationValue, RequestId, RoutedEnvelope, RoutedEnvelopePayload,
-    SessionId, SessionLifecycleState, SubscriptionId, TerminalAttachState, UiActionResult,
-    UiActionResultState, UiNode,
+    RunnableEntrypointKind, RunnableEntrypointLaunchMode, RunnableEntrypointProcessState,
+    RunnableEntrypointResultField, SessionId, SessionLifecycleState, SubscriptionId,
+    TerminalAttachState, UiActionResult, UiActionResultState, UiNode,
 };
 use botster_core_daemon::{
     GuardedWriteDecision, GuardedWriteDeliveryState, ReadinessEvidence, RegistrySessionState,
 };
 use botster_hub_client::DaemonTransportError as ClientDaemonTransportError;
 pub use botster_hub_client::{
-    DaemonAvailablePackage, DaemonCapability, DaemonCompatibility,
-    DaemonConnection as ClientDaemonConnection, DaemonCoordination, DaemonDiagnostic,
-    DaemonEndpoint, DaemonEnvelope, DaemonEnvelopeAck, DaemonEnvelopeDelivery,
+    DaemonApp, DaemonAppLaunchTarget, DaemonAvailablePackage, DaemonCapability,
+    DaemonCompatibility, DaemonConnection as ClientDaemonConnection, DaemonCoordination,
+    DaemonDiagnostic, DaemonEndpoint, DaemonEnvelope, DaemonEnvelopeAck, DaemonEnvelopeDelivery,
     DaemonEnvelopePublish, DaemonEvent, DaemonHello, DaemonHelloAck, DaemonIdentity, DaemonNotify,
     DaemonOperatorError, DaemonPackage, DaemonPackageActionRequest,
     DaemonPackageActionRequiredReference, DaemonPackageActionState, DaemonPackageActionStatus,
@@ -276,6 +277,7 @@ fn handle_control_request(
     request: DaemonRequest,
 ) -> DaemonTransportResult<DaemonResponse> {
     match request {
+        DaemonRequest::ListApps => list_apps_response(daemon),
         DaemonRequest::ListPackages => list_packages_response(daemon),
         DaemonRequest::ListAvailablePackages { registry_path } => {
             available_packages_response(daemon, registry_path)
@@ -883,6 +885,7 @@ fn handle_runtime_control_request(
                     .len(),
             )),
             sessions: Vec::new(),
+            apps: Vec::new(),
             packages: Vec::new(),
             available_packages: Vec::new(),
             install_plan: None,
@@ -899,7 +902,8 @@ fn handle_runtime_control_request(
             error: None,
             diagnostics: vec![DaemonDiagnostic::connected("shutdown")],
         }),
-        DaemonRequest::ListPackages
+        DaemonRequest::ListApps
+        | DaemonRequest::ListPackages
         | DaemonRequest::ListAvailablePackages { .. }
         | DaemonRequest::InspectAvailablePackage { .. }
         | DaemonRequest::PreviewPackageInstall { .. }
@@ -976,6 +980,12 @@ fn list_packages_response(daemon: &mut HubDaemon) -> DaemonTransportResult<Daemo
     let snapshots = daemon.entrypoint_supervisor().snapshots();
     apply_entrypoint_snapshots(&mut packages, snapshots);
     Ok(daemon_packages(packages))
+}
+
+fn list_apps_response(daemon: &mut HubDaemon) -> DaemonTransportResult<DaemonResponse> {
+    let registry = daemon.package_registry().clone();
+    let snapshots = daemon.entrypoint_supervisor().snapshots();
+    Ok(daemon_apps(apps_from_registry(&registry, snapshots)))
 }
 
 fn available_packages_response(
@@ -1092,6 +1102,199 @@ fn apply_entrypoint_snapshots(
             })
             .collect();
     }
+}
+
+fn apps_from_registry(
+    registry: &PackageRegistry,
+    snapshots: Vec<EntrypointProcessSnapshot>,
+) -> Vec<DaemonApp> {
+    let snapshots = snapshots
+        .into_iter()
+        .map(|snapshot| {
+            (
+                (
+                    snapshot.package_name.clone(),
+                    snapshot.entrypoint_id.clone(),
+                ),
+                snapshot,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    registry
+        .packages()
+        .into_iter()
+        .flat_map(|record| apps_from_record(record, &snapshots))
+        .collect()
+}
+
+fn apps_from_record(
+    record: &crate::PackageRecord,
+    snapshots: &BTreeMap<(String, String), EntrypointProcessSnapshot>,
+) -> Vec<DaemonApp> {
+    let package_state = package_state_label(record.state.into()).to_string();
+    record
+        .runnable_entrypoints
+        .iter()
+        .map(|entrypoint| {
+            let snapshot = snapshots.get(&(record.manifest.name.clone(), entrypoint.id.clone()));
+            let lifecycle_state = snapshot
+                .and_then(|snapshot| snapshot.launch_result.as_ref())
+                .map(|result| runnable_process_state_label(&result.process_state).to_string())
+                .or_else(|| snapshot.map(|snapshot| snapshot.state.clone()))
+                .unwrap_or_else(|| "not_started".to_string());
+            let diagnostics = snapshot
+                .map(|snapshot| {
+                    snapshot
+                        .diagnostics
+                        .iter()
+                        .map(|diagnostic| DaemonPackageDiagnostic {
+                            kind: diagnostic.kind.clone(),
+                            message: diagnostic.message.clone(),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let blocked_reasons = app_blocked_reasons(&package_state, entrypoint);
+            let actions = app_entrypoint_actions(
+                &record.manifest.name,
+                &package_state,
+                &entrypoint.id,
+                entrypoint.may_supervise && blocked_reasons.is_empty(),
+                &lifecycle_state,
+            );
+            DaemonApp {
+                package_name: record.manifest.name.clone(),
+                app_id: entrypoint.id.clone(),
+                entrypoint_id: entrypoint.id.clone(),
+                kind: runnable_entrypoint_kind_label(&entrypoint.kind).to_string(),
+                launch_mode: runnable_launch_mode_label(&entrypoint.launch_mode).to_string(),
+                lifecycle_state,
+                diagnostics,
+                actions,
+                blocked_reasons,
+                launch_target: DaemonAppLaunchTarget {
+                    kind: runnable_entrypoint_kind_label(&entrypoint.kind).to_string(),
+                    local_url: app_local_url(entrypoint, snapshot),
+                },
+            }
+        })
+        .collect()
+}
+
+fn app_blocked_reasons(
+    package_state: &str,
+    entrypoint: &crate::PackageRunnableEntrypoint,
+) -> Vec<String> {
+    let mut reasons = Vec::new();
+    if package_state != "enabled" {
+        reasons.push("package_not_enabled".to_string());
+    }
+    if !entrypoint.may_supervise {
+        reasons.push("entrypoint_not_supervisable".to_string());
+    }
+    if !matches!(
+        &entrypoint.launch_mode,
+        RunnableEntrypointLaunchMode::Background
+    ) {
+        reasons.push("unsupported_launch_mode".to_string());
+    }
+    reasons
+}
+
+fn app_entrypoint_actions(
+    package_name: &str,
+    package_state: &str,
+    entrypoint_id: &str,
+    may_supervise: bool,
+    lifecycle_state: &str,
+) -> Vec<DaemonPackageActionState> {
+    if !may_supervise {
+        return vec![
+            unavailable_action(
+                "start_package_entrypoint",
+                "entrypoint_not_supervisable",
+                "entrypoint cannot be supervised by the hub",
+            ),
+            unavailable_action(
+                "stop_package_entrypoint",
+                "entrypoint_not_supervisable",
+                "entrypoint cannot be supervised by the hub",
+            ),
+            unavailable_action(
+                "restart_package_entrypoint",
+                "entrypoint_not_supervisable",
+                "entrypoint cannot be supervised by the hub",
+            ),
+        ];
+    }
+    if package_state != "enabled" {
+        return vec![
+            blocked_action(
+                "start_package_entrypoint",
+                "package_not_enabled",
+                Vec::new(),
+                Vec::new(),
+            ),
+            blocked_action(
+                "stop_package_entrypoint",
+                "package_not_enabled",
+                Vec::new(),
+                Vec::new(),
+            ),
+            blocked_action(
+                "restart_package_entrypoint",
+                "package_not_enabled",
+                Vec::new(),
+                Vec::new(),
+            ),
+        ];
+    }
+    let running = lifecycle_state == "running";
+    let mut actions = Vec::new();
+    if running {
+        actions.push(unavailable_action(
+            "start_package_entrypoint",
+            "already_running",
+            "entrypoint is already running",
+        ));
+        actions.push(available_package_action(
+            "stop_package_entrypoint",
+            request_for_entrypoint("stop_package_entrypoint", package_name, entrypoint_id),
+        ));
+    } else {
+        actions.push(available_package_action(
+            "start_package_entrypoint",
+            request_for_entrypoint("start_package_entrypoint", package_name, entrypoint_id),
+        ));
+        actions.push(unavailable_action(
+            "stop_package_entrypoint",
+            "not_running",
+            "entrypoint is not running",
+        ));
+    }
+    actions.push(available_package_action(
+        "restart_package_entrypoint",
+        request_for_entrypoint("restart_package_entrypoint", package_name, entrypoint_id),
+    ));
+    actions
+}
+
+fn app_local_url(
+    entrypoint: &crate::PackageRunnableEntrypoint,
+    snapshot: Option<&EntrypointProcessSnapshot>,
+) -> Option<String> {
+    let declares_local_url = entrypoint.readiness.as_ref().is_some_and(|readiness| {
+        readiness
+            .result_fields
+            .iter()
+            .any(|field| matches!(field, RunnableEntrypointResultField::LocalUrl))
+    });
+    if !declares_local_url {
+        return None;
+    }
+    snapshot
+        .and_then(|snapshot| snapshot.launch_result.as_ref())
+        .and_then(|result| result.local_url.clone())
 }
 
 fn persist_package_registry(daemon: &HubDaemon) -> DaemonTransportResult<()> {
@@ -1274,6 +1477,7 @@ fn daemon_response_base(kind: DaemonResponseKind) -> DaemonResponse {
         kind,
         status: None,
         sessions: Vec::new(),
+        apps: Vec::new(),
         packages: Vec::new(),
         available_packages: Vec::new(),
         install_plan: None,
@@ -1327,6 +1531,12 @@ fn daemon_packages(packages: Vec<HubClientPackage>) -> DaemonResponse {
         .into_iter()
         .map(daemon_package_from_client)
         .collect();
+    response
+}
+
+fn daemon_apps(apps: Vec<DaemonApp>) -> DaemonResponse {
+    let mut response = daemon_response_base(DaemonResponseKind::Apps);
+    response.apps = apps;
     response
 }
 
@@ -1705,6 +1915,7 @@ fn daemon_package_from_client(package: HubClientPackage) -> DaemonPackage {
                 DaemonPackageRunnableEntrypoint {
                     id: entrypoint.id,
                     kind: entrypoint.kind,
+                    launch_mode: entrypoint.launch_mode,
                     command: entrypoint.command,
                     args: entrypoint.args,
                     working_directory: DaemonPackageWorkingDirectory {
@@ -1721,7 +1932,6 @@ fn daemon_package_from_client(package: HubClientPackage) -> DaemonPackage {
                             description: requirement.description,
                         })
                         .collect(),
-                    mode: entrypoint.mode,
                     capabilities: entrypoint
                         .capabilities
                         .into_iter()
@@ -2909,6 +3119,29 @@ fn package_state_label(state: crate::HubClientPackageState) -> &'static str {
         crate::HubClientPackageState::Installed => "installed",
         crate::HubClientPackageState::Enabled => "enabled",
         crate::HubClientPackageState::Disabled => "disabled",
+    }
+}
+
+fn runnable_entrypoint_kind_label(kind: &RunnableEntrypointKind) -> &'static str {
+    match kind {
+        RunnableEntrypointKind::WebApp => "web_app",
+        RunnableEntrypointKind::TerminalApp => "terminal_app",
+    }
+}
+
+fn runnable_launch_mode_label(mode: &RunnableEntrypointLaunchMode) -> &'static str {
+    match mode {
+        RunnableEntrypointLaunchMode::Background => "background",
+        RunnableEntrypointLaunchMode::ForegroundStdio => "foreground_stdio",
+    }
+}
+
+fn runnable_process_state_label(state: &RunnableEntrypointProcessState) -> &'static str {
+    match state {
+        RunnableEntrypointProcessState::NotStarted => "not_started",
+        RunnableEntrypointProcessState::Running => "running",
+        RunnableEntrypointProcessState::Exited => "exited",
+        RunnableEntrypointProcessState::Failed => "failed",
     }
 }
 
