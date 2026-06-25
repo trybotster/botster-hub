@@ -494,6 +494,7 @@ import net from 'net';
 const port = Number(process.env.BOTSTER_WEB_DOGFOOD_BRIDGE_PORT || '41739');
 const socket = process.env.BOTSTER_HUB_SOCKET;
 const dataDir = process.env.BOTSTER_HUB_DATA_DIR;
+const launchResult = process.env.BOTSTER_ENTRYPOINT_LAUNCH_RESULT;
 const mixedOwnership = Boolean(process.env.BOTSTER_WEB_DOGFOOD_DATA_DIR && (socket || dataDir));
 const source = socket ? 'socket' : (dataDir ? 'data_dir' : 'spawned');
 const mode = socket || dataDir ? 'existing_hub' : 'spawned_hub';
@@ -647,7 +648,15 @@ http.createServer(async (request, response) => {
     socketExists,
     mixedOwnership,
   }));
-}).listen(port, '127.0.0.1');
+}).listen(port, '127.0.0.1', () => {
+  if (launchResult) {
+    fs.writeFileSync(launchResult, JSON.stringify({
+      entrypoint_id: 'web-client',
+      process_state: 'running',
+      local_url: `http://127.0.0.1:${port}/?dogfood=real-hub`,
+    }));
+  }
+});
 "#,
     )
     .expect("write botster-web bridge script");
@@ -673,6 +682,7 @@ http.createServer(async (request, response) => {
                 { "name": "BOTSTER_WEB_DOGFOOD_BRIDGE_PORT", "required": false, "default": "41739" }
             ],
             "launch_mode": "background",
+            "readiness": { "result_fields": ["local_url"] },
             "capabilities": [{ "surface": "network", "scope": "localhost" }],
             "may_supervise": true
         }]
@@ -1943,6 +1953,76 @@ fn cli_dogfood_launcher_enables_local_tui_package_for_apps_open() {
         "tui=botster-hub apps open --data-dir {} botster-tui",
         data_dir.display()
     )));
+    assert!(
+        !text.contains(web_package_dir.to_string_lossy().as_ref()),
+        "launcher output should not leak the botster-web package source path"
+    );
+    assert!(
+        !text.contains(tui_package_dir.to_string_lossy().as_ref()),
+        "launcher output should not leak the botster-tui package source path"
+    );
+
+    let list_apps = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("apps")
+        .arg("list")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .output()
+        .expect("list dogfood apps from stable data dir");
+    assert!(
+        list_apps.status.success(),
+        "dogfood apps list failed: {}",
+        command_output_text(&list_apps)
+    );
+    let list_apps_text = command_output_text(&list_apps);
+    assert!(list_apps_text.contains("response=apps"));
+    assert!(list_apps_text.contains("app package=botster-web app_id=web-client"));
+    assert!(list_apps_text.contains("app package=botster-tui app_id=botster-tui"));
+    assert!(list_apps_text.contains("kind=web_app"));
+    assert!(list_apps_text.contains("kind=terminal_app"));
+    assert!(list_apps_text.contains(&format!(
+        "local_url=http://127.0.0.1:{web_bridge_port}/?dogfood=real-hub"
+    )));
+    assert!(!list_apps_text.contains(web_package_dir.to_string_lossy().as_ref()));
+    assert!(!list_apps_text.contains(tui_package_dir.to_string_lossy().as_ref()));
+
+    let show_web = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("apps")
+        .arg("show")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("botster-web/web-client")
+        .output()
+        .expect("show dogfood botster-web app");
+    assert!(
+        show_web.status.success(),
+        "dogfood apps show botster-web failed: {}",
+        command_output_text(&show_web)
+    );
+    let show_web_text = command_output_text(&show_web);
+    assert!(show_web_text.contains("response=app"));
+    assert!(show_web_text.contains("package=botster-web"));
+    assert!(show_web_text.contains("app_id=web-client"));
+    assert!(show_web_text.contains(&format!(
+        "local_url=http://127.0.0.1:{web_bridge_port}/?dogfood=real-hub"
+    )));
+
+    let open_web = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("apps")
+        .arg("open")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("botster-web/web-client")
+        .output()
+        .expect("open dogfood botster-web app");
+    assert!(
+        open_web.status.success(),
+        "dogfood apps open botster-web failed: {}",
+        command_output_text(&open_web)
+    );
+    assert!(command_output_text(&open_web).contains(&format!(
+        "app_url=http://127.0.0.1:{web_bridge_port}/?dogfood=real-hub"
+    )));
 
     let open_tui = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
         .arg("apps")
@@ -1958,6 +2038,21 @@ fn cli_dogfood_launcher_enables_local_tui_package_for_apps_open() {
         command_output_text(&open_tui)
     );
     assert!(command_output_text(&open_tui).contains("botster-tui-fixture"));
+
+    let alias = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("tui")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .output()
+        .expect("run dogfood tui alias");
+    assert!(
+        alias.status.success(),
+        "dogfood tui alias failed: {}",
+        command_output_text(&alias)
+    );
+    let alias_text = command_output_text(&alias);
+    assert!(alias_text.contains("botster-hub tui is deprecated"));
+    assert!(alias_text.contains("botster-tui-fixture"));
 
     shutdown_cli_daemon(&data_dir, child);
 }
