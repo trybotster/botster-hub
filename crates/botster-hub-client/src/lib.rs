@@ -588,6 +588,17 @@ pub enum DaemonRequest {
     InstallPackageLocalPath {
         path: PathBuf,
     },
+    CheckPackageUpdate {
+        package_name: String,
+    },
+    PreviewPackageUpdate {
+        package_name: String,
+        pin: DaemonPackagePin,
+    },
+    ApplyPackageUpdate {
+        package_name: String,
+        pin: DaemonPackagePin,
+    },
     ShowPackage {
         package_name: String,
     },
@@ -656,6 +667,8 @@ pub struct DaemonResponse {
     pub available_packages: Vec<DaemonAvailablePackage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub install_plan: Option<DaemonPackageInstallPlan>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update_status: Option<DaemonPackageUpdateStatus>,
     pub package_decision: Option<DaemonPackageDecision>,
     pub lifecycle: Vec<DaemonPluginLifecycle>,
     #[serde(default)]
@@ -684,6 +697,7 @@ pub enum DaemonResponseKind {
     Packages,
     AvailablePackages,
     PackageInstallPlan,
+    PackageUpdateStatus,
     PackageDecision,
     PluginLifecycle,
     PluginMcpTools,
@@ -861,6 +875,18 @@ pub struct DaemonPackageInstallPlan {
 pub struct DaemonPackageInstallEffect {
     pub kind: String,
     pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonPackageUpdateStatus {
+    pub package_name: String,
+    pub update_available: bool,
+    pub reload_required: bool,
+    pub restart_required: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pin: Option<DaemonPackagePin>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<DaemonPackageDiagnostic>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2070,6 +2096,9 @@ mod tests {
             DaemonRequest::PreviewPackageInstall { .. } => "preview_package_install",
             DaemonRequest::InstallPackageRegistryEntry { .. } => "install_package_registry_entry",
             DaemonRequest::InstallPackageLocalPath { .. } => "install_package_local_path",
+            DaemonRequest::CheckPackageUpdate { .. } => "check_package_update",
+            DaemonRequest::PreviewPackageUpdate { .. } => "preview_package_update",
+            DaemonRequest::ApplyPackageUpdate { .. } => "apply_package_update",
             DaemonRequest::ShowPackage { .. } => "show_package",
             DaemonRequest::SetPackageConfiguration { .. } => "set_package_configuration",
             DaemonRequest::EnablePackageLocalPath { .. } => "enable_package_local_path",
@@ -2098,6 +2127,7 @@ mod tests {
             DaemonResponseKind::Packages,
             DaemonResponseKind::AvailablePackages,
             DaemonResponseKind::PackageInstallPlan,
+            DaemonResponseKind::PackageUpdateStatus,
             DaemonResponseKind::PackageDecision,
             DaemonResponseKind::PluginLifecycle,
             DaemonResponseKind::PluginMcpTools,
@@ -2124,6 +2154,7 @@ mod tests {
             DaemonResponseKind::Packages => "packages",
             DaemonResponseKind::AvailablePackages => "available_packages",
             DaemonResponseKind::PackageInstallPlan => "package_install_plan",
+            DaemonResponseKind::PackageUpdateStatus => "package_update_status",
             DaemonResponseKind::PackageDecision => "package_decision",
             DaemonResponseKind::PluginLifecycle => "plugin_lifecycle",
             DaemonResponseKind::PluginMcpTools => "plugin_mcp_tools",
@@ -2234,6 +2265,17 @@ mod tests {
                 diagnostics: Vec::new(),
                 mutates_registry: false,
                 starts_entrypoints: false,
+            }),
+            update_status: Some(DaemonPackageUpdateStatus {
+                package_name: "workflow.plugin".to_string(),
+                update_available: false,
+                reload_required: false,
+                restart_required: false,
+                pin: None,
+                diagnostics: vec![DaemonPackageDiagnostic {
+                    kind: "update_unavailable".to_string(),
+                    message: "update resolution is unavailable for this package source".to_string(),
+                }],
             }),
             package_decision: Some(DaemonPackageDecision {
                 package_name: "workflow.plugin".to_string(),

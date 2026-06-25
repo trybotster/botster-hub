@@ -51,6 +51,9 @@ export type DaemonRequest =
   | { type: "preview_package_install"; registry_path: string; entry_id: string }
   | { type: "install_package_registry_entry"; registry_path: string; entry_id: string }
   | { type: "install_package_local_path"; path: string }
+  | { type: "check_package_update"; package_name: string }
+  | { type: "preview_package_update"; package_name: string; pin: DaemonPackagePin }
+  | { type: "apply_package_update"; package_name: string; pin: DaemonPackagePin }
   | { type: "show_package"; package_name: string }
   | { type: "set_package_configuration"; package_name: string; values: Record<string, JsonValue> }
   | { type: "enable_package_local_path"; path: string }
@@ -75,6 +78,7 @@ export interface DaemonResponse {
   packages: DaemonPackage[];
   available_packages?: DaemonAvailablePackage[];
   install_plan?: DaemonPackageInstallPlan | null;
+  update_status?: DaemonPackageUpdateStatus | null;
   package_decision: DaemonPackageDecision | null;
   lifecycle: DaemonPluginLifecycle[];
   plugin_tools: JsonValue[];
@@ -96,6 +100,7 @@ export type DaemonResponseKind =
   | "packages"
   | "available_packages"
   | "package_install_plan"
+  | "package_update_status"
   | "package_decision"
   | "plugin_lifecycle"
   | "plugin_mcp_tools"
@@ -237,6 +242,15 @@ export interface DaemonPackageInstallPlan {
 export interface DaemonPackageInstallEffect {
   kind: string;
   message: string;
+}
+
+export interface DaemonPackageUpdateStatus {
+  package_name: string;
+  update_available: boolean;
+  reload_required: boolean;
+  restart_required: boolean;
+  pin?: DaemonPackagePin | null;
+  diagnostics?: DaemonPackageDiagnostic[];
 }
 
 export interface DaemonPackageCompatibility {
