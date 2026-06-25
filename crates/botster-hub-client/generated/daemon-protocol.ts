@@ -46,6 +46,7 @@ export type DaemonRequest =
   | { type: "shutdown_session"; session_id: string }
   | { type: "drain"; session_id: string }
   | { type: "list_apps" }
+  | { type: "resolve_app_launch"; package_name: string; entrypoint_id: string }
   | { type: "list_packages" }
   | { type: "list_available_packages"; registry_path: string }
   | { type: "inspect_available_package"; registry_path: string; entry_id: string }
@@ -77,6 +78,7 @@ export interface DaemonResponse {
   status: DaemonStatus | null;
   sessions: DaemonSession[];
   apps?: DaemonApp[];
+  resolved_app_launch?: DaemonResolvedAppLaunch | null;
   packages: DaemonPackage[];
   available_packages?: DaemonAvailablePackage[];
   install_plan?: DaemonPackageInstallPlan | null;
@@ -100,6 +102,7 @@ export type DaemonResponseKind =
   | "spawned"
   | "events"
   | "apps"
+  | "resolved_app_launch"
   | "packages"
   | "available_packages"
   | "package_install_plan"
@@ -186,6 +189,18 @@ export interface DaemonApp {
 export interface DaemonAppLaunchTarget {
   kind: string;
   local_url?: string | null;
+}
+
+export interface DaemonResolvedAppLaunch {
+  package_name: string;
+  app_id: string;
+  entrypoint_id: string;
+  kind: string;
+  launch_mode: string;
+  command: string;
+  args?: string[];
+  working_directory: string;
+  environment?: Record<string, string>;
 }
 
 export interface DaemonPackage {

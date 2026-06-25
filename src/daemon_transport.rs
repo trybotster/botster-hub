@@ -39,8 +39,8 @@ pub use botster_hub_client::{
     DaemonPackageEnvironmentRequirement, DaemonPackageFeatureAvailability,
     DaemonPackageInstallEffect, DaemonPackageInstallPlan, DaemonPackagePin, DaemonPackageProcess,
     DaemonPackageRunnableEntrypoint, DaemonPackageSurfaceDescriptor, DaemonPackageUpdateStatus,
-    DaemonPackageWorkingDirectory, DaemonPluginLifecycle, DaemonRequest, DaemonResponse,
-    DaemonResponseKind, DaemonSession, DaemonSessionCleanup, DaemonStatus,
+    DaemonPackageWorkingDirectory, DaemonPluginLifecycle, DaemonRequest, DaemonResolvedAppLaunch,
+    DaemonResponse, DaemonResponseKind, DaemonSession, DaemonSessionCleanup, DaemonStatus,
     FEATURE_PLUGIN_SURFACE_ACTION, FEATURE_PLUGIN_SURFACE_RENDER, PROTOCOL, read_frame,
     read_frame_from_reader, write_frame,
 };
@@ -56,6 +56,7 @@ use crate::{
     HubStateLoadSource, HubStateStore, McpToolDescriptor, PackageAction, PackageAdmissionReason,
     PackageCompatibilityResult, PackageDecision, PackageInstallPlan, PackagePin, PackageRegistry,
     PackageRegistryEntrySourceKind, PackageRegistryError, PackageUpdatePolicy,
+    resolve_foreground_launch_contract,
 };
 use crate::{EntrypointProcessSnapshot, EntrypointSupervisorError};
 
@@ -278,6 +279,10 @@ fn handle_control_request(
 ) -> DaemonTransportResult<DaemonResponse> {
     match request {
         DaemonRequest::ListApps => list_apps_response(daemon),
+        DaemonRequest::ResolveAppLaunch {
+            package_name,
+            entrypoint_id,
+        } => resolve_app_launch_response(daemon, &package_name, &entrypoint_id),
         DaemonRequest::ListPackages => list_packages_response(daemon),
         DaemonRequest::ListAvailablePackages { registry_path } => {
             available_packages_response(daemon, registry_path)
@@ -886,6 +891,7 @@ fn handle_runtime_control_request(
             )),
             sessions: Vec::new(),
             apps: Vec::new(),
+            resolved_app_launch: None,
             packages: Vec::new(),
             available_packages: Vec::new(),
             install_plan: None,
@@ -903,6 +909,7 @@ fn handle_runtime_control_request(
             diagnostics: vec![DaemonDiagnostic::connected("shutdown")],
         }),
         DaemonRequest::ListApps
+        | DaemonRequest::ResolveAppLaunch { .. }
         | DaemonRequest::ListPackages
         | DaemonRequest::ListAvailablePackages { .. }
         | DaemonRequest::InspectAvailablePackage { .. }
@@ -986,6 +993,95 @@ fn list_apps_response(daemon: &mut HubDaemon) -> DaemonTransportResult<DaemonRes
     let registry = daemon.package_registry().clone();
     let snapshots = daemon.entrypoint_supervisor().snapshots();
     Ok(daemon_apps(apps_from_registry(&registry, snapshots)))
+}
+
+fn resolve_app_launch_response(
+    daemon: &mut HubDaemon,
+    package_name: &str,
+    entrypoint_id: &str,
+) -> DaemonTransportResult<DaemonResponse> {
+    let config = daemon
+        .runtime()
+        .ok_or(DaemonTransportError::DaemonNotRunning)?
+        .config()
+        .clone();
+    let socket = socket_path(&config)?;
+    let registry = daemon.package_registry();
+    let Some(record) = registry.package(package_name) else {
+        return Ok(daemon_app_launch_error(
+            package_name,
+            entrypoint_id,
+            "package_not_installed",
+            "package is not installed",
+        ));
+    };
+    if !record.is_enabled() {
+        return Ok(daemon_app_launch_error(
+            package_name,
+            entrypoint_id,
+            "package_not_enabled",
+            "package is not enabled",
+        ));
+    }
+    let Some(entrypoint) = record
+        .runnable_entrypoints
+        .iter()
+        .find(|entrypoint| entrypoint.id == entrypoint_id)
+    else {
+        return Ok(daemon_app_launch_error(
+            package_name,
+            entrypoint_id,
+            "entrypoint_not_found",
+            "entrypoint is not installed for package",
+        ));
+    };
+    if !matches!(entrypoint.kind, RunnableEntrypointKind::TerminalApp) {
+        return Ok(daemon_app_launch_error(
+            package_name,
+            entrypoint_id,
+            "unsupported_app_kind",
+            "app is not a terminal_app",
+        ));
+    }
+    if !matches!(
+        entrypoint.launch_mode,
+        RunnableEntrypointLaunchMode::ForegroundStdio
+    ) {
+        return Ok(daemon_app_launch_error(
+            package_name,
+            entrypoint_id,
+            "unsupported_launch_mode",
+            "terminal app must use foreground_stdio launch mode",
+        ));
+    }
+    let launch = match resolve_foreground_launch_contract(
+        record,
+        entrypoint,
+        &config.data_directory,
+        &socket,
+    ) {
+        Ok(launch) => launch,
+        Err(message) => {
+            return Ok(daemon_app_launch_error(
+                package_name,
+                entrypoint_id,
+                "launch_contract_unavailable",
+                message,
+            ));
+        }
+    };
+
+    Ok(daemon_resolved_app_launch(DaemonResolvedAppLaunch {
+        package_name: record.manifest.name.clone(),
+        app_id: entrypoint.id.clone(),
+        entrypoint_id: entrypoint.id.clone(),
+        kind: runnable_entrypoint_kind_label(&entrypoint.kind).to_string(),
+        launch_mode: runnable_launch_mode_label(&entrypoint.launch_mode).to_string(),
+        command: launch.command,
+        args: launch.args,
+        working_directory: launch.working_directory.display().to_string(),
+        environment: launch.environment,
+    }))
 }
 
 fn available_packages_response(
@@ -1159,7 +1255,7 @@ fn apps_from_record(
                 &record.manifest.name,
                 &package_state,
                 &entrypoint.id,
-                entrypoint.may_supervise && blocked_reasons.is_empty(),
+                entrypoint,
                 &lifecycle_state,
             );
             DaemonApp {
@@ -1189,13 +1285,24 @@ fn app_blocked_reasons(
     if package_state != "enabled" {
         reasons.push("package_not_enabled".to_string());
     }
-    if !entrypoint.may_supervise {
+    if matches!(
+        entrypoint.launch_mode,
+        RunnableEntrypointLaunchMode::Background
+    ) && !entrypoint.may_supervise
+    {
         reasons.push("entrypoint_not_supervisable".to_string());
     }
-    if !matches!(
-        &entrypoint.launch_mode,
-        RunnableEntrypointLaunchMode::Background
-    ) {
+    let supported = matches!(
+        (&entrypoint.kind, &entrypoint.launch_mode),
+        (
+            RunnableEntrypointKind::WebApp,
+            RunnableEntrypointLaunchMode::Background
+        ) | (
+            RunnableEntrypointKind::TerminalApp,
+            RunnableEntrypointLaunchMode::ForegroundStdio
+        )
+    );
+    if !supported {
         reasons.push("unsupported_launch_mode".to_string());
     }
     reasons
@@ -1205,10 +1312,16 @@ fn app_entrypoint_actions(
     package_name: &str,
     package_state: &str,
     entrypoint_id: &str,
-    may_supervise: bool,
+    entrypoint: &crate::PackageRunnableEntrypoint,
     lifecycle_state: &str,
 ) -> Vec<DaemonPackageActionState> {
-    if !may_supervise {
+    if !matches!(
+        entrypoint.launch_mode,
+        RunnableEntrypointLaunchMode::Background
+    ) {
+        return Vec::new();
+    }
+    if !entrypoint.may_supervise {
         return vec![
             unavailable_action(
                 "start_package_entrypoint",
@@ -1478,6 +1591,7 @@ fn daemon_response_base(kind: DaemonResponseKind) -> DaemonResponse {
         status: None,
         sessions: Vec::new(),
         apps: Vec::new(),
+        resolved_app_launch: None,
         packages: Vec::new(),
         available_packages: Vec::new(),
         install_plan: None,
@@ -1537,6 +1651,12 @@ fn daemon_packages(packages: Vec<HubClientPackage>) -> DaemonResponse {
 fn daemon_apps(apps: Vec<DaemonApp>) -> DaemonResponse {
     let mut response = daemon_response_base(DaemonResponseKind::Apps);
     response.apps = apps;
+    response
+}
+
+fn daemon_resolved_app_launch(launch: DaemonResolvedAppLaunch) -> DaemonResponse {
+    let mut response = daemon_response_base(DaemonResponseKind::ResolvedAppLaunch);
+    response.resolved_app_launch = Some(launch);
     response
 }
 
@@ -1701,6 +1821,27 @@ fn daemon_entrypoint_error(error: EntrypointSupervisorError) -> DaemonResponse {
     if let Some(error) = &response.error {
         response.diagnostics = error.diagnostics.clone();
     }
+    response
+}
+
+fn daemon_app_launch_error(
+    package_name: &str,
+    entrypoint_id: &str,
+    code: &str,
+    message: impl Into<String>,
+) -> DaemonResponse {
+    let message = message.into();
+    let diagnostic =
+        DaemonDiagnostic::action_failure("resolve_app_launch", format!("{code}: {message}"));
+    let mut response = daemon_response_base(DaemonResponseKind::OperatorError);
+    response.error = Some(DaemonOperatorError {
+        code: code.to_string(),
+        request_id: format!("resolve-app-launch-{package_name}-{entrypoint_id}"),
+        operation: "resolve_app_launch".to_string(),
+        message,
+        diagnostics: vec![diagnostic.clone()],
+    });
+    response.diagnostics = vec![diagnostic];
     response
 }
 

@@ -1046,6 +1046,75 @@ fn default_required_environment() -> bool {
     true
 }
 
+/// Daemon-resolved launch data for a local foreground runnable entrypoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackageResolvedForegroundLaunch {
+    pub command: String,
+    pub args: Vec<String>,
+    pub working_directory: PathBuf,
+    pub environment: BTreeMap<String, String>,
+}
+
+/// Resolve the host-local foreground launch contract owned by a package row.
+pub fn resolve_foreground_launch_contract(
+    record: &PackageRecord,
+    entrypoint: &PackageRunnableEntrypoint,
+    data_directory: &Path,
+    socket_path: &Path,
+) -> Result<PackageResolvedForegroundLaunch, String> {
+    let package_root = package_root(record)?;
+    let working_directory = match &entrypoint.working_directory {
+        PackageRunnableWorkingDirectory::PackageRoot => package_root.clone(),
+        PackageRunnableWorkingDirectory::EntrypointDir => {
+            resolve_command_path(&package_root, entrypoint.command.as_str())
+                .parent()
+                .unwrap_or(&package_root)
+                .to_path_buf()
+        }
+        PackageRunnableWorkingDirectory::Relative { path } => package_root.join(path),
+    };
+    let mut environment = BTreeMap::new();
+    environment.insert(
+        "BOTSTER_HUB_DATA_DIR".to_string(),
+        data_directory.display().to_string(),
+    );
+    environment.insert(
+        "BOTSTER_HUB_SOCKET".to_string(),
+        socket_path.display().to_string(),
+    );
+    for requirement in &entrypoint.environment {
+        if let Some(default) = requirement.default.as_ref() {
+            environment
+                .entry(requirement.name.clone())
+                .or_insert_with(|| default.clone());
+        }
+    }
+    Ok(PackageResolvedForegroundLaunch {
+        command: resolve_command_path(&package_root, entrypoint.command.as_str())
+            .display()
+            .to_string(),
+        args: entrypoint.args.clone(),
+        working_directory,
+        environment,
+    })
+}
+
+fn package_root(record: &PackageRecord) -> Result<PathBuf, String> {
+    match &record.manifest.source {
+        Some(PackageSource::Path { path }) => Ok(PathBuf::from(path)),
+        _ => Err("package source is not a local path".to_string()),
+    }
+}
+
+fn resolve_command_path(package_root: &Path, command: &str) -> PathBuf {
+    let command_path = Path::new(command);
+    if command_path.is_absolute() || command_path.components().count() == 1 {
+        command_path.to_path_buf()
+    } else {
+        package_root.join(command_path)
+    }
+}
+
 /// Static process-state DTO for package runnable entrypoints.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PackageRunnableProcess {

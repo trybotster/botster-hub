@@ -224,24 +224,25 @@ The launcher uses an isolated data directory under `target/` by default. Pass
 `--data-dir <path>` when you want state to survive across runs. It locates a
 co-located `botster-session-worker` next to the current `botster-hub` binary, or
 you can pass `--session-worker-bin <path>` explicitly. Pass
-`--web-package-path <path>` to the first-party `botster-web` checkout; the
-launcher enables that package, starts `web-client` through daemon supervision,
-passes the dogfood hub socket as `BOTSTER_HUB_SOCKET`, waits for `/health` to
-report `existing_hub` from `socket`, and then prints the exact commands for the
-current data directory:
+`--web-package-path <path>` to the first-party `botster-web` checkout; pass
+`--tui-package-path <path>` when you also want to enable a local `botster-tui`
+terminal app package. The launcher enables those packages, starts `web-client`
+through daemon supervision, passes the dogfood hub socket as
+`BOTSTER_HUB_SOCKET`, waits for `/health` to report `existing_hub` from
+`socket`, and then prints the exact commands for the current data directory:
 
 ```sh
 http://127.0.0.1:41739
-botster-tui --data-dir <path>
+botster-hub apps open --data-dir <path> botster-tui
 botster-hub mcp-serve --data-dir <path>
 botster-hub status --data-dir <path>
 botster-hub shutdown --data-dir <path>
 ```
 
 The supervised `botster-web` process receives `BOTSTER_HUB_SOCKET` because the
-launcher owns that child process. The standalone TUI is operator-run, so it uses
-`botster-tui --data-dir <path>` to resolve the same daemon socket from the shared
-data directory.
+launcher owns that child process. Foreground terminal apps run through
+`botster-hub apps open`, which asks the daemon for the resolved launch contract
+and then starts the child with inherited stdio.
 
 Keep the launcher running in the foreground. For graceful shutdown, run the
 printed shutdown command from another terminal; `Ctrl-C` hard-stops the
@@ -272,6 +273,10 @@ cargo run -- packages apply-update --data-dir target/botster-hub-dogfood-data \
 cargo run -- packages disable --data-dir target/botster-hub-dogfood-data dogfood.synthetic-plugin
 cargo run -- packages remove --data-dir target/botster-hub-dogfood-data dogfood.synthetic-plugin
 cargo run -- providers list --data-dir target/botster-hub-dogfood-data
+
+cargo run -- apps list --data-dir target/botster-hub-dogfood-data
+cargo run -- apps show --data-dir target/botster-hub-dogfood-data dogfood.synthetic-plugin/web
+cargo run -- apps open --data-dir target/botster-hub-dogfood-data dogfood.synthetic-plugin/web
 
 cargo run -- sessions spawn --data-dir target/botster-hub-dogfood-data \
   --session-id dogfood-session -- "printf 'dogfood-ok\n'; sleep 1"
@@ -310,11 +315,13 @@ dedicated inspection request.
 
 ## Standalone local TUI
 
-`botster-tui --data-dir <path>` opens the local terminal UI over the same daemon
-socket and `botster-hub-client` protocol path as the operator CLI. The hub no
-longer embeds a separate TUI renderer. `botster-hub tui --data-dir <path>` is a
-deprecated compatibility command that prints the equivalent standalone command
-and exits successfully.
+When a `botster-tui` terminal app package is installed and enabled,
+`botster-hub apps open --data-dir <path> botster-tui` opens the local terminal
+UI over the same daemon socket and `botster-hub-client` protocol path as the
+operator CLI. The hub resolves the foreground command, working directory, and
+allowlisted environment; the CLI only spawns that contract with inherited stdio.
+`botster-hub tui --data-dir <path>` is a deprecated compatibility alias for that
+apps command and reports clearly when `botster-tui` is not installed/enabled.
 
 ```sh
 # Terminal 1: leave the daemon running.
@@ -324,8 +331,8 @@ cargo run -- start --data-dir target/botster-hub-tui-dogfood-data
 cargo run -- sessions spawn --data-dir target/botster-hub-tui-dogfood-data \
   --session-id dogfood-session -- "printf 'dogfood-ok\n'; while IFS= read -r line; do printf 'dogfood:%s\n' \"$line\"; done"
 
-# Terminal 3: operate the session from the standalone TUI.
-botster-tui --data-dir target/botster-hub-tui-dogfood-data
+# Terminal 3: operate the session from the installed terminal app.
+botster-hub apps open --data-dir target/botster-hub-tui-dogfood-data botster-tui
 ```
 
 The echo-loop fixture is intentionally not a shell: typing `hello` should produce
