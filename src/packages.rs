@@ -1428,6 +1428,9 @@ pub enum PackageAction {
     Enable,
     Disable,
     Remove,
+    CheckUpdate,
+    PreviewUpdate,
+    ApplyUpdate,
     Pin,
     Prepare,
 }
