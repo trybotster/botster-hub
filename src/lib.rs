@@ -85,9 +85,9 @@ pub use daemon_transport::{
     DaemonPackageEnvironmentRequirement, DaemonPackageFeatureAvailability,
     DaemonPackageInstallEffect, DaemonPackageInstallPlan, DaemonPackagePin, DaemonPackageProcess,
     DaemonPackageRunnableEntrypoint, DaemonPackageWorkingDirectory, DaemonPluginLifecycle,
-    DaemonRequest, DaemonResponse, DaemonResponseKind, DaemonSession, DaemonSessionCleanup,
-    DaemonStatus, DaemonTransportError, DaemonTransportResult, request as daemon_transport_request,
-    serve_daemon, stream_attach,
+    DaemonRequest, DaemonResolvedAppLaunch, DaemonResponse, DaemonResponseKind, DaemonSession,
+    DaemonSessionCleanup, DaemonStatus, DaemonTransportError, DaemonTransportResult,
+    request as daemon_transport_request, serve_daemon, stream_attach,
 };
 pub use entrypoint_supervisor::{
     EntrypointDiagnostic, EntrypointProcessSnapshot, EntrypointSupervisor,
@@ -111,10 +111,11 @@ pub use packages::{
     PackageInstallPlan, PackagePin, PackageProvenance, PackageRecord, PackageRegistry,
     PackageRegistryEntrySourceKind, PackageRegistryError, PackageRegistryResult,
     PackageRegistrySnapshot, PackageRegistrySnapshotError, PackageRegistrySource,
-    PackageRegistrySourceKind, PackageRunnableDiagnostic, PackageRunnableEntrypoint,
-    PackageRunnableProcess, PackageRunnableProcessState, PackageRunnableWorkingDirectory,
-    PackageSourceMetadata, PackageState, PackageTrust, PackageTrustClassification,
-    PackageUpdatePolicy, PreparedLocalPackage, default_package_policy,
+    PackageRegistrySourceKind, PackageResolvedForegroundLaunch, PackageRunnableDiagnostic,
+    PackageRunnableEntrypoint, PackageRunnableProcess, PackageRunnableProcessState,
+    PackageRunnableWorkingDirectory, PackageSourceMetadata, PackageState, PackageTrust,
+    PackageTrustClassification, PackageUpdatePolicy, PreparedLocalPackage, default_package_policy,
+    resolve_foreground_launch_contract,
 };
 pub use persistence::{
     CapabilityGrantRecord, FileHubStateStore, HubAuditEntry, HubState, HubStateError,

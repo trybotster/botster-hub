@@ -422,7 +422,7 @@ fn write_app_registry_package(root: &Path) {
                 "id": "web",
                 "kind": "web_app",
                 "command": "sh",
-                "args": ["-c", "printf '%s\n' '{\"entrypoint_id\":\"web\",\"process_state\":\"running\",\"local_url\":\"http://127.0.0.1:49152\"}' > \"$BOTSTER_ENTRYPOINT_LAUNCH_RESULT\"; while true; do sleep 1; done"],
+                "args": ["-c", "echo 'http://127.0.0.1:59999'; printf '%s\n' '{\"entrypoint_id\":\"web\",\"process_state\":\"running\",\"local_url\":\"http://127.0.0.1:49152\"}' > \"$BOTSTER_ENTRYPOINT_LAUNCH_RESULT\"; while true; do sleep 1; done"],
                 "working_directory": { "policy": "package_root" },
                 "launch_mode": "background",
                 "readiness": { "result_fields": ["local_url"] },
@@ -445,6 +445,39 @@ fn write_app_registry_package(root: &Path) {
         serde_json::to_string_pretty(&manifest).expect("serialize app registry manifest"),
     )
     .expect("write app registry package manifest");
+}
+
+fn write_botster_tui_package(root: &Path) {
+    fs::create_dir_all(root).expect("create botster-tui package root");
+    fs::write(root.join("plugin.lua"), "return botster.register({})\n")
+        .expect("write botster-tui plugin entrypoint");
+    let manifest = serde_json::json!({
+        "name": "botster-tui",
+        "version": "1.0.0",
+        "kind": "plugin",
+        "botster": ">=0.1.0",
+        "source": { "type": "path", "path": "." },
+        "capabilities": [{ "surface": "surfaces" }],
+        "entrypoints": [
+            { "runtime": "lua", "path": "plugin.lua", "bootstrap": false }
+        ],
+        "runnable_entrypoints": [{
+            "id": "botster-tui",
+            "kind": "terminal_app",
+            "command": "sh",
+            "args": ["-c", "test -n \"$BOTSTER_HUB_SOCKET\" && test -n \"$BOTSTER_HUB_DATA_DIR\" && printf 'botster-tui-fixture\\n'"],
+            "working_directory": { "policy": "package_root" },
+            "environment": [
+                { "name": "BOTSTER_TUI_MODE", "required": false, "default": "headless" }
+            ],
+            "launch_mode": "foreground_stdio"
+        }]
+    });
+    fs::write(
+        root.join("botster-package.json"),
+        serde_json::to_string_pretty(&manifest).expect("serialize botster-tui manifest"),
+    )
+    .expect("write botster-tui manifest");
 }
 
 fn write_botster_web_package(root: &Path) {
@@ -1252,6 +1285,15 @@ fn spawn_dogfood_launcher(
     web_package_path: &Path,
     web_bridge_port: Option<u16>,
 ) -> (Child, mpsc::Receiver<String>) {
+    spawn_dogfood_launcher_with_tui(data_dir, web_package_path, None, web_bridge_port)
+}
+
+fn spawn_dogfood_launcher_with_tui(
+    data_dir: Option<&Path>,
+    web_package_path: &Path,
+    tui_package_path: Option<&Path>,
+    web_bridge_port: Option<u16>,
+) -> (Child, mpsc::Receiver<String>) {
     ensure_session_worker_binary();
     let mut command = Command::new(env!("CARGO_BIN_EXE_botster-hub"));
     command.arg("dogfood");
@@ -1259,6 +1301,9 @@ fn spawn_dogfood_launcher(
         command.arg("--data-dir").arg(data_dir);
     }
     command.arg("--web-package-path").arg(web_package_path);
+    if let Some(tui_package_path) = tui_package_path {
+        command.arg("--tui-package-path").arg(tui_package_path);
+    }
     if let Some(web_bridge_port) = web_bridge_port {
         command
             .arg("--web-bridge-port")
@@ -1514,7 +1559,7 @@ fn cli_dogfood_launcher_starts_botster_web_in_existing_hub_mode_and_shuts_down()
         format!("http://127.0.0.1:{web_bridge_port}/?dogfood=real-hub")
     );
     assert!(text.contains(&format!(
-        "tui=botster-tui --data-dir {}",
+        "tui=botster-hub apps open --data-dir {} botster-tui",
         data_dir.display()
     )));
     assert!(text.contains("mcp=botster-hub mcp-serve --data-dir"));
@@ -1611,28 +1656,6 @@ fn cli_dogfood_launcher_starts_botster_web_in_existing_hub_mode_and_shuts_down()
 
     shutdown_cli_daemon(&data_dir, child);
     wait_for_process_exit(web_pid);
-}
-
-#[test]
-fn cli_tui_prints_standalone_command_and_exits_successfully() {
-    let data_dir = unique_test_dir("cli-tui-deprecated-command");
-    let mut command = Command::new(env!("CARGO_BIN_EXE_botster-hub"));
-    command.arg("tui").arg("--data-dir").arg(&data_dir);
-    let output = run_command_with_timeout(command, Duration::from_secs(3));
-
-    assert!(
-        output.status.success(),
-        "deprecated tui command should exit successfully: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert_eq!(String::from_utf8_lossy(&output.stderr), "");
-    assert_eq!(
-        String::from_utf8_lossy(&output.stdout),
-        format!(
-            "botster-hub tui is deprecated. Use: botster-tui --data-dir {}\n",
-            data_dir.display()
-        )
-    );
 }
 
 #[test]
@@ -1887,6 +1910,54 @@ fn cli_dogfood_launcher_uses_generated_data_dir_and_dynamic_bridge_port() {
     assert_eq!(health["port"], web_bridge_port);
     let html = read_web_html(&web_url);
     assert!(html.contains("botster-web packaged UI"));
+
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
+fn cli_dogfood_launcher_enables_local_tui_package_for_apps_open() {
+    let _guard = daemon_test_lock()
+        .lock()
+        .expect("serialize real daemon test");
+    let data_dir = unique_test_dir("cli-dogfood-tui");
+    let web_package_dir = unique_test_dir("cli-dogfood-tui-botster-web-package");
+    let tui_package_dir = unique_test_dir("cli-dogfood-tui-package");
+    write_botster_web_package(&web_package_dir);
+    write_botster_tui_package(&tui_package_dir);
+    let web_bridge_port = unused_loopback_port();
+    let (mut child, rx) = spawn_dogfood_launcher_with_tui(
+        Some(&data_dir),
+        &web_package_dir,
+        Some(&tui_package_dir),
+        Some(web_bridge_port),
+    );
+    let lines = collect_dogfood_ready_output(&mut child, &rx);
+    let text = lines.join("\n");
+    assert!(text.contains("dogfood=ready"));
+    assert!(text.contains("package name=botster-web state=enabled"));
+    assert_eq!(
+        dogfood_web_url(&lines),
+        format!("http://127.0.0.1:{web_bridge_port}/?dogfood=real-hub")
+    );
+    assert!(text.contains(&format!(
+        "tui=botster-hub apps open --data-dir {} botster-tui",
+        data_dir.display()
+    )));
+
+    let open_tui = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("apps")
+        .arg("open")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("botster-tui")
+        .output()
+        .expect("open dogfood botster-tui app");
+    assert!(
+        open_tui.status.success(),
+        "dogfood apps open botster-tui failed: {}",
+        command_output_text(&open_tui)
+    );
+    assert!(command_output_text(&open_tui).contains("botster-tui-fixture"));
 
     shutdown_cli_daemon(&data_dir, child);
 }
@@ -4284,11 +4355,8 @@ fn daemon_list_apps_projects_installed_package_entrypoints() {
     assert_eq!(terminal.launch_mode, "foreground_stdio");
     assert_eq!(terminal.launch_target.kind, "terminal_app");
     assert_eq!(terminal.launch_target.local_url, None);
-    assert!(
-        terminal
-            .blocked_reasons
-            .contains(&"unsupported_launch_mode".to_string())
-    );
+    assert!(terminal.blocked_reasons.is_empty());
+    assert!(terminal.actions.is_empty());
 
     botster_hub::daemon_transport_request(
         &explicit_config(&data_dir),
@@ -4316,6 +4384,190 @@ fn daemon_list_apps_projects_installed_package_entrypoints() {
         package_action(&web.actions, "stop_package_entrypoint").status,
         botster_hub::DaemonPackageActionStatus::Available
     );
+
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
+fn daemon_resolves_terminal_app_foreground_launch_contract() {
+    let _guard = daemon_test_lock()
+        .lock()
+        .expect("serialize real daemon test");
+    let data_dir = unique_test_dir("resolve-terminal-app");
+    let package_dir = unique_test_dir("resolve-terminal-app-package");
+    write_botster_tui_package(&package_dir);
+    let child = start_cli_daemon(&data_dir);
+    enable_supervised_package(&data_dir, &package_dir);
+
+    let response = botster_hub::daemon_transport_request(
+        &explicit_config(&data_dir),
+        botster_hub::DaemonRequest::ResolveAppLaunch {
+            package_name: "botster-tui".to_string(),
+            entrypoint_id: "botster-tui".to_string(),
+        },
+    )
+    .expect("resolve terminal app launch");
+    assert_eq!(
+        response.kind,
+        botster_hub::DaemonResponseKind::ResolvedAppLaunch
+    );
+    let launch = response
+        .resolved_app_launch
+        .expect("resolved foreground launch");
+    assert_eq!(launch.package_name, "botster-tui");
+    assert_eq!(launch.kind, "terminal_app");
+    assert_eq!(launch.launch_mode, "foreground_stdio");
+    assert_eq!(launch.command, "sh");
+    assert!(launch.environment.contains_key("BOTSTER_HUB_SOCKET"));
+    assert!(launch.environment.contains_key("BOTSTER_HUB_DATA_DIR"));
+    assert_eq!(
+        launch
+            .environment
+            .get("BOTSTER_TUI_MODE")
+            .map(String::as_str),
+        Some("headless")
+    );
+
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
+fn cli_apps_list_show_and_open_web_use_structured_app_url() {
+    let _guard = daemon_test_lock()
+        .lock()
+        .expect("serialize real daemon test");
+    let data_dir = unique_test_dir("cli-apps-web");
+    let package_dir = unique_test_dir("cli-apps-web-package");
+    write_app_registry_package(&package_dir);
+    let child = start_cli_daemon(&data_dir);
+    enable_supervised_package(&data_dir, &package_dir);
+
+    let list = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("apps")
+        .arg("list")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .output()
+        .expect("run apps list");
+    assert!(
+        list.status.success(),
+        "apps list failed: {}",
+        command_output_text(&list)
+    );
+    let list_text = command_output_text(&list);
+    assert!(list_text.contains("response=apps"));
+    assert!(list_text.contains("app package=dogfood.apps app_id=web"));
+    assert!(list_text.contains("app package=dogfood.apps app_id=terminal"));
+
+    let show = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("apps")
+        .arg("show")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("dogfood.apps/web")
+        .output()
+        .expect("run apps show");
+    assert!(
+        show.status.success(),
+        "apps show failed: {}",
+        command_output_text(&show)
+    );
+    let show_text = command_output_text(&show);
+    assert!(show_text.contains("response=app"));
+    assert!(show_text.contains("package=dogfood.apps"));
+    assert!(show_text.contains("app_id=web"));
+
+    let open = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("apps")
+        .arg("open")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("web")
+        .output()
+        .expect("run apps open web");
+    assert!(
+        open.status.success(),
+        "apps open web failed: {}",
+        command_output_text(&open)
+    );
+    let open_text = command_output_text(&open);
+    assert!(open_text.contains("app_url=http://127.0.0.1:49152"));
+    assert!(!open_text.contains("http://127.0.0.1:59999"));
+    let apps = botster_hub::daemon_transport_request(
+        &explicit_config(&data_dir),
+        botster_hub::DaemonRequest::ListApps,
+    )
+    .expect("list apps after cli open");
+    assert_eq!(
+        app_row(&apps, "web").launch_target.local_url.as_deref(),
+        Some("http://127.0.0.1:49152")
+    );
+
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
+fn cli_apps_open_terminal_and_tui_alias_use_foreground_launch_contract() {
+    let _guard = daemon_test_lock()
+        .lock()
+        .expect("serialize real daemon test");
+    let data_dir = unique_test_dir("cli-apps-terminal");
+    let package_dir = unique_test_dir("cli-apps-terminal-package");
+    write_botster_tui_package(&package_dir);
+    let child = start_cli_daemon(&data_dir);
+    enable_supervised_package(&data_dir, &package_dir);
+
+    let open = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("apps")
+        .arg("open")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("botster-tui")
+        .output()
+        .expect("run apps open terminal");
+    assert!(
+        open.status.success(),
+        "apps open terminal failed: {}",
+        command_output_text(&open)
+    );
+    assert!(command_output_text(&open).contains("botster-tui-fixture"));
+
+    let alias = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("tui")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .output()
+        .expect("run tui alias");
+    assert!(
+        alias.status.success(),
+        "tui alias failed: {}",
+        command_output_text(&alias)
+    );
+    let alias_text = command_output_text(&alias);
+    assert!(alias_text.contains("botster-hub tui is deprecated"));
+    assert!(alias_text.contains("botster-tui-fixture"));
+
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
+fn cli_tui_alias_reports_missing_installed_app() {
+    let _guard = daemon_test_lock()
+        .lock()
+        .expect("serialize real daemon test");
+    let data_dir = unique_test_dir("cli-tui-missing");
+    let child = start_cli_daemon(&data_dir);
+
+    let alias = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("tui")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .output()
+        .expect("run missing tui alias");
+    assert!(!alias.status.success());
+    let text = command_output_text(&alias);
+    assert!(text.contains("botster-hub tui is deprecated"));
+    assert!(text.contains("app botster-tui is not installed or enabled"));
 
     shutdown_cli_daemon(&data_dir, child);
 }

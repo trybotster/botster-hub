@@ -14,12 +14,12 @@ use botster_core::{
 };
 use botster_hub::{
     DaemonApp, DaemonCompatibility, DaemonEvent, DaemonOperatorError, DaemonPackage,
-    DaemonPackagePin, DaemonRequest, DaemonResponse, DaemonResponseKind, DaemonSession,
-    DaemonStatus, DataDirectoryOption, HubClientApi, HubClientRequest, HubClientResponseBody,
-    HubDaemon, HubDaemonState, HubRuntime, HubStartupOptions, HubStateLoadSource,
-    RuntimeEnvironment, SessionDefaults, TransportBindings, build_default_config_for_runtime,
-    daemon_transport_request, default_package_policy, host_profile, serve_daemon, serve_mcp_stdio,
-    stream_attach,
+    DaemonPackageActionStatus, DaemonPackagePin, DaemonRequest, DaemonResponse, DaemonResponseKind,
+    DaemonSession, DaemonStatus, DataDirectoryOption, HubClientApi, HubClientRequest,
+    HubClientResponseBody, HubDaemon, HubDaemonState, HubRuntime, HubStartupOptions,
+    HubStateLoadSource, RuntimeEnvironment, SessionDefaults, TransportBindings,
+    build_default_config_for_runtime, daemon_transport_request, default_package_policy,
+    host_profile, serve_daemon, serve_mcp_stdio, stream_attach,
 };
 use botster_hub_client::DaemonPackageUpdateStatus;
 
@@ -73,6 +73,13 @@ fn main() {
         Some("tui") => {
             if let Err(error) = operator_tui(env::args().skip(2).collect()) {
                 eprintln!("botster-hub tui error: {error}");
+                process::exit(1);
+            }
+            return;
+        }
+        Some("apps") => {
+            if let Err(error) = operator_apps(env::args().skip(2).collect()) {
+                eprintln!("botster-hub apps error: {error}");
                 process::exit(1);
             }
             return;
@@ -234,6 +241,13 @@ fn dogfood(args: Vec<String>) -> Result<(), DogfoodError> {
             return Err(error);
         }
     };
+    if let Some(tui_package_path) = options.tui_package_path.as_ref()
+        && let Err(error) = enable_botster_tui_dogfood(&config, tui_package_path)
+    {
+        let _ = daemon_transport_request(&config, DaemonRequest::DaemonShutdown);
+        cleanup_dogfood_child(&mut child);
+        return Err(error);
+    }
 
     print_dogfood_ready(
         &data_directory,
@@ -407,6 +421,32 @@ fn enable_dogfood_package(
         },
     )
     .map_err(DogfoodError::Transport)
+}
+
+fn enable_botster_tui_dogfood(
+    config: &botster_hub::HubConfig,
+    package_path: &Path,
+) -> Result<(), DogfoodError> {
+    let response = enable_dogfood_package(config, "botster-tui", package_path.to_path_buf())?;
+    if response.kind == DaemonResponseKind::OperatorError {
+        return Err(DogfoodError::TuiPackageEnable(
+            response
+                .error
+                .map(|error| error.message)
+                .unwrap_or_else(|| "botster-tui package enable failed".to_string()),
+        ));
+    }
+    let package = response
+        .packages
+        .iter()
+        .find(|package| package.package_name == "botster-tui")
+        .ok_or(DogfoodError::WrongTuiPackage)?;
+    if !package.runnable_entrypoints.iter().any(|entrypoint| {
+        entrypoint.kind == "terminal_app" && entrypoint.launch_mode == "foreground_stdio"
+    }) {
+        return Err(DogfoodError::MissingTuiEntrypoint);
+    }
+    Ok(())
 }
 
 fn dogfood_package_already_installed(response: &DaemonResponse) -> bool {
@@ -668,7 +708,7 @@ fn print_dogfood_ready(
     println!("package name=botster-web state={}", web.package_state);
     println!("bridge={}", web.bridge_url);
     println!("web={}", web.web_url);
-    println!("tui=botster-tui --data-dir {dir}");
+    println!("tui=botster-hub apps open --data-dir {dir} botster-tui");
     println!("mcp=botster-hub mcp-serve --data-dir {dir}");
     println!("status=botster-hub status --data-dir {dir}");
     println!(
@@ -786,11 +826,227 @@ fn mcp_serve(args: Vec<String>) -> Result<(), McpCliError> {
 
 fn operator_tui(args: Vec<String>) -> Result<(), OperatorError> {
     let options = DataDirOptions::parse(args, "tui")?;
-    println!(
-        "botster-hub tui is deprecated. Use: botster-tui --data-dir {}",
-        options.data_directory.display()
+    eprintln!(
+        "botster-hub tui is deprecated; delegating to: botster-hub apps open --data-dir <path> botster-tui"
     );
+    open_app_by_selector(options.data_directory, "botster-tui")
+}
+
+fn operator_apps(args: Vec<String>) -> Result<(), OperatorError> {
+    let command = AppCommand::parse(args)?;
+    match command.action {
+        AppActionCommand::List => {
+            let config = explicit_config(command.data_directory)?;
+            let response = daemon_transport_request(&config, DaemonRequest::ListApps)?;
+            print_apps(&response.apps);
+            Ok(())
+        }
+        AppActionCommand::Show(selector) => {
+            let config = explicit_config(command.data_directory)?;
+            let response = daemon_transport_request(&config, DaemonRequest::ListApps)?;
+            let app = resolve_app_selector(&response.apps, &selector)?;
+            print_app_detail(app);
+            Ok(())
+        }
+        AppActionCommand::Open(selector) => open_app_by_selector(command.data_directory, &selector),
+    }
+}
+
+fn open_app_by_selector(data_directory: PathBuf, selector: &str) -> Result<(), OperatorError> {
+    let config = explicit_config(data_directory)?;
+    let response = daemon_transport_request(&config, DaemonRequest::ListApps)?;
+    let app = resolve_app_selector(&response.apps, selector)?.clone();
+    match app.kind.as_str() {
+        "web_app" => open_web_app(&config, app),
+        "terminal_app" => open_terminal_app(&config, app),
+        _ => Err(OperatorError::App(format!(
+            "unsupported app kind {} for {}",
+            app.kind, app.entrypoint_id
+        ))),
+    }
+}
+
+fn open_web_app(config: &botster_hub::HubConfig, app: DaemonApp) -> Result<(), OperatorError> {
+    if app.launch_mode != "background" {
+        return Err(OperatorError::App(format!(
+            "web_app {} must use background launch mode",
+            app.entrypoint_id
+        )));
+    }
+    if !app.blocked_reasons.is_empty() {
+        return Err(OperatorError::App(format!(
+            "app {} is blocked: {}",
+            app.entrypoint_id,
+            app.blocked_reasons.join(",")
+        )));
+    }
+    if app.lifecycle_state != "running" {
+        let response = daemon_transport_request(
+            config,
+            DaemonRequest::StartPackageEntrypoint {
+                package_name: app.package_name.clone(),
+                entrypoint_id: app.entrypoint_id.clone(),
+                environment_overrides: BTreeMap::new(),
+            },
+        )?;
+        if response.kind == DaemonResponseKind::OperatorError {
+            return print_daemon_response(response);
+        }
+    }
+    let app = wait_for_app_url(config, &app.package_name, &app.entrypoint_id)?;
+    let Some(url) = app.launch_target.local_url else {
+        return Err(OperatorError::App(format!(
+            "app {} did not report a structured local_url",
+            app.entrypoint_id
+        )));
+    };
+    println!("app_url={url}");
     Ok(())
+}
+
+fn open_terminal_app(config: &botster_hub::HubConfig, app: DaemonApp) -> Result<(), OperatorError> {
+    if app.launch_mode != "foreground_stdio" {
+        return Err(OperatorError::App(format!(
+            "terminal_app {} must use foreground_stdio launch mode",
+            app.entrypoint_id
+        )));
+    }
+    if !app.blocked_reasons.is_empty() {
+        return Err(OperatorError::App(format!(
+            "app {} is blocked: {}",
+            app.entrypoint_id,
+            app.blocked_reasons.join(",")
+        )));
+    }
+    let response = daemon_transport_request(
+        config,
+        DaemonRequest::ResolveAppLaunch {
+            package_name: app.package_name,
+            entrypoint_id: app.entrypoint_id,
+        },
+    )?;
+    if response.kind == DaemonResponseKind::OperatorError {
+        return print_daemon_response(response);
+    }
+    let launch = response
+        .resolved_app_launch
+        .ok_or(OperatorError::UnexpectedResponse("resolve_app_launch"))?;
+    let mut command = Command::new(&launch.command);
+    command.args(&launch.args);
+    command.current_dir(&launch.working_directory);
+    command.envs(&launch.environment);
+    command
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    let status = command.status().map_err(OperatorError::SpawnApp)?;
+    if let Some(code) = status.code() {
+        if code == 0 {
+            Ok(())
+        } else {
+            process::exit(code);
+        }
+    } else {
+        process::exit(1);
+    }
+}
+
+fn wait_for_app_url(
+    config: &botster_hub::HubConfig,
+    package_name: &str,
+    entrypoint_id: &str,
+) -> Result<DaemonApp, OperatorError> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut last_app = None;
+    while Instant::now() < deadline {
+        let response = daemon_transport_request(config, DaemonRequest::ListApps)?;
+        let app = response
+            .apps
+            .into_iter()
+            .find(|app| app.package_name == package_name && app.entrypoint_id == entrypoint_id)
+            .ok_or_else(|| OperatorError::App("app disappeared from registry".to_string()))?;
+        if app.lifecycle_state == "running" && app.launch_target.local_url.is_some() {
+            return Ok(app);
+        }
+        last_app = Some(app);
+        thread::sleep(Duration::from_millis(50));
+    }
+    let state = last_app
+        .map(|app| app.lifecycle_state)
+        .unwrap_or_else(|| "missing".to_string());
+    Err(OperatorError::App(format!(
+        "timed out waiting for structured app URL; lifecycle_state={state}"
+    )))
+}
+
+fn resolve_app_selector<'a>(
+    apps: &'a [DaemonApp],
+    selector: &str,
+) -> Result<&'a DaemonApp, OperatorError> {
+    let matches = if let Some((package, app_id)) = selector.split_once('/') {
+        apps.iter()
+            .filter(|app| app.package_name == package && app.app_id == app_id)
+            .collect::<Vec<_>>()
+    } else {
+        apps.iter()
+            .filter(|app| {
+                app.app_id == selector
+                    || app.entrypoint_id == selector
+                    || app.package_name == selector && app.kind == "terminal_app"
+            })
+            .collect::<Vec<_>>()
+    };
+    match matches.as_slice() {
+        [app] => Ok(*app),
+        [] => Err(OperatorError::App(format!(
+            "app {selector} is not installed or enabled"
+        ))),
+        _ => Err(OperatorError::App(format!(
+            "app selector {selector} is ambiguous; use package/app"
+        ))),
+    }
+}
+
+fn print_app_detail(app: &DaemonApp) {
+    println!("response=app");
+    println!("package={}", app.package_name);
+    println!("app_id={}", app.app_id);
+    println!("entrypoint_id={}", app.entrypoint_id);
+    println!("kind={}", app.kind);
+    println!("launch_mode={}", app.launch_mode);
+    println!("lifecycle_state={}", app.lifecycle_state);
+    println!("launch_target={}", app.launch_target.kind);
+    println!(
+        "local_url={}",
+        app.launch_target.local_url.as_deref().unwrap_or("")
+    );
+    println!("blocked_reasons={}", app.blocked_reasons.len());
+    for reason in &app.blocked_reasons {
+        println!("blocked_reason={reason}");
+    }
+    println!("diagnostics={}", app.diagnostics.len());
+    for diagnostic in &app.diagnostics {
+        println!(
+            "app_diagnostic kind={} message={}",
+            diagnostic.kind, diagnostic.message
+        );
+    }
+    println!("actions={}", app.actions.len());
+    for action in &app.actions {
+        println!(
+            "app_action id={} status={}",
+            action.action_id,
+            package_action_status_label(action.status)
+        );
+    }
+}
+
+fn package_action_status_label(status: DaemonPackageActionStatus) -> &'static str {
+    match status {
+        DaemonPackageActionStatus::Available => "available",
+        DaemonPackageActionStatus::Blocked => "blocked",
+        DaemonPackageActionStatus::Unavailable => "unavailable",
+    }
 }
 
 fn operator_packages(args: Vec<String>, providers_only: bool) -> Result<(), OperatorError> {
@@ -1099,6 +1355,19 @@ fn print_daemon_response(response: DaemonResponse) -> Result<(), OperatorError> 
         }
         DaemonResponseKind::Apps => {
             print_apps(&response.apps);
+        }
+        DaemonResponseKind::ResolvedAppLaunch => {
+            println!("response=resolved_app_launch");
+            if let Some(launch) = response.resolved_app_launch {
+                println!("package={}", launch.package_name);
+                println!("app_id={}", launch.app_id);
+                println!("entrypoint_id={}", launch.entrypoint_id);
+                println!("kind={}", launch.kind);
+                println!("launch_mode={}", launch.launch_mode);
+                println!("command_present={}", !launch.command.is_empty());
+                println!("args={}", launch.args.len());
+                println!("environment={}", launch.environment.len());
+            }
         }
         DaemonResponseKind::Packages => {
             print_packages(&response.packages, false);
@@ -1594,6 +1863,7 @@ struct DogfoodOptions {
     data_directory: Option<PathBuf>,
     session_worker_bin: Option<PathBuf>,
     web_package_path: Option<PathBuf>,
+    tui_package_path: Option<PathBuf>,
     web_bridge_port: Option<u16>,
     default_data_dir: bool,
 }
@@ -1603,6 +1873,7 @@ impl DogfoodOptions {
         let mut data_directory = None;
         let mut session_worker_bin = None;
         let mut web_package_path = None;
+        let mut tui_package_path = None;
         let mut web_bridge_port = None;
         let mut cursor = 0;
 
@@ -1629,6 +1900,13 @@ impl DogfoodOptions {
                     web_package_path = Some(PathBuf::from(value));
                     cursor += 2;
                 }
+                "--tui-package-path" => {
+                    let Some(value) = args.get(cursor + 1) else {
+                        return Err(DogfoodError::Usage);
+                    };
+                    tui_package_path = Some(PathBuf::from(value));
+                    cursor += 2;
+                }
                 "--web-bridge-port" => {
                     let Some(value) = args.get(cursor + 1) else {
                         return Err(DogfoodError::Usage);
@@ -1645,6 +1923,7 @@ impl DogfoodOptions {
             data_directory,
             session_worker_bin,
             web_package_path,
+            tui_package_path,
             web_bridge_port,
         })
     }
@@ -1887,6 +2166,55 @@ impl SessionCommand {
 struct PackageCommand {
     data_directory: PathBuf,
     action: PackageActionCommand,
+}
+
+struct AppCommand {
+    data_directory: PathBuf,
+    action: AppActionCommand,
+}
+
+enum AppActionCommand {
+    List,
+    Show(String),
+    Open(String),
+}
+
+impl AppCommand {
+    fn parse(args: Vec<String>) -> Result<Self, OperatorError> {
+        let Some(action) = args.first().map(String::as_str) else {
+            return Err(OperatorError::Usage("apps"));
+        };
+        match action {
+            "list" => {
+                let options = DataDirOptions::parse(args[1..].to_vec(), "apps list")?;
+                Ok(Self {
+                    data_directory: options.data_directory,
+                    action: AppActionCommand::List,
+                })
+            }
+            "show" => {
+                if args.len() != 4 {
+                    return Err(OperatorError::Usage("apps show"));
+                }
+                let options = DataDirOptions::parse(args[1..3].to_vec(), "apps show")?;
+                Ok(Self {
+                    data_directory: options.data_directory,
+                    action: AppActionCommand::Show(args[3].clone()),
+                })
+            }
+            "open" => {
+                if args.len() != 4 {
+                    return Err(OperatorError::Usage("apps open"));
+                }
+                let options = DataDirOptions::parse(args[1..3].to_vec(), "apps open")?;
+                Ok(Self {
+                    data_directory: options.data_directory,
+                    action: AppActionCommand::Open(args[3].clone()),
+                })
+            }
+            _ => Err(OperatorError::Usage("apps")),
+        }
+    }
 }
 
 enum PackageActionCommand {
@@ -2456,6 +2784,9 @@ enum DogfoodError {
     WebEntrypointStart(String),
     WebHealth(String),
     WebUi(String),
+    TuiPackageEnable(String),
+    WrongTuiPackage,
+    MissingTuiEntrypoint,
     WaitDaemon(io::Error),
     DaemonExited(String),
 }
@@ -2472,6 +2803,8 @@ enum OperatorError {
     Transport(botster_hub::DaemonTransportError),
     Package(botster_hub::PackageRegistryError),
     State(botster_hub::HubStateStoreError),
+    App(String),
+    SpawnApp(io::Error),
 }
 
 #[derive(Debug)]
@@ -2613,6 +2946,21 @@ impl fmt::Display for DogfoodError {
             Self::WebUi(message) => {
                 write!(formatter, "verify botster-web packaged UI: {message}")
             }
+            Self::TuiPackageEnable(message) => {
+                write!(formatter, "enable botster-tui package: {message}")
+            }
+            Self::WrongTuiPackage => {
+                write!(
+                    formatter,
+                    "--tui-package-path must enable package botster-tui"
+                )
+            }
+            Self::MissingTuiEntrypoint => {
+                write!(
+                    formatter,
+                    "botster-tui package must declare a terminal_app foreground_stdio entrypoint"
+                )
+            }
             Self::WaitDaemon(error) => write!(formatter, "wait for dogfood daemon: {error}"),
             Self::DaemonExited(status) => write!(formatter, "dogfood daemon exited with {status}"),
         }
@@ -2640,6 +2988,8 @@ impl fmt::Display for OperatorError {
             Self::Transport(error) => write!(formatter, "{error}"),
             Self::Package(error) => write!(formatter, "package policy error: {error:?}"),
             Self::State(error) => write!(formatter, "{error}"),
+            Self::App(message) => write!(formatter, "{message}"),
+            Self::SpawnApp(error) => write!(formatter, "spawn app command: {error}"),
         }
     }
 }
@@ -2648,7 +2998,7 @@ fn usage_for(command: &str) -> &'static str {
     match command {
         "start" => "usage: botster-hub start --data-dir <path> [--session-worker-bin <path>]",
         "dogfood" => {
-            "usage: botster-hub dogfood [--data-dir <path>] [--session-worker-bin <path>] --web-package-path <path> [--web-bridge-port <port>]"
+            "usage: botster-hub dogfood [--data-dir <path>] [--session-worker-bin <path>] --web-package-path <path> [--tui-package-path <path>] [--web-bridge-port <port>]"
         }
         "status" => "usage: botster-hub status --data-dir <path>",
         "sessions" => {
@@ -2676,8 +3026,12 @@ fn usage_for(command: &str) -> &'static str {
         "shutdown" => "usage: botster-hub shutdown --data-dir <path>",
         "mcp-serve" => "usage: botster-hub mcp-serve --data-dir <path>",
         "tui" => {
-            "usage: botster-hub tui --data-dir <path>  # prints: botster-tui --data-dir <path>"
+            "usage: botster-hub tui --data-dir <path>  # alias for: botster-hub apps open --data-dir <path> botster-tui"
         }
+        "apps" => "usage: botster-hub apps <list|show|open> ...",
+        "apps list" => "usage: botster-hub apps list --data-dir <path>",
+        "apps show" => "usage: botster-hub apps show --data-dir <path> <app|package/app>",
+        "apps open" => "usage: botster-hub apps open --data-dir <path> <app|package/app>",
         "packages" => {
             "usage: botster-hub packages <available|inspect|preview-install|install|list|show|config|enable|disable|remove|start-entrypoint|stop-entrypoint|restart-entrypoint|entrypoint-status> ..."
         }
@@ -2728,7 +3082,7 @@ fn usage_for(command: &str) -> &'static str {
         "providers" | "providers list" => "usage: botster-hub providers list --data-dir <path>",
         "inspect" => "usage: botster-hub inspect --data-dir <path> <session-id>",
         _ => {
-            "usage: botster-hub <start|dogfood|status|sessions|shutdown|mcp-serve|tui|packages|providers|inspect|run-one>"
+            "usage: botster-hub <start|dogfood|status|sessions|shutdown|mcp-serve|tui|apps|packages|providers|inspect|run-one>"
         }
     }
 }

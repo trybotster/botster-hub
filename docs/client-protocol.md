@@ -250,6 +250,17 @@ structured launch result through the hub-provided
 defaults, local package names, or known ports. Terminal apps use a terminal app
 launch target and do not expose fake background URLs.
 
+`ResolveAppLaunch { package_name, entrypoint_id }` is the request-scoped path
+for opening installed foreground terminal apps. The daemon validates that the
+package is enabled, the entrypoint is a `terminal_app`, and the launch mode is
+`foreground_stdio`, then returns `DaemonResponse.resolved_app_launch` with the
+hub-resolved command, arguments, working directory, and allowlisted environment
+needed by a same-device client that owns the foreground TTY. Clients should
+spawn that contract with inherited stdio and should not reconstruct package
+roots, socket paths, data-dir values, or manifest environment policy from
+package rows. Normal `ListApps` output intentionally omits this launch contract
+to avoid path and environment leakage.
+
 Supervised entrypoints are local development processes, not a production
 installer or sandbox. The daemon stops them on explicit stop/restart, package
 disable/remove, `DaemonShutdown`, and daemon SIGINT/SIGTERM cleanup.
