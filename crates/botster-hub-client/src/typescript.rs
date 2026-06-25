@@ -128,6 +128,15 @@ pub(crate) fn daemon_protocol_typescript() -> String {
                 &[("registry_path", "string"), ("entry_id", "string")],
             ),
             ("install_package_local_path", &[("path", "string")]),
+            ("check_package_update", &[("package_name", "string")]),
+            (
+                "preview_package_update",
+                &[("package_name", "string"), ("pin", "DaemonPackagePin")],
+            ),
+            (
+                "apply_package_update",
+                &[("package_name", "string"), ("pin", "DaemonPackagePin")],
+            ),
             ("show_package", &[("package_name", "string")]),
             (
                 "set_package_configuration",
@@ -197,6 +206,7 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             ("packages", "DaemonPackage[]"),
             ("available_packages?", "DaemonAvailablePackage[]"),
             ("install_plan?", "DaemonPackageInstallPlan | null"),
+            ("update_status?", "DaemonPackageUpdateStatus | null"),
             ("package_decision", "DaemonPackageDecision | null"),
             ("lifecycle", "DaemonPluginLifecycle[]"),
             ("plugin_tools", "JsonValue[]"),
@@ -221,6 +231,7 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             "packages",
             "available_packages",
             "package_install_plan",
+            "package_update_status",
             "package_decision",
             "plugin_lifecycle",
             "plugin_mcp_tools",
@@ -412,6 +423,18 @@ pub(crate) fn daemon_protocol_typescript() -> String {
         &mut output,
         "DaemonPackageInstallEffect",
         &[("kind", "string"), ("message", "string")],
+    );
+    emit_interface(
+        &mut output,
+        "DaemonPackageUpdateStatus",
+        &[
+            ("package_name", "string"),
+            ("update_available", "boolean"),
+            ("reload_required", "boolean"),
+            ("restart_required", "boolean"),
+            ("pin?", "DaemonPackagePin | null"),
+            ("diagnostics?", "DaemonPackageDiagnostic[]"),
+        ],
     );
     emit_interface(
         &mut output,

@@ -259,6 +259,11 @@ cargo run -- packages install --data-dir target/botster-hub-dogfood-data \
 cargo run -- packages list --data-dir target/botster-hub-dogfood-data
 cargo run -- packages show --data-dir target/botster-hub-dogfood-data dogfood.synthetic-plugin
 cargo run -- packages enable --data-dir target/botster-hub-dogfood-data dogfood.synthetic-plugin
+cargo run -- packages check-update --data-dir target/botster-hub-dogfood-data dogfood.synthetic-plugin
+cargo run -- packages preview-update --data-dir target/botster-hub-dogfood-data \
+  dogfood.synthetic-plugin --revision v1.0.1 --policy manual
+cargo run -- packages apply-update --data-dir target/botster-hub-dogfood-data \
+  dogfood.synthetic-plugin --revision v1.0.1 --checksum sha256:example --policy manual
 cargo run -- packages disable --data-dir target/botster-hub-dogfood-data dogfood.synthetic-plugin
 cargo run -- packages remove --data-dir target/botster-hub-dogfood-data dogfood.synthetic-plugin
 cargo run -- providers list --data-dir target/botster-hub-dogfood-data
@@ -283,7 +288,12 @@ as installed but disabled under `hub-state.json`, and then lists packages from
 the daemon's refreshed in-memory registry. `packages show`, `packages enable`,
 `packages disable`, `packages remove`, `packages list`, and `providers list` use
 the same daemon-backed registry view. `packages enable --path` remains available
-as a convenience that installs and enables in one daemon-owned mutation. The
+as a convenience that installs and enables in one daemon-owned mutation.
+`packages check-update`, `packages preview-update`, and `packages apply-update`
+also route through the daemon. They report structured unavailable diagnostics
+for unsupported update/reload paths and `apply-update` records pin/checksum
+metadata without fetching package code, starting entrypoints, or restarting the
+hub. The
 session commands also use the running daemon runtime, so a session created by
 one CLI process is visible to later `sessions list`, `sessions attach`,
 `sessions send-input`, `sessions resize`, `sessions detach`, and `sessions

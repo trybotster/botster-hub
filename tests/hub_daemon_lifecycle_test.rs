@@ -5484,6 +5484,205 @@ fn daemon_package_list_exposes_dependency_and_feature_availability_matrix() {
 }
 
 #[test]
+fn package_update_apply_preserves_configuration_and_pin_metadata() {
+    let _guard = daemon_test_lock()
+        .lock()
+        .expect("serialize real daemon test");
+    let data_dir = unique_test_dir("package-update-apply");
+    let package_dir = unique_test_dir("configurable-package-update");
+    write_configurable_local_plugin_package(&package_dir);
+    let child = start_cli_daemon(&data_dir);
+    let config = explicit_config(&data_dir);
+
+    botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::InstallPackageLocalPath {
+            path: package_dir.clone(),
+        },
+    )
+    .expect("install configurable package");
+    botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::SetPackageConfiguration {
+            package_name: "configurable.plugin".to_string(),
+            values: BTreeMap::from([
+                (
+                    "endpoint".to_string(),
+                    serde_json::json!({"type":"url","value":"https://example.invalid/hook"}),
+                ),
+                (
+                    "api_token".to_string(),
+                    serde_json::json!({"type":"secret","state":"write_only"}),
+                ),
+            ]),
+        },
+    )
+    .expect("set config before update");
+
+    let pin = botster_hub::DaemonPackagePin {
+        revision: "v1.0.1".to_string(),
+        branch: Some("main".to_string()),
+        tag: Some("v1.0.1".to_string()),
+        rev: Some("def456".to_string()),
+        checksum: Some("sha256:update-test".to_string()),
+        update_policy: "track_source".to_string(),
+    };
+    let preview = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::PreviewPackageUpdate {
+            package_name: "configurable.plugin".to_string(),
+            pin: pin.clone(),
+        },
+    )
+    .expect("preview update");
+    assert_eq!(
+        preview.kind,
+        botster_hub::DaemonResponseKind::PackageUpdateStatus
+    );
+    assert!(!preview.install_plan.expect("preview plan").mutates_registry);
+
+    let apply = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::ApplyPackageUpdate {
+            package_name: "configurable.plugin".to_string(),
+            pin: pin.clone(),
+        },
+    )
+    .expect("apply update");
+    assert_eq!(
+        apply.package_decision.expect("apply decision").action,
+        "apply_update"
+    );
+    let updated = apply
+        .packages
+        .iter()
+        .find(|package| package.package_name == "configurable.plugin")
+        .expect("updated package row");
+    assert_eq!(
+        updated.configuration.effective_values["api_token"],
+        serde_json::json!({"type":"secret","state":"redacted"})
+    );
+
+    shutdown_cli_daemon(&data_dir, child);
+    let restarted = start_cli_daemon(&data_dir);
+    let reloaded =
+        botster_hub::daemon_transport_request(&config, botster_hub::DaemonRequest::ListPackages)
+            .expect("list after restart");
+    let package = reloaded
+        .packages
+        .iter()
+        .find(|package| package.package_name == "configurable.plugin")
+        .expect("reloaded package");
+    assert_eq!(
+        package.configuration.effective_values["endpoint"],
+        serde_json::json!({"type":"url","value":"https://example.invalid/hook"})
+    );
+
+    shutdown_cli_daemon(&data_dir, restarted);
+    let state = FileHubStateStore::for_data_directory(&data_dir)
+        .load_or_initialize(&explicit_config(&data_dir))
+        .expect("load persisted hub state after update");
+    let restored =
+        PackageRegistry::from_snapshot(state.package_registry).expect("restore package registry");
+    let record = restored
+        .package("configurable.plugin")
+        .expect("restored configurable package");
+    let restored_pin = record.pin.as_ref().expect("restored pin");
+    assert_eq!(restored_pin.revision, "v1.0.1");
+    assert_eq!(restored_pin.rev.as_deref(), Some("def456"));
+    assert_eq!(
+        restored_pin.update_policy,
+        botster_hub::PackageUpdatePolicy::TrackSource
+    );
+    assert!(record.configuration.values.contains_key("api_token"));
+}
+
+#[test]
+fn package_update_unsupported_cases_return_structured_diagnostics() {
+    let _guard = daemon_test_lock()
+        .lock()
+        .expect("serialize real daemon test");
+    let data_dir = unique_test_dir("package-update-diagnostics");
+    let package_dir = unique_test_dir("local-package-update-diagnostics");
+    write_local_plugin_package(&package_dir);
+    let child = start_cli_daemon(&data_dir);
+    let config = explicit_config(&data_dir);
+
+    botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::InstallPackageLocalPath {
+            path: package_dir.clone(),
+        },
+    )
+    .expect("install local package");
+
+    let check = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::CheckPackageUpdate {
+            package_name: "dogfood.plugin".to_string(),
+        },
+    )
+    .expect("check update");
+    let status = check.update_status.expect("update status");
+    assert!(!status.update_available);
+    assert!(status.diagnostics.iter().any(|diagnostic| {
+        diagnostic.kind == "update_unavailable"
+            && diagnostic
+                .message
+                .contains("without registry source metadata")
+    }));
+    assert!(
+        status
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.kind == "pin_required")
+    );
+
+    botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::EnablePackage {
+            package_name: "dogfood.plugin".to_string(),
+        },
+    )
+    .expect("enable local package");
+    let enabled_check = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::CheckPackageUpdate {
+            package_name: "dogfood.plugin".to_string(),
+        },
+    )
+    .expect("check enabled update");
+    let enabled_status = enabled_check.update_status.expect("enabled update status");
+    assert!(enabled_status.reload_required);
+    assert!(enabled_status.diagnostics.iter().any(|diagnostic| {
+        diagnostic.kind == "reload_unavailable"
+            && diagnostic.message.contains("disable/enable cycle")
+    }));
+
+    let cli = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("packages")
+        .arg("check-update")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("dogfood.plugin")
+        .output()
+        .expect("run packages check-update");
+    assert!(
+        cli.status.success(),
+        "packages check-update failed: {}",
+        String::from_utf8_lossy(&cli.stderr)
+    );
+    let stdout = String::from_utf8(cli.stdout).expect("stdout is utf8");
+    assert!(stdout.contains("package_update package=dogfood.plugin"));
+    assert!(stdout.contains("reload_required=true"));
+    assert!(
+        stdout.contains("package_update_diagnostic package=dogfood.plugin kind=reload_unavailable")
+    );
+
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
 fn cli_packages_enable_local_process_package_does_not_attempt_lua_load() {
     let _guard = daemon_test_lock()
         .lock()

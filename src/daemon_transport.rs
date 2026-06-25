@@ -35,10 +35,11 @@ pub use botster_hub_client::{
     DaemonPackageDecision, DaemonPackageDependencyAvailability, DaemonPackageDiagnostic,
     DaemonPackageEnvironmentRequirement, DaemonPackageFeatureAvailability,
     DaemonPackageInstallEffect, DaemonPackageInstallPlan, DaemonPackagePin, DaemonPackageProcess,
-    DaemonPackageRunnableEntrypoint, DaemonPackageSurfaceDescriptor, DaemonPackageWorkingDirectory,
-    DaemonPluginLifecycle, DaemonRequest, DaemonResponse, DaemonResponseKind, DaemonSession,
-    DaemonSessionCleanup, DaemonStatus, FEATURE_PLUGIN_SURFACE_ACTION,
-    FEATURE_PLUGIN_SURFACE_RENDER, PROTOCOL, read_frame, read_frame_from_reader, write_frame,
+    DaemonPackageRunnableEntrypoint, DaemonPackageSurfaceDescriptor, DaemonPackageUpdateStatus,
+    DaemonPackageWorkingDirectory, DaemonPluginLifecycle, DaemonRequest, DaemonResponse,
+    DaemonResponseKind, DaemonSession, DaemonSessionCleanup, DaemonStatus,
+    FEATURE_PLUGIN_SURFACE_ACTION, FEATURE_PLUGIN_SURFACE_RENDER, PROTOCOL, read_frame,
+    read_frame_from_reader, write_frame,
 };
 use serde_json::Value;
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
@@ -324,6 +325,35 @@ fn handle_control_request(
             };
             persist_package_registry(daemon)?;
             package_decision_response(daemon, decision)
+        }
+        DaemonRequest::CheckPackageUpdate { package_name } => {
+            check_package_update_response(daemon, &package_name)
+        }
+        DaemonRequest::PreviewPackageUpdate { package_name, pin } => {
+            preview_package_update_response(daemon, &package_name, pin)
+        }
+        DaemonRequest::ApplyPackageUpdate { package_name, pin } => {
+            let update_status = package_update_status(daemon, &package_name, Some(pin.clone()))?;
+            let decision = {
+                let pin = package_pin_from_daemon(pin)?;
+                let record = daemon.package_registry_mut().pin(
+                    &package_name,
+                    pin,
+                    "daemon socket apply package update",
+                )?;
+                PackageDecision {
+                    package_name: record.manifest.name.clone(),
+                    action: PackageAction::ApplyUpdate,
+                    state: record.state,
+                    classification: record.classification,
+                    admitted_host_profile: record.admitted_host_profile.clone(),
+                    audit_reason: record.last_audit_reason.clone(),
+                }
+            };
+            persist_package_registry(daemon)?;
+            let mut response = package_decision_response(daemon, decision)?;
+            response.update_status = Some(update_status);
+            Ok(response)
         }
         DaemonRequest::ShowPackage { package_name } => show_package_response(daemon, &package_name),
         DaemonRequest::SetPackageConfiguration {
@@ -854,6 +884,7 @@ fn handle_runtime_control_request(
             packages: Vec::new(),
             available_packages: Vec::new(),
             install_plan: None,
+            update_status: None,
             package_decision: None,
             lifecycle: Vec::new(),
             plugin_tools: Vec::new(),
@@ -872,6 +903,9 @@ fn handle_runtime_control_request(
         | DaemonRequest::PreviewPackageInstall { .. }
         | DaemonRequest::InstallPackageRegistryEntry { .. }
         | DaemonRequest::InstallPackageLocalPath { .. }
+        | DaemonRequest::CheckPackageUpdate { .. }
+        | DaemonRequest::PreviewPackageUpdate { .. }
+        | DaemonRequest::ApplyPackageUpdate { .. }
         | DaemonRequest::ShowPackage { .. }
         | DaemonRequest::SetPackageConfiguration { .. }
         | DaemonRequest::PluginLifecycleStatus
@@ -1241,6 +1275,7 @@ fn daemon_response_base(kind: DaemonResponseKind) -> DaemonResponse {
         packages: Vec::new(),
         available_packages: Vec::new(),
         install_plan: None,
+        update_status: None,
         package_decision: None,
         lifecycle: Vec::new(),
         plugin_tools: Vec::new(),
@@ -1325,6 +1360,31 @@ fn daemon_package_install_plan(plan: PackageInstallPlan) -> DaemonResponse {
         mutates_registry: plan.mutates_registry,
         starts_entrypoints: plan.starts_entrypoints,
     });
+    response
+}
+
+fn check_package_update_response(
+    daemon: &mut HubDaemon,
+    package_name: &str,
+) -> DaemonTransportResult<DaemonResponse> {
+    let update_status = package_update_status(daemon, package_name, None)?;
+    Ok(daemon_package_update_status(update_status))
+}
+
+fn preview_package_update_response(
+    daemon: &mut HubDaemon,
+    package_name: &str,
+    pin: DaemonPackagePin,
+) -> DaemonTransportResult<DaemonResponse> {
+    let update_status = package_update_status(daemon, package_name, Some(pin.clone()))?;
+    let mut response = daemon_package_update_status(update_status);
+    response.install_plan = Some(package_update_plan(daemon, package_name, pin)?);
+    Ok(response)
+}
+
+fn daemon_package_update_status(update_status: DaemonPackageUpdateStatus) -> DaemonResponse {
+    let mut response = daemon_response_base(DaemonResponseKind::PackageUpdateStatus);
+    response.update_status = Some(update_status);
     response
 }
 
@@ -1796,6 +1856,158 @@ fn daemon_availability_reason(
     }
 }
 
+fn package_update_status(
+    daemon: &mut HubDaemon,
+    package_name: &str,
+    proposed_pin: Option<DaemonPackagePin>,
+) -> DaemonTransportResult<DaemonPackageUpdateStatus> {
+    let record = daemon
+        .package_registry()
+        .package(package_name)
+        .ok_or_else(|| {
+            PackageRegistryError::without_record(
+                package_name,
+                PackageAction::CheckUpdate,
+                PackageAdmissionReason::PackageNotInstalled,
+                "daemon socket check package update".to_string(),
+            )
+        })?;
+    let source_metadata_present = record.source_metadata.is_some();
+    let existing_pin = record.pin.clone();
+    let enabled = package_state_label(record.state.into()) == "enabled";
+    let live_entrypoint = daemon
+        .entrypoint_supervisor()
+        .snapshots()
+        .into_iter()
+        .any(|snapshot| snapshot.package_name == package_name && snapshot.state == "running");
+    let pin = proposed_pin.or_else(|| existing_pin.map(daemon_package_pin_from_policy));
+    let mut diagnostics = Vec::new();
+
+    if !source_metadata_present {
+        diagnostics.push(DaemonPackageDiagnostic {
+            kind: "update_unavailable".to_string(),
+            message:
+                "update resolution is unavailable for packages without registry source metadata"
+                    .to_string(),
+        });
+    }
+    if pin.is_none() {
+        diagnostics.push(DaemonPackageDiagnostic {
+            kind: "pin_required".to_string(),
+            message: "apply update requires explicit pinned source metadata".to_string(),
+        });
+    }
+    if enabled {
+        diagnostics.push(DaemonPackageDiagnostic {
+            kind: "reload_unavailable".to_string(),
+            message: "enabled package changes require an operator disable/enable cycle".to_string(),
+        });
+    }
+    if live_entrypoint {
+        diagnostics.push(DaemonPackageDiagnostic {
+            kind: "restart_required".to_string(),
+            message: "running package entrypoints must be restarted after update metadata changes"
+                .to_string(),
+        });
+    }
+
+    Ok(DaemonPackageUpdateStatus {
+        package_name: package_name.to_string(),
+        update_available: pin.is_some() && source_metadata_present,
+        reload_required: enabled,
+        restart_required: live_entrypoint,
+        pin,
+        diagnostics,
+    })
+}
+
+fn package_update_plan(
+    daemon: &mut HubDaemon,
+    package_name: &str,
+    pin: DaemonPackagePin,
+) -> DaemonTransportResult<DaemonPackageInstallPlan> {
+    let diagnostics = package_update_status(daemon, package_name, Some(pin.clone()))?.diagnostics;
+    let record = daemon
+        .package_registry()
+        .package(package_name)
+        .ok_or_else(|| {
+            PackageRegistryError::without_record(
+                package_name,
+                PackageAction::PreviewUpdate,
+                PackageAdmissionReason::PackageNotInstalled,
+                "daemon socket preview package update".to_string(),
+            )
+        })?;
+    let source = record.source_metadata.as_ref();
+    Ok(DaemonPackageInstallPlan {
+        entry: DaemonAvailablePackage {
+            entry_id: source
+                .map(|source| source.entry_id.clone())
+                .unwrap_or_else(|| package_name.to_string()),
+            package_name: record.manifest.name.clone(),
+            version: record.manifest.version.clone(),
+            classification: package_classification_label(record.classification.into()).to_string(),
+            source_kind: source
+                .map(|source| registry_source_kind_label(source.source_kind).to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+            source_label: source
+                .map(|source| source.source_label.clone())
+                .unwrap_or_else(|| "installed package has no registry source metadata".to_string()),
+            first_party: record.trust.first_party,
+            state: package_state_label(record.state.into()).to_string(),
+            requested_capabilities: record
+                .manifest
+                .capabilities
+                .iter()
+                .cloned()
+                .map(|capability| DaemonCapability {
+                    surface: format!("{:?}", capability.surface),
+                    scope: capability.scope,
+                })
+                .collect(),
+            compatibility: DaemonPackageCompatibility {
+                botster_requirement: record.compatibility.botster_requirement.clone(),
+                hub_version: record.compatibility.hub_version.clone(),
+                result: package_compatibility_label(record.compatibility.result).to_string(),
+                diagnostics: record.compatibility.diagnostics.clone(),
+            },
+            pin: Some(pin),
+        },
+        effects: vec![DaemonPackageInstallEffect {
+            kind: "update_pin_metadata".to_string(),
+            message: "would update pinned source metadata without fetching, enabling, or starting entrypoints"
+                .to_string(),
+        }],
+        diagnostics,
+        mutates_registry: false,
+        starts_entrypoints: false,
+    })
+}
+
+fn package_pin_from_daemon(pin: DaemonPackagePin) -> DaemonTransportResult<PackagePin> {
+    let update_policy = match pin.update_policy.as_str() {
+        "manual" => PackageUpdatePolicy::Manual,
+        "track_source" => PackageUpdatePolicy::TrackSource,
+        _ => {
+            return Err(PackageRegistryError::without_record(
+                "<package-update>",
+                PackageAction::ApplyUpdate,
+                PackageAdmissionReason::MissingPinRevision,
+                "daemon socket apply package update".to_string(),
+            )
+            .into());
+        }
+    };
+    Ok(PackagePin {
+        revision: pin.revision,
+        branch: pin.branch,
+        tag: pin.tag,
+        rev: pin.rev,
+        checksum: pin.checksum,
+        update_policy,
+    })
+}
+
 fn daemon_package_decision_from_policy(decision: PackageDecision) -> DaemonPackageDecision {
     DaemonPackageDecision {
         package_name: decision.package_name,
@@ -2259,6 +2471,9 @@ fn package_action_label(action: PackageAction) -> &'static str {
         PackageAction::Enable => "enable",
         PackageAction::Disable => "disable",
         PackageAction::Remove => "remove",
+        PackageAction::CheckUpdate => "check_update",
+        PackageAction::PreviewUpdate => "preview_update",
+        PackageAction::ApplyUpdate => "apply_update",
         PackageAction::Pin => "pin",
         PackageAction::Prepare => "prepare",
     }
