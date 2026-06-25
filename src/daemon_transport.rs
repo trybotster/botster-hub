@@ -55,7 +55,7 @@ use crate::{
     HubClientResponseBody, HubClientSession, HubConfig, HubDaemon, HubDaemonStatus,
     HubStateLoadSource, HubStateStore, McpToolDescriptor, PackageAction, PackageAdmissionReason,
     PackageCompatibilityResult, PackageDecision, PackageInstallPlan, PackagePin, PackageRegistry,
-    PackageRegistryEntrySourceKind, PackageRegistryError, PackageUpdatePolicy,
+    PackageRegistryEntrySourceKind, PackageRegistryError, PackageState, PackageUpdatePolicy,
     resolve_foreground_launch_contract,
 };
 use crate::{EntrypointProcessSnapshot, EntrypointSupervisorError};
@@ -445,12 +445,24 @@ fn handle_control_request(
             entrypoint_id,
             environment_overrides,
         } => {
+            let config = daemon
+                .runtime()
+                .ok_or(DaemonTransportError::DaemonNotRunning)?
+                .config()
+                .clone();
             let packages = daemon.package_registry().clone();
-            daemon.entrypoint_supervisor().start(
+            let environment = supervised_launch_environment(
+                &config,
                 &packages,
                 &package_name,
                 &entrypoint_id,
                 &environment_overrides,
+            )?;
+            daemon.entrypoint_supervisor().start(
+                &packages,
+                &package_name,
+                &entrypoint_id,
+                &environment,
             )?;
             show_package_response(daemon, &package_name)
         }
@@ -467,12 +479,24 @@ fn handle_control_request(
             package_name,
             entrypoint_id,
         } => {
+            let config = daemon
+                .runtime()
+                .ok_or(DaemonTransportError::DaemonNotRunning)?
+                .config()
+                .clone();
             let packages = daemon.package_registry().clone();
-            daemon.entrypoint_supervisor().restart(
+            let environment = supervised_launch_environment(
+                &config,
                 &packages,
                 &package_name,
                 &entrypoint_id,
                 &BTreeMap::new(),
+            )?;
+            daemon.entrypoint_supervisor().restart(
+                &packages,
+                &package_name,
+                &entrypoint_id,
+                &environment,
             )?;
             show_package_response(daemon, &package_name)
         }
@@ -993,6 +1017,69 @@ fn list_apps_response(daemon: &mut HubDaemon) -> DaemonTransportResult<DaemonRes
     let registry = daemon.package_registry().clone();
     let snapshots = daemon.entrypoint_supervisor().snapshots();
     Ok(daemon_apps(apps_from_registry(&registry, snapshots)))
+}
+
+fn supervised_launch_environment(
+    config: &HubConfig,
+    registry: &PackageRegistry,
+    package_name: &str,
+    entrypoint_id: &str,
+    environment_overrides: &BTreeMap<String, String>,
+) -> DaemonTransportResult<BTreeMap<String, String>> {
+    let socket = runtime_path(socket_path(config)?);
+    let record = registry.package(package_name).ok_or_else(|| {
+        DaemonTransportError::Entrypoint(EntrypointSupervisorError::PackageNotInstalled(
+            package_name.to_string(),
+        ))
+    })?;
+    if !matches!(record.state, PackageState::Enabled) {
+        return Err(DaemonTransportError::Entrypoint(
+            EntrypointSupervisorError::PackageDisabled(package_name.to_string()),
+        ));
+    }
+    let Some(entrypoint) = record
+        .runnable_entrypoints
+        .iter()
+        .find(|entrypoint| entrypoint.id == entrypoint_id)
+    else {
+        return Err(DaemonTransportError::Entrypoint(
+            EntrypointSupervisorError::EntrypointNotFound {
+                package_name: package_name.to_string(),
+                entrypoint_id: entrypoint_id.to_string(),
+            },
+        ));
+    };
+
+    let mut environment = BTreeMap::new();
+    environment.insert(
+        "BOTSTER_HUB_DATA_DIR".to_string(),
+        runtime_path(config.data_directory.clone())
+            .display()
+            .to_string(),
+    );
+    environment.insert(
+        "BOTSTER_HUB_SOCKET".to_string(),
+        socket.display().to_string(),
+    );
+    for requirement in &entrypoint.environment {
+        if let Some(default) = requirement.default.as_ref() {
+            environment
+                .entry(requirement.name.clone())
+                .or_insert_with(|| default.clone());
+        }
+    }
+    environment.extend(environment_overrides.clone());
+    Ok(environment)
+}
+
+fn runtime_path(path: PathBuf) -> PathBuf {
+    if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
+    }
 }
 
 fn resolve_app_launch_response(
