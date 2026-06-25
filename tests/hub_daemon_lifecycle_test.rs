@@ -178,6 +178,8 @@ fn provider_manifest() -> PackageManifest {
             path: "bin/provider".to_string(),
             bootstrap: true,
         }],
+        dependencies: Vec::new(),
+        features: Vec::new(),
         host_profile: Some(HostProfileMetadata {
             profile_id: "daemon-provider".to_string(),
             compatibility: ">=0.1.0".to_string(),
@@ -280,6 +282,58 @@ fn write_configurable_local_plugin_package(root: &Path) {
 "#,
     )
     .expect("write configurable package manifest");
+}
+
+fn write_project_pipelines_availability_package(root: &Path) {
+    fs::create_dir_all(root).expect("create project pipelines package root");
+    fs::write(root.join("plugin.lua"), "return botster.register({})\n")
+        .expect("write plugin entrypoint");
+    fs::write(
+        root.join("botster-package.json"),
+        r#"{
+  "name": "project-pipelines",
+  "version": "1.0.0",
+  "kind": "plugin",
+  "botster": ">=0.1.0",
+  "source": { "type": "path", "path": "." },
+  "capabilities": [
+    { "surface": "surfaces" },
+    { "surface": "mcp" },
+    { "surface": "plugin_db", "scope": "project-pipelines" }
+  ],
+  "entrypoints": [
+    { "runtime": "lua", "path": "plugin.lua", "bootstrap": false }
+  ],
+  "dependencies": [
+    {
+      "id": "github-provider",
+      "package": "github-provider",
+      "kind": "optional",
+      "feature": "github_pr_lifecycle",
+      "requirements": [
+        { "type": "provider", "provider": "github-provider" }
+      ]
+    }
+  ],
+  "features": [
+    {
+      "id": "local_pipelines",
+      "label": "Local pipelines"
+    },
+    {
+      "id": "github_pr_lifecycle",
+      "label": "GitHub PR lifecycle",
+      "dependencies": ["github-provider"],
+      "requirements": [
+        { "type": "config", "key": "github_app_id" },
+        { "type": "auth", "key": "github_token" }
+      ]
+    }
+  ]
+}
+"#,
+    )
+    .expect("write project pipelines availability manifest");
 }
 
 fn write_supervised_package(root: &Path, package_name: &str, command: &str, args: &[&str]) {
@@ -5344,6 +5398,89 @@ fn package_configuration_daemon_set_show_list_reload_and_cli_are_redacted() {
         serde_json::json!({"type":"secret","state":"redacted"})
     );
     shutdown_cli_daemon(&data_dir, restarted);
+}
+
+#[test]
+fn daemon_package_list_exposes_dependency_and_feature_availability_matrix() {
+    let _guard = daemon_test_lock()
+        .lock()
+        .expect("serialize real daemon test");
+    let data_dir = unique_test_dir("package-availability-daemon");
+    let package_dir = unique_test_dir("project-pipelines-availability-package");
+    write_project_pipelines_availability_package(&package_dir);
+    let config = explicit_config(&data_dir);
+    let child = start_cli_daemon(&data_dir);
+
+    let enable = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::EnablePackageLocalPath { path: package_dir },
+    )
+    .expect("enable project pipelines availability package");
+    assert_eq!(
+        enable.kind,
+        botster_hub::DaemonResponseKind::PackageDecision
+    );
+
+    let list =
+        botster_hub::daemon_transport_request(&config, botster_hub::DaemonRequest::ListPackages)
+            .expect("list packages with availability matrix");
+    let package = list
+        .packages
+        .iter()
+        .find(|package| package.package_name == "project-pipelines")
+        .expect("project pipelines package row");
+
+    assert_eq!(
+        package.availability.state,
+        botster_hub::DaemonPackageAvailabilityState::Available
+    );
+    let local_feature = package
+        .feature_availability
+        .iter()
+        .find(|feature| feature.id == "local_pipelines")
+        .expect("local pipelines feature row");
+    assert_eq!(
+        local_feature.state,
+        botster_hub::DaemonPackageAvailabilityState::Available
+    );
+    let github_feature = package
+        .feature_availability
+        .iter()
+        .find(|feature| feature.id == "github_pr_lifecycle")
+        .expect("github feature row");
+    assert_eq!(
+        github_feature.state,
+        botster_hub::DaemonPackageAvailabilityState::Blocked
+    );
+    assert!(github_feature.reasons.iter().any(|reason| {
+        reason.reason == "missing_package"
+            && reason.action == "install_package"
+            && reason.package_name.as_deref() == Some("github-provider")
+    }));
+    assert!(github_feature.reasons.iter().any(|reason| {
+        reason.reason == "missing_auth"
+            && reason.action == "authenticate"
+            && reason.requirement.as_deref() == Some("github_token")
+    }));
+
+    let show = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::ShowPackage {
+            package_name: "project-pipelines".to_string(),
+        },
+    )
+    .expect("show package with availability matrix");
+    assert_eq!(
+        show.packages[0].feature_availability,
+        package.feature_availability
+    );
+
+    let dto_json = serde_json::to_string(package).expect("serialize daemon package");
+    assert!(!dto_json.contains(&data_dir.display().to_string()));
+    assert!(!dto_json.contains(&config.data_directory.display().to_string()));
+    assert!(!dto_json.contains("token-value"));
+
+    shutdown_cli_daemon(&data_dir, child);
 }
 
 #[test]

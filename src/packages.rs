@@ -13,7 +13,9 @@ use botster_core::{
     AdmittedHostProfile, Capability, CapabilitySet, CapabilitySurface, ExtensionEntrypoint,
     ExtensionKind, HostProfileAdmissionError, PackageConfigurationField,
     PackageConfigurationFieldType, PackageConfigurationSchema, PackageConfigurationSecretValue,
-    PackageConfigurationValue, PackageManifest, PackageSource, admit_host_profile,
+    PackageConfigurationValue, PackageManifest, PackageRequirementStatus, PackageResolutionInput,
+    PackageResolutionMatrix, PackageResolutionPackage, PackageSource, admit_host_profile,
+    resolve_package_dependencies,
 };
 use serde::{Deserialize, Serialize};
 
@@ -566,6 +568,67 @@ impl PackageRegistry {
         self.records.values().collect()
     }
 
+    /// Resolve one installed package through the core dependency and feature matrix.
+    #[must_use]
+    pub fn resolution_matrix_for(&self, record: &PackageRecord) -> PackageResolutionMatrix {
+        resolve_package_dependencies(&record.manifest, &self.resolution_input())
+    }
+
+    /// Build core's policy-free resolution input from current hub registry state.
+    #[must_use]
+    pub fn resolution_input(&self) -> PackageResolutionInput {
+        let packages = self
+            .records
+            .values()
+            .map(|record| PackageResolutionPackage {
+                name: record.manifest.name.clone(),
+                enabled: record.is_enabled(),
+                providers: provider_ids_for_record(record),
+                capabilities: record.admitted_capabilities.clone(),
+            })
+            .collect();
+        let mut auth = BTreeMap::new();
+        let mut config = BTreeMap::new();
+
+        for record in self.records.values() {
+            let view = record.configuration_view();
+            let missing_required = view
+                .missing_required
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            if let Some(schema) = &view.schema {
+                for field in &schema.fields {
+                    let status = if view.effective_values.contains_key(&field.key)
+                        && !missing_required.contains(&field.key)
+                    {
+                        PackageRequirementStatus::Configured
+                    } else {
+                        PackageRequirementStatus::Missing
+                    };
+                    config.insert(field.key.clone(), status);
+                    if matches!(field.field_type, PackageConfigurationFieldType::Secret) {
+                        auth.insert(field.key.clone(), status);
+                    }
+                }
+            }
+        }
+
+        PackageResolutionInput {
+            packages,
+            providers: Vec::new(),
+            capabilities: self.granted_capabilities.iter().cloned().collect(),
+            auth: auth
+                .into_iter()
+                .map(|(key, status)| botster_core::PackageAuthState { key, status })
+                .collect(),
+            config: config
+                .into_iter()
+                .map(|(key, status)| botster_core::PackageConfigState { key, status })
+                .collect(),
+        }
+    }
+
     /// Export the trusted in-memory registry for durable hub state.
     #[must_use]
     pub fn snapshot(&self) -> PackageRegistrySnapshot {
@@ -749,6 +812,20 @@ impl PackageRegistry {
             )
         })
     }
+}
+
+fn provider_ids_for_record(record: &PackageRecord) -> Vec<String> {
+    if !record.is_enabled() || !matches!(record.manifest.kind, ExtensionKind::Provider) {
+        return Vec::new();
+    }
+
+    let mut providers = vec![record.manifest.name.clone()];
+    if let Some(host_profile) = &record.manifest.host_profile {
+        providers.push(host_profile.profile_id.clone());
+    }
+    providers.sort();
+    providers.dedup();
+    providers
 }
 
 /// Stored package policy record.
@@ -2536,6 +2613,8 @@ mod tests {
                 path: "plugin.lua".to_string(),
                 bootstrap: false,
             }],
+            dependencies: Vec::new(),
+            features: Vec::new(),
             configuration: None,
             host_profile: None,
             surfaces: Vec::new(),
@@ -2558,6 +2637,8 @@ mod tests {
                 path: "bin/provider".to_string(),
                 bootstrap: true,
             }],
+            dependencies: Vec::new(),
+            features: Vec::new(),
             host_profile: Some(HostProfileMetadata {
                 profile_id: "example-provider".to_string(),
                 compatibility: ">=0.1.0".to_string(),
