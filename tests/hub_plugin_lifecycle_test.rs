@@ -364,13 +364,25 @@ fn local_package_install_persist_enable_prepare_and_load_crosses_core_worker() {
         .prepare_local_package(package_name, "prepare local package")
         .expect("prepare local package");
     assert_eq!(prepared.package_name, package_name);
-    assert_eq!(prepared.selected_entrypoint.path, "plugin.lua");
     assert_eq!(
-        prepared.selected_entrypoint_path,
+        prepared
+            .selected_entrypoint
+            .as_ref()
+            .expect("prepared code-load entrypoint")
+            .path,
+        "plugin.lua"
+    );
+    let selected_entrypoint_path = prepared
+        .selected_entrypoint_path
+        .as_ref()
+        .expect("prepared code-load entrypoint path");
+    assert_eq!(
+        selected_entrypoint_path.as_path(),
         package_root
             .join("plugin.lua")
             .canonicalize()
             .expect("canonical plugin")
+            .as_path()
     );
     let command = handler(package_name, "advance");
     let runtime = FakeRuntime::new("local-ok");
@@ -381,12 +393,7 @@ fn local_package_install_persist_enable_prepare_and_load_crosses_core_worker() {
             &registry,
             package_name,
             HubPluginRuntimeBundle {
-                entrypoint: Some(
-                    prepared
-                        .selected_entrypoint_path
-                        .to_string_lossy()
-                        .into_owned(),
-                ),
+                entrypoint: Some(selected_entrypoint_path.to_string_lossy().into_owned()),
                 ..bundle(
                     package_name,
                     runtime.clone(),
