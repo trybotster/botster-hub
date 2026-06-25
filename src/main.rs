@@ -18,7 +18,7 @@ use botster_hub::{
     DataDirectoryOption, HubClientApi, HubClientRequest, HubClientResponseBody, HubDaemon,
     HubDaemonState, HubRuntime, HubStartupOptions, HubStateLoadSource, RuntimeEnvironment,
     SessionDefaults, TransportBindings, build_default_config_for_runtime, daemon_transport_request,
-    default_package_policy, host_profile, run_tui, serve_daemon, serve_mcp_stdio, stream_attach,
+    default_package_policy, host_profile, serve_daemon, serve_mcp_stdio, stream_attach,
 };
 use botster_hub_client::DaemonPackageUpdateStatus;
 
@@ -667,7 +667,7 @@ fn print_dogfood_ready(
     println!("package name=botster-web state={}", web.package_state);
     println!("bridge={}", web.bridge_url);
     println!("web={}", web.web_url);
-    println!("tui=botster-hub tui --data-dir {dir}");
+    println!("tui=botster-tui --data-dir {dir}");
     println!("mcp=botster-hub mcp-serve --data-dir {dir}");
     println!("status=botster-hub status --data-dir {dir}");
     println!(
@@ -785,8 +785,10 @@ fn mcp_serve(args: Vec<String>) -> Result<(), McpCliError> {
 
 fn operator_tui(args: Vec<String>) -> Result<(), OperatorError> {
     let options = DataDirOptions::parse(args, "tui")?;
-    let config = explicit_config(options.data_directory)?;
-    run_tui(config)?;
+    println!(
+        "botster-hub tui is deprecated. Use: botster-tui --data-dir {}",
+        options.data_directory.display()
+    );
     Ok(())
 }
 
@@ -2443,7 +2445,6 @@ enum OperatorError {
     DaemonOperator(DaemonOperatorError),
     Daemon(botster_hub::HubDaemonError),
     Transport(botster_hub::DaemonTransportError),
-    Tui(botster_hub::TuiError),
     Package(botster_hub::PackageRegistryError),
     State(botster_hub::HubStateStoreError),
 }
@@ -2612,7 +2613,6 @@ impl fmt::Display for OperatorError {
             }
             Self::Daemon(error) => write!(formatter, "{error}"),
             Self::Transport(error) => write!(formatter, "{error}"),
-            Self::Tui(error) => write!(formatter, "{error}"),
             Self::Package(error) => write!(formatter, "package policy error: {error:?}"),
             Self::State(error) => write!(formatter, "{error}"),
         }
@@ -2650,7 +2650,9 @@ fn usage_for(command: &str) -> &'static str {
         }
         "shutdown" => "usage: botster-hub shutdown --data-dir <path>",
         "mcp-serve" => "usage: botster-hub mcp-serve --data-dir <path>",
-        "tui" => "usage: botster-hub tui --data-dir <path>",
+        "tui" => {
+            "usage: botster-hub tui --data-dir <path>  # prints: botster-tui --data-dir <path>"
+        }
         "packages" => {
             "usage: botster-hub packages <available|inspect|preview-install|install|list|show|config|enable|disable|remove|start-entrypoint|stop-entrypoint|restart-entrypoint|entrypoint-status> ..."
         }
@@ -2805,12 +2807,6 @@ impl From<botster_hub::HubDaemonError> for OperatorError {
 impl From<botster_hub::DaemonTransportError> for OperatorError {
     fn from(error: botster_hub::DaemonTransportError) -> Self {
         Self::Transport(error)
-    }
-}
-
-impl From<botster_hub::TuiError> for OperatorError {
-    fn from(error: botster_hub::TuiError) -> Self {
-        Self::Tui(error)
     }
 }
 

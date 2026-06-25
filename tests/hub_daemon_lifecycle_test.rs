@@ -15,7 +15,7 @@ use botster_core::{
     Capability, CapabilitySurface, CoreSessionMetadata, ExtensionEntrypoint, ExtensionKind,
     ExtensionRuntime, HostProfileMetadata, HostProfilePolicySection, PackageManifest,
     PackageSource, ProcessIdentity, RequestId, ResizePayload, SessionId, SessionSpawnRequest,
-    SpawnEnvironment, SpawnWorkingDirectory, SubscriptionId, UiActionResultState,
+    SpawnEnvironment, SpawnWorkingDirectory, SubscriptionId,
 };
 use botster_core_daemon::{RegistryRecord, SessionRegistry};
 use botster_hub::{
@@ -1383,7 +1383,7 @@ fn cli_dogfood_launcher_starts_botster_web_in_existing_hub_mode_and_shuts_down()
         web_url,
         format!("http://127.0.0.1:{web_bridge_port}/?dogfood=real-hub")
     );
-    assert!(text.contains("tui=botster-hub tui --data-dir"));
+    assert!(text.contains("tui=botster-tui --data-dir"));
     assert!(text.contains("mcp=botster-hub mcp-serve --data-dir"));
     assert!(text.contains("status=botster-hub status --data-dir"));
     assert!(text.contains("shutdown=run botster-hub shutdown --data-dir"));
@@ -1478,6 +1478,28 @@ fn cli_dogfood_launcher_starts_botster_web_in_existing_hub_mode_and_shuts_down()
 
     shutdown_cli_daemon(&data_dir, child);
     wait_for_process_exit(web_pid);
+}
+
+#[test]
+fn cli_tui_prints_standalone_command_and_exits_successfully() {
+    let data_dir = unique_test_dir("cli-tui-deprecated-command");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_botster-hub"));
+    command.arg("tui").arg("--data-dir").arg(&data_dir);
+    let output = run_command_with_timeout(command, Duration::from_secs(3));
+
+    assert!(
+        output.status.success(),
+        "deprecated tui command should exit successfully: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stderr), "");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        format!(
+            "botster-hub tui is deprecated. Use: botster-tui --data-dir {}\n",
+            data_dir.display()
+        )
+    );
 }
 
 #[test]
@@ -3734,428 +3756,6 @@ fn daemon_notify_session_defers_without_observed_readiness_over_socket() {
         !observed.contains("echo:notify-socket"),
         "notify session without observed readiness should not reach PTY input path, got {observed:?}"
     );
-
-    shutdown_cli_daemon(&data_dir, child);
-}
-
-#[test]
-fn daemon_tui_project_pipelines_surface_action_round_trip_uses_plugin_result() {
-    let _guard = daemon_test_lock()
-        .lock()
-        .expect("serialize real daemon test");
-    let data_dir = unique_test_dir("daemon-tui-project-pipelines");
-    let config = explicit_config(&data_dir);
-    let child = start_cli_daemon(&data_dir);
-
-    let enabled = botster_hub::daemon_transport_request(
-        &config,
-        botster_hub::DaemonRequest::EnablePackageLocalPath {
-            path: PathBuf::from("examples/project-pipelines"),
-        },
-    )
-    .expect("enable project pipelines plugin over daemon socket");
-    assert_eq!(
-        enabled.kind,
-        botster_hub::DaemonResponseKind::PackageDecision
-    );
-
-    let mut driver =
-        botster_hub::tui::ScriptedTuiDriver::connect(config.clone()).expect("connect scripted TUI");
-    driver.set_project_pipelines_form("   ", "local_pipeline");
-    let invalid_results = driver.submit_project_pipelines_form();
-    let invalid = invalid_results.last().expect("invalid action result");
-    assert_eq!(invalid.state, UiActionResultState::Rejected);
-    assert_eq!(invalid.surface_id.0, "project-pipelines.create-ticket");
-    assert_eq!(
-        invalid
-            .field_errors
-            .get("project-pipelines-create-title")
-            .and_then(|errors| errors.first())
-            .map(String::as_str),
-        Some("Title is required")
-    );
-    assert_eq!(invalid.form_errors, vec!["Title is required".to_string()]);
-
-    driver.set_project_pipelines_form("  TUI dogfood ticket  ", "local.pipeline");
-    let valid_results = driver.submit_project_pipelines_form();
-    let valid = valid_results.last().expect("valid action result");
-    assert_eq!(valid.state, UiActionResultState::Accepted);
-    assert_eq!(valid.surface_id.0, "project-pipelines.create-ticket");
-    assert_eq!(
-        valid.normalized_values.as_ref().unwrap().0["title"],
-        "TUI dogfood ticket"
-    );
-
-    let context = botster_hub::daemon_transport_request(
-        &config,
-        botster_hub::DaemonRequest::PluginMcpCallTool {
-            name: "project_pipelines.current_context".to_string(),
-            arguments: serde_json::json!({}),
-        },
-    )
-    .expect("read project pipelines current context over daemon socket");
-    assert_eq!(
-        context.plugin_tool_result["tickets"][0]["title"],
-        "TUI dogfood ticket"
-    );
-
-    shutdown_cli_daemon(&data_dir, child);
-}
-
-#[test]
-fn scripted_tui_uses_daemon_socket_for_attach_input_doorbell_resize_and_restart_reconnect() {
-    let _guard = daemon_test_lock()
-        .lock()
-        .expect("serialize real daemon test");
-    let data_dir = unique_test_dir("scripted-tui");
-    let config = explicit_config(&data_dir);
-    let child = start_cli_daemon(&data_dir);
-
-    let spawn = botster_hub::daemon_transport_request(
-        &config,
-        botster_hub::DaemonRequest::Spawn {
-            session_id: "scripted-tui-session".to_string(),
-            command:
-                "printf 'ready\\n'; while IFS= read -r line; do if [ \"$line\" = size-check ]; then printf 'winsize:%s\\n' \"$(stty size)\"; else printf 'echo:%s\\n' \"$line\"; fi; done"
-                    .to_string(),
-        },
-    )
-    .expect("spawn scripted TUI session");
-    assert_eq!(spawn.kind, botster_hub::DaemonResponseKind::Spawned);
-
-    let proof = botster_hub::run_scripted_probe(config.clone(), "scripted-tui-session")
-        .expect("scripted TUI probe should complete core workflow");
-    assert!(
-        proof
-            .rendered_sessions
-            .contains(&"scripted-tui-session".to_string())
-    );
-    assert!(proof.ui_regions.contains(&"sessions-panel".to_string()));
-    assert!(proof.ui_regions.contains(&"activity-panel".to_string()));
-    assert!(proof.ui_regions.contains(&"attached-terminal".to_string()));
-    assert!(proof.observed_output.contains("echo:from-tui"));
-    assert!(proof.observed_output.contains("winsize:31 101"));
-    assert!(!proof.observed_output.contains("echo:doorbell-from-tui"));
-    assert!(proof.observed_output.contains("echo:after-reattach"));
-    assert!(proof.guarded_decision.starts_with("Defer"));
-    assert_eq!(proof.guarded_states, vec!["accepted", "deferred"]);
-    assert_eq!(proof.resize_sent, Some((31, 101)));
-    assert_ne!(
-        proof.first_subscription_id, proof.second_subscription_id,
-        "TUI reattach should allocate a fresh subscription id"
-    );
-
-    let mut driver = botster_hub::ScriptedTuiDriver::connect(config.clone())
-        .expect("connect scripted TUI driver before restart");
-    driver
-        .select_session("scripted-tui-session")
-        .expect("select recovered session before restart");
-    let before_restart_subscription = driver
-        .attach_selected()
-        .expect("attach before daemon restart");
-    driver.send_input("before-restart\n");
-    driver
-        .drain_until("echo:before-restart", Duration::from_secs(5))
-        .expect("observe pre-restart output");
-
-    shutdown_cli_daemon(&data_dir, child);
-    let restarted_child = start_cli_daemon(&data_dir);
-    driver
-        .reconnect()
-        .expect("scripted TUI should reconnect after daemon restart");
-    let after_restart_subscription = driver
-        .subscription_id()
-        .expect("reconnect should reattach recovered session");
-    assert_ne!(
-        before_restart_subscription, after_restart_subscription,
-        "daemon restart reconnect must discard stale subscription id"
-    );
-    driver.send_input("after-restart\n");
-    driver
-        .drain_until("echo:after-restart", Duration::from_secs(5))
-        .expect("TUI should observe output after daemon restart reconnect");
-    assert!(driver.output().contains("echo:after-restart"));
-
-    shutdown_cli_daemon(&data_dir, restarted_child);
-}
-
-#[test]
-fn scripted_tui_surfaces_session_lost_when_restart_does_not_recover_attached_session() {
-    let _guard = daemon_test_lock()
-        .lock()
-        .expect("serialize real daemon test");
-    let data_dir = unique_test_dir("scripted-tui-session-lost");
-    let config = explicit_config(&data_dir);
-    let child = start_cli_daemon(&data_dir);
-
-    let spawn = botster_hub::daemon_transport_request(
-        &config,
-        botster_hub::DaemonRequest::Spawn {
-            session_id: "scripted-lost-session".to_string(),
-            command:
-                "printf 'ready\\n'; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done"
-                    .to_string(),
-        },
-    )
-    .expect("spawn scripted lost-session fixture");
-    assert_eq!(spawn.kind, botster_hub::DaemonResponseKind::Spawned);
-
-    let mut driver = botster_hub::ScriptedTuiDriver::connect(config.clone())
-        .expect("connect scripted TUI driver before lost-session restart");
-    driver
-        .select_session("scripted-lost-session")
-        .expect("select session before loss");
-    driver
-        .attach_selected()
-        .expect("attach before intentional session loss");
-    driver.send_input("before-loss\n");
-    driver
-        .drain_until("echo:before-loss", Duration::from_secs(5))
-        .expect("observe pre-loss output");
-
-    let shutdown_session = botster_hub::daemon_transport_request(
-        &config,
-        botster_hub::DaemonRequest::ShutdownSession {
-            session_id: "scripted-lost-session".to_string(),
-        },
-    )
-    .expect("shut down session before daemon restart");
-    assert_eq!(
-        shutdown_session.kind,
-        botster_hub::DaemonResponseKind::Events
-    );
-
-    shutdown_cli_daemon(&data_dir, child);
-    let restarted_child = start_cli_daemon(&data_dir);
-    driver
-        .reconnect()
-        .expect("TUI reconnect should keep operator in status/session view");
-    assert!(
-        driver.subscription_id().is_none(),
-        "unrecovered session should not keep or recreate a subscription"
-    );
-    assert!(
-        driver
-            .errors()
-            .iter()
-            .any(|error| error.contains("attached session was not recovered")),
-        "TUI should surface visible session-lost error, got {:?}",
-        driver.errors()
-    );
-
-    shutdown_cli_daemon(&data_dir, restarted_child);
-}
-
-#[test]
-fn scripted_tui_does_not_attach_exited_dogfood_smoke_session() {
-    let _guard = daemon_test_lock()
-        .lock()
-        .expect("serialize real daemon test");
-    let data_dir = unique_test_dir("tui-exited-dogfood-smoke");
-    let config = explicit_config(&data_dir);
-    let child = start_cli_daemon(&data_dir);
-
-    let spawn = botster_hub::daemon_transport_request(
-        &config,
-        botster_hub::DaemonRequest::Spawn {
-            session_id: "dogfood-worker-smoke".to_string(),
-            command: "printf 'dogfood-worker-ok\\n'; sleep 1".to_string(),
-        },
-    )
-    .expect("spawn exited dogfood smoke fixture");
-    assert_eq!(spawn.kind, botster_hub::DaemonResponseKind::Spawned);
-
-    let shutdown = botster_hub::daemon_transport_request(
-        &config,
-        botster_hub::DaemonRequest::ShutdownSession {
-            session_id: "dogfood-worker-smoke".to_string(),
-        },
-    )
-    .expect("shut down dogfood smoke fixture");
-    assert_eq!(shutdown.kind, botster_hub::DaemonResponseKind::Events);
-
-    let mut driver = botster_hub::ScriptedTuiDriver::connect(config.clone())
-        .expect("connect scripted TUI driver after dogfood smoke exit");
-    driver
-        .select_session("dogfood-worker-smoke")
-        .expect("exited smoke session should remain visible in TUI session list");
-
-    let attach = driver.attach_selected();
-    assert!(
-        attach
-            .as_ref()
-            .is_err_and(|error| error.to_string().contains("exited - cannot attach")),
-        "exited smoke attach should fail with actionable diagnostic, got {attach:?}"
-    );
-    assert!(
-        driver.active_session_id().is_none(),
-        "exited smoke attach must not set active session"
-    );
-    assert!(
-        driver.subscription_id().is_none(),
-        "exited smoke attach must not create subscription"
-    );
-
-    let second_attach = driver.attach_selected();
-    assert!(
-        second_attach
-            .as_ref()
-            .is_err_and(|error| error.to_string().contains("exited - cannot attach")),
-        "repeated exited smoke attach should keep returning actionable diagnostic, got {second_attach:?}"
-    );
-    let errors = driver.errors();
-    let exited_rows = errors
-        .iter()
-        .filter(|error| error.contains("dogfood-worker-smoke exited - cannot attach"))
-        .count();
-    assert_eq!(
-        exited_rows, 1,
-        "repeated exited attach attempts should not duplicate diagnostics, got {errors:?}"
-    );
-    assert!(
-        !errors
-            .iter()
-            .any(|error| error.contains("attached session disappeared")),
-        "guarded exited attach should not reach UnknownSession recovery path, got {errors:?}"
-    );
-
-    let replacement = botster_hub::daemon_transport_request(
-        &config,
-        botster_hub::DaemonRequest::Spawn {
-            session_id: "dogfood-running-replacement".to_string(),
-            command:
-                "printf 'replacement-ready\\n'; while IFS= read -r line; do printf 'replacement:%s\\n' \"$line\"; done"
-                    .to_string(),
-        },
-    )
-    .expect("spawn running replacement after exited smoke attach guard");
-    assert_eq!(
-        replacement.kind,
-        botster_hub::DaemonResponseKind::Spawned,
-        "replacement spawn failed with {:?}",
-        replacement.error
-    );
-    driver
-        .select_session("dogfood-running-replacement")
-        .expect("select running replacement after exited smoke guard");
-    driver
-        .attach_selected()
-        .expect("running replacement should remain attachable");
-    driver.send_input("after-exited-guard\n");
-    driver
-        .drain_until("replacement:after-exited-guard", Duration::from_secs(5))
-        .expect("TUI should remain usable after exited smoke guard");
-
-    shutdown_cli_daemon(&data_dir, child);
-}
-
-#[test]
-fn scripted_tui_detaches_and_refreshes_when_drain_reports_unknown_session() {
-    let _guard = daemon_test_lock()
-        .lock()
-        .expect("serialize real daemon test");
-    let data_dir = unique_test_dir("tui-drain-loss");
-    let config = explicit_config(&data_dir);
-    let child = start_cli_daemon(&data_dir);
-
-    let spawn = botster_hub::daemon_transport_request(
-        &config,
-        botster_hub::DaemonRequest::Spawn {
-            session_id: "scripted-drain-loss-session".to_string(),
-            command:
-                "printf 'ready\\n'; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done"
-                    .to_string(),
-        },
-    )
-    .expect("spawn scripted drain-loss fixture");
-    assert_eq!(spawn.kind, botster_hub::DaemonResponseKind::Spawned);
-
-    let mut driver = botster_hub::ScriptedTuiDriver::connect(config.clone())
-        .expect("connect scripted TUI driver before drain loss");
-    driver
-        .select_session("scripted-drain-loss-session")
-        .expect("select session before drain loss");
-    driver.attach_selected().expect("attach before drain loss");
-    driver.send_input("before-drain-loss\n");
-    driver
-        .drain_until("echo:before-drain-loss", Duration::from_secs(5))
-        .expect("observe pre-loss output");
-
-    let shutdown_session = botster_hub::daemon_transport_request(
-        &config,
-        botster_hub::DaemonRequest::ShutdownSession {
-            session_id: "scripted-drain-loss-session".to_string(),
-        },
-    )
-    .expect("shut down attached session before drain");
-    assert_eq!(
-        shutdown_session.kind,
-        botster_hub::DaemonResponseKind::Events
-    );
-
-    for _ in 0..3 {
-        driver
-            .drain_once()
-            .expect("drain after attached session disappeared");
-        thread::sleep(Duration::from_millis(30));
-    }
-
-    assert!(
-        driver.active_session_id().is_none(),
-        "drain-time UnknownSession should clear the active session"
-    );
-    assert!(
-        driver.subscription_id().is_none(),
-        "drain-time UnknownSession should clear the stale subscription"
-    );
-    let errors = driver.errors();
-    let session_lost_rows = errors
-        .iter()
-        .filter(|error| error.contains("attached session disappeared"))
-        .count();
-    assert_eq!(
-        session_lost_rows, 1,
-        "TUI should surface exactly one actionable session-loss row, got {errors:?}"
-    );
-    assert!(
-        !errors
-            .iter()
-            .any(|error| error.contains("unknown_session: runtime failed")),
-        "TUI should suppress the generic repeated drain error, got {errors:?}"
-    );
-
-    let replacement = botster_hub::daemon_transport_request(
-        &config,
-        botster_hub::DaemonRequest::Spawn {
-            session_id: "drain-replacement".to_string(),
-            command:
-                "printf 'replacement-ready\\n'; while IFS= read -r line; do printf 'replacement:%s\\n' \"$line\"; done"
-                    .to_string(),
-        },
-    )
-    .expect("spawn replacement session after drain loss");
-    assert_eq!(
-        replacement.kind,
-        botster_hub::DaemonResponseKind::Spawned,
-        "replacement spawn failed with {:?}",
-        replacement.error
-    );
-    driver
-        .select_session("drain-replacement")
-        .expect("select replacement session after drain loss");
-    assert!(
-        driver
-            .session_ids()
-            .contains(&"drain-replacement".to_string()),
-        "TUI should refresh sessions after drain loss"
-    );
-    driver
-        .attach_selected()
-        .expect("attach replacement session after drain loss");
-    driver.send_input("after-drain-loss\n");
-    driver
-        .drain_until("replacement:after-drain-loss", Duration::from_secs(5))
-        .expect("TUI should remain usable after drain loss");
 
     shutdown_cli_daemon(&data_dir, child);
 }
