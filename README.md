@@ -238,6 +238,11 @@ botster-hub status --data-dir <path>
 botster-hub shutdown --data-dir <path>
 ```
 
+The supervised `botster-web` process receives `BOTSTER_HUB_SOCKET` because the
+launcher owns that child process. The standalone TUI is operator-run, so it uses
+`botster-tui --data-dir <path>` to resolve the same daemon socket from the shared
+data directory.
+
 Keep the launcher running in the foreground. For graceful shutdown, run the
 printed shutdown command from another terminal; `Ctrl-C` hard-stops the
 foreground launcher. Shutdown remains hub-owned: the existing-hub bridge does
