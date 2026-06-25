@@ -232,7 +232,7 @@ current data directory:
 
 ```sh
 http://127.0.0.1:41739
-botster-hub tui --data-dir <path>
+botster-tui --data-dir <path>
 botster-hub mcp-serve --data-dir <path>
 botster-hub status --data-dir <path>
 botster-hub shutdown --data-dir <path>
@@ -303,12 +303,13 @@ core runtime does not provide a process-exit frame. `inspect` is intentionally
 scoped to sanitized session list data until the stable client API grows a
 dedicated inspection request.
 
-## Minimal local TUI
+## Standalone local TUI
 
-`botster-hub tui --data-dir <path>` opens the first local terminal UI over the
-same daemon socket and `HubClientApi` path as the operator CLI. It does not
-start or embed a second `HubRuntime`; start the daemon first, then open the TUI
-from another terminal.
+`botster-tui --data-dir <path>` opens the local terminal UI over the same daemon
+socket and `botster-hub-client` protocol path as the operator CLI. The hub no
+longer embeds a separate TUI renderer. `botster-hub tui --data-dir <path>` is a
+deprecated compatibility command that prints the equivalent standalone command
+and exits successfully.
 
 ```sh
 # Terminal 1: leave the daemon running.
@@ -318,8 +319,8 @@ cargo run -- start --data-dir target/botster-hub-tui-dogfood-data
 cargo run -- sessions spawn --data-dir target/botster-hub-tui-dogfood-data \
   --session-id dogfood-session -- "printf 'dogfood-ok\n'; while IFS= read -r line; do printf 'dogfood:%s\n' \"$line\"; done"
 
-# Terminal 3: operate the session from the TUI.
-cargo run -- tui --data-dir target/botster-hub-tui-dogfood-data
+# Terminal 3: operate the session from the standalone TUI.
+botster-tui --data-dir target/botster-hub-tui-dogfood-data
 ```
 
 The echo-loop fixture is intentionally not a shell: typing `hello` should produce
@@ -332,12 +333,13 @@ cargo run -- sessions spawn --data-dir target/botster-hub-tui-dogfood-data \
   --session-id dogfood-shell -- "/bin/sh -i"
 ```
 
-The TUI lists daemon sessions, attaches with a persistent socket subscription,
-sends ordinary typed input to the active PTY, forwards terminal resize events,
-detaches and reattaches with fresh subscription ids, shuts down sessions, and can
-request daemon shutdown. On daemon socket loss it shows a reconnecting state,
-reconnects to the daemon, refreshes the session list, drops the stale
-subscription id, and reattaches when the worker-backed session is recovered.
+The standalone TUI lists daemon sessions, attaches with a persistent socket
+subscription, sends ordinary typed input to the active PTY, forwards terminal
+resize events, detaches and reattaches with fresh subscription ids, shuts down
+sessions, and can request daemon shutdown. On daemon socket loss it shows a
+reconnecting state, reconnects to the daemon, refreshes the session list, drops
+the stale subscription id, and reattaches when the worker-backed session is
+recovered.
 When recovery is absent, it leaves the operator in the session/status view with
 a visible session-lost error.
 
