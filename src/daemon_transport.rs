@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use botster_core::{
     EndpointId, EnvelopeCursor, EnvelopeDeliveryState, EnvelopeId, EnvelopeTarget,
-    ExtensionRuntime, PackageConfigurationValue, RequestId, RoutedEnvelope, RoutedEnvelopePayload,
+    PackageConfigurationValue, RequestId, RoutedEnvelope, RoutedEnvelopePayload,
     RunnableEntrypointKind, RunnableEntrypointLaunchMode, RunnableEntrypointProcessState,
     RunnableEntrypointResultField, SessionId, SessionLifecycleState, SubscriptionId,
     TerminalAttachState, UiActionResult, UiActionResultState, UiNode,
@@ -944,7 +944,7 @@ fn load_package_after_enable(
         package_name,
         "daemon socket load enabled local plugin package",
     )?;
-    if prepared.selected_entrypoint.runtime == ExtensionRuntime::Lua {
+    if prepared.selected_lua_entrypoint().is_some() {
         daemon
             .runtime_mut()
             .ok_or(DaemonTransportError::DaemonNotRunning)?
