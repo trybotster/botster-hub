@@ -14,7 +14,8 @@ use botster_core::{
     ExtensionKind, HostProfileAdmissionError, PackageConfigurationField,
     PackageConfigurationFieldType, PackageConfigurationSchema, PackageConfigurationSecretValue,
     PackageConfigurationValue, PackageManifest, PackageRequirementStatus, PackageResolutionInput,
-    PackageResolutionMatrix, PackageResolutionPackage, PackageSource, admit_host_profile,
+    PackageResolutionMatrix, PackageResolutionPackage, PackageSource, RunnableEntrypointKind,
+    RunnableEntrypointLaunchMode, RunnableEntrypointReadiness, admit_host_profile,
     resolve_package_dependencies,
 };
 use serde::{Deserialize, Serialize};
@@ -984,8 +985,10 @@ pub struct PackageConfigurationDiagnostic {
 pub struct PackageRunnableEntrypoint {
     /// Stable manifest-local entrypoint id.
     pub id: String,
-    /// Marketplace-shaped entrypoint kind.
-    pub kind: PackageRunnableEntrypointKind,
+    /// Core-owned runnable entrypoint kind.
+    pub kind: RunnableEntrypointKind,
+    /// Core-owned host launch mode.
+    pub launch_mode: RunnableEntrypointLaunchMode,
     /// Command name or package-relative command path.
     pub command: String,
     /// Command arguments. These are declarative and are not shell-expanded by this contract.
@@ -997,29 +1000,18 @@ pub struct PackageRunnableEntrypoint {
     /// Declarative environment requirements. Values are optional defaults, not host snapshots.
     #[serde(default)]
     pub environment: Vec<PackageEnvironmentRequirement>,
-    /// Local/dev execution mode.
-    #[serde(default)]
-    pub mode: PackageRunnableMode,
     /// Capability declarations needed by this entrypoint.
     #[serde(default)]
     pub capabilities: Vec<Capability>,
+    /// Structured readiness metadata declared by the core runnable contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readiness: Option<RunnableEntrypointReadiness>,
     /// Static policy declaring whether the hub may supervise this entrypoint later.
     #[serde(default)]
     pub may_supervise: bool,
     /// Static process-state DTO. This ticket does not spawn processes, so it defaults to not_started.
     #[serde(default)]
     pub process: PackageRunnableProcess,
-}
-
-/// Supported runnable entrypoint kinds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PackageRunnableEntrypointKind {
-    Client,
-    Web,
-    Mcp,
-    Daemon,
-    Provider,
 }
 
 /// Working-directory policy for a runnable package entrypoint.
@@ -1052,15 +1044,6 @@ pub struct PackageEnvironmentRequirement {
 
 fn default_required_environment() -> bool {
     true
-}
-
-/// Local/dev runnable entrypoint mode.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PackageRunnableMode {
-    Dev,
-    #[default]
-    Local,
 }
 
 /// Static process-state DTO for package runnable entrypoints.
@@ -2621,6 +2604,7 @@ mod tests {
             configuration: None,
             host_profile: None,
             surfaces: Vec::new(),
+            runnable_entrypoints: Vec::new(),
         }
     }
 
@@ -2652,6 +2636,7 @@ mod tests {
             }),
             configuration: None,
             surfaces: Vec::new(),
+            runnable_entrypoints: Vec::new(),
         }
     }
 
@@ -3549,7 +3534,7 @@ mod tests {
   "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }],
   "runnable_entrypoints": [{
     "id": "web",
-    "kind": "web",
+    "kind": "web_app",
     "command": "web/dev-server",
     "args": ["--host", "127.0.0.1"],
     "working_directory": { "policy": "relative", "path": "web" },
@@ -3559,7 +3544,7 @@ mod tests {
       "default": "5173",
       "description": "Local web client port"
     }],
-    "mode": "dev",
+    "launch_mode": "background",
     "capabilities": [{ "surface": "network", "scope": "localhost" }],
     "may_supervise": true
   }]
@@ -3578,7 +3563,11 @@ mod tests {
         assert_eq!(record.runnable_entrypoints.len(), 1);
         let entrypoint = &record.runnable_entrypoints[0];
         assert_eq!(entrypoint.id, "web");
-        assert_eq!(entrypoint.kind, PackageRunnableEntrypointKind::Web);
+        assert_eq!(entrypoint.kind, RunnableEntrypointKind::WebApp);
+        assert_eq!(
+            entrypoint.launch_mode,
+            RunnableEntrypointLaunchMode::Background
+        );
         assert_eq!(entrypoint.command, "web/dev-server");
         assert_eq!(entrypoint.args, ["--host", "127.0.0.1"]);
         assert_eq!(
@@ -3589,7 +3578,6 @@ mod tests {
         );
         assert_eq!(entrypoint.environment[0].name, "BOTSTER_WEB_PORT");
         assert_eq!(entrypoint.environment[0].default.as_deref(), Some("5173"));
-        assert_eq!(entrypoint.mode, PackageRunnableMode::Dev);
         assert_eq!(
             entrypoint.capabilities[0].surface,
             CapabilitySurface::Network
@@ -3628,27 +3616,27 @@ mod tests {
             (
                 "duplicate",
                 r#"[
-                  { "id": "web", "kind": "web", "command": "bin/web" },
-                  { "id": "web", "kind": "client", "command": "bin/client" }
+                  { "id": "web", "kind": "web_app", "command": "bin/web" },
+                  { "id": "web", "kind": "terminal_app", "command": "bin/client" }
                 ]"#,
             ),
             (
                 "missing-command",
-                r#"[{ "id": "web", "kind": "web", "command": "" }]"#,
+                r#"[{ "id": "web", "kind": "web_app", "command": "" }]"#,
             ),
             (
                 "absolute-command",
-                r#"[{ "id": "web", "kind": "web", "command": "/bin/web" }]"#,
+                r#"[{ "id": "web", "kind": "web_app", "command": "/bin/web" }]"#,
             ),
             (
                 "traversing-command",
-                r#"[{ "id": "web", "kind": "web", "command": "../bin/web" }]"#,
+                r#"[{ "id": "web", "kind": "web_app", "command": "../bin/web" }]"#,
             ),
             (
                 "traversing-working-directory",
                 r#"[{
                   "id": "web",
-                  "kind": "web",
+                  "kind": "web_app",
                   "command": "bin/web",
                   "working_directory": { "policy": "relative", "path": "../web" }
                 }]"#,

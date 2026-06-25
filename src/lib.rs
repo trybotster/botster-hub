@@ -44,6 +44,10 @@ pub mod profile;
 pub mod runtime;
 
 use botster_core::CapabilitySurface;
+pub use botster_core::{
+    RunnableEntrypointKind, RunnableEntrypointLaunchMode, RunnableEntrypointLaunchResult,
+    RunnableEntrypointProcessState, RunnableEntrypointReadiness, RunnableEntrypointResultField,
+};
 
 pub use capabilities::HubCapabilityRuntime;
 pub use client_api::{
@@ -70,14 +74,15 @@ pub use daemon::{
     HubDaemon, HubDaemonError, HubDaemonResult, HubDaemonState, HubDaemonStatus, HubStateLoadSource,
 };
 pub use daemon_transport::{
-    DaemonAvailablePackage, DaemonCapability, DaemonCompatibility, DaemonConnection,
-    DaemonCoordination, DaemonEnvelope, DaemonEnvelopeAck, DaemonEnvelopeDelivery,
-    DaemonEnvelopePublish, DaemonEvent, DaemonIdentity, DaemonNotify, DaemonOperatorError,
-    DaemonPackage, DaemonPackageActionRequest, DaemonPackageActionRequiredReference,
-    DaemonPackageActionState, DaemonPackageActionStatus, DaemonPackageAvailability,
-    DaemonPackageAvailabilityReason, DaemonPackageAvailabilityState, DaemonPackageCompatibility,
-    DaemonPackageConfiguration, DaemonPackageDecision, DaemonPackageDependencyAvailability,
-    DaemonPackageDiagnostic, DaemonPackageEnvironmentRequirement, DaemonPackageFeatureAvailability,
+    DaemonApp, DaemonAppLaunchTarget, DaemonAvailablePackage, DaemonCapability,
+    DaemonCompatibility, DaemonConnection, DaemonCoordination, DaemonEnvelope, DaemonEnvelopeAck,
+    DaemonEnvelopeDelivery, DaemonEnvelopePublish, DaemonEvent, DaemonIdentity, DaemonNotify,
+    DaemonOperatorError, DaemonPackage, DaemonPackageActionRequest,
+    DaemonPackageActionRequiredReference, DaemonPackageActionState, DaemonPackageActionStatus,
+    DaemonPackageAvailability, DaemonPackageAvailabilityReason, DaemonPackageAvailabilityState,
+    DaemonPackageCompatibility, DaemonPackageConfiguration, DaemonPackageDecision,
+    DaemonPackageDependencyAvailability, DaemonPackageDiagnostic,
+    DaemonPackageEnvironmentRequirement, DaemonPackageFeatureAvailability,
     DaemonPackageInstallEffect, DaemonPackageInstallPlan, DaemonPackagePin, DaemonPackageProcess,
     DaemonPackageRunnableEntrypoint, DaemonPackageWorkingDirectory, DaemonPluginLifecycle,
     DaemonRequest, DaemonResponse, DaemonResponseKind, DaemonSession, DaemonSessionCleanup,
@@ -107,10 +112,9 @@ pub use packages::{
     PackageRegistryEntrySourceKind, PackageRegistryError, PackageRegistryResult,
     PackageRegistrySnapshot, PackageRegistrySnapshotError, PackageRegistrySource,
     PackageRegistrySourceKind, PackageRunnableDiagnostic, PackageRunnableEntrypoint,
-    PackageRunnableEntrypointKind, PackageRunnableMode, PackageRunnableProcess,
-    PackageRunnableProcessState, PackageRunnableWorkingDirectory, PackageSourceMetadata,
-    PackageState, PackageTrust, PackageTrustClassification, PackageUpdatePolicy,
-    PreparedLocalPackage, default_package_policy,
+    PackageRunnableProcess, PackageRunnableProcessState, PackageRunnableWorkingDirectory,
+    PackageSourceMetadata, PackageState, PackageTrust, PackageTrustClassification,
+    PackageUpdatePolicy, PreparedLocalPackage, default_package_policy,
 };
 pub use persistence::{
     CapabilityGrantRecord, FileHubStateStore, HubAuditEntry, HubState, HubStateError,

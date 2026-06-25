@@ -362,9 +362,8 @@ mod tests {
     use super::*;
     use crate::{
         DataDirectoryOption, HostIdentityOptions, HubStartupOptions, PackageProvenance,
-        PackageRegistry, PackageRunnableEntrypoint, PackageRunnableEntrypointKind,
-        PackageRunnableMode, PackageRunnableProcessState, PackageRunnableWorkingDirectory,
-        RuntimeEnvironment,
+        PackageRegistry, PackageRunnableEntrypoint, PackageRunnableProcessState,
+        PackageRunnableWorkingDirectory, RuntimeEnvironment,
     };
 
     fn test_config(name: &str) -> HubConfig {
@@ -416,6 +415,7 @@ mod tests {
             configuration: None,
             host_profile: None,
             surfaces: Vec::new(),
+            runnable_entrypoints: Vec::new(),
         }
     }
 
@@ -584,13 +584,14 @@ mod tests {
         let mut snapshot = registry.snapshot();
         snapshot.records[0].runnable_entrypoints = vec![PackageRunnableEntrypoint {
             id: "web".to_string(),
-            kind: PackageRunnableEntrypointKind::Web,
+            kind: botster_core::RunnableEntrypointKind::WebApp,
+            launch_mode: botster_core::RunnableEntrypointLaunchMode::Background,
             command: "bin/botster-web".to_string(),
             args: vec!["--host".to_string(), "127.0.0.1".to_string()],
             working_directory: PackageRunnableWorkingDirectory::PackageRoot,
             environment: Vec::new(),
-            mode: PackageRunnableMode::Dev,
             capabilities: Vec::new(),
+            readiness: None,
             may_supervise: true,
             process: Default::default(),
         }];
