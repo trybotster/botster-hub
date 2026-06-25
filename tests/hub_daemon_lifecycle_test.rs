@@ -712,6 +712,16 @@ fn package_entrypoint<'a>(
         .expect("response includes web entrypoint")
 }
 
+fn package_action<'a>(
+    actions: &'a [botster_hub::DaemonPackageActionState],
+    action_id: &str,
+) -> &'a botster_hub::DaemonPackageActionState {
+    actions
+        .iter()
+        .find(|action| action.action_id == action_id)
+        .unwrap_or_else(|| panic!("response includes {action_id} action"))
+}
+
 fn process_exists(pid: u32) -> bool {
     unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
 }
@@ -4469,6 +4479,32 @@ fn package_entrypoint_supervision_starts_and_reports_running() {
     let entrypoint = package_entrypoint(&list, "dogfood.supervised");
     assert_eq!(entrypoint.process.state, "running");
     assert!(entrypoint.process.pid.is_some());
+    assert_eq!(
+        package_action(&entrypoint.actions, "start_package_entrypoint").status,
+        botster_hub::DaemonPackageActionStatus::Unavailable
+    );
+    let stop_action = package_action(&entrypoint.actions, "stop_package_entrypoint");
+    assert_eq!(
+        stop_action.status,
+        botster_hub::DaemonPackageActionStatus::Available
+    );
+    assert_eq!(
+        stop_action
+            .request
+            .as_ref()
+            .expect("stop entrypoint request")
+            .entrypoint_id
+            .as_deref(),
+        Some("web")
+    );
+    assert_eq!(
+        package_action(&entrypoint.actions, "restart_package_entrypoint")
+            .request
+            .as_ref()
+            .expect("restart entrypoint request")
+            .request_type,
+        "restart_package_entrypoint"
+    );
 
     let cli_status = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
         .arg("packages")
@@ -5018,6 +5054,33 @@ fn daemon_packages_registry_fixture_preview_and_install_flow() {
                 .source_label
                 .contains(registry_dir.to_string_lossy().as_ref())
     }));
+    let local_available = available
+        .available_packages
+        .iter()
+        .find(|package| package.entry_id == "dogfood-local")
+        .expect("local available entry");
+    let install_action = package_action(&local_available.actions, "install_package_registry_entry");
+    assert_eq!(
+        install_action.status,
+        botster_hub::DaemonPackageActionStatus::Available
+    );
+    let install_request = install_action
+        .request
+        .as_ref()
+        .expect("install request mapping");
+    assert_eq!(
+        install_request.request_type,
+        "install_package_registry_entry"
+    );
+    assert_eq!(install_request.entry_id.as_deref(), Some("dogfood-local"));
+    assert_eq!(
+        install_request.registry_path.as_deref(),
+        Some(registry_dir.to_string_lossy().as_ref())
+    );
+    assert_eq!(
+        package_action(&local_available.actions, "enable_package").status,
+        botster_hub::DaemonPackageActionStatus::Unavailable
+    );
 
     let inspect = botster_hub::daemon_transport_request(
         &config,
@@ -5076,6 +5139,29 @@ fn daemon_packages_registry_fixture_preview_and_install_flow() {
         .find(|package| package.package_name == "dogfood.git")
         .expect("installed package row");
     assert_eq!(installed.state, "installed");
+    let enable_action = package_action(&installed.actions, "enable_package");
+    assert_eq!(
+        enable_action.status,
+        botster_hub::DaemonPackageActionStatus::Blocked
+    );
+    let remove_action = package_action(&installed.actions, "remove_package");
+    assert_eq!(
+        remove_action.status,
+        botster_hub::DaemonPackageActionStatus::Available
+    );
+    assert_eq!(
+        remove_action
+            .request
+            .as_ref()
+            .expect("remove request mapping")
+            .request_type,
+        "remove_package"
+    );
+    let reload_action = package_action(&installed.actions, "reload_package");
+    assert_eq!(
+        reload_action.status,
+        botster_hub::DaemonPackageActionStatus::Unavailable
+    );
 
     shutdown_cli_daemon(&data_dir, child);
     let state = FileHubStateStore::for_data_directory(&data_dir)
@@ -5273,6 +5359,36 @@ fn package_configuration_daemon_set_show_list_reload_and_cli_are_redacted() {
     assert_eq!(
         installed.configuration.missing_required,
         vec!["endpoint".to_string(), "api_token".to_string()]
+    );
+    let enable_action = package_action(&installed.actions, "enable_package");
+    assert_eq!(
+        enable_action.status,
+        botster_hub::DaemonPackageActionStatus::Blocked
+    );
+    assert!(
+        enable_action
+            .required_references
+            .iter()
+            .any(|reference| { reference.kind == "config" && reference.key == "endpoint" })
+    );
+    assert!(
+        enable_action
+            .required_references
+            .iter()
+            .any(|reference| { reference.kind == "config" && reference.key == "api_token" })
+    );
+    let configure_action = package_action(&installed.actions, "set_package_configuration");
+    assert_eq!(
+        configure_action.status,
+        botster_hub::DaemonPackageActionStatus::Available
+    );
+    assert_eq!(
+        configure_action
+            .request
+            .as_ref()
+            .expect("configure request mapping")
+            .request_type,
+        "set_package_configuration"
     );
 
     let missing_enable = botster_hub::daemon_transport_request(
@@ -5636,6 +5752,25 @@ fn package_update_unsupported_cases_return_structured_diagnostics() {
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.kind == "pin_required")
+    );
+    assert_eq!(
+        package_action(&status.actions, "check_package_update").status,
+        botster_hub::DaemonPackageActionStatus::Available
+    );
+    let preview_action = package_action(&status.actions, "preview_package_update");
+    assert_eq!(
+        preview_action.status,
+        botster_hub::DaemonPackageActionStatus::Blocked
+    );
+    assert!(
+        preview_action
+            .required_references
+            .iter()
+            .any(|reference| { reference.kind == "pin" && reference.key == "package_update_pin" })
+    );
+    assert_eq!(
+        package_action(&status.actions, "reload_package").status,
+        botster_hub::DaemonPackageActionStatus::Unavailable
     );
 
     botster_hub::daemon_transport_request(
