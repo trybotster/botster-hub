@@ -42,7 +42,6 @@ pub mod packages;
 pub mod persistence;
 pub mod profile;
 pub mod runtime;
-pub mod tui;
 
 use botster_core::CapabilitySurface;
 
@@ -124,9 +123,6 @@ pub use profile::{
 pub use runtime::{
     HubLuaPluginLoadError, HubRuntime, HubRuntimeError, HubRuntimeObservation, HubRuntimeOutput,
     daemon_session_to_core_session,
-};
-pub use tui::{
-    ScriptedTuiDriver, ScriptedTuiProof, TuiError, TuiResult, run as run_tui, run_scripted_probe,
 };
 
 /// Compile-checked description of the profile plus the audited `HubRuntime` facade.
