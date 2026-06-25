@@ -449,8 +449,6 @@ fn write_app_registry_package(root: &Path) {
 
 fn write_botster_tui_package(root: &Path) {
     fs::create_dir_all(root).expect("create botster-tui package root");
-    fs::write(root.join("plugin.lua"), "return botster.register({})\n")
-        .expect("write botster-tui plugin entrypoint");
     let manifest = serde_json::json!({
         "name": "botster-tui",
         "version": "1.0.0",
@@ -458,9 +456,7 @@ fn write_botster_tui_package(root: &Path) {
         "botster": ">=0.1.0",
         "source": { "type": "path", "path": "." },
         "capabilities": [{ "surface": "surfaces" }],
-        "entrypoints": [
-            { "runtime": "lua", "path": "plugin.lua", "bootstrap": false }
-        ],
+        "entrypoints": [],
         "runnable_entrypoints": [{
             "id": "botster-tui",
             "kind": "terminal_app",
@@ -4524,6 +4520,39 @@ fn daemon_resolves_terminal_app_foreground_launch_contract() {
     );
 
     shutdown_cli_daemon(&data_dir, child);
+
+    let restarted = start_cli_daemon(&data_dir);
+    let apps = botster_hub::daemon_transport_request(
+        &explicit_config(&data_dir),
+        botster_hub::DaemonRequest::ListApps,
+    )
+    .expect("list apps after daemon restart");
+    let app = app_row(&apps, "botster-tui");
+    assert_eq!(app.package_name, "botster-tui");
+    assert_eq!(app.entrypoint_id, "botster-tui");
+    assert_eq!(app.kind, "terminal_app");
+
+    let reloaded = botster_hub::daemon_transport_request(
+        &explicit_config(&data_dir),
+        botster_hub::DaemonRequest::ResolveAppLaunch {
+            package_name: "botster-tui".to_string(),
+            entrypoint_id: "botster-tui".to_string(),
+        },
+    )
+    .expect("resolve terminal app launch after daemon restart");
+    assert_eq!(
+        reloaded.kind,
+        botster_hub::DaemonResponseKind::ResolvedAppLaunch
+    );
+    assert_eq!(
+        reloaded
+            .resolved_app_launch
+            .expect("resolved foreground launch after restart")
+            .command,
+        "sh"
+    );
+
+    shutdown_cli_daemon(&data_dir, restarted);
 }
 
 #[test]
