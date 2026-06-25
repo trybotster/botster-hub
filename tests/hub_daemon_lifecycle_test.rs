@@ -447,6 +447,47 @@ fn write_app_registry_package(root: &Path) {
     .expect("write app registry package manifest");
 }
 
+fn write_hub_env_web_app_package(root: &Path) {
+    fs::create_dir_all(root).expect("create hub-env web package root");
+    fs::write(root.join("plugin.lua"), "return botster.register({})\n")
+        .expect("write hub-env web package core entrypoint");
+    let manifest = serde_json::json!({
+        "name": "dogfood.hub-env",
+        "version": "1.0.0",
+        "kind": "plugin",
+        "botster": ">=0.1.0",
+        "source": { "type": "path", "path": "." },
+        "capabilities": [{ "surface": "surfaces" }],
+        "entrypoints": [
+            { "runtime": "lua", "path": "plugin.lua", "bootstrap": false }
+        ],
+        "runnable_entrypoints": [{
+            "id": "web",
+            "kind": "web_app",
+            "command": "sh",
+            "args": [
+                "-c",
+                "if [ -z \"$BOTSTER_HUB_SOCKET\" ] || [ -z \"$BOTSTER_HUB_DATA_DIR\" ]; then echo 'BOTSTER_HUB_BIN must point to a botster-hub binary' >&2; exit 42; fi; test -S \"$BOTSTER_HUB_SOCKET\" || exit 43; test -d \"$BOTSTER_HUB_DATA_DIR\" || exit 44; test \"$BOTSTER_WEB_MODE\" = daemon-default || exit 45; printf '%s\n' '{\"entrypoint_id\":\"web\",\"process_state\":\"running\",\"local_url\":\"http://127.0.0.1:49153\"}' > \"$BOTSTER_ENTRYPOINT_LAUNCH_RESULT\"; while true; do sleep 1; done"
+            ],
+            "working_directory": { "policy": "package_root" },
+            "environment": [
+                { "name": "BOTSTER_HUB_SOCKET", "required": false },
+                { "name": "BOTSTER_HUB_DATA_DIR", "required": false },
+                { "name": "BOTSTER_WEB_MODE", "required": false, "default": "daemon-default" }
+            ],
+            "launch_mode": "background",
+            "readiness": { "result_fields": ["local_url"] },
+            "capabilities": [{ "surface": "network", "scope": "localhost" }],
+            "may_supervise": true
+        }]
+    });
+    fs::write(
+        root.join("botster-package.json"),
+        serde_json::to_string_pretty(&manifest).expect("serialize hub-env web package manifest"),
+    )
+    .expect("write hub-env web package manifest");
+}
+
 fn write_botster_tui_package(root: &Path) {
     fs::create_dir_all(root).expect("create botster-tui package root");
     let manifest = serde_json::json!({
@@ -4631,6 +4672,53 @@ fn cli_apps_list_show_and_open_web_use_structured_app_url() {
 }
 
 #[test]
+fn cli_apps_open_web_injects_hub_connection_environment() {
+    let _guard = daemon_test_lock()
+        .lock()
+        .expect("serialize real daemon test");
+    let data_dir = unique_test_dir("cli-apps-web-hub-env");
+    let package_dir = unique_test_dir("cli-apps-web-hub-env-package");
+    write_hub_env_web_app_package(&package_dir);
+    let child = start_cli_daemon(&data_dir);
+    enable_supervised_package(&data_dir, &package_dir);
+
+    let open = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("apps")
+        .arg("open")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("dogfood.hub-env/web")
+        .output()
+        .expect("run apps open web with hub env fixture");
+    assert!(
+        open.status.success(),
+        "apps open web failed: {}",
+        command_output_text(&open)
+    );
+    let open_text = command_output_text(&open);
+    assert!(open_text.contains("app_url=http://127.0.0.1:49153"));
+    assert!(!open_text.contains("BOTSTER_HUB_BIN must point to a botster-hub binary"));
+
+    let status = botster_hub::daemon_transport_request(
+        &explicit_config(&data_dir),
+        botster_hub::DaemonRequest::PackageEntrypointStatus {
+            package_name: "dogfood.hub-env".to_string(),
+            entrypoint_id: "web".to_string(),
+        },
+    )
+    .expect("inspect web app entrypoint status");
+    let entrypoint = package_entrypoint(&status, "dogfood.hub-env");
+    assert_eq!(entrypoint.process.state, "running");
+    assert!(entrypoint.process.diagnostics.iter().all(|diagnostic| {
+        !diagnostic
+            .message
+            .contains("BOTSTER_HUB_BIN must point to a botster-hub binary")
+    }));
+
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
 fn cli_apps_open_terminal_and_tui_alias_use_foreground_launch_contract() {
     let _guard = daemon_test_lock()
         .lock()
@@ -4850,7 +4938,10 @@ fn package_entrypoint_supervision_stops_and_restarts() {
         &package_dir,
         "dogfood.restart",
         "sh",
-        &["-c", "while true; do sleep 1; done"],
+        &[
+            "-c",
+            "test -n \"$BOTSTER_HUB_SOCKET\" && test -n \"$BOTSTER_HUB_DATA_DIR\" && while true; do sleep 1; done",
+        ],
     );
     let child = start_cli_daemon(&data_dir);
     enable_supervised_package(&data_dir, &package_dir);
