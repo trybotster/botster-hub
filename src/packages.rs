@@ -11,7 +11,7 @@ use std::path::{Component, Path, PathBuf};
 
 use botster_core::{
     AdmittedHostProfile, Capability, CapabilitySet, CapabilitySurface, ExtensionEntrypoint,
-    ExtensionKind, HostProfileAdmissionError, PackageConfigurationField,
+    ExtensionKind, ExtensionRuntime, HostProfileAdmissionError, PackageConfigurationField,
     PackageConfigurationFieldType, PackageConfigurationSchema, PackageConfigurationSecretValue,
     PackageConfigurationValue, PackageManifest, PackageRequirementStatus, PackageResolutionInput,
     PackageResolutionMatrix, PackageResolutionPackage, PackageSource, RunnableEntrypointKind,
@@ -2304,10 +2304,10 @@ pub struct PreparedLocalPackage {
     pub package_root: PathBuf,
     /// Manifest entrypoints preserved from the core package manifest.
     pub entrypoints: Vec<ExtensionEntrypoint>,
-    /// Selected entrypoint from the manifest.
-    pub selected_entrypoint: ExtensionEntrypoint,
-    /// Canonical filesystem path for the selected entrypoint.
-    pub selected_entrypoint_path: PathBuf,
+    /// Selected code-load entrypoint from the manifest, if the package has one.
+    pub selected_entrypoint: Option<ExtensionEntrypoint>,
+    /// Canonical filesystem path for the selected code-load entrypoint, if the package has one.
+    pub selected_entrypoint_path: Option<PathBuf>,
 }
 
 impl PreparedLocalPackage {
@@ -2333,25 +2333,30 @@ impl PreparedLocalPackage {
             }
         };
 
-        let Some(selected_entrypoint) = record.manifest.entrypoints.first().cloned() else {
-            return Err(PackageRegistryError::with_record(
-                record.manifest.name.clone(),
-                PackageAction::Prepare,
-                PackageAdmissionReason::UnsafeEntrypoint(
-                    "local package has no entrypoints".to_string(),
-                ),
-                record.state,
-                record.classification,
-                audit_reason,
-            ));
-        };
-        let selected_entrypoint_path = canonical_entrypoint_path(
-            &package_root,
-            &selected_entrypoint.path,
-            &record.manifest.name,
-            PackageAction::Prepare,
-            audit_reason.clone(),
-        )?;
+        let (selected_entrypoint, selected_entrypoint_path) =
+            if let Some(entrypoint) = record.manifest.entrypoints.first().cloned() {
+                let entrypoint_path = canonical_entrypoint_path(
+                    &package_root,
+                    &entrypoint.path,
+                    &record.manifest.name,
+                    PackageAction::Prepare,
+                    audit_reason.clone(),
+                )?;
+                (Some(entrypoint), Some(entrypoint_path))
+            } else if record.runnable_entrypoints.is_empty() {
+                return Err(PackageRegistryError::with_record(
+                    record.manifest.name.clone(),
+                    PackageAction::Prepare,
+                    PackageAdmissionReason::UnsafeEntrypoint(
+                        "local package has no entrypoints".to_string(),
+                    ),
+                    record.state,
+                    record.classification,
+                    audit_reason,
+                ));
+            } else {
+                (None, None)
+            };
 
         Ok(Self {
             package_name: record.manifest.name.clone(),
@@ -2360,6 +2365,12 @@ impl PreparedLocalPackage {
             selected_entrypoint,
             selected_entrypoint_path,
         })
+    }
+
+    pub fn selected_lua_entrypoint(&self) -> Option<&ExtensionEntrypoint> {
+        self.selected_entrypoint
+            .as_ref()
+            .filter(|entrypoint| entrypoint.runtime == ExtensionRuntime::Lua)
     }
 }
 
@@ -3685,21 +3696,21 @@ mod tests {
             (
                 "duplicate",
                 r#"[
-                  { "id": "web", "kind": "web_app", "command": "bin/web" },
-                  { "id": "web", "kind": "terminal_app", "command": "bin/client" }
+                  { "id": "web", "kind": "web_app", "command": "bin/web", "launch_mode": "background" },
+                  { "id": "web", "kind": "terminal_app", "command": "bin/client", "launch_mode": "foreground_stdio" }
                 ]"#,
             ),
             (
                 "missing-command",
-                r#"[{ "id": "web", "kind": "web_app", "command": "" }]"#,
+                r#"[{ "id": "web", "kind": "web_app", "command": "", "launch_mode": "background" }]"#,
             ),
             (
                 "absolute-command",
-                r#"[{ "id": "web", "kind": "web_app", "command": "/bin/web" }]"#,
+                r#"[{ "id": "web", "kind": "web_app", "command": "/bin/web", "launch_mode": "background" }]"#,
             ),
             (
                 "traversing-command",
-                r#"[{ "id": "web", "kind": "web_app", "command": "../bin/web" }]"#,
+                r#"[{ "id": "web", "kind": "web_app", "command": "../bin/web", "launch_mode": "background" }]"#,
             ),
             (
                 "traversing-working-directory",
@@ -3707,6 +3718,7 @@ mod tests {
                   "id": "web",
                   "kind": "web_app",
                   "command": "bin/web",
+                  "launch_mode": "background",
                   "working_directory": { "policy": "relative", "path": "../web" }
                 }]"#,
             ),
@@ -3983,20 +3995,101 @@ mod tests {
             .collect();
 
         assert_eq!(package_names, vec!["alpha.local", "beta.local"]);
+        let alpha_entrypoint = alpha_root
+            .join("plugin.lua")
+            .canonicalize()
+            .expect("canonical alpha entrypoint");
+        let beta_entrypoint = beta_root
+            .join("plugin.lua")
+            .canonicalize()
+            .expect("canonical beta entrypoint");
         assert_eq!(
-            prepared[0].selected_entrypoint_path,
-            alpha_root
-                .join("plugin.lua")
-                .canonicalize()
-                .expect("canonical alpha entrypoint")
+            prepared[0].selected_entrypoint_path.as_deref(),
+            Some(alpha_entrypoint.as_path())
         );
         assert_eq!(
-            prepared[1].selected_entrypoint_path,
-            beta_root
-                .join("plugin.lua")
-                .canonicalize()
-                .expect("canonical beta entrypoint")
+            prepared[1].selected_entrypoint_path.as_deref(),
+            Some(beta_entrypoint.as_path())
         );
+    }
+
+    #[test]
+    fn prepare_local_package_accepts_client_app_only_package() {
+        let root = test_root("prepare-runnable-only-local-package");
+        fs::create_dir_all(&root).expect("create package root");
+        write_manifest_json(
+            &root,
+            r#"{
+  "name": "client.app",
+  "version": "1.0.0",
+  "kind": "plugin",
+  "botster": ">=0.1.0",
+  "capabilities": [{ "surface": "surfaces" }],
+  "entrypoints": [],
+  "runnable_entrypoints": [{
+    "id": "client",
+    "kind": "terminal_app",
+    "command": "bin/client",
+    "args": ["--headless"],
+    "working_directory": { "policy": "package_root" },
+    "launch_mode": "foreground_stdio"
+  }]
+}"#,
+        );
+        let mut registry =
+            PackageRegistry::new(grants(vec![capability(CapabilitySurface::Surfaces, None)]));
+        registry
+            .install_local_path(&root, "install runnable-only local package")
+            .expect("install runnable-only package");
+        registry
+            .enable("client.app", "enable runnable-only local package")
+            .expect("enable runnable-only package");
+
+        let prepared = registry
+            .prepare_local_package("client.app", "prepare runnable-only package")
+            .expect("prepare runnable-only package");
+
+        assert_eq!(prepared.package_name, "client.app");
+        assert!(prepared.entrypoints.is_empty());
+        assert!(prepared.selected_entrypoint.is_none());
+        assert!(prepared.selected_entrypoint_path.is_none());
+        assert!(prepared.selected_lua_entrypoint().is_none());
+    }
+
+    #[test]
+    fn prepare_local_package_rejects_package_without_entrypoints_or_runnables() {
+        let root = test_root("prepare-empty-local-package");
+        fs::create_dir_all(&root).expect("create package root");
+        write_manifest_json(
+            &root,
+            r#"{
+  "name": "empty.local",
+  "version": "1.0.0",
+  "kind": "plugin",
+  "botster": ">=0.1.0",
+  "capabilities": [{ "surface": "surfaces" }],
+  "entrypoints": [],
+  "runnable_entrypoints": []
+}"#,
+        );
+        let mut registry =
+            PackageRegistry::new(grants(vec![capability(CapabilitySurface::Surfaces, None)]));
+        registry
+            .install_local_path(&root, "install empty local package")
+            .expect("install empty package");
+        registry
+            .enable("empty.local", "enable empty local package")
+            .expect("enable empty package");
+
+        let error = registry
+            .prepare_local_package("empty.local", "prepare empty package")
+            .expect_err("empty package should still fail prepare");
+
+        assert!(matches!(
+            error.reason,
+            PackageAdmissionReason::UnsafeEntrypoint(reason)
+                if reason == "local package has no entrypoints"
+        ));
     }
 
     #[test]

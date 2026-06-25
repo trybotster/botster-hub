@@ -54,9 +54,13 @@ impl LuaPluginRuntime {
         routed_envelopes: SharedRoutedEnvelopeRuntime,
     ) -> Result<HubPluginRuntimeBundle, LuaPluginRuntimeError> {
         let plugin_key = PluginKey(prepared.package_name.clone());
+        let selected_entrypoint_path =
+            prepared.selected_entrypoint_path.as_ref().ok_or_else(|| {
+                LuaPluginRuntimeError::Load("local package has no lua entrypoint".to_string())
+            })?;
         let loaded = LoadedLuaPlugin::load(
             plugin_key.clone(),
-            &prepared.selected_entrypoint_path,
+            selected_entrypoint_path,
             configuration,
             capabilities,
             routed_envelopes,
@@ -66,12 +70,7 @@ impl LuaPluginRuntime {
             handlers: loaded.handlers,
             descriptors: loaded.descriptors,
             resources: loaded.resources,
-            entrypoint: Some(
-                prepared
-                    .selected_entrypoint_path
-                    .to_string_lossy()
-                    .into_owned(),
-            ),
+            entrypoint: Some(selected_entrypoint_path.to_string_lossy().into_owned()),
             metadata: Some(BoundaryJson(json!({
                 "runtime": "lua",
                 "abi": "botster.lua.v1",

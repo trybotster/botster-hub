@@ -80,7 +80,11 @@ fn run_local_dogfood() {
         .expect("prepare enabled local package");
     assert_eq!(prepared.package_name, DOGFOOD_PACKAGE);
     assert!(
-        prepared.selected_entrypoint_path.ends_with("plugin.lua"),
+        prepared
+            .selected_entrypoint_path
+            .as_ref()
+            .expect("prepared code-load entrypoint path")
+            .ends_with("plugin.lua"),
         "prepared entrypoint should resolve to plugin.lua"
     );
 

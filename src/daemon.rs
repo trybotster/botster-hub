@@ -197,7 +197,7 @@ pub(crate) fn load_enabled_local_plugins(
     let prepared = package_registry
         .prepare_enabled_local_packages("daemon startup load enabled local plugin packages")?;
     for package in prepared {
-        if package.selected_entrypoint.runtime == botster_core::ExtensionRuntime::Lua {
+        if package.selected_lua_entrypoint().is_some() {
             runtime.load_lua_plugin_package(package_registry, &package.package_name)?;
         }
     }
