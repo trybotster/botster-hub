@@ -114,6 +114,10 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             ("shutdown_session", &[("session_id", "string")]),
             ("drain", &[("session_id", "string")]),
             ("list_apps", &[]),
+            (
+                "resolve_app_launch",
+                &[("package_name", "string"), ("entrypoint_id", "string")],
+            ),
             ("list_packages", &[]),
             ("list_available_packages", &[("registry_path", "string")]),
             (
@@ -205,6 +209,7 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             ("status", "DaemonStatus | null"),
             ("sessions", "DaemonSession[]"),
             ("apps?", "DaemonApp[]"),
+            ("resolved_app_launch?", "DaemonResolvedAppLaunch | null"),
             ("packages", "DaemonPackage[]"),
             ("available_packages?", "DaemonAvailablePackage[]"),
             ("install_plan?", "DaemonPackageInstallPlan | null"),
@@ -231,6 +236,7 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             "spawned",
             "events",
             "apps",
+            "resolved_app_launch",
             "packages",
             "available_packages",
             "package_install_plan",
@@ -342,6 +348,21 @@ pub(crate) fn daemon_protocol_typescript() -> String {
         &mut output,
         "DaemonAppLaunchTarget",
         &[("kind", "string"), ("local_url?", "string | null")],
+    );
+    emit_interface(
+        &mut output,
+        "DaemonResolvedAppLaunch",
+        &[
+            ("package_name", "string"),
+            ("app_id", "string"),
+            ("entrypoint_id", "string"),
+            ("kind", "string"),
+            ("launch_mode", "string"),
+            ("command", "string"),
+            ("args?", "string[]"),
+            ("working_directory", "string"),
+            ("environment?", "Record<string, string>"),
+        ],
     );
     emit_interface(
         &mut output,
