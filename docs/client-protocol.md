@@ -178,6 +178,16 @@ starting entrypoints. Explicit registry install leaves packages in the installed
 state. Clients must call existing enable/start requests separately if the
 operator wants activation or process supervision.
 
+Package lifecycle UI must render hub-owned action descriptors instead of
+inferring policy from package state. Installed `DaemonPackage` rows, available
+`DaemonAvailablePackage` rows, `DaemonPackageUpdateStatus`, and runnable
+entrypoints can include an additive `actions` list. Each action carries a stable
+`action_id`, a status of `available`, `blocked`, or `unavailable`, optional
+diagnostics and required references, and an optional request mapping for actions
+the daemon can invoke. Unsupported reload and hub-restart style actions are
+reported as unavailable diagnostics; they are not hidden client policy and do
+not imply an implementation exists.
+
 CLI operators can inspect the same daemon path:
 
 ```sh
@@ -216,6 +226,8 @@ diagnostics. Runtime process fields are additive: `pid`, `started_at`,
 exists. The daemon response must not expose the local package root, provenance
 path, socket path, or host-resolved environment values. Environment defaults
 are manifest-provided literals, not snapshots from the operator's machine.
+Entrypoint `actions` are derived after the daemon applies current supervisor
+snapshots, so start/stop/restart availability reflects live process state.
 
 Supervised entrypoints are local development processes, not a production
 installer or sandbox. The daemon stops them on explicit stop/restart, package

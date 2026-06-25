@@ -30,9 +30,11 @@ pub use botster_hub_client::{
     DaemonConnection as ClientDaemonConnection, DaemonCoordination, DaemonDiagnostic,
     DaemonEndpoint, DaemonEnvelope, DaemonEnvelopeAck, DaemonEnvelopeDelivery,
     DaemonEnvelopePublish, DaemonEvent, DaemonHello, DaemonHelloAck, DaemonIdentity, DaemonNotify,
-    DaemonOperatorError, DaemonPackage, DaemonPackageAvailability, DaemonPackageAvailabilityReason,
-    DaemonPackageAvailabilityState, DaemonPackageCompatibility, DaemonPackageConfiguration,
-    DaemonPackageDecision, DaemonPackageDependencyAvailability, DaemonPackageDiagnostic,
+    DaemonOperatorError, DaemonPackage, DaemonPackageActionRequest,
+    DaemonPackageActionRequiredReference, DaemonPackageActionState, DaemonPackageActionStatus,
+    DaemonPackageAvailability, DaemonPackageAvailabilityReason, DaemonPackageAvailabilityState,
+    DaemonPackageCompatibility, DaemonPackageConfiguration, DaemonPackageDecision,
+    DaemonPackageDependencyAvailability, DaemonPackageDiagnostic,
     DaemonPackageEnvironmentRequirement, DaemonPackageFeatureAvailability,
     DaemonPackageInstallEffect, DaemonPackageInstallPlan, DaemonPackagePin, DaemonPackageProcess,
     DaemonPackageRunnableEntrypoint, DaemonPackageSurfaceDescriptor, DaemonPackageUpdateStatus,
@@ -982,8 +984,8 @@ fn available_packages_response(
 ) -> DaemonTransportResult<DaemonResponse> {
     let available = daemon
         .package_registry()
-        .available_packages(registry_path)?;
-    Ok(daemon_available_packages(available))
+        .available_packages(&registry_path)?;
+    Ok(daemon_available_packages(available, &registry_path))
 }
 
 fn inspect_available_package_response(
@@ -993,8 +995,8 @@ fn inspect_available_package_response(
 ) -> DaemonTransportResult<DaemonResponse> {
     let available = daemon
         .package_registry()
-        .inspect_available_package(registry_path, entry_id)?;
-    Ok(daemon_available_packages(vec![available]))
+        .inspect_available_package(&registry_path, entry_id)?;
+    Ok(daemon_available_packages(vec![available], &registry_path))
 }
 
 fn preview_package_install_response(
@@ -1328,11 +1330,14 @@ fn daemon_packages(packages: Vec<HubClientPackage>) -> DaemonResponse {
     response
 }
 
-fn daemon_available_packages(packages: Vec<AvailablePackage>) -> DaemonResponse {
+fn daemon_available_packages(
+    packages: Vec<AvailablePackage>,
+    registry_path: &PathBuf,
+) -> DaemonResponse {
     let mut response = daemon_response_base(DaemonResponseKind::AvailablePackages);
     response.available_packages = packages
         .into_iter()
-        .map(daemon_available_package_from_policy)
+        .map(|package| daemon_available_package_from_policy(package, Some(registry_path)))
         .collect();
     response
 }
@@ -1340,7 +1345,7 @@ fn daemon_available_packages(packages: Vec<AvailablePackage>) -> DaemonResponse 
 fn daemon_package_install_plan(plan: PackageInstallPlan) -> DaemonResponse {
     let mut response = daemon_response_base(DaemonResponseKind::PackageInstallPlan);
     response.install_plan = Some(DaemonPackageInstallPlan {
-        entry: daemon_available_package_from_policy(plan.entry),
+        entry: daemon_available_package_from_policy(plan.entry, None),
         effects: plan
             .effects
             .into_iter()
@@ -1662,6 +1667,9 @@ fn daemon_envelope_ack_from_state(state: Option<EnvelopeDeliveryState>) -> Daemo
 }
 
 fn daemon_package_from_client(package: HubClientPackage) -> DaemonPackage {
+    let package_name = package.package_name.clone();
+    let package_state = package_state_label(package.state).to_string();
+    let package_actions = installed_package_actions(&package);
     DaemonPackage {
         package_name: package.package_name,
         version: package.version,
@@ -1692,51 +1700,55 @@ fn daemon_package_from_client(package: HubClientPackage) -> DaemonPackage {
         runnable_entrypoints: package
             .runnable_entrypoints
             .into_iter()
-            .map(|entrypoint| DaemonPackageRunnableEntrypoint {
-                id: entrypoint.id,
-                kind: entrypoint.kind,
-                command: entrypoint.command,
-                args: entrypoint.args,
-                working_directory: DaemonPackageWorkingDirectory {
-                    policy: entrypoint.working_directory.policy,
-                    path: entrypoint.working_directory.path,
-                },
-                environment: entrypoint
-                    .environment
-                    .into_iter()
-                    .map(|requirement| DaemonPackageEnvironmentRequirement {
-                        name: requirement.name,
-                        required: requirement.required,
-                        default: requirement.default,
-                        description: requirement.description,
-                    })
-                    .collect(),
-                mode: entrypoint.mode,
-                capabilities: entrypoint
-                    .capabilities
-                    .into_iter()
-                    .map(|capability| DaemonCapability {
-                        surface: capability.surface,
-                        scope: capability.scope,
-                    })
-                    .collect(),
-                may_supervise: entrypoint.may_supervise,
-                process: DaemonPackageProcess {
-                    state: entrypoint.process.state,
-                    pid: entrypoint.process.pid,
-                    started_at: entrypoint.process.started_at,
-                    exited_at: entrypoint.process.exited_at,
-                    exit_status: entrypoint.process.exit_status,
-                    diagnostics: entrypoint
-                        .process
-                        .diagnostics
+            .map(|entrypoint| {
+                let actions = entrypoint_actions(&package_name, &package_state, &entrypoint);
+                DaemonPackageRunnableEntrypoint {
+                    id: entrypoint.id,
+                    kind: entrypoint.kind,
+                    command: entrypoint.command,
+                    args: entrypoint.args,
+                    working_directory: DaemonPackageWorkingDirectory {
+                        policy: entrypoint.working_directory.policy,
+                        path: entrypoint.working_directory.path,
+                    },
+                    environment: entrypoint
+                        .environment
                         .into_iter()
-                        .map(|diagnostic| DaemonPackageDiagnostic {
-                            kind: diagnostic.kind,
-                            message: diagnostic.message,
+                        .map(|requirement| DaemonPackageEnvironmentRequirement {
+                            name: requirement.name,
+                            required: requirement.required,
+                            default: requirement.default,
+                            description: requirement.description,
                         })
                         .collect(),
-                },
+                    mode: entrypoint.mode,
+                    capabilities: entrypoint
+                        .capabilities
+                        .into_iter()
+                        .map(|capability| DaemonCapability {
+                            surface: capability.surface,
+                            scope: capability.scope,
+                        })
+                        .collect(),
+                    may_supervise: entrypoint.may_supervise,
+                    process: DaemonPackageProcess {
+                        state: entrypoint.process.state,
+                        pid: entrypoint.process.pid,
+                        started_at: entrypoint.process.started_at,
+                        exited_at: entrypoint.process.exited_at,
+                        exit_status: entrypoint.process.exit_status,
+                        diagnostics: entrypoint
+                            .process
+                            .diagnostics
+                            .into_iter()
+                            .map(|diagnostic| DaemonPackageDiagnostic {
+                                kind: diagnostic.kind,
+                                message: diagnostic.message,
+                            })
+                            .collect(),
+                    },
+                    actions,
+                }
             })
             .collect(),
         configuration: DaemonPackageConfiguration {
@@ -1789,11 +1801,16 @@ fn daemon_package_from_client(package: HubClientPackage) -> DaemonPackage {
                     .collect(),
             })
             .collect(),
+        actions: package_actions,
         provider_profile_admitted: package.provider_profile_admitted,
     }
 }
 
-fn daemon_available_package_from_policy(package: AvailablePackage) -> DaemonAvailablePackage {
+fn daemon_available_package_from_policy(
+    package: AvailablePackage,
+    registry_path: Option<&PathBuf>,
+) -> DaemonAvailablePackage {
+    let actions = available_package_actions(&package, registry_path);
     DaemonAvailablePackage {
         entry_id: package.entry_id,
         package_name: package.package_name,
@@ -1818,7 +1835,476 @@ fn daemon_available_package_from_policy(package: AvailablePackage) -> DaemonAvai
             diagnostics: package.compatibility.diagnostics,
         },
         pin: package.pin.map(daemon_package_pin_from_policy),
+        actions,
     }
+}
+
+fn installed_package_actions(package: &HubClientPackage) -> Vec<DaemonPackageActionState> {
+    let package_name = package.package_name.as_str();
+    let availability_blocked = matches!(
+        package.availability.state,
+        HubClientPackageAvailabilityState::Blocked
+    );
+    let required_references = package_required_references(package);
+    let blocked_diagnostics =
+        package
+            .availability
+            .reasons
+            .iter()
+            .map(|reason| DaemonPackageDiagnostic {
+                kind: reason.reason.clone(),
+                message: format!("{} is blocked for {}", package.package_name, reason.action),
+            })
+            .chain(package.configuration.diagnostics.iter().map(|diagnostic| {
+                DaemonPackageDiagnostic {
+                    kind: diagnostic.kind.clone(),
+                    message: diagnostic.message.clone(),
+                }
+            }))
+            .collect::<Vec<_>>();
+    let state = package_state_label(package.state);
+    let mut actions = Vec::new();
+
+    actions.push(unavailable_action(
+        "install_package_registry_entry",
+        "already_installed",
+        "package is already installed; use update actions for source metadata changes",
+    ));
+
+    match state {
+        "enabled" => actions.push(unavailable_action(
+            "enable_package",
+            "already_enabled",
+            "package is already enabled",
+        )),
+        _ if availability_blocked => actions.push(blocked_action(
+            "enable_package",
+            "package_requirements_blocked",
+            blocked_diagnostics.clone(),
+            required_references.clone(),
+        )),
+        _ => actions.push(available_package_action(
+            "enable_package",
+            request_for_package("enable_package", package_name),
+        )),
+    }
+
+    if state == "enabled" {
+        actions.push(available_package_action(
+            "disable_package",
+            request_for_package("disable_package", package_name),
+        ));
+    } else {
+        actions.push(unavailable_action(
+            "disable_package",
+            "not_enabled",
+            "package is not enabled",
+        ));
+    }
+
+    actions.push(available_package_action(
+        "remove_package",
+        request_for_package("remove_package", package_name),
+    ));
+
+    if package.configuration.schema.is_some()
+        || !package.configuration.missing_required.is_empty()
+        || !package.configuration.diagnostics.is_empty()
+    {
+        actions.push(available_package_action(
+            "set_package_configuration",
+            request_for_package("set_package_configuration", package_name),
+        ));
+    } else {
+        actions.push(unavailable_action(
+            "set_package_configuration",
+            "no_configuration_schema",
+            "package does not declare configurable fields",
+        ));
+    }
+
+    actions.push(available_package_action(
+        "check_package_update",
+        request_for_package("check_package_update", package_name),
+    ));
+    actions.push(blocked_action(
+        "preview_package_update",
+        "pin_required",
+        vec![DaemonPackageDiagnostic {
+            kind: "pin_required".to_string(),
+            message: "preview update requires explicit pinned source metadata".to_string(),
+        }],
+        vec![DaemonPackageActionRequiredReference {
+            kind: "pin".to_string(),
+            key: "package_update_pin".to_string(),
+        }],
+    ));
+    actions.push(blocked_action(
+        "apply_package_update",
+        "pin_required",
+        vec![DaemonPackageDiagnostic {
+            kind: "pin_required".to_string(),
+            message: "apply update requires explicit pinned source metadata".to_string(),
+        }],
+        vec![DaemonPackageActionRequiredReference {
+            kind: "pin".to_string(),
+            key: "package_update_pin".to_string(),
+        }],
+    ));
+    actions.push(unavailable_action(
+        "reload_package",
+        "unsupported",
+        "package reload is not supported by the hub daemon; disable and enable the package instead",
+    ));
+    actions.push(unavailable_action(
+        "restart_hub",
+        "unsupported",
+        "hub restart is not exposed as a package lifecycle action",
+    ));
+
+    actions
+}
+
+fn available_package_actions(
+    package: &AvailablePackage,
+    registry_path: Option<&PathBuf>,
+) -> Vec<DaemonPackageActionState> {
+    let mut actions = Vec::new();
+    let compatible = matches!(
+        package.compatibility.result,
+        PackageCompatibilityResult::Compatible
+    );
+    let install_blocked = !matches!(package.state, AvailablePackageState::Available) || !compatible;
+    if install_blocked {
+        let reason = if compatible {
+            "already_installed"
+        } else {
+            "botster_compatibility"
+        };
+        let diagnostics = package
+            .compatibility
+            .diagnostics
+            .iter()
+            .map(|message| DaemonPackageDiagnostic {
+                kind: "botster_compatibility".to_string(),
+                message: message.clone(),
+            })
+            .collect();
+        actions.push(blocked_action(
+            "install_package_registry_entry",
+            reason,
+            diagnostics,
+            Vec::new(),
+        ));
+    } else if let Some(registry_path) = registry_path {
+        actions.push(available_package_action(
+            "install_package_registry_entry",
+            Some(DaemonPackageActionRequest {
+                request_type: "install_package_registry_entry".to_string(),
+                pin: None,
+                package_name: Some(package.package_name.clone()),
+                entry_id: Some(package.entry_id.clone()),
+                entrypoint_id: None,
+                registry_path: Some(registry_path.to_string_lossy().to_string()),
+            }),
+        ));
+    } else {
+        actions.push(blocked_action(
+            "install_package_registry_entry",
+            "registry_path_required",
+            vec![DaemonPackageDiagnostic {
+                kind: "registry_path_required".to_string(),
+                message:
+                    "install request mapping requires the registry path used to list the package"
+                        .to_string(),
+            }],
+            vec![DaemonPackageActionRequiredReference {
+                kind: "registry".to_string(),
+                key: "registry_path".to_string(),
+            }],
+        ));
+    }
+
+    for action_id in [
+        "enable_package",
+        "disable_package",
+        "remove_package",
+        "start_package_entrypoint",
+        "stop_package_entrypoint",
+        "restart_package_entrypoint",
+        "check_package_update",
+        "preview_package_update",
+        "apply_package_update",
+        "set_package_configuration",
+    ] {
+        actions.push(unavailable_action(
+            action_id,
+            "install_required",
+            "install the package before running installed-package lifecycle actions",
+        ));
+    }
+    actions.push(unavailable_action(
+        "reload_package",
+        "unsupported",
+        "package reload is not supported by the hub daemon",
+    ));
+    actions.push(unavailable_action(
+        "restart_hub",
+        "unsupported",
+        "hub restart is not exposed as a package lifecycle action",
+    ));
+    actions
+}
+
+fn entrypoint_actions(
+    package_name: &str,
+    package_state: &str,
+    entrypoint: &crate::HubClientPackageRunnableEntrypoint,
+) -> Vec<DaemonPackageActionState> {
+    if !entrypoint.may_supervise {
+        return vec![
+            unavailable_action(
+                "start_package_entrypoint",
+                "entrypoint_not_supervisable",
+                "entrypoint is not marked supervisable",
+            ),
+            unavailable_action(
+                "stop_package_entrypoint",
+                "entrypoint_not_supervisable",
+                "entrypoint is not marked supervisable",
+            ),
+            unavailable_action(
+                "restart_package_entrypoint",
+                "entrypoint_not_supervisable",
+                "entrypoint is not marked supervisable",
+            ),
+        ];
+    }
+
+    if package_state != "enabled" {
+        return vec![
+            blocked_action(
+                "start_package_entrypoint",
+                "package_not_enabled",
+                vec![DaemonPackageDiagnostic {
+                    kind: "package_not_enabled".to_string(),
+                    message: "enable the package before starting entrypoints".to_string(),
+                }],
+                Vec::new(),
+            ),
+            blocked_action(
+                "stop_package_entrypoint",
+                "package_not_enabled",
+                Vec::new(),
+                Vec::new(),
+            ),
+            blocked_action(
+                "restart_package_entrypoint",
+                "package_not_enabled",
+                Vec::new(),
+                Vec::new(),
+            ),
+        ];
+    }
+
+    let running = entrypoint.process.state == "running";
+    let mut actions = Vec::new();
+    if running {
+        actions.push(unavailable_action(
+            "start_package_entrypoint",
+            "already_running",
+            "entrypoint is already running",
+        ));
+        actions.push(available_package_action(
+            "stop_package_entrypoint",
+            request_for_entrypoint("stop_package_entrypoint", package_name, &entrypoint.id),
+        ));
+    } else {
+        actions.push(available_package_action(
+            "start_package_entrypoint",
+            request_for_entrypoint("start_package_entrypoint", package_name, &entrypoint.id),
+        ));
+        actions.push(unavailable_action(
+            "stop_package_entrypoint",
+            "not_running",
+            "entrypoint is not running",
+        ));
+    }
+    actions.push(available_package_action(
+        "restart_package_entrypoint",
+        request_for_entrypoint("restart_package_entrypoint", package_name, &entrypoint.id),
+    ));
+    actions
+}
+
+fn update_status_actions(
+    package_name: &str,
+    pin: Option<&DaemonPackagePin>,
+    has_pin: bool,
+    source_metadata_present: bool,
+) -> Vec<DaemonPackageActionState> {
+    let mut actions = vec![available_package_action(
+        "check_package_update",
+        request_for_package("check_package_update", package_name),
+    )];
+    if has_pin && source_metadata_present {
+        actions.push(available_package_action(
+            "preview_package_update",
+            request_for_package_with_pin("preview_package_update", package_name, pin.cloned()),
+        ));
+        actions.push(available_package_action(
+            "apply_package_update",
+            request_for_package_with_pin("apply_package_update", package_name, pin.cloned()),
+        ));
+    } else {
+        let reason = if source_metadata_present {
+            "pin_required"
+        } else {
+            "source_metadata_required"
+        };
+        let references = if has_pin {
+            Vec::new()
+        } else {
+            vec![DaemonPackageActionRequiredReference {
+                kind: "pin".to_string(),
+                key: "package_update_pin".to_string(),
+            }]
+        };
+        actions.push(blocked_action(
+            "preview_package_update",
+            reason,
+            Vec::new(),
+            references.clone(),
+        ));
+        actions.push(blocked_action(
+            "apply_package_update",
+            reason,
+            Vec::new(),
+            references,
+        ));
+    }
+    actions.push(unavailable_action(
+        "reload_package",
+        "unsupported",
+        "package reload is not supported by the hub daemon; disable and enable the package instead",
+    ));
+    actions.push(unavailable_action(
+        "restart_hub",
+        "unsupported",
+        "hub restart is not exposed as a package lifecycle action",
+    ));
+    actions
+}
+
+fn package_required_references(
+    package: &HubClientPackage,
+) -> Vec<DaemonPackageActionRequiredReference> {
+    let mut references = package
+        .configuration
+        .missing_required
+        .iter()
+        .map(|key| DaemonPackageActionRequiredReference {
+            kind: "config".to_string(),
+            key: key.clone(),
+        })
+        .collect::<Vec<_>>();
+    for dependency in &package.dependency_availability {
+        if matches!(dependency.state, HubClientPackageAvailabilityState::Blocked) {
+            references.push(DaemonPackageActionRequiredReference {
+                kind: "dependency".to_string(),
+                key: dependency.package_name.clone(),
+            });
+        }
+    }
+    references
+}
+
+fn available_package_action(
+    action_id: &str,
+    request: Option<DaemonPackageActionRequest>,
+) -> DaemonPackageActionState {
+    DaemonPackageActionState {
+        action_id: action_id.to_string(),
+        status: DaemonPackageActionStatus::Available,
+        reason: None,
+        diagnostics: Vec::new(),
+        required_references: Vec::new(),
+        request,
+    }
+}
+
+fn blocked_action(
+    action_id: &str,
+    reason: &str,
+    diagnostics: Vec<DaemonPackageDiagnostic>,
+    required_references: Vec<DaemonPackageActionRequiredReference>,
+) -> DaemonPackageActionState {
+    DaemonPackageActionState {
+        action_id: action_id.to_string(),
+        status: DaemonPackageActionStatus::Blocked,
+        reason: Some(reason.to_string()),
+        diagnostics,
+        required_references,
+        request: None,
+    }
+}
+
+fn unavailable_action(action_id: &str, reason: &str, message: &str) -> DaemonPackageActionState {
+    DaemonPackageActionState {
+        action_id: action_id.to_string(),
+        status: DaemonPackageActionStatus::Unavailable,
+        reason: Some(reason.to_string()),
+        diagnostics: vec![DaemonPackageDiagnostic {
+            kind: reason.to_string(),
+            message: message.to_string(),
+        }],
+        required_references: Vec::new(),
+        request: None,
+    }
+}
+
+fn request_for_package(
+    request_type: &str,
+    package_name: &str,
+) -> Option<DaemonPackageActionRequest> {
+    Some(DaemonPackageActionRequest {
+        request_type: request_type.to_string(),
+        pin: None,
+        package_name: Some(package_name.to_string()),
+        entry_id: None,
+        entrypoint_id: None,
+        registry_path: None,
+    })
+}
+
+fn request_for_package_with_pin(
+    request_type: &str,
+    package_name: &str,
+    pin: Option<DaemonPackagePin>,
+) -> Option<DaemonPackageActionRequest> {
+    Some(DaemonPackageActionRequest {
+        request_type: request_type.to_string(),
+        pin,
+        package_name: Some(package_name.to_string()),
+        entry_id: None,
+        entrypoint_id: None,
+        registry_path: None,
+    })
+}
+
+fn request_for_entrypoint(
+    request_type: &str,
+    package_name: &str,
+    entrypoint_id: &str,
+) -> Option<DaemonPackageActionRequest> {
+    Some(DaemonPackageActionRequest {
+        request_type: request_type.to_string(),
+        pin: None,
+        package_name: Some(package_name.to_string()),
+        entry_id: None,
+        entrypoint_id: Some(entrypoint_id.to_string()),
+        registry_path: None,
+    })
 }
 
 fn daemon_package_pin_from_policy(pin: PackagePin) -> DaemonPackagePin {
@@ -1911,13 +2397,17 @@ fn package_update_status(
         });
     }
 
+    let has_pin = pin.is_some();
+    let actions =
+        update_status_actions(package_name, pin.as_ref(), has_pin, source_metadata_present);
     Ok(DaemonPackageUpdateStatus {
         package_name: package_name.to_string(),
-        update_available: pin.is_some() && source_metadata_present,
+        update_available: has_pin && source_metadata_present,
         reload_required: enabled,
         restart_required: live_entrypoint,
         pin,
         diagnostics,
+        actions,
     })
 }
 
@@ -1972,6 +2462,7 @@ fn package_update_plan(
                 diagnostics: record.compatibility.diagnostics.clone(),
             },
             pin: Some(pin),
+            actions: Vec::new(),
         },
         effects: vec![DaemonPackageInstallEffect {
             kind: "update_pin_metadata".to_string(),
