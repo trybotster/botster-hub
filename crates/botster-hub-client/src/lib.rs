@@ -570,6 +570,10 @@ pub enum DaemonRequest {
         session_id: String,
     },
     ListApps,
+    ResolveAppLaunch {
+        package_name: String,
+        entrypoint_id: String,
+    },
     ListPackages,
     ListAvailablePackages {
         registry_path: PathBuf,
@@ -665,6 +669,8 @@ pub struct DaemonResponse {
     pub sessions: Vec<DaemonSession>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub apps: Vec<DaemonApp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_app_launch: Option<DaemonResolvedAppLaunch>,
     pub packages: Vec<DaemonPackage>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub available_packages: Vec<DaemonAvailablePackage>,
@@ -698,6 +704,7 @@ pub enum DaemonResponseKind {
     Spawned,
     Events,
     Apps,
+    ResolvedAppLaunch,
     Packages,
     AvailablePackages,
     PackageInstallPlan,
@@ -822,6 +829,21 @@ pub struct DaemonAppLaunchTarget {
     pub kind: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_url: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonResolvedAppLaunch {
+    pub package_name: String,
+    pub app_id: String,
+    pub entrypoint_id: String,
+    pub kind: String,
+    pub launch_mode: String,
+    pub command: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    pub working_directory: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub environment: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2077,6 +2099,10 @@ mod tests {
                 session_id: "session".to_string(),
             },
             DaemonRequest::ListApps,
+            DaemonRequest::ResolveAppLaunch {
+                package_name: "workflow.plugin".to_string(),
+                entrypoint_id: "terminal".to_string(),
+            },
             DaemonRequest::ListPackages,
             DaemonRequest::ListAvailablePackages {
                 registry_path: PathBuf::from("/tmp/registry"),
@@ -2176,6 +2202,7 @@ mod tests {
             DaemonRequest::ShutdownSession { .. } => "shutdown_session",
             DaemonRequest::Drain { .. } => "drain",
             DaemonRequest::ListApps => "list_apps",
+            DaemonRequest::ResolveAppLaunch { .. } => "resolve_app_launch",
             DaemonRequest::ListPackages => "list_packages",
             DaemonRequest::ListAvailablePackages { .. } => "list_available_packages",
             DaemonRequest::InspectAvailablePackage { .. } => "inspect_available_package",
@@ -2211,6 +2238,7 @@ mod tests {
             DaemonResponseKind::Spawned,
             DaemonResponseKind::Events,
             DaemonResponseKind::Apps,
+            DaemonResponseKind::ResolvedAppLaunch,
             DaemonResponseKind::Packages,
             DaemonResponseKind::AvailablePackages,
             DaemonResponseKind::PackageInstallPlan,
@@ -2239,6 +2267,7 @@ mod tests {
             DaemonResponseKind::Spawned => "spawned",
             DaemonResponseKind::Events => "events",
             DaemonResponseKind::Apps => "apps",
+            DaemonResponseKind::ResolvedAppLaunch => "resolved_app_launch",
             DaemonResponseKind::Packages => "packages",
             DaemonResponseKind::AvailablePackages => "available_packages",
             DaemonResponseKind::PackageInstallPlan => "package_install_plan",
@@ -2300,6 +2329,20 @@ mod tests {
                     local_url: Some("http://127.0.0.1:49152".to_string()),
                 },
             }],
+            resolved_app_launch: Some(DaemonResolvedAppLaunch {
+                package_name: "workflow.plugin".to_string(),
+                app_id: "terminal".to_string(),
+                entrypoint_id: "terminal".to_string(),
+                kind: "terminal_app".to_string(),
+                launch_mode: "foreground_stdio".to_string(),
+                command: "botster-tui".to_string(),
+                args: vec!["--data-dir".to_string(), "/tmp/botster".to_string()],
+                working_directory: "/tmp/workflow".to_string(),
+                environment: BTreeMap::from([(
+                    "BOTSTER_HUB_SOCKET".to_string(),
+                    "/tmp/botster.sock".to_string(),
+                )]),
+            }),
             packages: vec![DaemonPackage {
                 package_name: "workflow.plugin".to_string(),
                 version: "1.0.0".to_string(),
