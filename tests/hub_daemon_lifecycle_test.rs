@@ -336,6 +336,40 @@ fn write_project_pipelines_availability_package(root: &Path) {
     .expect("write project pipelines availability manifest");
 }
 
+fn write_required_dependency_package(root: &Path) {
+    fs::create_dir_all(root).expect("create required dependency package root");
+    fs::write(root.join("plugin.lua"), "return botster.register({})\n")
+        .expect("write required dependency plugin entrypoint");
+    fs::write(
+        root.join("botster-package.json"),
+        r#"{
+  "name": "dependency-blocked.plugin",
+  "version": "1.0.0",
+  "kind": "plugin",
+  "botster": ">=0.1.0",
+  "source": { "type": "path", "path": "." },
+  "capabilities": [
+    { "surface": "surfaces" }
+  ],
+  "entrypoints": [
+    { "runtime": "lua", "path": "plugin.lua", "bootstrap": false }
+  ],
+  "dependencies": [
+    {
+      "id": "github-provider",
+      "package": "github-provider",
+      "kind": "required",
+      "requirements": [
+        { "type": "provider", "provider": "github-provider" }
+      ]
+    }
+  ]
+}
+"#,
+    )
+    .expect("write required dependency package manifest");
+}
+
 fn write_supervised_package(root: &Path, package_name: &str, command: &str, args: &[&str]) {
     fs::create_dir_all(root).expect("create supervised package root");
     fs::write(root.join("plugin.lua"), "return botster.register({})\n")
@@ -5523,7 +5557,9 @@ fn daemon_package_list_exposes_dependency_and_feature_availability_matrix() {
         .expect("serialize real daemon test");
     let data_dir = unique_test_dir("package-availability-daemon");
     let package_dir = unique_test_dir("project-pipelines-availability-package");
+    let blocked_package_dir = unique_test_dir("required-dependency-package");
     write_project_pipelines_availability_package(&package_dir);
+    write_required_dependency_package(&blocked_package_dir);
     let config = explicit_config(&data_dir);
     let child = start_cli_daemon(&data_dir);
 
@@ -5536,6 +5572,13 @@ fn daemon_package_list_exposes_dependency_and_feature_availability_matrix() {
         enable.kind,
         botster_hub::DaemonResponseKind::PackageDecision
     );
+    botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::InstallPackageLocalPath {
+            path: blocked_package_dir,
+        },
+    )
+    .expect("install required dependency package");
 
     let list =
         botster_hub::daemon_transport_request(&config, botster_hub::DaemonRequest::ListPackages)
@@ -5578,6 +5621,25 @@ fn daemon_package_list_exposes_dependency_and_feature_availability_matrix() {
             && reason.action == "authenticate"
             && reason.requirement.as_deref() == Some("github_token")
     }));
+    let blocked_package = list
+        .packages
+        .iter()
+        .find(|package| package.package_name == "dependency-blocked.plugin")
+        .expect("dependency blocked package row");
+    assert_eq!(
+        blocked_package.availability.state,
+        botster_hub::DaemonPackageAvailabilityState::Blocked
+    );
+    let enable_action = package_action(&blocked_package.actions, "enable_package");
+    assert_eq!(
+        enable_action.status,
+        botster_hub::DaemonPackageActionStatus::Blocked
+    );
+    assert!(
+        enable_action.required_references.iter().any(|reference| {
+            reference.kind == "dependency" && reference.key == "github-provider"
+        })
+    );
 
     let show = botster_hub::daemon_transport_request(
         &config,
