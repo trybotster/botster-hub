@@ -13,12 +13,13 @@ use botster_core::{
     SessionSpawnRequest, SpawnEnvironment, SpawnWorkingDirectory, SubscriptionId, TransportEgress,
 };
 use botster_hub::{
-    DaemonCompatibility, DaemonEvent, DaemonOperatorError, DaemonPackage, DaemonPackagePin,
-    DaemonRequest, DaemonResponse, DaemonResponseKind, DaemonSession, DaemonStatus,
-    DataDirectoryOption, HubClientApi, HubClientRequest, HubClientResponseBody, HubDaemon,
-    HubDaemonState, HubRuntime, HubStartupOptions, HubStateLoadSource, RuntimeEnvironment,
-    SessionDefaults, TransportBindings, build_default_config_for_runtime, daemon_transport_request,
-    default_package_policy, host_profile, serve_daemon, serve_mcp_stdio, stream_attach,
+    DaemonApp, DaemonCompatibility, DaemonEvent, DaemonOperatorError, DaemonPackage,
+    DaemonPackagePin, DaemonRequest, DaemonResponse, DaemonResponseKind, DaemonSession,
+    DaemonStatus, DataDirectoryOption, HubClientApi, HubClientRequest, HubClientResponseBody,
+    HubDaemon, HubDaemonState, HubRuntime, HubStartupOptions, HubStateLoadSource,
+    RuntimeEnvironment, SessionDefaults, TransportBindings, build_default_config_for_runtime,
+    daemon_transport_request, default_package_policy, host_profile, serve_daemon, serve_mcp_stdio,
+    stream_attach,
 };
 use botster_hub_client::DaemonPackageUpdateStatus;
 
@@ -1096,6 +1097,9 @@ fn print_daemon_response(response: DaemonResponse) -> Result<(), OperatorError> 
             println!("response=events");
             print_daemon_events(&response.events);
         }
+        DaemonResponseKind::Apps => {
+            print_apps(&response.apps);
+        }
         DaemonResponseKind::Packages => {
             print_packages(&response.packages, false);
         }
@@ -1450,11 +1454,11 @@ fn print_packages(packages: &[DaemonPackage], providers_only: bool) {
         }
         for entrypoint in &package.runnable_entrypoints {
             println!(
-                "package_entrypoint package={} id={} kind={} mode={} command={} args={} working_directory={} environment={} capabilities={} may_supervise={} process_state={}",
+                "package_entrypoint package={} id={} kind={} launch_mode={} command={} args={} working_directory={} environment={} capabilities={} may_supervise={} process_state={}",
                 package.package_name,
                 entrypoint.id,
                 entrypoint.kind,
-                entrypoint.mode,
+                entrypoint.launch_mode,
                 entrypoint.command,
                 entrypoint.args.len(),
                 entrypoint.working_directory.policy,
@@ -1498,6 +1502,27 @@ fn print_packages(packages: &[DaemonPackage], providers_only: bool) {
                 );
             }
         }
+    }
+}
+
+fn print_apps(apps: &[DaemonApp]) {
+    println!("response=apps");
+    println!("app_count={}", apps.len());
+    for app in apps {
+        println!(
+            "app package={} app_id={} entrypoint_id={} kind={} launch_mode={} lifecycle_state={} diagnostics={} actions={} blocked_reasons={} launch_target={} local_url={}",
+            app.package_name,
+            app.app_id,
+            app.entrypoint_id,
+            app.kind,
+            app.launch_mode,
+            app.lifecycle_state,
+            app.diagnostics.len(),
+            app.actions.len(),
+            app.blocked_reasons.len(),
+            app.launch_target.kind,
+            app.launch_target.local_url.as_deref().unwrap_or("")
+        );
     }
 }
 

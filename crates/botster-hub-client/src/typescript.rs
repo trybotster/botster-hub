@@ -113,6 +113,7 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             ),
             ("shutdown_session", &[("session_id", "string")]),
             ("drain", &[("session_id", "string")]),
+            ("list_apps", &[]),
             ("list_packages", &[]),
             ("list_available_packages", &[("registry_path", "string")]),
             (
@@ -203,6 +204,7 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             ("kind", "DaemonResponseKind"),
             ("status", "DaemonStatus | null"),
             ("sessions", "DaemonSession[]"),
+            ("apps?", "DaemonApp[]"),
             ("packages", "DaemonPackage[]"),
             ("available_packages?", "DaemonAvailablePackage[]"),
             ("install_plan?", "DaemonPackageInstallPlan | null"),
@@ -228,6 +230,7 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             "sessions",
             "spawned",
             "events",
+            "apps",
             "packages",
             "available_packages",
             "package_install_plan",
@@ -318,6 +321,27 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             ("state_count", "number"),
             ("states", "string[]"),
         ],
+    );
+    emit_interface(
+        &mut output,
+        "DaemonApp",
+        &[
+            ("package_name", "string"),
+            ("app_id", "string"),
+            ("entrypoint_id", "string"),
+            ("kind", "string"),
+            ("launch_mode", "string"),
+            ("lifecycle_state", "string"),
+            ("diagnostics?", "DaemonPackageDiagnostic[]"),
+            ("actions?", "DaemonPackageActionState[]"),
+            ("blocked_reasons?", "string[]"),
+            ("launch_target", "DaemonAppLaunchTarget"),
+        ],
+    );
+    emit_interface(
+        &mut output,
+        "DaemonAppLaunchTarget",
+        &[("kind", "string"), ("local_url?", "string | null")],
     );
     emit_interface(
         &mut output,
@@ -528,11 +552,11 @@ pub(crate) fn daemon_protocol_typescript() -> String {
         &[
             ("id", "string"),
             ("kind", "string"),
+            ("launch_mode", "string"),
             ("command", "string"),
             ("args", "string[]"),
             ("working_directory", "DaemonPackageWorkingDirectory"),
             ("environment", "DaemonPackageEnvironmentRequirement[]"),
-            ("mode", "string"),
             ("capabilities", "DaemonCapability[]"),
             ("may_supervise", "boolean"),
             ("process", "DaemonPackageProcess"),

@@ -190,6 +190,7 @@ fn provider_manifest() -> PackageManifest {
         }),
         configuration: None,
         surfaces: Vec::new(),
+        runnable_entrypoints: Vec::new(),
     }
 }
 
@@ -214,14 +215,14 @@ fn write_local_plugin_package(root: &Path) {
   "runnable_entrypoints": [
     {
       "id": "web",
-      "kind": "web",
+      "kind": "web_app",
       "command": "bin/botster-web",
       "args": ["--host", "127.0.0.1"],
       "working_directory": { "policy": "package_root" },
       "environment": [
         { "name": "BOTSTER_WEB_PORT", "required": false, "default": "5173" }
       ],
-      "mode": "dev",
+      "launch_mode": "background",
       "capabilities": [
         { "surface": "network", "scope": "localhost" }
       ],
@@ -386,11 +387,11 @@ fn write_supervised_package(root: &Path, package_name: &str, command: &str, args
         ],
         "runnable_entrypoints": [{
             "id": "web",
-            "kind": "web",
+            "kind": "web_app",
             "command": command,
             "args": args,
             "working_directory": { "policy": "package_root" },
-            "mode": "dev",
+            "launch_mode": "background",
             "capabilities": [{ "surface": "network", "scope": "localhost" }],
             "may_supervise": true
         }]
@@ -400,6 +401,50 @@ fn write_supervised_package(root: &Path, package_name: &str, command: &str, args
         serde_json::to_string_pretty(&manifest).expect("serialize supervised manifest"),
     )
     .expect("write supervised package manifest");
+}
+
+fn write_app_registry_package(root: &Path) {
+    fs::create_dir_all(root).expect("create app registry package root");
+    fs::write(root.join("plugin.lua"), "return botster.register({})\n")
+        .expect("write plugin entrypoint");
+    let manifest = serde_json::json!({
+        "name": "dogfood.apps",
+        "version": "1.0.0",
+        "kind": "plugin",
+        "botster": ">=0.1.0",
+        "source": { "type": "path", "path": "." },
+        "capabilities": [{ "surface": "surfaces" }],
+        "entrypoints": [
+            { "runtime": "lua", "path": "plugin.lua", "bootstrap": false }
+        ],
+        "runnable_entrypoints": [
+            {
+                "id": "web",
+                "kind": "web_app",
+                "command": "sh",
+                "args": ["-c", "printf '%s\n' '{\"entrypoint_id\":\"web\",\"process_state\":\"running\",\"local_url\":\"http://127.0.0.1:49152\"}' > \"$BOTSTER_ENTRYPOINT_LAUNCH_RESULT\"; while true; do sleep 1; done"],
+                "working_directory": { "policy": "package_root" },
+                "launch_mode": "background",
+                "readiness": { "result_fields": ["local_url"] },
+                "capabilities": [{ "surface": "network", "scope": "localhost" }],
+                "may_supervise": true
+            },
+            {
+                "id": "terminal",
+                "kind": "terminal_app",
+                "command": "sh",
+                "args": ["-c", "echo terminal"],
+                "working_directory": { "policy": "package_root" },
+                "launch_mode": "foreground_stdio",
+                "may_supervise": true
+            }
+        ]
+    });
+    fs::write(
+        root.join("botster-package.json"),
+        serde_json::to_string_pretty(&manifest).expect("serialize app registry manifest"),
+    )
+    .expect("write app registry package manifest");
 }
 
 fn write_botster_web_package(root: &Path) {
@@ -585,7 +630,7 @@ http.createServer(async (request, response) => {
         ],
         "runnable_entrypoints": [{
             "id": "web-client",
-            "kind": "web",
+            "kind": "web_app",
             "command": "node",
             "args": ["scripts/real-hub-dogfood-bridge.mjs"],
             "working_directory": { "policy": "package_root" },
@@ -594,7 +639,7 @@ http.createServer(async (request, response) => {
                 { "name": "BOTSTER_HUB_DATA_DIR", "required": false },
                 { "name": "BOTSTER_WEB_DOGFOOD_BRIDGE_PORT", "required": false, "default": "41739" }
             ],
-            "mode": "dev",
+            "launch_mode": "background",
             "capabilities": [{ "surface": "network", "scope": "localhost" }],
             "may_supervise": true
         }]
@@ -653,7 +698,7 @@ http.createServer((request, response) => {
         ],
         "runnable_entrypoints": [{
             "id": "web-client",
-            "kind": "web",
+            "kind": "web_app",
             "command": "node",
             "args": ["scripts/real-hub-dogfood-bridge.mjs"],
             "working_directory": { "policy": "package_root" },
@@ -662,7 +707,7 @@ http.createServer((request, response) => {
                 { "name": "BOTSTER_HUB_DATA_DIR", "required": false },
                 { "name": "BOTSTER_WEB_DOGFOOD_BRIDGE_PORT", "required": false, "default": "41739" }
             ],
-            "mode": "dev",
+            "launch_mode": "background",
             "capabilities": [{ "surface": "network", "scope": "localhost" }],
             "may_supervise": true
         }]
@@ -696,7 +741,7 @@ fn write_failing_botster_web_package(root: &Path) {
         ],
         "runnable_entrypoints": [{
             "id": "web-client",
-            "kind": "web",
+            "kind": "web_app",
             "command": "node",
             "args": ["scripts/real-hub-dogfood-bridge.mjs"],
             "working_directory": { "policy": "package_root" },
@@ -705,7 +750,7 @@ fn write_failing_botster_web_package(root: &Path) {
                 { "name": "BOTSTER_HUB_DATA_DIR", "required": false },
                 { "name": "BOTSTER_WEB_DOGFOOD_BRIDGE_PORT", "required": false, "default": "41739" }
             ],
-            "mode": "dev",
+            "launch_mode": "background",
             "capabilities": [{ "surface": "network", "scope": "localhost" }],
             "may_supervise": true
         }]
@@ -744,6 +789,47 @@ fn package_entrypoint<'a>(
         .iter()
         .find(|entrypoint| entrypoint.id == "web")
         .expect("response includes web entrypoint")
+}
+
+fn app_row<'a>(
+    response: &'a botster_hub::DaemonResponse,
+    entrypoint_id: &str,
+) -> &'a botster_hub::DaemonApp {
+    response
+        .apps
+        .iter()
+        .find(|app| app.entrypoint_id == entrypoint_id)
+        .unwrap_or_else(|| panic!("response includes app for entrypoint {entrypoint_id}"))
+}
+
+fn wait_for_app_local_url(
+    data_dir: &Path,
+    entrypoint_id: &str,
+    expected_url: &str,
+) -> botster_hub::DaemonResponse {
+    let mut last_response = None;
+    for _ in 0..50 {
+        let response = botster_hub::daemon_transport_request(
+            &explicit_config(data_dir),
+            botster_hub::DaemonRequest::ListApps,
+        )
+        .expect("list apps while waiting for local url");
+        if app_row(&response, entrypoint_id)
+            .launch_target
+            .local_url
+            .as_deref()
+            == Some(expected_url)
+        {
+            return response;
+        }
+        last_response = Some(response);
+        thread::sleep(Duration::from_millis(20));
+    }
+    let response = last_response.expect("at least one list apps response");
+    panic!(
+        "expected app {entrypoint_id} local_url {expected_url}, got {:?}",
+        app_row(&response, entrypoint_id).launch_target.local_url
+    );
 }
 
 fn package_action<'a>(
@@ -1486,7 +1572,7 @@ fn cli_dogfood_launcher_starts_botster_web_in_existing_hub_mode_and_shuts_down()
     assert!(stdout.contains("package name=botster-web"));
     assert!(stdout.contains("state=enabled"));
     assert!(stdout.contains(
-        "package_entrypoint package=botster-web id=web-client kind=web mode=dev command=node"
+        "package_entrypoint package=botster-web id=web-client kind=web_app launch_mode=background command=node"
     ));
     assert!(stdout.contains("process_state=running"));
     assert!(!stdout.contains("examples/project-pipelines"));
@@ -3976,7 +4062,7 @@ fn cli_packages_enable_local_path_routes_through_running_daemon_and_persists() {
     assert!(stdout.contains("package name=dogfood.plugin"));
     assert!(stdout.contains("state=enabled"));
     assert!(stdout.contains("runnable_entrypoints=1"));
-    assert!(stdout.contains("package_entrypoint package=dogfood.plugin id=web kind=web mode=dev command=bin/botster-web args=2 working_directory=package_root environment=1 capabilities=1 may_supervise=true process_state=not_started"));
+    assert!(stdout.contains("package_entrypoint package=dogfood.plugin id=web kind=web_app launch_mode=background command=bin/botster-web args=2 working_directory=package_root environment=1 capabilities=1 may_supervise=true process_state=not_started"));
     assert!(!stdout.contains(package_dir.to_string_lossy().as_ref()));
 
     let status = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
@@ -4069,7 +4155,7 @@ fn cli_packages_enable_local_path_routes_through_running_daemon_and_persists() {
     assert!(stdout.contains("package name=dogfood.plugin"));
     assert!(stdout.contains("state=enabled"));
     assert!(stdout.contains("runnable_entrypoints=1"));
-    assert!(stdout.contains("package_entrypoint package=dogfood.plugin id=web kind=web mode=dev command=bin/botster-web args=2 working_directory=package_root environment=1 capabilities=1 may_supervise=true process_state=not_started"));
+    assert!(stdout.contains("package_entrypoint package=dogfood.plugin id=web kind=web_app launch_mode=background command=bin/botster-web args=2 working_directory=package_root environment=1 capabilities=1 may_supervise=true process_state=not_started"));
     assert!(!stdout.contains(package_dir.to_string_lossy().as_ref()));
 
     shutdown_cli_daemon(&data_dir, restarted);
@@ -4161,6 +4247,75 @@ fn package_entrypoint_supervision_starts_and_reports_running() {
     assert!(stdout.contains("response=packages"));
     assert!(stdout.contains("process_state=running"));
     assert!(stdout.contains("package_entrypoint_process package=dogfood.supervised id=web"));
+
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
+fn daemon_list_apps_projects_installed_package_entrypoints() {
+    let _guard = daemon_test_lock()
+        .lock()
+        .expect("serialize real daemon test");
+    let data_dir = unique_test_dir("list-apps");
+    let package_dir = unique_test_dir("list-apps-package");
+    write_app_registry_package(&package_dir);
+    let child = start_cli_daemon(&data_dir);
+    enable_supervised_package(&data_dir, &package_dir);
+
+    let before_start = botster_hub::daemon_transport_request(
+        &explicit_config(&data_dir),
+        botster_hub::DaemonRequest::ListApps,
+    )
+    .expect("list apps before start");
+    assert_eq!(before_start.kind, botster_hub::DaemonResponseKind::Apps);
+    assert_eq!(before_start.apps.len(), 2);
+    let web = app_row(&before_start, "web");
+    assert_eq!(web.package_name, "dogfood.apps");
+    assert_eq!(web.app_id, "web");
+    assert_eq!(web.entrypoint_id, "web");
+    assert_eq!(web.kind, "web_app");
+    assert_eq!(web.launch_mode, "background");
+    assert_eq!(web.lifecycle_state, "not_started");
+    assert_eq!(web.launch_target.kind, "web_app");
+    assert_eq!(web.launch_target.local_url, None);
+
+    let terminal = app_row(&before_start, "terminal");
+    assert_eq!(terminal.kind, "terminal_app");
+    assert_eq!(terminal.launch_mode, "foreground_stdio");
+    assert_eq!(terminal.launch_target.kind, "terminal_app");
+    assert_eq!(terminal.launch_target.local_url, None);
+    assert!(
+        terminal
+            .blocked_reasons
+            .contains(&"unsupported_launch_mode".to_string())
+    );
+
+    botster_hub::daemon_transport_request(
+        &explicit_config(&data_dir),
+        botster_hub::DaemonRequest::StartPackageEntrypoint {
+            package_name: "dogfood.apps".to_string(),
+            entrypoint_id: "web".to_string(),
+            environment_overrides: BTreeMap::new(),
+        },
+    )
+    .expect("start web app entrypoint");
+
+    let after_start = wait_for_app_local_url(&data_dir, "web", "http://127.0.0.1:49152");
+    let web = app_row(&after_start, "web");
+    assert_eq!(web.lifecycle_state, "running");
+    assert_eq!(web.launch_target.kind, "web_app");
+    assert_eq!(
+        web.launch_target.local_url.as_deref(),
+        Some("http://127.0.0.1:49152")
+    );
+    assert_eq!(
+        package_action(&web.actions, "start_package_entrypoint").status,
+        botster_hub::DaemonPackageActionStatus::Unavailable
+    );
+    assert_eq!(
+        package_action(&web.actions, "stop_package_entrypoint").status,
+        botster_hub::DaemonPackageActionStatus::Available
+    );
 
     shutdown_cli_daemon(&data_dir, child);
 }

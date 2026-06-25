@@ -569,6 +569,7 @@ pub enum DaemonRequest {
     Drain {
         session_id: String,
     },
+    ListApps,
     ListPackages,
     ListAvailablePackages {
         registry_path: PathBuf,
@@ -662,6 +663,8 @@ pub struct DaemonResponse {
     pub kind: DaemonResponseKind,
     pub status: Option<DaemonStatus>,
     pub sessions: Vec<DaemonSession>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub apps: Vec<DaemonApp>,
     pub packages: Vec<DaemonPackage>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub available_packages: Vec<DaemonAvailablePackage>,
@@ -694,6 +697,7 @@ pub enum DaemonResponseKind {
     Sessions,
     Spawned,
     Events,
+    Apps,
     Packages,
     AvailablePackages,
     PackageInstallPlan,
@@ -794,6 +798,30 @@ pub struct DaemonPackage {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub actions: Vec<DaemonPackageActionState>,
     pub provider_profile_admitted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonApp {
+    pub package_name: String,
+    pub app_id: String,
+    pub entrypoint_id: String,
+    pub kind: String,
+    pub launch_mode: String,
+    pub lifecycle_state: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<DaemonPackageDiagnostic>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub actions: Vec<DaemonPackageActionState>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocked_reasons: Vec<String>,
+    pub launch_target: DaemonAppLaunchTarget,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonAppLaunchTarget {
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_url: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -999,13 +1027,13 @@ pub struct DaemonPackageSurfaceDescriptor {
 pub struct DaemonPackageRunnableEntrypoint {
     pub id: String,
     pub kind: String,
+    pub launch_mode: String,
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
     pub working_directory: DaemonPackageWorkingDirectory,
     #[serde(default)]
     pub environment: Vec<DaemonPackageEnvironmentRequirement>,
-    pub mode: String,
     #[serde(default)]
     pub capabilities: Vec<DaemonCapability>,
     pub may_supervise: bool,
@@ -1560,7 +1588,7 @@ mod tests {
             "requested_capabilities": [],
             "runnable_entrypoints": [{
                 "id": "web",
-                "kind": "web",
+                "kind": "web_app",
                 "command": "bin/botster-web",
                 "args": ["--host", "127.0.0.1"],
                 "working_directory": { "policy": "package_root", "path": null },
@@ -1570,7 +1598,7 @@ mod tests {
                     "default": "5173",
                     "description": "Local web client port"
                 }],
-                "mode": "dev",
+                "launch_mode": "background",
                 "capabilities": [{ "surface": "Network", "scope": "localhost" }],
                 "may_supervise": true,
                 "process": {
@@ -2048,6 +2076,7 @@ mod tests {
             DaemonRequest::Drain {
                 session_id: "session".to_string(),
             },
+            DaemonRequest::ListApps,
             DaemonRequest::ListPackages,
             DaemonRequest::ListAvailablePackages {
                 registry_path: PathBuf::from("/tmp/registry"),
@@ -2146,6 +2175,7 @@ mod tests {
             DaemonRequest::Resize { .. } => "resize",
             DaemonRequest::ShutdownSession { .. } => "shutdown_session",
             DaemonRequest::Drain { .. } => "drain",
+            DaemonRequest::ListApps => "list_apps",
             DaemonRequest::ListPackages => "list_packages",
             DaemonRequest::ListAvailablePackages { .. } => "list_available_packages",
             DaemonRequest::InspectAvailablePackage { .. } => "inspect_available_package",
@@ -2180,6 +2210,7 @@ mod tests {
             DaemonResponseKind::Sessions,
             DaemonResponseKind::Spawned,
             DaemonResponseKind::Events,
+            DaemonResponseKind::Apps,
             DaemonResponseKind::Packages,
             DaemonResponseKind::AvailablePackages,
             DaemonResponseKind::PackageInstallPlan,
@@ -2207,6 +2238,7 @@ mod tests {
             DaemonResponseKind::Sessions => "sessions",
             DaemonResponseKind::Spawned => "spawned",
             DaemonResponseKind::Events => "events",
+            DaemonResponseKind::Apps => "apps",
             DaemonResponseKind::Packages => "packages",
             DaemonResponseKind::AvailablePackages => "available_packages",
             DaemonResponseKind::PackageInstallPlan => "package_install_plan",
@@ -2252,6 +2284,21 @@ mod tests {
             sessions: vec![DaemonSession {
                 session_id: "session".to_string(),
                 lifecycle: "running".to_string(),
+            }],
+            apps: vec![DaemonApp {
+                package_name: "workflow.plugin".to_string(),
+                app_id: "web".to_string(),
+                entrypoint_id: "web".to_string(),
+                kind: "web_app".to_string(),
+                launch_mode: "background".to_string(),
+                lifecycle_state: "running".to_string(),
+                diagnostics: Vec::new(),
+                actions: Vec::new(),
+                blocked_reasons: Vec::new(),
+                launch_target: DaemonAppLaunchTarget {
+                    kind: "web".to_string(),
+                    local_url: Some("http://127.0.0.1:49152".to_string()),
+                },
             }],
             packages: vec![DaemonPackage {
                 package_name: "workflow.plugin".to_string(),
