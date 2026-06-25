@@ -411,6 +411,8 @@ mod tests {
                 path: "plugin.lua".to_string(),
                 bootstrap: false,
             }],
+            dependencies: Vec::new(),
+            features: Vec::new(),
             configuration: None,
             host_profile: None,
             surfaces: Vec::new(),

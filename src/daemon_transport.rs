@@ -30,8 +30,10 @@ pub use botster_hub_client::{
     DaemonConnection as ClientDaemonConnection, DaemonCoordination, DaemonDiagnostic,
     DaemonEndpoint, DaemonEnvelope, DaemonEnvelopeAck, DaemonEnvelopeDelivery,
     DaemonEnvelopePublish, DaemonEvent, DaemonHello, DaemonHelloAck, DaemonIdentity, DaemonNotify,
-    DaemonOperatorError, DaemonPackage, DaemonPackageCompatibility, DaemonPackageConfiguration,
-    DaemonPackageDecision, DaemonPackageDiagnostic, DaemonPackageEnvironmentRequirement,
+    DaemonOperatorError, DaemonPackage, DaemonPackageAvailability, DaemonPackageAvailabilityReason,
+    DaemonPackageAvailabilityState, DaemonPackageCompatibility, DaemonPackageConfiguration,
+    DaemonPackageDecision, DaemonPackageDependencyAvailability, DaemonPackageDiagnostic,
+    DaemonPackageEnvironmentRequirement, DaemonPackageFeatureAvailability,
     DaemonPackageInstallEffect, DaemonPackageInstallPlan, DaemonPackagePin, DaemonPackageProcess,
     DaemonPackageRunnableEntrypoint, DaemonPackageSurfaceDescriptor, DaemonPackageWorkingDirectory,
     DaemonPluginLifecycle, DaemonRequest, DaemonResponse, DaemonResponseKind, DaemonSession,
@@ -44,7 +46,8 @@ use signal_hook::iterator::Signals;
 
 use crate::{
     AvailablePackage, AvailablePackageState, FileHubStateStore, HubClientApi, HubClientEvent,
-    HubClientPackage, HubClientPackageClassification, HubClientPluginLifecycle, HubClientRequest,
+    HubClientPackage, HubClientPackageAvailabilityReason, HubClientPackageAvailabilityState,
+    HubClientPackageClassification, HubClientPluginLifecycle, HubClientRequest,
     HubClientResponseBody, HubClientSession, HubConfig, HubDaemon, HubDaemonStatus,
     HubStateLoadSource, HubStateStore, McpToolDescriptor, PackageAction, PackageAdmissionReason,
     PackageCompatibilityResult, PackageDecision, PackageInstallPlan, PackagePin, PackageRegistry,
@@ -975,10 +978,10 @@ fn show_package_response(
     daemon: &mut HubDaemon,
     package_name: &str,
 ) -> DaemonTransportResult<DaemonResponse> {
-    let mut package = daemon
-        .package_registry()
+    let registry = daemon.package_registry();
+    let mut package = registry
         .package(package_name)
-        .map(HubClientPackage::from)
+        .map(|record| HubClientPackage::from_record(registry, record))
         .ok_or_else(|| {
             PackageRegistryError::without_record(
                 package_name,
@@ -1690,6 +1693,42 @@ fn daemon_package_from_client(package: HubClientPackage) -> DaemonPackage {
                 })
                 .collect(),
         },
+        availability: DaemonPackageAvailability {
+            state: daemon_availability_state(package.availability.state),
+            reasons: package
+                .availability
+                .reasons
+                .into_iter()
+                .map(daemon_availability_reason)
+                .collect(),
+        },
+        dependency_availability: package
+            .dependency_availability
+            .into_iter()
+            .map(|dependency| DaemonPackageDependencyAvailability {
+                id: dependency.id,
+                package_name: dependency.package_name,
+                state: daemon_availability_state(dependency.state),
+                reasons: dependency
+                    .reasons
+                    .into_iter()
+                    .map(daemon_availability_reason)
+                    .collect(),
+            })
+            .collect(),
+        feature_availability: package
+            .feature_availability
+            .into_iter()
+            .map(|feature| DaemonPackageFeatureAvailability {
+                id: feature.id,
+                state: daemon_availability_state(feature.state),
+                reasons: feature
+                    .reasons
+                    .into_iter()
+                    .map(daemon_availability_reason)
+                    .collect(),
+            })
+            .collect(),
         provider_profile_admitted: package.provider_profile_admitted,
     }
 }
@@ -1730,6 +1769,30 @@ fn daemon_package_pin_from_policy(pin: PackagePin) -> DaemonPackagePin {
         rev: pin.rev,
         checksum: pin.checksum,
         update_policy: package_update_policy_label(pin.update_policy).to_string(),
+    }
+}
+
+fn daemon_availability_state(
+    state: HubClientPackageAvailabilityState,
+) -> DaemonPackageAvailabilityState {
+    match state {
+        HubClientPackageAvailabilityState::Available => DaemonPackageAvailabilityState::Available,
+        HubClientPackageAvailabilityState::Blocked => DaemonPackageAvailabilityState::Blocked,
+    }
+}
+
+fn daemon_availability_reason(
+    reason: HubClientPackageAvailabilityReason,
+) -> DaemonPackageAvailabilityReason {
+    DaemonPackageAvailabilityReason {
+        reason: reason.reason,
+        action: reason.action,
+        package_name: reason.package_name,
+        capability: reason.capability.map(|capability| DaemonCapability {
+            surface: capability.surface,
+            scope: capability.scope,
+        }),
+        requirement: reason.requirement,
     }
 }
 

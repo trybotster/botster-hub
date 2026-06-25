@@ -10,5 +10,31 @@
   ],
   "entrypoints": [
     { "runtime": "lua", "path": "plugin.lua", "bootstrap": false }
+  ],
+  "dependencies": [
+    {
+      "id": "github-provider",
+      "package": "github-provider",
+      "kind": "optional",
+      "feature": "github_pr_lifecycle",
+      "requirements": [
+        { "type": "provider", "provider": "github-provider" }
+      ]
+    }
+  ],
+  "features": [
+    {
+      "id": "local_pipelines",
+      "label": "Local pipelines"
+    },
+    {
+      "id": "github_pr_lifecycle",
+      "label": "GitHub PR lifecycle",
+      "dependencies": ["github-provider"],
+      "requirements": [
+        { "type": "config", "key": "github_app_id" },
+        { "type": "auth", "key": "github_token" }
+      ]
+    }
   ]
 }
