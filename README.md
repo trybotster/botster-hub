@@ -214,10 +214,16 @@ client, sends input, drains the observed marker, and shuts down through the same
 local client API. Separate Lua runtime tests cover real Lua entrypoint
 execution. The PTY portion is Unix-only.
 
-For daily first-party plugin dogfood, use the single-command launcher:
+For daily first-party plugin dogfood from fresh main checkouts, keep local
+`botster-web` and `botster-tui` checkouts beside this repo or pass their paths
+explicitly. Use a stable data directory when you want the package installs and
+app registry to survive across reruns:
 
 ```sh
-cargo run -- dogfood --web-package-path /path/to/botster-web
+cargo run -- dogfood \
+  --data-dir target/botster-hub-client-dogfood-data \
+  --web-package-path ../botster-web \
+  --tui-package-path ../botster-tui
 ```
 
 The launcher uses an isolated data directory under `target/` by default. Pass
@@ -232,17 +238,33 @@ through daemon supervision, passes the dogfood hub socket as
 `socket`, and then prints the exact commands for the current data directory:
 
 ```sh
-http://127.0.0.1:41739
-botster-hub apps open --data-dir <path> botster-tui
-botster-hub mcp-serve --data-dir <path>
-botster-hub status --data-dir <path>
-botster-hub shutdown --data-dir <path>
+web=http://127.0.0.1:41739/?dogfood=real-hub
+tui=botster-hub apps open --data-dir <path> botster-tui
+mcp=botster-hub mcp-serve --data-dir <path>
+status=botster-hub status --data-dir <path>
+shutdown=run botster-hub shutdown --data-dir <path>
 ```
 
 The supervised `botster-web` process receives `BOTSTER_HUB_SOCKET` because the
 launcher owns that child process. Foreground terminal apps run through
 `botster-hub apps open`, which asks the daemon for the resolved launch contract
 and then starts the child with inherited stdio.
+
+From another terminal, the composed local client app path should be visible
+through the same stable data directory:
+
+```sh
+botster-hub apps list --data-dir target/botster-hub-client-dogfood-data
+botster-hub apps show --data-dir target/botster-hub-client-dogfood-data botster-web/web-client
+botster-hub apps open --data-dir target/botster-hub-client-dogfood-data botster-web/web-client
+botster-hub apps open --data-dir target/botster-hub-client-dogfood-data botster-tui
+botster-hub tui --data-dir target/botster-hub-client-dogfood-data
+```
+
+`apps open botster-web/web-client` reports an `app_url=` matching the printed
+`web=` URL. `apps open botster-tui` and the deprecated `botster-hub tui` alias
+both use the daemon-resolved `terminal_app` foreground launch contract; there is
+no standalone fallback when the package is missing or disabled.
 
 Keep the launcher running in the foreground. For graceful shutdown, run the
 printed shutdown command from another terminal; `Ctrl-C` hard-stops the
