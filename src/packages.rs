@@ -3392,6 +3392,60 @@ mod tests {
     }
 
     #[test]
+    fn default_package_policy_admits_botster_workspaces_plugin_db_namespace() {
+        let requested = capability(CapabilitySurface::PluginDb, Some("botster-workspaces"));
+        let mut policy = default_package_policy();
+
+        policy
+            .install(
+                plugin_manifest("botster-workspaces", vec![requested.clone()]),
+                provenance(),
+                "install botster workspaces",
+            )
+            .expect("install botster-workspaces package");
+
+        let decision = policy
+            .enable("botster-workspaces", "enable botster workspaces")
+            .expect("enable botster-workspaces package");
+
+        assert_eq!(decision.state, PackageState::Enabled);
+        assert_eq!(
+            policy
+                .registry()
+                .package("botster-workspaces")
+                .expect("botster-workspaces record")
+                .admitted_capabilities,
+            vec![requested]
+        );
+    }
+
+    #[test]
+    fn default_package_policy_denies_botster_workspaces_mismatched_plugin_db_namespace() {
+        let requested = capability(CapabilitySurface::PluginDb, Some("other-plugin"));
+        let mut policy = default_package_policy();
+
+        policy
+            .install(
+                plugin_manifest("botster-workspaces", vec![requested.clone()]),
+                provenance(),
+                "install mismatched botster workspaces",
+            )
+            .expect("install mismatched botster-workspaces package");
+
+        let error = policy
+            .enable("botster-workspaces", "enable mismatched botster workspaces")
+            .expect_err("mismatched plugin_db namespace should deny");
+
+        assert_eq!(error.package_name, "botster-workspaces");
+        assert_eq!(error.action, PackageAction::Enable);
+        assert_eq!(
+            error.reason,
+            PackageAdmissionReason::UngrantedCapability(requested)
+        );
+        assert_eq!(error.state, Some(PackageState::Installed));
+    }
+
+    #[test]
     fn explicit_local_manifest_installs_path_source_and_local_provenance() {
         let root = test_root("explicit-local-manifest");
         fs::write(root.join("plugin.lua"), "-- synthetic plugin").expect("write plugin");
