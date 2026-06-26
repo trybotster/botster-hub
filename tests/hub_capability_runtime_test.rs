@@ -402,6 +402,75 @@ fn hub_runtime_stores_plugin_json_under_plugin_data_and_enforces_namespace() {
 }
 
 #[test]
+fn hub_runtime_admits_botster_workspaces_plugin_store_namespace_only() {
+    let mut runtime = explicit_runtime("botster-workspaces-plugin-store");
+    let plugin_key = PluginKey("botster-workspaces".to_string());
+
+    runtime
+        .submit_capability_request(request(
+            &plugin_key.0,
+            "store-set",
+            CapabilityOperation::PluginStore(PluginStoreCapabilityRequest {
+                namespace: plugin_key.0.clone(),
+                operation: PluginStoreOperation::Set {
+                    key: PluginStoreKey("workspace/active".to_string()),
+                    schema_version: 1,
+                    payload: serde_json::json!({ "workspace_id": "ws_1" }),
+                    expected_revision: None,
+                },
+            }),
+        ))
+        .expect("botster-workspaces plugin-store set should submit");
+    let write_events = drain_until_completed(&mut runtime, &plugin_key);
+    assert!(write_events.iter().any(|event| matches!(
+        event,
+        CapabilityRuntimeEvent::Completed(completed)
+            if matches!(
+                completed.result,
+                Some(CapabilityOperationResult::PluginStore(
+                    PluginStoreResult::Written { .. }
+                ))
+            )
+    )));
+
+    runtime
+        .submit_capability_request(request(
+            &plugin_key.0,
+            "store-get",
+            CapabilityOperation::PluginStore(PluginStoreCapabilityRequest {
+                namespace: plugin_key.0.clone(),
+                operation: PluginStoreOperation::Get {
+                    key: PluginStoreKey("workspace/active".to_string()),
+                },
+            }),
+        ))
+        .expect("botster-workspaces plugin-store get should submit");
+    let read_events = drain_until_completed(&mut runtime, &plugin_key);
+    assert!(read_events.iter().any(|event| matches!(
+        event,
+        CapabilityRuntimeEvent::Completed(completed)
+            if matches!(
+                &completed.result,
+                Some(CapabilityOperationResult::PluginStore(
+                    PluginStoreResult::Record { record }
+                )) if record.payload["workspace_id"] == "ws_1"
+            )
+    )));
+
+    let denied = runtime
+        .submit_capability_request(request(
+            &plugin_key.0,
+            "wrong-namespace",
+            CapabilityOperation::PluginStore(PluginStoreCapabilityRequest {
+                namespace: "project-pipelines".to_string(),
+                operation: PluginStoreOperation::List { prefix: None },
+            }),
+        ))
+        .expect_err("botster-workspaces should not borrow project-pipelines namespace");
+    assert_eq!(denied.kind, CapabilityRuntimeErrorKind::CapabilityDenied);
+}
+
+#[test]
 fn hub_runtime_executes_admitted_http_through_real_loopback_transport() {
     let server = LocalHttpServer::start(
         b"HTTP/1.1 201 Created\r\nContent-Type: text/plain\r\nX-Botster-Test: real\r\nContent-Length: 11\r\nConnection: close\r\n\r\nhello-world",

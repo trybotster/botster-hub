@@ -1183,6 +1183,35 @@ fn write_denied_capability_local_package(root: &Path) {
     .expect("write denied capability package manifest");
 }
 
+fn write_botster_workspaces_local_package(root: &Path, plugin_db_scope: &str) {
+    fs::create_dir_all(root).expect("create botster-workspaces package root");
+    fs::write(root.join("plugin.lua"), "return botster.register({})\n")
+        .expect("write plugin entrypoint");
+    fs::write(
+        root.join("botster-package.json"),
+        format!(
+            r#"{{
+  "name": "botster-workspaces",
+  "version": "1.0.0",
+  "kind": "plugin",
+  "botster": ">=0.1.0",
+  "source": {{ "type": "path", "path": "." }},
+  "capabilities": [
+    {{ "surface": "mcp" }},
+    {{ "surface": "plugin_db", "scope": "{plugin_db_scope}" }},
+    {{ "surface": "surfaces" }},
+    {{ "surface": "filesystem", "scope": "workspace" }}
+  ],
+  "entrypoints": [
+    {{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }}
+  ]
+}}
+"#
+        ),
+    )
+    .expect("write botster-workspaces package manifest");
+}
+
 fn command_output_text(output: &Output) -> String {
     format!(
         "{}{}",
@@ -5583,6 +5612,137 @@ fn cli_packages_local_path_diagnostics_are_actionable() {
     assert!(text.contains("operation=remove"));
     assert!(text.contains("PackageNotInstalled"));
     assert!(text.contains("dogfood.missing-plugin"));
+    assert!(!text.contains(data_dir.to_string_lossy().as_ref()));
+
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
+fn cli_packages_enable_botster_workspaces_first_party_plugin_db_namespace() {
+    let _guard = daemon_test_lock()
+        .lock()
+        .expect("serialize real daemon test");
+    let data_dir = unique_short_test_dir("cli-pkg-ws");
+    let package_dir = unique_test_dir("botster-workspaces-package");
+    write_botster_workspaces_local_package(&package_dir, "botster-workspaces");
+    let child = start_cli_daemon(&data_dir);
+
+    let install = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("packages")
+        .arg("install")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("--path")
+        .arg(&package_dir)
+        .output()
+        .expect("run botster-workspaces package install");
+    assert!(
+        install.status.success(),
+        "botster-workspaces install failed: {}",
+        command_output_text(&install)
+    );
+    let text = command_output_text(&install);
+    assert!(text.contains("package name=botster-workspaces"));
+    assert!(text.contains("state=installed"));
+    assert!(!text.contains(package_dir.to_string_lossy().as_ref()));
+    assert!(!text.contains(data_dir.to_string_lossy().as_ref()));
+
+    let show_installed = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("packages")
+        .arg("show")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("botster-workspaces")
+        .output()
+        .expect("run botster-workspaces package show after install");
+    assert!(
+        show_installed.status.success(),
+        "botster-workspaces show failed: {}",
+        command_output_text(&show_installed)
+    );
+    let text = command_output_text(&show_installed);
+    assert!(text.contains("package name=botster-workspaces"));
+    assert!(text.contains("state=installed"));
+    assert!(text.contains("capabilities=4"));
+
+    let enable = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("packages")
+        .arg("enable")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("botster-workspaces")
+        .output()
+        .expect("run botster-workspaces package enable");
+    assert!(
+        enable.status.success(),
+        "botster-workspaces enable failed: {}",
+        command_output_text(&enable)
+    );
+    let text = command_output_text(&enable);
+    assert!(text.contains("package name=botster-workspaces"));
+    assert!(text.contains("state=enabled"));
+
+    let list = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("packages")
+        .arg("list")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .output()
+        .expect("run botster-workspaces package list");
+    assert!(
+        list.status.success(),
+        "botster-workspaces list failed: {}",
+        command_output_text(&list)
+    );
+    let text = command_output_text(&list);
+    assert!(text.contains("package name=botster-workspaces"));
+    assert!(text.contains("state=enabled"));
+    assert!(!text.contains(package_dir.to_string_lossy().as_ref()));
+    assert!(!text.contains(data_dir.to_string_lossy().as_ref()));
+
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
+fn cli_packages_deny_botster_workspaces_mismatched_plugin_db_namespace() {
+    let _guard = daemon_test_lock()
+        .lock()
+        .expect("serialize real daemon test");
+    let data_dir = unique_short_test_dir("cli-pkg-ws-denied");
+    let package_dir = unique_test_dir("botster-workspaces-denied-package");
+    write_botster_workspaces_local_package(&package_dir, "other-plugin");
+    let child = start_cli_daemon(&data_dir);
+
+    let install = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("packages")
+        .arg("install")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("--path")
+        .arg(&package_dir)
+        .output()
+        .expect("run mismatched botster-workspaces package install");
+    assert!(
+        install.status.success(),
+        "mismatched botster-workspaces install failed before enable: {}",
+        command_output_text(&install)
+    );
+
+    let enable = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("packages")
+        .arg("enable")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("botster-workspaces")
+        .output()
+        .expect("run mismatched botster-workspaces package enable");
+    assert!(!enable.status.success());
+    let text = command_output_text(&enable);
+    assert!(text.contains("response=operator_error"));
+    assert!(text.contains("operation=enable"));
+    assert!(text.contains("UngrantedCapability"));
+    assert!(text.contains("other-plugin"));
+    assert!(!text.contains(package_dir.to_string_lossy().as_ref()));
     assert!(!text.contains(data_dir.to_string_lossy().as_ref()));
 
     shutdown_cli_daemon(&data_dir, child);

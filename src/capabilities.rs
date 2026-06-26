@@ -1354,6 +1354,7 @@ fn default_hub_capability_grants() -> CapabilitySet {
         scoped_capability(CapabilitySurface::Network, "websocket"),
         scoped_capability(CapabilitySurface::Filesystem, DEFAULT_FILESYSTEM_SCOPE),
         scoped_capability(CapabilitySurface::PluginDb, "project-pipelines"),
+        scoped_capability(CapabilitySurface::PluginDb, "botster-workspaces"),
         scoped_capability(CapabilitySurface::Timers, "callbacks"),
     ])
 }

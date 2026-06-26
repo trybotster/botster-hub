@@ -195,6 +195,10 @@ fn default_capability_grants() -> Vec<Capability> {
             scope: Some("project-pipelines".to_string()),
         },
         Capability {
+            surface: CapabilitySurface::PluginDb,
+            scope: Some("botster-workspaces".to_string()),
+        },
+        Capability {
             surface: CapabilitySurface::Filesystem,
             scope: Some("workspace".to_string()),
         },
@@ -302,6 +306,10 @@ mod tests {
         assert!(profile.default_capability_grants().contains(&Capability {
             surface: CapabilitySurface::Timers,
             scope: Some("callbacks".to_string()),
+        }));
+        assert!(profile.default_capability_grants().contains(&Capability {
+            surface: CapabilitySurface::PluginDb,
+            scope: Some("botster-workspaces".to_string()),
         }));
         assert!(
             profile
