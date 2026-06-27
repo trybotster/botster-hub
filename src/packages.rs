@@ -280,7 +280,7 @@ impl PackageRegistry {
             PackageRegistryError::without_record(
                 manifest.name.clone(),
                 PackageAction::Install,
-                PackageAdmissionReason::UnsafeEntrypoint(reason),
+                PackageAdmissionReason::UnsafeSessionTemplate(reason),
                 audit_reason.clone(),
             )
         })?;
@@ -1661,6 +1661,8 @@ pub enum PackageAdmissionReason {
     InvalidLocalManifest(String),
     /// Local package entrypoint was absent or unsafe.
     UnsafeEntrypoint(String),
+    /// Local package session template was absent or unsafe.
+    UnsafeSessionTemplate(String),
     /// Capability surface is not governed by the current host profile.
     UngovernedCapabilitySurface(CapabilitySurface),
     /// Manifest requested a capability not present in the hub-owned grant set.
@@ -2251,7 +2253,7 @@ impl PreparedRegistryEntry {
                     PackageRegistryError::without_record(
                         manifest.name.clone(),
                         PackageAction::Install,
-                        PackageAdmissionReason::UnsafeEntrypoint(reason),
+                        PackageAdmissionReason::UnsafeSessionTemplate(reason),
                         "load registry local package".to_string(),
                     )
                 })?;

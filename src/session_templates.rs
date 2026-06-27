@@ -209,16 +209,14 @@ pub fn materialize_package_session_template(
         .session_id
         .unwrap_or_else(|| SessionId(format!("session-template-{}", template.id)));
     let context_id = format!("ctx-{}", session_id.0);
-    let context = assemble_context(
-        config,
-        &session_id,
-        &context_id,
-        &resolved_target_id,
-        &package_root,
-        &working_directory,
-        request.context,
-        &template.context,
-    );
+    let context_inputs = ContextAssemblyInputs {
+        session_id: &session_id,
+        context_id: &context_id,
+        target_id: &resolved_target_id,
+        package_root: &package_root,
+        working_directory: &working_directory,
+    };
+    let context = assemble_context(config, context_inputs, request.context, &template.context);
     inject_context_environment(config, &mut environment, &session_id, &context_id);
 
     let row = template_row(record, template);
@@ -259,6 +257,15 @@ pub fn materialize_package_session_template(
         spawn_request,
         context,
     })
+}
+
+/// Return one sanitized package-contributed template row by bare or full id.
+pub fn show_package_session_template(
+    records: &[&PackageRecord],
+    template_id: &str,
+) -> SessionTemplateResult<HubSessionTemplate> {
+    let (record, template) = find_template(records, template_id)?;
+    Ok(template_row(record, template))
 }
 
 fn template_row(record: &PackageRecord, template: &PackageSessionTemplate) -> HubSessionTemplate {
@@ -420,20 +427,24 @@ fn inject_context_environment(
     }
 }
 
+struct ContextAssemblyInputs<'a> {
+    session_id: &'a SessionId,
+    context_id: &'a str,
+    target_id: &'a str,
+    package_root: &'a Path,
+    working_directory: &'a Path,
+}
+
 fn assemble_context(
     config: &HubConfig,
-    session_id: &SessionId,
-    context_id: &str,
-    target_id: &str,
-    package_root: &Path,
-    working_directory: &Path,
+    trusted: ContextAssemblyInputs<'_>,
     input: SessionTemplateContextInput,
     declared_keys: &[String],
 ) -> HubSessionContext {
     let mut values = BTreeMap::new();
-    values.insert("session_id".to_string(), session_id.0.clone());
-    values.insert("context_id".to_string(), context_id.to_string());
-    values.insert("target_id".to_string(), target_id.to_string());
+    values.insert("session_id".to_string(), trusted.session_id.0.clone());
+    values.insert("context_id".to_string(), trusted.context_id.to_string());
+    values.insert("target_id".to_string(), trusted.target_id.to_string());
     values.insert(
         "session_dir".to_string(),
         absolute_path(&config.data_directory)
@@ -446,13 +457,13 @@ fn assemble_context(
         "repo_path".to_string(),
         input
             .repo_path
-            .unwrap_or_else(|| package_root.display().to_string()),
+            .unwrap_or_else(|| trusted.package_root.display().to_string()),
     );
     values.insert(
         "worktree_path".to_string(),
         input
             .worktree_path
-            .unwrap_or_else(|| working_directory.display().to_string()),
+            .unwrap_or_else(|| trusted.working_directory.display().to_string()),
     );
     insert_optional(&mut values, "branch_name", input.branch_name);
     insert_optional(&mut values, "prompt", input.prompt);
@@ -470,8 +481,8 @@ fn assemble_context(
         values.entry(key.clone()).or_default();
     }
     HubSessionContext {
-        context_id: context_id.to_string(),
-        session_id: session_id.clone(),
+        context_id: trusted.context_id.to_string(),
+        session_id: trusted.session_id.clone(),
         values,
     }
 }

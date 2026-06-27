@@ -29,6 +29,7 @@ use crate::packages::{
 use crate::session_templates::{
     HubSessionContext, HubSessionTemplate, ResolvedSessionTemplate, SessionTemplateRequest,
     list_package_session_templates, materialize_package_session_template,
+    show_package_session_template,
 };
 use crate::{HubRuntime, HubRuntimeError, daemon_session_to_core_session, host_profile};
 
@@ -307,16 +308,14 @@ impl HubClientApi {
             }
             HubClientRequest::ShowSessionTemplate { template_id, .. } => {
                 let records = packages.packages();
-                let template = list_package_session_templates(&records)
-                    .into_iter()
-                    .find(|template| {
-                        template.id == template_id || template.template_id == template_id
-                    })
-                    .ok_or_else(|| HubClientError::SessionTemplate {
-                        request_id: request_id.clone(),
-                        operation,
-                        kind: "unknown_template",
-                        message: "session template was not found".to_string(),
+                let template =
+                    show_package_session_template(&records, &template_id).map_err(|error| {
+                        HubClientError::SessionTemplate {
+                            request_id: request_id.clone(),
+                            operation,
+                            kind: error.kind,
+                            message: error.message,
+                        }
                     })?;
                 HubClientResponseBody::SessionTemplates(vec![template])
             }
@@ -360,14 +359,18 @@ impl HubClientApi {
                     message: error.message,
                 })?;
                 let context = materialized.context.clone();
-                runtime.record_session_context(context);
-                let outcome = runtime
-                    .spawn_session(
-                        materialized.spawn_request,
-                        client_session_metadata(),
-                        now_seconds,
-                    )
-                    .map_err(|error| runtime_error(request_id.clone(), operation, error))?;
+                runtime.record_session_context(context.clone());
+                let outcome = match runtime.spawn_session(
+                    materialized.spawn_request,
+                    client_session_metadata(),
+                    now_seconds,
+                ) {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        runtime.remove_session_context(&context);
+                        return Err(runtime_error(request_id.clone(), operation, error));
+                    }
+                };
                 HubClientResponseBody::Spawned(HubClientSpawned {
                     session: HubClientSession::from(outcome),
                     events: Vec::new(),

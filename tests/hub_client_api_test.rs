@@ -70,6 +70,10 @@ fn empty_registry() -> PackageRegistry {
 }
 
 fn write_session_template_package(root: &std::path::Path) {
+    write_named_session_template_package(root, "session-template.plugin");
+}
+
+fn write_named_session_template_package(root: &std::path::Path, package_name: &str) {
     fs::create_dir_all(root.join("bin")).expect("create session template package root");
     fs::write(root.join("plugin.lua"), "return botster.register({})\n")
         .expect("write plugin entrypoint");
@@ -87,7 +91,7 @@ fn write_session_template_package(root: &std::path::Path) {
     fs::write(
         root.join("botster-package.json"),
         r#"{
-  "name": "session-template.plugin",
+  "name": "__PACKAGE_NAME__",
   "version": "1.0.0",
   "kind": "plugin",
   "botster": ">=0.1.0",
@@ -106,7 +110,8 @@ fn write_session_template_package(root: &std::path::Path) {
     }
   ]
 }
-"#,
+"#
+        .replace("__PACKAGE_NAME__", package_name),
     )
     .expect("write session template package manifest");
 }
@@ -398,6 +403,77 @@ fn session_templates_resolve_spawn_context_and_reject_unadmitted_reads() {
         )
         .expect_err("unadmitted context reads are denied");
     assert!(matches!(denied, HubClientError::AdmissionDenied { .. }));
+}
+
+#[test]
+fn session_template_show_rejects_ambiguous_bare_ids() {
+    let first_root = std::path::PathBuf::from(
+        "target/botster-hub-test-data/client-api-session-template-first-package",
+    );
+    let second_root = std::path::PathBuf::from(
+        "target/botster-hub-test-data/client-api-session-template-second-package",
+    );
+    let _ = fs::remove_dir_all(&first_root);
+    let _ = fs::remove_dir_all(&second_root);
+    write_named_session_template_package(&first_root, "first-template.plugin");
+    write_named_session_template_package(&second_root, "second-template.plugin");
+
+    let mut packages = PackageRegistry::new(Vec::<Capability>::new().into_iter().collect());
+    packages
+        .install_local_path(&first_root, "install first session template package")
+        .expect("install first session template package");
+    packages
+        .enable(
+            "first-template.plugin",
+            "enable first session template package",
+        )
+        .expect("enable first session template package");
+    packages
+        .install_local_path(&second_root, "install second session template package")
+        .expect("install second session template package");
+    packages
+        .enable(
+            "second-template.plugin",
+            "enable second session template package",
+        )
+        .expect("enable second session template package");
+
+    let mut runtime = explicit_runtime("session-template-show-ambiguous");
+    let api = HubClientApi::local_operator("session-template-show-ambiguous-client");
+
+    let rejected = api
+        .handle_request(
+            &mut runtime,
+            &packages,
+            HubClientRequest::ShowSessionTemplate {
+                request_id: request_id("show-ambiguous-template"),
+                template_id: "init".to_string(),
+            },
+        )
+        .expect_err("ambiguous bare template id should be rejected");
+    assert!(matches!(
+        rejected,
+        HubClientError::SessionTemplate {
+            kind: "ambiguous_template",
+            ..
+        }
+    ));
+
+    let shown = api
+        .handle_request(
+            &mut runtime,
+            &packages,
+            HubClientRequest::ShowSessionTemplate {
+                request_id: request_id("show-full-template-id"),
+                template_id: "first-template.plugin/init".to_string(),
+            },
+        )
+        .expect("full template id remains unambiguous");
+    let HubClientResponseBody::SessionTemplates(templates) = shown.body else {
+        panic!("session templates response expected");
+    };
+    assert_eq!(templates.len(), 1);
+    assert_eq!(templates[0].template_id, "first-template.plugin/init");
 }
 
 #[test]
