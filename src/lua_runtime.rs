@@ -513,19 +513,9 @@ fn session_templates_table(
                         "session_templates.spawn requires template_id".to_string(),
                     )
                 })?;
-            let now_seconds = value
-                .get("now_seconds")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0);
             let request = session_template_request_from_lua(&value)?;
             let result = session_templates
-                .spawn(
-                    &plugin_key,
-                    template_id,
-                    request,
-                    now_seconds,
-                    package_records.clone(),
-                )
+                .spawn(&plugin_key, template_id, request, package_records.clone())
                 .map_err(|error| {
                     mlua::Error::RuntimeError(format!("session_templates.spawn failed: {error}"))
                 })?;

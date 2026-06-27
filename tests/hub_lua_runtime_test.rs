@@ -147,6 +147,28 @@ return botster.register({
       end,
     },
   },
+  handlers = {
+    {
+      id = "spawn_action",
+      kind = "ui_action",
+      descriptor_id = "session_template.spawn_action",
+      descriptor = {
+        action_id = "session_template.spawn_action",
+        surface_id = "session-template-spawner.surface",
+      },
+      call = function(args)
+        local spawned = botster.capabilities.session_templates.spawn(args)
+        return {
+          request_id = args.request_id or "spawn-action",
+          surface_id = "session-template-spawner.surface",
+          action_id = "session_template.spawn_action",
+          node_id = "session-template-spawner-form",
+          state = "accepted",
+          payload = spawned,
+        }
+      end,
+    },
+  },
 })
 "#,
     )
@@ -348,8 +370,7 @@ fn real_lua_plugin_spawns_session_template_through_worker_capability() {
                 "context": {
                     "prompt": "spawned from lua worker",
                     "ticket_id": "ticket-worker-proof"
-                },
-                "now_seconds": 10
+                }
             }),
         })
         .expect("spawn session template through real Lua worker");
@@ -380,6 +401,55 @@ fn real_lua_plugin_spawns_session_template_through_worker_capability() {
             .expect("list spawned session")
             .is_some(),
         "production core daemon should own the spawned PTY session"
+    );
+}
+
+#[test]
+fn session_template_spawn_helper_works_from_non_mcp_plugin_invocation_path() {
+    let registry = install_session_template_spawn_registry(
+        "session-template-spawn-action",
+        vec![
+            capability(CapabilitySurface::Mcp, None),
+            capability(
+                CapabilitySurface::SessionActions,
+                Some("session_template_spawn"),
+            ),
+        ],
+    );
+    let mut hub = explicit_runtime("session-template-spawn-action");
+    hub.load_lua_plugin_package(&registry, "session-template-spawner.plugin")
+        .expect("load session-template plugin");
+
+    let action = hub
+        .dispatch_plugin_surface_action(
+            "session-template-spawner.plugin",
+            "session-template-spawner.surface",
+            "session_template.spawn_action",
+            serde_json::json!({
+                "request_id": "spawn-action-non-mcp",
+                "template_id": "session-template-spawner.plugin/init",
+                "session_id": "lua-template-action-session",
+                "environment": { "BOTSTER_MODE": "action" },
+                "context": {
+                    "prompt": "spawned from lua action worker",
+                    "ticket_id": "ticket-action-proof"
+                }
+            }),
+        )
+        .expect("spawn session template through UI action worker path");
+
+    assert_eq!(action.state, UiActionResultState::Accepted);
+    assert_eq!(
+        action.payload.as_ref().unwrap()["session_id"],
+        "lua-template-action-session"
+    );
+    assert!(
+        hub.session(&botster_core::SessionId(
+            "lua-template-action-session".to_string()
+        ))
+        .expect("list action-spawned session")
+        .is_some(),
+        "generic invoke_plugin pump should fulfill non-MCP helper requests"
     );
 }
 
