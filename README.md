@@ -655,6 +655,32 @@ Local path manifest example:
 }
 ```
 
+Packages can also declare hub-owned `session_templates` for PTY session launches
+with trusted context injection:
+
+```json
+{
+  "session_templates": [
+    {
+      "id": "init",
+      "command": "bin/init.sh",
+      "working_directory": { "policy": "package_root" },
+      "environment": { "BOTSTER_MODE": "default" },
+      "allowed_environment_overrides": ["BOTSTER_MODE"],
+      "context": ["prompt", "ticket_id"]
+    }
+  ]
+}
+```
+
+The hub validates templates and materializes them into generic core spawn
+requests. Core remains unaware of template ids, Project Pipelines, Codex,
+Claude, agents, tickets, workspaces, and `botster context`. Explicit spawn
+overrides are admitted only when the template and target policy allow them.
+Spawned scripts receive `BOTSTER_SESSION_ID`, `BOTSTER_CONTEXT_ID`,
+`BOTSTER_HUB_DATA_DIR`, `BOTSTER_HUB_SOCKET`, and `BOTSTER_HUB_BIN`, and can read
+context with `"$BOTSTER_HUB_BIN" context --key prompt`.
+
 Git-source manifests use the same core shape. The registry can persist the Git
 URL/reference, provenance, pin revision/checksum, compatibility result, trust
 classification, and enabled/admitted-capability state, but this ticket does not

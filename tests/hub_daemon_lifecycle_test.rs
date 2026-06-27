@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
@@ -401,6 +402,46 @@ fn write_supervised_package(root: &Path, package_name: &str, command: &str, args
         serde_json::to_string_pretty(&manifest).expect("serialize supervised manifest"),
     )
     .expect("write supervised package manifest");
+}
+
+fn write_session_template_context_package(root: &Path) {
+    fs::create_dir_all(root.join("bin")).expect("create session template package root");
+    fs::write(root.join("plugin.lua"), "return botster.register({})\n")
+        .expect("write session template plugin entrypoint");
+    let script = root.join("bin/init.sh");
+    fs::write(
+        &script,
+        "#!/bin/sh\nprintf 'started\\n' > context-started.txt\n\"$BOTSTER_HUB_BIN\" context --key prompt > context-output.json 2> context-error.txt\nsleep 1\n",
+    )
+    .expect("write session template script");
+    let mut permissions = fs::metadata(&script)
+        .expect("script metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&script, permissions).expect("chmod session template script");
+    let manifest = serde_json::json!({
+        "name": "dogfood.session-template",
+        "version": "1.0.0",
+        "kind": "plugin",
+        "botster": ">=0.1.0",
+        "source": { "type": "path", "path": "." },
+        "capabilities": [{ "surface": "surfaces" }],
+        "entrypoints": [
+            { "runtime": "lua", "path": "plugin.lua", "bootstrap": false }
+        ],
+        "session_templates": [{
+            "id": "init",
+            "command": "bin/init.sh",
+            "context": ["prompt"],
+            "allowed_environment_overrides": ["BOTSTER_MODE"],
+            "environment": { "BOTSTER_MODE": "daemon" }
+        }]
+    });
+    fs::write(
+        root.join("botster-package.json"),
+        serde_json::to_string_pretty(&manifest).expect("serialize session template manifest"),
+    )
+    .expect("write session template package manifest");
 }
 
 fn write_app_registry_package(root: &Path) {
@@ -4544,6 +4585,102 @@ fn daemon_list_apps_projects_installed_package_entrypoints() {
     assert_eq!(
         package_action(&web.actions, "stop_package_entrypoint").status,
         botster_hub::DaemonPackageActionStatus::Available
+    );
+
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
+fn daemon_spawns_session_template_and_script_reads_botster_context() {
+    let _guard = daemon_test_lock()
+        .lock()
+        .expect("serialize real daemon test");
+    let data_dir = unique_short_test_dir("session-template-context");
+    let package_root = unique_test_dir("session-template-context-package");
+    write_session_template_context_package(&package_root);
+    let config = explicit_config(&data_dir);
+    let child = start_cli_daemon(&data_dir);
+
+    let enable = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::EnablePackageLocalPath {
+            path: package_root.clone(),
+        },
+    )
+    .expect("enable session template package");
+    assert_eq!(
+        enable.kind,
+        botster_hub::DaemonResponseKind::PackageDecision
+    );
+
+    let templates = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::ListSessionTemplates,
+    )
+    .expect("list session templates");
+    assert_eq!(
+        templates.session_templates[0].template_id,
+        "dogfood.session-template/init"
+    );
+
+    let rejected = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::ResolveSessionTemplate {
+            template_id: "init".to_string(),
+            request: botster_hub::DaemonSessionTemplateRequest {
+                cwd: Some("/tmp".to_string()),
+                ..botster_hub::DaemonSessionTemplateRequest::default()
+            },
+        },
+    )
+    .expect("unauthorized cwd response");
+    assert_eq!(
+        rejected.kind,
+        botster_hub::DaemonResponseKind::OperatorError
+    );
+    assert_eq!(
+        rejected.error.as_ref().map(|error| error.code.as_str()),
+        Some("cwd_not_admitted")
+    );
+
+    let spawn = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::SpawnSessionTemplate {
+            template_id: "init".to_string(),
+            session_id: "session-template-context".to_string(),
+            request: botster_hub::DaemonSessionTemplateRequest {
+                context: botster_hub::DaemonSessionTemplateContextInput {
+                    prompt: Some("pipeline prompt".to_string()),
+                    ticket_id: Some("ticket-123".to_string()),
+                    ..botster_hub::DaemonSessionTemplateContextInput::default()
+                },
+                ..botster_hub::DaemonSessionTemplateRequest::default()
+            },
+        },
+    )
+    .expect("spawn session template");
+    assert_eq!(spawn.kind, botster_hub::DaemonResponseKind::Spawned);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let context_output = package_root.join("context-output.json");
+    let mut output = String::new();
+    while std::time::Instant::now() < deadline {
+        if let Ok(contents) = fs::read_to_string(&context_output) {
+            output = contents;
+            if output.contains("pipeline prompt") {
+                break;
+            }
+        }
+        thread::sleep(Duration::from_millis(30));
+    }
+    assert!(
+        package_root.join("context-started.txt").exists(),
+        "template script should have started"
+    );
+    assert!(
+        output.contains("\"prompt\":\"pipeline prompt\""),
+        "template script should read botster context through CLI, context_output={output:?}, context_error={:?}",
+        fs::read_to_string(package_root.join("context-error.txt")).unwrap_or_default()
     );
 
     shutdown_cli_daemon(&data_dir, child);
