@@ -45,6 +45,11 @@ export type DaemonRequest =
   | { type: "resize"; session_id: string; rows: number; cols: number }
   | { type: "shutdown_session"; session_id: string }
   | { type: "drain"; session_id: string }
+  | { type: "list_session_templates" }
+  | { type: "show_session_template"; template_id: string }
+  | { type: "resolve_session_template"; template_id: string; request: DaemonSessionTemplateRequest }
+  | { type: "spawn_session_template"; template_id: string; session_id: string; request: DaemonSessionTemplateRequest }
+  | { type: "read_session_context"; session_id: string; context_id?: string | null; key?: string | null }
   | { type: "list_apps" }
   | { type: "resolve_app_launch"; package_name: string; entrypoint_id: string }
   | { type: "list_packages" }
@@ -77,6 +82,9 @@ export interface DaemonResponse {
   kind: DaemonResponseKind;
   status: DaemonStatus | null;
   sessions: DaemonSession[];
+  session_templates?: DaemonSessionTemplate[];
+  resolved_session_template?: DaemonResolvedSessionTemplate | null;
+  session_context?: DaemonSessionContext | null;
   apps?: DaemonApp[];
   resolved_app_launch?: DaemonResolvedAppLaunch | null;
   packages: DaemonPackage[];
@@ -101,6 +109,9 @@ export type DaemonResponseKind =
   | "sessions"
   | "spawned"
   | "events"
+  | "session_templates"
+  | "resolved_session_template"
+  | "session_context"
   | "apps"
   | "resolved_app_launch"
   | "packages"
@@ -171,6 +182,54 @@ export interface DaemonNotify {
   decision: string;
   state_count: number;
   states: string[];
+}
+
+export interface DaemonSessionTemplateRequest {
+  target_id?: string | null;
+  cwd?: string | null;
+  environment?: Record<string, string>;
+  context: DaemonSessionTemplateContextInput;
+}
+
+export interface DaemonSessionTemplateContextInput {
+  worktree_path?: string | null;
+  repo_path?: string | null;
+  branch_name?: string | null;
+  prompt?: string | null;
+  ticket_id?: string | null;
+  workspace_id?: string | null;
+  metadata?: Record<string, string>;
+}
+
+export interface DaemonSessionTemplate {
+  template_id: string;
+  package_name: string;
+  id: string;
+  source: string;
+  command: string;
+  args?: string[];
+  working_directory_policy: string;
+  allowed_environment_overrides?: string[];
+  context_keys?: string[];
+  target_id: string;
+  available: boolean;
+}
+
+export interface DaemonResolvedSessionTemplate {
+  template: DaemonSessionTemplate;
+  session_id: string;
+  executable: string;
+  arguments?: string[];
+  working_directory: string;
+  environment?: Record<string, string>;
+  context_id: string;
+  context_keys?: string[];
+}
+
+export interface DaemonSessionContext {
+  context_id: string;
+  session_id: string;
+  values: Record<string, string>;
 }
 
 export interface DaemonApp {

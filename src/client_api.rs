@@ -26,6 +26,10 @@ use crate::packages::{
     PackageClassification, PackageConfigurationView, PackageRecord, PackageRegistry,
     PackageRunnableProcessState, PackageRunnableWorkingDirectory, PackageState,
 };
+use crate::session_templates::{
+    HubSessionContext, HubSessionTemplate, ResolvedSessionTemplate, SessionTemplateRequest,
+    list_package_session_templates, materialize_package_session_template,
+};
 use crate::{HubRuntime, HubRuntimeError, daemon_session_to_core_session, host_profile};
 
 /// Transport-neutral local client API handler.
@@ -297,6 +301,116 @@ impl HubClientApi {
                     .map(|record| HubClientPackage::from_record(packages, record))
                     .collect(),
             ),
+            HubClientRequest::ListSessionTemplates { .. } => {
+                let records = packages.packages();
+                HubClientResponseBody::SessionTemplates(list_package_session_templates(&records))
+            }
+            HubClientRequest::ShowSessionTemplate { template_id, .. } => {
+                let records = packages.packages();
+                let template = list_package_session_templates(&records)
+                    .into_iter()
+                    .find(|template| {
+                        template.id == template_id || template.template_id == template_id
+                    })
+                    .ok_or_else(|| HubClientError::SessionTemplate {
+                        request_id: request_id.clone(),
+                        operation,
+                        kind: "unknown_template",
+                        message: "session template was not found".to_string(),
+                    })?;
+                HubClientResponseBody::SessionTemplates(vec![template])
+            }
+            HubClientRequest::ResolveSessionTemplate {
+                template_id,
+                template_request,
+                ..
+            } => {
+                let records = packages.packages();
+                let materialized = materialize_package_session_template(
+                    runtime.config(),
+                    &records,
+                    &template_id,
+                    template_request,
+                )
+                .map_err(|error| HubClientError::SessionTemplate {
+                    request_id: request_id.clone(),
+                    operation,
+                    kind: error.kind,
+                    message: error.message,
+                })?;
+                HubClientResponseBody::ResolvedSessionTemplate(materialized.resolved)
+            }
+            HubClientRequest::SpawnSessionTemplate {
+                template_id,
+                template_request,
+                now_seconds,
+                ..
+            } => {
+                let records = packages.packages();
+                let materialized = materialize_package_session_template(
+                    runtime.config(),
+                    &records,
+                    &template_id,
+                    template_request,
+                )
+                .map_err(|error| HubClientError::SessionTemplate {
+                    request_id: request_id.clone(),
+                    operation,
+                    kind: error.kind,
+                    message: error.message,
+                })?;
+                let context = materialized.context.clone();
+                runtime.record_session_context(context);
+                let outcome = runtime
+                    .spawn_session(
+                        materialized.spawn_request,
+                        client_session_metadata(),
+                        now_seconds,
+                    )
+                    .map_err(|error| runtime_error(request_id.clone(), operation, error))?;
+                HubClientResponseBody::Spawned(HubClientSpawned {
+                    session: HubClientSession::from(outcome),
+                    events: Vec::new(),
+                })
+            }
+            HubClientRequest::ReadSessionContext {
+                session_id,
+                context_id,
+                key,
+                ..
+            } => {
+                let lookup = context_id.as_deref().unwrap_or(session_id.0.as_str());
+                let context = runtime.session_context(lookup).cloned().ok_or_else(|| {
+                    HubClientError::SessionTemplate {
+                        request_id: request_id.clone(),
+                        operation,
+                        kind: "unknown_context",
+                        message: "session context was not found".to_string(),
+                    }
+                })?;
+                if context.session_id != session_id {
+                    return Err(HubClientError::SessionTemplate {
+                        request_id,
+                        operation,
+                        kind: "context_session_mismatch",
+                        message: "session context does not belong to the requested session"
+                            .to_string(),
+                    });
+                }
+                let context = if let Some(key) = key {
+                    HubSessionContext {
+                        values: context
+                            .values
+                            .get(&key)
+                            .map(|value| BTreeMap::from([(key, value.clone())]))
+                            .unwrap_or_default(),
+                        ..context
+                    }
+                } else {
+                    context
+                };
+                HubClientResponseBody::SessionContext(context)
+            }
             HubClientRequest::PluginLifecycleStatus { .. } => {
                 HubClientResponseBody::PluginLifecycle(
                     runtime
@@ -401,6 +515,12 @@ impl HubClientAdmission {
             | HubClientOperation::ReadScreen
             | HubClientOperation::CaptureSnapshot => self.allow_runtime,
             HubClientOperation::ListPackages => self.allow_packages,
+            HubClientOperation::ListSessionTemplates
+            | HubClientOperation::ShowSessionTemplate
+            | HubClientOperation::ResolveSessionTemplate => self.allow_packages,
+            HubClientOperation::SpawnSessionTemplate | HubClientOperation::ReadSessionContext => {
+                self.allow_runtime
+            }
             HubClientOperation::PluginLifecycleStatus
             | HubClientOperation::PluginSurfaceRender
             | HubClientOperation::PluginSurfaceAction => self.allow_lifecycle,
@@ -512,6 +632,33 @@ pub enum HubClientRequest {
     },
     /// Return sanitized package/provider records.
     ListPackages { request_id: RequestId },
+    /// Return sanitized session template rows.
+    ListSessionTemplates { request_id: RequestId },
+    /// Return one sanitized session template row.
+    ShowSessionTemplate {
+        request_id: RequestId,
+        template_id: String,
+    },
+    /// Resolve a session template without spawning it.
+    ResolveSessionTemplate {
+        request_id: RequestId,
+        template_id: String,
+        template_request: SessionTemplateRequest,
+    },
+    /// Spawn a session from a hub-owned session template.
+    SpawnSessionTemplate {
+        request_id: RequestId,
+        template_id: String,
+        template_request: SessionTemplateRequest,
+        now_seconds: u64,
+    },
+    /// Read trusted hub context for one spawned template session.
+    ReadSessionContext {
+        request_id: RequestId,
+        session_id: SessionId,
+        context_id: Option<String>,
+        key: Option<String>,
+    },
     /// Return read-only plugin lifecycle status.
     PluginLifecycleStatus { request_id: RequestId },
     /// Render one plugin-owned surface through its worker-owned route handler.
@@ -551,6 +698,11 @@ impl HubClientRequest {
             | Self::ReadScreen { request_id, .. }
             | Self::CaptureSnapshot { request_id, .. }
             | Self::ListPackages { request_id }
+            | Self::ListSessionTemplates { request_id }
+            | Self::ShowSessionTemplate { request_id, .. }
+            | Self::ResolveSessionTemplate { request_id, .. }
+            | Self::SpawnSessionTemplate { request_id, .. }
+            | Self::ReadSessionContext { request_id, .. }
             | Self::PluginLifecycleStatus { request_id }
             | Self::PluginSurfaceRender { request_id, .. }
             | Self::PluginSurfaceAction { request_id, .. } => request_id,
@@ -576,6 +728,11 @@ impl HubClientRequest {
             Self::ReadScreen { .. } => HubClientOperation::ReadScreen,
             Self::CaptureSnapshot { .. } => HubClientOperation::CaptureSnapshot,
             Self::ListPackages { .. } => HubClientOperation::ListPackages,
+            Self::ListSessionTemplates { .. } => HubClientOperation::ListSessionTemplates,
+            Self::ShowSessionTemplate { .. } => HubClientOperation::ShowSessionTemplate,
+            Self::ResolveSessionTemplate { .. } => HubClientOperation::ResolveSessionTemplate,
+            Self::SpawnSessionTemplate { .. } => HubClientOperation::SpawnSessionTemplate,
+            Self::ReadSessionContext { .. } => HubClientOperation::ReadSessionContext,
             Self::PluginLifecycleStatus { .. } => HubClientOperation::PluginLifecycleStatus,
             Self::PluginSurfaceRender { .. } => HubClientOperation::PluginSurfaceRender,
             Self::PluginSurfaceAction { .. } => HubClientOperation::PluginSurfaceAction,
@@ -603,6 +760,11 @@ pub enum HubClientOperation {
     ReadScreen,
     CaptureSnapshot,
     ListPackages,
+    ListSessionTemplates,
+    ShowSessionTemplate,
+    ResolveSessionTemplate,
+    SpawnSessionTemplate,
+    ReadSessionContext,
     PluginLifecycleStatus,
     PluginSurfaceRender,
     PluginSurfaceAction,
@@ -629,6 +791,9 @@ pub enum HubClientResponseBody {
     RoutedEnvelopeDrain(HubClientRoutedEnvelopeDrain),
     RoutedEnvelopeAck(HubClientRoutedEnvelopeAck),
     Packages(Vec<HubClientPackage>),
+    SessionTemplates(Vec<HubSessionTemplate>),
+    ResolvedSessionTemplate(ResolvedSessionTemplate),
+    SessionContext(HubSessionContext),
     PluginLifecycle(Vec<HubClientPluginLifecycle>),
     PluginSurface(UiNode),
     PluginActionResult(UiActionResult),
@@ -1378,6 +1543,12 @@ pub enum HubClientError {
         request_id: RequestId,
         operation: HubClientOperation,
         package_name: String,
+    },
+    SessionTemplate {
+        request_id: RequestId,
+        operation: HubClientOperation,
+        kind: &'static str,
+        message: String,
     },
     Plugin {
         request_id: RequestId,

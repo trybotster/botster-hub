@@ -569,6 +569,28 @@ pub enum DaemonRequest {
     Drain {
         session_id: String,
     },
+    ListSessionTemplates,
+    ShowSessionTemplate {
+        template_id: String,
+    },
+    ResolveSessionTemplate {
+        template_id: String,
+        #[serde(default)]
+        request: DaemonSessionTemplateRequest,
+    },
+    SpawnSessionTemplate {
+        template_id: String,
+        session_id: String,
+        #[serde(default)]
+        request: DaemonSessionTemplateRequest,
+    },
+    ReadSessionContext {
+        session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        context_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key: Option<String>,
+    },
     ListApps,
     ResolveAppLaunch {
         package_name: String,
@@ -668,6 +690,12 @@ pub struct DaemonResponse {
     pub status: Option<DaemonStatus>,
     pub sessions: Vec<DaemonSession>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub session_templates: Vec<DaemonSessionTemplate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_session_template: Option<DaemonResolvedSessionTemplate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_context: Option<DaemonSessionContext>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub apps: Vec<DaemonApp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_app_launch: Option<DaemonResolvedAppLaunch>,
@@ -703,6 +731,9 @@ pub enum DaemonResponseKind {
     Sessions,
     Spawned,
     Events,
+    SessionTemplates,
+    ResolvedSessionTemplate,
+    SessionContext,
     Apps,
     ResolvedAppLaunch,
     Packages,
@@ -781,6 +812,77 @@ pub struct DaemonNotify {
     pub decision: String,
     pub state_count: usize,
     pub states: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonSessionTemplateRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub environment: BTreeMap<String, String>,
+    #[serde(default)]
+    pub context: DaemonSessionTemplateContextInput,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonSessionTemplateContextInput {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ticket_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonSessionTemplate {
+    pub template_id: String,
+    pub package_name: String,
+    pub id: String,
+    pub source: String,
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    pub working_directory_policy: String,
+    #[serde(default)]
+    pub allowed_environment_overrides: Vec<String>,
+    #[serde(default)]
+    pub context_keys: Vec<String>,
+    pub target_id: String,
+    pub available: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonResolvedSessionTemplate {
+    pub template: DaemonSessionTemplate,
+    pub session_id: String,
+    pub executable: String,
+    #[serde(default)]
+    pub arguments: Vec<String>,
+    pub working_directory: String,
+    #[serde(default)]
+    pub environment: BTreeMap<String, String>,
+    pub context_id: String,
+    #[serde(default)]
+    pub context_keys: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonSessionContext {
+    pub context_id: String,
+    pub session_id: String,
+    #[serde(default)]
+    pub values: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2098,6 +2200,24 @@ mod tests {
             DaemonRequest::Drain {
                 session_id: "session".to_string(),
             },
+            DaemonRequest::ListSessionTemplates,
+            DaemonRequest::ShowSessionTemplate {
+                template_id: "init".to_string(),
+            },
+            DaemonRequest::ResolveSessionTemplate {
+                template_id: "init".to_string(),
+                request: DaemonSessionTemplateRequest::default(),
+            },
+            DaemonRequest::SpawnSessionTemplate {
+                template_id: "init".to_string(),
+                session_id: "session".to_string(),
+                request: DaemonSessionTemplateRequest::default(),
+            },
+            DaemonRequest::ReadSessionContext {
+                session_id: "session".to_string(),
+                context_id: Some("ctx-session".to_string()),
+                key: Some("prompt".to_string()),
+            },
             DaemonRequest::ListApps,
             DaemonRequest::ResolveAppLaunch {
                 package_name: "workflow.plugin".to_string(),
@@ -2201,6 +2321,11 @@ mod tests {
             DaemonRequest::Resize { .. } => "resize",
             DaemonRequest::ShutdownSession { .. } => "shutdown_session",
             DaemonRequest::Drain { .. } => "drain",
+            DaemonRequest::ListSessionTemplates => "list_session_templates",
+            DaemonRequest::ShowSessionTemplate { .. } => "show_session_template",
+            DaemonRequest::ResolveSessionTemplate { .. } => "resolve_session_template",
+            DaemonRequest::SpawnSessionTemplate { .. } => "spawn_session_template",
+            DaemonRequest::ReadSessionContext { .. } => "read_session_context",
             DaemonRequest::ListApps => "list_apps",
             DaemonRequest::ResolveAppLaunch { .. } => "resolve_app_launch",
             DaemonRequest::ListPackages => "list_packages",
@@ -2237,6 +2362,9 @@ mod tests {
             DaemonResponseKind::Sessions,
             DaemonResponseKind::Spawned,
             DaemonResponseKind::Events,
+            DaemonResponseKind::SessionTemplates,
+            DaemonResponseKind::ResolvedSessionTemplate,
+            DaemonResponseKind::SessionContext,
             DaemonResponseKind::Apps,
             DaemonResponseKind::ResolvedAppLaunch,
             DaemonResponseKind::Packages,
@@ -2266,6 +2394,9 @@ mod tests {
             DaemonResponseKind::Sessions => "sessions",
             DaemonResponseKind::Spawned => "spawned",
             DaemonResponseKind::Events => "events",
+            DaemonResponseKind::SessionTemplates => "session_templates",
+            DaemonResponseKind::ResolvedSessionTemplate => "resolved_session_template",
+            DaemonResponseKind::SessionContext => "session_context",
             DaemonResponseKind::Apps => "apps",
             DaemonResponseKind::ResolvedAppLaunch => "resolved_app_launch",
             DaemonResponseKind::Packages => "packages",
@@ -2314,6 +2445,49 @@ mod tests {
                 session_id: "session".to_string(),
                 lifecycle: "running".to_string(),
             }],
+            session_templates: vec![DaemonSessionTemplate {
+                template_id: "workflow.plugin/init".to_string(),
+                package_name: "workflow.plugin".to_string(),
+                id: "init".to_string(),
+                source: "package".to_string(),
+                command: "bin/init".to_string(),
+                args: vec!["--json".to_string()],
+                working_directory_policy: "package_root".to_string(),
+                allowed_environment_overrides: vec!["BOTSTER_MODE".to_string()],
+                context_keys: vec!["prompt".to_string()],
+                target_id: "package:workflow.plugin".to_string(),
+                available: true,
+            }],
+            resolved_session_template: Some(DaemonResolvedSessionTemplate {
+                template: DaemonSessionTemplate {
+                    template_id: "workflow.plugin/init".to_string(),
+                    package_name: "workflow.plugin".to_string(),
+                    id: "init".to_string(),
+                    source: "package".to_string(),
+                    command: "bin/init".to_string(),
+                    args: vec!["--json".to_string()],
+                    working_directory_policy: "package_root".to_string(),
+                    allowed_environment_overrides: vec!["BOTSTER_MODE".to_string()],
+                    context_keys: vec!["prompt".to_string()],
+                    target_id: "package:workflow.plugin".to_string(),
+                    available: true,
+                },
+                session_id: "session".to_string(),
+                executable: "/tmp/workflow.plugin/bin/init".to_string(),
+                arguments: vec!["--json".to_string()],
+                working_directory: "/tmp/workflow.plugin".to_string(),
+                environment: BTreeMap::from([(
+                    "BOTSTER_SESSION_ID".to_string(),
+                    "session".to_string(),
+                )]),
+                context_id: "ctx-session".to_string(),
+                context_keys: vec!["prompt".to_string()],
+            }),
+            session_context: Some(DaemonSessionContext {
+                context_id: "ctx-session".to_string(),
+                session_id: "session".to_string(),
+                values: BTreeMap::from([("prompt".to_string(), "hello".to_string())]),
+            }),
             apps: vec![DaemonApp {
                 package_name: "workflow.plugin".to_string(),
                 app_id: "web".to_string(),
