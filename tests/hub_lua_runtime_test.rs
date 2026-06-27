@@ -1,10 +1,13 @@
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
 use botster_core::{
-    BoundaryJson, PackageConfigurationSecretValue, PackageConfigurationValue, PluginHandlerKind,
-    PluginHandlerRef, PluginInvocationContext, PluginInvocationFailure,
-    PluginInvocationFailureKind, PluginInvocationRequest, PluginInvocationResult,
-    PluginInvocationSuccess, PluginKey, RequestId, UiActionResultState, UiNodeKind,
+    BoundaryJson, Capability, CapabilitySurface, PackageConfigurationSecretValue,
+    PackageConfigurationValue, PluginHandlerKind, PluginHandlerRef, PluginInvocationContext,
+    PluginInvocationFailure, PluginInvocationFailureKind, PluginInvocationRequest,
+    PluginInvocationResult, PluginInvocationSuccess, PluginKey, RequestId, UiActionResultState,
+    UiNodeKind,
 };
 use botster_hub::{
     DataDirectoryOption, HostIdentityOptions, HubClientApi, HubClientRequest,
@@ -12,7 +15,11 @@ use botster_hub::{
     RuntimeEnvironment, SessionDefaults, TransportBindings, default_package_policy,
 };
 
+mod support;
+use support::ensure_session_worker_binary;
+
 fn explicit_runtime(name: &str) -> HubRuntime {
+    ensure_session_worker_binary();
     let data_directory = PathBuf::from("target")
         .join("botster-hub-test-data")
         .join("lua-runtime")
@@ -105,6 +112,88 @@ fn install_project_pipelines_registry() -> PackageRegistry {
     policy
         .enable("project-pipelines", "enable project pipelines package")
         .expect("enable project pipelines package");
+    policy.registry().clone()
+}
+
+fn capability(surface: CapabilitySurface, scope: Option<&str>) -> Capability {
+    Capability {
+        surface,
+        scope: scope.map(ToString::to_string),
+    }
+}
+
+fn install_session_template_spawn_registry(
+    name: &str,
+    capabilities: Vec<Capability>,
+) -> PackageRegistry {
+    let root = PathBuf::from("target")
+        .join("botster-hub-test-data")
+        .join("lua-runtime-packages")
+        .join(name);
+    let source_root = std::env::current_dir().expect("current dir").join(&root);
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("bin")).expect("create session-template package root");
+    fs::write(
+        root.join("plugin.lua"),
+        r#"
+return botster.register({
+  tools = {
+    {
+      name = "session_template.spawn",
+      description = "Spawn a declared session template through the production Lua capability.",
+      handler = "spawn",
+      call = function(args)
+        return botster.capabilities.session_templates.spawn(args)
+      end,
+    },
+  },
+})
+"#,
+    )
+    .expect("write session-template plugin");
+    let script = root.join("bin/init.sh");
+    fs::write(
+        &script,
+        "#!/bin/sh\nprintf 'template:%s:%s\\n' \"$BOTSTER_SESSION_ID\" \"$BOTSTER_MODE\"\n",
+    )
+    .expect("write session-template script");
+    let mut permissions = fs::metadata(&script)
+        .expect("script metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&script, permissions).expect("chmod session-template script");
+    fs::write(
+        root.join("botster-package.json"),
+        serde_json::json!({
+            "name": "session-template-spawner.plugin",
+            "version": "1.0.0",
+            "kind": "plugin",
+            "botster": ">=0.1.0",
+            "source": { "type": "path", "path": source_root.display().to_string() },
+            "capabilities": capabilities,
+            "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }],
+            "session_templates": [{
+                "id": "init",
+                "command": "bin/init.sh",
+                "environment": { "BOTSTER_MODE": "default" },
+                "allowed_environment_overrides": ["BOTSTER_MODE"],
+                "context": ["prompt", "ticket_id"]
+            }]
+        })
+        .to_string(),
+    )
+    .expect("write session-template package manifest");
+
+    let mut policy = default_package_policy();
+    policy
+        .install_local_path(&root, "install session-template spawn lua package")
+        .expect("install session-template package");
+    policy
+        .enable(
+            "session-template-spawner.plugin",
+            "enable session-template package",
+        )
+        .expect("enable session-template package");
     policy.registry().clone()
 }
 
@@ -231,6 +320,100 @@ fn plugin_mcp_call_uses_loaded_runtime_and_returns_structured_payload() {
 
     assert_eq!(result["message"], "from-mcp");
     assert_eq!(result["ambient"]["os"], true);
+}
+
+#[test]
+fn real_lua_plugin_spawns_session_template_through_worker_capability() {
+    let registry = install_session_template_spawn_registry(
+        "session-template-spawn",
+        vec![
+            capability(CapabilitySurface::Mcp, None),
+            capability(
+                CapabilitySurface::SessionActions,
+                Some("session_template_spawn"),
+            ),
+        ],
+    );
+    let mut hub = explicit_runtime("session-template-spawn");
+    hub.load_lua_plugin_package(&registry, "session-template-spawner.plugin")
+        .expect("load session-template plugin");
+
+    let result = hub
+        .call_plugin_mcp_tool(botster_hub::McpCallRequest {
+            name: "session_template.spawn".to_string(),
+            arguments: serde_json::json!({
+                "template_id": "session-template-spawner.plugin/init",
+                "session_id": "lua-template-session",
+                "environment": { "BOTSTER_MODE": "worker" },
+                "context": {
+                    "prompt": "spawned from lua worker",
+                    "ticket_id": "ticket-worker-proof"
+                },
+                "now_seconds": 10
+            }),
+        })
+        .expect("spawn session template through real Lua worker");
+
+    assert_eq!(result["session_id"], "lua-template-session");
+    assert_eq!(result["lifecycle"], "running");
+    assert_eq!(
+        result["template_id"],
+        "session-template-spawner.plugin/init"
+    );
+    assert_eq!(result["context_id"], "ctx-lua-template-session");
+    assert_eq!(
+        result["context_keys"],
+        serde_json::json!([
+            "context_id",
+            "hub_socket",
+            "prompt",
+            "repo_path",
+            "session_dir",
+            "session_id",
+            "target_id",
+            "ticket_id",
+            "worktree_path"
+        ])
+    );
+    assert!(
+        hub.session(&botster_core::SessionId("lua-template-session".to_string()))
+            .expect("list spawned session")
+            .is_some(),
+        "production core daemon should own the spawned PTY session"
+    );
+}
+
+#[test]
+fn lua_session_template_spawn_requires_exact_scoped_package_capability() {
+    let registry = install_session_template_spawn_registry(
+        "session-template-spawn-unscoped",
+        vec![
+            capability(CapabilitySurface::Mcp, None),
+            capability(CapabilitySurface::SessionActions, None),
+        ],
+    );
+    let mut hub = explicit_runtime("session-template-spawn-unscoped");
+    hub.load_lua_plugin_package(&registry, "session-template-spawner.plugin")
+        .expect("load unscoped session-template plugin");
+
+    let error = hub
+        .call_plugin_mcp_tool(botster_hub::McpCallRequest {
+            name: "session_template.spawn".to_string(),
+            arguments: serde_json::json!({
+                "template_id": "session-template-spawner.plugin/init",
+                "session_id": "lua-template-denied"
+            }),
+        })
+        .expect_err("unscoped SessionActions grant must not allow template spawn");
+
+    assert_eq!(error.code, "plugin_tool_failed");
+    assert!(error.message.contains("session_template_spawn capability"));
+    assert!(
+        hub.session(&botster_core::SessionId("lua-template-denied".to_string()))
+            .expect("list denied session")
+            .is_none(),
+        "denied plugin call must not spawn a session"
+    );
 }
 
 #[test]
@@ -452,6 +635,8 @@ fn reload_replaces_lua_tool_descriptors_and_removes_stale_handlers() {
             .configuration_view(),
         hub.capability_runtime(),
         hub.routed_envelope_runtime(),
+        hub.session_template_spawner(),
+        registry.packages().into_iter().cloned().collect(),
     )
     .expect("load new reload lua bundle");
     let cleanup = hub
