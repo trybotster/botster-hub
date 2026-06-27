@@ -62,7 +62,7 @@ pub struct HubRuntime {
     session_contexts: SharedSessionContexts,
 }
 
-type SharedCoreDaemon = Arc<Mutex<CoreDaemon>>;
+type SharedCoreDaemon = Mutex<CoreDaemon>;
 type SharedSessionContexts = Arc<Mutex<BTreeMap<String, HubSessionContext>>>;
 const SESSION_TEMPLATE_SPAWN_TIMEOUT_MS: u64 = 30_000;
 
@@ -110,7 +110,7 @@ impl HubRuntime {
         let routed_envelopes = Arc::new(Mutex::new(RoutedEnvelopeRouter::with_config(
             core_config.routed_envelope_queue.clone(),
         )));
-        let core_daemon = Arc::new(Mutex::new(CoreDaemon::new(core_config)));
+        let core_daemon = Mutex::new(CoreDaemon::new(core_config));
         Self {
             capability_runtime: Arc::new(Mutex::new(HubCapabilityRuntime::from_config(&config))),
             session_template_spawner: Arc::new(HubSessionTemplateSpawner::new()),
@@ -141,7 +141,7 @@ impl HubRuntime {
         let routed_envelopes = Arc::new(Mutex::new(RoutedEnvelopeRouter::with_config(
             core_config.routed_envelope_queue.clone(),
         )));
-        let core_daemon = Arc::new(Mutex::new(CoreDaemon::new(core_config)));
+        let core_daemon = Mutex::new(CoreDaemon::new(core_config));
         let mut runtime = Self {
             capability_runtime: Arc::new(Mutex::new(HubCapabilityRuntime::from_config(&config))),
             session_template_spawner: Arc::new(HubSessionTemplateSpawner::new()),
@@ -470,10 +470,10 @@ impl HubRuntime {
     fn fulfill_pending_session_template_spawns(&self) {
         while let Some(pending) = self.session_template_spawner.take_pending() {
             let result = self.fulfill_session_template_spawn(&pending);
-            if pending.response.send(result.clone()).is_err() {
-                if let Ok(spawned) = result {
-                    self.cleanup_undelivered_session_template_spawn(&spawned);
-                }
+            if pending.response.send(result.clone()).is_err()
+                && let Ok(spawned) = result
+            {
+                self.cleanup_undelivered_session_template_spawn(&spawned);
             }
         }
     }
