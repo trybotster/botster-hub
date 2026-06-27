@@ -8,22 +8,23 @@
 use botster_core::{
     BotsterEngineObservation, BotsterEngineOutput, BoundaryJson, ClientId, CoreSession,
     CoreSessionMetadata, EnvelopeId, EnvelopeTarget, ManagedSessionRuntimeError,
-    PluginCapabilityRuntime, PluginCleanupResult, PluginHandlerKind, PluginInvocationOutcome,
-    PluginInvocationRequest, PluginInvocationResult, PluginKey, RequestId, RoutedEnvelope,
-    RoutedEnvelopeDrainOutcome, RoutedEnvelopePublishOutcome, RoutedEnvelopeRouter, SessionId,
-    SessionLifecycleState, SessionRuntimeErrorKind, SessionSpawnRequest, SubscriptionId,
-    UiActionResult, UiNode,
+    PluginCapabilityRuntime, PluginCleanupResult, PluginHandlerKind, PluginInvocationFailure,
+    PluginInvocationFailureKind, PluginInvocationOutcome, PluginInvocationRequest,
+    PluginInvocationResult, PluginKey, RequestId, RoutedEnvelope, RoutedEnvelopeDrainOutcome,
+    RoutedEnvelopePublishOutcome, RoutedEnvelopeRouter, SessionId, SessionLifecycleState,
+    SessionRuntimeErrorKind, SessionSpawnRequest, SubscriptionId, UiActionResult, UiNode,
 };
 use botster_core_daemon::{
     CoreDaemon, CoreDaemonConfig, CoreDaemonError, DaemonSession, DrainResult, GuardedWriteRequest,
     GuardedWriteResult, RegistrySessionState, RoutedEnvelopeDeliveryStateResult,
     SessionAdoptionReport, SessionAdoptionState, SpawnSessionRequest,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::error::Error;
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::capabilities::HubCapabilityRuntime;
 use crate::config::HubConfig;
@@ -34,9 +35,11 @@ use crate::lua_runtime::{
     LuaPluginRuntime, LuaPluginRuntimeError, SharedHubCapabilityRuntime,
     SharedRoutedEnvelopeRuntime,
 };
-use crate::packages::{PackageRegistry, PackageRegistryError};
+use crate::packages::{PackageRecord, PackageRegistry, PackageRegistryError, PackageState};
 use crate::persistence::{FileHubStateStore, HubState, HubStateStore, HubStateStoreError};
-use crate::session_templates::HubSessionContext;
+use crate::session_templates::{
+    HubSessionContext, SessionTemplateRequest, materialize_package_session_template,
+};
 
 /// Hub-owned adapter and policy facade over the default local core engine.
 ///
@@ -47,15 +50,46 @@ use crate::session_templates::HubSessionContext;
 pub struct HubRuntime {
     config: HubConfig,
     state: HubState,
-    core_daemon: CoreDaemon,
+    core_daemon: SharedCoreDaemon,
     reconciliation: HubSessionReconciliation,
     plugin_lifecycle: HubPluginLifecycle,
     capability_runtime: SharedHubCapabilityRuntime,
+    session_template_spawner: SharedSessionTemplateSpawner,
     // HubRuntime owns coordination routing so native MCP tools and Lua plugin
     // helpers share one route table from the plugin invocation path.
     routed_envelopes: SharedRoutedEnvelopeRuntime,
     last_capability_cleanup: Option<PluginCleanupResult>,
-    session_contexts: BTreeMap<String, HubSessionContext>,
+    session_contexts: SharedSessionContexts,
+}
+
+type SharedCoreDaemon = Mutex<CoreDaemon>;
+type SharedSessionContexts = Arc<Mutex<BTreeMap<String, HubSessionContext>>>;
+const SESSION_TEMPLATE_SPAWN_TIMEOUT_MS: u64 = 30_000;
+
+/// Shared hub-owned session-template spawn bridge exposed to Lua plugin workers.
+pub type SharedSessionTemplateSpawner = Arc<HubSessionTemplateSpawner>;
+
+/// Hub-owned policy bridge for plugin-safe session-template spawns.
+pub struct HubSessionTemplateSpawner {
+    pending: Mutex<VecDeque<PendingSessionTemplateSpawn>>,
+}
+
+struct PendingSessionTemplateSpawn {
+    plugin_key: PluginKey,
+    template_id: String,
+    request: SessionTemplateRequest,
+    package_records: Vec<PackageRecord>,
+    response: mpsc::Sender<Result<PluginSessionTemplateSpawned, String>>,
+}
+
+/// Structured Lua-facing session-template spawn response.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct PluginSessionTemplateSpawned {
+    pub session_id: String,
+    pub lifecycle: String,
+    pub template_id: String,
+    pub context_id: String,
+    pub context_keys: Vec<String>,
 }
 
 /// Deterministic session reconciliation summary from hub startup.
@@ -76,9 +110,10 @@ impl HubRuntime {
         let routed_envelopes = Arc::new(Mutex::new(RoutedEnvelopeRouter::with_config(
             core_config.routed_envelope_queue.clone(),
         )));
-        let core_daemon = CoreDaemon::new(core_config);
+        let core_daemon = Mutex::new(CoreDaemon::new(core_config));
         Self {
             capability_runtime: Arc::new(Mutex::new(HubCapabilityRuntime::from_config(&config))),
+            session_template_spawner: Arc::new(HubSessionTemplateSpawner::new()),
             routed_envelopes,
             config,
             state,
@@ -86,7 +121,7 @@ impl HubRuntime {
             reconciliation: HubSessionReconciliation::default(),
             plugin_lifecycle: HubPluginLifecycle::new(),
             last_capability_cleanup: None,
-            session_contexts: BTreeMap::new(),
+            session_contexts: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -106,9 +141,10 @@ impl HubRuntime {
         let routed_envelopes = Arc::new(Mutex::new(RoutedEnvelopeRouter::with_config(
             core_config.routed_envelope_queue.clone(),
         )));
-        let core_daemon = CoreDaemon::new(core_config);
+        let core_daemon = Mutex::new(CoreDaemon::new(core_config));
         let mut runtime = Self {
             capability_runtime: Arc::new(Mutex::new(HubCapabilityRuntime::from_config(&config))),
+            session_template_spawner: Arc::new(HubSessionTemplateSpawner::new()),
             routed_envelopes,
             config,
             state,
@@ -116,7 +152,7 @@ impl HubRuntime {
             reconciliation: HubSessionReconciliation::default(),
             plugin_lifecycle: HubPluginLifecycle::new(),
             last_capability_cleanup: None,
-            session_contexts: BTreeMap::new(),
+            session_contexts: Arc::new(Mutex::new(BTreeMap::new())),
         };
         runtime.reconcile_sessions(0)?;
         Ok(runtime)
@@ -142,6 +178,12 @@ impl HubRuntime {
     #[must_use]
     pub fn routed_envelope_runtime(&self) -> SharedRoutedEnvelopeRuntime {
         self.routed_envelopes.clone()
+    }
+
+    /// Return the shared session-template spawn bridge used by Lua helpers.
+    #[must_use]
+    pub fn session_template_spawner(&self) -> SharedSessionTemplateSpawner {
+        self.session_template_spawner.clone()
     }
 
     /// Return the durable hub state loaded for this runtime.
@@ -185,6 +227,8 @@ impl HubRuntime {
             configuration,
             self.capability_runtime.clone(),
             self.routed_envelopes.clone(),
+            self.session_template_spawner.clone(),
+            registry.packages().into_iter().cloned().collect(),
         )
         .map_err(HubLuaPluginLoadError::Lua)?;
         self.load_plugin_package(registry, package_name, bundle)
@@ -194,7 +238,55 @@ impl HubRuntime {
     /// Invoke a plugin handler through core plugin worker mechanics.
     #[must_use]
     pub fn invoke_plugin(&self, request: PluginInvocationRequest) -> PluginInvocationOutcome {
-        self.plugin_lifecycle.invoke(request)
+        let request_id = request.request_id.clone();
+        let handler = request.handler.clone();
+        let timeout_ms = request.timeout_ms;
+        let lifecycle = self.plugin_lifecycle.clone();
+        let (outcome_sender, outcome_receiver) = mpsc::channel();
+        let spawn_result = std::thread::Builder::new()
+            .name("botster-plugin-invocation".to_string())
+            .spawn(move || {
+                let _ = outcome_sender.send(lifecycle.invoke(request));
+            });
+        let Ok(worker) = spawn_result else {
+            return PluginInvocationOutcome {
+                result: PluginInvocationResult::Failed(PluginInvocationFailure {
+                    request_id,
+                    handler,
+                    kind: PluginInvocationFailureKind::WorkerStopped,
+                    timeout_ms: Some(timeout_ms),
+                    reason: "failed to start plugin invocation".to_string(),
+                }),
+                events: Vec::new(),
+            };
+        };
+        drop(worker);
+
+        loop {
+            match outcome_receiver.recv_timeout(Duration::from_millis(1)) {
+                Ok(outcome) => {
+                    self.fulfill_pending_session_template_spawns();
+                    break outcome;
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    self.fulfill_pending_session_template_spawns();
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    self.fulfill_pending_session_template_spawns();
+                    break PluginInvocationOutcome {
+                        result: PluginInvocationResult::Failed(PluginInvocationFailure {
+                            request_id,
+                            handler,
+                            kind: PluginInvocationFailureKind::WorkerStopped,
+                            timeout_ms: Some(timeout_ms),
+                            reason: "plugin invocation worker stopped before returning a result"
+                                .to_string(),
+                        }),
+                        events: Vec::new(),
+                    };
+                }
+            }
+        }
     }
 
     /// Reload an enabled package through core plugin worker cleanup and replacement.
@@ -349,10 +441,10 @@ impl HubRuntime {
         let handler = descriptor.handler.ok_or_else(|| {
             crate::McpToolError::new("plugin_tool_unavailable", "plugin MCP tool has no handler")
         })?;
-        let outcome = self.invoke_plugin(PluginInvocationRequest {
+        let request = PluginInvocationRequest {
             request_id: RequestId(format!("mcp-tool-{}", call.name)),
             handler,
-            timeout_ms: 1_000,
+            timeout_ms: SESSION_TEMPLATE_SPAWN_TIMEOUT_MS,
             context: botster_core::PluginInvocationContext {
                 client_id: None,
                 session_id: None,
@@ -362,7 +454,8 @@ impl HubRuntime {
                 metadata: None,
             },
             payload: botster_core::BoundaryJson(call.arguments),
-        });
+        };
+        let outcome = self.invoke_plugin(request);
         match outcome.result {
             botster_core::PluginInvocationResult::Completed(success) => {
                 Ok(success.payload.map_or_else(json_null, |payload| payload.0))
@@ -372,6 +465,89 @@ impl HubRuntime {
                 failure.reason,
             )),
         }
+    }
+
+    fn fulfill_pending_session_template_spawns(&self) {
+        while let Some(pending) = self.session_template_spawner.take_pending() {
+            let result = self.fulfill_session_template_spawn(&pending);
+            if pending.response.send(result.clone()).is_err()
+                && let Ok(spawned) = result
+            {
+                self.cleanup_undelivered_session_template_spawn(&spawned);
+            }
+        }
+    }
+
+    fn cleanup_undelivered_session_template_spawn(&self, spawned: &PluginSessionTemplateSpawned) {
+        let session_id = SessionId(spawned.session_id.clone());
+        if let Ok(mut daemon) = self.core_daemon.lock() {
+            let _ = daemon.shutdown(Some(session_id.clone()), current_unix_seconds());
+        }
+        if let Ok(mut contexts) = self.session_contexts.lock() {
+            contexts.remove(&spawned.context_id);
+            contexts.remove(&session_id.0);
+        }
+    }
+
+    fn fulfill_session_template_spawn(
+        &self,
+        pending: &PendingSessionTemplateSpawn,
+    ) -> Result<PluginSessionTemplateSpawned, String> {
+        if !package_allows_session_template_spawn(&pending.package_records, &pending.plugin_key) {
+            return Err("plugin package lacks session_template_spawn capability".to_string());
+        }
+
+        let records = pending.package_records.iter().collect::<Vec<_>>();
+        let materialized = materialize_package_session_template(
+            &self.config,
+            &records,
+            &pending.template_id,
+            pending.request.clone(),
+        )
+        .map_err(|error| format!("{}: {}", error.kind, error.message))?;
+        let context = materialized.context.clone();
+        {
+            let mut contexts = self
+                .session_contexts
+                .lock()
+                .map_err(|_| "session context lock poisoned".to_string())?;
+            contexts.insert(context.context_id.clone(), context.clone());
+            contexts.insert(context.session_id.0.clone(), context.clone());
+        }
+
+        let outcome = self
+            .core_daemon
+            .lock()
+            .map_err(|_| "core daemon lock poisoned".to_string())?
+            .spawn(
+                SpawnSessionRequest {
+                    request: materialized.spawn_request,
+                    metadata: plugin_session_metadata(&pending.plugin_key),
+                },
+                current_unix_seconds(),
+            )
+            .map_err(|error| {
+                match self.session_contexts.lock() {
+                    Ok(mut contexts) => {
+                        contexts.remove(&context.context_id);
+                        contexts.remove(&context.session_id.0);
+                        format!("session template spawn failed: {error}")
+                    }
+                    Err(_) => {
+                        format!(
+                            "session template spawn failed: {error}; session context rollback lock poisoned"
+                        )
+                    }
+                }
+            })?;
+
+        Ok(PluginSessionTemplateSpawned {
+            session_id: outcome.session_id.0,
+            lifecycle: session_lifecycle_label(outcome.lifecycle).to_string(),
+            template_id: materialized.resolved.template.template_id,
+            context_id: materialized.resolved.context_id,
+            context_keys: materialized.resolved.context_keys,
+        })
     }
 
     /// Render a plugin-owned surface route through the plugin worker path.
@@ -402,7 +578,7 @@ impl HubRuntime {
         let outcome = self.invoke_plugin(PluginInvocationRequest {
             request_id,
             handler,
-            timeout_ms: 1_000,
+            timeout_ms: SESSION_TEMPLATE_SPAWN_TIMEOUT_MS,
             context: botster_core::PluginInvocationContext {
                 client_id: None,
                 session_id: None,
@@ -456,7 +632,7 @@ impl HubRuntime {
                 kind: PluginHandlerKind::UiAction,
                 ..handler
             },
-            timeout_ms: 1_000,
+            timeout_ms: SESSION_TEMPLATE_SPAWN_TIMEOUT_MS,
             context: botster_core::PluginInvocationContext {
                 client_id: None,
                 session_id: None,
@@ -498,6 +674,8 @@ impl HubRuntime {
     ) -> Result<Option<DaemonSession>, CoreDaemonError> {
         Ok(self
             .core_daemon
+            .lock()
+            .expect("core daemon mutex")
             .list()?
             .into_iter()
             .find(|session| &session.session_id == session_id))
@@ -505,7 +683,7 @@ impl HubRuntime {
 
     /// Return daemon-recorded sessions for host visibility without exposing core's command router.
     pub fn list_sessions(&self) -> Result<Vec<DaemonSession>, CoreDaemonError> {
-        self.core_daemon.list()
+        self.core_daemon.lock().expect("core daemon mutex").list()
     }
 
     /// Spawn a daemon-owned session through core from a host-owned request.
@@ -516,27 +694,39 @@ impl HubRuntime {
         now_seconds: u64,
     ) -> Result<CoreSession, CoreDaemonError> {
         self.core_daemon
+            .lock()
+            .expect("core daemon mutex")
             .spawn(SpawnSessionRequest { request, metadata }, now_seconds)
     }
 
     /// Store hub-owned context for one spawned template session.
-    pub fn record_session_context(&mut self, context: HubSessionContext) {
-        self.session_contexts
-            .insert(context.context_id.clone(), context.clone());
-        self.session_contexts
-            .insert(context.session_id.0.clone(), context);
+    pub fn record_session_context(&self, context: HubSessionContext) {
+        let mut contexts = self
+            .session_contexts
+            .lock()
+            .expect("session contexts mutex");
+        contexts.insert(context.context_id.clone(), context.clone());
+        contexts.insert(context.session_id.0.clone(), context);
     }
 
     /// Remove hub-owned context for a template session that did not start.
-    pub fn remove_session_context(&mut self, context: &HubSessionContext) {
-        self.session_contexts.remove(&context.context_id);
-        self.session_contexts.remove(&context.session_id.0);
+    pub fn remove_session_context(&self, context: &HubSessionContext) {
+        let mut contexts = self
+            .session_contexts
+            .lock()
+            .expect("session contexts mutex");
+        contexts.remove(&context.context_id);
+        contexts.remove(&context.session_id.0);
     }
 
     /// Read hub-owned context by context id or session id.
     #[must_use]
-    pub fn session_context(&self, id: &str) -> Option<&HubSessionContext> {
-        self.session_contexts.get(id)
+    pub fn session_context(&self, id: &str) -> Option<HubSessionContext> {
+        self.session_contexts
+            .lock()
+            .expect("session contexts mutex")
+            .get(id)
+            .cloned()
     }
 
     /// Attach a client subscription to a session through the core daemon.
@@ -548,6 +738,8 @@ impl HubRuntime {
         now_seconds: u64,
     ) -> Result<(), CoreDaemonError> {
         self.core_daemon
+            .lock()
+            .expect("core daemon mutex")
             .attach(client_id, session_id, subscription_id, now_seconds)
             .map(|_| ())
     }
@@ -560,8 +752,12 @@ impl HubRuntime {
         subscription_id: SubscriptionId,
         now_seconds: u64,
     ) -> Result<(), CoreDaemonError> {
-        self.core_daemon
-            .detach(client_id, session_id, subscription_id, now_seconds)
+        self.core_daemon.lock().expect("core daemon mutex").detach(
+            client_id,
+            session_id,
+            subscription_id,
+            now_seconds,
+        )
     }
 
     /// Write terminal bytes into a session through the core daemon.
@@ -572,8 +768,12 @@ impl HubRuntime {
         data: impl Into<Vec<u8>>,
         now_seconds: u64,
     ) -> Result<(), CoreDaemonError> {
-        self.core_daemon
-            .input(client_id, session_id, data, now_seconds)
+        self.core_daemon.lock().expect("core daemon mutex").input(
+            client_id,
+            session_id,
+            data,
+            now_seconds,
+        )
     }
 
     /// Resize a session terminal through the core daemon.
@@ -585,8 +785,13 @@ impl HubRuntime {
         cols: u16,
         now_seconds: u64,
     ) -> Result<(), CoreDaemonError> {
-        self.core_daemon
-            .resize(client_id, session_id, rows, cols, now_seconds)
+        self.core_daemon.lock().expect("core daemon mutex").resize(
+            client_id,
+            session_id,
+            rows,
+            cols,
+            now_seconds,
+        )
     }
 
     /// Drain available daemon output through core's subscription path.
@@ -595,7 +800,10 @@ impl HubRuntime {
         session_id: &SessionId,
         last_output_at: u64,
     ) -> Result<DrainResult, CoreDaemonError> {
-        self.core_daemon.drain(session_id, last_output_at)
+        self.core_daemon
+            .lock()
+            .expect("core daemon mutex")
+            .drain(session_id, last_output_at)
     }
 
     /// Evaluate guarded-write readiness and inject only through the core daemon.
@@ -603,7 +811,10 @@ impl HubRuntime {
         &mut self,
         request: GuardedWriteRequest,
     ) -> Result<GuardedWriteResult, CoreDaemonError> {
-        self.core_daemon.guarded_write(request)
+        self.core_daemon
+            .lock()
+            .expect("core daemon mutex")
+            .guarded_write(request)
     }
 
     /// Publish one coordination envelope through the hub-owned routed-envelope router.
@@ -649,7 +860,10 @@ impl HubRuntime {
 
     /// Release worker-backed sessions before an intentional daemon restart.
     pub fn release_sessions_for_restart(&mut self) {
-        self.core_daemon.release_for_restart();
+        self.core_daemon
+            .lock()
+            .expect("core daemon mutex")
+            .release_for_restart();
     }
 
     /// Release worker-backed sessions before an intentional hub restart.
@@ -659,7 +873,10 @@ impl HubRuntime {
 
     /// Scan daemon registry records for worker-backed restart/adoption evidence.
     pub fn adoption_scan(&self) -> Result<Vec<SessionAdoptionReport>, CoreDaemonError> {
-        self.core_daemon.adoption_scan()
+        self.core_daemon
+            .lock()
+            .expect("core daemon mutex")
+            .adoption_scan()
     }
 
     /// Reattach one live worker-backed session after daemon restart.
@@ -668,7 +885,10 @@ impl HubRuntime {
         session_id: &SessionId,
         now_seconds: u64,
     ) -> Result<CoreSession, CoreDaemonError> {
-        self.core_daemon.adopt_session(session_id, now_seconds)
+        self.core_daemon
+            .lock()
+            .expect("core daemon mutex")
+            .adopt_session(session_id, now_seconds)
     }
 
     /// Shut down one daemon-owned session through core.
@@ -677,16 +897,26 @@ impl HubRuntime {
         session_id: SessionId,
         now_seconds: u64,
     ) -> Result<(), CoreDaemonError> {
-        self.core_daemon.shutdown(Some(session_id), now_seconds)
+        self.core_daemon
+            .lock()
+            .expect("core daemon mutex")
+            .shutdown(Some(session_id), now_seconds)
     }
 
     fn reconcile_sessions(&mut self, now_seconds: u64) -> Result<(), CoreDaemonError> {
         self.reconciliation = HubSessionReconciliation::default();
-        for report in self.core_daemon.adoption_scan()? {
+        let reports = self
+            .core_daemon
+            .lock()
+            .expect("core daemon mutex")
+            .adoption_scan()?;
+        for report in reports {
             match report.state {
                 SessionAdoptionState::Adoptable => {
                     match self
                         .core_daemon
+                        .lock()
+                        .expect("core daemon mutex")
                         .adopt_session(&report.record.session_id, now_seconds)
                     {
                         Ok(session) => {
@@ -696,6 +926,8 @@ impl HubRuntime {
                         }
                         Err(error) if is_stale_worker_control_socket_adoption_error(&error) => {
                             self.core_daemon
+                                .lock()
+                                .expect("core daemon mutex")
                                 .mark_stale(&report.record.session_id, now_seconds)?;
                             self.reconciliation
                                 .stale_sessions
@@ -709,6 +941,8 @@ impl HubRuntime {
                 | SessionAdoptionState::UnhealthyWorker { .. }
                 | SessionAdoptionState::DuplicateWorker { .. } => {
                     self.core_daemon
+                        .lock()
+                        .expect("core daemon mutex")
                         .mark_stale(&report.record.session_id, now_seconds)?;
                     self.reconciliation
                         .stale_sessions
@@ -717,6 +951,8 @@ impl HubRuntime {
                 SessionAdoptionState::Terminal => {
                     if report.record.state == RegistrySessionState::Running {
                         self.core_daemon
+                            .lock()
+                            .expect("core daemon mutex")
                             .mark_stale(&report.record.session_id, now_seconds)?;
                         self.reconciliation
                             .stale_sessions
@@ -727,6 +963,87 @@ impl HubRuntime {
         }
         Ok(())
     }
+}
+
+impl HubSessionTemplateSpawner {
+    fn new() -> Self {
+        Self {
+            pending: Mutex::new(VecDeque::new()),
+        }
+    }
+
+    /// Queue a session-template spawn for the hub owner and wait for its result.
+    pub fn spawn(
+        &self,
+        plugin_key: &PluginKey,
+        template_id: &str,
+        request: SessionTemplateRequest,
+        package_records: Vec<PackageRecord>,
+    ) -> Result<PluginSessionTemplateSpawned, String> {
+        let (response, receiver) = mpsc::channel();
+        {
+            let mut pending = self
+                .pending
+                .lock()
+                .map_err(|_| "session-template spawn queue lock poisoned".to_string())?;
+            pending.push_back(PendingSessionTemplateSpawn {
+                plugin_key: plugin_key.clone(),
+                template_id: template_id.to_string(),
+                request,
+                package_records,
+                response,
+            });
+        }
+
+        receiver
+            .recv_timeout(Duration::from_millis(SESSION_TEMPLATE_SPAWN_TIMEOUT_MS))
+            .map_err(|_| "session-template spawn did not complete before timeout".to_string())?
+    }
+
+    fn take_pending(&self) -> Option<PendingSessionTemplateSpawn> {
+        self.pending
+            .lock()
+            .expect("session-template spawn queue lock")
+            .pop_front()
+    }
+}
+
+fn package_allows_session_template_spawn(
+    package_records: &[PackageRecord],
+    plugin_key: &PluginKey,
+) -> bool {
+    package_records.iter().any(|record| {
+        record.manifest.name == plugin_key.0
+            && matches!(record.state, PackageState::Enabled)
+            && record.manifest.capabilities.iter().any(|capability| {
+                capability.surface == botster_core::CapabilitySurface::SessionActions
+                    && capability.scope.as_deref() == Some("session_template_spawn")
+            })
+    })
+}
+
+fn plugin_session_metadata(plugin_key: &PluginKey) -> CoreSessionMetadata {
+    CoreSessionMetadata::from_entries(BTreeMap::from([(
+        "client".to_string(),
+        format!("plugin:{}", plugin_key.0),
+    )]))
+}
+
+fn session_lifecycle_label(lifecycle: SessionLifecycleState) -> &'static str {
+    match lifecycle {
+        SessionLifecycleState::Starting => "starting",
+        SessionLifecycleState::Running => "running",
+        SessionLifecycleState::Stopping => "stopping",
+        SessionLifecycleState::Exited { .. } => "exited",
+        SessionLifecycleState::Failed { .. } => "failed",
+    }
+}
+
+fn current_unix_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
 }
 
 fn completed_plugin_payload(

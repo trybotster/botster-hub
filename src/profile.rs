@@ -187,6 +187,10 @@ fn default_capability_grants() -> Vec<Capability> {
             scope: None,
         },
         Capability {
+            surface: CapabilitySurface::SessionActions,
+            scope: Some("session_template_spawn".to_string()),
+        },
+        Capability {
             surface: CapabilitySurface::Mcp,
             scope: None,
         },

@@ -308,6 +308,50 @@ fn session_templates_resolve_spawn_context_and_reject_unadmitted_reads() {
         }
     ));
 
+    let rejected_target = api
+        .handle_request(
+            &mut runtime,
+            &packages,
+            HubClientRequest::ResolveSessionTemplate {
+                request_id: request_id("resolve-rejected-target"),
+                template_id: "init".to_string(),
+                template_request: botster_hub::SessionTemplateRequest {
+                    target_id: Some("package:other-template.plugin".to_string()),
+                    ..botster_hub::SessionTemplateRequest::default()
+                },
+            },
+        )
+        .expect_err("unadmitted target override rejected");
+    assert!(matches!(
+        rejected_target,
+        HubClientError::SessionTemplate {
+            kind: "target_not_admitted",
+            ..
+        }
+    ));
+
+    let rejected_cwd = api
+        .handle_request(
+            &mut runtime,
+            &packages,
+            HubClientRequest::ResolveSessionTemplate {
+                request_id: request_id("resolve-rejected-cwd"),
+                template_id: "init".to_string(),
+                template_request: botster_hub::SessionTemplateRequest {
+                    cwd: Some("/tmp/outside-template-root".to_string()),
+                    ..botster_hub::SessionTemplateRequest::default()
+                },
+            },
+        )
+        .expect_err("unadmitted cwd override rejected");
+    assert!(matches!(
+        rejected_cwd,
+        HubClientError::SessionTemplate {
+            kind: "cwd_not_admitted",
+            ..
+        }
+    ));
+
     let resolved = api
         .handle_request(
             &mut runtime,
