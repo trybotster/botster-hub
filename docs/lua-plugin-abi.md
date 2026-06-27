@@ -72,16 +72,16 @@ The initial capability helper is:
   values. Secret values are absent when unset and redacted when set.
 - `botster.capabilities.session_templates.spawn({ template_id = "...",
   session_id = nil, target_id = nil, cwd = nil, environment = {...},
-  context = {...}, now_seconds = 0 })`: requests a hub-owned session-template
-  spawn for a declared package template. The loaded plugin package must be
-  enabled and declare `{ surface = "session_actions", scope =
-  "session_template_spawn" }`. The hub reuses the same template materialization
-  policy as the daemon path: admitted target id, cwd below the package root,
-  declared environment overrides only, and hub-owned context injection. On
-  success the helper returns `{ session_id, lifecycle, template_id, context_id,
-  context_keys }`. Those fields are produced by the materialized template and
-  core spawn outcome. Policy and runtime failures raise Lua runtime errors
-  rather than returning placeholder diagnostics fields.
+  context = {...} })`: requests a hub-owned session-template spawn for a
+  declared package template. The loaded plugin package must be enabled and
+  declare `{ surface = "session_actions", scope = "session_template_spawn" }`.
+  The hub reuses the same template materialization policy as the daemon path:
+  admitted target id, cwd below the package root, declared environment
+  overrides only, and hub-owned context injection. The hub stamps lifecycle time
+  at fulfillment. On success the helper returns `{ session_id, lifecycle,
+  template_id, context_id, context_keys }`. Those fields are produced by the
+  materialized template and core spawn outcome. Policy and runtime failures
+  raise Lua runtime errors rather than returning placeholder diagnostics fields.
 
 `plugin_db` helpers always use the loaded plugin key as the namespace; Lua code
 cannot select another plugin's namespace. Mutating helpers submit to
@@ -95,7 +95,10 @@ self-mutation.
 
 `session_templates.spawn` accepts template request fields only. It does not
 accept command, args, shell, arbitrary process environment, or raw filesystem
-execution data; direct process spawning remains unsupported from Lua.
+execution data, or caller-supplied lifecycle time; direct process spawning
+remains unsupported from Lua. Hub plugin invocations use a 30s timeout for this
+helper path, and the hub cleans up spawned sessions if the worker result cannot
+be delivered.
 
 ## Coordination Access
 

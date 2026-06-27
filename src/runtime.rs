@@ -8,11 +8,11 @@
 use botster_core::{
     BotsterEngineObservation, BotsterEngineOutput, BoundaryJson, ClientId, CoreSession,
     CoreSessionMetadata, EnvelopeId, EnvelopeTarget, ManagedSessionRuntimeError,
-    PluginCapabilityRuntime, PluginCleanupResult, PluginHandlerKind, PluginInvocationOutcome,
-    PluginInvocationRequest, PluginInvocationResult, PluginKey, RequestId, RoutedEnvelope,
-    RoutedEnvelopeDrainOutcome, RoutedEnvelopePublishOutcome, RoutedEnvelopeRouter, SessionId,
-    SessionLifecycleState, SessionRuntimeErrorKind, SessionSpawnRequest, SubscriptionId,
-    UiActionResult, UiNode,
+    PluginCapabilityRuntime, PluginCleanupResult, PluginHandlerKind, PluginInvocationFailure,
+    PluginInvocationFailureKind, PluginInvocationOutcome, PluginInvocationRequest,
+    PluginInvocationResult, PluginKey, RequestId, RoutedEnvelope, RoutedEnvelopeDrainOutcome,
+    RoutedEnvelopePublishOutcome, RoutedEnvelopeRouter, SessionId, SessionLifecycleState,
+    SessionRuntimeErrorKind, SessionSpawnRequest, SubscriptionId, UiActionResult, UiNode,
 };
 use botster_core_daemon::{
     CoreDaemon, CoreDaemonConfig, CoreDaemonError, DaemonSession, DrainResult, GuardedWriteRequest,
@@ -23,8 +23,8 @@ use std::collections::{BTreeMap, VecDeque};
 use std::error::Error;
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::{Arc, Condvar, Mutex, mpsc};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, mpsc};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::capabilities::HubCapabilityRuntime;
 use crate::config::HubConfig;
@@ -64,6 +64,7 @@ pub struct HubRuntime {
 
 type SharedCoreDaemon = Arc<Mutex<CoreDaemon>>;
 type SharedSessionContexts = Arc<Mutex<BTreeMap<String, HubSessionContext>>>;
+const SESSION_TEMPLATE_SPAWN_TIMEOUT_MS: u64 = 30_000;
 
 /// Shared hub-owned session-template spawn bridge exposed to Lua plugin workers.
 pub type SharedSessionTemplateSpawner = Arc<HubSessionTemplateSpawner>;
@@ -71,14 +72,12 @@ pub type SharedSessionTemplateSpawner = Arc<HubSessionTemplateSpawner>;
 /// Hub-owned policy bridge for plugin-safe session-template spawns.
 pub struct HubSessionTemplateSpawner {
     pending: Mutex<VecDeque<PendingSessionTemplateSpawn>>,
-    ready: Condvar,
 }
 
 struct PendingSessionTemplateSpawn {
     plugin_key: PluginKey,
     template_id: String,
     request: SessionTemplateRequest,
-    now_seconds: u64,
     package_records: Vec<PackageRecord>,
     response: mpsc::Sender<Result<PluginSessionTemplateSpawned, String>>,
 }
@@ -239,7 +238,55 @@ impl HubRuntime {
     /// Invoke a plugin handler through core plugin worker mechanics.
     #[must_use]
     pub fn invoke_plugin(&self, request: PluginInvocationRequest) -> PluginInvocationOutcome {
-        self.plugin_lifecycle.invoke(request)
+        let request_id = request.request_id.clone();
+        let handler = request.handler.clone();
+        let timeout_ms = request.timeout_ms;
+        let lifecycle = self.plugin_lifecycle.clone();
+        let (outcome_sender, outcome_receiver) = mpsc::channel();
+        let spawn_result = std::thread::Builder::new()
+            .name("botster-plugin-invocation".to_string())
+            .spawn(move || {
+                let _ = outcome_sender.send(lifecycle.invoke(request));
+            });
+        let Ok(worker) = spawn_result else {
+            return PluginInvocationOutcome {
+                result: PluginInvocationResult::Failed(PluginInvocationFailure {
+                    request_id,
+                    handler,
+                    kind: PluginInvocationFailureKind::WorkerStopped,
+                    timeout_ms: Some(timeout_ms),
+                    reason: "failed to start plugin invocation".to_string(),
+                }),
+                events: Vec::new(),
+            };
+        };
+        drop(worker);
+
+        loop {
+            match outcome_receiver.recv_timeout(Duration::from_millis(1)) {
+                Ok(outcome) => {
+                    self.fulfill_pending_session_template_spawns();
+                    break outcome;
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    self.fulfill_pending_session_template_spawns();
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    self.fulfill_pending_session_template_spawns();
+                    break PluginInvocationOutcome {
+                        result: PluginInvocationResult::Failed(PluginInvocationFailure {
+                            request_id,
+                            handler,
+                            kind: PluginInvocationFailureKind::WorkerStopped,
+                            timeout_ms: Some(timeout_ms),
+                            reason: "plugin invocation worker stopped before returning a result"
+                                .to_string(),
+                        }),
+                        events: Vec::new(),
+                    };
+                }
+            }
+        }
     }
 
     /// Reload an enabled package through core plugin worker cleanup and replacement.
@@ -397,7 +444,7 @@ impl HubRuntime {
         let request = PluginInvocationRequest {
             request_id: RequestId(format!("mcp-tool-{}", call.name)),
             handler,
-            timeout_ms: 1_000,
+            timeout_ms: SESSION_TEMPLATE_SPAWN_TIMEOUT_MS,
             context: botster_core::PluginInvocationContext {
                 client_id: None,
                 session_id: None,
@@ -408,27 +455,7 @@ impl HubRuntime {
             },
             payload: botster_core::BoundaryJson(call.arguments),
         };
-        let lifecycle = self.plugin_lifecycle.clone();
-        let (outcome_sender, outcome_receiver) = mpsc::channel();
-        std::thread::Builder::new()
-            .name("botster-plugin-mcp-invocation".to_string())
-            .spawn(move || {
-                let _ = outcome_sender.send(lifecycle.invoke(request));
-            })
-            .map_err(|error| {
-                crate::McpToolError::new(
-                    "plugin_tool_failed",
-                    format!("failed to start plugin invocation: {error}"),
-                )
-            })?;
-        let outcome = loop {
-            if let Ok(outcome) = outcome_receiver.try_recv() {
-                break outcome;
-            }
-            self.fulfill_pending_session_template_spawns();
-            std::thread::sleep(Duration::from_millis(1));
-        };
-        self.fulfill_pending_session_template_spawns();
+        let outcome = self.invoke_plugin(request);
         match outcome.result {
             botster_core::PluginInvocationResult::Completed(success) => {
                 Ok(success.payload.map_or_else(json_null, |payload| payload.0))
@@ -443,7 +470,22 @@ impl HubRuntime {
     fn fulfill_pending_session_template_spawns(&self) {
         while let Some(pending) = self.session_template_spawner.take_pending() {
             let result = self.fulfill_session_template_spawn(&pending);
-            let _ = pending.response.send(result);
+            if pending.response.send(result.clone()).is_err() {
+                if let Ok(spawned) = result {
+                    self.cleanup_undelivered_session_template_spawn(&spawned);
+                }
+            }
+        }
+    }
+
+    fn cleanup_undelivered_session_template_spawn(&self, spawned: &PluginSessionTemplateSpawned) {
+        let session_id = SessionId(spawned.session_id.clone());
+        if let Ok(mut daemon) = self.core_daemon.lock() {
+            let _ = daemon.shutdown(Some(session_id.clone()), current_unix_seconds());
+        }
+        if let Ok(mut contexts) = self.session_contexts.lock() {
+            contexts.remove(&spawned.context_id);
+            contexts.remove(&session_id.0);
         }
     }
 
@@ -482,13 +524,21 @@ impl HubRuntime {
                     request: materialized.spawn_request,
                     metadata: plugin_session_metadata(&pending.plugin_key),
                 },
-                pending.now_seconds,
+                current_unix_seconds(),
             )
             .map_err(|error| {
-                let mut contexts = self.session_contexts.lock().expect("session context mutex");
-                contexts.remove(&context.context_id);
-                contexts.remove(&context.session_id.0);
-                format!("session template spawn failed: {error}")
+                match self.session_contexts.lock() {
+                    Ok(mut contexts) => {
+                        contexts.remove(&context.context_id);
+                        contexts.remove(&context.session_id.0);
+                        format!("session template spawn failed: {error}")
+                    }
+                    Err(_) => {
+                        format!(
+                            "session template spawn failed: {error}; session context rollback lock poisoned"
+                        )
+                    }
+                }
             })?;
 
         Ok(PluginSessionTemplateSpawned {
@@ -528,7 +578,7 @@ impl HubRuntime {
         let outcome = self.invoke_plugin(PluginInvocationRequest {
             request_id,
             handler,
-            timeout_ms: 1_000,
+            timeout_ms: SESSION_TEMPLATE_SPAWN_TIMEOUT_MS,
             context: botster_core::PluginInvocationContext {
                 client_id: None,
                 session_id: None,
@@ -582,7 +632,7 @@ impl HubRuntime {
                 kind: PluginHandlerKind::UiAction,
                 ..handler
             },
-            timeout_ms: 1_000,
+            timeout_ms: SESSION_TEMPLATE_SPAWN_TIMEOUT_MS,
             context: botster_core::PluginInvocationContext {
                 client_id: None,
                 session_id: None,
@@ -650,7 +700,7 @@ impl HubRuntime {
     }
 
     /// Store hub-owned context for one spawned template session.
-    pub fn record_session_context(&mut self, context: HubSessionContext) {
+    pub fn record_session_context(&self, context: HubSessionContext) {
         let mut contexts = self
             .session_contexts
             .lock()
@@ -660,7 +710,7 @@ impl HubRuntime {
     }
 
     /// Remove hub-owned context for a template session that did not start.
-    pub fn remove_session_context(&mut self, context: &HubSessionContext) {
+    pub fn remove_session_context(&self, context: &HubSessionContext) {
         let mut contexts = self
             .session_contexts
             .lock()
@@ -919,7 +969,6 @@ impl HubSessionTemplateSpawner {
     fn new() -> Self {
         Self {
             pending: Mutex::new(VecDeque::new()),
-            ready: Condvar::new(),
         }
     }
 
@@ -929,7 +978,6 @@ impl HubSessionTemplateSpawner {
         plugin_key: &PluginKey,
         template_id: &str,
         request: SessionTemplateRequest,
-        now_seconds: u64,
         package_records: Vec<PackageRecord>,
     ) -> Result<PluginSessionTemplateSpawned, String> {
         let (response, receiver) = mpsc::channel();
@@ -942,15 +990,13 @@ impl HubSessionTemplateSpawner {
                 plugin_key: plugin_key.clone(),
                 template_id: template_id.to_string(),
                 request,
-                now_seconds,
                 package_records,
                 response,
             });
-            self.ready.notify_one();
         }
 
         receiver
-            .recv_timeout(Duration::from_secs(30))
+            .recv_timeout(Duration::from_millis(SESSION_TEMPLATE_SPAWN_TIMEOUT_MS))
             .map_err(|_| "session-template spawn did not complete before timeout".to_string())?
     }
 
@@ -991,6 +1037,13 @@ fn session_lifecycle_label(lifecycle: SessionLifecycleState) -> &'static str {
         SessionLifecycleState::Exited { .. } => "exited",
         SessionLifecycleState::Failed { .. } => "failed",
     }
+}
+
+fn current_unix_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
 }
 
 fn completed_plugin_payload(
