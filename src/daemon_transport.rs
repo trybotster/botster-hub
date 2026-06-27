@@ -40,7 +40,9 @@ pub use botster_hub_client::{
     DaemonPackageInstallEffect, DaemonPackageInstallPlan, DaemonPackagePin, DaemonPackageProcess,
     DaemonPackageRunnableEntrypoint, DaemonPackageSurfaceDescriptor, DaemonPackageUpdateStatus,
     DaemonPackageWorkingDirectory, DaemonPluginLifecycle, DaemonRequest, DaemonResolvedAppLaunch,
-    DaemonResponse, DaemonResponseKind, DaemonSession, DaemonSessionCleanup, DaemonStatus,
+    DaemonResolvedSessionTemplate, DaemonResponse, DaemonResponseKind, DaemonSession,
+    DaemonSessionCleanup, DaemonSessionContext, DaemonSessionTemplate,
+    DaemonSessionTemplateContextInput, DaemonSessionTemplateRequest, DaemonStatus,
     FEATURE_PLUGIN_SURFACE_ACTION, FEATURE_PLUGIN_SURFACE_RENDER, PROTOCOL, read_frame,
     read_frame_from_reader, write_frame,
 };
@@ -56,6 +58,7 @@ use crate::{
     HubStateLoadSource, HubStateStore, McpToolDescriptor, PackageAction, PackageAdmissionReason,
     PackageCompatibilityResult, PackageDecision, PackageInstallPlan, PackagePin, PackageRegistry,
     PackageRegistryEntrySourceKind, PackageRegistryError, PackageState, PackageUpdatePolicy,
+    ResolvedSessionTemplate, SessionTemplateContextInput, SessionTemplateRequest,
     resolve_foreground_launch_contract,
 };
 use crate::{EntrypointProcessSnapshot, EntrypointSupervisorError};
@@ -706,6 +709,98 @@ fn handle_runtime_control_request(
             }
             Ok(response)
         }
+        DaemonRequest::ListSessionTemplates => {
+            let response = api.handle_request(
+                runtime,
+                &packages,
+                HubClientRequest::ListSessionTemplates {
+                    request_id: request_id("daemon-session-templates-list"),
+                },
+            )?;
+            let HubClientResponseBody::SessionTemplates(templates) = response.body else {
+                return Err(DaemonTransportError::UnexpectedResponse);
+            };
+            Ok(daemon_session_templates(templates))
+        }
+        DaemonRequest::ShowSessionTemplate { template_id } => {
+            let response = api.handle_request(
+                runtime,
+                &packages,
+                HubClientRequest::ShowSessionTemplate {
+                    request_id: request_id("daemon-session-templates-show"),
+                    template_id,
+                },
+            )?;
+            let HubClientResponseBody::SessionTemplates(templates) = response.body else {
+                return Err(DaemonTransportError::UnexpectedResponse);
+            };
+            Ok(daemon_session_templates(templates))
+        }
+        DaemonRequest::ResolveSessionTemplate {
+            template_id,
+            request,
+        } => {
+            let response = api.handle_request(
+                runtime,
+                &packages,
+                HubClientRequest::ResolveSessionTemplate {
+                    request_id: request_id("daemon-session-templates-resolve"),
+                    template_id,
+                    template_request: session_template_request_from_daemon(None, request),
+                },
+            )?;
+            let HubClientResponseBody::ResolvedSessionTemplate(resolved) = response.body else {
+                return Err(DaemonTransportError::UnexpectedResponse);
+            };
+            Ok(daemon_resolved_session_template(resolved))
+        }
+        DaemonRequest::SpawnSessionTemplate {
+            template_id,
+            session_id,
+            request,
+        } => {
+            let response = api.handle_request(
+                runtime,
+                &packages,
+                HubClientRequest::SpawnSessionTemplate {
+                    request_id: request_id("daemon-session-templates-spawn"),
+                    template_id,
+                    template_request: session_template_request_from_daemon(
+                        Some(SessionId(session_id)),
+                        request,
+                    ),
+                    now_seconds: tick(logical_clock),
+                },
+            )?;
+            let HubClientResponseBody::Spawned(spawned) = response.body else {
+                return Err(DaemonTransportError::UnexpectedResponse);
+            };
+            drain_cursors.insert(spawned.session.session_id.0.clone(), *logical_clock);
+            Ok(daemon_spawned(
+                daemon_session_from_client(spawned.session),
+                events_from_client(spawned.events),
+            ))
+        }
+        DaemonRequest::ReadSessionContext {
+            session_id,
+            context_id,
+            key,
+        } => {
+            let response = api.handle_request(
+                runtime,
+                &packages,
+                HubClientRequest::ReadSessionContext {
+                    request_id: request_id("daemon-session-context-read"),
+                    session_id: SessionId(session_id),
+                    context_id,
+                    key,
+                },
+            )?;
+            let HubClientResponseBody::SessionContext(context) = response.body else {
+                return Err(DaemonTransportError::UnexpectedResponse);
+            };
+            Ok(daemon_session_context(context))
+        }
         DaemonRequest::Whoami { caller_session_id } => Ok(daemon_coordination(
             DaemonResponseKind::Identity,
             daemon_coordination_identity(DaemonIdentity {
@@ -914,6 +1009,9 @@ fn handle_runtime_control_request(
                     .len(),
             )),
             sessions: Vec::new(),
+            session_templates: Vec::new(),
+            resolved_session_template: None,
+            session_context: None,
             apps: Vec::new(),
             resolved_app_launch: None,
             packages: Vec::new(),
@@ -1677,6 +1775,9 @@ fn daemon_response_base(kind: DaemonResponseKind) -> DaemonResponse {
         kind,
         status: None,
         sessions: Vec::new(),
+        session_templates: Vec::new(),
+        resolved_session_template: None,
+        session_context: None,
         apps: Vec::new(),
         resolved_app_launch: None,
         packages: Vec::new(),
@@ -1733,6 +1834,85 @@ fn daemon_packages(packages: Vec<HubClientPackage>) -> DaemonResponse {
         .map(daemon_package_from_client)
         .collect();
     response
+}
+
+fn daemon_session_templates(templates: Vec<crate::HubSessionTemplate>) -> DaemonResponse {
+    let mut response = daemon_response_base(DaemonResponseKind::SessionTemplates);
+    response.session_templates = templates
+        .into_iter()
+        .map(daemon_session_template_from_client)
+        .collect();
+    response
+}
+
+fn daemon_resolved_session_template(resolved: ResolvedSessionTemplate) -> DaemonResponse {
+    let mut response = daemon_response_base(DaemonResponseKind::ResolvedSessionTemplate);
+    response.resolved_session_template = Some(DaemonResolvedSessionTemplate {
+        template: daemon_session_template_from_client(resolved.template),
+        session_id: resolved.session_id.0,
+        executable: resolved.executable,
+        arguments: resolved.arguments,
+        working_directory: resolved.working_directory,
+        environment: resolved.environment,
+        context_id: resolved.context_id,
+        context_keys: resolved.context_keys,
+    });
+    response
+}
+
+fn daemon_session_context(context: crate::HubSessionContext) -> DaemonResponse {
+    let mut response = daemon_response_base(DaemonResponseKind::SessionContext);
+    response.session_context = Some(DaemonSessionContext {
+        context_id: context.context_id,
+        session_id: context.session_id.0,
+        values: context.values,
+    });
+    response
+}
+
+fn daemon_session_template_from_client(
+    template: crate::HubSessionTemplate,
+) -> DaemonSessionTemplate {
+    DaemonSessionTemplate {
+        template_id: template.template_id,
+        package_name: template.package_name,
+        id: template.id,
+        source: template.source,
+        command: template.command,
+        args: template.args,
+        working_directory_policy: template.working_directory_policy,
+        allowed_environment_overrides: template.allowed_environment_overrides,
+        context_keys: template.context_keys,
+        target_id: template.target_id,
+        available: template.available,
+    }
+}
+
+fn session_template_request_from_daemon(
+    session_id: Option<SessionId>,
+    request: DaemonSessionTemplateRequest,
+) -> SessionTemplateRequest {
+    SessionTemplateRequest {
+        target_id: request.target_id,
+        session_id,
+        cwd: request.cwd,
+        environment: request.environment,
+        context: session_template_context_from_daemon(request.context),
+    }
+}
+
+fn session_template_context_from_daemon(
+    context: DaemonSessionTemplateContextInput,
+) -> SessionTemplateContextInput {
+    SessionTemplateContextInput {
+        worktree_path: context.worktree_path,
+        repo_path: context.repo_path,
+        branch_name: context.branch_name,
+        prompt: context.prompt,
+        ticket_id: context.ticket_id,
+        workspace_id: context.workspace_id,
+        metadata: context.metadata,
+    }
 }
 
 fn daemon_apps(apps: Vec<DaemonApp>) -> DaemonResponse {
@@ -3051,6 +3231,18 @@ fn daemon_operator_error_from_client(error: crate::HubClientError) -> DaemonOper
             message: format!("{package_name} is not allowed to run {operation:?}"),
             diagnostics: Vec::new(),
         },
+        crate::HubClientError::SessionTemplate {
+            request_id,
+            operation,
+            kind,
+            message,
+        } => DaemonOperatorError {
+            code: kind.to_string(),
+            request_id: request_id.0,
+            operation: operation_label(operation).to_string(),
+            message,
+            diagnostics: Vec::new(),
+        },
         crate::HubClientError::Plugin {
             request_id,
             operation,
@@ -3314,6 +3506,11 @@ fn operation_label(operation: crate::HubClientOperation) -> &'static str {
         crate::HubClientOperation::ReadScreen => "read_screen",
         crate::HubClientOperation::CaptureSnapshot => "capture_snapshot",
         crate::HubClientOperation::ListPackages => "list_packages",
+        crate::HubClientOperation::ListSessionTemplates => "list_session_templates",
+        crate::HubClientOperation::ShowSessionTemplate => "show_session_template",
+        crate::HubClientOperation::ResolveSessionTemplate => "resolve_session_template",
+        crate::HubClientOperation::SpawnSessionTemplate => "spawn_session_template",
+        crate::HubClientOperation::ReadSessionContext => "read_session_context",
         crate::HubClientOperation::PluginLifecycleStatus => "plugin_lifecycle_status",
         crate::HubClientOperation::PluginSurfaceRender => "plugin_surface_render",
         crate::HubClientOperation::PluginSurfaceAction => "plugin_surface_action",

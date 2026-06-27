@@ -42,6 +42,7 @@ pub mod packages;
 pub mod persistence;
 pub mod profile;
 pub mod runtime;
+pub mod session_templates;
 
 use botster_core::CapabilitySurface;
 pub use botster_core::{
@@ -85,9 +86,11 @@ pub use daemon_transport::{
     DaemonPackageEnvironmentRequirement, DaemonPackageFeatureAvailability,
     DaemonPackageInstallEffect, DaemonPackageInstallPlan, DaemonPackagePin, DaemonPackageProcess,
     DaemonPackageRunnableEntrypoint, DaemonPackageWorkingDirectory, DaemonPluginLifecycle,
-    DaemonRequest, DaemonResolvedAppLaunch, DaemonResponse, DaemonResponseKind, DaemonSession,
-    DaemonSessionCleanup, DaemonStatus, DaemonTransportError, DaemonTransportResult,
-    request as daemon_transport_request, serve_daemon, stream_attach,
+    DaemonRequest, DaemonResolvedAppLaunch, DaemonResolvedSessionTemplate, DaemonResponse,
+    DaemonResponseKind, DaemonSession, DaemonSessionCleanup, DaemonSessionContext,
+    DaemonSessionTemplate, DaemonSessionTemplateContextInput, DaemonSessionTemplateRequest,
+    DaemonStatus, DaemonTransportError, DaemonTransportResult, request as daemon_transport_request,
+    serve_daemon, stream_attach,
 };
 pub use entrypoint_supervisor::{
     EntrypointDiagnostic, EntrypointProcessSnapshot, EntrypointSupervisor,
@@ -129,6 +132,11 @@ pub use profile::{
 pub use runtime::{
     HubLuaPluginLoadError, HubRuntime, HubRuntimeError, HubRuntimeObservation, HubRuntimeOutput,
     daemon_session_to_core_session,
+};
+pub use session_templates::{
+    HubSessionContext, HubSessionTemplate, MaterializedSessionTemplate, PackageSessionTemplate,
+    PackageSessionTemplateWorkingDirectory, ResolvedSessionTemplate, SessionTemplateContextInput,
+    SessionTemplateError, SessionTemplateRequest,
 };
 
 /// Compile-checked description of the profile plus the audited `HubRuntime` facade.

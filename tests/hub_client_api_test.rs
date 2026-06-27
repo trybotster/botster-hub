@@ -1,6 +1,7 @@
 #![cfg(unix)]
 
 use std::collections::BTreeMap;
+use std::os::unix::fs::PermissionsExt;
 use std::time::{Duration, Instant};
 use std::{fs, thread};
 
@@ -66,6 +67,53 @@ fn subscription_id() -> SubscriptionId {
 
 fn empty_registry() -> PackageRegistry {
     PackageRegistry::new(Vec::<Capability>::new().into_iter().collect())
+}
+
+fn write_session_template_package(root: &std::path::Path) {
+    write_named_session_template_package(root, "session-template.plugin");
+}
+
+fn write_named_session_template_package(root: &std::path::Path, package_name: &str) {
+    fs::create_dir_all(root.join("bin")).expect("create session template package root");
+    fs::write(root.join("plugin.lua"), "return botster.register({})\n")
+        .expect("write plugin entrypoint");
+    let script = root.join("bin/init.sh");
+    fs::write(
+        &script,
+        "#!/bin/sh\nprintf 'template:%s:%s\\n' \"$BOTSTER_SESSION_ID\" \"$BOTSTER_MODE\"\n",
+    )
+    .expect("write session template script");
+    let mut permissions = fs::metadata(&script)
+        .expect("script metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&script, permissions).expect("chmod session template script");
+    fs::write(
+        root.join("botster-package.json"),
+        r#"{
+  "name": "__PACKAGE_NAME__",
+  "version": "1.0.0",
+  "kind": "plugin",
+  "botster": ">=0.1.0",
+  "source": { "type": "path", "path": "." },
+  "capabilities": [],
+  "entrypoints": [
+    { "runtime": "lua", "path": "plugin.lua", "bootstrap": false }
+  ],
+  "session_templates": [
+    {
+      "id": "init",
+      "command": "bin/init.sh",
+      "environment": { "BOTSTER_MODE": "default" },
+      "allowed_environment_overrides": ["BOTSTER_MODE"],
+      "context": ["prompt"]
+    }
+  ]
+}
+"#
+        .replace("__PACKAGE_NAME__", package_name),
+    )
+    .expect("write session template package manifest");
 }
 
 fn capability(surface: CapabilitySurface, scope: Option<&str>) -> Capability {
@@ -201,6 +249,231 @@ fn capability_gated_plugin_manifest() -> botster_core::PackageManifest {
         }],
     }];
     manifest
+}
+
+#[test]
+fn session_templates_resolve_spawn_context_and_reject_unadmitted_reads() {
+    let package_root = std::path::PathBuf::from(
+        "target/botster-hub-test-data/client-api-session-template-package",
+    );
+    let _ = fs::remove_dir_all(&package_root);
+    write_session_template_package(&package_root);
+    let mut packages = PackageRegistry::new(Vec::<Capability>::new().into_iter().collect());
+    packages
+        .install_local_path(&package_root, "install session template package")
+        .expect("install session template package");
+    packages
+        .enable("session-template.plugin", "enable session template package")
+        .expect("enable session template package");
+    let mut runtime = explicit_runtime("session-template");
+    let api = HubClientApi::local_operator("session-template-client");
+
+    let list = api
+        .handle_request(
+            &mut runtime,
+            &packages,
+            HubClientRequest::ListSessionTemplates {
+                request_id: request_id("list-session-templates"),
+            },
+        )
+        .expect("list templates");
+    let HubClientResponseBody::SessionTemplates(templates) = list.body else {
+        panic!("session templates response expected");
+    };
+    assert_eq!(templates.len(), 1);
+    assert_eq!(templates[0].id, "init");
+
+    let rejected_env = api
+        .handle_request(
+            &mut runtime,
+            &packages,
+            HubClientRequest::ResolveSessionTemplate {
+                request_id: request_id("resolve-rejected-env"),
+                template_id: "init".to_string(),
+                template_request: botster_hub::SessionTemplateRequest {
+                    environment: BTreeMap::from([(
+                        "BOTSTER_UNDECLARED".to_string(),
+                        "no".to_string(),
+                    )]),
+                    ..botster_hub::SessionTemplateRequest::default()
+                },
+            },
+        )
+        .expect_err("undeclared env override rejected");
+    assert!(matches!(
+        rejected_env,
+        HubClientError::SessionTemplate {
+            kind: "environment_not_admitted",
+            ..
+        }
+    ));
+
+    let resolved = api
+        .handle_request(
+            &mut runtime,
+            &packages,
+            HubClientRequest::ResolveSessionTemplate {
+                request_id: request_id("resolve-generic-template-id"),
+                template_id: "init".to_string(),
+                template_request: botster_hub::SessionTemplateRequest {
+                    environment: BTreeMap::from([(
+                        "BOTSTER_MODE".to_string(),
+                        "override".to_string(),
+                    )]),
+                    context: botster_hub::SessionTemplateContextInput {
+                        prompt: Some("hello from api".to_string()),
+                        ..botster_hub::SessionTemplateContextInput::default()
+                    },
+                    ..botster_hub::SessionTemplateRequest::default()
+                },
+            },
+        )
+        .expect("resolve bare generic template id");
+    let HubClientResponseBody::ResolvedSessionTemplate(resolved) = resolved.body else {
+        panic!("resolved template response expected");
+    };
+    assert_eq!(resolved.template.id, "init");
+    assert_eq!(
+        resolved.environment.get("BOTSTER_MODE").map(String::as_str),
+        Some("override")
+    );
+    assert!(resolved.environment.contains_key("BOTSTER_CONTEXT_ID"));
+
+    let spawn = api
+        .handle_request(
+            &mut runtime,
+            &packages,
+            HubClientRequest::SpawnSessionTemplate {
+                request_id: request_id("spawn-session-template"),
+                template_id: "init".to_string(),
+                template_request: botster_hub::SessionTemplateRequest {
+                    session_id: Some(SessionId("session-template-api-session".to_string())),
+                    context: botster_hub::SessionTemplateContextInput {
+                        prompt: Some("hello from spawn".to_string()),
+                        ..botster_hub::SessionTemplateContextInput::default()
+                    },
+                    ..botster_hub::SessionTemplateRequest::default()
+                },
+                now_seconds: 1,
+            },
+        )
+        .expect("spawn session template");
+    let HubClientResponseBody::Spawned(spawned) = spawn.body else {
+        panic!("spawned response expected");
+    };
+    assert_eq!(spawned.session.session_id.0, "session-template-api-session");
+
+    let context = api
+        .handle_request(
+            &mut runtime,
+            &packages,
+            HubClientRequest::ReadSessionContext {
+                request_id: request_id("read-session-context"),
+                session_id: SessionId("session-template-api-session".to_string()),
+                context_id: None,
+                key: Some("prompt".to_string()),
+            },
+        )
+        .expect("read session context");
+    let HubClientResponseBody::SessionContext(context) = context.body else {
+        panic!("context response expected");
+    };
+    assert_eq!(
+        context.values.get("prompt").map(String::as_str),
+        Some("hello from spawn")
+    );
+
+    let unadmitted = HubClientApi::new(
+        HubClientIdentity {
+            client_id: botster_core::ClientId("unadmitted".to_string()),
+            role: HubClientRole::Unadmitted,
+        },
+        HubClientAdmission::deny_all(),
+    );
+    let denied = unadmitted
+        .handle_request(
+            &mut runtime,
+            &packages,
+            HubClientRequest::ReadSessionContext {
+                request_id: request_id("unadmitted-context-read"),
+                session_id: SessionId("session-template-api-session".to_string()),
+                context_id: None,
+                key: None,
+            },
+        )
+        .expect_err("unadmitted context reads are denied");
+    assert!(matches!(denied, HubClientError::AdmissionDenied { .. }));
+}
+
+#[test]
+fn session_template_show_rejects_ambiguous_bare_ids() {
+    let first_root = std::path::PathBuf::from(
+        "target/botster-hub-test-data/client-api-session-template-first-package",
+    );
+    let second_root = std::path::PathBuf::from(
+        "target/botster-hub-test-data/client-api-session-template-second-package",
+    );
+    let _ = fs::remove_dir_all(&first_root);
+    let _ = fs::remove_dir_all(&second_root);
+    write_named_session_template_package(&first_root, "first-template.plugin");
+    write_named_session_template_package(&second_root, "second-template.plugin");
+
+    let mut packages = PackageRegistry::new(Vec::<Capability>::new().into_iter().collect());
+    packages
+        .install_local_path(&first_root, "install first session template package")
+        .expect("install first session template package");
+    packages
+        .enable(
+            "first-template.plugin",
+            "enable first session template package",
+        )
+        .expect("enable first session template package");
+    packages
+        .install_local_path(&second_root, "install second session template package")
+        .expect("install second session template package");
+    packages
+        .enable(
+            "second-template.plugin",
+            "enable second session template package",
+        )
+        .expect("enable second session template package");
+
+    let mut runtime = explicit_runtime("session-template-show-ambiguous");
+    let api = HubClientApi::local_operator("session-template-show-ambiguous-client");
+
+    let rejected = api
+        .handle_request(
+            &mut runtime,
+            &packages,
+            HubClientRequest::ShowSessionTemplate {
+                request_id: request_id("show-ambiguous-template"),
+                template_id: "init".to_string(),
+            },
+        )
+        .expect_err("ambiguous bare template id should be rejected");
+    assert!(matches!(
+        rejected,
+        HubClientError::SessionTemplate {
+            kind: "ambiguous_template",
+            ..
+        }
+    ));
+
+    let shown = api
+        .handle_request(
+            &mut runtime,
+            &packages,
+            HubClientRequest::ShowSessionTemplate {
+                request_id: request_id("show-full-template-id"),
+                template_id: "first-template.plugin/init".to_string(),
+            },
+        )
+        .expect("full template id remains unambiguous");
+    let HubClientResponseBody::SessionTemplates(templates) = shown.body else {
+        panic!("session templates response expected");
+    };
+    assert_eq!(templates.len(), 1);
+    assert_eq!(templates[0].template_id, "first-template.plugin/init");
 }
 
 #[test]
