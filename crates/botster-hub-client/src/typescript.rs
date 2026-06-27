@@ -113,6 +113,31 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             ),
             ("shutdown_session", &[("session_id", "string")]),
             ("drain", &[("session_id", "string")]),
+            ("list_session_templates", &[]),
+            ("show_session_template", &[("template_id", "string")]),
+            (
+                "resolve_session_template",
+                &[
+                    ("template_id", "string"),
+                    ("request", "DaemonSessionTemplateRequest"),
+                ],
+            ),
+            (
+                "spawn_session_template",
+                &[
+                    ("template_id", "string"),
+                    ("session_id", "string"),
+                    ("request", "DaemonSessionTemplateRequest"),
+                ],
+            ),
+            (
+                "read_session_context",
+                &[
+                    ("session_id", "string"),
+                    ("context_id?", "string | null"),
+                    ("key?", "string | null"),
+                ],
+            ),
             ("list_apps", &[]),
             (
                 "resolve_app_launch",
@@ -208,6 +233,12 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             ("kind", "DaemonResponseKind"),
             ("status", "DaemonStatus | null"),
             ("sessions", "DaemonSession[]"),
+            ("session_templates?", "DaemonSessionTemplate[]"),
+            (
+                "resolved_session_template?",
+                "DaemonResolvedSessionTemplate | null",
+            ),
+            ("session_context?", "DaemonSessionContext | null"),
             ("apps?", "DaemonApp[]"),
             ("resolved_app_launch?", "DaemonResolvedAppLaunch | null"),
             ("packages", "DaemonPackage[]"),
@@ -235,6 +266,9 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             "sessions",
             "spawned",
             "events",
+            "session_templates",
+            "resolved_session_template",
+            "session_context",
             "apps",
             "resolved_app_launch",
             "packages",
@@ -326,6 +360,69 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             ("decision", "string"),
             ("state_count", "number"),
             ("states", "string[]"),
+        ],
+    );
+    emit_interface(
+        &mut output,
+        "DaemonSessionTemplateRequest",
+        &[
+            ("target_id?", "string | null"),
+            ("cwd?", "string | null"),
+            ("environment?", "Record<string, string>"),
+            ("context", "DaemonSessionTemplateContextInput"),
+        ],
+    );
+    emit_interface(
+        &mut output,
+        "DaemonSessionTemplateContextInput",
+        &[
+            ("worktree_path?", "string | null"),
+            ("repo_path?", "string | null"),
+            ("branch_name?", "string | null"),
+            ("prompt?", "string | null"),
+            ("ticket_id?", "string | null"),
+            ("workspace_id?", "string | null"),
+            ("metadata?", "Record<string, string>"),
+        ],
+    );
+    emit_interface(
+        &mut output,
+        "DaemonSessionTemplate",
+        &[
+            ("template_id", "string"),
+            ("package_name", "string"),
+            ("id", "string"),
+            ("source", "string"),
+            ("command", "string"),
+            ("args?", "string[]"),
+            ("working_directory_policy", "string"),
+            ("allowed_environment_overrides?", "string[]"),
+            ("context_keys?", "string[]"),
+            ("target_id", "string"),
+            ("available", "boolean"),
+        ],
+    );
+    emit_interface(
+        &mut output,
+        "DaemonResolvedSessionTemplate",
+        &[
+            ("template", "DaemonSessionTemplate"),
+            ("session_id", "string"),
+            ("executable", "string"),
+            ("arguments?", "string[]"),
+            ("working_directory", "string"),
+            ("environment?", "Record<string, string>"),
+            ("context_id", "string"),
+            ("context_keys?", "string[]"),
+        ],
+    );
+    emit_interface(
+        &mut output,
+        "DaemonSessionContext",
+        &[
+            ("context_id", "string"),
+            ("session_id", "string"),
+            ("values", "Record<string, string>"),
         ],
     );
     emit_interface(

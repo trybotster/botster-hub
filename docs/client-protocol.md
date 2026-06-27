@@ -270,6 +270,38 @@ Core `entrypoints` remain the plugin/provider code-load ABI, while
 `runnable_entrypoints` is the package discovery shape for clients and future
 launchers.
 
+## Session Templates And Context
+
+`session_templates` is a hub-owned package manifest extension for PTY session
+launch templates. Packages may contribute declarations, but the running hub
+validates and materializes them into the generic core spawn contract before
+calling core. Core receives only command, args, cwd, environment, metadata, and
+PTY size.
+
+Session templates are not `runnable_entrypoints`. Runnable entrypoints describe
+installed app/process launch contracts; session templates describe PTY sessions
+with trusted hub context. The protocol exposes `ListSessionTemplates`,
+`ShowSessionTemplate`, `ResolveSessionTemplate`, `SpawnSessionTemplate`, and
+`ReadSessionContext`.
+
+Resolution precedence is package defaults, then explicit spawn request values
+that are admitted by template and target policy. Explicit environment overrides
+must appear in `allowed_environment_overrides`. Explicit cwd overrides must stay
+inside the hub-admitted target root. Unauthorized target, cwd, path, template, or
+environment requests return operator errors before core spawn.
+
+Spawned scripts receive `BOTSTER_SESSION_ID`, `BOTSTER_CONTEXT_ID`,
+`BOTSTER_HUB_DATA_DIR`, `BOTSTER_HUB_SOCKET`, and `BOTSTER_HUB_BIN`. Scripts can
+call `botster-hub context` through `BOTSTER_HUB_BIN` to read selected values such
+as `prompt`, `repo_path`, `worktree_path`, `branch_name`, `ticket_id`,
+`workspace_id`, and safe metadata. Context reads reuse the existing admitted
+local daemon API boundary; an unadmitted local caller cannot read context by
+guessing a session or context id.
+
+List/show/resolve responses are sanitized and do not include prompt values or
+raw context payloads. `ReadSessionContext` is explicit user-path output for the
+spawned session or an admitted local operator.
+
 ## Package Availability
 
 `DaemonPackage` rows include resolved availability so clients do not infer

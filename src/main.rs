@@ -56,6 +56,20 @@ fn main() {
             }
             return;
         }
+        Some("session-templates") => {
+            if let Err(error) = operator_session_templates(env::args().skip(2).collect()) {
+                eprintln!("botster-hub session-templates error: {error}");
+                process::exit(1);
+            }
+            return;
+        }
+        Some("context") => {
+            if let Err(error) = operator_context(env::args().skip(2).collect()) {
+                eprintln!("botster-hub context error: {error}");
+                process::exit(1);
+            }
+            return;
+        }
         Some("shutdown") => {
             if let Err(error) = operator_shutdown(env::args().skip(2).collect()) {
                 eprintln!("botster-hub shutdown error: {error}");
@@ -807,6 +821,204 @@ fn operator_sessions(args: Vec<String>) -> Result<(), OperatorError> {
     Ok(())
 }
 
+fn operator_session_templates(args: Vec<String>) -> Result<(), OperatorError> {
+    let Some(action) = args.first().map(String::as_str) else {
+        return Err(OperatorError::Usage("session-templates"));
+    };
+    match action {
+        "list" => {
+            let options = DataDirOptions::parse(args[1..].to_vec(), "session-templates list")?;
+            let config = explicit_config(options.data_directory)?;
+            let response = daemon_transport_request(&config, DaemonRequest::ListSessionTemplates)?;
+            print_daemon_response(response)?;
+        }
+        "show" => {
+            if args.len() != 4 {
+                return Err(OperatorError::Usage("session-templates show"));
+            }
+            let options = DataDirOptions::parse(args[1..3].to_vec(), "session-templates show")?;
+            let config = explicit_config(options.data_directory)?;
+            let response = daemon_transport_request(
+                &config,
+                DaemonRequest::ShowSessionTemplate {
+                    template_id: args[3].clone(),
+                },
+            )?;
+            print_daemon_response(response)?;
+        }
+        "resolve" => {
+            if args.len() < 4 {
+                return Err(OperatorError::Usage("session-templates resolve"));
+            }
+            let options = DataDirOptions::parse(args[1..3].to_vec(), "session-templates resolve")?;
+            let config = explicit_config(options.data_directory)?;
+            let request = parse_session_template_request(&args[4..])?;
+            let response = daemon_transport_request(
+                &config,
+                DaemonRequest::ResolveSessionTemplate {
+                    template_id: args[3].clone(),
+                    request,
+                },
+            )?;
+            print_daemon_response(response)?;
+        }
+        "spawn" => {
+            if args.len() < 6 || args.get(4).map(String::as_str) != Some("--session-id") {
+                return Err(OperatorError::Usage("session-templates spawn"));
+            }
+            let options = DataDirOptions::parse(args[1..3].to_vec(), "session-templates spawn")?;
+            let config = explicit_config(options.data_directory)?;
+            let request = parse_session_template_request(&args[6..])?;
+            let response = daemon_transport_request(
+                &config,
+                DaemonRequest::SpawnSessionTemplate {
+                    template_id: args[3].clone(),
+                    session_id: args[5].clone(),
+                    request,
+                },
+            )?;
+            print_daemon_response(response)?;
+        }
+        _ => return Err(OperatorError::Usage("session-templates")),
+    }
+    Ok(())
+}
+
+fn operator_context(args: Vec<String>) -> Result<(), OperatorError> {
+    let data_dir = env::var("BOTSTER_HUB_DATA_DIR").ok().map(PathBuf::from);
+    let session_id = env::var("BOTSTER_SESSION_ID").ok();
+    let context_id = env::var("BOTSTER_CONTEXT_ID").ok();
+    let mut data_directory = data_dir;
+    let mut requested_session_id = session_id;
+    let mut requested_context_id = context_id;
+    let mut key = None;
+    let mut cursor = 0;
+    while cursor < args.len() {
+        match args[cursor].as_str() {
+            "--data-dir" => {
+                let Some(value) = args.get(cursor + 1) else {
+                    return Err(OperatorError::Usage("context"));
+                };
+                data_directory = Some(PathBuf::from(value));
+                cursor += 2;
+            }
+            "--session-id" => {
+                let Some(value) = args.get(cursor + 1) else {
+                    return Err(OperatorError::Usage("context"));
+                };
+                requested_session_id = Some(value.clone());
+                cursor += 2;
+            }
+            "--context-id" => {
+                let Some(value) = args.get(cursor + 1) else {
+                    return Err(OperatorError::Usage("context"));
+                };
+                requested_context_id = Some(value.clone());
+                cursor += 2;
+            }
+            "--key" => {
+                let Some(value) = args.get(cursor + 1) else {
+                    return Err(OperatorError::Usage("context"));
+                };
+                key = Some(value.clone());
+                cursor += 2;
+            }
+            _ => return Err(OperatorError::Usage("context")),
+        }
+    }
+    let Some(data_directory) = data_directory else {
+        return Err(OperatorError::Usage("context"));
+    };
+    let Some(session_id) = requested_session_id else {
+        return Err(OperatorError::Usage("context"));
+    };
+    let config = explicit_config(data_directory)?;
+    let response = daemon_transport_request(
+        &config,
+        DaemonRequest::ReadSessionContext {
+            session_id,
+            context_id: requested_context_id,
+            key,
+        },
+    )?;
+    if let Some(context) = response.session_context {
+        println!(
+            "{}",
+            serde_json::to_string(&context.values).map_err(OperatorError::Serialize)?
+        );
+        Ok(())
+    } else {
+        Err(OperatorError::UnexpectedResponse("context"))
+    }
+}
+
+fn parse_session_template_request(
+    args: &[String],
+) -> Result<botster_hub::DaemonSessionTemplateRequest, OperatorError> {
+    let mut request = botster_hub::DaemonSessionTemplateRequest::default();
+    let mut cursor = 0;
+    while cursor < args.len() {
+        match args[cursor].as_str() {
+            "--target-id" => {
+                let Some(value) = args.get(cursor + 1) else {
+                    return Err(OperatorError::Usage("session-templates"));
+                };
+                request.target_id = Some(value.clone());
+                cursor += 2;
+            }
+            "--cwd" => {
+                let Some(value) = args.get(cursor + 1) else {
+                    return Err(OperatorError::Usage("session-templates"));
+                };
+                request.cwd = Some(value.clone());
+                cursor += 2;
+            }
+            "--env" => {
+                let Some(value) = args.get(cursor + 1) else {
+                    return Err(OperatorError::Usage("session-templates"));
+                };
+                let Some((name, value)) = value.split_once('=') else {
+                    return Err(OperatorError::Usage("session-templates"));
+                };
+                request
+                    .environment
+                    .insert(name.to_string(), value.to_string());
+                cursor += 2;
+            }
+            "--prompt" => {
+                let Some(value) = args.get(cursor + 1) else {
+                    return Err(OperatorError::Usage("session-templates"));
+                };
+                request.context.prompt = Some(value.clone());
+                cursor += 2;
+            }
+            "--branch" => {
+                let Some(value) = args.get(cursor + 1) else {
+                    return Err(OperatorError::Usage("session-templates"));
+                };
+                request.context.branch_name = Some(value.clone());
+                cursor += 2;
+            }
+            "--ticket-id" => {
+                let Some(value) = args.get(cursor + 1) else {
+                    return Err(OperatorError::Usage("session-templates"));
+                };
+                request.context.ticket_id = Some(value.clone());
+                cursor += 2;
+            }
+            "--workspace-id" => {
+                let Some(value) = args.get(cursor + 1) else {
+                    return Err(OperatorError::Usage("session-templates"));
+                };
+                request.context.workspace_id = Some(value.clone());
+                cursor += 2;
+            }
+            _ => return Err(OperatorError::Usage("session-templates")),
+        }
+    }
+    Ok(request)
+}
+
 fn operator_shutdown(args: Vec<String>) -> Result<(), OperatorError> {
     let options = DataDirOptions::parse(args, "shutdown")?;
     let config = explicit_config(options.data_directory)?;
@@ -1352,6 +1564,37 @@ fn print_daemon_response(response: DaemonResponse) -> Result<(), OperatorError> 
         DaemonResponseKind::Events => {
             println!("response=events");
             print_daemon_events(&response.events);
+        }
+        DaemonResponseKind::SessionTemplates => {
+            println!("response=session_templates");
+            println!("template_count={}", response.session_templates.len());
+            for template in response.session_templates {
+                println!(
+                    "template id={} package={} available={} target={}",
+                    template.id, template.package_name, template.available, template.target_id
+                );
+            }
+        }
+        DaemonResponseKind::ResolvedSessionTemplate => {
+            println!("response=resolved_session_template");
+            if let Some(resolved) = response.resolved_session_template {
+                println!("template_id={}", resolved.template.template_id);
+                println!("session_id={}", resolved.session_id);
+                println!("command_present={}", !resolved.executable.is_empty());
+                println!("args={}", resolved.arguments.len());
+                println!("environment={}", resolved.environment.len());
+                println!("context_id={}", resolved.context_id);
+                println!("context_keys={}", resolved.context_keys.len());
+            }
+        }
+        DaemonResponseKind::SessionContext => {
+            println!("response=session_context");
+            if let Some(context) = response.session_context {
+                println!(
+                    "{}",
+                    serde_json::to_string(&context.values).map_err(OperatorError::Serialize)?
+                );
+            }
         }
         DaemonResponseKind::Apps => {
             print_apps(&response.apps);
@@ -2805,6 +3048,7 @@ enum OperatorError {
     State(botster_hub::HubStateStoreError),
     App(String),
     SpawnApp(io::Error),
+    Serialize(serde_json::Error),
 }
 
 #[derive(Debug)]
@@ -2990,6 +3234,7 @@ impl fmt::Display for OperatorError {
             Self::State(error) => write!(formatter, "{error}"),
             Self::App(message) => write!(formatter, "{message}"),
             Self::SpawnApp(error) => write!(formatter, "spawn app command: {error}"),
+            Self::Serialize(error) => write!(formatter, "serialize response: {error}"),
         }
     }
 }
@@ -3003,6 +3248,20 @@ fn usage_for(command: &str) -> &'static str {
         "status" => "usage: botster-hub status --data-dir <path>",
         "sessions" => {
             "usage: botster-hub sessions <list|spawn|attach|send-input|resize|detach|shutdown> ..."
+        }
+        "session-templates" => "usage: botster-hub session-templates <list|show|resolve|spawn> ...",
+        "session-templates list" => "usage: botster-hub session-templates list --data-dir <path>",
+        "session-templates show" => {
+            "usage: botster-hub session-templates show --data-dir <path> <template-id>"
+        }
+        "session-templates resolve" => {
+            "usage: botster-hub session-templates resolve --data-dir <path> <template-id> [--target-id <id>] [--cwd <path>] [--env NAME=value] [--prompt <text>] [--branch <name>] [--ticket-id <id>] [--workspace-id <id>]"
+        }
+        "session-templates spawn" => {
+            "usage: botster-hub session-templates spawn --data-dir <path> <template-id> --session-id <id> [--target-id <id>] [--cwd <path>] [--env NAME=value] [--prompt <text>] [--branch <name>] [--ticket-id <id>] [--workspace-id <id>]"
+        }
+        "context" => {
+            "usage: botster-hub context [--data-dir <path>] [--session-id <id>] [--context-id <id>] [--key <name>]"
         }
         "sessions list" => "usage: botster-hub sessions list --data-dir <path>",
         "sessions spawn" => {
