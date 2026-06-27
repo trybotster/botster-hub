@@ -527,6 +527,12 @@ impl HubRuntime {
             .insert(context.session_id.0.clone(), context);
     }
 
+    /// Remove hub-owned context for a template session that did not start.
+    pub fn remove_session_context(&mut self, context: &HubSessionContext) {
+        self.session_contexts.remove(&context.context_id);
+        self.session_contexts.remove(&context.session_id.0);
+    }
+
     /// Read hub-owned context by context id or session id.
     #[must_use]
     pub fn session_context(&self, id: &str) -> Option<&HubSessionContext> {
