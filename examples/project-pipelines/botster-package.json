@@ -6,7 +6,8 @@
   "source": { "type": "path", "path": "." },
   "capabilities": [
     { "surface": "mcp" },
-    { "surface": "plugin_db", "scope": "project-pipelines" }
+    { "surface": "plugin_db", "scope": "project-pipelines" },
+    { "surface": "session_actions", "scope": "session_template_spawn" }
   ],
   "entrypoints": [
     { "runtime": "lua", "path": "plugin.lua", "bootstrap": false }

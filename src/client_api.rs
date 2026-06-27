@@ -383,7 +383,7 @@ impl HubClientApi {
                 ..
             } => {
                 let lookup = context_id.as_deref().unwrap_or(session_id.0.as_str());
-                let context = runtime.session_context(lookup).cloned().ok_or_else(|| {
+                let context = runtime.session_context(lookup).ok_or_else(|| {
                     HubClientError::SessionTemplate {
                         request_id: request_id.clone(),
                         operation,
