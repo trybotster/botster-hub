@@ -3,6 +3,7 @@
 //! This module intentionally exposes a narrow ABI: plugin registration,
 //! handler invocation by stable id, and selected hub capability helpers.
 
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 use std::path::Path;
@@ -27,7 +28,9 @@ use serde_json::json;
 
 use crate::capabilities::HubCapabilityRuntime;
 use crate::lifecycle::HubPluginRuntimeBundle;
-use crate::packages::{PackageConfigurationView, PreparedLocalPackage};
+use crate::packages::{PackageConfigurationView, PackageRecord, PreparedLocalPackage};
+use crate::runtime::SharedSessionTemplateSpawner;
+use crate::session_templates::{SessionTemplateContextInput, SessionTemplateRequest};
 
 const DEFAULT_INSTRUCTION_BUDGET: u64 = 500_000;
 const PLUGIN_DB_TIMEOUT_MS: u64 = 1_000;
@@ -52,6 +55,8 @@ impl LuaPluginRuntime {
         configuration: PackageConfigurationView,
         capabilities: SharedHubCapabilityRuntime,
         routed_envelopes: SharedRoutedEnvelopeRuntime,
+        session_templates: SharedSessionTemplateSpawner,
+        package_records: Vec<PackageRecord>,
     ) -> Result<HubPluginRuntimeBundle, LuaPluginRuntimeError> {
         let plugin_key = PluginKey(prepared.package_name.clone());
         let selected_entrypoint_path =
@@ -64,6 +69,8 @@ impl LuaPluginRuntime {
             configuration,
             capabilities,
             routed_envelopes,
+            session_templates,
+            package_records,
         )?;
         Ok(HubPluginRuntimeBundle {
             runtime: Arc::new(loaded.runtime),
@@ -84,6 +91,8 @@ impl LuaPluginRuntime {
         configuration: PackageConfigurationView,
         capabilities: SharedHubCapabilityRuntime,
         routed_envelopes: SharedRoutedEnvelopeRuntime,
+        session_templates: SharedSessionTemplateSpawner,
+        package_records: Vec<PackageRecord>,
     ) -> Result<(Self, LuaRegistration), LuaPluginRuntimeError> {
         let lua = Lua::new_with(
             StdLib::TABLE | StdLib::STRING | StdLib::MATH | StdLib::UTF8,
@@ -109,6 +118,8 @@ impl LuaPluginRuntime {
             configuration,
             capabilities,
             routed_envelopes,
+            session_templates,
+            package_records,
         )?;
         let source = std::fs::read_to_string(entrypoint).map_err(|error| {
             LuaPluginRuntimeError::Load(format!("failed to read Lua entrypoint: {error}"))
@@ -244,6 +255,8 @@ impl LoadedLuaPlugin {
         configuration: PackageConfigurationView,
         capabilities: SharedHubCapabilityRuntime,
         routed_envelopes: SharedRoutedEnvelopeRuntime,
+        session_templates: SharedSessionTemplateSpawner,
+        package_records: Vec<PackageRecord>,
     ) -> Result<Self, LuaPluginRuntimeError> {
         let (runtime, registration) = LuaPluginRuntime::new(
             plugin_key.clone(),
@@ -251,6 +264,8 @@ impl LoadedLuaPlugin {
             configuration,
             capabilities,
             routed_envelopes,
+            session_templates,
+            package_records,
         )?;
         let mut handlers = Vec::new();
         let mut descriptors = Vec::new();
@@ -376,6 +391,8 @@ fn install_botster_api(
     configuration: PackageConfigurationView,
     capabilities: SharedHubCapabilityRuntime,
     routed_envelopes: SharedRoutedEnvelopeRuntime,
+    session_templates: SharedSessionTemplateSpawner,
+    package_records: Vec<PackageRecord>,
 ) -> Result<(), LuaPluginRuntimeError> {
     let globals = lua.globals();
     globals.set("__botster_handlers", lua.create_table()?)?;
@@ -440,6 +457,10 @@ fn install_botster_api(
         "plugin_db",
         plugin_db_table(lua, plugin_key.clone(), capabilities.clone())?,
     )?;
+    capabilities_table.set(
+        "session_templates",
+        session_templates_table(lua, plugin_key.clone(), session_templates, package_records)?,
+    )?;
     capabilities_table.set("config", config_table(lua, configuration)?)?;
     botster.set("capabilities", capabilities_table)?;
     botster.set(
@@ -470,6 +491,116 @@ fn config_table(lua: &Lua, configuration: PackageConfigurationView) -> Result<Ta
         })?,
     )?;
     Ok(config)
+}
+
+fn session_templates_table(
+    lua: &Lua,
+    plugin_key: PluginKey,
+    session_templates: SharedSessionTemplateSpawner,
+    package_records: Vec<PackageRecord>,
+) -> Result<Table, mlua::Error> {
+    let table = lua.create_table()?;
+    table.set(
+        "spawn",
+        lua.create_function(move |lua, args: Value| {
+            let value = lua.from_value::<serde_json::Value>(args)?;
+            let template_id = value
+                .get("template_id")
+                .or_else(|| value.get("id"))
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    mlua::Error::RuntimeError(
+                        "session_templates.spawn requires template_id".to_string(),
+                    )
+                })?;
+            let now_seconds = value
+                .get("now_seconds")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            let request = session_template_request_from_lua(&value)?;
+            let result = session_templates
+                .spawn(
+                    &plugin_key,
+                    template_id,
+                    request,
+                    now_seconds,
+                    package_records.clone(),
+                )
+                .map_err(|error| {
+                    mlua::Error::RuntimeError(format!("session_templates.spawn failed: {error}"))
+                })?;
+            lua.to_value(&result)
+        })?,
+    )?;
+    Ok(table)
+}
+
+fn session_template_request_from_lua(
+    value: &serde_json::Value,
+) -> Result<SessionTemplateRequest, mlua::Error> {
+    Ok(SessionTemplateRequest {
+        target_id: optional_string(value, "target_id"),
+        session_id: optional_string(value, "session_id").map(botster_core::SessionId),
+        cwd: optional_string(value, "cwd"),
+        environment: string_map(value.get("environment"), "environment")?,
+        context: session_template_context_from_lua(value.get("context"))?,
+    })
+}
+
+fn session_template_context_from_lua(
+    value: Option<&serde_json::Value>,
+) -> Result<SessionTemplateContextInput, mlua::Error> {
+    let Some(value) = value else {
+        return Ok(SessionTemplateContextInput::default());
+    };
+    if !value.is_object() {
+        return Err(mlua::Error::RuntimeError(
+            "session_templates.spawn context must be an object".to_string(),
+        ));
+    }
+    Ok(SessionTemplateContextInput {
+        worktree_path: optional_string(value, "worktree_path"),
+        repo_path: optional_string(value, "repo_path"),
+        branch_name: optional_string(value, "branch_name"),
+        prompt: optional_string(value, "prompt"),
+        ticket_id: optional_string(value, "ticket_id"),
+        workspace_id: optional_string(value, "workspace_id"),
+        metadata: string_map(value.get("metadata"), "context.metadata")?,
+    })
+}
+
+fn optional_string(value: &serde_json::Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(ToString::to_string)
+}
+
+fn string_map(
+    value: Option<&serde_json::Value>,
+    label: &str,
+) -> Result<BTreeMap<String, String>, mlua::Error> {
+    let Some(value) = value else {
+        return Ok(BTreeMap::new());
+    };
+    let Some(object) = value.as_object() else {
+        return Err(mlua::Error::RuntimeError(format!(
+            "session_templates.spawn {label} must be an object"
+        )));
+    };
+    object
+        .iter()
+        .map(|(key, value)| {
+            value
+                .as_str()
+                .map(|value| (key.clone(), value.to_string()))
+                .ok_or_else(|| {
+                    mlua::Error::RuntimeError(format!(
+                        "session_templates.spawn {label}.{key} must be a string"
+                    ))
+                })
+        })
+        .collect()
 }
 
 fn plugin_db_table(

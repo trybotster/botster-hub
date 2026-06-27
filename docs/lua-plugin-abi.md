@@ -70,6 +70,18 @@ The initial capability helper is:
   missing_required = {...}, diagnostics = {...} }`. Values use the package
   daemon DTO shape, including manifest defaults and operator-set non-secret
   values. Secret values are absent when unset and redacted when set.
+- `botster.capabilities.session_templates.spawn({ template_id = "...",
+  session_id = nil, target_id = nil, cwd = nil, environment = {...},
+  context = {...}, now_seconds = 0 })`: requests a hub-owned session-template
+  spawn for a declared package template. The loaded plugin package must be
+  enabled and declare `{ surface = "session_actions", scope =
+  "session_template_spawn" }`. The hub reuses the same template materialization
+  policy as the daemon path: admitted target id, cwd below the package root,
+  declared environment overrides only, and hub-owned context injection. On
+  success the helper returns `{ session_id, lifecycle, template_id, context_id,
+  context_keys }`. Those fields are produced by the materialized template and
+  core spawn outcome. Policy and runtime failures raise Lua runtime errors
+  rather than returning placeholder diagnostics fields.
 
 `plugin_db` helpers always use the loaded plugin key as the namespace; Lua code
 cannot select another plugin's namespace. Mutating helpers submit to
@@ -80,6 +92,10 @@ handler can read its just-committed state deterministically.
 package name and cannot read another package's configuration. Package
 configuration writes remain hub CLI/API responsibilities, not Lua plugin
 self-mutation.
+
+`session_templates.spawn` accepts template request fields only. It does not
+accept command, args, shell, arbitrary process environment, or raw filesystem
+execution data; direct process spawning remains unsupported from Lua.
 
 ## Coordination Access
 
