@@ -14,11 +14,12 @@ use botster_core::{
 };
 use botster_core_daemon::{GuardedWriteDecision, GuardedWriteDeliveryState, ReadinessEvidence};
 use botster_hub::{
-    DataDirectoryOption, HostIdentityOptions, HubClientAdmission, HubClientApi, HubClientError,
+    AdmittedSessionTemplateTarget, DataDirectoryOption, DeviceSessionTemplateSource,
+    FileHubStateStore, HostIdentityOptions, HubClientAdmission, HubClientApi, HubClientError,
     HubClientEvent, HubClientIdentity, HubClientOperation, HubClientPackageClassification,
     HubClientPackageState, HubClientRequest, HubClientResponseBody, HubClientRole, HubRuntime,
-    HubStartupOptions, PackageProvenance, PackageRegistry, RuntimeEnvironment, SessionDefaults,
-    TransportBindings,
+    HubStartupOptions, HubStateStore, PackageProvenance, PackageRegistry, PackageSessionTemplate,
+    PackageSessionTemplateWorkingDirectory, RuntimeEnvironment, SessionDefaults, TransportBindings,
 };
 
 mod support;
@@ -71,6 +72,28 @@ fn empty_registry() -> PackageRegistry {
 
 fn write_session_template_package(root: &std::path::Path) {
     write_named_session_template_package(root, "session-template.plugin");
+}
+
+fn write_executable_script(root: &std::path::Path, relative: &str, contents: &str) {
+    let path = root.join(relative);
+    fs::create_dir_all(path.parent().expect("script has parent")).expect("create script parent");
+    fs::write(&path, contents).expect("write script");
+    let mut permissions = fs::metadata(&path).expect("script metadata").permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&path, permissions).expect("chmod script");
+}
+
+fn session_template(command: &str, mode: &str) -> PackageSessionTemplate {
+    PackageSessionTemplate {
+        id: "init".to_string(),
+        command: command.to_string(),
+        args: Vec::new(),
+        working_directory: PackageSessionTemplateWorkingDirectory::PackageRoot,
+        environment: BTreeMap::from([("BOTSTER_MODE".to_string(), mode.to_string())]),
+        allowed_environment_overrides: vec!["BOTSTER_MODE".to_string()],
+        context: vec!["prompt".to_string()],
+        target_id: None,
+    }
 }
 
 fn write_named_session_template_package(root: &std::path::Path, package_name: &str) {
@@ -518,6 +541,145 @@ fn session_template_show_rejects_ambiguous_bare_ids() {
     };
     assert_eq!(templates.len(), 1);
     assert_eq!(templates[0].template_id, "first-template.plugin/init");
+}
+
+#[test]
+fn session_template_sources_apply_device_repo_precedence_and_reload_from_state() {
+    let package_root = std::path::PathBuf::from(
+        "target/botster-hub-test-data/client-api-session-template-precedence-package",
+    );
+    let device_root = std::path::PathBuf::from(
+        "target/botster-hub-test-data/client-api-session-template-precedence-device",
+    );
+    let repo_root = std::path::PathBuf::from(
+        "target/botster-hub-test-data/client-api-session-template-precedence-repo",
+    );
+    let _ = fs::remove_dir_all(&package_root);
+    let _ = fs::remove_dir_all(&device_root);
+    let _ = fs::remove_dir_all(&repo_root);
+    write_session_template_package(&package_root);
+    write_executable_script(
+        &device_root,
+        "bin/device.sh",
+        "#!/bin/sh\nprintf 'device:%s\\n' \"$BOTSTER_MODE\"\n",
+    );
+    write_executable_script(
+        &repo_root,
+        "bin/repo.sh",
+        "#!/bin/sh\nprintf 'repo:%s\\n' \"$BOTSTER_MODE\"\n",
+    );
+    fs::create_dir_all(repo_root.join(".botster")).expect("create repo .botster dir");
+    fs::write(
+        repo_root.join(".botster/session-templates.json"),
+        serde_json::json!({
+            "session_templates": [{
+                "id": "init",
+                "command": "bin/repo.sh",
+                "environment": { "BOTSTER_MODE": "repo" },
+                "allowed_environment_overrides": ["BOTSTER_MODE"],
+                "context": ["prompt"]
+            }]
+        })
+        .to_string(),
+    )
+    .expect("write repo session templates");
+
+    let mut packages = PackageRegistry::new(Vec::<Capability>::new().into_iter().collect());
+    packages
+        .install_local_path(&package_root, "install precedence package")
+        .expect("install package");
+    packages
+        .enable("session-template.plugin", "enable precedence package")
+        .expect("enable package");
+
+    let config = explicit_runtime("session-template-precedence")
+        .config()
+        .clone();
+    let store = FileHubStateStore::for_data_directory(&config.data_directory);
+    store
+        .update(&config, |state| {
+            state.device_session_template_sources = vec![DeviceSessionTemplateSource {
+                root: device_root.clone(),
+                session_templates: vec![session_template("bin/device.sh", "device")],
+            }];
+            state.admitted_session_template_targets = vec![AdmittedSessionTemplateTarget {
+                target_id: "repo:main".to_string(),
+                root: repo_root.clone(),
+                enabled: true,
+            }];
+        })
+        .expect("persist session template sources");
+
+    let mut runtime = HubRuntime::load_from_store(config, &store).expect("reload runtime state");
+    let api = HubClientApi::local_operator("session-template-precedence-client");
+
+    let list = api
+        .handle_request(
+            &mut runtime,
+            &packages,
+            HubClientRequest::ListSessionTemplates {
+                request_id: request_id("list-merged-session-templates"),
+            },
+        )
+        .expect("list merged templates");
+    let HubClientResponseBody::SessionTemplates(templates) = list.body else {
+        panic!("session templates response expected");
+    };
+    assert_eq!(templates.len(), 1);
+    assert_eq!(templates[0].source, "repo");
+    assert_eq!(templates[0].target_id, "repo:main");
+
+    let resolved = api
+        .handle_request(
+            &mut runtime,
+            &packages,
+            HubClientRequest::ResolveSessionTemplate {
+                request_id: request_id("resolve-repo-template"),
+                template_id: "init".to_string(),
+                template_request: botster_hub::SessionTemplateRequest {
+                    environment: BTreeMap::from([(
+                        "BOTSTER_MODE".to_string(),
+                        "explicit".to_string(),
+                    )]),
+                    ..botster_hub::SessionTemplateRequest::default()
+                },
+            },
+        )
+        .expect("resolve repo override");
+    let HubClientResponseBody::ResolvedSessionTemplate(resolved) = resolved.body else {
+        panic!("resolved session template expected");
+    };
+    assert_eq!(resolved.template.source, "repo");
+    assert_eq!(
+        resolved.executable,
+        repo_root.join("bin/repo.sh").display().to_string()
+    );
+    assert_eq!(
+        resolved.environment.get("BOTSTER_MODE").map(String::as_str),
+        Some("explicit")
+    );
+
+    let rejected = api
+        .handle_request(
+            &mut runtime,
+            &packages,
+            HubClientRequest::ResolveSessionTemplate {
+                request_id: request_id("resolve-repo-rejected-cwd"),
+                template_id: "init".to_string(),
+                template_request: botster_hub::SessionTemplateRequest {
+                    cwd: Some(device_root.display().to_string()),
+                    ..botster_hub::SessionTemplateRequest::default()
+                },
+            },
+        )
+        .expect_err("repo cwd outside target rejected");
+    assert!(matches!(
+        rejected,
+        HubClientError::SessionTemplate {
+            kind: "cwd_not_admitted",
+            ..
+        }
+    ));
 }
 
 #[test]

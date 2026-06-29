@@ -20,10 +20,10 @@ use botster_core::{
 };
 use botster_core_daemon::{RegistryRecord, SessionRegistry};
 use botster_hub::{
-    DataDirectoryOption, FileHubStateStore, HostIdentityOptions, HubClientApi, HubClientEvent,
-    HubClientRequest, HubClientResponseBody, HubDaemon, HubDaemonState, HubStartupOptions,
-    HubStateLoadSource, HubStateStore, PackageAdmissionPolicy, PackageProvenance, PackageRegistry,
-    RuntimeEnvironment, SessionDefaults, TransportBindings,
+    AdmittedSessionTemplateTarget, DataDirectoryOption, FileHubStateStore, HostIdentityOptions,
+    HubClientApi, HubClientEvent, HubClientRequest, HubClientResponseBody, HubDaemon,
+    HubDaemonState, HubStartupOptions, HubStateLoadSource, HubStateStore, PackageAdmissionPolicy,
+    PackageProvenance, PackageRegistry, RuntimeEnvironment, SessionDefaults, TransportBindings,
 };
 
 mod support;
@@ -4682,6 +4682,114 @@ fn daemon_spawns_session_template_and_script_reads_botster_context() {
         "template script should read botster context through CLI, context_output={output:?}, context_error={:?}",
         fs::read_to_string(package_root.join("context-error.txt")).unwrap_or_default()
     );
+
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
+fn daemon_spawns_repo_local_session_template_after_state_reload() {
+    let _guard = daemon_test_lock()
+        .lock()
+        .expect("serialize real daemon test");
+    let data_dir = unique_short_test_dir("repo-session-template");
+    let package_root = unique_test_dir("repo-session-template-package");
+    let repo_root = std::env::current_dir()
+        .expect("current dir")
+        .join(unique_test_dir("repo-session-template-repo"));
+    write_session_template_context_package(&package_root);
+    fs::create_dir_all(repo_root.join(".botster")).expect("create repo .botster dir");
+    fs::create_dir_all(repo_root.join("bin")).expect("create repo bin dir");
+    let script = repo_root.join("bin/repo-template.sh");
+    fs::write(
+        &script,
+        "#!/bin/sh\nprintf 'repo:%s\\n' \"$BOTSTER_MODE\" > repo-template-output.txt\nsleep 1\n",
+    )
+    .expect("write repo template script");
+    let mut permissions = fs::metadata(&script)
+        .expect("script metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&script, permissions).expect("chmod repo script");
+    fs::write(
+        repo_root.join(".botster/session-templates.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "session_templates": [{
+                "id": "init",
+                "command": "bin/repo-template.sh",
+                "environment": { "BOTSTER_MODE": "repo" },
+                "allowed_environment_overrides": ["BOTSTER_MODE"]
+            }]
+        }))
+        .expect("serialize repo templates"),
+    )
+    .expect("write repo templates");
+
+    let config = explicit_config(&data_dir);
+    let store = FileHubStateStore::for_data_directory(&config.data_directory);
+    store
+        .update(&config, |state| {
+            state.admitted_session_template_targets = vec![AdmittedSessionTemplateTarget {
+                target_id: "repo:dogfood".to_string(),
+                root: repo_root.clone(),
+                enabled: true,
+            }];
+        })
+        .expect("persist admitted repo target before daemon start");
+    let child = start_cli_daemon(&data_dir);
+
+    let enable = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::EnablePackageLocalPath {
+            path: package_root.clone(),
+        },
+    )
+    .expect("enable package session template baseline");
+    assert_eq!(
+        enable.kind,
+        botster_hub::DaemonResponseKind::PackageDecision
+    );
+
+    let templates = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::ListSessionTemplates,
+    )
+    .expect("list session templates");
+    assert_eq!(templates.session_templates.len(), 1);
+    assert_eq!(templates.session_templates[0].source, "repo");
+    assert_eq!(templates.session_templates[0].target_id, "repo:dogfood");
+
+    let spawn = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::SpawnSessionTemplate {
+            template_id: "init".to_string(),
+            session_id: "repo-session-template".to_string(),
+            request: botster_hub::DaemonSessionTemplateRequest {
+                environment: BTreeMap::from([("BOTSTER_MODE".to_string(), "explicit".to_string())]),
+                ..botster_hub::DaemonSessionTemplateRequest::default()
+            },
+        },
+    )
+    .expect("spawn repo session template");
+    assert_eq!(
+        spawn.kind,
+        botster_hub::DaemonResponseKind::Spawned,
+        "spawn response error={:?}",
+        spawn.error
+    );
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let output_path = repo_root.join("repo-template-output.txt");
+    let mut output = String::new();
+    while std::time::Instant::now() < deadline {
+        if let Ok(contents) = fs::read_to_string(&output_path) {
+            output = contents;
+            if output.contains("repo:explicit") {
+                break;
+            }
+        }
+        thread::sleep(Duration::from_millis(30));
+    }
+    assert_eq!(output.trim(), "repo:explicit");
 
     shutdown_cli_daemon(&data_dir, child);
 }
