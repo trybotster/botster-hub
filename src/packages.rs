@@ -302,6 +302,120 @@ impl PackageRegistry {
         )
     }
 
+    /// Re-read an installed local package from its persisted path-backed source.
+    pub fn reload_local_package(
+        &mut self,
+        package_name: &str,
+        audit_reason: impl Into<String>,
+    ) -> PackageRegistryResult<PackageDecision> {
+        let audit_reason = audit_reason.into();
+        let current = self
+            .record(package_name, PackageAction::Reload, audit_reason.clone())?
+            .clone();
+        let was_enabled = current.is_enabled();
+        let package_root = package_root(&current).map_err(|message| {
+            PackageRegistryError::with_record(
+                package_name,
+                PackageAction::Reload,
+                PackageAdmissionReason::UnsafeLocalPath(message),
+                current.state,
+                current.classification,
+                audit_reason.clone(),
+            )
+        })?;
+        let local_source = LocalPackageSource::resolve(&package_root, audit_reason.clone())?;
+        let local_manifest = local_source.read_manifest(audit_reason.clone())?;
+        let mut manifest = local_manifest.manifest;
+        if manifest.name != package_name {
+            return Err(PackageRegistryError::with_record(
+                package_name,
+                PackageAction::Reload,
+                PackageAdmissionReason::InvalidLocalManifest(format!(
+                    "reloaded package name {} does not match installed package {package_name}",
+                    manifest.name
+                )),
+                current.state,
+                current.classification,
+                audit_reason,
+            ));
+        }
+        local_source.validate_manifest_entrypoints(&manifest, audit_reason.clone())?;
+        validate_runnable_entrypoints(
+            &manifest.name,
+            &local_manifest.runnable_entrypoints,
+            PackageAction::Reload,
+            audit_reason.clone(),
+        )?;
+        validate_session_templates(&local_manifest.session_templates).map_err(|reason| {
+            PackageRegistryError::with_record(
+                package_name,
+                PackageAction::Reload,
+                PackageAdmissionReason::UnsafeSessionTemplate(reason),
+                current.state,
+                current.classification,
+                audit_reason.clone(),
+            )
+        })?;
+        manifest.source = Some(PackageSource::Path {
+            path: local_source.package_root.to_string_lossy().into_owned(),
+        });
+
+        let compatibility = PackageCompatibility::for_manifest(&manifest);
+        if !compatibility.is_compatible() {
+            return Err(PackageRegistryError::with_record(
+                package_name,
+                PackageAction::Reload,
+                PackageAdmissionReason::BotsterCompatibility(compatibility.diagnostics.clone()),
+                current.state,
+                current.classification,
+                audit_reason,
+            ));
+        }
+
+        let classification = PackageClassification::from_kind(&manifest.kind);
+        let mut candidate = self.clone();
+        candidate.records.insert(
+            package_name.to_string(),
+            PackageRecord {
+                manifest,
+                state: current.state,
+                classification,
+                trust: current.trust,
+                provenance: current.provenance,
+                source_metadata: current.source_metadata,
+                pin: current.pin,
+                update_policy: current.update_policy,
+                admitted_capabilities: Vec::new(),
+                compatibility,
+                runnable_entrypoints: local_manifest.runnable_entrypoints,
+                session_templates: local_manifest.session_templates,
+                configuration: current.configuration,
+                installed_at: current.installed_at,
+                updated_at: current.updated_at,
+                last_audit_reason: audit_reason.clone(),
+                admitted_host_profile: None,
+            },
+        );
+        if was_enabled {
+            candidate.enable(package_name, audit_reason.clone())?;
+        }
+
+        let refreshed = candidate
+            .records
+            .get(package_name)
+            .expect("candidate reload record should exist");
+        let decision = PackageDecision {
+            package_name: package_name.to_string(),
+            action: PackageAction::Reload,
+            state: refreshed.state,
+            classification: refreshed.classification,
+            admitted_host_profile: refreshed.admitted_host_profile.clone(),
+            audit_reason,
+        };
+        self.records = candidate.records;
+        Ok(decision)
+    }
+
     /// List packages from a hub-owned local/static marketplace registry.
     pub fn available_packages(
         &self,
@@ -1509,6 +1623,7 @@ pub enum PackageAction {
     Install,
     Show,
     Configure,
+    Reload,
     Enable,
     Disable,
     Remove,

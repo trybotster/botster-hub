@@ -235,6 +235,33 @@ impl HubRuntime {
             .map_err(HubLuaPluginLoadError::Lifecycle)
     }
 
+    /// Re-read and replace an enabled local Lua package through the real Lua runtime.
+    pub fn reload_lua_plugin_package(
+        &mut self,
+        request_id: RequestId,
+        registry: &PackageRegistry,
+        package_name: &str,
+    ) -> Result<PluginCleanupResult, HubLuaPluginLoadError> {
+        let prepared = registry
+            .prepare_local_package(package_name, "reload local lua plugin package")
+            .map_err(HubLuaPluginLoadError::Package)?;
+        let configuration = registry
+            .package(package_name)
+            .map(|record| record.configuration_view())
+            .expect("prepared local package must have a registry record");
+        let bundle = LuaPluginRuntime::load_prepared(
+            &prepared,
+            configuration,
+            self.capability_runtime.clone(),
+            self.routed_envelopes.clone(),
+            self.session_template_spawner.clone(),
+            registry.packages().into_iter().cloned().collect(),
+        )
+        .map_err(HubLuaPluginLoadError::Lua)?;
+        self.reload_plugin_package(request_id, registry, package_name, bundle)
+            .map_err(HubLuaPluginLoadError::Lifecycle)
+    }
+
     /// Invoke a plugin handler through core plugin worker mechanics.
     #[must_use]
     pub fn invoke_plugin(&self, request: PluginInvocationRequest) -> PluginInvocationOutcome {

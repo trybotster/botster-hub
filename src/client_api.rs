@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use botster_core::{
     BotsterEngineObservation, CapabilitySurface, ClientId, CoreSession, CoreSessionMetadata,
     EnvelopeCursor, EnvelopeDeliveryState, EnvelopeId, EnvelopeTarget, PackageBlockedReason,
-    PackageDependencyResolution, PackageFeatureResolution, PackageResolutionState,
+    PackageDependencyResolution, PackageFeatureResolution, PackageResolutionState, PackageSource,
     PackageSurfaceKind, PackageSurfaceOperation, RequestId, RoutedEnvelope,
     RoutedEnvelopeDrainOutcome, RoutedEnvelopePublishOutcome, RunnableEntrypointKind,
     RunnableEntrypointLaunchMode, SessionId, SessionLifecycleState, SessionRuntimeErrorKind,
@@ -968,6 +968,7 @@ pub struct HubClientPackage {
     pub package_name: String,
     pub version: String,
     pub classification: HubClientPackageClassification,
+    pub source_kind: String,
     pub state: HubClientPackageState,
     pub requested_capabilities: Vec<HubClientCapability>,
     pub surfaces: Vec<HubClientPackageSurfaceDescriptor>,
@@ -997,6 +998,7 @@ impl HubClientPackage {
             package_name: record.manifest.name.clone(),
             version: record.manifest.version.clone(),
             classification: record.classification.into(),
+            source_kind: package_source_kind_label(record.manifest.source.as_ref()).to_string(),
             state: record.state.into(),
             requested_capabilities: record
                 .manifest
@@ -1466,6 +1468,14 @@ fn package_surface_operation_label(operation: &PackageSurfaceOperation) -> &'sta
     match operation {
         PackageSurfaceOperation::Render => "render",
         PackageSurfaceOperation::Action => "action",
+    }
+}
+
+fn package_source_kind_label(source: Option<&PackageSource>) -> &'static str {
+    match source {
+        Some(PackageSource::Path { .. }) => "path",
+        Some(PackageSource::Git { .. }) => "git",
+        None => "unknown",
     }
 }
 

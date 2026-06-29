@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use botster_core::{
     EndpointId, EnvelopeCursor, EnvelopeDeliveryState, EnvelopeId, EnvelopeTarget,
-    PackageConfigurationValue, RequestId, RoutedEnvelope, RoutedEnvelopePayload,
+    PackageConfigurationValue, PackageSource, RequestId, RoutedEnvelope, RoutedEnvelopePayload,
     RunnableEntrypointKind, RunnableEntrypointLaunchMode, RunnableEntrypointProcessState,
     RunnableEntrypointResultField, SessionId, SessionLifecycleState, SubscriptionId,
     TerminalAttachState, UiActionResult, UiActionResultState, UiNode,
@@ -402,6 +402,26 @@ fn handle_control_request(
             )?;
             persist_package_registry(daemon)?;
             show_package_response(daemon, &package_name)
+        }
+        DaemonRequest::ReloadPackage { package_name } => {
+            let running_entrypoints = daemon
+                .entrypoint_supervisor()
+                .snapshots()
+                .into_iter()
+                .filter(|snapshot| {
+                    snapshot.package_name == package_name && snapshot.state == "running"
+                })
+                .map(|snapshot| snapshot.entrypoint_id)
+                .collect::<Vec<_>>();
+            let decision = daemon
+                .package_registry_mut()
+                .reload_local_package(&package_name, "daemon socket reload local package")?;
+            persist_package_registry(daemon)?;
+            if decision.state == PackageState::Enabled {
+                reload_package_after_reload(daemon, &package_name)?;
+            }
+            restart_running_package_entrypoints(daemon, &package_name, &running_entrypoints)?;
+            package_decision_response(daemon, decision)
         }
         DaemonRequest::EnablePackageLocalPath { path } => {
             let package_name = {
@@ -1043,6 +1063,7 @@ fn handle_runtime_control_request(
         | DaemonRequest::ApplyPackageUpdate { .. }
         | DaemonRequest::ShowPackage { .. }
         | DaemonRequest::SetPackageConfiguration { .. }
+        | DaemonRequest::ReloadPackage { .. }
         | DaemonRequest::PluginLifecycleStatus
         | DaemonRequest::EnablePackageLocalPath { .. }
         | DaemonRequest::EnablePackage { .. }
@@ -1076,6 +1097,29 @@ fn load_package_after_enable(
     Ok(())
 }
 
+fn reload_package_after_reload(
+    daemon: &mut HubDaemon,
+    package_name: &str,
+) -> DaemonTransportResult<()> {
+    let package_registry = daemon.package_registry().clone();
+    let prepared = package_registry.prepare_local_package(
+        package_name,
+        "daemon socket reload enabled local plugin package",
+    )?;
+    if prepared.selected_lua_entrypoint().is_some() {
+        daemon
+            .runtime_mut()
+            .ok_or(DaemonTransportError::DaemonNotRunning)?
+            .reload_lua_plugin_package(
+                request_id(&format!("daemon-reload-{package_name}")),
+                &package_registry,
+                package_name,
+            )
+            .map_err(crate::HubDaemonError::from)?;
+    }
+    Ok(())
+}
+
 fn unload_package_after_disable(
     daemon: &mut HubDaemon,
     package_name: &str,
@@ -1087,6 +1131,38 @@ fn unload_package_after_disable(
             request_id(&format!("daemon-disable-{package_name}")),
             package_name,
         );
+    Ok(())
+}
+
+fn restart_running_package_entrypoints(
+    daemon: &mut HubDaemon,
+    package_name: &str,
+    entrypoint_ids: &[String],
+) -> DaemonTransportResult<()> {
+    if entrypoint_ids.is_empty() {
+        return Ok(());
+    }
+    let config = daemon
+        .runtime()
+        .ok_or(DaemonTransportError::DaemonNotRunning)?
+        .config()
+        .clone();
+    let packages = daemon.package_registry().clone();
+    for entrypoint_id in entrypoint_ids {
+        let environment = supervised_launch_environment(
+            &config,
+            &packages,
+            package_name,
+            entrypoint_id,
+            &BTreeMap::new(),
+        )?;
+        daemon.entrypoint_supervisor().restart(
+            &packages,
+            package_name,
+            entrypoint_id,
+            &environment,
+        )?;
+    }
     Ok(())
 }
 
@@ -2292,6 +2368,7 @@ fn daemon_package_from_client(package: HubClientPackage) -> DaemonPackage {
         package_name: package.package_name,
         version: package.version,
         classification: package_classification_label(package.classification).to_string(),
+        source_kind: package.source_kind,
         state: package_state_label(package.state).to_string(),
         requested_capabilities: package
             .requested_capabilities
@@ -2569,11 +2646,18 @@ fn installed_package_actions(package: &HubClientPackage) -> Vec<DaemonPackageAct
             key: "package_update_pin".to_string(),
         }],
     ));
-    actions.push(unavailable_action(
-        "reload_package",
-        "unsupported",
-        "package reload is not supported by the hub daemon; disable and enable the package instead",
-    ));
+    if package.source_kind == "path" {
+        actions.push(available_package_action(
+            "reload_package",
+            request_for_package("reload_package", package_name),
+        ));
+    } else {
+        actions.push(unavailable_action(
+            "reload_package",
+            "local_path_required",
+            "package reload is only available for local path packages",
+        ));
+    }
     actions.push(unavailable_action(
         "restart_hub",
         "unsupported",
@@ -2760,6 +2844,7 @@ fn update_status_actions(
     pin: Option<&DaemonPackagePin>,
     has_pin: bool,
     source_metadata_present: bool,
+    local_path_source: bool,
 ) -> Vec<DaemonPackageActionState> {
     let mut actions = vec![available_package_action(
         "check_package_update",
@@ -2801,11 +2886,18 @@ fn update_status_actions(
             references,
         ));
     }
-    actions.push(unavailable_action(
-        "reload_package",
-        "unsupported",
-        "package reload is not supported by the hub daemon; disable and enable the package instead",
-    ));
+    if local_path_source {
+        actions.push(available_package_action(
+            "reload_package",
+            request_for_package("reload_package", package_name),
+        ));
+    } else {
+        actions.push(unavailable_action(
+            "reload_package",
+            "local_path_required",
+            "package reload is only available for local path packages",
+        ));
+    }
     actions.push(unavailable_action(
         "restart_hub",
         "unsupported",
@@ -2977,6 +3069,7 @@ fn package_update_status(
             )
         })?;
     let source_metadata_present = record.source_metadata.is_some();
+    let local_path_source = matches!(record.manifest.source, Some(PackageSource::Path { .. }));
     let existing_pin = record.pin.clone();
     let enabled = package_state_label(record.state.into()) == "enabled";
     let live_entrypoint = daemon
@@ -3001,10 +3094,16 @@ fn package_update_status(
             message: "apply update requires explicit pinned source metadata".to_string(),
         });
     }
-    if enabled {
+    if enabled && !local_path_source {
         diagnostics.push(DaemonPackageDiagnostic {
             kind: "reload_unavailable".to_string(),
             message: "enabled package changes require an operator disable/enable cycle".to_string(),
+        });
+    } else if enabled {
+        diagnostics.push(DaemonPackageDiagnostic {
+            kind: "reload_available".to_string(),
+            message: "enabled local path package changes can be reloaded with reload_package"
+                .to_string(),
         });
     }
     if live_entrypoint {
@@ -3016,8 +3115,13 @@ fn package_update_status(
     }
 
     let has_pin = pin.is_some();
-    let actions =
-        update_status_actions(package_name, pin.as_ref(), has_pin, source_metadata_present);
+    let actions = update_status_actions(
+        package_name,
+        pin.as_ref(),
+        has_pin,
+        source_metadata_present,
+        local_path_source,
+    );
     Ok(DaemonPackageUpdateStatus {
         package_name: package_name.to_string(),
         update_available: has_pin && source_metadata_present,
@@ -3617,6 +3721,7 @@ fn package_action_label(action: PackageAction) -> &'static str {
         PackageAction::Install => "install",
         PackageAction::Show => "show",
         PackageAction::Configure => "configure",
+        PackageAction::Reload => "reload",
         PackageAction::Enable => "enable",
         PackageAction::Disable => "disable",
         PackageAction::Remove => "remove",
