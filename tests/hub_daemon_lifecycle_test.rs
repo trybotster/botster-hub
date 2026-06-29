@@ -1345,6 +1345,66 @@ fn shutdown_cli_daemon(data_dir: &Path, child: Child) -> Output {
     output
 }
 
+fn run_dev_stack_bootstrap(
+    data_dir: &Path,
+    project_pipelines_package_path: &Path,
+    web_package_path: &Path,
+    tui_package_path: &Path,
+    workspaces_package_path: &Path,
+    web_bridge_port: u16,
+) -> Output {
+    ensure_session_worker_binary();
+    Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("dev-stack")
+        .arg("bootstrap")
+        .arg("--data-dir")
+        .arg(data_dir)
+        .arg("--session-worker-bin")
+        .arg(session_worker_binary_path())
+        .arg("--project-pipelines-package-path")
+        .arg(project_pipelines_package_path)
+        .arg("--web-package-path")
+        .arg(web_package_path)
+        .arg("--tui-package-path")
+        .arg(tui_package_path)
+        .arg("--workspaces-package-path")
+        .arg(workspaces_package_path)
+        .arg("--web-bridge-port")
+        .arg(web_bridge_port.to_string())
+        .output()
+        .expect("run dev-stack bootstrap")
+}
+
+fn shutdown_dev_stack_daemon(data_dir: &Path) {
+    let output = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("shutdown")
+        .arg("--data-dir")
+        .arg(data_dir)
+        .output()
+        .expect("run dev-stack shutdown");
+    assert!(
+        output.status.success(),
+        "dev-stack shutdown failed: {}",
+        command_output_text(&output)
+    );
+}
+
+fn enabled_package_names(data_dir: &Path) -> Vec<String> {
+    let response = botster_hub::daemon_transport_request(
+        &explicit_config(data_dir),
+        botster_hub::DaemonRequest::ListPackages,
+    )
+    .expect("list dev-stack packages");
+    let mut names = response
+        .packages
+        .into_iter()
+        .filter(|package| package.state == "enabled")
+        .map(|package| package.package_name)
+        .collect::<Vec<_>>();
+    names.sort();
+    names
+}
+
 fn has_diagnostic_kind(
     diagnostics: &[botster_hub_client::DaemonDiagnostic],
     kind: botster_hub_client::DaemonDiagnosticKind,
@@ -2164,6 +2224,176 @@ fn cli_dogfood_launcher_enables_local_tui_package_for_apps_open() {
     assert!(!removed_alias_text.contains("first-party host profile ready"));
 
     shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
+fn cli_dev_stack_bootstrap_starts_daemon_enables_first_party_packages_and_prints_apps() {
+    let _guard = daemon_test_lock()
+        .lock()
+        .expect("serialize real daemon test");
+    let data_dir = unique_test_dir("cli-dev-stack-bootstrap");
+    let project_pipelines_package_dir = unique_test_dir("cli-dev-stack-project-pipelines-package");
+    let web_package_dir = unique_test_dir("cli-dev-stack-web-package");
+    let tui_package_dir = unique_test_dir("cli-dev-stack-tui-package");
+    let workspaces_package_dir = unique_test_dir("cli-dev-stack-workspaces-package");
+    write_project_pipelines_availability_package(&project_pipelines_package_dir);
+    write_botster_web_package(&web_package_dir);
+    write_botster_tui_package(&tui_package_dir);
+    write_botster_workspaces_local_package(&workspaces_package_dir, "botster-workspaces");
+    let web_bridge_port = unused_loopback_port();
+
+    let output = run_dev_stack_bootstrap(
+        &data_dir,
+        &project_pipelines_package_dir,
+        &web_package_dir,
+        &tui_package_dir,
+        &workspaces_package_dir,
+        web_bridge_port,
+    );
+    assert!(
+        output.status.success(),
+        "dev-stack bootstrap failed: {}",
+        command_output_text(&output)
+    );
+    let text = command_output_text(&output);
+    assert!(text.contains("dev_stack=ready"));
+    assert!(text.contains("daemon=started"));
+    assert!(text.contains("package name=project-pipelines state=enabled"));
+    assert!(text.contains("package name=botster-web state=enabled"));
+    assert!(text.contains("package name=botster-tui state=enabled"));
+    assert!(text.contains("package name=botster-workspaces state=enabled"));
+    assert!(text.contains(&format!(
+        "web=http://127.0.0.1:{web_bridge_port}/?dogfood=real-hub"
+    )));
+    assert!(text.contains(&format!(
+        "tui=botster-hub apps open --data-dir {} botster-tui",
+        data_dir.display()
+    )));
+    assert!(text.contains(&format!(
+        "apps=botster-hub apps list --data-dir {}",
+        data_dir.display()
+    )));
+    for package_dir in [
+        &project_pipelines_package_dir,
+        &web_package_dir,
+        &tui_package_dir,
+        &workspaces_package_dir,
+    ] {
+        assert!(
+            !text.contains(package_dir.to_string_lossy().as_ref()),
+            "dev-stack output should not leak package source path {package_dir:?}: {text}"
+        );
+    }
+
+    let apps = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("apps")
+        .arg("list")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .output()
+        .expect("list dev-stack apps");
+    assert!(
+        apps.status.success(),
+        "apps list failed: {}",
+        command_output_text(&apps)
+    );
+    let apps_text = command_output_text(&apps);
+    assert!(apps_text.contains("app package=botster-web app_id=web-client"));
+    assert!(apps_text.contains("app package=botster-tui app_id=botster-tui"));
+    assert!(apps_text.contains(&format!(
+        "local_url=http://127.0.0.1:{web_bridge_port}/?dogfood=real-hub"
+    )));
+
+    shutdown_dev_stack_daemon(&data_dir);
+}
+
+#[test]
+fn cli_dev_stack_bootstrap_reuses_live_daemon_and_preserves_state_after_restart() {
+    let _guard = daemon_test_lock()
+        .lock()
+        .expect("serialize real daemon test");
+    let data_dir = unique_test_dir("cli-dev-stack-rerun");
+    let project_pipelines_package_dir = unique_test_dir("cli-dev-stack-rerun-project-pipelines");
+    let web_package_dir = unique_test_dir("cli-dev-stack-rerun-web");
+    let tui_package_dir = unique_test_dir("cli-dev-stack-rerun-tui");
+    let workspaces_package_dir = unique_test_dir("cli-dev-stack-rerun-workspaces");
+    write_project_pipelines_availability_package(&project_pipelines_package_dir);
+    write_botster_web_package(&web_package_dir);
+    write_botster_tui_package(&tui_package_dir);
+    write_botster_workspaces_local_package(&workspaces_package_dir, "botster-workspaces");
+
+    let first_port = unused_loopback_port();
+    let first = run_dev_stack_bootstrap(
+        &data_dir,
+        &project_pipelines_package_dir,
+        &web_package_dir,
+        &tui_package_dir,
+        &workspaces_package_dir,
+        first_port,
+    );
+    assert!(
+        first.status.success(),
+        "first dev-stack bootstrap failed: {}",
+        command_output_text(&first)
+    );
+
+    let second = run_dev_stack_bootstrap(
+        &data_dir,
+        &project_pipelines_package_dir,
+        &web_package_dir,
+        &tui_package_dir,
+        &workspaces_package_dir,
+        first_port,
+    );
+    assert!(
+        second.status.success(),
+        "second live dev-stack bootstrap failed: {}",
+        command_output_text(&second)
+    );
+    let second_text = command_output_text(&second);
+    assert!(second_text.contains("daemon=reused"));
+    assert_eq!(
+        enabled_package_names(&data_dir),
+        vec![
+            "botster-tui".to_string(),
+            "botster-web".to_string(),
+            "botster-workspaces".to_string(),
+            "project-pipelines".to_string(),
+        ]
+    );
+
+    shutdown_dev_stack_daemon(&data_dir);
+
+    let third_port = unused_loopback_port();
+    let third = run_dev_stack_bootstrap(
+        &data_dir,
+        &project_pipelines_package_dir,
+        &web_package_dir,
+        &tui_package_dir,
+        &workspaces_package_dir,
+        third_port,
+    );
+    assert!(
+        third.status.success(),
+        "post-shutdown dev-stack bootstrap failed: {}",
+        command_output_text(&third)
+    );
+    let third_text = command_output_text(&third);
+    assert!(third_text.contains("daemon=started"));
+    assert!(third_text.contains(&format!(
+        "web=http://127.0.0.1:{third_port}/?dogfood=real-hub"
+    )));
+    assert_eq!(
+        enabled_package_names(&data_dir),
+        vec![
+            "botster-tui".to_string(),
+            "botster-web".to_string(),
+            "botster-workspaces".to_string(),
+            "project-pipelines".to_string(),
+        ]
+    );
+
+    shutdown_dev_stack_daemon(&data_dir);
 }
 
 #[test]
