@@ -96,6 +96,15 @@ fn session_template(command: &str, mode: &str) -> PackageSessionTemplate {
     }
 }
 
+fn write_repo_session_templates(root: &std::path::Path, templates: serde_json::Value) {
+    fs::create_dir_all(root.join(".botster")).expect("create repo .botster dir");
+    fs::write(
+        root.join(".botster/session-templates.json"),
+        serde_json::json!({ "session_templates": templates }).to_string(),
+    )
+    .expect("write repo session templates");
+}
+
 fn write_named_session_template_package(root: &std::path::Path, package_name: &str) {
     fs::create_dir_all(root.join("bin")).expect("create session template package root");
     fs::write(root.join("plugin.lua"), "return botster.register({})\n")
@@ -677,6 +686,238 @@ fn session_template_sources_apply_device_repo_precedence_and_reload_from_state()
         rejected,
         HubClientError::SessionTemplate {
             kind: "cwd_not_admitted",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn session_template_sources_apply_device_over_package_when_repo_disabled() {
+    let package_root = std::path::PathBuf::from(
+        "target/botster-hub-test-data/client-api-session-template-device-package",
+    );
+    let device_root = std::path::PathBuf::from(
+        "target/botster-hub-test-data/client-api-session-template-device-root",
+    );
+    let repo_root = std::path::PathBuf::from(
+        "target/botster-hub-test-data/client-api-session-template-disabled-repo",
+    );
+    let _ = fs::remove_dir_all(&package_root);
+    let _ = fs::remove_dir_all(&device_root);
+    let _ = fs::remove_dir_all(&repo_root);
+    write_session_template_package(&package_root);
+    write_executable_script(
+        &device_root,
+        "bin/device.sh",
+        "#!/bin/sh\nprintf 'device:%s\\n' \"$BOTSTER_MODE\"\n",
+    );
+    write_repo_session_templates(
+        &repo_root,
+        serde_json::json!([{
+            "id": "init",
+            "command": "bin/repo.sh",
+            "environment": { "BOTSTER_MODE": "repo" }
+        }]),
+    );
+
+    let mut packages = PackageRegistry::new(Vec::<Capability>::new().into_iter().collect());
+    packages
+        .install_local_path(&package_root, "install package")
+        .expect("install package");
+    packages
+        .enable("session-template.plugin", "enable package")
+        .expect("enable package");
+
+    let config = explicit_runtime("session-template-device-over-package")
+        .config()
+        .clone();
+    let store = FileHubStateStore::for_data_directory(&config.data_directory);
+    store
+        .update(&config, |state| {
+            state.device_session_template_sources = vec![DeviceSessionTemplateSource {
+                root: device_root.clone(),
+                session_templates: vec![session_template("bin/device.sh", "device")],
+            }];
+            state.admitted_session_template_targets = vec![AdmittedSessionTemplateTarget {
+                target_id: "repo:disabled".to_string(),
+                root: repo_root.clone(),
+                enabled: false,
+            }];
+        })
+        .expect("persist sources");
+
+    let mut runtime = HubRuntime::load_from_store(config, &store).expect("reload runtime state");
+    let api = HubClientApi::local_operator("session-template-device-over-package-client");
+    let resolved = api
+        .handle_request(
+            &mut runtime,
+            &packages,
+            HubClientRequest::ResolveSessionTemplate {
+                request_id: request_id("resolve-device-over-package"),
+                template_id: "init".to_string(),
+                template_request: botster_hub::SessionTemplateRequest::default(),
+            },
+        )
+        .expect("resolve device template");
+    let HubClientResponseBody::ResolvedSessionTemplate(resolved) = resolved.body else {
+        panic!("resolved session template expected");
+    };
+
+    assert_eq!(resolved.template.source, "device");
+    assert_eq!(resolved.template.target_id, "device:local");
+    assert_eq!(
+        resolved.executable,
+        device_root.join("bin/device.sh").display().to_string()
+    );
+}
+
+#[test]
+fn session_template_sources_reject_duplicate_ids_within_device_source() {
+    let device_root = std::path::PathBuf::from(
+        "target/botster-hub-test-data/client-api-session-template-duplicate-device",
+    );
+    let _ = fs::remove_dir_all(&device_root);
+    let config = explicit_runtime("session-template-duplicate-device")
+        .config()
+        .clone();
+    let store = FileHubStateStore::for_data_directory(&config.data_directory);
+    store
+        .update(&config, |state| {
+            state.device_session_template_sources = vec![DeviceSessionTemplateSource {
+                root: device_root.clone(),
+                session_templates: vec![
+                    session_template("bin/first.sh", "first"),
+                    session_template("bin/second.sh", "second"),
+                ],
+            }];
+        })
+        .expect("persist duplicate device source");
+
+    let mut runtime = HubRuntime::load_from_store(config, &store).expect("reload runtime state");
+    let api = HubClientApi::local_operator("session-template-duplicate-device-client");
+    let error = api
+        .handle_request(
+            &mut runtime,
+            &empty_registry(),
+            HubClientRequest::ListSessionTemplates {
+                request_id: request_id("list-duplicate-device"),
+            },
+        )
+        .expect_err("duplicate device ids are rejected");
+
+    assert!(matches!(
+        error,
+        HubClientError::SessionTemplate {
+            kind: "invalid_device_session_templates",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn session_template_sources_reject_duplicate_ids_within_repo_source() {
+    let repo_root = std::path::PathBuf::from(
+        "target/botster-hub-test-data/client-api-session-template-duplicate-repo-root",
+    );
+    let _ = fs::remove_dir_all(&repo_root);
+    write_repo_session_templates(
+        &repo_root,
+        serde_json::json!([
+            { "id": "init", "command": "bin/first.sh" },
+            { "id": "init", "command": "bin/second.sh" }
+        ]),
+    );
+    let config = explicit_runtime("session-template-duplicate-repo")
+        .config()
+        .clone();
+    let store = FileHubStateStore::for_data_directory(&config.data_directory);
+    store
+        .update(&config, |state| {
+            state.admitted_session_template_targets = vec![AdmittedSessionTemplateTarget {
+                target_id: "repo:duplicate".to_string(),
+                root: repo_root.clone(),
+                enabled: true,
+            }];
+        })
+        .expect("persist duplicate repo target");
+
+    let mut runtime = HubRuntime::load_from_store(config, &store).expect("reload runtime state");
+    let api = HubClientApi::local_operator("session-template-duplicate-repo-client");
+    let error = api
+        .handle_request(
+            &mut runtime,
+            &empty_registry(),
+            HubClientRequest::ListSessionTemplates {
+                request_id: request_id("list-duplicate-repo"),
+            },
+        )
+        .expect_err("duplicate repo ids are rejected");
+
+    assert!(matches!(
+        error,
+        HubClientError::SessionTemplate {
+            kind: "invalid_repo_session_templates",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn session_template_sources_reject_ambiguous_same_rank_repo_ids() {
+    let first_repo = std::path::PathBuf::from(
+        "target/botster-hub-test-data/client-api-session-template-first-repo",
+    );
+    let second_repo = std::path::PathBuf::from(
+        "target/botster-hub-test-data/client-api-session-template-second-repo",
+    );
+    let _ = fs::remove_dir_all(&first_repo);
+    let _ = fs::remove_dir_all(&second_repo);
+    write_repo_session_templates(
+        &first_repo,
+        serde_json::json!([{ "id": "init", "command": "bin/first.sh" }]),
+    );
+    write_repo_session_templates(
+        &second_repo,
+        serde_json::json!([{ "id": "init", "command": "bin/second.sh" }]),
+    );
+    let config = explicit_runtime("session-template-ambiguous-repos")
+        .config()
+        .clone();
+    let store = FileHubStateStore::for_data_directory(&config.data_directory);
+    store
+        .update(&config, |state| {
+            state.admitted_session_template_targets = vec![
+                AdmittedSessionTemplateTarget {
+                    target_id: "repo:first".to_string(),
+                    root: first_repo.clone(),
+                    enabled: true,
+                },
+                AdmittedSessionTemplateTarget {
+                    target_id: "repo:second".to_string(),
+                    root: second_repo.clone(),
+                    enabled: true,
+                },
+            ];
+        })
+        .expect("persist ambiguous repo targets");
+
+    let mut runtime = HubRuntime::load_from_store(config, &store).expect("reload runtime state");
+    let api = HubClientApi::local_operator("session-template-ambiguous-repos-client");
+    let error = api
+        .handle_request(
+            &mut runtime,
+            &empty_registry(),
+            HubClientRequest::ShowSessionTemplate {
+                request_id: request_id("show-ambiguous-repo-template"),
+                template_id: "init".to_string(),
+            },
+        )
+        .expect_err("same-rank repo ids are ambiguous");
+
+    assert!(matches!(
+        error,
+        HubClientError::SessionTemplate {
+            kind: "ambiguous_template",
             ..
         }
     ));
