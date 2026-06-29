@@ -214,50 +214,60 @@ client, sends input, drains the observed marker, and shuts down through the same
 local client API. Separate Lua runtime tests cover real Lua entrypoint
 execution. The PTY portion is Unix-only.
 
-For daily first-party plugin dogfood from fresh main checkouts, keep local
-`botster-web` and `botster-tui` checkouts beside this repo or pass their paths
-explicitly. Use a stable data directory when you want the package installs and
-app registry to survive across reruns:
+For daily first-party local development from fresh main checkouts, use the
+persistent dev-stack bootstrap. It starts or reuses a daemon over a stable data
+directory, enables the first-party packages as ordinary local packages, starts
+the `botster-web` app entrypoint through daemon supervision, and prints the
+app/operator commands for the same data directory:
 
 ```sh
-cargo run -- dogfood \
-  --data-dir target/botster-hub-client-dogfood-data \
+cargo run -- dev-stack bootstrap \
+  --data-dir target/botster-hub-dev-stack-data \
+  --project-pipelines-package-path examples/project-pipelines \
   --web-package-path ../botster-web \
-  --tui-package-path ../botster-tui
+  --tui-package-path ../botster-tui \
+  --workspaces-package-path ../botster-workspaces
 ```
 
-The launcher uses an isolated data directory under `target/` by default. Pass
-`--data-dir <path>` when you want state to survive across runs. It locates a
+`dev-stack bootstrap` defaults to `target/botster-hub-dev-stack-data`, discovers
+`examples/project-pipelines`, `../botster-web`, `../botster-tui`, and
+`../botster-workspaces` when those package manifests exist, and accepts explicit
+package path flags for CI worktrees or non-sibling checkouts. It locates a
 co-located `botster-session-worker` next to the current `botster-hub` binary, or
-you can pass `--session-worker-bin <path>` explicitly. Pass
-`--web-package-path <path>` to the first-party `botster-web` checkout; pass
-`--tui-package-path <path>` when you also want to enable a local `botster-tui`
-terminal app package. The launcher enables those packages, starts `web-client`
-through daemon supervision, passes the dogfood hub socket as
-`BOTSTER_HUB_SOCKET`, waits for `/health` to report `existing_hub` from
-`socket`, and then prints the exact commands for the current data directory:
+you can pass `--session-worker-bin <path>` explicitly. The command is
+idempotent: rerunning it against a live daemon reuses that daemon, and rerunning
+after shutdown reloads the persisted package registry from `hub-state.json`.
+Normal output does not print local package source paths:
 
 ```sh
+dev_stack=ready
+data_dir=target/botster-hub-dev-stack-data
+daemon=started
+package name=project-pipelines state=enabled
+package name=botster-web state=enabled
+package name=botster-tui state=enabled
+package name=botster-workspaces state=enabled
 web=http://127.0.0.1:41739/?dogfood=real-hub
-tui=botster-hub apps open --data-dir <path> botster-tui
-mcp=botster-hub mcp-serve --data-dir <path>
-status=botster-hub status --data-dir <path>
-shutdown=run botster-hub shutdown --data-dir <path>
+tui=botster-hub apps open --data-dir target/botster-hub-dev-stack-data botster-tui
+mcp=botster-hub mcp-serve --data-dir target/botster-hub-dev-stack-data
+status=botster-hub status --data-dir target/botster-hub-dev-stack-data
+apps=botster-hub apps list --data-dir target/botster-hub-dev-stack-data
+shutdown=botster-hub shutdown --data-dir target/botster-hub-dev-stack-data
 ```
 
 The supervised `botster-web` process receives `BOTSTER_HUB_SOCKET` because the
-launcher owns that child process. Foreground terminal apps run through
-`botster-hub apps open`, which asks the daemon for the resolved launch contract
-and then starts the child with inherited stdio.
+daemon-owned entrypoint launch injects hub connection environment. Foreground
+terminal apps run through `botster-hub apps open`, which asks the daemon for the
+resolved launch contract and then starts the child with inherited stdio.
 
 From another terminal, the composed local client app path should be visible
 through the same stable data directory:
 
 ```sh
-botster-hub apps list --data-dir target/botster-hub-client-dogfood-data
-botster-hub apps show --data-dir target/botster-hub-client-dogfood-data botster-web/web-client
-botster-hub apps open --data-dir target/botster-hub-client-dogfood-data botster-web/web-client
-botster-hub apps open --data-dir target/botster-hub-client-dogfood-data botster-tui
+botster-hub apps list --data-dir target/botster-hub-dev-stack-data
+botster-hub apps show --data-dir target/botster-hub-dev-stack-data botster-web/web-client
+botster-hub apps open --data-dir target/botster-hub-dev-stack-data botster-web/web-client
+botster-hub apps open --data-dir target/botster-hub-dev-stack-data botster-tui
 ```
 
 `apps open botster-web/web-client` reports an `app_url=` matching the printed
@@ -265,11 +275,10 @@ botster-hub apps open --data-dir target/botster-hub-client-dogfood-data botster-
 foreground launch contract; there is no standalone fallback when the package is
 missing or disabled.
 
-Keep the launcher running in the foreground. For graceful shutdown, run the
-printed shutdown command from another terminal; `Ctrl-C` hard-stops the
-foreground launcher. Shutdown remains hub-owned: the existing-hub bridge does
-not stop the daemon it attached to, but daemon supervision stops the
-`botster-web` process.
+`botster-hub dogfood` remains the compatibility/test launcher for isolated
+foreground dogfood runs. It is useful for proving the bridge and shutdown path,
+but the persistent dev-stack bootstrap is the daily local first-party package
+path.
 
 The CLI commands below exercise the daemon-backed workflow across separate
 processes:
