@@ -84,13 +84,6 @@ fn main() {
             }
             return;
         }
-        Some("tui") => {
-            if let Err(error) = operator_tui(env::args().skip(2).collect()) {
-                eprintln!("botster-hub tui error: {error}");
-                process::exit(1);
-            }
-            return;
-        }
         Some("apps") => {
             if let Err(error) = operator_apps(env::args().skip(2).collect()) {
                 eprintln!("botster-hub apps error: {error}");
@@ -126,7 +119,12 @@ fn main() {
             }
             return;
         }
-        _ => {}
+        Some(command) => {
+            eprintln!("botster-hub {command} error: unknown command");
+            eprintln!("{}", usage_for(command));
+            process::exit(1);
+        }
+        None => {}
     }
 
     match boot_summary() {
@@ -1034,14 +1032,6 @@ fn mcp_serve(args: Vec<String>) -> Result<(), McpCliError> {
     let stdout = io::stdout();
     serve_mcp_stdio(config, BufReader::new(stdin.lock()), stdout.lock())?;
     Ok(())
-}
-
-fn operator_tui(args: Vec<String>) -> Result<(), OperatorError> {
-    let options = DataDirOptions::parse(args, "tui")?;
-    eprintln!(
-        "botster-hub tui is deprecated; delegating to: botster-hub apps open --data-dir <path> botster-tui"
-    );
-    open_app_by_selector(options.data_directory, "botster-tui")
 }
 
 fn operator_apps(args: Vec<String>) -> Result<(), OperatorError> {
@@ -3284,9 +3274,6 @@ fn usage_for(command: &str) -> &'static str {
         }
         "shutdown" => "usage: botster-hub shutdown --data-dir <path>",
         "mcp-serve" => "usage: botster-hub mcp-serve --data-dir <path>",
-        "tui" => {
-            "usage: botster-hub tui --data-dir <path>  # alias for: botster-hub apps open --data-dir <path> botster-tui"
-        }
         "apps" => "usage: botster-hub apps <list|show|open> ...",
         "apps list" => "usage: botster-hub apps list --data-dir <path>",
         "apps show" => "usage: botster-hub apps show --data-dir <path> <app|package/app>",
@@ -3341,7 +3328,7 @@ fn usage_for(command: &str) -> &'static str {
         "providers" | "providers list" => "usage: botster-hub providers list --data-dir <path>",
         "inspect" => "usage: botster-hub inspect --data-dir <path> <session-id>",
         _ => {
-            "usage: botster-hub <start|dogfood|status|sessions|shutdown|mcp-serve|tui|apps|packages|providers|inspect|run-one>"
+            "usage: botster-hub <start|dogfood|status|sessions|shutdown|mcp-serve|apps|packages|providers|inspect|run-one>"
         }
     }
 }

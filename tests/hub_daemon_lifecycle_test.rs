@@ -2146,20 +2146,22 @@ fn cli_dogfood_launcher_enables_local_tui_package_for_apps_open() {
     );
     assert!(command_output_text(&open_tui).contains("botster-tui-fixture"));
 
-    let alias = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+    let removed_alias = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
         .arg("tui")
         .arg("--data-dir")
         .arg(&data_dir)
         .output()
-        .expect("run dogfood tui alias");
+        .expect("run removed dogfood tui alias");
     assert!(
-        alias.status.success(),
-        "dogfood tui alias failed: {}",
-        command_output_text(&alias)
+        !removed_alias.status.success(),
+        "removed dogfood tui alias should fail: {}",
+        command_output_text(&removed_alias)
     );
-    let alias_text = command_output_text(&alias);
-    assert!(alias_text.contains("botster-hub tui is deprecated"));
-    assert!(alias_text.contains("botster-tui-fixture"));
+    let removed_alias_text = command_output_text(&removed_alias);
+    assert!(removed_alias_text.contains("unknown command"));
+    assert!(removed_alias_text.contains("usage: botster-hub <"));
+    assert!(!removed_alias_text.contains("botster-tui-fixture"));
+    assert!(!removed_alias_text.contains("first-party host profile ready"));
 
     shutdown_cli_daemon(&data_dir, child);
 }
@@ -4993,7 +4995,7 @@ fn cli_apps_open_web_injects_hub_connection_environment() {
 }
 
 #[test]
-fn cli_apps_open_terminal_and_tui_alias_use_foreground_launch_contract() {
+fn cli_apps_open_terminal_uses_foreground_launch_contract() {
     let _guard = daemon_test_lock()
         .lock()
         .expect("serialize real daemon test");
@@ -5018,44 +5020,39 @@ fn cli_apps_open_terminal_and_tui_alias_use_foreground_launch_contract() {
     );
     assert!(command_output_text(&open).contains("botster-tui-fixture"));
 
-    let alias = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+    let removed_alias = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
         .arg("tui")
         .arg("--data-dir")
         .arg(&data_dir)
         .output()
-        .expect("run tui alias");
+        .expect("run removed tui alias");
     assert!(
-        alias.status.success(),
-        "tui alias failed: {}",
-        command_output_text(&alias)
+        !removed_alias.status.success(),
+        "removed tui alias should fail: {}",
+        command_output_text(&removed_alias)
     );
-    let alias_text = command_output_text(&alias);
-    assert!(alias_text.contains("botster-hub tui is deprecated"));
-    assert!(alias_text.contains("botster-tui-fixture"));
+    let removed_alias_text = command_output_text(&removed_alias);
+    assert!(removed_alias_text.contains("unknown command"));
+    assert!(removed_alias_text.contains("usage: botster-hub <"));
+    assert!(!removed_alias_text.contains("botster-tui-fixture"));
+    assert!(!removed_alias_text.contains("first-party host profile ready"));
 
     shutdown_cli_daemon(&data_dir, child);
 }
 
 #[test]
-fn cli_tui_alias_reports_missing_installed_app() {
-    let _guard = daemon_test_lock()
-        .lock()
-        .expect("serialize real daemon test");
-    let data_dir = unique_test_dir("cli-tui-missing");
-    let child = start_cli_daemon(&data_dir);
-
-    let alias = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
-        .arg("tui")
-        .arg("--data-dir")
-        .arg(&data_dir)
+fn cli_no_arg_prints_host_profile_boot_summary() {
+    let summary = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
         .output()
-        .expect("run missing tui alias");
-    assert!(!alias.status.success());
-    let text = command_output_text(&alias);
-    assert!(text.contains("botster-hub tui is deprecated"));
-    assert!(text.contains("app botster-tui is not installed or enabled"));
-
-    shutdown_cli_daemon(&data_dir, child);
+        .expect("run no-arg hub summary");
+    assert!(
+        summary.status.success(),
+        "no-arg hub summary failed: {}",
+        command_output_text(&summary)
+    );
+    let text = command_output_text(&summary);
+    assert!(text.contains("first-party host profile ready"));
+    assert!(!text.contains("unknown command"));
 }
 
 #[test]
