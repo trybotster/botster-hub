@@ -284,11 +284,22 @@ with trusted hub context. The protocol exposes `ListSessionTemplates`,
 `ShowSessionTemplate`, `ResolveSessionTemplate`, `SpawnSessionTemplate`, and
 `ReadSessionContext`.
 
-Resolution precedence is package defaults, then explicit spawn request values
-that are admitted by template and target policy. Explicit environment overrides
-must appear in `allowed_environment_overrides`. Explicit cwd overrides must stay
-inside the hub-admitted target root. Unauthorized target, cwd, path, template, or
-environment requests return operator errors before core spawn.
+Resolution precedence is package < device < repo < explicit request values.
+Device template sources and admitted repo target roots are durable hub-state
+fields. They are additive v1 fields, so a `hub-state.json` written before these
+sources existed loads with empty device/repo sources rather than requiring a
+schema-version migration.
+
+Repo-local templates are read from `.botster/session-templates.json` under an
+admitted target root. The file uses the same `session_templates` array shape as
+package manifests. Repo-local files are rediscovered fresh for each
+list/show/resolve/spawn request; there is no separate reload command. Disabled
+or unadmitted targets do not contribute repo templates.
+
+Explicit environment overrides must appear in
+`allowed_environment_overrides`. Explicit cwd overrides must stay inside the
+selected source root. Unauthorized target, cwd, path, template, or environment
+requests return operator errors before core spawn.
 
 Spawned scripts receive `BOTSTER_SESSION_ID`, `BOTSTER_CONTEXT_ID`,
 `BOTSTER_HUB_DATA_DIR`, `BOTSTER_HUB_SOCKET`, and `BOTSTER_HUB_BIN`. Scripts can

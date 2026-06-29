@@ -121,9 +121,10 @@ pub use packages::{
     resolve_foreground_launch_contract,
 };
 pub use persistence::{
-    CapabilityGrantRecord, FileHubStateStore, HubAuditEntry, HubState, HubStateError,
-    HubStateResult, HubStateStore, HubStateStoreError, HubStateStoreResult, LocalRuntimeSettings,
-    PackageAdmissionDecision, SchemaMetadata,
+    AdmittedSessionTemplateTarget, CapabilityGrantRecord, DeviceSessionTemplateSource,
+    FileHubStateStore, HubAuditEntry, HubState, HubStateError, HubStateResult, HubStateStore,
+    HubStateStoreError, HubStateStoreResult, LocalRuntimeSettings, PackageAdmissionDecision,
+    SchemaMetadata,
 };
 pub use profile::{
     CoreRuntimeRole, HostProfileManifest, HostProfileTrust, PolicyArea, Responsibility,

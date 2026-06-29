@@ -28,8 +28,7 @@ use crate::packages::{
 };
 use crate::session_templates::{
     HubSessionContext, HubSessionTemplate, ResolvedSessionTemplate, SessionTemplateRequest,
-    list_package_session_templates, materialize_package_session_template,
-    show_package_session_template,
+    list_session_templates, materialize_session_template, show_session_template,
 };
 use crate::{HubRuntime, HubRuntimeError, daemon_session_to_core_session, host_profile};
 
@@ -304,18 +303,25 @@ impl HubClientApi {
             ),
             HubClientRequest::ListSessionTemplates { .. } => {
                 let records = packages.packages();
-                HubClientResponseBody::SessionTemplates(list_package_session_templates(&records))
-            }
-            HubClientRequest::ShowSessionTemplate { template_id, .. } => {
-                let records = packages.packages();
-                let template =
-                    show_package_session_template(&records, &template_id).map_err(|error| {
+                let templates =
+                    list_session_templates(&records, runtime.state()).map_err(|error| {
                         HubClientError::SessionTemplate {
                             request_id: request_id.clone(),
                             operation,
                             kind: error.kind,
                             message: error.message,
                         }
+                    })?;
+                HubClientResponseBody::SessionTemplates(templates)
+            }
+            HubClientRequest::ShowSessionTemplate { template_id, .. } => {
+                let records = packages.packages();
+                let template = show_session_template(&records, runtime.state(), &template_id)
+                    .map_err(|error| HubClientError::SessionTemplate {
+                        request_id: request_id.clone(),
+                        operation,
+                        kind: error.kind,
+                        message: error.message,
                     })?;
                 HubClientResponseBody::SessionTemplates(vec![template])
             }
@@ -325,9 +331,10 @@ impl HubClientApi {
                 ..
             } => {
                 let records = packages.packages();
-                let materialized = materialize_package_session_template(
+                let materialized = materialize_session_template(
                     runtime.config(),
                     &records,
+                    runtime.state(),
                     &template_id,
                     template_request,
                 )
@@ -346,9 +353,10 @@ impl HubClientApi {
                 ..
             } => {
                 let records = packages.packages();
-                let materialized = materialize_package_session_template(
+                let materialized = materialize_session_template(
                     runtime.config(),
                     &records,
+                    runtime.state(),
                     &template_id,
                     template_request,
                 )

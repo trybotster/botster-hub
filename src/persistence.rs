@@ -20,6 +20,7 @@ use crate::config::{
     CoreEngineOptions, HostIdentity, HubConfig, SessionDefaults, TransportBindings,
 };
 use crate::packages::PackageRegistrySnapshot;
+use crate::session_templates::PackageSessionTemplate;
 
 const HUB_STATE_SCHEMA_VERSION: u16 = 1;
 const HUB_STATE_FILE_NAME: &str = "hub-state.json";
@@ -47,6 +48,12 @@ pub struct HubState {
     pub schema: SchemaMetadata,
     /// Package/provider registry records, grants, pins, provenance, and enabled state.
     pub package_registry: PackageRegistrySnapshot,
+    /// Device-owned session template sources persisted by the hub profile.
+    #[serde(default)]
+    pub device_session_template_sources: Vec<DeviceSessionTemplateSource>,
+    /// Admitted repo roots that may contribute repo-local session templates.
+    #[serde(default)]
+    pub admitted_session_template_targets: Vec<AdmittedSessionTemplateTarget>,
     /// Audit-friendly capability grant records.
     pub capability_grants: Vec<CapabilityGrantRecord>,
     /// Admission decision history for package/provider policy.
@@ -66,6 +73,8 @@ impl HubState {
             host: config.host.clone(),
             schema: SchemaMetadata::v1(),
             package_registry: PackageRegistrySnapshot::empty(),
+            device_session_template_sources: Vec::new(),
+            admitted_session_template_targets: Vec::new(),
             capability_grants: Vec::new(),
             admission_decisions: Vec::new(),
             runtime_settings: LocalRuntimeSettings::from_config(config),
@@ -80,6 +89,32 @@ impl HubState {
             Err(HubStateError::UnsupportedVersion(self.schema_version))
         }
     }
+}
+
+/// One durable device-level session template source.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceSessionTemplateSource {
+    /// Root used to resolve relative template command and cwd policy paths.
+    pub root: PathBuf,
+    /// Device-owned template declarations.
+    #[serde(default)]
+    pub session_templates: Vec<PackageSessionTemplate>,
+}
+
+/// One admitted spawn target root that may contribute repo-local templates.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdmittedSessionTemplateTarget {
+    /// Hub-owned target id that callers must request explicitly.
+    pub target_id: String,
+    /// Admitted repo/worktree root.
+    pub root: PathBuf,
+    /// Disabled targets are persisted for audit but do not contribute templates.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+const fn default_true() -> bool {
+    true
 }
 
 /// Schema and migration metadata recorded inside the state file.
@@ -467,6 +502,31 @@ mod tests {
             reopened.runtime_settings.data_directory,
             config.data_directory
         );
+    }
+
+    #[test]
+    fn file_store_loads_v1_state_without_session_template_source_fields() {
+        let config = test_config("loads-v1-without-session-template-sources");
+        let store = FileHubStateStore::for_data_directory(&config.data_directory);
+        let state = HubState::from_config(&config);
+        let mut value = serde_json::to_value(&state).expect("serialize state value");
+        let object = value.as_object_mut().expect("state serializes as object");
+        object.remove("device_session_template_sources");
+        object.remove("admitted_session_template_targets");
+        fs::create_dir_all(&config.data_directory).expect("create data dir");
+        fs::write(
+            store.path(),
+            serde_json::to_vec_pretty(&value).expect("serialize legacy-shaped state"),
+        )
+        .expect("write legacy-shaped state");
+
+        let reopened = store
+            .load_or_initialize(&config)
+            .expect("load legacy-shaped v1 state");
+
+        assert!(reopened.device_session_template_sources.is_empty());
+        assert!(reopened.admitted_session_template_targets.is_empty());
+        assert_eq!(reopened.schema_version, 1);
     }
 
     #[test]

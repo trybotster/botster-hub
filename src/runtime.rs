@@ -38,7 +38,7 @@ use crate::lua_runtime::{
 use crate::packages::{PackageRecord, PackageRegistry, PackageRegistryError, PackageState};
 use crate::persistence::{FileHubStateStore, HubState, HubStateStore, HubStateStoreError};
 use crate::session_templates::{
-    HubSessionContext, SessionTemplateRequest, materialize_package_session_template,
+    HubSessionContext, SessionTemplateRequest, materialize_session_template,
 };
 
 /// Hub-owned adapter and policy facade over the default local core engine.
@@ -498,9 +498,10 @@ impl HubRuntime {
         }
 
         let records = pending.package_records.iter().collect::<Vec<_>>();
-        let materialized = materialize_package_session_template(
+        let materialized = materialize_session_template(
             &self.config,
             &records,
+            &self.state,
             &pending.template_id,
             pending.request.clone(),
         )
