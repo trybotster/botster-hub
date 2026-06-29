@@ -681,6 +681,32 @@ Spawned scripts receive `BOTSTER_SESSION_ID`, `BOTSTER_CONTEXT_ID`,
 `BOTSTER_HUB_DATA_DIR`, `BOTSTER_HUB_SOCKET`, and `BOTSTER_HUB_BIN`, and can read
 context with `"$BOTSTER_HUB_BIN" context --key prompt`.
 
+Template sources are layered by hub policy: package < device < repo < explicit
+request values. Device template sources and admitted repo target roots are
+durable fields in `hub-state.json`; the state schema stays additive within v1 so
+older files that omit those fields load with empty device/repo sources.
+Repo-local templates are read only from admitted target roots at
+`.botster/session-templates.json`:
+
+```json
+{
+  "session_templates": [
+    {
+      "id": "init",
+      "command": "bin/repo-init.sh",
+      "environment": { "BOTSTER_MODE": "repo" },
+      "allowed_environment_overrides": ["BOTSTER_MODE"]
+    }
+  ]
+}
+```
+
+The repo file uses the same template shape as package manifests. Repo files are
+rediscovered on each list/show/resolve/spawn request, so changing the file does
+not require a daemon reload. Disabled or unadmitted targets contribute no repo
+templates, and the final command, cwd, and environment are still checked against
+the selected source root before core spawn.
+
 Git-source manifests use the same core shape. The registry can persist the Git
 URL/reference, provenance, pin revision/checksum, compatibility result, trust
 classification, and enabled/admitted-capability state, but this ticket does not
