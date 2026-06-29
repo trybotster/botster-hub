@@ -4,6 +4,7 @@
 //! them into generic core spawn requests before `botster-core` sees anything.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 use botster_core::{
@@ -14,6 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::HubConfig;
 use crate::packages::{PackageRecord, PackageState};
+use crate::persistence::HubState;
 
 /// Package-provided session template declaration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -130,38 +132,67 @@ impl SessionTemplateError {
 
 pub type SessionTemplateResult<T> = Result<T, SessionTemplateError>;
 
-/// Return all package-contributed session templates.
-#[must_use]
-pub fn list_package_session_templates(records: &[&PackageRecord]) -> Vec<HubSessionTemplate> {
-    records
-        .iter()
-        .flat_map(|record| {
-            record
-                .session_templates
-                .iter()
-                .map(|template| template_row(record, template))
-        })
-        .collect()
+const DEVICE_TEMPLATE_SOURCE: &str = "device";
+const PACKAGE_TEMPLATE_SOURCE: &str = "package";
+const REPO_TEMPLATE_SOURCE: &str = "repo";
+const DEFAULT_DEVICE_TARGET_ID: &str = "device:local";
+const REPO_SESSION_TEMPLATES_FILE: &str = ".botster/session-templates.json";
+
+#[derive(Debug, Clone, Deserialize)]
+struct RepoSessionTemplatesFile {
+    #[serde(default)]
+    session_templates: Vec<PackageSessionTemplate>,
 }
 
-/// Resolve and materialize a template into the generic core spawn contract.
-pub fn materialize_package_session_template(
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum TemplateSourceRank {
+    Package = 0,
+    Device = 1,
+    Repo = 2,
+}
+
+#[derive(Debug, Clone)]
+struct SourceTemplate {
+    rank: TemplateSourceRank,
+    source: String,
+    source_name: String,
+    root: PathBuf,
+    template: PackageSessionTemplate,
+    available: bool,
+}
+
+/// Return effective session templates after applying package < device < repo precedence.
+pub fn list_session_templates(
+    records: &[&PackageRecord],
+    state: &HubState,
+) -> SessionTemplateResult<Vec<HubSessionTemplate>> {
+    let sources = source_templates(records, state)?;
+    Ok(effective_templates(sources)?
+        .into_iter()
+        .map(|source| template_row_from_source(&source))
+        .collect())
+}
+
+/// Resolve and materialize the effective template into the generic core spawn contract.
+pub fn materialize_session_template(
     config: &HubConfig,
     records: &[&PackageRecord],
+    state: &HubState,
     template_id: &str,
     request: SessionTemplateRequest,
 ) -> SessionTemplateResult<MaterializedSessionTemplate> {
-    let (record, template) = find_template(records, template_id)?;
-    if record.state != PackageState::Enabled {
+    let source = find_source_template(records, state, template_id)?;
+    if !source.available {
         return Err(SessionTemplateError::new(
             "template_unavailable",
-            "session template package is not enabled",
+            "session template source is not enabled",
         ));
     }
 
+    let template = &source.template;
     validate_template(template)?;
-    let package_root = package_root(record)?;
-    let default_target_id = package_target_id(&record.manifest.name);
+    let source_root = source.root.clone();
+    let default_target_id = source_default_target_id(&source);
     let resolved_target_id = request
         .target_id
         .clone()
@@ -174,10 +205,10 @@ pub fn materialize_package_session_template(
         ));
     }
 
-    let default_cwd = resolve_working_directory(&package_root, template)?;
+    let default_cwd = resolve_working_directory(&source_root, template)?;
     let working_directory = if let Some(cwd) = &request.cwd {
         let path = PathBuf::from(cwd);
-        if !path.is_absolute() || !path.starts_with(&package_root) {
+        if !path.is_absolute() || !path.starts_with(&source_root) {
             return Err(SessionTemplateError::new(
                 "cwd_not_admitted",
                 "requested cwd is outside the admitted spawn target",
@@ -213,17 +244,17 @@ pub fn materialize_package_session_template(
         session_id: &session_id,
         context_id: &context_id,
         target_id: &resolved_target_id,
-        package_root: &package_root,
+        package_root: &source_root,
         working_directory: &working_directory,
     };
     let context = assemble_context(config, context_inputs, request.context, &template.context);
     inject_context_environment(config, &mut environment, &session_id, &context_id);
 
-    let row = template_row(record, template);
+    let row = template_row_from_source(&source);
     let resolved = ResolvedSessionTemplate {
         template: row,
         session_id: session_id.clone(),
-        executable: resolve_command_path(&package_root, &template.command)
+        executable: resolve_command_path(&source_root, &template.command)
             .display()
             .to_string(),
         arguments: template.args.clone(),
@@ -259,59 +290,185 @@ pub fn materialize_package_session_template(
     })
 }
 
-/// Return one sanitized package-contributed template row by bare or full id.
-pub fn show_package_session_template(
+/// Return one effective template row by bare or full id.
+pub fn show_session_template(
     records: &[&PackageRecord],
+    state: &HubState,
     template_id: &str,
 ) -> SessionTemplateResult<HubSessionTemplate> {
-    let (record, template) = find_template(records, template_id)?;
-    Ok(template_row(record, template))
+    find_source_template(records, state, template_id)
+        .map(|source| template_row_from_source(&source))
 }
 
-fn template_row(record: &PackageRecord, template: &PackageSessionTemplate) -> HubSessionTemplate {
+fn template_row_from_source(source: &SourceTemplate) -> HubSessionTemplate {
     HubSessionTemplate {
-        template_id: format!("{}/{}", record.manifest.name, template.id),
-        package_name: record.manifest.name.clone(),
-        id: template.id.clone(),
-        source: "package".to_string(),
-        command: template.command.clone(),
-        args: template.args.clone(),
-        working_directory_policy: match &template.working_directory {
+        template_id: source_template_id(source),
+        package_name: source.source_name.clone(),
+        id: source.template.id.clone(),
+        source: source.source.clone(),
+        command: source.template.command.clone(),
+        args: source.template.args.clone(),
+        working_directory_policy: match &source.template.working_directory {
             PackageSessionTemplateWorkingDirectory::PackageRoot => "package_root".to_string(),
             PackageSessionTemplateWorkingDirectory::Relative { .. } => "relative".to_string(),
         },
-        allowed_environment_overrides: template.allowed_environment_overrides.clone(),
-        context_keys: template.context.clone(),
-        target_id: template
-            .target_id
-            .clone()
-            .unwrap_or_else(|| package_target_id(&record.manifest.name)),
-        available: record.state == PackageState::Enabled,
+        allowed_environment_overrides: source.template.allowed_environment_overrides.clone(),
+        context_keys: source.template.context.clone(),
+        target_id: source_default_target_id(source),
+        available: source.available,
     }
 }
 
-fn find_template<'a>(
-    records: &'a [&'a PackageRecord],
+fn source_template_id(source: &SourceTemplate) -> String {
+    format!("{}/{}", source.source_name, source.template.id)
+}
+
+fn source_default_target_id(source: &SourceTemplate) -> String {
+    source
+        .template
+        .target_id
+        .clone()
+        .unwrap_or_else(|| match source.rank {
+            TemplateSourceRank::Package => package_target_id(&source.source_name),
+            TemplateSourceRank::Device => DEFAULT_DEVICE_TARGET_ID.to_string(),
+            TemplateSourceRank::Repo => source.source_name.clone(),
+        })
+}
+
+fn find_source_template(
+    records: &[&PackageRecord],
+    state: &HubState,
     template_id: &str,
-) -> SessionTemplateResult<(&'a PackageRecord, &'a PackageSessionTemplate)> {
-    let mut matches = records
-        .iter()
-        .flat_map(|record| {
-            record.session_templates.iter().filter_map(|template| {
-                let full = format!("{}/{}", record.manifest.name, template.id);
-                (template.id == template_id || full == template_id).then_some((*record, template))
-            })
+) -> SessionTemplateResult<SourceTemplate> {
+    let sources = source_templates(records, state)?;
+    let matches = sources
+        .into_iter()
+        .filter(|source| {
+            source.template.id == template_id || source_template_id(source) == template_id
         })
         .collect::<Vec<_>>();
-    match matches.len() {
-        0 => Err(SessionTemplateError::new(
+    choose_effective_template(matches)
+}
+
+fn effective_templates(sources: Vec<SourceTemplate>) -> SessionTemplateResult<Vec<SourceTemplate>> {
+    let mut by_id = BTreeMap::<String, Vec<SourceTemplate>>::new();
+    for source in sources {
+        by_id
+            .entry(source.template.id.clone())
+            .or_default()
+            .push(source);
+    }
+    by_id
+        .into_values()
+        .map(choose_effective_template)
+        .collect::<SessionTemplateResult<Vec<_>>>()
+}
+
+fn choose_effective_template(
+    mut matches: Vec<SourceTemplate>,
+) -> SessionTemplateResult<SourceTemplate> {
+    if matches.is_empty() {
+        return Err(SessionTemplateError::new(
             "unknown_template",
             "session template was not found",
-        )),
-        1 => Ok(matches.remove(0)),
+        ));
+    }
+    matches.sort_by_key(|source| source.rank);
+    let best_rank = matches
+        .last()
+        .expect("matches is not empty after early return")
+        .rank;
+    let mut best = matches
+        .into_iter()
+        .filter(|source| source.rank == best_rank)
+        .collect::<Vec<_>>();
+    match best.len() {
+        1 => Ok(best.remove(0)),
         _ => Err(SessionTemplateError::new(
             "ambiguous_template",
-            "session template id matches more than one package",
+            "session template id matches more than one source at the same precedence",
+        )),
+    }
+}
+
+fn source_templates(
+    records: &[&PackageRecord],
+    state: &HubState,
+) -> SessionTemplateResult<Vec<SourceTemplate>> {
+    let mut sources = Vec::new();
+    for record in records {
+        let root = package_root(record).ok();
+        for template in &record.session_templates {
+            validate_template(template)?;
+            if let Some(root) = &root {
+                sources.push(SourceTemplate {
+                    rank: TemplateSourceRank::Package,
+                    source: PACKAGE_TEMPLATE_SOURCE.to_string(),
+                    source_name: record.manifest.name.clone(),
+                    root: root.clone(),
+                    template: template.clone(),
+                    available: record.state == PackageState::Enabled,
+                });
+            }
+        }
+    }
+
+    for device_source in &state.device_session_template_sources {
+        validate_session_templates(&device_source.session_templates).map_err(|message| {
+            SessionTemplateError::new("invalid_device_session_templates", message)
+        })?;
+        for template in &device_source.session_templates {
+            sources.push(SourceTemplate {
+                rank: TemplateSourceRank::Device,
+                source: DEVICE_TEMPLATE_SOURCE.to_string(),
+                source_name: DEVICE_TEMPLATE_SOURCE.to_string(),
+                root: device_source.root.clone(),
+                template: template.clone(),
+                available: true,
+            });
+        }
+    }
+
+    for target in &state.admitted_session_template_targets {
+        if !target.enabled {
+            continue;
+        }
+        let repo_templates = repo_session_templates(&target.root)?;
+        validate_session_templates(&repo_templates).map_err(|message| {
+            SessionTemplateError::new("invalid_repo_session_templates", message)
+        })?;
+        for template in repo_templates {
+            sources.push(SourceTemplate {
+                rank: TemplateSourceRank::Repo,
+                source: REPO_TEMPLATE_SOURCE.to_string(),
+                source_name: target.target_id.clone(),
+                root: target.root.clone(),
+                template,
+                available: true,
+            });
+        }
+    }
+
+    Ok(sources)
+}
+
+fn repo_session_templates(root: &Path) -> SessionTemplateResult<Vec<PackageSessionTemplate>> {
+    let path = root.join(REPO_SESSION_TEMPLATES_FILE);
+    match fs::read(&path) {
+        Ok(bytes) => {
+            let file: RepoSessionTemplatesFile =
+                serde_json::from_slice(&bytes).map_err(|error| {
+                    SessionTemplateError::new(
+                        "invalid_repo_session_templates",
+                        format!("repo-local session template file is invalid: {error}"),
+                    )
+                })?;
+            Ok(file.session_templates)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(SessionTemplateError::new(
+            "invalid_repo_session_templates",
+            format!("repo-local session template file could not be read: {error}"),
         )),
     }
 }
