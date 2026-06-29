@@ -63,6 +63,7 @@ export type DaemonRequest =
   | { type: "apply_package_update"; package_name: string; pin: DaemonPackagePin }
   | { type: "show_package"; package_name: string }
   | { type: "set_package_configuration"; package_name: string; values: Record<string, JsonValue> }
+  | { type: "reload_package"; package_name: string }
   | { type: "enable_package_local_path"; path: string }
   | { type: "enable_package"; package_name: string }
   | { type: "disable_package"; package_name: string }
@@ -266,6 +267,7 @@ export interface DaemonPackage {
   package_name: string;
   version: string;
   classification: string;
+  source_kind: string;
   state: string;
   requested_capabilities: DaemonCapability[];
   surfaces?: DaemonPackageSurfaceDescriptor[];

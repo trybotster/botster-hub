@@ -488,6 +488,46 @@ fn write_app_registry_package(root: &Path) {
     .expect("write app registry package manifest");
 }
 
+fn write_reloadable_app_package(root: &Path, version: &str, local_url: &str) {
+    write_reloadable_app_package_named(root, "dogfood.reloadable", version, local_url);
+}
+
+fn write_reloadable_app_package_named(root: &Path, name: &str, version: &str, local_url: &str) {
+    fs::create_dir_all(root).expect("create reloadable app package root");
+    fs::write(root.join("plugin.lua"), "return botster.register({})\n")
+        .expect("write reloadable app plugin entrypoint");
+    let command = format!(
+        "printf '%s\n' '{{\"entrypoint_id\":\"web\",\"process_state\":\"running\",\"local_url\":\"{local_url}\"}}' > \"$BOTSTER_ENTRYPOINT_LAUNCH_RESULT\"; while true; do sleep 1; done"
+    );
+    let manifest = serde_json::json!({
+        "name": name,
+        "version": version,
+        "kind": "plugin",
+        "botster": ">=0.1.0",
+        "source": { "type": "path", "path": "." },
+        "capabilities": [{ "surface": "surfaces" }],
+        "entrypoints": [
+            { "runtime": "lua", "path": "plugin.lua", "bootstrap": false }
+        ],
+        "runnable_entrypoints": [{
+            "id": "web",
+            "kind": "web_app",
+            "command": "sh",
+            "args": ["-c", command],
+            "working_directory": { "policy": "package_root" },
+            "launch_mode": "background",
+            "readiness": { "result_fields": ["local_url"] },
+            "capabilities": [{ "surface": "network", "scope": "localhost" }],
+            "may_supervise": true
+        }]
+    });
+    fs::write(
+        root.join("botster-package.json"),
+        serde_json::to_string_pretty(&manifest).expect("serialize reloadable app package manifest"),
+    )
+    .expect("write reloadable app package manifest");
+}
+
 fn write_hub_env_web_app_package(root: &Path) {
     fs::create_dir_all(root).expect("create hub-env web package root");
     fs::write(root.join("plugin.lua"), "return botster.register({})\n")
@@ -6408,6 +6448,176 @@ fn package_configuration_daemon_set_show_list_reload_and_cli_are_redacted() {
 }
 
 #[test]
+fn local_package_reload_rereads_manifest_restarts_running_app_and_cli_open_uses_refreshed_state() {
+    let _guard = daemon_test_lock()
+        .lock()
+        .expect("serialize real daemon test");
+    let data_dir = unique_test_dir("local-package-reload");
+    let package_dir = unique_test_dir("reloadable-app-package");
+    write_reloadable_app_package(&package_dir, "1.0.0", "http://127.0.0.1:49160");
+    let config = explicit_config(&data_dir);
+    let child = start_cli_daemon(&data_dir);
+
+    let enable = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::EnablePackageLocalPath {
+            path: package_dir.clone(),
+        },
+    )
+    .expect("enable reloadable local app package");
+    assert_eq!(
+        enable.package_decision.expect("enable decision").action,
+        "enable"
+    );
+    let enabled_package = enable
+        .packages
+        .iter()
+        .find(|package| package.package_name == "dogfood.reloadable")
+        .expect("enabled package row");
+    assert_eq!(enabled_package.source_kind, "path");
+    let reload_action = package_action(&enabled_package.actions, "reload_package");
+    assert_eq!(
+        reload_action.status,
+        botster_hub::DaemonPackageActionStatus::Available
+    );
+    assert_eq!(
+        reload_action
+            .request
+            .as_ref()
+            .expect("reload request")
+            .request_type,
+        "reload_package"
+    );
+
+    botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::StartPackageEntrypoint {
+            package_name: "dogfood.reloadable".to_string(),
+            entrypoint_id: "web".to_string(),
+            environment_overrides: BTreeMap::new(),
+        },
+    )
+    .expect("start reloadable app");
+    wait_for_app_local_url(&data_dir, "web", "http://127.0.0.1:49160");
+
+    write_reloadable_app_package(&package_dir, "1.1.0", "http://127.0.0.1:49161");
+    let reload = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::ReloadPackage {
+            package_name: "dogfood.reloadable".to_string(),
+        },
+    )
+    .expect("reload local package");
+    assert_eq!(
+        reload.package_decision.expect("reload decision").action,
+        "reload"
+    );
+    let reloaded_package = reload
+        .packages
+        .iter()
+        .find(|package| package.package_name == "dogfood.reloadable")
+        .expect("reloaded package row");
+    assert_eq!(reloaded_package.version, "1.1.0");
+
+    let apps = wait_for_app_local_url(&data_dir, "web", "http://127.0.0.1:49161");
+    let app = app_row(&apps, "web");
+    assert_eq!(app.package_name, "dogfood.reloadable");
+    assert_eq!(
+        app.launch_target.local_url.as_deref(),
+        Some("http://127.0.0.1:49161")
+    );
+
+    let open = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("apps")
+        .arg("open")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("dogfood.reloadable/web")
+        .output()
+        .expect("open refreshed web app");
+    assert!(
+        open.status.success(),
+        "apps open failed after reload: {}",
+        command_output_text(&open)
+    );
+    let open_text = command_output_text(&open);
+    assert!(open_text.contains("app_url=http://127.0.0.1:49161"));
+    assert!(!open_text.contains(package_dir.to_string_lossy().as_ref()));
+    assert!(!open_text.contains(data_dir.to_string_lossy().as_ref()));
+
+    let cli = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("packages")
+        .arg("reload")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("dogfood.reloadable")
+        .output()
+        .expect("run package reload CLI");
+    assert!(
+        cli.status.success(),
+        "packages reload failed: {}",
+        command_output_text(&cli)
+    );
+    let cli_text = command_output_text(&cli);
+    assert!(cli_text.contains("decision=package"));
+    assert!(cli_text.contains("package_name=dogfood.reloadable"));
+    assert!(cli_text.contains("action=reload"));
+    assert!(cli_text.contains("version=1.1.0"));
+    assert!(!cli_text.contains(package_dir.to_string_lossy().as_ref()));
+    assert!(!cli_text.contains(data_dir.to_string_lossy().as_ref()));
+
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
+fn local_package_reload_name_mismatch_returns_path_free_operator_error() {
+    let _guard = daemon_test_lock()
+        .lock()
+        .expect("serialize real daemon test");
+    let data_dir = unique_test_dir("reload-name-mismatch");
+    let package_dir = unique_test_dir("reload-pkg-mismatch");
+    write_reloadable_app_package(&package_dir, "1.0.0", "http://127.0.0.1:49162");
+    let config = explicit_config(&data_dir);
+    let child = start_cli_daemon(&data_dir);
+
+    botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::EnablePackageLocalPath {
+            path: package_dir.clone(),
+        },
+    )
+    .expect("enable reloadable local app package");
+
+    write_reloadable_app_package_named(
+        &package_dir,
+        "dogfood.reloadable-renamed",
+        "1.1.0",
+        "http://127.0.0.1:49163",
+    );
+    let reload = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::ReloadPackage {
+            package_name: "dogfood.reloadable".to_string(),
+        },
+    )
+    .expect("reload renamed local package returns operator frame");
+
+    assert_eq!(reload.kind, botster_hub::DaemonResponseKind::OperatorError);
+    let error = reload.error.as_ref().expect("operator error");
+    assert!(error.message.contains("InvalidLocalManifest"));
+    assert!(error.message.contains("dogfood.reloadable-renamed"));
+    assert!(error.message.contains("dogfood.reloadable"));
+    assert!(
+        !error
+            .message
+            .contains(package_dir.to_string_lossy().as_ref())
+    );
+    assert!(!error.message.contains(data_dir.to_string_lossy().as_ref()));
+
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
 fn daemon_package_list_exposes_dependency_and_feature_availability_matrix() {
     let _guard = daemon_test_lock()
         .lock()
@@ -6689,7 +6899,7 @@ fn package_update_unsupported_cases_return_structured_diagnostics() {
     );
     assert_eq!(
         package_action(&status.actions, "reload_package").status,
-        botster_hub::DaemonPackageActionStatus::Unavailable
+        botster_hub::DaemonPackageActionStatus::Available
     );
 
     botster_hub::daemon_transport_request(
@@ -6709,8 +6919,7 @@ fn package_update_unsupported_cases_return_structured_diagnostics() {
     let enabled_status = enabled_check.update_status.expect("enabled update status");
     assert!(enabled_status.reload_required);
     assert!(enabled_status.diagnostics.iter().any(|diagnostic| {
-        diagnostic.kind == "reload_unavailable"
-            && diagnostic.message.contains("disable/enable cycle")
+        diagnostic.kind == "reload_available" && diagnostic.message.contains("reload_package")
     }));
 
     let cli = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
@@ -6730,7 +6939,7 @@ fn package_update_unsupported_cases_return_structured_diagnostics() {
     assert!(stdout.contains("package_update package=dogfood.plugin"));
     assert!(stdout.contains("reload_required=true"));
     assert!(
-        stdout.contains("package_update_diagnostic package=dogfood.plugin kind=reload_unavailable")
+        stdout.contains("package_update_diagnostic package=dogfood.plugin kind=reload_available")
     );
 
     shutdown_cli_daemon(&data_dir, child);

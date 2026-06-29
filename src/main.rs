@@ -1511,6 +1511,11 @@ fn operator_packages(args: Vec<String>, providers_only: bool) -> Result<(), Oper
             )?;
             print_packages_response(response, providers_only)?;
         }
+        PackageActionCommand::Reload(package_name) => {
+            let response =
+                daemon_transport_request(&config, DaemonRequest::ReloadPackage { package_name })?;
+            print_packages_response(response, providers_only)?;
+        }
         PackageActionCommand::EnableLocalPath(path) => {
             let response =
                 daemon_transport_request(&config, DaemonRequest::EnablePackageLocalPath { path })?;
@@ -2859,6 +2864,7 @@ enum PackageActionCommand {
         package_name: String,
         values: BTreeMap<String, serde_json::Value>,
     },
+    Reload(String),
     EnableLocalPath(PathBuf),
     EnableName(String),
     Disable(String),
@@ -3051,6 +3057,16 @@ impl PackageCommand {
                 Ok(Self {
                     data_directory: options.data_directory,
                     action: PackageActionCommand::CheckUpdate(args[3].clone()),
+                })
+            }
+            "reload" if !providers_only => {
+                if args.len() != 4 {
+                    return Err(OperatorError::Usage("packages reload"));
+                }
+                let options = DataDirOptions::parse(args[1..3].to_vec(), "packages reload")?;
+                Ok(Self {
+                    data_directory: options.data_directory,
+                    action: PackageActionCommand::Reload(args[3].clone()),
                 })
             }
             "preview-update" if !providers_only => parse_package_update_command(
@@ -3818,6 +3834,7 @@ fn usage_for(command: &str) -> &'static str {
         "packages check-update" => {
             "usage: botster-hub packages check-update --data-dir <path> <name>"
         }
+        "packages reload" => "usage: botster-hub packages reload --data-dir <path> <name>",
         "packages preview-update" => {
             "usage: botster-hub packages preview-update --data-dir <path> <name> --revision <revision> [--branch <branch>] [--tag <tag>] [--rev <rev>] [--checksum <checksum>] [--policy manual|track_source]"
         }

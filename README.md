@@ -260,6 +260,10 @@ daemon-owned entrypoint launch injects hub connection environment. Foreground
 terminal apps run through `botster-hub apps open`, which asks the daemon for the
 resolved launch contract and then starts the child with inherited stdio.
 
+After editing an installed local package, run `botster-hub packages reload
+--data-dir <data-dir> <package-name>` to re-read its manifest and restart any
+running entrypoints for that package.
+
 From another terminal, the composed local client app path should be visible
 through the same stable data directory:
 
