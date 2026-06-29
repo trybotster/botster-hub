@@ -42,6 +42,13 @@ fn main() {
             }
             return;
         }
+        Some("dev-stack") => {
+            if let Err(error) = dev_stack(env::args().skip(2).collect()) {
+                eprintln!("botster-hub dev-stack error: {error}");
+                process::exit(1);
+            }
+            return;
+        }
         Some("status") => {
             if let Err(error) = operator_status(env::args().skip(2).collect()) {
                 eprintln!("botster-hub status error: {error}");
@@ -276,6 +283,150 @@ fn dogfood(args: Vec<String>) -> Result<(), DogfoodError> {
     }
 }
 
+fn dev_stack(args: Vec<String>) -> Result<(), DevStackError> {
+    let command = DevStackCommand::parse(args)?;
+    match command {
+        DevStackCommand::Bootstrap(options) => dev_stack_bootstrap(options),
+    }
+}
+
+fn dev_stack_bootstrap(options: DevStackOptions) -> Result<(), DevStackError> {
+    std::fs::create_dir_all(&options.data_directory).map_err(|source| {
+        DevStackError::CreateDataDir {
+            path: options.data_directory.clone(),
+            source,
+        }
+    })?;
+
+    let hub_bin = env::current_exe().map_err(DevStackError::CurrentExe)?;
+    let config = explicit_config(options.data_directory.clone())?;
+    let daemon_ownership = ensure_dev_stack_daemon(&hub_bin, &options, &config)?;
+
+    let project_pipelines = enable_dev_stack_package(
+        &config,
+        "project-pipelines",
+        "project-pipelines",
+        options.package_path("project-pipelines")?,
+    )?;
+    let web_bridge_port = options.web_bridge_port()?;
+    let web = start_botster_web_dogfood(
+        &config,
+        &options.data_directory,
+        &options.package_path("botster-web")?,
+        web_bridge_port,
+    )?;
+    let tui = enable_dev_stack_package(
+        &config,
+        "botster-tui",
+        "botster-tui",
+        options.package_path("botster-tui")?,
+    )?;
+    let workspaces = enable_dev_stack_package(
+        &config,
+        "botster-workspaces",
+        "botster-workspaces",
+        options.package_path("botster-workspaces")?,
+    )?;
+
+    print_dev_stack_ready(
+        &options.data_directory,
+        options.default_data_dir,
+        daemon_ownership,
+        &[
+            ("project-pipelines", project_pipelines.as_str()),
+            ("botster-web", web.package_state.as_str()),
+            ("botster-tui", tui.as_str()),
+            ("botster-workspaces", workspaces.as_str()),
+        ],
+        &web,
+    );
+
+    Ok(())
+}
+
+fn ensure_dev_stack_daemon(
+    hub_bin: &Path,
+    options: &DevStackOptions,
+    config: &botster_hub::HubConfig,
+) -> Result<DevStackDaemonOwnership, DevStackError> {
+    if daemon_transport_request(config, DaemonRequest::Status).is_ok() {
+        return Ok(DevStackDaemonOwnership::Reused);
+    }
+
+    if !hub_bin.is_file() {
+        return Err(DevStackError::MissingHubBinary(hub_bin.to_path_buf()));
+    }
+    let session_worker_bin = options.session_worker_bin(hub_bin)?;
+
+    let mut command = Command::new(hub_bin);
+    command
+        .arg("start")
+        .arg("--data-dir")
+        .arg(&options.data_directory)
+        .arg("--session-worker-bin")
+        .arg(session_worker_bin)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut child = command
+        .spawn()
+        .map_err(|source| DevStackError::SpawnDaemon {
+            path: hub_bin.to_path_buf(),
+            source,
+        })?;
+
+    wait_for_dev_stack_ready(config, &mut child)?;
+    Ok(DevStackDaemonOwnership::Started)
+}
+
+fn wait_for_dev_stack_ready(
+    config: &botster_hub::HubConfig,
+    child: &mut Child,
+) -> Result<(), DevStackError> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if let Some(status) = child.try_wait().map_err(DevStackError::PollDaemon)? {
+            return Err(DevStackError::DaemonExited(status.to_string()));
+        }
+        if daemon_transport_request(config, DaemonRequest::Status).is_ok() {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    Err(DevStackError::ReadinessTimeout)
+}
+
+fn enable_dev_stack_package(
+    config: &botster_hub::HubConfig,
+    label: &'static str,
+    expected_package_name: &str,
+    path: PathBuf,
+) -> Result<String, DevStackError> {
+    if !path.join("botster-package.json").is_file() {
+        return Err(DevStackError::MissingPackage { label });
+    }
+    let response = enable_dogfood_package(config, expected_package_name, path)?;
+    if response.kind == DaemonResponseKind::OperatorError {
+        return Err(DevStackError::PackageEnable {
+            label,
+            message: response
+                .error
+                .map(|error| error.message)
+                .unwrap_or_else(|| "package enable failed".to_string()),
+        });
+    }
+    let package = response
+        .packages
+        .iter()
+        .find(|package| package.package_name == expected_package_name)
+        .ok_or(DevStackError::WrongPackage { label })?;
+    Ok(response
+        .package_decision
+        .as_ref()
+        .map(|decision| decision.state.clone())
+        .unwrap_or_else(|| package.state.clone()))
+}
+
 fn verify_dogfood_session_worker(config: &botster_hub::HubConfig) -> Result<(), DogfoodError> {
     let response = daemon_transport_request(
         config,
@@ -408,11 +559,37 @@ fn start_botster_web_dogfood(
     let web_url = format!("{bridge_url}/?dogfood=real-hub");
     wait_for_botster_web_health(config, &bridge_url)?;
     wait_for_botster_web_ui(config, &web_url)?;
+    let web_url = wait_for_botster_web_app_url(config)?;
     Ok(DogfoodWebLaunch {
         bridge_url,
         web_url,
         package_state,
     })
+}
+
+fn wait_for_botster_web_app_url(config: &botster_hub::HubConfig) -> Result<String, DogfoodError> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut last_state = None;
+    while Instant::now() < deadline {
+        let response = daemon_transport_request(config, DaemonRequest::ListApps)?;
+        if let Some(app) = response
+            .apps
+            .iter()
+            .find(|app| app.package_name == "botster-web" && app.entrypoint_id == "web-client")
+        {
+            if app.lifecycle_state == "running"
+                && let Some(url) = app.launch_target.local_url.as_ref()
+            {
+                return Ok(url.clone());
+            }
+            last_state = Some(app.lifecycle_state.clone());
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    Err(DogfoodError::WebEntrypointStart(format!(
+        "missing structured local_url; lifecycle_state={}",
+        last_state.unwrap_or_else(|| "missing".to_string())
+    )))
 }
 
 fn enable_dogfood_package(
@@ -2101,6 +2278,216 @@ struct DogfoodOptions {
     default_data_dir: bool,
 }
 
+enum DevStackCommand {
+    Bootstrap(DevStackOptions),
+}
+
+impl DevStackCommand {
+    fn parse(args: Vec<String>) -> Result<Self, DevStackError> {
+        match args.first().map(String::as_str) {
+            Some("bootstrap") => Ok(Self::Bootstrap(DevStackOptions::parse(args[1..].to_vec())?)),
+            _ => Err(DevStackError::Usage),
+        }
+    }
+}
+
+struct DevStackOptions {
+    data_directory: PathBuf,
+    default_data_dir: bool,
+    session_worker_bin: Option<PathBuf>,
+    project_pipelines_package_path: Option<PathBuf>,
+    web_package_path: Option<PathBuf>,
+    tui_package_path: Option<PathBuf>,
+    workspaces_package_path: Option<PathBuf>,
+    web_bridge_port: Option<u16>,
+}
+
+impl DevStackOptions {
+    fn parse(args: Vec<String>) -> Result<Self, DevStackError> {
+        let mut data_directory = None;
+        let mut session_worker_bin = None;
+        let mut project_pipelines_package_path = None;
+        let mut web_package_path = None;
+        let mut tui_package_path = None;
+        let mut workspaces_package_path = None;
+        let mut web_bridge_port = None;
+        let mut cursor = 0;
+
+        while cursor < args.len() {
+            match args[cursor].as_str() {
+                "--data-dir" => {
+                    let Some(value) = args.get(cursor + 1) else {
+                        return Err(DevStackError::Usage);
+                    };
+                    data_directory = Some(PathBuf::from(value));
+                    cursor += 2;
+                }
+                "--session-worker-bin" => {
+                    let Some(value) = args.get(cursor + 1) else {
+                        return Err(DevStackError::Usage);
+                    };
+                    session_worker_bin = Some(PathBuf::from(value));
+                    cursor += 2;
+                }
+                "--project-pipelines-package-path" => {
+                    let Some(value) = args.get(cursor + 1) else {
+                        return Err(DevStackError::Usage);
+                    };
+                    project_pipelines_package_path = Some(PathBuf::from(value));
+                    cursor += 2;
+                }
+                "--web-package-path" => {
+                    let Some(value) = args.get(cursor + 1) else {
+                        return Err(DevStackError::Usage);
+                    };
+                    web_package_path = Some(PathBuf::from(value));
+                    cursor += 2;
+                }
+                "--tui-package-path" => {
+                    let Some(value) = args.get(cursor + 1) else {
+                        return Err(DevStackError::Usage);
+                    };
+                    tui_package_path = Some(PathBuf::from(value));
+                    cursor += 2;
+                }
+                "--workspaces-package-path" => {
+                    let Some(value) = args.get(cursor + 1) else {
+                        return Err(DevStackError::Usage);
+                    };
+                    workspaces_package_path = Some(PathBuf::from(value));
+                    cursor += 2;
+                }
+                "--web-bridge-port" => {
+                    let Some(value) = args.get(cursor + 1) else {
+                        return Err(DevStackError::Usage);
+                    };
+                    web_bridge_port = Some(value.parse::<u16>().map_err(|_| DevStackError::Usage)?);
+                    cursor += 2;
+                }
+                _ => return Err(DevStackError::Usage),
+            }
+        }
+
+        let default_data_dir = data_directory.is_none();
+        Ok(Self {
+            data_directory: data_directory.unwrap_or_else(default_dev_stack_data_dir),
+            default_data_dir,
+            session_worker_bin,
+            project_pipelines_package_path,
+            web_package_path,
+            tui_package_path,
+            workspaces_package_path,
+            web_bridge_port,
+        })
+    }
+
+    fn package_path(&self, label: &'static str) -> Result<PathBuf, DevStackError> {
+        let explicit = match label {
+            "project-pipelines" => self.project_pipelines_package_path.as_ref(),
+            "botster-web" => self.web_package_path.as_ref(),
+            "botster-tui" => self.tui_package_path.as_ref(),
+            "botster-workspaces" => self.workspaces_package_path.as_ref(),
+            _ => None,
+        };
+        if let Some(path) = explicit {
+            return Ok(path.clone());
+        }
+
+        let fallback = match label {
+            "project-pipelines" => PathBuf::from("examples/project-pipelines"),
+            "botster-web" => PathBuf::from("../botster-web"),
+            "botster-tui" => PathBuf::from("../botster-tui"),
+            "botster-workspaces" => PathBuf::from("../botster-workspaces"),
+            _ => return Err(DevStackError::MissingPackage { label }),
+        };
+        if fallback.join("botster-package.json").is_file() {
+            Ok(fallback)
+        } else {
+            Err(DevStackError::MissingPackage { label })
+        }
+    }
+
+    fn session_worker_bin(&self, hub_bin: &Path) -> Result<PathBuf, DevStackError> {
+        if let Some(path) = self.session_worker_bin.as_ref() {
+            if path.is_file() {
+                return Ok(path.clone());
+            }
+            return Err(DevStackError::MissingSessionWorkerBinary(path.clone()));
+        }
+
+        DogfoodOptions {
+            data_directory: None,
+            session_worker_bin: None,
+            web_package_path: None,
+            tui_package_path: None,
+            web_bridge_port: None,
+            default_data_dir: false,
+        }
+        .session_worker_bin(hub_bin)
+        .map_err(DevStackError::from)
+    }
+
+    fn web_bridge_port(&self) -> Result<u16, DevStackError> {
+        match self.web_bridge_port {
+            Some(port) => Ok(port),
+            None => choose_loopback_port().map_err(DevStackError::from),
+        }
+    }
+}
+
+fn default_dev_stack_data_dir() -> PathBuf {
+    PathBuf::from("target").join("botster-hub-dev-stack-data")
+}
+
+fn dev_stack_package_path_flag(label: &str) -> &'static str {
+    match label {
+        "project-pipelines" => "project-pipelines",
+        "botster-web" => "web",
+        "botster-tui" => "tui",
+        "botster-workspaces" => "workspaces",
+        _ => "package",
+    }
+}
+
+#[derive(Clone, Copy)]
+enum DevStackDaemonOwnership {
+    Started,
+    Reused,
+}
+
+fn print_dev_stack_ready(
+    data_directory: &Path,
+    default_data_dir: bool,
+    daemon_ownership: DevStackDaemonOwnership,
+    packages: &[(&str, &str)],
+    web: &DogfoodWebLaunch,
+) {
+    let dir = data_directory.display();
+    println!("dev_stack=ready");
+    if default_data_dir {
+        println!("data_dir=stable:{dir}");
+    } else {
+        println!("data_dir={dir}");
+    }
+    println!(
+        "daemon={}",
+        match daemon_ownership {
+            DevStackDaemonOwnership::Started => "started",
+            DevStackDaemonOwnership::Reused => "reused",
+        }
+    );
+    for (name, state) in packages {
+        println!("package name={name} state={state}");
+    }
+    println!("bridge={}", web.bridge_url);
+    println!("web={}", web.web_url);
+    println!("tui=botster-hub apps open --data-dir {dir} botster-tui");
+    println!("mcp=botster-hub mcp-serve --data-dir {dir}");
+    println!("status=botster-hub status --data-dir {dir}");
+    println!("apps=botster-hub apps list --data-dir {dir}");
+    println!("shutdown=botster-hub shutdown --data-dir {dir}");
+}
+
 impl DogfoodOptions {
     fn parse(args: Vec<String>) -> Result<Self, DogfoodError> {
         let mut data_directory = None;
@@ -3025,6 +3412,38 @@ enum DogfoodError {
 }
 
 #[derive(Debug)]
+enum DevStackError {
+    Usage,
+    CurrentExe(io::Error),
+    CreateDataDir {
+        path: PathBuf,
+        source: io::Error,
+    },
+    MissingHubBinary(PathBuf),
+    MissingSessionWorkerBinary(PathBuf),
+    SpawnDaemon {
+        path: PathBuf,
+        source: io::Error,
+    },
+    PollDaemon(io::Error),
+    ReadinessTimeout,
+    Config(botster_hub::HubConfigError),
+    Transport(botster_hub::DaemonTransportError),
+    MissingPackage {
+        label: &'static str,
+    },
+    WrongPackage {
+        label: &'static str,
+    },
+    PackageEnable {
+        label: &'static str,
+        message: String,
+    },
+    Dogfood(Box<DogfoodError>),
+    DaemonExited(String),
+}
+
+#[derive(Debug)]
 enum OperatorError {
     Usage(&'static str),
     UnexpectedResponse(&'static str),
@@ -3201,6 +3620,95 @@ impl fmt::Display for DogfoodError {
     }
 }
 
+impl fmt::Display for DevStackError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Usage => write!(formatter, "{}", usage_for("dev-stack bootstrap")),
+            Self::CurrentExe(error) => {
+                write!(formatter, "resolve current botster-hub binary: {error}")
+            }
+            Self::CreateDataDir { path, source } => {
+                write!(
+                    formatter,
+                    "create dev-stack data dir {}: {source}",
+                    path.display()
+                )
+            }
+            Self::MissingHubBinary(path) => {
+                write!(
+                    formatter,
+                    "missing botster-hub binary at {}",
+                    path.display()
+                )
+            }
+            Self::MissingSessionWorkerBinary(path) => write!(
+                formatter,
+                "missing botster-session-worker binary at {}; pass --session-worker-bin <path>",
+                path.display()
+            ),
+            Self::SpawnDaemon { path, source } => {
+                write!(
+                    formatter,
+                    "spawn dev-stack daemon {}: {source}",
+                    path.display()
+                )
+            }
+            Self::PollDaemon(error) => write!(formatter, "poll dev-stack daemon: {error}"),
+            Self::ReadinessTimeout => {
+                write!(
+                    formatter,
+                    "timed out waiting for dev-stack daemon readiness"
+                )
+            }
+            Self::Config(error) => write!(formatter, "{error}"),
+            Self::Transport(error) => write!(formatter, "{error}"),
+            Self::MissingPackage { label } => write!(
+                formatter,
+                "missing {label} package; pass --{}-package-path <path>",
+                dev_stack_package_path_flag(label)
+            ),
+            Self::WrongPackage { label } => {
+                write!(
+                    formatter,
+                    "package path did not enable expected package {label}"
+                )
+            }
+            Self::PackageEnable { label, message } => {
+                write!(formatter, "enable {label} package: {message}")
+            }
+            Self::Dogfood(error) => write!(formatter, "{error}"),
+            Self::DaemonExited(status) => {
+                write!(formatter, "dev-stack daemon exited with {status}")
+            }
+        }
+    }
+}
+
+impl From<botster_hub::HubConfigError> for DevStackError {
+    fn from(error: botster_hub::HubConfigError) -> Self {
+        Self::Config(error)
+    }
+}
+
+impl From<botster_hub::DaemonTransportError> for DevStackError {
+    fn from(error: botster_hub::DaemonTransportError) -> Self {
+        Self::Transport(error)
+    }
+}
+
+impl From<DogfoodError> for DevStackError {
+    fn from(error: DogfoodError) -> Self {
+        match error {
+            DogfoodError::MissingSessionWorkerBinary(path) => {
+                Self::MissingSessionWorkerBinary(path)
+            }
+            DogfoodError::Config(error) => Self::Config(error),
+            DogfoodError::Transport(error) => Self::Transport(error),
+            other => Self::Dogfood(Box::new(other)),
+        }
+    }
+}
+
 impl fmt::Display for OperatorError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -3234,6 +3742,9 @@ fn usage_for(command: &str) -> &'static str {
         "start" => "usage: botster-hub start --data-dir <path> [--session-worker-bin <path>]",
         "dogfood" => {
             "usage: botster-hub dogfood [--data-dir <path>] [--session-worker-bin <path>] --web-package-path <path> [--tui-package-path <path>] [--web-bridge-port <port>]"
+        }
+        "dev-stack" | "dev-stack bootstrap" => {
+            "usage: botster-hub dev-stack bootstrap [--data-dir <path>] [--session-worker-bin <path>] [--project-pipelines-package-path <path>] [--web-package-path <path>] [--tui-package-path <path>] [--workspaces-package-path <path>] [--web-bridge-port <port>]"
         }
         "status" => "usage: botster-hub status --data-dir <path>",
         "sessions" => {
@@ -3328,7 +3839,7 @@ fn usage_for(command: &str) -> &'static str {
         "providers" | "providers list" => "usage: botster-hub providers list --data-dir <path>",
         "inspect" => "usage: botster-hub inspect --data-dir <path> <session-id>",
         _ => {
-            "usage: botster-hub <start|dogfood|status|sessions|shutdown|mcp-serve|apps|packages|providers|inspect|run-one>"
+            "usage: botster-hub <start|dogfood|dev-stack|status|sessions|shutdown|mcp-serve|apps|packages|providers|inspect|run-one>"
         }
     }
 }
