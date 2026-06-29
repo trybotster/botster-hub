@@ -633,6 +633,9 @@ pub enum DaemonRequest {
         package_name: String,
         values: BTreeMap<String, Value>,
     },
+    ReloadPackage {
+        package_name: String,
+    },
     EnablePackageLocalPath {
         path: PathBuf,
     },
@@ -890,6 +893,8 @@ pub struct DaemonPackage {
     pub package_name: String,
     pub version: String,
     pub classification: String,
+    #[serde(default = "default_daemon_package_source_kind")]
+    pub source_kind: String,
     pub state: String,
     pub requested_capabilities: Vec<DaemonCapability>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -907,6 +912,10 @@ pub struct DaemonPackage {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub actions: Vec<DaemonPackageActionState>,
     pub provider_profile_admitted: bool,
+}
+
+fn default_daemon_package_source_kind() -> String {
+    "unknown".to_string()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2003,6 +2012,7 @@ mod tests {
             package_name: "workflow.plugin".to_string(),
             version: "1.0.0".to_string(),
             classification: "plugin".to_string(),
+            source_kind: "path".to_string(),
             state: "enabled".to_string(),
             requested_capabilities: Vec::new(),
             surfaces: Vec::new(),
@@ -2252,6 +2262,9 @@ mod tests {
                     serde_json::json!({"type":"url","value":"https://example.invalid/hook"}),
                 )]),
             },
+            DaemonRequest::ReloadPackage {
+                package_name: "workflow.plugin".to_string(),
+            },
             DaemonRequest::EnablePackageLocalPath {
                 path: PathBuf::from("/tmp/plugin"),
             },
@@ -2339,6 +2352,7 @@ mod tests {
             DaemonRequest::ApplyPackageUpdate { .. } => "apply_package_update",
             DaemonRequest::ShowPackage { .. } => "show_package",
             DaemonRequest::SetPackageConfiguration { .. } => "set_package_configuration",
+            DaemonRequest::ReloadPackage { .. } => "reload_package",
             DaemonRequest::EnablePackageLocalPath { .. } => "enable_package_local_path",
             DaemonRequest::EnablePackage { .. } => "enable_package",
             DaemonRequest::DisablePackage { .. } => "disable_package",
@@ -2521,6 +2535,7 @@ mod tests {
                 package_name: "workflow.plugin".to_string(),
                 version: "1.0.0".to_string(),
                 classification: "plugin".to_string(),
+                source_kind: "path".to_string(),
                 state: "enabled".to_string(),
                 requested_capabilities: vec![DaemonCapability {
                     surface: "Network".to_string(),
