@@ -258,13 +258,12 @@ botster-hub apps list --data-dir target/botster-hub-client-dogfood-data
 botster-hub apps show --data-dir target/botster-hub-client-dogfood-data botster-web/web-client
 botster-hub apps open --data-dir target/botster-hub-client-dogfood-data botster-web/web-client
 botster-hub apps open --data-dir target/botster-hub-client-dogfood-data botster-tui
-botster-hub tui --data-dir target/botster-hub-client-dogfood-data
 ```
 
 `apps open botster-web/web-client` reports an `app_url=` matching the printed
-`web=` URL. `apps open botster-tui` and the deprecated `botster-hub tui` alias
-both use the daemon-resolved `terminal_app` foreground launch contract; there is
-no standalone fallback when the package is missing or disabled.
+`web=` URL. `apps open botster-tui` uses the daemon-resolved `terminal_app`
+foreground launch contract; there is no standalone fallback when the package is
+missing or disabled.
 
 Keep the launcher running in the foreground. For graceful shutdown, run the
 printed shutdown command from another terminal; `Ctrl-C` hard-stops the
@@ -342,8 +341,6 @@ When a `botster-tui` terminal app package is installed and enabled,
 UI over the same daemon socket and `botster-hub-client` protocol path as the
 operator CLI. The hub resolves the foreground command, working directory, and
 allowlisted environment; the CLI only spawns that contract with inherited stdio.
-`botster-hub tui --data-dir <path>` is a deprecated compatibility alias for that
-apps command and reports clearly when `botster-tui` is not installed/enabled.
 
 ```sh
 # Terminal 1: leave the daemon running.
