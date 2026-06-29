@@ -161,20 +161,6 @@ struct SourceTemplate {
     available: bool,
 }
 
-/// Return all package-contributed session templates.
-#[must_use]
-pub fn list_package_session_templates(records: &[&PackageRecord]) -> Vec<HubSessionTemplate> {
-    records
-        .iter()
-        .flat_map(|record| {
-            record
-                .session_templates
-                .iter()
-                .map(|template| template_row(record, template))
-        })
-        .collect()
-}
-
 /// Return effective session templates after applying package < device < repo precedence.
 pub fn list_session_templates(
     records: &[&PackageRecord],
@@ -185,17 +171,6 @@ pub fn list_session_templates(
         .into_iter()
         .map(|source| template_row_from_source(&source))
         .collect())
-}
-
-/// Resolve and materialize a template into the generic core spawn contract.
-pub fn materialize_package_session_template(
-    config: &HubConfig,
-    records: &[&PackageRecord],
-    template_id: &str,
-    request: SessionTemplateRequest,
-) -> SessionTemplateResult<MaterializedSessionTemplate> {
-    let state = HubState::from_config(config);
-    materialize_session_template(config, records, &state, template_id, request)
 }
 
 /// Resolve and materialize the effective template into the generic core spawn contract.
@@ -315,15 +290,6 @@ pub fn materialize_session_template(
     })
 }
 
-/// Return one sanitized package-contributed template row by bare or full id.
-pub fn show_package_session_template(
-    records: &[&PackageRecord],
-    template_id: &str,
-) -> SessionTemplateResult<HubSessionTemplate> {
-    let (record, template) = find_template(records, template_id)?;
-    Ok(template_row(record, template))
-}
-
 /// Return one effective template row by bare or full id.
 pub fn show_session_template(
     records: &[&PackageRecord],
@@ -332,28 +298,6 @@ pub fn show_session_template(
 ) -> SessionTemplateResult<HubSessionTemplate> {
     find_source_template(records, state, template_id)
         .map(|source| template_row_from_source(&source))
-}
-
-fn template_row(record: &PackageRecord, template: &PackageSessionTemplate) -> HubSessionTemplate {
-    HubSessionTemplate {
-        template_id: format!("{}/{}", record.manifest.name, template.id),
-        package_name: record.manifest.name.clone(),
-        id: template.id.clone(),
-        source: "package".to_string(),
-        command: template.command.clone(),
-        args: template.args.clone(),
-        working_directory_policy: match &template.working_directory {
-            PackageSessionTemplateWorkingDirectory::PackageRoot => "package_root".to_string(),
-            PackageSessionTemplateWorkingDirectory::Relative { .. } => "relative".to_string(),
-        },
-        allowed_environment_overrides: template.allowed_environment_overrides.clone(),
-        context_keys: template.context.clone(),
-        target_id: template
-            .target_id
-            .clone()
-            .unwrap_or_else(|| package_target_id(&record.manifest.name)),
-        available: record.state == PackageState::Enabled,
-    }
 }
 
 fn template_row_from_source(source: &SourceTemplate) -> HubSessionTemplate {
@@ -389,32 +333,6 @@ fn source_default_target_id(source: &SourceTemplate) -> String {
             TemplateSourceRank::Device => DEFAULT_DEVICE_TARGET_ID.to_string(),
             TemplateSourceRank::Repo => source.source_name.clone(),
         })
-}
-
-fn find_template<'a>(
-    records: &'a [&'a PackageRecord],
-    template_id: &str,
-) -> SessionTemplateResult<(&'a PackageRecord, &'a PackageSessionTemplate)> {
-    let mut matches = records
-        .iter()
-        .flat_map(|record| {
-            record.session_templates.iter().filter_map(|template| {
-                let full = format!("{}/{}", record.manifest.name, template.id);
-                (template.id == template_id || full == template_id).then_some((*record, template))
-            })
-        })
-        .collect::<Vec<_>>();
-    match matches.len() {
-        0 => Err(SessionTemplateError::new(
-            "unknown_template",
-            "session template was not found",
-        )),
-        1 => Ok(matches.remove(0)),
-        _ => Err(SessionTemplateError::new(
-            "ambiguous_template",
-            "session template id matches more than one package",
-        )),
-    }
 }
 
 fn find_source_template(
