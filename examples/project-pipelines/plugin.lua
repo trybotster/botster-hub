@@ -286,6 +286,7 @@ local function coordination_for(ticket_id, run_number, target_id, worktree, agen
   local request_id = "project-pipelines:" .. ticket_id .. ":" .. run_number
   local target = { type = "plugin", plugin_key = PLUGIN }
   local envelope_id = "project-pipelines-run:" .. request_id
+  local session_id = "project-pipelines-step-" .. run_number
   local extension = {
     request_id = request_id,
     target_id = target_id,
@@ -308,15 +309,29 @@ local function coordination_for(ticket_id, run_number, target_id, worktree, agen
     target = target,
     envelope_id = envelope.id,
   })
+  local spawned = botster.capabilities.session_templates.spawn({
+    template_id = "project-pipelines/agent-step",
+    session_id = session_id,
+    context = {
+      prompt = "Project Pipelines local step for " .. ticket_id,
+      ticket_id = ticket_id,
+      worktree_path = worktree,
+      metadata = {
+        request_id = primitive.request_id,
+        agent_name = agent_name,
+      },
+    },
+  })
   return {
     target_id = primitive.target_id,
     assigned_worktree = primitive.assigned_worktree,
     request_id = primitive.request_id,
     owner_plugin = primitive.owner_plugin,
     agent_name = primitive.agent_name,
-    -- This constrained local start records primitive-backed coordination before
-    -- any agent session is spawned, so there is no real session UUID to attach.
-    session_uuid = nil,
+    session_uuid = spawned.session_id,
+    session_template_id = spawned.template_id,
+    session_context_id = spawned.context_id,
+    session_lifecycle = spawned.lifecycle,
     envelope_id = envelope.id,
     publish_delivery_status = published.deliveries[1].status,
     drain_cursor = envelope.cursor,
