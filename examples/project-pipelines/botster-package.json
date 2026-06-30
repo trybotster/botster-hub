@@ -12,6 +12,13 @@
   "entrypoints": [
     { "runtime": "lua", "path": "plugin.lua", "bootstrap": false }
   ],
+  "session_templates": [
+    {
+      "id": "agent-step",
+      "command": "bin/agent-step.sh",
+      "context": ["prompt", "ticket_id", "worktree_path", "metadata.request_id", "metadata.agent_name"]
+    }
+  ],
   "dependencies": [
     {
       "id": "github-provider",
