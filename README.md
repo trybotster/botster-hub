@@ -215,8 +215,20 @@ local client API. Separate Lua runtime tests cover real Lua entrypoint
 execution. The PTY portion is Unix-only.
 
 For daily first-party local development from fresh main checkouts, use the
-persistent dev-stack bootstrap. It starts or reuses a daemon over a stable data
-directory, enables the first-party packages as ordinary local packages, starts
+persistent dev-stack bootstrap. The expected local checkout set is this
+`botster-hub` repo, the checked-in `examples/project-pipelines` package, and
+local package roots for `botster-web`, `botster-tui`, and
+`botster-workspaces`. The sibling paths below are only examples; use the package
+path flags when those repos live elsewhere.
+
+Build `botster-hub` normally with Cargo before treating this as a daily stack.
+The session path also needs a built `botster-session-worker` next to the
+`botster-hub` binary, or an explicit `--session-worker-bin <path>`. First-party
+package app entrypoints must already exist in their package roots before `apps
+open` can launch them.
+
+`dev-stack bootstrap` starts or reuses a daemon over a stable data directory,
+installs and enables the first-party packages as ordinary local packages, starts
 the `botster-web` app entrypoint through daemon supervision, and prints the
 app/operator commands for the same data directory:
 
@@ -232,12 +244,14 @@ cargo run -- dev-stack bootstrap \
 `dev-stack bootstrap` defaults to `target/botster-hub-dev-stack-data`, discovers
 `examples/project-pipelines`, `../botster-web`, `../botster-tui`, and
 `../botster-workspaces` when those package manifests exist, and accepts explicit
-package path flags for CI worktrees or non-sibling checkouts. It locates a
-co-located `botster-session-worker` next to the current `botster-hub` binary, or
-you can pass `--session-worker-bin <path>` explicitly. The command is
-idempotent: rerunning it against a live daemon reuses that daemon, and rerunning
-after shutdown reloads the persisted package registry from `hub-state.json`.
-Normal output does not print local package source paths:
+package path flags for CI worktrees or non-sibling checkouts. Keep the same
+`--data-dir` for `dev-stack bootstrap`, `apps`, `mcp-serve`, `status`, package
+reloads, and shutdown. That directory persists `hub-state.json`, package
+registry state, plugin data, and Project Pipelines state.
+
+The command is idempotent: rerunning it against a live daemon reuses that daemon,
+and rerunning after shutdown reloads the persisted package registry from
+`hub-state.json`. Normal output does not print local package source paths:
 
 ```sh
 dev_stack=ready
@@ -255,14 +269,34 @@ apps=botster-hub apps list --data-dir target/botster-hub-dev-stack-data
 shutdown=botster-hub shutdown --data-dir target/botster-hub-dev-stack-data
 ```
 
-The supervised `botster-web` process receives `BOTSTER_HUB_SOCKET` because the
-daemon-owned entrypoint launch injects hub connection environment. Foreground
-terminal apps run through `botster-hub apps open`, which asks the daemon for the
-resolved launch contract and then starts the child with inherited stdio.
+The supervised `botster-web` process receives `BOTSTER_HUB_SOCKET` and
+`BOTSTER_HUB_DATA_DIR` because the daemon-owned entrypoint launch injects hub
+connection environment. Foreground terminal apps run through `botster-hub apps
+open`, which asks the daemon for the resolved launch contract and then starts
+the child with inherited stdio.
 
-After editing an installed local package, run `botster-hub packages reload
---data-dir <data-dir> <package-name>` to re-read its manifest and restart any
-running entrypoints for that package.
+For lower-level package diagnostics, the daily flow maps to the daemon-owned
+package commands:
+
+```sh
+botster-hub packages install --data-dir target/botster-hub-dev-stack-data \
+  --path ../botster-web
+botster-hub packages enable --data-dir target/botster-hub-dev-stack-data botster-web
+botster-hub packages check-update --data-dir target/botster-hub-dev-stack-data botster-web
+botster-hub packages preview-update --data-dir target/botster-hub-dev-stack-data \
+  botster-web --revision local-dev --policy manual
+botster-hub packages apply-update --data-dir target/botster-hub-dev-stack-data \
+  botster-web --revision local-dev --policy manual
+botster-hub packages reload --data-dir target/botster-hub-dev-stack-data botster-web
+```
+
+`dev-stack bootstrap` normally performs the first install/enable step for the
+first-party local packages. `packages check-update`, `preview-update`, and
+`apply-update` exercise the hub's update metadata path; they do not fetch local
+package code or rebuild a sibling repo for you. After editing an installed local
+package, rebuild that package's own output when needed, then run `packages
+reload` to re-read its manifest and restart any running entrypoints for that
+package.
 
 From another terminal, the composed local client app path should be visible
 through the same stable data directory:
@@ -283,6 +317,14 @@ missing or disabled.
 foreground dogfood runs. It is useful for proving the bridge and shutdown path,
 but the persistent dev-stack bootstrap is the daily local first-party package
 path.
+
+The dev-stack acceptance smoke is the test path, not the daily launcher:
+
+```sh
+./test.sh --test hub_daemon_lifecycle_test \
+  cli_dev_stack_acceptance_smoke_exercises_first_party_plugins_project_pipelines_session_templates_reload_and_shutdown \
+  -- --test-threads=1
+```
 
 The CLI commands below exercise the daemon-backed workflow across separate
 processes:
@@ -463,14 +505,17 @@ the Lua ABI.
 ## Project Pipelines Local Readiness
 
 The checked-in `examples/project-pipelines` package is ready for constrained
-daily local coordination dogfood. Prefer the single-command launcher:
+daily local coordination dogfood through the same persistent dev-stack data
+directory. For day-to-day work, bootstrap the dev stack and run MCP from that
+same directory:
 
 ```sh
-cargo run -- dogfood
+cargo run -- dev-stack bootstrap --data-dir target/botster-hub-dev-stack-data
+botster-hub mcp-serve --data-dir target/botster-hub-dev-stack-data
 ```
 
-For lower-level diagnostics, enable it through a running daemon and serve MCP
-from the same data directory:
+For lower-level diagnostics, enable the plugin package through a running daemon
+and serve MCP from the same data directory:
 
 ```sh
 cargo run -- packages install --data-dir target/botster-hub-dogfood-data \
@@ -485,8 +530,17 @@ PluginWorkerEngine -> LuaPluginRuntime`. `project_pipelines.start` requires an
 explicit `target_id` and assigned worktree and records primitive-backed
 coordination evidence on the run: request id, agent name, owner plugin, routed
 envelope id, publish delivery status, drain cursor, and acknowledge delivery
-status. `session_uuid` is intentionally absent in this constrained local flow
-because the plugin records coordination before spawning an agent session.
+status. It then spawns the hub-owned `project-pipelines/agent-step` session
+template through the plugin worker `session_templates.spawn` path and records
+`session_uuid`, `session_template_id`, `session_context_id`, and
+`session_lifecycle` on the run coordination record.
+
+Session templates are hub-owned PTY launch contracts, not Project Pipelines
+entrypoints or legacy monolith agent runners. The plugin supplies product
+workflow policy and context, while the hub validates and materializes the
+template into a generic session spawn. Project Pipelines prompts and tool calls
+must carry an explicit target id and worktree; they should not depend on the
+agent's ambient current directory.
 
 Project Pipelines state persists through PluginDb under
 `plugin-data/project-pipelines/`, not a host-supplied runtime bundle or plugin
@@ -501,6 +555,10 @@ those integrations land. Live monolith Project Pipelines data is not imported in
 this milestone; cutover requires no in-flight monolith tickets or a future
 explicit one-shot export/import before switching active work to the local
 plugin.
+
+`botster-hub dogfood` remains useful for isolated bridge/bootstrap tests, but it
+is not the daily Project Pipelines workflow. The daily path is persistent daemon
+plus first-party local packages plus `mcp-serve` over one data directory.
 
 Dogfood-ready today: explicit local daemon lifecycle, file-backed hub/package
 state, local package admission from a manifest path, typed status/package reads,
@@ -536,11 +594,45 @@ coordination tools, and constrained Project Pipelines MCP workflow tools over
 the Lua plugin runtime.
 
 Feature parity still pending: durable PTY recovery after daemon exit, provider
-process supervision, GitHub/PR automation, install/update packaging,
-cloud/Rails/WebRTC/browser/marketplace surfaces, broad migration compatibility
-from the monolith, missing-public-socket self-heal after the socket path is
-externally removed, long-running attach signal handling, and uncoordinated crash
-PTY recovery.
+process supervision, GitHub/PR automation, marketplace fetch/update packaging,
+cloud/Rails/WebRTC/browser surfaces, broad migration compatibility from the
+monolith, missing-public-socket self-heal after the socket path is externally
+removed, long-running attach signal handling, and uncoordinated crash PTY
+recovery.
+
+## Daily Dev Troubleshooting
+
+Stale package build output: rebuild the edited sibling package with its own
+repo's build command, then run `botster-hub packages reload --data-dir
+target/botster-hub-dev-stack-data <package-name>`. Package reload re-reads the
+manifest and restarts running entrypoints, but it does not rebuild sibling repo
+artifacts or fetch updated code.
+
+Missing app or Lua entrypoints: run `botster-hub packages show --data-dir
+target/botster-hub-dev-stack-data <package-name>` and `botster-hub apps list
+--data-dir target/botster-hub-dev-stack-data`. Local packages need a valid
+`botster-package.json`; runnable client apps need `runnable_entrypoints`; Lua
+plugins such as Project Pipelines also need their `entrypoints` path to exist.
+`apps open` has no fallback when the package is missing, disabled, or lacks the
+requested app selector.
+
+Missing provider config or auth: the local dev stack does not import cloud,
+GitHub, or monolith credentials. Re-enter provider credentials when a provider
+integration asks for them, and treat unavailable provider/GitHub automation as
+deferred unless the relevant package and config are installed.
+
+Session-template spawn failure: confirm the Project Pipelines package is
+enabled, the same data directory is used for `mcp-serve`, and the package still
+declares the `project-pipelines/agent-step` template. `project_pipelines.start`
+also requires explicit `target_id` and `worktree` arguments; missing either one
+is a tool-call error, not a template fallback.
+
+Terminal attach or scrollback issues: use `botster-hub sessions list --data-dir
+target/botster-hub-dev-stack-data`, attach only to a running session, and expect
+terminal output to arrive through the session-backed drain/subscription path.
+Late attach may replay existing terminal output as ordinary terminal data rather
+than a distinct scrollback frame, and current long-running attach signal
+handling is still listed as pending readiness work.
 
 Schema and consistency posture are documented in
 [`docs/adr/durable-hub-state-v1.md`](docs/adr/durable-hub-state-v1.md).
