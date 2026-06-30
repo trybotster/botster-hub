@@ -2416,6 +2416,151 @@ fn cli_dev_stack_bootstrap_starts_daemon_enables_first_party_packages_and_prints
 }
 
 #[test]
+fn cli_dev_stack_project_pipelines_configuration_schema_acceptance_target() {
+    let _guard = daemon_test_lock()
+        .lock()
+        .expect("serialize real daemon test");
+    let data_dir = unique_short_test_dir("cli-dev-stack-project-pipelines-config");
+    let project_pipelines_package_dir = std::env::current_dir()
+        .expect("current dir")
+        .join("examples")
+        .join("project-pipelines");
+    let web_package_dir = unique_test_dir("cli-dev-stack-config-web");
+    let tui_package_dir = unique_test_dir("cli-dev-stack-config-tui");
+    let workspaces_package_dir = unique_test_dir("cli-dev-stack-config-workspaces");
+    write_botster_web_package(&web_package_dir);
+    write_botster_tui_package(&tui_package_dir);
+    write_botster_workspaces_local_package(&workspaces_package_dir, "botster-workspaces");
+
+    let output = run_dev_stack_bootstrap(
+        &data_dir,
+        &project_pipelines_package_dir,
+        &web_package_dir,
+        &tui_package_dir,
+        &workspaces_package_dir,
+        unused_loopback_port(),
+    );
+    assert!(
+        output.status.success(),
+        "dev-stack bootstrap failed: {}",
+        command_output_text(&output)
+    );
+    let config = explicit_config(&data_dir);
+    let list =
+        botster_hub::daemon_transport_request(&config, botster_hub::DaemonRequest::ListPackages)
+            .expect("list dev-stack packages");
+    let project_pipelines = list
+        .packages
+        .iter()
+        .find(|package| package.package_name == "project-pipelines")
+        .expect("project-pipelines package row");
+    assert_eq!(project_pipelines.state, "enabled");
+    let schema = project_pipelines
+        .configuration
+        .schema
+        .as_ref()
+        .expect("project-pipelines configuration schema");
+    let fields = schema["fields"].as_array().expect("schema fields");
+    assert!(fields.iter().any(|field| {
+        field["key"] == "operator_endpoint"
+            && field["type"] == "url"
+            && field["default"]["value"] == "https://example.invalid/project-pipelines"
+    }));
+    assert!(fields.iter().any(|field| {
+        field["key"] == "pipeline_mode"
+            && field["type"] == "select"
+            && field["default"]["value"] == "local"
+    }));
+    assert_eq!(
+        project_pipelines.configuration.effective_values["operator_endpoint"],
+        serde_json::json!({"type":"url","value":"https://example.invalid/project-pipelines"})
+    );
+    assert_eq!(
+        project_pipelines.configuration.effective_values["pipeline_mode"],
+        serde_json::json!({"type":"select","value":"local"})
+    );
+    assert!(project_pipelines.configuration.missing_required.is_empty());
+
+    let invalid = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::SetPackageConfiguration {
+            package_name: "project-pipelines".to_string(),
+            values: BTreeMap::from([(
+                "pipeline_mode".to_string(),
+                serde_json::json!({"type":"select","value":"sideways"}),
+            )]),
+        },
+    )
+    .expect("invalid project-pipelines config returns operator error");
+    assert_eq!(invalid.kind, botster_hub::DaemonResponseKind::OperatorError);
+    assert!(
+        invalid.diagnostics.iter().any(|diagnostic| {
+            diagnostic.kind == botster_hub_client::DaemonDiagnosticKind::ActionFailure
+                && diagnostic.operation.as_deref() == Some("configure")
+                && diagnostic.feature.as_deref() == Some("package_registry")
+                && diagnostic
+                    .message
+                    .as_deref()
+                    .is_some_and(|message| message.contains("sideways"))
+        }),
+        "expected package configuration diagnostic, got {:?}",
+        invalid.diagnostics
+    );
+
+    let saved = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::SetPackageConfiguration {
+            package_name: "project-pipelines".to_string(),
+            values: BTreeMap::from([
+                (
+                    "operator_endpoint".to_string(),
+                    serde_json::json!({"type":"url","value":"https://example.invalid/project-pipelines/acceptance"}),
+                ),
+                (
+                    "pipeline_mode".to_string(),
+                    serde_json::json!({"type":"select","value":"github"}),
+                ),
+            ]),
+        },
+    )
+    .expect("set project-pipelines config through daemon");
+    let saved_package = saved
+        .packages
+        .iter()
+        .find(|package| package.package_name == "project-pipelines")
+        .expect("saved project-pipelines package row");
+    assert_eq!(
+        saved_package.configuration.effective_values["operator_endpoint"],
+        serde_json::json!({"type":"url","value":"https://example.invalid/project-pipelines/acceptance"})
+    );
+    assert_eq!(
+        saved_package.configuration.effective_values["pipeline_mode"],
+        serde_json::json!({"type":"select","value":"github"})
+    );
+
+    shutdown_dev_stack_daemon(&data_dir);
+
+    let restarted = start_cli_daemon(&data_dir);
+    let reloaded =
+        botster_hub::daemon_transport_request(&config, botster_hub::DaemonRequest::ListPackages)
+            .expect("list project-pipelines after restart");
+    let reloaded_package = reloaded
+        .packages
+        .iter()
+        .find(|package| package.package_name == "project-pipelines")
+        .expect("reloaded project-pipelines package row");
+    assert_eq!(
+        reloaded_package.configuration.effective_values["operator_endpoint"],
+        serde_json::json!({"type":"url","value":"https://example.invalid/project-pipelines/acceptance"})
+    );
+    assert_eq!(
+        reloaded_package.configuration.effective_values["pipeline_mode"],
+        serde_json::json!({"type":"select","value":"github"})
+    );
+    shutdown_cli_daemon(&data_dir, restarted);
+}
+
+#[test]
 fn cli_dev_stack_bootstrap_reuses_live_daemon_and_preserves_state_after_restart() {
     let _guard = daemon_test_lock()
         .lock()
