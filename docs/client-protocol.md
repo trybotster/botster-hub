@@ -270,6 +270,13 @@ Supervised entrypoints are local development processes, not a production
 installer or sandbox. The daemon stops them on explicit stop/restart, package
 disable/remove, `DaemonShutdown`, and daemon SIGINT/SIGTERM cleanup.
 
+Web app `local_url` values, including `botster-web` dogfood `bridge=` / `web=`
+URLs, are supervised local package app outputs. They are not production browser
+transport and they do not prove E2E browser WebRTC. Production browser transport
+must be admitted separately, preserve the same encrypted Botster stream after
+local or remote admission, and attach through one ordered/reliable WebRTC
+DataChannel without app-layer reordering.
+
 The runnable contract is intentionally adjacent to core package `entrypoints`.
 Core `entrypoints` remain the plugin/provider code-load ABI, while
 `runnable_entrypoints` is the package discovery shape for clients and future
