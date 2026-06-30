@@ -23,7 +23,7 @@ Assumptions applied:
 | CLI commands | `src/main.rs` commands using `daemon_transport_request` | Operator control plane over daemon socket | Package, session, status, app, dogfood, and dev-stack commands frame public `DaemonRequest` values | Not browser transport |
 | TUI / same-device attach | `stream_attach`, `Attach`, `SendInput`, `Resize`, `Drain` | Same-device client over hub daemon protocol; terminal data path enters core `SessionIo` / `ClientWorker` abstractions | `handle_runtime_control_request` constructs `HubClientApi::local_operator`, then calls `HubClientApi::handle_request`; attach/input/resize flow into `HubRuntime` | Correct data-plane shape to reuse behind a future transport adapter |
 | Package app launch | `DaemonRequest::StartPackageEntrypoint`, `ListApps`, `ResolveAppLaunch`; `EntrypointSupervisor` | Hub-owned local/dev process launch contract | `StartPackageEntrypoint` builds supervised environment and starts the package; `ListApps` projects runnable entrypoints plus supervisor snapshots | Useful for local installed app bootstrap, not a browser data plane |
-| `botster-web` dogfood bridge | `botster-hub dogfood`, `dev-stack bootstrap`, printed `bridge=` / `web=` URLs | Dev harness / package app surface over localhost HTTP | `start_botster_web_dogfood` enables `botster-web`, injects `BOTSTER_HUB_SOCKET`, `BOTSTER_HUB_DATA_DIR`, and `BOTSTER_WEB_DOGFOOD_BRIDGE_PORT`, then requires structured `local_url` and verified HTML shell | Must not be treated as production browser WebRTC |
+| `botster-web` dogfood bridge | `botster-hub dogfood`, `dev-stack bootstrap`, printed `bridge=` / `web=` URLs | Dev harness / package app surface over localhost HTTP | `start_botster_web_dogfood` enables `botster-web`, injects `BOTSTER_HUB_SOCKET`, `BOTSTER_HUB_DATA_DIR`, and `BOTSTER_WEB_DOGFOOD_BRIDGE_PORT`, then requires structured `local_url` and verified HTML shell. When no port is supplied, dogfood selects an ephemeral `127.0.0.1:0` port with `TcpListener`; that is bridge port probing, not `TransportBindings.tcp`. | Must not be treated as production browser WebRTC |
 | Plugin HTTP capability runtime | `HubCapabilityRuntime` HTTP runtime in `src/capabilities.rs` | Plugin capability surface after package admission | Hub policy grants localhost/http(s) capability operations to plugins | Not client browser transport |
 | Plugin WebSocket capability runtime | `InMemoryWebSocketCapabilityRuntime` in `src/capabilities.rs` | Plugin network capability surface | Runtime accepts plugin network operations through core capability contracts | Not client browser WebRTC |
 | TCP binding config | `TransportBindings.tcp` in `src/config.rs` | Config shape only | Config validates host/port, but repo inspection found no daemon listener using TCP bindings | Scaffold only; not a production transport today |
@@ -107,6 +107,40 @@ Ordering is a fixed design constraint for future WebRTC work:
 - On anomaly, the client or hub should detect and abort or request replay after reconnect.
 - The implementation must not add an application-layer reorder buffer, resequencing queue, holdback timer, or normal-delivery buffering mechanism over the DataChannel.
 
+## Side-Band Metadata / OSC-Spam Lane
+
+The browser WebRTC audit also needs a side-band metadata lane because terminal metadata can churn independently from user-visible terminal bytes. Title changes, working-directory updates, prompt marks, bells, notifications, and mode changes must not be allowed to starve attach, input, resize, shutdown, or terminal output delivery.
+
+Old-stack reference design:
+
+- `session/mod.rs` carried latest-win flags and anti-spam handling for high-churn terminal metadata.
+- `worker/session_io_runtime.rs` used `SessionIoCoalescer` thresholds of 32 KiB output, 16 frames, and a 4 ms window.
+- `worker/client.rs` used `DeliveryKind` lanes and bounded egress to keep non-critical metadata from consuming critical delivery capacity.
+- `protocol.rs` had separate frame-type lanes for PTY bytes, resize/control, title/cwd/prompt/bell/notification/mode, snapshot, and lifecycle frames.
+
+New-stack inventory:
+
+- Present: the pinned `botster-core` revision already carries the taxonomy and coalescing contract. `contract/session_protocol.rs` defines frame types for PTY input/output, resize, snapshot, process exit, ping/pong, shutdown, mode flags, title changed, bell, cwd changed, prompt mark, notification, color profile, and spawn. `contract/actor.rs` defines `SessionIoCoalescingPolicy` with default 32 KiB / 16 frames / 4 ms thresholds, `metadata_age_expired`, and `SessionIoOrderedEvent` for prompt, bell, notification, process exit, EOF, desync, and shutdown.
+- Partial: metadata frame contracts exist, but repo inspection shows no hub-side browser transport lane classification today. `HubClientObservationKind` only surfaces `SessionActivity`, `Subscription`, `Backpressure`, and `RoutedEnvelope`; plugin capability backpressure exists separately in `src/capabilities.rs`.
+- Absent/gap: the old concrete producer wiring from terminal OSC callbacks into classified metadata frames has not been ported into the new session-worker/terminal runtime. Until that is done, PTY output is effectively forwarded through the terminal byte path without the old latest-win metadata lane.
+- Gap: `botster-session-worker` uses a bounded `sync_channel` for egress. The future WebRTC transport must make slow-consumer behavior explicit instead of silently losing the difference between safe metadata shaping and unsafe control/terminal-byte loss.
+
+Required invariant for the future single ordered/reliable DataChannel:
+
+- Metadata shaping happens before enqueue into the DataChannel transport, at the hub egress scheduler or equivalent transport adapter boundary.
+- Shaped classes include high-churn OSC metadata such as title OSC 0/2, cwd OSC 7, prompt OSC 133, bell, notification OSC 9/777, and terminal mode metadata.
+- Shaping means coalesce, latest-win, rate-limit, or drop non-critical metadata before enqueue. It does not mean resequencing normal DataChannel delivery.
+- Terminal bytes, input, resize, attach/detach, shutdown, lifecycle, signaling, and encryption/auth failures must not be dropped by the metadata coalescing lane and must preserve their transport ordering.
+
+Follow-up tickets:
+
+- CORE-1 (botster-core: `bin/botster-session-worker.rs` + `botster-terminal-ghostty`): Port/defer-completed old OSC/semantic metadata producer wiring into the new core session-worker/terminal runtime. The metadata contract/taxonomy exists; only the producer wiring from old `ghostty_vt` callbacks into classified frames was intentionally deferred during extraction, not lost behavior. Implementation may differ if cleaner, but the anti-spam/latest-win edge case behavior must be preserved for high-churn OSC metadata: title OSC 0/2, cwd OSC 7, prompt OSC 133, bell, notification OSC 9/777, and mode changes. CORE-1 emits classified metadata frames; it does not define hub egress shaping.
+- CORE-2 (botster-core): Define explicit slow-consumer semantics for session-worker/client egress so metadata can be shaped while terminal bytes and critical control frames preserve order and backpressure.
+- HUB-1 (botster-hub): Add a hub egress scheduler or transport adapter policy that classifies critical vs side-band metadata frames before WebRTC/DataChannel enqueue, with bounded lanes and coalescing in line with [[botster hub events use bounded priority lanes instead of unbounded queue fuses]], [[botster hub event lanes coalesce repeatable work before rejecting under pressure]], and [[botster hub event storms must be rejected before queues grow unbounded]].
+- WEB/TRANSPORT-1 (botster-web / browser transport): Consume the classified metadata lane through operation gates and reconnect replay without adding app-level reorder buffers over the ordered/reliable DataChannel.
+
+Acceptance check for future implementation work: the transport audit and implementation tickets must classify spammy terminal metadata into a non-critical side-band lane, and must explicitly assert that terminal bytes, input, resize, attach/detach, shutdown, lifecycle, signaling, and auth/encryption failures are protected from metadata coalescing/drop.
+
 ## Non-Invasive Guard Added
 
 `docs/client-protocol.md` now states that supervised web app `local_url` / dogfood bridge URLs are local package app/dev harness outputs, not production browser transport or an E2E WebRTC substitute. It also states that production browser transport must be a separate admitted encrypted WebRTC stream over one ordered/reliable DataChannel.
@@ -132,6 +166,7 @@ Commands and inspections used for this report:
 - `rg` inventory over `src`, `crates`, `docs`, `tests`, `examples`, and `Cargo.toml` for transport, bridge, identity, credential, secret, bootstrap, admission, WebRTC, and app launch terms.
 - `Cargo.lock`: confirmed `botster-core` / `botster-core-daemon` source revision `42538009bc6f6291872c5657bedbe7370f504f8d`.
 - Cargo git checkout at `42538009bc6f6291872c5657bedbe7370f504f8d`: inspected `identity/keyring.rs`, `identity/crypto.rs`, `identity/device.rs`, and `lib.rs` re-exports.
+- Cargo git checkout at `42538009bc6f6291872c5657bedbe7370f504f8d`: inspected `contract/session_protocol.rs`, `contract/actor.rs`, and `bin/botster-session-worker.rs` for metadata frame taxonomy, coalescing policy, and bounded egress evidence.
 - `src/daemon_transport.rs`, `src/client_api.rs`, `src/config.rs`, `src/persistence.rs`, `src/auth.rs`, `src/capabilities.rs`, `src/main.rs`, `crates/botster-hub-client/src/lib.rs`, `docs/client-protocol.md`, and `tests/hub_daemon_lifecycle_test.rs`: inspected concrete entry points and tests listed above.
 
 ## Residual Risk
@@ -140,6 +175,7 @@ Commands and inspections used for this report:
 - `TransportBindings.tcp` remains a config shape without a production listener in this repo; future TCP work should either wire it or document it as scaffold-only.
 - Browser-side operation gates, reconnect replay, and pairing UI behavior are referenced from vault guidance but not implemented or tested here.
 - Checklist creation for the Implement step timed out in the Project Pipelines plugin worker; the same vault/checklist evidence is recorded in this durable report and gate evidence instead.
+- Side-band metadata lane producer wiring and hub egress shaping are intentionally follow-up work. This audit names the lane, required invariant, and follow-up owners but does not implement producer callbacks or scheduler behavior.
 
 ## Vault Capture Candidates
 
@@ -147,3 +183,4 @@ Commands and inspections used for this report:
 - Hub credential-store wiring owner split over existing core primitives.
 - Dogfood HTTP bridge classification as dev harness, not production browser transport.
 - Single ordered/reliable DataChannel plus detection-only sequence/transcript rule as a reusable WebRTC planning constraint.
+- OSC/side-band metadata spam lane as a required Botster transport-audit dimension: classify, coalesce/latest-win/rate-limit/drop before DataChannel enqueue while protecting terminal bytes and critical control frames.
