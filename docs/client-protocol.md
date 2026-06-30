@@ -261,6 +261,11 @@ roots, socket paths, data-dir values, or manifest environment policy from
 package rows. Normal `ListApps` output intentionally omits this launch contract
 to avoid path and environment leakage.
 
+Foreground terminal launch contracts currently inject `BOTSTER_HUB_SOCKET` and
+`BOTSTER_HUB_DATA_DIR`. These are the canonical same-device connection and
+runtime data directory values for terminal clients; clients should not expect the
+older example names `BOTSTER_HUB_CONNECTION` or `BOTSTER_PACKAGE_DATA_DIR`.
+
 Supervised entrypoints are local development processes, not a production
 installer or sandbox. The daemon stops them on explicit stop/restart, package
 disable/remove, `DaemonShutdown`, and daemon SIGINT/SIGTERM cleanup.
@@ -514,6 +519,15 @@ against the first-party Project Pipelines example, provide a checkout path to
 the example package and call the optional `run_project_pipelines_conformance`
 helper. Its report includes the rejected-action diagnostic for the invalid form
 submission path.
+
+To prove foreground package app-open support without recreating hub launcher
+policy, call `run_foreground_terminal_app_open_conformance`. The helper installs
+a local `terminal_app` / `foreground_stdio` package, discovers it through
+`ListApps`, resolves it through `ResolveAppLaunch`, executes the returned
+command with the daemon-provided working directory and environment, and has the
+child process perform a real `Status` request through `BOTSTER_HUB_SOCKET`. Its
+report asserts the canonical `BOTSTER_HUB_SOCKET` and `BOTSTER_HUB_DATA_DIR`
+environment values were present and that the child exited with code 0.
 
 The matrix currently marks JSON plugin surface render/action dispatch as
 supported and full plugin entity-frame hydration as intentionally unsupported by

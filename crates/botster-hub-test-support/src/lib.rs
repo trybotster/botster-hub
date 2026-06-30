@@ -526,6 +526,25 @@ pub struct ProjectPipelinesConformanceReport {
     pub invalid_title_error: String,
 }
 
+/// Stable observation returned by [`run_foreground_terminal_app_open_conformance`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForegroundTerminalAppOpenConformanceReport {
+    pub package_state: String,
+    pub package_name: String,
+    pub app_id: String,
+    pub entrypoint_id: String,
+    pub app_kind: String,
+    pub launch_mode: String,
+    pub resolved_command: String,
+    pub hub_socket_env_present: bool,
+    pub hub_data_dir_env_present: bool,
+    pub real_hub_action_operation: String,
+    pub real_hub_action_result: String,
+    pub exit_code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+}
+
 /// Run the hub-owned conformance flow for same-device external clients.
 ///
 /// The flow starts from an already isolated hub, then exercises status, session
@@ -868,6 +887,287 @@ pub fn run_project_pipelines_conformance(
     })
 }
 
+/// Run the foreground terminal app-open conformance flow for first-party clients.
+///
+/// The helper installs a local package with a `terminal_app` / `foreground_stdio`
+/// runnable entrypoint, discovers it through `ListApps`, resolves it through
+/// `ResolveAppLaunch`, then executes the daemon-resolved command with the
+/// daemon-provided working directory and environment. The child process uses
+/// `BOTSTER_HUB_SOCKET` to perform a real `Status` daemon request before
+/// exiting.
+pub fn run_foreground_terminal_app_open_conformance(
+    hub: &IsolatedHub,
+) -> Result<ForegroundTerminalAppOpenConformanceReport, ConformanceError> {
+    let package_path = hub.data_dir().join("foreground-terminal-app-open-package");
+    write_foreground_terminal_app_package(&package_path)?;
+
+    let enabled = request(
+        hub.endpoint(),
+        DaemonRequest::EnablePackageLocalPath {
+            path: package_path.clone(),
+        },
+        "enable_foreground_terminal_app",
+    )?;
+    expect_kind(
+        &enabled,
+        DaemonResponseKind::PackageDecision,
+        "enable_foreground_terminal_app",
+    )?;
+    let package_state = enabled
+        .package_decision
+        .ok_or(ConformanceError::MissingBody {
+            operation: "enable_foreground_terminal_app",
+            field: "package_decision",
+        })?
+        .state;
+
+    let apps = request(hub.endpoint(), DaemonRequest::ListApps, "list_apps")?;
+    expect_kind(&apps, DaemonResponseKind::Apps, "list_apps")?;
+    let app = apps
+        .apps
+        .iter()
+        .find(|app| {
+            app.package_name == "first-party.terminal-client"
+                && app.entrypoint_id == "tui"
+                && app.kind == "terminal_app"
+                && app.launch_mode == "foreground_stdio"
+        })
+        .cloned()
+        .ok_or(ConformanceError::MissingApp {
+            package_name: "first-party.terminal-client",
+            entrypoint_id: "tui",
+        })?;
+
+    let resolved = request(
+        hub.endpoint(),
+        DaemonRequest::ResolveAppLaunch {
+            package_name: app.package_name.clone(),
+            entrypoint_id: app.entrypoint_id.clone(),
+        },
+        "resolve_app_launch",
+    )?;
+    expect_kind(
+        &resolved,
+        DaemonResponseKind::ResolvedAppLaunch,
+        "resolve_app_launch",
+    )?;
+    let launch = resolved
+        .resolved_app_launch
+        .ok_or(ConformanceError::MissingBody {
+            operation: "resolve_app_launch",
+            field: "resolved_app_launch",
+        })?;
+    let hub_socket_env_present = launch.environment.contains_key("BOTSTER_HUB_SOCKET");
+    let hub_data_dir_env_present = launch.environment.contains_key("BOTSTER_HUB_DATA_DIR");
+    if !hub_socket_env_present {
+        return Err(ConformanceError::MissingEnvironment {
+            operation: "resolve_app_launch",
+            name: "BOTSTER_HUB_SOCKET",
+        });
+    }
+    if !hub_data_dir_env_present {
+        return Err(ConformanceError::MissingEnvironment {
+            operation: "resolve_app_launch",
+            name: "BOTSTER_HUB_DATA_DIR",
+        });
+    }
+
+    let output = Command::new(&launch.command)
+        .args(&launch.args)
+        .current_dir(&launch.working_directory)
+        .envs(&launch.environment)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|source| ConformanceError::Io {
+            operation: "foreground_terminal_app_open",
+            source,
+        })?;
+    let exit_code = output.status.code();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if !output.status.success() {
+        return Err(ConformanceError::ChildFailed {
+            operation: "foreground_terminal_app_open",
+            status: output.status.to_string(),
+            stdout,
+            stderr,
+        });
+    }
+    let real_hub_action_result =
+        output_value(&stdout, "daemon_status").ok_or(ConformanceError::MissingOutput {
+            needle: "daemon_status=",
+            output: stdout.clone(),
+        })?;
+
+    Ok(ForegroundTerminalAppOpenConformanceReport {
+        package_state,
+        package_name: app.package_name,
+        app_id: app.app_id,
+        entrypoint_id: app.entrypoint_id,
+        app_kind: app.kind,
+        launch_mode: app.launch_mode,
+        resolved_command: launch.command,
+        hub_socket_env_present,
+        hub_data_dir_env_present,
+        real_hub_action_operation: "status".to_string(),
+        real_hub_action_result,
+        exit_code,
+        stdout,
+        stderr,
+    })
+}
+
+fn write_foreground_terminal_app_package(package_path: &Path) -> Result<(), ConformanceError> {
+    let scripts_dir = package_path.join("scripts");
+    fs::create_dir_all(&scripts_dir).map_err(|source| ConformanceError::Io {
+        operation: "write_foreground_terminal_app_package",
+        source,
+    })?;
+    fs::write(
+        package_path.join("plugin.lua"),
+        "return botster.register({})\n",
+    )
+    .map_err(|source| ConformanceError::Io {
+        operation: "write_foreground_terminal_app_package",
+        source,
+    })?;
+    fs::write(
+        scripts_dir.join("foreground-terminal-client.mjs"),
+        r#"
+import fs from 'fs';
+import net from 'net';
+
+const socket = process.env.BOTSTER_HUB_SOCKET;
+const dataDir = process.env.BOTSTER_HUB_DATA_DIR;
+
+if (!socket) {
+  console.error('missing BOTSTER_HUB_SOCKET');
+  process.exit(42);
+}
+if (!dataDir) {
+  console.error('missing BOTSTER_HUB_DATA_DIR');
+  process.exit(43);
+}
+if (!fs.existsSync(socket)) {
+  console.error('BOTSTER_HUB_SOCKET is not a socket path that exists');
+  process.exit(44);
+}
+if (!fs.existsSync(dataDir) || !fs.statSync(dataDir).isDirectory()) {
+  console.error('BOTSTER_HUB_DATA_DIR is not a directory');
+  process.exit(45);
+}
+
+function readLine(connection) {
+  const newline = connection.buffer.indexOf('\n');
+  if (newline >= 0) {
+    const line = connection.buffer.slice(0, newline);
+    connection.buffer = connection.buffer.slice(newline + 1);
+    return Promise.resolve(line);
+  }
+
+  return new Promise((resolve, reject) => {
+    const onData = (chunk) => {
+      connection.buffer += chunk.toString('utf8');
+      const newline = connection.buffer.indexOf('\n');
+      if (newline < 0) {
+        return;
+      }
+      cleanup();
+      const line = connection.buffer.slice(0, newline);
+      connection.buffer = connection.buffer.slice(newline + 1);
+      resolve(line);
+    };
+    const onError = (error) => {
+      cleanup();
+      reject(error);
+    };
+    const cleanup = () => {
+      connection.stream.off('data', onData);
+      connection.stream.off('error', onError);
+    };
+    connection.stream.on('data', onData);
+    connection.stream.once('error', onError);
+  });
+}
+
+const stream = net.createConnection(socket);
+const connection = { stream, buffer: '' };
+
+await new Promise((resolve, reject) => {
+  stream.once('connect', resolve);
+  stream.once('error', reject);
+});
+stream.write(JSON.stringify({
+  protocol: 'botster-hub-daemon-v1',
+  compatibility: {
+    protocol: 'botster-hub-daemon-v1',
+    minimum_protocol_version: 1,
+    required_features: [],
+    minimum_conformance_fixture_revision: 1,
+    client_name: 'foreground-terminal-app-open-fixture',
+  },
+}) + '\n');
+await readLine(connection);
+stream.write(JSON.stringify({ type: 'status' }) + '\n');
+const response = JSON.parse(await readLine(connection));
+stream.end();
+
+if (response.kind !== 'status' || !response.status) {
+  console.error(`unexpected daemon response ${JSON.stringify(response)}`);
+  process.exit(46);
+}
+
+console.log(`hub_socket_present=${Boolean(socket)}`);
+console.log(`hub_data_dir_present=${Boolean(dataDir)}`);
+console.log(`daemon_status=${response.status.lifecycle_state}`);
+"#,
+    )
+    .map_err(|source| ConformanceError::Io {
+        operation: "write_foreground_terminal_app_package",
+        source,
+    })?;
+    let manifest = serde_json::json!({
+        "name": "first-party.terminal-client",
+        "version": "1.0.0",
+        "kind": "plugin",
+        "botster": ">=0.1.0",
+        "source": { "type": "path", "path": "." },
+        "capabilities": [{ "surface": "surfaces" }],
+        "entrypoints": [
+            { "runtime": "lua", "path": "plugin.lua", "bootstrap": false }
+        ],
+        "runnable_entrypoints": [{
+            "id": "tui",
+            "kind": "terminal_app",
+            "command": "node",
+            "args": ["scripts/foreground-terminal-client.mjs"],
+            "working_directory": { "policy": "package_root" },
+            "environment": [
+                { "name": "BOTSTER_HUB_SOCKET", "required": false },
+                { "name": "BOTSTER_HUB_DATA_DIR", "required": false }
+            ],
+            "launch_mode": "foreground_stdio"
+        }]
+    });
+    fs::write(
+        package_path.join("botster-package.json"),
+        serde_json::to_string_pretty(&manifest)
+            .expect("foreground terminal app manifest serializes"),
+    )
+    .map_err(|source| ConformanceError::Io {
+        operation: "write_foreground_terminal_app_package",
+        source,
+    })?;
+    Ok(())
+}
+
+fn output_value(output: &str, key: &str) -> Option<String> {
+    let prefix = format!("{key}=");
+    output
+        .lines()
+        .find_map(|line| line.strip_prefix(&prefix).map(str::to_string))
+}
+
 fn request(
     endpoint: &DaemonEndpoint,
     request: DaemonRequest,
@@ -1032,12 +1332,30 @@ pub enum ConformanceError {
         operation: &'static str,
         kind: DaemonDiagnosticKind,
     },
+    MissingEnvironment {
+        operation: &'static str,
+        name: &'static str,
+    },
+    MissingApp {
+        package_name: &'static str,
+        entrypoint_id: &'static str,
+    },
     MissingSession {
         session_id: String,
     },
     MissingOutput {
         needle: &'static str,
         output: String,
+    },
+    Io {
+        operation: &'static str,
+        source: std::io::Error,
+    },
+    ChildFailed {
+        operation: &'static str,
+        status: String,
+        stdout: String,
+        stderr: String,
     },
     AttachThreadPanicked,
 }
@@ -1075,11 +1393,37 @@ impl fmt::Display for ConformanceError {
                     "{operation} response missing {kind:?} diagnostic"
                 )
             }
+            Self::MissingEnvironment { operation, name } => {
+                write!(formatter, "{operation} launch missing {name}")
+            }
+            Self::MissingApp {
+                package_name,
+                entrypoint_id,
+            } => {
+                write!(
+                    formatter,
+                    "list_apps missing terminal app {package_name}/{entrypoint_id}"
+                )
+            }
             Self::MissingSession { session_id } => {
                 write!(formatter, "spawn response missing session {session_id}")
             }
             Self::MissingOutput { needle, output } => {
                 write!(formatter, "stream output missing {needle:?}: {output:?}")
+            }
+            Self::Io { operation, source } => {
+                write!(formatter, "{operation} I/O failed: {source}")
+            }
+            Self::ChildFailed {
+                operation,
+                status,
+                stdout,
+                stderr,
+            } => {
+                write!(
+                    formatter,
+                    "{operation} child exited {status}; stdout={stdout:?}; stderr={stderr:?}"
+                )
             }
             Self::AttachThreadPanicked => write!(formatter, "stream attach thread panicked"),
         }
@@ -1094,9 +1438,13 @@ impl Error for ConformanceError {
             | Self::MissingBody { .. }
             | Self::MissingJsonField { .. }
             | Self::MissingDiagnostic { .. }
+            | Self::MissingEnvironment { .. }
+            | Self::MissingApp { .. }
             | Self::MissingSession { .. }
             | Self::MissingOutput { .. }
+            | Self::ChildFailed { .. }
             | Self::AttachThreadPanicked => None,
+            Self::Io { source, .. } => Some(source),
         }
     }
 }
