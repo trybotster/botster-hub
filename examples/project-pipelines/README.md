@@ -20,15 +20,18 @@ Supported in this milestone:
   id and `form_errors` for form-level feedback
 - routed-envelope-backed start coordination with publish, drain, and
   acknowledge delivery evidence
-- intentionally absent `session_uuid` on `start` because this constrained local
-  flow records coordination before spawning any agent session
+- session-template spawn on `start`, returning `session_uuid`,
+  `session_template_id`, `session_context_id`, and `session_lifecycle` from the
+  spawned step session through the plugin worker `session_templates.spawn`
+  capability
 
 Unsupported monolith features:
 
 - Rails/cloud/WebRTC/browser marketplace surfaces
 - GitHub provider supervision and PR automation
 - broad compatibility with monolith SQLite state
-- full agent spawn/worktree orchestration from Project Pipelines Lua policy
+- multi-step agent supervision and worktree lifecycle management beyond the
+  single package-owned step session spawned by this local fixture
 
 Cutover posture: live monolith Project Pipelines data is not imported in this
 milestone. Cutover requires no in-flight monolith tickets, or a future explicit
