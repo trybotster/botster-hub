@@ -4031,6 +4031,35 @@ fn external_hub_test_support_drives_isolated_daemon_socket_protocol() {
             .invalid_action_diagnostic_kind
     );
     assert_eq!(plugin_report.invalid_title_error, "Title is required");
+
+    let terminal_app_report =
+        botster_hub_test_support::run_foreground_terminal_app_open_conformance(&first)
+            .expect("run foreground terminal app open conformance");
+    assert_eq!(terminal_app_report.package_state, "enabled");
+    assert_eq!(
+        terminal_app_report.package_name,
+        "first-party.terminal-client"
+    );
+    assert_eq!(terminal_app_report.app_id, "tui");
+    assert_eq!(terminal_app_report.entrypoint_id, "tui");
+    assert_eq!(terminal_app_report.app_kind, "terminal_app");
+    assert_eq!(terminal_app_report.launch_mode, "foreground_stdio");
+    assert!(terminal_app_report.hub_socket_env_present);
+    assert!(terminal_app_report.hub_data_dir_env_present);
+    assert_eq!(terminal_app_report.real_hub_action_operation, "status");
+    assert_eq!(terminal_app_report.real_hub_action_result, "running");
+    assert_eq!(terminal_app_report.exit_code, Some(0));
+    assert!(
+        terminal_app_report
+            .stdout
+            .contains("hub_socket_present=true")
+    );
+    assert!(
+        terminal_app_report
+            .stdout
+            .contains("hub_data_dir_present=true")
+    );
+    assert!(terminal_app_report.stderr.is_empty());
     first.shutdown().expect("shutdown first isolated hub");
 
     let second = botster_hub_test_support::IsolatedHubBuilder::new()
