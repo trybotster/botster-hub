@@ -3364,17 +3364,44 @@ fn daemon_operator_error_from_client(error: crate::HubClientError) -> DaemonOper
 
 fn daemon_operator_error_from_package(error: crate::PackageRegistryError) -> DaemonOperatorError {
     let package_name = package_error_display_name(&error);
+    let operation = package_action_label(error.action).to_string();
+    let diagnostics = package_registry_error_diagnostics(&error, &operation);
     DaemonOperatorError {
         code: "package_policy_error".to_string(),
         request_id: "daemon-package-mutation".to_string(),
-        operation: package_action_label(error.action).to_string(),
+        operation: operation.clone(),
         message: format!(
             "package {} denied for {}: {:?}",
-            package_name,
-            package_action_label(error.action),
-            error.reason
+            package_name, operation, error.reason
         ),
-        diagnostics: Vec::new(),
+        diagnostics,
+    }
+}
+
+fn package_registry_error_diagnostics(
+    error: &crate::PackageRegistryError,
+    operation: &str,
+) -> Vec<DaemonDiagnostic> {
+    match &error.reason {
+        PackageAdmissionReason::InvalidConfiguration(diagnostics) => diagnostics
+            .iter()
+            .map(|diagnostic| DaemonDiagnostic {
+                kind: botster_hub_client::DaemonDiagnosticKind::ActionFailure,
+                operation: Some(operation.to_string()),
+                feature: Some("package_registry".to_string()),
+                message: Some(diagnostic.message.clone()),
+            })
+            .collect(),
+        PackageAdmissionReason::MissingRequiredConfiguration(fields) => fields
+            .iter()
+            .map(|field| DaemonDiagnostic {
+                kind: botster_hub_client::DaemonDiagnosticKind::ActionFailure,
+                operation: Some(operation.to_string()),
+                feature: Some("package_registry".to_string()),
+                message: Some(format!("required configuration field {field} is missing")),
+            })
+            .collect(),
+        _ => Vec::new(),
     }
 }
 

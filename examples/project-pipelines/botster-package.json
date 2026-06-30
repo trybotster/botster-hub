@@ -44,5 +44,31 @@
         { "type": "auth", "key": "github_token" }
       ]
     }
-  ]
+  ],
+  "configuration": {
+    "fields": [
+      {
+        "key": "operator_endpoint",
+        "type": "url",
+        "label": "Operator endpoint",
+        "default": { "type": "url", "value": "https://example.invalid/project-pipelines" }
+      },
+      {
+        "key": "pipeline_mode",
+        "type": "select",
+        "label": "Pipeline mode",
+        "default": { "type": "select", "value": "local" },
+        "options": [
+          { "value": "local", "label": "Local" },
+          { "value": "github", "label": "GitHub" }
+        ]
+      },
+      {
+        "key": "api_token",
+        "type": "secret",
+        "label": "API token",
+        "default": { "type": "secret", "state": "unset" }
+      }
+    ]
+  }
 }

@@ -377,6 +377,11 @@ CLI operators can inspect package configuration with:
 botster-hub packages config --data-dir <path> <package>
 ```
 
+The checked-in dev-stack acceptance target is `project-pipelines` at
+`examples/project-pipelines`. Its manifest exposes deterministic
+`operator_endpoint`, `pipeline_mode`, and `api_token` configuration fields
+through the same `DaemonPackage.configuration` DTO used by first-party clients.
+
 They can update configuration with a JSON object whose values use the core
 configuration value shape:
 
