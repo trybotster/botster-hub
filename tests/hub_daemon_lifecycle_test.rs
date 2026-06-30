@@ -1266,8 +1266,76 @@ fn write_denied_capability_local_package(root: &Path) {
 
 fn write_botster_workspaces_local_package(root: &Path, plugin_db_scope: &str) {
     fs::create_dir_all(root).expect("create botster-workspaces package root");
-    fs::write(root.join("plugin.lua"), "return botster.register({})\n")
-        .expect("write plugin entrypoint");
+    fs::write(
+        root.join("plugin.lua"),
+        r#"local function workspace_id(arguments)
+  if type(arguments.workspace_id) == "string" and arguments.workspace_id ~= "" then
+    return arguments.workspace_id
+  end
+  return "workspace-local-1"
+end
+
+local function create(arguments)
+  local workspace = {
+    id = workspace_id(arguments),
+    name = arguments.name or "Local Workspace",
+    status = "created",
+  }
+  botster.capabilities.plugin_db.set({
+    key = "workspace/" .. workspace.id,
+    schema_version = 1,
+    payload = workspace,
+  })
+  return { ok = true, workspace = workspace }
+end
+
+local function use_workspace(arguments)
+  local id = workspace_id(arguments)
+  local record = botster.capabilities.plugin_db.get({ key = "workspace/" .. id })
+  local workspace = record.record.payload
+  workspace.status = "used"
+  botster.capabilities.plugin_db.set({
+    key = "workspace/" .. workspace.id,
+    schema_version = 1,
+    payload = workspace,
+  })
+  return { ok = true, workspace = workspace }
+end
+
+return botster.register({
+  tools = {
+    {
+      name = "botster_workspaces.create",
+      description = "Create a constrained local workspace.",
+      input_schema = {
+        type = "object",
+        properties = {
+          workspace_id = { type = "string" },
+          name = { type = "string" },
+        },
+        additionalProperties = false,
+      },
+      handler = "create",
+      call = create,
+    },
+    {
+      name = "botster_workspaces.use",
+      description = "Use a constrained local workspace.",
+      input_schema = {
+        type = "object",
+        properties = {
+          workspace_id = { type = "string" },
+        },
+        additionalProperties = false,
+      },
+      handler = "use",
+      call = use_workspace,
+    },
+  },
+})
+"#,
+    )
+    .expect("write plugin entrypoint");
     fs::write(
         root.join("botster-package.json"),
         format!(
@@ -2434,6 +2502,283 @@ fn cli_dev_stack_bootstrap_reuses_live_daemon_and_preserves_state_after_restart(
     );
 
     shutdown_dev_stack_daemon(&data_dir);
+}
+
+#[test]
+fn cli_dev_stack_acceptance_smoke_exercises_first_party_plugins_project_pipelines_session_templates_reload_and_shutdown()
+ {
+    let _guard = daemon_test_lock()
+        .lock()
+        .expect("serialize real daemon test");
+    let data_dir = unique_test_dir("cli-dev-stack-acceptance");
+    let project_pipelines_package_dir = std::env::current_dir()
+        .expect("current dir")
+        .join("examples/project-pipelines");
+    let web_package_dir = unique_test_dir("cli-dev-stack-acceptance-web");
+    let tui_package_dir = unique_test_dir("cli-dev-stack-acceptance-tui");
+    let workspaces_package_dir = unique_test_dir("cli-dev-stack-acceptance-workspaces");
+    write_botster_web_package(&web_package_dir);
+    write_botster_tui_package(&tui_package_dir);
+    write_botster_workspaces_local_package(&workspaces_package_dir, "botster-workspaces");
+    let web_bridge_port = unused_loopback_port();
+
+    let bootstrap = run_dev_stack_bootstrap(
+        &data_dir,
+        &project_pipelines_package_dir,
+        &web_package_dir,
+        &tui_package_dir,
+        &workspaces_package_dir,
+        web_bridge_port,
+    );
+    assert!(
+        bootstrap.status.success(),
+        "dev-stack bootstrap failed: {}",
+        command_output_text(&bootstrap)
+    );
+    let bootstrap_text = command_output_text(&bootstrap);
+    assert!(bootstrap_text.contains("dev_stack=ready"));
+    assert!(bootstrap_text.contains("package name=project-pipelines state=enabled"));
+    assert!(bootstrap_text.contains("package name=botster-web state=enabled"));
+    assert!(bootstrap_text.contains("package name=botster-tui state=enabled"));
+    assert!(bootstrap_text.contains("package name=botster-workspaces state=enabled"));
+
+    let config = explicit_config(&data_dir);
+    let apps = botster_hub::daemon_transport_request(&config, botster_hub::DaemonRequest::ListApps)
+        .expect("list first-party dev-stack apps");
+    let web_app = app_row(&apps, "web-client");
+    assert_eq!(web_app.package_name, "botster-web");
+    assert_eq!(
+        web_app.launch_target.local_url.as_deref(),
+        Some(format!("http://127.0.0.1:{web_bridge_port}/?dogfood=real-hub").as_str())
+    );
+    let tui_app = app_row(&apps, "botster-tui");
+    assert_eq!(tui_app.package_name, "botster-tui");
+    assert_eq!(tui_app.kind, "terminal_app");
+
+    let web_open = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("apps")
+        .arg("open")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("botster-web/web-client")
+        .output()
+        .expect("open botster-web app descriptor");
+    assert!(
+        web_open.status.success(),
+        "apps open botster-web failed: {}",
+        command_output_text(&web_open)
+    );
+    assert!(command_output_text(&web_open).contains(&format!(
+        "app_url=http://127.0.0.1:{web_bridge_port}/?dogfood=real-hub"
+    )));
+    read_web_html(&format!(
+        "http://127.0.0.1:{web_bridge_port}/?dogfood=real-hub"
+    ));
+
+    let tui_open = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("apps")
+        .arg("open")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("botster-tui")
+        .output()
+        .expect("open botster-tui launch descriptor");
+    assert!(
+        tui_open.status.success(),
+        "apps open botster-tui failed: {}",
+        command_output_text(&tui_open)
+    );
+    assert!(command_output_text(&tui_open).contains("botster-tui-fixture"));
+
+    let workspace_create = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::PluginMcpCallTool {
+            name: "botster_workspaces.create".to_string(),
+            arguments: serde_json::json!({
+                "workspace_id": "workspace-acceptance-1",
+                "name": "Acceptance Workspace"
+            }),
+        },
+    )
+    .expect("create workspace through botster-workspaces MCP tool");
+    assert_eq!(
+        workspace_create.kind,
+        botster_hub::DaemonResponseKind::PluginMcpToolResult
+    );
+    assert_eq!(
+        workspace_create.plugin_tool_result["workspace"]["status"],
+        "created"
+    );
+    let workspace_use = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::PluginMcpCallTool {
+            name: "botster_workspaces.use".to_string(),
+            arguments: serde_json::json!({ "workspace_id": "workspace-acceptance-1" }),
+        },
+    )
+    .expect("use workspace through botster-workspaces MCP tool");
+    assert_eq!(
+        workspace_use.plugin_tool_result["workspace"]["status"],
+        "used"
+    );
+
+    let tools = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::PluginMcpListTools,
+    )
+    .expect("list plugin MCP tools");
+    let tool_names = tools
+        .plugin_tools
+        .iter()
+        .filter_map(|tool| tool.get("name").and_then(serde_json::Value::as_str))
+        .collect::<Vec<_>>();
+    assert!(tool_names.contains(&"project_pipelines.create"));
+    assert!(tool_names.contains(&"project_pipelines.start"));
+    assert!(tool_names.contains(&"botster_workspaces.create"));
+
+    let created_ticket = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::PluginMcpCallTool {
+            name: "project_pipelines.create".to_string(),
+            arguments: serde_json::json!({
+                "title": "Acceptance smoke",
+                "pipeline_id": "local_pipeline"
+            }),
+        },
+    )
+    .expect("create project-pipelines ticket through live plugin MCP");
+    assert_eq!(created_ticket.plugin_tool_result["ok"], true);
+    let ticket_id = created_ticket.plugin_tool_result["ticket"]["id"]
+        .as_str()
+        .expect("created ticket id")
+        .to_string();
+    let start_run = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::PluginMcpCallTool {
+            name: "project_pipelines.start".to_string(),
+            arguments: serde_json::json!({
+                "ticket_id": ticket_id,
+                "target_id": "target-acceptance",
+                "worktree": "acceptance-worktree",
+                "agent_name": "codex"
+            }),
+        },
+    )
+    .expect("start project-pipelines run through live plugin MCP");
+    assert_eq!(start_run.plugin_tool_result["ok"], true);
+    let run = &start_run.plugin_tool_result["run"];
+    assert_eq!(run["coordination"]["target_id"], "target-acceptance");
+    assert_eq!(
+        run["coordination"]["assigned_worktree"],
+        "acceptance-worktree"
+    );
+    assert_eq!(
+        run["coordination"]["session_template_id"],
+        "project-pipelines/agent-step"
+    );
+    assert_eq!(run["coordination"]["session_lifecycle"], "running");
+    let session_id = run["coordination"]["session_uuid"]
+        .as_str()
+        .expect("project-pipelines session id")
+        .to_string();
+
+    let mut connection =
+        botster_hub::DaemonConnection::connect(&config).expect("connect daemon socket");
+    let attach = connection
+        .request(&botster_hub::DaemonRequest::Attach {
+            session_id: session_id.clone(),
+            subscription_id: "project-pipelines-acceptance-subscription".to_string(),
+        })
+        .expect("attach project-pipelines spawned session");
+    assert_eq!(attach.kind, botster_hub::DaemonResponseKind::Events);
+    let send = connection
+        .request(&botster_hub::DaemonRequest::SendInput {
+            session_id: session_id.clone(),
+            data: "acceptance-input\n".to_string(),
+        })
+        .expect("send input to project-pipelines spawned session");
+    assert_eq!(send.kind, botster_hub::DaemonResponseKind::Events);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut observed = String::new();
+    while std::time::Instant::now() < deadline {
+        let drain = connection
+            .request(&botster_hub::DaemonRequest::Drain {
+                session_id: session_id.clone(),
+            })
+            .expect("drain project-pipelines spawned session");
+        for event in drain.events {
+            match event {
+                botster_hub::DaemonEvent::TerminalOutput { data, .. }
+                | botster_hub::DaemonEvent::Snapshot { data, .. }
+                | botster_hub::DaemonEvent::Scrollback { data, .. } => observed.push_str(&data),
+                _ => {}
+            }
+        }
+        if observed.contains("project-pipelines-step:acceptance-input") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(30));
+    }
+    assert!(
+        observed.contains("project-pipelines-step:acceptance-input"),
+        "project-pipelines spawned PTY should echo input through attach/drain, got {observed:?}"
+    );
+
+    let mut web_manifest: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(web_package_dir.join("botster-package.json"))
+            .expect("read botster-web manifest"),
+    )
+    .expect("parse botster-web manifest");
+    web_manifest["version"] = serde_json::Value::String("1.1.0".to_string());
+    fs::write(
+        web_package_dir.join("botster-package.json"),
+        serde_json::to_string_pretty(&web_manifest)
+            .expect("serialize updated botster-web manifest"),
+    )
+    .expect("write updated botster-web manifest");
+    let reload = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::ReloadPackage {
+            package_name: "botster-web".to_string(),
+        },
+    )
+    .expect("reload updated botster-web package");
+    assert_eq!(
+        reload.package_decision.expect("reload decision").action,
+        "reload"
+    );
+    let reloaded_web = reload
+        .packages
+        .iter()
+        .find(|package| package.package_name == "botster-web")
+        .expect("reloaded botster-web package row");
+    assert_eq!(reloaded_web.version, "1.1.0");
+
+    let shutdown_session = connection
+        .request(&botster_hub::DaemonRequest::ShutdownSession { session_id })
+        .expect("shutdown project-pipelines spawned session");
+    assert!(
+        matches!(
+            shutdown_session.kind,
+            botster_hub::DaemonResponseKind::Events
+                | botster_hub::DaemonResponseKind::SessionCleanup
+        ),
+        "unexpected session shutdown response: {:?}",
+        shutdown_session.kind
+    );
+    drop(connection);
+    shutdown_dev_stack_daemon(&data_dir);
+    let status = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("status")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .output()
+        .expect("check dev-stack status after shutdown");
+    assert!(
+        !status.status.success(),
+        "dev-stack daemon should be stopped after shutdown: {}",
+        command_output_text(&status)
+    );
 }
 
 #[test]

@@ -829,11 +829,17 @@ fn mcp_serve_lists_calls_and_reloads_project_pipelines_plugin_tools() {
         messages[4]["result"]["structuredContent"]["run"]["coordination"]["agent_name"],
         "codex"
     );
-    assert!(
-        messages[4]["result"]["structuredContent"]["run"]["coordination"]
-            .get("session_uuid")
-            .is_none(),
-        "session_uuid should be absent because constrained local start records coordination before spawning an agent session"
+    assert_eq!(
+        messages[4]["result"]["structuredContent"]["run"]["coordination"]["session_uuid"],
+        "project-pipelines-step-1"
+    );
+    assert_eq!(
+        messages[4]["result"]["structuredContent"]["run"]["coordination"]["session_template_id"],
+        "project-pipelines/agent-step"
+    );
+    assert_eq!(
+        messages[4]["result"]["structuredContent"]["run"]["coordination"]["session_lifecycle"],
+        "running"
     );
     assert_eq!(
         messages[4]["result"]["structuredContent"]["run"]["coordination"]["publish_delivery_status"],
