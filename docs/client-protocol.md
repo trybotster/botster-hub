@@ -286,6 +286,8 @@ The local signaling surface is the daemon request
 `LocalWebrtcSignal { grant_id, grant_secret, origin, offer }`. The hub validates
 that the grant exists, has not expired, has not already been redeemed, has the
 expected secret, and matches the expected origin before creating a WebRTC answer.
+The origin check is defense in depth for same-device launches; the short-lived
+grant secret is the admission boundary.
 Accepted DataChannel messages are JSON serialized `botster_core::AesGcmEnvelope`
 values. The envelope plaintext is the existing daemon `DaemonRequest`, and the
 encrypted response plaintext is `DaemonResponse`; invalid or unauthenticated

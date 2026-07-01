@@ -5,6 +5,10 @@ use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Sender};
+use std::sync::{
+    Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -26,20 +30,11 @@ use crate::daemon_transport::ControlMessage;
 const GRANT_TTL_SECONDS: u64 = 120;
 const WEBRTC_SIGNAL_OPERATION: &str = "local_webrtc_signal";
 /// Ephemeral local WebRTC admission and peer registry.
+#[derive(Default)]
 pub struct LocalWebrtcTransport {
     grants: BTreeMap<String, LocalWebrtcGrant>,
     peers: BTreeMap<String, Arc<dyn PeerConnection>>,
     runtime: Option<tokio::runtime::Runtime>,
-}
-
-impl Default for LocalWebrtcTransport {
-    fn default() -> Self {
-        Self {
-            grants: BTreeMap::new(),
-            peers: BTreeMap::new(),
-            runtime: None,
-        }
-    }
 }
 
 impl LocalWebrtcTransport {
@@ -48,13 +43,13 @@ impl LocalWebrtcTransport {
         &mut self,
         entrypoint_id: &str,
         environment: &mut BTreeMap<String, String>,
-    ) -> Option<DaemonLocalWebrtcBootstrap> {
+    ) -> LocalWebrtcResult<Option<DaemonLocalWebrtcBootstrap>> {
         if entrypoint_id != "web-client" {
-            return None;
+            return Ok(None);
         }
         let now = now_seconds();
-        let grant_id = random_token("grant");
-        let grant_secret = random_secret_token();
+        let grant_id = random_token("grant")?;
+        let grant_secret = random_secret_token()?;
         let expected_origin = expected_origin(environment);
         let bootstrap = DaemonLocalWebrtcBootstrap {
             grant_id: grant_id.clone(),
@@ -95,7 +90,7 @@ impl LocalWebrtcTransport {
                 redeemed: false,
             },
         );
-        Some(bootstrap)
+        Ok(Some(bootstrap))
     }
 
     /// Redeem one grant and create a WebRTC answer for the supplied offer.
@@ -131,6 +126,11 @@ impl LocalWebrtcTransport {
                 let _ = runtime.block_on(peer.close());
             }
         }
+    }
+
+    /// Forget one active peer after its DataChannel or peer connection closes.
+    pub(crate) fn remove_peer(&mut self, grant_id: &str) {
+        self.peers.remove(grant_id);
     }
 
     fn runtime(&mut self) -> LocalWebrtcResult<&tokio::runtime::Runtime> {
@@ -185,12 +185,97 @@ struct LocalWebrtcAnswer {
     peer: Arc<dyn PeerConnection>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LocalWebrtcAttachedSubscription {
+    pub session_id: String,
+    pub subscription_id: String,
+}
+
+enum LocalWebrtcAttachedSubscriptionChange {
+    Attach(LocalWebrtcAttachedSubscription),
+    Detach(LocalWebrtcAttachedSubscription),
+}
+
+impl LocalWebrtcAttachedSubscriptionChange {
+    fn from_request(request: &DaemonRequest) -> Option<Self> {
+        match request {
+            DaemonRequest::Attach {
+                session_id,
+                subscription_id,
+            } => Some(Self::Attach(LocalWebrtcAttachedSubscription {
+                session_id: session_id.clone(),
+                subscription_id: subscription_id.clone(),
+            })),
+            DaemonRequest::Detach {
+                session_id,
+                subscription_id,
+            } => Some(Self::Detach(LocalWebrtcAttachedSubscription {
+                session_id: session_id.clone(),
+                subscription_id: subscription_id.clone(),
+            })),
+            _ => None,
+        }
+    }
+}
+
+struct LocalWebrtcPeerState {
+    grant_id: String,
+    runtime_tx: Sender<ControlMessage>,
+    attached_subscriptions: Mutex<Vec<LocalWebrtcAttachedSubscription>>,
+    cleanup_sent: AtomicBool,
+}
+
+impl LocalWebrtcPeerState {
+    fn new(grant_id: String, runtime_tx: Sender<ControlMessage>) -> Self {
+        Self {
+            grant_id,
+            runtime_tx,
+            attached_subscriptions: Mutex::new(Vec::new()),
+            cleanup_sent: AtomicBool::new(false),
+        }
+    }
+
+    fn apply_subscription_change(&self, change: Option<LocalWebrtcAttachedSubscriptionChange>) {
+        let Some(change) = change else {
+            return;
+        };
+        let mut attached_subscriptions = self
+            .attached_subscriptions
+            .lock()
+            .expect("local WebRTC peer subscription mutex");
+        match change {
+            LocalWebrtcAttachedSubscriptionChange::Attach(subscription) => {
+                if !attached_subscriptions.contains(&subscription) {
+                    attached_subscriptions.push(subscription);
+                }
+            }
+            LocalWebrtcAttachedSubscriptionChange::Detach(subscription) => {
+                attached_subscriptions.retain(|attached| attached != &subscription);
+            }
+        }
+    }
+
+    fn cleanup_once(&self) {
+        if self.cleanup_sent.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let attached_subscriptions = self
+            .attached_subscriptions
+            .lock()
+            .expect("local WebRTC peer subscription mutex")
+            .clone();
+        let _ = self.runtime_tx.send(ControlMessage::LocalWebrtcPeerClosed {
+            grant_id: self.grant_id.clone(),
+            attached_subscriptions,
+        });
+    }
+}
+
 #[derive(Clone)]
 struct LocalWebrtcHandler {
-    grant_id: String,
     stream_key: AesGcmKey,
     runtime: Arc<dyn Runtime>,
-    runtime_tx: Sender<ControlMessage>,
+    peer_state: Arc<LocalWebrtcPeerState>,
     gather_complete_tx: AsyncSender<()>,
 }
 
@@ -210,12 +295,13 @@ impl PeerConnectionEventHandler for LocalWebrtcHandler {
                 | RTCPeerConnectionState::Closed
         ) {
             let _ = self.gather_complete_tx.try_send(());
+            self.peer_state.cleanup_once();
         }
     }
 
     async fn on_data_channel(&self, data_channel: Arc<dyn DataChannel>) {
-        let runtime_tx = self.runtime_tx.clone();
-        let grant_id = self.grant_id.clone();
+        let peer_state = self.peer_state.clone();
+        let runtime_tx = peer_state.runtime_tx.clone();
         let stream_key = self.stream_key.clone();
         self.runtime.spawn(Box::pin(async move {
             while let Some(event) = data_channel.poll().await {
@@ -226,9 +312,14 @@ impl PeerConnectionEventHandler for LocalWebrtcHandler {
                         else {
                             break;
                         };
+                        let subscription_change =
+                            LocalWebrtcAttachedSubscriptionChange::from_request(&request);
                         let (reply_tx, reply_rx) = mpsc::channel();
                         if runtime_tx
-                            .send(ControlMessage::Request { request, reply_tx })
+                            .send(ControlMessage::Request {
+                                request: Box::new(request),
+                                reply_tx,
+                            })
                             .is_err()
                         {
                             break;
@@ -247,6 +338,7 @@ impl PeerConnectionEventHandler for LocalWebrtcHandler {
                                     error.to_string(),
                                 ))
                             });
+                        peer_state.apply_subscription_change(subscription_change);
                         let Ok(response) = encrypt_daemon_response(&stream_key, &response) else {
                             break;
                         };
@@ -259,7 +351,7 @@ impl PeerConnectionEventHandler for LocalWebrtcHandler {
                     _ => {}
                 }
             }
-            let _ = grant_id;
+            peer_state.cleanup_once();
         }));
     }
 }
@@ -272,11 +364,14 @@ async fn answer_offer(
         .ok_or_else(|| LocalWebrtcError::Webrtc("no async runtime".to_string()))?;
     let stream_key = secret_stream_key(&request.grant_secret)?;
     let (gather_complete_tx, mut gather_complete_rx) = channel::<()>(1);
+    let peer_state = Arc::new(LocalWebrtcPeerState::new(
+        request.grant_id.clone(),
+        runtime_tx,
+    ));
     let handler = Arc::new(LocalWebrtcHandler {
-        grant_id: request.grant_id.clone(),
         stream_key,
         runtime: runtime.clone(),
-        runtime_tx,
+        peer_state,
         gather_complete_tx,
     });
 
@@ -364,22 +459,16 @@ fn expected_origin(environment: &BTreeMap<String, String>) -> String {
         .unwrap_or_else(|| "http://127.0.0.1".to_string())
 }
 
-fn random_token(prefix: &str) -> String {
+fn random_token(prefix: &str) -> LocalWebrtcResult<String> {
     let mut bytes = [0_u8; 16];
-    if getrandom::fill(&mut bytes).is_err() {
-        let fallback = now_seconds().to_le_bytes();
-        bytes[..fallback.len()].copy_from_slice(&fallback);
-    }
-    format!("{prefix}-{}", hex(&bytes))
+    getrandom::fill(&mut bytes).map_err(|error| LocalWebrtcError::Random(error.to_string()))?;
+    Ok(format!("{prefix}-{}", hex(&bytes)))
 }
 
-fn random_secret_token() -> String {
+fn random_secret_token() -> LocalWebrtcResult<String> {
     let mut bytes = [0_u8; 32];
-    if getrandom::fill(&mut bytes).is_err() {
-        let fallback = now_seconds().to_le_bytes();
-        bytes[..fallback.len()].copy_from_slice(&fallback);
-    }
-    format!("secret-{}", hex(&bytes))
+    getrandom::fill(&mut bytes).map_err(|error| LocalWebrtcError::Random(error.to_string()))?;
+    Ok(format!("secret-{}", hex(&bytes)))
 }
 
 fn secret_stream_key(secret: &str) -> LocalWebrtcResult<AesGcmKey> {
@@ -392,7 +481,7 @@ fn secret_stream_key(secret: &str) -> LocalWebrtcResult<AesGcmKey> {
 }
 
 fn decode_hex(encoded: &str) -> Option<Vec<u8>> {
-    if encoded.len() % 2 != 0 {
+    if !encoded.len().is_multiple_of(2) {
         return None;
     }
     let mut output = Vec::with_capacity(encoded.len() / 2);
@@ -440,6 +529,7 @@ pub enum LocalWebrtcError {
     SecretMismatch,
     OriginMismatch,
     InvalidOffer(String),
+    Random(String),
     Webrtc(String),
 }
 
@@ -457,6 +547,7 @@ impl fmt::Display for LocalWebrtcError {
             }
             Self::OriginMismatch => write!(formatter, "local WebRTC bootstrap origin mismatch"),
             Self::InvalidOffer(error) => write!(formatter, "invalid local WebRTC offer: {error}"),
+            Self::Random(error) => write!(formatter, "local WebRTC random token failed: {error}"),
             Self::Webrtc(error) => write!(formatter, "local WebRTC signaling failed: {error}"),
         }
     }
