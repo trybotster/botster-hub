@@ -457,14 +457,15 @@ pub type HubStateStoreResult<T> = Result<T, HubStateStoreError>;
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::collections::BTreeMap;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use botster_core::{
-        Capability, CapabilitySurface, CredentialRecord, CredentialStore, ExtensionEntrypoint,
-        ExtensionKind, ExtensionRuntime, PackageConfigurationField, PackageConfigurationFieldType,
-        PackageConfigurationSchema, PackageConfigurationSecretValue, PackageConfigurationValue,
-        PackageManifest, PackageSource,
+        Capability, CapabilitySurface, CredentialRecord, CredentialStore, CredentialStoreError,
+        ExtensionEntrypoint, ExtensionKind, ExtensionRuntime, PackageConfigurationField,
+        PackageConfigurationFieldType, PackageConfigurationSchema, PackageConfigurationSecretValue,
+        PackageConfigurationValue, PackageManifest, PackageSource,
     };
 
     use super::*;
@@ -535,6 +536,30 @@ mod tests {
         PackageProvenance {
             source: "https://example.invalid/botster/package-index".to_string(),
             checksum: Some("sha256:test-checksum".to_string()),
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct CountingCredentialStore {
+        reads: Cell<usize>,
+    }
+
+    impl CredentialStore for CountingCredentialStore {
+        fn get(&self, _key: &str) -> Result<Option<CredentialRecord>, CredentialStoreError> {
+            self.reads.set(self.reads.get() + 1);
+            Ok(Some(CredentialRecord::new(vec![41, 43, 47, 53])))
+        }
+
+        fn set(
+            &mut self,
+            _key: &str,
+            _record: CredentialRecord,
+        ) -> Result<(), CredentialStoreError> {
+            Ok(())
+        }
+
+        fn delete(&mut self, _key: &str) -> Result<(), CredentialStoreError> {
+            Ok(())
         }
     }
 
@@ -730,6 +755,50 @@ mod tests {
         revoked_grant.revoked_at_unix_ms = Some(25);
         assert!(!revoked_grant.is_redeemable_at(26));
         assert!(!valid.is_redeemable_at(30));
+    }
+
+    #[test]
+    fn browser_and_grant_references_do_not_re_read_validated_credential_keys() {
+        let config = test_config("browser-grant-no-duplicate-reads");
+        let key_id = credential_key_id(
+            &config.host.id,
+            CredentialKeyPurpose::BrowserIdentity,
+            "browser-a",
+        );
+        let public_key = b"browser reference public key".to_vec();
+        let mut state = HubState::from_config(&config);
+        state.credential_keys.push(CredentialKeyReference {
+            key_id: key_id.clone(),
+            provider: CredentialProviderKind::TestFile,
+            purpose: CredentialKeyPurpose::BrowserIdentity,
+            created_at_unix_ms: 10,
+            rotated_at_unix_ms: None,
+        });
+        let mut browser =
+            TrustedBrowserIdentity::trusted("browser-a", public_key, 10, "trust synthetic browser");
+        browser.credential_key_id = Some(key_id.clone());
+        state.trusted_browser_identities.push(browser);
+        state.bootstrap_grants.push(BootstrapGrantRecord {
+            grant_id: "grant-a".to_string(),
+            package_instance_id: "package-instance-a".to_string(),
+            origin: "localhost".to_string(),
+            peer_id: "peer-a".to_string(),
+            credential_key_id: Some(key_id),
+            expires_at_unix_ms: 100,
+            revoked_at_unix_ms: None,
+            redeemed_at_unix_ms: None,
+            audit_reason: "issue synthetic bootstrap grant".to_string(),
+        });
+        let credential_store = CountingCredentialStore::default();
+
+        validate_hub_credentials(&state, CredentialProviderKind::TestFile, &credential_store)
+            .expect("state credential references should validate");
+
+        assert_eq!(
+            credential_store.reads.get(),
+            1,
+            "one credential key should be read once even when browser and grant reference it"
+        );
     }
 
     #[test]
