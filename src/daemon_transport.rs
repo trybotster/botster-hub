@@ -30,12 +30,12 @@ pub use botster_hub_client::{
     DaemonApp, DaemonAppLaunchTarget, DaemonAvailablePackage, DaemonCapability,
     DaemonCompatibility, DaemonConnection as ClientDaemonConnection, DaemonCoordination,
     DaemonDiagnostic, DaemonEndpoint, DaemonEnvelope, DaemonEnvelopeAck, DaemonEnvelopeDelivery,
-    DaemonEnvelopePublish, DaemonEvent, DaemonHello, DaemonHelloAck, DaemonIdentity, DaemonNotify,
-    DaemonOperatorError, DaemonPackage, DaemonPackageActionRequest,
-    DaemonPackageActionRequiredReference, DaemonPackageActionState, DaemonPackageActionStatus,
-    DaemonPackageAvailability, DaemonPackageAvailabilityReason, DaemonPackageAvailabilityState,
-    DaemonPackageCompatibility, DaemonPackageConfiguration, DaemonPackageDecision,
-    DaemonPackageDependencyAvailability, DaemonPackageDiagnostic,
+    DaemonEnvelopePublish, DaemonEvent, DaemonHello, DaemonHelloAck, DaemonIdentity,
+    DaemonLocalWebrtcAnswer, DaemonNotify, DaemonOperatorError, DaemonPackage,
+    DaemonPackageActionRequest, DaemonPackageActionRequiredReference, DaemonPackageActionState,
+    DaemonPackageActionStatus, DaemonPackageAvailability, DaemonPackageAvailabilityReason,
+    DaemonPackageAvailabilityState, DaemonPackageCompatibility, DaemonPackageConfiguration,
+    DaemonPackageDecision, DaemonPackageDependencyAvailability, DaemonPackageDiagnostic,
     DaemonPackageEnvironmentRequirement, DaemonPackageFeatureAvailability,
     DaemonPackageInstallEffect, DaemonPackageInstallPlan, DaemonPackagePin, DaemonPackageProcess,
     DaemonPackageRunnableEntrypoint, DaemonPackageSurfaceDescriptor, DaemonPackageUpdateStatus,
@@ -50,6 +50,7 @@ use serde_json::Value;
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
 
+use crate::local_webrtc::LocalWebrtcSignalRequest;
 use crate::{
     AvailablePackage, AvailablePackageState, FileHubStateStore, HubClientApi, HubClientEvent,
     HubClientPackage, HubClientPackageAvailabilityReason, HubClientPackageAvailabilityState,
@@ -64,6 +65,7 @@ use crate::{
 use crate::{EntrypointProcessSnapshot, EntrypointSupervisorError};
 
 const MESSAGE_CONTENT_TYPE: &str = "application/vnd.botster.coordination.message+text";
+const WEBRTC_SIGNAL_OPERATION: &str = "local_webrtc_signal";
 
 /// Run the local daemon socket until a shutdown request is received.
 pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus> {
@@ -96,6 +98,7 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
                         &mut daemon,
                         &mut logical_clock,
                         &mut drain_cursors,
+                        control_tx.clone(),
                         message,
                     ) {
                         let status = daemon.stop();
@@ -250,19 +253,21 @@ fn handle_control_message(
     daemon: &mut HubDaemon,
     logical_clock: &mut u64,
     drain_cursors: &mut BTreeMap<String, u64>,
+    control_tx: Sender<ControlMessage>,
     message: ControlMessage,
 ) -> bool {
     let ControlMessage::Request { request, reply_tx } = message;
     let response =
-        handle_control_request(daemon, logical_clock, drain_cursors, request).or_else(|error| {
-            match error {
+        handle_control_request(daemon, logical_clock, drain_cursors, control_tx, request).or_else(
+            |error| match error {
                 DaemonTransportError::Client(error) => Ok(daemon_operator_error(error)),
                 DaemonTransportError::Package(error) => Ok(daemon_package_error(error)),
                 DaemonTransportError::State(error) => Ok(daemon_state_error(error)),
                 DaemonTransportError::Entrypoint(error) => Ok(daemon_entrypoint_error(error)),
+                DaemonTransportError::LocalWebrtc(error) => Ok(daemon_local_webrtc_error(error)),
                 error => Err(error),
-            }
-        });
+            },
+        );
     let should_stop = matches!(
         response,
         Ok(DaemonResponse {
@@ -278,6 +283,7 @@ fn handle_control_request(
     daemon: &mut HubDaemon,
     logical_clock: &mut u64,
     drain_cursors: &mut BTreeMap<String, u64>,
+    control_tx: Sender<ControlMessage>,
     request: DaemonRequest,
 ) -> DaemonTransportResult<DaemonResponse> {
     match request {
@@ -474,20 +480,47 @@ fn handle_control_request(
                 .config()
                 .clone();
             let packages = daemon.package_registry().clone();
-            let environment = supervised_launch_environment(
+            let mut environment = supervised_launch_environment(
                 &config,
                 &packages,
                 &package_name,
                 &entrypoint_id,
                 &environment_overrides,
             )?;
+            let local_webrtc_bootstrap = if package_name == "botster-web" {
+                daemon
+                    .local_webrtc()
+                    .issue_botster_web_bootstrap(&entrypoint_id, &mut environment)
+            } else {
+                None
+            };
             daemon.entrypoint_supervisor().start(
                 &packages,
                 &package_name,
                 &entrypoint_id,
                 &environment,
             )?;
-            show_package_response(daemon, &package_name)
+            let mut response = show_package_response(daemon, &package_name)?;
+            if let Some(bootstrap) = local_webrtc_bootstrap {
+                response.kind = DaemonResponseKind::LocalWebrtcBootstrap;
+                response.local_webrtc_bootstrap = Some(bootstrap);
+            }
+            Ok(response)
+        }
+        DaemonRequest::LocalWebrtcSignal {
+            grant_id,
+            grant_secret,
+            origin,
+            offer,
+        } => {
+            let signal = LocalWebrtcSignalRequest {
+                grant_id,
+                grant_secret,
+                origin,
+                offer,
+            };
+            let answer = daemon.local_webrtc().signal(signal, control_tx.clone())?;
+            Ok(daemon_local_webrtc_answer(answer))
         }
         DaemonRequest::StopPackageEntrypoint {
             package_name,
@@ -1044,12 +1077,15 @@ fn handle_runtime_control_request(
             plugin_tool_result: Value::Null,
             plugin_surface: None,
             plugin_action_result: None,
+            local_webrtc_bootstrap: None,
+            local_webrtc_answer: None,
             events: Vec::new(),
             cleanup: None,
             coordination: None,
             error: None,
             diagnostics: vec![DaemonDiagnostic::connected("shutdown")],
         }),
+        DaemonRequest::LocalWebrtcSignal { .. } => Err(DaemonTransportError::UnexpectedResponse),
         DaemonRequest::ListApps
         | DaemonRequest::ResolveAppLaunch { .. }
         | DaemonRequest::ListPackages
@@ -1806,7 +1842,7 @@ fn events_from_client(events: Vec<HubClientEvent>) -> Vec<DaemonEvent> {
 }
 
 #[derive(Debug)]
-enum ControlMessage {
+pub(crate) enum ControlMessage {
     Request {
         request: DaemonRequest,
         reply_tx: Sender<DaemonTransportResult<DaemonResponse>>,
@@ -1866,6 +1902,8 @@ fn daemon_response_base(kind: DaemonResponseKind) -> DaemonResponse {
         plugin_tool_result: Value::Null,
         plugin_surface: None,
         plugin_action_result: None,
+        local_webrtc_bootstrap: None,
+        local_webrtc_answer: None,
         events: Vec::new(),
         cleanup: None,
         coordination: None,
@@ -2164,6 +2202,22 @@ fn daemon_entrypoint_error(error: EntrypointSupervisorError) -> DaemonResponse {
     if let Some(error) = &response.error {
         response.diagnostics = error.diagnostics.clone();
     }
+    response
+}
+
+fn daemon_local_webrtc_error(error: crate::LocalWebrtcError) -> DaemonResponse {
+    let mut response = daemon_response_base(DaemonResponseKind::OperatorError);
+    response.error = Some(daemon_operator_error_from_local_webrtc(error));
+    if let Some(error) = &response.error {
+        response.diagnostics = error.diagnostics.clone();
+    }
+    response
+}
+
+fn daemon_local_webrtc_answer(answer: DaemonLocalWebrtcAnswer) -> DaemonResponse {
+    let mut response = daemon_response_base(DaemonResponseKind::LocalWebrtcAnswer);
+    response.diagnostics = answer.diagnostics.clone();
+    response.local_webrtc_answer = Some(answer);
     response
 }
 
@@ -3465,6 +3519,47 @@ fn daemon_operator_error_from_entrypoint(error: EntrypointSupervisorError) -> Da
     }
 }
 
+fn daemon_operator_error_from_local_webrtc(error: crate::LocalWebrtcError) -> DaemonOperatorError {
+    let (code, message) = match error {
+        crate::LocalWebrtcError::MissingGrant => (
+            "local_webrtc_missing_grant",
+            "local WebRTC bootstrap grant was not found".to_string(),
+        ),
+        crate::LocalWebrtcError::ExpiredGrant => (
+            "local_webrtc_expired_grant",
+            "local WebRTC bootstrap grant expired".to_string(),
+        ),
+        crate::LocalWebrtcError::RedeemedGrant => (
+            "local_webrtc_redeemed_grant",
+            "local WebRTC bootstrap grant was already redeemed".to_string(),
+        ),
+        crate::LocalWebrtcError::SecretMismatch => (
+            "local_webrtc_secret_mismatch",
+            "local WebRTC bootstrap grant secret mismatch".to_string(),
+        ),
+        crate::LocalWebrtcError::OriginMismatch => (
+            "local_webrtc_origin_mismatch",
+            "local WebRTC bootstrap origin mismatch".to_string(),
+        ),
+        crate::LocalWebrtcError::InvalidOffer(message) => (
+            "local_webrtc_invalid_offer",
+            format!("invalid local WebRTC offer: {message}"),
+        ),
+        crate::LocalWebrtcError::Webrtc(message) => (
+            "local_webrtc_signaling_failed",
+            format!("local WebRTC signaling failed: {message}"),
+        ),
+    };
+    let diagnostic = DaemonDiagnostic::action_failure(WEBRTC_SIGNAL_OPERATION, message.clone());
+    DaemonOperatorError {
+        code: code.to_string(),
+        request_id: WEBRTC_SIGNAL_OPERATION.to_string(),
+        operation: WEBRTC_SIGNAL_OPERATION.to_string(),
+        message,
+        diagnostics: vec![diagnostic],
+    }
+}
+
 fn daemon_event_from_client(event: HubClientEvent) -> DaemonEvent {
     match event {
         HubClientEvent::SessionLifecycle { session_id, state } => DaemonEvent::SessionLifecycle {
@@ -3797,6 +3892,7 @@ pub enum DaemonTransportError {
     Package(crate::PackageRegistryError),
     State(crate::HubStateStoreError),
     Entrypoint(EntrypointSupervisorError),
+    LocalWebrtc(crate::LocalWebrtcError),
     Runtime(crate::HubRuntimeError),
     Lifecycle(crate::HubLifecycleError),
 }
@@ -3820,6 +3916,7 @@ impl fmt::Display for DaemonTransportError {
             Self::Package(error) => write!(formatter, "{error:?}"),
             Self::State(error) => write!(formatter, "{error}"),
             Self::Entrypoint(error) => write!(formatter, "{error:?}"),
+            Self::LocalWebrtc(error) => write!(formatter, "{error}"),
             Self::Runtime(error) => write!(formatter, "{error:?}"),
             Self::Lifecycle(error) => write!(formatter, "{error:?}"),
         }
@@ -3833,6 +3930,7 @@ impl Error for DaemonTransportError {
             Self::Json(error) => Some(error),
             Self::Compatibility(error) => Some(error),
             Self::Daemon(error) => Some(error),
+            Self::LocalWebrtc(error) => Some(error),
             Self::State(error) => Some(error),
             _ => None,
         }
@@ -3882,6 +3980,12 @@ impl From<crate::HubStateStoreError> for DaemonTransportError {
 impl From<EntrypointSupervisorError> for DaemonTransportError {
     fn from(error: EntrypointSupervisorError) -> Self {
         Self::Entrypoint(error)
+    }
+}
+
+impl From<crate::LocalWebrtcError> for DaemonTransportError {
+    fn from(error: crate::LocalWebrtcError) -> Self {
+        Self::LocalWebrtc(error)
     }
 }
 
