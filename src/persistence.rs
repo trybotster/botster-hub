@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::{
     CoreEngineOptions, HostIdentity, HubConfig, SessionDefaults, TransportBindings,
 };
+use crate::credentials::{CredentialKeyPurpose, CredentialProviderKind};
 use crate::packages::PackageRegistrySnapshot;
 use crate::session_templates::PackageSessionTemplate;
 
@@ -54,6 +55,15 @@ pub struct HubState {
     /// Admitted repo roots that may contribute repo-local session templates.
     #[serde(default)]
     pub admitted_session_template_targets: Vec<AdmittedSessionTemplateTarget>,
+    /// References to secret material held by the credential provider.
+    #[serde(default)]
+    pub credential_keys: Vec<CredentialKeyReference>,
+    /// Durable trusted browser public identity metadata. No private keys or grant secrets.
+    #[serde(default)]
+    pub trusted_browser_identities: Vec<TrustedBrowserIdentity>,
+    /// Bootstrap grant metadata. Grant secret material, when durable, is provider-owned.
+    #[serde(default)]
+    pub bootstrap_grants: Vec<BootstrapGrantRecord>,
     /// Audit-friendly capability grant records.
     pub capability_grants: Vec<CapabilityGrantRecord>,
     /// Admission decision history for package/provider policy.
@@ -75,6 +85,9 @@ impl HubState {
             package_registry: PackageRegistrySnapshot::empty(),
             device_session_template_sources: Vec::new(),
             admitted_session_template_targets: Vec::new(),
+            credential_keys: Vec::new(),
+            trusted_browser_identities: Vec::new(),
+            bootstrap_grants: Vec::new(),
             capability_grants: Vec::new(),
             admission_decisions: Vec::new(),
             runtime_settings: LocalRuntimeSettings::from_config(config),
@@ -115,6 +128,65 @@ pub struct AdmittedSessionTemplateTarget {
 
 const fn default_true() -> bool {
     true
+}
+
+/// Reference to credential-provider-owned secret material.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CredentialKeyReference {
+    /// Stable provider key id. The referenced credential value is never in hub-state.
+    pub key_id: String,
+    /// Concrete provider expected to hold this credential.
+    pub provider: CredentialProviderKind,
+    /// Hub-owned purpose for audit and lookup policy.
+    pub purpose: CredentialKeyPurpose,
+    /// Logical creation time supplied by the caller.
+    pub created_at_unix_ms: u64,
+    /// Optional rotation time supplied by the caller.
+    pub rotated_at_unix_ms: Option<u64>,
+}
+
+/// Durable public browser identity trust metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrustedBrowserIdentity {
+    /// Synthetic browser identity id. Do not use hostnames, emails, or local paths.
+    pub browser_id: String,
+    /// Public verifying key bytes. Private key material is credential-provider-owned.
+    pub public_key: Vec<u8>,
+    /// Public-key-derived fingerprint.
+    pub fingerprint: String,
+    /// Optional credential key reference for browser-owned secret/session material.
+    pub credential_key_id: Option<String>,
+    /// Time this browser identity became trusted.
+    pub trusted_at_unix_ms: u64,
+    /// Optional trust expiry.
+    pub expires_at_unix_ms: Option<u64>,
+    /// Revocation time when trust has been revoked.
+    pub revoked_at_unix_ms: Option<u64>,
+    /// Audit-safe reason. Callers must not put PII or secrets here.
+    pub audit_reason: String,
+}
+
+/// Durable bootstrap grant metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BootstrapGrantRecord {
+    /// Synthetic grant id. The raw grant token is never in hub-state.
+    pub grant_id: String,
+    /// Package or app instance this grant is scoped to.
+    pub package_instance_id: String,
+    /// Expected local origin label, such as `localhost`.
+    pub origin: String,
+    /// Expected peer/session route id.
+    pub peer_id: String,
+    /// Optional credential key reference for sealed grant material.
+    pub credential_key_id: Option<String>,
+    /// Grant expiry time.
+    pub expires_at_unix_ms: u64,
+    /// Revocation time when the grant has been revoked.
+    pub revoked_at_unix_ms: Option<u64>,
+    /// Redemption time when the grant has been consumed.
+    pub redeemed_at_unix_ms: Option<u64>,
+    /// Audit-safe reason. Callers must not put PII or secrets here.
+    pub audit_reason: String,
 }
 
 /// Schema and migration metadata recorded inside the state file.
@@ -385,16 +457,22 @@ pub type HubStateStoreResult<T> = Result<T, HubStateStoreError>;
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::collections::BTreeMap;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use botster_core::{
-        Capability, CapabilitySurface, ExtensionEntrypoint, ExtensionKind, ExtensionRuntime,
-        PackageConfigurationField, PackageConfigurationFieldType, PackageConfigurationSchema,
-        PackageConfigurationSecretValue, PackageConfigurationValue, PackageManifest, PackageSource,
+        Capability, CapabilitySurface, CredentialRecord, CredentialStore, CredentialStoreError,
+        ExtensionEntrypoint, ExtensionKind, ExtensionRuntime, PackageConfigurationField,
+        PackageConfigurationFieldType, PackageConfigurationSchema, PackageConfigurationSecretValue,
+        PackageConfigurationValue, PackageManifest, PackageSource,
     };
 
     use super::*;
+    use crate::credentials::{
+        CredentialKeyPurpose, CredentialProviderKind, TestFileCredentialStore, credential_key_id,
+        validate_hub_credentials,
+    };
     use crate::{
         DataDirectoryOption, HostIdentityOptions, HubStartupOptions, PackageProvenance,
         PackageRegistry, PackageRunnableEntrypoint, PackageRunnableProcessState,
@@ -461,6 +539,30 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Default)]
+    struct CountingCredentialStore {
+        reads: Cell<usize>,
+    }
+
+    impl CredentialStore for CountingCredentialStore {
+        fn get(&self, _key: &str) -> Result<Option<CredentialRecord>, CredentialStoreError> {
+            self.reads.set(self.reads.get() + 1);
+            Ok(Some(CredentialRecord::new(vec![41, 43, 47, 53])))
+        }
+
+        fn set(
+            &mut self,
+            _key: &str,
+            _record: CredentialRecord,
+        ) -> Result<(), CredentialStoreError> {
+            Ok(())
+        }
+
+        fn delete(&mut self, _key: &str) -> Result<(), CredentialStoreError> {
+            Ok(())
+        }
+    }
+
     fn configurable_plugin_manifest() -> PackageManifest {
         let mut manifest = plugin_manifest();
         manifest.configuration = Some(PackageConfigurationSchema {
@@ -513,6 +615,9 @@ mod tests {
         let object = value.as_object_mut().expect("state serializes as object");
         object.remove("device_session_template_sources");
         object.remove("admitted_session_template_targets");
+        object.remove("credential_keys");
+        object.remove("trusted_browser_identities");
+        object.remove("bootstrap_grants");
         fs::create_dir_all(&config.data_directory).expect("create data dir");
         fs::write(
             store.path(),
@@ -526,7 +631,174 @@ mod tests {
 
         assert!(reopened.device_session_template_sources.is_empty());
         assert!(reopened.admitted_session_template_targets.is_empty());
+        assert!(reopened.credential_keys.is_empty());
+        assert!(reopened.trusted_browser_identities.is_empty());
+        assert!(reopened.bootstrap_grants.is_empty());
         assert_eq!(reopened.schema_version, 1);
+    }
+
+    #[test]
+    fn browser_trust_metadata_survives_restart_without_raw_secret_material() {
+        let config = test_config("browser-trust-metadata");
+        let store = FileHubStateStore::for_data_directory(&config.data_directory);
+        let public_key = b"synthetic browser public key".to_vec();
+        let key_id = credential_key_id(
+            &config.host.id,
+            CredentialKeyPurpose::BrowserIdentity,
+            "browser-a",
+        );
+
+        store
+            .update(&config, |state| {
+                state.credential_keys.push(CredentialKeyReference {
+                    key_id: key_id.clone(),
+                    provider: CredentialProviderKind::TestFile,
+                    purpose: CredentialKeyPurpose::BrowserIdentity,
+                    created_at_unix_ms: 10,
+                    rotated_at_unix_ms: None,
+                });
+                let mut browser = TrustedBrowserIdentity::trusted(
+                    "browser-a",
+                    public_key.clone(),
+                    11,
+                    "trust synthetic browser",
+                );
+                browser.credential_key_id = Some(key_id.clone());
+                state.trusted_browser_identities.push(browser);
+                state.bootstrap_grants.push(BootstrapGrantRecord {
+                    grant_id: "grant-a".to_string(),
+                    package_instance_id: "package-instance-a".to_string(),
+                    origin: "localhost".to_string(),
+                    peer_id: "peer-a".to_string(),
+                    credential_key_id: Some(key_id.clone()),
+                    expires_at_unix_ms: 100,
+                    revoked_at_unix_ms: None,
+                    redeemed_at_unix_ms: None,
+                    audit_reason: "issue synthetic bootstrap grant".to_string(),
+                });
+            })
+            .expect("persist browser trust state");
+
+        let mut credential_store =
+            TestFileCredentialStore::new(config.data_directory.join("test-credentials.json"));
+        credential_store
+            .set(&key_id, CredentialRecord::new(vec![7, 11, 13, 17]))
+            .expect("persist test credential outside hub-state");
+
+        let raw_state = fs::read_to_string(store.path()).expect("read hub state");
+        assert!(raw_state.contains("browser-a"));
+        assert!(raw_state.contains(&key_id));
+        assert!(!raw_state.contains("[7,11,13,17]"));
+        assert!(!raw_state.contains("[7, 11, 13, 17]"));
+        assert!(!raw_state.contains("grant-token"));
+        assert!(!raw_state.contains("private key"));
+        assert!(!raw_state.contains("write_only"));
+        assert!(!raw_state.contains(concat!("/", "Users", "/")));
+        assert!(!raw_state.contains("@example.com"));
+
+        let reopened = FileHubStateStore::for_data_directory(&config.data_directory)
+            .load_or_initialize(&config)
+            .expect("load browser trust metadata");
+        assert_eq!(reopened.credential_keys.len(), 1);
+        assert_eq!(reopened.trusted_browser_identities.len(), 1);
+        assert_eq!(reopened.bootstrap_grants.len(), 1);
+        assert!(reopened.trusted_browser_identities[0].is_trusted_at(50));
+        assert!(reopened.bootstrap_grants[0].is_redeemable_at(50));
+        validate_hub_credentials(
+            &reopened,
+            CredentialProviderKind::TestFile,
+            &credential_store,
+        )
+        .expect("credential references resolve through explicit test store");
+    }
+
+    #[test]
+    fn revoked_or_expired_browser_identities_and_grants_are_denied() {
+        let public_key = b"revoked browser public key".to_vec();
+        let mut revoked = TrustedBrowserIdentity::trusted(
+            "browser-revoked",
+            public_key.clone(),
+            10,
+            "trust synthetic browser",
+        );
+        revoked.revoked_at_unix_ms = Some(20);
+        assert!(!revoked.is_trusted_at(30));
+
+        let mut expired = TrustedBrowserIdentity::trusted(
+            "browser-expired",
+            public_key,
+            10,
+            "trust synthetic browser",
+        );
+        expired.expires_at_unix_ms = Some(20);
+        assert!(!expired.is_trusted_at(20));
+        assert!(!expired.is_trusted_at(21));
+
+        let valid = BootstrapGrantRecord {
+            grant_id: "grant-valid".to_string(),
+            package_instance_id: "package-instance".to_string(),
+            origin: "localhost".to_string(),
+            peer_id: "peer".to_string(),
+            credential_key_id: None,
+            expires_at_unix_ms: 30,
+            revoked_at_unix_ms: None,
+            redeemed_at_unix_ms: None,
+            audit_reason: "grant synthetic local bootstrap".to_string(),
+        };
+        assert!(valid.is_redeemable_at(29));
+
+        let mut redeemed = valid.clone();
+        redeemed.redeemed_at_unix_ms = Some(25);
+        assert!(!redeemed.is_redeemable_at(26));
+
+        let mut revoked_grant = valid.clone();
+        revoked_grant.revoked_at_unix_ms = Some(25);
+        assert!(!revoked_grant.is_redeemable_at(26));
+        assert!(!valid.is_redeemable_at(30));
+    }
+
+    #[test]
+    fn browser_and_grant_references_do_not_re_read_validated_credential_keys() {
+        let config = test_config("browser-grant-no-duplicate-reads");
+        let key_id = credential_key_id(
+            &config.host.id,
+            CredentialKeyPurpose::BrowserIdentity,
+            "browser-a",
+        );
+        let public_key = b"browser reference public key".to_vec();
+        let mut state = HubState::from_config(&config);
+        state.credential_keys.push(CredentialKeyReference {
+            key_id: key_id.clone(),
+            provider: CredentialProviderKind::TestFile,
+            purpose: CredentialKeyPurpose::BrowserIdentity,
+            created_at_unix_ms: 10,
+            rotated_at_unix_ms: None,
+        });
+        let mut browser =
+            TrustedBrowserIdentity::trusted("browser-a", public_key, 10, "trust synthetic browser");
+        browser.credential_key_id = Some(key_id.clone());
+        state.trusted_browser_identities.push(browser);
+        state.bootstrap_grants.push(BootstrapGrantRecord {
+            grant_id: "grant-a".to_string(),
+            package_instance_id: "package-instance-a".to_string(),
+            origin: "localhost".to_string(),
+            peer_id: "peer-a".to_string(),
+            credential_key_id: Some(key_id),
+            expires_at_unix_ms: 100,
+            revoked_at_unix_ms: None,
+            redeemed_at_unix_ms: None,
+            audit_reason: "issue synthetic bootstrap grant".to_string(),
+        });
+        let credential_store = CountingCredentialStore::default();
+
+        validate_hub_credentials(&state, CredentialProviderKind::TestFile, &credential_store)
+            .expect("state credential references should validate");
+
+        assert_eq!(
+            credential_store.reads.get(),
+            1,
+            "one credential key should be read once even when browser and grant reference it"
+        );
     }
 
     #[test]

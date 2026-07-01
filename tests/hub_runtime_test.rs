@@ -5,17 +5,19 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use botster_core::{
-    ClientId, CoreSessionMetadata, ModeFlags, RequestId, ResizePayload, SessionId,
-    SessionLifecycleState, SessionSpawnRequest, SpawnEnvironment, SpawnWorkingDirectory,
-    SubscriptionId, TransportEgress,
+    ClientId, CoreSessionMetadata, CredentialRecord, CredentialStore, CredentialStoreError,
+    ModeFlags, RequestId, ResizePayload, SessionId, SessionLifecycleState, SessionSpawnRequest,
+    SpawnEnvironment, SpawnWorkingDirectory, SubscriptionId, TransportEgress,
 };
 use botster_core_daemon::{
     GuardedWriteDecision, GuardedWriteDeliveryState, GuardedWriteRequest, ReadinessEvidence,
     RegistrySessionState, SessionAdoptionState,
 };
 use botster_hub::{
-    DataDirectoryOption, FileHubStateStore, HostIdentityOptions, HubRuntime, HubStartupOptions,
-    RuntimeEnvironment, SessionDefaults, TransportBindings,
+    CredentialKeyPurpose, CredentialKeyReference, CredentialProviderKind, DataDirectoryOption,
+    FileHubStateStore, HostIdentityOptions, HubRuntime, HubRuntimeError, HubStartupOptions,
+    HubStateStore, RuntimeEnvironment, SessionDefaults, TestFileCredentialStore, TransportBindings,
+    TrustedBrowserIdentity, credential_key_id,
 };
 
 mod support;
@@ -78,6 +80,29 @@ fn spawn_request(config: &botster_hub::HubConfig) -> SessionSpawnRequest {
             rows: config.session_defaults.initial_rows,
             cols: config.session_defaults.initial_cols,
         }),
+    }
+}
+
+#[derive(Debug, Clone)]
+struct UnavailableCredentialStore;
+
+impl CredentialStore for UnavailableCredentialStore {
+    fn get(&self, _key: &str) -> Result<Option<CredentialRecord>, CredentialStoreError> {
+        Err(CredentialStoreError::Rejected(
+            "credential provider unavailable".to_string(),
+        ))
+    }
+
+    fn set(&mut self, _key: &str, _record: CredentialRecord) -> Result<(), CredentialStoreError> {
+        Err(CredentialStoreError::Rejected(
+            "credential provider unavailable".to_string(),
+        ))
+    }
+
+    fn delete(&mut self, _key: &str) -> Result<(), CredentialStoreError> {
+        Err(CredentialStoreError::Rejected(
+            "credential provider unavailable".to_string(),
+        ))
     }
 }
 
@@ -194,6 +219,120 @@ fn hub_runtime_routes_production_session_verbs_through_core_daemon() {
         .expect("shutdown through core daemon");
     let listed = runtime.list_sessions().expect("daemon list after shutdown");
     assert_eq!(listed[0].registry_state, RegistrySessionState::Exited);
+}
+
+#[test]
+fn hub_runtime_starts_with_available_empty_credential_store() {
+    let config = explicit_config_with_data_dir("target/botster-hub-test-data/runtime-empty-creds");
+    let store = FileHubStateStore::for_data_directory(&config.data_directory);
+    let credential_store = TestFileCredentialStore::new(
+        config
+            .data_directory
+            .join("test-credentials")
+            .join("credentials.json"),
+    );
+
+    let runtime = HubRuntime::load_from_store_with_credentials(
+        config,
+        &store,
+        CredentialProviderKind::TestFile,
+        &credential_store,
+    )
+    .expect("empty credential store is valid first boot state");
+
+    assert!(runtime.state().credential_keys.is_empty());
+    assert!(runtime.state().trusted_browser_identities.is_empty());
+}
+
+#[test]
+fn hub_runtime_reloads_trusted_browser_identity_when_credential_reference_resolves() {
+    let config =
+        explicit_config_with_data_dir("target/botster-hub-test-data/runtime-trusted-browser");
+    let store = FileHubStateStore::for_data_directory(&config.data_directory);
+    let key_id = credential_key_id(
+        &config.host.id,
+        CredentialKeyPurpose::BrowserIdentity,
+        "browser-a",
+    );
+    let public_key = b"runtime browser public key".to_vec();
+    let mut credential_store = TestFileCredentialStore::new(
+        config
+            .data_directory
+            .join("test-credentials")
+            .join("credentials.json"),
+    );
+    credential_store
+        .set(&key_id, CredentialRecord::new(vec![19, 23, 29, 31]))
+        .expect("write explicit test credential");
+
+    store
+        .update(&config, |state| {
+            state.credential_keys.push(CredentialKeyReference {
+                key_id: key_id.clone(),
+                provider: CredentialProviderKind::TestFile,
+                purpose: CredentialKeyPurpose::BrowserIdentity,
+                created_at_unix_ms: 10,
+                rotated_at_unix_ms: None,
+            });
+            let mut browser = TrustedBrowserIdentity::trusted(
+                "browser-a",
+                public_key.clone(),
+                10,
+                "trust runtime browser fixture",
+            );
+            browser.credential_key_id = Some(key_id.clone());
+            state.trusted_browser_identities.push(browser);
+        })
+        .expect("persist trusted browser metadata");
+
+    let runtime = HubRuntime::load_from_store_with_credentials(
+        config,
+        &store,
+        CredentialProviderKind::TestFile,
+        &credential_store,
+    )
+    .expect("trusted browser metadata should validate against credential store");
+
+    assert_eq!(runtime.state().credential_keys.len(), 1);
+    assert_eq!(runtime.state().trusted_browser_identities.len(), 1);
+    assert!(runtime.state().trusted_browser_identities[0].is_trusted_at(20));
+}
+
+#[test]
+fn hub_runtime_fails_closed_when_required_credential_store_is_unavailable() {
+    let config =
+        explicit_config_with_data_dir("target/botster-hub-test-data/runtime-unavailable-creds");
+    let store = FileHubStateStore::for_data_directory(&config.data_directory);
+    let key_id = credential_key_id(
+        &config.host.id,
+        CredentialKeyPurpose::BrowserIdentity,
+        "browser-a",
+    );
+
+    store
+        .update(&config, |state| {
+            state.credential_keys.push(CredentialKeyReference {
+                key_id: key_id.clone(),
+                provider: CredentialProviderKind::TestFile,
+                purpose: CredentialKeyPurpose::BrowserIdentity,
+                created_at_unix_ms: 10,
+                rotated_at_unix_ms: None,
+            });
+        })
+        .expect("persist credential reference");
+
+    let error = match HubRuntime::load_from_store_with_credentials(
+        config,
+        &store,
+        CredentialProviderKind::TestFile,
+        &UnavailableCredentialStore,
+    ) {
+        Ok(_) => panic!("required credential provider failure must fail closed"),
+        Err(error) => error,
+    };
+
+    assert!(matches!(error, HubRuntimeError::Credentials(_)));
+    assert!(error.to_string().contains("credential provider rejected"));
 }
 
 #[test]
