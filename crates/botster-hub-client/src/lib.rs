@@ -2123,10 +2123,7 @@ mod tests {
             let value = serde_json::to_value(&request).expect("request serializes");
 
             assert_eq!(value["type"], expected_tag);
-            assert!(
-                daemon_protocol_typescript().contains(&format!("type: \"{expected_tag}\"")),
-                "generated TypeScript should include request variant {expected_tag}"
-            );
+            assert_generated_union_variant_fields("DaemonRequest", expected_tag, &value);
 
             let round_tripped: DaemonRequest =
                 serde_json::from_value(value).expect("request deserializes");
@@ -2146,6 +2143,7 @@ mod tests {
                 daemon_protocol_typescript().contains(&format!("\"{expected_kind}\"")),
                 "generated TypeScript should include response kind {expected_kind}"
             );
+            assert_generated_interface_fields("DaemonResponse", &value);
 
             let round_tripped: DaemonResponse =
                 serde_json::from_value(value).expect("response deserializes");
@@ -2160,15 +2158,46 @@ mod tests {
             let value = serde_json::to_value(&event).expect("event serializes");
 
             assert_eq!(value["type"], expected_tag);
-            assert!(
-                daemon_protocol_typescript().contains(&format!("type: \"{expected_tag}\"")),
-                "generated TypeScript should include event variant {expected_tag}"
-            );
+            assert_generated_union_variant_fields("DaemonEvent", expected_tag, &value);
 
             let round_tripped: DaemonEvent =
                 serde_json::from_value(value).expect("event deserializes");
             assert_eq!(round_tripped, event);
         }
+    }
+
+    #[test]
+    fn generated_typescript_local_webrtc_fields_match_serde_json() {
+        let response = daemon_response_example(DaemonResponseKind::LocalWebrtcBootstrap);
+        let value = serde_json::to_value(response).expect("response serializes");
+
+        assert_generated_interface_fields(
+            "DaemonLocalWebrtcBootstrap",
+            &value["local_webrtc_bootstrap"],
+        );
+        assert!(
+            value["local_webrtc_bootstrap"]
+                .get("max_retransmits")
+                .is_none(),
+            "empty bootstrap max_retransmits should be omitted in serde JSON"
+        );
+        assert!(
+            generated_interface("DaemonLocalWebrtcBootstrap")
+                .contains("  max_retransmits?: number | null;"),
+            "generated TypeScript should mark omitted max_retransmits optional"
+        );
+        assert!(
+            value["local_webrtc_bootstrap"]
+                .get("max_packet_lifetime_ms")
+                .is_none(),
+            "empty bootstrap max_packet_lifetime_ms should be omitted in serde JSON"
+        );
+        assert!(
+            generated_interface("DaemonLocalWebrtcBootstrap")
+                .contains("  max_packet_lifetime_ms?: number | null;"),
+            "generated TypeScript should mark omitted max_packet_lifetime_ms optional"
+        );
+        assert_generated_interface_fields("DaemonLocalWebrtcAnswer", &value["local_webrtc_answer"]);
     }
 
     fn assert_serde_omits_empty_diagnostics(type_name: &str, value: Value) {
@@ -2182,6 +2211,36 @@ mod tests {
         );
     }
 
+    fn assert_generated_interface_fields(type_name: &str, value: &Value) {
+        let object = value
+            .as_object()
+            .unwrap_or_else(|| panic!("{type_name} serde example should be an object"));
+        let interface = generated_interface(type_name);
+        for key in object.keys() {
+            assert!(
+                interface.contains(&format!("  {key}:"))
+                    || interface.contains(&format!("  {key}?:")),
+                "generated TypeScript {type_name} should include serde field {key}"
+            );
+        }
+    }
+
+    fn assert_generated_union_variant_fields(union_name: &str, tag: &str, value: &Value) {
+        let object = value
+            .as_object()
+            .unwrap_or_else(|| panic!("{union_name}::{tag} serde example should be an object"));
+        let variant = generated_union_variant(union_name, tag);
+        for key in object.keys() {
+            assert!(
+                variant.contains(&format!("; {key}:"))
+                    || variant.contains(&format!("; {key}?:"))
+                    || variant.contains(&format!("{{ {key}:"))
+                    || variant.contains(&format!("{{ {key}?:")),
+                "generated TypeScript {union_name} variant {tag} should include serde field {key}"
+            );
+        }
+    }
+
     fn generated_interface(type_name: &str) -> String {
         let generated = daemon_protocol_typescript();
         let start = generated
@@ -2192,6 +2251,16 @@ mod tests {
             .find("\n}\n")
             .unwrap_or_else(|| panic!("generated TypeScript interface should close {type_name}"));
         rest[..end + 3].to_string()
+    }
+
+    fn generated_union_variant(union_name: &str, tag: &str) -> String {
+        daemon_protocol_typescript()
+            .lines()
+            .find(|line| line.contains(&format!("type: \"{tag}\"")))
+            .unwrap_or_else(|| {
+                panic!("generated TypeScript {union_name} should include variant {tag}")
+            })
+            .to_string()
     }
 
     fn daemon_request_examples() -> Vec<DaemonRequest> {
