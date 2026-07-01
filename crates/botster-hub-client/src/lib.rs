@@ -654,6 +654,12 @@ pub enum DaemonRequest {
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         environment_overrides: BTreeMap<String, String>,
     },
+    LocalWebrtcSignal {
+        grant_id: String,
+        grant_secret: String,
+        origin: String,
+        offer: Value,
+    },
     StopPackageEntrypoint {
         package_name: String,
         entrypoint_id: String,
@@ -719,6 +725,10 @@ pub struct DaemonResponse {
     pub plugin_surface: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plugin_action_result: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_webrtc_bootstrap: Option<DaemonLocalWebrtcBootstrap>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_webrtc_answer: Option<DaemonLocalWebrtcAnswer>,
     pub events: Vec<DaemonEvent>,
     pub cleanup: Option<DaemonSessionCleanup>,
     pub coordination: Option<DaemonCoordination>,
@@ -749,6 +759,8 @@ pub enum DaemonResponseKind {
     PluginMcpToolResult,
     PluginSurface,
     PluginActionResult,
+    LocalWebrtcBootstrap,
+    LocalWebrtcAnswer,
     SessionCleanup,
     Identity,
     MessagePosted,
@@ -955,6 +967,31 @@ pub struct DaemonResolvedAppLaunch {
     pub working_directory: String,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub environment: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonLocalWebrtcBootstrap {
+    pub grant_id: String,
+    pub grant_secret: String,
+    pub package_name: String,
+    pub entrypoint_id: String,
+    pub expected_origin: String,
+    pub expires_at: u64,
+    pub signaling_transport: String,
+    pub data_plane: String,
+    pub ordered: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_retransmits: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_packet_lifetime_ms: Option<u16>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DaemonLocalWebrtcAnswer {
+    pub grant_id: String,
+    pub answer: Value,
+    #[serde(default)]
+    pub diagnostics: Vec<DaemonDiagnostic>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2285,6 +2322,15 @@ mod tests {
                     "/tmp/botster.sock".to_string(),
                 )]),
             },
+            DaemonRequest::LocalWebrtcSignal {
+                grant_id: "grant".to_string(),
+                grant_secret: "secret".to_string(),
+                origin: "http://127.0.0.1:49152".to_string(),
+                offer: serde_json::json!({
+                    "type": "offer",
+                    "sdp": "v=0\r\n"
+                }),
+            },
             DaemonRequest::StopPackageEntrypoint {
                 package_name: "workflow.plugin".to_string(),
                 entrypoint_id: "web".to_string(),
@@ -2358,6 +2404,7 @@ mod tests {
             DaemonRequest::DisablePackage { .. } => "disable_package",
             DaemonRequest::RemovePackage { .. } => "remove_package",
             DaemonRequest::StartPackageEntrypoint { .. } => "start_package_entrypoint",
+            DaemonRequest::LocalWebrtcSignal { .. } => "local_webrtc_signal",
             DaemonRequest::StopPackageEntrypoint { .. } => "stop_package_entrypoint",
             DaemonRequest::RestartPackageEntrypoint { .. } => "restart_package_entrypoint",
             DaemonRequest::PackageEntrypointStatus { .. } => "package_entrypoint_status",
@@ -2391,6 +2438,8 @@ mod tests {
             DaemonResponseKind::PluginMcpToolResult,
             DaemonResponseKind::PluginSurface,
             DaemonResponseKind::PluginActionResult,
+            DaemonResponseKind::LocalWebrtcBootstrap,
+            DaemonResponseKind::LocalWebrtcAnswer,
             DaemonResponseKind::SessionCleanup,
             DaemonResponseKind::Identity,
             DaemonResponseKind::MessagePosted,
@@ -2423,6 +2472,8 @@ mod tests {
             DaemonResponseKind::PluginMcpToolResult => "plugin_mcp_tool_result",
             DaemonResponseKind::PluginSurface => "plugin_surface",
             DaemonResponseKind::PluginActionResult => "plugin_action_result",
+            DaemonResponseKind::LocalWebrtcBootstrap => "local_webrtc_bootstrap",
+            DaemonResponseKind::LocalWebrtcAnswer => "local_webrtc_answer",
             DaemonResponseKind::SessionCleanup => "session_cleanup",
             DaemonResponseKind::Identity => "identity",
             DaemonResponseKind::MessagePosted => "message_posted",
@@ -2631,6 +2682,27 @@ mod tests {
             plugin_tool_result: serde_json::json!({ "content": [] }),
             plugin_surface: Some(serde_json::json!({ "type": "text", "value": "surface" })),
             plugin_action_result: Some(serde_json::json!({ "state": "accepted" })),
+            local_webrtc_bootstrap: Some(DaemonLocalWebrtcBootstrap {
+                grant_id: "grant".to_string(),
+                grant_secret: "secret".to_string(),
+                package_name: "workflow.plugin".to_string(),
+                entrypoint_id: "web".to_string(),
+                expected_origin: "http://127.0.0.1:49152".to_string(),
+                expires_at: 123,
+                signaling_transport: "daemon_request".to_string(),
+                data_plane: "webrtc_data_channel".to_string(),
+                ordered: true,
+                max_retransmits: None,
+                max_packet_lifetime_ms: None,
+            }),
+            local_webrtc_answer: Some(DaemonLocalWebrtcAnswer {
+                grant_id: "grant".to_string(),
+                answer: serde_json::json!({
+                    "type": "answer",
+                    "sdp": "v=0\r\n"
+                }),
+                diagnostics: vec![DaemonDiagnostic::connected("local_webrtc_signal")],
+            }),
             events: daemon_event_examples(),
             cleanup: Some(DaemonSessionCleanup {
                 session_id: "session".to_string(),

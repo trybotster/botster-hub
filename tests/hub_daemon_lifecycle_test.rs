@@ -8,15 +8,16 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
-use std::sync::{Mutex, OnceLock, mpsc};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use botster_core::{
-    Capability, CapabilitySurface, CoreSessionMetadata, ExtensionEntrypoint, ExtensionKind,
-    ExtensionRuntime, HostProfileMetadata, HostProfilePolicySection, PackageManifest,
-    PackageSource, ProcessIdentity, RequestId, ResizePayload, SessionId, SessionSpawnRequest,
-    SpawnEnvironment, SpawnWorkingDirectory, SubscriptionId,
+    AesGcmEnvelope, AesGcmKey, Capability, CapabilitySurface, CoreSessionMetadata,
+    ExtensionEntrypoint, ExtensionKind, ExtensionRuntime, HostProfileMetadata,
+    HostProfilePolicySection, PackageManifest, PackageSource, ProcessIdentity, RequestId,
+    ResizePayload, SessionId, SessionSpawnRequest, SpawnEnvironment, SpawnWorkingDirectory,
+    SubscriptionId, decrypt_aes_gcm, encrypt_aes_gcm,
 };
 use botster_core_daemon::{RegistryRecord, SessionRegistry};
 use botster_hub::{
@@ -24,6 +25,15 @@ use botster_hub::{
     HubClientApi, HubClientEvent, HubClientRequest, HubClientResponseBody, HubDaemon,
     HubDaemonState, HubStartupOptions, HubStateLoadSource, HubStateStore, PackageAdmissionPolicy,
     PackageProvenance, PackageRegistry, RuntimeEnvironment, SessionDefaults, TransportBindings,
+};
+use webrtc::data_channel::{DataChannel, DataChannelEvent, RTCDataChannelInit};
+use webrtc::peer_connection::{
+    PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler, RTCIceGatheringState,
+    RTCPeerConnectionState, RTCSessionDescription,
+};
+use webrtc::runtime::{
+    Receiver as AsyncReceiver, Sender as AsyncSender, block_on, channel, default_runtime, sleep,
+    timeout,
 };
 
 mod support;
@@ -149,6 +159,177 @@ fn drain_until_client_output(
         "timed out waiting for {:?} in client output",
         String::from_utf8_lossy(needle)
     );
+}
+
+struct LocalWebrtcOffererHandler {
+    gather_complete_tx: AsyncSender<()>,
+    connected_tx: AsyncSender<()>,
+}
+
+#[async_trait::async_trait]
+impl PeerConnectionEventHandler for LocalWebrtcOffererHandler {
+    async fn on_ice_gathering_state_change(&self, state: RTCIceGatheringState) {
+        if state == RTCIceGatheringState::Complete {
+            let _ = self.gather_complete_tx.try_send(());
+        }
+    }
+
+    async fn on_connection_state_change(&self, state: RTCPeerConnectionState) {
+        if state == RTCPeerConnectionState::Connected {
+            let _ = self.connected_tx.try_send(());
+        }
+    }
+}
+
+struct LocalWebrtcOfferPeer {
+    peer: Box<dyn PeerConnection>,
+    data_channel: Arc<dyn DataChannel>,
+    connected_rx: AsyncReceiver<()>,
+    data_channel_open_rx: AsyncReceiver<()>,
+    data_channel_message_rx: AsyncReceiver<String>,
+}
+
+impl LocalWebrtcOfferPeer {
+    async fn create_offer() -> Result<(Self, serde_json::Value), Box<dyn std::error::Error>> {
+        let runtime =
+            default_runtime().ok_or_else(|| std::io::Error::other("no async runtime found"))?;
+        let (gather_complete_tx, mut gather_complete_rx) = channel::<()>(1);
+        let (connected_tx, connected_rx) = channel::<()>(1);
+        let (data_channel_open_tx, data_channel_open_rx) = channel::<()>(1);
+        let (data_channel_message_tx, data_channel_message_rx) = channel::<String>(256);
+        let handler = Arc::new(LocalWebrtcOffererHandler {
+            gather_complete_tx,
+            connected_tx,
+        });
+        let peer = PeerConnectionBuilder::new()
+            .with_handler(handler)
+            .with_runtime(runtime.clone())
+            .with_udp_addrs(vec!["127.0.0.1:0".to_string()])
+            .build()
+            .await?;
+        let data_channel = peer
+            .create_data_channel(
+                "botster-client",
+                Some(RTCDataChannelInit {
+                    ordered: true,
+                    max_retransmits: None,
+                    max_packet_life_time: None,
+                    ..Default::default()
+                }),
+            )
+            .await?;
+        assert!(data_channel.ordered().await?);
+        assert_eq!(data_channel.max_retransmits().await?, None);
+        assert_eq!(data_channel.max_packet_life_time().await?, None);
+
+        {
+            let data_channel = data_channel.clone();
+            let open_tx = data_channel_open_tx.clone();
+            let message_tx = data_channel_message_tx.clone();
+            runtime.spawn(Box::pin(async move {
+                while let Some(event) = data_channel.poll().await {
+                    match event {
+                        DataChannelEvent::OnOpen => {
+                            let _ = open_tx.try_send(());
+                        }
+                        DataChannelEvent::OnMessage(message) => {
+                            if let Ok(text) = String::from_utf8(message.data.to_vec()) {
+                                let _ = message_tx.try_send(text);
+                            }
+                        }
+                        DataChannelEvent::OnClose => break,
+                        _ => {}
+                    }
+                }
+            }));
+        }
+
+        let offer = peer.create_offer(None).await?;
+        peer.set_local_description(offer).await?;
+        let _ = timeout(Duration::from_secs(5), gather_complete_rx.recv()).await;
+        let offer = peer
+            .local_description()
+            .await
+            .ok_or_else(|| std::io::Error::other("offer local description missing"))?;
+        let offer = serde_json::to_value(offer)?;
+
+        Ok((
+            Self {
+                peer: Box::new(peer),
+                data_channel,
+                connected_rx,
+                data_channel_open_rx,
+                data_channel_message_rx,
+            },
+            offer,
+        ))
+    }
+
+    async fn accept_answer(
+        &mut self,
+        answer: serde_json::Value,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let answer = serde_json::from_value::<RTCSessionDescription>(answer)?;
+        self.peer.set_remote_description(answer).await?;
+        timeout(Duration::from_secs(15), self.connected_rx.recv())
+            .await
+            .map_err(|_| std::io::Error::other("timed out waiting for WebRTC connection"))?;
+        timeout(Duration::from_secs(10), self.data_channel_open_rx.recv())
+            .await
+            .map_err(|_| std::io::Error::other("timed out waiting for data channel open"))?;
+        Ok(())
+    }
+
+    async fn encrypted_request(
+        &mut self,
+        key: &AesGcmKey,
+        request: &botster_hub_client::DaemonRequest,
+    ) -> Result<botster_hub_client::DaemonResponse, Box<dyn std::error::Error>> {
+        let plaintext = serde_json::to_vec(request)?;
+        let envelope = encrypt_aes_gcm(key, &plaintext, 1)?;
+        self.data_channel
+            .send_text(&serde_json::to_string(&envelope)?)
+            .await?;
+        let response = timeout(Duration::from_secs(10), self.data_channel_message_rx.recv())
+            .await
+            .map_err(|_| std::io::Error::other("timed out waiting for data channel response"))?
+            .ok_or_else(|| {
+                std::io::Error::other("local WebRTC data channel closed before response")
+            })?;
+        let envelope = serde_json::from_str::<AesGcmEnvelope>(&response)?;
+        let plaintext = decrypt_aes_gcm(key, &envelope)?;
+        Ok(serde_json::from_slice(&plaintext)?)
+    }
+}
+
+fn local_webrtc_stream_key(secret: &str) -> AesGcmKey {
+    let hex = secret
+        .strip_prefix("secret-")
+        .expect("local WebRTC secret prefix");
+    let bytes = decode_hex_bytes(hex).expect("local WebRTC secret hex");
+    AesGcmKey::from_slice(&bytes).expect("local WebRTC secret is an AES-GCM key")
+}
+
+fn decode_hex_bytes(encoded: &str) -> Option<Vec<u8>> {
+    if encoded.len() % 2 != 0 {
+        return None;
+    }
+    let mut output = Vec::with_capacity(encoded.len() / 2);
+    for pair in encoded.as_bytes().chunks_exact(2) {
+        let high = decode_hex_nibble(pair[0])?;
+        let low = decode_hex_nibble(pair[1])?;
+        output.push((high << 4) | low);
+    }
+    Some(output)
+}
+
+fn decode_hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn package_provenance() -> PackageProvenance {
@@ -617,6 +798,9 @@ const mixedOwnership = Boolean(process.env.BOTSTER_WEB_DOGFOOD_DATA_DIR && (sock
 const source = socket ? 'socket' : (dataDir ? 'data_dir' : 'spawned');
 const mode = socket || dataDir ? 'existing_hub' : 'spawned_hub';
 const socketExists = socket ? fs.existsSync(socket) : false;
+const localWebrtcGrantPresent = Boolean(process.env.BOTSTER_LOCAL_WEBRTC_GRANT_ID);
+const localWebrtcSecretPresent = Boolean(process.env.BOTSTER_LOCAL_WEBRTC_GRANT_SECRET);
+const localWebrtcOriginPresent = Boolean(process.env.BOTSTER_LOCAL_WEBRTC_EXPECTED_ORIGIN);
 const connections = new Map();
 
 function currentRequirement() {
@@ -772,6 +956,9 @@ http.createServer(async (request, response) => {
       entrypoint_id: 'web-client',
       process_state: 'running',
       local_url: `http://127.0.0.1:${port}/?dogfood=real-hub`,
+      local_webrtc_grant_present: localWebrtcGrantPresent,
+      local_webrtc_secret_present: localWebrtcSecretPresent,
+      local_webrtc_origin_present: localWebrtcOriginPresent,
     }));
   }
 });
@@ -797,7 +984,11 @@ http.createServer(async (request, response) => {
             "environment": [
                 { "name": "BOTSTER_HUB_SOCKET", "required": false },
                 { "name": "BOTSTER_HUB_DATA_DIR", "required": false },
-                { "name": "BOTSTER_WEB_DOGFOOD_BRIDGE_PORT", "required": false, "default": "41739" }
+                { "name": "BOTSTER_WEB_DOGFOOD_BRIDGE_PORT", "required": false, "default": "41739" },
+                { "name": "BOTSTER_LOCAL_WEBRTC_GRANT_ID", "required": false },
+                { "name": "BOTSTER_LOCAL_WEBRTC_GRANT_SECRET", "required": false },
+                { "name": "BOTSTER_LOCAL_WEBRTC_SIGNALING_TRANSPORT", "required": false },
+                { "name": "BOTSTER_LOCAL_WEBRTC_EXPECTED_ORIGIN", "required": false }
             ],
             "launch_mode": "background",
             "readiness": { "result_fields": ["local_url"] },
@@ -3999,6 +4190,247 @@ fn external_hub_client_crate_drives_real_daemon_socket_protocol() {
         shutdown_session.kind,
         botster_hub_client::DaemonResponseKind::Events
     );
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
+fn installed_botster_web_launch_issues_local_webrtc_grant_and_data_channel_adapter() {
+    let _guard = daemon_test_lock()
+        .lock()
+        .expect("serialize real daemon test");
+    let data_dir = unique_short_test_dir("web-webrtc");
+    let package_dir = unique_test_dir("web-webrtc-package");
+    write_botster_web_package(&package_dir);
+    let config = explicit_config(&data_dir);
+    let socket_path = config
+        .transports
+        .local_socket
+        .as_ref()
+        .expect("test config has local socket")
+        .path
+        .clone();
+    let endpoint = botster_hub_client::DaemonEndpoint::new(socket_path);
+    let child = start_cli_daemon(&data_dir);
+    enable_supervised_package(&data_dir, &package_dir);
+
+    let web_bridge_port = unused_loopback_port();
+    let start = botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::StartPackageEntrypoint {
+            package_name: "botster-web".to_string(),
+            entrypoint_id: "web-client".to_string(),
+            environment_overrides: BTreeMap::from([(
+                "BOTSTER_WEB_DOGFOOD_BRIDGE_PORT".to_string(),
+                web_bridge_port.to_string(),
+            )]),
+        },
+    )
+    .expect("start botster-web entrypoint");
+    assert_eq!(
+        start.kind,
+        botster_hub_client::DaemonResponseKind::LocalWebrtcBootstrap
+    );
+    let bootstrap = start
+        .local_webrtc_bootstrap
+        .expect("start response includes local WebRTC bootstrap");
+    assert_eq!(bootstrap.package_name, "botster-web");
+    assert_eq!(bootstrap.entrypoint_id, "web-client");
+    assert_eq!(
+        bootstrap.expected_origin,
+        format!("http://127.0.0.1:{web_bridge_port}")
+    );
+    assert_eq!(bootstrap.signaling_transport, "daemon_request");
+    assert_eq!(bootstrap.data_plane, "webrtc_data_channel");
+    assert!(bootstrap.ordered);
+    assert_eq!(bootstrap.max_retransmits, None);
+    assert_eq!(bootstrap.max_packet_lifetime_ms, None);
+
+    let stream_key = local_webrtc_stream_key(&bootstrap.grant_secret);
+
+    block_on(async {
+        let (mut offer_peer, offer) = LocalWebrtcOfferPeer::create_offer()
+            .await
+            .expect("create WebRTC offer peer");
+
+        let rejected_origin = botster_hub_client::request(
+            &endpoint,
+            botster_hub_client::DaemonRequest::LocalWebrtcSignal {
+                grant_id: bootstrap.grant_id.clone(),
+                grant_secret: bootstrap.grant_secret.clone(),
+                origin: "http://127.0.0.1:1".to_string(),
+                offer: serde_json::Value::Null,
+            },
+        )
+        .expect("wrong-origin signal returns operator response");
+        assert_eq!(
+            rejected_origin.kind,
+            botster_hub_client::DaemonResponseKind::OperatorError
+        );
+        assert_eq!(
+            rejected_origin
+                .error
+                .as_ref()
+                .map(|error| error.code.as_str()),
+            Some("local_webrtc_origin_mismatch")
+        );
+
+        let signal = botster_hub_client::request(
+            &endpoint,
+            botster_hub_client::DaemonRequest::LocalWebrtcSignal {
+                grant_id: bootstrap.grant_id.clone(),
+                grant_secret: bootstrap.grant_secret.clone(),
+                origin: bootstrap.expected_origin.clone(),
+                offer,
+            },
+        )
+        .expect("signal local WebRTC offer");
+        assert_eq!(
+            signal.kind,
+            botster_hub_client::DaemonResponseKind::LocalWebrtcAnswer
+        );
+        let answer = signal
+            .local_webrtc_answer
+            .as_ref()
+            .expect("signal response includes WebRTC answer")
+            .answer
+            .clone();
+
+        offer_peer
+            .accept_answer(answer)
+            .await
+            .expect("offer peer accepts answer and opens channel");
+
+        let status = offer_peer
+            .encrypted_request(&stream_key, &botster_hub_client::DaemonRequest::Status)
+            .await
+            .expect("status over encrypted WebRTC data channel");
+        assert_eq!(status.kind, botster_hub_client::DaemonResponseKind::Status);
+
+        let list = offer_peer
+            .encrypted_request(
+                &stream_key,
+                &botster_hub_client::DaemonRequest::ListSessions,
+            )
+            .await
+            .expect("list sessions over encrypted WebRTC data channel");
+        assert_eq!(list.kind, botster_hub_client::DaemonResponseKind::Sessions);
+
+        let spawn = offer_peer
+            .encrypted_request(
+                &stream_key,
+                &botster_hub_client::DaemonRequest::Spawn {
+                    session_id: "local-webrtc-session".to_string(),
+                    command: "printf 'local-webrtc-ready\\n'; while IFS= read -r line; do printf 'webrtc:%s\\n' \"$line\"; done".to_string(),
+                },
+            )
+            .await
+            .expect("spawn over encrypted WebRTC data channel");
+        assert_eq!(spawn.kind, botster_hub_client::DaemonResponseKind::Spawned);
+
+        let attach = offer_peer
+            .encrypted_request(
+                &stream_key,
+                &botster_hub_client::DaemonRequest::Attach {
+                    session_id: "local-webrtc-session".to_string(),
+                    subscription_id: "local-webrtc-subscription".to_string(),
+                },
+            )
+            .await
+            .expect("attach over encrypted WebRTC data channel");
+        assert_eq!(attach.kind, botster_hub_client::DaemonResponseKind::Events);
+
+        let resize = offer_peer
+            .encrypted_request(
+                &stream_key,
+                &botster_hub_client::DaemonRequest::Resize {
+                    session_id: "local-webrtc-session".to_string(),
+                    rows: 33,
+                    cols: 111,
+                },
+            )
+            .await
+            .expect("resize over encrypted WebRTC data channel");
+        assert_eq!(resize.kind, botster_hub_client::DaemonResponseKind::Events);
+
+        let send = offer_peer
+            .encrypted_request(
+                &stream_key,
+                &botster_hub_client::DaemonRequest::SendInput {
+                    session_id: "local-webrtc-session".to_string(),
+                    data: "from-local-webrtc\n".to_string(),
+                },
+            )
+            .await
+            .expect("send input over encrypted WebRTC data channel");
+        assert_eq!(send.kind, botster_hub_client::DaemonResponseKind::Events);
+
+        let mut observed = String::new();
+        for _ in 0..120 {
+            let drain = offer_peer
+                .encrypted_request(
+                    &stream_key,
+                    &botster_hub_client::DaemonRequest::Drain {
+                        session_id: "local-webrtc-session".to_string(),
+                    },
+                )
+                .await
+                .expect("drain over encrypted WebRTC data channel");
+            for event in drain.events {
+                if let botster_hub_client::DaemonEvent::TerminalOutput { data, .. } = event {
+                    observed.push_str(&data);
+                }
+            }
+            if observed.contains("webrtc:from-local-webrtc") {
+                break;
+            }
+            sleep(Duration::from_millis(30)).await;
+        }
+        assert!(
+            observed.contains("webrtc:from-local-webrtc"),
+            "encrypted WebRTC data channel should drain session output, got {observed:?}"
+        );
+
+        let shutdown = offer_peer
+            .encrypted_request(
+                &stream_key,
+                &botster_hub_client::DaemonRequest::ShutdownSession {
+                    session_id: "local-webrtc-session".to_string(),
+                },
+            )
+            .await
+            .expect("shutdown over encrypted WebRTC data channel");
+        assert_eq!(
+            shutdown.kind,
+            botster_hub_client::DaemonResponseKind::Events
+        );
+        offer_peer.peer.close().await.expect("close offer peer");
+    });
+
+    let reused = botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::LocalWebrtcSignal {
+            grant_id: bootstrap.grant_id.clone(),
+            grant_secret: bootstrap.grant_secret.clone(),
+            origin: bootstrap.expected_origin.clone(),
+            offer: serde_json::Value::Null,
+        },
+    )
+    .expect("reused grant returns operator response");
+    assert_eq!(
+        reused.kind,
+        botster_hub_client::DaemonResponseKind::OperatorError
+    );
+    assert_eq!(
+        reused.error.as_ref().map(|error| error.code.as_str()),
+        Some("local_webrtc_redeemed_grant")
+    );
+
+    let persisted_state =
+        fs::read_to_string(data_dir.join("hub-state.json")).expect("read hub state");
+    assert!(!persisted_state.contains(&bootstrap.grant_id));
+    assert!(!persisted_state.contains(&bootstrap.grant_secret));
+    assert!(!persisted_state.contains("grant_secret"));
+
     shutdown_cli_daemon(&data_dir, child);
 }
 
