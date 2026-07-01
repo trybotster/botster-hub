@@ -5,7 +5,7 @@
 //! browser trust metadata, and fail-closed validation against persisted
 //! references.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 use std::fs;
@@ -245,8 +245,10 @@ pub fn validate_hub_credentials(
     provider_kind: CredentialProviderKind,
     store: &impl CredentialStore,
 ) -> Result<(), CredentialPolicyError> {
+    let mut validated_key_ids = BTreeSet::new();
     for key in &state.credential_keys {
         validate_key_reference(key, provider_kind, store)?;
+        validated_key_ids.insert(key.key_id.clone());
     }
 
     for browser in &state.trusted_browser_identities {
@@ -256,31 +258,30 @@ pub fn validate_hub_credentials(
             });
         }
         if let Some(key_id) = &browser.credential_key_id {
-            let key = state
-                .credential_keys
-                .iter()
-                .find(|key| key.key_id == *key_id)
-                .ok_or_else(|| CredentialPolicyError::MissingCredential {
-                    key_id: key_id.clone(),
-                })?;
-            validate_key_reference(key, provider_kind, store)?;
+            ensure_validated_key_id(&validated_key_ids, key_id)?;
         }
     }
 
     for grant in &state.bootstrap_grants {
         if let Some(key_id) = &grant.credential_key_id {
-            let key = state
-                .credential_keys
-                .iter()
-                .find(|key| key.key_id == *key_id)
-                .ok_or_else(|| CredentialPolicyError::MissingCredential {
-                    key_id: key_id.clone(),
-                })?;
-            validate_key_reference(key, provider_kind, store)?;
+            ensure_validated_key_id(&validated_key_ids, key_id)?;
         }
     }
 
     Ok(())
+}
+
+fn ensure_validated_key_id(
+    validated_key_ids: &BTreeSet<String>,
+    key_id: &str,
+) -> Result<(), CredentialPolicyError> {
+    if validated_key_ids.contains(key_id) {
+        Ok(())
+    } else {
+        Err(CredentialPolicyError::MissingCredential {
+            key_id: key_id.to_string(),
+        })
+    }
 }
 
 fn validate_key_reference(
