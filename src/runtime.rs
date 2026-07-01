@@ -970,12 +970,11 @@ impl HubRuntime {
         for report in reports {
             match report.state {
                 SessionAdoptionState::Adoptable => {
-                    match self
-                        .core_daemon
-                        .lock()
-                        .expect("core daemon mutex")
-                        .adopt_session(&report.record.session_id, now_seconds)
-                    {
+                    let adoption_result = {
+                        let mut core_daemon = self.core_daemon.lock().expect("core daemon mutex");
+                        core_daemon.adopt_session(&report.record.session_id, now_seconds)
+                    };
+                    match adoption_result {
                         Ok(session) => {
                             self.reconciliation
                                 .recovered_sessions

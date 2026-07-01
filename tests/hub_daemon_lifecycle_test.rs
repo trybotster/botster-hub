@@ -3491,69 +3491,86 @@ fn daemon_startup_reconciliation_marks_stale_and_recovers_missing_live_sessions(
 
 #[test]
 fn daemon_startup_reconciliation_marks_stale_adoption_socket_and_continues() {
-    let config = explicit_config(unique_test_dir("stale-adoption-socket"));
-    let session_id = SessionId("hub-daemon-stale-adoption-socket".to_string());
-    let stale_socket = PathBuf::from(format!(
-        "/tmp/bh-stale-{}.sock",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time after epoch")
-            .as_nanos()
-    ));
-    let registry = SessionRegistry::new(config.data_directory.clone());
-    let mut record = RegistryRecord::running(
-        session_id.clone(),
-        Some(ProcessIdentity {
-            pid: Some(42),
-            runtime_id: Some("stale-adoption-runtime".to_string()),
-        }),
-        ResizePayload { rows: 24, cols: 80 },
-        "sh".to_string(),
-        1,
-    );
-    record.observe_restart_contract(
-        serde_json::json!({
-            "worker_control_socket": stale_socket,
-            "mode": "worker_process"
-        }),
-        2,
-    );
-    registry
-        .save(&record)
-        .expect("stale adoption registry fixture should save");
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let result = std::panic::catch_unwind(|| {
+            let config = explicit_config(unique_test_dir("stale-adoption-socket"));
+            let session_id = SessionId("hub-daemon-stale-adoption-socket".to_string());
+            let stale_socket = PathBuf::from(format!(
+                "/tmp/bh-stale-{}.sock",
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("system time after epoch")
+                    .as_nanos()
+            ));
+            let registry = SessionRegistry::new(config.data_directory.clone());
+            let mut record = RegistryRecord::running(
+                session_id.clone(),
+                Some(ProcessIdentity {
+                    pid: Some(42),
+                    runtime_id: Some("stale-adoption-runtime".to_string()),
+                }),
+                ResizePayload { rows: 24, cols: 80 },
+                "sh".to_string(),
+                1,
+            );
+            record.observe_restart_contract(
+                serde_json::json!({
+                    "worker_control_socket": stale_socket,
+                    "mode": "worker_process"
+                }),
+                2,
+            );
+            registry
+                .save(&record)
+                .expect("stale adoption registry fixture should save");
 
-    let mut daemon =
-        HubDaemon::start(config).expect("start daemon with stale worker control socket");
-    let status = daemon.status();
-    assert!(
-        status.stale_sessions.contains(&session_id),
-        "stale worker control socket should be surfaced in daemon status"
-    );
+            let mut daemon =
+                HubDaemon::start(config).expect("start daemon with stale worker control socket");
+            let status = daemon.status();
+            assert!(
+                status.stale_sessions.contains(&session_id),
+                "stale worker control socket should be surfaced in daemon status"
+            );
 
-    let packages = empty_registry();
-    let api = HubClientApi::local_operator("hub-daemon-stale-adoption-client");
-    let fresh_session_id = SessionId("hub-daemon-fresh-after-stale".to_string());
-    api.handle_request(
-        daemon.runtime_mut().expect("runtime initialized"),
-        &packages,
-        HubClientRequest::Spawn {
-            request_id: RequestId("hub-daemon-fresh-after-stale-spawn".to_string()),
-            session_id: fresh_session_id.clone(),
-            command: "printf 'fresh-after-stale-ready\\n'; sleep 1".to_string(),
-            now_seconds: 3,
-        },
-    )
-    .expect("fresh session should spawn after stale adoption reconciliation");
-    assert!(
-        daemon
-            .runtime()
-            .expect("runtime initialized")
-            .list_sessions()
-            .expect("list sessions after fresh spawn")
-            .iter()
-            .any(|session| session.session_id == fresh_session_id),
-        "fresh session should be visible after stale adoption reconciliation"
-    );
+            let packages = empty_registry();
+            let api = HubClientApi::local_operator("hub-daemon-stale-adoption-client");
+            let fresh_session_id = SessionId("hub-daemon-fresh-after-stale".to_string());
+            api.handle_request(
+                daemon.runtime_mut().expect("runtime initialized"),
+                &packages,
+                HubClientRequest::Spawn {
+                    request_id: RequestId("hub-daemon-fresh-after-stale-spawn".to_string()),
+                    session_id: fresh_session_id.clone(),
+                    command: "printf 'fresh-after-stale-ready\\n'; sleep 1".to_string(),
+                    now_seconds: 3,
+                },
+            )
+            .expect("fresh session should spawn after stale adoption reconciliation");
+            assert!(
+                daemon
+                    .runtime()
+                    .expect("runtime initialized")
+                    .list_sessions()
+                    .expect("list sessions after fresh spawn")
+                    .iter()
+                    .any(|session| session.session_id == fresh_session_id),
+                "fresh session should be visible after stale adoption reconciliation"
+            );
+        });
+        let _ = tx.send(result);
+    });
+
+    match rx.recv_timeout(Duration::from_secs(15)) {
+        Ok(Ok(())) => {}
+        Ok(Err(payload)) => std::panic::resume_unwind(payload),
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            panic!("stale adoption socket startup reconciliation deadlocked")
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            panic!("stale adoption socket startup reconciliation worker exited unexpectedly")
+        }
+    }
 }
 
 #[test]
