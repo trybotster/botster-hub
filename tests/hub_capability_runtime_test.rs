@@ -708,6 +708,139 @@ fn hub_runtime_reports_bounded_http_failures_without_blocking_hot_path() {
 }
 
 #[test]
+fn hub_runtime_isolates_local_capability_event_queues_per_plugin() {
+    let mut runtime = explicit_runtime("per-plugin-event-queues");
+    let slow_plugin = PluginKey("project-pipelines".to_string());
+    let fast_plugin = PluginKey("botster-workspaces".to_string());
+
+    for index in 0..128 {
+        runtime
+            .submit_capability_request(request(
+                &slow_plugin.0,
+                &format!("slow-timer-{index}"),
+                CapabilityOperation::Timer(TimerCapabilityRequest::Once { delay_ms: 60_000 }),
+            ))
+            .expect("slow plugin should fill only its own local event queue");
+    }
+
+    runtime
+        .submit_capability_request(request(
+            &fast_plugin.0,
+            "fast-timer",
+            CapabilityOperation::Timer(TimerCapabilityRequest::Once { delay_ms: 60_000 }),
+        ))
+        .expect("other plugin should not inherit slow plugin queue pressure");
+
+    let fast_events = runtime
+        .drain_capability_events(&fast_plugin)
+        .expect("drain fast plugin events");
+    assert_eq!(fast_events.len(), 2);
+    assert!(fast_events.iter().all(|event| {
+        matches!(
+            event,
+            CapabilityRuntimeEvent::ResourceOpened(opened)
+                if opened.plugin_key == fast_plugin
+        ) || matches!(
+            event,
+            CapabilityRuntimeEvent::Completed(completed)
+                if completed.plugin_key == fast_plugin
+        )
+    }));
+
+    let empty_events = runtime
+        .drain_capability_events(&PluginKey("missing-plugin".to_string()))
+        .expect("empty plugin drain should not fail under another plugin's pressure");
+    assert!(empty_events.is_empty());
+
+    let slow_events = runtime
+        .drain_capability_events(&slow_plugin)
+        .expect("drain slow plugin events");
+    assert_eq!(slow_events.len(), 256);
+    assert!(slow_events.iter().all(|event| {
+        matches!(
+            event,
+            CapabilityRuntimeEvent::ResourceOpened(opened)
+                if opened.plugin_key == slow_plugin
+        ) || matches!(
+            event,
+            CapabilityRuntimeEvent::Completed(completed)
+                if completed.plugin_key == slow_plugin
+        )
+    }));
+}
+
+#[test]
+fn hub_runtime_reports_backpressure_only_for_saturated_plugin_queue() {
+    let mut runtime = explicit_runtime("per-plugin-backpressure");
+    let saturated_plugin = PluginKey("project-pipelines".to_string());
+    let independent_plugin = PluginKey("botster-workspaces".to_string());
+
+    for index in 0..64 {
+        runtime
+            .submit_capability_request(request(
+                &saturated_plugin.0,
+                &format!("saturated-timer-{index}"),
+                CapabilityOperation::Timer(TimerCapabilityRequest::Once { delay_ms: 60_000 }),
+            ))
+            .expect("timer submit should fill saturated plugin to operation capacity");
+    }
+
+    let backpressured = runtime
+        .submit_capability_request(request(
+            &saturated_plugin.0,
+            "saturated-filesystem",
+            CapabilityOperation::Filesystem(FilesystemCapabilityRequest {
+                scope_id: "workspace".to_string(),
+                operation: FilesystemOperation::Read {
+                    path: ScopedRelativePath("never-read".to_string()),
+                },
+                limits: None,
+            }),
+        ))
+        .expect_err("same plugin should report bounded backpressure");
+    assert_eq!(
+        backpressured.kind,
+        CapabilityRuntimeErrorKind::Backpressured
+    );
+
+    runtime
+        .submit_capability_request(request(
+            &independent_plugin.0,
+            "independent-timer",
+            CapabilityOperation::Timer(TimerCapabilityRequest::Once { delay_ms: 60_000 }),
+        ))
+        .expect("independent plugin should still submit after another plugin backpressures");
+
+    let saturated_events = runtime
+        .drain_capability_events(&saturated_plugin)
+        .expect("drain saturated plugin events");
+    assert!(saturated_events.iter().any(|event| matches!(
+        event,
+        CapabilityRuntimeEvent::Backpressure(backpressure)
+            if backpressure.route.plugin_key.as_ref() == Some(&saturated_plugin)
+                && backpressure.capacity == 128
+                && backpressure.depth == 128
+    )));
+    assert!(!format!("{saturated_events:?}").contains("never-read"));
+
+    let independent_events = runtime
+        .drain_capability_events(&independent_plugin)
+        .expect("drain independent plugin events");
+    assert_eq!(independent_events.len(), 2);
+    assert!(independent_events.iter().all(|event| {
+        matches!(
+            event,
+            CapabilityRuntimeEvent::ResourceOpened(opened)
+                if opened.plugin_key == independent_plugin
+        ) || matches!(
+            event,
+            CapabilityRuntimeEvent::Completed(completed)
+                if completed.plugin_key == independent_plugin
+        )
+    }));
+}
+
+#[test]
 fn hub_runtime_keeps_session_hot_path_responsive_during_failing_http_transport() {
     let server = LocalHttpServer::start(b"not an http response\r\n", Duration::from_millis(500));
     let mut runtime = explicit_runtime("http-failure-hot-path");

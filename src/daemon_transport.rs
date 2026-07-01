@@ -66,6 +66,7 @@ use crate::{EntrypointProcessSnapshot, EntrypointSupervisorError};
 
 const MESSAGE_CONTENT_TYPE: &str = "application/vnd.botster.coordination.message+text";
 const WEBRTC_SIGNAL_OPERATION: &str = "local_webrtc_signal";
+const DAEMON_CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Run the local daemon socket until a shutdown request is received.
 pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus> {
@@ -81,6 +82,7 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
     let mut daemon = HubDaemon::start(config)?;
     let mut logical_clock = 1;
     let mut drain_cursors = BTreeMap::<String, u64>::new();
+    let mut egress_diagnostics = DaemonEgressDiagnostics::default();
 
     loop {
         match listener.accept() {
@@ -98,6 +100,7 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
                         &mut daemon,
                         &mut logical_clock,
                         &mut drain_cursors,
+                        &mut egress_diagnostics,
                         control_tx.clone(),
                         message,
                     ) {
@@ -166,6 +169,9 @@ fn handle_connection(
     stream
         .set_nonblocking(false)
         .map_err(DaemonTransportError::Io)?;
+    stream
+        .set_write_timeout(Some(DAEMON_CLIENT_WRITE_TIMEOUT))
+        .map_err(DaemonTransportError::Io)?;
     let mut reader = BufReader::new(stream.try_clone().map_err(DaemonTransportError::Io)?);
     let hello: DaemonHello = read_frame_from_reader(&mut reader)?;
     if hello.protocol != PROTOCOL {
@@ -204,6 +210,9 @@ fn handle_connection(
             .map_err(|_| DaemonTransportError::ControlThreadStopped)??;
         apply_attached_subscription_change(&mut attached_subscriptions, active_change);
         if let Err(error) = write_frame(&mut stream, &response) {
+            let _ = control_tx.send(ControlMessage::EgressWriteFailed {
+                delivery_kind: daemon_delivery_kind(&response),
+            });
             detach_connection_subscriptions(&control_tx, &attached_subscriptions);
             return Err(error.into());
         }
@@ -256,25 +265,28 @@ fn handle_control_message(
     daemon: &mut HubDaemon,
     logical_clock: &mut u64,
     drain_cursors: &mut BTreeMap<String, u64>,
+    egress_diagnostics: &mut DaemonEgressDiagnostics,
     control_tx: Sender<ControlMessage>,
     message: ControlMessage,
 ) -> bool {
     match message {
         ControlMessage::Request { request, reply_tx } => {
-            let response =
-                handle_control_request(daemon, logical_clock, drain_cursors, control_tx, *request)
-                    .or_else(|error| match error {
-                        DaemonTransportError::Client(error) => Ok(daemon_operator_error(error)),
-                        DaemonTransportError::Package(error) => Ok(daemon_package_error(error)),
-                        DaemonTransportError::State(error) => Ok(daemon_state_error(error)),
-                        DaemonTransportError::Entrypoint(error) => {
-                            Ok(daemon_entrypoint_error(error))
-                        }
-                        DaemonTransportError::LocalWebrtc(error) => {
-                            Ok(daemon_local_webrtc_error(error))
-                        }
-                        error => Err(error),
-                    });
+            let response = handle_control_request(
+                daemon,
+                logical_clock,
+                drain_cursors,
+                egress_diagnostics,
+                control_tx,
+                *request,
+            )
+            .or_else(|error| match error {
+                DaemonTransportError::Client(error) => Ok(daemon_operator_error(error)),
+                DaemonTransportError::Package(error) => Ok(daemon_package_error(error)),
+                DaemonTransportError::State(error) => Ok(daemon_state_error(error)),
+                DaemonTransportError::Entrypoint(error) => Ok(daemon_entrypoint_error(error)),
+                DaemonTransportError::LocalWebrtc(error) => Ok(daemon_local_webrtc_error(error)),
+                error => Err(error),
+            });
             let should_stop = matches!(
                 response,
                 Ok(DaemonResponse {
@@ -295,8 +307,13 @@ fn handle_control_message(
                 logical_clock,
                 drain_cursors,
                 control_tx,
+                egress_diagnostics,
                 attached_subscriptions,
             );
+            false
+        }
+        ControlMessage::EgressWriteFailed { delivery_kind } => {
+            egress_diagnostics.record_write_failure(delivery_kind);
             false
         }
     }
@@ -307,6 +324,7 @@ fn detach_local_webrtc_subscriptions(
     logical_clock: &mut u64,
     drain_cursors: &mut BTreeMap<String, u64>,
     control_tx: Sender<ControlMessage>,
+    egress_diagnostics: &mut DaemonEgressDiagnostics,
     attached_subscriptions: Vec<LocalWebrtcAttachedSubscription>,
 ) {
     for subscription in attached_subscriptions {
@@ -314,6 +332,7 @@ fn detach_local_webrtc_subscriptions(
             daemon,
             logical_clock,
             drain_cursors,
+            egress_diagnostics,
             control_tx.clone(),
             DaemonRequest::Detach {
                 session_id: subscription.session_id,
@@ -327,6 +346,7 @@ fn handle_control_request(
     daemon: &mut HubDaemon,
     logical_clock: &mut u64,
     drain_cursors: &mut BTreeMap<String, u64>,
+    egress_diagnostics: &DaemonEgressDiagnostics,
     control_tx: Sender<ControlMessage>,
     request: DaemonRequest,
 ) -> DaemonTransportResult<DaemonResponse> {
@@ -609,7 +629,13 @@ fn handle_control_request(
                 .status(&package_name, &entrypoint_id);
             show_package_response(daemon, &package_name)
         }
-        other => handle_runtime_control_request(daemon, logical_clock, drain_cursors, other),
+        other => handle_runtime_control_request(
+            daemon,
+            logical_clock,
+            drain_cursors,
+            egress_diagnostics,
+            other,
+        ),
     }
 }
 
@@ -617,6 +643,7 @@ fn handle_runtime_control_request(
     daemon: &mut HubDaemon,
     logical_clock: &mut u64,
     drain_cursors: &mut BTreeMap<String, u64>,
+    egress_diagnostics: &DaemonEgressDiagnostics,
     request: DaemonRequest,
 ) -> DaemonTransportResult<DaemonResponse> {
     let status = daemon.status();
@@ -638,7 +665,11 @@ fn handle_runtime_control_request(
             let HubClientResponseBody::Status(client_status) = response.body else {
                 return Err(DaemonTransportError::UnexpectedResponse);
             };
-            Ok(daemon_status(status, client_status.session_count))
+            Ok(daemon_status(
+                status,
+                client_status.session_count,
+                egress_diagnostics.diagnostics(),
+            ))
         }
         DaemonRequest::ListSessions => {
             let response = api.handle_request(
@@ -1104,6 +1135,7 @@ fn handle_runtime_control_request(
                     .list_sessions()
                     .map_err(crate::HubRuntimeError::from)?
                     .len(),
+                Vec::new(),
             )),
             sessions: Vec::new(),
             session_templates: Vec::new(),
@@ -1891,10 +1923,92 @@ pub(crate) enum ControlMessage {
         request: Box<DaemonRequest>,
         reply_tx: Sender<DaemonTransportResult<DaemonResponse>>,
     },
+    EgressWriteFailed {
+        delivery_kind: DaemonDeliveryKind,
+    },
     LocalWebrtcPeerClosed {
         grant_id: String,
         attached_subscriptions: Vec<LocalWebrtcAttachedSubscription>,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DaemonDeliveryKind {
+    Terminal,
+    Control,
+}
+
+impl DaemonDeliveryKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Terminal => "terminal",
+            Self::Control => "control",
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct DaemonEgressDiagnostics {
+    terminal_write_failures: u64,
+    control_write_failures: u64,
+}
+
+impl DaemonEgressDiagnostics {
+    fn record_write_failure(&mut self, delivery_kind: DaemonDeliveryKind) {
+        match delivery_kind {
+            DaemonDeliveryKind::Terminal => {
+                self.terminal_write_failures = self.terminal_write_failures.saturating_add(1);
+            }
+            DaemonDeliveryKind::Control => {
+                self.control_write_failures = self.control_write_failures.saturating_add(1);
+            }
+        }
+    }
+
+    fn diagnostics(&self) -> Vec<DaemonDiagnostic> {
+        let mut diagnostics = Vec::new();
+        if self.terminal_write_failures > 0 {
+            diagnostics.push(egress_backpressure_diagnostic(
+                DaemonDeliveryKind::Terminal,
+                self.terminal_write_failures,
+            ));
+        }
+        if self.control_write_failures > 0 {
+            diagnostics.push(egress_backpressure_diagnostic(
+                DaemonDeliveryKind::Control,
+                self.control_write_failures,
+            ));
+        }
+        diagnostics
+    }
+}
+
+fn egress_backpressure_diagnostic(
+    delivery_kind: DaemonDeliveryKind,
+    failures: u64,
+) -> DaemonDiagnostic {
+    DaemonDiagnostic::backpressure(
+        "daemon_client_egress",
+        format!(
+            "daemon client {} egress observed {failures} bounded write failure(s)",
+            delivery_kind.label()
+        ),
+    )
+}
+
+fn daemon_delivery_kind(response: &DaemonResponse) -> DaemonDeliveryKind {
+    if response.events.iter().any(|event| {
+        matches!(
+            event,
+            DaemonEvent::TerminalOutput { .. }
+                | DaemonEvent::Snapshot { .. }
+                | DaemonEvent::Scrollback { .. }
+        )
+    }) {
+        DaemonDeliveryKind::Terminal
+    } else {
+        DaemonDeliveryKind::Control
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1960,10 +2074,19 @@ fn daemon_response_base(kind: DaemonResponseKind) -> DaemonResponse {
     }
 }
 
-fn daemon_status(status: HubDaemonStatus, session_count: usize) -> DaemonResponse {
+fn daemon_status(
+    status: HubDaemonStatus,
+    session_count: usize,
+    mut egress_diagnostics: Vec<DaemonDiagnostic>,
+) -> DaemonResponse {
     let mut response = daemon_response_base(DaemonResponseKind::Status);
-    response.status = Some(daemon_status_from_status(&status, session_count));
+    response.status = Some(daemon_status_from_status(
+        &status,
+        session_count,
+        egress_diagnostics.clone(),
+    ));
     response.diagnostics = vec![DaemonDiagnostic::connected("status")];
+    response.diagnostics.append(&mut egress_diagnostics);
     response
 }
 
@@ -3342,7 +3465,11 @@ fn daemon_plugin_lifecycle_from_client(
     }
 }
 
-fn daemon_status_from_status(status: &HubDaemonStatus, session_count: usize) -> DaemonStatus {
+fn daemon_status_from_status(
+    status: &HubDaemonStatus,
+    session_count: usize,
+    diagnostics: Vec<DaemonDiagnostic>,
+) -> DaemonStatus {
     DaemonStatus {
         lifecycle_state: match status.lifecycle_state {
             crate::HubDaemonState::Created => "created",
@@ -3376,7 +3503,7 @@ fn daemon_status_from_status(status: &HubDaemonStatus, session_count: usize) -> 
             .iter()
             .map(|session_id| session_id.0.clone())
             .collect(),
-        diagnostics: Vec::new(),
+        diagnostics,
     }
 }
 
@@ -4093,5 +4220,38 @@ mod tests {
                 bytes: 10,
             }
         );
+    }
+
+    #[test]
+    fn daemon_egress_diagnostics_classify_terminal_and_control_backpressure() {
+        let terminal = daemon_events(vec![DaemonEvent::TerminalOutput {
+            session_id: "session-redacted".to_string(),
+            subscription_id: "subscription-redacted".to_string(),
+            data: "private terminal payload".to_string(),
+        }]);
+        let control = daemon_response_base(DaemonResponseKind::Sessions);
+
+        assert_eq!(
+            daemon_delivery_kind(&terminal),
+            DaemonDeliveryKind::Terminal
+        );
+        assert_eq!(daemon_delivery_kind(&control), DaemonDeliveryKind::Control);
+
+        let mut diagnostics = DaemonEgressDiagnostics::default();
+        diagnostics.record_write_failure(daemon_delivery_kind(&terminal));
+        diagnostics.record_write_failure(daemon_delivery_kind(&control));
+        let rows = diagnostics.diagnostics();
+
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|diagnostic| {
+            diagnostic.kind == botster_hub_client::DaemonDiagnosticKind::Backpressure
+                && diagnostic.operation.as_deref() == Some("daemon_client_egress")
+        }));
+        let debug = format!("{rows:?}");
+        assert!(debug.contains("terminal"));
+        assert!(debug.contains("control"));
+        assert!(!debug.contains("private terminal payload"));
+        assert!(!debug.contains("session-redacted"));
+        assert!(!debug.contains("subscription-redacted"));
     }
 }

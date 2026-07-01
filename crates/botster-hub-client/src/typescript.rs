@@ -840,6 +840,7 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             "terminal_stream_unavailable",
             "action_failure",
             "daemon_startup_failure",
+            "backpressure",
         ],
     );
 
