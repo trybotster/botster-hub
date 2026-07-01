@@ -20,7 +20,7 @@ mod typescript;
 
 pub const PROTOCOL: &str = "botster-hub-daemon-v1";
 pub const PROTOCOL_VERSION: u16 = 1;
-pub const CONFORMANCE_FIXTURE_REVISION: u16 = 2;
+pub const CONFORMANCE_FIXTURE_REVISION: u16 = 3;
 pub const FEATURE_SESSIONS: &str = "sessions";
 pub const FEATURE_TERMINAL_STREAMING: &str = "terminal_streaming";
 pub const FEATURE_RESIZE: &str = "resize";
@@ -1392,6 +1392,16 @@ impl DaemonDiagnostic {
             message: Some(message.into()),
         }
     }
+
+    #[must_use]
+    pub fn backpressure(operation: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            kind: DaemonDiagnosticKind::Backpressure,
+            operation: Some(operation.into()),
+            feature: None,
+            message: Some(message.into()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1407,6 +1417,7 @@ pub enum DaemonDiagnosticKind {
     TerminalStreamUnavailable,
     ActionFailure,
     DaemonStartupFailure,
+    Backpressure,
 }
 
 /// Events returned by daemon attach and drain requests.
@@ -1600,6 +1611,22 @@ mod tests {
             error.diagnostics,
             vec![DaemonDiagnostic::unsupported_feature("future_feature")]
         );
+    }
+
+    #[test]
+    fn backpressure_diagnostic_is_serde_stable_and_generated() {
+        let diagnostic = DaemonDiagnostic::backpressure(
+            "daemon_client_egress",
+            "daemon client terminal egress observed 1 bounded write failure(s)",
+        );
+        let value = serde_json::to_value(&diagnostic).expect("diagnostic serializes");
+
+        assert_eq!(value["kind"], "backpressure");
+        assert!(daemon_protocol_typescript().contains("| \"backpressure\""));
+
+        let round_tripped: DaemonDiagnostic =
+            serde_json::from_value(value).expect("diagnostic deserializes");
+        assert_eq!(round_tripped, diagnostic);
     }
 
     #[test]

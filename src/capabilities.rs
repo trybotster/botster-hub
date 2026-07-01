@@ -46,7 +46,7 @@ pub struct HubCapabilityRuntime {
     http: HttpCapabilityRuntime,
     websocket: InMemoryWebSocketCapabilityRuntime,
     timers: BTreeMap<CapabilityResourceId, HubTimer>,
-    pending_events: VecDeque<CapabilityRuntimeEvent>,
+    pending_events: BTreeMap<String, VecDeque<CapabilityRuntimeEvent>>,
     completions_sender: mpsc::Sender<HubCapabilityCompletion>,
     completions_receiver: mpsc::Receiver<HubCapabilityCompletion>,
     operation_capacity: usize,
@@ -105,7 +105,7 @@ impl HubCapabilityRuntime {
             http,
             websocket,
             timers: BTreeMap::new(),
-            pending_events: VecDeque::new(),
+            pending_events: BTreeMap::new(),
             completions_sender,
             completions_receiver,
             operation_capacity: DEFAULT_CAPABILITY_OPERATION_CAPACITY,
@@ -290,7 +290,7 @@ impl HubCapabilityRuntime {
             request.operation_id.0
         )));
         let resource_id = CapabilityResourceId(resource.resource_id.clone());
-        self.ensure_event_capacity(2)?;
+        self.ensure_event_capacity(&request.plugin_key, 2)?;
         self.timers.insert(
             resource_id,
             HubTimer {
@@ -301,22 +301,20 @@ impl HubCapabilityRuntime {
                 sequence: 0,
             },
         );
-        self.pending_events
-            .push_back(CapabilityRuntimeEvent::ResourceOpened(
-                CapabilityResourceEvent {
-                    plugin_key: request.plugin_key.clone(),
-                    operation_id: request.operation_id.clone(),
-                    resource: resource.clone(),
-                },
-            ));
-        self.pending_events
-            .push_back(CapabilityRuntimeEvent::Completed(
-                CapabilityOperationCompleted {
-                    plugin_key: request.plugin_key.clone(),
-                    operation_id: request.operation_id.clone(),
-                    result: None,
-                },
-            ));
+        self.push_local_event(CapabilityRuntimeEvent::ResourceOpened(
+            CapabilityResourceEvent {
+                plugin_key: request.plugin_key.clone(),
+                operation_id: request.operation_id.clone(),
+                resource: resource.clone(),
+            },
+        ));
+        self.push_local_event(CapabilityRuntimeEvent::Completed(
+            CapabilityOperationCompleted {
+                plugin_key: request.plugin_key.clone(),
+                operation_id: request.operation_id.clone(),
+                result: None,
+            },
+        ));
 
         let required_capability = request.required_capability();
         Ok(CapabilityRuntimeHandle {
@@ -344,23 +342,21 @@ impl HubCapabilityRuntime {
                 "timer resource is not owned by this plugin",
             ));
         }
-        self.ensure_event_capacity(2)?;
-        self.pending_events
-            .push_back(CapabilityRuntimeEvent::ResourceReleased(
-                CapabilityResourceEvent {
-                    plugin_key: request.plugin_key.clone(),
-                    operation_id: request.operation_id.clone(),
-                    resource: timer.resource.clone(),
-                },
-            ));
-        self.pending_events
-            .push_back(CapabilityRuntimeEvent::Completed(
-                CapabilityOperationCompleted {
-                    plugin_key: request.plugin_key.clone(),
-                    operation_id: request.operation_id.clone(),
-                    result: None,
-                },
-            ));
+        self.ensure_event_capacity(&request.plugin_key, 2)?;
+        self.push_local_event(CapabilityRuntimeEvent::ResourceReleased(
+            CapabilityResourceEvent {
+                plugin_key: request.plugin_key.clone(),
+                operation_id: request.operation_id.clone(),
+                resource: timer.resource.clone(),
+            },
+        ));
+        self.push_local_event(CapabilityRuntimeEvent::Completed(
+            CapabilityOperationCompleted {
+                plugin_key: request.plugin_key.clone(),
+                operation_id: request.operation_id.clone(),
+                result: None,
+            },
+        ));
 
         let required_capability = request.required_capability();
         Ok(CapabilityRuntimeHandle {
@@ -382,22 +378,25 @@ impl HubCapabilityRuntime {
             .filter(|(_, timer)| &timer.plugin_key == plugin_key && timer.next_fire_ms <= now_ms)
             .map(|(resource_id, _)| resource_id.clone())
             .collect::<Vec<_>>();
-        self.ensure_event_capacity(due.len())?;
+        self.ensure_event_capacity(plugin_key, due.len())?;
 
         for resource_id in due {
             let mut remove = false;
+            let mut event = None;
             if let Some(timer) = self.timers.get_mut(&resource_id) {
                 timer.sequence += 1;
-                self.pending_events
-                    .push_back(CapabilityRuntimeEvent::TimerFired(CapabilityTimerEvent {
-                        resource: timer.resource.clone(),
-                        sequence: timer.sequence,
-                    }));
+                event = Some(CapabilityRuntimeEvent::TimerFired(CapabilityTimerEvent {
+                    resource: timer.resource.clone(),
+                    sequence: timer.sequence,
+                }));
                 if let Some(interval_ms) = timer.interval_ms {
                     timer.next_fire_ms = now_ms.saturating_add(interval_ms);
                 } else {
                     remove = true;
                 }
+            }
+            if let Some(event) = event {
+                self.push_local_event(event);
             }
             if remove {
                 self.timers.remove(&resource_id);
@@ -412,11 +411,13 @@ impl HubCapabilityRuntime {
         request: &CapabilityRuntimeRequest,
     ) -> Result<(), CapabilityRuntimeError> {
         self.drain_worker_completions()?;
-        if self.pending_events.len() >= self.operation_capacity {
-            self.pending_events
-                .push_back(CapabilityRuntimeEvent::Backpressure(
-                    request.backpressure(self.operation_capacity, self.pending_events.len()),
+        let queue_len = self.local_event_len(&request.plugin_key);
+        if queue_len >= self.operation_capacity {
+            if queue_len < self.event_capacity {
+                self.push_local_event(CapabilityRuntimeEvent::Backpressure(
+                    request.backpressure(self.operation_capacity, queue_len),
                 ));
+            }
             return Err(CapabilityRuntimeError::new(
                 CapabilityRuntimeErrorKind::Backpressured,
                 "hub capability runtime queue is at capacity",
@@ -425,8 +426,12 @@ impl HubCapabilityRuntime {
         Ok(())
     }
 
-    fn ensure_event_capacity(&self, additional: usize) -> Result<(), CapabilityRuntimeError> {
-        if self.pending_events.len().saturating_add(additional) > self.event_capacity {
+    fn ensure_event_capacity(
+        &self,
+        plugin_key: &PluginKey,
+        additional: usize,
+    ) -> Result<(), CapabilityRuntimeError> {
+        if self.local_event_len(plugin_key).saturating_add(additional) > self.event_capacity {
             return Err(CapabilityRuntimeError::new(
                 CapabilityRuntimeErrorKind::Backpressured,
                 "hub capability runtime event queue is at capacity",
@@ -452,7 +457,7 @@ impl HubCapabilityRuntime {
 
     fn drain_worker_completions(&mut self) -> Result<(), CapabilityRuntimeError> {
         while let Ok(completion) = self.completions_receiver.try_recv() {
-            self.ensure_event_capacity(1)?;
+            self.ensure_event_capacity(&completion.plugin_key, 1)?;
             let event = match completion.result {
                 Ok(result) => CapabilityRuntimeEvent::Completed(CapabilityOperationCompleted {
                     plugin_key: completion.plugin_key,
@@ -466,7 +471,7 @@ impl HubCapabilityRuntime {
                     reason: error.message,
                 }),
             };
-            self.pending_events.push_back(event);
+            self.push_local_event(event);
         }
         Ok(())
     }
@@ -476,17 +481,27 @@ impl HubCapabilityRuntime {
         plugin_key: &PluginKey,
     ) -> Result<Vec<CapabilityRuntimeEvent>, CapabilityRuntimeError> {
         self.drain_worker_completions()?;
-        let mut events = Vec::new();
-        let mut retained = VecDeque::new();
-        while let Some(event) = self.pending_events.pop_front() {
-            if event_plugin_key(&event).as_ref() == Some(plugin_key) {
-                events.push(event);
-            } else {
-                retained.push_back(event);
-            }
+        Ok(self
+            .pending_events
+            .remove(&plugin_key.0)
+            .map(|events| events.into_iter().collect())
+            .unwrap_or_default())
+    }
+
+    fn local_event_len(&self, plugin_key: &PluginKey) -> usize {
+        self.pending_events
+            .get(&plugin_key.0)
+            .map(VecDeque::len)
+            .unwrap_or_default()
+    }
+
+    fn push_local_event(&mut self, event: CapabilityRuntimeEvent) {
+        if let Some(plugin_key) = event_plugin_key(&event) {
+            self.pending_events
+                .entry(plugin_key.0)
+                .or_default()
+                .push_back(event);
         }
-        self.pending_events = retained;
-        Ok(events)
     }
 }
 
@@ -570,8 +585,7 @@ impl PluginCapabilityRuntime for HubCapabilityRuntime {
         for (resource_id, _) in &local_removed {
             self.timers.remove(resource_id);
         }
-        self.pending_events
-            .retain(|event| event_plugin_key(event).as_ref() != Some(plugin_key));
+        self.pending_events.remove(&plugin_key.0);
 
         let mut removed_resources = local_removed
             .into_iter()

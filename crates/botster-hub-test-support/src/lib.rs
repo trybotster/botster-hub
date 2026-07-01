@@ -1229,6 +1229,7 @@ fn diagnostic_kind_label(kind: DaemonDiagnosticKind) -> &'static str {
         DaemonDiagnosticKind::TerminalStreamUnavailable => "terminal_stream_unavailable",
         DaemonDiagnosticKind::ActionFailure => "action_failure",
         DaemonDiagnosticKind::DaemonStartupFailure => "daemon_startup_failure",
+        DaemonDiagnosticKind::Backpressure => "backpressure",
     }
 }
 
@@ -1241,6 +1242,7 @@ fn daemon_diagnostic_kind_labels() -> Vec<&'static str> {
         diagnostic_kind_label(DaemonDiagnosticKind::TerminalStreamUnavailable),
         diagnostic_kind_label(DaemonDiagnosticKind::ActionFailure),
         diagnostic_kind_label(DaemonDiagnosticKind::DaemonStartupFailure),
+        diagnostic_kind_label(DaemonDiagnosticKind::Backpressure),
     ]
 }
 
