@@ -106,7 +106,12 @@ Current diagnostic kinds are:
   result;
 - `daemon_startup_failure` for startup failures reported by client/test-support
   helpers before a daemon socket protocol response can exist;
+- `backpressure` for bounded daemon-client egress pressure summaries such as
+  terminal or control write failures;
 - `disconnected` for client-side transport disconnect classification.
+
+Backpressure diagnostics report only lane and counter summaries. They must not
+include terminal payloads, session ids, plugin payloads, secrets, or local paths.
 
 Downstream clients should prefer the structured fields over private string
 parsing:
