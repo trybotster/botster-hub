@@ -18,6 +18,15 @@ pub(crate) fn daemon_protocol_typescript() -> String {
         "export type JsonObject = { [key: string]: JsonValue };",
     );
     line(&mut output, "");
+    emit_interface(
+        &mut output,
+        "AesGcmEnvelope",
+        &[
+            ("nonce", "string"),
+            ("ciphertext", "string"),
+            ("version", "number"),
+        ],
+    );
 
     emit_interface(
         &mut output,
