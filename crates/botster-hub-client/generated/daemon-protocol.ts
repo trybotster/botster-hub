@@ -544,7 +544,8 @@ export type DaemonDiagnosticKind =
   | "unsupported_feature"
   | "terminal_stream_unavailable"
   | "action_failure"
-  | "daemon_startup_failure";
+  | "daemon_startup_failure"
+  | "backpressure";
 
 export type DaemonEvent =
   | { type: "session_lifecycle"; session_id: string; state: string }
