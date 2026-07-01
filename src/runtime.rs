@@ -28,6 +28,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::capabilities::HubCapabilityRuntime;
 use crate::config::HubConfig;
+use crate::credentials::{
+    CredentialPolicyError, CredentialProviderKind, OsKeychainCredentialStore,
+    validate_hub_credentials,
+};
 use crate::lifecycle::{
     HubLifecycleResult, HubPluginLifecycle, HubPluginLifecycleStatus, HubPluginRuntimeBundle,
 };
@@ -137,6 +141,31 @@ impl HubRuntime {
         store: &impl HubStateStore,
     ) -> HubRuntimeResult<Self> {
         let state = store.load_or_initialize(&config)?;
+        validate_hub_credentials(
+            &state,
+            CredentialProviderKind::OsKeychain,
+            &OsKeychainCredentialStore::new(),
+        )?;
+        Self::from_validated_state(config, state)
+    }
+
+    /// Load durable hub state with an explicit credential store.
+    ///
+    /// Production callers should use [`Self::load_from_store`], which selects
+    /// the OS keychain provider. This hook exists for deterministic tests and
+    /// tightly controlled embedders that need to exercise provider failures.
+    pub fn load_from_store_with_credentials(
+        config: HubConfig,
+        store: &impl HubStateStore,
+        provider_kind: CredentialProviderKind,
+        credential_store: &impl botster_core::CredentialStore,
+    ) -> HubRuntimeResult<Self> {
+        let state = store.load_or_initialize(&config)?;
+        validate_hub_credentials(&state, provider_kind, credential_store)?;
+        Self::from_validated_state(config, state)
+    }
+
+    fn from_validated_state(config: HubConfig, state: HubState) -> HubRuntimeResult<Self> {
         let core_config = core_daemon_config(&config);
         let routed_envelopes = Arc::new(Mutex::new(RoutedEnvelopeRouter::with_config(
             core_config.routed_envelope_queue.clone(),
@@ -1114,6 +1143,8 @@ pub enum HubRuntimeError {
     CoreDaemon(CoreDaemonError),
     /// Durable hub state failed to load.
     State(HubStateStoreError),
+    /// Credential provider or persisted credential references failed validation.
+    Credentials(CredentialPolicyError),
 }
 
 impl fmt::Display for HubRuntimeError {
@@ -1121,6 +1152,7 @@ impl fmt::Display for HubRuntimeError {
         match self {
             Self::CoreDaemon(error) => write!(formatter, "{error}"),
             Self::State(error) => write!(formatter, "{error}"),
+            Self::Credentials(error) => write!(formatter, "{error}"),
         }
     }
 }
@@ -1130,6 +1162,7 @@ impl Error for HubRuntimeError {
         match self {
             Self::CoreDaemon(error) => Some(error),
             Self::State(error) => Some(error),
+            Self::Credentials(error) => Some(error),
         }
     }
 }
@@ -1143,6 +1176,12 @@ impl From<CoreDaemonError> for HubRuntimeError {
 impl From<HubStateStoreError> for HubRuntimeError {
     fn from(error: HubStateStoreError) -> Self {
         Self::State(error)
+    }
+}
+
+impl From<CredentialPolicyError> for HubRuntimeError {
+    fn from(error: CredentialPolicyError) -> Self {
+        Self::Credentials(error)
     }
 }
 

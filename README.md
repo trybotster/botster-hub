@@ -150,9 +150,29 @@ posture.
 `FileHubStateStore` persists versioned local state at
 `<HubConfig.data_directory>/hub-state.json`. The v1 state model records host
 identity, config/schema metadata, package/provider registry snapshots,
-capability grants, package admission decisions, enabled/disabled/pinned state,
-provenance/checksum/update policy fields, local runtime settings, and audit
-history.
+credential key references, trusted browser public identities/fingerprints,
+bootstrap grant metadata, capability grants, package admission decisions,
+enabled/disabled/pinned state, provenance/checksum/update policy fields, local
+runtime settings, and audit history.
+
+Durable credential material is not stored in `hub-state.json`. Production
+startup uses the OS credential store through the hub-owned `keyring` adapter:
+macOS Keychain Services, Windows Credential Manager, or the platform Secret
+Service on Unix-like systems. Hub-state records only stable key ids such as
+`hub/<host-id>/<purpose>/<local-id>`, the expected provider kind, public browser
+identity bytes, derived public fingerprints, trust timestamps, expiry,
+revocation, and audit-safe reasons. Raw private keys, browser secrets, bootstrap
+grant tokens, file-encryption keys, local paths, hostnames, and emails do not
+belong in this JSON file.
+
+An available-but-empty credential store is a valid first boot state. Once
+hub-state references credential keys or trusted browser identities,
+`HubRuntime::load_from_store` validates those references before session
+reconciliation and fails closed if the OS credential store rejects lookup, a
+referenced key is missing, the provider kind does not match, or a browser public
+key no longer matches its stored fingerprint. The file-backed credential store
+is intentionally named and constructed as `TestFileCredentialStore`; it is for
+deterministic tests and local fixtures only, not a production fallback.
 
 The durable local startup path is explicit:
 
