@@ -4,6 +4,12 @@
 export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 export type JsonObject = { [key: string]: JsonValue };
 
+export interface AesGcmEnvelope {
+  nonce: string;
+  ciphertext: string;
+  version: number;
+}
+
 export interface DaemonHello {
   protocol: string;
   compatibility: DaemonCompatibilityRequirement;

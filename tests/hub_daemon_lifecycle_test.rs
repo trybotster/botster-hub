@@ -310,6 +310,41 @@ fn local_webrtc_stream_key(secret: &str) -> AesGcmKey {
     AesGcmKey::from_slice(&bytes).expect("local WebRTC secret is an AES-GCM key")
 }
 
+#[test]
+fn generated_daemon_protocol_mirrors_core_aes_gcm_envelope_fields() {
+    let envelope = AesGcmEnvelope {
+        nonce: "base64-nonce".to_string(),
+        ciphertext: "base64-ciphertext".to_string(),
+        version: 1,
+    };
+    let value = serde_json::to_value(envelope).expect("core AES-GCM envelope serializes");
+    let fields = value
+        .as_object()
+        .expect("core AES-GCM envelope serializes as object")
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(fields, vec!["ciphertext", "nonce", "version"]);
+
+    let artifact = fs::read_to_string("crates/botster-hub-client/generated/daemon-protocol.ts")
+        .expect("generated daemon protocol artifact is readable");
+    let interface = generated_typescript_interface(&artifact, "AesGcmEnvelope");
+    assert!(interface.contains("  nonce: string;"));
+    assert!(interface.contains("  ciphertext: string;"));
+    assert!(interface.contains("  version: number;"));
+}
+
+fn generated_typescript_interface(artifact: &str, name: &str) -> String {
+    let start = artifact
+        .find(&format!("export interface {name} {{"))
+        .unwrap_or_else(|| panic!("generated daemon protocol should export {name}"));
+    let rest = &artifact[start..];
+    let end = rest
+        .find("\n}\n")
+        .unwrap_or_else(|| panic!("generated daemon protocol should close {name}"));
+    rest[..end + 3].to_string()
+}
+
 fn decode_hex_bytes(encoded: &str) -> Option<Vec<u8>> {
     if !encoded.len().is_multiple_of(2) {
         return None;
