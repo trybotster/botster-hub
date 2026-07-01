@@ -311,7 +311,7 @@ fn local_webrtc_stream_key(secret: &str) -> AesGcmKey {
 }
 
 fn decode_hex_bytes(encoded: &str) -> Option<Vec<u8>> {
-    if encoded.len() % 2 != 0 {
+    if !encoded.len().is_multiple_of(2) {
         return None;
     }
     let mut output = Vec::with_capacity(encoded.len() / 2);
@@ -4274,6 +4274,28 @@ fn installed_botster_web_launch_issues_local_webrtc_grant_and_data_channel_adapt
             Some("local_webrtc_origin_mismatch")
         );
 
+        let rejected_secret = botster_hub_client::request(
+            &endpoint,
+            botster_hub_client::DaemonRequest::LocalWebrtcSignal {
+                grant_id: bootstrap.grant_id.clone(),
+                grant_secret: "wrong-secret".to_string(),
+                origin: bootstrap.expected_origin.clone(),
+                offer: serde_json::Value::Null,
+            },
+        )
+        .expect("wrong-secret signal returns operator response");
+        assert_eq!(
+            rejected_secret.kind,
+            botster_hub_client::DaemonResponseKind::OperatorError
+        );
+        assert_eq!(
+            rejected_secret
+                .error
+                .as_ref()
+                .map(|error| error.code.as_str()),
+            Some("local_webrtc_secret_mismatch")
+        );
+
         let signal = botster_hub_client::request(
             &endpoint,
             botster_hub_client::DaemonRequest::LocalWebrtcSignal {
@@ -4431,6 +4453,175 @@ fn installed_botster_web_launch_issues_local_webrtc_grant_and_data_channel_adapt
     assert!(!persisted_state.contains(&bootstrap.grant_secret));
     assert!(!persisted_state.contains("grant_secret"));
 
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
+fn local_webrtc_peer_close_detaches_terminal_subscriptions() {
+    let _guard = daemon_test_lock()
+        .lock()
+        .expect("serialize real daemon test");
+    let data_dir = unique_short_test_dir("web-webrtc-close");
+    let package_dir = unique_test_dir("web-webrtc-close-package");
+    write_botster_web_package(&package_dir);
+    let config = explicit_config(&data_dir);
+    let socket_path = config
+        .transports
+        .local_socket
+        .as_ref()
+        .expect("test config has local socket")
+        .path
+        .clone();
+    let endpoint = botster_hub_client::DaemonEndpoint::new(socket_path);
+    let child = start_cli_daemon(&data_dir);
+    enable_supervised_package(&data_dir, &package_dir);
+
+    let web_bridge_port = unused_loopback_port();
+    let start = botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::StartPackageEntrypoint {
+            package_name: "botster-web".to_string(),
+            entrypoint_id: "web-client".to_string(),
+            environment_overrides: BTreeMap::from([(
+                "BOTSTER_WEB_DOGFOOD_BRIDGE_PORT".to_string(),
+                web_bridge_port.to_string(),
+            )]),
+        },
+    )
+    .expect("start botster-web entrypoint");
+    let bootstrap = start
+        .local_webrtc_bootstrap
+        .expect("start response includes local WebRTC bootstrap");
+    let stream_key = local_webrtc_stream_key(&bootstrap.grant_secret);
+
+    block_on(async {
+        let (mut offer_peer, offer) = LocalWebrtcOfferPeer::create_offer()
+            .await
+            .expect("create WebRTC offer peer");
+        let signal = botster_hub_client::request(
+            &endpoint,
+            botster_hub_client::DaemonRequest::LocalWebrtcSignal {
+                grant_id: bootstrap.grant_id.clone(),
+                grant_secret: bootstrap.grant_secret.clone(),
+                origin: bootstrap.expected_origin.clone(),
+                offer,
+            },
+        )
+        .expect("signal local WebRTC offer");
+        let answer = signal
+            .local_webrtc_answer
+            .as_ref()
+            .expect("signal response includes WebRTC answer")
+            .answer
+            .clone();
+        offer_peer
+            .accept_answer(answer)
+            .await
+            .expect("offer peer accepts answer and opens channel");
+
+        let spawn = offer_peer
+            .encrypted_request(
+                &stream_key,
+                &botster_hub_client::DaemonRequest::Spawn {
+                    session_id: "local-webrtc-drop-session".to_string(),
+                    command: "printf 'local-webrtc-drop-ready\\n'; while IFS= read -r line; do printf 'drop:%s\\n' \"$line\"; done".to_string(),
+                },
+            )
+            .await
+            .expect("spawn over encrypted WebRTC data channel");
+        assert_eq!(spawn.kind, botster_hub_client::DaemonResponseKind::Spawned);
+
+        let attach = offer_peer
+            .encrypted_request(
+                &stream_key,
+                &botster_hub_client::DaemonRequest::Attach {
+                    session_id: "local-webrtc-drop-session".to_string(),
+                    subscription_id: "local-webrtc-drop-subscription".to_string(),
+                },
+            )
+            .await
+            .expect("attach over encrypted WebRTC data channel");
+        assert_eq!(attach.kind, botster_hub_client::DaemonResponseKind::Events);
+
+        offer_peer.peer.close().await.expect("close offer peer");
+    });
+
+    thread::sleep(Duration::from_millis(300));
+
+    let mut connection =
+        botster_hub_client::DaemonConnection::connect(&endpoint).expect("external connect");
+    let socket_attach = connection
+        .request(&botster_hub_client::DaemonRequest::Attach {
+            session_id: "local-webrtc-drop-session".to_string(),
+            subscription_id: "socket-after-webrtc-close-subscription".to_string(),
+        })
+        .expect("attach socket client after WebRTC peer close");
+    assert_eq!(
+        socket_attach.kind,
+        botster_hub_client::DaemonResponseKind::Events
+    );
+    let send = connection
+        .request(&botster_hub_client::DaemonRequest::SendInput {
+            session_id: "local-webrtc-drop-session".to_string(),
+            data: "after-webrtc-close\n".to_string(),
+        })
+        .expect("send input after WebRTC peer close");
+    assert_eq!(send.kind, botster_hub_client::DaemonResponseKind::Events);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut observed = String::new();
+    let mut events_after_close = Vec::new();
+    while std::time::Instant::now() < deadline {
+        let drain = connection
+            .request(&botster_hub_client::DaemonRequest::Drain {
+                session_id: "local-webrtc-drop-session".to_string(),
+            })
+            .expect("drain after WebRTC peer close");
+        for event in drain.events {
+            if let botster_hub_client::DaemonEvent::TerminalOutput {
+                data,
+                subscription_id,
+                ..
+            } = &event
+                && subscription_id == "socket-after-webrtc-close-subscription"
+            {
+                observed.push_str(data);
+            }
+            events_after_close.push(event);
+        }
+        if observed.contains("drop:after-webrtc-close") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(30));
+    }
+    assert!(
+        observed.contains("drop:after-webrtc-close"),
+        "socket client should observe output after WebRTC close, got {observed:?}"
+    );
+    assert!(
+        events_after_close.iter().all(|event| {
+            !matches!(
+                event,
+                botster_hub_client::DaemonEvent::TerminalOutput {
+                    subscription_id,
+                    data,
+                    ..
+                } if subscription_id == "local-webrtc-drop-subscription"
+                    && data.contains("drop:after-webrtc-close")
+            )
+        }),
+        "closed WebRTC peer subscription must not receive later output: {events_after_close:?}"
+    );
+
+    let shutdown_session = connection
+        .request(&botster_hub_client::DaemonRequest::ShutdownSession {
+            session_id: "local-webrtc-drop-session".to_string(),
+        })
+        .expect("shutdown drop test session");
+    assert_eq!(
+        shutdown_session.kind,
+        botster_hub_client::DaemonResponseKind::Events
+    );
     shutdown_cli_daemon(&data_dir, child);
 }
 

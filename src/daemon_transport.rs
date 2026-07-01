@@ -50,7 +50,7 @@ use serde_json::Value;
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
 
-use crate::local_webrtc::LocalWebrtcSignalRequest;
+use crate::local_webrtc::{LocalWebrtcAttachedSubscription, LocalWebrtcSignalRequest};
 use crate::{
     AvailablePackage, AvailablePackageState, FileHubStateStore, HubClientApi, HubClientEvent,
     HubClientPackage, HubClientPackageAvailabilityReason, HubClientPackageAvailabilityState,
@@ -194,7 +194,10 @@ fn handle_connection(
         let close_after_response = matches!(request, DaemonRequest::DaemonShutdown);
         let active_change = AttachedSubscriptionChange::from_request(&request);
         control_tx
-            .send(ControlMessage::Request { request, reply_tx })
+            .send(ControlMessage::Request {
+                request: Box::new(request),
+                reply_tx,
+            })
             .map_err(|_| DaemonTransportError::ControlThreadStopped)?;
         let response = reply_rx
             .recv()
@@ -219,10 +222,10 @@ fn detach_connection_subscriptions(
         let (reply_tx, reply_rx) = mpsc::channel();
         if control_tx
             .send(ControlMessage::Request {
-                request: DaemonRequest::Detach {
+                request: Box::new(DaemonRequest::Detach {
                     session_id: subscription.session_id.clone(),
                     subscription_id: subscription.subscription_id.clone(),
-                },
+                }),
                 reply_tx,
             })
             .is_ok()
@@ -256,27 +259,68 @@ fn handle_control_message(
     control_tx: Sender<ControlMessage>,
     message: ControlMessage,
 ) -> bool {
-    let ControlMessage::Request { request, reply_tx } = message;
-    let response =
-        handle_control_request(daemon, logical_clock, drain_cursors, control_tx, request).or_else(
-            |error| match error {
-                DaemonTransportError::Client(error) => Ok(daemon_operator_error(error)),
-                DaemonTransportError::Package(error) => Ok(daemon_package_error(error)),
-                DaemonTransportError::State(error) => Ok(daemon_state_error(error)),
-                DaemonTransportError::Entrypoint(error) => Ok(daemon_entrypoint_error(error)),
-                DaemonTransportError::LocalWebrtc(error) => Ok(daemon_local_webrtc_error(error)),
-                error => Err(error),
+    match message {
+        ControlMessage::Request { request, reply_tx } => {
+            let response =
+                handle_control_request(daemon, logical_clock, drain_cursors, control_tx, *request)
+                    .or_else(|error| match error {
+                        DaemonTransportError::Client(error) => Ok(daemon_operator_error(error)),
+                        DaemonTransportError::Package(error) => Ok(daemon_package_error(error)),
+                        DaemonTransportError::State(error) => Ok(daemon_state_error(error)),
+                        DaemonTransportError::Entrypoint(error) => {
+                            Ok(daemon_entrypoint_error(error))
+                        }
+                        DaemonTransportError::LocalWebrtc(error) => {
+                            Ok(daemon_local_webrtc_error(error))
+                        }
+                        error => Err(error),
+                    });
+            let should_stop = matches!(
+                response,
+                Ok(DaemonResponse {
+                    kind: DaemonResponseKind::Shutdown,
+                    ..
+                })
+            );
+            let _ = reply_tx.send(response);
+            should_stop
+        }
+        ControlMessage::LocalWebrtcPeerClosed {
+            grant_id,
+            attached_subscriptions,
+        } => {
+            daemon.local_webrtc().remove_peer(&grant_id);
+            detach_local_webrtc_subscriptions(
+                daemon,
+                logical_clock,
+                drain_cursors,
+                control_tx,
+                attached_subscriptions,
+            );
+            false
+        }
+    }
+}
+
+fn detach_local_webrtc_subscriptions(
+    daemon: &mut HubDaemon,
+    logical_clock: &mut u64,
+    drain_cursors: &mut BTreeMap<String, u64>,
+    control_tx: Sender<ControlMessage>,
+    attached_subscriptions: Vec<LocalWebrtcAttachedSubscription>,
+) {
+    for subscription in attached_subscriptions {
+        let _ = handle_control_request(
+            daemon,
+            logical_clock,
+            drain_cursors,
+            control_tx.clone(),
+            DaemonRequest::Detach {
+                session_id: subscription.session_id,
+                subscription_id: subscription.subscription_id,
             },
         );
-    let should_stop = matches!(
-        response,
-        Ok(DaemonResponse {
-            kind: DaemonResponseKind::Shutdown,
-            ..
-        })
-    );
-    let _ = reply_tx.send(response);
-    should_stop
+    }
 }
 
 fn handle_control_request(
@@ -490,7 +534,7 @@ fn handle_control_request(
             let local_webrtc_bootstrap = if package_name == "botster-web" {
                 daemon
                     .local_webrtc()
-                    .issue_botster_web_bootstrap(&entrypoint_id, &mut environment)
+                    .issue_botster_web_bootstrap(&entrypoint_id, &mut environment)?
             } else {
                 None
             };
@@ -1792,7 +1836,7 @@ fn install_signal_forwarder(control_tx: Sender<ControlMessage>) -> DaemonTranspo
         if signals.forever().next().is_some() {
             let (reply_tx, _reply_rx) = mpsc::channel();
             let _ = control_tx.send(ControlMessage::Request {
-                request: DaemonRequest::DaemonShutdown,
+                request: Box::new(DaemonRequest::DaemonShutdown),
                 reply_tx,
             });
         }
@@ -1844,8 +1888,12 @@ fn events_from_client(events: Vec<HubClientEvent>) -> Vec<DaemonEvent> {
 #[derive(Debug)]
 pub(crate) enum ControlMessage {
     Request {
-        request: DaemonRequest,
+        request: Box<DaemonRequest>,
         reply_tx: Sender<DaemonTransportResult<DaemonResponse>>,
+    },
+    LocalWebrtcPeerClosed {
+        grant_id: String,
+        attached_subscriptions: Vec<LocalWebrtcAttachedSubscription>,
     },
 }
 
@@ -3544,6 +3592,10 @@ fn daemon_operator_error_from_local_webrtc(error: crate::LocalWebrtcError) -> Da
         crate::LocalWebrtcError::InvalidOffer(message) => (
             "local_webrtc_invalid_offer",
             format!("invalid local WebRTC offer: {message}"),
+        ),
+        crate::LocalWebrtcError::Random(message) => (
+            "local_webrtc_random_failed",
+            format!("local WebRTC random token failed: {message}"),
         ),
         crate::LocalWebrtcError::Webrtc(message) => (
             "local_webrtc_signaling_failed",

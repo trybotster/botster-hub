@@ -30,19 +30,30 @@
   values. Plaintext inside the envelope is the existing `DaemonRequest` /
   `DaemonResponse` protocol; invalid unauthenticated DataChannel frames are not
   answered with a plaintext fallback.
+- Follow-up review fixes track terminal `Attach` subscriptions owned by each
+  WebRTC peer and submit owner-thread cleanup when the DataChannel or peer
+  connection closes, so normal browser tab-close detaches subscriptions and
+  prunes the peer registry before daemon shutdown.
+- Bootstrap random token generation now hard-fails through a typed local WebRTC
+  operator error instead of falling back to a low-entropy clock token.
 
 ## Verification
 
 - `cargo test -p botster-hub-client`
 - `./test.sh installed_botster_web_launch_issues_local_webrtc_grant_and_data_channel_adapter`
+- `./test.sh local_webrtc_peer_close_detaches_terminal_subscriptions`
+- `cargo clippy --all-targets -- -D warnings`
 - `cargo check --workspace`
 
 The WebRTC acceptance drives the installed package launch, receives the
-bootstrap from that production request, rejects a wrong-origin signal, completes
-offer/answer with a Rust WebRTC peer, proves ordered/reliable DataChannel
-settings, sends encrypted status/list/spawn/attach/resize/input/drain/shutdown
-requests, rejects grant reuse, and checks persisted hub state does not contain
-the runtime grant id/secret.
+bootstrap from that production request, rejects wrong-origin and wrong-secret
+signals, completes offer/answer with a Rust WebRTC peer, proves ordered/reliable
+DataChannel settings, sends encrypted
+status/list/spawn/attach/resize/input/drain/shutdown requests, rejects grant
+reuse, and checks persisted hub state does not contain the runtime grant
+id/secret. The dropped-peer regression closes a WebRTC peer without
+`ShutdownSession`, then proves later terminal output reaches a socket
+subscription but not the closed WebRTC subscription.
 
 ## Residual Risk
 
@@ -54,6 +65,9 @@ the runtime grant id/secret.
   owner-thread request path and does not add an unbounded application queue.
 - Durable browser identity, trusted browser persistence, and long-lived secret
   storage remain blocked on the dedicated key-storage dependency.
+- The ephemeral bootstrap grant secret is still used directly as the local
+  stream key for this slice. A future durable-identity/key-storage pass should
+  add explicit KDF/domain separation when that protocol becomes long-lived.
 
 ## Missing Vault Guidance
 
