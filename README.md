@@ -76,8 +76,9 @@ accepts `botster-core` `CapabilityRuntimeRequest` values through
 `submit_capability_request`, returns core `CapabilityRuntimeHandle` values, and
 drains core `CapabilityRuntimeEvent` values through `drain_capability_events`.
 The hub adapter implements scoped filesystem operations, plugin JSON store
-operations, logical timers, policy-gated HTTP execution, and core's in-memory
-WebSocket runtime. It does not add product cloud, public WebRTC, webhook, OAuth,
+operations, logical timers, policy-gated HTTP execution, core's in-memory
+WebSocket runtime, and the local hub-side WebRTC adapter for installed
+`botster-web`. It does not add product cloud, public WebRTC, webhook, OAuth,
 Rails, or provider-specific API behavior.
 
 Filesystem access is rooted under the explicit hub data directory at
@@ -128,12 +129,12 @@ not add a physical multi-crate split.
 
 ## Scaffold-only exclusions
 
-This repo does not yet implement Rails, TryBotster Cloud, ActionCable, WebRTC,
-signaling servers, browser shells, API clients, OAuth/device-code flows,
-provider processes, persistence databases, marketplace fetches, package
-installers, or client transports. The hub does include local file-backed
-durable state for dogfood; database-backed persistence and cloud sync remain
-excluded.
+This repo does not yet implement Rails, TryBotster Cloud, ActionCable, public
+WebRTC signaling servers, browser shells, API clients, OAuth/device-code flows,
+provider processes, persistence databases, marketplace fetches, or package
+installers. The hub does include local file-backed durable state for dogfood and
+a local installed-package WebRTC signaling/DataChannel adapter; database-backed
+persistence and cloud sync remain excluded.
 
 The exception in this scaffold is the constrained `examples/project-pipelines`
 local plugin package. The daemon loads that package through the real Lua plugin
@@ -693,9 +694,9 @@ dumps, keys, or fingerprints.
 
 The in-process `HubClientApi` local dogfood workflow supports status, session
 list, spawn, attach, input, resize, drain/output events, shutdown, guarded
-notification write, package queries, and plugin lifecycle status. Browser, TUI,
-socket, WebRTC, and cloud transports remain future adapters over this same local
-API; they are not implemented by the smoke command.
+notification write, package queries, and plugin lifecycle status. The daemon
+socket and local WebRTC adapter route through this same API. Browser parity,
+TUI, and cloud transports remain outside the smoke command.
 
 ## Package registry policy
 
@@ -873,7 +874,7 @@ contracts, optional install/update timestamps, and the latest audit reason.
 
 Deferred production concerns remain outside this contract slice: signing,
 sandboxing, dependency solving, installer-managed binaries, hosted marketplace
-resolution, and production WebRTC launch paths.
+resolution, browser WebRTC parity, and remote/cloud WebRTC launch paths.
 
 Compatibility remains deliberately narrow in this slice. The manifest `botster`
 field accepts only exact `MAJOR.MINOR.PATCH` or lower-bound

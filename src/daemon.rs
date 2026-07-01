@@ -13,6 +13,7 @@ use botster_core::SessionId;
 use crate::HubLuaPluginLoadError;
 use crate::config::HubConfig;
 use crate::entrypoint_supervisor::EntrypointSupervisor;
+use crate::local_webrtc::LocalWebrtcTransport;
 use crate::packages::{
     PackageClassification, PackageRegistry, PackageRegistrySnapshotError, PackageState,
 };
@@ -77,6 +78,7 @@ pub struct HubDaemon {
     state_source: HubStateLoadSource,
     package_registry: PackageRegistry,
     entrypoint_supervisor: EntrypointSupervisor,
+    local_webrtc: LocalWebrtcTransport,
     runtime: Option<HubRuntime>,
     lifecycle_state: HubDaemonState,
 }
@@ -101,6 +103,7 @@ impl HubDaemon {
             state_source,
             package_registry,
             entrypoint_supervisor: EntrypointSupervisor::default(),
+            local_webrtc: LocalWebrtcTransport::default(),
             runtime: Some(runtime),
             lifecycle_state: HubDaemonState::Running,
         })
@@ -132,6 +135,11 @@ impl HubDaemon {
     /// Return the local package entrypoint supervisor.
     pub const fn entrypoint_supervisor(&mut self) -> &mut EntrypointSupervisor {
         &mut self.entrypoint_supervisor
+    }
+
+    /// Return the ephemeral local WebRTC signaling/admission registry.
+    pub const fn local_webrtc(&mut self) -> &mut LocalWebrtcTransport {
+        &mut self.local_webrtc
     }
 
     /// Return deterministic lifecycle status without exposing local paths.
@@ -180,6 +188,7 @@ impl HubDaemon {
 
     /// Stop the daemon lifecycle. This is idempotent.
     pub fn stop(&mut self) -> HubDaemonStatus {
+        self.local_webrtc.stop_all();
         self.entrypoint_supervisor.stop_all();
         if let Some(runtime) = self.runtime.as_mut() {
             runtime.release_for_restart();

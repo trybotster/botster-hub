@@ -271,11 +271,34 @@ installer or sandbox. The daemon stops them on explicit stop/restart, package
 disable/remove, `DaemonShutdown`, and daemon SIGINT/SIGTERM cleanup.
 
 Web app `local_url` values, including `botster-web` dogfood `bridge=` / `web=`
-URLs, are supervised local package app outputs. They are not production browser
-transport and they do not prove E2E browser WebRTC. Production browser transport
-must be admitted separately, preserve the same encrypted Botster stream after
-local or remote admission, and attach through one ordered/reliable WebRTC
-DataChannel without app-layer reordering.
+URLs, are supervised local package app outputs. They remain health and dev
+bridge surfaces, not the terminal/session data plane.
+
+For the installed `botster-web` `web-client` entrypoint, `StartPackageEntrypoint`
+also returns `local_webrtc_bootstrap` when it mints a short-lived local browser
+grant. The bootstrap contains the grant id/secret, expected same-device origin,
+expiry, signaling transport (`daemon_request`), data plane
+(`webrtc_data_channel`), and the required DataChannel reliability contract:
+ordered `true`, no `max_retransmits`, no `max_packet_lifetime_ms`, and no hub
+application reorder buffer.
+
+The local signaling surface is the daemon request
+`LocalWebrtcSignal { grant_id, grant_secret, origin, offer }`. The hub validates
+that the grant exists, has not expired, has not already been redeemed, has the
+expected secret, and matches the expected origin before creating a WebRTC answer.
+The origin check is defense in depth for same-device launches; the short-lived
+grant secret is the admission boundary.
+Accepted DataChannel messages are JSON serialized `botster_core::AesGcmEnvelope`
+values. The envelope plaintext is the existing daemon `DaemonRequest`, and the
+encrypted response plaintext is `DaemonResponse`; invalid or unauthenticated
+DataChannel frames are not answered with a plaintext fallback.
+
+The first hub-side harness uses a Rust WebRTC peer to prove localhost signaling,
+ordered/reliable DataChannel establishment, encrypted representative
+status/list/attach/input/resize/drain/session traffic, bounded grants, and no
+persistence of grant secrets. That proves the hub adapter and local signaling
+contract. Real browser `RTCPeerConnection` interop remains a botster-web parity
+follow-up while the HTTP/SSE dogfood bridge stays available.
 
 The runnable contract is intentionally adjacent to core package `entrypoints`.
 Core `entrypoints` remain the plugin/provider code-load ABI, while

@@ -1850,6 +1850,32 @@ fn print_daemon_response(response: DaemonResponse) -> Result<(), OperatorError> 
                 println!("result={json}");
             }
         }
+        DaemonResponseKind::LocalWebrtcBootstrap => {
+            println!("response=local_webrtc_bootstrap");
+            if let Some(bootstrap) = response.local_webrtc_bootstrap {
+                println!("package={}", bootstrap.package_name);
+                println!("entrypoint_id={}", bootstrap.entrypoint_id);
+                println!("grant_id={}", bootstrap.grant_id);
+                println!("expected_origin={}", bootstrap.expected_origin);
+                println!("expires_at={}", bootstrap.expires_at);
+                println!("signaling_transport={}", bootstrap.signaling_transport);
+                println!("data_plane={}", bootstrap.data_plane);
+                println!("ordered={}", bootstrap.ordered);
+                println!("max_retransmits={:?}", bootstrap.max_retransmits);
+                println!(
+                    "max_packet_lifetime_ms={:?}",
+                    bootstrap.max_packet_lifetime_ms
+                );
+            }
+        }
+        DaemonResponseKind::LocalWebrtcAnswer => {
+            println!("response=local_webrtc_answer");
+            if let Some(answer) = response.local_webrtc_answer {
+                println!("grant_id={}", answer.grant_id);
+                println!("answer_present={}", !answer.answer.is_null());
+                println!("diagnostic_count={}", answer.diagnostics.len());
+            }
+        }
         DaemonResponseKind::SessionCleanup => {
             println!("response=session_cleanup");
             if let Some(cleanup) = response.cleanup {
