@@ -32,6 +32,7 @@ pub mod auth;
 pub mod capabilities;
 pub mod client_api;
 pub mod config;
+pub mod credentials;
 pub mod daemon;
 pub mod daemon_transport;
 pub mod entrypoint_supervisor;
@@ -70,6 +71,10 @@ pub use config::{
     HostIdentityOptions, HubConfig, HubConfigError, HubStartupOptions, LocalSocketBinding,
     RuntimeEnvironment, SessionDefaults, SessionIoCoalescingOptions, TcpBinding, TransportBindings,
     build_default_config_for_runtime,
+};
+pub use credentials::{
+    CredentialKeyPurpose, CredentialPolicyError, CredentialProviderKind, OsKeychainCredentialStore,
+    TestFileCredentialStore, credential_key_id, validate_hub_credentials,
 };
 pub use daemon::{
     HubDaemon, HubDaemonError, HubDaemonResult, HubDaemonState, HubDaemonStatus, HubStateLoadSource,
@@ -121,10 +126,11 @@ pub use packages::{
     resolve_foreground_launch_contract,
 };
 pub use persistence::{
-    AdmittedSessionTemplateTarget, CapabilityGrantRecord, DeviceSessionTemplateSource,
-    FileHubStateStore, HubAuditEntry, HubState, HubStateError, HubStateResult, HubStateStore,
-    HubStateStoreError, HubStateStoreResult, LocalRuntimeSettings, PackageAdmissionDecision,
-    SchemaMetadata,
+    AdmittedSessionTemplateTarget, BootstrapGrantRecord, CapabilityGrantRecord,
+    CredentialKeyReference, DeviceSessionTemplateSource, FileHubStateStore, HubAuditEntry,
+    HubState, HubStateError, HubStateResult, HubStateStore, HubStateStoreError,
+    HubStateStoreResult, LocalRuntimeSettings, PackageAdmissionDecision, SchemaMetadata,
+    TrustedBrowserIdentity,
 };
 pub use profile::{
     CoreRuntimeRole, HostProfileManifest, HostProfileTrust, PolicyArea, Responsibility,
