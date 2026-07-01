@@ -21,6 +21,9 @@ the generated file as a downstream contract artifact, not as an independent
 source of truth. The artifact intentionally includes the hello/compatibility
 handshake DTOs as well as request, response, event, package, plugin lifecycle,
 plugin surface/action, diagnostics, coordination, and session DTO families.
+Downstream `botster-web` drift checks should point
+`BOTSTER_HUB_CLIENT_DAEMON_PROTOCOL` at this exact file; a skipped check because
+the hub checkout was not found is not protocol evidence.
 
 ## Compatibility Handshake
 
@@ -292,6 +295,10 @@ Accepted DataChannel messages are JSON serialized `botster_core::AesGcmEnvelope`
 values. The envelope plaintext is the existing daemon `DaemonRequest`, and the
 encrypted response plaintext is `DaemonResponse`; invalid or unauthenticated
 DataChannel frames are not answered with a plaintext fallback.
+The generated TypeScript artifact mirrors the browser-visible envelope as
+`AesGcmEnvelope` with `nonce`, `ciphertext`, and `version` fields while keeping
+the authoritative core Rust struct out of the `botster-hub-client` dependency
+boundary.
 
 The first hub-side harness uses a Rust WebRTC peer to prove localhost signaling,
 ordered/reliable DataChannel establishment, encrypted representative
