@@ -1621,6 +1621,7 @@ fn runtime_error(
         )) => HubClientRuntimeErrorKind::SessionAlreadyExists,
         HubRuntimeError::CoreDaemon(_) => HubClientRuntimeErrorKind::Runtime,
         HubRuntimeError::State(_) => HubClientRuntimeErrorKind::State,
+        HubRuntimeError::Credentials(_) => HubClientRuntimeErrorKind::State,
     };
     HubClientError::Runtime {
         request_id,
