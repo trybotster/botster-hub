@@ -5,7 +5,7 @@ use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::UnixStream;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
@@ -1709,6 +1709,35 @@ fn run_dev_stack_bootstrap(
         .expect("run dev-stack bootstrap")
 }
 
+fn run_local_runtime_up(
+    data_dir: &Path,
+    project_pipelines_package_path: &Path,
+    web_package_path: &Path,
+    tui_package_path: &Path,
+    workspaces_package_path: &Path,
+    web_bridge_port: u16,
+) -> Output {
+    ensure_session_worker_binary();
+    Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("up")
+        .arg("--data-dir")
+        .arg(data_dir)
+        .arg("--session-worker-bin")
+        .arg(session_worker_binary_path())
+        .arg("--project-pipelines-package-path")
+        .arg(project_pipelines_package_path)
+        .arg("--web-package-path")
+        .arg(web_package_path)
+        .arg("--tui-package-path")
+        .arg(tui_package_path)
+        .arg("--workspaces-package-path")
+        .arg(workspaces_package_path)
+        .arg("--web-bridge-port")
+        .arg(web_bridge_port.to_string())
+        .output()
+        .expect("run botster-hub up")
+}
+
 fn shutdown_dev_stack_daemon(data_dir: &Path) {
     let output = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
         .arg("shutdown")
@@ -2873,6 +2902,180 @@ fn cli_dev_stack_bootstrap_reuses_live_daemon_and_preserves_state_after_restart(
     );
 
     shutdown_dev_stack_daemon(&data_dir);
+}
+
+#[test]
+fn cli_local_runtime_up_starts_reuses_and_down_stops_runtime() {
+    let _guard = daemon_test_lock()
+        .lock()
+        .expect("serialize real daemon test");
+    let data_dir = unique_test_dir("cli-local-runtime-up");
+    let project_pipelines_package_dir = unique_test_dir("cli-up-project-pipelines");
+    let web_package_dir = unique_test_dir("cli-up-web");
+    let tui_package_dir = unique_test_dir("cli-up-tui");
+    let workspaces_package_dir = unique_test_dir("cli-up-workspaces");
+    write_project_pipelines_availability_package(&project_pipelines_package_dir);
+    write_botster_web_package(&web_package_dir);
+    write_botster_tui_package(&tui_package_dir);
+    write_botster_workspaces_local_package(&workspaces_package_dir, "botster-workspaces");
+
+    let web_bridge_port = unused_loopback_port();
+    let first = run_local_runtime_up(
+        &data_dir,
+        &project_pipelines_package_dir,
+        &web_package_dir,
+        &tui_package_dir,
+        &workspaces_package_dir,
+        web_bridge_port,
+    );
+    assert!(
+        first.status.success(),
+        "first up failed: {}",
+        command_output_text(&first)
+    );
+    let first_text = command_output_text(&first);
+    assert!(first_text.contains("runtime=ready"));
+    assert!(first_text.contains("daemon=started"));
+    assert!(first_text.contains("protocol=botster-hub-daemon-v1"));
+    assert!(first_text.contains("protocol_version=1"));
+    assert!(first_text.contains("conformance_fixture_revision="));
+    assert!(first_text.contains("package_count=4"));
+    assert!(first_text.contains("enabled_package_count=4"));
+    assert!(first_text.contains("app_count="));
+    assert!(first_text.contains("app package=botster-web app_id=web-client"));
+    assert!(first_text.contains(&format!(
+        "web=http://127.0.0.1:{web_bridge_port}/?dogfood=real-hub"
+    )));
+    assert!(first_text.contains(&format!(
+        "down=botster-hub down --data-dir {}",
+        data_dir.display()
+    )));
+    for package_dir in [
+        &project_pipelines_package_dir,
+        &web_package_dir,
+        &tui_package_dir,
+        &workspaces_package_dir,
+    ] {
+        assert!(
+            !first_text.contains(package_dir.to_string_lossy().as_ref()),
+            "up output should not leak package source path {package_dir:?}: {first_text}"
+        );
+    }
+
+    let second = run_local_runtime_up(
+        &data_dir,
+        &project_pipelines_package_dir,
+        &web_package_dir,
+        &tui_package_dir,
+        &workspaces_package_dir,
+        web_bridge_port,
+    );
+    assert!(
+        second.status.success(),
+        "second up failed: {}",
+        command_output_text(&second)
+    );
+    assert!(command_output_text(&second).contains("daemon=reused"));
+
+    let down = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("down")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .output()
+        .expect("run botster-hub down");
+    assert!(
+        down.status.success(),
+        "down failed: {}",
+        command_output_text(&down)
+    );
+    let down_text = command_output_text(&down);
+    assert!(down_text.contains("response=shutdown"));
+
+    let status = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("status")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .output()
+        .expect("run botster-hub status after down");
+    assert!(
+        !status.status.success(),
+        "status should fail after down: {}",
+        command_output_text(&status)
+    );
+}
+
+#[test]
+fn cli_local_runtime_up_reports_incompatible_daemon_without_deleting_socket() {
+    let _guard = daemon_test_lock()
+        .lock()
+        .expect("serialize real daemon test");
+    let data_dir = unique_short_test_dir("cli-up-incompat");
+    let config = explicit_config(&data_dir);
+    let socket_path = config
+        .transports
+        .local_socket
+        .as_ref()
+        .expect("local socket binding")
+        .path
+        .clone();
+    fs::create_dir_all(socket_path.parent().expect("socket parent")).expect("create socket parent");
+    let listener = UnixListener::bind(&socket_path).expect("bind fake incompatible daemon");
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let handle = thread::spawn(move || {
+        ready_tx.send(()).expect("send listener ready");
+        for _ in 0..2 {
+            let Ok((mut stream, _addr)) = listener.accept() else {
+                break;
+            };
+            let mut reader = BufReader::new(stream.try_clone().expect("clone fake stream"));
+            let mut hello = String::new();
+            let _ = reader.read_line(&mut hello);
+            let _ = stream.write_all(b"{\"protocol\":\"botster-hub-daemon-v1\"}\n");
+        }
+    });
+    ready_rx.recv().expect("fake listener ready");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("up")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .output()
+        .expect("run botster-hub up against incompatible daemon");
+    assert!(
+        !output.status.success(),
+        "up unexpectedly succeeded: {}",
+        command_output_text(&output)
+    );
+    let text = command_output_text(&output);
+    assert!(text.contains("running daemon is incompatible or stale"));
+    assert!(text.contains("botster-hub down"));
+    assert!(text.contains("may fail against this daemon"));
+    assert!(text.contains("Stop the running botster-hub process directly"));
+    assert!(text.contains("remove the stale local socket"));
+    assert!(text.contains("botster-hub up --data-dir <path>"));
+    assert!(
+        socket_path.exists(),
+        "up must not delete a connectable socket on compatibility failure"
+    );
+
+    let down = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("down")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .output()
+        .expect("run botster-hub down against incompatible daemon");
+    assert!(
+        !down.status.success(),
+        "down unexpectedly succeeded: {}",
+        command_output_text(&down)
+    );
+    let down_text = command_output_text(&down);
+    assert!(down_text.contains("running daemon is incompatible or stale"));
+    assert!(down_text.contains("Stop the running botster-hub process directly"));
+    assert!(down_text.contains("remove the stale local socket"));
+
+    handle.join().expect("fake incompatible daemon thread");
+    let _ = fs::remove_file(socket_path);
 }
 
 #[test]
