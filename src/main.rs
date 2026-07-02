@@ -417,7 +417,10 @@ fn ensure_dev_stack_daemon(
 ) -> Result<DevStackDaemonOwnership, DevStackError> {
     match daemon_transport_request(config, DaemonRequest::Status) {
         Ok(_) => return Ok(DevStackDaemonOwnership::Reused),
-        Err(botster_hub::DaemonTransportError::NotRunning) => {}
+        Err(
+            botster_hub::DaemonTransportError::NotRunning
+            | botster_hub::DaemonTransportError::ClientDisconnected,
+        ) => {}
         Err(botster_hub::DaemonTransportError::Compatibility(error)) => {
             return Err(DevStackError::IncompatibleDaemon(error.to_string()));
         }
@@ -458,11 +461,11 @@ fn wait_for_dev_stack_ready(
 ) -> Result<(), DevStackError> {
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
-        if daemon_transport_request(config, DaemonRequest::Status).is_ok() {
-            return Ok(());
-        }
         if let Some(status) = child.try_wait().map_err(DevStackError::PollDaemon)? {
             return Err(DevStackError::DaemonExited(status.to_string()));
+        }
+        if daemon_transport_request(config, DaemonRequest::Status).is_ok() {
+            return Ok(());
         }
         thread::sleep(Duration::from_millis(50));
     }
