@@ -49,6 +49,20 @@ fn main() {
             }
             return;
         }
+        Some("up") => {
+            if let Err(error) = local_runtime_up(env::args().skip(2).collect()) {
+                eprintln!("botster-hub up error: {error}");
+                process::exit(1);
+            }
+            return;
+        }
+        Some("down") => {
+            if let Err(error) = local_runtime_down(env::args().skip(2).collect()) {
+                eprintln!("botster-hub down error: {error}");
+                process::exit(1);
+            }
+            return;
+        }
         Some("status") => {
             if let Err(error) = operator_status(env::args().skip(2).collect()) {
                 eprintln!("botster-hub status error: {error}");
@@ -291,6 +305,54 @@ fn dev_stack(args: Vec<String>) -> Result<(), DevStackError> {
 }
 
 fn dev_stack_bootstrap(options: DevStackOptions) -> Result<(), DevStackError> {
+    let outcome = prepare_local_runtime(options)?;
+    print_dev_stack_ready(
+        &outcome.options.data_directory,
+        outcome.options.default_data_dir,
+        outcome.daemon_ownership,
+        &[
+            ("project-pipelines", outcome.project_pipelines.as_str()),
+            ("botster-web", outcome.web.package_state.as_str()),
+            ("botster-tui", outcome.tui.as_str()),
+            ("botster-workspaces", outcome.workspaces.as_str()),
+        ],
+        &outcome.web,
+    );
+
+    Ok(())
+}
+
+fn local_runtime_up(args: Vec<String>) -> Result<(), DevStackError> {
+    let outcome = prepare_local_runtime(DevStackOptions::parse(args)?)?;
+    let status = daemon_transport_request(&outcome.config, DaemonRequest::Status)?;
+    let apps = daemon_transport_request(&outcome.config, DaemonRequest::ListApps)?;
+    let status = status
+        .status
+        .as_ref()
+        .ok_or(botster_hub::DaemonTransportError::UnexpectedResponse)?;
+    print_local_runtime_ready(&outcome, status, &apps.apps);
+    Ok(())
+}
+
+fn local_runtime_down(args: Vec<String>) -> Result<(), DevStackError> {
+    let options = LocalRuntimeDownOptions::parse(args)?;
+    let config = explicit_config(options.data_directory)?;
+    let response = daemon_transport_request(&config, DaemonRequest::DaemonShutdown)?;
+    print_daemon_response(response)?;
+    Ok(())
+}
+
+struct LocalRuntimeOutcome {
+    options: DevStackOptions,
+    config: botster_hub::HubConfig,
+    daemon_ownership: DevStackDaemonOwnership,
+    project_pipelines: String,
+    web: DogfoodWebLaunch,
+    tui: String,
+    workspaces: String,
+}
+
+fn prepare_local_runtime(options: DevStackOptions) -> Result<LocalRuntimeOutcome, DevStackError> {
     std::fs::create_dir_all(&options.data_directory).map_err(|source| {
         DevStackError::CreateDataDir {
             path: options.data_directory.clone(),
@@ -328,20 +390,15 @@ fn dev_stack_bootstrap(options: DevStackOptions) -> Result<(), DevStackError> {
         options.package_path("botster-workspaces")?,
     )?;
 
-    print_dev_stack_ready(
-        &options.data_directory,
-        options.default_data_dir,
+    Ok(LocalRuntimeOutcome {
+        options,
+        config,
         daemon_ownership,
-        &[
-            ("project-pipelines", project_pipelines.as_str()),
-            ("botster-web", web.package_state.as_str()),
-            ("botster-tui", tui.as_str()),
-            ("botster-workspaces", workspaces.as_str()),
-        ],
-        &web,
-    );
-
-    Ok(())
+        project_pipelines,
+        web,
+        tui,
+        workspaces,
+    })
 }
 
 fn ensure_dev_stack_daemon(
@@ -349,8 +406,16 @@ fn ensure_dev_stack_daemon(
     options: &DevStackOptions,
     config: &botster_hub::HubConfig,
 ) -> Result<DevStackDaemonOwnership, DevStackError> {
-    if daemon_transport_request(config, DaemonRequest::Status).is_ok() {
-        return Ok(DevStackDaemonOwnership::Reused);
+    match daemon_transport_request(config, DaemonRequest::Status) {
+        Ok(_) => return Ok(DevStackDaemonOwnership::Reused),
+        Err(botster_hub::DaemonTransportError::NotRunning) => {}
+        Err(botster_hub::DaemonTransportError::Compatibility(error)) => {
+            return Err(DevStackError::IncompatibleDaemon(error.to_string()));
+        }
+        Err(botster_hub::DaemonTransportError::Protocol(message)) => {
+            return Err(DevStackError::IncompatibleDaemon(message.to_string()));
+        }
+        Err(error) => return Err(error.into()),
     }
 
     if !hub_bin.is_file() {
@@ -384,11 +449,11 @@ fn wait_for_dev_stack_ready(
 ) -> Result<(), DevStackError> {
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
-        if let Some(status) = child.try_wait().map_err(DevStackError::PollDaemon)? {
-            return Err(DevStackError::DaemonExited(status.to_string()));
-        }
         if daemon_transport_request(config, DaemonRequest::Status).is_ok() {
             return Ok(());
+        }
+        if let Some(status) = child.try_wait().map_err(DevStackError::PollDaemon)? {
+            return Err(DevStackError::DaemonExited(status.to_string()));
         }
         thread::sleep(Duration::from_millis(50));
     }
@@ -2333,6 +2398,24 @@ struct DevStackOptions {
     web_bridge_port: Option<u16>,
 }
 
+struct LocalRuntimeDownOptions {
+    data_directory: PathBuf,
+}
+
+impl LocalRuntimeDownOptions {
+    fn parse(args: Vec<String>) -> Result<Self, DevStackError> {
+        match args.as_slice() {
+            [] => Ok(Self {
+                data_directory: default_dev_stack_data_dir(),
+            }),
+            [flag, value] if flag == "--data-dir" => Ok(Self {
+                data_directory: PathBuf::from(value),
+            }),
+            _ => Err(DevStackError::Usage),
+        }
+    }
+}
+
 impl DevStackOptions {
     fn parse(args: Vec<String>) -> Result<Self, DevStackError> {
         let mut data_directory = None;
@@ -2517,6 +2600,53 @@ fn print_dev_stack_ready(
     println!("status=botster-hub status --data-dir {dir}");
     println!("apps=botster-hub apps list --data-dir {dir}");
     println!("shutdown=botster-hub shutdown --data-dir {dir}");
+}
+
+fn print_local_runtime_ready(
+    outcome: &LocalRuntimeOutcome,
+    status: &DaemonStatus,
+    apps: &[DaemonApp],
+) {
+    let dir = outcome.options.data_directory.display();
+    println!("runtime=ready");
+    if outcome.options.default_data_dir {
+        println!("data_dir=stable:local-runtime");
+    } else {
+        println!("data_dir={dir}");
+    }
+    println!(
+        "daemon={}",
+        match outcome.daemon_ownership {
+            DevStackDaemonOwnership::Started => "started",
+            DevStackDaemonOwnership::Reused => "reused",
+        }
+    );
+    println!("protocol={}", status.compatibility.protocol);
+    println!("protocol_version={}", status.compatibility.protocol_version);
+    println!(
+        "conformance_fixture_revision={}",
+        status.compatibility.conformance_fixture_revision
+    );
+    println!("package_count={}", status.package_count);
+    println!("enabled_package_count={}", status.enabled_package_count);
+    println!("app_count={}", apps.len());
+    for app in apps {
+        println!(
+            "app package={} app_id={} kind={} lifecycle_state={} local_url={}",
+            app.package_name,
+            app.entrypoint_id,
+            app.kind,
+            app.lifecycle_state,
+            app.launch_target.local_url.as_deref().unwrap_or("none")
+        );
+    }
+    println!("bridge={}", outcome.web.bridge_url);
+    println!("web={}", outcome.web.web_url);
+    println!("tui=botster-hub apps open --data-dir {dir} botster-tui");
+    println!("mcp=botster-hub mcp-serve --data-dir {dir}");
+    println!("status=botster-hub status --data-dir {dir}");
+    println!("apps=botster-hub apps list --data-dir {dir}");
+    println!("down=botster-hub down --data-dir {dir}");
 }
 
 impl DogfoodOptions {
@@ -3481,7 +3611,9 @@ enum DevStackError {
         label: &'static str,
         message: String,
     },
+    Operator(Box<OperatorError>),
     Dogfood(Box<DogfoodError>),
+    IncompatibleDaemon(String),
     DaemonExited(String),
 }
 
@@ -3718,7 +3850,12 @@ impl fmt::Display for DevStackError {
             Self::PackageEnable { label, message } => {
                 write!(formatter, "enable {label} package: {message}")
             }
+            Self::Operator(error) => write!(formatter, "{error}"),
             Self::Dogfood(error) => write!(formatter, "{error}"),
+            Self::IncompatibleDaemon(message) => write!(
+                formatter,
+                "running daemon is incompatible or stale: {message}; run `botster-hub down --data-dir <path>` for this local runtime, then retry `botster-hub up --data-dir <path>`"
+            ),
             Self::DaemonExited(status) => {
                 write!(formatter, "dev-stack daemon exited with {status}")
             }
@@ -3748,6 +3885,12 @@ impl From<DogfoodError> for DevStackError {
             DogfoodError::Transport(error) => Self::Transport(error),
             other => Self::Dogfood(Box::new(other)),
         }
+    }
+}
+
+impl From<OperatorError> for DevStackError {
+    fn from(error: OperatorError) -> Self {
+        Self::Operator(Box::new(error))
     }
 }
 
@@ -3788,6 +3931,10 @@ fn usage_for(command: &str) -> &'static str {
         "dev-stack" | "dev-stack bootstrap" => {
             "usage: botster-hub dev-stack bootstrap [--data-dir <path>] [--session-worker-bin <path>] [--project-pipelines-package-path <path>] [--web-package-path <path>] [--tui-package-path <path>] [--workspaces-package-path <path>] [--web-bridge-port <port>]"
         }
+        "up" => {
+            "usage: botster-hub up [--data-dir <path>] [--session-worker-bin <path>] [--project-pipelines-package-path <path>] [--web-package-path <path>] [--tui-package-path <path>] [--workspaces-package-path <path>] [--web-bridge-port <port>]"
+        }
+        "down" => "usage: botster-hub down [--data-dir <path>]",
         "status" => "usage: botster-hub status --data-dir <path>",
         "sessions" => {
             "usage: botster-hub sessions <list|spawn|attach|send-input|resize|detach|shutdown> ..."
@@ -3882,7 +4029,7 @@ fn usage_for(command: &str) -> &'static str {
         "providers" | "providers list" => "usage: botster-hub providers list --data-dir <path>",
         "inspect" => "usage: botster-hub inspect --data-dir <path> <session-id>",
         _ => {
-            "usage: botster-hub <start|dogfood|dev-stack|status|sessions|shutdown|mcp-serve|apps|packages|providers|inspect|run-one>"
+            "usage: botster-hub <up|down|start|dogfood|dev-stack|status|sessions|shutdown|mcp-serve|apps|packages|providers|inspect|run-one>"
         }
     }
 }

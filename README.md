@@ -235,8 +235,8 @@ client, sends input, drains the observed marker, and shuts down through the same
 local client API. Separate Lua runtime tests cover real Lua entrypoint
 execution. The PTY portion is Unix-only.
 
-For daily first-party local development from fresh main checkouts, use the
-persistent dev-stack bootstrap. The expected local checkout set is this
+For daily first-party local development from fresh main checkouts, use
+`botster-hub up` and `botster-hub down`. The expected local checkout set is this
 `botster-hub` repo, the checked-in `examples/project-pipelines` package, and
 local package roots for `botster-web`, `botster-tui`, and
 `botster-workspaces`. The sibling paths below are only examples; use the package
@@ -248,13 +248,13 @@ The session path also needs a built `botster-session-worker` next to the
 package app entrypoints must already exist in their package roots before `apps
 open` can launch them.
 
-`dev-stack bootstrap` starts or reuses a daemon over a stable data directory,
+`botster-hub up` starts or reuses a daemon over a stable data directory,
 installs and enables the first-party packages as ordinary local packages, starts
 the `botster-web` app entrypoint through daemon supervision, and prints the
 app/operator commands for the same data directory:
 
 ```sh
-cargo run -- dev-stack bootstrap \
+cargo run -- up \
   --data-dir target/botster-hub-dev-stack-data \
   --project-pipelines-package-path examples/project-pipelines \
   --web-package-path ../botster-web \
@@ -262,12 +262,12 @@ cargo run -- dev-stack bootstrap \
   --workspaces-package-path ../botster-workspaces
 ```
 
-`dev-stack bootstrap` defaults to `target/botster-hub-dev-stack-data`, discovers
+`botster-hub up` defaults to `target/botster-hub-dev-stack-data`, discovers
 `examples/project-pipelines`, `../botster-web`, `../botster-tui`, and
 `../botster-workspaces` when those package manifests exist, and accepts explicit
 package path flags for CI worktrees or non-sibling checkouts. Keep the same
-`--data-dir` for `dev-stack bootstrap`, `apps`, `mcp-serve`, `status`, package
-reloads, and shutdown. That directory persists `hub-state.json`, package
+`--data-dir` for `up`, `apps`, `mcp-serve`, `status`, package reloads, and
+`down`. That directory persists `hub-state.json`, package
 registry state, plugin data, and Project Pipelines state.
 
 The command is idempotent: rerunning it against a live daemon reuses that daemon,
@@ -275,20 +275,27 @@ and rerunning after shutdown reloads the persisted package registry from
 `hub-state.json`. Normal output does not print local package source paths:
 
 ```sh
-dev_stack=ready
+runtime=ready
 data_dir=target/botster-hub-dev-stack-data
 daemon=started
-package name=project-pipelines state=enabled
-package name=botster-web state=enabled
-package name=botster-tui state=enabled
-package name=botster-workspaces state=enabled
+protocol=botster-hub-daemon-v1
+protocol_version=1
+conformance_fixture_revision=3
+package_count=4
+enabled_package_count=4
+app_count=2
+app package=botster-web app_id=web-client kind=web_app lifecycle_state=running local_url=http://127.0.0.1:41739/?dogfood=real-hub
 web=http://127.0.0.1:41739/?dogfood=real-hub
 tui=botster-hub apps open --data-dir target/botster-hub-dev-stack-data botster-tui
 mcp=botster-hub mcp-serve --data-dir target/botster-hub-dev-stack-data
 status=botster-hub status --data-dir target/botster-hub-dev-stack-data
 apps=botster-hub apps list --data-dir target/botster-hub-dev-stack-data
-shutdown=botster-hub shutdown --data-dir target/botster-hub-dev-stack-data
+down=botster-hub down --data-dir target/botster-hub-dev-stack-data
 ```
+
+`dev-stack bootstrap` remains available as a compatibility command with its
+existing output contract. `start`, `shutdown`, `packages`, and `apps` remain the
+lower-level operator surfaces.
 
 The supervised `botster-web` process receives `BOTSTER_HUB_SOCKET` and
 `BOTSTER_HUB_DATA_DIR` because the daemon-owned entrypoint launch injects hub
