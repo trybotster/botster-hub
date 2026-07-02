@@ -337,7 +337,16 @@ fn local_runtime_up(args: Vec<String>) -> Result<(), DevStackError> {
 fn local_runtime_down(args: Vec<String>) -> Result<(), DevStackError> {
     let options = LocalRuntimeDownOptions::parse(args)?;
     let config = explicit_config(options.data_directory)?;
-    let response = daemon_transport_request(&config, DaemonRequest::DaemonShutdown)?;
+    let response = match daemon_transport_request(&config, DaemonRequest::DaemonShutdown) {
+        Ok(response) => response,
+        Err(botster_hub::DaemonTransportError::Compatibility(error)) => {
+            return Err(DevStackError::IncompatibleDaemon(error.to_string()));
+        }
+        Err(botster_hub::DaemonTransportError::Protocol(message)) => {
+            return Err(DevStackError::IncompatibleDaemon(message.to_string()));
+        }
+        Err(error) => return Err(error.into()),
+    };
     print_daemon_response(response)?;
     Ok(())
 }
@@ -2610,7 +2619,7 @@ fn print_local_runtime_ready(
     let dir = outcome.options.data_directory.display();
     println!("runtime=ready");
     if outcome.options.default_data_dir {
-        println!("data_dir=stable:local-runtime");
+        println!("data_dir=stable:{dir}");
     } else {
         println!("data_dir={dir}");
     }
@@ -3854,7 +3863,7 @@ impl fmt::Display for DevStackError {
             Self::Dogfood(error) => write!(formatter, "{error}"),
             Self::IncompatibleDaemon(message) => write!(
                 formatter,
-                "running daemon is incompatible or stale: {message}; run `botster-hub down --data-dir <path>` for this local runtime, then retry `botster-hub up --data-dir <path>`"
+                "running daemon is incompatible or stale: {message}; `botster-hub down` may fail against this daemon because shutdown uses the same protocol handshake. Stop the running botster-hub process directly, remove the stale local socket for this data dir if one remains, then retry `botster-hub up --data-dir <path>`"
             ),
             Self::DaemonExited(status) => {
                 write!(formatter, "dev-stack daemon exited with {status}")
