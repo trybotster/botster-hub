@@ -3023,7 +3023,10 @@ fn cli_local_runtime_up_reports_incompatible_daemon_without_deleting_socket() {
     let (ready_tx, ready_rx) = mpsc::channel();
     let handle = thread::spawn(move || {
         ready_tx.send(()).expect("send listener ready");
-        if let Ok((mut stream, _addr)) = listener.accept() {
+        for _ in 0..2 {
+            let Ok((mut stream, _addr)) = listener.accept() else {
+                break;
+            };
             let mut reader = BufReader::new(stream.try_clone().expect("clone fake stream"));
             let mut hello = String::new();
             let _ = reader.read_line(&mut hello);
@@ -3045,11 +3048,32 @@ fn cli_local_runtime_up_reports_incompatible_daemon_without_deleting_socket() {
     );
     let text = command_output_text(&output);
     assert!(text.contains("running daemon is incompatible or stale"));
-    assert!(text.contains("botster-hub down --data-dir <path>"));
+    assert!(text.contains("botster-hub down"));
+    assert!(text.contains("may fail against this daemon"));
+    assert!(text.contains("Stop the running botster-hub process directly"));
+    assert!(text.contains("remove the stale local socket"));
+    assert!(text.contains("botster-hub up --data-dir <path>"));
     assert!(
         socket_path.exists(),
         "up must not delete a connectable socket on compatibility failure"
     );
+
+    let down = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("down")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .output()
+        .expect("run botster-hub down against incompatible daemon");
+    assert!(
+        !down.status.success(),
+        "down unexpectedly succeeded: {}",
+        command_output_text(&down)
+    );
+    let down_text = command_output_text(&down);
+    assert!(down_text.contains("running daemon is incompatible or stale"));
+    assert!(down_text.contains("Stop the running botster-hub process directly"));
+    assert!(down_text.contains("remove the stale local socket"));
+
     handle.join().expect("fake incompatible daemon thread");
     let _ = fs::remove_file(socket_path);
 }
