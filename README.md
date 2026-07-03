@@ -297,6 +297,19 @@ down=botster-hub down --data-dir target/botster-hub-dev-stack-data
 existing output contract. `start`, `shutdown`, `packages`, and `apps` remain the
 lower-level operator surfaces.
 
+`botster-hub doctor --data-dir <path>` is the non-mutating diagnostic path for a
+selected local runtime. It reports stable check rows such as daemon running,
+daemon compatibility, core initialization, package registry counts, first-party
+package state, and the `botster-web` app URL state. Stopped runtimes and
+stale/incompatible daemons exit nonzero with a remediation command instead of
+leaking raw protocol errors.
+
+`botster-hub smoke --data-dir <path>` is the explicit end-to-end local runtime
+proof. It requires an explicit data dir because it may start or reuse the daemon,
+enable first-party local packages, start package entrypoints, and create a
+disposable smoke session. When the first-party package prerequisites are not
+available, it exits nonzero with a named `missing_prerequisite=...` diagnostic.
+
 The daily aliases are only shortcuts over the lower-level daemon-backed
 commands:
 
