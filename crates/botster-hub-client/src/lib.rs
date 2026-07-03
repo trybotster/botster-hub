@@ -654,6 +654,11 @@ pub enum DaemonRequest {
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         environment_overrides: BTreeMap<String, String>,
     },
+    IssueLocalWebrtcBootstrap {
+        package_name: String,
+        entrypoint_id: String,
+        origin: String,
+    },
     LocalWebrtcSignal {
         grant_id: String,
         grant_secret: String,
@@ -1930,6 +1935,28 @@ mod tests {
     }
 
     #[test]
+    fn issue_local_webrtc_bootstrap_request_is_serde_stable() {
+        let request = DaemonRequest::IssueLocalWebrtcBootstrap {
+            package_name: "botster-web".to_string(),
+            entrypoint_id: "web-client".to_string(),
+            origin: "http://127.0.0.1:41739".to_string(),
+        };
+        let value = serde_json::to_value(&request).expect("serialize request");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "type": "issue_local_webrtc_bootstrap",
+                "package_name": "botster-web",
+                "entrypoint_id": "web-client",
+                "origin": "http://127.0.0.1:41739"
+            })
+        );
+        let round_tripped: DaemonRequest =
+            serde_json::from_value(value).expect("deserialize bootstrap issuance request");
+        assert_eq!(round_tripped, request);
+    }
+
+    #[test]
     fn generated_typescript_protocol_matches_checked_artifact() {
         let generated = daemon_protocol_typescript();
         let checked = std::fs::read_to_string(concat!(
@@ -2418,6 +2445,11 @@ mod tests {
                     "/tmp/botster.sock".to_string(),
                 )]),
             },
+            DaemonRequest::IssueLocalWebrtcBootstrap {
+                package_name: "botster-web".to_string(),
+                entrypoint_id: "web-client".to_string(),
+                origin: "http://127.0.0.1:49152".to_string(),
+            },
             DaemonRequest::LocalWebrtcSignal {
                 grant_id: "grant".to_string(),
                 grant_secret: "secret".to_string(),
@@ -2500,6 +2532,7 @@ mod tests {
             DaemonRequest::DisablePackage { .. } => "disable_package",
             DaemonRequest::RemovePackage { .. } => "remove_package",
             DaemonRequest::StartPackageEntrypoint { .. } => "start_package_entrypoint",
+            DaemonRequest::IssueLocalWebrtcBootstrap { .. } => "issue_local_webrtc_bootstrap",
             DaemonRequest::LocalWebrtcSignal { .. } => "local_webrtc_signal",
             DaemonRequest::StopPackageEntrypoint { .. } => "stop_package_entrypoint",
             DaemonRequest::RestartPackageEntrypoint { .. } => "restart_package_entrypoint",
