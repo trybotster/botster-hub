@@ -2554,6 +2554,22 @@ fn cli_dogfood_launcher_enables_local_tui_package_for_apps_open() {
         "app_url=http://127.0.0.1:{web_bridge_port}/?dogfood=real-hub"
     )));
 
+    let open_web_alias = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("open")
+        .arg("web")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .output()
+        .expect("open dogfood botster-web app through alias");
+    assert!(
+        open_web_alias.status.success(),
+        "dogfood open web alias failed: {}",
+        command_output_text(&open_web_alias)
+    );
+    assert!(command_output_text(&open_web_alias).contains(&format!(
+        "app_url=http://127.0.0.1:{web_bridge_port}/?dogfood=real-hub"
+    )));
+
     let open_tui = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
         .arg("apps")
         .arg("open")
@@ -2568,6 +2584,20 @@ fn cli_dogfood_launcher_enables_local_tui_package_for_apps_open() {
         command_output_text(&open_tui)
     );
     assert!(command_output_text(&open_tui).contains("botster-tui-fixture"));
+
+    let open_tui_alias = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("open")
+        .arg("tui")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .output()
+        .expect("open dogfood botster-tui app through alias");
+    assert!(
+        open_tui_alias.status.success(),
+        "dogfood open tui alias failed: {}",
+        command_output_text(&open_tui_alias)
+    );
+    assert!(command_output_text(&open_tui_alias).contains("botster-tui-fixture"));
 
     let removed_alias = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
         .arg("tui")
@@ -6719,7 +6749,42 @@ fn cli_no_arg_prints_host_profile_boot_summary() {
     );
     let text = command_output_text(&summary);
     assert!(text.contains("first-party host profile ready"));
+    assert!(text.contains("Daily runtime commands:"));
+    assert!(text.contains("botster-hub open web --data-dir <path>"));
+    assert!(text.contains(
+        "botster-hub packages available --data-dir <path> --registry <registry-dir-or-file>"
+    ));
+    assert!(text.contains("botster-hub packages reload --data-dir <path> <name>"));
     assert!(!text.contains("unknown command"));
+}
+
+#[test]
+fn cli_help_like_args_print_command_guidance_without_daemon() {
+    for arg in ["help", "--help"] {
+        let help = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+            .arg(arg)
+            .output()
+            .expect("run help-like hub command");
+        assert!(
+            help.status.success(),
+            "help command failed: {}",
+            command_output_text(&help)
+        );
+        let text = command_output_text(&help);
+        assert!(text.contains("Daily runtime commands:"));
+        assert!(text.contains("botster-hub up [--data-dir <path>]"));
+        assert!(text.contains("botster-hub apps open --data-dir <path> <app|package/app>"));
+        assert!(
+            text.contains(
+                "botster-hub packages config set --data-dir <path> <name> '<json-object>'"
+            )
+        );
+        assert!(text.contains(
+            "botster-hub packages apply-update --data-dir <path> <name> --revision <revision>"
+        ));
+        assert!(!text.contains("first-party host profile ready"));
+        assert!(!text.contains("unknown command"));
+    }
 }
 
 #[test]
@@ -7962,6 +8027,26 @@ fn local_package_reload_rereads_manifest_restarts_running_app_and_cli_open_uses_
     assert!(cli_text.contains("version=1.1.0"));
     assert!(!cli_text.contains(package_dir.to_string_lossy().as_ref()));
     assert!(!cli_text.contains(data_dir.to_string_lossy().as_ref()));
+
+    let alias = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("reload")
+        .arg("dogfood.reloadable")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .output()
+        .expect("run package reload alias CLI");
+    assert!(
+        alias.status.success(),
+        "reload alias failed: {}",
+        command_output_text(&alias)
+    );
+    let alias_text = command_output_text(&alias);
+    assert!(alias_text.contains("decision=package"));
+    assert!(alias_text.contains("package_name=dogfood.reloadable"));
+    assert!(alias_text.contains("action=reload"));
+    assert!(alias_text.contains("version=1.1.0"));
+    assert!(!alias_text.contains(package_dir.to_string_lossy().as_ref()));
+    assert!(!alias_text.contains(data_dir.to_string_lossy().as_ref()));
 
     shutdown_cli_daemon(&data_dir, child);
 }

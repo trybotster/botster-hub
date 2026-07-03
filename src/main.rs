@@ -105,6 +105,20 @@ fn main() {
             }
             return;
         }
+        Some("open") => {
+            if let Err(error) = operator_open_alias(env::args().skip(2).collect()) {
+                eprintln!("botster-hub open error: {error}");
+                process::exit(1);
+            }
+            return;
+        }
+        Some("reload") => {
+            if let Err(error) = operator_reload_alias(env::args().skip(2).collect()) {
+                eprintln!("botster-hub reload error: {error}");
+                process::exit(1);
+            }
+            return;
+        }
         Some("apps") => {
             if let Err(error) = operator_apps(env::args().skip(2).collect()) {
                 eprintln!("botster-hub apps error: {error}");
@@ -140,6 +154,10 @@ fn main() {
             }
             return;
         }
+        Some("help" | "--help" | "-h") => {
+            print_global_help();
+            return;
+        }
         Some(command) => {
             eprintln!("botster-hub {command} error: unknown command");
             eprintln!("{}", usage_for(command));
@@ -161,6 +179,7 @@ fn main() {
                 profile.capability_surfaces().len(),
                 package_policy.registry().granted_capabilities().len()
             );
+            print_global_help();
         }
         Err(error) => {
             eprintln!("botster-hub config error: {error}");
@@ -1286,6 +1305,35 @@ fn mcp_serve(args: Vec<String>) -> Result<(), McpCliError> {
     let stdout = io::stdout();
     serve_mcp_stdio(config, BufReader::new(stdin.lock()), stdout.lock())?;
     Ok(())
+}
+
+fn operator_open_alias(args: Vec<String>) -> Result<(), OperatorError> {
+    if args.len() != 3 {
+        return Err(OperatorError::Usage("open"));
+    }
+    let selector = match args[0].as_str() {
+        "web" => "botster-web/web-client",
+        "tui" => "botster-tui",
+        _ => return Err(OperatorError::Usage("open")),
+    };
+    let options = DataDirOptions::parse(args[1..3].to_vec(), "open")?;
+    open_app_by_selector(options.data_directory, selector)
+}
+
+fn operator_reload_alias(args: Vec<String>) -> Result<(), OperatorError> {
+    if args.len() != 3 {
+        return Err(OperatorError::Usage("reload"));
+    }
+    let options = DataDirOptions::parse(args[1..3].to_vec(), "reload")?;
+    operator_packages(
+        vec![
+            "reload".to_string(),
+            "--data-dir".to_string(),
+            options.data_directory.to_string_lossy().into_owned(),
+            args[0].clone(),
+        ],
+        false,
+    )
 }
 
 fn operator_apps(args: Vec<String>) -> Result<(), OperatorError> {
@@ -3934,8 +3982,50 @@ impl fmt::Display for OperatorError {
     }
 }
 
+fn print_global_help() {
+    println!("{}", usage_for("global"));
+}
+
 fn usage_for(command: &str) -> &'static str {
     match command {
+        "global" => {
+            "usage: botster-hub <command> [args...]
+
+Daily runtime commands:
+  botster-hub up [--data-dir <path>] [...]
+  botster-hub down [--data-dir <path>]
+  botster-hub status --data-dir <path>
+  botster-hub open web --data-dir <path>
+  botster-hub open tui --data-dir <path>
+  botster-hub mcp-serve --data-dir <path>
+
+Apps:
+  botster-hub apps list --data-dir <path>
+  botster-hub apps show --data-dir <path> <app|package/app>
+  botster-hub apps open --data-dir <path> <app|package/app>
+
+Packages:
+  botster-hub packages list --data-dir <path>
+  botster-hub packages available --data-dir <path> --registry <registry-dir-or-file>
+  botster-hub packages inspect --data-dir <path> --registry <registry-dir-or-file> <entry-id>
+  botster-hub packages preview-install --data-dir <path> --registry <registry-dir-or-file> <entry-id>
+  botster-hub packages install --data-dir <path> (--path <package-dir-or-manifest>|--registry <registry-dir-or-file> <entry-id>)
+  botster-hub packages show --data-dir <path> <name>
+  botster-hub packages config --data-dir <path> <name>
+  botster-hub packages config set --data-dir <path> <name> '<json-object>'
+  botster-hub packages enable --data-dir <path> (--path <package-dir-or-manifest>|<name>)
+  botster-hub packages disable --data-dir <path> <name>
+  botster-hub packages remove --data-dir <path> <name>
+  botster-hub packages reload --data-dir <path> <name>
+  botster-hub reload <name> --data-dir <path>
+  botster-hub packages check-update --data-dir <path> <name>
+  botster-hub packages preview-update --data-dir <path> <name> --revision <revision> [...]
+  botster-hub packages apply-update --data-dir <path> <name> --revision <revision> [...]
+  botster-hub packages start-entrypoint --data-dir <path> <package> <entrypoint>
+  botster-hub packages stop-entrypoint --data-dir <path> <package> <entrypoint>
+  botster-hub packages restart-entrypoint --data-dir <path> <package> <entrypoint>
+  botster-hub packages entrypoint-status --data-dir <path> <package> <entrypoint>"
+        }
         "start" => "usage: botster-hub start --data-dir <path> [--session-worker-bin <path>]",
         "dogfood" => {
             "usage: botster-hub dogfood [--data-dir <path>] [--session-worker-bin <path>] --web-package-path <path> [--tui-package-path <path>] [--web-bridge-port <port>]"
@@ -3986,12 +4076,13 @@ fn usage_for(command: &str) -> &'static str {
         }
         "shutdown" => "usage: botster-hub shutdown --data-dir <path>",
         "mcp-serve" => "usage: botster-hub mcp-serve --data-dir <path>",
+        "open" => "usage: botster-hub open <web|tui> --data-dir <path>",
         "apps" => "usage: botster-hub apps <list|show|open> ...",
         "apps list" => "usage: botster-hub apps list --data-dir <path>",
         "apps show" => "usage: botster-hub apps show --data-dir <path> <app|package/app>",
         "apps open" => "usage: botster-hub apps open --data-dir <path> <app|package/app>",
         "packages" => {
-            "usage: botster-hub packages <available|inspect|preview-install|install|list|show|config|enable|disable|remove|start-entrypoint|stop-entrypoint|restart-entrypoint|entrypoint-status> ..."
+            "usage: botster-hub packages <available|inspect|preview-install|install|list|show|config|enable|disable|remove|reload|check-update|preview-update|apply-update|start-entrypoint|stop-entrypoint|restart-entrypoint|entrypoint-status> ..."
         }
         "packages install" => {
             "usage: botster-hub packages install --data-dir <path> (--path <package-dir-or-manifest>|--registry <registry-dir-or-file> <entry-id>)"
@@ -4016,6 +4107,7 @@ fn usage_for(command: &str) -> &'static str {
         }
         "packages disable" => "usage: botster-hub packages disable --data-dir <path> <name>",
         "packages remove" => "usage: botster-hub packages remove --data-dir <path> <name>",
+        "reload" => "usage: botster-hub reload <name> --data-dir <path>",
         "packages check-update" => {
             "usage: botster-hub packages check-update --data-dir <path> <name>"
         }
@@ -4041,7 +4133,7 @@ fn usage_for(command: &str) -> &'static str {
         "providers" | "providers list" => "usage: botster-hub providers list --data-dir <path>",
         "inspect" => "usage: botster-hub inspect --data-dir <path> <session-id>",
         _ => {
-            "usage: botster-hub <up|down|start|dogfood|dev-stack|status|sessions|shutdown|mcp-serve|apps|packages|providers|inspect|run-one>"
+            "usage: botster-hub <help|up|down|open|reload|start|dogfood|dev-stack|status|sessions|shutdown|mcp-serve|apps|packages|providers|inspect|run-one>"
         }
     }
 }
