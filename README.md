@@ -297,6 +297,33 @@ down=botster-hub down --data-dir target/botster-hub-dev-stack-data
 existing output contract. `start`, `shutdown`, `packages`, and `apps` remain the
 lower-level operator surfaces.
 
+The daily aliases are only shortcuts over the lower-level daemon-backed
+commands:
+
+```sh
+botster-hub open web --data-dir target/botster-hub-dev-stack-data
+botster-hub open tui --data-dir target/botster-hub-dev-stack-data
+botster-hub reload botster-web --data-dir target/botster-hub-dev-stack-data
+```
+
+`open web` resolves the first-party `botster-web/web-client` app through the
+same `apps open` path. `open tui` resolves `botster-tui` through the daemon's
+terminal launch contract. `reload <package>` is a package reload alias; it does
+not mean entrypoint restart.
+
+Command layers:
+
+- Runtime commands: `up`, `down`, `status`, `mcp-serve`, plus the daily
+  `open web`, `open tui`, and `reload <package>` aliases.
+- App entrypoints: `apps list`, `apps show`, and `apps open` operate on
+  installed package runnable entrypoints projected by the daemon.
+- Local packages: `packages install --path`, `packages enable`, `disable`,
+  `remove`, `reload`, and update commands mutate the running daemon owner.
+- Registry packages: `packages available`, `inspect`, `preview-install`, and
+  `install --registry` operate on a registry directory or file.
+- Plugin configuration: `packages config` reads configuration and
+  `packages config set` writes configuration JSON for an installed package.
+
 The supervised `botster-web` process receives `BOTSTER_HUB_SOCKET` and
 `BOTSTER_HUB_DATA_DIR` because the daemon-owned entrypoint launch injects hub
 connection environment. Foreground terminal apps run through `botster-hub apps
@@ -366,14 +393,34 @@ cargo run -- status --data-dir target/botster-hub-dogfood-data
 
 cargo run -- packages install --data-dir target/botster-hub-dogfood-data \
   --path examples/synthetic-plugin
+cargo run -- packages available --data-dir target/botster-hub-dogfood-data \
+  --registry path/to/package-registry.json
+cargo run -- packages inspect --data-dir target/botster-hub-dogfood-data \
+  --registry path/to/package-registry.json dogfood.synthetic-plugin
+cargo run -- packages preview-install --data-dir target/botster-hub-dogfood-data \
+  --registry path/to/package-registry.json dogfood.synthetic-plugin
+cargo run -- packages install --data-dir target/botster-hub-dogfood-data \
+  --registry path/to/package-registry.json dogfood.synthetic-plugin
 cargo run -- packages list --data-dir target/botster-hub-dogfood-data
 cargo run -- packages show --data-dir target/botster-hub-dogfood-data dogfood.synthetic-plugin
+cargo run -- packages config --data-dir target/botster-hub-dogfood-data dogfood.synthetic-plugin
+cargo run -- packages config set --data-dir target/botster-hub-dogfood-data \
+  dogfood.synthetic-plugin '{"enabled":true}'
 cargo run -- packages enable --data-dir target/botster-hub-dogfood-data dogfood.synthetic-plugin
 cargo run -- packages check-update --data-dir target/botster-hub-dogfood-data dogfood.synthetic-plugin
 cargo run -- packages preview-update --data-dir target/botster-hub-dogfood-data \
   dogfood.synthetic-plugin --revision v1.0.1 --policy manual
 cargo run -- packages apply-update --data-dir target/botster-hub-dogfood-data \
   dogfood.synthetic-plugin --revision v1.0.1 --checksum sha256:example --policy manual
+cargo run -- packages reload --data-dir target/botster-hub-dogfood-data dogfood.synthetic-plugin
+cargo run -- packages start-entrypoint --data-dir target/botster-hub-dogfood-data \
+  dogfood.synthetic-plugin web
+cargo run -- packages entrypoint-status --data-dir target/botster-hub-dogfood-data \
+  dogfood.synthetic-plugin web
+cargo run -- packages restart-entrypoint --data-dir target/botster-hub-dogfood-data \
+  dogfood.synthetic-plugin web
+cargo run -- packages stop-entrypoint --data-dir target/botster-hub-dogfood-data \
+  dogfood.synthetic-plugin web
 cargo run -- packages disable --data-dir target/botster-hub-dogfood-data dogfood.synthetic-plugin
 cargo run -- packages remove --data-dir target/botster-hub-dogfood-data dogfood.synthetic-plugin
 cargo run -- providers list --data-dir target/botster-hub-dogfood-data
@@ -403,11 +450,18 @@ the daemon's refreshed in-memory registry. `packages show`, `packages enable`,
 `packages disable`, `packages remove`, `packages list`, and `providers list` use
 the same daemon-backed registry view. `packages enable --path` remains available
 as a convenience that installs and enables in one daemon-owned mutation.
-`packages check-update`, `packages preview-update`, and `packages apply-update`
-also route through the daemon. They report structured unavailable diagnostics
-for unsupported update/reload paths and `apply-update` records pin/checksum
-metadata without fetching package code, starting entrypoints, or restarting the
-hub. The
+Registry package discovery uses `packages available`; there is no separate
+`search` command. `packages inspect`, `preview-install`, and
+`install --registry` operate on entries from that registry view. Plugin
+configuration is separate package state and uses `packages config` plus
+`packages config set`. `packages check-update`, `packages preview-update`, and
+`packages apply-update` also route through the daemon. They report structured
+unavailable diagnostics for unsupported update/reload paths and `apply-update`
+records pin/checksum metadata without fetching package code, starting
+entrypoints, or restarting the hub. `packages reload` re-reads an installed
+package manifest and restarts any running entrypoints for that package.
+`packages start-entrypoint`, `stop-entrypoint`, `restart-entrypoint`, and
+`entrypoint-status` control app entrypoint processes directly. The
 session commands also use the running daemon runtime, so a session created by
 one CLI process is visible to later `sessions list`, `sessions attach`,
 `sessions send-input`, `sessions resize`, `sessions detach`, and `sessions
