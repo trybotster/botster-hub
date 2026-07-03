@@ -3287,7 +3287,17 @@ fn cli_smoke_proves_local_runtime_daemon_package_app_session_and_webrtc() {
     assert!(text.contains("check name=webrtc status=pass"));
     assert!(text.contains("smoke_result=pass"));
 
-    shutdown_dev_stack_daemon(&data_dir);
+    let status = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("status")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .output()
+        .expect("run botster-hub status after smoke-owned daemon cleanup");
+    assert!(
+        !status.status.success(),
+        "smoke should stop the daemon it started: {}",
+        command_output_text(&status)
+    );
 }
 
 #[test]

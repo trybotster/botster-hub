@@ -118,10 +118,10 @@
 - `./test.sh --test hub_daemon_lifecycle_test cli_smoke_reports_missing_first_party_prerequisites -- --test-threads=1`
   - Runs smoke without required first-party package fixture(s) and asserts precise missing-prerequisite diagnostics.
 - Existing focused regressions:
-  - `./test.sh --test hub_daemon_lifecycle_test cli_local_runtime_up_starts_reuses_and_down_stops_dev_stack -- --test-threads=1`
+  - `./test.sh --test hub_daemon_lifecycle_test cli_local_runtime_up_starts_reuses_and_down_stops_runtime -- --test-threads=1`
   - `./test.sh --test hub_daemon_lifecycle_test cli_local_runtime_up_reports_incompatible_daemon_without_deleting_socket -- --test-threads=1`
   - `./test.sh --test hub_daemon_lifecycle_test cli_dev_stack_acceptance_smoke_exercises_first_party_plugins_project_pipelines_session_templates_reload_and_shutdown -- --test-threads=1`
-  - `./test.sh --test hub_daemon_lifecycle_test daemon_status_exposes_same_compatibility_descriptor_as_hello -- --test-threads=1`
+  - `./test.sh --test hub_daemon_lifecycle_test external_hub_client_reports_compatibility_descriptor_and_mismatch_diagnostics -- --test-threads=1`
 - If client DTOs or generated protocol change:
   - `./test.sh --test hub_client_api_test`
   - TypeScript protocol generation/drift test already present in the client crate, if touched.

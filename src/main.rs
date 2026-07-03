@@ -535,6 +535,7 @@ fn local_runtime_smoke(args: Vec<String>) -> Result<(), SmokeError> {
     preflight_smoke_packages(&options.dev_stack)?;
 
     let outcome = prepare_local_runtime(options.dev_stack)?;
+    let _cleanup = SmokeRuntimeCleanup::new(&outcome);
     print_runtime_check(
         "daemon",
         RuntimeCheckStatus::Pass,
@@ -655,7 +656,9 @@ fn smoke_session_round_trip(config: &botster_hub::HubConfig) -> Result<(), Smoke
         },
     )?;
     if spawn.kind == DaemonResponseKind::OperatorError {
-        return Err(SmokeError::OperatorResponse(spawn));
+        return Err(SmokeError::OperatorResponse(operator_response_message(
+            &spawn,
+        )));
     }
     let mut observed = Vec::new();
     stream_attach(
@@ -675,12 +678,20 @@ fn smoke_session_round_trip(config: &botster_hub::HubConfig) -> Result<(), Smoke
     Err(SmokeError::SessionRoundTrip(observed))
 }
 
+fn operator_response_message(response: &DaemonResponse) -> String {
+    response
+        .error
+        .as_ref()
+        .map(|error| error.message.clone())
+        .unwrap_or_else(|| "operator error".to_string())
+}
+
 fn smoke_local_webrtc_round_trip(
     config: &botster_hub::HubConfig,
     bootstrap: &DaemonLocalWebrtcBootstrap,
 ) -> Result<(), SmokeError> {
     let stream_key = local_webrtc_stream_key(&bootstrap.grant_secret)?;
-    let signal = block_on(async {
+    block_on(async {
         let (mut offer_peer, offer) = LocalWebrtcOfferPeer::create_offer().await?;
         let signal = daemon_transport_request(
             config,
@@ -768,8 +779,7 @@ fn smoke_local_webrtc_round_trip(
                 observed.len()
             )))
         }
-    });
-    signal
+    })
 }
 
 struct LocalWebrtcOffererHandler {
@@ -1043,7 +1053,7 @@ fn require_smoke_package(packages: &[DaemonPackage], name: &'static str) -> Resu
 }
 
 fn sanitize_runtime_message(message: &str) -> String {
-    message.replace('\n', " ").replace('\r', " ")
+    message.replace(['\n', '\r'], " ")
 }
 
 struct LocalRuntimeOutcome {
@@ -1054,6 +1064,35 @@ struct LocalRuntimeOutcome {
     web: DogfoodWebLaunch,
     tui: String,
     workspaces: String,
+}
+
+struct SmokeRuntimeCleanup<'a> {
+    outcome: &'a LocalRuntimeOutcome,
+}
+
+impl<'a> SmokeRuntimeCleanup<'a> {
+    fn new(outcome: &'a LocalRuntimeOutcome) -> Self {
+        Self { outcome }
+    }
+}
+
+impl Drop for SmokeRuntimeCleanup<'_> {
+    fn drop(&mut self) {
+        if !matches!(
+            self.outcome.daemon_ownership,
+            DevStackDaemonOwnership::Started
+        ) {
+            return;
+        }
+        let _ = daemon_transport_request(
+            &self.outcome.config,
+            DaemonRequest::StopPackageEntrypoint {
+                package_name: "botster-web".to_string(),
+                entrypoint_id: "web-client".to_string(),
+            },
+        );
+        let _ = daemon_transport_request(&self.outcome.config, DaemonRequest::DaemonShutdown);
+    }
 }
 
 fn prepare_local_runtime(options: DevStackOptions) -> Result<LocalRuntimeOutcome, DevStackError> {
@@ -4346,7 +4385,7 @@ enum SmokeError {
     Transport(botster_hub::DaemonTransportError),
     UnexpectedResponse(&'static str),
     MissingPrerequisite(&'static str),
-    OperatorResponse(DaemonResponse),
+    OperatorResponse(String),
     SessionRoundTrip(String),
     Webrtc(String),
 }
@@ -4610,14 +4649,7 @@ impl fmt::Display for SmokeError {
             Self::MissingPrerequisite(name) => {
                 write!(formatter, "missing_prerequisite={name}")
             }
-            Self::OperatorResponse(response) => {
-                let message = response
-                    .error
-                    .as_ref()
-                    .map(|error| error.message.as_str())
-                    .unwrap_or("operator error");
-                write!(formatter, "operator response: {message}")
-            }
+            Self::OperatorResponse(message) => write!(formatter, "operator response: {message}"),
             Self::SessionRoundTrip(observed) => write!(
                 formatter,
                 "session terminal round trip did not observe marker; observed_bytes={}",
