@@ -1738,6 +1738,35 @@ fn run_local_runtime_up(
         .expect("run botster-hub up")
 }
 
+fn run_local_runtime_smoke(
+    data_dir: &Path,
+    project_pipelines_package_path: &Path,
+    web_package_path: &Path,
+    tui_package_path: &Path,
+    workspaces_package_path: &Path,
+    web_bridge_port: u16,
+) -> Output {
+    ensure_session_worker_binary();
+    Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("smoke")
+        .arg("--data-dir")
+        .arg(data_dir)
+        .arg("--session-worker-bin")
+        .arg(session_worker_binary_path())
+        .arg("--project-pipelines-package-path")
+        .arg(project_pipelines_package_path)
+        .arg("--web-package-path")
+        .arg(web_package_path)
+        .arg("--tui-package-path")
+        .arg(tui_package_path)
+        .arg("--workspaces-package-path")
+        .arg(workspaces_package_path)
+        .arg("--web-bridge-port")
+        .arg(web_bridge_port.to_string())
+        .output()
+        .expect("run botster-hub smoke")
+}
+
 fn shutdown_dev_stack_daemon(data_dir: &Path) {
     let output = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
         .arg("shutdown")
@@ -2935,6 +2964,33 @@ fn cli_dev_stack_bootstrap_reuses_live_daemon_and_preserves_state_after_restart(
 }
 
 #[test]
+fn cli_doctor_reports_stopped_runtime_with_remediation() {
+    let _guard = daemon_test_lock()
+        .lock()
+        .expect("serialize real daemon test");
+    let data_dir = unique_short_test_dir("cli-doctor-stopped");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("doctor")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .output()
+        .expect("run botster-hub doctor against stopped runtime");
+    assert!(
+        !output.status.success(),
+        "doctor should fail for stopped runtime: {}",
+        command_output_text(&output)
+    );
+    let text = command_output_text(&output);
+    assert!(text.contains("doctor=local_runtime"));
+    assert!(text.contains("check name=daemon_running status=fail"));
+    assert!(text.contains(&format!(
+        "remediation=botster-hub up --data-dir {}",
+        data_dir.display()
+    )));
+}
+
+#[test]
 fn cli_local_runtime_up_starts_reuses_and_down_stops_runtime() {
     let _guard = daemon_test_lock()
         .lock()
@@ -3035,6 +3091,68 @@ fn cli_local_runtime_up_starts_reuses_and_down_stops_runtime() {
 }
 
 #[test]
+fn cli_doctor_reports_healthy_runtime_checks() {
+    let _guard = daemon_test_lock()
+        .lock()
+        .expect("serialize real daemon test");
+    let data_dir = unique_test_dir("cli-doctor-healthy");
+    let project_pipelines_package_dir = unique_test_dir("cli-doctor-project-pipelines");
+    let web_package_dir = unique_test_dir("cli-doctor-web");
+    let tui_package_dir = unique_test_dir("cli-doctor-tui");
+    let workspaces_package_dir = unique_test_dir("cli-doctor-workspaces");
+    write_project_pipelines_availability_package(&project_pipelines_package_dir);
+    write_botster_web_package(&web_package_dir);
+    write_botster_tui_package(&tui_package_dir);
+    write_botster_workspaces_local_package(&workspaces_package_dir, "botster-workspaces");
+
+    let up = run_local_runtime_up(
+        &data_dir,
+        &project_pipelines_package_dir,
+        &web_package_dir,
+        &tui_package_dir,
+        &workspaces_package_dir,
+        unused_loopback_port(),
+    );
+    assert!(
+        up.status.success(),
+        "up failed: {}",
+        command_output_text(&up)
+    );
+
+    let doctor = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("doctor")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .output()
+        .expect("run botster-hub doctor against healthy runtime");
+    assert!(
+        doctor.status.success(),
+        "doctor failed: {}",
+        command_output_text(&doctor)
+    );
+    let text = command_output_text(&doctor);
+    assert!(text.contains("check name=daemon_running status=pass"));
+    assert!(text.contains("check name=daemon_compatible status=pass"));
+    assert!(text.contains("conformance_fixture_revision="));
+    assert!(text.contains("check name=core_initialized status=pass"));
+    assert!(text.contains("check name=package_registry status=pass"));
+    assert!(text.contains("check name=botster_web_app status=pass"));
+    for package_dir in [
+        &project_pipelines_package_dir,
+        &web_package_dir,
+        &tui_package_dir,
+        &workspaces_package_dir,
+    ] {
+        assert!(
+            !text.contains(package_dir.to_string_lossy().as_ref()),
+            "doctor output should not leak package source path {package_dir:?}: {text}"
+        );
+    }
+
+    shutdown_dev_stack_daemon(&data_dir);
+}
+
+#[test]
 fn cli_local_runtime_up_reports_incompatible_daemon_without_deleting_socket() {
     let _guard = daemon_test_lock()
         .lock()
@@ -3106,6 +3224,135 @@ fn cli_local_runtime_up_reports_incompatible_daemon_without_deleting_socket() {
 
     handle.join().expect("fake incompatible daemon thread");
     let _ = fs::remove_file(socket_path);
+}
+
+#[test]
+fn cli_doctor_reports_incompatible_stale_daemon_without_deleting_socket() {
+    let _guard = daemon_test_lock()
+        .lock()
+        .expect("serialize real daemon test");
+    let data_dir = unique_short_test_dir("cli-doctor-incompat");
+    let config = explicit_config(&data_dir);
+    let socket_path = config
+        .transports
+        .local_socket
+        .as_ref()
+        .expect("local socket binding")
+        .path
+        .clone();
+    fs::create_dir_all(socket_path.parent().expect("socket parent")).expect("create socket parent");
+    let listener = UnixListener::bind(&socket_path).expect("bind fake incompatible daemon");
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let handle = thread::spawn(move || {
+        ready_tx.send(()).expect("send listener ready");
+        let Ok((mut stream, _addr)) = listener.accept() else {
+            return;
+        };
+        let mut reader = BufReader::new(stream.try_clone().expect("clone fake stream"));
+        let mut hello = String::new();
+        let _ = reader.read_line(&mut hello);
+        let _ = stream.write_all(b"{\"protocol\":\"botster-hub-daemon-v1\"}\n");
+    });
+    ready_rx.recv().expect("fake listener ready");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("doctor")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .output()
+        .expect("run botster-hub doctor against incompatible daemon");
+    assert!(
+        !output.status.success(),
+        "doctor unexpectedly succeeded: {}",
+        command_output_text(&output)
+    );
+    let text = command_output_text(&output);
+    assert!(text.contains("check name=daemon_compatible status=fail"));
+    assert!(text.contains("running daemon is incompatible or stale"));
+    assert!(text.contains("stop the stale botster-hub process"));
+    assert!(
+        socket_path.exists(),
+        "doctor must not delete a connectable socket on compatibility failure"
+    );
+
+    handle.join().expect("fake incompatible daemon thread");
+    let _ = fs::remove_file(socket_path);
+}
+
+#[test]
+fn cli_smoke_proves_local_runtime_daemon_package_app_session_and_webrtc() {
+    let _guard = daemon_test_lock()
+        .lock()
+        .expect("serialize real daemon test");
+    let data_dir = unique_test_dir("cli-smoke-success");
+    let project_pipelines_package_dir = unique_test_dir("cli-smoke-project-pipelines");
+    let web_package_dir = unique_test_dir("cli-smoke-web");
+    let tui_package_dir = unique_test_dir("cli-smoke-tui");
+    let workspaces_package_dir = unique_test_dir("cli-smoke-workspaces");
+    write_project_pipelines_availability_package(&project_pipelines_package_dir);
+    write_botster_web_package(&web_package_dir);
+    write_botster_tui_package(&tui_package_dir);
+    write_botster_workspaces_local_package(&workspaces_package_dir, "botster-workspaces");
+
+    let output = run_local_runtime_smoke(
+        &data_dir,
+        &project_pipelines_package_dir,
+        &web_package_dir,
+        &tui_package_dir,
+        &workspaces_package_dir,
+        unused_loopback_port(),
+    );
+    assert!(
+        output.status.success(),
+        "smoke failed: {}",
+        command_output_text(&output)
+    );
+    let text = command_output_text(&output);
+    assert!(text.contains("smoke=local_runtime"));
+    assert!(text.contains("check name=daemon status=pass"));
+    assert!(text.contains("check name=core status=pass"));
+    assert!(text.contains("check name=packages status=pass"));
+    assert!(text.contains("check name=apps status=pass"));
+    assert!(text.contains("check name=session_terminal status=pass"));
+    assert!(text.contains("check name=webrtc status=pass"));
+    assert!(text.contains("smoke_result=pass"));
+
+    let status = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("status")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .output()
+        .expect("run botster-hub status after smoke-owned daemon cleanup");
+    assert!(
+        !status.status.success(),
+        "smoke should stop the daemon it started: {}",
+        command_output_text(&status)
+    );
+}
+
+#[test]
+fn cli_smoke_reports_missing_first_party_prerequisites() {
+    let _guard = daemon_test_lock()
+        .lock()
+        .expect("serialize real daemon test");
+    let data_dir = unique_short_test_dir("cli-smoke-missing");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("smoke")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("--project-pipelines-package-path")
+        .arg(data_dir.join("missing-project-pipelines"))
+        .output()
+        .expect("run botster-hub smoke without package prerequisites");
+    assert!(
+        !output.status.success(),
+        "smoke unexpectedly succeeded: {}",
+        command_output_text(&output)
+    );
+    let text = command_output_text(&output);
+    assert!(text.contains("smoke=local_runtime"));
+    assert!(text.contains("missing_prerequisite=project-pipelines"));
 }
 
 #[test]
