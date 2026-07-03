@@ -310,6 +310,41 @@ fn local_webrtc_stream_key(secret: &str) -> AesGcmKey {
     AesGcmKey::from_slice(&bytes).expect("local WebRTC secret is an AES-GCM key")
 }
 
+async fn open_local_webrtc_peer(
+    endpoint: &botster_hub_client::DaemonEndpoint,
+    bootstrap: &botster_hub_client::DaemonLocalWebrtcBootstrap,
+) -> (LocalWebrtcOfferPeer, AesGcmKey) {
+    let stream_key = local_webrtc_stream_key(&bootstrap.grant_secret);
+    let (mut offer_peer, offer) = LocalWebrtcOfferPeer::create_offer()
+        .await
+        .expect("create WebRTC offer peer");
+    let signal = botster_hub_client::request(
+        endpoint,
+        botster_hub_client::DaemonRequest::LocalWebrtcSignal {
+            grant_id: bootstrap.grant_id.clone(),
+            grant_secret: bootstrap.grant_secret.clone(),
+            origin: bootstrap.expected_origin.clone(),
+            offer,
+        },
+    )
+    .expect("signal local WebRTC offer");
+    assert_eq!(
+        signal.kind,
+        botster_hub_client::DaemonResponseKind::LocalWebrtcAnswer
+    );
+    let answer = signal
+        .local_webrtc_answer
+        .as_ref()
+        .expect("signal response includes WebRTC answer")
+        .answer
+        .clone();
+    offer_peer
+        .accept_answer(answer)
+        .await
+        .expect("offer peer accepts answer and opens channel");
+    (offer_peer, stream_key)
+}
+
 #[test]
 fn generated_daemon_protocol_mirrors_core_aes_gcm_envelope_fields() {
     let envelope = AesGcmEnvelope {
@@ -941,8 +976,35 @@ function readBody(request) {
 
 http.createServer(async (request, response) => {
   if (request.url === '/?dogfood=real-hub') {
-    response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
-    response.end('<!doctype html><html><head><title>Botster Web</title></head><body><main id="root">botster-web packaged UI</main><script type="module" src="/assets/index.js"></script></body></html>');
+    try {
+      let bootstrap = null;
+      if (socket && fs.existsSync(socket)) {
+        const origin = `http://${request.headers.host}`;
+        try {
+          const daemonResponse = await daemonRequest({
+            request: {
+              type: 'issue_local_webrtc_bootstrap',
+              package_name: 'botster-web',
+              entrypoint_id: 'web-client',
+              origin,
+            },
+          });
+          bootstrap = daemonResponse.local_webrtc_bootstrap || null;
+          if (!bootstrap) {
+            throw new Error(`missing local WebRTC bootstrap: ${JSON.stringify(daemonResponse)}`);
+          }
+        } catch (error) {
+          if (!String(error && error.message ? error.message : error).includes('ENOENT')) {
+            throw error;
+          }
+        }
+      }
+      response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+      response.end(`<!doctype html><html><head><title>Botster Web</title><script>globalThis.__BOTSTER_LOCAL_WEBRTC_BOOTSTRAP__ = ${JSON.stringify(bootstrap)};</script></head><body><main id="root">botster-web packaged UI</main><script type="module" src="/assets/index.js"></script></body></html>`);
+    } catch (error) {
+      response.writeHead(502, { 'content-type': 'text/plain; charset=utf-8' });
+      response.end(String(error && error.message ? error.message : error));
+    }
     return;
   }
   if (request.url === '/bridge' && request.method === 'POST') {
@@ -1276,7 +1338,8 @@ fn read_http_path(url: &str, path: &str) -> (String, String) {
         .parse::<u16>()
         .expect("HTTP port");
     let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect HTTP endpoint");
-    let request = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+    let request =
+        format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
     stream
         .write_all(request.as_bytes())
         .expect("write HTTP request");
@@ -1347,6 +1410,48 @@ fn dogfood_bridge_request(
     assert_eq!(envelope["source"], "socket");
     assert_eq!(envelope["socketExists"], true);
     serde_json::from_value(envelope["response"].clone()).expect("daemon response JSON")
+}
+
+fn botster_web_page_bootstrap(bridge_url: &str) -> botster_hub_client::DaemonLocalWebrtcBootstrap {
+    let (headers, body) = read_http_path(bridge_url, "/?dogfood=real-hub");
+    assert!(
+        headers.starts_with("HTTP/1.1 200") || headers.starts_with("HTTP/1.0 200"),
+        "botster-web page returned non-200: {headers} body={body}"
+    );
+    assert!(
+        headers
+            .to_ascii_lowercase()
+            .contains("content-type: text/html"),
+        "botster-web page should be HTML: {headers}"
+    );
+    let marker = "globalThis.__BOTSTER_LOCAL_WEBRTC_BOOTSTRAP__ = ";
+    let start = body
+        .find(marker)
+        .map(|index| index + marker.len())
+        .expect("HTML page includes local WebRTC bootstrap global");
+    let rest = &body[start..];
+    let end = rest
+        .find(";</script>")
+        .expect("HTML bootstrap script terminates");
+    serde_json::from_str(&rest[..end]).expect("HTML bootstrap JSON")
+}
+
+fn wait_for_botster_web_health(bridge_url: &str) {
+    let port = bridge_url
+        .strip_prefix("http://127.0.0.1:")
+        .expect("local HTTP URL")
+        .parse::<u16>()
+        .expect("HTTP port");
+    for _ in 0..100 {
+        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            let health = read_json_health(bridge_url);
+            if health["ok"] == true {
+                return;
+            }
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    panic!("botster-web bridge health did not become ready");
 }
 
 fn unused_loopback_port() -> u16 {
@@ -4983,6 +5088,237 @@ fn installed_botster_web_launch_issues_local_webrtc_grant_and_data_channel_adapt
         fs::read_to_string(data_dir.join("hub-state.json")).expect("read hub state");
     assert!(!persisted_state.contains(&bootstrap.grant_id));
     assert!(!persisted_state.contains(&bootstrap.grant_secret));
+    assert!(!persisted_state.contains("grant_secret"));
+
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
+fn botster_web_same_url_reload_issues_fresh_local_webrtc_bootstrap() {
+    let _guard = daemon_test_lock()
+        .lock()
+        .expect("serialize real daemon test");
+    let data_dir = unique_short_test_dir("web-webrtc-reload");
+    let package_dir = unique_test_dir("web-webrtc-reload-package");
+    write_botster_web_package(&package_dir);
+    let config = explicit_config(&data_dir);
+    let socket_path = config
+        .transports
+        .local_socket
+        .as_ref()
+        .expect("test config has local socket")
+        .path
+        .clone();
+    let endpoint = botster_hub_client::DaemonEndpoint::new(socket_path);
+    let child = start_cli_daemon(&data_dir);
+    enable_supervised_package(&data_dir, &package_dir);
+
+    let web_bridge_port = unused_loopback_port();
+    let start = botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::StartPackageEntrypoint {
+            package_name: "botster-web".to_string(),
+            entrypoint_id: "web-client".to_string(),
+            environment_overrides: BTreeMap::from([(
+                "BOTSTER_WEB_DOGFOOD_BRIDGE_PORT".to_string(),
+                web_bridge_port.to_string(),
+            )]),
+        },
+    )
+    .expect("start botster-web entrypoint");
+    assert_eq!(
+        start.kind,
+        botster_hub_client::DaemonResponseKind::LocalWebrtcBootstrap
+    );
+    let bridge_url = format!("http://127.0.0.1:{web_bridge_port}");
+    wait_for_botster_web_health(&bridge_url);
+
+    let wrong_origin = botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::IssueLocalWebrtcBootstrap {
+            package_name: "botster-web".to_string(),
+            entrypoint_id: "web-client".to_string(),
+            origin: "http://127.0.0.1:1".to_string(),
+        },
+    )
+    .expect("wrong-origin bootstrap issuance returns operator response");
+    assert_eq!(
+        wrong_origin.kind,
+        botster_hub_client::DaemonResponseKind::OperatorError
+    );
+    assert_eq!(
+        wrong_origin.error.as_ref().map(|error| error.code.as_str()),
+        Some("local_webrtc_bootstrap_origin_mismatch")
+    );
+
+    let bootstrap_a = botster_web_page_bootstrap(&bridge_url);
+    let bootstrap_b = botster_web_page_bootstrap(&bridge_url);
+    assert_eq!(bootstrap_a.package_name, "botster-web");
+    assert_eq!(bootstrap_a.entrypoint_id, "web-client");
+    assert_eq!(bootstrap_a.expected_origin, bridge_url);
+    assert_eq!(bootstrap_b.expected_origin, bootstrap_a.expected_origin);
+    assert_ne!(bootstrap_a.grant_id, bootstrap_b.grant_id);
+    assert_ne!(bootstrap_a.grant_secret, bootstrap_b.grant_secret);
+
+    block_on(async {
+        let (mut first_peer, first_key) = open_local_webrtc_peer(&endpoint, &bootstrap_a).await;
+        let status = first_peer
+            .encrypted_request(&first_key, &botster_hub_client::DaemonRequest::Status)
+            .await
+            .expect("status over first encrypted WebRTC data channel");
+        assert_eq!(status.kind, botster_hub_client::DaemonResponseKind::Status);
+        let spawn = first_peer
+            .encrypted_request(
+                &first_key,
+                &botster_hub_client::DaemonRequest::Spawn {
+                    session_id: "local-webrtc-reload-session".to_string(),
+                    command: "printf 'reload-ready\\n'; while IFS= read -r line; do printf 'reload:%s\\n' \"$line\"; done".to_string(),
+                },
+            )
+            .await
+            .expect("spawn over first encrypted WebRTC data channel");
+        assert_eq!(spawn.kind, botster_hub_client::DaemonResponseKind::Spawned);
+        first_peer.peer.close().await.expect("close first peer");
+
+        let rejected_secret = botster_hub_client::request(
+            &endpoint,
+            botster_hub_client::DaemonRequest::LocalWebrtcSignal {
+                grant_id: bootstrap_b.grant_id.clone(),
+                grant_secret: "wrong-secret".to_string(),
+                origin: bootstrap_b.expected_origin.clone(),
+                offer: serde_json::Value::Null,
+            },
+        )
+        .expect("wrong-secret reload signal returns operator response");
+        assert_eq!(
+            rejected_secret.kind,
+            botster_hub_client::DaemonResponseKind::OperatorError
+        );
+        assert_eq!(
+            rejected_secret
+                .error
+                .as_ref()
+                .map(|error| error.code.as_str()),
+            Some("local_webrtc_secret_mismatch")
+        );
+
+        let (mut reload_peer, reload_key) = open_local_webrtc_peer(&endpoint, &bootstrap_b).await;
+        let status = reload_peer
+            .encrypted_request(&reload_key, &botster_hub_client::DaemonRequest::Status)
+            .await
+            .expect("status over reload encrypted WebRTC data channel");
+        assert_eq!(status.kind, botster_hub_client::DaemonResponseKind::Status);
+        let sessions = reload_peer
+            .encrypted_request(
+                &reload_key,
+                &botster_hub_client::DaemonRequest::ListSessions,
+            )
+            .await
+            .expect("list sessions over reload encrypted WebRTC data channel");
+        assert_eq!(
+            sessions.kind,
+            botster_hub_client::DaemonResponseKind::Sessions
+        );
+        assert!(
+            sessions
+                .sessions
+                .iter()
+                .any(|session| session.session_id == "local-webrtc-reload-session"),
+            "reload DataChannel should hydrate existing sessions"
+        );
+        let attach = reload_peer
+            .encrypted_request(
+                &reload_key,
+                &botster_hub_client::DaemonRequest::Attach {
+                    session_id: "local-webrtc-reload-session".to_string(),
+                    subscription_id: "local-webrtc-reload-subscription".to_string(),
+                },
+            )
+            .await
+            .expect("attach over reload encrypted WebRTC data channel");
+        assert_eq!(attach.kind, botster_hub_client::DaemonResponseKind::Events);
+        let send = reload_peer
+            .encrypted_request(
+                &reload_key,
+                &botster_hub_client::DaemonRequest::SendInput {
+                    session_id: "local-webrtc-reload-session".to_string(),
+                    data: "after-reload\n".to_string(),
+                },
+            )
+            .await
+            .expect("send input over reload encrypted WebRTC data channel");
+        assert_eq!(send.kind, botster_hub_client::DaemonResponseKind::Events);
+        let mut observed = String::new();
+        for _ in 0..120 {
+            let drain = reload_peer
+                .encrypted_request(
+                    &reload_key,
+                    &botster_hub_client::DaemonRequest::Drain {
+                        session_id: "local-webrtc-reload-session".to_string(),
+                    },
+                )
+                .await
+                .expect("drain over reload encrypted WebRTC data channel");
+            for event in drain.events {
+                if let botster_hub_client::DaemonEvent::TerminalOutput { data, .. } = event {
+                    observed.push_str(&data);
+                }
+            }
+            if observed.contains("reload:after-reload") {
+                break;
+            }
+            sleep(Duration::from_millis(30)).await;
+        }
+        assert!(
+            observed.contains("reload:after-reload"),
+            "reload encrypted WebRTC data channel should drain session output, got {observed:?}"
+        );
+
+        let shutdown = reload_peer
+            .encrypted_request(
+                &reload_key,
+                &botster_hub_client::DaemonRequest::ShutdownSession {
+                    session_id: "local-webrtc-reload-session".to_string(),
+                },
+            )
+            .await
+            .expect("shutdown over reload encrypted WebRTC data channel");
+        assert_eq!(
+            shutdown.kind,
+            botster_hub_client::DaemonResponseKind::Events
+        );
+        reload_peer.peer.close().await.expect("close reload peer");
+    });
+
+    let reused = botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::LocalWebrtcSignal {
+            grant_id: bootstrap_a.grant_id.clone(),
+            grant_secret: bootstrap_a.grant_secret.clone(),
+            origin: bootstrap_a.expected_origin.clone(),
+            offer: serde_json::Value::Null,
+        },
+    )
+    .expect("reused first page-load grant returns operator response");
+    assert_eq!(
+        reused.kind,
+        botster_hub_client::DaemonResponseKind::OperatorError
+    );
+    assert_eq!(
+        reused.error.as_ref().map(|error| error.code.as_str()),
+        Some("local_webrtc_redeemed_grant")
+    );
+
+    let persisted_state =
+        fs::read_to_string(data_dir.join("hub-state.json")).expect("read hub state");
+    for secret in [
+        bootstrap_a.grant_id.as_str(),
+        bootstrap_a.grant_secret.as_str(),
+        bootstrap_b.grant_id.as_str(),
+        bootstrap_b.grant_secret.as_str(),
+    ] {
+        assert!(!persisted_state.contains(secret));
+    }
     assert!(!persisted_state.contains("grant_secret"));
 
     shutdown_cli_daemon(&data_dir, child);

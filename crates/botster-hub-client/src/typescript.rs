@@ -198,6 +198,14 @@ pub(crate) fn daemon_protocol_typescript() -> String {
                 ],
             ),
             (
+                "issue_local_webrtc_bootstrap",
+                &[
+                    ("package_name", "string"),
+                    ("entrypoint_id", "string"),
+                    ("origin", "string"),
+                ],
+            ),
+            (
                 "stop_package_entrypoint",
                 &[("package_name", "string"), ("entrypoint_id", "string")],
             ),
