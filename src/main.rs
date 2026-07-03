@@ -1585,7 +1585,9 @@ fn read_botster_web_ui(web_url: &str) -> Result<(), String> {
         .ok_or_else(|| "unsupported botster-web UI URL".to_string())?;
     let (headers, body) = read_botster_web_http(bridge_url, "/?dogfood=real-hub", "UI")?;
     if !headers.starts_with("HTTP/1.1 200") && !headers.starts_with("HTTP/1.0 200") {
-        return Err("botster-web UI returned non-200 status".to_string());
+        return Err(format!(
+            "botster-web UI returned non-200 status: {headers}; body={body}"
+        ));
     }
     let normalized_headers = headers.to_ascii_lowercase();
     if !normalized_headers.contains("content-type: text/html") {
@@ -1616,7 +1618,8 @@ fn read_botster_web_http(
     stream
         .set_read_timeout(Some(Duration::from_secs(1)))
         .map_err(|error| format!("set botster-web {label} read timeout: {error}"))?;
-    let request = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+    let request =
+        format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
     stream
         .write_all(request.as_bytes())
         .map_err(|error| format!("write botster-web {label} request: {error}"))?;

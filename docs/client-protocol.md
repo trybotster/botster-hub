@@ -290,6 +290,15 @@ expiry, signaling transport (`daemon_request`), data plane
 ordered `true`, no `max_retransmits`, no `max_packet_lifetime_ms`, and no hub
 application reorder buffer.
 
+After the entrypoint is already running, a page-serving runtime can request a
+fresh one-shot browser grant with
+`IssueLocalWebrtcBootstrap { package_name, entrypoint_id, origin }`. Initial
+support is deliberately limited to `botster-web` / `web-client`. The daemon only
+mints a grant when the package is enabled, the entrypoint is running, and the
+supplied origin matches the origin of the supervisor's structured
+`launch_target.local_url`. This request is the reload-safe page-load contract;
+it does not make existing grants reusable.
+
 The local signaling surface is the daemon request
 `LocalWebrtcSignal { grant_id, grant_secret, origin, offer }`. The hub validates
 that the grant exists, has not expired, has not already been redeemed, has the

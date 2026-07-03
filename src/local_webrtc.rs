@@ -47,30 +47,15 @@ impl LocalWebrtcTransport {
         if entrypoint_id != "web-client" {
             return Ok(None);
         }
-        let now = now_seconds();
-        let grant_id = random_token("grant")?;
-        let grant_secret = random_secret_token()?;
         let expected_origin = expected_origin(environment);
-        let bootstrap = DaemonLocalWebrtcBootstrap {
-            grant_id: grant_id.clone(),
-            grant_secret: grant_secret.clone(),
-            package_name: "botster-web".to_string(),
-            entrypoint_id: entrypoint_id.to_string(),
-            expected_origin: expected_origin.clone(),
-            expires_at: now + GRANT_TTL_SECONDS,
-            signaling_transport: "daemon_request".to_string(),
-            data_plane: "webrtc_data_channel".to_string(),
-            ordered: true,
-            max_retransmits: None,
-            max_packet_lifetime_ms: None,
-        };
+        let bootstrap = self.issue_bootstrap("botster-web", entrypoint_id, &expected_origin)?;
         environment.insert(
             "BOTSTER_LOCAL_WEBRTC_GRANT_ID".to_string(),
-            grant_id.clone(),
+            bootstrap.grant_id.clone(),
         );
         environment.insert(
             "BOTSTER_LOCAL_WEBRTC_GRANT_SECRET".to_string(),
-            grant_secret.clone(),
+            bootstrap.grant_secret.clone(),
         );
         environment.insert(
             "BOTSTER_LOCAL_WEBRTC_SIGNALING_TRANSPORT".to_string(),
@@ -80,17 +65,43 @@ impl LocalWebrtcTransport {
             "BOTSTER_LOCAL_WEBRTC_EXPECTED_ORIGIN".to_string(),
             expected_origin.clone(),
         );
+        Ok(Some(bootstrap))
+    }
+
+    /// Mint a local, single-use bootstrap grant bound to an already-running app origin.
+    pub fn issue_bootstrap(
+        &mut self,
+        package_name: &str,
+        entrypoint_id: &str,
+        expected_origin: &str,
+    ) -> LocalWebrtcResult<DaemonLocalWebrtcBootstrap> {
+        let now = now_seconds();
+        let grant_id = random_token("grant")?;
+        let grant_secret = random_secret_token()?;
+        let bootstrap = DaemonLocalWebrtcBootstrap {
+            grant_id: grant_id.clone(),
+            grant_secret: grant_secret.clone(),
+            package_name: package_name.to_string(),
+            entrypoint_id: entrypoint_id.to_string(),
+            expected_origin: expected_origin.to_string(),
+            expires_at: now + GRANT_TTL_SECONDS,
+            signaling_transport: "daemon_request".to_string(),
+            data_plane: "webrtc_data_channel".to_string(),
+            ordered: true,
+            max_retransmits: None,
+            max_packet_lifetime_ms: None,
+        };
         self.grants.insert(
             grant_id.clone(),
             LocalWebrtcGrant {
                 grant_id,
                 grant_secret,
-                expected_origin,
+                expected_origin: expected_origin.to_string(),
                 expires_at: bootstrap.expires_at,
                 redeemed: false,
             },
         );
-        Ok(Some(bootstrap))
+        Ok(bootstrap)
     }
 
     /// Redeem one grant and create a WebRTC answer for the supplied offer.

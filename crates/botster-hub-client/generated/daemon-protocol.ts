@@ -75,6 +75,7 @@ export type DaemonRequest =
   | { type: "disable_package"; package_name: string }
   | { type: "remove_package"; package_name: string }
   | { type: "start_package_entrypoint"; package_name: string; entrypoint_id: string; environment_overrides?: Record<string, string> }
+  | { type: "issue_local_webrtc_bootstrap"; package_name: string; entrypoint_id: string; origin: string }
   | { type: "stop_package_entrypoint"; package_name: string; entrypoint_id: string }
   | { type: "restart_package_entrypoint"; package_name: string; entrypoint_id: string }
   | { type: "package_entrypoint_status"; package_name: string; entrypoint_id: string }
