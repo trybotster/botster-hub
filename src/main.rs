@@ -5,12 +5,14 @@ use std::io::{self, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{self, Child, Command, Stdio};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use botster_core::{
-    ClientId, CoreSessionMetadata, RequestId, ResizePayload, SessionId, SessionLifecycleState,
-    SessionSpawnRequest, SpawnEnvironment, SpawnWorkingDirectory, SubscriptionId, TransportEgress,
+    AesGcmEnvelope, AesGcmKey, ClientId, CoreSessionMetadata, RequestId, ResizePayload, SessionId,
+    SessionLifecycleState, SessionSpawnRequest, SpawnEnvironment, SpawnWorkingDirectory,
+    SubscriptionId, TransportEgress, decrypt_aes_gcm, encrypt_aes_gcm,
 };
 use botster_hub::{
     DaemonApp, DaemonCompatibility, DaemonEvent, DaemonOperatorError, DaemonPackage,
@@ -21,7 +23,16 @@ use botster_hub::{
     build_default_config_for_runtime, daemon_transport_request, default_package_policy,
     host_profile, serve_daemon, serve_mcp_stdio, stream_attach,
 };
-use botster_hub_client::DaemonPackageUpdateStatus;
+use botster_hub_client::{DaemonDiagnostic, DaemonLocalWebrtcBootstrap, DaemonPackageUpdateStatus};
+use webrtc::data_channel::{DataChannel, DataChannelEvent, RTCDataChannelInit};
+use webrtc::peer_connection::{
+    PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler, RTCIceGatheringState,
+    RTCPeerConnectionState, RTCSessionDescription,
+};
+use webrtc::runtime::{
+    Receiver as AsyncReceiver, Sender as AsyncSender, block_on, channel, default_runtime, sleep,
+    timeout,
+};
 
 const SMOKE_MARKER: &str = "botster-hub-smoke-ok";
 const SMOKE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -59,6 +70,20 @@ fn main() {
         Some("down") => {
             if let Err(error) = local_runtime_down(env::args().skip(2).collect()) {
                 eprintln!("botster-hub down error: {error}");
+                process::exit(1);
+            }
+            return;
+        }
+        Some("doctor") => {
+            if let Err(error) = local_runtime_doctor(env::args().skip(2).collect()) {
+                eprintln!("botster-hub doctor error: {error}");
+                process::exit(1);
+            }
+            return;
+        }
+        Some("smoke") => {
+            if let Err(error) = local_runtime_smoke(env::args().skip(2).collect()) {
+                eprintln!("botster-hub smoke error: {error}");
                 process::exit(1);
             }
             return;
@@ -349,6 +374,676 @@ fn local_runtime_down(args: Vec<String>) -> Result<(), DevStackError> {
     };
     print_daemon_response(response)?;
     Ok(())
+}
+
+fn local_runtime_doctor(args: Vec<String>) -> Result<(), OperatorError> {
+    let options = DataDirOptions::parse(args, "doctor")?;
+    let config = explicit_config(options.data_directory.clone())?;
+    println!("doctor=local_runtime");
+    println!("data_dir=explicit");
+
+    let status_response = match daemon_transport_request(&config, DaemonRequest::Status) {
+        Ok(response) => response,
+        Err(
+            botster_hub::DaemonTransportError::NotRunning
+            | botster_hub::DaemonTransportError::ClientDisconnected,
+        ) => {
+            print_runtime_check(
+                "daemon_running",
+                RuntimeCheckStatus::Fail,
+                "daemon is not running",
+            );
+            print_remediation(&format!(
+                "botster-hub up --data-dir {}",
+                options.data_directory.display()
+            ));
+            return Err(OperatorError::DaemonNotRunning);
+        }
+        Err(botster_hub::DaemonTransportError::Compatibility(error)) => {
+            print_runtime_check(
+                "daemon_compatible",
+                RuntimeCheckStatus::Fail,
+                "running daemon is incompatible or stale",
+            );
+            print_daemon_diagnostics(&error.diagnostics);
+            print_remediation(&format!(
+                "stop the stale botster-hub process, remove the stale local socket if needed, then run botster-hub up --data-dir {}",
+                options.data_directory.display()
+            ));
+            return Err(OperatorError::App(error.to_string()));
+        }
+        Err(botster_hub::DaemonTransportError::Protocol(message)) => {
+            print_runtime_check(
+                "daemon_compatible",
+                RuntimeCheckStatus::Fail,
+                "running daemon did not speak the current protocol",
+            );
+            print_remediation(&format!(
+                "stop the stale botster-hub process, remove the stale local socket if needed, then run botster-hub up --data-dir {}",
+                options.data_directory.display()
+            ));
+            return Err(OperatorError::App(message.to_string()));
+        }
+        Err(error) => return Err(error.into()),
+    };
+
+    let status = status_response
+        .status
+        .as_ref()
+        .ok_or(OperatorError::UnexpectedResponse("status"))?;
+    print_runtime_check(
+        "daemon_running",
+        RuntimeCheckStatus::Pass,
+        "daemon socket answered",
+    );
+    print_runtime_check(
+        "daemon_compatible",
+        RuntimeCheckStatus::Pass,
+        &format!(
+            "protocol={} protocol_version={} conformance_fixture_revision={}",
+            status.compatibility.protocol,
+            status.compatibility.protocol_version,
+            status.compatibility.conformance_fixture_revision
+        ),
+    );
+    print_runtime_check(
+        "core_initialized",
+        if status.core_initialized {
+            RuntimeCheckStatus::Pass
+        } else {
+            RuntimeCheckStatus::Fail
+        },
+        &format!("core_initialized={}", status.core_initialized),
+    );
+    print_runtime_check(
+        "package_registry",
+        RuntimeCheckStatus::Pass,
+        &format!(
+            "package_count={} enabled_package_count={} provider_count={} enabled_provider_count={}",
+            status.package_count,
+            status.enabled_package_count,
+            status.provider_count,
+            status.enabled_provider_count
+        ),
+    );
+    print_daemon_diagnostics(&status_response.diagnostics);
+    print_daemon_diagnostics(&status.diagnostics);
+
+    let packages = daemon_transport_request(&config, DaemonRequest::ListPackages)?;
+    print_runtime_check(
+        "packages_list",
+        RuntimeCheckStatus::Pass,
+        &format!("package_count={}", packages.packages.len()),
+    );
+    print_first_party_package_check(&packages.packages, "project-pipelines");
+    print_first_party_package_check(&packages.packages, "botster-web");
+    print_first_party_package_check(&packages.packages, "botster-tui");
+    print_first_party_package_check(&packages.packages, "botster-workspaces");
+
+    let apps = daemon_transport_request(&config, DaemonRequest::ListApps)?;
+    let web_app = apps
+        .apps
+        .iter()
+        .find(|app| app.package_name == "botster-web" && app.entrypoint_id == "web-client");
+    match web_app {
+        Some(app) if app.lifecycle_state == "running" && app.launch_target.local_url.is_some() => {
+            print_runtime_check(
+                "botster_web_app",
+                RuntimeCheckStatus::Pass,
+                "botster-web web-client is running with structured local_url",
+            );
+        }
+        Some(app) => {
+            print_runtime_check(
+                "botster_web_app",
+                RuntimeCheckStatus::Warn,
+                &format!(
+                    "botster-web web-client lifecycle_state={} local_url={}",
+                    app.lifecycle_state,
+                    app.launch_target.local_url.as_deref().unwrap_or("none")
+                ),
+            );
+            print_remediation(&format!(
+                "botster-hub up --data-dir {}",
+                options.data_directory.display()
+            ));
+        }
+        None => {
+            print_runtime_check(
+                "botster_web_app",
+                RuntimeCheckStatus::Warn,
+                "botster-web web-client app is not installed",
+            );
+            print_remediation(&format!(
+                "botster-hub up --data-dir {} --web-package-path <path>",
+                options.data_directory.display()
+            ));
+        }
+    }
+
+    if status.core_initialized {
+        Ok(())
+    } else {
+        Err(OperatorError::App("core is not initialized".to_string()))
+    }
+}
+
+fn local_runtime_smoke(args: Vec<String>) -> Result<(), SmokeError> {
+    let options = SmokeOptions::parse(args)?;
+    println!("smoke=local_runtime");
+    println!("data_dir=explicit");
+    preflight_smoke_packages(&options.dev_stack)?;
+
+    let outcome = prepare_local_runtime(options.dev_stack)?;
+    print_runtime_check(
+        "daemon",
+        RuntimeCheckStatus::Pass,
+        match outcome.daemon_ownership {
+            DevStackDaemonOwnership::Started => "daemon started",
+            DevStackDaemonOwnership::Reused => "daemon reused",
+        },
+    );
+
+    let status = daemon_transport_request(&outcome.config, DaemonRequest::Status)?;
+    let status = status
+        .status
+        .as_ref()
+        .ok_or(SmokeError::UnexpectedResponse("status"))?;
+    print_runtime_check(
+        "core",
+        if status.core_initialized {
+            RuntimeCheckStatus::Pass
+        } else {
+            RuntimeCheckStatus::Fail
+        },
+        &format!("core_initialized={}", status.core_initialized),
+    );
+
+    let packages = daemon_transport_request(&outcome.config, DaemonRequest::ListPackages)?;
+    require_smoke_package(&packages.packages, "project-pipelines")?;
+    require_smoke_package(&packages.packages, "botster-web")?;
+    require_smoke_package(&packages.packages, "botster-tui")?;
+    require_smoke_package(&packages.packages, "botster-workspaces")?;
+    print_runtime_check(
+        "packages",
+        RuntimeCheckStatus::Pass,
+        &format!("enabled_package_count={}", status.enabled_package_count),
+    );
+
+    let apps = daemon_transport_request(&outcome.config, DaemonRequest::ListApps)?;
+    let web_app = apps
+        .apps
+        .iter()
+        .find(|app| app.package_name == "botster-web" && app.entrypoint_id == "web-client")
+        .ok_or(SmokeError::MissingPrerequisite(
+            "botster-web web-client app",
+        ))?;
+    if web_app.lifecycle_state != "running" || web_app.launch_target.local_url.is_none() {
+        return Err(SmokeError::MissingPrerequisite(
+            "botster-web running local_url",
+        ));
+    }
+    print_runtime_check(
+        "apps",
+        RuntimeCheckStatus::Pass,
+        "botster-web web-client running",
+    );
+
+    smoke_session_round_trip(&outcome.config)?;
+    print_runtime_check(
+        "session_terminal",
+        RuntimeCheckStatus::Pass,
+        "spawn stream-attach marker shutdown succeeded",
+    );
+
+    let bootstrap = daemon_transport_request(
+        &outcome.config,
+        DaemonRequest::StartPackageEntrypoint {
+            package_name: "botster-web".to_string(),
+            entrypoint_id: "web-client".to_string(),
+            environment_overrides: BTreeMap::new(),
+        },
+    )?;
+    let Some(bootstrap) = bootstrap.local_webrtc_bootstrap.as_ref() else {
+        return Err(SmokeError::MissingPrerequisite(
+            "botster-web local WebRTC bootstrap",
+        ));
+    };
+    if bootstrap.data_plane != "webrtc_data_channel" {
+        return Err(SmokeError::MissingPrerequisite("webrtc_data_channel"));
+    }
+    smoke_local_webrtc_round_trip(&outcome.config, bootstrap)?;
+    print_runtime_check(
+        "webrtc",
+        RuntimeCheckStatus::Pass,
+        "encrypted local WebRTC data-channel terminal round trip succeeded",
+    );
+    println!("smoke_result=pass");
+    Ok(())
+}
+
+fn preflight_smoke_packages(options: &DevStackOptions) -> Result<(), SmokeError> {
+    for label in [
+        "project-pipelines",
+        "botster-web",
+        "botster-tui",
+        "botster-workspaces",
+    ] {
+        let path = options.package_path(label)?;
+        if !path.join("botster-package.json").is_file() {
+            return Err(SmokeError::MissingPrerequisite(label));
+        }
+    }
+    Ok(())
+}
+
+fn smoke_session_round_trip(config: &botster_hub::HubConfig) -> Result<(), SmokeError> {
+    let session_id = format!(
+        "smoke-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| SmokeError::Clock)?
+            .as_nanos()
+    );
+    let subscription_id = format!("{session_id}-subscription");
+    let marker = "botster-smoke-terminal-ok";
+    let spawn = daemon_transport_request(
+        config,
+        DaemonRequest::Spawn {
+            session_id: session_id.clone(),
+            command: format!("printf 'smoke:{marker}\\n'"),
+        },
+    )?;
+    if spawn.kind == DaemonResponseKind::OperatorError {
+        return Err(SmokeError::OperatorResponse(spawn));
+    }
+    let mut observed = Vec::new();
+    stream_attach(
+        config,
+        SessionId(session_id.clone()),
+        SubscriptionId(subscription_id),
+        &mut observed,
+    )
+    .map_err(SmokeError::Transport)?;
+    let observed = String::from_utf8_lossy(&observed).to_string();
+    if observed.contains(&format!("smoke:{marker}")) {
+        let _ = daemon_transport_request(config, DaemonRequest::ShutdownSession { session_id });
+        return Ok(());
+    }
+
+    let _ = daemon_transport_request(config, DaemonRequest::ShutdownSession { session_id });
+    Err(SmokeError::SessionRoundTrip(observed))
+}
+
+fn smoke_local_webrtc_round_trip(
+    config: &botster_hub::HubConfig,
+    bootstrap: &DaemonLocalWebrtcBootstrap,
+) -> Result<(), SmokeError> {
+    let stream_key = local_webrtc_stream_key(&bootstrap.grant_secret)?;
+    let signal = block_on(async {
+        let (mut offer_peer, offer) = LocalWebrtcOfferPeer::create_offer().await?;
+        let signal = daemon_transport_request(
+            config,
+            DaemonRequest::LocalWebrtcSignal {
+                grant_id: bootstrap.grant_id.clone(),
+                grant_secret: bootstrap.grant_secret.clone(),
+                origin: bootstrap.expected_origin.clone(),
+                offer,
+            },
+        )?;
+        let answer = signal
+            .local_webrtc_answer
+            .as_ref()
+            .ok_or_else(|| SmokeError::Webrtc("missing local WebRTC answer".to_string()))?
+            .answer
+            .clone();
+        offer_peer.accept_answer(answer).await?;
+        offer_peer
+            .encrypted_request(&stream_key, &DaemonRequest::Status)
+            .await?;
+
+        let session_id = "smoke-local-webrtc-session".to_string();
+        let subscription_id = "smoke-local-webrtc-subscription".to_string();
+        offer_peer
+            .encrypted_request(
+                &stream_key,
+                &DaemonRequest::Spawn {
+                    session_id: session_id.clone(),
+                    command: "printf 'webrtc-smoke-ready\\n'; while IFS= read -r line; do printf 'webrtc:%s\\n' \"$line\"; done".to_string(),
+                },
+            )
+            .await?;
+        offer_peer
+            .encrypted_request(
+                &stream_key,
+                &DaemonRequest::Attach {
+                    session_id: session_id.clone(),
+                    subscription_id,
+                },
+            )
+            .await?;
+        offer_peer
+            .encrypted_request(
+                &stream_key,
+                &DaemonRequest::SendInput {
+                    session_id: session_id.clone(),
+                    data: "from-smoke-webrtc\n".to_string(),
+                },
+            )
+            .await?;
+        let mut observed = String::new();
+        for _ in 0..120 {
+            let drain = offer_peer
+                .encrypted_request(
+                    &stream_key,
+                    &DaemonRequest::Drain {
+                        session_id: session_id.clone(),
+                    },
+                )
+                .await?;
+            for event in drain.events {
+                if let DaemonEvent::TerminalOutput { data, .. } = event {
+                    observed.push_str(&data);
+                }
+            }
+            if observed.contains("webrtc:from-smoke-webrtc") {
+                break;
+            }
+            sleep(Duration::from_millis(30)).await;
+        }
+        let _ = offer_peer
+            .encrypted_request(
+                &stream_key,
+                &DaemonRequest::ShutdownSession {
+                    session_id: session_id.clone(),
+                },
+            )
+            .await;
+        let _ = offer_peer.peer.close().await;
+        if observed.contains("webrtc:from-smoke-webrtc") {
+            Ok(())
+        } else {
+            Err(SmokeError::Webrtc(format!(
+                "local WebRTC terminal marker not observed; observed_bytes={}",
+                observed.len()
+            )))
+        }
+    });
+    signal
+}
+
+struct LocalWebrtcOffererHandler {
+    gather_complete_tx: AsyncSender<()>,
+    connected_tx: AsyncSender<()>,
+}
+
+#[async_trait::async_trait]
+impl PeerConnectionEventHandler for LocalWebrtcOffererHandler {
+    async fn on_ice_gathering_state_change(&self, state: RTCIceGatheringState) {
+        if state == RTCIceGatheringState::Complete {
+            let _ = self.gather_complete_tx.try_send(());
+        }
+    }
+
+    async fn on_connection_state_change(&self, state: RTCPeerConnectionState) {
+        if state == RTCPeerConnectionState::Connected {
+            let _ = self.connected_tx.try_send(());
+        }
+    }
+}
+
+struct LocalWebrtcOfferPeer {
+    peer: Box<dyn PeerConnection>,
+    data_channel: Arc<dyn DataChannel>,
+    connected_rx: AsyncReceiver<()>,
+    data_channel_open_rx: AsyncReceiver<()>,
+    data_channel_message_rx: AsyncReceiver<String>,
+}
+
+impl LocalWebrtcOfferPeer {
+    async fn create_offer() -> Result<(Self, serde_json::Value), SmokeError> {
+        let runtime = default_runtime()
+            .ok_or_else(|| SmokeError::Webrtc("no async runtime found".to_string()))?;
+        let (gather_complete_tx, mut gather_complete_rx) = channel::<()>(1);
+        let (connected_tx, connected_rx) = channel::<()>(1);
+        let (data_channel_open_tx, data_channel_open_rx) = channel::<()>(1);
+        let (data_channel_message_tx, data_channel_message_rx) = channel::<String>(256);
+        let handler = Arc::new(LocalWebrtcOffererHandler {
+            gather_complete_tx,
+            connected_tx,
+        });
+        let peer = PeerConnectionBuilder::new()
+            .with_handler(handler)
+            .with_runtime(runtime.clone())
+            .with_udp_addrs(vec!["127.0.0.1:0".to_string()])
+            .build()
+            .await
+            .map_err(|error| SmokeError::Webrtc(error.to_string()))?;
+        let data_channel = peer
+            .create_data_channel(
+                "botster-client",
+                Some(RTCDataChannelInit {
+                    ordered: true,
+                    max_retransmits: None,
+                    max_packet_life_time: None,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .map_err(|error| SmokeError::Webrtc(error.to_string()))?;
+
+        {
+            let data_channel = data_channel.clone();
+            let open_tx = data_channel_open_tx.clone();
+            let message_tx = data_channel_message_tx.clone();
+            runtime.spawn(Box::pin(async move {
+                while let Some(event) = data_channel.poll().await {
+                    match event {
+                        DataChannelEvent::OnOpen => {
+                            let _ = open_tx.try_send(());
+                        }
+                        DataChannelEvent::OnMessage(message) => {
+                            if let Ok(text) = String::from_utf8(message.data.to_vec()) {
+                                let _ = message_tx.try_send(text);
+                            }
+                        }
+                        DataChannelEvent::OnClose => break,
+                        _ => {}
+                    }
+                }
+            }));
+        }
+
+        let offer = peer
+            .create_offer(None)
+            .await
+            .map_err(|error| SmokeError::Webrtc(error.to_string()))?;
+        peer.set_local_description(offer)
+            .await
+            .map_err(|error| SmokeError::Webrtc(error.to_string()))?;
+        let _ = timeout(Duration::from_secs(5), gather_complete_rx.recv()).await;
+        let offer = peer
+            .local_description()
+            .await
+            .ok_or_else(|| SmokeError::Webrtc("offer local description missing".to_string()))?;
+        let offer =
+            serde_json::to_value(offer).map_err(|error| SmokeError::Webrtc(error.to_string()))?;
+
+        Ok((
+            Self {
+                peer: Box::new(peer),
+                data_channel,
+                connected_rx,
+                data_channel_open_rx,
+                data_channel_message_rx,
+            },
+            offer,
+        ))
+    }
+
+    async fn accept_answer(&mut self, answer: serde_json::Value) -> Result<(), SmokeError> {
+        let answer = serde_json::from_value::<RTCSessionDescription>(answer)
+            .map_err(|error| SmokeError::Webrtc(error.to_string()))?;
+        self.peer
+            .set_remote_description(answer)
+            .await
+            .map_err(|error| SmokeError::Webrtc(error.to_string()))?;
+        timeout(Duration::from_secs(15), self.connected_rx.recv())
+            .await
+            .map_err(|_| {
+                SmokeError::Webrtc("timed out waiting for WebRTC connection".to_string())
+            })?;
+        timeout(Duration::from_secs(10), self.data_channel_open_rx.recv())
+            .await
+            .map_err(|_| {
+                SmokeError::Webrtc("timed out waiting for data channel open".to_string())
+            })?;
+        Ok(())
+    }
+
+    async fn encrypted_request(
+        &mut self,
+        key: &AesGcmKey,
+        request: &DaemonRequest,
+    ) -> Result<DaemonResponse, SmokeError> {
+        let plaintext =
+            serde_json::to_vec(request).map_err(|error| SmokeError::Webrtc(error.to_string()))?;
+        let envelope = encrypt_aes_gcm(key, &plaintext, 1)
+            .map_err(|error| SmokeError::Webrtc(error.to_string()))?;
+        self.data_channel
+            .send_text(
+                &serde_json::to_string(&envelope)
+                    .map_err(|error| SmokeError::Webrtc(error.to_string()))?,
+            )
+            .await
+            .map_err(|error| SmokeError::Webrtc(error.to_string()))?;
+        let response = timeout(Duration::from_secs(10), self.data_channel_message_rx.recv())
+            .await
+            .map_err(|_| {
+                SmokeError::Webrtc("timed out waiting for data channel response".to_string())
+            })?
+            .ok_or_else(|| {
+                SmokeError::Webrtc("local WebRTC data channel closed before response".to_string())
+            })?;
+        let envelope = serde_json::from_str::<AesGcmEnvelope>(&response)
+            .map_err(|error| SmokeError::Webrtc(error.to_string()))?;
+        let plaintext = decrypt_aes_gcm(key, &envelope)
+            .map_err(|error| SmokeError::Webrtc(error.to_string()))?;
+        serde_json::from_slice(&plaintext).map_err(|error| SmokeError::Webrtc(error.to_string()))
+    }
+}
+
+fn local_webrtc_stream_key(secret: &str) -> Result<AesGcmKey, SmokeError> {
+    let hex = secret
+        .strip_prefix("secret-")
+        .ok_or_else(|| SmokeError::Webrtc("local WebRTC secret prefix missing".to_string()))?;
+    let bytes = decode_hex_bytes(hex)
+        .ok_or_else(|| SmokeError::Webrtc("local WebRTC secret hex invalid".to_string()))?;
+    AesGcmKey::from_slice(&bytes).map_err(|error| SmokeError::Webrtc(error.to_string()))
+}
+
+fn decode_hex_bytes(encoded: &str) -> Option<Vec<u8>> {
+    if !encoded.len().is_multiple_of(2) {
+        return None;
+    }
+    let mut output = Vec::with_capacity(encoded.len() / 2);
+    for pair in encoded.as_bytes().chunks_exact(2) {
+        let high = decode_hex_nibble(pair[0])?;
+        let low = decode_hex_nibble(pair[1])?;
+        output.push((high << 4) | low);
+    }
+    Some(output)
+}
+
+fn decode_hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Copy)]
+enum RuntimeCheckStatus {
+    Pass,
+    Warn,
+    Fail,
+}
+
+impl RuntimeCheckStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Pass => "pass",
+            Self::Warn => "warn",
+            Self::Fail => "fail",
+        }
+    }
+}
+
+fn print_runtime_check(name: &str, status: RuntimeCheckStatus, message: &str) {
+    println!(
+        "check name={name} status={} message={}",
+        status.as_str(),
+        sanitize_runtime_message(message)
+    );
+}
+
+fn print_remediation(command: &str) {
+    println!("remediation={}", sanitize_runtime_message(command));
+}
+
+fn print_daemon_diagnostics(diagnostics: &[DaemonDiagnostic]) {
+    for diagnostic in diagnostics {
+        println!(
+            "diagnostic kind={:?} operation={} feature={} message={}",
+            diagnostic.kind,
+            diagnostic.operation.as_deref().unwrap_or("none"),
+            diagnostic.feature.as_deref().unwrap_or("none"),
+            sanitize_runtime_message(diagnostic.message.as_deref().unwrap_or("none"))
+        );
+    }
+}
+
+fn print_first_party_package_check(packages: &[DaemonPackage], name: &'static str) {
+    match packages.iter().find(|package| package.package_name == name) {
+        Some(package) if package.state == "enabled" => {
+            print_runtime_check(
+                &format!("package_{name}"),
+                RuntimeCheckStatus::Pass,
+                "package is enabled",
+            );
+        }
+        Some(package) => {
+            print_runtime_check(
+                &format!("package_{name}"),
+                RuntimeCheckStatus::Warn,
+                &format!("package state={}", package.state),
+            );
+        }
+        None => {
+            print_runtime_check(
+                &format!("package_{name}"),
+                RuntimeCheckStatus::Warn,
+                "package is not installed",
+            );
+        }
+    }
+}
+
+fn require_smoke_package(packages: &[DaemonPackage], name: &'static str) -> Result<(), SmokeError> {
+    let package = packages
+        .iter()
+        .find(|package| package.package_name == name)
+        .ok_or(SmokeError::MissingPrerequisite(name))?;
+    if package.state != "enabled" {
+        return Err(SmokeError::MissingPrerequisite(name));
+    }
+    Ok(())
+}
+
+fn sanitize_runtime_message(message: &str) -> String {
+    message.replace('\n', " ").replace('\r', " ")
 }
 
 struct LocalRuntimeOutcome {
@@ -2410,6 +3105,10 @@ struct DevStackOptions {
     web_bridge_port: Option<u16>,
 }
 
+struct SmokeOptions {
+    dev_stack: DevStackOptions,
+}
+
 struct LocalRuntimeDownOptions {
     data_directory: PathBuf,
 }
@@ -2558,6 +3257,16 @@ impl DevStackOptions {
             Some(port) => Ok(port),
             None => choose_loopback_port().map_err(DevStackError::from),
         }
+    }
+}
+
+impl SmokeOptions {
+    fn parse(args: Vec<String>) -> Result<Self, SmokeError> {
+        let dev_stack = DevStackOptions::parse(args)?;
+        if dev_stack.default_data_dir {
+            return Err(SmokeError::Usage);
+        }
+        Ok(Self { dev_stack })
     }
 }
 
@@ -3630,6 +4339,19 @@ enum DevStackError {
 }
 
 #[derive(Debug)]
+enum SmokeError {
+    Usage,
+    Clock,
+    DevStack(DevStackError),
+    Transport(botster_hub::DaemonTransportError),
+    UnexpectedResponse(&'static str),
+    MissingPrerequisite(&'static str),
+    OperatorResponse(DaemonResponse),
+    SessionRoundTrip(String),
+    Webrtc(String),
+}
+
+#[derive(Debug)]
 enum OperatorError {
     Usage(&'static str),
     UnexpectedResponse(&'static str),
@@ -3875,6 +4597,37 @@ impl fmt::Display for DevStackError {
     }
 }
 
+impl fmt::Display for SmokeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Usage => write!(formatter, "{}", usage_for("smoke")),
+            Self::Clock => write!(formatter, "system clock is before unix epoch"),
+            Self::DevStack(error) => write!(formatter, "{error}"),
+            Self::Transport(error) => write!(formatter, "{error}"),
+            Self::UnexpectedResponse(response) => {
+                write!(formatter, "unexpected client API response for {response}")
+            }
+            Self::MissingPrerequisite(name) => {
+                write!(formatter, "missing_prerequisite={name}")
+            }
+            Self::OperatorResponse(response) => {
+                let message = response
+                    .error
+                    .as_ref()
+                    .map(|error| error.message.as_str())
+                    .unwrap_or("operator error");
+                write!(formatter, "operator response: {message}")
+            }
+            Self::SessionRoundTrip(observed) => write!(
+                formatter,
+                "session terminal round trip did not observe marker; observed_bytes={}",
+                observed.len()
+            ),
+            Self::Webrtc(message) => write!(formatter, "local_webrtc={message}"),
+        }
+    }
+}
+
 impl From<botster_hub::HubConfigError> for DevStackError {
     fn from(error: botster_hub::HubConfigError) -> Self {
         Self::Config(error)
@@ -3903,6 +4656,22 @@ impl From<DogfoodError> for DevStackError {
 impl From<OperatorError> for DevStackError {
     fn from(error: OperatorError) -> Self {
         Self::Operator(Box::new(error))
+    }
+}
+
+impl From<DevStackError> for SmokeError {
+    fn from(error: DevStackError) -> Self {
+        match error {
+            DevStackError::Usage => Self::Usage,
+            DevStackError::MissingPackage { label } => Self::MissingPrerequisite(label),
+            other => Self::DevStack(other),
+        }
+    }
+}
+
+impl From<botster_hub::DaemonTransportError> for SmokeError {
+    fn from(error: botster_hub::DaemonTransportError) -> Self {
+        Self::Transport(error)
     }
 }
 
@@ -3947,6 +4716,10 @@ fn usage_for(command: &str) -> &'static str {
             "usage: botster-hub up [--data-dir <path>] [--session-worker-bin <path>] [--project-pipelines-package-path <path>] [--web-package-path <path>] [--tui-package-path <path>] [--workspaces-package-path <path>] [--web-bridge-port <port>]"
         }
         "down" => "usage: botster-hub down [--data-dir <path>]",
+        "doctor" => "usage: botster-hub doctor --data-dir <path>",
+        "smoke" => {
+            "usage: botster-hub smoke --data-dir <path> [--session-worker-bin <path>] [--project-pipelines-package-path <path>] [--web-package-path <path>] [--tui-package-path <path>] [--workspaces-package-path <path>] [--web-bridge-port <port>]"
+        }
         "status" => "usage: botster-hub status --data-dir <path>",
         "sessions" => {
             "usage: botster-hub sessions <list|spawn|attach|send-input|resize|detach|shutdown> ..."
@@ -4041,7 +4814,7 @@ fn usage_for(command: &str) -> &'static str {
         "providers" | "providers list" => "usage: botster-hub providers list --data-dir <path>",
         "inspect" => "usage: botster-hub inspect --data-dir <path> <session-id>",
         _ => {
-            "usage: botster-hub <up|down|start|dogfood|dev-stack|status|sessions|shutdown|mcp-serve|apps|packages|providers|inspect|run-one>"
+            "usage: botster-hub <up|down|doctor|smoke|start|dogfood|dev-stack|status|sessions|shutdown|mcp-serve|apps|packages|providers|inspect|run-one>"
         }
     }
 }
