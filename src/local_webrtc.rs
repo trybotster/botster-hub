@@ -76,6 +76,7 @@ impl LocalWebrtcTransport {
         expected_origin: &str,
     ) -> LocalWebrtcResult<DaemonLocalWebrtcBootstrap> {
         let now = now_seconds();
+        self.prune_expired_grants(now);
         let grant_id = random_token("grant")?;
         let grant_secret = random_secret_token()?;
         let bootstrap = DaemonLocalWebrtcBootstrap {
@@ -155,6 +156,10 @@ impl LocalWebrtcTransport {
             );
         }
         Ok(self.runtime.as_ref().expect("runtime was initialized"))
+    }
+
+    fn prune_expired_grants(&mut self, now: u64) {
+        self.grants.retain(|_, grant| grant.expires_at > now);
     }
 }
 
@@ -565,3 +570,43 @@ impl fmt::Display for LocalWebrtcError {
 }
 
 impl Error for LocalWebrtcError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn issuing_bootstrap_prunes_expired_grants_and_keeps_live_replay_diagnostics() {
+        let now = now_seconds();
+        let mut transport = LocalWebrtcTransport::default();
+        transport.grants.insert(
+            "grant-expired".to_string(),
+            LocalWebrtcGrant {
+                grant_id: "grant-expired".to_string(),
+                grant_secret: "secret-expired".to_string(),
+                expected_origin: "http://127.0.0.1:1".to_string(),
+                expires_at: now.saturating_sub(1),
+                redeemed: true,
+            },
+        );
+        transport.grants.insert(
+            "grant-live-redeemed".to_string(),
+            LocalWebrtcGrant {
+                grant_id: "grant-live-redeemed".to_string(),
+                grant_secret: "secret-live".to_string(),
+                expected_origin: "http://127.0.0.1:2".to_string(),
+                expires_at: now + GRANT_TTL_SECONDS,
+                redeemed: true,
+            },
+        );
+
+        let bootstrap = transport
+            .issue_bootstrap("botster-web", "web-client", "http://127.0.0.1:41739")
+            .expect("issue bootstrap");
+
+        assert!(!transport.grants.contains_key("grant-expired"));
+        assert!(transport.grants.contains_key("grant-live-redeemed"));
+        assert!(transport.grants.contains_key(&bootstrap.grant_id));
+        assert_eq!(transport.grants.len(), 2);
+    }
+}
