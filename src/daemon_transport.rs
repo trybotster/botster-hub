@@ -31,12 +31,12 @@ pub use botster_hub_client::{
     DaemonCompatibility, DaemonConnection as ClientDaemonConnection, DaemonCoordination,
     DaemonDiagnostic, DaemonEndpoint, DaemonEnvelope, DaemonEnvelopeAck, DaemonEnvelopeDelivery,
     DaemonEnvelopePublish, DaemonEvent, DaemonHello, DaemonHelloAck, DaemonIdentity,
-    DaemonLocalWebrtcAnswer, DaemonNotify, DaemonOperatorError, DaemonPackage,
-    DaemonPackageActionRequest, DaemonPackageActionRequiredReference, DaemonPackageActionState,
-    DaemonPackageActionStatus, DaemonPackageAvailability, DaemonPackageAvailabilityReason,
-    DaemonPackageAvailabilityState, DaemonPackageCompatibility, DaemonPackageConfiguration,
-    DaemonPackageDecision, DaemonPackageDependencyAvailability, DaemonPackageDiagnostic,
-    DaemonPackageEnvironmentRequirement, DaemonPackageFeatureAvailability,
+    DaemonLocalWebrtcAnswer, DaemonLocalWebrtcBootstrap, DaemonNotify, DaemonOperatorError,
+    DaemonPackage, DaemonPackageActionRequest, DaemonPackageActionRequiredReference,
+    DaemonPackageActionState, DaemonPackageActionStatus, DaemonPackageAvailability,
+    DaemonPackageAvailabilityReason, DaemonPackageAvailabilityState, DaemonPackageCompatibility,
+    DaemonPackageConfiguration, DaemonPackageDecision, DaemonPackageDependencyAvailability,
+    DaemonPackageDiagnostic, DaemonPackageEnvironmentRequirement, DaemonPackageFeatureAvailability,
     DaemonPackageInstallEffect, DaemonPackageInstallPlan, DaemonPackagePin, DaemonPackageProcess,
     DaemonPackageRunnableEntrypoint, DaemonPackageSurfaceDescriptor, DaemonPackageUpdateStatus,
     DaemonPackageWorkingDirectory, DaemonPluginLifecycle, DaemonRequest, DaemonResolvedAppLaunch,
@@ -571,6 +571,11 @@ fn handle_control_request(
             }
             Ok(response)
         }
+        DaemonRequest::IssueLocalWebrtcBootstrap {
+            package_name,
+            entrypoint_id,
+            origin,
+        } => issue_local_webrtc_bootstrap_response(daemon, &package_name, &entrypoint_id, &origin),
         DaemonRequest::LocalWebrtcSignal {
             grant_id,
             grant_secret,
@@ -1161,7 +1166,8 @@ fn handle_runtime_control_request(
             error: None,
             diagnostics: vec![DaemonDiagnostic::connected("shutdown")],
         }),
-        DaemonRequest::LocalWebrtcSignal { .. } => Err(DaemonTransportError::UnexpectedResponse),
+        DaemonRequest::IssueLocalWebrtcBootstrap { .. }
+        | DaemonRequest::LocalWebrtcSignal { .. } => Err(DaemonTransportError::UnexpectedResponse),
         DaemonRequest::ListApps
         | DaemonRequest::ResolveAppLaunch { .. }
         | DaemonRequest::ListPackages
@@ -1783,6 +1789,92 @@ fn app_local_url(
         .and_then(|result| result.local_url.clone())
 }
 
+fn issue_local_webrtc_bootstrap_response(
+    daemon: &mut HubDaemon,
+    package_name: &str,
+    entrypoint_id: &str,
+    origin: &str,
+) -> DaemonTransportResult<DaemonResponse> {
+    if package_name != "botster-web" || entrypoint_id != "web-client" {
+        return Ok(local_webrtc_bootstrap_issue_error(
+            "local_webrtc_bootstrap_unsupported_entrypoint",
+            "local WebRTC page-load bootstrap is only supported for botster-web/web-client",
+        ));
+    }
+
+    let packages = daemon.package_registry().clone();
+    let Some(record) = packages.package(package_name) else {
+        return Ok(local_webrtc_bootstrap_issue_error(
+            "local_webrtc_bootstrap_package_not_installed",
+            format!("package {package_name} is not installed"),
+        ));
+    };
+    if !record.is_enabled() {
+        return Ok(local_webrtc_bootstrap_issue_error(
+            "local_webrtc_bootstrap_package_disabled",
+            format!("package {package_name} is not enabled"),
+        ));
+    }
+    let Some(entrypoint) = record
+        .runnable_entrypoints
+        .iter()
+        .find(|entrypoint| entrypoint.id == entrypoint_id)
+    else {
+        return Ok(local_webrtc_bootstrap_issue_error(
+            "local_webrtc_bootstrap_entrypoint_not_found",
+            format!("entrypoint {entrypoint_id} was not found for package {package_name}"),
+        ));
+    };
+
+    let snapshot = daemon
+        .entrypoint_supervisor()
+        .status(package_name, entrypoint_id);
+    if snapshot.state != "running" {
+        return Ok(local_webrtc_bootstrap_issue_error(
+            "local_webrtc_bootstrap_entrypoint_not_running",
+            format!("entrypoint {package_name}/{entrypoint_id} is not running"),
+        ));
+    }
+
+    let Some(local_url) = app_local_url(entrypoint, Some(&snapshot)) else {
+        return Ok(local_webrtc_bootstrap_issue_error(
+            "local_webrtc_bootstrap_local_url_unavailable",
+            format!("entrypoint {package_name}/{entrypoint_id} has no structured local_url"),
+        ));
+    };
+    let Some(expected_origin) = origin_from_local_url(&local_url) else {
+        return Ok(local_webrtc_bootstrap_issue_error(
+            "local_webrtc_bootstrap_invalid_local_url",
+            format!("entrypoint {package_name}/{entrypoint_id} local_url has no origin"),
+        ));
+    };
+    if origin != expected_origin {
+        return Ok(local_webrtc_bootstrap_issue_error(
+            "local_webrtc_bootstrap_origin_mismatch",
+            "requested origin does not match running entrypoint local_url origin",
+        ));
+    }
+
+    let bootstrap =
+        daemon
+            .local_webrtc()
+            .issue_bootstrap(package_name, entrypoint_id, &expected_origin)?;
+    Ok(daemon_local_webrtc_bootstrap(bootstrap))
+}
+
+fn origin_from_local_url(local_url: &str) -> Option<String> {
+    let scheme_end = local_url.find("://")?;
+    let after_scheme = scheme_end + 3;
+    let authority_end = local_url[after_scheme..]
+        .find(['/', '?', '#'])
+        .map(|index| after_scheme + index)
+        .unwrap_or(local_url.len());
+    if authority_end == after_scheme {
+        return None;
+    }
+    Some(local_url[..authority_end].to_string())
+}
+
 fn persist_package_registry(daemon: &HubDaemon) -> DaemonTransportResult<()> {
     let runtime = daemon
         .runtime()
@@ -2389,6 +2481,28 @@ fn daemon_local_webrtc_answer(answer: DaemonLocalWebrtcAnswer) -> DaemonResponse
     let mut response = daemon_response_base(DaemonResponseKind::LocalWebrtcAnswer);
     response.diagnostics = answer.diagnostics.clone();
     response.local_webrtc_answer = Some(answer);
+    response
+}
+
+fn daemon_local_webrtc_bootstrap(bootstrap: DaemonLocalWebrtcBootstrap) -> DaemonResponse {
+    let mut response = daemon_response_base(DaemonResponseKind::LocalWebrtcBootstrap);
+    response.local_webrtc_bootstrap = Some(bootstrap);
+    response
+}
+
+fn local_webrtc_bootstrap_issue_error(code: &str, message: impl Into<String>) -> DaemonResponse {
+    let message = message.into();
+    let diagnostic =
+        DaemonDiagnostic::action_failure("issue_local_webrtc_bootstrap", message.clone());
+    let mut response = daemon_response_base(DaemonResponseKind::OperatorError);
+    response.error = Some(DaemonOperatorError {
+        code: code.to_string(),
+        request_id: "issue-local-webrtc-bootstrap".to_string(),
+        operation: "issue_local_webrtc_bootstrap".to_string(),
+        message,
+        diagnostics: vec![diagnostic.clone()],
+    });
+    response.diagnostics = vec![diagnostic];
     response
 }
 
