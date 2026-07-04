@@ -152,6 +152,10 @@ pub(crate) fn daemon_protocol_typescript() -> String {
                 "resolve_app_launch",
                 &[("package_name", "string"), ("entrypoint_id", "string")],
             ),
+            (
+                "resolve_package_route",
+                &[("package_name", "string"), ("route_id", "string")],
+            ),
             ("list_packages", &[]),
             ("list_available_packages", &[("registry_path", "string")]),
             (
@@ -268,6 +272,10 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             ("session_context?", "DaemonSessionContext | null"),
             ("apps?", "DaemonApp[]"),
             ("resolved_app_launch?", "DaemonResolvedAppLaunch | null"),
+            (
+                "resolved_package_route?",
+                "DaemonPackageRouteDescriptor | null",
+            ),
             ("packages", "DaemonPackage[]"),
             ("available_packages?", "DaemonAvailablePackage[]"),
             ("install_plan?", "DaemonPackageInstallPlan | null"),
@@ -303,6 +311,7 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             "session_context",
             "apps",
             "resolved_app_launch",
+            "resolved_package_route",
             "packages",
             "available_packages",
             "package_install_plan",
@@ -473,6 +482,7 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             ("actions?", "DaemonPackageActionState[]"),
             ("blocked_reasons?", "string[]"),
             ("launch_target", "DaemonAppLaunchTarget"),
+            ("route?", "DaemonPackageRouteDescriptor | null"),
         ],
     );
     emit_interface(
@@ -493,6 +503,37 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             ("args?", "string[]"),
             ("working_directory", "string"),
             ("environment?", "Record<string, string>"),
+        ],
+    );
+    emit_interface(
+        &mut output,
+        "DaemonPackageRouteDescriptor",
+        &[
+            ("package_name", "string"),
+            ("route_id", "string"),
+            ("route_path", "string"),
+            ("target", "DaemonPackageRouteTarget"),
+            ("title", "string"),
+            ("label", "string"),
+            ("app_id?", "string | null"),
+            ("surface_id?", "string | null"),
+            ("icon?", "string | null"),
+            ("category?", "string | null"),
+            ("layout_mode", "string"),
+            ("required_capabilities?", "DaemonCapability[]"),
+            ("enabled", "boolean"),
+            ("blocked", "boolean"),
+            ("diagnostics?", "DaemonPackageDiagnostic[]"),
+            ("supports_settings", "boolean"),
+        ],
+    );
+    emit_interface(
+        &mut output,
+        "DaemonPackageRouteTarget",
+        &[
+            ("kind", "string"),
+            ("entrypoint_id?", "string | null"),
+            ("surface_id?", "string | null"),
         ],
     );
     emit_interface(
@@ -532,6 +573,7 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             ("state", "string"),
             ("requested_capabilities", "DaemonCapability[]"),
             ("surfaces?", "DaemonPackageSurfaceDescriptor[]"),
+            ("routes?", "DaemonPackageRouteDescriptor[]"),
             ("runnable_entrypoints", "DaemonPackageRunnableEntrypoint[]"),
             ("configuration", "DaemonPackageConfiguration"),
             ("availability", "DaemonPackageAvailability"),
