@@ -326,6 +326,46 @@ Core `entrypoints` remain the plugin/provider code-load ABI, while
 `runnable_entrypoints` is the package discovery shape for clients and future
 launchers.
 
+## Stable Package Routes
+
+`DaemonPackage.routes` is the hub-owned browser route contract for installed
+package surfaces and package settings. Clients should use these descriptors for
+navigation, refresh, direct-load, and browser history instead of reconstructing
+paths from local UI conventions.
+
+Route ids are deterministic:
+
+- Plugin surface routes use `surface:<surface_id>` and
+  `/packages/<package_name>/surfaces/<surface_id>`.
+- Package settings/config routes use `settings` and
+  `/packages/<package_name>/settings`.
+- Runnable app entrypoint routes use `app:<entrypoint_id>` and
+  `/packages/<package_name>/apps/<entrypoint_id>`.
+
+Each descriptor includes `package_name`, `route_id`, `route_path`, `target`,
+`title`, `label`, optional `app_id` / `surface_id`, optional icon/category,
+`layout_mode`, `required_capabilities`, `enabled`, `blocked`, route
+`diagnostics`, and `supports_settings`.
+
+Producer rules are intentionally narrow. Plugin surface route metadata comes
+from manifest `surfaces` and package capabilities. Settings routes are exposed
+only when the package has a configuration schema; their `required_capabilities`
+list is empty because configuration has no package capability producer today.
+`layout_mode` is hub-derived route disposition: `plugin_surface`,
+`settings_form`, or `app_entrypoint`. Runnable app entrypoint routes use the
+entrypoint's declared capabilities. Descriptors must not expose commands, args,
+working directories, environment values, package roots, socket paths, or
+provenance paths.
+
+`DaemonApp.route` carries the same route descriptor for app rows projected from
+runnable entrypoints. `ResolvePackageRoute { package_name, route_id }` resolves a
+single route descriptor through the daemon socket without requiring a prior
+`ListApps` or `ListPackages` click state. Existing but disabled/blocked routes
+return descriptors with structured diagnostics such as `package_not_enabled` or
+`missing_required_configuration`. Missing packages or undeclared route ids return
+`operator_error` responses with specific codes such as `package_not_installed`
+or `route_not_found`.
+
 ## Session Templates And Context
 
 `session_templates` is a hub-owned package manifest extension for PTY session

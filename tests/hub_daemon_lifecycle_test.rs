@@ -505,6 +505,16 @@ fn write_configurable_local_plugin_package(root: &Path) {
   "entrypoints": [
     { "runtime": "lua", "path": "plugin.lua", "bootstrap": false }
   ],
+  "surfaces": [{
+    "id": "config.home",
+    "kind": "app",
+    "title": "Config Home",
+    "description": "Configuration workbench",
+    "icon": "settings",
+    "order": 10,
+    "category": "configuration",
+    "supports": ["render", "action"]
+  }],
   "configuration": {
     "fields": [
       {
@@ -1249,6 +1259,16 @@ fn app_row<'a>(
         .iter()
         .find(|app| app.entrypoint_id == entrypoint_id)
         .unwrap_or_else(|| panic!("response includes app for entrypoint {entrypoint_id}"))
+}
+
+fn package_route<'a>(
+    routes: &'a [botster_hub_client::DaemonPackageRouteDescriptor],
+    route_id: &str,
+) -> &'a botster_hub_client::DaemonPackageRouteDescriptor {
+    routes
+        .iter()
+        .find(|route| route.route_id == route_id)
+        .unwrap_or_else(|| panic!("response includes package route {route_id}"))
 }
 
 fn wait_for_app_local_url(
@@ -7128,6 +7148,20 @@ fn daemon_resolves_terminal_app_foreground_launch_contract() {
     assert_eq!(app.package_name, "botster-tui");
     assert_eq!(app.entrypoint_id, "botster-tui");
     assert_eq!(app.kind, "terminal_app");
+    let app_route = app.route.as_ref().expect("app route descriptor");
+    assert_eq!(app_route.route_id, "app:botster-tui");
+    assert_eq!(
+        app_route.route_path,
+        "/packages/botster-tui/apps/botster-tui"
+    );
+    assert_eq!(app_route.target.kind, "app_entrypoint");
+    assert_eq!(
+        app_route.target.entrypoint_id.as_deref(),
+        Some("botster-tui")
+    );
+    assert_eq!(app_route.layout_mode, "app_entrypoint");
+    assert!(app_route.enabled);
+    assert!(!app_route.blocked);
 
     let reloaded = botster_hub::daemon_transport_request(
         &explicit_config(&data_dir),
@@ -7147,6 +7181,25 @@ fn daemon_resolves_terminal_app_foreground_launch_contract() {
             .expect("resolved foreground launch after restart")
             .command,
         "sh"
+    );
+    let resolved_route = botster_hub::daemon_transport_request(
+        &explicit_config(&data_dir),
+        botster_hub::DaemonRequest::ResolvePackageRoute {
+            package_name: "botster-tui".to_string(),
+            route_id: "app:botster-tui".to_string(),
+        },
+    )
+    .expect("resolve terminal app route after daemon restart");
+    assert_eq!(
+        resolved_route.kind,
+        botster_hub::DaemonResponseKind::ResolvedPackageRoute
+    );
+    assert_eq!(
+        resolved_route
+            .resolved_package_route
+            .expect("resolved app route")
+            .route_path,
+        "/packages/botster-tui/apps/botster-tui"
     );
 
     shutdown_cli_daemon(&data_dir, restarted);
@@ -8630,6 +8683,155 @@ fn local_package_reload_rereads_manifest_restarts_running_app_and_cli_open_uses_
     assert!(alias_text.contains("version=1.1.0"));
     assert!(!alias_text.contains(package_dir.to_string_lossy().as_ref()));
     assert!(!alias_text.contains(data_dir.to_string_lossy().as_ref()));
+
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
+fn daemon_exposes_and_resolves_plugin_surface_and_settings_routes() {
+    let _guard = daemon_test_lock()
+        .lock()
+        .expect("serialize real daemon test");
+    let data_dir = unique_test_dir("package-route-descriptors");
+    let package_dir = unique_test_dir("package-route-descriptors-package");
+    write_configurable_local_plugin_package(&package_dir);
+    let config = explicit_config(&data_dir);
+    let child = start_cli_daemon(&data_dir);
+
+    let install = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::InstallPackageLocalPath {
+            path: package_dir.clone(),
+        },
+    )
+    .expect("install configurable package");
+    assert_eq!(
+        install.kind,
+        botster_hub::DaemonResponseKind::PackageDecision
+    );
+    let installed = install
+        .packages
+        .iter()
+        .find(|package| package.package_name == "configurable.plugin")
+        .expect("installed configurable package");
+    let surface_route = package_route(&installed.routes, "surface:config.home");
+    assert_eq!(
+        surface_route.route_path,
+        "/packages/configurable.plugin/surfaces/config.home"
+    );
+    assert_eq!(surface_route.target.kind, "plugin_surface");
+    assert_eq!(
+        surface_route.target.surface_id.as_deref(),
+        Some("config.home")
+    );
+    assert_eq!(surface_route.app_id.as_deref(), Some("config.home"));
+    assert_eq!(surface_route.surface_id.as_deref(), Some("config.home"));
+    assert_eq!(surface_route.title, "Config Home");
+    assert_eq!(surface_route.icon.as_deref(), Some("settings"));
+    assert_eq!(surface_route.category.as_deref(), Some("configuration"));
+    assert_eq!(surface_route.layout_mode, "plugin_surface");
+    assert!(surface_route.supports_settings);
+    assert!(!surface_route.enabled);
+    assert!(surface_route.blocked);
+    assert!(
+        surface_route
+            .required_capabilities
+            .iter()
+            .any(|capability| capability.surface.eq_ignore_ascii_case("surfaces"))
+    );
+    assert!(
+        surface_route
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.kind == "package_not_enabled")
+    );
+
+    let settings_route = package_route(&installed.routes, "settings");
+    assert_eq!(
+        settings_route.route_path,
+        "/packages/configurable.plugin/settings"
+    );
+    assert_eq!(settings_route.target.kind, "package_settings");
+    assert_eq!(settings_route.layout_mode, "settings_form");
+    assert!(settings_route.supports_settings);
+    assert!(settings_route.enabled);
+    assert!(!settings_route.blocked);
+    assert!(settings_route.required_capabilities.is_empty());
+    assert!(
+        settings_route
+            .diagnostics
+            .iter()
+            .any(
+                |diagnostic| diagnostic.kind == "missing_required_configuration"
+                    && diagnostic.message.contains("endpoint")
+            )
+    );
+
+    let resolved_surface = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::ResolvePackageRoute {
+            package_name: "configurable.plugin".to_string(),
+            route_id: "surface:config.home".to_string(),
+        },
+    )
+    .expect("resolve plugin surface route");
+    assert_eq!(
+        resolved_surface.kind,
+        botster_hub::DaemonResponseKind::ResolvedPackageRoute
+    );
+    assert_eq!(
+        resolved_surface
+            .resolved_package_route
+            .as_ref()
+            .expect("resolved route")
+            .route_path,
+        surface_route.route_path
+    );
+
+    let resolved_settings = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::ResolvePackageRoute {
+            package_name: "configurable.plugin".to_string(),
+            route_id: "settings".to_string(),
+        },
+    )
+    .expect("resolve settings route");
+    assert_eq!(
+        resolved_settings.kind,
+        botster_hub::DaemonResponseKind::ResolvedPackageRoute
+    );
+    assert_eq!(
+        resolved_settings
+            .resolved_package_route
+            .as_ref()
+            .expect("resolved settings route")
+            .target
+            .kind,
+        "package_settings"
+    );
+
+    let missing_route = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::ResolvePackageRoute {
+            package_name: "configurable.plugin".to_string(),
+            route_id: "surface:missing".to_string(),
+        },
+    )
+    .expect("missing route returns operator error");
+    assert_eq!(
+        missing_route.kind,
+        botster_hub::DaemonResponseKind::OperatorError
+    );
+    assert_eq!(
+        missing_route.error.as_ref().expect("operator error").code,
+        "route_not_found"
+    );
+    assert!(missing_route.diagnostics.iter().any(|diagnostic| {
+        diagnostic
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains("route_not_found"))
+    }));
 
     shutdown_cli_daemon(&data_dir, child);
 }

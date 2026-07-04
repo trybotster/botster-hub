@@ -38,13 +38,13 @@ pub use botster_hub_client::{
     DaemonPackageConfiguration, DaemonPackageDecision, DaemonPackageDependencyAvailability,
     DaemonPackageDiagnostic, DaemonPackageEnvironmentRequirement, DaemonPackageFeatureAvailability,
     DaemonPackageInstallEffect, DaemonPackageInstallPlan, DaemonPackagePin, DaemonPackageProcess,
-    DaemonPackageRunnableEntrypoint, DaemonPackageSurfaceDescriptor, DaemonPackageUpdateStatus,
-    DaemonPackageWorkingDirectory, DaemonPluginLifecycle, DaemonRequest, DaemonResolvedAppLaunch,
-    DaemonResolvedSessionTemplate, DaemonResponse, DaemonResponseKind, DaemonSession,
-    DaemonSessionCleanup, DaemonSessionContext, DaemonSessionTemplate,
-    DaemonSessionTemplateContextInput, DaemonSessionTemplateRequest, DaemonStatus,
-    FEATURE_PLUGIN_SURFACE_ACTION, FEATURE_PLUGIN_SURFACE_RENDER, PROTOCOL, read_frame,
-    read_frame_from_reader, write_frame,
+    DaemonPackageRouteDescriptor, DaemonPackageRouteTarget, DaemonPackageRunnableEntrypoint,
+    DaemonPackageSurfaceDescriptor, DaemonPackageUpdateStatus, DaemonPackageWorkingDirectory,
+    DaemonPluginLifecycle, DaemonRequest, DaemonResolvedAppLaunch, DaemonResolvedSessionTemplate,
+    DaemonResponse, DaemonResponseKind, DaemonSession, DaemonSessionCleanup, DaemonSessionContext,
+    DaemonSessionTemplate, DaemonSessionTemplateContextInput, DaemonSessionTemplateRequest,
+    DaemonStatus, FEATURE_PLUGIN_SURFACE_ACTION, FEATURE_PLUGIN_SURFACE_RENDER, PROTOCOL,
+    read_frame, read_frame_from_reader, write_frame,
 };
 use serde_json::Value;
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
@@ -356,6 +356,10 @@ fn handle_control_request(
             package_name,
             entrypoint_id,
         } => resolve_app_launch_response(daemon, &package_name, &entrypoint_id),
+        DaemonRequest::ResolvePackageRoute {
+            package_name,
+            route_id,
+        } => resolve_package_route_response(daemon, &package_name, &route_id),
         DaemonRequest::ListPackages => list_packages_response(daemon),
         DaemonRequest::ListAvailablePackages { registry_path } => {
             available_packages_response(daemon, registry_path)
@@ -1148,6 +1152,7 @@ fn handle_runtime_control_request(
             session_context: None,
             apps: Vec::new(),
             resolved_app_launch: None,
+            resolved_package_route: None,
             packages: Vec::new(),
             available_packages: Vec::new(),
             install_plan: None,
@@ -1170,6 +1175,7 @@ fn handle_runtime_control_request(
         | DaemonRequest::LocalWebrtcSignal { .. } => Err(DaemonTransportError::UnexpectedResponse),
         DaemonRequest::ListApps
         | DaemonRequest::ResolveAppLaunch { .. }
+        | DaemonRequest::ResolvePackageRoute { .. }
         | DaemonRequest::ListPackages
         | DaemonRequest::ListAvailablePackages { .. }
         | DaemonRequest::InspectAvailablePackage { .. }
@@ -1309,6 +1315,35 @@ fn list_apps_response(daemon: &mut HubDaemon) -> DaemonTransportResult<DaemonRes
     let registry = daemon.package_registry().clone();
     let snapshots = daemon.entrypoint_supervisor().snapshots();
     Ok(daemon_apps(apps_from_registry(&registry, snapshots)))
+}
+
+fn resolve_package_route_response(
+    daemon: &mut HubDaemon,
+    package_name: &str,
+    route_id: &str,
+) -> DaemonTransportResult<DaemonResponse> {
+    let registry = daemon.package_registry();
+    let Some(record) = registry.package(package_name) else {
+        return Ok(daemon_package_route_error(
+            package_name,
+            route_id,
+            "package_not_installed",
+            "package is not installed",
+        ));
+    };
+    let package = HubClientPackage::from_record(registry, record);
+    let route = package_route_descriptors(&package)
+        .into_iter()
+        .find(|route| route.route_id == route_id);
+    match route {
+        Some(route) => Ok(daemon_resolved_package_route(route)),
+        None => Ok(daemon_package_route_error(
+            package_name,
+            route_id,
+            "route_not_found",
+            "package route is not declared",
+        )),
+    }
 }
 
 fn supervised_launch_environment(
@@ -1617,7 +1652,7 @@ fn apps_from_record(
                 .map(|result| runnable_process_state_label(&result.process_state).to_string())
                 .or_else(|| snapshot.map(|snapshot| snapshot.state.clone()))
                 .unwrap_or_else(|| "not_started".to_string());
-            let diagnostics = snapshot
+            let diagnostics: Vec<DaemonPackageDiagnostic> = snapshot
                 .map(|snapshot| {
                     snapshot
                         .diagnostics
@@ -1644,13 +1679,20 @@ fn apps_from_record(
                 kind: runnable_entrypoint_kind_label(&entrypoint.kind).to_string(),
                 launch_mode: runnable_launch_mode_label(&entrypoint.launch_mode).to_string(),
                 lifecycle_state,
-                diagnostics,
+                diagnostics: diagnostics.clone(),
                 actions,
-                blocked_reasons,
+                blocked_reasons: blocked_reasons.clone(),
                 launch_target: DaemonAppLaunchTarget {
                     kind: runnable_entrypoint_kind_label(&entrypoint.kind).to_string(),
                     local_url: app_local_url(entrypoint, snapshot),
                 },
+                route: Some(app_entrypoint_route_descriptor(
+                    record,
+                    entrypoint,
+                    &package_state,
+                    blocked_reasons,
+                    diagnostics.clone(),
+                )),
             }
         })
         .collect()
@@ -1787,6 +1829,283 @@ fn app_local_url(
     snapshot
         .and_then(|snapshot| snapshot.launch_result.as_ref())
         .and_then(|result| result.local_url.clone())
+}
+
+fn package_route_descriptors(package: &HubClientPackage) -> Vec<DaemonPackageRouteDescriptor> {
+    let package_state = package_state_label(package.state).to_string();
+    let supports_settings = package.configuration.schema.is_some();
+    let mut routes = package
+        .surfaces
+        .iter()
+        .map(|surface| {
+            plugin_surface_route_descriptor(
+                &package.package_name,
+                &package_state,
+                &package.requested_capabilities,
+                surface,
+                supports_settings,
+            )
+        })
+        .collect::<Vec<_>>();
+    routes.extend(package.runnable_entrypoints.iter().map(|entrypoint| {
+        client_entrypoint_route_descriptor(
+            &package.package_name,
+            &package_state,
+            entrypoint,
+            supports_settings,
+        )
+    }));
+    if supports_settings {
+        routes.push(settings_route_descriptor(
+            &package.package_name,
+            &package_state,
+            &package.configuration,
+        ));
+    }
+    routes
+}
+
+fn plugin_surface_route_descriptor(
+    package_name: &str,
+    package_state: &str,
+    requested_capabilities: &[crate::HubClientCapability],
+    surface: &crate::client_api::HubClientPackageSurfaceDescriptor,
+    supports_settings: bool,
+) -> DaemonPackageRouteDescriptor {
+    let diagnostics = route_state_diagnostics(package_state);
+    DaemonPackageRouteDescriptor {
+        package_name: package_name.to_string(),
+        route_id: surface_route_id(&surface.id),
+        route_path: surface_route_path(package_name, &surface.id),
+        target: DaemonPackageRouteTarget {
+            kind: "plugin_surface".to_string(),
+            entrypoint_id: None,
+            surface_id: Some(surface.id.clone()),
+        },
+        title: surface.title.clone(),
+        label: surface.title.clone(),
+        app_id: (surface.kind == "app").then(|| surface.id.clone()),
+        surface_id: Some(surface.id.clone()),
+        icon: surface.icon.clone(),
+        category: surface.category.clone(),
+        layout_mode: "plugin_surface".to_string(),
+        required_capabilities: requested_capabilities
+            .iter()
+            .filter(|capability| capability.surface.eq_ignore_ascii_case("surfaces"))
+            .map(daemon_capability_from_client)
+            .collect(),
+        enabled: package_state == "enabled",
+        blocked: !diagnostics.is_empty(),
+        diagnostics,
+        supports_settings,
+    }
+}
+
+fn client_entrypoint_route_descriptor(
+    package_name: &str,
+    package_state: &str,
+    entrypoint: &crate::HubClientPackageRunnableEntrypoint,
+    supports_settings: bool,
+) -> DaemonPackageRouteDescriptor {
+    let mut diagnostics = route_state_diagnostics(package_state);
+    diagnostics.extend(
+        client_app_blocked_reasons(package_state, entrypoint)
+            .into_iter()
+            .map(|reason| DaemonPackageDiagnostic {
+                kind: reason,
+                message: format!("{package_name}/{} cannot be opened", entrypoint.id),
+            }),
+    );
+    DaemonPackageRouteDescriptor {
+        package_name: package_name.to_string(),
+        route_id: app_route_id(&entrypoint.id),
+        route_path: app_route_path(package_name, &entrypoint.id),
+        target: DaemonPackageRouteTarget {
+            kind: "app_entrypoint".to_string(),
+            entrypoint_id: Some(entrypoint.id.clone()),
+            surface_id: None,
+        },
+        title: entrypoint.id.clone(),
+        label: entrypoint.id.clone(),
+        app_id: Some(entrypoint.id.clone()),
+        surface_id: None,
+        icon: None,
+        category: Some("apps".to_string()),
+        layout_mode: "app_entrypoint".to_string(),
+        required_capabilities: entrypoint
+            .capabilities
+            .iter()
+            .map(daemon_capability_from_client)
+            .collect(),
+        enabled: package_state == "enabled" && diagnostics.is_empty(),
+        blocked: !diagnostics.is_empty(),
+        diagnostics,
+        supports_settings,
+    }
+}
+
+fn client_app_blocked_reasons(
+    package_state: &str,
+    entrypoint: &crate::HubClientPackageRunnableEntrypoint,
+) -> Vec<String> {
+    let mut reasons = Vec::new();
+    if package_state != "enabled" {
+        reasons.push("package_not_enabled".to_string());
+    }
+    if entrypoint.launch_mode == "background" && !entrypoint.may_supervise {
+        reasons.push("entrypoint_not_supervisable".to_string());
+    }
+    let supported = (entrypoint.kind == "web_app" && entrypoint.launch_mode == "background")
+        || (entrypoint.kind == "terminal_app" && entrypoint.launch_mode == "foreground_stdio");
+    if !supported {
+        reasons.push("unsupported_launch_mode".to_string());
+    }
+    reasons
+}
+
+fn app_entrypoint_route_descriptor(
+    record: &crate::PackageRecord,
+    entrypoint: &crate::PackageRunnableEntrypoint,
+    package_state: &str,
+    blocked_reasons: Vec<String>,
+    mut diagnostics: Vec<DaemonPackageDiagnostic>,
+) -> DaemonPackageRouteDescriptor {
+    diagnostics.extend(
+        blocked_reasons
+            .iter()
+            .map(|reason| DaemonPackageDiagnostic {
+                kind: reason.clone(),
+                message: format!("{} cannot be opened", entrypoint.id),
+            }),
+    );
+    DaemonPackageRouteDescriptor {
+        package_name: record.manifest.name.clone(),
+        route_id: app_route_id(&entrypoint.id),
+        route_path: app_route_path(&record.manifest.name, &entrypoint.id),
+        target: DaemonPackageRouteTarget {
+            kind: "app_entrypoint".to_string(),
+            entrypoint_id: Some(entrypoint.id.clone()),
+            surface_id: None,
+        },
+        title: entrypoint.id.clone(),
+        label: entrypoint.id.clone(),
+        app_id: Some(entrypoint.id.clone()),
+        surface_id: None,
+        icon: None,
+        category: Some("apps".to_string()),
+        layout_mode: "app_entrypoint".to_string(),
+        required_capabilities: entrypoint
+            .capabilities
+            .iter()
+            .map(|capability| DaemonCapability {
+                surface: core_capability_surface_label(&capability.surface).to_string(),
+                scope: capability.scope.clone(),
+            })
+            .collect(),
+        enabled: package_state == "enabled" && diagnostics.is_empty(),
+        blocked: !diagnostics.is_empty(),
+        diagnostics,
+        supports_settings: record.configuration_view().schema.is_some(),
+    }
+}
+
+fn settings_route_descriptor(
+    package_name: &str,
+    package_state: &str,
+    configuration: &crate::HubClientPackageConfiguration,
+) -> DaemonPackageRouteDescriptor {
+    let mut diagnostics = route_state_diagnostics(package_state);
+    diagnostics.extend(configuration.diagnostics.iter().map(|diagnostic| {
+        DaemonPackageDiagnostic {
+            kind: diagnostic.kind.clone(),
+            message: diagnostic.message.clone(),
+        }
+    }));
+    for key in &configuration.missing_required {
+        diagnostics.push(DaemonPackageDiagnostic {
+            kind: "missing_required_configuration".to_string(),
+            message: format!("configuration field {key} is required"),
+        });
+    }
+    DaemonPackageRouteDescriptor {
+        package_name: package_name.to_string(),
+        route_id: "settings".to_string(),
+        route_path: settings_route_path(package_name),
+        target: DaemonPackageRouteTarget {
+            kind: "package_settings".to_string(),
+            entrypoint_id: None,
+            surface_id: None,
+        },
+        title: "Settings".to_string(),
+        label: "Settings".to_string(),
+        app_id: None,
+        surface_id: None,
+        icon: Some("settings".to_string()),
+        category: Some("settings".to_string()),
+        layout_mode: "settings_form".to_string(),
+        required_capabilities: Vec::new(),
+        enabled: true,
+        blocked: false,
+        diagnostics,
+        supports_settings: true,
+    }
+}
+
+fn route_state_diagnostics(package_state: &str) -> Vec<DaemonPackageDiagnostic> {
+    if package_state == "enabled" {
+        Vec::new()
+    } else {
+        vec![DaemonPackageDiagnostic {
+            kind: "package_not_enabled".to_string(),
+            message: "package is not enabled".to_string(),
+        }]
+    }
+}
+
+fn daemon_capability_from_client(capability: &crate::HubClientCapability) -> DaemonCapability {
+    DaemonCapability {
+        surface: capability.surface.clone(),
+        scope: capability.scope.clone(),
+    }
+}
+
+fn core_capability_surface_label(surface: &botster_core::CapabilitySurface) -> &'static str {
+    match surface {
+        botster_core::CapabilitySurface::ClientAdmission => "ClientAdmission",
+        botster_core::CapabilitySurface::PairingInvites => "PairingInvites",
+        botster_core::CapabilitySurface::SignalingRelay => "SignalingRelay",
+        botster_core::CapabilitySurface::HubPresence => "HubPresence",
+        botster_core::CapabilitySurface::BrowserShell => "BrowserShell",
+        botster_core::CapabilitySurface::Secrets => "Secrets",
+        botster_core::CapabilitySurface::Crypto => "Crypto",
+        botster_core::CapabilitySurface::Network => "Network",
+        botster_core::CapabilitySurface::Surfaces => "Surfaces",
+        botster_core::CapabilitySurface::SessionActions => "SessionActions",
+        botster_core::CapabilitySurface::Mcp => "Mcp",
+        botster_core::CapabilitySurface::PluginDb => "PluginDb",
+        botster_core::CapabilitySurface::Filesystem => "Filesystem",
+        botster_core::CapabilitySurface::Timers => "Timers",
+    }
+}
+
+fn surface_route_id(surface_id: &str) -> String {
+    format!("surface:{surface_id}")
+}
+
+fn app_route_id(entrypoint_id: &str) -> String {
+    format!("app:{entrypoint_id}")
+}
+
+fn surface_route_path(package_name: &str, surface_id: &str) -> String {
+    format!("/packages/{package_name}/surfaces/{surface_id}")
+}
+
+fn app_route_path(package_name: &str, entrypoint_id: &str) -> String {
+    format!("/packages/{package_name}/apps/{entrypoint_id}")
+}
+
+fn settings_route_path(package_name: &str) -> String {
+    format!("/packages/{package_name}/settings")
 }
 
 fn issue_local_webrtc_bootstrap_response(
@@ -2146,6 +2465,7 @@ fn daemon_response_base(kind: DaemonResponseKind) -> DaemonResponse {
         session_context: None,
         apps: Vec::new(),
         resolved_app_launch: None,
+        resolved_package_route: None,
         packages: Vec::new(),
         available_packages: Vec::new(),
         install_plan: None,
@@ -2301,6 +2621,12 @@ fn daemon_apps(apps: Vec<DaemonApp>) -> DaemonResponse {
 fn daemon_resolved_app_launch(launch: DaemonResolvedAppLaunch) -> DaemonResponse {
     let mut response = daemon_response_base(DaemonResponseKind::ResolvedAppLaunch);
     response.resolved_app_launch = Some(launch);
+    response
+}
+
+fn daemon_resolved_package_route(route: DaemonPackageRouteDescriptor) -> DaemonResponse {
+    let mut response = daemon_response_base(DaemonResponseKind::ResolvedPackageRoute);
+    response.resolved_package_route = Some(route);
     response
 }
 
@@ -2527,6 +2853,27 @@ fn daemon_app_launch_error(
     response
 }
 
+fn daemon_package_route_error(
+    package_name: &str,
+    route_id: &str,
+    code: &str,
+    message: impl Into<String>,
+) -> DaemonResponse {
+    let message = message.into();
+    let diagnostic =
+        DaemonDiagnostic::action_failure("resolve_package_route", format!("{code}: {message}"));
+    let mut response = daemon_response_base(DaemonResponseKind::OperatorError);
+    response.error = Some(DaemonOperatorError {
+        code: code.to_string(),
+        request_id: format!("resolve-package-route-{package_name}-{route_id}"),
+        operation: "resolve_package_route".to_string(),
+        message,
+        diagnostics: vec![diagnostic.clone()],
+    });
+    response.diagnostics = vec![diagnostic];
+    response
+}
+
 fn daemon_coordination(
     kind: DaemonResponseKind,
     coordination: DaemonCoordination,
@@ -2703,6 +3050,7 @@ fn daemon_package_from_client(package: HubClientPackage) -> DaemonPackage {
     let package_name = package.package_name.clone();
     let package_state = package_state_label(package.state).to_string();
     let package_actions = installed_package_actions(&package);
+    let routes = package_route_descriptors(&package);
     DaemonPackage {
         package_name: package.package_name,
         version: package.version,
@@ -2731,6 +3079,7 @@ fn daemon_package_from_client(package: HubClientPackage) -> DaemonPackage {
                 supports: surface.supports,
             })
             .collect(),
+        routes,
         runnable_entrypoints: package
             .runnable_entrypoints
             .into_iter()

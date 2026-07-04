@@ -2646,6 +2646,19 @@ fn print_daemon_response(response: DaemonResponse) -> Result<(), OperatorError> 
                 println!("environment={}", launch.environment.len());
             }
         }
+        DaemonResponseKind::ResolvedPackageRoute => {
+            println!("response=resolved_package_route");
+            if let Some(route) = response.resolved_package_route {
+                println!("package={}", route.package_name);
+                println!("route_id={}", route.route_id);
+                println!("route_path={}", route.route_path);
+                println!("target={}", route.target.kind);
+                println!("layout_mode={}", route.layout_mode);
+                println!("enabled={}", route.enabled);
+                println!("blocked={}", route.blocked);
+                println!("diagnostics={}", route.diagnostics.len());
+            }
+        }
         DaemonResponseKind::Packages => {
             print_packages(&response.packages, false);
         }
