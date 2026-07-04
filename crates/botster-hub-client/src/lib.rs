@@ -26,6 +26,7 @@ pub const FEATURE_TERMINAL_STREAMING: &str = "terminal_streaming";
 pub const FEATURE_RESIZE: &str = "resize";
 pub const FEATURE_PLUGIN_SURFACE_RENDER: &str = "plugin_surface_render";
 pub const FEATURE_PLUGIN_SURFACE_ACTION: &str = "plugin_surface_action";
+pub const FEATURE_PACKAGE_ROUTES: &str = "package_routes";
 const ATTACH_DRAIN_INTERVAL: Duration = Duration::from_millis(25);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -511,6 +512,7 @@ fn current_feature_list() -> Vec<&'static str> {
         FEATURE_RESIZE,
         FEATURE_PLUGIN_SURFACE_RENDER,
         FEATURE_PLUGIN_SURFACE_ACTION,
+        FEATURE_PACKAGE_ROUTES,
     ]
 }
 
@@ -595,6 +597,10 @@ pub enum DaemonRequest {
     ResolveAppLaunch {
         package_name: String,
         entrypoint_id: String,
+    },
+    ResolvePackageRoute {
+        package_name: String,
+        route_id: String,
     },
     ListPackages,
     ListAvailablePackages {
@@ -713,6 +719,8 @@ pub struct DaemonResponse {
     pub apps: Vec<DaemonApp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_app_launch: Option<DaemonResolvedAppLaunch>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_package_route: Option<DaemonPackageRouteDescriptor>,
     pub packages: Vec<DaemonPackage>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub available_packages: Vec<DaemonAvailablePackage>,
@@ -754,6 +762,7 @@ pub enum DaemonResponseKind {
     SessionContext,
     Apps,
     ResolvedAppLaunch,
+    ResolvedPackageRoute,
     Packages,
     AvailablePackages,
     PackageInstallPlan,
@@ -916,6 +925,8 @@ pub struct DaemonPackage {
     pub requested_capabilities: Vec<DaemonCapability>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub surfaces: Vec<DaemonPackageSurfaceDescriptor>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub routes: Vec<DaemonPackageRouteDescriptor>,
     #[serde(default)]
     pub runnable_entrypoints: Vec<DaemonPackageRunnableEntrypoint>,
     #[serde(default)]
@@ -950,6 +961,8 @@ pub struct DaemonApp {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub blocked_reasons: Vec<String>,
     pub launch_target: DaemonAppLaunchTarget,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route: Option<DaemonPackageRouteDescriptor>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -972,6 +985,41 @@ pub struct DaemonResolvedAppLaunch {
     pub working_directory: String,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub environment: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonPackageRouteDescriptor {
+    pub package_name: String,
+    pub route_id: String,
+    pub route_path: String,
+    pub target: DaemonPackageRouteTarget,
+    pub title: String,
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub surface_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+    pub layout_mode: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_capabilities: Vec<DaemonCapability>,
+    pub enabled: bool,
+    pub blocked: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<DaemonPackageDiagnostic>,
+    pub supports_settings: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonPackageRouteTarget {
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entrypoint_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub surface_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2013,6 +2061,7 @@ mod tests {
 
         let package = DaemonPackage {
             surfaces: Vec::new(),
+            routes: Vec::new(),
             ..daemon_response_example(DaemonResponseKind::Packages).packages[0].clone()
         };
         let value = serde_json::to_value(package).expect("package serializes");
@@ -2035,6 +2084,7 @@ mod tests {
                 category: Some("workflows".to_string()),
                 supports: vec!["render".to_string(), "action".to_string()],
             }],
+            routes: Vec::new(),
             ..daemon_response_example(DaemonResponseKind::Packages).packages[0].clone()
         };
 
@@ -2098,6 +2148,91 @@ mod tests {
     }
 
     #[test]
+    fn package_route_descriptors_are_serde_stable_and_generated() {
+        let route = DaemonPackageRouteDescriptor {
+            package_name: "workflow.plugin".to_string(),
+            route_id: "surface:workflow.home".to_string(),
+            route_path: "/packages/workflow.plugin/surfaces/workflow.home".to_string(),
+            target: DaemonPackageRouteTarget {
+                kind: "plugin_surface".to_string(),
+                entrypoint_id: None,
+                surface_id: Some("workflow.home".to_string()),
+            },
+            title: "Workflow".to_string(),
+            label: "Workflow".to_string(),
+            app_id: Some("workflow.home".to_string()),
+            surface_id: Some("workflow.home".to_string()),
+            icon: Some("workflow".to_string()),
+            category: Some("workflows".to_string()),
+            layout_mode: "plugin_surface".to_string(),
+            required_capabilities: vec![DaemonCapability {
+                surface: "Surfaces".to_string(),
+                scope: None,
+            }],
+            enabled: true,
+            blocked: false,
+            diagnostics: Vec::new(),
+            supports_settings: true,
+        };
+        let package = DaemonPackage {
+            routes: vec![route.clone()],
+            ..daemon_response_example(DaemonResponseKind::Packages).packages[0].clone()
+        };
+        let value = serde_json::to_value(package).expect("package route serializes");
+        assert_eq!(
+            value["routes"][0],
+            serde_json::json!({
+                "package_name": "workflow.plugin",
+                "route_id": "surface:workflow.home",
+                "route_path": "/packages/workflow.plugin/surfaces/workflow.home",
+                "target": {
+                    "kind": "plugin_surface",
+                    "surface_id": "workflow.home"
+                },
+                "title": "Workflow",
+                "label": "Workflow",
+                "app_id": "workflow.home",
+                "surface_id": "workflow.home",
+                "icon": "workflow",
+                "category": "workflows",
+                "layout_mode": "plugin_surface",
+                "required_capabilities": [{"surface": "Surfaces", "scope": null}],
+                "enabled": true,
+                "blocked": false,
+                "supports_settings": true
+            })
+        );
+
+        let request = DaemonRequest::ResolvePackageRoute {
+            package_name: "workflow.plugin".to_string(),
+            route_id: "surface:workflow.home".to_string(),
+        };
+        let request_value = serde_json::to_value(request).expect("request serializes");
+        assert_eq!(
+            request_value,
+            serde_json::json!({
+                "type": "resolve_package_route",
+                "package_name": "workflow.plugin",
+                "route_id": "surface:workflow.home"
+            })
+        );
+
+        let generated = daemon_protocol_typescript();
+        assert!(generated.contains("routes?: DaemonPackageRouteDescriptor[];"));
+        assert!(generated.contains("route?: DaemonPackageRouteDescriptor | null;"));
+        assert!(
+            generated.contains("resolved_package_route?: DaemonPackageRouteDescriptor | null;")
+        );
+        assert!(generated.contains("export interface DaemonPackageRouteDescriptor"));
+        assert!(
+            generated.contains(
+                r#"| { type: "resolve_package_route"; package_name: string; route_id: string }"#
+            ),
+            "generated TypeScript should include resolve_package_route request"
+        );
+    }
+
+    #[test]
     fn daemon_package_configuration_optional_fields_match_serde_omission() {
         let package = DaemonPackage {
             package_name: "workflow.plugin".to_string(),
@@ -2107,6 +2242,7 @@ mod tests {
             state: "enabled".to_string(),
             requested_capabilities: Vec::new(),
             surfaces: Vec::new(),
+            routes: Vec::new(),
             runnable_entrypoints: Vec::new(),
             configuration: DaemonPackageConfiguration::default(),
             availability: DaemonPackageAvailability::default(),
@@ -2393,6 +2529,10 @@ mod tests {
                 package_name: "workflow.plugin".to_string(),
                 entrypoint_id: "terminal".to_string(),
             },
+            DaemonRequest::ResolvePackageRoute {
+                package_name: "workflow.plugin".to_string(),
+                route_id: "surface:workflow.home".to_string(),
+            },
             DaemonRequest::ListPackages,
             DaemonRequest::ListAvailablePackages {
                 registry_path: PathBuf::from("/tmp/registry"),
@@ -2515,6 +2655,7 @@ mod tests {
             DaemonRequest::ReadSessionContext { .. } => "read_session_context",
             DaemonRequest::ListApps => "list_apps",
             DaemonRequest::ResolveAppLaunch { .. } => "resolve_app_launch",
+            DaemonRequest::ResolvePackageRoute { .. } => "resolve_package_route",
             DaemonRequest::ListPackages => "list_packages",
             DaemonRequest::ListAvailablePackages { .. } => "list_available_packages",
             DaemonRequest::InspectAvailablePackage { .. } => "inspect_available_package",
@@ -2557,6 +2698,7 @@ mod tests {
             DaemonResponseKind::SessionContext,
             DaemonResponseKind::Apps,
             DaemonResponseKind::ResolvedAppLaunch,
+            DaemonResponseKind::ResolvedPackageRoute,
             DaemonResponseKind::Packages,
             DaemonResponseKind::AvailablePackages,
             DaemonResponseKind::PackageInstallPlan,
@@ -2591,6 +2733,7 @@ mod tests {
             DaemonResponseKind::SessionContext => "session_context",
             DaemonResponseKind::Apps => "apps",
             DaemonResponseKind::ResolvedAppLaunch => "resolved_app_launch",
+            DaemonResponseKind::ResolvedPackageRoute => "resolved_package_route",
             DaemonResponseKind::Packages => "packages",
             DaemonResponseKind::AvailablePackages => "available_packages",
             DaemonResponseKind::PackageInstallPlan => "package_install_plan",
@@ -2696,6 +2839,7 @@ mod tests {
                     kind: "web".to_string(),
                     local_url: Some("http://127.0.0.1:49152".to_string()),
                 },
+                route: None,
             }],
             resolved_app_launch: Some(DaemonResolvedAppLaunch {
                 package_name: "workflow.plugin".to_string(),
@@ -2711,6 +2855,31 @@ mod tests {
                     "/tmp/botster.sock".to_string(),
                 )]),
             }),
+            resolved_package_route: Some(DaemonPackageRouteDescriptor {
+                package_name: "workflow.plugin".to_string(),
+                route_id: "surface:workflow.home".to_string(),
+                route_path: "/packages/workflow.plugin/surfaces/workflow.home".to_string(),
+                target: DaemonPackageRouteTarget {
+                    kind: "plugin_surface".to_string(),
+                    entrypoint_id: None,
+                    surface_id: Some("workflow.home".to_string()),
+                },
+                title: "Workflow".to_string(),
+                label: "Workflow".to_string(),
+                app_id: Some("workflow.home".to_string()),
+                surface_id: Some("workflow.home".to_string()),
+                icon: Some("workflow".to_string()),
+                category: Some("workflows".to_string()),
+                layout_mode: "plugin_surface".to_string(),
+                required_capabilities: vec![DaemonCapability {
+                    surface: "Surfaces".to_string(),
+                    scope: None,
+                }],
+                enabled: true,
+                blocked: false,
+                diagnostics: Vec::new(),
+                supports_settings: true,
+            }),
             packages: vec![DaemonPackage {
                 package_name: "workflow.plugin".to_string(),
                 version: "1.0.0".to_string(),
@@ -2722,6 +2891,7 @@ mod tests {
                     scope: Some("localhost".to_string()),
                 }],
                 surfaces: Vec::new(),
+                routes: Vec::new(),
                 runnable_entrypoints: Vec::new(),
                 configuration: DaemonPackageConfiguration::default(),
                 availability: DaemonPackageAvailability::default(),

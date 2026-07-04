@@ -58,6 +58,7 @@ export type DaemonRequest =
   | { type: "read_session_context"; session_id: string; context_id?: string | null; key?: string | null }
   | { type: "list_apps" }
   | { type: "resolve_app_launch"; package_name: string; entrypoint_id: string }
+  | { type: "resolve_package_route"; package_name: string; route_id: string }
   | { type: "list_packages" }
   | { type: "list_available_packages"; registry_path: string }
   | { type: "inspect_available_package"; registry_path: string; entry_id: string }
@@ -96,6 +97,7 @@ export interface DaemonResponse {
   session_context?: DaemonSessionContext | null;
   apps?: DaemonApp[];
   resolved_app_launch?: DaemonResolvedAppLaunch | null;
+  resolved_package_route?: DaemonPackageRouteDescriptor | null;
   packages: DaemonPackage[];
   available_packages?: DaemonAvailablePackage[];
   install_plan?: DaemonPackageInstallPlan | null;
@@ -125,6 +127,7 @@ export type DaemonResponseKind =
   | "session_context"
   | "apps"
   | "resolved_app_launch"
+  | "resolved_package_route"
   | "packages"
   | "available_packages"
   | "package_install_plan"
@@ -256,6 +259,7 @@ export interface DaemonApp {
   actions?: DaemonPackageActionState[];
   blocked_reasons?: string[];
   launch_target: DaemonAppLaunchTarget;
+  route?: DaemonPackageRouteDescriptor | null;
 }
 
 export interface DaemonAppLaunchTarget {
@@ -273,6 +277,31 @@ export interface DaemonResolvedAppLaunch {
   args?: string[];
   working_directory: string;
   environment?: Record<string, string>;
+}
+
+export interface DaemonPackageRouteDescriptor {
+  package_name: string;
+  route_id: string;
+  route_path: string;
+  target: DaemonPackageRouteTarget;
+  title: string;
+  label: string;
+  app_id?: string | null;
+  surface_id?: string | null;
+  icon?: string | null;
+  category?: string | null;
+  layout_mode: string;
+  required_capabilities?: DaemonCapability[];
+  enabled: boolean;
+  blocked: boolean;
+  diagnostics?: DaemonPackageDiagnostic[];
+  supports_settings: boolean;
+}
+
+export interface DaemonPackageRouteTarget {
+  kind: string;
+  entrypoint_id?: string | null;
+  surface_id?: string | null;
 }
 
 export interface DaemonLocalWebrtcBootstrap {
@@ -303,6 +332,7 @@ export interface DaemonPackage {
   state: string;
   requested_capabilities: DaemonCapability[];
   surfaces?: DaemonPackageSurfaceDescriptor[];
+  routes?: DaemonPackageRouteDescriptor[];
   runnable_entrypoints: DaemonPackageRunnableEntrypoint[];
   configuration: DaemonPackageConfiguration;
   availability: DaemonPackageAvailability;
