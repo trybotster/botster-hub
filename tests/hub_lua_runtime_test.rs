@@ -509,9 +509,11 @@ fn project_pipelines_surface_action_round_trip_uses_client_api_and_plugin_worker
     let HubClientResponseBody::PluginSurface(surface) = surface.body else {
         panic!("plugin surface response expected");
     };
-    assert_eq!(surface.kind, UiNodeKind::Panel);
+    assert_eq!(surface.package_name, "project-pipelines");
+    assert_eq!(surface.surface_id, "project-pipelines.create-ticket");
+    assert_eq!(surface.body.kind, UiNodeKind::Panel);
     assert_eq!(
-        surface.id.as_ref().map(|id| id.0.as_str()),
+        surface.body.id.as_ref().map(|id| id.0.as_str()),
         Some("project-pipelines-create-panel")
     );
 

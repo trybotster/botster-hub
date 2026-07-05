@@ -284,7 +284,7 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             ("lifecycle", "DaemonPluginLifecycle[]"),
             ("plugin_tools", "JsonValue[]"),
             ("plugin_tool_result", "JsonValue"),
-            ("plugin_surface?", "JsonValue"),
+            ("plugin_surface?", "DaemonPluginSurface | null"),
             ("plugin_action_result?", "JsonValue"),
             (
                 "local_webrtc_bootstrap?",
@@ -296,6 +296,15 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             ("coordination", "DaemonCoordination | null"),
             ("error", "DaemonOperatorError | null"),
             ("diagnostics?", "DaemonDiagnostic[]"),
+        ],
+    );
+    emit_interface(
+        &mut output,
+        "DaemonPluginSurface",
+        &[
+            ("package_name", "string"),
+            ("surface_id", "string"),
+            ("body", "JsonValue"),
         ],
     );
     emit_string_union(

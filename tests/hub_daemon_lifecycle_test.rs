@@ -1653,7 +1653,38 @@ local function use_workspace(arguments)
   return { ok = true, workspace = workspace }
 end
 
+local function render_workspaces(_arguments)
+  return {
+    type = "panel",
+    id = "botster-workspaces-panel",
+    props = {
+      title = "Workspaces",
+    },
+    children = {
+      {
+        type = "text",
+        id = "botster-workspaces-title",
+        props = {
+          text = "Workspaces",
+        },
+      },
+    },
+  }
+end
+
 return botster.register({
+  handlers = {
+    {
+      id = "workspaces_surface",
+      kind = "surface_route",
+      descriptor_id = "workspaces",
+      descriptor = {
+        title = "Workspaces",
+        surface_id = "workspaces",
+      },
+      call = render_workspaces,
+    },
+  },
   tools = {
     {
       name = "botster_workspaces.create",
@@ -1701,6 +1732,14 @@ return botster.register({
     {{ "surface": "plugin_db", "scope": "{plugin_db_scope}" }},
     {{ "surface": "surfaces" }},
     {{ "surface": "filesystem", "scope": "workspace" }}
+  ],
+  "surfaces": [
+    {{
+      "id": "workspaces",
+      "kind": "app",
+      "title": "Workspaces",
+      "supports": ["render"]
+    }}
   ],
   "entrypoints": [
     {{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }}
@@ -2198,8 +2237,10 @@ fn daemon_package_dtos_expose_declared_surfaces_and_validate_surface_ids() {
     let data_dir = unique_short_test_dir("package-surfaces");
     let surface_package_dir = unique_test_dir("daemon-declared-surface-package");
     let legacy_package_dir = unique_test_dir("daemon-legacy-surface-package");
+    let workspaces_package_dir = unique_test_dir("daemon-workspaces-surface-package");
     write_declared_surface_plugin_package(&surface_package_dir);
     write_local_plugin_package(&legacy_package_dir);
+    write_botster_workspaces_local_package(&workspaces_package_dir, "botster-workspaces");
     let config = explicit_config(&data_dir);
     let socket_path = config
         .transports
@@ -2235,6 +2276,15 @@ fn daemon_package_dtos_expose_declared_surfaces_and_validate_surface_ids() {
         install_legacy.kind,
         botster_hub_client::DaemonResponseKind::PackageDecision
     );
+    let enable_workspaces = connection
+        .request(&botster_hub_client::DaemonRequest::EnablePackageLocalPath {
+            path: workspaces_package_dir,
+        })
+        .expect("enable workspaces package with declared surface");
+    assert_eq!(
+        enable_workspaces.kind,
+        botster_hub_client::DaemonResponseKind::PackageDecision
+    );
 
     let packages = connection
         .request(&botster_hub_client::DaemonRequest::ListPackages)
@@ -2265,6 +2315,25 @@ fn daemon_package_dtos_expose_declared_surfaces_and_validate_surface_ids() {
         .expect("show package with declared surfaces");
     assert_eq!(show.packages.len(), 1);
     assert_eq!(show.packages[0].surfaces, surface_package.surfaces);
+
+    let workspaces = connection
+        .request(&botster_hub_client::DaemonRequest::PluginSurfaceRender {
+            package_name: "botster-workspaces".to_string(),
+            surface_id: "workspaces".to_string(),
+            payload: serde_json::json!({}),
+        })
+        .expect("workspaces surface render returns plugin surface envelope");
+    assert_eq!(
+        workspaces.kind,
+        botster_hub_client::DaemonResponseKind::PluginSurface
+    );
+    let plugin_surface = workspaces
+        .plugin_surface
+        .expect("workspaces render includes plugin surface");
+    assert_eq!(plugin_surface.package_name, "botster-workspaces");
+    assert_eq!(plugin_surface.surface_id, "workspaces");
+    assert_eq!(plugin_surface.body["type"], "panel");
+    assert_eq!(plugin_surface.body["id"], "botster-workspaces-panel");
 
     let undeclared = connection
         .request(&botster_hub_client::DaemonRequest::PluginSurfaceRender {
