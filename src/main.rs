@@ -1,8 +1,9 @@
 use std::collections::BTreeMap;
 use std::env;
 use std::fmt;
-use std::io::{self, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{self, Child, Command, Stdio};
 use std::sync::Arc;
@@ -24,6 +25,7 @@ use botster_hub::{
     host_profile, serve_daemon, serve_mcp_stdio, stream_attach,
 };
 use botster_hub_client::{DaemonDiagnostic, DaemonLocalWebrtcBootstrap, DaemonPackageUpdateStatus};
+use serde::{Deserialize, Serialize};
 use webrtc::data_channel::{DataChannel, DataChannelEvent, RTCDataChannelInit};
 use webrtc::peer_connection::{
     PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler, RTCIceGatheringState,
@@ -36,6 +38,8 @@ use webrtc::runtime::{
 
 const SMOKE_MARKER: &str = "botster-hub-smoke-ok";
 const SMOKE_TIMEOUT: Duration = Duration::from_secs(5);
+const DEV_STACK_DAEMON_METADATA_FILE: &str = ".botster-hub-dev-stack-daemon.json";
+const TEST_INCOMPATIBLE_DAEMON_ENV: &str = "BOTSTER_HUB_TEST_INCOMPATIBLE_DAEMON";
 
 fn main() {
     match env::args().nth(1).as_deref() {
@@ -222,6 +226,12 @@ fn start_daemon(args: Vec<String>) -> Result<(), StartError> {
     let options = StartOptions::parse(args)?;
     let config = explicit_config_with_worker(options.data_directory, options.session_worker_bin)?;
 
+    if env::var_os(TEST_INCOMPATIBLE_DAEMON_ENV).is_some()
+        && env::var("BOTSTER_ENV").as_deref() == Ok("test")
+    {
+        return serve_test_incompatible_daemon(&config).map_err(StartError::Transport);
+    }
+
     let stopped = serve_daemon(config)?;
     let status = DaemonStatus {
         lifecycle_state: lifecycle_state_label(stopped.lifecycle_state).to_string(),
@@ -380,13 +390,21 @@ fn local_runtime_up(args: Vec<String>) -> Result<(), DevStackError> {
 
 fn local_runtime_down(args: Vec<String>) -> Result<(), DevStackError> {
     let options = LocalRuntimeDownOptions::parse(args)?;
-    let config = explicit_config(options.data_directory)?;
+    let config = explicit_config(options.data_directory.clone())?;
     let response = match daemon_transport_request(&config, DaemonRequest::DaemonShutdown) {
         Ok(response) => response,
         Err(botster_hub::DaemonTransportError::Compatibility(error)) => {
+            if recover_owned_stale_dev_stack_daemon(&options.data_directory, &config)? {
+                println!("daemon=recovered_stale");
+                return Ok(());
+            }
             return Err(DevStackError::IncompatibleDaemon(error.to_string()));
         }
         Err(botster_hub::DaemonTransportError::Protocol(message)) => {
+            if recover_owned_stale_dev_stack_daemon(&options.data_directory, &config)? {
+                println!("daemon=recovered_stale");
+                return Ok(());
+            }
             return Err(DevStackError::IncompatibleDaemon(message.to_string()));
         }
         Err(error) => return Err(error.into()),
@@ -1175,14 +1193,28 @@ fn ensure_dev_stack_daemon(
             | botster_hub::DaemonTransportError::ClientDisconnected,
         ) => {}
         Err(botster_hub::DaemonTransportError::Compatibility(error)) => {
+            if recover_owned_stale_dev_stack_daemon(&options.data_directory, config)? {
+                return spawn_dev_stack_daemon(hub_bin, options, config);
+            }
             return Err(DevStackError::IncompatibleDaemon(error.to_string()));
         }
         Err(botster_hub::DaemonTransportError::Protocol(message)) => {
+            if recover_owned_stale_dev_stack_daemon(&options.data_directory, config)? {
+                return spawn_dev_stack_daemon(hub_bin, options, config);
+            }
             return Err(DevStackError::IncompatibleDaemon(message.to_string()));
         }
         Err(error) => return Err(error.into()),
     }
 
+    spawn_dev_stack_daemon(hub_bin, options, config)
+}
+
+fn spawn_dev_stack_daemon(
+    hub_bin: &Path,
+    options: &DevStackOptions,
+    config: &botster_hub::HubConfig,
+) -> Result<DevStackDaemonOwnership, DevStackError> {
     if !hub_bin.is_file() {
         return Err(DevStackError::MissingHubBinary(hub_bin.to_path_buf()));
     }
@@ -1204,7 +1236,18 @@ fn ensure_dev_stack_daemon(
             source,
         })?;
 
-    wait_for_dev_stack_ready(config, &mut child)?;
+    if let Err(error) =
+        write_dev_stack_daemon_metadata(&options.data_directory, config, hub_bin, child.id())
+    {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
+    }
+
+    if let Err(error) = wait_for_dev_stack_ready(config, &mut child) {
+        let _ = remove_dev_stack_daemon_metadata(&options.data_directory);
+        return Err(error);
+    }
     Ok(DevStackDaemonOwnership::Started)
 }
 
@@ -1224,6 +1267,235 @@ fn wait_for_dev_stack_ready(
     }
 
     Err(DevStackError::ReadinessTimeout)
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct DevStackDaemonMetadata {
+    pid: u32,
+    data_directory: String,
+    #[serde(default)]
+    data_directory_arg: Option<String>,
+    socket_path: String,
+    hub_bin: String,
+}
+
+fn recover_owned_stale_dev_stack_daemon(
+    data_directory: &Path,
+    config: &botster_hub::HubConfig,
+) -> Result<bool, DevStackError> {
+    let Some(metadata) = read_dev_stack_daemon_metadata(data_directory)? else {
+        return Ok(false);
+    };
+    if !dev_stack_daemon_metadata_matches(&metadata, data_directory, config)? {
+        return Ok(false);
+    }
+    let Some(command) = process_command(metadata.pid)? else {
+        return Ok(false);
+    };
+    if !dev_stack_daemon_command_matches(&metadata, &command) {
+        return Ok(false);
+    }
+
+    terminate_process(metadata.pid)?;
+    wait_for_dev_stack_daemon_exit(metadata.pid)?;
+    remove_configured_local_socket(config)?;
+    remove_dev_stack_daemon_metadata(data_directory)?;
+    Ok(true)
+}
+
+fn write_dev_stack_daemon_metadata(
+    data_directory: &Path,
+    config: &botster_hub::HubConfig,
+    hub_bin: &Path,
+    pid: u32,
+) -> Result<(), DevStackError> {
+    let metadata = DevStackDaemonMetadata {
+        pid,
+        data_directory: stable_path_string(data_directory),
+        data_directory_arg: Some(data_directory.display().to_string()),
+        socket_path: configured_local_socket_path(config)?.display().to_string(),
+        hub_bin: stable_path_string(hub_bin),
+    };
+    let bytes = serde_json::to_vec_pretty(&metadata).map_err(DevStackError::SerializeMetadata)?;
+    std::fs::write(dev_stack_daemon_metadata_path(data_directory), bytes).map_err(|source| {
+        DevStackError::WriteDaemonMetadata {
+            path: dev_stack_daemon_metadata_path(data_directory),
+            source,
+        }
+    })
+}
+
+fn read_dev_stack_daemon_metadata(
+    data_directory: &Path,
+) -> Result<Option<DevStackDaemonMetadata>, DevStackError> {
+    let path = dev_stack_daemon_metadata_path(data_directory);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => return Err(DevStackError::ReadDaemonMetadata { path, source }),
+    };
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(DevStackError::ReadDaemonMetadataJson)
+}
+
+fn dev_stack_daemon_metadata_matches(
+    metadata: &DevStackDaemonMetadata,
+    data_directory: &Path,
+    config: &botster_hub::HubConfig,
+) -> Result<bool, DevStackError> {
+    Ok(
+        metadata.data_directory == stable_path_string(data_directory)
+            && metadata.socket_path == configured_local_socket_path(config)?.display().to_string(),
+    )
+}
+
+fn dev_stack_daemon_command_matches(metadata: &DevStackDaemonMetadata, command: &str) -> bool {
+    let hub_bin_name = Path::new(&metadata.hub_bin)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("botster-hub");
+    command.contains(hub_bin_name)
+        && command.contains(" start ")
+        && command.contains("--data-dir")
+        && (command.contains(&metadata.data_directory)
+            || metadata
+                .data_directory_arg
+                .as_ref()
+                .is_some_and(|argument| command.contains(argument)))
+}
+
+fn configured_local_socket_path(config: &botster_hub::HubConfig) -> Result<PathBuf, DevStackError> {
+    config
+        .transports
+        .local_socket
+        .as_ref()
+        .map(|binding| binding.path.clone())
+        .ok_or(DevStackError::MissingLocalSocket)
+}
+
+fn remove_configured_local_socket(config: &botster_hub::HubConfig) -> Result<(), DevStackError> {
+    let socket_path = configured_local_socket_path(config)?;
+    match std::fs::remove_file(&socket_path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(DevStackError::RemoveLocalSocket {
+            path: socket_path,
+            source,
+        }),
+    }
+}
+
+fn remove_dev_stack_daemon_metadata(data_directory: &Path) -> Result<(), DevStackError> {
+    let path = dev_stack_daemon_metadata_path(data_directory);
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(DevStackError::RemoveDaemonMetadata { path, source }),
+    }
+}
+
+fn dev_stack_daemon_metadata_path(data_directory: &Path) -> PathBuf {
+    data_directory.join(DEV_STACK_DAEMON_METADATA_FILE)
+}
+
+fn stable_path_string(path: &Path) -> String {
+    std::fs::canonicalize(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .display()
+        .to_string()
+}
+
+fn process_command(pid: u32) -> Result<Option<String>, DevStackError> {
+    let output = Command::new("ps")
+        .arg("-p")
+        .arg(pid.to_string())
+        .arg("-o")
+        .arg("command=")
+        .output()
+        .map_err(DevStackError::InspectProcess)?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let command = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if command.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(command))
+    }
+}
+
+fn terminate_process(pid: u32) -> Result<(), DevStackError> {
+    let result = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(DevStackError::TerminateDaemon(io::Error::last_os_error()))
+    }
+}
+
+fn wait_for_dev_stack_daemon_exit(pid: u32) -> Result<(), DevStackError> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        match process_state(pid)? {
+            None => return Ok(()),
+            Some(state) if state.starts_with('Z') => return Ok(()),
+            Some(_) => {}
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    Err(DevStackError::TerminateDaemonTimeout(pid))
+}
+
+fn process_state(pid: u32) -> Result<Option<String>, DevStackError> {
+    let output = Command::new("ps")
+        .arg("-p")
+        .arg(pid.to_string())
+        .arg("-o")
+        .arg("stat=")
+        .output()
+        .map_err(DevStackError::InspectProcess)?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let state = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if state.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(state))
+    }
+}
+
+fn serve_test_incompatible_daemon(
+    config: &botster_hub::HubConfig,
+) -> Result<(), botster_hub::DaemonTransportError> {
+    let socket_path = config
+        .transports
+        .local_socket
+        .as_ref()
+        .map(|binding| binding.path.clone())
+        .ok_or(botster_hub::DaemonTransportError::MissingSocketBinding)?;
+    if let Some(parent) = socket_path.parent() {
+        std::fs::create_dir_all(parent).map_err(botster_hub::DaemonTransportError::Io)?;
+    }
+    let _ = std::fs::remove_file(&socket_path);
+    let listener =
+        UnixListener::bind(&socket_path).map_err(botster_hub::DaemonTransportError::Io)?;
+    loop {
+        let (mut stream, _) = listener
+            .accept()
+            .map_err(botster_hub::DaemonTransportError::Io)?;
+        let mut reader = BufReader::new(
+            stream
+                .try_clone()
+                .map_err(botster_hub::DaemonTransportError::Io)?,
+        );
+        let mut hello = String::new();
+        let _ = reader.read_line(&mut hello);
+        stream
+            .write_all(b"{\"protocol\":\"botster-hub-daemon-v1\"}\n")
+            .map_err(botster_hub::DaemonTransportError::Io)?;
+    }
 }
 
 fn enable_dev_stack_package(
@@ -4423,6 +4695,28 @@ enum DevStackError {
     },
     PollDaemon(io::Error),
     ReadinessTimeout,
+    MissingLocalSocket,
+    WriteDaemonMetadata {
+        path: PathBuf,
+        source: io::Error,
+    },
+    ReadDaemonMetadata {
+        path: PathBuf,
+        source: io::Error,
+    },
+    ReadDaemonMetadataJson(serde_json::Error),
+    RemoveDaemonMetadata {
+        path: PathBuf,
+        source: io::Error,
+    },
+    RemoveLocalSocket {
+        path: PathBuf,
+        source: io::Error,
+    },
+    SerializeMetadata(serde_json::Error),
+    InspectProcess(io::Error),
+    TerminateDaemon(io::Error),
+    TerminateDaemonTimeout(u32),
     Config(botster_hub::HubConfigError),
     Transport(botster_hub::DaemonTransportError),
     MissingPackage {
@@ -4669,6 +4963,53 @@ impl fmt::Display for DevStackError {
                 write!(
                     formatter,
                     "timed out waiting for dev-stack daemon readiness"
+                )
+            }
+            Self::MissingLocalSocket => write!(formatter, "local socket transport is disabled"),
+            Self::WriteDaemonMetadata { path, source } => {
+                write!(
+                    formatter,
+                    "write dev-stack daemon metadata {}: {source}",
+                    path.display()
+                )
+            }
+            Self::ReadDaemonMetadata { path, source } => {
+                write!(
+                    formatter,
+                    "read dev-stack daemon metadata {}: {source}",
+                    path.display()
+                )
+            }
+            Self::ReadDaemonMetadataJson(error) => {
+                write!(formatter, "parse dev-stack daemon metadata: {error}")
+            }
+            Self::RemoveDaemonMetadata { path, source } => {
+                write!(
+                    formatter,
+                    "remove dev-stack daemon metadata {}: {source}",
+                    path.display()
+                )
+            }
+            Self::RemoveLocalSocket { path, source } => {
+                write!(
+                    formatter,
+                    "remove stale dev-stack local socket {}: {source}",
+                    path.display()
+                )
+            }
+            Self::SerializeMetadata(error) => {
+                write!(formatter, "serialize dev-stack daemon metadata: {error}")
+            }
+            Self::InspectProcess(error) => {
+                write!(formatter, "inspect dev-stack daemon process: {error}")
+            }
+            Self::TerminateDaemon(error) => {
+                write!(formatter, "terminate stale dev-stack daemon: {error}")
+            }
+            Self::TerminateDaemonTimeout(pid) => {
+                write!(
+                    formatter,
+                    "timed out waiting for stale dev-stack daemon process {pid} to exit"
                 )
             }
             Self::Config(error) => write!(formatter, "{error}"),
