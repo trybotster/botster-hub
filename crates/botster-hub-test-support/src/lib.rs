@@ -5,6 +5,7 @@
 //! hub and session-worker binary paths explicitly, or via `BOTSTER_HUB_BIN` and
 //! `BOTSTER_SESSION_WORKER_BIN`.
 
+use std::collections::BTreeMap;
 use std::env;
 use std::error::Error;
 use std::fmt;
@@ -37,6 +38,12 @@ const LATE_ATTACH_NO_HISTORY_LIVE_DATA: &str = "live-without-history\r\n";
 const PROJECT_PIPELINES_PACKAGE: &str = "project-pipelines";
 const PROJECT_PIPELINES_SURFACE: &str = "project-pipelines.create-ticket";
 const PROJECT_PIPELINES_ACTION: &str = "project_pipelines.create_ticket";
+const PLUGIN_CONTRACT_MATRIX_PACKAGE: &str = "botster.plugin-contract-matrix";
+const PLUGIN_CONTRACT_APP_SURFACE: &str = "contract.app";
+const PLUGIN_CONTRACT_EMPTY_SURFACE: &str = "contract.empty";
+const PLUGIN_CONTRACT_BLOCKED_SURFACE: &str = "contract.blocked";
+const PLUGIN_CONTRACT_SETTINGS_SURFACE: &str = "contract.settings";
+const PLUGIN_CONTRACT_ACTION: &str = "contract.action";
 const SUPPORTED_PLUGIN_SURFACE_JSON_ACTIONS: &str = "plugin_surface_json_actions";
 const UNSUPPORTED_PLUGIN_ENTITY_FRAMES: &str = "plugin_entity_frames";
 
@@ -178,10 +185,10 @@ pub fn first_party_client_support_matrix() -> FirstPartyClientSupportMatrix {
             render_feature: botster_hub_client::FEATURE_PLUGIN_SURFACE_RENDER.to_string(),
             action_supported: true,
             action_feature: botster_hub_client::FEATURE_PLUGIN_SURFACE_ACTION.to_string(),
-            package_name: PROJECT_PIPELINES_PACKAGE.to_string(),
-            surface_id: PROJECT_PIPELINES_SURFACE.to_string(),
+            package_name: PLUGIN_CONTRACT_MATRIX_PACKAGE.to_string(),
+            surface_id: PLUGIN_CONTRACT_APP_SURFACE.to_string(),
             rendered_surface_kind: "panel".to_string(),
-            rendered_surface_node_id: "project-pipelines-create-panel".to_string(),
+            rendered_surface_node_id: "contract-app-panel".to_string(),
             invalid_action_diagnostic_kind: diagnostic_kind_label(
                 DaemonDiagnosticKind::ActionFailure,
             )
@@ -524,6 +531,88 @@ pub struct ProjectPipelinesConformanceReport {
     pub invalid_action_status: String,
     pub invalid_action_diagnostic_kind: String,
     pub invalid_title_error: String,
+}
+
+/// Stable observation returned by [`run_plugin_contract_matrix_conformance`].
+///
+/// Producer failures are returned as [`ConformanceError`] values with
+/// [`ConformanceFailureClass::ProducerContract`]. Renderer/client failures are
+/// intentionally downstream comparisons against the `client_render_*` fields.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginContractMatrixConformanceReport {
+    pub package_name: String,
+    pub installed_state: String,
+    pub enabled_state: String,
+    pub version: String,
+    pub source_kind: String,
+    pub surface_ids: Vec<String>,
+    pub settings_surface_kind: String,
+    pub settings_surface_supports: Vec<String>,
+    pub app_route_path: String,
+    pub app_route_target_kind: String,
+    pub app_route_surface_id: String,
+    pub app_route_enabled_after_install: bool,
+    pub app_route_blocked_after_install: bool,
+    pub enable_action_status_after_install: String,
+    pub invalid_configuration_diagnostic_kind: String,
+    pub invalid_configuration_diagnostic_operation: String,
+    pub invalid_configuration_diagnostic_mentions_rejected_value: bool,
+    pub valid_configuration_mode: String,
+    pub valid_configuration_secret_state: String,
+    pub list_state: String,
+    pub list_surfaces_match_enabled: bool,
+    pub show_state: String,
+    pub show_routes_match_list: bool,
+    pub settings_route_supports_settings: bool,
+    pub app_surface_package_name: String,
+    pub app_surface_id: String,
+    pub app_surface_kind: String,
+    pub app_surface_node_id: String,
+    pub empty_surface_node_id: String,
+    pub empty_surface_child_id: String,
+    pub blocked_render_error_code: String,
+    pub blocked_render_operation: String,
+    pub blocked_render_message_contains_failure: bool,
+    pub settings_surface_node_id: String,
+    pub settings_text_contains_endpoint: bool,
+    pub settings_text_contains_mode: bool,
+    pub settings_text_contains_redacted_secret: bool,
+    pub action_success_state: String,
+    pub action_success_request_id: String,
+    pub action_success_message: String,
+    pub action_error_state: String,
+    pub action_error_request_id: String,
+    pub action_error_diagnostic_kind: String,
+    pub action_error_diagnostic_operation: String,
+    pub client_render_check: PluginContractMatrixClientRenderCheck,
+    pub failure_classes: PluginConformanceFailureClasses,
+}
+
+/// Fields downstream clients should compare against their renderer output.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginContractMatrixClientRenderCheck {
+    pub class: ConformanceFailureClass,
+    pub app_surface_node_id: String,
+    pub empty_surface_child_id: String,
+    pub settings_surface_node_id: String,
+    pub expected_redacted_secret_state: String,
+}
+
+/// Named classes exposed by the plugin UI conformance harness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConformanceFailureClass {
+    ProducerContract,
+    ClientRendering,
+    EnvironmentSetup,
+}
+
+/// Stable labels for the three failure classes this harness distinguishes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginConformanceFailureClasses {
+    pub producer_contract: ConformanceFailureClass,
+    pub client_rendering: ConformanceFailureClass,
+    pub environment_setup: ConformanceFailureClass,
 }
 
 /// Stable observation returned by [`run_foreground_terminal_app_open_conformance`].
@@ -903,6 +992,616 @@ pub fn run_project_pipelines_conformance(
     })
 }
 
+/// Run the reusable plugin UI conformance flow against the contract matrix fixture.
+///
+/// Callers pass a checkout path to `fixtures/plugins/plugin-contract-matrix`.
+/// The helper installs and enables that package through the daemon socket,
+/// then verifies package descriptors, routes, render envelopes, action results,
+/// configuration validation, and daemon responsiveness using only
+/// `botster-hub-client` requests.
+pub fn run_plugin_contract_matrix_conformance(
+    hub: &IsolatedHub,
+    package_path: impl Into<PathBuf>,
+) -> Result<PluginContractMatrixConformanceReport, ConformanceError> {
+    let package_path = package_path.into();
+    let installed = request(
+        hub.endpoint(),
+        DaemonRequest::InstallPackageLocalPath { path: package_path },
+        "contract_matrix_install",
+    )?;
+    expect_kind(
+        &installed,
+        DaemonResponseKind::PackageDecision,
+        "contract_matrix_install",
+    )?;
+    let installed_package = package_row(&installed.packages, PLUGIN_CONTRACT_MATRIX_PACKAGE)?;
+    expect_value(
+        "contract_matrix_install",
+        "state",
+        "installed",
+        &installed_package.state,
+    )?;
+    expect_value(
+        "contract_matrix_install",
+        "version",
+        "1.0.0",
+        &installed_package.version,
+    )?;
+    expect_value(
+        "contract_matrix_install",
+        "source_kind",
+        "path",
+        &installed_package.source_kind,
+    )?;
+    let surface_ids = installed_package
+        .surfaces
+        .iter()
+        .map(|surface| surface.id.clone())
+        .collect::<Vec<_>>();
+    expect_value(
+        "contract_matrix_install",
+        "surface_ids",
+        r#"["contract.app","contract.empty","contract.blocked","contract.settings"]"#,
+        &serde_json::to_string(&surface_ids).expect("surface ids serialize"),
+    )?;
+    let settings_surface_descriptor = surface_descriptor(
+        &installed_package.surfaces,
+        PLUGIN_CONTRACT_SETTINGS_SURFACE,
+    )?;
+    expect_value(
+        "contract_matrix_install",
+        "settings_surface.kind",
+        "settings",
+        &settings_surface_descriptor.kind,
+    )?;
+    expect_value(
+        "contract_matrix_install",
+        "settings_surface.supports",
+        r#"["render"]"#,
+        &serde_json::to_string(&settings_surface_descriptor.supports).expect("supports serialize"),
+    )?;
+    let app_route = package_route(&installed_package.routes, "surface:contract.app")?;
+    expect_value(
+        "contract_matrix_install",
+        "app_route.route_path",
+        "/packages/botster.plugin-contract-matrix/surfaces/contract.app",
+        &app_route.route_path,
+    )?;
+    expect_value(
+        "contract_matrix_install",
+        "app_route.target.kind",
+        "plugin_surface",
+        &app_route.target.kind,
+    )?;
+    expect_value(
+        "contract_matrix_install",
+        "app_route.surface_id",
+        PLUGIN_CONTRACT_APP_SURFACE,
+        app_route.surface_id.as_deref().unwrap_or_default(),
+    )?;
+    if app_route.enabled {
+        return Err(ConformanceError::UnexpectedValue {
+            operation: "contract_matrix_install",
+            field: "app_route.enabled",
+            expected: "false".to_string(),
+            actual: "true".to_string(),
+        });
+    }
+    if !app_route.blocked {
+        return Err(ConformanceError::UnexpectedValue {
+            operation: "contract_matrix_install",
+            field: "app_route.blocked",
+            expected: "true".to_string(),
+            actual: "false".to_string(),
+        });
+    }
+    let enable_action = package_action(&installed_package.actions, "enable_package")?;
+    let enable_action_status_after_install = package_action_status_label(enable_action.status);
+    expect_value(
+        "contract_matrix_install",
+        "enable_action.status",
+        "blocked",
+        enable_action_status_after_install,
+    )?;
+    if !installed_package.configuration.missing_required.is_empty() {
+        return Err(ConformanceError::UnexpectedValue {
+            operation: "contract_matrix_install",
+            field: "configuration.missing_required",
+            expected: "[]".to_string(),
+            actual: format!("{:?}", installed_package.configuration.missing_required),
+        });
+    }
+
+    let invalid_config = request(
+        hub.endpoint(),
+        DaemonRequest::SetPackageConfiguration {
+            package_name: PLUGIN_CONTRACT_MATRIX_PACKAGE.to_string(),
+            values: BTreeMap::from([(
+                "mode".to_string(),
+                serde_json::json!({"type":"select","value":"sideways"}),
+            )]),
+        },
+        "contract_matrix_config_invalid",
+    )?;
+    expect_kind(
+        &invalid_config,
+        DaemonResponseKind::OperatorError,
+        "contract_matrix_config_invalid",
+    )?;
+    let (
+        invalid_configuration_diagnostic_kind,
+        invalid_configuration_diagnostic_operation,
+        invalid_configuration_diagnostic_message,
+    ) = diagnostic_details(
+        &invalid_config,
+        DaemonDiagnosticKind::ActionFailure,
+        Some("configure"),
+        "contract_matrix_config_invalid",
+    )?;
+    let invalid_configuration_diagnostic_mentions_rejected_value =
+        invalid_configuration_diagnostic_message.contains("sideways");
+    if !invalid_configuration_diagnostic_mentions_rejected_value {
+        return Err(ConformanceError::UnexpectedValue {
+            operation: "contract_matrix_config_invalid",
+            field: "diagnostic.message",
+            expected: "message mentioning rejected value sideways".to_string(),
+            actual: invalid_configuration_diagnostic_message,
+        });
+    }
+
+    let configured = request(
+        hub.endpoint(),
+        DaemonRequest::SetPackageConfiguration {
+            package_name: PLUGIN_CONTRACT_MATRIX_PACKAGE.to_string(),
+            values: BTreeMap::from([
+                (
+                    "endpoint".to_string(),
+                    serde_json::json!({"type":"url","value":"https://example.invalid/plugin-contract-matrix/acceptance"}),
+                ),
+                (
+                    "mode".to_string(),
+                    serde_json::json!({"type":"select","value":"write"}),
+                ),
+                (
+                    "api_token".to_string(),
+                    serde_json::json!({"type":"secret","state":"write_only"}),
+                ),
+            ]),
+        },
+        "contract_matrix_config_valid",
+    )?;
+    expect_kind(
+        &configured,
+        DaemonResponseKind::Packages,
+        "contract_matrix_config_valid",
+    )?;
+    let configured_package = package_row(&configured.packages, PLUGIN_CONTRACT_MATRIX_PACKAGE)?;
+    let valid_configuration_mode = value_string(
+        &configured_package.configuration.effective_values["mode"],
+        "value",
+        "contract_matrix_config_valid",
+    )?;
+    let valid_configuration_secret_state = value_string(
+        &configured_package.configuration.effective_values["api_token"],
+        "state",
+        "contract_matrix_config_valid",
+    )?;
+    expect_value(
+        "contract_matrix_config_valid",
+        "mode.value",
+        "write",
+        &valid_configuration_mode,
+    )?;
+    expect_value(
+        "contract_matrix_config_valid",
+        "api_token.state",
+        "redacted",
+        &valid_configuration_secret_state,
+    )?;
+
+    let enable = request(
+        hub.endpoint(),
+        DaemonRequest::EnablePackage {
+            package_name: PLUGIN_CONTRACT_MATRIX_PACKAGE.to_string(),
+        },
+        "contract_matrix_enable",
+    )?;
+    expect_kind(
+        &enable,
+        DaemonResponseKind::PackageDecision,
+        "contract_matrix_enable",
+    )?;
+    let enabled_package = package_row(&enable.packages, PLUGIN_CONTRACT_MATRIX_PACKAGE)?;
+    expect_value(
+        "contract_matrix_enable",
+        "state",
+        "enabled",
+        &enabled_package.state,
+    )?;
+    let enabled_app_route = package_route(&enabled_package.routes, "surface:contract.app")?;
+    if enabled_app_route.blocked {
+        return Err(ConformanceError::UnexpectedValue {
+            operation: "contract_matrix_enable",
+            field: "app_route.blocked",
+            expected: "false".to_string(),
+            actual: "true".to_string(),
+        });
+    }
+    let reload_action = package_action(&enabled_package.actions, "reload_package")?;
+    if reload_action.request.is_none() {
+        return Err(ConformanceError::MissingJsonField {
+            operation: "contract_matrix_enable",
+            field: "reload_package.request",
+        });
+    }
+
+    let list = request(
+        hub.endpoint(),
+        DaemonRequest::ListPackages,
+        "contract_matrix_list",
+    )?;
+    expect_kind(&list, DaemonResponseKind::Packages, "contract_matrix_list")?;
+    let listed = package_row(&list.packages, PLUGIN_CONTRACT_MATRIX_PACKAGE)?;
+    expect_value("contract_matrix_list", "state", "enabled", &listed.state)?;
+    let list_surfaces_match_enabled = listed.surfaces == enabled_package.surfaces;
+    if !list_surfaces_match_enabled {
+        return Err(ConformanceError::UnexpectedValue {
+            operation: "contract_matrix_list",
+            field: "surfaces",
+            expected: format!("{:?}", enabled_package.surfaces),
+            actual: format!("{:?}", listed.surfaces),
+        });
+    }
+    let settings_route_supports_settings =
+        package_route(&listed.routes, "settings")?.supports_settings;
+    if !settings_route_supports_settings {
+        return Err(ConformanceError::UnexpectedValue {
+            operation: "contract_matrix_list",
+            field: "settings.supports_settings",
+            expected: "true".to_string(),
+            actual: "false".to_string(),
+        });
+    }
+
+    let show = request(
+        hub.endpoint(),
+        DaemonRequest::ShowPackage {
+            package_name: PLUGIN_CONTRACT_MATRIX_PACKAGE.to_string(),
+        },
+        "contract_matrix_show",
+    )?;
+    expect_kind(&show, DaemonResponseKind::Packages, "contract_matrix_show")?;
+    let shown = package_row(&show.packages, PLUGIN_CONTRACT_MATRIX_PACKAGE)?;
+    expect_value("contract_matrix_show", "state", "enabled", &shown.state)?;
+    let show_routes_match_list = shown.routes == listed.routes;
+    if !show_routes_match_list {
+        return Err(ConformanceError::UnexpectedValue {
+            operation: "contract_matrix_show",
+            field: "routes",
+            expected: format!("{:?}", listed.routes),
+            actual: format!("{:?}", shown.routes),
+        });
+    }
+
+    let app_surface = render_plugin_surface(
+        hub,
+        PLUGIN_CONTRACT_APP_SURFACE,
+        "contract_matrix_render_app",
+    )?;
+    let app_surface_kind = value_string(&app_surface.body, "type", "contract_matrix_render_app")?;
+    let app_surface_node_id = value_string(&app_surface.body, "id", "contract_matrix_render_app")?;
+    expect_value(
+        "contract_matrix_render_app",
+        "package_name",
+        PLUGIN_CONTRACT_MATRIX_PACKAGE,
+        &app_surface.package_name,
+    )?;
+    expect_value(
+        "contract_matrix_render_app",
+        "surface_id",
+        PLUGIN_CONTRACT_APP_SURFACE,
+        &app_surface.surface_id,
+    )?;
+    expect_value(
+        "contract_matrix_render_app",
+        "type",
+        "panel",
+        &app_surface_kind,
+    )?;
+    expect_value(
+        "contract_matrix_render_app",
+        "id",
+        "contract-app-panel",
+        &app_surface_node_id,
+    )?;
+
+    let empty_surface = render_plugin_surface(
+        hub,
+        PLUGIN_CONTRACT_EMPTY_SURFACE,
+        "contract_matrix_render_empty",
+    )?;
+    let empty_surface_node_id =
+        value_string(&empty_surface.body, "id", "contract_matrix_render_empty")?;
+    let empty_surface_child_id = empty_surface
+        .body
+        .get("children")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|children| children.first())
+        .and_then(|child| child.get("id"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .ok_or(ConformanceError::MissingJsonField {
+            operation: "contract_matrix_render_empty",
+            field: "children[0].id",
+        })?;
+    expect_value(
+        "contract_matrix_render_empty",
+        "id",
+        "contract-empty-panel",
+        &empty_surface_node_id,
+    )?;
+    expect_value(
+        "contract_matrix_render_empty",
+        "children[0].id",
+        "contract-empty-message",
+        &empty_surface_child_id,
+    )?;
+
+    let blocked = request(
+        hub.endpoint(),
+        DaemonRequest::PluginSurfaceRender {
+            package_name: PLUGIN_CONTRACT_MATRIX_PACKAGE.to_string(),
+            surface_id: PLUGIN_CONTRACT_BLOCKED_SURFACE.to_string(),
+            payload: serde_json::json!({}),
+        },
+        "contract_matrix_render_blocked",
+    )?;
+    expect_kind(
+        &blocked,
+        DaemonResponseKind::OperatorError,
+        "contract_matrix_render_blocked",
+    )?;
+    let blocked_error = blocked
+        .error
+        .as_ref()
+        .ok_or(ConformanceError::MissingBody {
+            operation: "contract_matrix_render_blocked",
+            field: "error",
+        })?;
+    expect_value(
+        "contract_matrix_render_blocked",
+        "error.code",
+        "plugin_invocation_failed",
+        &blocked_error.code,
+    )?;
+    expect_value(
+        "contract_matrix_render_blocked",
+        "error.operation",
+        "plugin_surface_render",
+        &blocked_error.operation,
+    )?;
+    let blocked_render_message_contains_failure = blocked_error
+        .message
+        .contains("plugin surface render failed");
+    if !blocked_render_message_contains_failure {
+        return Err(ConformanceError::UnexpectedValue {
+            operation: "contract_matrix_render_blocked",
+            field: "error.message",
+            expected: "message containing plugin surface render failed".to_string(),
+            actual: blocked_error.message.clone(),
+        });
+    }
+    expect_kind(
+        &request(
+            hub.endpoint(),
+            DaemonRequest::Status,
+            "contract_matrix_status_after_blocked",
+        )?,
+        DaemonResponseKind::Status,
+        "contract_matrix_status_after_blocked",
+    )?;
+
+    let settings_surface = render_plugin_surface(
+        hub,
+        PLUGIN_CONTRACT_SETTINGS_SURFACE,
+        "contract_matrix_render_settings",
+    )?;
+    let settings_surface_node_id = value_string(
+        &settings_surface.body,
+        "id",
+        "contract_matrix_render_settings",
+    )?;
+    let settings_text = settings_surface
+        .body
+        .get("children")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|children| children.first())
+        .and_then(|child| child.get("props"))
+        .and_then(|props| props.get("text"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or(ConformanceError::MissingJsonField {
+            operation: "contract_matrix_render_settings",
+            field: "children[0].props.text",
+        })?;
+    let settings_text_contains_endpoint = settings_text
+        .contains("endpoint=https://example.invalid/plugin-contract-matrix/acceptance");
+    let settings_text_contains_mode = settings_text.contains("mode=write");
+    let settings_text_contains_redacted_secret = settings_text.contains("api_token_state=redacted");
+    if !settings_text_contains_endpoint
+        || !settings_text_contains_mode
+        || !settings_text_contains_redacted_secret
+    {
+        return Err(ConformanceError::UnexpectedValue {
+            operation: "contract_matrix_render_settings",
+            field: "settings_text",
+            expected: "endpoint, mode, and redacted secret state".to_string(),
+            actual: settings_text.to_string(),
+        });
+    }
+
+    let action = request(
+        hub.endpoint(),
+        DaemonRequest::PluginSurfaceAction {
+            package_name: PLUGIN_CONTRACT_MATRIX_PACKAGE.to_string(),
+            surface_id: PLUGIN_CONTRACT_APP_SURFACE.to_string(),
+            action_id: PLUGIN_CONTRACT_ACTION.to_string(),
+            payload: serde_json::json!({
+                "request_id": "contract-action-success",
+                "message": "hello",
+            }),
+        },
+        "contract_matrix_action_success",
+    )?;
+    expect_kind(
+        &action,
+        DaemonResponseKind::PluginActionResult,
+        "contract_matrix_action_success",
+    )?;
+    let action_result =
+        action
+            .plugin_action_result
+            .as_ref()
+            .ok_or(ConformanceError::MissingBody {
+                operation: "contract_matrix_action_success",
+                field: "plugin_action_result",
+            })?;
+    let action_success_state =
+        value_string(action_result, "state", "contract_matrix_action_success")?;
+    let action_success_request_id = value_string(
+        action_result,
+        "request_id",
+        "contract_matrix_action_success",
+    )?;
+    let action_success_message = action_result
+        .get("normalized_values")
+        .and_then(|values| values.get("message"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .ok_or(ConformanceError::MissingJsonField {
+            operation: "contract_matrix_action_success",
+            field: "normalized_values.message",
+        })?;
+    expect_value(
+        "contract_matrix_action_success",
+        "state",
+        "accepted",
+        &action_success_state,
+    )?;
+    if !action.diagnostics.is_empty() {
+        return Err(ConformanceError::UnexpectedValue {
+            operation: "contract_matrix_action_success",
+            field: "diagnostics",
+            expected: "[]".to_string(),
+            actual: format!("{:?}", action.diagnostics),
+        });
+    }
+
+    let action_error = request(
+        hub.endpoint(),
+        DaemonRequest::PluginSurfaceAction {
+            package_name: PLUGIN_CONTRACT_MATRIX_PACKAGE.to_string(),
+            surface_id: PLUGIN_CONTRACT_APP_SURFACE.to_string(),
+            action_id: PLUGIN_CONTRACT_ACTION.to_string(),
+            payload: serde_json::json!({
+                "request_id": "contract-action-error",
+                "fail": true,
+            }),
+        },
+        "contract_matrix_action_error",
+    )?;
+    expect_kind(
+        &action_error,
+        DaemonResponseKind::PluginActionResult,
+        "contract_matrix_action_error",
+    )?;
+    let (action_error_diagnostic_kind, action_error_diagnostic_operation, _) = diagnostic_details(
+        &action_error,
+        DaemonDiagnosticKind::ActionFailure,
+        Some("plugin_surface_action"),
+        "contract_matrix_action_error",
+    )?;
+    let action_error_result =
+        action_error
+            .plugin_action_result
+            .as_ref()
+            .ok_or(ConformanceError::MissingBody {
+                operation: "contract_matrix_action_error",
+                field: "plugin_action_result",
+            })?;
+    let action_error_state =
+        value_string(action_error_result, "state", "contract_matrix_action_error")?;
+    let action_error_request_id = value_string(
+        action_error_result,
+        "request_id",
+        "contract_matrix_action_error",
+    )?;
+    expect_value(
+        "contract_matrix_action_error",
+        "state",
+        "error",
+        &action_error_state,
+    )?;
+
+    Ok(PluginContractMatrixConformanceReport {
+        package_name: PLUGIN_CONTRACT_MATRIX_PACKAGE.to_string(),
+        installed_state: installed_package.state.clone(),
+        enabled_state: enabled_package.state.clone(),
+        version: installed_package.version.clone(),
+        source_kind: installed_package.source_kind.clone(),
+        surface_ids,
+        settings_surface_kind: settings_surface_descriptor.kind.clone(),
+        settings_surface_supports: settings_surface_descriptor.supports.clone(),
+        app_route_path: app_route.route_path.clone(),
+        app_route_target_kind: app_route.target.kind.clone(),
+        app_route_surface_id: app_route.surface_id.clone().unwrap_or_default(),
+        app_route_enabled_after_install: app_route.enabled,
+        app_route_blocked_after_install: app_route.blocked,
+        enable_action_status_after_install: enable_action_status_after_install.to_string(),
+        invalid_configuration_diagnostic_kind,
+        invalid_configuration_diagnostic_operation,
+        invalid_configuration_diagnostic_mentions_rejected_value,
+        valid_configuration_mode,
+        valid_configuration_secret_state: valid_configuration_secret_state.clone(),
+        list_state: listed.state.clone(),
+        list_surfaces_match_enabled,
+        show_state: shown.state.clone(),
+        show_routes_match_list,
+        settings_route_supports_settings,
+        app_surface_package_name: app_surface.package_name,
+        app_surface_id: app_surface.surface_id,
+        app_surface_kind,
+        app_surface_node_id: app_surface_node_id.clone(),
+        empty_surface_node_id,
+        empty_surface_child_id: empty_surface_child_id.clone(),
+        blocked_render_error_code: blocked_error.code.clone(),
+        blocked_render_operation: blocked_error.operation.clone(),
+        blocked_render_message_contains_failure,
+        settings_surface_node_id: settings_surface_node_id.clone(),
+        settings_text_contains_endpoint,
+        settings_text_contains_mode,
+        settings_text_contains_redacted_secret,
+        action_success_state,
+        action_success_request_id,
+        action_success_message,
+        action_error_state,
+        action_error_request_id,
+        action_error_diagnostic_kind,
+        action_error_diagnostic_operation,
+        client_render_check: PluginContractMatrixClientRenderCheck {
+            class: ConformanceFailureClass::ClientRendering,
+            app_surface_node_id,
+            empty_surface_child_id,
+            settings_surface_node_id,
+            expected_redacted_secret_state: valid_configuration_secret_state,
+        },
+        failure_classes: PluginConformanceFailureClasses {
+            producer_contract: ConformanceFailureClass::ProducerContract,
+            client_rendering: ConformanceFailureClass::ClientRendering,
+            environment_setup: ConformanceFailureClass::EnvironmentSetup,
+        },
+    })
+}
+
 /// Run the foreground terminal app-open conformance flow for first-party clients.
 ///
 /// The helper installs a local package with a `terminal_app` / `foreground_stdio`
@@ -1177,6 +1876,98 @@ console.log(`daemon_status=${response.status.lifecycle_state}`);
     Ok(())
 }
 
+fn package_row<'a>(
+    packages: &'a [botster_hub_client::DaemonPackage],
+    package_name: &'static str,
+) -> Result<&'a botster_hub_client::DaemonPackage, ConformanceError> {
+    packages
+        .iter()
+        .find(|package| package.package_name == package_name)
+        .ok_or(ConformanceError::MissingPackage { package_name })
+}
+
+fn surface_descriptor<'a>(
+    surfaces: &'a [botster_hub_client::DaemonPackageSurfaceDescriptor],
+    surface_id: &'static str,
+) -> Result<&'a botster_hub_client::DaemonPackageSurfaceDescriptor, ConformanceError> {
+    surfaces
+        .iter()
+        .find(|surface| surface.id == surface_id)
+        .ok_or(ConformanceError::MissingSurface { surface_id })
+}
+
+fn package_route<'a>(
+    routes: &'a [botster_hub_client::DaemonPackageRouteDescriptor],
+    route_id: &'static str,
+) -> Result<&'a botster_hub_client::DaemonPackageRouteDescriptor, ConformanceError> {
+    routes
+        .iter()
+        .find(|route| route.route_id == route_id)
+        .ok_or(ConformanceError::MissingRoute { route_id })
+}
+
+fn package_action<'a>(
+    actions: &'a [botster_hub_client::DaemonPackageActionState],
+    action_id: &'static str,
+) -> Result<&'a botster_hub_client::DaemonPackageActionState, ConformanceError> {
+    actions
+        .iter()
+        .find(|action| action.action_id == action_id)
+        .ok_or(ConformanceError::MissingPackageAction { action_id })
+}
+
+fn package_action_status_label(
+    status: botster_hub_client::DaemonPackageActionStatus,
+) -> &'static str {
+    match status {
+        botster_hub_client::DaemonPackageActionStatus::Available => "available",
+        botster_hub_client::DaemonPackageActionStatus::Blocked => "blocked",
+        botster_hub_client::DaemonPackageActionStatus::Unavailable => "unavailable",
+    }
+}
+
+fn render_plugin_surface(
+    hub: &IsolatedHub,
+    surface_id: &'static str,
+    operation: &'static str,
+) -> Result<botster_hub_client::DaemonPluginSurface, ConformanceError> {
+    let response = request(
+        hub.endpoint(),
+        DaemonRequest::PluginSurfaceRender {
+            package_name: PLUGIN_CONTRACT_MATRIX_PACKAGE.to_string(),
+            surface_id: surface_id.to_string(),
+            payload: serde_json::json!({}),
+        },
+        operation,
+    )?;
+    expect_kind(&response, DaemonResponseKind::PluginSurface, operation)?;
+    response
+        .plugin_surface
+        .ok_or(ConformanceError::MissingBody {
+            operation,
+            field: "plugin_surface",
+        })
+}
+
+fn expect_value(
+    operation: &'static str,
+    field: &'static str,
+    expected: impl Into<String>,
+    actual: &str,
+) -> Result<(), ConformanceError> {
+    let expected = expected.into();
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(ConformanceError::UnexpectedValue {
+            operation,
+            field,
+            expected,
+            actual: actual.to_string(),
+        })
+    }
+}
+
 fn output_value(output: &str, key: &str) -> Option<String> {
     let prefix = format!("{key}=");
     output
@@ -1234,6 +2025,40 @@ fn diagnostic_kind(
         .any(|diagnostic| diagnostic.kind == kind)
         .then(|| diagnostic_kind_label(kind).to_string())
         .ok_or(ConformanceError::MissingDiagnostic { operation, kind })
+}
+
+fn diagnostic_details(
+    response: &DaemonResponse,
+    kind: DaemonDiagnosticKind,
+    expected_operation: Option<&'static str>,
+    operation: &'static str,
+) -> Result<(String, String, String), ConformanceError> {
+    let diagnostic = response
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.kind == kind)
+        .ok_or(ConformanceError::MissingDiagnostic { operation, kind })?;
+    let diagnostic_operation =
+        diagnostic
+            .operation
+            .clone()
+            .ok_or(ConformanceError::MissingJsonField {
+                operation,
+                field: "diagnostic.operation",
+            })?;
+    if let Some(expected) = expected_operation {
+        expect_value(
+            operation,
+            "diagnostic.operation",
+            expected,
+            &diagnostic_operation,
+        )?;
+    }
+    Ok((
+        diagnostic_kind_label(kind).to_string(),
+        diagnostic_operation,
+        diagnostic.message.clone().unwrap_or_default(),
+    ))
 }
 
 fn diagnostic_kind_label(kind: DaemonDiagnosticKind) -> &'static str {
@@ -1350,6 +2175,18 @@ pub enum ConformanceError {
         operation: &'static str,
         kind: DaemonDiagnosticKind,
     },
+    MissingPackage {
+        package_name: &'static str,
+    },
+    MissingSurface {
+        surface_id: &'static str,
+    },
+    MissingRoute {
+        route_id: &'static str,
+    },
+    MissingPackageAction {
+        action_id: &'static str,
+    },
     UnexpectedValue {
         operation: &'static str,
         field: &'static str,
@@ -1384,6 +2221,32 @@ pub enum ConformanceError {
     AttachThreadPanicked,
 }
 
+impl ConformanceError {
+    /// Classify conformance failures for harness output and downstream reports.
+    #[must_use]
+    pub const fn failure_class(&self) -> ConformanceFailureClass {
+        match self {
+            Self::Client { .. }
+            | Self::Io { .. }
+            | Self::ChildFailed { .. }
+            | Self::AttachThreadPanicked => ConformanceFailureClass::EnvironmentSetup,
+            Self::UnexpectedKind { .. }
+            | Self::MissingBody { .. }
+            | Self::MissingJsonField { .. }
+            | Self::MissingDiagnostic { .. }
+            | Self::MissingPackage { .. }
+            | Self::MissingSurface { .. }
+            | Self::MissingRoute { .. }
+            | Self::MissingPackageAction { .. }
+            | Self::UnexpectedValue { .. }
+            | Self::MissingEnvironment { .. }
+            | Self::MissingApp { .. }
+            | Self::MissingSession { .. }
+            | Self::MissingOutput { .. } => ConformanceFailureClass::ProducerContract,
+        }
+    }
+}
+
 impl fmt::Display for ConformanceError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -1416,6 +2279,18 @@ impl fmt::Display for ConformanceError {
                     formatter,
                     "{operation} response missing {kind:?} diagnostic"
                 )
+            }
+            Self::MissingPackage { package_name } => {
+                write!(formatter, "response missing package {package_name}")
+            }
+            Self::MissingSurface { surface_id } => {
+                write!(formatter, "response missing package surface {surface_id}")
+            }
+            Self::MissingRoute { route_id } => {
+                write!(formatter, "response missing package route {route_id}")
+            }
+            Self::MissingPackageAction { action_id } => {
+                write!(formatter, "response missing package action {action_id}")
             }
             Self::UnexpectedValue {
                 operation,
@@ -1473,6 +2348,10 @@ impl Error for ConformanceError {
             | Self::MissingBody { .. }
             | Self::MissingJsonField { .. }
             | Self::MissingDiagnostic { .. }
+            | Self::MissingPackage { .. }
+            | Self::MissingSurface { .. }
+            | Self::MissingRoute { .. }
+            | Self::MissingPackageAction { .. }
             | Self::UnexpectedValue { .. }
             | Self::MissingEnvironment { .. }
             | Self::MissingApp { .. }
@@ -1583,6 +2462,12 @@ impl fmt::Display for IsolatedHubError {
 }
 
 impl IsolatedHubError {
+    /// Classify startup and teardown failures as environment/setup failures.
+    #[must_use]
+    pub const fn failure_class(&self) -> ConformanceFailureClass {
+        ConformanceFailureClass::EnvironmentSetup
+    }
+
     /// Return a path-neutral diagnostic for startup failures that occur before
     /// the daemon socket protocol can emit a response.
     #[must_use]
@@ -1825,6 +2710,7 @@ mod tests {
                     botster_hub_client::FEATURE_RESIZE,
                     botster_hub_client::FEATURE_PLUGIN_SURFACE_RENDER,
                     botster_hub_client::FEATURE_PLUGIN_SURFACE_ACTION,
+                    botster_hub_client::FEATURE_PACKAGE_ROUTES,
                 ],
                 "supported_features": [
                     botster_hub_client::FEATURE_SESSIONS,
@@ -1832,6 +2718,7 @@ mod tests {
                     botster_hub_client::FEATURE_RESIZE,
                     botster_hub_client::FEATURE_PLUGIN_SURFACE_RENDER,
                     botster_hub_client::FEATURE_PLUGIN_SURFACE_ACTION,
+                    botster_hub_client::FEATURE_PACKAGE_ROUTES,
                 ],
                 "diagnostic_kinds": [
                     "connected",
@@ -1841,6 +2728,7 @@ mod tests {
                     "terminal_stream_unavailable",
                     "action_failure",
                     "daemon_startup_failure",
+                    "backpressure",
                 ],
                 "session_actions": [
                     "status",
@@ -1872,10 +2760,10 @@ mod tests {
                     "render_feature": botster_hub_client::FEATURE_PLUGIN_SURFACE_RENDER,
                     "action_supported": true,
                     "action_feature": botster_hub_client::FEATURE_PLUGIN_SURFACE_ACTION,
-                    "package_name": PROJECT_PIPELINES_PACKAGE,
-                    "surface_id": PROJECT_PIPELINES_SURFACE,
+                    "package_name": PLUGIN_CONTRACT_MATRIX_PACKAGE,
+                    "surface_id": PLUGIN_CONTRACT_APP_SURFACE,
                     "rendered_surface_kind": "panel",
-                    "rendered_surface_node_id": "project-pipelines-create-panel",
+                    "rendered_surface_node_id": "contract-app-panel",
                     "invalid_action_diagnostic_kind": "action_failure",
                 },
                 "entity_actions": {
@@ -2096,6 +2984,58 @@ mod tests {
                 ],
             })
         );
+    }
+
+    #[test]
+    fn plugin_conformance_failure_classes_are_distinct_and_stable() {
+        let producer_error = ConformanceError::MissingRoute {
+            route_id: "surface:contract.app",
+        };
+        let environment_error = IsolatedHubError::MissingBinaryEnv {
+            variable: "__BOTSTER_HUB_TEST_MISSING_BIN",
+        };
+        let io_error = ConformanceError::Io {
+            operation: "write_fixture",
+            source: std::io::Error::other("fixture write failed"),
+        };
+        let child_error = ConformanceError::ChildFailed {
+            operation: "foreground_app_child",
+            status: "exit status: 1".to_string(),
+            stdout: String::new(),
+            stderr: "child failed".to_string(),
+        };
+        let attach_thread_error = ConformanceError::AttachThreadPanicked;
+        let render_check = PluginContractMatrixClientRenderCheck {
+            class: ConformanceFailureClass::ClientRendering,
+            app_surface_node_id: "contract-app-panel".to_string(),
+            empty_surface_child_id: "contract-empty-message".to_string(),
+            settings_surface_node_id: "contract-settings-panel".to_string(),
+            expected_redacted_secret_state: "redacted".to_string(),
+        };
+
+        assert_eq!(
+            producer_error.failure_class(),
+            ConformanceFailureClass::ProducerContract
+        );
+        assert_eq!(
+            environment_error.failure_class(),
+            ConformanceFailureClass::EnvironmentSetup
+        );
+        assert_eq!(
+            io_error.failure_class(),
+            ConformanceFailureClass::EnvironmentSetup
+        );
+        assert_eq!(
+            child_error.failure_class(),
+            ConformanceFailureClass::EnvironmentSetup
+        );
+        assert_eq!(
+            attach_thread_error.failure_class(),
+            ConformanceFailureClass::EnvironmentSetup
+        );
+        assert_eq!(render_check.class, ConformanceFailureClass::ClientRendering);
+        assert_ne!(producer_error.failure_class(), render_check.class);
+        assert_ne!(environment_error.failure_class(), render_check.class);
     }
 
     #[test]

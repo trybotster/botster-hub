@@ -2388,312 +2388,79 @@ fn daemon_plugin_contract_matrix_fixture_exercises_public_package_contracts() {
     let _guard = daemon_test_lock()
         .lock()
         .expect("serialize real daemon test");
-    let data_dir = unique_short_test_dir("plugin-contract-matrix");
     let fixture_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("fixtures")
         .join("plugins")
         .join("plugin-contract-matrix");
-    let config = explicit_config(&data_dir);
-    let socket_path = config
-        .transports
-        .local_socket
-        .as_ref()
-        .expect("test config has local socket")
-        .path
-        .clone();
-    let endpoint = botster_hub_client::DaemonEndpoint::new(socket_path);
-    let child = start_cli_daemon(&data_dir);
-    let mut connection =
-        botster_hub_client::DaemonConnection::connect(&endpoint).expect("external connect");
+    let hub = botster_hub_test_support::IsolatedHubBuilder::new()
+        .hub_bin(env!("CARGO_BIN_EXE_botster-hub"))
+        .session_worker_bin(session_worker_binary_path())
+        .root(PathBuf::from("/tmp/bh-plugin-contract-matrix"))
+        .name("plugin-contract-matrix")
+        .start()
+        .expect("start isolated hub through public test-support harness");
 
-    let install = connection
-        .request(
-            &botster_hub_client::DaemonRequest::InstallPackageLocalPath {
-                path: fixture_dir.clone(),
-            },
-        )
-        .expect("install plugin contract matrix fixture");
+    let report =
+        botster_hub_test_support::run_plugin_contract_matrix_conformance(&hub, fixture_dir)
+            .expect("run plugin contract matrix conformance");
+    assert_eq!(report.package_name, "botster.plugin-contract-matrix");
+    assert_eq!(report.installed_state, "installed");
+    assert_eq!(report.enabled_state, "enabled");
     assert_eq!(
-        install.kind,
-        botster_hub_client::DaemonResponseKind::PackageDecision
-    );
-    let installed = install
-        .packages
-        .iter()
-        .find(|package| package.package_name == "botster.plugin-contract-matrix")
-        .expect("installed contract matrix package");
-    assert_eq!(installed.state, "installed");
-    assert_eq!(installed.version, "1.0.0");
-    assert_eq!(installed.source_kind, "path");
-    assert_eq!(installed.surfaces.len(), 4);
-    assert_eq!(
-        installed
-            .surfaces
-            .iter()
-            .map(|surface| surface.id.as_str())
-            .collect::<Vec<_>>(),
+        report.surface_ids,
         vec![
             "contract.app",
             "contract.empty",
             "contract.blocked",
-            "contract.settings"
+            "contract.settings",
         ]
     );
-    let settings_surface = installed
-        .surfaces
-        .iter()
-        .find(|surface| surface.id == "contract.settings")
-        .expect("settings surface descriptor");
-    assert_eq!(settings_surface.kind, "settings");
-    assert_eq!(settings_surface.supports, ["render"]);
-    let app_route = package_route(&installed.routes, "surface:contract.app");
+    assert_eq!(report.app_route_target_kind, "plugin_surface");
+    assert_eq!(report.app_route_surface_id, "contract.app");
+    assert!(report.app_route_blocked_after_install);
     assert_eq!(
-        app_route.route_path,
-        "/packages/botster.plugin-contract-matrix/surfaces/contract.app"
-    );
-    assert_eq!(app_route.target.kind, "plugin_surface");
-    assert_eq!(app_route.surface_id.as_deref(), Some("contract.app"));
-    assert!(!app_route.enabled);
-    assert!(app_route.blocked);
-    let enable_action = package_action(&installed.actions, "enable_package");
-    assert_eq!(
-        enable_action.status,
-        botster_hub_client::DaemonPackageActionStatus::Blocked
-    );
-    assert!(installed.configuration.missing_required.is_empty());
-
-    let invalid_config = connection
-        .request(
-            &botster_hub_client::DaemonRequest::SetPackageConfiguration {
-                package_name: "botster.plugin-contract-matrix".to_string(),
-                values: BTreeMap::from([(
-                    "mode".to_string(),
-                    serde_json::json!({"type":"select","value":"sideways"}),
-                )]),
-            },
-        )
-        .expect("invalid config returns operator frame");
-    assert_eq!(
-        invalid_config.kind,
-        botster_hub_client::DaemonResponseKind::OperatorError
-    );
-    assert!(invalid_config.diagnostics.iter().any(|diagnostic| {
-        diagnostic.kind == botster_hub_client::DaemonDiagnosticKind::ActionFailure
-            && diagnostic.operation.as_deref() == Some("configure")
-            && diagnostic
-                .message
-                .as_deref()
-                .is_some_and(|message| message.contains("sideways"))
-    }));
-
-    let configured = connection
-        .request(
-            &botster_hub_client::DaemonRequest::SetPackageConfiguration {
-                package_name: "botster.plugin-contract-matrix".to_string(),
-                values: BTreeMap::from([
-                    (
-                        "endpoint".to_string(),
-                        serde_json::json!({"type":"url","value":"https://example.invalid/plugin-contract-matrix/acceptance"}),
-                    ),
-                    (
-                        "mode".to_string(),
-                        serde_json::json!({"type":"select","value":"write"}),
-                    ),
-                    (
-                        "api_token".to_string(),
-                        serde_json::json!({"type":"secret","state":"write_only"}),
-                    ),
-                ]),
-            },
-        )
-        .expect("valid config saves through daemon");
-    assert_eq!(
-        configured.kind,
-        botster_hub_client::DaemonResponseKind::Packages
-    );
-    let configured_package = configured
-        .packages
-        .iter()
-        .find(|package| package.package_name == "botster.plugin-contract-matrix")
-        .expect("configured contract matrix package");
-    assert_eq!(
-        configured_package.configuration.effective_values["mode"],
-        serde_json::json!({"type":"select","value":"write"})
+        report.invalid_configuration_diagnostic_kind,
+        "action_failure"
     );
     assert_eq!(
-        configured_package.configuration.effective_values["api_token"],
-        serde_json::json!({"type":"secret","state":"redacted"})
+        report.invalid_configuration_diagnostic_operation,
+        "configure"
+    );
+    assert!(report.invalid_configuration_diagnostic_mentions_rejected_value);
+    assert_eq!(report.valid_configuration_mode, "write");
+    assert_eq!(report.valid_configuration_secret_state, "redacted");
+    assert!(report.list_surfaces_match_enabled);
+    assert!(report.show_routes_match_list);
+    assert_eq!(report.app_surface_node_id, "contract-app-panel");
+    assert_eq!(report.empty_surface_child_id, "contract-empty-message");
+    assert_eq!(report.blocked_render_operation, "plugin_surface_render");
+    assert!(report.blocked_render_message_contains_failure);
+    assert_eq!(report.settings_surface_node_id, "contract-settings-panel");
+    assert!(report.settings_text_contains_endpoint);
+    assert!(report.settings_text_contains_mode);
+    assert!(report.settings_text_contains_redacted_secret);
+    assert_eq!(report.action_success_state, "accepted");
+    assert_eq!(report.action_success_message, "hello");
+    assert_eq!(report.action_error_state, "error");
+    assert_eq!(report.action_error_diagnostic_kind, "action_failure");
+    assert_eq!(
+        report.action_error_diagnostic_operation,
+        "plugin_surface_action"
+    );
+    assert_eq!(
+        report.client_render_check.class,
+        botster_hub_test_support::ConformanceFailureClass::ClientRendering
+    );
+    assert_eq!(
+        report.failure_classes.producer_contract,
+        botster_hub_test_support::ConformanceFailureClass::ProducerContract
+    );
+    assert_eq!(
+        report.failure_classes.environment_setup,
+        botster_hub_test_support::ConformanceFailureClass::EnvironmentSetup
     );
 
-    let enable = connection
-        .request(&botster_hub_client::DaemonRequest::EnablePackage {
-            package_name: "botster.plugin-contract-matrix".to_string(),
-        })
-        .expect("enable plugin contract matrix fixture");
-    assert_eq!(
-        enable.kind,
-        botster_hub_client::DaemonResponseKind::PackageDecision
-    );
-    let enabled = enable
-        .packages
-        .iter()
-        .find(|package| package.package_name == "botster.plugin-contract-matrix")
-        .expect("enabled contract matrix package");
-    assert_eq!(enabled.state, "enabled");
-    assert!(!package_route(&enabled.routes, "surface:contract.app").blocked);
-    assert!(
-        package_action(&enabled.actions, "reload_package")
-            .request
-            .is_some()
-    );
-
-    let list = connection
-        .request(&botster_hub_client::DaemonRequest::ListPackages)
-        .expect("list packages after fixture enable");
-    let listed = list
-        .packages
-        .iter()
-        .find(|package| package.package_name == "botster.plugin-contract-matrix")
-        .expect("listed contract matrix package");
-    assert_eq!(listed.state, "enabled");
-    assert_eq!(listed.surfaces, enabled.surfaces);
-    assert!(package_route(&listed.routes, "settings").supports_settings);
-
-    let show = connection
-        .request(&botster_hub_client::DaemonRequest::ShowPackage {
-            package_name: "botster.plugin-contract-matrix".to_string(),
-        })
-        .expect("show enabled contract matrix package");
-    assert_eq!(show.packages.len(), 1);
-    assert_eq!(show.packages[0].state, "enabled");
-    assert_eq!(show.packages[0].routes, listed.routes);
-
-    let app = connection
-        .request(&botster_hub_client::DaemonRequest::PluginSurfaceRender {
-            package_name: "botster.plugin-contract-matrix".to_string(),
-            surface_id: "contract.app".to_string(),
-            payload: serde_json::json!({}),
-        })
-        .expect("render app surface through daemon");
-    assert_eq!(
-        app.kind,
-        botster_hub_client::DaemonResponseKind::PluginSurface
-    );
-    let app_surface = app.plugin_surface.expect("app plugin surface envelope");
-    assert_eq!(app_surface.package_name, "botster.plugin-contract-matrix");
-    assert_eq!(app_surface.surface_id, "contract.app");
-    assert_eq!(app_surface.body["type"], "panel");
-    assert_eq!(app_surface.body["id"], "contract-app-panel");
-
-    let empty = connection
-        .request(&botster_hub_client::DaemonRequest::PluginSurfaceRender {
-            package_name: "botster.plugin-contract-matrix".to_string(),
-            surface_id: "contract.empty".to_string(),
-            payload: serde_json::json!({}),
-        })
-        .expect("render empty surface through daemon");
-    assert_eq!(
-        empty.kind,
-        botster_hub_client::DaemonResponseKind::PluginSurface
-    );
-    let empty_surface = empty.plugin_surface.expect("empty plugin surface envelope");
-    assert_eq!(empty_surface.body["id"], "contract-empty-panel");
-    assert_eq!(
-        empty_surface.body["children"][0]["id"],
-        "contract-empty-message"
-    );
-
-    let blocked = connection
-        .request(&botster_hub_client::DaemonRequest::PluginSurfaceRender {
-            package_name: "botster.plugin-contract-matrix".to_string(),
-            surface_id: "contract.blocked".to_string(),
-            payload: serde_json::json!({}),
-        })
-        .expect("blocked surface returns operator frame");
-    assert_eq!(
-        blocked.kind,
-        botster_hub_client::DaemonResponseKind::OperatorError
-    );
-    let blocked_error = blocked.error.as_ref().expect("blocked operator error");
-    assert_eq!(blocked_error.code, "plugin_invocation_failed");
-    assert_eq!(blocked_error.operation, "plugin_surface_render");
-    assert!(
-        blocked_error
-            .message
-            .contains("plugin surface render failed")
-    );
-    let status = connection
-        .request(&botster_hub_client::DaemonRequest::Status)
-        .expect("daemon remains responsive after blocked render");
-    assert_eq!(status.kind, botster_hub_client::DaemonResponseKind::Status);
-
-    let settings = connection
-        .request(&botster_hub_client::DaemonRequest::PluginSurfaceRender {
-            package_name: "botster.plugin-contract-matrix".to_string(),
-            surface_id: "contract.settings".to_string(),
-            payload: serde_json::json!({}),
-        })
-        .expect("render settings surface through daemon");
-    assert_eq!(
-        settings.kind,
-        botster_hub_client::DaemonResponseKind::PluginSurface,
-        "settings render response: {settings:?}"
-    );
-    let settings_surface = settings
-        .plugin_surface
-        .expect("settings plugin surface envelope");
-    assert_eq!(settings_surface.body["id"], "contract-settings-panel");
-    let settings_text = settings_surface.body["children"][0]["props"]["text"]
-        .as_str()
-        .expect("settings text prop");
-    assert!(
-        settings_text
-            .contains("endpoint=https://example.invalid/plugin-contract-matrix/acceptance")
-    );
-    assert!(settings_text.contains("mode=write"));
-    assert!(settings_text.contains("api_token_state=redacted"));
-
-    let action = connection
-        .request(&botster_hub_client::DaemonRequest::PluginSurfaceAction {
-            package_name: "botster.plugin-contract-matrix".to_string(),
-            surface_id: "contract.app".to_string(),
-            action_id: "contract.action".to_string(),
-            payload: serde_json::json!({"request_id":"contract-action-success","message":"hello"}),
-        })
-        .expect("dispatch successful surface action through daemon");
-    assert_eq!(
-        action.kind,
-        botster_hub_client::DaemonResponseKind::PluginActionResult
-    );
-    let action_result = action.plugin_action_result.expect("action result body");
-    assert_eq!(action_result["state"], "accepted");
-    assert_eq!(action_result["request_id"], "contract-action-success");
-    assert_eq!(action_result["normalized_values"]["message"], "hello");
-    assert!(action.diagnostics.is_empty());
-
-    let action_error = connection
-        .request(&botster_hub_client::DaemonRequest::PluginSurfaceAction {
-            package_name: "botster.plugin-contract-matrix".to_string(),
-            surface_id: "contract.app".to_string(),
-            action_id: "contract.action".to_string(),
-            payload: serde_json::json!({"request_id":"contract-action-error","fail":true}),
-        })
-        .expect("dispatch failed surface action through daemon");
-    assert_eq!(
-        action_error.kind,
-        botster_hub_client::DaemonResponseKind::PluginActionResult
-    );
-    let action_error_result = action_error
-        .plugin_action_result
-        .expect("error action result body");
-    assert_eq!(action_error_result["state"], "error");
-    assert_eq!(action_error_result["request_id"], "contract-action-error");
-    assert!(action_error.diagnostics.iter().any(|diagnostic| {
-        diagnostic.kind == botster_hub_client::DaemonDiagnosticKind::ActionFailure
-            && diagnostic.operation.as_deref() == Some("plugin_surface_action")
-    }));
-
-    shutdown_cli_daemon(&data_dir, child);
+    hub.shutdown().expect("shutdown isolated hub");
 }
 
 #[test]
@@ -6606,30 +6373,36 @@ fn external_hub_test_support_drives_isolated_daemon_socket_protocol() {
     assert_eq!(support_matrix.resize.action, "resize");
     assert_eq!(support_matrix.resize.conformance_output_prefix, "winsize:");
 
-    let plugin_report = botster_hub_test_support::run_project_pipelines_conformance(
+    let plugin_report = botster_hub_test_support::run_plugin_contract_matrix_conformance(
         &first,
-        PathBuf::from("examples/project-pipelines"),
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures")
+            .join("plugins")
+            .join("plugin-contract-matrix"),
     )
-    .expect("run project pipelines conformance");
-    assert_eq!(plugin_report.package_state, "enabled");
+    .expect("run plugin contract matrix conformance");
+    assert_eq!(plugin_report.enabled_state, "enabled");
     assert!(support_matrix.plugin_surfaces.render_supported);
     assert!(support_matrix.plugin_surfaces.action_supported);
     assert_eq!(
-        plugin_report.surface_kind,
+        plugin_report.app_surface_kind,
         support_matrix.plugin_surfaces.rendered_surface_kind
     );
     assert_eq!(
-        plugin_report.surface_id,
+        plugin_report.app_surface_node_id,
         support_matrix.plugin_surfaces.rendered_surface_node_id
     );
-    assert_eq!(plugin_report.invalid_action_status, "failure");
+    assert_eq!(plugin_report.action_error_state, "error");
     assert_eq!(
-        plugin_report.invalid_action_diagnostic_kind,
+        plugin_report.action_error_diagnostic_kind,
         support_matrix
             .plugin_surfaces
             .invalid_action_diagnostic_kind
     );
-    assert_eq!(plugin_report.invalid_title_error, "Title is required");
+    assert_eq!(
+        plugin_report.client_render_check.class,
+        botster_hub_test_support::ConformanceFailureClass::ClientRendering
+    );
 
     let terminal_app_report =
         botster_hub_test_support::run_foreground_terminal_app_open_conformance(&first)
