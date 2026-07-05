@@ -62,10 +62,10 @@ pub use client_api::{
     HubClientPackageDiagnostic, HubClientPackageEnvironmentRequirement,
     HubClientPackageFeatureAvailability, HubClientPackageProcess,
     HubClientPackageRunnableEntrypoint, HubClientPackageState, HubClientPackageWorkingDirectory,
-    HubClientPluginLifecycle, HubClientRequest, HubClientResponse, HubClientResponseBody,
-    HubClientResult, HubClientRole, HubClientRoutedEnvelopeAck, HubClientRoutedEnvelopeDrain,
-    HubClientRoutedEnvelopePublish, HubClientRuntimeErrorKind, HubClientSession, HubClientSpawned,
-    HubClientStatus,
+    HubClientPluginLifecycle, HubClientPluginSurface, HubClientRequest, HubClientResponse,
+    HubClientResponseBody, HubClientResult, HubClientRole, HubClientRoutedEnvelopeAck,
+    HubClientRoutedEnvelopeDrain, HubClientRoutedEnvelopePublish, HubClientRuntimeErrorKind,
+    HubClientSession, HubClientSpawned, HubClientStatus,
 };
 pub use config::{
     CoreEngineOptions, CoreQueueCapacity, DataDirectoryOption, DirectoryList, HostIdentity,

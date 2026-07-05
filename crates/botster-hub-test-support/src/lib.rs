@@ -837,8 +837,24 @@ pub fn run_project_pipelines_conformance(
             operation: "project_pipelines_surface",
             field: "plugin_surface",
         })?;
-    let surface_kind = value_string(&surface, "type", "project_pipelines_surface")?;
-    let surface_id = value_string(&surface, "id", "project_pipelines_surface")?;
+    if surface.package_name != PROJECT_PIPELINES_PACKAGE {
+        return Err(ConformanceError::UnexpectedValue {
+            operation: "project_pipelines_surface",
+            field: "package_name",
+            expected: PROJECT_PIPELINES_PACKAGE.to_string(),
+            actual: surface.package_name,
+        });
+    }
+    if surface.surface_id != PROJECT_PIPELINES_SURFACE {
+        return Err(ConformanceError::UnexpectedValue {
+            operation: "project_pipelines_surface",
+            field: "surface_id",
+            expected: PROJECT_PIPELINES_SURFACE.to_string(),
+            actual: surface.surface_id,
+        });
+    }
+    let surface_kind = value_string(&surface.body, "type", "project_pipelines_surface")?;
+    let surface_id = value_string(&surface.body, "id", "project_pipelines_surface")?;
 
     let invalid = request(
         hub.endpoint(),
@@ -1334,6 +1350,12 @@ pub enum ConformanceError {
         operation: &'static str,
         kind: DaemonDiagnosticKind,
     },
+    UnexpectedValue {
+        operation: &'static str,
+        field: &'static str,
+        expected: String,
+        actual: String,
+    },
     MissingEnvironment {
         operation: &'static str,
         name: &'static str,
@@ -1395,6 +1417,17 @@ impl fmt::Display for ConformanceError {
                     "{operation} response missing {kind:?} diagnostic"
                 )
             }
+            Self::UnexpectedValue {
+                operation,
+                field,
+                expected,
+                actual,
+            } => {
+                write!(
+                    formatter,
+                    "{operation} response field {field} was {actual:?}, expected {expected:?}"
+                )
+            }
             Self::MissingEnvironment { operation, name } => {
                 write!(formatter, "{operation} launch missing {name}")
             }
@@ -1440,6 +1473,7 @@ impl Error for ConformanceError {
             | Self::MissingBody { .. }
             | Self::MissingJsonField { .. }
             | Self::MissingDiagnostic { .. }
+            | Self::UnexpectedValue { .. }
             | Self::MissingEnvironment { .. }
             | Self::MissingApp { .. }
             | Self::MissingSession { .. }

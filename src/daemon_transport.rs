@@ -20,7 +20,7 @@ use botster_core::{
     PackageConfigurationValue, PackageSource, RequestId, RoutedEnvelope, RoutedEnvelopePayload,
     RunnableEntrypointKind, RunnableEntrypointLaunchMode, RunnableEntrypointProcessState,
     RunnableEntrypointResultField, SessionId, SessionLifecycleState, SubscriptionId,
-    TerminalAttachState, UiActionResult, UiActionResultState, UiNode,
+    TerminalAttachState, UiActionResult, UiActionResultState,
 };
 use botster_core_daemon::{
     GuardedWriteDecision, GuardedWriteDeliveryState, ReadinessEvidence, RegistrySessionState,
@@ -40,11 +40,12 @@ pub use botster_hub_client::{
     DaemonPackageInstallEffect, DaemonPackageInstallPlan, DaemonPackagePin, DaemonPackageProcess,
     DaemonPackageRouteDescriptor, DaemonPackageRouteTarget, DaemonPackageRunnableEntrypoint,
     DaemonPackageSurfaceDescriptor, DaemonPackageUpdateStatus, DaemonPackageWorkingDirectory,
-    DaemonPluginLifecycle, DaemonRequest, DaemonResolvedAppLaunch, DaemonResolvedSessionTemplate,
-    DaemonResponse, DaemonResponseKind, DaemonSession, DaemonSessionCleanup, DaemonSessionContext,
-    DaemonSessionTemplate, DaemonSessionTemplateContextInput, DaemonSessionTemplateRequest,
-    DaemonStatus, FEATURE_PLUGIN_SURFACE_ACTION, FEATURE_PLUGIN_SURFACE_RENDER, PROTOCOL,
-    read_frame, read_frame_from_reader, write_frame,
+    DaemonPluginLifecycle, DaemonPluginSurface, DaemonRequest, DaemonResolvedAppLaunch,
+    DaemonResolvedSessionTemplate, DaemonResponse, DaemonResponseKind, DaemonSession,
+    DaemonSessionCleanup, DaemonSessionContext, DaemonSessionTemplate,
+    DaemonSessionTemplateContextInput, DaemonSessionTemplateRequest, DaemonStatus,
+    FEATURE_PLUGIN_SURFACE_ACTION, FEATURE_PLUGIN_SURFACE_RENDER, PROTOCOL, read_frame,
+    read_frame_from_reader, write_frame,
 };
 use serde_json::Value;
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
@@ -54,13 +55,13 @@ use crate::local_webrtc::{LocalWebrtcAttachedSubscription, LocalWebrtcSignalRequ
 use crate::{
     AvailablePackage, AvailablePackageState, FileHubStateStore, HubClientApi, HubClientEvent,
     HubClientPackage, HubClientPackageAvailabilityReason, HubClientPackageAvailabilityState,
-    HubClientPackageClassification, HubClientPluginLifecycle, HubClientRequest,
-    HubClientResponseBody, HubClientSession, HubConfig, HubDaemon, HubDaemonStatus,
-    HubStateLoadSource, HubStateStore, McpToolDescriptor, PackageAction, PackageAdmissionReason,
-    PackageCompatibilityResult, PackageDecision, PackageInstallPlan, PackagePin, PackageRegistry,
-    PackageRegistryEntrySourceKind, PackageRegistryError, PackageState, PackageUpdatePolicy,
-    ResolvedSessionTemplate, SessionTemplateContextInput, SessionTemplateRequest,
-    resolve_foreground_launch_contract,
+    HubClientPackageClassification, HubClientPluginLifecycle, HubClientPluginSurface,
+    HubClientRequest, HubClientResponseBody, HubClientSession, HubConfig, HubDaemon,
+    HubDaemonStatus, HubStateLoadSource, HubStateStore, McpToolDescriptor, PackageAction,
+    PackageAdmissionReason, PackageCompatibilityResult, PackageDecision, PackageInstallPlan,
+    PackagePin, PackageRegistry, PackageRegistryEntrySourceKind, PackageRegistryError,
+    PackageState, PackageUpdatePolicy, ResolvedSessionTemplate, SessionTemplateContextInput,
+    SessionTemplateRequest, resolve_foreground_launch_contract,
 };
 use crate::{EntrypointProcessSnapshot, EntrypointSupervisorError};
 
@@ -2898,9 +2899,13 @@ fn daemon_plugin_tool_result(plugin_tool_result: Value) -> DaemonResponse {
     response
 }
 
-fn daemon_plugin_surface(plugin_surface: UiNode) -> DaemonResponse {
+fn daemon_plugin_surface(plugin_surface: HubClientPluginSurface) -> DaemonResponse {
     let mut response = daemon_response_base(DaemonResponseKind::PluginSurface);
-    response.plugin_surface = Some(serde_json::to_value(plugin_surface).unwrap_or(Value::Null));
+    response.plugin_surface = Some(DaemonPluginSurface {
+        package_name: plugin_surface.package_name,
+        surface_id: plugin_surface.surface_id,
+        body: serde_json::to_value(plugin_surface.body).unwrap_or(Value::Null),
+    });
     response
 }
 
