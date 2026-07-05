@@ -83,7 +83,7 @@ Checklist note: `project_pipelines_create_vault_checklist` timed out at the Proj
   - `./test.sh -p botster-hub-test-support`
   - Proves the new report struct serializes or compares stably if serialization is added, compile-checks usage examples, and verifies support matrix changes if any.
 - Live isolated hub harness proof:
-  - `./test.sh --test hub_daemon_lifecycle_test downstream_shaped_test_support_harness_starts_isolated_hub_and_reports_deterministic_conformance`
+  - `./test.sh --test hub_daemon_lifecycle_test external_hub_test_support_drives_isolated_daemon_socket_protocol`
   - Or the renamed focused test that already exercises `IsolatedHubBuilder`; expected proof is that the real helper runs against a spawned hub and returns deterministic contract-matrix fields.
 - Existing fixture path proof:
   - `./test.sh --test hub_daemon_lifecycle_test daemon_plugin_contract_matrix_fixture_exercises_public_package_contracts`

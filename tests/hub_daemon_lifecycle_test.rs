@@ -2422,11 +2422,19 @@ fn daemon_plugin_contract_matrix_fixture_exercises_public_package_contracts() {
         report.invalid_configuration_diagnostic_kind,
         "action_failure"
     );
+    assert_eq!(
+        report.invalid_configuration_diagnostic_operation,
+        "configure"
+    );
+    assert!(report.invalid_configuration_diagnostic_mentions_rejected_value);
     assert_eq!(report.valid_configuration_mode, "write");
     assert_eq!(report.valid_configuration_secret_state, "redacted");
+    assert!(report.list_surfaces_match_enabled);
+    assert!(report.show_routes_match_list);
     assert_eq!(report.app_surface_node_id, "contract-app-panel");
     assert_eq!(report.empty_surface_child_id, "contract-empty-message");
     assert_eq!(report.blocked_render_operation, "plugin_surface_render");
+    assert!(report.blocked_render_message_contains_failure);
     assert_eq!(report.settings_surface_node_id, "contract-settings-panel");
     assert!(report.settings_text_contains_endpoint);
     assert!(report.settings_text_contains_mode);
@@ -2435,6 +2443,10 @@ fn daemon_plugin_contract_matrix_fixture_exercises_public_package_contracts() {
     assert_eq!(report.action_success_message, "hello");
     assert_eq!(report.action_error_state, "error");
     assert_eq!(report.action_error_diagnostic_kind, "action_failure");
+    assert_eq!(
+        report.action_error_diagnostic_operation,
+        "plugin_surface_action"
+    );
     assert_eq!(
         report.client_render_check.class,
         botster_hub_test_support::ConformanceFailureClass::ClientRendering

@@ -555,10 +555,14 @@ pub struct PluginContractMatrixConformanceReport {
     pub app_route_blocked_after_install: bool,
     pub enable_action_status_after_install: String,
     pub invalid_configuration_diagnostic_kind: String,
+    pub invalid_configuration_diagnostic_operation: String,
+    pub invalid_configuration_diagnostic_mentions_rejected_value: bool,
     pub valid_configuration_mode: String,
     pub valid_configuration_secret_state: String,
     pub list_state: String,
+    pub list_surfaces_match_enabled: bool,
     pub show_state: String,
+    pub show_routes_match_list: bool,
     pub settings_route_supports_settings: bool,
     pub app_surface_package_name: String,
     pub app_surface_id: String,
@@ -568,6 +572,7 @@ pub struct PluginContractMatrixConformanceReport {
     pub empty_surface_child_id: String,
     pub blocked_render_error_code: String,
     pub blocked_render_operation: String,
+    pub blocked_render_message_contains_failure: bool,
     pub settings_surface_node_id: String,
     pub settings_text_contains_endpoint: bool,
     pub settings_text_contains_mode: bool,
@@ -578,6 +583,7 @@ pub struct PluginContractMatrixConformanceReport {
     pub action_error_state: String,
     pub action_error_request_id: String,
     pub action_error_diagnostic_kind: String,
+    pub action_error_diagnostic_operation: String,
     pub client_render_check: PluginContractMatrixClientRenderCheck,
     pub failure_classes: PluginConformanceFailureClasses,
 }
@@ -1122,11 +1128,26 @@ pub fn run_plugin_contract_matrix_conformance(
         DaemonResponseKind::OperatorError,
         "contract_matrix_config_invalid",
     )?;
-    let invalid_configuration_diagnostic_kind = diagnostic_kind(
+    let (
+        invalid_configuration_diagnostic_kind,
+        invalid_configuration_diagnostic_operation,
+        invalid_configuration_diagnostic_message,
+    ) = diagnostic_details(
         &invalid_config,
         DaemonDiagnosticKind::ActionFailure,
+        Some("configure"),
         "contract_matrix_config_invalid",
     )?;
+    let invalid_configuration_diagnostic_mentions_rejected_value =
+        invalid_configuration_diagnostic_message.contains("sideways");
+    if !invalid_configuration_diagnostic_mentions_rejected_value {
+        return Err(ConformanceError::UnexpectedValue {
+            operation: "contract_matrix_config_invalid",
+            field: "diagnostic.message",
+            expected: "message mentioning rejected value sideways".to_string(),
+            actual: invalid_configuration_diagnostic_message,
+        });
+    }
 
     let configured = request(
         hub.endpoint(),
@@ -1222,6 +1243,15 @@ pub fn run_plugin_contract_matrix_conformance(
     expect_kind(&list, DaemonResponseKind::Packages, "contract_matrix_list")?;
     let listed = package_row(&list.packages, PLUGIN_CONTRACT_MATRIX_PACKAGE)?;
     expect_value("contract_matrix_list", "state", "enabled", &listed.state)?;
+    let list_surfaces_match_enabled = listed.surfaces == enabled_package.surfaces;
+    if !list_surfaces_match_enabled {
+        return Err(ConformanceError::UnexpectedValue {
+            operation: "contract_matrix_list",
+            field: "surfaces",
+            expected: format!("{:?}", enabled_package.surfaces),
+            actual: format!("{:?}", listed.surfaces),
+        });
+    }
     let settings_route_supports_settings =
         package_route(&listed.routes, "settings")?.supports_settings;
     if !settings_route_supports_settings {
@@ -1243,6 +1273,15 @@ pub fn run_plugin_contract_matrix_conformance(
     expect_kind(&show, DaemonResponseKind::Packages, "contract_matrix_show")?;
     let shown = package_row(&show.packages, PLUGIN_CONTRACT_MATRIX_PACKAGE)?;
     expect_value("contract_matrix_show", "state", "enabled", &shown.state)?;
+    let show_routes_match_list = shown.routes == listed.routes;
+    if !show_routes_match_list {
+        return Err(ConformanceError::UnexpectedValue {
+            operation: "contract_matrix_show",
+            field: "routes",
+            expected: format!("{:?}", listed.routes),
+            actual: format!("{:?}", shown.routes),
+        });
+    }
 
     let app_surface = render_plugin_surface(
         hub,
@@ -1341,6 +1380,17 @@ pub fn run_plugin_contract_matrix_conformance(
         "plugin_surface_render",
         &blocked_error.operation,
     )?;
+    let blocked_render_message_contains_failure = blocked_error
+        .message
+        .contains("plugin surface render failed");
+    if !blocked_render_message_contains_failure {
+        return Err(ConformanceError::UnexpectedValue {
+            operation: "contract_matrix_render_blocked",
+            field: "error.message",
+            expected: "message containing plugin surface render failed".to_string(),
+            actual: blocked_error.message.clone(),
+        });
+    }
     expect_kind(
         &request(
             hub.endpoint(),
@@ -1464,9 +1514,10 @@ pub fn run_plugin_contract_matrix_conformance(
         DaemonResponseKind::PluginActionResult,
         "contract_matrix_action_error",
     )?;
-    let action_error_diagnostic_kind = diagnostic_kind(
+    let (action_error_diagnostic_kind, action_error_diagnostic_operation, _) = diagnostic_details(
         &action_error,
         DaemonDiagnosticKind::ActionFailure,
+        Some("plugin_surface_action"),
         "contract_matrix_action_error",
     )?;
     let action_error_result =
@@ -1507,10 +1558,14 @@ pub fn run_plugin_contract_matrix_conformance(
         app_route_blocked_after_install: app_route.blocked,
         enable_action_status_after_install: enable_action_status_after_install.to_string(),
         invalid_configuration_diagnostic_kind,
+        invalid_configuration_diagnostic_operation,
+        invalid_configuration_diagnostic_mentions_rejected_value,
         valid_configuration_mode,
         valid_configuration_secret_state: valid_configuration_secret_state.clone(),
         list_state: listed.state.clone(),
+        list_surfaces_match_enabled,
         show_state: shown.state.clone(),
+        show_routes_match_list,
         settings_route_supports_settings,
         app_surface_package_name: app_surface.package_name,
         app_surface_id: app_surface.surface_id,
@@ -1520,6 +1575,7 @@ pub fn run_plugin_contract_matrix_conformance(
         empty_surface_child_id: empty_surface_child_id.clone(),
         blocked_render_error_code: blocked_error.code.clone(),
         blocked_render_operation: blocked_error.operation.clone(),
+        blocked_render_message_contains_failure,
         settings_surface_node_id: settings_surface_node_id.clone(),
         settings_text_contains_endpoint,
         settings_text_contains_mode,
@@ -1530,6 +1586,7 @@ pub fn run_plugin_contract_matrix_conformance(
         action_error_state,
         action_error_request_id,
         action_error_diagnostic_kind,
+        action_error_diagnostic_operation,
         client_render_check: PluginContractMatrixClientRenderCheck {
             class: ConformanceFailureClass::ClientRendering,
             app_surface_node_id,
@@ -1970,6 +2027,40 @@ fn diagnostic_kind(
         .ok_or(ConformanceError::MissingDiagnostic { operation, kind })
 }
 
+fn diagnostic_details(
+    response: &DaemonResponse,
+    kind: DaemonDiagnosticKind,
+    expected_operation: Option<&'static str>,
+    operation: &'static str,
+) -> Result<(String, String, String), ConformanceError> {
+    let diagnostic = response
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.kind == kind)
+        .ok_or(ConformanceError::MissingDiagnostic { operation, kind })?;
+    let diagnostic_operation =
+        diagnostic
+            .operation
+            .clone()
+            .ok_or(ConformanceError::MissingJsonField {
+                operation,
+                field: "diagnostic.operation",
+            })?;
+    if let Some(expected) = expected_operation {
+        expect_value(
+            operation,
+            "diagnostic.operation",
+            expected,
+            &diagnostic_operation,
+        )?;
+    }
+    Ok((
+        diagnostic_kind_label(kind).to_string(),
+        diagnostic_operation,
+        diagnostic.message.clone().unwrap_or_default(),
+    ))
+}
+
 fn diagnostic_kind_label(kind: DaemonDiagnosticKind) -> &'static str {
     match kind {
         DaemonDiagnosticKind::Connected => "connected",
@@ -2135,7 +2226,10 @@ impl ConformanceError {
     #[must_use]
     pub const fn failure_class(&self) -> ConformanceFailureClass {
         match self {
-            Self::Client { .. } => ConformanceFailureClass::EnvironmentSetup,
+            Self::Client { .. }
+            | Self::Io { .. }
+            | Self::ChildFailed { .. }
+            | Self::AttachThreadPanicked => ConformanceFailureClass::EnvironmentSetup,
             Self::UnexpectedKind { .. }
             | Self::MissingBody { .. }
             | Self::MissingJsonField { .. }
@@ -2148,10 +2242,7 @@ impl ConformanceError {
             | Self::MissingEnvironment { .. }
             | Self::MissingApp { .. }
             | Self::MissingSession { .. }
-            | Self::MissingOutput { .. }
-            | Self::Io { .. }
-            | Self::ChildFailed { .. }
-            | Self::AttachThreadPanicked => ConformanceFailureClass::ProducerContract,
+            | Self::MissingOutput { .. } => ConformanceFailureClass::ProducerContract,
         }
     }
 }
@@ -2903,6 +2994,17 @@ mod tests {
         let environment_error = IsolatedHubError::MissingBinaryEnv {
             variable: "__BOTSTER_HUB_TEST_MISSING_BIN",
         };
+        let io_error = ConformanceError::Io {
+            operation: "write_fixture",
+            source: std::io::Error::other("fixture write failed"),
+        };
+        let child_error = ConformanceError::ChildFailed {
+            operation: "foreground_app_child",
+            status: "exit status: 1".to_string(),
+            stdout: String::new(),
+            stderr: "child failed".to_string(),
+        };
+        let attach_thread_error = ConformanceError::AttachThreadPanicked;
         let render_check = PluginContractMatrixClientRenderCheck {
             class: ConformanceFailureClass::ClientRendering,
             app_surface_node_id: "contract-app-panel".to_string(),
@@ -2917,6 +3019,18 @@ mod tests {
         );
         assert_eq!(
             environment_error.failure_class(),
+            ConformanceFailureClass::EnvironmentSetup
+        );
+        assert_eq!(
+            io_error.failure_class(),
+            ConformanceFailureClass::EnvironmentSetup
+        );
+        assert_eq!(
+            child_error.failure_class(),
+            ConformanceFailureClass::EnvironmentSetup
+        );
+        assert_eq!(
+            attach_thread_error.failure_class(),
             ConformanceFailureClass::EnvironmentSetup
         );
         assert_eq!(render_check.class, ConformanceFailureClass::ClientRendering);
