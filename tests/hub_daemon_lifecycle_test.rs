@@ -2464,6 +2464,253 @@ fn daemon_plugin_contract_matrix_fixture_exercises_public_package_contracts() {
 }
 
 #[test]
+fn cli_dev_stack_first_party_plugin_dogfood_smoke_runs_contract_matrix_then_real_packages() {
+    let _guard = daemon_test_lock()
+        .lock()
+        .expect("serialize real daemon test");
+    let fixture_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("fixtures")
+        .join("plugins")
+        .join("plugin-contract-matrix");
+    let project_pipelines_package_dir = std::env::current_dir()
+        .expect("current dir")
+        .join("examples")
+        .join("project-pipelines");
+    assert!(
+        project_pipelines_package_dir
+            .join("botster-package.json")
+            .is_file(),
+        "failure_class=local_package_path missing project-pipelines package at {project_pipelines_package_dir:?}"
+    );
+    let workspaces_package_dir = unique_test_dir("first-party-dogfood-workspaces-package");
+    write_botster_workspaces_local_package(&workspaces_package_dir, "botster-workspaces");
+
+    let hub = botster_hub_test_support::IsolatedHubBuilder::new()
+        .hub_bin(env!("CARGO_BIN_EXE_botster-hub"))
+        .session_worker_bin(session_worker_binary_path())
+        .root(PathBuf::from("/tmp/bh-first-party-plugin-dogfood"))
+        .name("first-party-plugin-dogfood")
+        .start()
+        .expect("failure_class=environment start isolated hub through public harness");
+
+    let contract_report =
+        botster_hub_test_support::run_plugin_contract_matrix_conformance(&hub, fixture_dir)
+            .expect("failure_class=hub_contract run generic plugin contract matrix first");
+    assert_eq!(
+        contract_report.package_name,
+        "botster.plugin-contract-matrix"
+    );
+    assert_eq!(
+        contract_report.app_surface_package_name,
+        "botster.plugin-contract-matrix"
+    );
+    assert_eq!(contract_report.app_surface_id, "contract.app");
+
+    let workspaces_install = botster_hub_client::request(
+        hub.endpoint(),
+        botster_hub_client::DaemonRequest::InstallPackageLocalPath {
+            path: workspaces_package_dir.clone(),
+        },
+    )
+    .expect("failure_class=local_package_path install helper-written botster-workspaces package");
+    assert_eq!(
+        workspaces_install.kind,
+        botster_hub_client::DaemonResponseKind::PackageDecision
+    );
+    let installed_workspaces = workspaces_install
+        .packages
+        .iter()
+        .find(|package| package.package_name == "botster-workspaces")
+        .expect("failure_class=plugin_producer install response includes botster-workspaces");
+    assert_eq!(installed_workspaces.state, "installed");
+    let installed_workspaces_route =
+        package_route(&installed_workspaces.routes, "surface:workspaces");
+    assert_eq!(
+        installed_workspaces_route.route_path,
+        "/packages/botster-workspaces/surfaces/workspaces"
+    );
+    assert_eq!(installed_workspaces_route.target.kind, "plugin_surface");
+    assert_eq!(
+        installed_workspaces_route.target.surface_id.as_deref(),
+        Some("workspaces"),
+        "failure_class=plugin_producer missing package route target surface metadata"
+    );
+    assert_eq!(
+        installed_workspaces_route.surface_id.as_deref(),
+        Some("workspaces"),
+        "failure_class=web_tui_consumer missing package route surface metadata"
+    );
+    assert!(installed_workspaces_route.blocked);
+
+    let workspaces_enable = botster_hub_client::request(
+        hub.endpoint(),
+        botster_hub_client::DaemonRequest::EnablePackage {
+            package_name: "botster-workspaces".to_string(),
+        },
+    )
+    .expect("failure_class=hub_contract enable botster-workspaces package");
+    assert_eq!(
+        workspaces_enable.kind,
+        botster_hub_client::DaemonResponseKind::PackageDecision
+    );
+    let enabled_workspaces = workspaces_enable
+        .packages
+        .iter()
+        .find(|package| package.package_name == "botster-workspaces")
+        .expect("failure_class=plugin_producer enable response includes botster-workspaces");
+    assert_eq!(enabled_workspaces.state, "enabled");
+    let enabled_workspaces_route = package_route(&enabled_workspaces.routes, "surface:workspaces");
+    assert!(!enabled_workspaces_route.blocked);
+    assert!(enabled_workspaces_route.enabled);
+
+    let workspaces_reload = botster_hub_client::request(
+        hub.endpoint(),
+        botster_hub_client::DaemonRequest::ReloadPackage {
+            package_name: "botster-workspaces".to_string(),
+        },
+    )
+    .expect("failure_class=stale_build reload helper-written botster-workspaces package");
+    assert_eq!(
+        workspaces_reload.kind,
+        botster_hub_client::DaemonResponseKind::PackageDecision
+    );
+    assert_eq!(
+        workspaces_reload
+            .package_decision
+            .as_ref()
+            .expect("failure_class=stale_build reload decision")
+            .action,
+        "reload"
+    );
+
+    let workspaces_show = botster_hub_client::request(
+        hub.endpoint(),
+        botster_hub_client::DaemonRequest::ShowPackage {
+            package_name: "botster-workspaces".to_string(),
+        },
+    )
+    .expect("failure_class=hub_contract show botster-workspaces package");
+    assert_eq!(
+        workspaces_show.kind,
+        botster_hub_client::DaemonResponseKind::Packages
+    );
+    let shown_workspaces = workspaces_show
+        .packages
+        .iter()
+        .find(|package| package.package_name == "botster-workspaces")
+        .expect("failure_class=plugin_producer show response includes botster-workspaces");
+    assert_eq!(
+        shown_workspaces.routes, enabled_workspaces.routes,
+        "failure_class=web_tui_consumer ListPackages/ShowPackage route descriptors diverged"
+    );
+
+    let workspaces_surface = botster_hub_client::request(
+        hub.endpoint(),
+        botster_hub_client::DaemonRequest::PluginSurfaceRender {
+            package_name: "botster-workspaces".to_string(),
+            surface_id: "workspaces".to_string(),
+            payload: serde_json::json!({}),
+        },
+    )
+    .expect("failure_class=plugin_producer render botster-workspaces surface");
+    assert_eq!(
+        workspaces_surface.kind,
+        botster_hub_client::DaemonResponseKind::PluginSurface
+    );
+    let workspaces_surface = workspaces_surface
+        .plugin_surface
+        .expect("failure_class=web_tui_consumer missing wrapped plugin_surface payload metadata");
+    assert_eq!(workspaces_surface.package_name, "botster-workspaces");
+    assert_eq!(workspaces_surface.surface_id, "workspaces");
+    assert_eq!(workspaces_surface.body["type"], "panel");
+    assert_eq!(workspaces_surface.body["id"], "botster-workspaces-panel");
+
+    let project_report = botster_hub_test_support::run_project_pipelines_conformance(
+        &hub,
+        project_pipelines_package_dir,
+    )
+    .expect("failure_class=plugin_producer run real Project Pipelines surface/action conformance");
+    assert_eq!(project_report.package_state, "enabled");
+    assert_eq!(project_report.surface_kind, "panel");
+    assert_eq!(project_report.surface_id, "project-pipelines-create-panel");
+    assert_eq!(project_report.invalid_action_status, "failure");
+    assert_eq!(
+        project_report.invalid_action_diagnostic_kind,
+        "action_failure"
+    );
+    assert_eq!(project_report.invalid_title_error, "Title is required");
+
+    let project_show = botster_hub_client::request(
+        hub.endpoint(),
+        botster_hub_client::DaemonRequest::ShowPackage {
+            package_name: "project-pipelines".to_string(),
+        },
+    )
+    .expect("failure_class=hub_contract show project-pipelines package");
+    assert_eq!(
+        project_show.kind,
+        botster_hub_client::DaemonResponseKind::Packages
+    );
+    let project_package = project_show
+        .packages
+        .iter()
+        .find(|package| package.package_name == "project-pipelines")
+        .expect("failure_class=plugin_producer show response includes project-pipelines");
+    let settings_route = package_route(&project_package.routes, "settings");
+    assert_eq!(
+        settings_route.route_path,
+        "/packages/project-pipelines/settings"
+    );
+    assert_eq!(settings_route.target.kind, "package_settings");
+    assert_eq!(settings_route.layout_mode, "settings_form");
+    assert!(settings_route.supports_settings);
+    assert!(
+        settings_route.enabled || settings_route.blocked,
+        "failure_class=web_tui_consumer settings route should open or report precise blocked state"
+    );
+    assert!(
+        settings_route.enabled
+            || settings_route
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.kind.contains("configuration")
+                    || diagnostic.kind.contains("provider")),
+        "failure_class=plugin_producer settings/config route blocked without precise provider/config diagnostic: {:?}",
+        settings_route.diagnostics
+    );
+
+    let project_reload = botster_hub_client::request(
+        hub.endpoint(),
+        botster_hub_client::DaemonRequest::ReloadPackage {
+            package_name: "project-pipelines".to_string(),
+        },
+    )
+    .expect("failure_class=stale_build reload project-pipelines package");
+    assert_eq!(
+        project_reload.kind,
+        botster_hub_client::DaemonResponseKind::PackageDecision
+    );
+    assert_eq!(
+        project_reload
+            .package_decision
+            .as_ref()
+            .expect("failure_class=stale_build project-pipelines reload decision")
+            .action,
+        "reload"
+    );
+
+    let status = botster_hub_client::request(
+        hub.endpoint(),
+        botster_hub_client::DaemonRequest::Status,
+    )
+    .expect("failure_class=environment daemon remains responsive after first-party dogfood smoke");
+    assert_eq!(status.kind, botster_hub_client::DaemonResponseKind::Status);
+
+    hub.shutdown()
+        .expect("failure_class=environment shutdown isolated first-party dogfood hub");
+}
+
+#[test]
 fn cli_dogfood_launcher_starts_botster_web_in_existing_hub_mode_and_shuts_down() {
     let _guard = daemon_test_lock()
         .lock()
