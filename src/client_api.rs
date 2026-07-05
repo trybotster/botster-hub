@@ -436,11 +436,16 @@ impl HubClientApi {
                 surface_id,
                 payload,
                 ..
-            } => HubClientResponseBody::PluginSurface(
-                runtime
+            } => {
+                let body = runtime
                     .render_plugin_surface(&package_name, &surface_id, payload)
-                    .map_err(|error| plugin_error(request_id.clone(), operation, error))?,
-            ),
+                    .map_err(|error| plugin_error(request_id.clone(), operation, error))?;
+                HubClientResponseBody::PluginSurface(HubClientPluginSurface {
+                    package_name,
+                    surface_id,
+                    body,
+                })
+            }
             HubClientRequest::PluginSurfaceAction {
                 package_name,
                 surface_id,
@@ -806,8 +811,15 @@ pub enum HubClientResponseBody {
     ResolvedSessionTemplate(ResolvedSessionTemplate),
     SessionContext(HubSessionContext),
     PluginLifecycle(Vec<HubClientPluginLifecycle>),
-    PluginSurface(UiNode),
+    PluginSurface(HubClientPluginSurface),
     PluginActionResult(UiActionResult),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct HubClientPluginSurface {
+    pub package_name: String,
+    pub surface_id: String,
+    pub body: UiNode,
 }
 
 /// Path-neutral hub status.

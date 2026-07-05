@@ -546,7 +546,12 @@ revision during the hello handshake.
 
 Do not reuse `botster_core::contract` session-worker protocol, session frame magic, `DefaultEngineCommand`, `TransportIngress`, or `BoundaryJson` for external clients. Those are not the client-to-hub protocol. The client crate also intentionally excludes hub runtime, Lua/plugin runtime, `ratatui`, `crossterm`, `mlua`, and core UI action/node types.
 
-Plugin surface and action responses cross the daemon boundary as JSON values. Hub-owned code may deserialize them into local core UI types, but external clients are not required to compile those internal UI/runtime dependencies.
+Plugin surface render responses cross the daemon boundary as a
+`DaemonPluginSurface` envelope containing `package_name`, `surface_id`, and a
+JSON `body` payload for the rendered UI node. Plugin action responses still cross
+as JSON values. Hub-owned code may deserialize payloads into local core UI types,
+but external clients are not required to compile those internal UI/runtime
+dependencies.
 
 ## Isolated Integration Tests For External Clients
 
