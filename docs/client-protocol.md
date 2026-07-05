@@ -591,7 +591,7 @@ internally because Cargo only injects that variable for the package that owns th
 binary. The compile-checked usage examples live on
 `botster_hub_test_support::IsolatedHubBuilder`,
 `botster_hub_test_support::run_client_conformance`, and
-`botster_hub_test_support::run_project_pipelines_conformance`.
+`botster_hub_test_support::run_plugin_contract_matrix_conformance`.
 
 Each harness instance creates a disposable data directory and socket path under
 the configured test root, uses synthetic default hub identity, and attempts a
@@ -615,11 +615,53 @@ scenario as serialized JSON, for example with
 step, rather than mirroring the matrix or daemon event fields by hand in
 TypeScript.
 
-If a downstream client also wants to prove plugin surface/action dispatch
-against the first-party Project Pipelines example, provide a checkout path to
-the example package and call the optional `run_project_pipelines_conformance`
-helper. Its report includes the rejected-action diagnostic for the invalid form
-submission path.
+If a downstream client also wants to prove plugin surface/action dispatch,
+configuration, route descriptors, and failure diagnostics, provide a checkout
+path to `fixtures/plugins/plugin-contract-matrix` and call
+`run_plugin_contract_matrix_conformance`:
+
+```rust
+let hub = botster_hub_test_support::IsolatedHubBuilder::new()
+    .hub_bin(std::env::var("BOTSTER_HUB_BIN").expect("BOTSTER_HUB_BIN"))
+    .session_worker_bin(
+        std::env::var("BOTSTER_SESSION_WORKER_BIN").expect("BOTSTER_SESSION_WORKER_BIN"),
+    )
+    .start()
+    .expect("isolated hub starts");
+
+let report = botster_hub_test_support::run_plugin_contract_matrix_conformance(
+    &hub,
+    "fixtures/plugins/plugin-contract-matrix",
+)
+.expect("plugin UI conformance");
+assert_eq!(report.app_surface_node_id, "contract-app-panel");
+assert_eq!(report.action_error_diagnostic_kind, "action_failure");
+assert_eq!(
+    report.client_render_check.class,
+    botster_hub_test_support::ConformanceFailureClass::ClientRendering,
+);
+hub.shutdown().expect("shutdown isolated hub");
+```
+
+Hub developers can run the full fixture proof from this repository with:
+
+```bash
+./test.sh --test hub_daemon_lifecycle_test daemon_plugin_contract_matrix_fixture_exercises_public_package_contracts
+```
+
+Web and TUI developers should run their renderer-specific tests against the
+same report fields. Producer contract failures are `ConformanceError` values
+classified as `ProducerContract`; local setup failures such as missing
+`BOTSTER_HUB_BIN` or `BOTSTER_SESSION_WORKER_BIN` are `IsolatedHubError` values
+classified as `EnvironmentSetup`; renderer mismatches are client-owned
+comparisons against `report.client_render_check` and classified as
+`ClientRendering`.
+
+First-party plugin developers should keep plugin contract tests pointed at this
+hub-owned fixture unless they need product-specific behavior. Product helpers
+such as `run_project_pipelines_conformance` can still cover product workflows,
+but the support matrix's plugin-surface claim is backed by the generic contract
+matrix fixture.
 
 To prove foreground package app-open support without recreating hub launcher
 policy, call `run_foreground_terminal_app_open_conformance`. The helper installs
@@ -631,7 +673,8 @@ report asserts the canonical `BOTSTER_HUB_SOCKET` and `BOTSTER_HUB_DATA_DIR`
 environment values were present and that the child exited with code 0.
 
 The matrix currently marks JSON plugin surface render/action dispatch as
-supported and full plugin entity-frame hydration as intentionally unsupported by
-this conformance fixture. Clients that render plugin entity stores should prove
-that path with their own entity-frame tests until the hub publishes a dedicated
-entity conformance fixture.
+supported through the contract-matrix fixture and full plugin entity-frame
+hydration as intentionally unsupported by this conformance fixture. Clients
+that render plugin entity stores should prove that path with their own
+entity-frame tests until the hub publishes a dedicated entity conformance
+fixture.

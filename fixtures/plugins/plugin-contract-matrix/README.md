@@ -9,6 +9,29 @@ botster-hub packages install fixtures/plugins/plugin-contract-matrix
 botster-hub packages enable botster.plugin-contract-matrix
 ```
 
+Rust client and plugin repos should prefer the hub-owned test-support helper
+instead of inventing DTO fixtures:
+
+```rust
+let report = botster_hub_test_support::run_plugin_contract_matrix_conformance(
+    &hub,
+    "fixtures/plugins/plugin-contract-matrix",
+)
+.expect("plugin UI conformance");
+assert_eq!(report.app_surface_node_id, "contract-app-panel");
+assert_eq!(report.client_render_check.expected_redacted_secret_state, "redacted");
+```
+
+In this repository, the full isolated-hub proof is:
+
+```bash
+./test.sh --test hub_daemon_lifecycle_test daemon_plugin_contract_matrix_fixture_exercises_public_package_contracts
+```
+
+Harness failures are classified as producer contract failures, downstream
+renderer comparisons, or environment/setup failures such as missing hub binary
+paths.
+
 ## Matrix
 
 - `contract.app`: app surface returning a concrete UiNode payload through `plugin_surface_render`.
