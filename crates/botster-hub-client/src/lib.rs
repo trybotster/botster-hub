@@ -735,7 +735,7 @@ pub struct DaemonResponse {
     #[serde(default)]
     pub plugin_tool_result: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub plugin_surface: Option<Value>,
+    pub plugin_surface: Option<DaemonPluginSurface>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plugin_action_result: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -748,6 +748,13 @@ pub struct DaemonResponse {
     pub error: Option<DaemonOperatorError>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub diagnostics: Vec<DaemonDiagnostic>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DaemonPluginSurface {
+    pub package_name: String,
+    pub surface_id: String,
+    pub body: Value,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2979,7 +2986,11 @@ mod tests {
             }],
             plugin_tools: vec![serde_json::json!({ "name": "tool" })],
             plugin_tool_result: serde_json::json!({ "content": [] }),
-            plugin_surface: Some(serde_json::json!({ "type": "text", "value": "surface" })),
+            plugin_surface: Some(DaemonPluginSurface {
+                package_name: "workflow.plugin".to_string(),
+                surface_id: "workflow.surface".to_string(),
+                body: serde_json::json!({ "type": "text", "value": "surface" }),
+            }),
             plugin_action_result: Some(serde_json::json!({ "state": "accepted" })),
             local_webrtc_bootstrap: Some(DaemonLocalWebrtcBootstrap {
                 grant_id: "grant".to_string(),
