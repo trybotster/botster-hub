@@ -1739,6 +1739,92 @@ fn start_cli_daemon(data_dir: &Path) -> Child {
     child
 }
 
+fn start_owned_incompatible_dev_stack_daemon(data_dir: &Path) -> Child {
+    ensure_session_worker_binary();
+    fs::create_dir_all(data_dir).expect("create data dir");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("start")
+        .arg("--data-dir")
+        .arg(data_dir)
+        .arg("--session-worker-bin")
+        .arg(session_worker_binary_path())
+        .env("BOTSTER_HUB_TEST_INCOMPATIBLE_DAEMON", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn incompatible botster-hub start");
+    wait_for_incompatible_status(data_dir, &mut child);
+    write_dev_stack_daemon_metadata(data_dir, child.id());
+    child
+}
+
+fn wait_for_incompatible_status(data_dir: &Path, child: &mut Child) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut last_output = String::new();
+    while std::time::Instant::now() < deadline {
+        if let Some(status) = child.try_wait().expect("check incompatible daemon child") {
+            let mut stdout = String::new();
+            let mut stderr = String::new();
+            if let Some(mut pipe) = child.stdout.take() {
+                let _ = pipe.read_to_string(&mut stdout);
+            }
+            if let Some(mut pipe) = child.stderr.take() {
+                let _ = pipe.read_to_string(&mut stderr);
+            }
+            panic!(
+                "incompatible daemon exited before ready with {status}: stdout={stdout:?} stderr={stderr:?}"
+            );
+        }
+        let output = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+            .arg("status")
+            .arg("--data-dir")
+            .arg(data_dir)
+            .output()
+            .expect("run botster-hub status against incompatible daemon");
+        last_output = command_output_text(&output);
+        if !output.status.success()
+            && (last_output.contains("running daemon is incompatible or stale")
+                || last_output.contains("hub predates compatibility handshake"))
+        {
+            return;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    panic!("incompatible daemon did not become ready; last status output: {last_output}");
+}
+
+fn write_dev_stack_daemon_metadata(data_dir: &Path, pid: u32) {
+    let config = explicit_config(data_dir);
+    let socket_path = config
+        .transports
+        .local_socket
+        .as_ref()
+        .expect("local socket binding")
+        .path
+        .clone();
+    let metadata = serde_json::json!({
+        "pid": pid,
+        "data_directory": stable_path_string(data_dir),
+        "data_directory_arg": data_dir.display().to_string(),
+        "socket_path": socket_path.display().to_string(),
+        "hub_bin": stable_path_string(Path::new(env!("CARGO_BIN_EXE_botster-hub"))),
+    });
+    let metadata_path = data_dir.join(".botster-hub-dev-stack-daemon.json");
+    fs::write(
+        &metadata_path,
+        serde_json::to_string_pretty(&metadata).expect("serialize daemon metadata"),
+    )
+    .expect("write daemon metadata");
+    assert!(metadata_path.exists(), "daemon metadata should exist");
+}
+
+fn stable_path_string(path: &Path) -> String {
+    fs::canonicalize(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .display()
+        .to_string()
+}
+
 fn start_cli_daemon_with_session_worker(data_dir: &Path, session_worker_bin: &Path) -> Child {
     let mut child = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
         .arg("start")
@@ -3278,7 +3364,137 @@ fn cli_doctor_reports_healthy_runtime_checks() {
 }
 
 #[test]
-fn cli_local_runtime_up_reports_incompatible_daemon_without_deleting_socket() {
+fn cli_local_runtime_up_recovers_owned_incompatible_daemon() {
+    let _guard = daemon_test_lock()
+        .lock()
+        .expect("serialize real daemon test");
+    let data_dir = unique_test_dir("cli-up-owned-incompat");
+    let project_pipelines_package_dir = unique_test_dir("cli-up-owned-project-pipelines");
+    let web_package_dir = unique_test_dir("cli-up-owned-web");
+    let tui_package_dir = unique_test_dir("cli-up-owned-tui");
+    let workspaces_package_dir = unique_test_dir("cli-up-owned-workspaces");
+    write_project_pipelines_availability_package(&project_pipelines_package_dir);
+    write_botster_web_package(&web_package_dir);
+    write_botster_tui_package(&tui_package_dir);
+    write_botster_workspaces_local_package(&workspaces_package_dir, "botster-workspaces");
+    let stale_child = start_owned_incompatible_dev_stack_daemon(&data_dir);
+    let stale_pid = stale_child.id();
+
+    let output = run_local_runtime_up(
+        &data_dir,
+        &project_pipelines_package_dir,
+        &web_package_dir,
+        &tui_package_dir,
+        &workspaces_package_dir,
+        unused_loopback_port(),
+    );
+    assert!(
+        output.status.success(),
+        "up failed after stale daemon recovery: {}",
+        command_output_text(&output)
+    );
+    let text = command_output_text(&output);
+    assert!(text.contains("runtime=ready"));
+    assert!(text.contains("daemon=started"));
+    let _ = stale_child.wait_with_output().expect("reap stale daemon");
+    assert!(
+        !process_exists(stale_pid),
+        "stale incompatible daemon should be stopped"
+    );
+
+    shutdown_dev_stack_daemon(&data_dir);
+}
+
+#[test]
+fn cli_local_runtime_down_recovers_owned_incompatible_daemon() {
+    let _guard = daemon_test_lock()
+        .lock()
+        .expect("serialize real daemon test");
+    let data_dir = unique_short_test_dir("cli-down-owned-incompat");
+    let stale_child = start_owned_incompatible_dev_stack_daemon(&data_dir);
+    let stale_pid = stale_child.id();
+    let socket_path = explicit_config(&data_dir)
+        .transports
+        .local_socket
+        .as_ref()
+        .expect("local socket binding")
+        .path
+        .clone();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("down")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .output()
+        .expect("run botster-hub down against owned incompatible daemon");
+    assert!(
+        output.status.success(),
+        "down failed after stale daemon recovery: {}",
+        command_output_text(&output)
+    );
+    assert!(command_output_text(&output).contains("daemon=recovered_stale"));
+    let _ = stale_child.wait_with_output().expect("reap stale daemon");
+    assert!(
+        !process_exists(stale_pid),
+        "stale incompatible daemon should be stopped"
+    );
+    assert!(
+        !socket_path.exists(),
+        "down recovery should remove the selected data dir socket"
+    );
+}
+
+#[test]
+fn cli_local_runtime_recovery_removes_only_selected_data_dir_socket() {
+    let _guard = daemon_test_lock()
+        .lock()
+        .expect("serialize real daemon test");
+    let data_dir = unique_short_test_dir("cli-scoped-owned-incompat");
+    let other_data_dir = unique_short_test_dir("cli-scoped-other-incompat");
+    let stale_child = start_owned_incompatible_dev_stack_daemon(&data_dir);
+    let selected_socket_path = explicit_config(&data_dir)
+        .transports
+        .local_socket
+        .as_ref()
+        .expect("selected local socket binding")
+        .path
+        .clone();
+    let other_socket_path = explicit_config(&other_data_dir)
+        .transports
+        .local_socket
+        .as_ref()
+        .expect("other local socket binding")
+        .path
+        .clone();
+    fs::create_dir_all(other_socket_path.parent().expect("other socket parent"))
+        .expect("create other socket parent");
+    let _other_listener = UnixListener::bind(&other_socket_path).expect("bind other socket");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("down")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .output()
+        .expect("run botster-hub down for selected data dir");
+    assert!(
+        output.status.success(),
+        "down failed after stale daemon recovery: {}",
+        command_output_text(&output)
+    );
+    let _ = stale_child.wait_with_output().expect("reap stale daemon");
+    assert!(
+        !selected_socket_path.exists(),
+        "selected data dir socket should be removed"
+    );
+    assert!(
+        other_socket_path.exists(),
+        "recovery must not remove sockets for other data dirs"
+    );
+    let _ = fs::remove_file(other_socket_path);
+}
+
+#[test]
+fn cli_local_runtime_up_refuses_unowned_incompatible_daemon() {
     let _guard = daemon_test_lock()
         .lock()
         .expect("serialize real daemon test");
