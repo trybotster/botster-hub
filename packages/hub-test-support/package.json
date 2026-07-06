@@ -2,7 +2,7 @@
   "name": "@trybotster/hub-test-support",
   "version": "0.1.0",
   "description": "Node-consumable Botster hub client protocol and plugin contract test assets",
-  "license": "SEE LICENSE IN ../../LICENSE",
+  "license": "SEE LICENSE IN LICENSE",
   "type": "module",
   "main": "./index.js",
   "types": "./index.d.ts",
@@ -17,6 +17,7 @@
   },
   "files": [
     "README.md",
+    "LICENSE",
     "index.js",
     "index.d.ts",
     "metadata.json",
