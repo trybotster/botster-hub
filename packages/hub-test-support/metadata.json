@@ -1,0 +1,32 @@
+{
+  "package_name": "@trybotster/hub-test-support",
+  "package_version": "0.1.0",
+  "protocol": "botster-hub-daemon-v1",
+  "protocol_version": 1,
+  "conformance_fixture_revision": 4,
+  "generated_by": "cargo run -p botster-hub-test-support --example node_package_assets",
+  "daemon_protocol": {
+    "artifact_path": "daemon-protocol.ts",
+    "source_artifact_path": "crates/botster-hub-client/generated/daemon-protocol.ts",
+    "sha256": "112eca7f4a0a135fc36d2a83a56de21f0cdd7f5022b726bcb5da965d8d327829"
+  },
+  "plugin_contract_matrix": {
+    "package_name": "botster.plugin-contract-matrix",
+    "artifact_path": "fixtures/plugin-contract-matrix",
+    "source_artifact_path": "botster_hub_test_support::plugin_contract_matrix_fixture_asset()",
+    "files": [
+      {
+        "path": "README.md",
+        "sha256": "7ef31be6dcbd39410f1c489dafcf58eed9ba07606dbb28912699ba6d85293749"
+      },
+      {
+        "path": "botster-package.json",
+        "sha256": "bb87925c29075d568cdd9f7cd4b67e7ca510ddb2621117e01d3207f177188d09"
+      },
+      {
+        "path": "plugin.lua",
+        "sha256": "8e5fbc67ffdd38064a301f3790614a61d7f88468b5cb4594ca8090e96a2ace23"
+      }
+    ]
+  }
+}

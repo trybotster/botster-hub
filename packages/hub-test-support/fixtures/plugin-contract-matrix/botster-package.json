@@ -1,0 +1,91 @@
+{
+  "name": "botster.plugin-contract-matrix",
+  "version": "1.0.0",
+  "kind": "plugin",
+  "botster": ">=0.1.0",
+  "source": { "type": "path", "path": "." },
+  "capabilities": [
+    { "surface": "surfaces" }
+  ],
+  "entrypoints": [
+    { "runtime": "lua", "path": "plugin.lua", "bootstrap": false }
+  ],
+  "surfaces": [
+    {
+      "id": "contract.app",
+      "kind": "app",
+      "title": "Contract App",
+      "description": "Conformance app surface with a concrete UiNode payload.",
+      "icon": "workflow",
+      "order": 10,
+      "category": "contract",
+      "supports": ["render", "action"]
+    },
+    {
+      "id": "contract.empty",
+      "kind": "app",
+      "title": "Contract Empty State",
+      "description": "Conformance placeholder surface with an empty-state UiNode payload.",
+      "icon": "circle",
+      "order": 20,
+      "category": "contract",
+      "supports": ["render"]
+    },
+    {
+      "id": "contract.blocked",
+      "kind": "app",
+      "title": "Contract Blocked Surface",
+      "description": "Conformance surface whose handler fails so clients can assert daemon error handling.",
+      "icon": "ban",
+      "order": 30,
+      "category": "contract",
+      "supports": ["render"]
+    },
+    {
+      "id": "contract.invalid_body",
+      "kind": "app",
+      "title": "Contract Invalid Body",
+      "description": "Conformance surface whose handler returns malformed UiNode data so clients can assert validation diagnostics.",
+      "icon": "warning",
+      "order": 35,
+      "category": "contract",
+      "supports": ["render"]
+    },
+    {
+      "id": "contract.settings",
+      "kind": "settings",
+      "title": "Contract Settings",
+      "description": "Conformance settings surface that renders sanitized effective package configuration.",
+      "icon": "settings",
+      "order": 40,
+      "category": "configuration",
+      "supports": ["render"]
+    }
+  ],
+  "configuration": {
+    "fields": [
+      {
+        "key": "endpoint",
+        "type": "url",
+        "label": "Endpoint",
+        "default": { "type": "url", "value": "https://example.invalid/plugin-contract-matrix" }
+      },
+      {
+        "key": "mode",
+        "type": "select",
+        "label": "Mode",
+        "default": { "type": "select", "value": "read" },
+        "options": [
+          { "value": "read", "label": "Read" },
+          { "value": "write", "label": "Write" }
+        ]
+      },
+      {
+        "key": "api_token",
+        "type": "secret",
+        "label": "API token",
+        "default": { "type": "secret", "state": "unset" }
+      }
+    ]
+  }
+}
