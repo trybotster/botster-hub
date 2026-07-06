@@ -156,6 +156,7 @@ pub(crate) fn daemon_protocol_typescript() -> String {
                 "resolve_package_route",
                 &[("package_name", "string"), ("route_id", "string")],
             ),
+            ("list_package_navigation", &[]),
             ("list_packages", &[]),
             ("list_available_packages", &[("registry_path", "string")]),
             (
@@ -276,6 +277,7 @@ pub(crate) fn daemon_protocol_typescript() -> String {
                 "resolved_package_route?",
                 "DaemonPackageRouteDescriptor | null",
             ),
+            ("package_navigation?", "DaemonPackageNavigationEntry[]"),
             ("packages", "DaemonPackage[]"),
             ("available_packages?", "DaemonAvailablePackage[]"),
             ("install_plan?", "DaemonPackageInstallPlan | null"),
@@ -331,6 +333,7 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             "apps",
             "resolved_app_launch",
             "resolved_package_route",
+            "package_navigation",
             "packages",
             "available_packages",
             "package_install_plan",
@@ -553,6 +556,33 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             ("kind", "string"),
             ("entrypoint_id?", "string | null"),
             ("surface_id?", "string | null"),
+        ],
+    );
+    emit_interface(
+        &mut output,
+        "DaemonPackageNavigationEntry",
+        &[
+            ("package_name", "string"),
+            ("item_id", "string"),
+            ("label", "string"),
+            ("icon?", "string | null"),
+            ("description?", "string | null"),
+            ("route_id", "string"),
+            ("route_path", "string"),
+            ("target", "DaemonPackageRouteTarget"),
+            ("source", "DaemonPackageNavigationSource"),
+            ("enabled", "boolean"),
+            ("blocked", "boolean"),
+            ("diagnostics?", "DaemonPackageDiagnostic[]"),
+        ],
+    );
+    emit_interface(
+        &mut output,
+        "DaemonPackageNavigationSource",
+        &[
+            ("kind", "string"),
+            ("surface_id?", "string | null"),
+            ("entrypoint_id?", "string | null"),
         ],
     );
     emit_interface(

@@ -27,6 +27,7 @@ pub const FEATURE_RESIZE: &str = "resize";
 pub const FEATURE_PLUGIN_SURFACE_RENDER: &str = "plugin_surface_render";
 pub const FEATURE_PLUGIN_SURFACE_ACTION: &str = "plugin_surface_action";
 pub const FEATURE_PACKAGE_ROUTES: &str = "package_routes";
+pub const FEATURE_PACKAGE_NAVIGATION: &str = "package_navigation";
 const ATTACH_DRAIN_INTERVAL: Duration = Duration::from_millis(25);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -513,6 +514,7 @@ fn current_feature_list() -> Vec<&'static str> {
         FEATURE_PLUGIN_SURFACE_RENDER,
         FEATURE_PLUGIN_SURFACE_ACTION,
         FEATURE_PACKAGE_ROUTES,
+        FEATURE_PACKAGE_NAVIGATION,
     ]
 }
 
@@ -602,6 +604,7 @@ pub enum DaemonRequest {
         package_name: String,
         route_id: String,
     },
+    ListPackageNavigation,
     ListPackages,
     ListAvailablePackages {
         registry_path: PathBuf,
@@ -721,6 +724,8 @@ pub struct DaemonResponse {
     pub resolved_app_launch: Option<DaemonResolvedAppLaunch>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_package_route: Option<DaemonPackageRouteDescriptor>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub package_navigation: Vec<DaemonPackageNavigationEntry>,
     pub packages: Vec<DaemonPackage>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub available_packages: Vec<DaemonAvailablePackage>,
@@ -779,6 +784,7 @@ pub enum DaemonResponseKind {
     Apps,
     ResolvedAppLaunch,
     ResolvedPackageRoute,
+    PackageNavigation,
     Packages,
     AvailablePackages,
     PackageInstallPlan,
@@ -1036,6 +1042,34 @@ pub struct DaemonPackageRouteTarget {
     pub entrypoint_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub surface_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonPackageNavigationEntry {
+    pub package_name: String,
+    pub item_id: String,
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub route_id: String,
+    pub route_path: String,
+    pub target: DaemonPackageRouteTarget,
+    pub source: DaemonPackageNavigationSource,
+    pub enabled: bool,
+    pub blocked: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<DaemonPackageDiagnostic>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonPackageNavigationSource {
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub surface_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entrypoint_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2288,6 +2322,79 @@ mod tests {
     }
 
     #[test]
+    fn package_navigation_entries_are_serde_stable_and_generated_without_order_authority() {
+        let entry = DaemonPackageNavigationEntry {
+            package_name: "workflow.plugin".to_string(),
+            item_id: "home".to_string(),
+            label: "Workflow".to_string(),
+            icon: Some("workflow".to_string()),
+            description: Some("Workflow home".to_string()),
+            route_id: "surface:workflow.home".to_string(),
+            route_path: "/packages/workflow.plugin/surfaces/workflow.home".to_string(),
+            target: DaemonPackageRouteTarget {
+                kind: "plugin_surface".to_string(),
+                entrypoint_id: None,
+                surface_id: Some("workflow.home".to_string()),
+            },
+            source: DaemonPackageNavigationSource {
+                kind: "surface".to_string(),
+                surface_id: Some("workflow.home".to_string()),
+                entrypoint_id: None,
+            },
+            enabled: true,
+            blocked: false,
+            diagnostics: Vec::new(),
+        };
+        let response = DaemonResponse {
+            kind: DaemonResponseKind::PackageNavigation,
+            package_navigation: vec![entry],
+            ..daemon_response_example(DaemonResponseKind::PackageNavigation)
+        };
+        let value = serde_json::to_value(response).expect("navigation response serializes");
+        assert_eq!(
+            value["package_navigation"][0],
+            serde_json::json!({
+                "package_name": "workflow.plugin",
+                "item_id": "home",
+                "label": "Workflow",
+                "icon": "workflow",
+                "description": "Workflow home",
+                "route_id": "surface:workflow.home",
+                "route_path": "/packages/workflow.plugin/surfaces/workflow.home",
+                "target": {
+                    "kind": "plugin_surface",
+                    "surface_id": "workflow.home"
+                },
+                "source": {
+                    "kind": "surface",
+                    "surface_id": "workflow.home"
+                },
+                "enabled": true,
+                "blocked": false
+            })
+        );
+        let navigation_entry = value["package_navigation"][0].to_string();
+        assert!(!navigation_entry.contains("order"));
+        assert!(!navigation_entry.contains("priority"));
+
+        let request = DaemonRequest::ListPackageNavigation;
+        let request_value = serde_json::to_value(request).expect("request serializes");
+        assert_eq!(
+            request_value,
+            serde_json::json!({ "type": "list_package_navigation" })
+        );
+
+        let generated = daemon_protocol_typescript();
+        assert!(generated.contains("package_navigation?: DaemonPackageNavigationEntry[];"));
+        assert!(generated.contains("export interface DaemonPackageNavigationEntry"));
+        assert!(generated.contains("export interface DaemonPackageNavigationSource"));
+        assert!(generated.contains(r#"| { type: "list_package_navigation" }"#));
+        let navigation = generated_interface("DaemonPackageNavigationEntry");
+        assert!(!navigation.contains("order"));
+        assert!(!navigation.contains("priority"));
+    }
+
+    #[test]
     fn daemon_package_configuration_optional_fields_match_serde_omission() {
         let package = DaemonPackage {
             package_name: "workflow.plugin".to_string(),
@@ -2727,6 +2834,7 @@ mod tests {
                 package_name: "workflow.plugin".to_string(),
                 route_id: "surface:workflow.home".to_string(),
             },
+            DaemonRequest::ListPackageNavigation,
             DaemonRequest::ListPackages,
             DaemonRequest::ListAvailablePackages {
                 registry_path: PathBuf::from("/tmp/registry"),
@@ -2850,6 +2958,7 @@ mod tests {
             DaemonRequest::ListApps => "list_apps",
             DaemonRequest::ResolveAppLaunch { .. } => "resolve_app_launch",
             DaemonRequest::ResolvePackageRoute { .. } => "resolve_package_route",
+            DaemonRequest::ListPackageNavigation => "list_package_navigation",
             DaemonRequest::ListPackages => "list_packages",
             DaemonRequest::ListAvailablePackages { .. } => "list_available_packages",
             DaemonRequest::InspectAvailablePackage { .. } => "inspect_available_package",
@@ -2893,6 +3002,7 @@ mod tests {
             DaemonResponseKind::Apps,
             DaemonResponseKind::ResolvedAppLaunch,
             DaemonResponseKind::ResolvedPackageRoute,
+            DaemonResponseKind::PackageNavigation,
             DaemonResponseKind::Packages,
             DaemonResponseKind::AvailablePackages,
             DaemonResponseKind::PackageInstallPlan,
@@ -2928,6 +3038,7 @@ mod tests {
             DaemonResponseKind::Apps => "apps",
             DaemonResponseKind::ResolvedAppLaunch => "resolved_app_launch",
             DaemonResponseKind::ResolvedPackageRoute => "resolved_package_route",
+            DaemonResponseKind::PackageNavigation => "package_navigation",
             DaemonResponseKind::Packages => "packages",
             DaemonResponseKind::AvailablePackages => "available_packages",
             DaemonResponseKind::PackageInstallPlan => "package_install_plan",
@@ -3074,6 +3185,28 @@ mod tests {
                 diagnostics: Vec::new(),
                 supports_settings: true,
             }),
+            package_navigation: vec![DaemonPackageNavigationEntry {
+                package_name: "workflow.plugin".to_string(),
+                item_id: "home".to_string(),
+                label: "Workflow".to_string(),
+                icon: Some("workflow".to_string()),
+                description: Some("Workflow home".to_string()),
+                route_id: "surface:workflow.home".to_string(),
+                route_path: "/packages/workflow.plugin/surfaces/workflow.home".to_string(),
+                target: DaemonPackageRouteTarget {
+                    kind: "plugin_surface".to_string(),
+                    entrypoint_id: None,
+                    surface_id: Some("workflow.home".to_string()),
+                },
+                source: DaemonPackageNavigationSource {
+                    kind: "surface".to_string(),
+                    surface_id: Some("workflow.home".to_string()),
+                    entrypoint_id: None,
+                },
+                enabled: true,
+                blocked: false,
+                diagnostics: Vec::new(),
+            }],
             packages: vec![DaemonPackage {
                 package_name: "workflow.plugin".to_string(),
                 version: "1.0.0".to_string(),
