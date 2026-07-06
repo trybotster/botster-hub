@@ -602,6 +602,11 @@ binary. The compile-checked usage examples live on
 `botster_hub_test_support::IsolatedHubBuilder`,
 `botster_hub_test_support::run_client_conformance`, and
 `botster_hub_test_support::run_plugin_contract_matrix_conformance`.
+Client protocol drift checks can obtain the checked generated TypeScript
+protocol through
+`botster_hub_test_support::daemon_protocol_typescript_artifact()`. The returned
+artifact path is stable for reports, while the contents still come from the
+authoritative `botster-hub-client` generator.
 
 Each harness instance creates a disposable data directory and socket path under
 the configured test root, uses synthetic default hub identity, and attempts a
@@ -626,11 +631,17 @@ step, rather than mirroring the matrix or daemon event fields by hand in
 TypeScript.
 
 If a downstream client also wants to prove plugin surface/action dispatch,
-configuration, route descriptors, and failure diagnostics, provide a checkout
-path to `fixtures/plugins/plugin-contract-matrix` and call
-`run_plugin_contract_matrix_conformance`:
+configuration, route descriptors, and failure diagnostics, copy the published
+fixture from `botster-hub-test-support` into a caller-owned temp directory and
+call `run_plugin_contract_matrix_conformance` with the copied package root:
 
 ```rust
+let fixture_root = tempfile::tempdir().expect("fixture tempdir");
+let fixture_path = botster_hub_test_support::copy_plugin_contract_matrix_fixture(
+    fixture_root.path(),
+)
+.expect("copy plugin contract matrix fixture");
+
 let hub = botster_hub_test_support::IsolatedHubBuilder::new()
     .hub_bin(std::env::var("BOTSTER_HUB_BIN").expect("BOTSTER_HUB_BIN"))
     .session_worker_bin(
@@ -641,7 +652,7 @@ let hub = botster_hub_test_support::IsolatedHubBuilder::new()
 
 let report = botster_hub_test_support::run_plugin_contract_matrix_conformance(
     &hub,
-    "fixtures/plugins/plugin-contract-matrix",
+    fixture_path,
 )
 .expect("plugin UI conformance");
 assert_eq!(report.app_surface_node_id, "contract-app-panel");
@@ -652,6 +663,10 @@ assert_eq!(
 );
 hub.shutdown().expect("shutdown isolated hub");
 ```
+
+Explicit local package paths and environment-specific binary paths remain useful
+for hub developers and local overrides, but client repositories should not need
+a sibling hub checkout for the normal fixture or protocol-artifact path.
 
 Hub developers can run the full fixture proof from this repository with:
 

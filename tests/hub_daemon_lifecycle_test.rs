@@ -2436,10 +2436,10 @@ fn daemon_plugin_contract_matrix_fixture_exercises_public_package_contracts() {
     let _guard = daemon_test_lock()
         .lock()
         .expect("serialize real daemon test");
-    let fixture_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("fixtures")
-        .join("plugins")
-        .join("plugin-contract-matrix");
+    let fixture_dir = botster_hub_test_support::copy_plugin_contract_matrix_fixture(
+        unique_test_dir("daemon-plugin-contract-matrix-fixture"),
+    )
+    .expect("copy published plugin contract matrix fixture");
     let hub = botster_hub_test_support::IsolatedHubBuilder::new()
         .hub_bin(env!("CARGO_BIN_EXE_botster-hub"))
         .session_worker_bin(session_worker_binary_path())
