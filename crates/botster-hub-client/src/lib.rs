@@ -20,7 +20,7 @@ mod typescript;
 
 pub const PROTOCOL: &str = "botster-hub-daemon-v1";
 pub const PROTOCOL_VERSION: u16 = 1;
-pub const CONFORMANCE_FIXTURE_REVISION: u16 = 3;
+pub const CONFORMANCE_FIXTURE_REVISION: u16 = 4;
 pub const FEATURE_SESSIONS: &str = "sessions";
 pub const FEATURE_TERMINAL_STREAMING: &str = "terminal_streaming";
 pub const FEATURE_RESIZE: &str = "resize";
@@ -752,6 +752,15 @@ pub struct DaemonResponse {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DaemonPluginSurface {
+    pub package_name: String,
+    pub surface_id: String,
+    pub body: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ui_tree_snapshot: Option<DaemonUiTreeSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DaemonUiTreeSnapshot {
     pub package_name: String,
     pub surface_id: String,
     pub body: Value,
@@ -2079,6 +2088,44 @@ mod tests {
     }
 
     #[test]
+    fn plugin_surface_snapshot_is_serde_stable_and_generated() {
+        let surface = DaemonPluginSurface {
+            package_name: "workflow.plugin".to_string(),
+            surface_id: "workflow.surface".to_string(),
+            body: serde_json::json!({ "type": "text", "value": "surface" }),
+            ui_tree_snapshot: Some(DaemonUiTreeSnapshot {
+                package_name: "workflow.plugin".to_string(),
+                surface_id: "workflow.surface".to_string(),
+                body: serde_json::json!({ "type": "text", "value": "surface" }),
+            }),
+        };
+        let value = serde_json::to_value(&surface).expect("plugin surface serializes");
+        assert_generated_interface_fields("DaemonPluginSurface", &value);
+        assert_generated_interface_fields(
+            "DaemonUiTreeSnapshot",
+            value
+                .get("ui_tree_snapshot")
+                .expect("plugin surface serializes ui tree snapshot"),
+        );
+        assert!(
+            generated_interface("DaemonPluginSurface")
+                .contains("  ui_tree_snapshot?: DaemonUiTreeSnapshot | null;"),
+            "generated TypeScript should mark additive snapshot field optional"
+        );
+
+        let legacy_surface = DaemonPluginSurface {
+            ui_tree_snapshot: None,
+            ..surface
+        };
+        let legacy_value =
+            serde_json::to_value(&legacy_surface).expect("legacy plugin surface serializes");
+        assert!(
+            legacy_value.get("ui_tree_snapshot").is_none(),
+            "plugin surface should omit absent ui_tree_snapshot"
+        );
+    }
+
+    #[test]
     fn daemon_package_surface_descriptors_use_core_manifest_field_names() {
         let package = DaemonPackage {
             surfaces: vec![DaemonPackageSurfaceDescriptor {
@@ -2990,6 +3037,11 @@ mod tests {
                 package_name: "workflow.plugin".to_string(),
                 surface_id: "workflow.surface".to_string(),
                 body: serde_json::json!({ "type": "text", "value": "surface" }),
+                ui_tree_snapshot: Some(DaemonUiTreeSnapshot {
+                    package_name: "workflow.plugin".to_string(),
+                    surface_id: "workflow.surface".to_string(),
+                    body: serde_json::json!({ "type": "text", "value": "surface" }),
+                }),
             }),
             plugin_action_result: Some(serde_json::json!({ "state": "accepted" })),
             local_webrtc_bootstrap: Some(DaemonLocalWebrtcBootstrap {

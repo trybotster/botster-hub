@@ -42,6 +42,16 @@
       "supports": ["render"]
     },
     {
+      "id": "contract.invalid_body",
+      "kind": "app",
+      "title": "Contract Invalid Body",
+      "description": "Conformance surface whose handler returns malformed UiNode data so clients can assert validation diagnostics.",
+      "icon": "warning",
+      "order": 35,
+      "category": "contract",
+      "supports": ["render"]
+    },
+    {
       "id": "contract.settings",
       "kind": "settings",
       "title": "Contract Settings",

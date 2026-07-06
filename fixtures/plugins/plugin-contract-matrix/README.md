@@ -37,8 +37,14 @@ paths.
 - `contract.app`: app surface returning a concrete UiNode payload through `plugin_surface_render`.
 - `contract.empty`: placeholder app surface returning a valid empty-state UiNode payload.
 - `contract.blocked`: render handler that fails deliberately so clients can assert the daemon `operator_error` response and continued daemon responsiveness.
+- `contract.invalid_body`: declared render surface whose handler returns malformed UiNode data so clients can assert `invalid_surface` and a structured `plugin_surface_render` diagnostic from hub validation.
 - `contract.settings`: settings surface returning sanitized effective configuration from `botster.capabilities.config.get()`.
 - Configuration schema: `endpoint` URL default, `mode` select default and validation options, and redacted `api_token` secret.
 - `contract.action`: `plugin_surface_action` handler with accepted and error states selected by the request payload.
 - Package route descriptors: manifest `surfaces` should project to `surface:<id>` routes under `/packages/botster.plugin-contract-matrix/surfaces/<id>`.
 - Package lifecycle compatibility: hub conformance should prove install, enable, list, show, route descriptors, and action-state projection through the daemon package DTOs. The installed `DaemonPackage` row currently does not expose a separate protocol compatibility descriptor; that remains covered by package admission and lifecycle state.
+
+Successful render responses should expose the validated UI payload through
+`plugin_surface.ui_tree_snapshot`. The compatibility `plugin_surface.body` field
+is preserved, but browser and TUI clients should treat the hub-validated
+snapshot as the blessed rendering contract.

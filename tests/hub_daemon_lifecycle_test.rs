@@ -2375,6 +2375,13 @@ fn daemon_package_dtos_expose_declared_surfaces_and_validate_surface_ids() {
     assert_eq!(plugin_surface.surface_id, "workspaces");
     assert_eq!(plugin_surface.body["type"], "panel");
     assert_eq!(plugin_surface.body["id"], "botster-workspaces-panel");
+    let snapshot = plugin_surface
+        .ui_tree_snapshot
+        .as_ref()
+        .expect("workspaces render includes validated ui tree snapshot");
+    assert_eq!(snapshot.package_name, "botster-workspaces");
+    assert_eq!(snapshot.surface_id, "workspaces");
+    assert_eq!(snapshot.body["id"], "botster-workspaces-panel");
 
     let undeclared = connection
         .request(&botster_hub_client::DaemonRequest::PluginSurfaceRender {
@@ -2453,6 +2460,7 @@ fn daemon_plugin_contract_matrix_fixture_exercises_public_package_contracts() {
             "contract.app",
             "contract.empty",
             "contract.blocked",
+            "contract.invalid_body",
             "contract.settings",
         ]
     );
@@ -2473,9 +2481,22 @@ fn daemon_plugin_contract_matrix_fixture_exercises_public_package_contracts() {
     assert!(report.list_surfaces_match_enabled);
     assert!(report.show_routes_match_list);
     assert_eq!(report.app_surface_node_id, "contract-app-panel");
+    assert_eq!(
+        report.app_surface_snapshot_package_name,
+        "botster.plugin-contract-matrix"
+    );
+    assert_eq!(report.app_surface_snapshot_id, "contract.app");
+    assert_eq!(report.app_surface_snapshot_node_id, "contract-app-panel");
     assert_eq!(report.empty_surface_child_id, "contract-empty-message");
     assert_eq!(report.blocked_render_operation, "plugin_surface_render");
     assert!(report.blocked_render_message_contains_failure);
+    assert_eq!(report.invalid_body_error_code, "invalid_surface");
+    assert_eq!(report.invalid_body_operation, "plugin_surface_render");
+    assert_eq!(report.invalid_body_diagnostic_kind, "action_failure");
+    assert_eq!(
+        report.invalid_body_diagnostic_operation,
+        "plugin_surface_render"
+    );
     assert_eq!(report.settings_surface_node_id, "contract-settings-panel");
     assert!(report.settings_text_contains_endpoint);
     assert!(report.settings_text_contains_mode);
@@ -2665,6 +2686,13 @@ fn cli_dev_stack_first_party_plugin_dogfood_smoke_runs_contract_matrix_then_real
     assert_eq!(workspaces_surface.surface_id, "workspaces");
     assert_eq!(workspaces_surface.body["type"], "panel");
     assert_eq!(workspaces_surface.body["id"], "botster-workspaces-panel");
+    let workspaces_snapshot = workspaces_surface
+        .ui_tree_snapshot
+        .as_ref()
+        .expect("failure_class=web_tui_consumer missing validated ui_tree_snapshot payload");
+    assert_eq!(workspaces_snapshot.package_name, "botster-workspaces");
+    assert_eq!(workspaces_snapshot.surface_id, "workspaces");
+    assert_eq!(workspaces_snapshot.body["id"], "botster-workspaces-panel");
 
     let project_report = botster_hub_test_support::run_project_pipelines_conformance(
         &hub,
