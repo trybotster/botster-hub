@@ -66,6 +66,13 @@ local function blocked_surface(_arguments)
   error("contract matrix blocked render")
 end
 
+local function invalid_body_surface(_arguments)
+  return {
+    type = "not_a_uinode_kind",
+    id = "contract-invalid-body-panel",
+  }
+end
+
 local function settings_surface(_arguments)
   local config = botster.capabilities.config.get()
   local endpoint = config.values.endpoint or {}
@@ -144,6 +151,16 @@ return botster.register({
         surface_id = "contract.blocked",
       },
       call = blocked_surface,
+    },
+    {
+      id = "contract_invalid_body_surface",
+      kind = "surface_route",
+      descriptor_id = "contract.invalid_body",
+      descriptor = {
+        title = "Contract Invalid Body",
+        surface_id = "contract.invalid_body",
+      },
+      call = invalid_body_surface,
     },
     {
       id = "contract_settings_surface",

@@ -42,6 +42,7 @@ const PLUGIN_CONTRACT_MATRIX_PACKAGE: &str = "botster.plugin-contract-matrix";
 const PLUGIN_CONTRACT_APP_SURFACE: &str = "contract.app";
 const PLUGIN_CONTRACT_EMPTY_SURFACE: &str = "contract.empty";
 const PLUGIN_CONTRACT_BLOCKED_SURFACE: &str = "contract.blocked";
+const PLUGIN_CONTRACT_INVALID_BODY_SURFACE: &str = "contract.invalid_body";
 const PLUGIN_CONTRACT_SETTINGS_SURFACE: &str = "contract.settings";
 const PLUGIN_CONTRACT_ACTION: &str = "contract.action";
 const SUPPORTED_PLUGIN_SURFACE_JSON_ACTIONS: &str = "plugin_surface_json_actions";
@@ -568,11 +569,18 @@ pub struct PluginContractMatrixConformanceReport {
     pub app_surface_id: String,
     pub app_surface_kind: String,
     pub app_surface_node_id: String,
+    pub app_surface_snapshot_package_name: String,
+    pub app_surface_snapshot_id: String,
+    pub app_surface_snapshot_node_id: String,
     pub empty_surface_node_id: String,
     pub empty_surface_child_id: String,
     pub blocked_render_error_code: String,
     pub blocked_render_operation: String,
     pub blocked_render_message_contains_failure: bool,
+    pub invalid_body_error_code: String,
+    pub invalid_body_operation: String,
+    pub invalid_body_diagnostic_kind: String,
+    pub invalid_body_diagnostic_operation: String,
     pub settings_surface_node_id: String,
     pub settings_text_contains_endpoint: bool,
     pub settings_text_contains_mode: bool,
@@ -1041,7 +1049,7 @@ pub fn run_plugin_contract_matrix_conformance(
     expect_value(
         "contract_matrix_install",
         "surface_ids",
-        r#"["contract.app","contract.empty","contract.blocked","contract.settings"]"#,
+        r#"["contract.app","contract.empty","contract.blocked","contract.invalid_body","contract.settings"]"#,
         &serde_json::to_string(&surface_ids).expect("surface ids serialize"),
     )?;
     let settings_surface_descriptor = surface_descriptor(
@@ -1288,8 +1296,21 @@ pub fn run_plugin_contract_matrix_conformance(
         PLUGIN_CONTRACT_APP_SURFACE,
         "contract_matrix_render_app",
     )?;
+    let app_surface_snapshot =
+        app_surface
+            .ui_tree_snapshot
+            .as_ref()
+            .ok_or(ConformanceError::MissingBody {
+                operation: "contract_matrix_render_app",
+                field: "plugin_surface.ui_tree_snapshot",
+            })?;
     let app_surface_kind = value_string(&app_surface.body, "type", "contract_matrix_render_app")?;
     let app_surface_node_id = value_string(&app_surface.body, "id", "contract_matrix_render_app")?;
+    let app_surface_snapshot_id = value_string(
+        &app_surface_snapshot.body,
+        "id",
+        "contract_matrix_render_app",
+    )?;
     expect_value(
         "contract_matrix_render_app",
         "package_name",
@@ -1313,6 +1334,24 @@ pub fn run_plugin_contract_matrix_conformance(
         "id",
         "contract-app-panel",
         &app_surface_node_id,
+    )?;
+    expect_value(
+        "contract_matrix_render_app",
+        "ui_tree_snapshot.package_name",
+        PLUGIN_CONTRACT_MATRIX_PACKAGE,
+        &app_surface_snapshot.package_name,
+    )?;
+    expect_value(
+        "contract_matrix_render_app",
+        "ui_tree_snapshot.surface_id",
+        PLUGIN_CONTRACT_APP_SURFACE,
+        &app_surface_snapshot.surface_id,
+    )?;
+    expect_value(
+        "contract_matrix_render_app",
+        "ui_tree_snapshot.body.id",
+        app_surface_node_id.as_str(),
+        &app_surface_snapshot_id,
     )?;
 
     let empty_surface = render_plugin_surface(
@@ -1391,6 +1430,54 @@ pub fn run_plugin_contract_matrix_conformance(
             actual: blocked_error.message.clone(),
         });
     }
+
+    let invalid_body = request(
+        hub.endpoint(),
+        DaemonRequest::PluginSurfaceRender {
+            package_name: PLUGIN_CONTRACT_MATRIX_PACKAGE.to_string(),
+            surface_id: PLUGIN_CONTRACT_INVALID_BODY_SURFACE.to_string(),
+            payload: serde_json::json!({}),
+        },
+        "contract_matrix_render_invalid_body",
+    )?;
+    expect_kind(
+        &invalid_body,
+        DaemonResponseKind::OperatorError,
+        "contract_matrix_render_invalid_body",
+    )?;
+    let invalid_body_error = invalid_body
+        .error
+        .as_ref()
+        .ok_or(ConformanceError::MissingBody {
+            operation: "contract_matrix_render_invalid_body",
+            field: "error",
+        })?;
+    expect_value(
+        "contract_matrix_render_invalid_body",
+        "error.code",
+        "invalid_surface",
+        &invalid_body_error.code,
+    )?;
+    expect_value(
+        "contract_matrix_render_invalid_body",
+        "error.operation",
+        "plugin_surface_render",
+        &invalid_body_error.operation,
+    )?;
+    let invalid_body_diagnostic = invalid_body
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.operation.as_deref() == Some("plugin_surface_render"))
+        .ok_or(ConformanceError::MissingBody {
+            operation: "contract_matrix_render_invalid_body",
+            field: "diagnostics[operation=plugin_surface_render]",
+        })?;
+    expect_value(
+        "contract_matrix_render_invalid_body",
+        "diagnostic.kind",
+        "action_failure",
+        diagnostic_kind_label(invalid_body_diagnostic.kind),
+    )?;
     expect_kind(
         &request(
             hub.endpoint(),
@@ -1567,15 +1654,26 @@ pub fn run_plugin_contract_matrix_conformance(
         show_state: shown.state.clone(),
         show_routes_match_list,
         settings_route_supports_settings,
-        app_surface_package_name: app_surface.package_name,
-        app_surface_id: app_surface.surface_id,
+        app_surface_package_name: app_surface.package_name.clone(),
+        app_surface_id: app_surface.surface_id.clone(),
         app_surface_kind,
         app_surface_node_id: app_surface_node_id.clone(),
+        app_surface_snapshot_package_name: app_surface_snapshot.package_name.clone(),
+        app_surface_snapshot_id: app_surface_snapshot.surface_id.clone(),
+        app_surface_snapshot_node_id: app_surface_snapshot_id,
         empty_surface_node_id,
         empty_surface_child_id: empty_surface_child_id.clone(),
         blocked_render_error_code: blocked_error.code.clone(),
         blocked_render_operation: blocked_error.operation.clone(),
         blocked_render_message_contains_failure,
+        invalid_body_error_code: invalid_body_error.code.clone(),
+        invalid_body_operation: invalid_body_error.operation.clone(),
+        invalid_body_diagnostic_kind: diagnostic_kind_label(invalid_body_diagnostic.kind)
+            .to_string(),
+        invalid_body_diagnostic_operation: invalid_body_diagnostic
+            .operation
+            .clone()
+            .unwrap_or_default(),
         settings_surface_node_id: settings_surface_node_id.clone(),
         settings_text_contains_endpoint,
         settings_text_contains_mode,

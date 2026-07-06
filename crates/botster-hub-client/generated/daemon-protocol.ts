@@ -121,6 +121,13 @@ export interface DaemonPluginSurface {
   package_name: string;
   surface_id: string;
   body: JsonValue;
+  ui_tree_snapshot?: DaemonUiTreeSnapshot | null;
+}
+
+export interface DaemonUiTreeSnapshot {
+  package_name: string;
+  surface_id: string;
+  body: JsonValue;
 }
 
 export type DaemonResponseKind =
