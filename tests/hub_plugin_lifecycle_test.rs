@@ -143,6 +143,7 @@ fn plugin_manifest(name: &str, capabilities: Vec<Capability>) -> PackageManifest
         host_profile: None,
         surfaces: Vec::new(),
         runnable_entrypoints: Vec::new(),
+        navigation: Vec::new(),
     }
 }
 
@@ -181,6 +182,7 @@ fn provider_manifest(name: &str, capabilities: Vec<Capability>) -> PackageManife
         configuration: None,
         surfaces: Vec::new(),
         runnable_entrypoints: Vec::new(),
+        navigation: Vec::new(),
     }
 }
 

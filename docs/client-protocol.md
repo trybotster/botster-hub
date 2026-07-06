@@ -70,7 +70,7 @@ The current descriptor includes:
 
 - protocol name and version;
 - supported features: sessions, terminal streaming, resize, plugin surface
-  render, and plugin surface action dispatch;
+  render, plugin surface action dispatch, and package navigation discovery;
 - conformance fixture revision.
 
 The hub-owned first-party support matrix lives in
@@ -398,6 +398,27 @@ return descriptors with structured diagnostics such as `package_not_enabled` or
 `missing_required_configuration`. Missing packages or undeclared route ids return
 `operator_error` responses with specific codes such as `package_not_installed`
 or `route_not_found`.
+
+`ListPackageNavigation` exposes the admitted package navigation registry as
+`DaemonPackageNavigationEntry` rows. Explicit manifest `navigation` entries win;
+packages without explicit navigation derive default rows from app-like
+`surfaces`. Navigation rows reuse the same route descriptors and diagnostics as
+`DaemonPackage.routes`, so disabled or blocked packages stay visible but carry
+`enabled=false`, `blocked=true`, and the route diagnostic that explains why.
+Navigation rows intentionally do not contain ordering authority such as
+`order`, `priority`, sidebar placement, layout, or route padding policy.
+Clients that need presentation ordering should apply their own local grouping
+rules over the stable route and navigation ids.
+
+Plugin surfaces that need embedded package content should return typed UI nodes
+such as `iframe` with a package-scoped URL reference in `props.src`, for example
+`/packages/<package_name>/assets/<file>`, for the client package bridge to
+resolve. The daemon response preserves the validated UI tree in both
+`plugin_surface.body` and `plugin_surface.ui_tree_snapshot.body`. The parent UI
+node payload must not carry raw HTML fields such as `html`, `raw_html`,
+`inner_html`, or `srcdoc`; HTML content remains behind the URL/reference rather
+than being injected into the client app DOM. The hub daemon does not currently
+serve that URL as a static HTTP asset endpoint.
 
 ## Session Templates And Context
 

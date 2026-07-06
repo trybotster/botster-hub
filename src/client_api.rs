@@ -9,12 +9,12 @@ use std::collections::BTreeMap;
 use botster_core::{
     BotsterEngineObservation, CapabilitySurface, ClientId, CoreSession, CoreSessionMetadata,
     EnvelopeCursor, EnvelopeDeliveryState, EnvelopeId, EnvelopeTarget, PackageBlockedReason,
-    PackageDependencyResolution, PackageFeatureResolution, PackageResolutionState, PackageSource,
-    PackageSurfaceKind, PackageSurfaceOperation, RequestId, RoutedEnvelope,
-    RoutedEnvelopeDrainOutcome, RoutedEnvelopePublishOutcome, RunnableEntrypointKind,
-    RunnableEntrypointLaunchMode, SessionId, SessionLifecycleState, SessionRuntimeErrorKind,
-    SessionSpawnRequest, SpawnEnvironment, SpawnWorkingDirectory, SubscriptionId,
-    TerminalAttachState, TransportEgress, UiActionResult, UiNode,
+    PackageDependencyResolution, PackageFeatureResolution, PackageNavigationTarget,
+    PackageResolutionState, PackageSource, PackageSurfaceKind, PackageSurfaceOperation, RequestId,
+    RoutedEnvelope, RoutedEnvelopeDrainOutcome, RoutedEnvelopePublishOutcome,
+    RunnableEntrypointKind, RunnableEntrypointLaunchMode, SessionId, SessionLifecycleState,
+    SessionRuntimeErrorKind, SessionSpawnRequest, SpawnEnvironment, SpawnWorkingDirectory,
+    SubscriptionId, TerminalAttachState, TransportEgress, UiActionResult, UiNode,
 };
 use botster_core_daemon::{
     GuardedWriteDecision, GuardedWriteDeliveryState, GuardedWriteRequest, GuardedWriteResult,
@@ -301,6 +301,16 @@ impl HubClientApi {
                     .map(|record| HubClientPackage::from_record(packages, record))
                     .collect(),
             ),
+            HubClientRequest::ListPackageNavigation { .. } => {
+                HubClientResponseBody::PackageNavigation(
+                    packages
+                        .packages()
+                        .into_iter()
+                        .map(|record| HubClientPackage::from_record(packages, record))
+                        .flat_map(HubClientPackage::navigation_entries)
+                        .collect(),
+                )
+            }
             HubClientRequest::ListSessionTemplates { .. } => {
                 let records = packages.packages();
                 let templates =
@@ -530,7 +540,9 @@ impl HubClientAdmission {
             | HubClientOperation::AcknowledgeRoutedEnvelope
             | HubClientOperation::ReadScreen
             | HubClientOperation::CaptureSnapshot => self.allow_runtime,
-            HubClientOperation::ListPackages => self.allow_packages,
+            HubClientOperation::ListPackages | HubClientOperation::ListPackageNavigation => {
+                self.allow_packages
+            }
             HubClientOperation::ListSessionTemplates
             | HubClientOperation::ShowSessionTemplate
             | HubClientOperation::ResolveSessionTemplate => self.allow_packages,
@@ -648,6 +660,8 @@ pub enum HubClientRequest {
     },
     /// Return sanitized package/provider records.
     ListPackages { request_id: RequestId },
+    /// Return hub-admitted package navigation intent rows.
+    ListPackageNavigation { request_id: RequestId },
     /// Return sanitized session template rows.
     ListSessionTemplates { request_id: RequestId },
     /// Return one sanitized session template row.
@@ -714,6 +728,7 @@ impl HubClientRequest {
             | Self::ReadScreen { request_id, .. }
             | Self::CaptureSnapshot { request_id, .. }
             | Self::ListPackages { request_id }
+            | Self::ListPackageNavigation { request_id }
             | Self::ListSessionTemplates { request_id }
             | Self::ShowSessionTemplate { request_id, .. }
             | Self::ResolveSessionTemplate { request_id, .. }
@@ -744,6 +759,7 @@ impl HubClientRequest {
             Self::ReadScreen { .. } => HubClientOperation::ReadScreen,
             Self::CaptureSnapshot { .. } => HubClientOperation::CaptureSnapshot,
             Self::ListPackages { .. } => HubClientOperation::ListPackages,
+            Self::ListPackageNavigation { .. } => HubClientOperation::ListPackageNavigation,
             Self::ListSessionTemplates { .. } => HubClientOperation::ListSessionTemplates,
             Self::ShowSessionTemplate { .. } => HubClientOperation::ShowSessionTemplate,
             Self::ResolveSessionTemplate { .. } => HubClientOperation::ResolveSessionTemplate,
@@ -776,6 +792,7 @@ pub enum HubClientOperation {
     ReadScreen,
     CaptureSnapshot,
     ListPackages,
+    ListPackageNavigation,
     ListSessionTemplates,
     ShowSessionTemplate,
     ResolveSessionTemplate,
@@ -807,6 +824,7 @@ pub enum HubClientResponseBody {
     RoutedEnvelopeDrain(HubClientRoutedEnvelopeDrain),
     RoutedEnvelopeAck(HubClientRoutedEnvelopeAck),
     Packages(Vec<HubClientPackage>),
+    PackageNavigation(Vec<HubClientPackageNavigationEntry>),
     SessionTemplates(Vec<HubSessionTemplate>),
     ResolvedSessionTemplate(ResolvedSessionTemplate),
     SessionContext(HubSessionContext),
@@ -984,6 +1002,7 @@ pub struct HubClientPackage {
     pub state: HubClientPackageState,
     pub requested_capabilities: Vec<HubClientCapability>,
     pub surfaces: Vec<HubClientPackageSurfaceDescriptor>,
+    pub navigation: Vec<HubClientPackageNavigationEntry>,
     pub runnable_entrypoints: Vec<HubClientPackageRunnableEntrypoint>,
     pub configuration: HubClientPackageConfiguration,
     pub availability: HubClientPackageAvailability,
@@ -1038,6 +1057,25 @@ impl HubClientPackage {
                         .iter()
                         .map(|operation| package_surface_operation_label(operation).to_string())
                         .collect(),
+                })
+                .collect(),
+            navigation: record
+                .manifest
+                .navigation
+                .iter()
+                .map(|entry| HubClientPackageNavigationEntry {
+                    package_name: record.manifest.name.clone(),
+                    item_id: entry.id.clone(),
+                    label: entry.label.clone(),
+                    icon: entry.icon.clone(),
+                    description: entry.description.clone(),
+                    target: match &entry.target {
+                        PackageNavigationTarget::Surface { surface_id } => {
+                            HubClientPackageNavigationTarget::Surface {
+                                surface_id: surface_id.clone(),
+                            }
+                        }
+                    },
                 })
                 .collect(),
             runnable_entrypoints: record
@@ -1113,6 +1151,43 @@ impl HubClientPackage {
             provider_profile_admitted: record.admitted_host_profile.is_some(),
         }
     }
+
+    fn navigation_entries(self) -> Vec<HubClientPackageNavigationEntry> {
+        if !self.navigation.is_empty() {
+            return self.navigation;
+        }
+
+        self.surfaces
+            .into_iter()
+            .filter(|surface| surface.kind == "app")
+            .map(|surface| HubClientPackageNavigationEntry {
+                package_name: self.package_name.clone(),
+                item_id: surface.id.clone(),
+                label: surface.title,
+                icon: surface.icon,
+                description: surface.description,
+                target: HubClientPackageNavigationTarget::Surface {
+                    surface_id: surface.id,
+                },
+            })
+            .collect()
+    }
+}
+
+/// Hub-admitted package navigation intent before route resolution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HubClientPackageNavigationEntry {
+    pub package_name: String,
+    pub item_id: String,
+    pub label: String,
+    pub icon: Option<String>,
+    pub description: Option<String>,
+    pub target: HubClientPackageNavigationTarget,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HubClientPackageNavigationTarget {
+    Surface { surface_id: String },
 }
 
 /// Sanitized package-level availability projection.

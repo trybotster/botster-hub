@@ -529,6 +529,7 @@ mod tests {
             host_profile: None,
             surfaces: Vec::new(),
             runnable_entrypoints: Vec::new(),
+            navigation: Vec::new(),
         }
     }
 
