@@ -49,6 +49,9 @@ step: botster_implement
 - `./test.sh --test hub_plugin_lifecycle_test enabled_provider_package_loads_through_same_core_worker_path` passed: 1 test.
 - `node packages/hub-test-support/scripts/sync-assets.mjs --check` passed.
 - `git diff --check` passed.
+- Verify return fixes:
+  - `cargo clippy --workspace --all-targets -- -D warnings` passed after replacing `find(...).is_none()` with `!contains(...)` in the navigation serde test.
+  - `git diff --check main...HEAD` passed after normalizing the plan artifact EOF whitespace.
 
 ## Unverified behavior or residual risk
 

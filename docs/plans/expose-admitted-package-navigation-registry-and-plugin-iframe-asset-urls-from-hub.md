@@ -65,4 +65,3 @@
 - Capture the final admitted navigation DTO vocabulary once implemented: how it relates to route descriptors, app rows, plugin ordering hints, and blocked diagnostics.
 - Capture the settled iframe/custom HTML asset policy if implementation defines the durable rule for asset URL/reference shape and worker-to-hub asset readability.
 - Capture any new conformance fixture revision rule if additive navigation/asset DTOs require fixture metadata updates.
-
