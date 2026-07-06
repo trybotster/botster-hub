@@ -2374,8 +2374,8 @@ mod tests {
             })
         );
         let navigation_entry = value["package_navigation"][0].to_string();
-        assert!(navigation_entry.find("order").is_none());
-        assert!(navigation_entry.find("priority").is_none());
+        assert!(!navigation_entry.contains("order"));
+        assert!(!navigation_entry.contains("priority"));
 
         let request = DaemonRequest::ListPackageNavigation;
         let request_value = serde_json::to_value(request).expect("request serializes");
