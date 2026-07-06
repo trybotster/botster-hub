@@ -37,7 +37,8 @@ pub use botster_hub_client::{
     DaemonPackageAvailabilityReason, DaemonPackageAvailabilityState, DaemonPackageCompatibility,
     DaemonPackageConfiguration, DaemonPackageDecision, DaemonPackageDependencyAvailability,
     DaemonPackageDiagnostic, DaemonPackageEnvironmentRequirement, DaemonPackageFeatureAvailability,
-    DaemonPackageInstallEffect, DaemonPackageInstallPlan, DaemonPackagePin, DaemonPackageProcess,
+    DaemonPackageInstallEffect, DaemonPackageInstallPlan, DaemonPackageNavigationEntry,
+    DaemonPackageNavigationSource, DaemonPackagePin, DaemonPackageProcess,
     DaemonPackageRouteDescriptor, DaemonPackageRouteTarget, DaemonPackageRunnableEntrypoint,
     DaemonPackageSurfaceDescriptor, DaemonPackageUpdateStatus, DaemonPackageWorkingDirectory,
     DaemonPluginLifecycle, DaemonPluginSurface, DaemonRequest, DaemonResolvedAppLaunch,
@@ -55,7 +56,8 @@ use crate::local_webrtc::{LocalWebrtcAttachedSubscription, LocalWebrtcSignalRequ
 use crate::{
     AvailablePackage, AvailablePackageState, FileHubStateStore, HubClientApi, HubClientEvent,
     HubClientPackage, HubClientPackageAvailabilityReason, HubClientPackageAvailabilityState,
-    HubClientPackageClassification, HubClientPluginLifecycle, HubClientPluginSurface,
+    HubClientPackageClassification, HubClientPackageNavigationEntry,
+    HubClientPackageNavigationTarget, HubClientPluginLifecycle, HubClientPluginSurface,
     HubClientRequest, HubClientResponseBody, HubClientSession, HubConfig, HubDaemon,
     HubDaemonStatus, HubStateLoadSource, HubStateStore, McpToolDescriptor, PackageAction,
     PackageAdmissionReason, PackageCompatibilityResult, PackageDecision, PackageInstallPlan,
@@ -361,6 +363,7 @@ fn handle_control_request(
             package_name,
             route_id,
         } => resolve_package_route_response(daemon, &package_name, &route_id),
+        DaemonRequest::ListPackageNavigation => list_package_navigation_response(daemon),
         DaemonRequest::ListPackages => list_packages_response(daemon),
         DaemonRequest::ListAvailablePackages { registry_path } => {
             available_packages_response(daemon, registry_path)
@@ -1154,6 +1157,7 @@ fn handle_runtime_control_request(
             apps: Vec::new(),
             resolved_app_launch: None,
             resolved_package_route: None,
+            package_navigation: Vec::new(),
             packages: Vec::new(),
             available_packages: Vec::new(),
             install_plan: None,
@@ -1177,6 +1181,7 @@ fn handle_runtime_control_request(
         DaemonRequest::ListApps
         | DaemonRequest::ResolveAppLaunch { .. }
         | DaemonRequest::ResolvePackageRoute { .. }
+        | DaemonRequest::ListPackageNavigation
         | DaemonRequest::ListPackages
         | DaemonRequest::ListAvailablePackages { .. }
         | DaemonRequest::InspectAvailablePackage { .. }
@@ -1310,6 +1315,32 @@ fn list_packages_response(daemon: &mut HubDaemon) -> DaemonTransportResult<Daemo
     let snapshots = daemon.entrypoint_supervisor().snapshots();
     apply_entrypoint_snapshots(&mut packages, snapshots);
     Ok(daemon_packages(packages))
+}
+
+fn list_package_navigation_response(
+    daemon: &mut HubDaemon,
+) -> DaemonTransportResult<DaemonResponse> {
+    let packages = daemon.package_registry().clone();
+    let api = HubClientApi::local_operator("botster-hub-daemon-socket");
+    let Some(runtime) = daemon.runtime_mut() else {
+        return Err(DaemonTransportError::DaemonNotRunning);
+    };
+    let response = api.handle_request(
+        runtime,
+        &packages,
+        HubClientRequest::ListPackageNavigation {
+            request_id: request_id("daemon-package-navigation-list"),
+        },
+    )?;
+    let HubClientResponseBody::PackageNavigation(navigation) = response.body else {
+        return Err(DaemonTransportError::UnexpectedResponse);
+    };
+    let packages = packages
+        .packages()
+        .into_iter()
+        .map(|record| HubClientPackage::from_record(&packages, record))
+        .collect::<Vec<_>>();
+    Ok(daemon_package_navigation(navigation, &packages))
 }
 
 fn list_apps_response(daemon: &mut HubDaemon) -> DaemonTransportResult<DaemonResponse> {
@@ -1864,6 +1895,82 @@ fn package_route_descriptors(package: &HubClientPackage) -> Vec<DaemonPackageRou
         ));
     }
     routes
+}
+
+fn package_navigation_entries(
+    navigation: Vec<HubClientPackageNavigationEntry>,
+    packages: &[HubClientPackage],
+) -> Vec<DaemonPackageNavigationEntry> {
+    navigation
+        .into_iter()
+        .map(|entry| package_navigation_entry(entry, packages))
+        .collect()
+}
+
+fn package_navigation_entry(
+    entry: HubClientPackageNavigationEntry,
+    packages: &[HubClientPackage],
+) -> DaemonPackageNavigationEntry {
+    let (route_id, source) = match &entry.target {
+        HubClientPackageNavigationTarget::Surface { surface_id } => (
+            surface_route_id(surface_id),
+            DaemonPackageNavigationSource {
+                kind: "surface".to_string(),
+                surface_id: Some(surface_id.clone()),
+                entrypoint_id: None,
+            },
+        ),
+    };
+    let route = packages
+        .iter()
+        .find(|package| package.package_name == entry.package_name)
+        .and_then(|package| {
+            package_route_descriptors(package)
+                .into_iter()
+                .find(|route| route.route_id == route_id)
+        });
+
+    match route {
+        Some(route) => DaemonPackageNavigationEntry {
+            package_name: entry.package_name,
+            item_id: entry.item_id,
+            label: entry.label,
+            icon: entry.icon,
+            description: entry.description,
+            route_id: route.route_id,
+            route_path: route.route_path,
+            target: route.target,
+            source,
+            enabled: route.enabled,
+            blocked: route.blocked,
+            diagnostics: route.diagnostics,
+        },
+        None => DaemonPackageNavigationEntry {
+            package_name: entry.package_name.clone(),
+            item_id: entry.item_id,
+            label: entry.label,
+            icon: entry.icon,
+            description: entry.description,
+            route_id,
+            route_path: String::new(),
+            target: match entry.target {
+                HubClientPackageNavigationTarget::Surface { surface_id } => {
+                    DaemonPackageRouteTarget {
+                        kind: "plugin_surface".to_string(),
+                        entrypoint_id: None,
+                        surface_id: Some(surface_id),
+                    }
+                }
+            },
+            source,
+            enabled: false,
+            blocked: true,
+            diagnostics: vec![DaemonPackageDiagnostic {
+                kind: "navigation_target_not_found".to_string(),
+                message: "navigation target route is not declared".to_string(),
+            }],
+        },
+    }
 }
 
 fn plugin_surface_route_descriptor(
@@ -2467,6 +2574,7 @@ fn daemon_response_base(kind: DaemonResponseKind) -> DaemonResponse {
         apps: Vec::new(),
         resolved_app_launch: None,
         resolved_package_route: None,
+        package_navigation: Vec::new(),
         packages: Vec::new(),
         available_packages: Vec::new(),
         install_plan: None,
@@ -2531,6 +2639,15 @@ fn daemon_packages(packages: Vec<HubClientPackage>) -> DaemonResponse {
         .into_iter()
         .map(daemon_package_from_client)
         .collect();
+    response
+}
+
+fn daemon_package_navigation(
+    navigation: Vec<HubClientPackageNavigationEntry>,
+    packages: &[HubClientPackage],
+) -> DaemonResponse {
+    let mut response = daemon_response_base(DaemonResponseKind::PackageNavigation);
+    response.package_navigation = package_navigation_entries(navigation, packages);
     response
 }
 
@@ -4400,6 +4517,7 @@ fn operation_label(operation: crate::HubClientOperation) -> &'static str {
         crate::HubClientOperation::ReadScreen => "read_screen",
         crate::HubClientOperation::CaptureSnapshot => "capture_snapshot",
         crate::HubClientOperation::ListPackages => "list_packages",
+        crate::HubClientOperation::ListPackageNavigation => "list_package_navigation",
         crate::HubClientOperation::ListSessionTemplates => "list_session_templates",
         crate::HubClientOperation::ShowSessionTemplate => "show_session_template",
         crate::HubClientOperation::ResolveSessionTemplate => "resolve_session_template",

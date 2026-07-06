@@ -8,7 +8,7 @@
   "daemon_protocol": {
     "artifact_path": "daemon-protocol.ts",
     "source_artifact_path": "crates/botster-hub-client/generated/daemon-protocol.ts",
-    "sha256": "112eca7f4a0a135fc36d2a83a56de21f0cdd7f5022b726bcb5da965d8d327829"
+    "sha256": "d9103b3990300dd5aebdaa64b81ee0e7a2ba72ab604a47963f42d7d9e7213a6f"
   },
   "plugin_contract_matrix": {
     "package_name": "botster.plugin-contract-matrix",
