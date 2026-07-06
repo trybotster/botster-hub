@@ -226,6 +226,8 @@ fn start_daemon(args: Vec<String>) -> Result<(), StartError> {
     let options = StartOptions::parse(args)?;
     let config = explicit_config_with_worker(options.data_directory, options.session_worker_bin)?;
 
+    // Integration tests run the production binary, so keep the incompatible
+    // daemon fixture behind both an explicit fixture opt-in and test mode.
     if env::var_os(TEST_INCOMPATIBLE_DAEMON_ENV).is_some()
         && env::var("BOTSTER_ENV").as_deref() == Ok("test")
     {
@@ -1355,6 +1357,9 @@ fn dev_stack_daemon_command_matches(metadata: &DevStackDaemonMetadata, command: 
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("botster-hub");
+    // PID reuse cannot be proven away with macOS process-table primitives alone.
+    // Recovery therefore treats the live PID's command line as required ownership
+    // evidence and refuses to signal when any recorded daemon token is missing.
     command.contains(hub_bin_name)
         && command.contains(" start ")
         && command.contains("--data-dir")
