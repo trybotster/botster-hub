@@ -1315,6 +1315,47 @@ fn process_exists(pid: u32) -> bool {
     unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
 }
 
+struct ChildCleanup {
+    child: Child,
+}
+
+impl ChildCleanup {
+    fn spawn_non_botster_decoy() -> Self {
+        let child = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn non-botster decoy process");
+        Self { child }
+    }
+
+    fn id(&self) -> u32 {
+        self.child.id()
+    }
+
+    fn assert_alive(&mut self) {
+        assert!(
+            self.child
+                .try_wait()
+                .expect("poll non-botster decoy")
+                .is_none(),
+            "non-botster decoy process should remain alive"
+        );
+        assert!(
+            process_exists(self.id()),
+            "non-botster decoy pid should still exist"
+        );
+    }
+}
+
+impl Drop for ChildCleanup {
+    fn drop(&mut self) {
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = self.child.kill();
+        }
+        let _ = self.child.wait();
+    }
+}
+
 fn wait_for_process_exit(pid: u32) {
     for _ in 0..100 {
         if !process_exists(pid) {
@@ -3958,6 +3999,84 @@ fn cli_local_runtime_up_refuses_unowned_incompatible_daemon() {
     assert!(down_text.contains("running daemon is incompatible or stale"));
     assert!(down_text.contains("Stop the running botster-hub process directly"));
     assert!(down_text.contains("remove the stale local socket"));
+
+    handle.join().expect("fake incompatible daemon thread");
+    let _ = fs::remove_file(socket_path);
+}
+
+#[test]
+fn cli_local_runtime_refuses_forged_metadata_for_live_non_botster_pid() {
+    let _guard = daemon_test_lock()
+        .lock()
+        .expect("serialize real daemon test");
+    let data_dir = unique_short_test_dir("cli-forged-pid-incompat");
+    let config = explicit_config(&data_dir);
+    let socket_path = config
+        .transports
+        .local_socket
+        .as_ref()
+        .expect("local socket binding")
+        .path
+        .clone();
+    fs::create_dir_all(socket_path.parent().expect("socket parent")).expect("create socket parent");
+    let listener = UnixListener::bind(&socket_path).expect("bind fake incompatible daemon");
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let handle = thread::spawn(move || {
+        ready_tx.send(()).expect("send listener ready");
+        for _ in 0..2 {
+            let Ok((mut stream, _addr)) = listener.accept() else {
+                break;
+            };
+            let mut reader = BufReader::new(stream.try_clone().expect("clone fake stream"));
+            let mut hello = String::new();
+            let _ = reader.read_line(&mut hello);
+            let _ = stream.write_all(b"{\"protocol\":\"botster-hub-daemon-v1\"}\n");
+        }
+    });
+    ready_rx.recv().expect("fake listener ready");
+
+    let mut decoy = ChildCleanup::spawn_non_botster_decoy();
+    write_dev_stack_daemon_metadata(&data_dir, decoy.id());
+
+    let output = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("up")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .output()
+        .expect("run botster-hub up against forged daemon metadata");
+    assert!(
+        !output.status.success(),
+        "up unexpectedly recovered forged metadata: {}",
+        command_output_text(&output)
+    );
+    let text = command_output_text(&output);
+    assert!(text.contains("running daemon is incompatible or stale"));
+    assert!(text.contains("Stop the running botster-hub process directly"));
+    decoy.assert_alive();
+    assert!(
+        socket_path.exists(),
+        "up must not delete a connectable socket when metadata pid is not botster-owned"
+    );
+
+    let down = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("down")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .output()
+        .expect("run botster-hub down against forged daemon metadata");
+    assert!(
+        !down.status.success(),
+        "down unexpectedly recovered forged metadata: {}",
+        command_output_text(&down)
+    );
+    let down_text = command_output_text(&down);
+    assert!(down_text.contains("running daemon is incompatible or stale"));
+    assert!(down_text.contains("Stop the running botster-hub process directly"));
+    decoy.assert_alive();
+    assert!(
+        socket_path.exists(),
+        "down must not delete a connectable socket when metadata pid is not botster-owned"
+    );
 
     handle.join().expect("fake incompatible daemon thread");
     let _ = fs::remove_file(socket_path);
