@@ -2,7 +2,7 @@
 
 This is the canonical hub-owned fixture package for exercising public Botster package and plugin contracts. It is intentionally PII-free and uses only `example.invalid` fixture values.
 
-Client repos can install this directory as a local package and use the real daemon protocol to verify conformance:
+Hub developers can install this source fixture directory as a local package and use the real daemon protocol to verify conformance:
 
 ```text
 botster-hub packages install fixtures/plugins/plugin-contract-matrix
@@ -10,17 +10,28 @@ botster-hub packages enable botster.plugin-contract-matrix
 ```
 
 Rust client and plugin repos should prefer the hub-owned test-support helper
-instead of inventing DTO fixtures:
+instead of inventing DTO fixtures or relying on a sibling hub checkout:
 
 ```rust
+let fixture_root = tempfile::tempdir().expect("fixture tempdir");
+let fixture_path = botster_hub_test_support::copy_plugin_contract_matrix_fixture(
+    fixture_root.path(),
+)
+.expect("copy plugin contract matrix fixture");
+
 let report = botster_hub_test_support::run_plugin_contract_matrix_conformance(
     &hub,
-    "fixtures/plugins/plugin-contract-matrix",
+    fixture_path,
 )
 .expect("plugin UI conformance");
 assert_eq!(report.app_surface_node_id, "contract-app-panel");
 assert_eq!(report.client_render_check.expected_redacted_secret_state, "redacted");
 ```
+
+Client protocol drift checks can read the generated TypeScript protocol through
+`botster_hub_test_support::daemon_protocol_typescript_artifact()`. The helper is
+a convenience wrapper; `botster-hub-client` remains the protocol source of
+truth.
 
 In this repository, the full isolated-hub proof is:
 
