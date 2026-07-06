@@ -25,6 +25,31 @@ Downstream `botster-web` drift checks should point
 `BOTSTER_HUB_CLIENT_DAEMON_PROTOCOL` at this exact file; a skipped check because
 the hub checkout was not found is not protocol evidence.
 
+Node-based first-party clients can consume the same checked artifact without a
+sibling hub checkout through the package:
+
+```sh
+npm install --save-dev @trybotster/hub-test-support
+```
+
+```js
+import {
+  materializePluginContractMatrixFixture,
+  metadata,
+  readDaemonProtocolTypescript,
+} from "@trybotster/hub-test-support";
+
+const protocolSource = readDaemonProtocolTypescript();
+const fixturePath = materializePluginContractMatrixFixture(tempDirectory);
+
+console.log(metadata.protocol, metadata.conformance_fixture_revision, fixturePath);
+```
+
+The package includes checksum metadata so browser-client tests can fail clearly
+when checked assets are stale. The metadata's protocol version and conformance
+fixture revision are emitted by the Rust `botster-hub-test-support` asset
+generator instead of being maintained independently in JavaScript.
+
 ## Compatibility Handshake
 
 Clients should check hub compatibility before depending on request-specific
@@ -607,6 +632,23 @@ protocol through
 `botster_hub_test_support::daemon_protocol_typescript_artifact()`. The returned
 artifact path is stable for reports, while the contents still come from the
 authoritative `botster-hub-client` generator.
+
+Node client tests should use the declared npm dependency instead of a relative
+hub checkout:
+
+```js
+import {
+  materializePluginContractMatrixFixture,
+  readDaemonProtocolTypescript,
+} from "@trybotster/hub-test-support";
+
+const protocolSource = readDaemonProtocolTypescript();
+const fixturePath = materializePluginContractMatrixFixture(tempDirectory);
+```
+
+Local environment variables may still point legacy drift checks at a checked-out
+hub artifact, but the normal web-client dependency coordinate is
+`@trybotster/hub-test-support`.
 
 Each harness instance creates a disposable data directory and socket path under
 the configured test root, uses synthetic default hub identity, and attempts a

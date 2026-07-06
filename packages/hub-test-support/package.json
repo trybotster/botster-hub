@@ -1,0 +1,31 @@
+{
+  "name": "@trybotster/hub-test-support",
+  "version": "0.1.0",
+  "description": "Node-consumable Botster hub client protocol and plugin contract test assets",
+  "license": "SEE LICENSE IN ../../LICENSE",
+  "type": "module",
+  "main": "./index.js",
+  "types": "./index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "default": "./index.js"
+    },
+    "./daemon-protocol": "./daemon-protocol.ts",
+    "./metadata": "./metadata.json",
+    "./fixtures/plugin-contract-matrix/*": "./fixtures/plugin-contract-matrix/*"
+  },
+  "files": [
+    "README.md",
+    "index.js",
+    "index.d.ts",
+    "metadata.json",
+    "daemon-protocol.ts",
+    "fixtures/plugin-contract-matrix"
+  ],
+  "scripts": {
+    "sync": "node scripts/sync-assets.mjs",
+    "check": "node scripts/sync-assets.mjs --check",
+    "test": "node test.mjs"
+  }
+}
