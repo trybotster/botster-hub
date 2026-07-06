@@ -33,6 +33,19 @@ Client protocol drift checks can read the generated TypeScript protocol through
 a convenience wrapper; `botster-hub-client` remains the protocol source of
 truth.
 
+Node client repos should consume the published package instead of relying on a
+sibling hub checkout:
+
+```js
+import {
+  materializePluginContractMatrixFixture,
+  readDaemonProtocolTypescript,
+} from "@trybotster/hub-test-support";
+
+const protocolSource = readDaemonProtocolTypescript();
+const fixturePath = materializePluginContractMatrixFixture(tempDirectory);
+```
+
 In this repository, the full isolated-hub proof is:
 
 ```bash
