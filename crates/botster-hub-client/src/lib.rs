@@ -1632,6 +1632,7 @@ impl Error for DaemonTransportError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
 
     #[test]
     fn compatibility_accepts_current_descriptor() {
@@ -2430,6 +2431,11 @@ mod tests {
                 .contains("  max_retransmits?: number | null;"),
             "generated TypeScript should mark omitted max_retransmits optional"
         );
+        assert_generated_interface_field_type(
+            "DaemonLocalWebrtcBootstrap",
+            "max_retransmits",
+            "number | null",
+        );
         assert!(
             value["local_webrtc_bootstrap"]
                 .get("max_packet_lifetime_ms")
@@ -2441,7 +2447,55 @@ mod tests {
                 .contains("  max_packet_lifetime_ms?: number | null;"),
             "generated TypeScript should mark omitted max_packet_lifetime_ms optional"
         );
+        assert_generated_interface_field_type(
+            "DaemonLocalWebrtcBootstrap",
+            "max_packet_lifetime_ms",
+            "number | null",
+        );
         assert_generated_interface_fields("DaemonLocalWebrtcAnswer", &value["local_webrtc_answer"]);
+        assert_generated_interface_field_type(
+            "DaemonLocalWebrtcAnswer",
+            "diagnostics",
+            "DaemonDiagnostic[]",
+        );
+    }
+
+    #[test]
+    fn generated_interface_helper_rejects_extra_required_typescript_field() {
+        let value = serde_json::json!({ "grant_id": "grant-1" });
+        let interface =
+            "export interface TestDto {\n  grant_id: string;\n  stale_required: string;\n}\n";
+
+        let result = std::panic::catch_unwind(|| {
+            assert_interface_fields("TestDto", interface, &value);
+        });
+
+        assert!(
+            result.is_err(),
+            "helper should fail when generated TypeScript has a required field absent from serde"
+        );
+    }
+
+    #[test]
+    fn generated_interface_helper_allows_absent_optional_typescript_field() {
+        let value = serde_json::json!({ "grant_id": "grant-1" });
+        let interface = "export interface TestDto {\n  grant_id: string;\n  omitted_optional?: string | null;\n}\n";
+
+        assert_interface_fields("TestDto", interface, &value);
+    }
+
+    #[test]
+    fn generated_interface_helper_rejects_changed_typescript_field_type() {
+        let interface = "export interface TestDto {\n  expires_at: string;\n}\n";
+
+        let result = std::panic::catch_unwind(|| {
+            assert_interface_field_type("TestDto", interface, "expires_at", "number");
+        });
+
+        assert!(
+            result.is_err(),
+            "helper should fail when a generated TypeScript field has the wrong obvious type"
+        );
     }
 
     fn assert_serde_omits_empty_diagnostics(type_name: &str, value: Value) {
@@ -2456,17 +2510,103 @@ mod tests {
     }
 
     fn assert_generated_interface_fields(type_name: &str, value: &Value) {
+        let interface = generated_interface(type_name);
+        assert_interface_fields(type_name, &interface, value);
+    }
+
+    fn assert_interface_fields(type_name: &str, interface: &str, value: &Value) {
         let object = value
             .as_object()
             .unwrap_or_else(|| panic!("{type_name} serde example should be an object"));
-        let interface = generated_interface(type_name);
+        let fields = parse_interface_fields(type_name, interface);
+
         for key in object.keys() {
             assert!(
-                interface.contains(&format!("  {key}:"))
-                    || interface.contains(&format!("  {key}?:")),
+                fields.contains_key(key),
                 "generated TypeScript {type_name} should include serde field {key}"
             );
         }
+
+        for (field_name, field) in fields {
+            if field.optional {
+                continue;
+            }
+
+            assert!(
+                object.contains_key(&field_name),
+                "generated TypeScript {type_name} required field {field_name} should be present in serde example"
+            );
+        }
+    }
+
+    fn assert_generated_interface_field_type(
+        type_name: &str,
+        field_name: &str,
+        expected_ts_type: &str,
+    ) {
+        let interface = generated_interface(type_name);
+        assert_interface_field_type(type_name, &interface, field_name, expected_ts_type);
+    }
+
+    fn assert_interface_field_type(
+        type_name: &str,
+        interface: &str,
+        field_name: &str,
+        expected_ts_type: &str,
+    ) {
+        let fields = parse_interface_fields(type_name, interface);
+        let field = fields.get(field_name).unwrap_or_else(|| {
+            panic!("generated TypeScript {type_name} should include field {field_name}")
+        });
+
+        assert_eq!(
+            field.ts_type, expected_ts_type,
+            "generated TypeScript {type_name}.{field_name} should have expected type"
+        );
+    }
+
+    #[derive(Debug)]
+    struct TypeScriptInterfaceField {
+        optional: bool,
+        ts_type: String,
+    }
+
+    fn parse_interface_fields(
+        type_name: &str,
+        interface: &str,
+    ) -> BTreeMap<String, TypeScriptInterfaceField> {
+        let mut fields = BTreeMap::new();
+
+        for line in interface.lines() {
+            let Some(field_line) = line.strip_prefix("  ") else {
+                continue;
+            };
+            let Some(field_line) = field_line.strip_suffix(';') else {
+                continue;
+            };
+            let Some((field_name, ts_type)) = field_line.split_once(": ") else {
+                continue;
+            };
+            let (field_name, optional) = match field_name.strip_suffix('?') {
+                Some(field_name) => (field_name, true),
+                None => (field_name, false),
+            };
+
+            fields.insert(
+                field_name.to_string(),
+                TypeScriptInterfaceField {
+                    optional,
+                    ts_type: ts_type.to_string(),
+                },
+            );
+        }
+
+        assert!(
+            !fields.is_empty(),
+            "generated TypeScript interface should expose parseable fields for {type_name}"
+        );
+
+        fields
     }
 
     fn assert_generated_union_variant_fields(union_name: &str, tag: &str, value: &Value) {
