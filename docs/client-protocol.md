@@ -29,7 +29,7 @@ Node-based first-party clients can consume the same checked artifact without a
 sibling hub checkout through the package:
 
 ```sh
-npm install --save-dev @trybotster/hub-test-support
+npm install --save-dev @trybotster/hub-test-support@0.1.0
 ```
 
 ```js
@@ -49,6 +49,14 @@ The package includes checksum metadata so browser-client tests can fail clearly
 when checked assets are stale. The metadata's protocol version and conformance
 fixture revision are emitted by the Rust `botster-hub-test-support` asset
 generator instead of being maintained independently in JavaScript.
+
+For npm-based client repos such as botster-web, use the exact dependency spec
+`"@trybotster/hub-test-support": "0.1.0"` in `devDependencies` and let npm write
+the corresponding package-lock entry from the public npm registry. The package
+is public, so install does not require a scoped `.npmrc` entry or CI auth token.
+After updating the lockfile, run the client smoke that imports the package,
+reads the daemon protocol artifact, calls `verifyPackageAssets()`, and
+materializes the plugin contract matrix fixture.
 
 ## Compatibility Handshake
 
@@ -636,6 +644,10 @@ authoritative `botster-hub-client` generator.
 Node client tests should use the declared npm dependency instead of a relative
 hub checkout:
 
+```sh
+npm install --save-dev @trybotster/hub-test-support@0.1.0
+```
+
 ```js
 import {
   materializePluginContractMatrixFixture,
@@ -648,7 +660,7 @@ const fixturePath = materializePluginContractMatrixFixture(tempDirectory);
 
 Local environment variables may still point legacy drift checks at a checked-out
 hub artifact, but the normal web-client dependency coordinate is
-`@trybotster/hub-test-support`.
+`@trybotster/hub-test-support@0.1.0` from the public npm registry.
 
 Each harness instance creates a disposable data directory and socket path under
 the configured test root, uses synthetic default hub identity, and attempts a
