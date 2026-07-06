@@ -9,8 +9,9 @@ use botster_core::{
     Capability, CapabilitySurface, ExtensionEntrypoint, ExtensionKind, ExtensionRuntime, ModeFlags,
     PackageBlockedReason, PackageConfigurationField, PackageConfigurationFieldType,
     PackageConfigurationSchema, PackageConfigurationSecretValue, PackageConfigurationValue,
-    PackageDependency, PackageDependencyKind, PackageFeatureGate, PackageRequirement, RequestId,
-    SessionId, SessionLifecycleState, SubscriptionId,
+    PackageDependency, PackageDependencyKind, PackageFeatureGate, PackageNavigationEntry,
+    PackageNavigationTarget, PackageRequirement, PackageSurfaceDescriptor, PackageSurfaceKind,
+    PackageSurfaceOperation, RequestId, SessionId, SessionLifecycleState, SubscriptionId,
 };
 use botster_core_daemon::{GuardedWriteDecision, GuardedWriteDeliveryState, ReadinessEvidence};
 use botster_hub::{
@@ -177,6 +178,7 @@ fn plugin_manifest(name: &str, capabilities: Vec<Capability>) -> botster_core::P
         host_profile: None,
         surfaces: Vec::new(),
         runnable_entrypoints: Vec::new(),
+        navigation: Vec::new(),
     }
 }
 
@@ -281,6 +283,22 @@ fn capability_gated_plugin_manifest() -> botster_core::PackageManifest {
         }],
     }];
     manifest
+}
+
+fn app_surface(id: &str, title: &str) -> PackageSurfaceDescriptor {
+    PackageSurfaceDescriptor {
+        id: id.to_string(),
+        kind: PackageSurfaceKind::App,
+        title: title.to_string(),
+        description: Some(format!("{title} surface")),
+        icon: Some("workflow".to_string()),
+        order: Some(99),
+        category: Some("workflows".to_string()),
+        supports: vec![
+            PackageSurfaceOperation::Render,
+            PackageSurfaceOperation::Action,
+        ],
+    }
 }
 
 #[test]
@@ -985,6 +1003,89 @@ fn package_configuration_client_package_rows_are_sanitized() {
         .expect("serialize effective values");
     assert!(!row_json.contains("write_only"));
     assert!(!row_json.contains("super-secret-token"));
+}
+
+#[test]
+fn package_navigation_uses_explicit_manifest_entries_and_route_diagnostics() {
+    let api = HubClientApi::local_operator("package-navigation-explicit-client");
+    let surfaces = capability(CapabilitySurface::Surfaces, None);
+    let mut packages = PackageRegistry::new(vec![surfaces.clone()].into_iter().collect());
+    let mut manifest = plugin_manifest("navigation.plugin", vec![surfaces]);
+    manifest.surfaces = vec![app_surface("workbench", "Workbench")];
+    manifest.navigation = vec![PackageNavigationEntry {
+        id: "primary".to_string(),
+        label: "Primary Workbench".to_string(),
+        icon: Some("workflow".to_string()),
+        description: Some("Open the workbench".to_string()),
+        target: PackageNavigationTarget::Surface {
+            surface_id: "workbench".to_string(),
+        },
+    }];
+    packages
+        .install(manifest, provenance(), "install navigation package")
+        .expect("install navigation package");
+    let mut runtime = explicit_runtime("package-navigation-explicit");
+
+    let response = api
+        .handle_request(
+            &mut runtime,
+            &packages,
+            HubClientRequest::ListPackageNavigation {
+                request_id: request_id("list-package-navigation-explicit"),
+            },
+        )
+        .expect("list package navigation");
+    let HubClientResponseBody::PackageNavigation(rows) = response.body else {
+        panic!("package navigation response expected");
+    };
+    assert_eq!(rows.len(), 1);
+    let row = &rows[0];
+    assert_eq!(row.package_name, "navigation.plugin");
+    assert_eq!(row.item_id, "primary");
+    assert_eq!(row.label, "Primary Workbench");
+    assert_eq!(row.icon.as_deref(), Some("workflow"));
+    assert_eq!(
+        row.target,
+        botster_hub::HubClientPackageNavigationTarget::Surface {
+            surface_id: "workbench".to_string()
+        }
+    );
+}
+
+#[test]
+fn package_navigation_derives_default_app_surface_entries_without_order_authority() {
+    let api = HubClientApi::local_operator("package-navigation-default-client");
+    let surfaces = capability(CapabilitySurface::Surfaces, None);
+    let mut packages = PackageRegistry::new(vec![surfaces.clone()].into_iter().collect());
+    let mut manifest = plugin_manifest("default-nav.plugin", vec![surfaces]);
+    manifest.surfaces = vec![app_surface("home", "Home")];
+    packages
+        .install(manifest, provenance(), "install default nav package")
+        .expect("install default nav package");
+    packages
+        .enable("default-nav.plugin", "enable default nav package")
+        .expect("enable default nav package");
+    let mut runtime = explicit_runtime("package-navigation-default");
+
+    let response = api
+        .handle_request(
+            &mut runtime,
+            &packages,
+            HubClientRequest::ListPackageNavigation {
+                request_id: request_id("list-package-navigation-default"),
+            },
+        )
+        .expect("list package navigation");
+    let HubClientResponseBody::PackageNavigation(rows) = response.body else {
+        panic!("package navigation response expected");
+    };
+    assert_eq!(rows.len(), 1);
+    let row = &rows[0];
+    assert_eq!(row.item_id, "home");
+    assert_eq!(row.label, "Home");
+    let serialized = format!("{row:?}");
+    assert!(!serialized.contains("order"));
+    assert!(!serialized.contains("priority"));
 }
 
 #[test]

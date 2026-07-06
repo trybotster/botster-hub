@@ -59,6 +59,7 @@ export type DaemonRequest =
   | { type: "list_apps" }
   | { type: "resolve_app_launch"; package_name: string; entrypoint_id: string }
   | { type: "resolve_package_route"; package_name: string; route_id: string }
+  | { type: "list_package_navigation" }
   | { type: "list_packages" }
   | { type: "list_available_packages"; registry_path: string }
   | { type: "inspect_available_package"; registry_path: string; entry_id: string }
@@ -98,6 +99,7 @@ export interface DaemonResponse {
   apps?: DaemonApp[];
   resolved_app_launch?: DaemonResolvedAppLaunch | null;
   resolved_package_route?: DaemonPackageRouteDescriptor | null;
+  package_navigation?: DaemonPackageNavigationEntry[];
   packages: DaemonPackage[];
   available_packages?: DaemonAvailablePackage[];
   install_plan?: DaemonPackageInstallPlan | null;
@@ -141,6 +143,7 @@ export type DaemonResponseKind =
   | "apps"
   | "resolved_app_launch"
   | "resolved_package_route"
+  | "package_navigation"
   | "packages"
   | "available_packages"
   | "package_install_plan"
@@ -315,6 +318,27 @@ export interface DaemonPackageRouteTarget {
   kind: string;
   entrypoint_id?: string | null;
   surface_id?: string | null;
+}
+
+export interface DaemonPackageNavigationEntry {
+  package_name: string;
+  item_id: string;
+  label: string;
+  icon?: string | null;
+  description?: string | null;
+  route_id: string;
+  route_path: string;
+  target: DaemonPackageRouteTarget;
+  source: DaemonPackageNavigationSource;
+  enabled: boolean;
+  blocked: boolean;
+  diagnostics?: DaemonPackageDiagnostic[];
+}
+
+export interface DaemonPackageNavigationSource {
+  kind: string;
+  surface_id?: string | null;
+  entrypoint_id?: string | null;
 }
 
 export interface DaemonLocalWebrtcBootstrap {

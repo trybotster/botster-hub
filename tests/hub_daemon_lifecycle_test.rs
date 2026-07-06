@@ -380,6 +380,28 @@ fn generated_typescript_interface(artifact: &str, name: &str) -> String {
     rest[..end + 3].to_string()
 }
 
+fn assert_no_raw_html_ui_fields(value: &serde_json::Value) {
+    match value {
+        serde_json::Value::Object(object) => {
+            for forbidden in ["html", "raw_html", "inner_html", "srcdoc"] {
+                assert!(
+                    !object.contains_key(forbidden),
+                    "iframe render must expose an asset URL reference instead of raw HTML field {forbidden}"
+                );
+            }
+            for child in object.values() {
+                assert_no_raw_html_ui_fields(child);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                assert_no_raw_html_ui_fields(item);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn decode_hex_bytes(encoded: &str) -> Option<Vec<u8>> {
     if !encoded.len().is_multiple_of(2) {
         return None;
@@ -443,6 +465,7 @@ fn provider_manifest() -> PackageManifest {
         configuration: None,
         surfaces: Vec::new(),
         runnable_entrypoints: Vec::new(),
+        navigation: Vec::new(),
     }
 }
 
@@ -545,6 +568,111 @@ fn write_configurable_local_plugin_package(root: &Path) {
 "#,
     )
     .expect("write configurable package manifest");
+}
+
+fn write_explicit_navigation_local_plugin_package(root: &Path) {
+    fs::create_dir_all(root).expect("create navigation package root");
+    fs::write(root.join("plugin.lua"), "return botster.register({})\n")
+        .expect("write plugin entrypoint");
+    fs::write(
+        root.join("botster-package.json"),
+        r#"{
+  "name": "navigation.plugin",
+  "version": "1.0.0",
+  "kind": "plugin",
+  "botster": ">=0.1.0",
+  "source": { "type": "path", "path": "." },
+  "capabilities": [
+    { "surface": "surfaces" }
+  ],
+  "entrypoints": [
+    { "runtime": "lua", "path": "plugin.lua", "bootstrap": false }
+  ],
+  "surfaces": [{
+    "id": "workbench",
+    "kind": "app",
+    "title": "Workbench",
+    "description": "Navigation workbench",
+    "icon": "workflow",
+    "order": 100,
+    "category": "workflows",
+    "supports": ["render", "action"]
+  }],
+  "navigation": [{
+    "id": "primary",
+    "label": "Primary Workbench",
+    "icon": "workflow",
+    "description": "Open the workbench",
+    "target": { "kind": "surface", "surface_id": "workbench" }
+  }]
+}
+"#,
+    )
+    .expect("write explicit navigation package manifest");
+}
+
+fn write_iframe_surface_local_plugin_package(root: &Path) {
+    fs::create_dir_all(root.join("assets")).expect("create iframe package assets");
+    fs::write(root.join("assets/preview.html"), "<main>Preview</main>\n")
+        .expect("write iframe asset");
+    fs::write(
+        root.join("plugin.lua"),
+        r#"local function render_preview(_arguments)
+  return {
+    type = "iframe",
+    id = "preview-frame",
+    props = {
+      src = "/packages/iframe.plugin/assets/preview.html",
+      title = "Preview"
+    }
+  }
+end
+
+return botster.register({
+  handlers = {
+    {
+      id = "preview_surface",
+      kind = "surface_route",
+      descriptor_id = "preview",
+      descriptor = {
+        title = "Preview",
+        surface_id = "preview",
+      },
+      call = render_preview,
+    },
+  },
+})
+"#,
+    )
+    .expect("write iframe plugin entrypoint");
+    fs::write(
+        root.join("botster-package.json"),
+        r#"{
+  "name": "iframe.plugin",
+  "version": "1.0.0",
+  "kind": "plugin",
+  "botster": ">=0.1.0",
+  "source": { "type": "path", "path": "." },
+  "capabilities": [
+    { "surface": "surfaces" }
+  ],
+  "entrypoints": [
+    { "runtime": "lua", "path": "plugin.lua", "bootstrap": false }
+  ],
+  "surfaces": [{
+    "id": "preview",
+    "kind": "app",
+    "title": "Preview",
+    "description": "Iframe preview",
+    "icon": "panel-top",
+    "order": 30,
+    "category": "previews",
+    "supports": ["render"]
+  }]
+}
+"#,
+    )
+    .expect("write iframe package manifest");
 }
 
 fn write_project_pipelines_availability_package(root: &Path) {
@@ -1269,6 +1397,17 @@ fn package_route<'a>(
         .iter()
         .find(|route| route.route_id == route_id)
         .unwrap_or_else(|| panic!("response includes package route {route_id}"))
+}
+
+fn package_navigation<'a>(
+    entries: &'a [botster_hub_client::DaemonPackageNavigationEntry],
+    package_name: &str,
+    item_id: &str,
+) -> &'a botster_hub_client::DaemonPackageNavigationEntry {
+    entries
+        .iter()
+        .find(|entry| entry.package_name == package_name && entry.item_id == item_id)
+        .unwrap_or_else(|| panic!("response includes navigation {package_name}/{item_id}"))
 }
 
 fn wait_for_app_local_url(
@@ -2279,9 +2418,11 @@ fn daemon_package_dtos_expose_declared_surfaces_and_validate_surface_ids() {
     let surface_package_dir = unique_test_dir("daemon-declared-surface-package");
     let legacy_package_dir = unique_test_dir("daemon-legacy-surface-package");
     let workspaces_package_dir = unique_test_dir("daemon-workspaces-surface-package");
+    let iframe_package_dir = unique_test_dir("daemon-iframe-surface-package");
     write_declared_surface_plugin_package(&surface_package_dir);
     write_local_plugin_package(&legacy_package_dir);
     write_botster_workspaces_local_package(&workspaces_package_dir, "botster-workspaces");
+    write_iframe_surface_local_plugin_package(&iframe_package_dir);
     let config = explicit_config(&data_dir);
     let socket_path = config
         .transports
@@ -2324,6 +2465,15 @@ fn daemon_package_dtos_expose_declared_surfaces_and_validate_surface_ids() {
         .expect("enable workspaces package with declared surface");
     assert_eq!(
         enable_workspaces.kind,
+        botster_hub_client::DaemonResponseKind::PackageDecision
+    );
+    let enable_iframe = connection
+        .request(&botster_hub_client::DaemonRequest::EnablePackageLocalPath {
+            path: iframe_package_dir,
+        })
+        .expect("enable iframe package with declared surface");
+    assert_eq!(
+        enable_iframe.kind,
         botster_hub_client::DaemonResponseKind::PackageDecision
     );
 
@@ -2382,6 +2532,34 @@ fn daemon_package_dtos_expose_declared_surfaces_and_validate_surface_ids() {
     assert_eq!(snapshot.package_name, "botster-workspaces");
     assert_eq!(snapshot.surface_id, "workspaces");
     assert_eq!(snapshot.body["id"], "botster-workspaces-panel");
+
+    let iframe = connection
+        .request(&botster_hub_client::DaemonRequest::PluginSurfaceRender {
+            package_name: "iframe.plugin".to_string(),
+            surface_id: "preview".to_string(),
+            payload: serde_json::json!({}),
+        })
+        .expect("iframe surface render returns plugin surface envelope");
+    assert_eq!(
+        iframe.kind,
+        botster_hub_client::DaemonResponseKind::PluginSurface
+    );
+    let iframe_surface = iframe
+        .plugin_surface
+        .expect("iframe render includes plugin surface");
+    assert_eq!(iframe_surface.body["type"], "iframe");
+    assert_eq!(iframe_surface.body["id"], "preview-frame");
+    assert_eq!(
+        iframe_surface.body["props"]["src"],
+        "/packages/iframe.plugin/assets/preview.html"
+    );
+    assert_eq!(iframe_surface.body["props"]["title"], "Preview");
+    let iframe_snapshot = iframe_surface
+        .ui_tree_snapshot
+        .as_ref()
+        .expect("iframe render includes validated ui tree snapshot");
+    assert_eq!(iframe_snapshot.body, iframe_surface.body);
+    assert_no_raw_html_ui_fields(&iframe_surface.body);
 
     let undeclared = connection
         .request(&botster_hub_client::DaemonRequest::PluginSurfaceRender {
@@ -9597,6 +9775,111 @@ fn daemon_exposes_and_resolves_plugin_surface_and_settings_routes() {
             .as_deref()
             .is_some_and(|message| message.contains("route_not_found"))
     }));
+
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
+fn daemon_lists_admitted_package_navigation_with_default_app_surface_fallback() {
+    let _guard = daemon_test_lock()
+        .lock()
+        .expect("serialize real daemon test");
+    let data_dir = unique_test_dir("package-navigation-registry");
+    let default_package_dir = unique_test_dir("package-navigation-default-package");
+    let explicit_package_dir = unique_test_dir("package-navigation-explicit-package");
+    write_configurable_local_plugin_package(&default_package_dir);
+    write_explicit_navigation_local_plugin_package(&explicit_package_dir);
+    let config = explicit_config(&data_dir);
+    let child = start_cli_daemon(&data_dir);
+
+    botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::InstallPackageLocalPath {
+            path: default_package_dir,
+        },
+    )
+    .expect("install default navigation package");
+    botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::InstallPackageLocalPath {
+            path: explicit_package_dir,
+        },
+    )
+    .expect("install explicit navigation package");
+
+    let blocked = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::ListPackageNavigation,
+    )
+    .expect("list package navigation");
+    assert_eq!(
+        blocked.kind,
+        botster_hub::DaemonResponseKind::PackageNavigation
+    );
+    let default_nav = package_navigation(
+        &blocked.package_navigation,
+        "configurable.plugin",
+        "config.home",
+    );
+    assert_eq!(default_nav.label, "Config Home");
+    assert_eq!(default_nav.route_id, "surface:config.home");
+    assert_eq!(
+        default_nav.route_path,
+        "/packages/configurable.plugin/surfaces/config.home"
+    );
+    assert!(!default_nav.enabled);
+    assert!(default_nav.blocked);
+    assert!(
+        default_nav
+            .diagnostics
+            .iter()
+            .any(|diagnostic| { diagnostic.kind == "package_not_enabled" })
+    );
+
+    let explicit_blocked =
+        package_navigation(&blocked.package_navigation, "navigation.plugin", "primary");
+    assert_eq!(explicit_blocked.label, "Primary Workbench");
+    assert_eq!(explicit_blocked.route_id, "surface:workbench");
+    assert!(!explicit_blocked.enabled);
+    assert!(explicit_blocked.blocked);
+    let blocked_json =
+        serde_json::to_string(&blocked.package_navigation).expect("serialize navigation rows");
+    assert!(!blocked_json.contains("order"));
+    assert!(!blocked_json.contains("priority"));
+
+    botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::EnablePackage {
+            package_name: "navigation.plugin".to_string(),
+        },
+    )
+    .expect("enable explicit navigation package");
+
+    let enabled = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::ListPackageNavigation,
+    )
+    .expect("list enabled package navigation");
+    let enabled_nav =
+        package_navigation(&enabled.package_navigation, "navigation.plugin", "primary");
+    assert!(enabled_nav.enabled);
+    assert!(!enabled_nav.blocked);
+    assert!(enabled_nav.diagnostics.is_empty());
+
+    let resolved = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::ResolvePackageRoute {
+            package_name: "navigation.plugin".to_string(),
+            route_id: enabled_nav.route_id.clone(),
+        },
+    )
+    .expect("resolve explicit navigation route");
+    let route = resolved
+        .resolved_package_route
+        .as_ref()
+        .expect("resolved route");
+    assert_eq!(enabled_nav.route_path, route.route_path);
+    assert_eq!(enabled_nav.target, route.target);
 
     shutdown_cli_daemon(&data_dir, child);
 }

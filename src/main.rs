@@ -2936,6 +2936,22 @@ fn print_daemon_response(response: DaemonResponse) -> Result<(), OperatorError> 
                 println!("diagnostics={}", route.diagnostics.len());
             }
         }
+        DaemonResponseKind::PackageNavigation => {
+            println!("response=package_navigation");
+            println!("navigation_count={}", response.package_navigation.len());
+            for entry in response.package_navigation {
+                println!(
+                    "navigation package={} item={} label={} route={} enabled={} blocked={} diagnostics={}",
+                    entry.package_name,
+                    entry.item_id,
+                    entry.label,
+                    entry.route_path,
+                    entry.enabled,
+                    entry.blocked,
+                    entry.diagnostics.len()
+                );
+            }
+        }
         DaemonResponseKind::Packages => {
             print_packages(&response.packages, false);
         }

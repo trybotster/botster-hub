@@ -449,6 +449,7 @@ fn response_with_diagnostic(diagnostic: DaemonDiagnostic) -> DaemonResponse {
         apps: Vec::new(),
         resolved_app_launch: None,
         resolved_package_route: None,
+        package_navigation: Vec::new(),
         packages: Vec::new(),
         available_packages: Vec::new(),
         install_plan: None,
