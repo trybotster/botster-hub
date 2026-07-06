@@ -40,20 +40,6 @@ const PROJECT_PIPELINES_SURFACE: &str = "project-pipelines.create-ticket";
 const PROJECT_PIPELINES_ACTION: &str = "project_pipelines.create_ticket";
 const PLUGIN_CONTRACT_MATRIX_PACKAGE: &str = "botster.plugin-contract-matrix";
 const PLUGIN_CONTRACT_MATRIX_FIXTURE_ARTIFACT: &str = "fixtures/plugin-contract-matrix";
-const PLUGIN_CONTRACT_MATRIX_FIXTURE_FILES: &[(&str, &[u8])] = &[
-    (
-        "README.md",
-        include_bytes!("../fixtures/plugin-contract-matrix/README.md"),
-    ),
-    (
-        "botster-package.json",
-        include_bytes!("../fixtures/plugin-contract-matrix/botster-package.json"),
-    ),
-    (
-        "plugin.lua",
-        include_bytes!("../fixtures/plugin-contract-matrix/plugin.lua"),
-    ),
-];
 const DAEMON_PROTOCOL_TYPESCRIPT_ARTIFACT: &str =
     "crates/botster-hub-client/generated/daemon-protocol.ts";
 const PLUGIN_CONTRACT_APP_SURFACE: &str = "contract.app";
@@ -178,16 +164,16 @@ pub struct DaemonProtocolTypescriptArtifact {
 
 static PLUGIN_CONTRACT_MATRIX_FIXTURE_ASSET_FILES: &[TestAssetFile] = &[
     TestAssetFile {
-        relative_path: PLUGIN_CONTRACT_MATRIX_FIXTURE_FILES[0].0,
-        contents: PLUGIN_CONTRACT_MATRIX_FIXTURE_FILES[0].1,
+        relative_path: "README.md",
+        contents: include_bytes!("../fixtures/plugin-contract-matrix/README.md"),
     },
     TestAssetFile {
-        relative_path: PLUGIN_CONTRACT_MATRIX_FIXTURE_FILES[1].0,
-        contents: PLUGIN_CONTRACT_MATRIX_FIXTURE_FILES[1].1,
+        relative_path: "botster-package.json",
+        contents: include_bytes!("../fixtures/plugin-contract-matrix/botster-package.json"),
     },
     TestAssetFile {
-        relative_path: PLUGIN_CONTRACT_MATRIX_FIXTURE_FILES[2].0,
-        contents: PLUGIN_CONTRACT_MATRIX_FIXTURE_FILES[2].1,
+        relative_path: "plugin.lua",
+        contents: include_bytes!("../fixtures/plugin-contract-matrix/plugin.lua"),
     },
 ];
 
