@@ -305,6 +305,16 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             ("package_name", "string"),
             ("surface_id", "string"),
             ("body", "JsonValue"),
+            ("ui_tree_snapshot?", "DaemonUiTreeSnapshot | null"),
+        ],
+    );
+    emit_interface(
+        &mut output,
+        "DaemonUiTreeSnapshot",
+        &[
+            ("package_name", "string"),
+            ("surface_id", "string"),
+            ("body", "JsonValue"),
         ],
     );
     emit_string_union(

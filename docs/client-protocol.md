@@ -547,11 +547,21 @@ revision during the hello handshake.
 Do not reuse `botster_core::contract` session-worker protocol, session frame magic, `DefaultEngineCommand`, `TransportIngress`, or `BoundaryJson` for external clients. Those are not the client-to-hub protocol. The client crate also intentionally excludes hub runtime, Lua/plugin runtime, `ratatui`, `crossterm`, `mlua`, and core UI action/node types.
 
 Plugin surface render responses cross the daemon boundary as a
-`DaemonPluginSurface` envelope containing `package_name`, `surface_id`, and a
-JSON `body` payload for the rendered UI node. Plugin action responses still cross
-as JSON values. Hub-owned code may deserialize payloads into local core UI types,
-but external clients are not required to compile those internal UI/runtime
-dependencies.
+`DaemonPluginSurface` envelope containing `package_name`, `surface_id`, a JSON
+`body` payload for compatibility, and `ui_tree_snapshot` for browser/TUI
+rendering. The snapshot repeats `package_name` and `surface_id` and carries the
+same validated UiNode JSON in `body`. Hub-owned code renders through
+`HubRuntime::render_plugin_surface`, deserializes the plugin payload into the
+locked core UiNode contract, and validates it before serializing this response.
+Clients should prefer `ui_tree_snapshot` as the blessed surface rendering path
+and keep `body` only as a compatibility fallback for older hubs.
+
+Adding `ui_tree_snapshot` increments `CONFORMANCE_FIXTURE_REVISION`.
+`PROTOCOL_VERSION` remains unchanged because daemon framing and request issuance
+are unchanged. Clients that require hub-validated plugin surface snapshots should
+require the current conformance fixture revision during the hello handshake.
+Plugin action responses still cross as JSON values. External clients are not
+required to compile internal UI/runtime dependencies.
 
 ## Isolated Integration Tests For External Clients
 

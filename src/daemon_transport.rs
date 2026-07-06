@@ -44,8 +44,8 @@ pub use botster_hub_client::{
     DaemonResolvedSessionTemplate, DaemonResponse, DaemonResponseKind, DaemonSession,
     DaemonSessionCleanup, DaemonSessionContext, DaemonSessionTemplate,
     DaemonSessionTemplateContextInput, DaemonSessionTemplateRequest, DaemonStatus,
-    FEATURE_PLUGIN_SURFACE_ACTION, FEATURE_PLUGIN_SURFACE_RENDER, PROTOCOL, read_frame,
-    read_frame_from_reader, write_frame,
+    DaemonUiTreeSnapshot, FEATURE_PLUGIN_SURFACE_ACTION, FEATURE_PLUGIN_SURFACE_RENDER, PROTOCOL,
+    read_frame, read_frame_from_reader, write_frame,
 };
 use serde_json::Value;
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
@@ -2901,10 +2901,16 @@ fn daemon_plugin_tool_result(plugin_tool_result: Value) -> DaemonResponse {
 
 fn daemon_plugin_surface(plugin_surface: HubClientPluginSurface) -> DaemonResponse {
     let mut response = daemon_response_base(DaemonResponseKind::PluginSurface);
+    let body = serde_json::to_value(plugin_surface.body).unwrap_or(Value::Null);
     response.plugin_surface = Some(DaemonPluginSurface {
-        package_name: plugin_surface.package_name,
-        surface_id: plugin_surface.surface_id,
-        body: serde_json::to_value(plugin_surface.body).unwrap_or(Value::Null),
+        package_name: plugin_surface.package_name.clone(),
+        surface_id: plugin_surface.surface_id.clone(),
+        body: body.clone(),
+        ui_tree_snapshot: Some(DaemonUiTreeSnapshot {
+            package_name: plugin_surface.package_name,
+            surface_id: plugin_surface.surface_id,
+            body,
+        }),
     });
     response
 }
@@ -4050,13 +4056,28 @@ fn daemon_operator_error_from_client(error: crate::HubClientError) -> DaemonOper
             code,
             message,
         } => DaemonOperatorError {
+            diagnostics: plugin_error_diagnostics(operation, &code, &message),
             code,
             request_id: request_id.0,
             operation: operation_label(operation).to_string(),
             message,
-            diagnostics: Vec::new(),
         },
     }
+}
+
+fn plugin_error_diagnostics(
+    operation: crate::HubClientOperation,
+    code: &str,
+    message: &str,
+) -> Vec<DaemonDiagnostic> {
+    if operation == crate::HubClientOperation::PluginSurfaceRender && code == "invalid_surface" {
+        return vec![DaemonDiagnostic::action_failure(
+            operation_label(operation),
+            message.to_string(),
+        )];
+    }
+
+    Vec::new()
 }
 
 fn daemon_operator_error_from_package(error: crate::PackageRegistryError) -> DaemonOperatorError {
