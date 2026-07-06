@@ -39,6 +39,23 @@ const PROJECT_PIPELINES_PACKAGE: &str = "project-pipelines";
 const PROJECT_PIPELINES_SURFACE: &str = "project-pipelines.create-ticket";
 const PROJECT_PIPELINES_ACTION: &str = "project_pipelines.create_ticket";
 const PLUGIN_CONTRACT_MATRIX_PACKAGE: &str = "botster.plugin-contract-matrix";
+const PLUGIN_CONTRACT_MATRIX_FIXTURE_ARTIFACT: &str = "fixtures/plugin-contract-matrix";
+const PLUGIN_CONTRACT_MATRIX_FIXTURE_FILES: &[(&str, &[u8])] = &[
+    (
+        "README.md",
+        include_bytes!("../fixtures/plugin-contract-matrix/README.md"),
+    ),
+    (
+        "botster-package.json",
+        include_bytes!("../fixtures/plugin-contract-matrix/botster-package.json"),
+    ),
+    (
+        "plugin.lua",
+        include_bytes!("../fixtures/plugin-contract-matrix/plugin.lua"),
+    ),
+];
+const DAEMON_PROTOCOL_TYPESCRIPT_ARTIFACT: &str =
+    "crates/botster-hub-client/generated/daemon-protocol.ts";
 const PLUGIN_CONTRACT_APP_SURFACE: &str = "contract.app";
 const PLUGIN_CONTRACT_EMPTY_SURFACE: &str = "contract.empty";
 const PLUGIN_CONTRACT_BLOCKED_SURFACE: &str = "contract.blocked";
@@ -135,6 +152,91 @@ pub struct LateAttachHistoryConformanceScenario {
     pub no_history_subscription_id: String,
     pub history_then_live: Vec<DaemonEvent>,
     pub no_history_then_live: Vec<DaemonEvent>,
+}
+
+/// A stable file published by `botster-hub-test-support` for downstream tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TestAssetFile {
+    pub relative_path: &'static str,
+    pub contents: &'static [u8],
+}
+
+/// Published plugin fixture asset set for cross-repo package conformance tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PluginContractMatrixFixtureAsset {
+    pub package_name: &'static str,
+    pub artifact_path: &'static str,
+    pub files: &'static [TestAssetFile],
+}
+
+/// Published generated daemon protocol artifact for client drift checks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DaemonProtocolTypescriptArtifact {
+    pub artifact_path: &'static str,
+    pub contents: String,
+}
+
+static PLUGIN_CONTRACT_MATRIX_FIXTURE_ASSET_FILES: &[TestAssetFile] = &[
+    TestAssetFile {
+        relative_path: PLUGIN_CONTRACT_MATRIX_FIXTURE_FILES[0].0,
+        contents: PLUGIN_CONTRACT_MATRIX_FIXTURE_FILES[0].1,
+    },
+    TestAssetFile {
+        relative_path: PLUGIN_CONTRACT_MATRIX_FIXTURE_FILES[1].0,
+        contents: PLUGIN_CONTRACT_MATRIX_FIXTURE_FILES[1].1,
+    },
+    TestAssetFile {
+        relative_path: PLUGIN_CONTRACT_MATRIX_FIXTURE_FILES[2].0,
+        contents: PLUGIN_CONTRACT_MATRIX_FIXTURE_FILES[2].1,
+    },
+];
+
+/// Return the crate-managed plugin contract matrix fixture assets.
+///
+/// The repo-root `fixtures/plugins/plugin-contract-matrix` directory remains the
+/// source of truth. Hub tests assert this published asset set has the same
+/// recursive file list and byte contents.
+#[must_use]
+pub fn plugin_contract_matrix_fixture_asset() -> PluginContractMatrixFixtureAsset {
+    PluginContractMatrixFixtureAsset {
+        package_name: PLUGIN_CONTRACT_MATRIX_PACKAGE,
+        artifact_path: PLUGIN_CONTRACT_MATRIX_FIXTURE_ARTIFACT,
+        files: PLUGIN_CONTRACT_MATRIX_FIXTURE_ASSET_FILES,
+    }
+}
+
+/// Copy the published plugin contract matrix fixture into a caller-owned directory.
+///
+/// The returned path is the copied package root. Pass it to
+/// [`run_plugin_contract_matrix_conformance`] so tests never mutate crate source
+/// or rely on a sibling hub checkout.
+pub fn copy_plugin_contract_matrix_fixture(
+    destination: impl AsRef<Path>,
+) -> Result<PathBuf, std::io::Error> {
+    let package_dir = destination
+        .as_ref()
+        .join(PLUGIN_CONTRACT_MATRIX_FIXTURE_ARTIFACT);
+    fs::create_dir_all(&package_dir)?;
+    for file in plugin_contract_matrix_fixture_asset().files {
+        let path = package_dir.join(file.relative_path);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(path, file.contents)?;
+    }
+    Ok(package_dir)
+}
+
+/// Return the authoritative generated daemon TypeScript protocol artifact.
+///
+/// This is a convenience wrapper around `botster-hub-client`, which remains the
+/// source of truth for protocol DTOs and TypeScript generation.
+#[must_use]
+pub fn daemon_protocol_typescript_artifact() -> DaemonProtocolTypescriptArtifact {
+    DaemonProtocolTypescriptArtifact {
+        artifact_path: DAEMON_PROTOCOL_TYPESCRIPT_ARTIFACT,
+        contents: botster_hub_client::daemon_protocol_typescript(),
+    }
 }
 
 /// Return the current first-party support matrix for downstream client tests.
@@ -1002,7 +1104,9 @@ pub fn run_project_pipelines_conformance(
 
 /// Run the reusable plugin UI conformance flow against the contract matrix fixture.
 ///
-/// Callers pass a checkout path to `fixtures/plugins/plugin-contract-matrix`.
+/// Callers should usually pass a package root returned by
+/// [`copy_plugin_contract_matrix_fixture`]. An explicit package path remains
+/// supported for local override tests.
 /// The helper installs and enables that package through the daemon socket,
 /// then verifies package descriptors, routes, render envelopes, action results,
 /// configuration validation, and daemon responsiveness using only
@@ -2768,6 +2872,86 @@ mod tests {
     }
 
     #[test]
+    fn plugin_contract_matrix_fixture_asset_describes_published_files() {
+        let asset = plugin_contract_matrix_fixture_asset();
+
+        assert_eq!(asset.package_name, PLUGIN_CONTRACT_MATRIX_PACKAGE);
+        assert_eq!(asset.artifact_path, PLUGIN_CONTRACT_MATRIX_FIXTURE_ARTIFACT);
+        assert_eq!(
+            asset
+                .files
+                .iter()
+                .map(|file| file.relative_path)
+                .collect::<Vec<_>>(),
+            vec!["README.md", "botster-package.json", "plugin.lua"]
+        );
+        assert!(
+            asset.files.iter().all(|file| !file.contents.is_empty()),
+            "published fixture files must not be empty"
+        );
+    }
+
+    #[test]
+    fn copy_plugin_contract_matrix_fixture_writes_caller_owned_package() {
+        let root = unique_root("plugin-contract-copy");
+        let package_dir =
+            copy_plugin_contract_matrix_fixture(&root).expect("copy plugin contract fixture");
+
+        assert_eq!(
+            package_dir,
+            root.join(PLUGIN_CONTRACT_MATRIX_FIXTURE_ARTIFACT)
+        );
+        for file in plugin_contract_matrix_fixture_asset().files {
+            assert_eq!(
+                fs::read(package_dir.join(file.relative_path)).expect("copied fixture file"),
+                file.contents
+            );
+        }
+    }
+
+    #[test]
+    fn published_plugin_contract_matrix_fixture_matches_repo_source_tree() {
+        let repo_fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("fixtures")
+            .join("plugins")
+            .join("plugin-contract-matrix");
+        let crate_fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures")
+            .join("plugin-contract-matrix");
+
+        assert_eq!(
+            recursive_file_bytes(&crate_fixture),
+            recursive_file_bytes(&repo_fixture)
+        );
+        assert_eq!(
+            recursive_file_bytes(&repo_fixture),
+            plugin_contract_matrix_fixture_asset()
+                .files
+                .iter()
+                .map(|file| (file.relative_path.to_string(), file.contents.to_vec()))
+                .collect::<BTreeMap<_, _>>()
+        );
+    }
+
+    #[test]
+    fn daemon_protocol_typescript_artifact_matches_checked_generated_file() {
+        let artifact = daemon_protocol_typescript_artifact();
+        let checked = fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("botster-hub-client")
+                .join("generated")
+                .join("daemon-protocol.ts"),
+        )
+        .expect("read checked generated daemon protocol");
+
+        assert_eq!(artifact.artifact_path, DAEMON_PROTOCOL_TYPESCRIPT_ARTIFACT);
+        assert_eq!(artifact.contents, checked);
+    }
+
+    #[test]
     fn support_matrix_entity_capabilities_are_disjoint_and_complete() {
         let matrix = first_party_client_support_matrix();
         let mut declared = matrix.entity_actions.supported_capabilities.clone();
@@ -3303,6 +3487,32 @@ done
         let path = root.join(name);
         fs::write(&path, b"").expect("write fake binary placeholder");
         path
+    }
+
+    fn recursive_file_bytes(root: &Path) -> BTreeMap<String, Vec<u8>> {
+        let mut files = BTreeMap::new();
+        collect_file_bytes(root, root, &mut files);
+        files
+    }
+
+    fn collect_file_bytes(root: &Path, current: &Path, files: &mut BTreeMap<String, Vec<u8>>) {
+        for entry in fs::read_dir(current).expect("read fixture directory") {
+            let entry = entry.expect("read fixture entry");
+            let path = entry.path();
+            if path.is_dir() {
+                collect_file_bytes(root, &path, files);
+            } else {
+                let relative_path = path
+                    .strip_prefix(root)
+                    .expect("fixture file under root")
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                files.insert(
+                    relative_path,
+                    fs::read(path).expect("read fixture file contents"),
+                );
+            }
+        }
     }
 
     #[cfg(unix)]
