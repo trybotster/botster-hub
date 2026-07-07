@@ -24,8 +24,8 @@ local function default_state()
 end
 
 local function load_state()
-  local ok, result = pcall(botster.capabilities.plugin_db.get, { key = STATE_KEY })
-  if not ok then
+  local result = botster.capabilities.plugin_db.get({ key = STATE_KEY })
+  if result.record == nil then
     return default_state()
   end
   return result.record.payload
