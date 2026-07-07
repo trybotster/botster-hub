@@ -2979,6 +2979,7 @@ mod tests {
                     botster_hub_client::FEATURE_PLUGIN_SURFACE_RENDER,
                     botster_hub_client::FEATURE_PLUGIN_SURFACE_ACTION,
                     botster_hub_client::FEATURE_PACKAGE_ROUTES,
+                    botster_hub_client::FEATURE_PACKAGE_NAVIGATION,
                 ],
                 "supported_features": [
                     botster_hub_client::FEATURE_SESSIONS,
@@ -2987,6 +2988,7 @@ mod tests {
                     botster_hub_client::FEATURE_PLUGIN_SURFACE_RENDER,
                     botster_hub_client::FEATURE_PLUGIN_SURFACE_ACTION,
                     botster_hub_client::FEATURE_PACKAGE_ROUTES,
+                    botster_hub_client::FEATURE_PACKAGE_NAVIGATION,
                 ],
                 "diagnostic_kinds": [
                     "connected",
