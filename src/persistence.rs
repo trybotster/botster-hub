@@ -23,6 +23,7 @@ use crate::credentials::{CredentialKeyPurpose, CredentialProviderKind};
 use crate::packages::PackageRegistrySnapshot;
 use crate::session_templates::PackageSessionTemplate;
 use crate::spawn_targets::SpawnTarget;
+use crate::worktrees::Worktree;
 
 const HUB_STATE_SCHEMA_VERSION: u16 = 1;
 const HUB_STATE_FILE_NAME: &str = "hub-state.json";
@@ -56,6 +57,9 @@ pub struct HubState {
     /// Hub-owned spawn targets admitted for client/plugin references.
     #[serde(default, alias = "admitted_session_template_targets")]
     pub spawn_targets: Vec<SpawnTarget>,
+    /// Hub-owned worktree records scoped to admitted spawn targets.
+    #[serde(default)]
+    pub worktrees: Vec<Worktree>,
     /// References to secret material held by the credential provider.
     #[serde(default)]
     pub credential_keys: Vec<CredentialKeyReference>,
@@ -86,6 +90,7 @@ impl HubState {
             package_registry: PackageRegistrySnapshot::empty(),
             device_session_template_sources: Vec::new(),
             spawn_targets: Vec::new(),
+            worktrees: Vec::new(),
             credential_keys: Vec::new(),
             trusted_browser_identities: Vec::new(),
             bootstrap_grants: Vec::new(),

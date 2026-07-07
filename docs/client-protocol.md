@@ -136,6 +136,26 @@ not user-specific absolute paths. `kind` is generic; the initial value is
 `directory`, and git metadata is optional. A plain existing directory can be
 admitted and used as a target.
 
+## Worktrees
+
+Worktrees are hub-owned working-directory records scoped to an admitted spawn
+target. They live in `hub-state.json` and reference `target_id`; they are not a
+second target model and do not carry workflow-specific ticket, run, gate, or PR
+fields. Plugins should persist those associations in plugin state and reference
+the returned `worktree_id`.
+
+The daemon protocol exposes `ListWorktrees`, `ShowWorktree`, `CreateWorktree`,
+and `DeleteWorktree`. Create admits an existing directory under the selected
+spawn target root. The hub canonicalizes the target root and requested path and
+rejects traversal or symlink escapes before persisting the row. Delete removes
+the hub record only; it does not remove filesystem contents.
+
+`DaemonWorktree.status` is reconciled when rows are returned. Current values are
+`present`, `missing`, and `stale`. Missing paths remain listable after daemon
+reload so clients can explain stale local state instead of treating startup as a
+fatal error. `DaemonWorktree.git` is optional opportunistic metadata; plain
+directories without `.git` are valid worktrees.
+
 ## Connection Diagnostics
 
 The daemon protocol exposes policy-free diagnostics through stable
