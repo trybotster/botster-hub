@@ -20,7 +20,7 @@ mod typescript;
 
 pub const PROTOCOL: &str = "botster-hub-daemon-v1";
 pub const PROTOCOL_VERSION: u16 = 1;
-pub const CONFORMANCE_FIXTURE_REVISION: u16 = 5;
+pub const CONFORMANCE_FIXTURE_REVISION: u16 = 6;
 pub const FEATURE_SESSIONS: &str = "sessions";
 pub const FEATURE_TERMINAL_STREAMING: &str = "terminal_streaming";
 pub const FEATURE_RESIZE: &str = "resize";
@@ -29,6 +29,7 @@ pub const FEATURE_PLUGIN_SURFACE_ACTION: &str = "plugin_surface_action";
 pub const FEATURE_PACKAGE_ROUTES: &str = "package_routes";
 pub const FEATURE_PACKAGE_NAVIGATION: &str = "package_navigation";
 pub const FEATURE_SPAWN_TARGETS: &str = "spawn_targets";
+pub const FEATURE_WORKTREES: &str = "worktrees";
 const ATTACH_DRAIN_INTERVAL: Duration = Duration::from_millis(25);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -517,6 +518,7 @@ fn current_feature_list() -> Vec<&'static str> {
         FEATURE_PACKAGE_ROUTES,
         FEATURE_PACKAGE_NAVIGATION,
         FEATURE_SPAWN_TARGETS,
+        FEATURE_WORKTREES,
     ]
 }
 
@@ -632,6 +634,23 @@ pub enum DaemonRequest {
     },
     ValidateSpawnTarget {
         target_id: String,
+    },
+    ListWorktrees,
+    ShowWorktree {
+        worktree_id: String,
+    },
+    CreateWorktree {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        worktree_id: Option<String>,
+        target_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+        path: PathBuf,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        metadata: BTreeMap<String, String>,
+    },
+    DeleteWorktree {
+        worktree_id: String,
     },
     ListApps,
     ResolveAppLaunch {
@@ -761,6 +780,8 @@ pub struct DaemonResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spawn_target_validation: Option<DaemonSpawnTargetValidation>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub worktrees: Vec<DaemonWorktree>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub apps: Vec<DaemonApp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_app_launch: Option<DaemonResolvedAppLaunch>,
@@ -825,6 +846,7 @@ pub enum DaemonResponseKind {
     SessionContext,
     SpawnTargets,
     SpawnTargetValidation,
+    Worktrees,
     Apps,
     ResolvedAppLaunch,
     ResolvedPackageRoute,
@@ -996,6 +1018,28 @@ pub struct DaemonSpawnTargetValidation {
     pub target_id: String,
     pub ok: bool,
     pub status: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonWorktree {
+    pub worktree_id: String,
+    pub target_id: String,
+    pub label: String,
+    pub path: PathBuf,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git: Option<DaemonWorktreeGitMetadata>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonWorktreeGitMetadata {
+    pub repository_root: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head: Option<String>,
 }
 
 const fn default_true() -> bool {
@@ -2917,6 +2961,20 @@ mod tests {
             DaemonRequest::ValidateSpawnTarget {
                 target_id: "tgt_example".to_string(),
             },
+            DaemonRequest::ListWorktrees,
+            DaemonRequest::ShowWorktree {
+                worktree_id: "wt_example".to_string(),
+            },
+            DaemonRequest::CreateWorktree {
+                worktree_id: Some("wt_example".to_string()),
+                target_id: "tgt_example".to_string(),
+                label: Some("Example Worktree".to_string()),
+                path: PathBuf::from("/tmp/example/worktree"),
+                metadata: BTreeMap::from([("purpose".to_string(), "test".to_string())]),
+            },
+            DaemonRequest::DeleteWorktree {
+                worktree_id: "wt_example".to_string(),
+            },
             DaemonRequest::ListApps,
             DaemonRequest::ResolveAppLaunch {
                 package_name: "workflow.plugin".to_string(),
@@ -3053,6 +3111,10 @@ mod tests {
             DaemonRequest::UpdateSpawnTarget { .. } => "update_spawn_target",
             DaemonRequest::DeleteSpawnTarget { .. } => "delete_spawn_target",
             DaemonRequest::ValidateSpawnTarget { .. } => "validate_spawn_target",
+            DaemonRequest::ListWorktrees => "list_worktrees",
+            DaemonRequest::ShowWorktree { .. } => "show_worktree",
+            DaemonRequest::CreateWorktree { .. } => "create_worktree",
+            DaemonRequest::DeleteWorktree { .. } => "delete_worktree",
             DaemonRequest::ListApps => "list_apps",
             DaemonRequest::ResolveAppLaunch { .. } => "resolve_app_launch",
             DaemonRequest::ResolvePackageRoute { .. } => "resolve_package_route",
@@ -3099,6 +3161,7 @@ mod tests {
             DaemonResponseKind::SessionContext,
             DaemonResponseKind::SpawnTargets,
             DaemonResponseKind::SpawnTargetValidation,
+            DaemonResponseKind::Worktrees,
             DaemonResponseKind::Apps,
             DaemonResponseKind::ResolvedAppLaunch,
             DaemonResponseKind::ResolvedPackageRoute,
@@ -3137,6 +3200,7 @@ mod tests {
             DaemonResponseKind::SessionContext => "session_context",
             DaemonResponseKind::SpawnTargets => "spawn_targets",
             DaemonResponseKind::SpawnTargetValidation => "spawn_target_validation",
+            DaemonResponseKind::Worktrees => "worktrees",
             DaemonResponseKind::Apps => "apps",
             DaemonResponseKind::ResolvedAppLaunch => "resolved_app_launch",
             DaemonResponseKind::ResolvedPackageRoute => "resolved_package_route",
@@ -3245,6 +3309,19 @@ mod tests {
                 ok: true,
                 status: "ok".to_string(),
             }),
+            worktrees: vec![DaemonWorktree {
+                worktree_id: "wt_example".to_string(),
+                target_id: "tgt_example".to_string(),
+                label: "Example Worktree".to_string(),
+                path: PathBuf::from("/tmp/example/worktree"),
+                status: "present".to_string(),
+                git: Some(DaemonWorktreeGitMetadata {
+                    repository_root: PathBuf::from("/tmp/example/worktree"),
+                    branch: Some("main".to_string()),
+                    head: Some("ref: refs/heads/main".to_string()),
+                }),
+                metadata: BTreeMap::from([("purpose".to_string(), "test".to_string())]),
+            }],
             apps: vec![DaemonApp {
                 package_name: "workflow.plugin".to_string(),
                 app_id: "web".to_string(),

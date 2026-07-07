@@ -46,6 +46,7 @@ pub mod profile;
 pub mod runtime;
 pub mod session_templates;
 pub mod spawn_targets;
+pub mod worktrees;
 
 use botster_core::CapabilitySurface;
 pub use botster_core::{
@@ -100,7 +101,8 @@ pub use daemon_transport::{
     DaemonSessionCleanup, DaemonSessionContext, DaemonSessionTemplate,
     DaemonSessionTemplateContextInput, DaemonSessionTemplateRequest, DaemonSpawnTarget,
     DaemonSpawnTargetValidation, DaemonStatus, DaemonTransportError, DaemonTransportResult,
-    request as daemon_transport_request, serve_daemon, stream_attach,
+    DaemonWorktree, DaemonWorktreeGitMetadata, request as daemon_transport_request, serve_daemon,
+    stream_attach,
 };
 pub use entrypoint_supervisor::{
     EntrypointDiagnostic, EntrypointProcessSnapshot, EntrypointSupervisor,
@@ -154,6 +156,10 @@ pub use spawn_targets::{
     SpawnTarget, SpawnTargetCreate, SpawnTargetError, SpawnTargetResult, SpawnTargetUpdate,
     SpawnTargetValidation, create_spawn_target, delete_spawn_target, list_spawn_targets,
     show_spawn_target, update_spawn_target, validate_spawn_target,
+};
+pub use worktrees::{
+    Worktree, WorktreeCreate, WorktreeError, WorktreeGitMetadata, WorktreeResult, create_worktree,
+    delete_worktree, list_worktrees, show_worktree,
 };
 
 /// Compile-checked description of the profile plus the audited `HubRuntime` facade.
