@@ -128,4 +128,3 @@
 - If plugin list/validate semantics become durable, capture whether disabled target validation means "exists but unavailable" or simply false.
 - If a new protocol feature is added, capture the convention for when daemon CRUD additions require feature constants and conformance fixture revision bumps.
 - The checklist worker timeout should be captured if it recurs outside this run; for this plan the fallback evidence is preserved in artifact/gate payloads.
-
