@@ -52,17 +52,19 @@ The initial capability helper is:
   request through the hub-owned `HubCapabilityRuntime` and returns structured
   handle/event metadata.
 - `botster.capabilities.plugin_db.get({ key = "..." })`: reads one JSON
-  record from the loaded plugin's namespace. Missing records raise a structured
-  runtime error that Lua code may handle with `pcall`.
+  record from the loaded plugin's namespace. Missing records return the same
+  result family with no `record` field, so Lua code can branch with
+  `if result.record == nil then ... end` instead of using `pcall`.
 - `botster.capabilities.plugin_db.set({ key = "...", schema_version = 1,
   payload = {...}, expected_revision = nil })`: writes one JSON record through
   the declared `PluginDb` capability, drains the completion event, and returns
   the typed plugin-store result.
 - `botster.capabilities.plugin_db.patch({ key = "...", patch = {...},
   expected_revision = nil })`: applies a merge patch through the plugin-store
-  capability and waits for completion.
+  capability and waits for completion. Missing records remain runtime errors.
 - `botster.capabilities.plugin_db.delete({ key = "..." })`: deletes one
-  plugin-store record and waits for completion.
+  plugin-store record and waits for completion. Missing records remain runtime
+  errors.
 - `botster.capabilities.plugin_db.list({ prefix = "..." })`: lists deterministic
   plugin-store record metadata.
 - `botster.capabilities.config.get()`: returns the loaded plugin's own

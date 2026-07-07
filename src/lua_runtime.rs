@@ -14,14 +14,14 @@ use std::time::Duration;
 
 use botster_core::{
     BoundaryJson, CapabilityOperation, CapabilityOperationId, CapabilityOperationResult,
-    CapabilityRuntimeEvent, CapabilityRuntimeRequest, EndpointId, EnvelopeCursor, EnvelopeId,
-    EnvelopeTarget, PluginCancellationToken, PluginCapabilityRuntime, PluginDescriptorKind,
-    PluginDescriptorRef, PluginHandlerKind, PluginHandlerRef, PluginHandlerRegistration,
-    PluginInvocationFailure, PluginInvocationFailureKind, PluginInvocationRequest,
-    PluginInvocationResult, PluginInvocationSuccess, PluginKey, PluginOwnedDescriptor,
-    PluginResourceKind, PluginResourceRef, PluginRuntime, PluginStoreCapabilityRequest,
-    PluginStoreKey, PluginStoreOperation, RoutedEnvelope, RoutedEnvelopePayload,
-    RoutedEnvelopeRouter, TimerCapabilityRequest,
+    CapabilityRuntimeErrorKind, CapabilityRuntimeEvent, CapabilityRuntimeRequest, EndpointId,
+    EnvelopeCursor, EnvelopeId, EnvelopeTarget, PluginCancellationToken, PluginCapabilityRuntime,
+    PluginDescriptorKind, PluginDescriptorRef, PluginHandlerKind, PluginHandlerRef,
+    PluginHandlerRegistration, PluginInvocationFailure, PluginInvocationFailureKind,
+    PluginInvocationRequest, PluginInvocationResult, PluginInvocationSuccess, PluginKey,
+    PluginOwnedDescriptor, PluginResourceKind, PluginResourceRef, PluginRuntime,
+    PluginStoreCapabilityRequest, PluginStoreKey, PluginStoreOperation, RoutedEnvelope,
+    RoutedEnvelopePayload, RoutedEnvelopeRouter, TimerCapabilityRequest,
 };
 use mlua::{Function, HookTriggers, Lua, LuaOptions, LuaSerdeExt, StdLib, Table, Value, VmState};
 use serde_json::json;
@@ -711,7 +711,7 @@ fn submit_plugin_store_and_wait(
                 .drain_events(&plugin_key)
                 .map_err(|error| mlua::Error::RuntimeError(error.to_string()))?
         };
-        if let Some(value) = plugin_store_event_to_lua(lua, &operation_id, events)? {
+        if let Some(value) = plugin_store_event_to_lua(lua, action, &operation_id, events)? {
             return Ok(value);
         }
         thread::sleep(Duration::from_millis(1));
@@ -724,6 +724,7 @@ fn submit_plugin_store_and_wait(
 
 fn plugin_store_event_to_lua(
     lua: &Lua,
+    action: &str,
     operation_id: &CapabilityOperationId,
     events: Vec<CapabilityRuntimeEvent>,
 ) -> Result<Option<Value>, mlua::Error> {
@@ -740,6 +741,11 @@ fn plugin_store_event_to_lua(
                 return lua.to_value(&result).map(Some);
             }
             CapabilityRuntimeEvent::Failed(failure) if failure.operation_id == *operation_id => {
+                if action == "get"
+                    && failure.error_kind == CapabilityRuntimeErrorKind::StoreNotFound
+                {
+                    return lua.to_value(&json!({ "kind": "record" })).map(Some);
+                }
                 return Err(mlua::Error::RuntimeError(format!(
                     "plugin_db operation failed: {}",
                     failure.reason
