@@ -13,7 +13,7 @@ node packages/hub-test-support/scripts/sync-assets.mjs
 ## Usage
 
 ```sh
-npm install --save-dev @trybotster/hub-test-support@0.1.0
+npm install --save-dev @trybotster/hub-test-support@0.1.1
 ```
 
 ```js
@@ -34,12 +34,12 @@ Use this exact package spec in npm-based client repos:
 ```json
 {
   "devDependencies": {
-    "@trybotster/hub-test-support": "0.1.0"
+    "@trybotster/hub-test-support": "0.1.1"
   }
 }
 ```
 
-`@trybotster/hub-test-support@0.1.0` is published to the public npm registry.
+`@trybotster/hub-test-support@0.1.1` is published to the public npm registry.
 No scoped `.npmrc` entry or CI auth token is required for install. Client repos
 should update their lockfile from that registry coordinate, then run a smoke
 that imports the package, reads the daemon protocol artifact, verifies package
