@@ -20,7 +20,7 @@ mod typescript;
 
 pub const PROTOCOL: &str = "botster-hub-daemon-v1";
 pub const PROTOCOL_VERSION: u16 = 1;
-pub const CONFORMANCE_FIXTURE_REVISION: u16 = 4;
+pub const CONFORMANCE_FIXTURE_REVISION: u16 = 5;
 pub const FEATURE_SESSIONS: &str = "sessions";
 pub const FEATURE_TERMINAL_STREAMING: &str = "terminal_streaming";
 pub const FEATURE_RESIZE: &str = "resize";
@@ -28,6 +28,7 @@ pub const FEATURE_PLUGIN_SURFACE_RENDER: &str = "plugin_surface_render";
 pub const FEATURE_PLUGIN_SURFACE_ACTION: &str = "plugin_surface_action";
 pub const FEATURE_PACKAGE_ROUTES: &str = "package_routes";
 pub const FEATURE_PACKAGE_NAVIGATION: &str = "package_navigation";
+pub const FEATURE_SPAWN_TARGETS: &str = "spawn_targets";
 const ATTACH_DRAIN_INTERVAL: Duration = Duration::from_millis(25);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -515,6 +516,7 @@ fn current_feature_list() -> Vec<&'static str> {
         FEATURE_PLUGIN_SURFACE_ACTION,
         FEATURE_PACKAGE_ROUTES,
         FEATURE_PACKAGE_NAVIGATION,
+        FEATURE_SPAWN_TARGETS,
     ]
 }
 
@@ -594,6 +596,42 @@ pub enum DaemonRequest {
         context_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         key: Option<String>,
+    },
+    ListSpawnTargets,
+    ShowSpawnTarget {
+        target_id: String,
+    },
+    CreateSpawnTarget {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+        root: PathBuf,
+        #[serde(default = "default_true")]
+        enabled: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<String>,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        metadata: BTreeMap<String, String>,
+    },
+    UpdateSpawnTarget {
+        target_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        root: Option<PathBuf>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        enabled: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        metadata: Option<BTreeMap<String, String>>,
+    },
+    DeleteSpawnTarget {
+        target_id: String,
+    },
+    ValidateSpawnTarget {
+        target_id: String,
     },
     ListApps,
     ResolveAppLaunch {
@@ -719,6 +757,10 @@ pub struct DaemonResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_context: Option<DaemonSessionContext>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub spawn_targets: Vec<DaemonSpawnTarget>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawn_target_validation: Option<DaemonSpawnTargetValidation>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub apps: Vec<DaemonApp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_app_launch: Option<DaemonResolvedAppLaunch>,
@@ -781,6 +823,8 @@ pub enum DaemonResponseKind {
     SessionTemplates,
     ResolvedSessionTemplate,
     SessionContext,
+    SpawnTargets,
+    SpawnTargetValidation,
     Apps,
     ResolvedAppLaunch,
     ResolvedPackageRoute,
@@ -934,6 +978,28 @@ pub struct DaemonSessionContext {
     pub session_id: String,
     #[serde(default)]
     pub values: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonSpawnTarget {
+    pub target_id: String,
+    pub label: String,
+    pub root: PathBuf,
+    pub enabled: bool,
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonSpawnTargetValidation {
+    pub target_id: String,
+    pub ok: bool,
+    pub status: String,
+}
+
+const fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2825,6 +2891,32 @@ mod tests {
                 context_id: Some("ctx-session".to_string()),
                 key: Some("prompt".to_string()),
             },
+            DaemonRequest::ListSpawnTargets,
+            DaemonRequest::ShowSpawnTarget {
+                target_id: "tgt_example".to_string(),
+            },
+            DaemonRequest::CreateSpawnTarget {
+                target_id: Some("tgt_example".to_string()),
+                label: Some("Example".to_string()),
+                root: PathBuf::from("/tmp/example"),
+                enabled: true,
+                kind: Some("directory".to_string()),
+                metadata: BTreeMap::from([("purpose".to_string(), "test".to_string())]),
+            },
+            DaemonRequest::UpdateSpawnTarget {
+                target_id: "tgt_example".to_string(),
+                label: Some("Example Updated".to_string()),
+                root: Some(PathBuf::from("/tmp/example-updated")),
+                enabled: Some(false),
+                kind: Some("directory".to_string()),
+                metadata: Some(BTreeMap::new()),
+            },
+            DaemonRequest::DeleteSpawnTarget {
+                target_id: "tgt_example".to_string(),
+            },
+            DaemonRequest::ValidateSpawnTarget {
+                target_id: "tgt_example".to_string(),
+            },
             DaemonRequest::ListApps,
             DaemonRequest::ResolveAppLaunch {
                 package_name: "workflow.plugin".to_string(),
@@ -2955,6 +3047,12 @@ mod tests {
             DaemonRequest::ResolveSessionTemplate { .. } => "resolve_session_template",
             DaemonRequest::SpawnSessionTemplate { .. } => "spawn_session_template",
             DaemonRequest::ReadSessionContext { .. } => "read_session_context",
+            DaemonRequest::ListSpawnTargets => "list_spawn_targets",
+            DaemonRequest::ShowSpawnTarget { .. } => "show_spawn_target",
+            DaemonRequest::CreateSpawnTarget { .. } => "create_spawn_target",
+            DaemonRequest::UpdateSpawnTarget { .. } => "update_spawn_target",
+            DaemonRequest::DeleteSpawnTarget { .. } => "delete_spawn_target",
+            DaemonRequest::ValidateSpawnTarget { .. } => "validate_spawn_target",
             DaemonRequest::ListApps => "list_apps",
             DaemonRequest::ResolveAppLaunch { .. } => "resolve_app_launch",
             DaemonRequest::ResolvePackageRoute { .. } => "resolve_package_route",
@@ -2999,6 +3097,8 @@ mod tests {
             DaemonResponseKind::SessionTemplates,
             DaemonResponseKind::ResolvedSessionTemplate,
             DaemonResponseKind::SessionContext,
+            DaemonResponseKind::SpawnTargets,
+            DaemonResponseKind::SpawnTargetValidation,
             DaemonResponseKind::Apps,
             DaemonResponseKind::ResolvedAppLaunch,
             DaemonResponseKind::ResolvedPackageRoute,
@@ -3035,6 +3135,8 @@ mod tests {
             DaemonResponseKind::SessionTemplates => "session_templates",
             DaemonResponseKind::ResolvedSessionTemplate => "resolved_session_template",
             DaemonResponseKind::SessionContext => "session_context",
+            DaemonResponseKind::SpawnTargets => "spawn_targets",
+            DaemonResponseKind::SpawnTargetValidation => "spawn_target_validation",
             DaemonResponseKind::Apps => "apps",
             DaemonResponseKind::ResolvedAppLaunch => "resolved_app_launch",
             DaemonResponseKind::ResolvedPackageRoute => "resolved_package_route",
@@ -3129,6 +3231,19 @@ mod tests {
                 context_id: "ctx-session".to_string(),
                 session_id: "session".to_string(),
                 values: BTreeMap::from([("prompt".to_string(), "hello".to_string())]),
+            }),
+            spawn_targets: vec![DaemonSpawnTarget {
+                target_id: "tgt_example".to_string(),
+                label: "Example".to_string(),
+                root: PathBuf::from("/tmp/example"),
+                enabled: true,
+                kind: "directory".to_string(),
+                metadata: BTreeMap::from([("purpose".to_string(), "test".to_string())]),
+            }],
+            spawn_target_validation: Some(DaemonSpawnTargetValidation {
+                target_id: "tgt_example".to_string(),
+                ok: true,
+                status: "ok".to_string(),
             }),
             apps: vec![DaemonApp {
                 package_name: "workflow.plugin".to_string(),

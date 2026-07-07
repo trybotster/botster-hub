@@ -18,9 +18,9 @@ use botster_core::{
 use botster_hub::{
     DaemonApp, DaemonCompatibility, DaemonEvent, DaemonOperatorError, DaemonPackage,
     DaemonPackageActionStatus, DaemonPackagePin, DaemonRequest, DaemonResponse, DaemonResponseKind,
-    DaemonSession, DaemonStatus, DataDirectoryOption, HubClientApi, HubClientRequest,
-    HubClientResponseBody, HubDaemon, HubDaemonState, HubRuntime, HubStartupOptions,
-    HubStateLoadSource, RuntimeEnvironment, SessionDefaults, TransportBindings,
+    DaemonSession, DaemonSpawnTarget, DaemonStatus, DataDirectoryOption, HubClientApi,
+    HubClientRequest, HubClientResponseBody, HubDaemon, HubDaemonState, HubRuntime,
+    HubStartupOptions, HubStateLoadSource, RuntimeEnvironment, SessionDefaults, TransportBindings,
     build_default_config_for_runtime, daemon_transport_request, default_package_policy,
     host_profile, serve_daemon, serve_mcp_stdio, stream_attach,
 };
@@ -109,6 +109,13 @@ fn main() {
         Some("session-templates") => {
             if let Err(error) = operator_session_templates(env::args().skip(2).collect()) {
                 eprintln!("botster-hub session-templates error: {error}");
+                process::exit(1);
+            }
+            return;
+        }
+        Some("spawn-targets") => {
+            if let Err(error) = operator_spawn_targets(env::args().skip(2).collect()) {
+                eprintln!("botster-hub spawn-targets error: {error}");
                 process::exit(1);
             }
             return;
@@ -2169,6 +2176,186 @@ fn operator_session_templates(args: Vec<String>) -> Result<(), OperatorError> {
     Ok(())
 }
 
+fn operator_spawn_targets(args: Vec<String>) -> Result<(), OperatorError> {
+    let Some(action) = args.first().map(String::as_str) else {
+        return Err(OperatorError::Usage("spawn-targets"));
+    };
+    match action {
+        "list" => {
+            let options = DataDirOptions::parse(args[1..].to_vec(), "spawn-targets list")?;
+            let config = explicit_config(options.data_directory)?;
+            print_daemon_response(daemon_transport_request(
+                &config,
+                DaemonRequest::ListSpawnTargets,
+            )?)?;
+        }
+        "show" => {
+            if args.len() != 4 {
+                return Err(OperatorError::Usage("spawn-targets show"));
+            }
+            let options = DataDirOptions::parse(args[1..3].to_vec(), "spawn-targets show")?;
+            let config = explicit_config(options.data_directory)?;
+            print_daemon_response(daemon_transport_request(
+                &config,
+                DaemonRequest::ShowSpawnTarget {
+                    target_id: args[3].clone(),
+                },
+            )?)?;
+        }
+        "create" => {
+            if args.len() < 3 {
+                return Err(OperatorError::Usage("spawn-targets create"));
+            }
+            let options = DataDirOptions::parse(args[1..3].to_vec(), "spawn-targets create")?;
+            let request = parse_spawn_target_create(&args[3..])?;
+            let config = explicit_config(options.data_directory)?;
+            print_daemon_response(daemon_transport_request(&config, request)?)?;
+        }
+        "update" => {
+            if args.len() < 4 {
+                return Err(OperatorError::Usage("spawn-targets update"));
+            }
+            let options = DataDirOptions::parse(args[1..3].to_vec(), "spawn-targets update")?;
+            let request = parse_spawn_target_update(&args[3], &args[4..])?;
+            let config = explicit_config(options.data_directory)?;
+            print_daemon_response(daemon_transport_request(&config, request)?)?;
+        }
+        "delete" => {
+            if args.len() != 4 {
+                return Err(OperatorError::Usage("spawn-targets delete"));
+            }
+            let options = DataDirOptions::parse(args[1..3].to_vec(), "spawn-targets delete")?;
+            let config = explicit_config(options.data_directory)?;
+            print_daemon_response(daemon_transport_request(
+                &config,
+                DaemonRequest::DeleteSpawnTarget {
+                    target_id: args[3].clone(),
+                },
+            )?)?;
+        }
+        "validate" => {
+            if args.len() != 4 {
+                return Err(OperatorError::Usage("spawn-targets validate"));
+            }
+            let options = DataDirOptions::parse(args[1..3].to_vec(), "spawn-targets validate")?;
+            let config = explicit_config(options.data_directory)?;
+            print_daemon_response(daemon_transport_request(
+                &config,
+                DaemonRequest::ValidateSpawnTarget {
+                    target_id: args[3].clone(),
+                },
+            )?)?;
+        }
+        _ => return Err(OperatorError::Usage("spawn-targets")),
+    }
+    Ok(())
+}
+
+fn parse_spawn_target_create(args: &[String]) -> Result<DaemonRequest, OperatorError> {
+    let mut target_id = None;
+    let mut label = None;
+    let mut root = None;
+    let mut enabled = true;
+    let mut kind = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--id" => {
+                target_id = Some(required_arg(args, index + 1, "spawn-targets create")?);
+                index += 2;
+            }
+            "--label" => {
+                label = Some(required_arg(args, index + 1, "spawn-targets create")?);
+                index += 2;
+            }
+            "--root" => {
+                root = Some(PathBuf::from(required_arg(
+                    args,
+                    index + 1,
+                    "spawn-targets create",
+                )?));
+                index += 2;
+            }
+            "--kind" => {
+                kind = Some(required_arg(args, index + 1, "spawn-targets create")?);
+                index += 2;
+            }
+            "--disabled" => {
+                enabled = false;
+                index += 1;
+            }
+            _ => return Err(OperatorError::Usage("spawn-targets create")),
+        }
+    }
+    let root = root.ok_or(OperatorError::Usage("spawn-targets create"))?;
+    Ok(DaemonRequest::CreateSpawnTarget {
+        target_id,
+        label,
+        root,
+        enabled,
+        kind,
+        metadata: BTreeMap::new(),
+    })
+}
+
+fn parse_spawn_target_update(
+    target_id: &str,
+    args: &[String],
+) -> Result<DaemonRequest, OperatorError> {
+    let mut label = None;
+    let mut root = None;
+    let mut enabled = None;
+    let mut kind = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--label" => {
+                label = Some(required_arg(args, index + 1, "spawn-targets update")?);
+                index += 2;
+            }
+            "--root" => {
+                root = Some(PathBuf::from(required_arg(
+                    args,
+                    index + 1,
+                    "spawn-targets update",
+                )?));
+                index += 2;
+            }
+            "--kind" => {
+                kind = Some(required_arg(args, index + 1, "spawn-targets update")?);
+                index += 2;
+            }
+            "--enable" => {
+                enabled = Some(true);
+                index += 1;
+            }
+            "--disable" => {
+                enabled = Some(false);
+                index += 1;
+            }
+            _ => return Err(OperatorError::Usage("spawn-targets update")),
+        }
+    }
+    Ok(DaemonRequest::UpdateSpawnTarget {
+        target_id: target_id.to_string(),
+        label,
+        root,
+        enabled,
+        kind,
+        metadata: None,
+    })
+}
+
+fn required_arg(
+    args: &[String],
+    index: usize,
+    command: &'static str,
+) -> Result<String, OperatorError> {
+    args.get(index)
+        .cloned()
+        .ok_or(OperatorError::Usage(command))
+}
+
 fn operator_context(args: Vec<String>) -> Result<(), OperatorError> {
     let data_dir = env::var("BOTSTER_HUB_DATA_DIR").ok().map(PathBuf::from);
     let session_id = env::var("BOTSTER_SESSION_ID").ok();
@@ -2907,6 +3094,21 @@ fn print_daemon_response(response: DaemonResponse) -> Result<(), OperatorError> 
                 );
             }
         }
+        DaemonResponseKind::SpawnTargets => {
+            println!("response=spawn_targets");
+            println!("target_count={}", response.spawn_targets.len());
+            for target in response.spawn_targets {
+                print_spawn_target(&target);
+            }
+        }
+        DaemonResponseKind::SpawnTargetValidation => {
+            println!("response=spawn_target_validation");
+            if let Some(validation) = response.spawn_target_validation {
+                println!("target_id={}", validation.target_id);
+                println!("ok={}", validation.ok);
+                println!("status={}", validation.status);
+            }
+        }
         DaemonResponseKind::Apps => {
             print_apps(&response.apps);
         }
@@ -3092,6 +3294,17 @@ fn print_daemon_session(session: &DaemonSession) {
     println!(
         "session id={} lifecycle={}",
         session.session_id, session.lifecycle
+    );
+}
+
+fn print_spawn_target(target: &DaemonSpawnTarget) {
+    println!(
+        "target id={} label={} enabled={} kind={} root={}",
+        target.target_id,
+        target.label,
+        target.enabled,
+        target.kind,
+        target.root.display()
     );
 }
 
@@ -5183,6 +5396,14 @@ Apps:
   botster-hub apps show --data-dir <path> <app|package/app>
   botster-hub apps open --data-dir <path> <app|package/app>
 
+Spawn targets:
+  botster-hub spawn-targets list --data-dir <path>
+  botster-hub spawn-targets show --data-dir <path> <target-id>
+  botster-hub spawn-targets create --data-dir <path> --root <dir> [--id <id>] [--label <label>] [--kind directory] [--disabled]
+  botster-hub spawn-targets update --data-dir <path> <target-id> [--label <label>] [--root <dir>] [--enable|--disable]
+  botster-hub spawn-targets delete --data-dir <path> <target-id>
+  botster-hub spawn-targets validate --data-dir <path> <target-id>
+
 Packages:
   botster-hub packages list --data-dir <path>
   botster-hub packages available --data-dir <path> --registry <registry-dir-or-file>
@@ -5234,6 +5455,24 @@ Packages:
         }
         "session-templates spawn" => {
             "usage: botster-hub session-templates spawn --data-dir <path> <template-id> --session-id <id> [--target-id <id>] [--cwd <path>] [--env NAME=value] [--prompt <text>] [--branch <name>] [--ticket-id <id>] [--workspace-id <id>]"
+        }
+        "spawn-targets" | "spawn-targets list" => {
+            "usage: botster-hub spawn-targets list --data-dir <path>"
+        }
+        "spawn-targets show" => {
+            "usage: botster-hub spawn-targets show --data-dir <path> <target-id>"
+        }
+        "spawn-targets create" => {
+            "usage: botster-hub spawn-targets create --data-dir <path> --root <dir> [--id <id>] [--label <label>] [--kind directory] [--disabled]"
+        }
+        "spawn-targets update" => {
+            "usage: botster-hub spawn-targets update --data-dir <path> <target-id> [--label <label>] [--root <dir>] [--kind directory] [--enable|--disable]"
+        }
+        "spawn-targets delete" => {
+            "usage: botster-hub spawn-targets delete --data-dir <path> <target-id>"
+        }
+        "spawn-targets validate" => {
+            "usage: botster-hub spawn-targets validate --data-dir <path> <target-id>"
         }
         "context" => {
             "usage: botster-hub context [--data-dir <path>] [--session-id <id>] [--context-id <id>] [--key <name>]"

@@ -70,7 +70,8 @@ The current descriptor includes:
 
 - protocol name and version;
 - supported features: sessions, terminal streaming, resize, plugin surface
-  render, plugin surface action dispatch, and package navigation discovery;
+  render, plugin surface action dispatch, package navigation discovery, and
+  hub-owned spawn targets;
 - conformance fixture revision.
 
 The hub-owned first-party support matrix lives in
@@ -117,6 +118,23 @@ connection error instead of continuing into session or terminal operations.
 `botster-web` should perform the same check in its local hub bridge/status path
 before relying on sessions, terminal streaming, resize, or plugin surface/action
 dispatch, and show the diagnostic in the hub connection state.
+
+## Spawn Targets
+
+Spawn targets are hub-owned runtime policy state. They live in `hub-state.json`
+under the hub profile, not in `botster-core`, package manifests, or plugin
+state. Clients and plugins reference the stable `target_id`; the hub admits and
+resolves the local directory root.
+
+The daemon protocol exposes `ListSpawnTargets`, `ShowSpawnTarget`,
+`CreateSpawnTarget`, `UpdateSpawnTarget`, `DeleteSpawnTarget`, and
+`ValidateSpawnTarget`.
+
+`DaemonSpawnTarget.root` is a runtime local path returned to trusted same-device
+clients. Committed docs and fixtures must use placeholders or temporary paths,
+not user-specific absolute paths. `kind` is generic; the initial value is
+`directory`, and git metadata is optional. A plain existing directory can be
+admitted and used as a target.
 
 ## Connection Diagnostics
 
