@@ -15,12 +15,13 @@ use botster_core::{
 };
 use botster_core_daemon::{GuardedWriteDecision, GuardedWriteDeliveryState, ReadinessEvidence};
 use botster_hub::{
-    AdmittedSessionTemplateTarget, DataDirectoryOption, DeviceSessionTemplateSource,
-    FileHubStateStore, HostIdentityOptions, HubClientAdmission, HubClientApi, HubClientError,
-    HubClientEvent, HubClientIdentity, HubClientOperation, HubClientPackageClassification,
-    HubClientPackageState, HubClientRequest, HubClientResponseBody, HubClientRole, HubRuntime,
-    HubStartupOptions, HubStateStore, PackageProvenance, PackageRegistry, PackageSessionTemplate,
-    PackageSessionTemplateWorkingDirectory, RuntimeEnvironment, SessionDefaults, TransportBindings,
+    DataDirectoryOption, DeviceSessionTemplateSource, FileHubStateStore, HostIdentityOptions,
+    HubClientAdmission, HubClientApi, HubClientError, HubClientEvent, HubClientIdentity,
+    HubClientOperation, HubClientPackageClassification, HubClientPackageState, HubClientRequest,
+    HubClientResponseBody, HubClientRole, HubRuntime, HubStartupOptions, HubStateStore,
+    PackageProvenance, PackageRegistry, PackageSessionTemplate,
+    PackageSessionTemplateWorkingDirectory, RuntimeEnvironment, SessionDefaults, SpawnTarget,
+    TransportBindings,
 };
 
 mod support;
@@ -629,10 +630,13 @@ fn session_template_sources_apply_device_repo_precedence_and_reload_from_state()
                 root: device_root.clone(),
                 session_templates: vec![session_template("bin/device.sh", "device")],
             }];
-            state.admitted_session_template_targets = vec![AdmittedSessionTemplateTarget {
+            state.spawn_targets = vec![SpawnTarget {
                 target_id: "repo:main".to_string(),
+                label: "repo:main".to_string(),
                 root: repo_root.clone(),
                 enabled: true,
+                kind: "directory".to_string(),
+                metadata: BTreeMap::new(),
             }];
         })
         .expect("persist session template sources");
@@ -756,10 +760,13 @@ fn session_template_sources_apply_device_over_package_when_repo_disabled() {
                 root: device_root.clone(),
                 session_templates: vec![session_template("bin/device.sh", "device")],
             }];
-            state.admitted_session_template_targets = vec![AdmittedSessionTemplateTarget {
+            state.spawn_targets = vec![SpawnTarget {
                 target_id: "repo:disabled".to_string(),
+                label: "repo:disabled".to_string(),
                 root: repo_root.clone(),
                 enabled: false,
+                kind: "directory".to_string(),
+                metadata: BTreeMap::new(),
             }];
         })
         .expect("persist sources");
@@ -851,10 +858,13 @@ fn session_template_sources_reject_duplicate_ids_within_repo_source() {
     let store = FileHubStateStore::for_data_directory(&config.data_directory);
     store
         .update(&config, |state| {
-            state.admitted_session_template_targets = vec![AdmittedSessionTemplateTarget {
+            state.spawn_targets = vec![SpawnTarget {
                 target_id: "repo:duplicate".to_string(),
+                label: "repo:duplicate".to_string(),
                 root: repo_root.clone(),
                 enabled: true,
+                kind: "directory".to_string(),
+                metadata: BTreeMap::new(),
             }];
         })
         .expect("persist duplicate repo target");
@@ -904,16 +914,22 @@ fn session_template_sources_reject_ambiguous_same_rank_repo_ids() {
     let store = FileHubStateStore::for_data_directory(&config.data_directory);
     store
         .update(&config, |state| {
-            state.admitted_session_template_targets = vec![
-                AdmittedSessionTemplateTarget {
+            state.spawn_targets = vec![
+                SpawnTarget {
                     target_id: "repo:first".to_string(),
+                    label: "repo:first".to_string(),
                     root: first_repo.clone(),
                     enabled: true,
+                    kind: "directory".to_string(),
+                    metadata: BTreeMap::new(),
                 },
-                AdmittedSessionTemplateTarget {
+                SpawnTarget {
                     target_id: "repo:second".to_string(),
+                    label: "repo:second".to_string(),
                     root: second_repo.clone(),
                     enabled: true,
+                    kind: "directory".to_string(),
+                    metadata: BTreeMap::new(),
                 },
             ];
         })

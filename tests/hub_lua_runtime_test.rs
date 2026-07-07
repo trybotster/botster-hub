@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
@@ -12,7 +13,7 @@ use botster_core::{
 use botster_hub::{
     DataDirectoryOption, HostIdentityOptions, HubClientApi, HubClientRequest,
     HubClientResponseBody, HubRuntime, HubStartupOptions, LuaPluginRuntime, PackageRegistry,
-    RuntimeEnvironment, SessionDefaults, TransportBindings, default_package_policy,
+    RuntimeEnvironment, SessionDefaults, SpawnTarget, TransportBindings, default_package_policy,
 };
 
 mod support;
@@ -216,6 +217,71 @@ return botster.register({
             "enable session-template package",
         )
         .expect("enable session-template package");
+    policy.registry().clone()
+}
+
+fn install_spawn_target_reader_registry(name: &str) -> PackageRegistry {
+    let root = PathBuf::from("target")
+        .join("botster-hub-test-data")
+        .join("lua-runtime-packages")
+        .join(name);
+    let source_root = std::env::current_dir().expect("current dir").join(&root);
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).expect("create spawn-target package root");
+    fs::write(
+        root.join("plugin.lua"),
+        r#"
+return botster.register({
+  tools = {
+    {
+      name = "spawn_targets.inspect",
+      description = "Inspect hub-owned spawn target capability shape.",
+      handler = "inspect",
+      call = function(args)
+        local targets = botster.capabilities.spawn_targets.list()
+        local validation = botster.capabilities.spawn_targets.validate({ target_id = args.target_id })
+        local disabled = botster.capabilities.spawn_targets.validate({ target_id = args.disabled_target_id })
+        local missing = botster.capabilities.spawn_targets.validate({ target_id = "missing-target" })
+        return {
+          targets = targets,
+          validation = validation,
+          disabled = disabled,
+          missing = missing,
+          mutation_methods = {
+            create = botster.capabilities.spawn_targets.create ~= nil,
+            update = botster.capabilities.spawn_targets.update ~= nil,
+            delete = botster.capabilities.spawn_targets.delete ~= nil,
+          },
+        }
+      end,
+    },
+  },
+})
+"#,
+    )
+    .expect("write spawn-target plugin");
+    fs::write(
+        root.join("botster-package.json"),
+        serde_json::json!({
+            "name": "spawn-target-reader.plugin",
+            "version": "1.0.0",
+            "kind": "plugin",
+            "botster": ">=0.1.0",
+            "source": { "type": "path", "path": source_root.display().to_string() },
+            "capabilities": [{ "surface": "mcp" }],
+            "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }]
+        })
+        .to_string(),
+    )
+    .expect("write spawn-target package manifest");
+
+    let mut policy = default_package_policy();
+    policy
+        .install_local_path(&root, "install spawn target reader package")
+        .expect("install spawn target reader package");
+    policy
+        .enable("spawn-target-reader.plugin", "enable spawn target reader")
+        .expect("enable spawn target reader package");
     policy.registry().clone()
 }
 
@@ -447,6 +513,60 @@ fn real_lua_plugin_loads_invokes_tool_and_uses_hub_capability_runtime() {
             .as_str()
             .is_some_and(|resource| resource.starts_with("timer-"))
     );
+}
+
+#[test]
+fn real_lua_plugin_lists_and_validates_spawn_targets_without_mutation_surface() {
+    let registry = install_spawn_target_reader_registry("spawn-target-reader");
+    let mut hub = explicit_runtime("spawn-target-reader");
+    let target_root = PathBuf::from("target")
+        .join("botster-hub-test-data")
+        .join("lua-runtime")
+        .join("spawn-target-reader-target");
+    fs::create_dir_all(&target_root).expect("create target root");
+    let mut state = hub.state().clone();
+    state.spawn_targets = vec![
+        SpawnTarget {
+            target_id: "tgt_lua_enabled".to_string(),
+            label: "Lua Enabled".to_string(),
+            root: target_root.clone(),
+            enabled: true,
+            kind: "directory".to_string(),
+            metadata: BTreeMap::new(),
+        },
+        SpawnTarget {
+            target_id: "tgt_lua_disabled".to_string(),
+            label: "Lua Disabled".to_string(),
+            root: target_root,
+            enabled: false,
+            kind: "directory".to_string(),
+            metadata: BTreeMap::new(),
+        },
+    ];
+    hub.replace_state(state);
+    hub.load_lua_plugin_package(&registry, "spawn-target-reader.plugin")
+        .expect("load spawn target reader plugin");
+
+    let result = hub
+        .call_plugin_mcp_tool(botster_hub::McpCallRequest {
+            name: "spawn_targets.inspect".to_string(),
+            arguments: serde_json::json!({
+                "target_id": "tgt_lua_enabled",
+                "disabled_target_id": "tgt_lua_disabled"
+            }),
+        })
+        .expect("call spawn target reader tool");
+
+    assert_eq!(result["targets"].as_array().expect("target list").len(), 2);
+    assert_eq!(result["validation"]["ok"], true);
+    assert_eq!(result["validation"]["status"], "ok");
+    assert_eq!(result["disabled"]["ok"], false);
+    assert_eq!(result["disabled"]["status"], "disabled");
+    assert_eq!(result["missing"]["ok"], false);
+    assert_eq!(result["missing"]["status"], "not_found");
+    assert_eq!(result["mutation_methods"]["create"], false);
+    assert_eq!(result["mutation_methods"]["update"], false);
+    assert_eq!(result["mutation_methods"]["delete"], false);
 }
 
 #[test]
@@ -870,6 +990,7 @@ fn reload_replaces_lua_tool_descriptors_and_removes_stale_handlers() {
         hub.capability_runtime(),
         hub.routed_envelope_runtime(),
         hub.session_template_spawner(),
+        hub.spawn_targets(),
         registry.packages().into_iter().cloned().collect(),
     )
     .expect("load new reload lua bundle");

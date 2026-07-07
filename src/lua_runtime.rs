@@ -29,7 +29,7 @@ use serde_json::json;
 use crate::capabilities::HubCapabilityRuntime;
 use crate::lifecycle::HubPluginRuntimeBundle;
 use crate::packages::{PackageConfigurationView, PackageRecord, PreparedLocalPackage};
-use crate::runtime::SharedSessionTemplateSpawner;
+use crate::runtime::{SharedSessionTemplateSpawner, SharedSpawnTargets};
 use crate::session_templates::{SessionTemplateContextInput, SessionTemplateRequest};
 
 const DEFAULT_INSTRUCTION_BUDGET: u64 = 500_000;
@@ -39,6 +39,15 @@ static LUA_OPERATION_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 pub type SharedHubCapabilityRuntime = Arc<Mutex<HubCapabilityRuntime>>;
 /// Shared routed-envelope primitive used by Lua coordination helpers.
 pub type SharedRoutedEnvelopeRuntime = Arc<Mutex<RoutedEnvelopeRouter>>;
+
+struct LuaHostApi {
+    configuration: PackageConfigurationView,
+    capabilities: SharedHubCapabilityRuntime,
+    routed_envelopes: SharedRoutedEnvelopeRuntime,
+    session_templates: SharedSessionTemplateSpawner,
+    spawn_targets: SharedSpawnTargets,
+    package_records: Vec<PackageRecord>,
+}
 
 /// Real Lua runtime for one loaded plugin package.
 pub struct LuaPluginRuntime {
@@ -56,6 +65,7 @@ impl LuaPluginRuntime {
         capabilities: SharedHubCapabilityRuntime,
         routed_envelopes: SharedRoutedEnvelopeRuntime,
         session_templates: SharedSessionTemplateSpawner,
+        spawn_targets: SharedSpawnTargets,
         package_records: Vec<PackageRecord>,
     ) -> Result<HubPluginRuntimeBundle, LuaPluginRuntimeError> {
         let plugin_key = PluginKey(prepared.package_name.clone());
@@ -63,15 +73,15 @@ impl LuaPluginRuntime {
             prepared.selected_entrypoint_path.as_ref().ok_or_else(|| {
                 LuaPluginRuntimeError::Load("local package has no lua entrypoint".to_string())
             })?;
-        let loaded = LoadedLuaPlugin::load(
-            plugin_key.clone(),
-            selected_entrypoint_path,
+        let host_api = LuaHostApi {
             configuration,
             capabilities,
             routed_envelopes,
             session_templates,
+            spawn_targets,
             package_records,
-        )?;
+        };
+        let loaded = LoadedLuaPlugin::load(plugin_key.clone(), selected_entrypoint_path, host_api)?;
         Ok(HubPluginRuntimeBundle {
             runtime: Arc::new(loaded.runtime),
             handlers: loaded.handlers,
@@ -88,11 +98,7 @@ impl LuaPluginRuntime {
     fn new(
         plugin_key: PluginKey,
         entrypoint: &Path,
-        configuration: PackageConfigurationView,
-        capabilities: SharedHubCapabilityRuntime,
-        routed_envelopes: SharedRoutedEnvelopeRuntime,
-        session_templates: SharedSessionTemplateSpawner,
-        package_records: Vec<PackageRecord>,
+        host_api: LuaHostApi,
     ) -> Result<(Self, LuaRegistration), LuaPluginRuntimeError> {
         let lua = Lua::new_with(
             StdLib::TABLE | StdLib::STRING | StdLib::MATH | StdLib::UTF8,
@@ -112,15 +118,7 @@ impl LuaPluginRuntime {
                 Ok(VmState::Continue)
             },
         )?;
-        install_botster_api(
-            &lua,
-            plugin_key.clone(),
-            configuration,
-            capabilities,
-            routed_envelopes,
-            session_templates,
-            package_records,
-        )?;
+        install_botster_api(&lua, plugin_key.clone(), host_api)?;
         let source = std::fs::read_to_string(entrypoint).map_err(|error| {
             LuaPluginRuntimeError::Load(format!("failed to read Lua entrypoint: {error}"))
         })?;
@@ -252,21 +250,10 @@ impl LoadedLuaPlugin {
     fn load(
         plugin_key: PluginKey,
         entrypoint: &Path,
-        configuration: PackageConfigurationView,
-        capabilities: SharedHubCapabilityRuntime,
-        routed_envelopes: SharedRoutedEnvelopeRuntime,
-        session_templates: SharedSessionTemplateSpawner,
-        package_records: Vec<PackageRecord>,
+        host_api: LuaHostApi,
     ) -> Result<Self, LuaPluginRuntimeError> {
-        let (runtime, registration) = LuaPluginRuntime::new(
-            plugin_key.clone(),
-            entrypoint,
-            configuration,
-            capabilities,
-            routed_envelopes,
-            session_templates,
-            package_records,
-        )?;
+        let (runtime, registration) =
+            LuaPluginRuntime::new(plugin_key.clone(), entrypoint, host_api)?;
         let mut handlers = Vec::new();
         let mut descriptors = Vec::new();
         let mut resources = Vec::new();
@@ -388,11 +375,7 @@ fn empty_object() -> serde_json::Value {
 fn install_botster_api(
     lua: &Lua,
     plugin_key: PluginKey,
-    configuration: PackageConfigurationView,
-    capabilities: SharedHubCapabilityRuntime,
-    routed_envelopes: SharedRoutedEnvelopeRuntime,
-    session_templates: SharedSessionTemplateSpawner,
-    package_records: Vec<PackageRecord>,
+    host_api: LuaHostApi,
 ) -> Result<(), LuaPluginRuntimeError> {
     let globals = lua.globals();
     globals.set("__botster_handlers", lua.create_table()?)?;
@@ -424,7 +407,7 @@ fn install_botster_api(
     botster.set("register", register)?;
 
     let capabilities_table = lua.create_table()?;
-    let timer_capabilities = capabilities.clone();
+    let timer_capabilities = host_api.capabilities.clone();
     let timer_plugin_key = plugin_key.clone();
     capabilities_table.set(
         "timer_once",
@@ -455,20 +438,65 @@ fn install_botster_api(
     )?;
     capabilities_table.set(
         "plugin_db",
-        plugin_db_table(lua, plugin_key.clone(), capabilities.clone())?,
+        plugin_db_table(lua, plugin_key.clone(), host_api.capabilities.clone())?,
     )?;
     capabilities_table.set(
         "session_templates",
-        session_templates_table(lua, plugin_key.clone(), session_templates, package_records)?,
+        session_templates_table(
+            lua,
+            plugin_key.clone(),
+            host_api.session_templates,
+            host_api.package_records,
+        )?,
     )?;
-    capabilities_table.set("config", config_table(lua, configuration)?)?;
+    capabilities_table.set(
+        "spawn_targets",
+        spawn_targets_table(lua, host_api.spawn_targets)?,
+    )?;
+    capabilities_table.set("config", config_table(lua, host_api.configuration)?)?;
     botster.set("capabilities", capabilities_table)?;
     botster.set(
         "coordination",
-        coordination_table(lua, plugin_key, routed_envelopes)?,
+        coordination_table(lua, plugin_key, host_api.routed_envelopes)?,
     )?;
     globals.set("botster", botster)?;
     Ok(())
+}
+
+fn spawn_targets_table(lua: &Lua, spawn_targets: SharedSpawnTargets) -> Result<Table, mlua::Error> {
+    let table = lua.create_table()?;
+    let list_targets = spawn_targets.clone();
+    table.set(
+        "list",
+        lua.create_function(move |lua, ()| {
+            let targets = list_targets.lock().map_err(|_| {
+                mlua::Error::RuntimeError("spawn target registry lock poisoned".to_string())
+            })?;
+            lua.to_value(&crate::spawn_targets::list_spawn_targets(&targets))
+        })?,
+    )?;
+    table.set(
+        "validate",
+        lua.create_function(move |lua, args: Value| {
+            let value = lua.from_value::<serde_json::Value>(args)?;
+            let target_id = value
+                .get("target_id")
+                .or_else(|| value.get("id"))
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    mlua::Error::RuntimeError(
+                        "spawn_targets.validate requires target_id".to_string(),
+                    )
+                })?;
+            let targets = spawn_targets.lock().map_err(|_| {
+                mlua::Error::RuntimeError("spawn target registry lock poisoned".to_string())
+            })?;
+            lua.to_value(&crate::spawn_targets::validate_spawn_target(
+                &targets, target_id,
+            ))
+        })?,
+    )?;
+    Ok(table)
 }
 
 fn config_table(lua: &Lua, configuration: PackageConfigurationView) -> Result<Table, mlua::Error> {

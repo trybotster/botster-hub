@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::HubConfig;
 use crate::packages::{PackageRecord, PackageState};
 use crate::persistence::HubState;
+use crate::spawn_targets::list_spawn_targets;
 
 /// Package-provided session template declaration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -429,7 +430,7 @@ fn source_templates(
         }
     }
 
-    for target in &state.admitted_session_template_targets {
+    for target in list_spawn_targets(&state.spawn_targets) {
         if !target.enabled {
             continue;
         }

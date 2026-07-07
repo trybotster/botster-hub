@@ -147,6 +147,32 @@ pub(crate) fn daemon_protocol_typescript() -> String {
                     ("key?", "string | null"),
                 ],
             ),
+            ("list_spawn_targets", &[]),
+            ("show_spawn_target", &[("target_id", "string")]),
+            (
+                "create_spawn_target",
+                &[
+                    ("target_id?", "string | null"),
+                    ("label?", "string | null"),
+                    ("root", "string"),
+                    ("enabled?", "boolean"),
+                    ("kind?", "string | null"),
+                    ("metadata?", "Record<string, string>"),
+                ],
+            ),
+            (
+                "update_spawn_target",
+                &[
+                    ("target_id", "string"),
+                    ("label?", "string | null"),
+                    ("root?", "string | null"),
+                    ("enabled?", "boolean | null"),
+                    ("kind?", "string | null"),
+                    ("metadata?", "Record<string, string> | null"),
+                ],
+            ),
+            ("delete_spawn_target", &[("target_id", "string")]),
+            ("validate_spawn_target", &[("target_id", "string")]),
             ("list_apps", &[]),
             (
                 "resolve_app_launch",
@@ -271,6 +297,11 @@ pub(crate) fn daemon_protocol_typescript() -> String {
                 "DaemonResolvedSessionTemplate | null",
             ),
             ("session_context?", "DaemonSessionContext | null"),
+            ("spawn_targets?", "DaemonSpawnTarget[]"),
+            (
+                "spawn_target_validation?",
+                "DaemonSpawnTargetValidation | null",
+            ),
             ("apps?", "DaemonApp[]"),
             ("resolved_app_launch?", "DaemonResolvedAppLaunch | null"),
             (
@@ -330,6 +361,8 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             "session_templates",
             "resolved_session_template",
             "session_context",
+            "spawn_targets",
+            "spawn_target_validation",
             "apps",
             "resolved_app_launch",
             "resolved_package_route",
@@ -367,6 +400,27 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             ("next_cursor", "number | null"),
             ("ack", "DaemonEnvelopeAck | null"),
             ("notify", "DaemonNotify | null"),
+        ],
+    );
+    emit_interface(
+        &mut output,
+        "DaemonSpawnTarget",
+        &[
+            ("target_id", "string"),
+            ("label", "string"),
+            ("root", "string"),
+            ("enabled", "boolean"),
+            ("kind", "string"),
+            ("metadata?", "Record<string, string>"),
+        ],
+    );
+    emit_interface(
+        &mut output,
+        "DaemonSpawnTargetValidation",
+        &[
+            ("target_id", "string"),
+            ("ok", "boolean"),
+            ("status", "string"),
         ],
     );
     emit_interface(

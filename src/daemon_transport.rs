@@ -44,9 +44,9 @@ pub use botster_hub_client::{
     DaemonPluginLifecycle, DaemonPluginSurface, DaemonRequest, DaemonResolvedAppLaunch,
     DaemonResolvedSessionTemplate, DaemonResponse, DaemonResponseKind, DaemonSession,
     DaemonSessionCleanup, DaemonSessionContext, DaemonSessionTemplate,
-    DaemonSessionTemplateContextInput, DaemonSessionTemplateRequest, DaemonStatus,
-    DaemonUiTreeSnapshot, FEATURE_PLUGIN_SURFACE_ACTION, FEATURE_PLUGIN_SURFACE_RENDER, PROTOCOL,
-    read_frame, read_frame_from_reader, write_frame,
+    DaemonSessionTemplateContextInput, DaemonSessionTemplateRequest, DaemonSpawnTarget,
+    DaemonSpawnTargetValidation, DaemonStatus, DaemonUiTreeSnapshot, FEATURE_PLUGIN_SURFACE_ACTION,
+    FEATURE_PLUGIN_SURFACE_RENDER, PROTOCOL, read_frame, read_frame_from_reader, write_frame,
 };
 use serde_json::Value;
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
@@ -66,6 +66,9 @@ use crate::{
     SessionTemplateRequest, resolve_foreground_launch_contract,
 };
 use crate::{EntrypointProcessSnapshot, EntrypointSupervisorError};
+use crate::{
+    SpawnTarget, SpawnTargetCreate, SpawnTargetError, SpawnTargetUpdate, SpawnTargetValidation,
+};
 
 const MESSAGE_CONTENT_TYPE: &str = "application/vnd.botster.coordination.message+text";
 const WEBRTC_SIGNAL_OPERATION: &str = "local_webrtc_signal";
@@ -285,6 +288,7 @@ fn handle_control_message(
             .or_else(|error| match error {
                 DaemonTransportError::Client(error) => Ok(daemon_operator_error(error)),
                 DaemonTransportError::Package(error) => Ok(daemon_package_error(error)),
+                DaemonTransportError::SpawnTarget(error) => Ok(daemon_spawn_target_error(error)),
                 DaemonTransportError::State(error) => Ok(daemon_state_error(error)),
                 DaemonTransportError::Entrypoint(error) => Ok(daemon_entrypoint_error(error)),
                 DaemonTransportError::LocalWebrtc(error) => Ok(daemon_local_webrtc_error(error)),
@@ -355,6 +359,65 @@ fn handle_control_request(
 ) -> DaemonTransportResult<DaemonResponse> {
     match request {
         DaemonRequest::ListApps => list_apps_response(daemon),
+        DaemonRequest::ListSpawnTargets => list_spawn_targets_response(daemon),
+        DaemonRequest::ShowSpawnTarget { target_id } => {
+            show_spawn_target_response(daemon, &target_id)
+        }
+        DaemonRequest::CreateSpawnTarget {
+            target_id,
+            label,
+            root,
+            enabled,
+            kind,
+            metadata,
+        } => mutate_spawn_targets_response(daemon, |targets| {
+            crate::create_spawn_target(
+                targets,
+                SpawnTargetCreate {
+                    target_id,
+                    label,
+                    root,
+                    enabled,
+                    kind,
+                    metadata,
+                },
+            )
+        }),
+        DaemonRequest::UpdateSpawnTarget {
+            target_id,
+            label,
+            root,
+            enabled,
+            kind,
+            metadata,
+        } => mutate_spawn_targets_response(daemon, |targets| {
+            crate::update_spawn_target(
+                targets,
+                &target_id,
+                SpawnTargetUpdate {
+                    label,
+                    root,
+                    enabled,
+                    kind,
+                    metadata,
+                },
+            )
+        }),
+        DaemonRequest::DeleteSpawnTarget { target_id } => {
+            mutate_spawn_targets_response(daemon, |targets| {
+                crate::delete_spawn_target(targets, &target_id)
+            })
+        }
+        DaemonRequest::ValidateSpawnTarget { target_id } => Ok(daemon_spawn_target_validation(
+            crate::validate_spawn_target(
+                &daemon
+                    .runtime()
+                    .ok_or(DaemonTransportError::DaemonNotRunning)?
+                    .state()
+                    .spawn_targets,
+                &target_id,
+            ),
+        )),
         DaemonRequest::ResolveAppLaunch {
             package_name,
             entrypoint_id,
@@ -1154,6 +1217,8 @@ fn handle_runtime_control_request(
             session_templates: Vec::new(),
             resolved_session_template: None,
             session_context: None,
+            spawn_targets: Vec::new(),
+            spawn_target_validation: None,
             apps: Vec::new(),
             resolved_app_launch: None,
             resolved_package_route: None,
@@ -1183,6 +1248,12 @@ fn handle_runtime_control_request(
         | DaemonRequest::ResolvePackageRoute { .. }
         | DaemonRequest::ListPackageNavigation
         | DaemonRequest::ListPackages
+        | DaemonRequest::ListSpawnTargets
+        | DaemonRequest::ShowSpawnTarget { .. }
+        | DaemonRequest::CreateSpawnTarget { .. }
+        | DaemonRequest::UpdateSpawnTarget { .. }
+        | DaemonRequest::DeleteSpawnTarget { .. }
+        | DaemonRequest::ValidateSpawnTarget { .. }
         | DaemonRequest::ListAvailablePackages { .. }
         | DaemonRequest::InspectAvailablePackage { .. }
         | DaemonRequest::PreviewPackageInstall { .. }
@@ -2315,6 +2386,27 @@ fn persist_package_registry(daemon: &HubDaemon) -> DaemonTransportResult<()> {
     Ok(())
 }
 
+fn persist_spawn_targets(
+    daemon: &mut HubDaemon,
+    update: impl FnOnce(&mut Vec<SpawnTarget>) -> crate::SpawnTargetResult<SpawnTarget>,
+) -> DaemonTransportResult<SpawnTarget> {
+    let runtime = daemon
+        .runtime()
+        .ok_or(DaemonTransportError::DaemonNotRunning)?;
+    let config = runtime.config().clone();
+    let store = FileHubStateStore::for_data_directory(&config.data_directory);
+    let mut changed = None;
+    let state = store.update(&config, |state| {
+        let target = update(&mut state.spawn_targets);
+        changed = Some(target);
+    })?;
+    let target = changed
+        .expect("spawn target update closure always runs")
+        .map_err(DaemonTransportError::SpawnTarget)?;
+    daemon.replace_state(state);
+    Ok(target)
+}
+
 fn events_response(body: HubClientResponseBody) -> DaemonTransportResult<DaemonResponse> {
     let HubClientResponseBody::Events(events) = body else {
         return Err(DaemonTransportError::UnexpectedResponse);
@@ -2571,6 +2663,8 @@ fn daemon_response_base(kind: DaemonResponseKind) -> DaemonResponse {
         session_templates: Vec::new(),
         resolved_session_template: None,
         session_context: None,
+        spawn_targets: Vec::new(),
+        spawn_target_validation: None,
         apps: Vec::new(),
         resolved_app_launch: None,
         resolved_package_route: None,
@@ -2683,6 +2777,63 @@ fn daemon_session_context(context: crate::HubSessionContext) -> DaemonResponse {
         values: context.values,
     });
     response
+}
+
+fn daemon_spawn_targets(targets: Vec<SpawnTarget>) -> DaemonResponse {
+    let mut response = daemon_response_base(DaemonResponseKind::SpawnTargets);
+    response.spawn_targets = targets.into_iter().map(daemon_spawn_target).collect();
+    response
+}
+
+fn daemon_spawn_target_validation(validation: SpawnTargetValidation) -> DaemonResponse {
+    let mut response = daemon_response_base(DaemonResponseKind::SpawnTargetValidation);
+    response.spawn_target_validation = Some(DaemonSpawnTargetValidation {
+        target_id: validation.target_id,
+        ok: validation.ok,
+        status: validation.status,
+    });
+    response
+}
+
+fn list_spawn_targets_response(daemon: &mut HubDaemon) -> DaemonTransportResult<DaemonResponse> {
+    let runtime = daemon
+        .runtime()
+        .ok_or(DaemonTransportError::DaemonNotRunning)?;
+    Ok(daemon_spawn_targets(crate::list_spawn_targets(
+        &runtime.state().spawn_targets,
+    )))
+}
+
+fn show_spawn_target_response(
+    daemon: &mut HubDaemon,
+    target_id: &str,
+) -> DaemonTransportResult<DaemonResponse> {
+    let runtime = daemon
+        .runtime()
+        .ok_or(DaemonTransportError::DaemonNotRunning)?;
+    Ok(daemon_spawn_targets(vec![crate::show_spawn_target(
+        &runtime.state().spawn_targets,
+        target_id,
+    )?]))
+}
+
+fn mutate_spawn_targets_response(
+    daemon: &mut HubDaemon,
+    update: impl FnOnce(&mut Vec<SpawnTarget>) -> crate::SpawnTargetResult<SpawnTarget>,
+) -> DaemonTransportResult<DaemonResponse> {
+    let target = persist_spawn_targets(daemon, update)?;
+    Ok(daemon_spawn_targets(vec![target]))
+}
+
+fn daemon_spawn_target(target: SpawnTarget) -> DaemonSpawnTarget {
+    DaemonSpawnTarget {
+        target_id: target.target_id,
+        label: target.label,
+        root: target.root,
+        enabled: target.enabled,
+        kind: target.kind,
+        metadata: target.metadata,
+    }
 }
 
 fn daemon_session_template_from_client(
@@ -2891,6 +3042,18 @@ fn daemon_package_error(error: crate::PackageRegistryError) -> DaemonResponse {
     if let Some(error) = &response.error {
         response.diagnostics = error.diagnostics.clone();
     }
+    response
+}
+
+fn daemon_spawn_target_error(error: SpawnTargetError) -> DaemonResponse {
+    let mut response = daemon_response_base(DaemonResponseKind::OperatorError);
+    response.error = Some(DaemonOperatorError {
+        code: error.kind.to_string(),
+        request_id: "daemon-spawn-targets".to_string(),
+        operation: "spawn_targets".to_string(),
+        message: error.message,
+        diagnostics: Vec::new(),
+    });
     response
 }
 
@@ -4676,6 +4839,7 @@ pub enum DaemonTransportError {
     Daemon(crate::HubDaemonError),
     Client(crate::HubClientError),
     Package(crate::PackageRegistryError),
+    SpawnTarget(SpawnTargetError),
     State(crate::HubStateStoreError),
     Entrypoint(EntrypointSupervisorError),
     LocalWebrtc(crate::LocalWebrtcError),
@@ -4700,6 +4864,7 @@ impl fmt::Display for DaemonTransportError {
             Self::Daemon(error) => write!(formatter, "{error}"),
             Self::Client(error) => write!(formatter, "{error:?}"),
             Self::Package(error) => write!(formatter, "{error:?}"),
+            Self::SpawnTarget(error) => write!(formatter, "{error}"),
             Self::State(error) => write!(formatter, "{error}"),
             Self::Entrypoint(error) => write!(formatter, "{error:?}"),
             Self::LocalWebrtc(error) => write!(formatter, "{error}"),
@@ -4717,6 +4882,7 @@ impl Error for DaemonTransportError {
             Self::Compatibility(error) => Some(error),
             Self::Daemon(error) => Some(error),
             Self::LocalWebrtc(error) => Some(error),
+            Self::SpawnTarget(error) => Some(error),
             Self::State(error) => Some(error),
             _ => None,
         }
@@ -4754,6 +4920,12 @@ impl From<crate::HubClientError> for DaemonTransportError {
 impl From<crate::PackageRegistryError> for DaemonTransportError {
     fn from(error: crate::PackageRegistryError) -> Self {
         Self::Package(error)
+    }
+}
+
+impl From<SpawnTargetError> for DaemonTransportError {
+    fn from(error: SpawnTargetError) -> Self {
+        Self::SpawnTarget(error)
     }
 }
 

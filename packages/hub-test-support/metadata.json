@@ -3,12 +3,12 @@
   "package_version": "0.1.1",
   "protocol": "botster-hub-daemon-v1",
   "protocol_version": 1,
-  "conformance_fixture_revision": 4,
+  "conformance_fixture_revision": 5,
   "generated_by": "cargo run -p botster-hub-test-support --example node_package_assets",
   "daemon_protocol": {
     "artifact_path": "daemon-protocol.ts",
     "source_artifact_path": "crates/botster-hub-client/generated/daemon-protocol.ts",
-    "sha256": "d9103b3990300dd5aebdaa64b81ee0e7a2ba72ab604a47963f42d7d9e7213a6f"
+    "sha256": "b5e24a4dba621b08c35b5924037926711b15c8a0d765d1c313586755667fc2a9"
   },
   "plugin_contract_matrix": {
     "package_name": "botster.plugin-contract-matrix",

@@ -45,6 +45,7 @@ pub mod persistence;
 pub mod profile;
 pub mod runtime;
 pub mod session_templates;
+pub mod spawn_targets;
 
 use botster_core::CapabilitySurface;
 pub use botster_core::{
@@ -97,9 +98,9 @@ pub use daemon_transport::{
     DaemonPackageWorkingDirectory, DaemonPluginLifecycle, DaemonRequest, DaemonResolvedAppLaunch,
     DaemonResolvedSessionTemplate, DaemonResponse, DaemonResponseKind, DaemonSession,
     DaemonSessionCleanup, DaemonSessionContext, DaemonSessionTemplate,
-    DaemonSessionTemplateContextInput, DaemonSessionTemplateRequest, DaemonStatus,
-    DaemonTransportError, DaemonTransportResult, request as daemon_transport_request, serve_daemon,
-    stream_attach,
+    DaemonSessionTemplateContextInput, DaemonSessionTemplateRequest, DaemonSpawnTarget,
+    DaemonSpawnTargetValidation, DaemonStatus, DaemonTransportError, DaemonTransportResult,
+    request as daemon_transport_request, serve_daemon, stream_attach,
 };
 pub use entrypoint_supervisor::{
     EntrypointDiagnostic, EntrypointProcessSnapshot, EntrypointSupervisor,
@@ -131,11 +132,10 @@ pub use packages::{
     resolve_foreground_launch_contract,
 };
 pub use persistence::{
-    AdmittedSessionTemplateTarget, BootstrapGrantRecord, CapabilityGrantRecord,
-    CredentialKeyReference, DeviceSessionTemplateSource, FileHubStateStore, HubAuditEntry,
-    HubState, HubStateError, HubStateResult, HubStateStore, HubStateStoreError,
-    HubStateStoreResult, LocalRuntimeSettings, PackageAdmissionDecision, SchemaMetadata,
-    TrustedBrowserIdentity,
+    BootstrapGrantRecord, CapabilityGrantRecord, CredentialKeyReference,
+    DeviceSessionTemplateSource, FileHubStateStore, HubAuditEntry, HubState, HubStateError,
+    HubStateResult, HubStateStore, HubStateStoreError, HubStateStoreResult, LocalRuntimeSettings,
+    PackageAdmissionDecision, SchemaMetadata, TrustedBrowserIdentity,
 };
 pub use profile::{
     CoreRuntimeRole, HostProfileManifest, HostProfileTrust, PolicyArea, Responsibility,
@@ -149,6 +149,11 @@ pub use session_templates::{
     HubSessionContext, HubSessionTemplate, MaterializedSessionTemplate, PackageSessionTemplate,
     PackageSessionTemplateWorkingDirectory, ResolvedSessionTemplate, SessionTemplateContextInput,
     SessionTemplateError, SessionTemplateRequest,
+};
+pub use spawn_targets::{
+    SpawnTarget, SpawnTargetCreate, SpawnTargetError, SpawnTargetResult, SpawnTargetUpdate,
+    SpawnTargetValidation, create_spawn_target, delete_spawn_target, list_spawn_targets,
+    show_spawn_target, update_spawn_target, validate_spawn_target,
 };
 
 /// Compile-checked description of the profile plus the audited `HubRuntime` facade.
