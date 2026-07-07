@@ -84,6 +84,14 @@ The initial capability helper is:
   template_id, context_id, context_keys }`. Those fields are produced by the
   materialized template and core spawn outcome. Policy and runtime failures
   raise Lua runtime errors rather than returning placeholder diagnostics fields.
+- `botster.capabilities.spawn_targets.list()`: returns sanitized hub-owned spawn
+  target rows visible to plugins. Plugins receive ids, labels, enabled state,
+  kind, root, and sanitized metadata, but they do not own or mutate the
+  registry.
+- `botster.capabilities.spawn_targets.validate({ target_id = "..." })`: returns
+  `{ target_id = "...", ok = boolean, status = "ok"|"disabled"|"not_found" }`.
+  Disabled targets exist but are unavailable for plugin references, so
+  validation returns `ok = false` with `status = "disabled"`.
 
 `plugin_db` helpers always use the loaded plugin key as the namespace; Lua code
 cannot select another plugin's namespace. Mutating helpers submit to
@@ -101,6 +109,10 @@ execution data, or caller-supplied lifecycle time; direct process spawning
 remains unsupported from Lua. Hub plugin invocations use a 30s timeout for this
 helper path, and the hub cleans up spawned sessions if the worker result cannot
 be delivered.
+
+`spawn_targets` is intentionally read-only in Lua. Create, update, and delete
+are daemon/CLI operator responsibilities; exposing mutation helpers to plugin
+workers would let plugins admit local host paths without the hub operator path.
 
 ## Coordination Access
 

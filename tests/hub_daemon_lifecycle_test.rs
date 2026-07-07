@@ -21,10 +21,10 @@ use botster_core::{
 };
 use botster_core_daemon::{RegistryRecord, SessionRegistry};
 use botster_hub::{
-    AdmittedSessionTemplateTarget, DataDirectoryOption, FileHubStateStore, HostIdentityOptions,
-    HubClientApi, HubClientEvent, HubClientRequest, HubClientResponseBody, HubDaemon,
-    HubDaemonState, HubStartupOptions, HubStateLoadSource, HubStateStore, PackageAdmissionPolicy,
-    PackageProvenance, PackageRegistry, RuntimeEnvironment, SessionDefaults, TransportBindings,
+    DataDirectoryOption, FileHubStateStore, HostIdentityOptions, HubClientApi, HubClientEvent,
+    HubClientRequest, HubClientResponseBody, HubDaemon, HubDaemonState, HubStartupOptions,
+    HubStateLoadSource, HubStateStore, PackageAdmissionPolicy, PackageProvenance, PackageRegistry,
+    RuntimeEnvironment, SessionDefaults, SpawnTarget, TransportBindings,
 };
 use webrtc::data_channel::{DataChannel, DataChannelEvent, RTCDataChannelInit};
 use webrtc::peer_connection::{
@@ -7932,6 +7932,147 @@ fn daemon_spawns_session_template_and_script_reads_botster_context() {
 }
 
 #[test]
+fn daemon_spawn_target_crud_persists_plain_non_git_directory_and_cli_lists_it() {
+    let _guard = daemon_test_lock().lock().expect("daemon test lock");
+    let data_dir = unique_short_test_dir("spawn-target-crud");
+    let target_root = unique_short_test_dir("plain-target");
+    fs::create_dir_all(&target_root).expect("create plain target root");
+    assert!(
+        !target_root.join(".git").exists(),
+        "test target intentionally has no git metadata"
+    );
+    let config = explicit_config(&data_dir);
+    let child = start_cli_daemon(&data_dir);
+
+    let created = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::CreateSpawnTarget {
+            target_id: Some("tgt_plain_directory".to_string()),
+            label: Some("Plain Directory".to_string()),
+            root: target_root.clone(),
+            enabled: true,
+            kind: Some("directory".to_string()),
+            metadata: BTreeMap::new(),
+        },
+    )
+    .expect("create spawn target through daemon");
+    assert_eq!(created.kind, botster_hub::DaemonResponseKind::SpawnTargets);
+    assert_eq!(created.spawn_targets[0].target_id, "tgt_plain_directory");
+    assert!(created.spawn_targets[0].enabled);
+
+    let listed = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::ListSpawnTargets,
+    )
+    .expect("list spawn targets through daemon");
+    assert_eq!(listed.spawn_targets.len(), 1);
+    assert_eq!(
+        listed.spawn_targets[0].root,
+        fs::canonicalize(&target_root).expect("canonical target root")
+    );
+
+    let cli_list = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("spawn-targets")
+        .arg("list")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .output()
+        .expect("run spawn-targets list cli");
+    assert!(
+        cli_list.status.success(),
+        "spawn-targets list failed: {}",
+        String::from_utf8_lossy(&cli_list.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&cli_list.stdout);
+    assert!(stdout.contains("response=spawn_targets"));
+    assert!(stdout.contains("id=tgt_plain_directory"));
+
+    let validation = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::ValidateSpawnTarget {
+            target_id: "tgt_plain_directory".to_string(),
+        },
+    )
+    .expect("validate enabled target")
+    .spawn_target_validation
+    .expect("validation response");
+    assert!(validation.ok);
+    assert_eq!(validation.status, "ok");
+
+    let disabled = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::UpdateSpawnTarget {
+            target_id: "tgt_plain_directory".to_string(),
+            label: Some("Plain Directory Disabled".to_string()),
+            root: None,
+            enabled: Some(false),
+            kind: None,
+            metadata: None,
+        },
+    )
+    .expect("disable target");
+    assert!(!disabled.spawn_targets[0].enabled);
+    let validation = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::ValidateSpawnTarget {
+            target_id: "tgt_plain_directory".to_string(),
+        },
+    )
+    .expect("validate disabled target")
+    .spawn_target_validation
+    .expect("validation response");
+    assert!(!validation.ok);
+    assert_eq!(validation.status, "disabled");
+
+    let enabled = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::UpdateSpawnTarget {
+            target_id: "tgt_plain_directory".to_string(),
+            label: None,
+            root: None,
+            enabled: Some(true),
+            kind: None,
+            metadata: None,
+        },
+    )
+    .expect("re-enable target");
+    assert!(enabled.spawn_targets[0].enabled);
+
+    shutdown_cli_daemon(&data_dir, child);
+    let restarted = start_cli_daemon(&data_dir);
+    let reloaded = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::ShowSpawnTarget {
+            target_id: "tgt_plain_directory".to_string(),
+        },
+    )
+    .expect("show reloaded target");
+    assert_eq!(reloaded.spawn_targets.len(), 1);
+    assert_eq!(reloaded.spawn_targets[0].label, "Plain Directory Disabled");
+
+    let deleted = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::DeleteSpawnTarget {
+            target_id: "tgt_plain_directory".to_string(),
+        },
+    )
+    .expect("delete target");
+    assert_eq!(deleted.spawn_targets[0].target_id, "tgt_plain_directory");
+    let validation = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::ValidateSpawnTarget {
+            target_id: "tgt_plain_directory".to_string(),
+        },
+    )
+    .expect("validate deleted target")
+    .spawn_target_validation
+    .expect("validation response");
+    assert!(!validation.ok);
+    assert_eq!(validation.status, "not_found");
+    shutdown_cli_daemon(&data_dir, restarted);
+}
+
+#[test]
 fn daemon_spawns_repo_local_session_template_after_state_reload() {
     let _guard = daemon_test_lock()
         .lock()
@@ -7973,10 +8114,13 @@ fn daemon_spawns_repo_local_session_template_after_state_reload() {
     let store = FileHubStateStore::for_data_directory(&config.data_directory);
     store
         .update(&config, |state| {
-            state.admitted_session_template_targets = vec![AdmittedSessionTemplateTarget {
+            state.spawn_targets = vec![SpawnTarget {
                 target_id: "repo:dogfood".to_string(),
+                label: "Repo Dogfood".to_string(),
                 root: repo_root.clone(),
                 enabled: true,
+                kind: "directory".to_string(),
+                metadata: BTreeMap::new(),
             }];
         })
         .expect("persist admitted repo target before daemon start");

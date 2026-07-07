@@ -44,6 +44,7 @@ use crate::persistence::{FileHubStateStore, HubState, HubStateStore, HubStateSto
 use crate::session_templates::{
     HubSessionContext, SessionTemplateRequest, materialize_session_template,
 };
+use crate::spawn_targets::SpawnTarget;
 
 /// Hub-owned adapter and policy facade over the default local core engine.
 ///
@@ -58,6 +59,7 @@ pub struct HubRuntime {
     reconciliation: HubSessionReconciliation,
     plugin_lifecycle: HubPluginLifecycle,
     capability_runtime: SharedHubCapabilityRuntime,
+    spawn_targets: SharedSpawnTargets,
     session_template_spawner: SharedSessionTemplateSpawner,
     // HubRuntime owns coordination routing so native MCP tools and Lua plugin
     // helpers share one route table from the plugin invocation path.
@@ -72,6 +74,8 @@ const SESSION_TEMPLATE_SPAWN_TIMEOUT_MS: u64 = 30_000;
 
 /// Shared hub-owned session-template spawn bridge exposed to Lua plugin workers.
 pub type SharedSessionTemplateSpawner = Arc<HubSessionTemplateSpawner>;
+/// Shared hub-owned spawn-target projection exposed to Lua plugin workers.
+pub type SharedSpawnTargets = Arc<Mutex<Vec<SpawnTarget>>>;
 
 /// Hub-owned policy bridge for plugin-safe session-template spawns.
 pub struct HubSessionTemplateSpawner {
@@ -117,6 +121,7 @@ impl HubRuntime {
         let core_daemon = Mutex::new(CoreDaemon::new(core_config));
         Self {
             capability_runtime: Arc::new(Mutex::new(HubCapabilityRuntime::from_config(&config))),
+            spawn_targets: Arc::new(Mutex::new(state.spawn_targets.clone())),
             session_template_spawner: Arc::new(HubSessionTemplateSpawner::new()),
             routed_envelopes,
             config,
@@ -173,6 +178,7 @@ impl HubRuntime {
         let core_daemon = Mutex::new(CoreDaemon::new(core_config));
         let mut runtime = Self {
             capability_runtime: Arc::new(Mutex::new(HubCapabilityRuntime::from_config(&config))),
+            spawn_targets: Arc::new(Mutex::new(state.spawn_targets.clone())),
             session_template_spawner: Arc::new(HubSessionTemplateSpawner::new()),
             routed_envelopes,
             config,
@@ -221,6 +227,20 @@ impl HubRuntime {
         &self.state
     }
 
+    /// Replace durable hub state after an owner-thread mutation.
+    pub fn replace_state(&mut self, state: HubState) {
+        if let Ok(mut spawn_targets) = self.spawn_targets.lock() {
+            *spawn_targets = state.spawn_targets.clone();
+        }
+        self.state = state;
+    }
+
+    /// Return the shared spawn-target projection used by Lua helpers.
+    #[must_use]
+    pub fn spawn_targets(&self) -> SharedSpawnTargets {
+        self.spawn_targets.clone()
+    }
+
     /// Return the startup reconciliation decisions made against the core daemon registry.
     #[must_use]
     pub const fn reconciliation(&self) -> &HubSessionReconciliation {
@@ -257,6 +277,7 @@ impl HubRuntime {
             self.capability_runtime.clone(),
             self.routed_envelopes.clone(),
             self.session_template_spawner.clone(),
+            self.spawn_targets.clone(),
             registry.packages().into_iter().cloned().collect(),
         )
         .map_err(HubLuaPluginLoadError::Lua)?;
@@ -284,6 +305,7 @@ impl HubRuntime {
             self.capability_runtime.clone(),
             self.routed_envelopes.clone(),
             self.session_template_spawner.clone(),
+            self.spawn_targets.clone(),
             registry.packages().into_iter().cloned().collect(),
         )
         .map_err(HubLuaPluginLoadError::Lua)?;
