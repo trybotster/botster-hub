@@ -121,6 +121,14 @@ impl HubDaemon {
         self.runtime.as_mut()
     }
 
+    /// Replace durable hub state after an owner-thread mutation.
+    pub fn replace_state(&mut self, state: HubState) {
+        if let Some(runtime) = self.runtime.as_mut() {
+            runtime.replace_state(state.clone());
+        }
+        self.state = state;
+    }
+
     /// Return the package registry restored for this daemon lifecycle.
     #[must_use]
     pub const fn package_registry(&self) -> &PackageRegistry {

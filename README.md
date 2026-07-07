@@ -889,9 +889,11 @@ Spawned scripts receive `BOTSTER_SESSION_ID`, `BOTSTER_CONTEXT_ID`,
 context with `"$BOTSTER_HUB_BIN" context --key prompt`.
 
 Template sources are layered by hub policy: package < device < repo < explicit
-request values. Device template sources and admitted repo target roots are
-durable fields in `hub-state.json`; the state schema stays additive within v1 so
-older files that omit those fields load with empty device/repo sources.
+request values. Device template sources and hub-owned spawn targets are durable
+fields in `hub-state.json`; the state schema stays additive within v1 so older
+files that omit those fields load with empty device/repo sources. Spawn targets
+replace the older admitted repo-template target list as the canonical source for
+repo-local template discovery.
 Repo-local templates are read only from admitted target roots at
 `.botster/session-templates.json`:
 
@@ -913,6 +915,13 @@ rediscovered on each list/show/resolve/spawn request, so changing the file does
 not require a daemon reload. Disabled or unadmitted targets contribute no repo
 templates, and the final command, cwd, and environment are still checked against
 the selected source root before core spawn.
+
+Hub-owned spawn targets are generic local directory admissions with stable
+`target_id`, label, root, enabled state, kind, and small sanitized metadata.
+They are hub policy state, not `botster-core` state. Plugins reference target
+ids and may list or validate them through Lua capabilities, while create,
+update, and delete stay on the daemon/CLI operator path. Git metadata is not
+required; a plain existing directory is a valid spawn target.
 
 Git-source manifests use the same core shape. The registry can persist the Git
 URL/reference, provenance, pin revision/checksum, compatibility result, trust

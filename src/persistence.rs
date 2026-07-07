@@ -22,6 +22,7 @@ use crate::config::{
 use crate::credentials::{CredentialKeyPurpose, CredentialProviderKind};
 use crate::packages::PackageRegistrySnapshot;
 use crate::session_templates::PackageSessionTemplate;
+use crate::spawn_targets::SpawnTarget;
 
 const HUB_STATE_SCHEMA_VERSION: u16 = 1;
 const HUB_STATE_FILE_NAME: &str = "hub-state.json";
@@ -52,9 +53,9 @@ pub struct HubState {
     /// Device-owned session template sources persisted by the hub profile.
     #[serde(default)]
     pub device_session_template_sources: Vec<DeviceSessionTemplateSource>,
-    /// Admitted repo roots that may contribute repo-local session templates.
-    #[serde(default)]
-    pub admitted_session_template_targets: Vec<AdmittedSessionTemplateTarget>,
+    /// Hub-owned spawn targets admitted for client/plugin references.
+    #[serde(default, alias = "admitted_session_template_targets")]
+    pub spawn_targets: Vec<SpawnTarget>,
     /// References to secret material held by the credential provider.
     #[serde(default)]
     pub credential_keys: Vec<CredentialKeyReference>,
@@ -84,7 +85,7 @@ impl HubState {
             schema: SchemaMetadata::v1(),
             package_registry: PackageRegistrySnapshot::empty(),
             device_session_template_sources: Vec::new(),
-            admitted_session_template_targets: Vec::new(),
+            spawn_targets: Vec::new(),
             credential_keys: Vec::new(),
             trusted_browser_identities: Vec::new(),
             bootstrap_grants: Vec::new(),
@@ -112,22 +113,6 @@ pub struct DeviceSessionTemplateSource {
     /// Device-owned template declarations.
     #[serde(default)]
     pub session_templates: Vec<PackageSessionTemplate>,
-}
-
-/// One admitted spawn target root that may contribute repo-local templates.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AdmittedSessionTemplateTarget {
-    /// Hub-owned target id that callers must request explicitly.
-    pub target_id: String,
-    /// Admitted repo/worktree root.
-    pub root: PathBuf,
-    /// Disabled targets are persisted for audit but do not contribute templates.
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-}
-
-const fn default_true() -> bool {
-    true
 }
 
 /// Reference to credential-provider-owned secret material.
@@ -615,7 +600,7 @@ mod tests {
         let mut value = serde_json::to_value(&state).expect("serialize state value");
         let object = value.as_object_mut().expect("state serializes as object");
         object.remove("device_session_template_sources");
-        object.remove("admitted_session_template_targets");
+        object.remove("spawn_targets");
         object.remove("credential_keys");
         object.remove("trusted_browser_identities");
         object.remove("bootstrap_grants");
@@ -631,7 +616,7 @@ mod tests {
             .expect("load legacy-shaped v1 state");
 
         assert!(reopened.device_session_template_sources.is_empty());
-        assert!(reopened.admitted_session_template_targets.is_empty());
+        assert!(reopened.spawn_targets.is_empty());
         assert!(reopened.credential_keys.is_empty());
         assert!(reopened.trusted_browser_identities.is_empty());
         assert!(reopened.bootstrap_grants.is_empty());
