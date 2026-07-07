@@ -285,6 +285,105 @@ return botster.register({
     policy.registry().clone()
 }
 
+fn install_plugin_db_probe_registry(name: &str) -> PackageRegistry {
+    let root = PathBuf::from("target")
+        .join("botster-hub-test-data")
+        .join("lua-runtime-packages")
+        .join(name);
+    let source_root = std::env::current_dir().expect("current dir").join(&root);
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).expect("create plugin-db probe package root");
+    fs::write(
+        root.join("plugin.lua"),
+        r#"
+local plugin_db = botster.capabilities.plugin_db
+
+return botster.register({
+  tools = {
+    {
+      name = "plugin_db_probe.missing_get",
+      description = "Read a missing plugin_db record through the production Lua helper.",
+      handler = "missing_get",
+      call = function()
+        local result = plugin_db.get({ key = "missing-state" })
+        return {
+          kind = result.kind,
+          record_is_nil = result.record == nil,
+          record_type = type(result.record),
+        }
+      end,
+    },
+    {
+      name = "plugin_db_probe.successful_get",
+      description = "Write then read a plugin_db record through the production Lua helper.",
+      handler = "successful_get",
+      call = function()
+        plugin_db.set({
+          key = "state",
+          schema_version = 1,
+          payload = { count = 2, label = "stored" },
+        })
+        local result = plugin_db.get({ key = "state" })
+        return {
+          kind = result.kind,
+          record_payload = result.record.payload,
+          record_revision = result.record.revision,
+        }
+      end,
+    },
+    {
+      name = "plugin_db_probe.missing_writes",
+      description = "Prove missing patch and delete still raise runtime errors.",
+      handler = "missing_writes",
+      call = function()
+        local patch_ok, patch_error = pcall(plugin_db.patch, {
+          key = "missing-state",
+          patch = { archived = true },
+        })
+        local delete_ok, delete_error = pcall(plugin_db.delete, {
+          key = "missing-state",
+        })
+        return {
+          patch_ok = patch_ok,
+          patch_error = tostring(patch_error),
+          delete_ok = delete_ok,
+          delete_error = tostring(delete_error),
+        }
+      end,
+    },
+  },
+})
+"#,
+    )
+    .expect("write plugin-db probe plugin");
+    fs::write(
+        root.join("botster-package.json"),
+        serde_json::json!({
+            "name": "botster-workspaces",
+            "version": "1.0.0",
+            "kind": "plugin",
+            "botster": ">=0.1.0",
+            "source": { "type": "path", "path": source_root.display().to_string() },
+            "capabilities": [
+                { "surface": "mcp" },
+                { "surface": "plugin_db", "scope": "botster-workspaces" }
+            ],
+            "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }]
+        })
+        .to_string(),
+    )
+    .expect("write plugin-db probe manifest");
+
+    let mut policy = default_package_policy();
+    policy
+        .install_local_path(&root, "install plugin-db probe lua package")
+        .expect("install plugin-db probe package");
+    policy
+        .enable("botster-workspaces", "enable plugin-db probe package")
+        .expect("enable plugin-db probe package");
+    policy.registry().clone()
+}
+
 fn invocation(handler: PluginHandlerRef, payload: serde_json::Value) -> PluginInvocationRequest {
     PluginInvocationRequest {
         request_id: RequestId("lua-runtime-invoke".to_string()),
@@ -300,6 +399,69 @@ fn invocation(handler: PluginHandlerRef, payload: serde_json::Value) -> PluginIn
         },
         payload: BoundaryJson(payload),
     }
+}
+
+#[test]
+fn plugin_db_missing_get_returns_absent_record_shape_and_preserves_success_shape() {
+    let registry = install_plugin_db_probe_registry("plugin-db-missing-get");
+    let mut hub = explicit_runtime("plugin-db-missing-get");
+    hub.load_lua_plugin_package(&registry, "botster-workspaces")
+        .expect("load plugin-db probe package");
+
+    let missing = hub
+        .call_plugin_mcp_tool(botster_hub::McpCallRequest {
+            name: "plugin_db_probe.missing_get".to_string(),
+            arguments: serde_json::json!({}),
+        })
+        .expect("missing plugin_db.get should return absent data");
+
+    assert_eq!(missing["kind"], "record");
+    assert_eq!(missing["record_is_nil"], true);
+    assert_eq!(missing["record_type"], "nil");
+
+    let present = hub
+        .call_plugin_mcp_tool(botster_hub::McpCallRequest {
+            name: "plugin_db_probe.successful_get".to_string(),
+            arguments: serde_json::json!({}),
+        })
+        .expect("successful plugin_db.get should preserve record shape");
+
+    assert_eq!(present["kind"], "record");
+    assert_eq!(
+        present["record_payload"],
+        serde_json::json!({ "count": 2, "label": "stored" })
+    );
+    assert_eq!(present["record_revision"], 1);
+}
+
+#[test]
+fn plugin_db_missing_patch_and_delete_still_raise_runtime_errors() {
+    let registry = install_plugin_db_probe_registry("plugin-db-missing-writes");
+    let mut hub = explicit_runtime("plugin-db-missing-writes");
+    hub.load_lua_plugin_package(&registry, "botster-workspaces")
+        .expect("load plugin-db probe package");
+
+    let result = hub
+        .call_plugin_mcp_tool(botster_hub::McpCallRequest {
+            name: "plugin_db_probe.missing_writes".to_string(),
+            arguments: serde_json::json!({}),
+        })
+        .expect("missing patch/delete probe should return pcall results");
+
+    assert_eq!(result["patch_ok"], false);
+    assert!(
+        result["patch_error"]
+            .as_str()
+            .unwrap()
+            .contains("plugin_db operation failed: plugin-store record was not found")
+    );
+    assert_eq!(result["delete_ok"], false);
+    assert!(
+        result["delete_error"]
+            .as_str()
+            .unwrap()
+            .contains("plugin_db operation failed: plugin-store record was not found")
+    );
 }
 
 #[test]
