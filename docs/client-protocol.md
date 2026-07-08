@@ -624,6 +624,21 @@ tests that cannot depend on the Rust crate should mirror the stable JSON from
 assert the same event ordering and classification. `AttachState` and
 `ProcessExit` are metadata/control events, not terminal bytes to render.
 
+`DaemonEvent::WorktreeLifecycle` exposes hub-owned worktree CRUD lifecycle
+events to clients through the normal `DaemonResponse.events` field. The inner
+`DaemonWorktreeLifecycleEvent` carries `event`, optional `worktree_id`, optional
+`target_id`, optional `status`, optional `label`, optional relative
+`display_path`, and failure `failure_kind`/`message` fields. Current emitted
+event names are `worktree_created`, `worktree_create_failed`,
+`worktree_deleted`, and `worktree_delete_failed`. `worktree_deleted` is the
+canonical successful delete event because the hub deletes the record, not the
+filesystem directory.
+
+Worktree lifecycle events are sanitized. They do not include raw absolute
+worktree paths by default; clients that need trusted local paths should read the
+ordinary `DaemonWorktree.path` field from the worktree response DTO. There is no
+separate worktree entity family in this protocol revision.
+
 The fixture is a client conformance contract, not a replacement daemon harness.
 The live runtime path remains covered by
 `external_daemon_attach_replays_prior_history_with_renderable_byte_count`, which
@@ -635,6 +650,10 @@ increments `CONFORMANCE_FIXTURE_REVISION`. `PROTOCOL_VERSION` remains unchanged
 because the daemon framing and request/response protocol are the same; clients
 that depend on renderable history should require the current conformance fixture
 revision during the hello handshake.
+
+Adding `worktree_lifecycle` increments `CONFORMANCE_FIXTURE_REVISION`.
+`PROTOCOL_VERSION` remains unchanged because daemon framing and request issuance
+are unchanged.
 
 Do not reuse `botster_core::contract` session-worker protocol, session frame magic, `DefaultEngineCommand`, `TransportIngress`, or `BoundaryJson` for external clients. Those are not the client-to-hub protocol. The client crate also intentionally excludes hub runtime, Lua/plugin runtime, `ratatui`, `crossterm`, `mlua`, and core UI action/node types.
 
