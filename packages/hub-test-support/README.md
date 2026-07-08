@@ -13,11 +13,12 @@ node packages/hub-test-support/scripts/sync-assets.mjs
 ## Usage
 
 ```sh
-npm install --save-dev @trybotster/hub-test-support@0.1.1
+npm install --save-dev @trybotster/hub-test-support@0.1.2
 ```
 
 ```js
 import {
+  materializeApplicationPrimitivesFixture,
   materializePluginContractMatrixFixture,
   metadata,
   readDaemonProtocolTypescript,
@@ -25,8 +26,18 @@ import {
 
 const protocolSource = readDaemonProtocolTypescript();
 const fixturePath = materializePluginContractMatrixFixture(tempDirectory);
+const applicationPrimitivesPath = materializeApplicationPrimitivesFixture(tempDirectory);
+const applicationSurfaceId = metadata.application_primitives.surface_id;
+const rendererEntryPoint = metadata.application_primitives.renderer_entrypoint;
 
-console.log(metadata.protocol, metadata.conformance_fixture_revision, fixturePath);
+console.log(
+  metadata.protocol,
+  metadata.conformance_fixture_revision,
+  fixturePath,
+  applicationPrimitivesPath,
+  applicationSurfaceId,
+  rendererEntryPoint,
+);
 ```
 
 Use this exact package spec in npm-based client repos:
@@ -34,16 +45,30 @@ Use this exact package spec in npm-based client repos:
 ```json
 {
   "devDependencies": {
-    "@trybotster/hub-test-support": "0.1.1"
+    "@trybotster/hub-test-support": "0.1.2"
   }
 }
 ```
 
-`@trybotster/hub-test-support@0.1.1` is published to the public npm registry.
-No scoped `.npmrc` entry or CI auth token is required for install. Client repos
-should update their lockfile from that registry coordinate, then run a smoke
-that imports the package, reads the daemon protocol artifact, verifies package
-assets, and materializes the plugin contract matrix fixture.
+When `@trybotster/hub-test-support@0.1.2` is published to the public npm
+registry, no scoped `.npmrc` entry or CI auth token is required for install.
+If the registry does not have `0.1.2` yet, install the packed tarball produced
+by `npm pack` from this package directory with a `file:` dependency until the
+registry publish is available.
+
+Botster web and TUI renderers should consume
+`metadata.application_primitives.surface_id` (`contract.app`) and render
+`metadata.application_primitives.renderer_entrypoint` (`ui_tree_snapshot.body`).
+The current core-validated primitive inventory is exposed as
+`metadata.application_primitives.primitive_kinds`: `button`, `empty_state`,
+`metric`, `metric_grid`, `panel`, `section`, `status_badge`, `table`, and
+`toolbar`. The current core contract fixture does not include `list`, `form`,
+or an `action_bar` alias; downstream clients should not invent those shapes.
+
+Client repos should update their lockfile from the registry coordinate or
+packed tarball, then run a smoke that imports the package, reads the daemon
+protocol artifact, calls `verifyPackageAssets()`, and materializes the
+application-primitives fixture.
 
 The normal consumer path is the declared npm dependency. Environment variables
 such as `BOTSTER_HUB_CLIENT_DAEMON_PROTOCOL` remain local override inputs for
