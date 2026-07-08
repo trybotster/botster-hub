@@ -12,8 +12,9 @@ use botster_core::{
 };
 use botster_hub::{
     DataDirectoryOption, HostIdentityOptions, HubClientApi, HubClientRequest,
-    HubClientResponseBody, HubRuntime, HubStartupOptions, LuaPluginRuntime, PackageRegistry,
-    RuntimeEnvironment, SessionDefaults, SpawnTarget, TransportBindings, default_package_policy,
+    HubClientResponseBody, HubRuntime, HubStartupOptions, LuaPluginHostApi, LuaPluginRuntime,
+    PackageRegistry, RuntimeEnvironment, SessionDefaults, SpawnTarget, TransportBindings, Worktree,
+    default_package_policy,
 };
 
 mod support;
@@ -282,6 +283,69 @@ return botster.register({
     policy
         .enable("spawn-target-reader.plugin", "enable spawn target reader")
         .expect("enable spawn target reader package");
+    policy.registry().clone()
+}
+
+fn install_worktree_reader_registry(name: &str) -> PackageRegistry {
+    let root = PathBuf::from("target")
+        .join("botster-hub-test-data")
+        .join("lua-runtime-packages")
+        .join(name);
+    let source_root = std::env::current_dir().expect("current dir").join(&root);
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).expect("create worktree package root");
+    fs::write(
+        root.join("plugin.lua"),
+        r#"
+return botster.register({
+  tools = {
+    {
+      name = "worktrees.inspect",
+      description = "Inspect hub-owned worktree capability shape.",
+      handler = "inspect",
+      call = function(args)
+        local worktrees = botster.capabilities.worktrees.list()
+        local shown = botster.capabilities.worktrees.show({ worktree_id = args.worktree_id })
+        local missing = botster.capabilities.worktrees.show({ worktree_id = "missing-worktree" })
+        return {
+          worktrees = worktrees,
+          shown = shown,
+          missing = missing,
+          mutation_methods = {
+            create = botster.capabilities.worktrees.create ~= nil,
+            update = botster.capabilities.worktrees.update ~= nil,
+            delete = botster.capabilities.worktrees.delete ~= nil,
+          },
+        }
+      end,
+    },
+  },
+})
+"#,
+    )
+    .expect("write worktree plugin");
+    fs::write(
+        root.join("botster-package.json"),
+        serde_json::json!({
+            "name": "worktree-reader.plugin",
+            "version": "1.0.0",
+            "kind": "plugin",
+            "botster": ">=0.1.0",
+            "source": { "type": "path", "path": source_root.display().to_string() },
+            "capabilities": [{ "surface": "mcp" }],
+            "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }]
+        })
+        .to_string(),
+    )
+    .expect("write worktree package manifest");
+
+    let mut policy = default_package_policy();
+    policy
+        .install_local_path(&root, "install worktree reader package")
+        .expect("install worktree reader package");
+    policy
+        .enable("worktree-reader.plugin", "enable worktree reader")
+        .expect("enable worktree reader package");
     policy.registry().clone()
 }
 
@@ -705,6 +769,109 @@ fn real_lua_plugin_lists_and_validates_spawn_targets_without_mutation_surface() 
 }
 
 #[test]
+fn real_lua_plugin_lists_and_shows_worktrees_without_mutation_surface() {
+    let registry = install_worktree_reader_registry("worktree-reader");
+    let mut hub = explicit_runtime("worktree-reader");
+    let target_root = PathBuf::from("target")
+        .join("botster-hub-test-data")
+        .join("lua-runtime")
+        .join("worktree-reader-target");
+    let worktree_path = target_root.join("plain");
+    fs::create_dir_all(&worktree_path).expect("create worktree path");
+    let mut state = hub.state().clone();
+    state.spawn_targets = vec![SpawnTarget {
+        target_id: "tgt_lua_worktrees".to_string(),
+        label: "Lua Worktrees".to_string(),
+        root: target_root,
+        enabled: true,
+        kind: "directory".to_string(),
+        metadata: BTreeMap::new(),
+    }];
+    state.worktrees = vec![Worktree {
+        worktree_id: "wt_lua_plain".to_string(),
+        target_id: "tgt_lua_worktrees".to_string(),
+        label: "Lua Plain".to_string(),
+        path: worktree_path,
+        status: "present".to_string(),
+        git: None,
+        metadata: BTreeMap::new(),
+    }];
+    hub.replace_state(state);
+    hub.load_lua_plugin_package(&registry, "worktree-reader.plugin")
+        .expect("load worktree reader plugin");
+
+    let result = hub
+        .call_plugin_mcp_tool(botster_hub::McpCallRequest {
+            name: "worktrees.inspect".to_string(),
+            arguments: serde_json::json!({ "worktree_id": "wt_lua_plain" }),
+        })
+        .expect("call worktree reader tool");
+
+    assert_eq!(
+        result["worktrees"].as_array().expect("worktree list").len(),
+        1
+    );
+    assert_eq!(result["worktrees"][0]["status"], "present");
+    assert_eq!(result["shown"]["ok"], true);
+    assert_eq!(result["shown"]["status"], "present");
+    assert_eq!(result["shown"]["worktree"]["worktree_id"], "wt_lua_plain");
+    assert_eq!(result["missing"]["ok"], false);
+    assert_eq!(result["missing"]["status"], "not_found");
+    assert_eq!(result["mutation_methods"]["create"], false);
+    assert_eq!(result["mutation_methods"]["update"], false);
+    assert_eq!(result["mutation_methods"]["delete"], false);
+}
+
+#[test]
+fn real_lua_plugin_observes_worktrees_added_after_plugin_load() {
+    let registry = install_worktree_reader_registry("worktree-live-refresh");
+    let mut hub = explicit_runtime("worktree-live-refresh");
+    let target_root = PathBuf::from("target")
+        .join("botster-hub-test-data")
+        .join("lua-runtime")
+        .join("worktree-live-refresh-target");
+    let worktree_path = target_root.join("late");
+    fs::create_dir_all(&worktree_path).expect("create late worktree path");
+    let mut state = hub.state().clone();
+    state.spawn_targets = vec![SpawnTarget {
+        target_id: "tgt_lua_worktrees".to_string(),
+        label: "Lua Worktrees".to_string(),
+        root: target_root,
+        enabled: true,
+        kind: "directory".to_string(),
+        metadata: BTreeMap::new(),
+    }];
+    hub.replace_state(state.clone());
+    hub.load_lua_plugin_package(&registry, "worktree-reader.plugin")
+        .expect("load worktree reader plugin");
+
+    state.worktrees = vec![Worktree {
+        worktree_id: "wt_lua_late".to_string(),
+        target_id: "tgt_lua_worktrees".to_string(),
+        label: "Lua Late".to_string(),
+        path: worktree_path,
+        status: "present".to_string(),
+        git: None,
+        metadata: BTreeMap::new(),
+    }];
+    hub.replace_state(state);
+
+    let result = hub
+        .call_plugin_mcp_tool(botster_hub::McpCallRequest {
+            name: "worktrees.inspect".to_string(),
+            arguments: serde_json::json!({ "worktree_id": "wt_lua_late" }),
+        })
+        .expect("call worktree reader tool after state refresh");
+
+    assert_eq!(
+        result["worktrees"].as_array().expect("worktree list").len(),
+        1
+    );
+    assert_eq!(result["shown"]["ok"], true);
+    assert_eq!(result["shown"]["worktree"]["worktree_id"], "wt_lua_late");
+}
+
+#[test]
 fn real_lua_plugin_reads_operator_config_and_redacted_secret_from_own_package_only() {
     let registry = configured_fixture_registry();
     let mut hub = explicit_runtime("configured-fixture");
@@ -1122,10 +1289,13 @@ fn reload_replaces_lua_tool_descriptors_and_removes_stale_handlers() {
             .package("reload.plugin")
             .expect("reload package")
             .configuration_view(),
-        hub.capability_runtime(),
-        hub.routed_envelope_runtime(),
-        hub.session_template_spawner(),
-        hub.spawn_targets(),
+        LuaPluginHostApi {
+            capabilities: hub.capability_runtime(),
+            routed_envelopes: hub.routed_envelope_runtime(),
+            session_templates: hub.session_template_spawner(),
+            spawn_targets: hub.spawn_targets(),
+            worktrees: hub.worktrees(),
+        },
         registry.packages().into_iter().cloned().collect(),
     )
     .expect("load new reload lua bundle");

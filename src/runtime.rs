@@ -36,7 +36,7 @@ use crate::lifecycle::{
     HubLifecycleResult, HubPluginLifecycle, HubPluginLifecycleStatus, HubPluginRuntimeBundle,
 };
 use crate::lua_runtime::{
-    LuaPluginRuntime, LuaPluginRuntimeError, SharedHubCapabilityRuntime,
+    LuaPluginHostApi, LuaPluginRuntime, LuaPluginRuntimeError, SharedHubCapabilityRuntime,
     SharedRoutedEnvelopeRuntime,
 };
 use crate::packages::{PackageRecord, PackageRegistry, PackageRegistryError, PackageState};
@@ -45,6 +45,7 @@ use crate::session_templates::{
     HubSessionContext, SessionTemplateRequest, materialize_session_template,
 };
 use crate::spawn_targets::SpawnTarget;
+use crate::worktrees::Worktree;
 
 /// Hub-owned adapter and policy facade over the default local core engine.
 ///
@@ -60,6 +61,7 @@ pub struct HubRuntime {
     plugin_lifecycle: HubPluginLifecycle,
     capability_runtime: SharedHubCapabilityRuntime,
     spawn_targets: SharedSpawnTargets,
+    worktrees: SharedWorktrees,
     session_template_spawner: SharedSessionTemplateSpawner,
     // HubRuntime owns coordination routing so native MCP tools and Lua plugin
     // helpers share one route table from the plugin invocation path.
@@ -77,6 +79,8 @@ const PLUGIN_EVENT_TIMEOUT_MS: u64 = 1_000;
 pub type SharedSessionTemplateSpawner = Arc<HubSessionTemplateSpawner>;
 /// Shared hub-owned spawn-target projection exposed to Lua plugin workers.
 pub type SharedSpawnTargets = Arc<Mutex<Vec<SpawnTarget>>>;
+/// Shared hub-owned worktree projection exposed to Lua plugin workers.
+pub type SharedWorktrees = Arc<Mutex<Vec<Worktree>>>;
 
 /// Hub-owned policy bridge for plugin-safe session-template spawns.
 pub struct HubSessionTemplateSpawner {
@@ -123,6 +127,7 @@ impl HubRuntime {
         Self {
             capability_runtime: Arc::new(Mutex::new(HubCapabilityRuntime::from_config(&config))),
             spawn_targets: Arc::new(Mutex::new(state.spawn_targets.clone())),
+            worktrees: Arc::new(Mutex::new(state.worktrees.clone())),
             session_template_spawner: Arc::new(HubSessionTemplateSpawner::new()),
             routed_envelopes,
             config,
@@ -180,6 +185,7 @@ impl HubRuntime {
         let mut runtime = Self {
             capability_runtime: Arc::new(Mutex::new(HubCapabilityRuntime::from_config(&config))),
             spawn_targets: Arc::new(Mutex::new(state.spawn_targets.clone())),
+            worktrees: Arc::new(Mutex::new(state.worktrees.clone())),
             session_template_spawner: Arc::new(HubSessionTemplateSpawner::new()),
             routed_envelopes,
             config,
@@ -233,6 +239,9 @@ impl HubRuntime {
         if let Ok(mut spawn_targets) = self.spawn_targets.lock() {
             *spawn_targets = state.spawn_targets.clone();
         }
+        if let Ok(mut worktrees) = self.worktrees.lock() {
+            *worktrees = state.worktrees.clone();
+        }
         self.state = state;
     }
 
@@ -240,6 +249,22 @@ impl HubRuntime {
     #[must_use]
     pub fn spawn_targets(&self) -> SharedSpawnTargets {
         self.spawn_targets.clone()
+    }
+
+    /// Return the shared worktree projection used by Lua helpers.
+    #[must_use]
+    pub fn worktrees(&self) -> SharedWorktrees {
+        self.worktrees.clone()
+    }
+
+    fn lua_plugin_host_api(&self) -> LuaPluginHostApi {
+        LuaPluginHostApi {
+            capabilities: self.capability_runtime.clone(),
+            routed_envelopes: self.routed_envelopes.clone(),
+            session_templates: self.session_template_spawner.clone(),
+            spawn_targets: self.spawn_targets.clone(),
+            worktrees: self.worktrees.clone(),
+        }
     }
 
     /// Return the startup reconciliation decisions made against the core daemon registry.
@@ -275,10 +300,7 @@ impl HubRuntime {
         let bundle = LuaPluginRuntime::load_prepared(
             &prepared,
             configuration,
-            self.capability_runtime.clone(),
-            self.routed_envelopes.clone(),
-            self.session_template_spawner.clone(),
-            self.spawn_targets.clone(),
+            self.lua_plugin_host_api(),
             registry.packages().into_iter().cloned().collect(),
         )
         .map_err(HubLuaPluginLoadError::Lua)?;
@@ -303,10 +325,7 @@ impl HubRuntime {
         let bundle = LuaPluginRuntime::load_prepared(
             &prepared,
             configuration,
-            self.capability_runtime.clone(),
-            self.routed_envelopes.clone(),
-            self.session_template_spawner.clone(),
-            self.spawn_targets.clone(),
+            self.lua_plugin_host_api(),
             registry.packages().into_iter().cloned().collect(),
         )
         .map_err(HubLuaPluginLoadError::Lua)?;

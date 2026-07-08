@@ -16,7 +16,7 @@
     {
       "id": "agent-step",
       "command": "bin/agent-step.sh",
-      "context": ["prompt", "ticket_id", "worktree_path", "metadata.request_id", "metadata.agent_name"]
+      "context": ["prompt", "ticket_id", "worktree_path", "metadata.request_id", "metadata.agent_name", "metadata.worktree_id"]
     }
   ],
   "dependencies": [
