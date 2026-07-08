@@ -22,21 +22,110 @@ local function app_surface(_arguments)
     id = "contract-app-panel",
     props = {
       title = "Plugin Contract Matrix",
+      density = "regular",
+      variant = "plain",
     },
     children = {
       {
-        type = "text",
-        id = "contract-app-summary",
+        type = "toolbar",
+        id = "contract-app-toolbar",
         props = {
-          text = "UiNode payload delivered through plugin_surface_render.",
+          label = "Contract actions",
+          density = "compact",
+          variant = "plain",
+        },
+        slots = {
+          actions = {
+            {
+              type = "button",
+              id = "contract-app-action",
+              props = {
+                label = "Run contract action",
+                action = {
+                  id = "contract.action",
+                },
+              },
+            },
+          },
         },
       },
       {
-        type = "button",
-        id = "contract-app-action",
+        type = "metric_grid",
+        id = "contract-app-metrics",
         props = {
-          label = "Run contract action",
-          action = "contract.action",
+          density = "compact",
+          variant = "subtle",
+          compact = true,
+        },
+        children = {
+          {
+            type = "metric",
+            id = "contract-app-render-metric",
+            props = {
+              label = "Render path",
+              value = "validated",
+              caption = "plugin_surface_render",
+              tone = "success",
+              status = "healthy",
+            },
+          },
+        },
+      },
+      {
+        type = "section",
+        id = "contract-app-section",
+        props = {
+          title = "Application primitives",
+          description = "Renderer-neutral UiNode application surface.",
+        },
+        children = {
+          {
+            type = "status_badge",
+            id = "contract-app-status",
+            props = {
+              label = "Validated",
+              status = "supported",
+              tone = "success",
+            },
+          },
+          {
+            type = "table",
+            id = "contract-app-table",
+            props = {
+              columns = {
+                {
+                  id = "primitive",
+                  label = "Primitive",
+                },
+                "status",
+              },
+              rows = {
+                {
+                  id = "contract-app-row-toolbar",
+                  cells = {
+                    primitive = "toolbar",
+                    status = "supported",
+                  },
+                },
+              },
+              empty_state = {
+                type = "empty_state",
+                id = "contract-app-table-empty",
+                props = {
+                  title = "No primitives",
+                  description = "The fixture did not publish primitive rows.",
+                },
+              },
+            },
+          },
+          {
+            type = "empty_state",
+            id = "contract-app-empty-state",
+            props = {
+              title = "No pending contracts",
+              description = "All required application primitives validated.",
+            },
+          },
         },
       },
     },
