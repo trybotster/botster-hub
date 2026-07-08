@@ -932,6 +932,23 @@ and reference the returned `worktree_id` rather than adding workflow fields to
 hub records. Worktree delete removes the hub record only and does not delete
 filesystem contents.
 
+Worktree CRUD emits client-visible `worktree_lifecycle` daemon events and
+worker-isolated Lua plugin events:
+
+```lua
+events.on("worktree_created", function(event)
+  -- Store workflow-specific associations in plugin state keyed by worktree id.
+  return { worktree_id = event.worktree_id, target_id = event.target_id }
+end)
+
+return botster.register({})
+```
+
+The stable event names are `worktree_created`, `worktree_create_failed`,
+`worktree_deleted`, and `worktree_delete_failed`. Lifecycle payloads include ids
+and sanitized metadata such as status, label, relative display path, and failure
+kind/message, but they do not include raw absolute worktree paths by default.
+
 Git-source manifests use the same core shape. The registry can persist the Git
 URL/reference, provenance, pin revision/checksum, compatibility result, trust
 classification, and enabled/admitted-capability state, but this ticket does not

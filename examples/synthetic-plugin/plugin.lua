@@ -1,4 +1,12 @@
 -- Local-only synthetic package fixture for the botster-hub dogfood proof.
+events.on("worktree_created", function(event)
+  return {
+    observed = "worktree_created",
+    worktree_id = event.worktree_id,
+    target_id = event.target_id,
+  }
+end)
+
 return botster.register({
   tools = {
     {

@@ -364,6 +364,20 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             ("body", "JsonValue"),
         ],
     );
+    emit_interface(
+        &mut output,
+        "DaemonWorktreeLifecycleEvent",
+        &[
+            ("event", "string"),
+            ("worktree_id?", "string | null"),
+            ("target_id?", "string | null"),
+            ("status?", "string | null"),
+            ("label?", "string | null"),
+            ("display_path?", "string | null"),
+            ("failure_kind?", "string | null"),
+            ("message?", "string | null"),
+        ],
+    );
     emit_string_union(
         &mut output,
         "DaemonResponseKind",
@@ -1094,6 +1108,10 @@ pub(crate) fn daemon_protocol_typescript() -> String {
                 ],
             ),
             ("runtime_observation", &[("kind", "string")]),
+            (
+                "worktree_lifecycle",
+                &[("event", "DaemonWorktreeLifecycleEvent")],
+            ),
         ],
     );
 

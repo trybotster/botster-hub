@@ -40,6 +40,43 @@ Supported registration fields:
 Handler ids are stable strings. Hub registries store descriptor bodies and
 handler refs, not Lua closure identities.
 
+## Rust-Emitted Events
+
+Plugins subscribe to hub-emitted lifecycle events with the injected `events`
+global:
+
+```lua
+events.on("worktree_created", function(event)
+  return {
+    worktree_id = event.worktree_id,
+    target_id = event.target_id,
+  }
+end)
+
+return botster.register({})
+```
+
+`events.on(name, fn)` is narrow sugar over an Event-kind handler registration.
+Handlers run through the normal plugin worker invocation path, so a failing
+callback does not roll back the hub operation that emitted the event. Event
+delivery is bounded and isolated, but it is synchronous with the emitting
+worktree CRUD request; a slow handler can add latency until the worker timeout.
+Event names match exactly.
+
+Worktree lifecycle events are emitted by hub-owned worktree CRUD:
+
+- `worktree_created`
+- `worktree_create_failed`
+- `worktree_deleted`
+- `worktree_delete_failed`
+
+Payloads include stable ids and sanitized metadata: `event`, optional
+`worktree_id`, optional `target_id`, optional `status`, optional `label`,
+optional relative `display_path`, and failure `failure_kind`/`message` when
+applicable. They do not include raw absolute worktree paths by default.
+`worktree_deleted` is the canonical successful delete event; the hub deletes the
+record and does not delete filesystem contents.
+
 ## Capability Access
 
 Lua has no ambient `os`, `io`, or `package` globals. Filesystem, network,

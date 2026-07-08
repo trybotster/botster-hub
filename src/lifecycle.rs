@@ -22,6 +22,7 @@ pub struct HubPluginLifecycle {
     engine: PluginWorkerEngine,
     loaded: Arc<Mutex<BTreeSet<String>>>,
     descriptors: Arc<Mutex<BTreeMap<String, Vec<PluginOwnedDescriptor>>>>,
+    event_handlers: Arc<Mutex<BTreeMap<String, Vec<HubPluginEventHandler>>>>,
 }
 
 impl HubPluginLifecycle {
@@ -32,6 +33,7 @@ impl HubPluginLifecycle {
             engine: PluginWorkerEngine::new(),
             loaded: Arc::new(Mutex::new(BTreeSet::new())),
             descriptors: Arc::new(Mutex::new(BTreeMap::new())),
+            event_handlers: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -45,6 +47,7 @@ impl HubPluginLifecycle {
         let record = enabled_record(registry, package_name)?;
         let plugin_key = plugin_key_for(record);
         let descriptors = bundle.descriptors.clone();
+        let event_handlers = bundle.event_handlers.clone();
         let registration = registration_for(record, plugin_key.clone(), bundle)?;
 
         self.engine.load_plugin(registration);
@@ -56,6 +59,10 @@ impl HubPluginLifecycle {
             .lock()
             .expect("hub plugin lifecycle descriptors lock")
             .insert(plugin_key.0.clone(), descriptors);
+        self.event_handlers
+            .lock()
+            .expect("hub plugin lifecycle event handlers lock")
+            .insert(plugin_key.0.clone(), event_handlers);
 
         Ok(plugin_key)
     }
@@ -77,6 +84,7 @@ impl HubPluginLifecycle {
         let record = enabled_record(registry, package_name)?;
         let plugin_key = plugin_key_for(record);
         let descriptors = bundle.descriptors.clone();
+        let event_handlers = bundle.event_handlers.clone();
         let registration = registration_for(record, plugin_key.clone(), bundle)?;
         let cleanup = self.engine.reload_plugin(
             PluginReloadSpec {
@@ -95,6 +103,10 @@ impl HubPluginLifecycle {
             .lock()
             .expect("hub plugin lifecycle descriptors lock")
             .insert(plugin_key.0.clone(), descriptors);
+        self.event_handlers
+            .lock()
+            .expect("hub plugin lifecycle event handlers lock")
+            .insert(plugin_key.0.clone(), event_handlers);
 
         Ok(cleanup)
     }
@@ -115,6 +127,10 @@ impl HubPluginLifecycle {
         self.descriptors
             .lock()
             .expect("hub plugin lifecycle descriptors lock")
+            .remove(package_name);
+        self.event_handlers
+            .lock()
+            .expect("hub plugin lifecycle event handlers lock")
             .remove(package_name);
         cleanup
     }
@@ -152,6 +168,18 @@ impl HubPluginLifecycle {
             .values()
             .flat_map(|descriptors| descriptors.iter().cloned())
             .filter(|descriptor| descriptor.descriptor.kind == PluginDescriptorKind::UiAction)
+            .collect()
+    }
+
+    /// Return Event-kind plugin handlers subscribed to one exact event name.
+    #[must_use]
+    pub fn event_handlers_for(&self, event_name: &str) -> Vec<HubPluginEventHandler> {
+        self.event_handlers
+            .lock()
+            .expect("hub plugin lifecycle event handlers lock")
+            .values()
+            .flat_map(|handlers| handlers.iter().cloned())
+            .filter(|handler| handler.event_name == event_name)
             .collect()
     }
 
@@ -195,6 +223,8 @@ pub struct HubPluginRuntimeBundle {
     pub runtime: Arc<dyn PluginRuntime>,
     /// Stable handlers exposed by this package.
     pub handlers: Vec<PluginHandlerRegistration>,
+    /// Event-kind handlers and the exact event names they subscribe to.
+    pub event_handlers: Vec<HubPluginEventHandler>,
     /// Plugin-owned descriptors exposed to the hub.
     pub descriptors: Vec<PluginOwnedDescriptor>,
     /// Runtime resources owned by this package.
@@ -203,6 +233,15 @@ pub struct HubPluginRuntimeBundle {
     pub entrypoint: Option<String>,
     /// Optional plugin-owned load metadata.
     pub metadata: Option<BoundaryJson>,
+}
+
+/// Hub-owned event subscription metadata for one plugin handler.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HubPluginEventHandler {
+    /// Exact event name passed to `events.on(...)`.
+    pub event_name: String,
+    /// Stable handler address invoked through the core plugin worker.
+    pub handler: botster_core::PluginHandlerRef,
 }
 
 /// Typed hub lifecycle denial.

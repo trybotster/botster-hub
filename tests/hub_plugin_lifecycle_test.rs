@@ -236,6 +236,7 @@ fn bundle(
             handler: handler.clone(),
             required_capability,
         }],
+        event_handlers: Vec::new(),
         descriptors: vec![descriptor(package_name, descriptor_id, handler)],
         resources: vec![resource(package_name, resource_id)],
         entrypoint: None,
