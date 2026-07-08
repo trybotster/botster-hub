@@ -923,6 +923,15 @@ ids and may list or validate them through Lua capabilities, while create,
 update, and delete stay on the daemon/CLI operator path. Git metadata is not
 required; a plain existing directory is a valid spawn target.
 
+Hub-owned worktrees are generic working-directory records scoped to a spawn
+target. They persist a stable `worktree_id`, `target_id`, label, canonical path,
+reconciled status, optional git metadata, and small sanitized metadata. A
+worktree does not require git; `.git` is inspected only when present. Plugins
+that need workflow associations should store those associations in plugin state
+and reference the returned `worktree_id` rather than adding workflow fields to
+hub records. Worktree delete removes the hub record only and does not delete
+filesystem contents.
+
 Git-source manifests use the same core shape. The registry can persist the Git
 URL/reference, provenance, pin revision/checksum, compatibility result, trust
 classification, and enabled/admitted-capability state, but this ticket does not

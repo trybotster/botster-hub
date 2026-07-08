@@ -18,8 +18,8 @@ use botster_core::{
 use botster_hub::{
     DaemonApp, DaemonCompatibility, DaemonEvent, DaemonOperatorError, DaemonPackage,
     DaemonPackageActionStatus, DaemonPackagePin, DaemonRequest, DaemonResponse, DaemonResponseKind,
-    DaemonSession, DaemonSpawnTarget, DaemonStatus, DataDirectoryOption, HubClientApi,
-    HubClientRequest, HubClientResponseBody, HubDaemon, HubDaemonState, HubRuntime,
+    DaemonSession, DaemonSpawnTarget, DaemonStatus, DaemonWorktree, DataDirectoryOption,
+    HubClientApi, HubClientRequest, HubClientResponseBody, HubDaemon, HubDaemonState, HubRuntime,
     HubStartupOptions, HubStateLoadSource, RuntimeEnvironment, SessionDefaults, TransportBindings,
     build_default_config_for_runtime, daemon_transport_request, default_package_policy,
     host_profile, serve_daemon, serve_mcp_stdio, stream_attach,
@@ -3109,6 +3109,13 @@ fn print_daemon_response(response: DaemonResponse) -> Result<(), OperatorError> 
                 println!("status={}", validation.status);
             }
         }
+        DaemonResponseKind::Worktrees => {
+            println!("response=worktrees");
+            println!("worktree_count={}", response.worktrees.len());
+            for worktree in response.worktrees {
+                print_worktree(&worktree);
+            }
+        }
         DaemonResponseKind::Apps => {
             print_apps(&response.apps);
         }
@@ -3305,6 +3312,18 @@ fn print_spawn_target(target: &DaemonSpawnTarget) {
         target.enabled,
         target.kind,
         target.root.display()
+    );
+}
+
+fn print_worktree(worktree: &DaemonWorktree) {
+    println!(
+        "worktree id={} target={} label={} status={} path={} git={}",
+        worktree.worktree_id,
+        worktree.target_id,
+        worktree.label,
+        worktree.status,
+        worktree.path.display(),
+        worktree.git.is_some()
     );
 }
 
