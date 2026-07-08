@@ -674,6 +674,14 @@ require the current conformance fixture revision during the hello handshake.
 Plugin action responses still cross as JSON values. External clients are not
 required to compile internal UI/runtime dependencies.
 
+Expanding the plugin contract matrix `contract.app` fixture to cover
+application primitives `metric_grid`, `table`, `toolbar`, `empty_state`,
+`status_badge`, `section`, and `panel` increments
+`CONFORMANCE_FIXTURE_REVISION`. `PROTOCOL_VERSION` remains unchanged because
+the daemon framing and `plugin_surface_render` request/response shape are
+unchanged; the hub still delegates validation to the locked
+`botster_core::UiNode` contract.
+
 ## Isolated Integration Tests For External Clients
 
 External clients that need a true live-hub integration test should depend on the
