@@ -8121,6 +8121,25 @@ fn daemon_worktree_crud_scopes_paths_to_spawn_targets_without_requiring_git() {
     assert_eq!(created.worktrees[0].worktree_id, "wt_plain");
     assert_eq!(created.worktrees[0].target_id, "tgt_worktrees");
     assert_eq!(created.worktrees[0].status, "present");
+    let created_event = created
+        .events
+        .iter()
+        .find_map(|event| match event {
+            botster_hub::DaemonEvent::WorktreeLifecycle { event } => Some(event),
+            _ => None,
+        })
+        .expect("create response should include worktree lifecycle event");
+    assert_eq!(created_event.event, "worktree_created");
+    assert_eq!(created_event.worktree_id.as_deref(), Some("wt_plain"));
+    assert_eq!(created_event.target_id.as_deref(), Some("tgt_worktrees"));
+    assert_eq!(created_event.status.as_deref(), Some("present"));
+    assert_eq!(created_event.display_path.as_deref(), Some("plain"));
+    let created_events_json =
+        serde_json::to_string(&created.events).expect("serialize created worktree events");
+    assert!(
+        !created_events_json.contains(target_root.to_string_lossy().as_ref()),
+        "worktree lifecycle events must not expose raw spawn target paths: {created_events_json}"
+    );
     assert!(
         created.worktrees[0].git.is_none(),
         "git metadata must be optional for plain directories"
@@ -8152,9 +8171,44 @@ fn daemon_worktree_crud_scopes_paths_to_spawn_targets_without_requiring_git() {
     )
     .expect("delete worktree record through daemon");
     assert_eq!(deleted.worktrees[0].worktree_id, "wt_plain");
+    let deleted_event = deleted
+        .events
+        .iter()
+        .find_map(|event| match event {
+            botster_hub::DaemonEvent::WorktreeLifecycle { event } => Some(event),
+            _ => None,
+        })
+        .expect("delete response should include worktree lifecycle event");
+    assert_eq!(deleted_event.event, "worktree_deleted");
+    assert_eq!(deleted_event.worktree_id.as_deref(), Some("wt_plain"));
     assert!(
         plain_worktree.exists(),
         "worktree record deletion must not delete filesystem contents"
+    );
+    let delete_missing = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::DeleteWorktree {
+            worktree_id: "wt_plain".to_string(),
+        },
+    )
+    .expect("delete missing worktree response");
+    assert_eq!(
+        delete_missing.kind,
+        botster_hub::DaemonResponseKind::OperatorError
+    );
+    let delete_failed_event = delete_missing
+        .events
+        .iter()
+        .find_map(|event| match event {
+            botster_hub::DaemonEvent::WorktreeLifecycle { event } => Some(event),
+            _ => None,
+        })
+        .expect("delete failure response should include worktree lifecycle event");
+    assert_eq!(delete_failed_event.event, "worktree_delete_failed");
+    assert_eq!(delete_failed_event.worktree_id.as_deref(), Some("wt_plain"));
+    assert_eq!(
+        delete_failed_event.failure_kind.as_deref(),
+        Some("not_found")
     );
 
     let git_created = botster_hub::daemon_transport_request(
@@ -8194,6 +8248,34 @@ fn daemon_worktree_crud_scopes_paths_to_spawn_targets_without_requiring_git() {
     assert_eq!(
         traversal.error.as_ref().map(|error| error.code.as_str()),
         Some("path_outside_target")
+    );
+    let create_failed_event = traversal
+        .events
+        .iter()
+        .find_map(|event| match event {
+            botster_hub::DaemonEvent::WorktreeLifecycle { event } => Some(event),
+            _ => None,
+        })
+        .expect("create failure response should include worktree lifecycle event");
+    assert_eq!(create_failed_event.event, "worktree_create_failed");
+    assert_eq!(
+        create_failed_event.worktree_id.as_deref(),
+        Some("wt_escape_parent")
+    );
+    assert_eq!(
+        create_failed_event.target_id.as_deref(),
+        Some("tgt_worktrees")
+    );
+    assert_eq!(
+        create_failed_event.failure_kind.as_deref(),
+        Some("path_outside_target")
+    );
+    let failure_events_json =
+        serde_json::to_string(&traversal.events).expect("serialize failure events");
+    assert!(
+        !failure_events_json.contains(target_root.to_string_lossy().as_ref())
+            && !failure_events_json.contains("/Users/"),
+        "failure lifecycle events must not expose raw local paths: {failure_events_json}"
     );
 
     let symlink_escape = botster_hub::daemon_transport_request(

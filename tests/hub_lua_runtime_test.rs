@@ -384,6 +384,61 @@ return botster.register({
     policy.registry().clone()
 }
 
+fn install_event_probe_registry(name: &str) -> PackageRegistry {
+    let root = PathBuf::from("target")
+        .join("botster-hub-test-data")
+        .join("lua-runtime-packages")
+        .join(name);
+    let source_root = std::env::current_dir().expect("current dir").join(&root);
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).expect("create event probe package root");
+    fs::write(
+        root.join("plugin.lua"),
+        r#"
+events.on("worktree_created", function(event)
+  return {
+    received = event.event,
+    worktree_id = event.worktree_id,
+    target_id = event.target_id,
+  }
+end)
+
+events.on("worktree_deleted", function(event)
+  return {
+    received = event.event,
+    worktree_id = event.worktree_id,
+  }
+end)
+
+return botster.register({})
+"#,
+    )
+    .expect("write event probe plugin");
+    fs::write(
+        root.join("botster-package.json"),
+        serde_json::json!({
+            "name": "event-probe.plugin",
+            "version": "1.0.0",
+            "kind": "plugin",
+            "botster": ">=0.1.0",
+            "source": { "type": "path", "path": source_root.display().to_string() },
+            "capabilities": [],
+            "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }]
+        })
+        .to_string(),
+    )
+    .expect("write event probe manifest");
+
+    let mut policy = default_package_policy();
+    policy
+        .install_local_path(&root, "install event probe lua package")
+        .expect("install event probe package");
+    policy
+        .enable("event-probe.plugin", "enable event probe package")
+        .expect("enable event probe package");
+    policy.registry().clone()
+}
+
 fn invocation(handler: PluginHandlerRef, payload: serde_json::Value) -> PluginInvocationRequest {
     PluginInvocationRequest {
         request_id: RequestId("lua-runtime-invoke".to_string()),
@@ -399,6 +454,44 @@ fn invocation(handler: PluginHandlerRef, payload: serde_json::Value) -> PluginIn
         },
         payload: BoundaryJson(payload),
     }
+}
+
+#[test]
+fn events_on_registers_exact_event_subscription_and_invokes_worker_handler() {
+    let registry = install_event_probe_registry("event-probe");
+    let mut hub = explicit_runtime("event-probe");
+    hub.load_lua_plugin_package(&registry, "event-probe.plugin")
+        .expect("load event probe plugin");
+
+    let outcomes = hub.emit_plugin_event(
+        "worktree_created",
+        serde_json::json!({
+            "event": "worktree_created",
+            "worktree_id": "wt_1",
+            "target_id": "tgt_1",
+        }),
+    );
+    assert_eq!(outcomes.len(), 1);
+    let botster_core::PluginInvocationResult::Completed(success) = &outcomes[0].result else {
+        panic!("event handler should complete: {:?}", outcomes[0].result);
+    };
+    assert_eq!(
+        success.payload.as_ref().map(|payload| payload.0.clone()),
+        Some(serde_json::json!({
+            "received": "worktree_created",
+            "worktree_id": "wt_1",
+            "target_id": "tgt_1",
+        }))
+    );
+
+    let unmatched = hub.emit_plugin_event(
+        "worktree_create_failed",
+        serde_json::json!({ "event": "worktree_create_failed" }),
+    );
+    assert!(
+        unmatched.is_empty(),
+        "event subscriptions should match exact event names"
+    );
 }
 
 #[test]

@@ -3386,6 +3386,16 @@ fn print_daemon_events(events: &[DaemonEvent]) {
             DaemonEvent::RuntimeObservation { kind } => {
                 println!("event=runtime_observation kind={kind}");
             }
+            DaemonEvent::WorktreeLifecycle { event } => {
+                println!(
+                    "event=worktree_lifecycle name={} worktree_id={} target_id={} status={} failure_kind={}",
+                    event.event,
+                    event.worktree_id.as_deref().unwrap_or("none"),
+                    event.target_id.as_deref().unwrap_or("none"),
+                    event.status.as_deref().unwrap_or("none"),
+                    event.failure_kind.as_deref().unwrap_or("none")
+                );
+            }
         }
     }
 }

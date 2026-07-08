@@ -20,7 +20,7 @@ mod typescript;
 
 pub const PROTOCOL: &str = "botster-hub-daemon-v1";
 pub const PROTOCOL_VERSION: u16 = 1;
-pub const CONFORMANCE_FIXTURE_REVISION: u16 = 6;
+pub const CONFORMANCE_FIXTURE_REVISION: u16 = 7;
 pub const FEATURE_SESSIONS: &str = "sessions";
 pub const FEATURE_TERMINAL_STREAMING: &str = "terminal_streaming";
 pub const FEATURE_RESIZE: &str = "resize";
@@ -1042,6 +1042,25 @@ pub struct DaemonWorktreeGitMetadata {
     pub head: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonWorktreeLifecycleEvent {
+    pub event: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
 const fn default_true() -> bool {
     true
 }
@@ -1708,6 +1727,9 @@ pub enum DaemonEvent {
     },
     RuntimeObservation {
         kind: String,
+    },
+    WorktreeLifecycle {
+        event: DaemonWorktreeLifecycleEvent,
     },
 }
 
@@ -3620,6 +3642,18 @@ mod tests {
             DaemonEvent::RuntimeObservation {
                 kind: "observation".to_string(),
             },
+            DaemonEvent::WorktreeLifecycle {
+                event: DaemonWorktreeLifecycleEvent {
+                    event: "worktree_created".to_string(),
+                    worktree_id: Some("worktree".to_string()),
+                    target_id: Some("target".to_string()),
+                    status: Some("present".to_string()),
+                    label: Some("Worktree".to_string()),
+                    display_path: Some("workspace".to_string()),
+                    failure_kind: None,
+                    message: None,
+                },
+            },
         ]
     }
 
@@ -3632,6 +3666,7 @@ mod tests {
             DaemonEvent::ProcessExit { .. } => "process_exit",
             DaemonEvent::AttachState { .. } => "attach_state",
             DaemonEvent::RuntimeObservation { .. } => "runtime_observation",
+            DaemonEvent::WorktreeLifecycle { .. } => "worktree_lifecycle",
         }
     }
 
