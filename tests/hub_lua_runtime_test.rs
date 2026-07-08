@@ -410,6 +410,14 @@ events.on("worktree_deleted", function(event)
   }
 end)
 
+events.on("worktree_created", function(event)
+  return {
+    received = event.event,
+    observer = "second",
+    worktree_id = event.worktree_id,
+  }
+end)
+
 return botster.register({})
 "#,
     )
@@ -471,17 +479,33 @@ fn events_on_registers_exact_event_subscription_and_invokes_worker_handler() {
             "target_id": "tgt_1",
         }),
     );
-    assert_eq!(outcomes.len(), 1);
-    let botster_core::PluginInvocationResult::Completed(success) = &outcomes[0].result else {
-        panic!("event handler should complete: {:?}", outcomes[0].result);
-    };
-    assert_eq!(
-        success.payload.as_ref().map(|payload| payload.0.clone()),
-        Some(serde_json::json!({
-            "received": "worktree_created",
+    assert_eq!(outcomes.len(), 2);
+    let payloads = completed_payloads(&outcomes);
+    assert!(payloads.contains(&serde_json::json!({
+        "received": "worktree_created",
+        "worktree_id": "wt_1",
+        "target_id": "tgt_1",
+    })));
+    assert!(payloads.contains(&serde_json::json!({
+        "received": "worktree_created",
+        "observer": "second",
+        "worktree_id": "wt_1",
+    })));
+
+    let deleted = hub.emit_plugin_event(
+        "worktree_deleted",
+        serde_json::json!({
+            "event": "worktree_deleted",
             "worktree_id": "wt_1",
-            "target_id": "tgt_1",
-        }))
+        }),
+    );
+    assert_eq!(deleted.len(), 1);
+    assert_eq!(
+        completed_payloads(&deleted),
+        vec![serde_json::json!({
+            "received": "worktree_deleted",
+            "worktree_id": "wt_1",
+        })]
     );
 
     let unmatched = hub.emit_plugin_event(
@@ -492,6 +516,24 @@ fn events_on_registers_exact_event_subscription_and_invokes_worker_handler() {
         unmatched.is_empty(),
         "event subscriptions should match exact event names"
     );
+}
+
+fn completed_payloads(
+    outcomes: &[botster_core::PluginInvocationOutcome],
+) -> Vec<serde_json::Value> {
+    outcomes
+        .iter()
+        .map(|outcome| {
+            let botster_core::PluginInvocationResult::Completed(success) = &outcome.result else {
+                panic!("event handler should complete: {:?}", outcome.result);
+            };
+            success
+                .payload
+                .as_ref()
+                .map(|payload| payload.0.clone())
+                .expect("event handler should return payload")
+        })
+        .collect()
 }
 
 #[test]

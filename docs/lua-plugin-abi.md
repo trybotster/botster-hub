@@ -57,8 +57,10 @@ return botster.register({})
 ```
 
 `events.on(name, fn)` is narrow sugar over an Event-kind handler registration.
-Handlers run through the normal plugin worker invocation path, so a slow or
-failing callback does not roll back the hub operation that emitted the event.
+Handlers run through the normal plugin worker invocation path, so a failing
+callback does not roll back the hub operation that emitted the event. Event
+delivery is bounded and isolated, but it is synchronous with the emitting
+worktree CRUD request; a slow handler can add latency until the worker timeout.
 Event names match exactly.
 
 Worktree lifecycle events are emitted by hub-owned worktree CRUD:

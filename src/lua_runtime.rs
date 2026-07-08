@@ -413,9 +413,6 @@ fn install_botster_api(
                     "events.on requires a non-empty event name".to_string(),
                 ));
             }
-            let handler_id = format!("event:{event_name}");
-            let handlers = lua.globals().get::<Table>("__botster_handlers")?;
-            handlers.set(handler_id.clone(), handler)?;
             let registration = lua.globals().get::<Table>("__botster_registration")?;
             let handler_table: Table = match registration.get("handlers") {
                 Ok(handler_table) => handler_table,
@@ -425,6 +422,9 @@ fn install_botster_api(
                     handler_table
                 }
             };
+            let handler_id = format!("event:{event_name}:{}", handler_table.raw_len() + 1);
+            let handlers = lua.globals().get::<Table>("__botster_handlers")?;
+            handlers.set(handler_id.clone(), handler)?;
             let entry = lua.create_table()?;
             entry.set("id", handler_id)?;
             entry.set("kind", "event")?;
