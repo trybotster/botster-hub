@@ -29,7 +29,7 @@ use serde_json::json;
 use crate::capabilities::HubCapabilityRuntime;
 use crate::lifecycle::{HubPluginEventHandler, HubPluginRuntimeBundle};
 use crate::packages::{PackageConfigurationView, PackageRecord, PreparedLocalPackage};
-use crate::runtime::{SharedSessionTemplateSpawner, SharedSpawnTargets};
+use crate::runtime::{SharedSessionTemplateSpawner, SharedSpawnTargets, SharedWorktrees};
 use crate::session_templates::{SessionTemplateContextInput, SessionTemplateRequest};
 
 const DEFAULT_INSTRUCTION_BUDGET: u64 = 500_000;
@@ -46,7 +46,18 @@ struct LuaHostApi {
     routed_envelopes: SharedRoutedEnvelopeRuntime,
     session_templates: SharedSessionTemplateSpawner,
     spawn_targets: SharedSpawnTargets,
+    worktrees: SharedWorktrees,
     package_records: Vec<PackageRecord>,
+}
+
+/// Shared hub-owned primitives exposed to one Lua plugin runtime.
+#[derive(Clone)]
+pub struct LuaPluginHostApi {
+    pub capabilities: SharedHubCapabilityRuntime,
+    pub routed_envelopes: SharedRoutedEnvelopeRuntime,
+    pub session_templates: SharedSessionTemplateSpawner,
+    pub spawn_targets: SharedSpawnTargets,
+    pub worktrees: SharedWorktrees,
 }
 
 /// Real Lua runtime for one loaded plugin package.
@@ -62,10 +73,7 @@ impl LuaPluginRuntime {
     pub fn load_prepared(
         prepared: &PreparedLocalPackage,
         configuration: PackageConfigurationView,
-        capabilities: SharedHubCapabilityRuntime,
-        routed_envelopes: SharedRoutedEnvelopeRuntime,
-        session_templates: SharedSessionTemplateSpawner,
-        spawn_targets: SharedSpawnTargets,
+        api: LuaPluginHostApi,
         package_records: Vec<PackageRecord>,
     ) -> Result<HubPluginRuntimeBundle, LuaPluginRuntimeError> {
         let plugin_key = PluginKey(prepared.package_name.clone());
@@ -75,10 +83,11 @@ impl LuaPluginRuntime {
             })?;
         let host_api = LuaHostApi {
             configuration,
-            capabilities,
-            routed_envelopes,
-            session_templates,
-            spawn_targets,
+            capabilities: api.capabilities,
+            routed_envelopes: api.routed_envelopes,
+            session_templates: api.session_templates,
+            spawn_targets: api.spawn_targets,
+            worktrees: api.worktrees,
             package_records,
         };
         let loaded = LoadedLuaPlugin::load(plugin_key.clone(), selected_entrypoint_path, host_api)?;
@@ -523,7 +532,11 @@ fn install_botster_api(
     )?;
     capabilities_table.set(
         "spawn_targets",
-        spawn_targets_table(lua, host_api.spawn_targets)?,
+        spawn_targets_table(lua, host_api.spawn_targets.clone())?,
+    )?;
+    capabilities_table.set(
+        "worktrees",
+        worktrees_table(lua, host_api.worktrees, host_api.spawn_targets)?,
     )?;
     capabilities_table.set("config", config_table(lua, host_api.configuration)?)?;
     botster.set("capabilities", capabilities_table)?;
@@ -566,6 +579,64 @@ fn spawn_targets_table(lua: &Lua, spawn_targets: SharedSpawnTargets) -> Result<T
             lua.to_value(&crate::spawn_targets::validate_spawn_target(
                 &targets, target_id,
             ))
+        })?,
+    )?;
+    Ok(table)
+}
+
+fn worktrees_table(
+    lua: &Lua,
+    worktrees: SharedWorktrees,
+    spawn_targets: SharedSpawnTargets,
+) -> Result<Table, mlua::Error> {
+    let table = lua.create_table()?;
+    let list_worktrees = worktrees.clone();
+    let list_targets = spawn_targets.clone();
+    table.set(
+        "list",
+        lua.create_function(move |lua, ()| {
+            let targets = list_targets.lock().map_err(|_| {
+                mlua::Error::RuntimeError("spawn target registry lock poisoned".to_string())
+            })?;
+            let worktrees = list_worktrees.lock().map_err(|_| {
+                mlua::Error::RuntimeError("worktree registry lock poisoned".to_string())
+            })?;
+            lua.to_value(&crate::worktrees::list_worktrees(&worktrees, &targets))
+        })?,
+    )?;
+    table.set(
+        "show",
+        lua.create_function(move |lua, args: Value| {
+            let value = lua.from_value::<serde_json::Value>(args)?;
+            let worktree_id = value
+                .get("worktree_id")
+                .or_else(|| value.get("id"))
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    mlua::Error::RuntimeError("worktrees.show requires worktree_id".to_string())
+                })?;
+            let targets = spawn_targets.lock().map_err(|_| {
+                mlua::Error::RuntimeError("spawn target registry lock poisoned".to_string())
+            })?;
+            let worktrees = worktrees.lock().map_err(|_| {
+                mlua::Error::RuntimeError("worktree registry lock poisoned".to_string())
+            })?;
+            match crate::worktrees::show_worktree(&worktrees, &targets, worktree_id) {
+                Ok(worktree) => lua.to_value(&json!({
+                    "ok": true,
+                    "status": worktree.status,
+                    "worktree": worktree,
+                })),
+                Err(error) if error.kind == "not_found" => lua.to_value(&json!({
+                    "ok": false,
+                    "status": error.kind,
+                    "worktree_id": worktree_id,
+                    "message": error.message,
+                })),
+                Err(error) => Err(mlua::Error::RuntimeError(format!(
+                    "worktrees.show failed: {error}"
+                ))),
+            }
         })?,
     )?;
     Ok(table)

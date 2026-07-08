@@ -137,6 +137,18 @@ local function not_found(kind, id)
   }
 end
 
+local function worktree_unavailable(worktree_id, status)
+  return {
+    ok = false,
+    error = {
+      code = "worktree_unavailable",
+      message = "worktree " .. worktree_id .. " is " .. status,
+    },
+    worktree_id = worktree_id,
+    status = status,
+  }
+end
+
 local function push_event(state, kind, payload)
   table.insert(state.events, {
     kind = kind,
@@ -282,7 +294,7 @@ local function update(arguments)
   return { ok = true, ticket = ticket }
 end
 
-local function coordination_for(ticket_id, run_number, target_id, worktree, agent_name)
+local function coordination_for(ticket_id, run_number, target_id, worktree_id, worktree_path, agent_name)
   local request_id = "project-pipelines:" .. ticket_id .. ":" .. run_number
   local target = { type = "plugin", plugin_key = PLUGIN }
   local envelope_id = "project-pipelines-run:" .. request_id
@@ -290,7 +302,8 @@ local function coordination_for(ticket_id, run_number, target_id, worktree, agen
   local extension = {
     request_id = request_id,
     target_id = target_id,
-    assigned_worktree = worktree,
+    worktree_id = worktree_id,
+    assigned_worktree = worktree_path,
     owner_plugin = PLUGIN,
     agent_name = agent_name,
   }
@@ -315,15 +328,17 @@ local function coordination_for(ticket_id, run_number, target_id, worktree, agen
     context = {
       prompt = "Project Pipelines local step for " .. ticket_id,
       ticket_id = ticket_id,
-      worktree_path = worktree,
+      worktree_path = worktree_path,
       metadata = {
         request_id = primitive.request_id,
         agent_name = agent_name,
+        worktree_id = primitive.worktree_id,
       },
     },
   })
   return {
     target_id = primitive.target_id,
+    worktree_id = primitive.worktree_id,
     assigned_worktree = primitive.assigned_worktree,
     request_id = primitive.request_id,
     owner_plugin = primitive.owner_plugin,
@@ -359,14 +374,22 @@ local function start(arguments)
   if not target_id then
     return missing_arg("target_id")
   end
-  local worktree = string_arg(arguments, "worktree")
-  if not worktree then
-    return missing_arg("worktree")
+  local worktree_id = string_arg(arguments, "worktree_id")
+  if not worktree_id then
+    return missing_arg("worktree_id")
+  end
+  local worktree_lookup = botster.capabilities.worktrees.show({ worktree_id = worktree_id })
+  if not worktree_lookup.ok then
+    return not_found("worktree", worktree_id)
+  end
+  local worktree = worktree_lookup.worktree
+  if worktree.status ~= "present" then
+    return worktree_unavailable(worktree_id, worktree.status)
   end
   local agent_name = string_arg(arguments, "agent_name") or "codex"
   state.next_run = state.next_run + 1
   state.next_step = state.next_step + 1
-  local coordination = coordination_for(ticket_id, state.next_run, target_id, worktree, agent_name)
+  local coordination = coordination_for(ticket_id, state.next_run, target_id, worktree_id, worktree.path, agent_name)
   local run = {
     id = "run_local_" .. state.next_run,
     ticket_id = ticket_id,
@@ -378,6 +401,7 @@ local function start(arguments)
     run_id = run.id,
     request_id = coordination.request_id,
     target_id = coordination.target_id,
+    worktree_id = coordination.worktree_id,
     assigned_worktree = coordination.assigned_worktree,
     owner_plugin = coordination.owner_plugin,
     envelope_id = coordination.envelope_id,
@@ -530,10 +554,10 @@ return botster.register({
         properties = {
           ticket_id = { type = "string" },
           target_id = { type = "string" },
-          worktree = { type = "string" },
+          worktree_id = { type = "string" },
           agent_name = { type = "string" },
         },
-        required = { "ticket_id", "target_id", "worktree" },
+        required = { "ticket_id", "target_id", "worktree_id" },
         additionalProperties = false,
       },
       handler = "start",

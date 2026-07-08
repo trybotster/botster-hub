@@ -1,5 +1,6 @@
 #![cfg(unix)]
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -9,6 +10,11 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
+
+use botster_hub::{
+    DataDirectoryOption, HostIdentityOptions, HubStartupOptions, RuntimeEnvironment,
+    SessionDefaults, TransportBindings,
+};
 
 static MCP_DAEMON_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -26,6 +32,29 @@ fn unique_test_dir(name: &str) -> PathBuf {
         .join("mcp")
         .join(name)
         .join(nanos.to_string())
+}
+
+fn explicit_config(data_dir: &Path) -> botster_hub::HubConfig {
+    HubStartupOptions {
+        host: HostIdentityOptions {
+            id: "hub-mcp-test".to_string(),
+            display_name: "Hub MCP Test".to_string(),
+            fingerprint: None,
+        },
+        data_directory: DataDirectoryOption::Explicit(data_dir.to_path_buf()),
+        session_defaults: SessionDefaults {
+            shell: "/bin/sh".to_string(),
+            working_directory: Some(".".into()),
+            initial_rows: 24,
+            initial_cols: 80,
+        },
+        transports: TransportBindings {
+            ..TransportBindings::default()
+        },
+        ..HubStartupOptions::default()
+    }
+    .build_config_for_environment(&RuntimeEnvironment::from_values(None, None, None))
+    .expect("explicit MCP test config should build")
 }
 
 fn start_cli_daemon(data_dir: &Path) -> Child {
@@ -691,6 +720,50 @@ fn mcp_serve_lists_calls_and_reloads_project_pipelines_plugin_tools() {
     let _ = fs::remove_dir_all(&data_dir);
     let daemon = start_cli_daemon(&data_dir);
     enable_project_pipelines_package(&data_dir);
+    let config = explicit_config(&data_dir);
+    let target_root = unique_test_dir("project-pipelines-plugin-target");
+    let worktree_path = target_root.join("project-pipelines-local");
+    fs::create_dir_all(&worktree_path).expect("create project-pipelines MCP worktree");
+    let created_target = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::CreateSpawnTarget {
+            target_id: Some("tgt_local_project".to_string()),
+            label: Some("Local Project".to_string()),
+            root: fs::canonicalize(&target_root).expect("canonical project-pipelines MCP target"),
+            enabled: true,
+            kind: Some("directory".to_string()),
+            metadata: BTreeMap::new(),
+        },
+    )
+    .expect("create project-pipelines MCP spawn target");
+    assert_eq!(
+        created_target.kind,
+        botster_hub::DaemonResponseKind::SpawnTargets
+    );
+    let created_worktree = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::CreateWorktree {
+            worktree_id: Some("wt_local_project".to_string()),
+            target_id: "tgt_local_project".to_string(),
+            label: Some("Local Project Worktree".to_string()),
+            path: fs::canonicalize(&worktree_path)
+                .expect("canonical project-pipelines MCP worktree for create"),
+            metadata: BTreeMap::new(),
+        },
+    )
+    .expect("create project-pipelines MCP worktree");
+    assert_eq!(
+        created_worktree.kind,
+        botster_hub::DaemonResponseKind::Worktrees
+    );
+    assert_eq!(
+        created_worktree.worktrees[0].worktree_id,
+        "wt_local_project"
+    );
+    let listed_worktrees =
+        botster_hub::daemon_transport_request(&config, botster_hub::DaemonRequest::ListWorktrees)
+            .expect("list project-pipelines MCP worktrees");
+    assert_eq!(listed_worktrees.worktrees.len(), 1);
 
     let output = run_mcp_serve(
         &data_dir,
@@ -736,7 +809,7 @@ fn mcp_serve_lists_calls_and_reloads_project_pipelines_plugin_tools() {
                     "arguments": {
                         "ticket_id": "ticket_local_1",
                         "target_id": "tgt_local_project",
-                        "worktree": "worktrees/project-pipelines-local",
+                        "worktree_id": "wt_local_project",
                         "agent_name": "codex"
                     }
                 }
@@ -786,7 +859,7 @@ fn mcp_serve_lists_calls_and_reloads_project_pipelines_plugin_tools() {
                     "arguments": {
                         "ticket_id": "ticket_local_missing",
                         "target_id": "tgt_local_project",
-                        "worktree": "worktrees/project-pipelines-local"
+                        "worktree_id": "wt_local_project"
                     }
                 }
             }),
@@ -815,7 +888,14 @@ fn mcp_serve_lists_calls_and_reloads_project_pipelines_plugin_tools() {
     );
     assert_eq!(
         messages[4]["result"]["structuredContent"]["run"]["coordination"]["assigned_worktree"],
-        "worktrees/project-pipelines-local"
+        fs::canonicalize(&worktree_path)
+            .expect("canonical project-pipelines MCP worktree")
+            .display()
+            .to_string()
+    );
+    assert_eq!(
+        messages[4]["result"]["structuredContent"]["run"]["coordination"]["worktree_id"],
+        "wt_local_project"
     );
     assert_eq!(
         messages[4]["result"]["structuredContent"]["run"]["coordination"]["owner_plugin"],

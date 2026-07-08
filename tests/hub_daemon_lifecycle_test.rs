@@ -1807,10 +1807,21 @@ fn write_botster_workspaces_local_package(root: &Path, plugin_db_scope: &str) {
 end
 
 local function create(arguments)
+  local target_id = arguments.target_id
+  local target_validation = nil
+  if type(target_id) == "string" and target_id ~= "" then
+    target_validation = botster.capabilities.spawn_targets.validate({ target_id = target_id })
+    if not target_validation.ok then
+      return { ok = false, status = target_validation.status, target_id = target_id }
+    end
+  else
+    target_id = nil
+  end
   local workspace = {
     id = workspace_id(arguments),
     name = arguments.name or "Local Workspace",
     status = "created",
+    target_id = target_id,
   }
   botster.capabilities.plugin_db.set({
     key = "workspace/" .. workspace.id,
@@ -1824,6 +1835,13 @@ local function use_workspace(arguments)
   local id = workspace_id(arguments)
   local record = botster.capabilities.plugin_db.get({ key = "workspace/" .. id })
   local workspace = record.record.payload
+  if type(arguments.target_id) == "string" and arguments.target_id ~= "" then
+    local validation = botster.capabilities.spawn_targets.validate({ target_id = arguments.target_id })
+    if not validation.ok then
+      return { ok = false, status = validation.status, target_id = arguments.target_id }
+    end
+    workspace.target_id = arguments.target_id
+  end
   workspace.status = "used"
   botster.capabilities.plugin_db.set({
     key = "workspace/" .. workspace.id,
@@ -1831,6 +1849,14 @@ local function use_workspace(arguments)
     payload = workspace,
   })
   return { ok = true, workspace = workspace }
+end
+
+local function validate_target(arguments)
+  local target_id = arguments.target_id
+  if type(target_id) ~= "string" or target_id == "" then
+    return { ok = false, status = "missing_argument" }
+  end
+  return botster.capabilities.spawn_targets.validate({ target_id = target_id })
 end
 
 local function render_workspaces(_arguments)
@@ -1874,6 +1900,7 @@ return botster.register({
         properties = {
           workspace_id = { type = "string" },
           name = { type = "string" },
+          target_id = { type = "string" },
         },
         additionalProperties = false,
       },
@@ -1887,11 +1914,26 @@ return botster.register({
         type = "object",
         properties = {
           workspace_id = { type = "string" },
+          target_id = { type = "string" },
         },
         additionalProperties = false,
       },
       handler = "use",
       call = use_workspace,
+    },
+    {
+      name = "botster_workspaces.validate_target",
+      description = "Validate a hub-owned spawn target reference for a workspace.",
+      input_schema = {
+        type = "object",
+        properties = {
+          target_id = { type = "string" },
+        },
+        required = { "target_id" },
+        additionalProperties = false,
+      },
+      handler = "validate_target",
+      call = validate_target,
     },
   },
 })
@@ -4488,6 +4530,60 @@ fn cli_dev_stack_acceptance_smoke_exercises_first_party_plugins_project_pipeline
         "http://127.0.0.1:{web_bridge_port}/?dogfood=real-hub"
     ));
 
+    let target_root = unique_test_dir("cli-dev-stack-acceptance-target");
+    let worktree_path = target_root.join("project-pipelines-worktree");
+    fs::create_dir_all(&worktree_path).expect("create acceptance worktree path");
+    let created_target = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::CreateSpawnTarget {
+            target_id: Some("target-acceptance".to_string()),
+            label: Some("Acceptance Target".to_string()),
+            root: fs::canonicalize(&target_root).expect("canonical acceptance target root"),
+            enabled: true,
+            kind: Some("directory".to_string()),
+            metadata: BTreeMap::new(),
+        },
+    )
+    .expect("create acceptance spawn target through daemon");
+    assert_eq!(
+        created_target.kind,
+        botster_hub::DaemonResponseKind::SpawnTargets
+    );
+    let created_disabled_target = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::CreateSpawnTarget {
+            target_id: Some("target-disabled".to_string()),
+            label: Some("Disabled Target".to_string()),
+            root: fs::canonicalize(&target_root)
+                .expect("canonical disabled acceptance target root"),
+            enabled: false,
+            kind: Some("directory".to_string()),
+            metadata: BTreeMap::new(),
+        },
+    )
+    .expect("create disabled acceptance spawn target through daemon");
+    assert_eq!(
+        created_disabled_target.kind,
+        botster_hub::DaemonResponseKind::SpawnTargets
+    );
+    let created_worktree = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::CreateWorktree {
+            worktree_id: Some("worktree-acceptance".to_string()),
+            target_id: "target-acceptance".to_string(),
+            label: Some("Acceptance Worktree".to_string()),
+            path: fs::canonicalize(&worktree_path)
+                .expect("canonical acceptance worktree for create"),
+            metadata: BTreeMap::new(),
+        },
+    )
+    .expect("create acceptance worktree through daemon");
+    assert_eq!(
+        created_worktree.kind,
+        botster_hub::DaemonResponseKind::Worktrees
+    );
+    assert_eq!(created_worktree.worktrees[0].status, "present");
+
     let tui_open = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
         .arg("apps")
         .arg("open")
@@ -4509,7 +4605,8 @@ fn cli_dev_stack_acceptance_smoke_exercises_first_party_plugins_project_pipeline
             name: "botster_workspaces.create".to_string(),
             arguments: serde_json::json!({
                 "workspace_id": "workspace-acceptance-1",
-                "name": "Acceptance Workspace"
+                "name": "Acceptance Workspace",
+                "target_id": "target-acceptance"
             }),
         },
     )
@@ -4522,6 +4619,10 @@ fn cli_dev_stack_acceptance_smoke_exercises_first_party_plugins_project_pipeline
         workspace_create.plugin_tool_result["workspace"]["status"],
         "created"
     );
+    assert_eq!(
+        workspace_create.plugin_tool_result["workspace"]["target_id"],
+        "target-acceptance"
+    );
     let workspace_use = botster_hub::daemon_transport_request(
         &config,
         botster_hub::DaemonRequest::PluginMcpCallTool {
@@ -4533,6 +4634,42 @@ fn cli_dev_stack_acceptance_smoke_exercises_first_party_plugins_project_pipeline
     assert_eq!(
         workspace_use.plugin_tool_result["workspace"]["status"],
         "used"
+    );
+    let workspace_valid_target = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::PluginMcpCallTool {
+            name: "botster_workspaces.validate_target".to_string(),
+            arguments: serde_json::json!({ "target_id": "target-acceptance" }),
+        },
+    )
+    .expect("validate enabled target through botster-workspaces MCP tool");
+    assert_eq!(workspace_valid_target.plugin_tool_result["ok"], true);
+    assert_eq!(workspace_valid_target.plugin_tool_result["status"], "ok");
+    let workspace_disabled_target = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::PluginMcpCallTool {
+            name: "botster_workspaces.validate_target".to_string(),
+            arguments: serde_json::json!({ "target_id": "target-disabled" }),
+        },
+    )
+    .expect("validate disabled target through botster-workspaces MCP tool");
+    assert_eq!(workspace_disabled_target.plugin_tool_result["ok"], false);
+    assert_eq!(
+        workspace_disabled_target.plugin_tool_result["status"],
+        "disabled"
+    );
+    let workspace_missing_target = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::PluginMcpCallTool {
+            name: "botster_workspaces.validate_target".to_string(),
+            arguments: serde_json::json!({ "target_id": "target-missing" }),
+        },
+    )
+    .expect("validate missing target through botster-workspaces MCP tool");
+    assert_eq!(workspace_missing_target.plugin_tool_result["ok"], false);
+    assert_eq!(
+        workspace_missing_target.plugin_tool_result["status"],
+        "not_found"
     );
 
     let tools = botster_hub::daemon_transport_request(
@@ -4548,6 +4685,7 @@ fn cli_dev_stack_acceptance_smoke_exercises_first_party_plugins_project_pipeline
     assert!(tool_names.contains(&"project_pipelines.create"));
     assert!(tool_names.contains(&"project_pipelines.start"));
     assert!(tool_names.contains(&"botster_workspaces.create"));
+    assert!(tool_names.contains(&"botster_workspaces.validate_target"));
 
     let created_ticket = botster_hub::daemon_transport_request(
         &config,
@@ -4572,7 +4710,7 @@ fn cli_dev_stack_acceptance_smoke_exercises_first_party_plugins_project_pipeline
             arguments: serde_json::json!({
                 "ticket_id": ticket_id,
                 "target_id": "target-acceptance",
-                "worktree": "acceptance-worktree",
+                "worktree_id": "worktree-acceptance",
                 "agent_name": "codex"
             }),
         },
@@ -4581,9 +4719,13 @@ fn cli_dev_stack_acceptance_smoke_exercises_first_party_plugins_project_pipeline
     assert_eq!(start_run.plugin_tool_result["ok"], true);
     let run = &start_run.plugin_tool_result["run"];
     assert_eq!(run["coordination"]["target_id"], "target-acceptance");
+    assert_eq!(run["coordination"]["worktree_id"], "worktree-acceptance");
     assert_eq!(
         run["coordination"]["assigned_worktree"],
-        "acceptance-worktree"
+        fs::canonicalize(&worktree_path)
+            .expect("canonical acceptance worktree")
+            .display()
+            .to_string()
     );
     assert_eq!(
         run["coordination"]["session_template_id"],
@@ -4594,6 +4736,30 @@ fn cli_dev_stack_acceptance_smoke_exercises_first_party_plugins_project_pipeline
         .as_str()
         .expect("project-pipelines session id")
         .to_string();
+    let session_context = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::ReadSessionContext {
+            session_id: session_id.clone(),
+            context_id: run["coordination"]["session_context_id"]
+                .as_str()
+                .map(ToString::to_string),
+            key: None,
+        },
+    )
+    .expect("read project-pipelines spawned session context")
+    .session_context
+    .expect("project-pipelines session context");
+    assert_eq!(
+        session_context.values["worktree_path"],
+        fs::canonicalize(&worktree_path)
+            .expect("canonical acceptance context worktree")
+            .display()
+            .to_string()
+    );
+    assert_eq!(
+        session_context.values["metadata.worktree_id"],
+        "worktree-acceptance"
+    );
 
     let mut connection =
         botster_hub::DaemonConnection::connect(&config).expect("connect daemon socket");
