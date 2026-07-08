@@ -448,6 +448,7 @@ fn response_with_diagnostic(diagnostic: DaemonDiagnostic) -> DaemonResponse {
         session_context: None,
         spawn_targets: Vec::new(),
         spawn_target_validation: None,
+        worktrees: Vec::new(),
         apps: Vec::new(),
         resolved_app_launch: None,
         resolved_package_route: None,

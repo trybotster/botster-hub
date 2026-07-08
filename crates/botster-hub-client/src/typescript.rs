@@ -173,6 +173,19 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             ),
             ("delete_spawn_target", &[("target_id", "string")]),
             ("validate_spawn_target", &[("target_id", "string")]),
+            ("list_worktrees", &[]),
+            ("show_worktree", &[("worktree_id", "string")]),
+            (
+                "create_worktree",
+                &[
+                    ("worktree_id?", "string | null"),
+                    ("target_id", "string"),
+                    ("label?", "string | null"),
+                    ("path", "string"),
+                    ("metadata?", "Record<string, string>"),
+                ],
+            ),
+            ("delete_worktree", &[("worktree_id", "string")]),
             ("list_apps", &[]),
             (
                 "resolve_app_launch",
@@ -302,6 +315,7 @@ pub(crate) fn daemon_protocol_typescript() -> String {
                 "spawn_target_validation?",
                 "DaemonSpawnTargetValidation | null",
             ),
+            ("worktrees?", "DaemonWorktree[]"),
             ("apps?", "DaemonApp[]"),
             ("resolved_app_launch?", "DaemonResolvedAppLaunch | null"),
             (
@@ -363,6 +377,7 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             "session_context",
             "spawn_targets",
             "spawn_target_validation",
+            "worktrees",
             "apps",
             "resolved_app_launch",
             "resolved_package_route",
@@ -421,6 +436,28 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             ("target_id", "string"),
             ("ok", "boolean"),
             ("status", "string"),
+        ],
+    );
+    emit_interface(
+        &mut output,
+        "DaemonWorktree",
+        &[
+            ("worktree_id", "string"),
+            ("target_id", "string"),
+            ("label", "string"),
+            ("path", "string"),
+            ("status", "string"),
+            ("git?", "DaemonWorktreeGitMetadata | null"),
+            ("metadata?", "Record<string, string>"),
+        ],
+    );
+    emit_interface(
+        &mut output,
+        "DaemonWorktreeGitMetadata",
+        &[
+            ("repository_root", "string"),
+            ("branch?", "string | null"),
+            ("head?", "string | null"),
         ],
     );
     emit_interface(

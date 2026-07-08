@@ -8073,6 +8073,174 @@ fn daemon_spawn_target_crud_persists_plain_non_git_directory_and_cli_lists_it() 
 }
 
 #[test]
+fn daemon_worktree_crud_scopes_paths_to_spawn_targets_without_requiring_git() {
+    let _guard = daemon_test_lock().lock().expect("daemon test lock");
+    let data_dir = unique_short_test_dir("worktree-crud");
+    let target_root = unique_short_test_dir("worktree-target");
+    let plain_worktree = target_root.join("plain");
+    let git_worktree = target_root.join("gitish");
+    let outside_dir = unique_short_test_dir("worktree-outside");
+    fs::create_dir_all(&plain_worktree).expect("create plain worktree");
+    fs::create_dir_all(git_worktree.join(".git")).expect("create git metadata dir");
+    fs::write(git_worktree.join(".git/HEAD"), "ref: refs/heads/main\n").expect("write HEAD");
+    fs::create_dir_all(&outside_dir).expect("create outside dir");
+    let escape_link = target_root.join("escape-link");
+    std::os::unix::fs::symlink(&outside_dir, &escape_link).expect("create symlink escape");
+    assert!(
+        !plain_worktree.join(".git").exists(),
+        "plain worktree intentionally has no git metadata"
+    );
+    let config = explicit_config(&data_dir);
+    let child = start_cli_daemon(&data_dir);
+
+    botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::CreateSpawnTarget {
+            target_id: Some("tgt_worktrees".to_string()),
+            label: Some("Worktree Target".to_string()),
+            root: target_root.clone(),
+            enabled: true,
+            kind: Some("directory".to_string()),
+            metadata: BTreeMap::new(),
+        },
+    )
+    .expect("create spawn target for worktrees");
+
+    let created = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::CreateWorktree {
+            worktree_id: Some("wt_plain".to_string()),
+            target_id: "tgt_worktrees".to_string(),
+            label: Some("Plain Worktree".to_string()),
+            path: plain_worktree.clone(),
+            metadata: BTreeMap::new(),
+        },
+    )
+    .expect("create plain worktree through daemon");
+    assert_eq!(created.kind, botster_hub::DaemonResponseKind::Worktrees);
+    assert_eq!(created.worktrees[0].worktree_id, "wt_plain");
+    assert_eq!(created.worktrees[0].target_id, "tgt_worktrees");
+    assert_eq!(created.worktrees[0].status, "present");
+    assert!(
+        created.worktrees[0].git.is_none(),
+        "git metadata must be optional for plain directories"
+    );
+
+    let listed =
+        botster_hub::daemon_transport_request(&config, botster_hub::DaemonRequest::ListWorktrees)
+            .expect("list worktrees through daemon");
+    assert_eq!(listed.worktrees.len(), 1);
+    assert_eq!(listed.worktrees[0].worktree_id, "wt_plain");
+
+    let shown = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::ShowWorktree {
+            worktree_id: "wt_plain".to_string(),
+        },
+    )
+    .expect("show worktree through daemon");
+    assert_eq!(
+        shown.worktrees[0].path,
+        fs::canonicalize(&plain_worktree).expect("canonical plain worktree")
+    );
+
+    let deleted = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::DeleteWorktree {
+            worktree_id: "wt_plain".to_string(),
+        },
+    )
+    .expect("delete worktree record through daemon");
+    assert_eq!(deleted.worktrees[0].worktree_id, "wt_plain");
+    assert!(
+        plain_worktree.exists(),
+        "worktree record deletion must not delete filesystem contents"
+    );
+
+    let git_created = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::CreateWorktree {
+            worktree_id: Some("wt_gitish".to_string()),
+            target_id: "tgt_worktrees".to_string(),
+            label: Some("Git Metadata Worktree".to_string()),
+            path: git_worktree.clone(),
+            metadata: BTreeMap::new(),
+        },
+    )
+    .expect("create git metadata worktree through daemon");
+    assert_eq!(
+        git_created.worktrees[0]
+            .git
+            .as_ref()
+            .and_then(|git| git.branch.as_deref()),
+        Some("main")
+    );
+
+    let traversal = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::CreateWorktree {
+            worktree_id: Some("wt_escape_parent".to_string()),
+            target_id: "tgt_worktrees".to_string(),
+            label: None,
+            path: target_root.join(".."),
+            metadata: BTreeMap::new(),
+        },
+    )
+    .expect("traversal rejection response");
+    assert_eq!(
+        traversal.kind,
+        botster_hub::DaemonResponseKind::OperatorError
+    );
+    assert_eq!(
+        traversal.error.as_ref().map(|error| error.code.as_str()),
+        Some("path_outside_target")
+    );
+
+    let symlink_escape = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::CreateWorktree {
+            worktree_id: Some("wt_symlink_escape".to_string()),
+            target_id: "tgt_worktrees".to_string(),
+            label: None,
+            path: escape_link,
+            metadata: BTreeMap::new(),
+        },
+    )
+    .expect("symlink escape rejection response");
+    assert_eq!(
+        symlink_escape
+            .error
+            .as_ref()
+            .map(|error| error.code.as_str()),
+        Some("path_outside_target")
+    );
+
+    shutdown_cli_daemon(&data_dir, child);
+    let restarted = start_cli_daemon(&data_dir);
+    let reloaded = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::ShowWorktree {
+            worktree_id: "wt_gitish".to_string(),
+        },
+    )
+    .expect("show persisted worktree after restart");
+    assert_eq!(reloaded.worktrees[0].status, "present");
+    fs::remove_dir_all(&git_worktree).expect("remove persisted worktree path");
+    shutdown_cli_daemon(&data_dir, restarted);
+    let restarted_missing = start_cli_daemon(&data_dir);
+    let missing = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::ShowWorktree {
+            worktree_id: "wt_gitish".to_string(),
+        },
+    )
+    .expect("show missing worktree after restart");
+    assert_eq!(missing.worktrees[0].status, "missing");
+
+    shutdown_cli_daemon(&data_dir, restarted_missing);
+}
+
+#[test]
 fn daemon_spawns_repo_local_session_template_after_state_reload() {
     let _guard = daemon_test_lock()
         .lock()

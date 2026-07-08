@@ -45,8 +45,9 @@ pub use botster_hub_client::{
     DaemonResolvedSessionTemplate, DaemonResponse, DaemonResponseKind, DaemonSession,
     DaemonSessionCleanup, DaemonSessionContext, DaemonSessionTemplate,
     DaemonSessionTemplateContextInput, DaemonSessionTemplateRequest, DaemonSpawnTarget,
-    DaemonSpawnTargetValidation, DaemonStatus, DaemonUiTreeSnapshot, FEATURE_PLUGIN_SURFACE_ACTION,
-    FEATURE_PLUGIN_SURFACE_RENDER, PROTOCOL, read_frame, read_frame_from_reader, write_frame,
+    DaemonSpawnTargetValidation, DaemonStatus, DaemonUiTreeSnapshot, DaemonWorktree,
+    DaemonWorktreeGitMetadata, FEATURE_PLUGIN_SURFACE_ACTION, FEATURE_PLUGIN_SURFACE_RENDER,
+    PROTOCOL, read_frame, read_frame_from_reader, write_frame,
 };
 use serde_json::Value;
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
@@ -69,6 +70,7 @@ use crate::{EntrypointProcessSnapshot, EntrypointSupervisorError};
 use crate::{
     SpawnTarget, SpawnTargetCreate, SpawnTargetError, SpawnTargetUpdate, SpawnTargetValidation,
 };
+use crate::{Worktree, WorktreeCreate, WorktreeError};
 
 const MESSAGE_CONTENT_TYPE: &str = "application/vnd.botster.coordination.message+text";
 const WEBRTC_SIGNAL_OPERATION: &str = "local_webrtc_signal";
@@ -289,6 +291,7 @@ fn handle_control_message(
                 DaemonTransportError::Client(error) => Ok(daemon_operator_error(error)),
                 DaemonTransportError::Package(error) => Ok(daemon_package_error(error)),
                 DaemonTransportError::SpawnTarget(error) => Ok(daemon_spawn_target_error(error)),
+                DaemonTransportError::Worktree(error) => Ok(daemon_worktree_error(error)),
                 DaemonTransportError::State(error) => Ok(daemon_state_error(error)),
                 DaemonTransportError::Entrypoint(error) => Ok(daemon_entrypoint_error(error)),
                 DaemonTransportError::LocalWebrtc(error) => Ok(daemon_local_webrtc_error(error)),
@@ -418,6 +421,32 @@ fn handle_control_request(
                 &target_id,
             ),
         )),
+        DaemonRequest::ListWorktrees => list_worktrees_response(daemon),
+        DaemonRequest::ShowWorktree { worktree_id } => show_worktree_response(daemon, &worktree_id),
+        DaemonRequest::CreateWorktree {
+            worktree_id,
+            target_id,
+            label,
+            path,
+            metadata,
+        } => mutate_worktrees_response(daemon, |worktrees, targets| {
+            crate::create_worktree(
+                worktrees,
+                targets,
+                WorktreeCreate {
+                    worktree_id,
+                    target_id,
+                    label,
+                    path,
+                    metadata,
+                },
+            )
+        }),
+        DaemonRequest::DeleteWorktree { worktree_id } => {
+            mutate_worktrees_response(daemon, |worktrees, targets| {
+                crate::delete_worktree(worktrees, targets, &worktree_id)
+            })
+        }
         DaemonRequest::ResolveAppLaunch {
             package_name,
             entrypoint_id,
@@ -1219,6 +1248,7 @@ fn handle_runtime_control_request(
             session_context: None,
             spawn_targets: Vec::new(),
             spawn_target_validation: None,
+            worktrees: Vec::new(),
             apps: Vec::new(),
             resolved_app_launch: None,
             resolved_package_route: None,
@@ -1254,6 +1284,10 @@ fn handle_runtime_control_request(
         | DaemonRequest::UpdateSpawnTarget { .. }
         | DaemonRequest::DeleteSpawnTarget { .. }
         | DaemonRequest::ValidateSpawnTarget { .. }
+        | DaemonRequest::ListWorktrees
+        | DaemonRequest::ShowWorktree { .. }
+        | DaemonRequest::CreateWorktree { .. }
+        | DaemonRequest::DeleteWorktree { .. }
         | DaemonRequest::ListAvailablePackages { .. }
         | DaemonRequest::InspectAvailablePackage { .. }
         | DaemonRequest::PreviewPackageInstall { .. }
@@ -2407,6 +2441,28 @@ fn persist_spawn_targets(
     Ok(target)
 }
 
+fn persist_worktrees(
+    daemon: &mut HubDaemon,
+    update: impl FnOnce(&mut Vec<Worktree>, &[SpawnTarget]) -> crate::WorktreeResult<Worktree>,
+) -> DaemonTransportResult<Worktree> {
+    let runtime = daemon
+        .runtime()
+        .ok_or(DaemonTransportError::DaemonNotRunning)?;
+    let config = runtime.config().clone();
+    let store = FileHubStateStore::for_data_directory(&config.data_directory);
+    let mut changed = None;
+    let state = store.update(&config, |state| {
+        let targets = state.spawn_targets.clone();
+        let worktree = update(&mut state.worktrees, &targets);
+        changed = Some(worktree);
+    })?;
+    let worktree = changed
+        .expect("worktree update closure always runs")
+        .map_err(DaemonTransportError::Worktree)?;
+    daemon.replace_state(state);
+    Ok(worktree)
+}
+
 fn events_response(body: HubClientResponseBody) -> DaemonTransportResult<DaemonResponse> {
     let HubClientResponseBody::Events(events) = body else {
         return Err(DaemonTransportError::UnexpectedResponse);
@@ -2665,6 +2721,7 @@ fn daemon_response_base(kind: DaemonResponseKind) -> DaemonResponse {
         session_context: None,
         spawn_targets: Vec::new(),
         spawn_target_validation: None,
+        worktrees: Vec::new(),
         apps: Vec::new(),
         resolved_app_launch: None,
         resolved_package_route: None,
@@ -2795,6 +2852,12 @@ fn daemon_spawn_target_validation(validation: SpawnTargetValidation) -> DaemonRe
     response
 }
 
+fn daemon_worktrees(worktrees: Vec<Worktree>) -> DaemonResponse {
+    let mut response = daemon_response_base(DaemonResponseKind::Worktrees);
+    response.worktrees = worktrees.into_iter().map(daemon_worktree).collect();
+    response
+}
+
 fn list_spawn_targets_response(daemon: &mut HubDaemon) -> DaemonTransportResult<DaemonResponse> {
     let runtime = daemon
         .runtime()
@@ -2833,6 +2896,54 @@ fn daemon_spawn_target(target: SpawnTarget) -> DaemonSpawnTarget {
         enabled: target.enabled,
         kind: target.kind,
         metadata: target.metadata,
+    }
+}
+
+fn list_worktrees_response(daemon: &mut HubDaemon) -> DaemonTransportResult<DaemonResponse> {
+    let runtime = daemon
+        .runtime()
+        .ok_or(DaemonTransportError::DaemonNotRunning)?;
+    Ok(daemon_worktrees(crate::list_worktrees(
+        &runtime.state().worktrees,
+        &runtime.state().spawn_targets,
+    )))
+}
+
+fn show_worktree_response(
+    daemon: &mut HubDaemon,
+    worktree_id: &str,
+) -> DaemonTransportResult<DaemonResponse> {
+    let runtime = daemon
+        .runtime()
+        .ok_or(DaemonTransportError::DaemonNotRunning)?;
+    Ok(daemon_worktrees(vec![crate::show_worktree(
+        &runtime.state().worktrees,
+        &runtime.state().spawn_targets,
+        worktree_id,
+    )?]))
+}
+
+fn mutate_worktrees_response(
+    daemon: &mut HubDaemon,
+    update: impl FnOnce(&mut Vec<Worktree>, &[SpawnTarget]) -> crate::WorktreeResult<Worktree>,
+) -> DaemonTransportResult<DaemonResponse> {
+    let worktree = persist_worktrees(daemon, update)?;
+    Ok(daemon_worktrees(vec![worktree]))
+}
+
+fn daemon_worktree(worktree: Worktree) -> DaemonWorktree {
+    DaemonWorktree {
+        worktree_id: worktree.worktree_id,
+        target_id: worktree.target_id,
+        label: worktree.label,
+        path: worktree.path,
+        status: worktree.status,
+        git: worktree.git.map(|git| DaemonWorktreeGitMetadata {
+            repository_root: git.repository_root,
+            branch: git.branch,
+            head: git.head,
+        }),
+        metadata: worktree.metadata,
     }
 }
 
@@ -3051,6 +3162,18 @@ fn daemon_spawn_target_error(error: SpawnTargetError) -> DaemonResponse {
         code: error.kind.to_string(),
         request_id: "daemon-spawn-targets".to_string(),
         operation: "spawn_targets".to_string(),
+        message: error.message,
+        diagnostics: Vec::new(),
+    });
+    response
+}
+
+fn daemon_worktree_error(error: WorktreeError) -> DaemonResponse {
+    let mut response = daemon_response_base(DaemonResponseKind::OperatorError);
+    response.error = Some(DaemonOperatorError {
+        code: error.kind.to_string(),
+        request_id: "daemon-worktrees".to_string(),
+        operation: "worktrees".to_string(),
         message: error.message,
         diagnostics: Vec::new(),
     });
@@ -4840,6 +4963,7 @@ pub enum DaemonTransportError {
     Client(crate::HubClientError),
     Package(crate::PackageRegistryError),
     SpawnTarget(SpawnTargetError),
+    Worktree(WorktreeError),
     State(crate::HubStateStoreError),
     Entrypoint(EntrypointSupervisorError),
     LocalWebrtc(crate::LocalWebrtcError),
@@ -4865,6 +4989,7 @@ impl fmt::Display for DaemonTransportError {
             Self::Client(error) => write!(formatter, "{error:?}"),
             Self::Package(error) => write!(formatter, "{error:?}"),
             Self::SpawnTarget(error) => write!(formatter, "{error}"),
+            Self::Worktree(error) => write!(formatter, "{error}"),
             Self::State(error) => write!(formatter, "{error}"),
             Self::Entrypoint(error) => write!(formatter, "{error:?}"),
             Self::LocalWebrtc(error) => write!(formatter, "{error}"),
@@ -4883,6 +5008,7 @@ impl Error for DaemonTransportError {
             Self::Daemon(error) => Some(error),
             Self::LocalWebrtc(error) => Some(error),
             Self::SpawnTarget(error) => Some(error),
+            Self::Worktree(error) => Some(error),
             Self::State(error) => Some(error),
             _ => None,
         }
@@ -4926,6 +5052,12 @@ impl From<crate::PackageRegistryError> for DaemonTransportError {
 impl From<SpawnTargetError> for DaemonTransportError {
     fn from(error: SpawnTargetError) -> Self {
         Self::SpawnTarget(error)
+    }
+}
+
+impl From<WorktreeError> for DaemonTransportError {
+    fn from(error: WorktreeError) -> Self {
+        Self::Worktree(error)
     }
 }
 
