@@ -21,6 +21,15 @@ export interface HubTestSupportMetadata {
     source_artifact_path: string;
     files: PackageAssetChecksum[];
   };
+  application_primitives: {
+    fixture_package_name: string;
+    artifact_path: "fixtures/plugin-contract-matrix";
+    source_artifact_path: string;
+    surface_id: "contract.app";
+    route_id: "surface:contract.app";
+    renderer_entrypoint: "ui_tree_snapshot.body";
+    primitive_kinds: string[];
+  };
 }
 
 export const metadata: HubTestSupportMetadata;
@@ -29,4 +38,6 @@ export function daemonProtocolTypescriptPath(): string;
 export function readDaemonProtocolTypescript(): string;
 export function pluginContractMatrixFixturePath(): string;
 export function materializePluginContractMatrixFixture(destination: string): string;
+export function applicationPrimitivesFixturePath(): string;
+export function materializeApplicationPrimitivesFixture(destination: string): string;
 export function verifyPackageAssets(): { ok: boolean; failures: string[] };

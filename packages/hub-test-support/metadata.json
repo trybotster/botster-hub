@@ -1,6 +1,6 @@
 {
   "package_name": "@trybotster/hub-test-support",
-  "package_version": "0.1.1",
+  "package_version": "0.1.2",
   "protocol": "botster-hub-daemon-v1",
   "protocol_version": 1,
   "conformance_fixture_revision": 8,
@@ -27,6 +27,25 @@
         "path": "plugin.lua",
         "sha256": "4fc3d982ac8c18792827a895a4d22f38081b625e69fbd771345f1281647a90a1"
       }
+    ]
+  },
+  "application_primitives": {
+    "fixture_package_name": "botster.plugin-contract-matrix",
+    "artifact_path": "fixtures/plugin-contract-matrix",
+    "source_artifact_path": "botster_hub_test_support::application_primitives_fixture_descriptor()",
+    "surface_id": "contract.app",
+    "route_id": "surface:contract.app",
+    "renderer_entrypoint": "ui_tree_snapshot.body",
+    "primitive_kinds": [
+      "button",
+      "empty_state",
+      "metric",
+      "metric_grid",
+      "panel",
+      "section",
+      "status_badge",
+      "table",
+      "toolbar"
     ]
   }
 }
