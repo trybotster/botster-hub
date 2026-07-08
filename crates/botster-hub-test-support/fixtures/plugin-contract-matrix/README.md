@@ -58,7 +58,7 @@ paths.
 
 ## Matrix
 
-- `contract.app`: app surface returning a concrete UiNode payload through `plugin_surface_render`.
+- `contract.app`: app surface returning a concrete UiNode payload through `plugin_surface_render`; it exercises the hub-validated application primitives `panel`, `toolbar`, `metric_grid`, `table`, `empty_state`, `status_badge`, and `section`.
 - `contract.empty`: placeholder app surface returning a valid empty-state UiNode payload.
 - `contract.blocked`: render handler that fails deliberately so clients can assert the daemon `operator_error` response and continued daemon responsiveness.
 - `contract.invalid_body`: declared render surface whose handler returns malformed UiNode data so clients can assert `invalid_surface` and a structured `plugin_surface_render` diagnostic from hub validation.

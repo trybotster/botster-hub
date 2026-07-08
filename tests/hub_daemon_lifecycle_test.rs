@@ -2702,11 +2702,30 @@ fn daemon_plugin_contract_matrix_fixture_exercises_public_package_contracts() {
     assert!(report.show_routes_match_list);
     assert_eq!(report.app_surface_node_id, "contract-app-panel");
     assert_eq!(
+        report.app_surface_node_kinds,
+        vec![
+            "button",
+            "empty_state",
+            "empty_state",
+            "metric",
+            "metric_grid",
+            "panel",
+            "section",
+            "status_badge",
+            "table",
+            "toolbar",
+        ]
+    );
+    assert_eq!(
         report.app_surface_snapshot_package_name,
         "botster.plugin-contract-matrix"
     );
     assert_eq!(report.app_surface_snapshot_id, "contract.app");
     assert_eq!(report.app_surface_snapshot_node_id, "contract-app-panel");
+    assert_eq!(
+        report.app_surface_snapshot_node_kinds,
+        report.app_surface_node_kinds
+    );
     assert_eq!(report.empty_surface_child_id, "contract-empty-message");
     assert_eq!(report.blocked_render_operation, "plugin_surface_render");
     assert!(report.blocked_render_message_contains_failure);
