@@ -27,7 +27,7 @@ use mlua::{Function, HookTriggers, Lua, LuaOptions, LuaSerdeExt, StdLib, Table, 
 use serde_json::json;
 
 use crate::capabilities::HubCapabilityRuntime;
-use crate::lifecycle::HubPluginRuntimeBundle;
+use crate::lifecycle::{HubPluginEventHandler, HubPluginRuntimeBundle};
 use crate::packages::{PackageConfigurationView, PackageRecord, PreparedLocalPackage};
 use crate::runtime::{SharedSessionTemplateSpawner, SharedSpawnTargets};
 use crate::session_templates::{SessionTemplateContextInput, SessionTemplateRequest};
@@ -85,6 +85,7 @@ impl LuaPluginRuntime {
         Ok(HubPluginRuntimeBundle {
             runtime: Arc::new(loaded.runtime),
             handlers: loaded.handlers,
+            event_handlers: loaded.event_handlers,
             descriptors: loaded.descriptors,
             resources: loaded.resources,
             entrypoint: Some(selected_entrypoint_path.to_string_lossy().into_owned()),
@@ -242,6 +243,7 @@ impl PluginRuntime for LuaPluginRuntime {
 struct LoadedLuaPlugin {
     runtime: LuaPluginRuntime,
     handlers: Vec<PluginHandlerRegistration>,
+    event_handlers: Vec<HubPluginEventHandler>,
     descriptors: Vec<PluginOwnedDescriptor>,
     resources: Vec<PluginResourceRef>,
 }
@@ -255,6 +257,7 @@ impl LoadedLuaPlugin {
         let (runtime, registration) =
             LuaPluginRuntime::new(plugin_key.clone(), entrypoint, host_api)?;
         let mut handlers = Vec::new();
+        let mut event_handlers = Vec::new();
         let mut descriptors = Vec::new();
         let mut resources = Vec::new();
 
@@ -299,6 +302,22 @@ impl LoadedLuaPlugin {
                 handler: handler_ref.clone(),
                 required_capability: None,
             });
+            if handler.kind == PluginHandlerKind::Event {
+                let event_name = handler.event_name.ok_or_else(|| {
+                    LuaPluginRuntimeError::Lua(
+                        "event handlers require an event or event_name field".to_string(),
+                    )
+                })?;
+                if event_name.trim().is_empty() {
+                    return Err(LuaPluginRuntimeError::Lua(
+                        "event handlers require a non-empty event name".to_string(),
+                    ));
+                }
+                event_handlers.push(HubPluginEventHandler {
+                    event_name,
+                    handler: handler_ref.clone(),
+                });
+            }
             if let Some(kind) = descriptor_kind {
                 descriptors.push(PluginOwnedDescriptor {
                     descriptor: PluginDescriptorRef {
@@ -315,6 +334,7 @@ impl LoadedLuaPlugin {
         Ok(Self {
             runtime,
             handlers,
+            event_handlers,
             descriptors,
             resources,
         })
@@ -362,6 +382,7 @@ struct LuaHandlerRegistration {
     id: String,
     kind: PluginHandlerKind,
     descriptor_id: String,
+    event_name: Option<String>,
     body: serde_json::Value,
 }
 
@@ -383,9 +404,57 @@ fn install_botster_api(
     globals.set("io", Value::Nil)?;
     globals.set("package", Value::Nil)?;
 
+    let events = lua.create_table()?;
+    events.set(
+        "on",
+        lua.create_function(|lua, (event_name, handler): (String, Function)| {
+            if event_name.trim().is_empty() {
+                return Err(mlua::Error::RuntimeError(
+                    "events.on requires a non-empty event name".to_string(),
+                ));
+            }
+            let handler_id = format!("event:{event_name}");
+            let handlers = lua.globals().get::<Table>("__botster_handlers")?;
+            handlers.set(handler_id.clone(), handler)?;
+            let registration = lua.globals().get::<Table>("__botster_registration")?;
+            let handler_table: Table = match registration.get("handlers") {
+                Ok(handler_table) => handler_table,
+                Err(_) => {
+                    let handler_table = lua.create_table()?;
+                    registration.set("handlers", handler_table.clone())?;
+                    handler_table
+                }
+            };
+            let entry = lua.create_table()?;
+            entry.set("id", handler_id)?;
+            entry.set("kind", "event")?;
+            entry.set("event", event_name)?;
+            handler_table.set(handler_table.raw_len() + 1, entry)?;
+            Ok(())
+        })?,
+    )?;
+    globals.set("__botster_registration", lua.create_table()?)?;
+    globals.set("events", events)?;
+
     let botster = lua.create_table()?;
     let register = lua.create_function(|lua, registration: Table| {
         let handlers = lua.globals().get::<Table>("__botster_handlers")?;
+        let pending_registration = lua.globals().get::<Table>("__botster_registration")?;
+        if let Ok(pending_handlers) = pending_registration.get::<Table>("handlers") {
+            let custom_handlers: Table = match registration.get("handlers") {
+                Ok(custom_handlers) => custom_handlers,
+                Err(_) => {
+                    let custom_handlers = lua.create_table()?;
+                    registration.set("handlers", custom_handlers.clone())?;
+                    custom_handlers
+                }
+            };
+            let mut index = custom_handlers.raw_len();
+            for pending_handler in pending_handlers.sequence_values::<Table>() {
+                index += 1;
+                custom_handlers.set(index, pending_handler?)?;
+            }
+        }
         if let Ok(tools) = registration.get::<Table>("tools") {
             for tool in tools.sequence_values::<Table>() {
                 let tool = tool?;
@@ -398,10 +467,13 @@ fn install_botster_api(
             for custom_handler in custom_handlers.sequence_values::<Table>() {
                 let custom_handler = custom_handler?;
                 let handler_id: String = custom_handler.get("id")?;
-                let handler: Function = custom_handler.get("call")?;
-                handlers.set(handler_id, handler)?;
+                if let Ok(handler) = custom_handler.get::<Function>("call") {
+                    handlers.set(handler_id, handler)?;
+                }
             }
         }
+        lua.globals()
+            .set("__botster_registration", registration.clone())?;
         Ok(registration)
     })?;
     botster.set("register", register)?;
@@ -943,6 +1015,10 @@ fn registration_from_value(
                     .get("descriptor_id")
                     .or_else(|_| handler.get("id"))
                     .map_err(LuaPluginRuntimeError::from)?,
+                event_name: handler
+                    .get::<Option<String>>("event")
+                    .map_err(LuaPluginRuntimeError::from)?
+                    .or_else(|| handler.get::<Option<String>>("event_name").ok().flatten()),
                 body: match handler.get::<Value>("descriptor") {
                     Ok(value) => lua
                         .from_value::<serde_json::Value>(value)

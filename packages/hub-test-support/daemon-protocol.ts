@@ -145,6 +145,17 @@ export interface DaemonUiTreeSnapshot {
   body: JsonValue;
 }
 
+export interface DaemonWorktreeLifecycleEvent {
+  event: string;
+  worktree_id?: string | null;
+  target_id?: string | null;
+  status?: string | null;
+  label?: string | null;
+  display_path?: string | null;
+  failure_kind?: string | null;
+  message?: string | null;
+}
+
 export type DaemonResponseKind =
   | "status"
   | "sessions"
@@ -675,4 +686,5 @@ export type DaemonEvent =
   | { type: "scrollback"; session_id: string; subscription_id: string; data: string; bytes: number }
   | { type: "process_exit"; session_id: string; subscription_id: string; code: number | null }
   | { type: "attach_state"; session_id: string; subscription_id: string; state: string }
-  | { type: "runtime_observation"; kind: string };
+  | { type: "runtime_observation"; kind: string }
+  | { type: "worktree_lifecycle"; event: DaemonWorktreeLifecycleEvent };

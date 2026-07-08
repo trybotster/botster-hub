@@ -71,6 +71,7 @@ pub struct HubRuntime {
 type SharedCoreDaemon = Mutex<CoreDaemon>;
 type SharedSessionContexts = Arc<Mutex<BTreeMap<String, HubSessionContext>>>;
 const SESSION_TEMPLATE_SPAWN_TIMEOUT_MS: u64 = 30_000;
+const PLUGIN_EVENT_TIMEOUT_MS: u64 = 1_000;
 
 /// Shared hub-owned session-template spawn bridge exposed to Lua plugin workers.
 pub type SharedSessionTemplateSpawner = Arc<HubSessionTemplateSpawner>;
@@ -365,6 +366,38 @@ impl HubRuntime {
                 }
             }
         }
+    }
+
+    /// Emit a hub lifecycle event to matching plugin event handlers.
+    #[must_use]
+    pub fn emit_plugin_event(
+        &self,
+        event_name: &str,
+        payload: serde_json::Value,
+    ) -> Vec<PluginInvocationOutcome> {
+        self.plugin_lifecycle
+            .event_handlers_for(event_name)
+            .into_iter()
+            .map(|event_handler| {
+                self.invoke_plugin(PluginInvocationRequest {
+                    request_id: RequestId(format!(
+                        "plugin-event-{}-{}",
+                        event_name, event_handler.handler.plugin_key.0
+                    )),
+                    handler: event_handler.handler,
+                    timeout_ms: PLUGIN_EVENT_TIMEOUT_MS,
+                    context: botster_core::PluginInvocationContext {
+                        client_id: None,
+                        session_id: None,
+                        subscription_id: None,
+                        surface_id: None,
+                        origin: Some("hub-worktree-lifecycle".to_string()),
+                        metadata: None,
+                    },
+                    payload: BoundaryJson(payload.clone()),
+                })
+            })
+            .collect()
     }
 
     /// Reload an enabled package through core plugin worker cleanup and replacement.

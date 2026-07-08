@@ -46,8 +46,8 @@ pub use botster_hub_client::{
     DaemonSessionCleanup, DaemonSessionContext, DaemonSessionTemplate,
     DaemonSessionTemplateContextInput, DaemonSessionTemplateRequest, DaemonSpawnTarget,
     DaemonSpawnTargetValidation, DaemonStatus, DaemonUiTreeSnapshot, DaemonWorktree,
-    DaemonWorktreeGitMetadata, FEATURE_PLUGIN_SURFACE_ACTION, FEATURE_PLUGIN_SURFACE_RENDER,
-    PROTOCOL, read_frame, read_frame_from_reader, write_frame,
+    DaemonWorktreeGitMetadata, DaemonWorktreeLifecycleEvent, FEATURE_PLUGIN_SURFACE_ACTION,
+    FEATURE_PLUGIN_SURFACE_RENDER, PROTOCOL, read_frame, read_frame_from_reader, write_frame,
 };
 use serde_json::Value;
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
@@ -429,23 +429,18 @@ fn handle_control_request(
             label,
             path,
             metadata,
-        } => mutate_worktrees_response(daemon, |worktrees, targets| {
-            crate::create_worktree(
-                worktrees,
-                targets,
-                WorktreeCreate {
-                    worktree_id,
-                    target_id,
-                    label,
-                    path,
-                    metadata,
-                },
-            )
-        }),
+        } => create_worktree_response(
+            daemon,
+            WorktreeCreate {
+                worktree_id,
+                target_id,
+                label,
+                path,
+                metadata,
+            },
+        ),
         DaemonRequest::DeleteWorktree { worktree_id } => {
-            mutate_worktrees_response(daemon, |worktrees, targets| {
-                crate::delete_worktree(worktrees, targets, &worktree_id)
-            })
+            delete_worktree_response(daemon, &worktree_id)
         }
         DaemonRequest::ResolveAppLaunch {
             package_name,
@@ -2923,12 +2918,151 @@ fn show_worktree_response(
     )?]))
 }
 
-fn mutate_worktrees_response(
+fn create_worktree_response(
     daemon: &mut HubDaemon,
-    update: impl FnOnce(&mut Vec<Worktree>, &[SpawnTarget]) -> crate::WorktreeResult<Worktree>,
+    request: WorktreeCreate,
 ) -> DaemonTransportResult<DaemonResponse> {
-    let worktree = persist_worktrees(daemon, update)?;
-    Ok(daemon_worktrees(vec![worktree]))
+    let requested_worktree_id = request.worktree_id.clone();
+    let requested_target_id = request.target_id.clone();
+    match persist_worktrees(daemon, |worktrees, targets| {
+        crate::create_worktree(worktrees, targets, request)
+    }) {
+        Ok(worktree) => {
+            let event = worktree_lifecycle_event(
+                "worktree_created",
+                Some(&worktree),
+                daemon_targets(daemon),
+                None,
+            );
+            let mut response = daemon_worktrees(vec![worktree]);
+            emit_worktree_lifecycle_event(daemon, &mut response, event);
+            Ok(response)
+        }
+        Err(DaemonTransportError::Worktree(error)) => {
+            let event = worktree_failure_event(
+                "worktree_create_failed",
+                requested_worktree_id,
+                Some(requested_target_id),
+                &error,
+            );
+            let mut response = daemon_worktree_error(error);
+            emit_worktree_lifecycle_event(daemon, &mut response, event);
+            Ok(response)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn delete_worktree_response(
+    daemon: &mut HubDaemon,
+    worktree_id: &str,
+) -> DaemonTransportResult<DaemonResponse> {
+    match persist_worktrees(daemon, |worktrees, targets| {
+        crate::delete_worktree(worktrees, targets, worktree_id)
+    }) {
+        Ok(worktree) => {
+            let event = worktree_lifecycle_event(
+                "worktree_deleted",
+                Some(&worktree),
+                daemon_targets(daemon),
+                None,
+            );
+            let mut response = daemon_worktrees(vec![worktree]);
+            emit_worktree_lifecycle_event(daemon, &mut response, event);
+            Ok(response)
+        }
+        Err(DaemonTransportError::Worktree(error)) => {
+            let event = worktree_failure_event(
+                "worktree_delete_failed",
+                Some(worktree_id.to_string()),
+                None,
+                &error,
+            );
+            let mut response = daemon_worktree_error(error);
+            emit_worktree_lifecycle_event(daemon, &mut response, event);
+            Ok(response)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn daemon_targets(daemon: &HubDaemon) -> &[SpawnTarget] {
+    daemon
+        .runtime()
+        .map(|runtime| runtime.state().spawn_targets.as_slice())
+        .unwrap_or(&[])
+}
+
+fn emit_worktree_lifecycle_event(
+    daemon: &HubDaemon,
+    response: &mut DaemonResponse,
+    event: DaemonWorktreeLifecycleEvent,
+) {
+    if let Some(runtime) = daemon.runtime()
+        && let Ok(payload) = serde_json::to_value(&event)
+    {
+        let _ = runtime.emit_plugin_event(&event.event, payload);
+    }
+    response
+        .events
+        .push(DaemonEvent::WorktreeLifecycle { event });
+}
+
+fn worktree_lifecycle_event(
+    event: &str,
+    worktree: Option<&Worktree>,
+    targets: &[SpawnTarget],
+    failure: Option<(&str, &str)>,
+) -> DaemonWorktreeLifecycleEvent {
+    DaemonWorktreeLifecycleEvent {
+        event: event.to_string(),
+        worktree_id: worktree.map(|worktree| worktree.worktree_id.clone()),
+        target_id: worktree.map(|worktree| worktree.target_id.clone()),
+        status: worktree.map(|worktree| worktree.status.clone()),
+        label: worktree.map(|worktree| worktree.label.clone()),
+        display_path: worktree
+            .and_then(|worktree| sanitized_worktree_display_path(worktree, targets)),
+        failure_kind: failure.map(|(kind, _)| kind.to_string()),
+        message: failure.map(|(_, message)| message.to_string()),
+    }
+}
+
+fn worktree_failure_event(
+    event: &str,
+    worktree_id: Option<String>,
+    target_id: Option<String>,
+    error: &WorktreeError,
+) -> DaemonWorktreeLifecycleEvent {
+    DaemonWorktreeLifecycleEvent {
+        event: event.to_string(),
+        worktree_id,
+        target_id,
+        status: None,
+        label: None,
+        display_path: None,
+        failure_kind: Some(error.kind.to_string()),
+        message: Some(sanitize_worktree_error_message(&error.message)),
+    }
+}
+
+fn sanitized_worktree_display_path(worktree: &Worktree, targets: &[SpawnTarget]) -> Option<String> {
+    let target = targets
+        .iter()
+        .find(|target| target.target_id == worktree.target_id)?;
+    let relative = worktree.path.strip_prefix(&target.root).ok()?;
+    if relative.as_os_str().is_empty() {
+        None
+    } else {
+        Some(relative.to_string_lossy().into_owned())
+    }
+}
+
+fn sanitize_worktree_error_message(message: &str) -> String {
+    if message.contains('/') {
+        "worktree operation failed".to_string()
+    } else {
+        message.to_string()
+    }
 }
 
 fn daemon_worktree(worktree: Worktree) -> DaemonWorktree {
