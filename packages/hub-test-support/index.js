@@ -65,6 +65,14 @@ export function materializePluginContractMatrixFixture(destination) {
   return target;
 }
 
+export function applicationPrimitivesFixturePath() {
+  return pluginContractMatrixFixturePath();
+}
+
+export function materializeApplicationPrimitivesFixture(destination) {
+  return materializePluginContractMatrixFixture(destination);
+}
+
 export function verifyPackageAssets() {
   const failures = [];
 

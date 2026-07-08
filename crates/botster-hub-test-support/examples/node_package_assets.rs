@@ -4,10 +4,23 @@ use std::fs;
 use std::path::PathBuf;
 
 use botster_hub_test_support::{
-    copy_plugin_contract_matrix_fixture, daemon_protocol_typescript_artifact,
-    first_party_client_support_matrix, plugin_contract_matrix_fixture_asset,
+    application_primitives_fixture_descriptor, copy_plugin_contract_matrix_fixture,
+    daemon_protocol_typescript_artifact, first_party_client_support_matrix,
+    plugin_contract_matrix_fixture_asset,
 };
 use serde_json::json;
+
+fn ordered_unique(values: &[&'static str]) -> Vec<&'static str> {
+    values
+        .iter()
+        .copied()
+        .fold(Vec::new(), |mut unique, value| {
+            if !unique.contains(&value) {
+                unique.push(value);
+            }
+            unique
+        })
+}
 
 fn main() -> Result<(), Box<dyn Error>> {
     let output_dir = env::args()
@@ -22,6 +35,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let fixture = plugin_contract_matrix_fixture_asset();
     copy_plugin_contract_matrix_fixture(&output_dir)?;
+    let application_primitives = application_primitives_fixture_descriptor();
 
     let matrix = first_party_client_support_matrix();
     let metadata = json!({
@@ -37,6 +51,14 @@ fn main() -> Result<(), Box<dyn Error>> {
                 .iter()
                 .map(|file| file.relative_path)
                 .collect::<Vec<_>>(),
+        },
+        "application_primitives": {
+            "fixture_package_name": application_primitives.fixture_package_name,
+            "artifact_path": application_primitives.artifact_path,
+            "surface_id": application_primitives.surface_id,
+            "route_id": application_primitives.route_id,
+            "renderer_entrypoint": application_primitives.renderer_entrypoint,
+            "primitive_kinds": ordered_unique(application_primitives.node_kinds),
         },
     });
 

@@ -155,6 +155,17 @@ pub struct PluginContractMatrixFixtureAsset {
     pub files: &'static [TestAssetFile],
 }
 
+/// Published descriptor for the application-primitives surface inside the matrix fixture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ApplicationPrimitivesFixtureDescriptor {
+    pub fixture_package_name: &'static str,
+    pub artifact_path: &'static str,
+    pub surface_id: &'static str,
+    pub route_id: &'static str,
+    pub renderer_entrypoint: &'static str,
+    pub node_kinds: &'static [&'static str],
+}
+
 /// Published generated daemon protocol artifact for client drift checks.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DaemonProtocolTypescriptArtifact {
@@ -177,6 +188,19 @@ static PLUGIN_CONTRACT_MATRIX_FIXTURE_ASSET_FILES: &[TestAssetFile] = &[
     },
 ];
 
+const APPLICATION_PRIMITIVE_NODE_KINDS: &[&str] = &[
+    "button",
+    "empty_state",
+    "empty_state",
+    "metric",
+    "metric_grid",
+    "panel",
+    "section",
+    "status_badge",
+    "table",
+    "toolbar",
+];
+
 /// Return the crate-managed plugin contract matrix fixture assets.
 ///
 /// The repo-root `fixtures/plugins/plugin-contract-matrix` directory remains the
@@ -188,6 +212,19 @@ pub fn plugin_contract_matrix_fixture_asset() -> PluginContractMatrixFixtureAsse
         package_name: PLUGIN_CONTRACT_MATRIX_PACKAGE,
         artifact_path: PLUGIN_CONTRACT_MATRIX_FIXTURE_ARTIFACT,
         files: PLUGIN_CONTRACT_MATRIX_FIXTURE_ASSET_FILES,
+    }
+}
+
+/// Return the application-primitives descriptor published for downstream renderers.
+#[must_use]
+pub fn application_primitives_fixture_descriptor() -> ApplicationPrimitivesFixtureDescriptor {
+    ApplicationPrimitivesFixtureDescriptor {
+        fixture_package_name: PLUGIN_CONTRACT_MATRIX_PACKAGE,
+        artifact_path: PLUGIN_CONTRACT_MATRIX_FIXTURE_ARTIFACT,
+        surface_id: PLUGIN_CONTRACT_APP_SURFACE,
+        route_id: "surface:contract.app",
+        renderer_entrypoint: "ui_tree_snapshot.body",
+        node_kinds: APPLICATION_PRIMITIVE_NODE_KINDS,
     }
 }
 
@@ -1406,18 +1443,11 @@ pub fn run_plugin_contract_matrix_conformance(
     )?;
     let app_surface_node_kinds = ui_node_type_values(&app_surface.body);
     let app_surface_snapshot_node_kinds = ui_node_type_values(&app_surface_snapshot.body);
-    let expected_app_surface_node_kinds = vec![
-        "button".to_string(),
-        "empty_state".to_string(),
-        "empty_state".to_string(),
-        "metric".to_string(),
-        "metric_grid".to_string(),
-        "panel".to_string(),
-        "section".to_string(),
-        "status_badge".to_string(),
-        "table".to_string(),
-        "toolbar".to_string(),
-    ];
+    let expected_app_surface_node_kinds = application_primitives_fixture_descriptor()
+        .node_kinds
+        .iter()
+        .map(|kind| (*kind).to_string())
+        .collect::<Vec<_>>();
     if app_surface_node_kinds != expected_app_surface_node_kinds {
         return Err(ConformanceError::UnexpectedValue {
             operation: "contract_matrix_render_app",

@@ -29,11 +29,12 @@ Node-based first-party clients can consume the same checked artifact without a
 sibling hub checkout through the package:
 
 ```sh
-npm install --save-dev @trybotster/hub-test-support@0.1.1
+npm install --save-dev @trybotster/hub-test-support@0.1.2
 ```
 
 ```js
 import {
+  materializeApplicationPrimitivesFixture,
   materializePluginContractMatrixFixture,
   metadata,
   readDaemonProtocolTypescript,
@@ -41,8 +42,16 @@ import {
 
 const protocolSource = readDaemonProtocolTypescript();
 const fixturePath = materializePluginContractMatrixFixture(tempDirectory);
+const applicationPrimitivesPath = materializeApplicationPrimitivesFixture(tempDirectory);
+const applicationSurfaceId = metadata.application_primitives.surface_id;
 
-console.log(metadata.protocol, metadata.conformance_fixture_revision, fixturePath);
+console.log(
+  metadata.protocol,
+  metadata.conformance_fixture_revision,
+  fixturePath,
+  applicationPrimitivesPath,
+  applicationSurfaceId,
+);
 ```
 
 The package includes checksum metadata so browser-client tests can fail clearly
@@ -51,12 +60,24 @@ fixture revision are emitted by the Rust `botster-hub-test-support` asset
 generator instead of being maintained independently in JavaScript.
 
 For npm-based client repos such as botster-web, use the exact dependency spec
-`"@trybotster/hub-test-support": "0.1.1"` in `devDependencies` and let npm write
-the corresponding package-lock entry from the public npm registry. The package
-is public, so install does not require a scoped `.npmrc` entry or CI auth token.
-After updating the lockfile, run the client smoke that imports the package,
-reads the daemon protocol artifact, calls `verifyPackageAssets()`, and
-materializes the plugin contract matrix fixture.
+`"@trybotster/hub-test-support": "0.1.2"` in `devDependencies` and let npm write
+the corresponding package-lock entry from the public npm registry. When the
+registry does not have `0.1.2` yet, install the tarball produced by `npm pack`
+from `packages/hub-test-support` with a `file:` dependency. The package is
+public, so registry install does not require a scoped `.npmrc` entry or CI auth
+token. After updating the lockfile, run the client smoke that imports the
+package, reads the daemon protocol artifact, calls `verifyPackageAssets()`, and
+materializes the application-primitives fixture.
+
+The application-primitives fixture is an explicit consumer alias over the
+hub/core-validated plugin contract matrix package. Botster web and TUI should
+use `materializeApplicationPrimitivesFixture(destination)`,
+`metadata.application_primitives.surface_id` (`contract.app`), and
+`metadata.application_primitives.renderer_entrypoint` (`ui_tree_snapshot.body`).
+The current primitive inventory is `button`, `empty_state`, `metric`,
+`metric_grid`, `panel`, `section`, `status_badge`, `table`, and `toolbar`.
+The current core contract fixture does not include `list`, `form`, or an
+`action_bar` alias; downstream renderers should not hand-author those shapes.
 
 ## Compatibility Handshake
 
@@ -681,6 +702,12 @@ application primitives `metric_grid`, `table`, `toolbar`, `empty_state`,
 the daemon framing and `plugin_surface_render` request/response shape are
 unchanged; the hub still delegates validation to the locked
 `botster_core::UiNode` contract.
+
+Publishing `@trybotster/hub-test-support@0.1.2` adds an explicit
+application-primitives package API and metadata alias over that already-revised
+fixture. This does not increment `CONFORMANCE_FIXTURE_REVISION` again because
+the daemon conformance surface, fixture bytes, protocol DTOs, and validated
+UiNode payload are unchanged from revision 8.
 
 ## Isolated Integration Tests For External Clients
 

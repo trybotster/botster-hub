@@ -114,6 +114,15 @@ function metadataJson(originDir) {
       source_artifact_path: "botster_hub_test_support::plugin_contract_matrix_fixture_asset()",
       files: fixtureFiles,
     },
+    application_primitives: {
+      fixture_package_name: origin.application_primitives.fixture_package_name,
+      artifact_path: origin.application_primitives.artifact_path,
+      source_artifact_path: "botster_hub_test_support::application_primitives_fixture_descriptor()",
+      surface_id: origin.application_primitives.surface_id,
+      route_id: origin.application_primitives.route_id,
+      renderer_entrypoint: origin.application_primitives.renderer_entrypoint,
+      primitive_kinds: origin.application_primitives.primitive_kinds,
+    },
   };
 }
 
