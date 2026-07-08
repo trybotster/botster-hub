@@ -113,7 +113,9 @@ pub use lifecycle::{
     HubPluginRuntimeBundle,
 };
 pub use local_webrtc::{LocalWebrtcError, LocalWebrtcTransport};
-pub use lua_runtime::{LuaPluginRuntime, LuaPluginRuntimeError, SharedHubCapabilityRuntime};
+pub use lua_runtime::{
+    LuaPluginHostApi, LuaPluginRuntime, LuaPluginRuntimeError, SharedHubCapabilityRuntime,
+};
 pub use mcp::{
     McpCallRequest, McpServeError, McpToolDescriptor, McpToolError, McpToolProvider,
     McpToolRegistry, McpToolResult, NativeHubToolProvider, PluginHubToolProvider, serve_mcp_stdio,

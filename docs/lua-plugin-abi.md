@@ -129,6 +129,15 @@ The initial capability helper is:
   `{ target_id = "...", ok = boolean, status = "ok"|"disabled"|"not_found" }`.
   Disabled targets exist but are unavailable for plugin references, so
   validation returns `ok = false` with `status = "disabled"`.
+- `botster.capabilities.worktrees.list()`: returns deterministic sanitized
+  hub-owned worktree rows with reconciled `status` values. Worktree rows include
+  `worktree_id`, `target_id`, label, path, status, optional git metadata, and
+  sanitized metadata.
+- `botster.capabilities.worktrees.show({ worktree_id = "..." })`: returns
+  `{ ok = true, status = "...", worktree = {...} }` for an existing worktree.
+  Missing ids return `{ ok = false, status = "not_found", worktree_id = "...",
+  message = "..." }` so plugins can produce diagnostics without wrapping normal
+  absence in `pcall`.
 
 `plugin_db` helpers always use the loaded plugin key as the namespace; Lua code
 cannot select another plugin's namespace. Mutating helpers submit to
@@ -150,6 +159,12 @@ be delivered.
 `spawn_targets` is intentionally read-only in Lua. Create, update, and delete
 are daemon/CLI operator responsibilities; exposing mutation helpers to plugin
 workers would let plugins admit local host paths without the hub operator path.
+
+`worktrees` is also intentionally read-only in Lua. Hub-owned daemon/CLI APIs
+create, update, delete, persist, and emit lifecycle events for worktrees.
+Plugins may reference worktree ids and resolve paths for session-template
+context, but workflow ownership remains in plugin state while filesystem
+authority stays with the hub.
 
 ## Coordination Access
 

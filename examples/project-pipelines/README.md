@@ -10,8 +10,9 @@ Supported in this milestone:
 - create, list, update, start, current-context, gate submission, and step
   advance for a constrained local workflow
 - daemon-backed package enablement and restart reload
-- worker-backed MCP handler invocation with explicit target id, assigned
-  worktree, request id, and plugin ownership metadata on started runs
+- worker-backed MCP handler invocation with explicit target id, hub worktree id,
+  resolved worktree path, request id, and plugin ownership metadata on started
+  runs
 - a plugin-owned UiNode create-ticket surface at
   `project-pipelines.create-ticket` plus UI action
   `project_pipelines.create_ticket`
@@ -25,6 +26,14 @@ Supported in this milestone:
   spawned step session through the plugin worker `session_templates.spawn`
   capability
 
+`project_pipelines.start` accepts `target_id` and `worktree_id`. The hub owns
+spawn target and worktree CRUD; this fixture resolves the supplied worktree id
+through `botster.capabilities.worktrees.show()` and passes the resolved
+`worktree_path` only to the session-template context needed to start the local
+step. Project Pipelines keeps workflow/run state and references the hub-owned
+ids; it does not create worktrees or treat caller-supplied raw paths as the
+workflow contract.
+
 Unsupported monolith features:
 
 - Rails/cloud/WebRTC/browser marketplace surfaces
@@ -32,6 +41,11 @@ Unsupported monolith features:
 - broad compatibility with monolith SQLite state
 - multi-step agent supervision and worktree lifecycle management beyond the
   single package-owned step session spawned by this local fixture
+
+Follow-up plugin-repo work: move first-party Project Pipelines and Workspaces
+repos to the same hub-owned spawn target/worktree contract proved here:
+Project Pipelines starts from `worktree_id`, and Workspaces validates target
+refs through `botster.capabilities.spawn_targets`.
 
 Cutover posture: live monolith Project Pipelines data is not imported in this
 milestone. Cutover requires no in-flight monolith tickets, or a future explicit
