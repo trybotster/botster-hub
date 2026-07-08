@@ -657,9 +657,11 @@ pub struct PluginContractMatrixConformanceReport {
     pub app_surface_id: String,
     pub app_surface_kind: String,
     pub app_surface_node_id: String,
+    pub app_surface_node_kinds: Vec<String>,
     pub app_surface_snapshot_package_name: String,
     pub app_surface_snapshot_id: String,
     pub app_surface_snapshot_node_id: String,
+    pub app_surface_snapshot_node_kinds: Vec<String>,
     pub empty_surface_node_id: String,
     pub empty_surface_child_id: String,
     pub blocked_render_error_code: String,
@@ -689,6 +691,7 @@ pub struct PluginContractMatrixConformanceReport {
 pub struct PluginContractMatrixClientRenderCheck {
     pub class: ConformanceFailureClass,
     pub app_surface_node_id: String,
+    pub app_surface_node_kinds: Vec<String>,
     pub empty_surface_child_id: String,
     pub settings_surface_node_id: String,
     pub expected_redacted_secret_state: String,
@@ -1401,6 +1404,36 @@ pub fn run_plugin_contract_matrix_conformance(
         "id",
         "contract_matrix_render_app",
     )?;
+    let app_surface_node_kinds = ui_node_type_values(&app_surface.body);
+    let app_surface_snapshot_node_kinds = ui_node_type_values(&app_surface_snapshot.body);
+    let expected_app_surface_node_kinds = vec![
+        "button".to_string(),
+        "empty_state".to_string(),
+        "empty_state".to_string(),
+        "metric".to_string(),
+        "metric_grid".to_string(),
+        "panel".to_string(),
+        "section".to_string(),
+        "status_badge".to_string(),
+        "table".to_string(),
+        "toolbar".to_string(),
+    ];
+    if app_surface_node_kinds != expected_app_surface_node_kinds {
+        return Err(ConformanceError::UnexpectedValue {
+            operation: "contract_matrix_render_app",
+            field: "node kinds",
+            expected: format!("{expected_app_surface_node_kinds:?}"),
+            actual: format!("{app_surface_node_kinds:?}"),
+        });
+    }
+    if app_surface_snapshot_node_kinds != app_surface_node_kinds {
+        return Err(ConformanceError::UnexpectedValue {
+            operation: "contract_matrix_render_app",
+            field: "ui_tree_snapshot.body node kinds",
+            expected: format!("{app_surface_node_kinds:?}"),
+            actual: format!("{app_surface_snapshot_node_kinds:?}"),
+        });
+    }
     expect_value(
         "contract_matrix_render_app",
         "package_name",
@@ -1748,9 +1781,11 @@ pub fn run_plugin_contract_matrix_conformance(
         app_surface_id: app_surface.surface_id.clone(),
         app_surface_kind,
         app_surface_node_id: app_surface_node_id.clone(),
+        app_surface_node_kinds: app_surface_node_kinds.clone(),
         app_surface_snapshot_package_name: app_surface_snapshot.package_name.clone(),
         app_surface_snapshot_id: app_surface_snapshot.surface_id.clone(),
         app_surface_snapshot_node_id: app_surface_snapshot_id,
+        app_surface_snapshot_node_kinds,
         empty_surface_node_id,
         empty_surface_child_id: empty_surface_child_id.clone(),
         blocked_render_error_code: blocked_error.code.clone(),
@@ -1778,6 +1813,7 @@ pub fn run_plugin_contract_matrix_conformance(
         client_render_check: PluginContractMatrixClientRenderCheck {
             class: ConformanceFailureClass::ClientRendering,
             app_surface_node_id,
+            app_surface_node_kinds,
             empty_surface_child_id,
             settings_surface_node_id,
             expected_redacted_secret_state: valid_configuration_secret_state,
@@ -2285,6 +2321,36 @@ fn value_string(
         .and_then(serde_json::Value::as_str)
         .map(str::to_string)
         .ok_or(ConformanceError::MissingJsonField { operation, field })
+}
+
+fn ui_node_type_values(value: &serde_json::Value) -> Vec<String> {
+    let mut values = Vec::new();
+    collect_ui_node_type_values(value, &mut values);
+    values.sort();
+    values
+}
+
+fn collect_ui_node_type_values(value: &serde_json::Value, values: &mut Vec<String>) {
+    if let Some(kind) = value.get("type").and_then(serde_json::Value::as_str) {
+        values.push(kind.to_string());
+    }
+    if let Some(children) = value.get("children").and_then(serde_json::Value::as_array) {
+        for child in children {
+            collect_ui_node_type_values(child, values);
+        }
+    }
+    if let Some(slots) = value.get("slots").and_then(serde_json::Value::as_object) {
+        for slot_children in slots.values().filter_map(serde_json::Value::as_array) {
+            for child in slot_children {
+                collect_ui_node_type_values(child, values);
+            }
+        }
+    }
+    if let Some(props) = value.get("props").and_then(serde_json::Value::as_object) {
+        for prop in props.values() {
+            collect_ui_node_type_values(prop, values);
+        }
+    }
 }
 
 fn action_status_string(
@@ -3282,6 +3348,18 @@ mod tests {
         let render_check = PluginContractMatrixClientRenderCheck {
             class: ConformanceFailureClass::ClientRendering,
             app_surface_node_id: "contract-app-panel".to_string(),
+            app_surface_node_kinds: vec![
+                "button".to_string(),
+                "empty_state".to_string(),
+                "empty_state".to_string(),
+                "metric".to_string(),
+                "metric_grid".to_string(),
+                "panel".to_string(),
+                "section".to_string(),
+                "status_badge".to_string(),
+                "table".to_string(),
+                "toolbar".to_string(),
+            ],
             empty_surface_child_id: "contract-empty-message".to_string(),
             settings_surface_node_id: "contract-settings-panel".to_string(),
             expected_redacted_secret_state: "redacted".to_string(),
