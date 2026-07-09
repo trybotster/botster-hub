@@ -189,7 +189,11 @@ local function create_ticket_surface(_arguments)
       {
         type = "form",
         id = "project-pipelines-create-form",
-        props = { action = "project_pipelines.create_ticket" },
+        props = {
+          action = {
+            id = "project_pipelines.create_ticket",
+          },
+        },
         children = {
           {
             type = "text_input",
@@ -216,7 +220,9 @@ local function create_ticket_surface(_arguments)
             id = "project-pipelines-create-submit",
             props = {
               label = "Create ticket",
-              action = "project_pipelines.create_ticket",
+              action = {
+                id = "project_pipelines.create_ticket",
+              },
             },
           },
         },
