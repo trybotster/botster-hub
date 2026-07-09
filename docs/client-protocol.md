@@ -74,9 +74,9 @@ hub/core-validated plugin contract matrix package. Botster web and TUI should
 use `materializeApplicationPrimitivesFixture(destination)`,
 `metadata.application_primitives.surface_id` (`contract.app`), and
 `metadata.application_primitives.renderer_entrypoint` (`ui_tree_snapshot.body`).
-The current primitive inventory is `button`, `empty_state`, `metric`,
-`metric_grid`, `panel`, `section`, `status_badge`, `table`, and `toolbar`.
-The current core contract fixture does not include `list`, `form`, or an
+The current primitive inventory is `button`, `empty_state`, `form`, `metric`,
+`metric_grid`, `panel`, `section`, `status_badge`, `table`, `text_input`, and
+`toolbar`. The current core contract fixture does not include `list` or an
 `action_bar` alias; downstream renderers should not hand-author those shapes.
 
 ## Compatibility Handshake
