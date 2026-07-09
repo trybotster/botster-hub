@@ -1,9 +1,10 @@
 //! Public architecture facade for the `botster-hub` first-party host profile.
 //!
 //! `botster-hub` is a trusted profile over reusable `botster-core` mechanics.
-//! This crate defines profile-owned policy seams and a minimal runtime facade
-//! over `botster-core`; provider, cloud, Rails, WebRTC, and client transport
-//! implementations intentionally live outside this scaffold.
+//! This crate defines profile-owned policy surfaces and a runtime facade over
+//! `botster-core-daemon` (`CoreDaemon` + session worker). Provider, cloud,
+//! Rails, public WebRTC, and non-local client transport implementations live
+//! outside this host profile, not as parallel hub runtimes.
 //!
 //! ```
 //! let profile = botster_hub::host_profile();
@@ -337,7 +338,7 @@ const HUB_FACADE_DECISIONS: &[HubFacadeDecision] = &[
     HubFacadeDecision::new(
         "read_screen/capture_snapshot/report_delivery_*",
         HubFacadeExposure::Deferred,
-        "daemon-backed core API does not expose these embedded-engine-only helpers yet",
+        "CoreDaemon exposes screen/snapshot readback on botster-core main; hub client still returns UnsupportedDaemonOperation until HubRuntime is wired through those methods",
     ),
 ];
 
@@ -412,7 +413,7 @@ mod tests {
         assert!(summary.facade_decisions().iter().any(|decision| {
             decision.core_operation() == "read_screen/capture_snapshot/report_delivery_*"
                 && decision.exposure() == HubFacadeExposure::Deferred
-                && decision.reason().contains("daemon-backed core API")
+                && decision.reason().contains("hub client still returns UnsupportedDaemonOperation")
         }));
     }
 }
