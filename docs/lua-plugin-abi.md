@@ -186,6 +186,11 @@ routed-envelope APIs. They raise a Lua runtime error if the daemon rejects the
 request, including the stopped-daemon case; callers that need to recover should
 wrap coordination calls with `pcall`.
 
+Coordination helpers are available during registered handler invocation only.
+They are not available while the plugin entrypoint is loading, because the hub
+owner thread is executing the plugin load and cannot also service coordination
+requests.
+
 Future capability helpers must continue to submit through hub/core capability
 contracts. They must not expose raw host filesystem, network, process, or C
 module access.
