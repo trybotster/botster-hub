@@ -61,9 +61,10 @@ Botster web and TUI renderers should consume
 `metadata.application_primitives.renderer_entrypoint` (`ui_tree_snapshot.body`).
 The current core-validated primitive inventory is exposed as
 `metadata.application_primitives.primitive_kinds`: `button`, `empty_state`,
-`metric`, `metric_grid`, `panel`, `section`, `status_badge`, `table`, and
-`toolbar`. The current core contract fixture does not include `list`, `form`,
-or an `action_bar` alias; downstream clients should not invent those shapes.
+`form`, `metric`, `metric_grid`, `panel`, `section`, `status_badge`, `table`,
+`text_input`, and `toolbar`. The current core contract fixture does not include
+`list` or an `action_bar` alias; downstream clients should not invent those
+shapes.
 
 Client repos should update their lockfile from the registry coordinate or
 packed tarball, then run a smoke that imports the package, reads the daemon

@@ -190,14 +190,17 @@ static PLUGIN_CONTRACT_MATRIX_FIXTURE_ASSET_FILES: &[TestAssetFile] = &[
 
 const APPLICATION_PRIMITIVE_NODE_KINDS: &[&str] = &[
     "button",
+    "button",
     "empty_state",
     "empty_state",
+    "form",
     "metric",
     "metric_grid",
     "panel",
     "section",
     "status_badge",
     "table",
+    "text_input",
     "toolbar",
 ];
 
@@ -652,8 +655,18 @@ pub struct ClientConformanceReport {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectPipelinesConformanceReport {
     pub package_state: String,
+    pub rendered_package_name: String,
+    pub rendered_surface_id: String,
     pub surface_kind: String,
     pub surface_id: String,
+    pub surface_node_kinds: Vec<String>,
+    pub form_node_id: String,
+    pub form_node_kind: String,
+    pub form_action_id: String,
+    pub snapshot_package_name: String,
+    pub snapshot_surface_id: String,
+    pub snapshot_node_id: String,
+    pub snapshot_node_kinds: Vec<String>,
     pub invalid_action_status: String,
     pub invalid_action_diagnostic_kind: String,
     pub invalid_title_error: String,
@@ -719,6 +732,12 @@ pub struct PluginContractMatrixConformanceReport {
     pub action_error_request_id: String,
     pub action_error_diagnostic_kind: String,
     pub action_error_diagnostic_operation: String,
+    pub submit_action_id: String,
+    pub action_field_error_state: String,
+    pub action_field_error_request_id: String,
+    pub action_field_error_diagnostic_kind: String,
+    pub action_field_error_diagnostic_operation: String,
+    pub action_field_error_message: String,
     pub client_render_check: PluginContractMatrixClientRenderCheck,
     pub failure_classes: PluginConformanceFailureClasses,
 }
@@ -1078,15 +1097,78 @@ pub fn run_project_pipelines_conformance(
             actual: surface.surface_id,
         });
     }
+    let surface_package_name = surface.package_name.clone();
+    let rendered_surface_id = surface.surface_id.clone();
     let surface_kind = value_string(&surface.body, "type", "project_pipelines_surface")?;
     let surface_id = value_string(&surface.body, "id", "project_pipelines_surface")?;
+    let surface_node_kinds = ui_node_type_values(&surface.body);
+    let form_node = find_ui_node_by_id(&surface.body, "project-pipelines-create-form").ok_or(
+        ConformanceError::MissingJsonField {
+            operation: "project_pipelines_surface",
+            field: "project-pipelines-create-form",
+        },
+    )?;
+    let form_node_id = value_string(form_node, "id", "project_pipelines_surface")?;
+    let form_node_kind = value_string(form_node, "type", "project_pipelines_surface")?;
+    expect_value(
+        "project_pipelines_surface",
+        "form type",
+        "form",
+        &form_node_kind,
+    )?;
+    let form_action_id = ui_action_id(
+        form_node,
+        "project_pipelines_surface",
+        "form.props.action.id",
+    )?;
+    expect_value(
+        "project_pipelines_surface",
+        "form.props.action.id",
+        PROJECT_PIPELINES_ACTION,
+        &form_action_id,
+    )?;
+    let snapshot = surface
+        .ui_tree_snapshot
+        .as_ref()
+        .ok_or(ConformanceError::MissingBody {
+            operation: "project_pipelines_surface",
+            field: "plugin_surface.ui_tree_snapshot",
+        })?;
+    let snapshot_package_name = snapshot.package_name.clone();
+    let snapshot_surface_id = snapshot.surface_id.clone();
+    let snapshot_node_id = value_string(&snapshot.body, "id", "project_pipelines_surface")?;
+    let snapshot_node_kinds = ui_node_type_values(&snapshot.body);
+    if snapshot_package_name != PROJECT_PIPELINES_PACKAGE {
+        return Err(ConformanceError::UnexpectedValue {
+            operation: "project_pipelines_surface",
+            field: "ui_tree_snapshot.package_name",
+            expected: PROJECT_PIPELINES_PACKAGE.to_string(),
+            actual: snapshot_package_name,
+        });
+    }
+    if snapshot_surface_id != PROJECT_PIPELINES_SURFACE {
+        return Err(ConformanceError::UnexpectedValue {
+            operation: "project_pipelines_surface",
+            field: "ui_tree_snapshot.surface_id",
+            expected: PROJECT_PIPELINES_SURFACE.to_string(),
+            actual: snapshot_surface_id,
+        });
+    }
+    if snapshot_node_kinds != surface_node_kinds {
+        return Err(ConformanceError::UnexpectedValue {
+            operation: "project_pipelines_surface",
+            field: "ui_tree_snapshot.body node kinds",
+            expected: format!("{surface_node_kinds:?}"),
+            actual: format!("{snapshot_node_kinds:?}"),
+        });
+    }
 
     let invalid = request(
         hub.endpoint(),
         DaemonRequest::PluginSurfaceAction {
             package_name: PROJECT_PIPELINES_PACKAGE.to_string(),
             surface_id: PROJECT_PIPELINES_SURFACE.to_string(),
-            action_id: PROJECT_PIPELINES_ACTION.to_string(),
+            action_id: form_action_id.clone(),
             payload: serde_json::json!({
                 "request_id": "invalid-project-pipelines-conformance",
                 "title": "   ",
@@ -1120,8 +1202,18 @@ pub fn run_project_pipelines_conformance(
 
     Ok(ProjectPipelinesConformanceReport {
         package_state,
+        rendered_package_name: surface_package_name,
+        rendered_surface_id,
         surface_kind,
         surface_id,
+        surface_node_kinds,
+        form_node_id,
+        form_node_kind,
+        form_action_id,
+        snapshot_package_name,
+        snapshot_surface_id,
+        snapshot_node_id,
+        snapshot_node_kinds,
         invalid_action_status,
         invalid_action_diagnostic_kind,
         invalid_title_error,
@@ -1506,6 +1598,23 @@ pub fn run_plugin_contract_matrix_conformance(
         app_surface_node_id.as_str(),
         &app_surface_snapshot_id,
     )?;
+    let submit_node = find_ui_node_by_id(&app_surface.body, "contract-app-submit").ok_or(
+        ConformanceError::MissingJsonField {
+            operation: "contract_matrix_render_app",
+            field: "contract-app-submit",
+        },
+    )?;
+    let submit_action_id = ui_action_id(
+        submit_node,
+        "contract_matrix_render_app",
+        "contract-app-submit.props.action.id",
+    )?;
+    expect_value(
+        "contract_matrix_render_app",
+        "contract-app-submit.props.action.id",
+        PLUGIN_CONTRACT_ACTION,
+        &submit_action_id,
+    )?;
 
     let empty_surface = render_plugin_surface(
         hub,
@@ -1684,7 +1793,7 @@ pub fn run_plugin_contract_matrix_conformance(
         DaemonRequest::PluginSurfaceAction {
             package_name: PLUGIN_CONTRACT_MATRIX_PACKAGE.to_string(),
             surface_id: PLUGIN_CONTRACT_APP_SURFACE.to_string(),
-            action_id: PLUGIN_CONTRACT_ACTION.to_string(),
+            action_id: submit_action_id.clone(),
             payload: serde_json::json!({
                 "request_id": "contract-action-success",
                 "message": "hello",
@@ -1741,7 +1850,7 @@ pub fn run_plugin_contract_matrix_conformance(
         DaemonRequest::PluginSurfaceAction {
             package_name: PLUGIN_CONTRACT_MATRIX_PACKAGE.to_string(),
             surface_id: PLUGIN_CONTRACT_APP_SURFACE.to_string(),
-            action_id: PLUGIN_CONTRACT_ACTION.to_string(),
+            action_id: submit_action_id.clone(),
             payload: serde_json::json!({
                 "request_id": "contract-action-error",
                 "fail": true,
@@ -1780,6 +1889,61 @@ pub fn run_plugin_contract_matrix_conformance(
         "state",
         "error",
         &action_error_state,
+    )?;
+
+    let action_field_error = request(
+        hub.endpoint(),
+        DaemonRequest::PluginSurfaceAction {
+            package_name: PLUGIN_CONTRACT_MATRIX_PACKAGE.to_string(),
+            surface_id: PLUGIN_CONTRACT_APP_SURFACE.to_string(),
+            action_id: submit_action_id.clone(),
+            payload: serde_json::json!({
+                "request_id": "contract-action-field-error",
+                "field_error": true,
+            }),
+        },
+        "contract_matrix_action_field_error",
+    )?;
+    expect_kind(
+        &action_field_error,
+        DaemonResponseKind::PluginActionResult,
+        "contract_matrix_action_field_error",
+    )?;
+    let (action_field_error_diagnostic_kind, action_field_error_diagnostic_operation, _) =
+        diagnostic_details(
+            &action_field_error,
+            DaemonDiagnosticKind::ActionFailure,
+            Some("plugin_surface_action"),
+            "contract_matrix_action_field_error",
+        )?;
+    let action_field_error_result =
+        action_field_error
+            .plugin_action_result
+            .as_ref()
+            .ok_or(ConformanceError::MissingBody {
+                operation: "contract_matrix_action_field_error",
+                field: "plugin_action_result",
+            })?;
+    let action_field_error_state = value_string(
+        action_field_error_result,
+        "state",
+        "contract_matrix_action_field_error",
+    )?;
+    let action_field_error_request_id = value_string(
+        action_field_error_result,
+        "request_id",
+        "contract_matrix_action_field_error",
+    )?;
+    let action_field_error_message = field_error_string(
+        action_field_error_result,
+        "contract-app-message",
+        "contract_matrix_action_field_error",
+    )?;
+    expect_value(
+        "contract_matrix_action_field_error",
+        "state",
+        "error",
+        &action_field_error_state,
     )?;
 
     Ok(PluginContractMatrixConformanceReport {
@@ -1840,6 +2004,12 @@ pub fn run_plugin_contract_matrix_conformance(
         action_error_request_id,
         action_error_diagnostic_kind,
         action_error_diagnostic_operation,
+        submit_action_id,
+        action_field_error_state,
+        action_field_error_request_id,
+        action_field_error_diagnostic_kind,
+        action_field_error_diagnostic_operation,
+        action_field_error_message,
         client_render_check: PluginContractMatrixClientRenderCheck {
             class: ConformanceFailureClass::ClientRendering,
             app_surface_node_id,
@@ -2381,6 +2551,57 @@ fn collect_ui_node_type_values(value: &serde_json::Value, values: &mut Vec<Strin
             collect_ui_node_type_values(prop, values);
         }
     }
+}
+
+fn find_ui_node_by_id<'a>(
+    value: &'a serde_json::Value,
+    node_id: &str,
+) -> Option<&'a serde_json::Value> {
+    if value.get("type").is_some()
+        && value
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|id| id == node_id)
+    {
+        return Some(value);
+    }
+    if let Some(children) = value.get("children").and_then(serde_json::Value::as_array) {
+        for child in children {
+            if let Some(found) = find_ui_node_by_id(child, node_id) {
+                return Some(found);
+            }
+        }
+    }
+    if let Some(slots) = value.get("slots").and_then(serde_json::Value::as_object) {
+        for slot_children in slots.values().filter_map(serde_json::Value::as_array) {
+            for child in slot_children {
+                if let Some(found) = find_ui_node_by_id(child, node_id) {
+                    return Some(found);
+                }
+            }
+        }
+    }
+    if let Some(props) = value.get("props").and_then(serde_json::Value::as_object) {
+        for prop in props.values() {
+            if let Some(found) = find_ui_node_by_id(prop, node_id) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+fn ui_action_id(
+    node: &serde_json::Value,
+    operation: &'static str,
+    field: &'static str,
+) -> Result<String, ConformanceError> {
+    node.get("props")
+        .and_then(|props| props.get("action"))
+        .and_then(|action| action.get("id"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .ok_or(ConformanceError::MissingJsonField { operation, field })
 }
 
 fn action_status_string(
@@ -3380,14 +3601,17 @@ mod tests {
             app_surface_node_id: "contract-app-panel".to_string(),
             app_surface_node_kinds: vec![
                 "button".to_string(),
+                "button".to_string(),
                 "empty_state".to_string(),
                 "empty_state".to_string(),
+                "form".to_string(),
                 "metric".to_string(),
                 "metric_grid".to_string(),
                 "panel".to_string(),
                 "section".to_string(),
                 "status_badge".to_string(),
                 "table".to_string(),
+                "text_input".to_string(),
                 "toolbar".to_string(),
             ],
             empty_surface_child_id: "contract-empty-message".to_string(),

@@ -58,13 +58,13 @@ paths.
 
 ## Matrix
 
-- `contract.app`: app surface returning a concrete UiNode payload through `plugin_surface_render`; it exercises the hub-validated application primitives `panel`, `toolbar`, `metric_grid`, `table`, `empty_state`, `status_badge`, and `section`.
+- `contract.app`: app surface returning a concrete UiNode payload through `plugin_surface_render`; it exercises the hub-validated application primitives `panel`, `toolbar`, `metric_grid`, `table`, `empty_state`, `status_badge`, `section`, `form`, `text_input`, and `button`.
 - `contract.empty`: placeholder app surface returning a valid empty-state UiNode payload.
 - `contract.blocked`: render handler that fails deliberately so clients can assert the daemon `operator_error` response and continued daemon responsiveness.
 - `contract.invalid_body`: declared render surface whose handler returns malformed UiNode data so clients can assert `invalid_surface` and a structured `plugin_surface_render` diagnostic from hub validation.
 - `contract.settings`: settings surface returning sanitized effective configuration from `botster.capabilities.config.get()`.
 - Configuration schema: `endpoint` URL default, `mode` select default and validation options, and redacted `api_token` secret.
-- `contract.action`: `plugin_surface_action` handler with accepted and error states selected by the request payload.
+- `contract.action`: `plugin_surface_action` handler with accepted, generic error, and field-error states selected by the request payload. Field-error responses are keyed by the rendered `contract-app-message` input id.
 - Package route descriptors: manifest `surfaces` should project to `surface:<id>` routes under `/packages/botster.plugin-contract-matrix/surfaces/<id>`.
 - Package lifecycle compatibility: hub conformance should prove install, enable, list, show, route descriptors, and action-state projection through the daemon package DTOs. The installed `DaemonPackage` row currently does not expose a separate protocol compatibility descriptor; that remains covered by package admission and lifecycle state.
 
