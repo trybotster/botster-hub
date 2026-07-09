@@ -17,9 +17,9 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use botster_hub_client::{
-    DaemonCompatibility, DaemonCompatibilityRequirement, DaemonDiagnostic, DaemonDiagnosticKind,
-    DaemonEndpoint, DaemonEvent, DaemonOperatorError, DaemonRequest, DaemonResponse,
-    DaemonResponseKind, DaemonTransportError, ensure_compatible,
+    DaemonCompatibility, DaemonCompatibilityRequirement, DaemonConnection, DaemonDiagnostic,
+    DaemonDiagnosticKind, DaemonEndpoint, DaemonEvent, DaemonOperatorError, DaemonRequest,
+    DaemonResponse, DaemonResponseKind, DaemonTransportError, ensure_compatible,
 };
 use serde::{Deserialize, Serialize};
 
@@ -53,6 +53,13 @@ const UNSUPPORTED_PLUGIN_ENTITY_FRAMES: &str = "plugin_entity_frames";
 
 const DEFAULT_SOCKET_NAME: &str = "botster-hub.sock";
 const READY_TIMEOUT: Duration = Duration::from_secs(5);
+const MANY_PTY_DEADLINE: Duration = Duration::from_secs(10);
+const MANY_PTY_POLL_INTERVAL: Duration = Duration::from_millis(30);
+const MANY_PTY_NOISY_SESSION_ID: &str = "many-pty-noisy";
+const MANY_PTY_SUBSCRIPTION_ID: &str = "many-pty-late-subscription";
+const MANY_PTY_HISTORY_MARKER: &str = "many-pty-history-ready";
+const MANY_PTY_INPUT: &str = "many-pty-client-input";
+const MANY_PTY_LIVE_MARKER: &str = "many-pty-live:many-pty-client-input";
 
 /// Hub-owned support matrix for first-party same-device clients.
 ///
@@ -649,6 +656,633 @@ pub struct ClientConformanceReport {
     pub validation_error_code: String,
     pub validation_error_operation: String,
     pub validation_diagnostic_kind: String,
+}
+
+/// Stable failure stages for the joint many-PTY product-path proof.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManyPtyConformanceStage {
+    Spawn,
+    Attach,
+    Drain,
+    Input,
+    History,
+    Cleanup,
+}
+
+impl ManyPtyConformanceStage {
+    /// Return the machine-readable label used by test and CI output.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Spawn => "spawn",
+            Self::Attach => "attach",
+            Self::Drain => "drain",
+            Self::Input => "input",
+            Self::History => "history",
+            Self::Cleanup => "cleanup",
+        }
+    }
+}
+
+impl fmt::Display for ManyPtyConformanceStage {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// Path-neutral failure from [`run_many_pty_client_attach_conformance`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManyPtyConformanceError {
+    pub stage: ManyPtyConformanceStage,
+    pub session_id: String,
+    pub details: String,
+    pub cleanup_failures: Vec<String>,
+}
+
+impl fmt::Display for ManyPtyConformanceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{} failure for {}: {}",
+            self.stage, self.session_id, self.details
+        )?;
+        if !self.cleanup_failures.is_empty() {
+            write!(
+                formatter,
+                "; cleanup also failed for {:?}",
+                self.cleanup_failures
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl Error for ManyPtyConformanceError {}
+
+/// Stable observations from the joint many-PTY product-path proof.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManyPtyConformanceReport {
+    pub total_sessions: usize,
+    pub quiet_sessions: usize,
+    pub quiet_sessions_exited: usize,
+    pub history_observed: bool,
+    pub screen_marker_observed: bool,
+    pub snapshot_payload_bytes: usize,
+    pub live_output_observed: bool,
+    pub cleaned_sessions: usize,
+}
+
+/// Prove many worker-backed PTYs, quiet completion, late attach/history, input, and cleanup.
+///
+/// The flow uses only the public daemon socket client. Quiet sessions are never
+/// attached; public drains advance lifecycle reconciliation before bounded
+/// `ListSessions` polling observes their completion.
+pub fn run_many_pty_client_attach_conformance(
+    hub: &IsolatedHub,
+    total_sessions: usize,
+) -> Result<ManyPtyConformanceReport, ManyPtyConformanceError> {
+    if total_sessions < 2 {
+        return Err(many_pty_error(
+            ManyPtyConformanceStage::Spawn,
+            "scenario",
+            "at least two sessions are required",
+        ));
+    }
+
+    let mut connection = DaemonConnection::connect(hub.endpoint()).map_err(|_| {
+        many_pty_error(
+            ManyPtyConformanceStage::Spawn,
+            "daemon",
+            "public daemon connection failed",
+        )
+    })?;
+    let mut created_sessions = Vec::with_capacity(total_sessions);
+    let result =
+        run_many_pty_client_attach_scenario(&mut connection, total_sessions, &mut created_sessions);
+    let (cleaned_sessions, cleanup_failures) =
+        cleanup_many_pty_sessions(&mut connection, &created_sessions);
+
+    match result {
+        Ok(mut report) if cleanup_failures.is_empty() => {
+            report.cleaned_sessions = cleaned_sessions;
+            Ok(report)
+        }
+        Ok(_) => Err(ManyPtyConformanceError {
+            stage: ManyPtyConformanceStage::Cleanup,
+            session_id: cleanup_failures[0].clone(),
+            details: "one or more session cleanup requests failed".to_string(),
+            cleanup_failures,
+        }),
+        Err(mut error) => {
+            error.cleanup_failures = cleanup_failures;
+            Err(error)
+        }
+    }
+}
+
+fn run_many_pty_client_attach_scenario(
+    connection: &mut DaemonConnection,
+    total_sessions: usize,
+    created_sessions: &mut Vec<String>,
+) -> Result<ManyPtyConformanceReport, ManyPtyConformanceError> {
+    let baseline = many_pty_request(
+        connection,
+        &DaemonRequest::ListSessions,
+        ManyPtyConformanceStage::Spawn,
+        "baseline",
+    )?;
+    many_pty_expect_kind(
+        &baseline,
+        DaemonResponseKind::Sessions,
+        ManyPtyConformanceStage::Spawn,
+        "baseline",
+    )?;
+    if !baseline.sessions.is_empty() {
+        return Err(many_pty_error(
+            ManyPtyConformanceStage::Spawn,
+            "baseline",
+            "isolated hub did not start with an empty session list",
+        ));
+    }
+
+    created_sessions.push(MANY_PTY_NOISY_SESSION_ID.to_string());
+    let noisy = many_pty_request(
+        connection,
+        &DaemonRequest::Spawn {
+            session_id: MANY_PTY_NOISY_SESSION_ID.to_string(),
+            command: format!(
+                "i=0; while [ \"$i\" -lt 48 ]; do printf 'many-pty-noise-%03d-abcdefghijklmnopqrstuvwxyz0123456789\\n' \"$i\"; i=$((i + 1)); done; printf '{MANY_PTY_HISTORY_MARKER}\\n'; while IFS= read -r line; do printf 'many-pty-live:%s\\n' \"$line\"; done"
+            ),
+        },
+        ManyPtyConformanceStage::Spawn,
+        MANY_PTY_NOISY_SESSION_ID,
+    )?;
+    many_pty_expect_kind(
+        &noisy,
+        DaemonResponseKind::Spawned,
+        ManyPtyConformanceStage::Spawn,
+        MANY_PTY_NOISY_SESSION_ID,
+    )?;
+
+    let quiet_session_ids = (1..total_sessions)
+        .map(|index| format!("many-pty-quiet-{index:02}"))
+        .collect::<Vec<_>>();
+    for (index, session_id) in quiet_session_ids.iter().enumerate() {
+        created_sessions.push(session_id.clone());
+        let marker = format!("many-pty-quiet-complete-{index:02}");
+        let spawn = many_pty_request(
+            connection,
+            &DaemonRequest::Spawn {
+                session_id: session_id.clone(),
+                command: format!("printf '{marker}\\n'"),
+            },
+            ManyPtyConformanceStage::Spawn,
+            session_id,
+        )?;
+        many_pty_expect_kind(
+            &spawn,
+            DaemonResponseKind::Spawned,
+            ManyPtyConformanceStage::Spawn,
+            session_id,
+        )?;
+    }
+
+    wait_for_quiet_sessions(connection, &quiet_session_ids)?;
+    wait_for_many_pty_screen_marker(connection)?;
+
+    let attach = many_pty_request(
+        connection,
+        &DaemonRequest::Attach {
+            session_id: MANY_PTY_NOISY_SESSION_ID.to_string(),
+            subscription_id: MANY_PTY_SUBSCRIPTION_ID.to_string(),
+        },
+        ManyPtyConformanceStage::Attach,
+        MANY_PTY_NOISY_SESSION_ID,
+    )?;
+    many_pty_expect_kind(
+        &attach,
+        DaemonResponseKind::Events,
+        ManyPtyConformanceStage::Attach,
+        MANY_PTY_NOISY_SESSION_ID,
+    )?;
+    let mut observed_events = attach.events;
+
+    let screen = many_pty_request(
+        connection,
+        &DaemonRequest::ReadScreen {
+            session_id: MANY_PTY_NOISY_SESSION_ID.to_string(),
+        },
+        ManyPtyConformanceStage::History,
+        MANY_PTY_NOISY_SESSION_ID,
+    )?;
+    many_pty_expect_kind(
+        &screen,
+        DaemonResponseKind::ReadScreen,
+        ManyPtyConformanceStage::History,
+        MANY_PTY_NOISY_SESSION_ID,
+    )?;
+    let screen = screen.read_screen.ok_or_else(|| {
+        many_pty_error(
+            ManyPtyConformanceStage::History,
+            MANY_PTY_NOISY_SESSION_ID,
+            "read_screen response was missing its body",
+        )
+    })?;
+    if !screen.text.contains(MANY_PTY_HISTORY_MARKER) {
+        return Err(many_pty_error(
+            ManyPtyConformanceStage::History,
+            MANY_PTY_NOISY_SESSION_ID,
+            "read_screen did not contain the pre-attach marker",
+        ));
+    }
+
+    let snapshot = many_pty_request(
+        connection,
+        &DaemonRequest::CaptureSnapshot {
+            session_id: MANY_PTY_NOISY_SESSION_ID.to_string(),
+        },
+        ManyPtyConformanceStage::History,
+        MANY_PTY_NOISY_SESSION_ID,
+    )?;
+    many_pty_expect_kind(
+        &snapshot,
+        DaemonResponseKind::CaptureSnapshot,
+        ManyPtyConformanceStage::History,
+        MANY_PTY_NOISY_SESSION_ID,
+    )?;
+    let snapshot = snapshot.capture_snapshot.ok_or_else(|| {
+        many_pty_error(
+            ManyPtyConformanceStage::History,
+            MANY_PTY_NOISY_SESSION_ID,
+            "capture_snapshot response was missing its body",
+        )
+    })?;
+    if snapshot.payload_bytes == 0 || snapshot.payload_format.as_deref() != Some("plain-opaque-v1")
+    {
+        return Err(many_pty_error(
+            ManyPtyConformanceStage::History,
+            MANY_PTY_NOISY_SESSION_ID,
+            "capture_snapshot did not return a non-empty plain-opaque-v1 payload",
+        ));
+    }
+
+    let input = many_pty_request(
+        connection,
+        &DaemonRequest::SendInput {
+            session_id: MANY_PTY_NOISY_SESSION_ID.to_string(),
+            data: format!("{MANY_PTY_INPUT}\n"),
+        },
+        ManyPtyConformanceStage::Input,
+        MANY_PTY_NOISY_SESSION_ID,
+    )?;
+    many_pty_expect_kind(
+        &input,
+        DaemonResponseKind::Events,
+        ManyPtyConformanceStage::Input,
+        MANY_PTY_NOISY_SESSION_ID,
+    )?;
+    observed_events.extend(input.events);
+
+    let deadline = Instant::now() + MANY_PTY_DEADLINE;
+    while Instant::now() < deadline && !many_pty_saw_live_output(&observed_events) {
+        let drain = many_pty_request(
+            connection,
+            &DaemonRequest::Drain {
+                session_id: MANY_PTY_NOISY_SESSION_ID.to_string(),
+            },
+            ManyPtyConformanceStage::Drain,
+            MANY_PTY_NOISY_SESSION_ID,
+        )?;
+        many_pty_expect_kind(
+            &drain,
+            DaemonResponseKind::Events,
+            ManyPtyConformanceStage::Drain,
+            MANY_PTY_NOISY_SESSION_ID,
+        )?;
+        observed_events.extend(drain.events);
+        if !many_pty_saw_live_output(&observed_events) {
+            thread::sleep(MANY_PTY_POLL_INTERVAL);
+        }
+    }
+
+    let history_index = observed_events
+        .iter()
+        .position(|event| match event {
+            DaemonEvent::Snapshot {
+                subscription_id,
+                data,
+                bytes,
+                ..
+            }
+            | DaemonEvent::Scrollback {
+                subscription_id,
+                data,
+                bytes,
+                ..
+            } if subscription_id == MANY_PTY_SUBSCRIPTION_ID => {
+                !data.is_empty() && *bytes == data.len() && data.contains(MANY_PTY_HISTORY_MARKER)
+            }
+            _ => false,
+        })
+        .ok_or_else(|| {
+            many_pty_error(
+                ManyPtyConformanceStage::History,
+                MANY_PTY_NOISY_SESSION_ID,
+                "late attach did not return renderable marker history with a matching byte count",
+            )
+        })?;
+    if observed_events.iter().any(|event| {
+        matches!(
+            event,
+            DaemonEvent::Snapshot { subscription_id, data, bytes, .. }
+                | DaemonEvent::Scrollback { subscription_id, data, bytes, .. }
+                if subscription_id == MANY_PTY_SUBSCRIPTION_ID && *bytes > 0 && data.is_empty()
+        )
+    }) {
+        return Err(many_pty_error(
+            ManyPtyConformanceStage::History,
+            MANY_PTY_NOISY_SESSION_ID,
+            "late attach returned opaque history without renderable data",
+        ));
+    }
+    let live_index = many_pty_live_output_index(&observed_events).ok_or_else(|| {
+        let output = many_pty_terminal_output(&observed_events);
+        let output_tail = output
+            .chars()
+            .rev()
+            .take(240)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect::<String>();
+        many_pty_error(
+            ManyPtyConformanceStage::Drain,
+            MANY_PTY_NOISY_SESSION_ID,
+            format!(
+                "drain did not observe the input-driven live marker; terminal tail: {output_tail:?}"
+            ),
+        )
+    })?;
+    if history_index >= live_index {
+        return Err(many_pty_error(
+            ManyPtyConformanceStage::History,
+            MANY_PTY_NOISY_SESSION_ID,
+            "restored history was not ordered before later live output",
+        ));
+    }
+
+    Ok(ManyPtyConformanceReport {
+        total_sessions,
+        quiet_sessions: quiet_session_ids.len(),
+        quiet_sessions_exited: quiet_session_ids.len(),
+        history_observed: true,
+        screen_marker_observed: true,
+        snapshot_payload_bytes: snapshot.payload_bytes,
+        live_output_observed: true,
+        cleaned_sessions: 0,
+    })
+}
+
+fn wait_for_quiet_sessions(
+    connection: &mut DaemonConnection,
+    quiet_session_ids: &[String],
+) -> Result<(), ManyPtyConformanceError> {
+    let deadline = Instant::now() + MANY_PTY_DEADLINE;
+    let mut observed_lifecycles = BTreeMap::new();
+    while Instant::now() < deadline {
+        for session_id in quiet_session_ids {
+            let drain = many_pty_request(
+                connection,
+                &DaemonRequest::Drain {
+                    session_id: session_id.clone(),
+                },
+                ManyPtyConformanceStage::Spawn,
+                session_id,
+            )?;
+            many_pty_expect_kind(
+                &drain,
+                DaemonResponseKind::Events,
+                ManyPtyConformanceStage::Spawn,
+                session_id,
+            )?;
+        }
+        let list = many_pty_request(
+            connection,
+            &DaemonRequest::ListSessions,
+            ManyPtyConformanceStage::Spawn,
+            "quiet-sessions",
+        )?;
+        many_pty_expect_kind(
+            &list,
+            DaemonResponseKind::Sessions,
+            ManyPtyConformanceStage::Spawn,
+            "quiet-sessions",
+        )?;
+        let mut all_exited = true;
+        for session_id in quiet_session_ids {
+            let lifecycle = list
+                .sessions
+                .iter()
+                .find(|session| session.session_id == *session_id)
+                .map(|session| session.lifecycle.as_str());
+            observed_lifecycles.insert(
+                session_id.clone(),
+                lifecycle.unwrap_or("missing").to_string(),
+            );
+            match lifecycle {
+                Some("exited") => {}
+                Some("failed") => {
+                    return Err(many_pty_error(
+                        ManyPtyConformanceStage::Spawn,
+                        session_id,
+                        "quiet session reached lifecycle failed",
+                    ));
+                }
+                Some(_) | None => all_exited = false,
+            }
+        }
+        if all_exited {
+            return Ok(());
+        }
+        thread::sleep(MANY_PTY_POLL_INTERVAL);
+    }
+
+    Err(many_pty_error(
+        ManyPtyConformanceStage::Spawn,
+        observed_lifecycles
+            .iter()
+            .find(|(_, lifecycle)| lifecycle.as_str() != "exited")
+            .map(|(session_id, _)| session_id.as_str())
+            .unwrap_or("quiet-sessions"),
+        format!(
+            "quiet sessions did not all reach lifecycle exited before the deadline; observed lifecycles: {observed_lifecycles:?}"
+        ),
+    ))
+}
+
+fn wait_for_many_pty_screen_marker(
+    connection: &mut DaemonConnection,
+) -> Result<(), ManyPtyConformanceError> {
+    let deadline = Instant::now() + MANY_PTY_DEADLINE;
+    let mut last_screen = String::new();
+    while Instant::now() < deadline {
+        let drain = many_pty_request(
+            connection,
+            &DaemonRequest::Drain {
+                session_id: MANY_PTY_NOISY_SESSION_ID.to_string(),
+            },
+            ManyPtyConformanceStage::History,
+            MANY_PTY_NOISY_SESSION_ID,
+        )?;
+        many_pty_expect_kind(
+            &drain,
+            DaemonResponseKind::Events,
+            ManyPtyConformanceStage::History,
+            MANY_PTY_NOISY_SESSION_ID,
+        )?;
+        let response = many_pty_request(
+            connection,
+            &DaemonRequest::ReadScreen {
+                session_id: MANY_PTY_NOISY_SESSION_ID.to_string(),
+            },
+            ManyPtyConformanceStage::History,
+            MANY_PTY_NOISY_SESSION_ID,
+        )?;
+        many_pty_expect_kind(
+            &response,
+            DaemonResponseKind::ReadScreen,
+            ManyPtyConformanceStage::History,
+            MANY_PTY_NOISY_SESSION_ID,
+        )?;
+        if let Some(screen) = response.read_screen {
+            if screen.text.contains(MANY_PTY_HISTORY_MARKER) {
+                return Ok(());
+            }
+            last_screen = screen.text;
+        }
+        thread::sleep(MANY_PTY_POLL_INTERVAL);
+    }
+    let screen_tail = last_screen
+        .chars()
+        .rev()
+        .take(240)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    Err(many_pty_error(
+        ManyPtyConformanceStage::History,
+        MANY_PTY_NOISY_SESSION_ID,
+        format!(
+            "pre-attach screen marker did not appear before the deadline; screen tail: {screen_tail:?}"
+        ),
+    ))
+}
+
+fn many_pty_saw_live_output(events: &[DaemonEvent]) -> bool {
+    many_pty_live_output_index(events).is_some()
+}
+
+fn many_pty_live_output_index(events: &[DaemonEvent]) -> Option<usize> {
+    let mut output = String::new();
+    for (index, event) in events.iter().enumerate() {
+        if let DaemonEvent::TerminalOutput {
+            subscription_id,
+            data,
+            ..
+        } = event
+            && subscription_id == MANY_PTY_SUBSCRIPTION_ID
+        {
+            output.push_str(data);
+            if output.contains(MANY_PTY_LIVE_MARKER) {
+                return Some(index);
+            }
+        }
+    }
+    None
+}
+
+fn many_pty_terminal_output(events: &[DaemonEvent]) -> String {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            DaemonEvent::TerminalOutput {
+                subscription_id,
+                data,
+                ..
+            } if subscription_id == MANY_PTY_SUBSCRIPTION_ID => Some(data.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn cleanup_many_pty_sessions(
+    connection: &mut DaemonConnection,
+    session_ids: &[String],
+) -> (usize, Vec<String>) {
+    let mut cleaned = 0;
+    let mut failures = Vec::new();
+    for session_id in session_ids {
+        match connection.request(&DaemonRequest::ShutdownSession {
+            session_id: session_id.clone(),
+        }) {
+            Ok(response)
+                if matches!(
+                    response.kind,
+                    DaemonResponseKind::Events | DaemonResponseKind::SessionCleanup
+                ) =>
+            {
+                cleaned += 1;
+            }
+            Ok(_) | Err(_) => failures.push(session_id.clone()),
+        }
+    }
+    (cleaned, failures)
+}
+
+fn many_pty_request(
+    connection: &mut DaemonConnection,
+    request: &DaemonRequest,
+    stage: ManyPtyConformanceStage,
+    session_id: &str,
+) -> Result<DaemonResponse, ManyPtyConformanceError> {
+    connection
+        .request(request)
+        .map_err(|_| many_pty_error(stage, session_id, "public daemon request failed"))
+}
+
+fn many_pty_expect_kind(
+    response: &DaemonResponse,
+    expected: DaemonResponseKind,
+    stage: ManyPtyConformanceStage,
+    session_id: &str,
+) -> Result<(), ManyPtyConformanceError> {
+    if response.kind == expected {
+        Ok(())
+    } else {
+        Err(many_pty_error(
+            stage,
+            session_id,
+            format!(
+                "daemon returned response kind {:?}, expected {expected:?}",
+                response.kind
+            ),
+        ))
+    }
+}
+
+fn many_pty_error(
+    stage: ManyPtyConformanceStage,
+    session_id: impl Into<String>,
+    details: impl Into<String>,
+) -> ManyPtyConformanceError {
+    ManyPtyConformanceError {
+        stage,
+        session_id: session_id.into(),
+        details: details.into(),
+        cleanup_failures: Vec::new(),
+    }
 }
 
 /// Stable observation returned by [`run_project_pipelines_conformance`].
@@ -3123,6 +3757,22 @@ mod tests {
     use std::io::Write;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn many_pty_failure_stage_labels_are_stable() {
+        assert_eq!(
+            [
+                ManyPtyConformanceStage::Spawn,
+                ManyPtyConformanceStage::Attach,
+                ManyPtyConformanceStage::Drain,
+                ManyPtyConformanceStage::Input,
+                ManyPtyConformanceStage::History,
+                ManyPtyConformanceStage::Cleanup,
+            ]
+            .map(ManyPtyConformanceStage::as_str),
+            ["spawn", "attach", "drain", "input", "history", "cleanup"]
+        );
+    }
 
     #[test]
     fn support_matrix_matches_current_compatibility_descriptor() {
