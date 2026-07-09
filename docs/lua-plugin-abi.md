@@ -168,8 +168,8 @@ authority stays with the hub.
 
 ## Coordination Access
 
-Lua coordination helpers expose the generic routed-envelope primitive without
-embedding Project Pipelines policy in Rust:
+Lua coordination helpers expose the CoreDaemon-backed generic routed-envelope
+primitive without embedding Project Pipelines policy in Rust:
 
 - `botster.coordination.publish({ id = "...", target = {...}, content_type =
   "...", body = "...", extension = {...}, created_at = 0 })`: publishes one
@@ -180,6 +180,11 @@ embedding Project Pipelines policy in Rust:
   including primitive-assigned cursors.
 - `botster.coordination.acknowledge({ target = {...}, envelope_id = "..." })`:
   acknowledges one delivered target copy and returns its delivery state.
+
+These helpers submit to the hub owner thread and use CoreDaemon's
+routed-envelope APIs. They raise a Lua runtime error if the daemon rejects the
+request, including the stopped-daemon case; callers that need to recover should
+wrap coordination calls with `pcall`.
 
 Future capability helpers must continue to submit through hub/core capability
 contracts. They must not expose raw host filesystem, network, process, or C

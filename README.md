@@ -603,9 +603,9 @@ in-process closure path.
 The native local coordination path uses no Lua or plugin tool execution:
 `whoami`, `post_message`, `receive_messages`, `ack_message`, and
 `notify_session` are native hub tools even when the binary also has the Lua
-plugin runtime available. Project Pipelines separately composes the same
-routed-envelope primitives from `examples/project-pipelines/plugin.lua` through
-the Lua ABI.
+plugin runtime available. Project Pipelines composes the same CoreDaemon-backed
+routed-envelope helper from `examples/project-pipelines/plugin.lua` through the
+Lua ABI.
 
 ## Project Pipelines Local Readiness
 
