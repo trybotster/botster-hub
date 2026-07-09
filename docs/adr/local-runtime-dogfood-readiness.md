@@ -1,16 +1,20 @@
-# Local Runtime Dogfood Readiness
+# Local Runtime Product Path Readiness
 
 ## Status
 
-Ready for local dogfood of the explicit daemon-backed Unix runtime path plus
-constrained Project Pipelines MCP coordination over the Lua plugin runtime.
+Ready for daily local use of the single product topology—explicit data-dir
+daemon, CoreDaemon + session worker, package policy, `HubClientApi`, daemon
+CLI/MCP, and constrained Project Pipelines MCP coordination over the Lua plugin
+runtime. Integration tests and dogfood launchers prove that path; they are not a
+second runtime story.
 
 This note is scoped to the local `botster-hub` stack: hub as host profile and
-control plane, `botster-core-daemon` as session supervisor/router,
-worker-backed sessions as PTY owners, daemon-backed MCP stdio, the minimal local
-TUI, and the constrained Project Pipelines Lua plugin package. It does not
-cover cloud, Rails, WebRTC, browser, marketplace, provider process supervision,
-GitHub/PR automation, hosted preview feature parity, broad monolith migration,
+control plane, `botster-core-daemon` as session supervisor and coordination
+owner, worker-backed sessions as PTY owners, daemon-backed MCP stdio, the local
+TUI attach path, and the constrained Project Pipelines Lua plugin package. It
+does not cover cloud, Rails, public WebRTC, browser-as-hub-builtin, marketplace
+fetch UX, provider process supervision, GitHub/PR automation, hosted preview
+feature parity, broad monolith migration, hub client screen/snapshot un-defer,
 or uncoordinated crash PTY recovery.
 
 ## Evidence Matrix
@@ -39,23 +43,27 @@ hub that could silently diverge from live daemon state.
 
 ## Readiness Conclusion
 
-The new stack is ready for local dogfood where the operator uses an explicit
-data directory, starts the local hub daemon, drives session operations through
-the daemon-backed CLI or minimal local TUI, coordinates agents through native
-MCP routed-envelope tools, and runs the constrained Project Pipelines MCP
-workflow through `examples/project-pipelines/plugin.lua` over the Lua ABI.
+The stack is ready for daily local product use where the operator uses an
+explicit data directory, starts the local hub daemon, drives session operations
+through the daemon-backed CLI or local TUI, coordinates agents through native
+MCP tools on the **CoreDaemon-owned** routed-envelope bus, and runs the
+constrained Project Pipelines MCP workflow through
+`examples/project-pipelines/plugin.lua` over the Lua ABI.
 
 The readiness claim is intentionally narrower than full monolith parity.
 Project Pipelines state persists through PluginDb, and intentional daemon
 restart/reconnect is proved for package/plugin reload and worker-backed session
-recovery, but routed-envelope inboxes are in-memory. Secrets are not imported by
-the proof; provider credentials must be re-entered when deferred provider
+recovery, but routed-envelope inboxes are process memory (not restart-durable).
+Hub client `ReadScreen` / `CaptureSnapshot` remain Deferred even though
+CoreDaemon on botster-core main exposes readback APIs. Secrets are not imported
+by the proof; provider credentials must be re-entered when deferred provider
 integrations land. Live monolith Project Pipelines state is not imported in this
 milestone; cutover requires no in-flight monolith tickets or a future explicit
 one-shot export/import tool.
 
-Remaining feature-parity work is provider process supervision, package
-fetching/index behavior, GitHub/PR automation, install/update packaging,
-cloud/Rails/WebRTC/browser/marketplace adapters, public socket self-heal,
-long-running attach signal handling, broad migration compatibility, and
-uncoordinated full daemon/process-crash PTY recovery.
+Remaining feature-parity work on the same path: hub screen/snapshot un-defer,
+provider process supervision, package fetching/index behavior, GitHub/PR
+automation, install/update packaging, cloud/Rails/public WebRTC/browser
+adapters, public socket self-heal, long-running attach signal handling, broad
+migration compatibility, and uncoordinated full daemon/process-crash PTY
+recovery.

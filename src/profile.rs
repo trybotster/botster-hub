@@ -1,8 +1,9 @@
 //! First-party host profile metadata for `botster-hub`.
 //!
 //! The profile owns trusted Botster policy and composes the policy-free
-//! `botster-core` engine facade. This is static scaffold metadata, not a
-//! marketplace manifest parser or package lifecycle engine.
+//! production path through `botster_core_daemon::CoreDaemon`. This module is
+//! static host-profile metadata, not a marketplace manifest parser or package
+//! lifecycle engine.
 
 use botster_core::{Capability, CapabilitySurface};
 
