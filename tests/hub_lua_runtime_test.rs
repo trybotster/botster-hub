@@ -4,11 +4,12 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
 use botster_core::{
-    BoundaryJson, Capability, CapabilitySurface, PackageConfigurationSecretValue,
-    PackageConfigurationValue, PluginHandlerKind, PluginHandlerRef, PluginInvocationContext,
-    PluginInvocationFailure, PluginInvocationFailureKind, PluginInvocationRequest,
-    PluginInvocationResult, PluginInvocationSuccess, PluginKey, RequestId, UiActionResultState,
-    UiNodeKind,
+    BoundaryJson, Capability, CapabilitySurface, EndpointId, EnvelopeDeliveryStatus, EnvelopeId,
+    EnvelopeTarget, PackageConfigurationSecretValue, PackageConfigurationValue, PluginHandlerKind,
+    PluginHandlerRef, PluginInvocationContext, PluginInvocationFailure,
+    PluginInvocationFailureKind, PluginInvocationRequest, PluginInvocationResult,
+    PluginInvocationSuccess, PluginKey, RequestId, RoutedEnvelope, RoutedEnvelopePayload,
+    SessionId, UiActionResultState, UiNodeKind,
 };
 use botster_hub::{
     DataDirectoryOption, HostIdentityOptions, HubClientApi, HubClientRequest,
@@ -114,6 +115,89 @@ fn install_project_pipelines_registry() -> PackageRegistry {
     policy
         .enable("project-pipelines", "enable project pipelines package")
         .expect("enable project pipelines package");
+    policy.registry().clone()
+}
+
+fn install_coordination_probe_registry(name: &str) -> PackageRegistry {
+    let root = PathBuf::from("target")
+        .join("botster-hub-test-data")
+        .join("lua-runtime-packages")
+        .join(name);
+    let source_root = std::env::current_dir().expect("current dir").join(&root);
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).expect("create coordination probe package root");
+    fs::write(
+        root.join("plugin.lua"),
+        r#"
+return botster.register({
+  tools = {
+    {
+      name = "coordination_probe.publish",
+      description = "Publish one routed envelope through Lua coordination.",
+      handler = "publish",
+      call = function(args)
+        return botster.coordination.publish({
+          id = args.envelope_id,
+          target = args.target,
+          body = "lua coordination payload",
+          content_type = "text/plain",
+          created_at = 42,
+        })
+      end,
+    },
+    {
+      name = "coordination_probe.drain",
+      description = "Drain routed envelopes through Lua coordination.",
+      handler = "drain",
+      call = function(args)
+        return botster.coordination.drain({
+          target = args.target,
+          after = args.after,
+          limit = args.limit or 16,
+        })
+      end,
+    },
+    {
+      name = "coordination_probe.acknowledge",
+      description = "Acknowledge one routed envelope through Lua coordination.",
+      handler = "acknowledge",
+      call = function(args)
+        return botster.coordination.acknowledge({
+          target = args.target,
+          envelope_id = args.envelope_id,
+        })
+      end,
+    },
+  },
+})
+"#,
+    )
+    .expect("write coordination probe plugin");
+    fs::write(
+        root.join("botster-package.json"),
+        serde_json::json!({
+            "name": "coordination-probe.plugin",
+            "version": "1.0.0",
+            "kind": "plugin",
+            "botster": ">=0.1.0",
+            "source": { "type": "path", "path": source_root.display().to_string() },
+            "capabilities": [{ "surface": "mcp" }],
+            "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }]
+        })
+        .to_string(),
+    )
+    .expect("write coordination probe manifest");
+
+    let mut policy = default_package_policy();
+    policy
+        .install_local_path(&root, "install coordination probe package")
+        .expect("install coordination probe package");
+    policy
+        .enable(
+            "coordination-probe.plugin",
+            "enable coordination probe package",
+        )
+        .expect("enable coordination probe package");
     policy.registry().clone()
 }
 
@@ -1171,6 +1255,110 @@ fn project_pipelines_surface_action_round_trip_uses_client_api_and_plugin_worker
 }
 
 #[test]
+fn lua_and_native_coordination_publish_into_coredaemon_router() {
+    let registry = install_coordination_probe_registry("coordination-probe");
+    let mut hub = explicit_runtime("single-coredaemon-coordination");
+    hub.load_lua_plugin_package(&registry, "coordination-probe.plugin")
+        .expect("load coordination probe package");
+
+    let native_target = EnvelopeTarget::Session {
+        session_id: SessionId("native-coordination-target".to_string()),
+    };
+    let native_envelope_id = EnvelopeId("native-coredaemon-visible".to_string());
+    let native_publish = hub
+        .publish_routed_envelope(RoutedEnvelope::new(
+            native_envelope_id.clone(),
+            EndpointId("hub:native-test".to_string()),
+            vec![native_target.clone()],
+            RoutedEnvelopePayload {
+                content_type: "text/plain".to_string(),
+                body: b"native coordination payload".to_vec(),
+                extension: None,
+            },
+            41,
+        ))
+        .expect("publish native routed envelope");
+    assert_eq!(
+        native_publish.deliveries[0].status,
+        EnvelopeDeliveryStatus::Queued
+    );
+    assert_eq!(
+        hub.routed_envelope_delivery_state(&native_target, &native_envelope_id)
+            .state
+            .expect("CoreDaemon should record native delivery")
+            .status,
+        EnvelopeDeliveryStatus::Queued
+    );
+    let lua_drain_native = hub
+        .call_plugin_mcp_tool(botster_hub::McpCallRequest {
+            name: "coordination_probe.drain".to_string(),
+            arguments: serde_json::json!({
+                "target": native_target.clone(),
+                "limit": 1,
+            }),
+        })
+        .expect("drain native envelope through Lua coordination");
+    assert_eq!(
+        lua_drain_native["envelopes"][0]["id"],
+        native_envelope_id.0.as_str()
+    );
+    let lua_ack_native = hub
+        .call_plugin_mcp_tool(botster_hub::McpCallRequest {
+            name: "coordination_probe.acknowledge".to_string(),
+            arguments: serde_json::json!({
+                "target": native_target.clone(),
+                "envelope_id": native_envelope_id.0,
+            }),
+        })
+        .expect("ack native envelope through Lua coordination");
+    assert_eq!(lua_ack_native["state"]["status"], "acknowledged");
+    assert_eq!(
+        hub.routed_envelope_delivery_state(&native_target, &native_envelope_id)
+            .state
+            .expect("CoreDaemon should record Lua ack")
+            .status,
+        EnvelopeDeliveryStatus::Acknowledged
+    );
+
+    let lua_target = EnvelopeTarget::Session {
+        session_id: SessionId("lua-coordination-target".to_string()),
+    };
+    let lua_envelope_id = EnvelopeId("lua-coredaemon-visible".to_string());
+    let lua_publish = hub
+        .call_plugin_mcp_tool(botster_hub::McpCallRequest {
+            name: "coordination_probe.publish".to_string(),
+            arguments: serde_json::json!({
+                "envelope_id": lua_envelope_id.0,
+                "target": lua_target.clone(),
+            }),
+        })
+        .expect("publish routed envelope through Lua coordination");
+    assert_eq!(lua_publish["deliveries"][0]["status"], "queued");
+
+    let native_drain_lua = hub
+        .drain_routed_envelopes(lua_target.clone(), None, 1)
+        .expect("drain Lua envelope through native HubRuntime");
+    assert_eq!(native_drain_lua.envelopes[0].id, lua_envelope_id);
+    let native_ack_lua = hub
+        .acknowledge_routed_envelope(lua_target.clone(), lua_envelope_id.clone())
+        .expect("ack Lua envelope through native HubRuntime");
+    assert_eq!(
+        native_ack_lua
+            .state
+            .expect("CoreDaemon should return native ack state")
+            .status,
+        EnvelopeDeliveryStatus::Acknowledged
+    );
+    assert_eq!(
+        hub.routed_envelope_delivery_state(&lua_target, &lua_envelope_id)
+            .state
+            .expect("CoreDaemon should record Lua delivery")
+            .status,
+        EnvelopeDeliveryStatus::Acknowledged
+    );
+}
+
+#[test]
 fn lua_instruction_budget_reports_structured_handler_failure() {
     let root = PathBuf::from("target")
         .join("botster-hub-test-data")
@@ -1291,7 +1479,7 @@ fn reload_replaces_lua_tool_descriptors_and_removes_stale_handlers() {
             .configuration_view(),
         LuaPluginHostApi {
             capabilities: hub.capability_runtime(),
-            routed_envelopes: hub.routed_envelope_runtime(),
+            coordination: hub.coordination_bridge(),
             session_templates: hub.session_template_spawner(),
             spawn_targets: hub.spawn_targets(),
             worktrees: hub.worktrees(),

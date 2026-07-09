@@ -3,12 +3,12 @@
 //! This module intentionally exposes a narrow ABI: plugin registration,
 //! handler invocation by stable id, and selected hub capability helpers.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::error::Error;
 use std::fmt;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
 
@@ -21,8 +21,10 @@ use botster_core::{
     PluginInvocationRequest, PluginInvocationResult, PluginInvocationSuccess, PluginKey,
     PluginOwnedDescriptor, PluginResourceKind, PluginResourceRef, PluginRuntime,
     PluginStoreCapabilityRequest, PluginStoreKey, PluginStoreOperation, RoutedEnvelope,
-    RoutedEnvelopePayload, RoutedEnvelopeRouter, TimerCapabilityRequest,
+    RoutedEnvelopeDrainOutcome, RoutedEnvelopePayload, RoutedEnvelopePublishOutcome,
+    TimerCapabilityRequest,
 };
+use botster_core_daemon::RoutedEnvelopeDeliveryStateResult;
 use mlua::{Function, HookTriggers, Lua, LuaOptions, LuaSerdeExt, StdLib, Table, Value, VmState};
 use serde_json::json;
 
@@ -34,16 +36,119 @@ use crate::session_templates::{SessionTemplateContextInput, SessionTemplateReque
 
 const DEFAULT_INSTRUCTION_BUDGET: u64 = 500_000;
 const PLUGIN_DB_TIMEOUT_MS: u64 = 1_000;
+const COORDINATION_REQUEST_TIMEOUT_MS: u64 = 1_000;
 static LUA_OPERATION_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 /// Shared host capability runtime used by Lua capability helpers.
 pub type SharedHubCapabilityRuntime = Arc<Mutex<HubCapabilityRuntime>>;
-/// Shared routed-envelope primitive used by Lua coordination helpers.
-pub type SharedRoutedEnvelopeRuntime = Arc<Mutex<RoutedEnvelopeRouter>>;
+
+/// Narrow CoreDaemon-backed coordination bridge exposed to Lua helpers.
+#[derive(Clone)]
+pub struct HubCoordinationBridge {
+    pending: Arc<Mutex<VecDeque<PendingCoordinationRequest>>>,
+}
+
+impl HubCoordinationBridge {
+    pub(crate) fn new() -> Self {
+        Self {
+            pending: Arc::new(Mutex::new(VecDeque::new())),
+        }
+    }
+
+    fn publish(&self, envelope: RoutedEnvelope) -> Result<RoutedEnvelopePublishOutcome, String> {
+        let response = self.request(PendingCoordinationOperation::Publish { envelope })?;
+        match response {
+            HubCoordinationResponse::Publish(outcome) => Ok(outcome),
+            _ => Err("coordination publish returned unexpected response".to_string()),
+        }
+    }
+
+    fn drain(
+        &self,
+        target: EnvelopeTarget,
+        after: Option<EnvelopeCursor>,
+        limit: usize,
+    ) -> Result<RoutedEnvelopeDrainOutcome, String> {
+        let response = self.request(PendingCoordinationOperation::Drain {
+            target,
+            after,
+            limit,
+        })?;
+        match response {
+            HubCoordinationResponse::Drain(outcome) => Ok(outcome),
+            _ => Err("coordination drain returned unexpected response".to_string()),
+        }
+    }
+
+    fn acknowledge(
+        &self,
+        target: EnvelopeTarget,
+        envelope_id: EnvelopeId,
+    ) -> Result<RoutedEnvelopeDeliveryStateResult, String> {
+        let response = self.request(PendingCoordinationOperation::Acknowledge {
+            target,
+            envelope_id,
+        })?;
+        match response {
+            HubCoordinationResponse::Acknowledge(outcome) => Ok(outcome),
+            _ => Err("coordination acknowledge returned unexpected response".to_string()),
+        }
+    }
+
+    fn request(
+        &self,
+        operation: PendingCoordinationOperation,
+    ) -> Result<HubCoordinationResponse, String> {
+        let (response, receiver) = mpsc::channel();
+        self.pending
+            .lock()
+            .map_err(|_| "coordination queue lock poisoned".to_string())?
+            .push_back(PendingCoordinationRequest {
+                operation,
+                response,
+            });
+        receiver
+            .recv_timeout(Duration::from_millis(COORDINATION_REQUEST_TIMEOUT_MS))
+            .map_err(|_| "coordination request did not complete before timeout".to_string())?
+    }
+
+    pub(crate) fn take_pending(&self) -> Option<PendingCoordinationRequest> {
+        self.pending
+            .lock()
+            .expect("coordination queue lock")
+            .pop_front()
+    }
+}
+
+pub(crate) struct PendingCoordinationRequest {
+    pub(crate) operation: PendingCoordinationOperation,
+    pub(crate) response: mpsc::Sender<Result<HubCoordinationResponse, String>>,
+}
+
+pub(crate) enum PendingCoordinationOperation {
+    Publish {
+        envelope: RoutedEnvelope,
+    },
+    Drain {
+        target: EnvelopeTarget,
+        after: Option<EnvelopeCursor>,
+        limit: usize,
+    },
+    Acknowledge {
+        target: EnvelopeTarget,
+        envelope_id: EnvelopeId,
+    },
+}
+
+pub(crate) enum HubCoordinationResponse {
+    Publish(RoutedEnvelopePublishOutcome),
+    Drain(RoutedEnvelopeDrainOutcome),
+    Acknowledge(RoutedEnvelopeDeliveryStateResult),
+}
 
 struct LuaHostApi {
     configuration: PackageConfigurationView,
     capabilities: SharedHubCapabilityRuntime,
-    routed_envelopes: SharedRoutedEnvelopeRuntime,
+    coordination: HubCoordinationBridge,
     session_templates: SharedSessionTemplateSpawner,
     spawn_targets: SharedSpawnTargets,
     worktrees: SharedWorktrees,
@@ -54,7 +159,7 @@ struct LuaHostApi {
 #[derive(Clone)]
 pub struct LuaPluginHostApi {
     pub capabilities: SharedHubCapabilityRuntime,
-    pub routed_envelopes: SharedRoutedEnvelopeRuntime,
+    pub coordination: HubCoordinationBridge,
     pub session_templates: SharedSessionTemplateSpawner,
     pub spawn_targets: SharedSpawnTargets,
     pub worktrees: SharedWorktrees,
@@ -84,7 +189,7 @@ impl LuaPluginRuntime {
         let host_api = LuaHostApi {
             configuration,
             capabilities: api.capabilities,
-            routed_envelopes: api.routed_envelopes,
+            coordination: api.coordination,
             session_templates: api.session_templates,
             spawn_targets: api.spawn_targets,
             worktrees: api.worktrees,
@@ -542,7 +647,7 @@ fn install_botster_api(
     botster.set("capabilities", capabilities_table)?;
     botster.set(
         "coordination",
-        coordination_table(lua, plugin_key, host_api.routed_envelopes)?,
+        coordination_table(lua, plugin_key, host_api.coordination)?,
     )?;
     globals.set("botster", botster)?;
     Ok(())
@@ -931,24 +1036,24 @@ fn plugin_store_event_to_lua(
 fn coordination_table(
     lua: &Lua,
     plugin_key: PluginKey,
-    routed_envelopes: SharedRoutedEnvelopeRuntime,
+    coordination_bridge: HubCoordinationBridge,
 ) -> Result<Table, mlua::Error> {
     let coordination = lua.create_table()?;
 
-    let publish_runtime = routed_envelopes.clone();
+    let publish_bridge = coordination_bridge.clone();
     let publish_plugin_key = plugin_key.clone();
     coordination.set(
         "publish",
         lua.create_function(move |lua, args: Value| {
             let envelope = routed_envelope_from_lua(lua, publish_plugin_key.clone(), args)?;
-            let mut runtime = publish_runtime.lock().map_err(|_| {
-                mlua::Error::RuntimeError("routed envelope runtime lock poisoned".to_string())
-            })?;
-            lua.to_value(&runtime.publish(envelope))
+            let outcome = publish_bridge
+                .publish(envelope)
+                .map_err(mlua::Error::RuntimeError)?;
+            lua.to_value(&outcome)
         })?,
     )?;
 
-    let drain_runtime = routed_envelopes.clone();
+    let drain_bridge = coordination_bridge.clone();
     coordination.set(
         "drain",
         lua.create_function(move |lua, args: Value| {
@@ -963,14 +1068,14 @@ fn coordination_table(
                 .and_then(serde_json::Value::as_u64)
                 .and_then(|limit| usize::try_from(limit).ok())
                 .unwrap_or(16);
-            let mut runtime = drain_runtime.lock().map_err(|_| {
-                mlua::Error::RuntimeError("routed envelope runtime lock poisoned".to_string())
-            })?;
-            lua.to_value(&runtime.drain(&target, after, limit))
+            let outcome = drain_bridge
+                .drain(target, after, limit)
+                .map_err(mlua::Error::RuntimeError)?;
+            lua.to_value(&outcome)
         })?,
     )?;
 
-    let ack_runtime = routed_envelopes;
+    let ack_bridge = coordination_bridge;
     coordination.set(
         "acknowledge",
         lua.create_function(move |lua, args: Value| {
@@ -984,12 +1089,10 @@ fn coordination_table(
                         "coordination.acknowledge requires envelope_id".to_string(),
                     )
                 })?;
-            let mut runtime = ack_runtime.lock().map_err(|_| {
-                mlua::Error::RuntimeError("routed envelope runtime lock poisoned".to_string())
-            })?;
-            lua.to_value(&json!({
-                "state": runtime.acknowledge(&target, &EnvelopeId(envelope_id.to_string())),
-            }))
+            let outcome = ack_bridge
+                .acknowledge(target, EnvelopeId(envelope_id.to_string()))
+                .map_err(mlua::Error::RuntimeError)?;
+            lua.to_value(&outcome)
         })?,
     )?;
 
