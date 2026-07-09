@@ -3094,6 +3094,23 @@ fn print_daemon_response(response: DaemonResponse) -> Result<(), OperatorError> 
                 );
             }
         }
+        DaemonResponseKind::ReadScreen => {
+            println!("response=read_screen");
+            if let Some(screen) = response.read_screen {
+                println!("session_id={}", screen.session_id);
+                println!("text={}", screen.text);
+            }
+        }
+        DaemonResponseKind::CaptureSnapshot => {
+            println!("response=capture_snapshot");
+            if let Some(snapshot) = response.capture_snapshot {
+                println!("session_id={}", snapshot.session_id);
+                println!("rows={}", snapshot.rows);
+                println!("cols={}", snapshot.cols);
+                println!("payload_format={:?}", snapshot.payload_format);
+                println!("payload_bytes={}", snapshot.payload_bytes);
+            }
+        }
         DaemonResponseKind::SpawnTargets => {
             println!("response=spawn_targets");
             println!("target_count={}", response.spawn_targets.len());
