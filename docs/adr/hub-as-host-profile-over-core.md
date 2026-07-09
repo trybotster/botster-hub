@@ -173,10 +173,12 @@ coordination (no hub-local parallel inbox).
 `DefaultBotsterEngine` remains a core library embed detail. Hub does not treat
 it as a second product runtime for local sessions.
 
-Remaining work is product gaps on that same path, not dual ownership stories:
+Product terminal surfaces on that path already include attach/drain history and
+hub client `ReadScreen` / `CaptureSnapshot` through CoreDaemon. Remaining work
+is product gaps on the same path, not dual ownership stories:
 
-1. Wire hub client screen/snapshot/`report_delivery_*` through CoreDaemon
-   readback APIs (still Deferred on hub main while CoreDaemon exposes them).
+1. Expose delivery-pressure reporting (`report_delivery_*`) if core and clients
+   need it; still Deferred on the hub product surface today.
 2. Keep runtime proof paths facade-backed: typed CoreDaemon verbs and
    worker-backed sessions—not assembling `MultiplexerEngine` in hub, owning PTY
    handles in the hub process, or parsing core daemon CLI output.

@@ -20,7 +20,7 @@ mod typescript;
 
 pub const PROTOCOL: &str = "botster-hub-daemon-v1";
 pub const PROTOCOL_VERSION: u16 = 1;
-pub const CONFORMANCE_FIXTURE_REVISION: u16 = 9;
+pub const CONFORMANCE_FIXTURE_REVISION: u16 = 10;
 pub const FEATURE_SESSIONS: &str = "sessions";
 pub const FEATURE_TERMINAL_STREAMING: &str = "terminal_streaming";
 pub const FEATURE_RESIZE: &str = "resize";
@@ -30,6 +30,7 @@ pub const FEATURE_PACKAGE_ROUTES: &str = "package_routes";
 pub const FEATURE_PACKAGE_NAVIGATION: &str = "package_navigation";
 pub const FEATURE_SPAWN_TARGETS: &str = "spawn_targets";
 pub const FEATURE_WORKTREES: &str = "worktrees";
+pub const FEATURE_TERMINAL_READBACK: &str = "terminal_readback";
 const ATTACH_DRAIN_INTERVAL: Duration = Duration::from_millis(25);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -519,6 +520,7 @@ fn current_feature_list() -> Vec<&'static str> {
         FEATURE_PACKAGE_NAVIGATION,
         FEATURE_SPAWN_TARGETS,
         FEATURE_WORKTREES,
+        FEATURE_TERMINAL_READBACK,
     ]
 }
 
@@ -575,6 +577,12 @@ pub enum DaemonRequest {
         session_id: String,
     },
     Drain {
+        session_id: String,
+    },
+    ReadScreen {
+        session_id: String,
+    },
+    CaptureSnapshot {
         session_id: String,
     },
     ListSessionTemplates,
@@ -775,6 +783,10 @@ pub struct DaemonResponse {
     pub resolved_session_template: Option<DaemonResolvedSessionTemplate>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_context: Option<DaemonSessionContext>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_screen: Option<DaemonReadScreen>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_snapshot: Option<DaemonCaptureSnapshot>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub spawn_targets: Vec<DaemonSpawnTarget>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -844,6 +856,8 @@ pub enum DaemonResponseKind {
     SessionTemplates,
     ResolvedSessionTemplate,
     SessionContext,
+    ReadScreen,
+    CaptureSnapshot,
     SpawnTargets,
     SpawnTargetValidation,
     Worktrees,
@@ -871,6 +885,22 @@ pub enum DaemonResponseKind {
     SessionNotified,
     OperatorError,
     Shutdown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonReadScreen {
+    pub session_id: String,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonCaptureSnapshot {
+    pub session_id: String,
+    pub rows: u16,
+    pub cols: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload_format: Option<String>,
+    pub payload_bytes: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2939,6 +2969,12 @@ mod tests {
             DaemonRequest::Drain {
                 session_id: "session".to_string(),
             },
+            DaemonRequest::ReadScreen {
+                session_id: "session".to_string(),
+            },
+            DaemonRequest::CaptureSnapshot {
+                session_id: "session".to_string(),
+            },
             DaemonRequest::ListSessionTemplates,
             DaemonRequest::ShowSessionTemplate {
                 template_id: "init".to_string(),
@@ -3122,6 +3158,8 @@ mod tests {
             DaemonRequest::Resize { .. } => "resize",
             DaemonRequest::ShutdownSession { .. } => "shutdown_session",
             DaemonRequest::Drain { .. } => "drain",
+            DaemonRequest::ReadScreen { .. } => "read_screen",
+            DaemonRequest::CaptureSnapshot { .. } => "capture_snapshot",
             DaemonRequest::ListSessionTemplates => "list_session_templates",
             DaemonRequest::ShowSessionTemplate { .. } => "show_session_template",
             DaemonRequest::ResolveSessionTemplate { .. } => "resolve_session_template",
@@ -3220,6 +3258,8 @@ mod tests {
             DaemonResponseKind::SessionTemplates => "session_templates",
             DaemonResponseKind::ResolvedSessionTemplate => "resolved_session_template",
             DaemonResponseKind::SessionContext => "session_context",
+            DaemonResponseKind::ReadScreen => "read_screen",
+            DaemonResponseKind::CaptureSnapshot => "capture_snapshot",
             DaemonResponseKind::SpawnTargets => "spawn_targets",
             DaemonResponseKind::SpawnTargetValidation => "spawn_target_validation",
             DaemonResponseKind::Worktrees => "worktrees",
@@ -3317,6 +3357,17 @@ mod tests {
                 context_id: "ctx-session".to_string(),
                 session_id: "session".to_string(),
                 values: BTreeMap::from([("prompt".to_string(), "hello".to_string())]),
+            }),
+            read_screen: Some(DaemonReadScreen {
+                session_id: "session".to_string(),
+                text: "ready".to_string(),
+            }),
+            capture_snapshot: Some(DaemonCaptureSnapshot {
+                session_id: "session".to_string(),
+                rows: 24,
+                cols: 80,
+                payload_format: Some("plain-opaque-v1".to_string()),
+                payload_bytes: 5,
             }),
             spawn_targets: vec![DaemonSpawnTarget {
                 target_id: "tgt_example".to_string(),

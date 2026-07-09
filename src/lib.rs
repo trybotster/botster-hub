@@ -57,19 +57,19 @@ pub use botster_core::{
 
 pub use capabilities::HubCapabilityRuntime;
 pub use client_api::{
-    HubClientAdmission, HubClientApi, HubClientCapability, HubClientError, HubClientEvent,
-    HubClientGuardedWrite, HubClientIdentity, HubClientObservationKind, HubClientOperation,
-    HubClientPackage, HubClientPackageAvailability, HubClientPackageAvailabilityReason,
-    HubClientPackageAvailabilityState, HubClientPackageClassification,
-    HubClientPackageConfiguration, HubClientPackageDependencyAvailability,
-    HubClientPackageDiagnostic, HubClientPackageEnvironmentRequirement,
-    HubClientPackageFeatureAvailability, HubClientPackageNavigationEntry,
-    HubClientPackageNavigationTarget, HubClientPackageProcess, HubClientPackageRunnableEntrypoint,
-    HubClientPackageState, HubClientPackageWorkingDirectory, HubClientPluginLifecycle,
-    HubClientPluginSurface, HubClientRequest, HubClientResponse, HubClientResponseBody,
-    HubClientResult, HubClientRole, HubClientRoutedEnvelopeAck, HubClientRoutedEnvelopeDrain,
-    HubClientRoutedEnvelopePublish, HubClientRuntimeErrorKind, HubClientSession, HubClientSpawned,
-    HubClientStatus,
+    HubClientAdmission, HubClientApi, HubClientCapability, HubClientCaptureSnapshot,
+    HubClientError, HubClientEvent, HubClientGuardedWrite, HubClientIdentity,
+    HubClientObservationKind, HubClientOperation, HubClientPackage, HubClientPackageAvailability,
+    HubClientPackageAvailabilityReason, HubClientPackageAvailabilityState,
+    HubClientPackageClassification, HubClientPackageConfiguration,
+    HubClientPackageDependencyAvailability, HubClientPackageDiagnostic,
+    HubClientPackageEnvironmentRequirement, HubClientPackageFeatureAvailability,
+    HubClientPackageNavigationEntry, HubClientPackageNavigationTarget, HubClientPackageProcess,
+    HubClientPackageRunnableEntrypoint, HubClientPackageState, HubClientPackageWorkingDirectory,
+    HubClientPluginLifecycle, HubClientPluginSurface, HubClientReadScreen, HubClientRequest,
+    HubClientResponse, HubClientResponseBody, HubClientResult, HubClientRole,
+    HubClientRoutedEnvelopeAck, HubClientRoutedEnvelopeDrain, HubClientRoutedEnvelopePublish,
+    HubClientRuntimeErrorKind, HubClientSession, HubClientSpawned, HubClientStatus,
 };
 pub use config::{
     CoreEngineOptions, CoreQueueCapacity, DataDirectoryOption, DirectoryList, HostIdentity,
@@ -336,9 +336,14 @@ const HUB_FACADE_DECISIONS: &[HubFacadeDecision] = &[
         "explicit daemon restart/adoption control over worker-backed core sessions",
     ),
     HubFacadeDecision::new(
-        "read_screen/capture_snapshot/report_delivery_*",
+        "read_screen/capture_snapshot",
+        HubFacadeExposure::Exposed,
+        "explicit daemon-backed terminal readback through HubRuntime and CoreDaemon",
+    ),
+    HubFacadeDecision::new(
+        "report_delivery_*",
         HubFacadeExposure::Deferred,
-        "CoreDaemon exposes screen/snapshot readback on botster-core main; hub client still returns UnsupportedDaemonOperation until HubRuntime is wired through those methods",
+        "core daemon does not expose delivery-pressure reporting through the production hub path yet",
     ),
 ];
 
@@ -405,15 +410,16 @@ mod tests {
         assert!(exposed.contains(&"guarded_write"));
         assert!(exposed.contains(&"publish/drain/acknowledge_routed_envelope"));
         assert!(exposed.contains(&"release_sessions_for_restart/adoption_scan/adopt_session"));
+        assert!(exposed.contains(&"read_screen/capture_snapshot"));
         assert!(summary.facade_decisions().iter().any(|decision| {
             decision.core_operation() == "execute_command(DefaultEngineCommand)"
                 && decision.exposure() == HubFacadeExposure::Hidden
                 && decision.reason().contains("generic core router")
         }));
         assert!(summary.facade_decisions().iter().any(|decision| {
-            decision.core_operation() == "read_screen/capture_snapshot/report_delivery_*"
+            decision.core_operation() == "report_delivery_*"
                 && decision.exposure() == HubFacadeExposure::Deferred
-                && decision.reason().contains("hub client still returns UnsupportedDaemonOperation")
+                && decision.reason().contains("delivery-pressure")
         }));
     }
 }

@@ -5983,6 +5983,52 @@ fn external_hub_client_crate_drives_real_daemon_socket_protocol() {
     assert!(!terminal_debug.contains(concat!("/", "Users", "/")));
     assert!(!terminal_debug.contains("/home/"));
 
+    let missing_read_screen = connection
+        .request(&botster_hub_client::DaemonRequest::ReadScreen {
+            session_id: "missing-external-client-session".to_string(),
+        })
+        .expect("missing read_screen returns operator response");
+    assert_eq!(
+        missing_read_screen.kind,
+        botster_hub_client::DaemonResponseKind::OperatorError
+    );
+    let error = missing_read_screen.error.expect("read_screen error frame");
+    assert_eq!(error.code, "unknown_session");
+    assert_eq!(error.operation, "read_screen");
+
+    let status_after_read_error = connection
+        .request(&botster_hub_client::DaemonRequest::Status)
+        .expect("connection stays usable after read_screen error");
+    assert_eq!(
+        status_after_read_error.kind,
+        botster_hub_client::DaemonResponseKind::Status
+    );
+
+    let missing_snapshot = connection
+        .request(&botster_hub_client::DaemonRequest::CaptureSnapshot {
+            session_id: "missing-external-client-session".to_string(),
+        })
+        .expect("missing capture_snapshot returns operator response");
+    assert_eq!(
+        missing_snapshot.kind,
+        botster_hub_client::DaemonResponseKind::OperatorError
+    );
+    let error = missing_snapshot
+        .error
+        .expect("capture_snapshot error frame");
+    assert_eq!(error.code, "unknown_session");
+    assert_eq!(error.operation, "capture_snapshot");
+
+    let status_after_snapshot_error = connection
+        .request(&botster_hub_client::DaemonRequest::Status)
+        .expect("connection stays usable after capture_snapshot error");
+    assert_eq!(
+        status_after_snapshot_error.kind,
+        botster_hub_client::DaemonResponseKind::Status
+    );
+
+    drop(connection);
+
     let reconnect =
         botster_hub_client::DaemonConnection::connect(&endpoint).expect("external reconnect");
     drop(reconnect);
@@ -7296,6 +7342,41 @@ fn external_daemon_attach_replays_prior_history_with_renderable_byte_count() {
         })
         .expect("attach late subscription");
     assert_eq!(late_attach.kind, botster_hub::DaemonResponseKind::Events);
+
+    let read_screen = connection
+        .request(&botster_hub::DaemonRequest::ReadScreen {
+            session_id: "late-history-session".to_string(),
+        })
+        .expect("read screen between late attach and first drain");
+    assert_eq!(
+        read_screen.kind,
+        botster_hub::DaemonResponseKind::ReadScreen
+    );
+    let screen = read_screen.read_screen.expect("read screen response body");
+    assert_eq!(screen.session_id, "late-history-session");
+    assert!(
+        screen.text.contains("before-late"),
+        "daemon read screen should observe prior output before late drain, got {:?}",
+        screen.text
+    );
+
+    let snapshot = connection
+        .request(&botster_hub::DaemonRequest::CaptureSnapshot {
+            session_id: "late-history-session".to_string(),
+        })
+        .expect("capture snapshot through daemon socket");
+    assert_eq!(
+        snapshot.kind,
+        botster_hub::DaemonResponseKind::CaptureSnapshot
+    );
+    let snapshot = snapshot
+        .capture_snapshot
+        .expect("capture snapshot response body");
+    assert_eq!(snapshot.session_id, "late-history-session");
+    assert_eq!(snapshot.rows, 24);
+    assert_eq!(snapshot.cols, 80);
+    assert_eq!(snapshot.payload_format.as_deref(), Some("plain-opaque-v1"));
+    assert!(snapshot.payload_bytes > 0);
 
     let send = connection
         .request(&botster_hub::DaemonRequest::SendInput {

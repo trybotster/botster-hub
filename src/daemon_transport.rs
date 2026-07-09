@@ -28,22 +28,23 @@ use botster_core_daemon::{
 use botster_hub_client::DaemonTransportError as ClientDaemonTransportError;
 pub use botster_hub_client::{
     DaemonApp, DaemonAppLaunchTarget, DaemonAvailablePackage, DaemonCapability,
-    DaemonCompatibility, DaemonConnection as ClientDaemonConnection, DaemonCoordination,
-    DaemonDiagnostic, DaemonEndpoint, DaemonEnvelope, DaemonEnvelopeAck, DaemonEnvelopeDelivery,
-    DaemonEnvelopePublish, DaemonEvent, DaemonHello, DaemonHelloAck, DaemonIdentity,
-    DaemonLocalWebrtcAnswer, DaemonLocalWebrtcBootstrap, DaemonNotify, DaemonOperatorError,
-    DaemonPackage, DaemonPackageActionRequest, DaemonPackageActionRequiredReference,
-    DaemonPackageActionState, DaemonPackageActionStatus, DaemonPackageAvailability,
-    DaemonPackageAvailabilityReason, DaemonPackageAvailabilityState, DaemonPackageCompatibility,
-    DaemonPackageConfiguration, DaemonPackageDecision, DaemonPackageDependencyAvailability,
-    DaemonPackageDiagnostic, DaemonPackageEnvironmentRequirement, DaemonPackageFeatureAvailability,
+    DaemonCaptureSnapshot, DaemonCompatibility, DaemonConnection as ClientDaemonConnection,
+    DaemonCoordination, DaemonDiagnostic, DaemonEndpoint, DaemonEnvelope, DaemonEnvelopeAck,
+    DaemonEnvelopeDelivery, DaemonEnvelopePublish, DaemonEvent, DaemonHello, DaemonHelloAck,
+    DaemonIdentity, DaemonLocalWebrtcAnswer, DaemonLocalWebrtcBootstrap, DaemonNotify,
+    DaemonOperatorError, DaemonPackage, DaemonPackageActionRequest,
+    DaemonPackageActionRequiredReference, DaemonPackageActionState, DaemonPackageActionStatus,
+    DaemonPackageAvailability, DaemonPackageAvailabilityReason, DaemonPackageAvailabilityState,
+    DaemonPackageCompatibility, DaemonPackageConfiguration, DaemonPackageDecision,
+    DaemonPackageDependencyAvailability, DaemonPackageDiagnostic,
+    DaemonPackageEnvironmentRequirement, DaemonPackageFeatureAvailability,
     DaemonPackageInstallEffect, DaemonPackageInstallPlan, DaemonPackageNavigationEntry,
     DaemonPackageNavigationSource, DaemonPackagePin, DaemonPackageProcess,
     DaemonPackageRouteDescriptor, DaemonPackageRouteTarget, DaemonPackageRunnableEntrypoint,
     DaemonPackageSurfaceDescriptor, DaemonPackageUpdateStatus, DaemonPackageWorkingDirectory,
-    DaemonPluginLifecycle, DaemonPluginSurface, DaemonRequest, DaemonResolvedAppLaunch,
-    DaemonResolvedSessionTemplate, DaemonResponse, DaemonResponseKind, DaemonSession,
-    DaemonSessionCleanup, DaemonSessionContext, DaemonSessionTemplate,
+    DaemonPluginLifecycle, DaemonPluginSurface, DaemonReadScreen, DaemonRequest,
+    DaemonResolvedAppLaunch, DaemonResolvedSessionTemplate, DaemonResponse, DaemonResponseKind,
+    DaemonSession, DaemonSessionCleanup, DaemonSessionContext, DaemonSessionTemplate,
     DaemonSessionTemplateContextInput, DaemonSessionTemplateRequest, DaemonSpawnTarget,
     DaemonSpawnTargetValidation, DaemonStatus, DaemonUiTreeSnapshot, DaemonWorktree,
     DaemonWorktreeGitMetadata, DaemonWorktreeLifecycleEvent, FEATURE_PLUGIN_SURFACE_ACTION,
@@ -55,16 +56,17 @@ use signal_hook::iterator::Signals;
 
 use crate::local_webrtc::{LocalWebrtcAttachedSubscription, LocalWebrtcSignalRequest};
 use crate::{
-    AvailablePackage, AvailablePackageState, FileHubStateStore, HubClientApi, HubClientEvent,
-    HubClientPackage, HubClientPackageAvailabilityReason, HubClientPackageAvailabilityState,
-    HubClientPackageClassification, HubClientPackageNavigationEntry,
-    HubClientPackageNavigationTarget, HubClientPluginLifecycle, HubClientPluginSurface,
-    HubClientRequest, HubClientResponseBody, HubClientSession, HubConfig, HubDaemon,
-    HubDaemonStatus, HubStateLoadSource, HubStateStore, McpToolDescriptor, PackageAction,
-    PackageAdmissionReason, PackageCompatibilityResult, PackageDecision, PackageInstallPlan,
-    PackagePin, PackageRegistry, PackageRegistryEntrySourceKind, PackageRegistryError,
-    PackageState, PackageUpdatePolicy, ResolvedSessionTemplate, SessionTemplateContextInput,
-    SessionTemplateRequest, resolve_foreground_launch_contract,
+    AvailablePackage, AvailablePackageState, FileHubStateStore, HubClientApi,
+    HubClientCaptureSnapshot, HubClientEvent, HubClientPackage, HubClientPackageAvailabilityReason,
+    HubClientPackageAvailabilityState, HubClientPackageClassification,
+    HubClientPackageNavigationEntry, HubClientPackageNavigationTarget, HubClientPluginLifecycle,
+    HubClientPluginSurface, HubClientReadScreen, HubClientRequest, HubClientResponseBody,
+    HubClientSession, HubConfig, HubDaemon, HubDaemonStatus, HubStateLoadSource, HubStateStore,
+    McpToolDescriptor, PackageAction, PackageAdmissionReason, PackageCompatibilityResult,
+    PackageDecision, PackageInstallPlan, PackagePin, PackageRegistry,
+    PackageRegistryEntrySourceKind, PackageRegistryError, PackageState, PackageUpdatePolicy,
+    ResolvedSessionTemplate, SessionTemplateContextInput, SessionTemplateRequest,
+    resolve_foreground_launch_contract,
 };
 use crate::{EntrypointProcessSnapshot, EntrypointSupervisorError};
 use crate::{
@@ -937,6 +939,36 @@ fn handle_runtime_control_request(
             }
             Ok(response)
         }
+        DaemonRequest::ReadScreen { session_id } => {
+            let response = api.handle_request(
+                runtime,
+                &packages,
+                HubClientRequest::ReadScreen {
+                    request_id: request_id("daemon-sessions-read-screen"),
+                    session_id: SessionId(session_id),
+                    now_seconds: tick(logical_clock),
+                },
+            )?;
+            let HubClientResponseBody::ReadScreen(screen) = response.body else {
+                return Err(DaemonTransportError::UnexpectedResponse);
+            };
+            Ok(daemon_read_screen(screen))
+        }
+        DaemonRequest::CaptureSnapshot { session_id } => {
+            let response = api.handle_request(
+                runtime,
+                &packages,
+                HubClientRequest::CaptureSnapshot {
+                    request_id: request_id("daemon-sessions-capture-snapshot"),
+                    session_id: SessionId(session_id),
+                    now_seconds: tick(logical_clock),
+                },
+            )?;
+            let HubClientResponseBody::CaptureSnapshot(snapshot) = response.body else {
+                return Err(DaemonTransportError::UnexpectedResponse);
+            };
+            Ok(daemon_capture_snapshot(snapshot))
+        }
         DaemonRequest::ListSessionTemplates => {
             let response = api.handle_request(
                 runtime,
@@ -1241,6 +1273,8 @@ fn handle_runtime_control_request(
             session_templates: Vec::new(),
             resolved_session_template: None,
             session_context: None,
+            read_screen: None,
+            capture_snapshot: None,
             spawn_targets: Vec::new(),
             spawn_target_validation: None,
             worktrees: Vec::new(),
@@ -2714,6 +2748,8 @@ fn daemon_response_base(kind: DaemonResponseKind) -> DaemonResponse {
         session_templates: Vec::new(),
         resolved_session_template: None,
         session_context: None,
+        read_screen: None,
+        capture_snapshot: None,
         spawn_targets: Vec::new(),
         spawn_target_validation: None,
         worktrees: Vec::new(),
@@ -2776,6 +2812,27 @@ fn daemon_spawned(session: DaemonSession, events: Vec<DaemonEvent>) -> DaemonRes
 fn daemon_events(events: Vec<DaemonEvent>) -> DaemonResponse {
     let mut response = daemon_response_base(DaemonResponseKind::Events);
     response.events = events;
+    response
+}
+
+fn daemon_read_screen(screen: HubClientReadScreen) -> DaemonResponse {
+    let mut response = daemon_response_base(DaemonResponseKind::ReadScreen);
+    response.read_screen = Some(DaemonReadScreen {
+        session_id: screen.session_id.0,
+        text: screen.text,
+    });
+    response
+}
+
+fn daemon_capture_snapshot(snapshot: HubClientCaptureSnapshot) -> DaemonResponse {
+    let mut response = daemon_response_base(DaemonResponseKind::CaptureSnapshot);
+    response.capture_snapshot = Some(DaemonCaptureSnapshot {
+        session_id: snapshot.session_id.0,
+        rows: snapshot.rows,
+        cols: snapshot.cols,
+        payload_format: snapshot.payload_format,
+        payload_bytes: snapshot.payload_bytes,
+    });
     response
 }
 
@@ -4553,17 +4610,6 @@ fn daemon_operator_error_from_client(error: crate::HubClientError) -> DaemonOper
                 message,
             }
         }
-        crate::HubClientError::UnsupportedDaemonOperation {
-            request_id,
-            operation,
-            daemon_operation,
-        } => DaemonOperatorError {
-            code: "unsupported_daemon_operation".to_string(),
-            request_id: request_id.0,
-            operation: operation_label(operation).to_string(),
-            message: format!("{daemon_operation} is not supported by the daemon"),
-            diagnostics: vec![DaemonDiagnostic::unsupported_feature(daemon_operation)],
-        },
         crate::HubClientError::PackageCapabilityDenied {
             request_id,
             operation,
