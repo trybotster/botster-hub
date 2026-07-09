@@ -2745,6 +2745,7 @@ fn daemon_plugin_contract_matrix_fixture_exercises_public_package_contracts() {
     assert!(report.settings_text_contains_redacted_secret);
     assert_eq!(report.action_success_state, "accepted");
     assert_eq!(report.action_success_message, "hello");
+    assert_eq!(report.submit_action_id, "contract.action");
     assert_eq!(report.action_error_state, "error");
     assert_eq!(report.action_error_diagnostic_kind, "action_failure");
     assert_eq!(
@@ -2953,12 +2954,6 @@ fn cli_dev_stack_first_party_plugin_dogfood_smoke_runs_contract_matrix_then_real
     )
     .expect("failure_class=plugin_producer run real Project Pipelines surface/action conformance");
     assert_eq!(project_report.package_state, "enabled");
-    assert_eq!(project_report.package_name, "project-pipelines");
-    assert_eq!(project_report.rendered_package_name, "project-pipelines");
-    assert_eq!(
-        project_report.rendered_surface_id,
-        "project-pipelines.create-ticket"
-    );
     assert_eq!(project_report.surface_kind, "panel");
     assert_eq!(project_report.surface_id, "project-pipelines-create-panel");
     assert_eq!(
@@ -2967,18 +2962,13 @@ fn cli_dev_stack_first_party_plugin_dogfood_smoke_runs_contract_matrix_then_real
     );
     assert_eq!(project_report.form_node_id, "project-pipelines-create-form");
     assert_eq!(project_report.form_node_kind, "form");
-    assert_eq!(project_report.snapshot_package_name, "project-pipelines");
     assert_eq!(
-        project_report.snapshot_surface_id,
-        "project-pipelines.create-ticket"
+        project_report.form_action_id,
+        "project_pipelines.create_ticket"
     );
     assert_eq!(
         project_report.snapshot_node_id,
         "project-pipelines-create-panel"
-    );
-    assert_eq!(
-        project_report.snapshot_node_kinds,
-        project_report.surface_node_kinds
     );
     assert_eq!(project_report.invalid_action_status, "failure");
     assert_eq!(

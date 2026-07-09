@@ -655,7 +655,6 @@ pub struct ClientConformanceReport {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectPipelinesConformanceReport {
     pub package_state: String,
-    pub package_name: String,
     pub rendered_package_name: String,
     pub rendered_surface_id: String,
     pub surface_kind: String,
@@ -663,6 +662,7 @@ pub struct ProjectPipelinesConformanceReport {
     pub surface_node_kinds: Vec<String>,
     pub form_node_id: String,
     pub form_node_kind: String,
+    pub form_action_id: String,
     pub snapshot_package_name: String,
     pub snapshot_surface_id: String,
     pub snapshot_node_id: String,
@@ -732,6 +732,7 @@ pub struct PluginContractMatrixConformanceReport {
     pub action_error_request_id: String,
     pub action_error_diagnostic_kind: String,
     pub action_error_diagnostic_operation: String,
+    pub submit_action_id: String,
     pub action_field_error_state: String,
     pub action_field_error_request_id: String,
     pub action_field_error_diagnostic_kind: String,
@@ -1115,6 +1116,17 @@ pub fn run_project_pipelines_conformance(
         "form",
         &form_node_kind,
     )?;
+    let form_action_id = ui_action_id(
+        form_node,
+        "project_pipelines_surface",
+        "form.props.action.id",
+    )?;
+    expect_value(
+        "project_pipelines_surface",
+        "form.props.action.id",
+        PROJECT_PIPELINES_ACTION,
+        &form_action_id,
+    )?;
     let snapshot = surface
         .ui_tree_snapshot
         .as_ref()
@@ -1156,7 +1168,7 @@ pub fn run_project_pipelines_conformance(
         DaemonRequest::PluginSurfaceAction {
             package_name: PROJECT_PIPELINES_PACKAGE.to_string(),
             surface_id: PROJECT_PIPELINES_SURFACE.to_string(),
-            action_id: PROJECT_PIPELINES_ACTION.to_string(),
+            action_id: form_action_id.clone(),
             payload: serde_json::json!({
                 "request_id": "invalid-project-pipelines-conformance",
                 "title": "   ",
@@ -1190,7 +1202,6 @@ pub fn run_project_pipelines_conformance(
 
     Ok(ProjectPipelinesConformanceReport {
         package_state,
-        package_name: PROJECT_PIPELINES_PACKAGE.to_string(),
         rendered_package_name: surface_package_name,
         rendered_surface_id,
         surface_kind,
@@ -1198,6 +1209,7 @@ pub fn run_project_pipelines_conformance(
         surface_node_kinds,
         form_node_id,
         form_node_kind,
+        form_action_id,
         snapshot_package_name,
         snapshot_surface_id,
         snapshot_node_id,
@@ -1586,6 +1598,23 @@ pub fn run_plugin_contract_matrix_conformance(
         app_surface_node_id.as_str(),
         &app_surface_snapshot_id,
     )?;
+    let submit_node = find_ui_node_by_id(&app_surface.body, "contract-app-submit").ok_or(
+        ConformanceError::MissingJsonField {
+            operation: "contract_matrix_render_app",
+            field: "contract-app-submit",
+        },
+    )?;
+    let submit_action_id = ui_action_id(
+        submit_node,
+        "contract_matrix_render_app",
+        "contract-app-submit.props.action.id",
+    )?;
+    expect_value(
+        "contract_matrix_render_app",
+        "contract-app-submit.props.action.id",
+        PLUGIN_CONTRACT_ACTION,
+        &submit_action_id,
+    )?;
 
     let empty_surface = render_plugin_surface(
         hub,
@@ -1764,7 +1793,7 @@ pub fn run_plugin_contract_matrix_conformance(
         DaemonRequest::PluginSurfaceAction {
             package_name: PLUGIN_CONTRACT_MATRIX_PACKAGE.to_string(),
             surface_id: PLUGIN_CONTRACT_APP_SURFACE.to_string(),
-            action_id: PLUGIN_CONTRACT_ACTION.to_string(),
+            action_id: submit_action_id.clone(),
             payload: serde_json::json!({
                 "request_id": "contract-action-success",
                 "message": "hello",
@@ -1821,7 +1850,7 @@ pub fn run_plugin_contract_matrix_conformance(
         DaemonRequest::PluginSurfaceAction {
             package_name: PLUGIN_CONTRACT_MATRIX_PACKAGE.to_string(),
             surface_id: PLUGIN_CONTRACT_APP_SURFACE.to_string(),
-            action_id: PLUGIN_CONTRACT_ACTION.to_string(),
+            action_id: submit_action_id.clone(),
             payload: serde_json::json!({
                 "request_id": "contract-action-error",
                 "fail": true,
@@ -1867,7 +1896,7 @@ pub fn run_plugin_contract_matrix_conformance(
         DaemonRequest::PluginSurfaceAction {
             package_name: PLUGIN_CONTRACT_MATRIX_PACKAGE.to_string(),
             surface_id: PLUGIN_CONTRACT_APP_SURFACE.to_string(),
-            action_id: PLUGIN_CONTRACT_ACTION.to_string(),
+            action_id: submit_action_id.clone(),
             payload: serde_json::json!({
                 "request_id": "contract-action-field-error",
                 "field_error": true,
@@ -1975,6 +2004,7 @@ pub fn run_plugin_contract_matrix_conformance(
         action_error_request_id,
         action_error_diagnostic_kind,
         action_error_diagnostic_operation,
+        submit_action_id,
         action_field_error_state,
         action_field_error_request_id,
         action_field_error_diagnostic_kind,
@@ -2527,10 +2557,11 @@ fn find_ui_node_by_id<'a>(
     value: &'a serde_json::Value,
     node_id: &str,
 ) -> Option<&'a serde_json::Value> {
-    if value
-        .get("id")
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(|id| id == node_id)
+    if value.get("type").is_some()
+        && value
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|id| id == node_id)
     {
         return Some(value);
     }
@@ -2558,6 +2589,19 @@ fn find_ui_node_by_id<'a>(
         }
     }
     None
+}
+
+fn ui_action_id(
+    node: &serde_json::Value,
+    operation: &'static str,
+    field: &'static str,
+) -> Result<String, ConformanceError> {
+    node.get("props")
+        .and_then(|props| props.get("action"))
+        .and_then(|action| action.get("id"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .ok_or(ConformanceError::MissingJsonField { operation, field })
 }
 
 fn action_status_string(
