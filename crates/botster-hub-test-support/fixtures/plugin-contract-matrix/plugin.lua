@@ -50,6 +50,36 @@ local function app_surface(_arguments)
         },
       },
       {
+        type = "form",
+        id = "contract-app-form",
+        props = {
+          action = {
+            id = "contract.action",
+          },
+        },
+        children = {
+          {
+            type = "text_input",
+            id = "contract-app-message",
+            props = {
+              name = "message",
+              label = "Message",
+              required = true,
+            },
+          },
+          {
+            type = "button",
+            id = "contract-app-submit",
+            props = {
+              label = "Submit contract action",
+              action = {
+                id = "contract.action",
+              },
+            },
+          },
+        },
+      },
+      {
         type = "metric_grid",
         id = "contract-app-metrics",
         props = {
@@ -196,6 +226,15 @@ local function contract_action(arguments)
     return action_result(arguments, "error", {
       error = "contract action failed by request",
       form_errors = { "contract action failed by request" },
+    })
+  end
+  if arguments.field_error == true then
+    return action_result(arguments, "error", {
+      error = "message is required",
+      field_errors = {
+        ["contract-app-message"] = { "Message is required" },
+      },
+      form_errors = { "Message is required" },
     })
   end
   return action_result(arguments, "accepted", {
