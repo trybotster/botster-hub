@@ -15,9 +15,10 @@ use botster_core::{
     SessionSpawnRequest, SubscriptionId, UiActionResult, UiNode,
 };
 use botster_core_daemon::{
-    AcknowledgeRoutedEnvelopeRequest, CoreDaemon, CoreDaemonConfig, CoreDaemonError, DaemonSession,
-    DrainResult, DrainRoutedEnvelopesRequest, GuardedWriteRequest, GuardedWriteResult,
-    PublishRoutedEnvelopeRequest, RegistrySessionState, RoutedEnvelopeDeliveryStateResult,
+    AcknowledgeRoutedEnvelopeRequest, CaptureSnapshotRequest, CaptureSnapshotResult, CoreDaemon,
+    CoreDaemonConfig, CoreDaemonError, DaemonSession, DrainResult, DrainRoutedEnvelopesRequest,
+    GuardedWriteRequest, GuardedWriteResult, PublishRoutedEnvelopeRequest, ReadScreenRequest,
+    ReadScreenResult, RegistrySessionState, RoutedEnvelopeDeliveryStateResult,
     SessionAdoptionReport, SessionAdoptionState, SpawnSessionRequest,
 };
 use std::collections::{BTreeMap, VecDeque};
@@ -983,6 +984,40 @@ impl HubRuntime {
             .drain(session_id, last_output_at)
     }
 
+    /// Read the current daemon-owned terminal screen through the production core path.
+    pub fn read_screen(
+        &mut self,
+        request_id: RequestId,
+        session_id: SessionId,
+        now_seconds: u64,
+    ) -> Result<ReadScreenResult, CoreDaemonError> {
+        self.core_daemon
+            .lock()
+            .expect("core daemon mutex")
+            .read_screen(ReadScreenRequest {
+                request_id,
+                session_id,
+                now_seconds,
+            })
+    }
+
+    /// Capture daemon-owned terminal snapshot metadata through the production core path.
+    pub fn capture_snapshot(
+        &mut self,
+        request_id: RequestId,
+        session_id: SessionId,
+        now_seconds: u64,
+    ) -> Result<CaptureSnapshotResult, CoreDaemonError> {
+        self.core_daemon
+            .lock()
+            .expect("core daemon mutex")
+            .capture_snapshot(CaptureSnapshotRequest {
+                request_id,
+                session_id,
+                now_seconds,
+            })
+    }
+
     /// Evaluate guarded-write readiness and inject only through the core daemon.
     pub fn guarded_write(
         &mut self,
@@ -1126,7 +1161,10 @@ impl HubRuntime {
                         Err(error) => return Err(error),
                     }
                 }
-                SessionAdoptionState::MissingProtocolEvidence
+                SessionAdoptionState::InProcessDaemonNotRestartDurable
+                // Hub always builds CoreDaemonConfig with a worker path, so this is
+                // only reachable for stale records written by an older or invalid embedder.
+                | SessionAdoptionState::MissingProtocolEvidence
                 | SessionAdoptionState::StaleWorker { .. }
                 | SessionAdoptionState::UnhealthyWorker { .. }
                 | SessionAdoptionState::DuplicateWorker { .. } => {
@@ -1393,4 +1431,43 @@ pub fn daemon_session_to_core_session(session: DaemonSession) -> CoreSession {
         },
     };
     CoreSession::new(session.session_id, lifecycle)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        DataDirectoryOption, HostIdentityOptions, HubStartupOptions, RuntimeEnvironment,
+        SessionDefaults, TransportBindings,
+    };
+
+    #[test]
+    fn hub_core_daemon_config_always_supplies_worker_path() {
+        let config = HubStartupOptions {
+            host: HostIdentityOptions {
+                id: "runtime-test".to_string(),
+                display_name: "Runtime Test".to_string(),
+                fingerprint: None,
+            },
+            data_directory: DataDirectoryOption::Explicit(
+                "target/botster-hub-test-data/runtime/worker-path-invariant".into(),
+            ),
+            session_defaults: SessionDefaults {
+                shell: "/bin/sh".to_string(),
+                working_directory: Some(".".into()),
+                initial_rows: 24,
+                initial_cols: 80,
+            },
+            transports: TransportBindings::default(),
+            ..HubStartupOptions::default()
+        }
+        .build_config_for_environment(&RuntimeEnvironment::from_values(None, None, None))
+        .expect("runtime config should build");
+
+        let core_config = core_daemon_config(&config);
+        assert!(
+            core_config.worker_path.is_some(),
+            "hub CoreDaemonConfig must use worker-backed sessions so in-process durability adoption is unreachable"
+        );
+    }
 }
