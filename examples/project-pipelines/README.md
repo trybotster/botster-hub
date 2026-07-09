@@ -53,9 +53,9 @@ one-shot export/import tool before switching active work to this local plugin.
 
 Runtime note: this package now registers descriptors and handlers through the
 Lua ABI. Project Pipelines workflow policy lives in `plugin.lua`; Rust exposes
-only reusable PluginDb and routed-envelope helpers needed by the plugin. The
-production daemon/MCP/worker/storage path is proved without a second
-`mcp-serve` runtime or a host-supplied Project Pipelines bundle.
+only reusable PluginDb and CoreDaemon-backed routed-envelope helpers needed by
+the plugin. The production daemon/MCP/worker/storage path is proved without a
+second `mcp-serve` runtime or a host-supplied Project Pipelines bundle.
 
 Manual dogfood path: run `botster-hub dogfood --web-package-path /path/to/botster-web`
 from the hub checkout, then open the printed TUI command or botster-web bridge
