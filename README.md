@@ -50,8 +50,11 @@ instead of bypassing hub admission or calling core routers directly. Attach is a
 subscription handshake only, so clients still explicitly pull status, packages,
 lifecycle status, or sessions when they need them. Hub code may start or embed
 the typed core daemon API; it must not shell out to the core daemon CLI or parse
-CLI output for session routing. Screen and snapshot requests return a typed
-unsupported response until the daemon-backed core API exposes those operations.
+CLI output for session routing. Screen and snapshot requests route through
+`HubRuntime -> CoreDaemon` and return typed readback response DTOs. Snapshot
+readback returns metadata only; opaque snapshot bytes stay on the attach/drain
+data plane. Subscription history still flows through attach/drain events rather
+than through readback responses.
 
 | Core operation | HubRuntime decision | Reason |
 | --- | --- | --- |
@@ -64,7 +67,8 @@ unsupported response until the daemon-backed core API exposes those operations.
 | `resize` | Exposed | Explicit client terminal resize path through the core daemon. |
 | `guarded_write` | Exposed | Hub admits the package/provider request, then core daemon owns readiness and delivery states. |
 | `release_sessions_for_restart` / `adoption_scan` / `adopt_session` | Exposed | Explicit daemon restart/adoption controls over worker-backed core sessions. |
-| `read_screen` / `capture_snapshot` / `report_delivery_*` | Deferred | Daemon-backed core API does not expose these embedded-engine-only helpers yet. |
+| `read_screen` / `capture_snapshot` | Exposed | Explicit daemon-backed terminal readback through `HubRuntime` and `CoreDaemon`; `capture_snapshot` returns metadata only, keeping opaque bytes on the attach/drain data plane. |
+| `report_delivery_*` | Deferred | Core daemon does not expose delivery-pressure reporting through the production hub path yet. |
 | `PluginCapabilityRuntime::submit` | Exposed | Hub owns concrete local capability policy and submits through core request contracts. |
 | `PluginCapabilityRuntime::drain_events` | Exposed | Plugin capability completions and timer events are drained through a hub-owned path. |
 | `PluginCapabilityRuntime::cleanup_plugin` | Exposed | Capability resources are released during hub plugin reload and unload. |
