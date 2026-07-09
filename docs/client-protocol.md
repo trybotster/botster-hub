@@ -90,9 +90,9 @@ operator UIs can show protocol diagnostics without opening a special endpoint.
 The current descriptor includes:
 
 - protocol name and version;
-- supported features: sessions, terminal streaming, resize, plugin surface
-  render, plugin surface action dispatch, package navigation discovery, and
-  hub-owned spawn targets;
+- supported features: sessions, terminal streaming, resize, terminal readback,
+  plugin surface render, plugin surface action dispatch, package navigation
+  discovery, and hub-owned spawn targets;
 - conformance fixture revision.
 
 The hub-owned first-party support matrix lives in
@@ -628,6 +628,15 @@ not maintain a separate scrollback cache. `stream_attach` writes only
 history payloads, history fallback handling, byte-count metadata, or ordering
 metadata should use `DaemonConnection` with `Attach` and `Drain`.
 
+`DaemonRequest::ReadScreen` and `DaemonRequest::CaptureSnapshot` are
+control-plane request/response readback operations for a running session. They
+route through the same production path as other local clients:
+`daemon_transport -> HubClientApi -> HubRuntime -> CoreDaemon`. `ReadScreen`
+returns `DaemonReadScreen { session_id, text }`. `CaptureSnapshot` returns
+`DaemonCaptureSnapshot { session_id, rows, cols, payload_format, payload_bytes }`.
+The hub does not expose the opaque snapshot bytes in this response; terminal
+history and renderable output remain on the attach/drain event stream.
+
 The reusable first-party fixture for this rendering contract lives in
 `botster_hub_test_support::late_attach_history_conformance_scenario`. It returns
 public `botster_hub_client::DaemonEvent` values only:
@@ -675,6 +684,11 @@ revision during the hello handshake.
 Adding `worktree_lifecycle` increments `CONFORMANCE_FIXTURE_REVISION`.
 `PROTOCOL_VERSION` remains unchanged because daemon framing and request issuance
 are unchanged.
+
+Adding `read_screen` and `capture_snapshot` daemon requests, readback response
+fields, and the `terminal_readback` feature increments
+`CONFORMANCE_FIXTURE_REVISION`. `PROTOCOL_VERSION` remains unchanged because
+daemon framing and request issuance are unchanged.
 
 Do not reuse `botster_core::contract` session-worker protocol, session frame magic, `DefaultEngineCommand`, `TransportIngress`, or `BoundaryJson` for external clients. Those are not the client-to-hub protocol. The client crate also intentionally excludes hub runtime, Lua/plugin runtime, `ratatui`, `crossterm`, `mlua`, and core UI action/node types.
 

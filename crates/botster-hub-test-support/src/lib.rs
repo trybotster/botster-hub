@@ -3299,6 +3299,7 @@ mod tests {
                     botster_hub_client::FEATURE_PACKAGE_NAVIGATION,
                     botster_hub_client::FEATURE_SPAWN_TARGETS,
                     botster_hub_client::FEATURE_WORKTREES,
+                    botster_hub_client::FEATURE_TERMINAL_READBACK,
                 ],
                 "supported_features": [
                     botster_hub_client::FEATURE_SESSIONS,
@@ -3310,6 +3311,7 @@ mod tests {
                     botster_hub_client::FEATURE_PACKAGE_NAVIGATION,
                     botster_hub_client::FEATURE_SPAWN_TARGETS,
                     botster_hub_client::FEATURE_WORKTREES,
+                    botster_hub_client::FEATURE_TERMINAL_READBACK,
                 ],
                 "diagnostic_kinds": [
                     "connected",

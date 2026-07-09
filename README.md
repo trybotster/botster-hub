@@ -74,22 +74,20 @@ hub-native routed envelopes and guarded notification writes:
   restart-durable. Worker-backed sessions and file-backed hub/package state are
   a different durability story.
 
-### Session history, screen, and snapshot (honest status)
+### Session history, screen, and snapshot (product surfaces)
 
-| Surface | Status on current hub main |
+| Surface | Status on the product path |
 | --- | --- |
-| Attach + drain terminal egress | Product path. Control ops ack through CoreDaemon; bytes arrive via drain/subscription. Late attach may replay prior output as Snapshot/Scrollback/TerminalOutput events when the worker path emits them. |
-| `CoreDaemon::read_screen` / `capture_snapshot` | Present on **botster-core main** (daemon terminal readback API). |
-| Hub `HubClientApi` `ReadScreen` / `CaptureSnapshot` | Still **Deferred**. Request shapes exist, but handlers return `UnsupportedDaemonOperation`. Hub facade audit still marks `read_screen` / `capture_snapshot` / `report_delivery_*` Deferred until a separate un-defer ticket wires `HubRuntime` through those CoreDaemon methods. |
-| `report_delivery_*` pressure helpers | Not exposed on the hub client product surface yet. |
-
-Do not document hub client screen/snapshot as product features while the facade
-still marks them Deferred. Un-defer is out of scope for this docs pass.
+| Attach + drain terminal egress | Product. Control ops ack through CoreDaemon; bytes arrive via drain/subscription. Late attach may replay prior output as Snapshot/Scrollback/TerminalOutput events when the worker path emits them. |
+| Hub `ReadScreen` / `CaptureSnapshot` | Product. Routes `HubClientApi` → `HubRuntime` → `CoreDaemon` readback. `ReadScreen` returns session text; `CaptureSnapshot` returns metadata only (rows/cols/format/byte count). Opaque snapshot bytes stay on the attach/drain data plane. |
+| Subscription history | Product. History and live terminal output flow through attach/drain events, not through readback responses. |
+| `report_delivery_*` pressure helpers | Still unfinished. Not exposed on the hub client product surface yet. |
 
 ### Product today vs still unfinished
 
 **Product on this path:** explicit data-dir daemon lifecycle; worker-backed
 local PTY sessions (spawn/list/attach/input/resize/detach/session-shutdown);
+attach/drain history; hub client screen and snapshot readback through CoreDaemon;
 package install/enable/disable/reload and entrypoint supervision for local
 packages; `HubClientApi` + daemon socket protocol; native MCP coordination
 tools; Lua plugin runtime including constrained Project Pipelines; local
@@ -97,12 +95,12 @@ capability runtimes; OS credential store for production secrets; durable
 `hub-state.json` package/provider policy; intentional restart adoption of
 worker-backed sessions.
 
-**Still unfinished / out of product claims:** hub client screen and snapshot
-readback (core daemon APIs exist; hub wiring deferred); observed terminal
-readiness for always-delivered doorbells; restart-durable routed-envelope
-inboxes; uncoordinated full daemon/worker crash PTY recovery; marketplace
-fetch/update packaging UX; provider process supervision; cloud/Rails/public
-WebRTC/browser shell as hub builtins; broad monolith migration import.
+**Still unfinished / out of product claims:** delivery-pressure reporting
+(`report_delivery_*`); observed terminal readiness for always-delivered
+doorbells; restart-durable routed-envelope inboxes; uncoordinated full
+daemon/worker crash PTY recovery; marketplace fetch/update packaging UX;
+provider process supervision; cloud/Rails/public WebRTC/browser shell as hub
+builtins; broad monolith migration import.
 
 ## Responsibility split
 
@@ -135,7 +133,11 @@ contract instead of bypassing hub admission or calling raw core routers.
 Attach is a subscription handshake only, so clients still explicitly pull
 status, packages, lifecycle status, or sessions when they need them. Hub code
 embeds the typed CoreDaemon API; it must not shell out to the thin core daemon
-CLI or parse CLI output for session routing.
+CLI or parse CLI output for session routing. Screen and snapshot requests route
+through `HubRuntime -> CoreDaemon` and return typed readback response DTOs.
+Snapshot readback returns metadata only; opaque snapshot bytes stay on the
+attach/drain data plane. Subscription history still flows through attach/drain
+events rather than through readback responses.
 
 | Core / daemon operation | HubRuntime decision | Reason |
 | --- | --- | --- |
@@ -149,7 +151,8 @@ CLI or parse CLI output for session routing.
 | `guarded_write` | Exposed | Hub admits the request; CoreDaemon owns readiness and delivery states. |
 | `publish` / `drain` / `acknowledge` routed envelope | Exposed | Single CoreDaemon coordination bus for native MCP and Lua. |
 | `release_sessions_for_restart` / `adoption_scan` / `adopt_session` | Exposed | Explicit daemon restart/adoption over worker-backed sessions. |
-| `read_screen` / `capture_snapshot` / `report_delivery_*` | Deferred | CoreDaemon on botster-core main exposes screen/snapshot readback; hub client still returns `UnsupportedDaemonOperation` until un-defer wires HubRuntime through those methods. |
+| `read_screen` / `capture_snapshot` | Exposed | Daemon-backed terminal readback through `HubRuntime` and `CoreDaemon`; `capture_snapshot` returns metadata only, keeping opaque bytes on the attach/drain data plane. |
+| `report_delivery_*` | Deferred | Delivery-pressure reporting is not exposed on the production hub path yet. |
 | `PluginCapabilityRuntime::submit` | Exposed | Hub owns concrete local capability policy and submits through core request contracts. |
 | `PluginCapabilityRuntime::drain_events` | Exposed | Plugin capability completions and timer events are drained through a hub-owned path. |
 | `PluginCapabilityRuntime::cleanup_plugin` | Exposed | Capability resources are released during hub plugin reload and unload. |
@@ -758,8 +761,8 @@ Dogfood-ready today: explicit local daemon lifecycle, file-backed hub/package
 state, local package admission from a manifest path, typed status/package reads,
 plugin lifecycle observation/invocation through the hub facade, daemon-backed
 PTY spawn/list/attach/input/resize/detach/session-shutdown through
-`HubClientApi`, and cross-process daemon transport proof for hub restart
-recovery.
+`HubClientApi`, attach/drain history plus screen/snapshot readback through
+CoreDaemon, and cross-process daemon transport proof for hub restart recovery.
 
 The production-shaped restart proof lives in `hub_daemon_lifecycle_test`: it
 starts the `botster-hub` binary, spawns a long-running worker-backed session
@@ -783,18 +786,19 @@ control-plane acknowledgements. Terminal egress is delivered by explicit
 from those control operations.
 
 Ready for daily local use today: explicit daemon lifecycle, daemon-backed local
-PTY session operations, minimal daemon-backed TUI attach/reconnect, native MCP
-coordination tools, and constrained Project Pipelines MCP workflow tools over
-the Lua plugin runtime.
+PTY session operations including attach/drain history and screen/snapshot
+readback, minimal daemon-backed TUI attach/reconnect, native MCP coordination
+tools, and constrained Project Pipelines MCP workflow tools over the Lua plugin
+runtime.
 
-Still unfinished (not alternate production paths): hub client screen/snapshot
-readback wiring (CoreDaemon APIs exist; hub Deferred), durable PTY recovery after
-uncoordinated daemon/worker crash, provider process supervision, GitHub/PR
-automation, marketplace fetch/update packaging, cloud/Rails/public
-WebRTC/browser-as-hub-builtin surfaces, broad migration compatibility from the
-monolith, missing-public-socket self-heal after the socket path is externally
-removed, long-running attach signal handling, restart-durable coordination
-inboxes, and observed readiness for always-delivered doorbells.
+Still unfinished (not alternate production paths): delivery-pressure reporting
+(`report_delivery_*`), durable PTY recovery after uncoordinated daemon/worker
+crash, provider process supervision, GitHub/PR automation, marketplace
+fetch/update packaging, cloud/Rails/public WebRTC/browser-as-hub-builtin
+surfaces, broad migration compatibility from the monolith, missing-public-socket
+self-heal after the socket path is externally removed, long-running attach
+signal handling, restart-durable coordination inboxes, and observed readiness
+for always-delivered doorbells.
 
 ## Daily Dev Troubleshooting
 
@@ -868,11 +872,10 @@ daemon-path facts so pipeline artifacts do not need local paths, environment
 dumps, keys, or fingerprints.
 
 The in-process `HubClientApi` product client workflow supports status, session
-list, spawn, attach, input, resize, drain/output events, shutdown, guarded
-notification write, routed-envelope publish/drain/ack, package queries, and
-plugin lifecycle status. The daemon socket and local WebRTC adapter route
-through this same API. Screen and snapshot client requests remain Deferred
-(unsupported) until hub un-defer. Browser parity and cloud transports remain
+list, spawn, attach, input, resize, drain/output events, screen and snapshot
+readback, shutdown, guarded notification write, routed-envelope publish/drain/ack,
+package queries, and plugin lifecycle status. The daemon socket and local WebRTC
+adapter route through this same API. Browser parity and cloud transports remain
 outside the smoke command; local TUI attaches through the same daemon socket.
 
 ## Package registry policy
