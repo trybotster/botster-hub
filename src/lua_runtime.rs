@@ -44,12 +44,14 @@ pub type SharedHubCapabilityRuntime = Arc<Mutex<HubCapabilityRuntime>>;
 /// Narrow CoreDaemon-backed coordination bridge exposed to Lua helpers.
 #[derive(Clone)]
 pub struct HubCoordinationBridge {
+    owner_thread: thread::ThreadId,
     pending: Arc<Mutex<VecDeque<PendingCoordinationRequest>>>,
 }
 
 impl HubCoordinationBridge {
     pub(crate) fn new() -> Self {
         Self {
+            owner_thread: thread::current().id(),
             pending: Arc::new(Mutex::new(VecDeque::new())),
         }
     }
@@ -98,6 +100,13 @@ impl HubCoordinationBridge {
         &self,
         operation: PendingCoordinationOperation,
     ) -> Result<HubCoordinationResponse, String> {
+        if thread::current().id() == self.owner_thread {
+            return Err(
+                "botster.coordination is only available during handler invocation, not at plugin load"
+                    .to_string(),
+            );
+        }
+
         let (response, receiver) = mpsc::channel();
         self.pending
             .lock()

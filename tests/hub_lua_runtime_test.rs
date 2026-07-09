@@ -201,6 +201,57 @@ return botster.register({
     policy.registry().clone()
 }
 
+fn install_load_time_coordination_registry(name: &str) -> PackageRegistry {
+    let root = PathBuf::from("target")
+        .join("botster-hub-test-data")
+        .join("lua-runtime-packages")
+        .join(name);
+    let source_root = std::env::current_dir().expect("current dir").join(&root);
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).expect("create load-time coordination package root");
+    fs::write(
+        root.join("plugin.lua"),
+        r#"
+botster.coordination.publish({
+  id = "load-time-envelope",
+  target = { type = "session", session_id = "load-time-target" },
+  body = "load-time coordination payload",
+  content_type = "text/plain",
+  created_at = 42,
+})
+
+return botster.register({})
+"#,
+    )
+    .expect("write load-time coordination plugin");
+    fs::write(
+        root.join("botster-package.json"),
+        serde_json::json!({
+            "name": "load-time-coordination.plugin",
+            "version": "1.0.0",
+            "kind": "plugin",
+            "botster": ">=0.1.0",
+            "source": { "type": "path", "path": source_root.display().to_string() },
+            "capabilities": [{ "surface": "mcp" }],
+            "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }]
+        })
+        .to_string(),
+    )
+    .expect("write load-time coordination manifest");
+
+    let mut policy = default_package_policy();
+    policy
+        .install_local_path(&root, "install load-time coordination package")
+        .expect("install load-time coordination package");
+    policy
+        .enable(
+            "load-time-coordination.plugin",
+            "enable load-time coordination package",
+        )
+        .expect("enable load-time coordination package");
+    policy.registry().clone()
+}
+
 fn capability(surface: CapabilitySurface, scope: Option<&str>) -> Capability {
     Capability {
         surface,
@@ -1355,6 +1406,28 @@ fn lua_and_native_coordination_publish_into_coredaemon_router() {
             .expect("CoreDaemon should record Lua delivery")
             .status,
         EnvelopeDeliveryStatus::Acknowledged
+    );
+}
+
+#[test]
+fn lua_coordination_at_plugin_load_fails_with_context_error() {
+    let registry = install_load_time_coordination_registry("load-time-coordination");
+    let mut hub = explicit_runtime("load-time-coordination");
+
+    let error = hub
+        .load_lua_plugin_package(&registry, "load-time-coordination.plugin")
+        .expect_err("load-time coordination should fail before timeout");
+
+    let message = error.to_string();
+    assert!(
+        message.contains(
+            "botster.coordination is only available during handler invocation, not at plugin load"
+        ),
+        "unexpected load error: {message}"
+    );
+    assert!(
+        !message.contains("did not complete before timeout"),
+        "load-time coordination should fail with a context error, not timeout: {message}"
     );
 }
 
