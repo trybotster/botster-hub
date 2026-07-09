@@ -122,6 +122,8 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             ),
             ("shutdown_session", &[("session_id", "string")]),
             ("drain", &[("session_id", "string")]),
+            ("read_screen", &[("session_id", "string")]),
+            ("capture_snapshot", &[("session_id", "string")]),
             ("list_session_templates", &[]),
             ("show_session_template", &[("template_id", "string")]),
             (
@@ -310,6 +312,8 @@ pub(crate) fn daemon_protocol_typescript() -> String {
                 "DaemonResolvedSessionTemplate | null",
             ),
             ("session_context?", "DaemonSessionContext | null"),
+            ("read_screen?", "DaemonReadScreen | null"),
+            ("capture_snapshot?", "DaemonCaptureSnapshot | null"),
             ("spawn_targets?", "DaemonSpawnTarget[]"),
             (
                 "spawn_target_validation?",
@@ -343,6 +347,22 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             ("coordination", "DaemonCoordination | null"),
             ("error", "DaemonOperatorError | null"),
             ("diagnostics?", "DaemonDiagnostic[]"),
+        ],
+    );
+    emit_interface(
+        &mut output,
+        "DaemonReadScreen",
+        &[("session_id", "string"), ("text", "string")],
+    );
+    emit_interface(
+        &mut output,
+        "DaemonCaptureSnapshot",
+        &[
+            ("session_id", "string"),
+            ("rows", "number"),
+            ("cols", "number"),
+            ("payload_format?", "string | null"),
+            ("payload_bytes", "number"),
         ],
     );
     emit_interface(
@@ -389,6 +409,8 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             "session_templates",
             "resolved_session_template",
             "session_context",
+            "read_screen",
+            "capture_snapshot",
             "spawn_targets",
             "spawn_target_validation",
             "worktrees",

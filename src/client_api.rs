@@ -280,20 +280,24 @@ impl HubClientApi {
                     .state;
                 HubClientResponseBody::RoutedEnvelopeAck(HubClientRoutedEnvelopeAck { state })
             }
-            HubClientRequest::ReadScreen { .. } => {
-                return Err(HubClientError::UnsupportedDaemonOperation {
-                    request_id,
-                    operation,
-                    daemon_operation: "read_screen",
-                });
-            }
-            HubClientRequest::CaptureSnapshot { .. } => {
-                return Err(HubClientError::UnsupportedDaemonOperation {
-                    request_id,
-                    operation,
-                    daemon_operation: "capture_snapshot",
-                });
-            }
+            HubClientRequest::ReadScreen {
+                request_id: read_request_id,
+                session_id,
+                now_seconds,
+            } => HubClientResponseBody::ReadScreen(HubClientReadScreen::from(
+                runtime
+                    .read_screen(read_request_id, session_id, now_seconds)
+                    .map_err(|error| runtime_error(request_id.clone(), operation, error))?,
+            )),
+            HubClientRequest::CaptureSnapshot {
+                request_id: snapshot_request_id,
+                session_id,
+                now_seconds,
+            } => HubClientResponseBody::CaptureSnapshot(HubClientCaptureSnapshot::from(
+                runtime
+                    .capture_snapshot(snapshot_request_id, session_id, now_seconds)
+                    .map_err(|error| runtime_error(request_id.clone(), operation, error))?,
+            )),
             HubClientRequest::ListPackages { .. } => HubClientResponseBody::Packages(
                 packages
                     .packages()
@@ -823,6 +827,8 @@ pub enum HubClientResponseBody {
     RoutedEnvelopePublish(HubClientRoutedEnvelopePublish),
     RoutedEnvelopeDrain(HubClientRoutedEnvelopeDrain),
     RoutedEnvelopeAck(HubClientRoutedEnvelopeAck),
+    ReadScreen(HubClientReadScreen),
+    CaptureSnapshot(HubClientCaptureSnapshot),
     Packages(Vec<HubClientPackage>),
     PackageNavigation(Vec<HubClientPackageNavigationEntry>),
     SessionTemplates(Vec<HubSessionTemplate>),
@@ -922,6 +928,44 @@ impl From<RoutedEnvelopeDrainOutcome> for HubClientRoutedEnvelopeDrain {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HubClientRoutedEnvelopeAck {
     pub state: Option<EnvelopeDeliveryState>,
+}
+
+/// Client-facing screen readback response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HubClientReadScreen {
+    pub session_id: SessionId,
+    pub text: String,
+}
+
+impl From<botster_core_daemon::ReadScreenResult> for HubClientReadScreen {
+    fn from(result: botster_core_daemon::ReadScreenResult) -> Self {
+        Self {
+            session_id: result.screen.session_id,
+            text: result.screen.text,
+        }
+    }
+}
+
+/// Client-facing snapshot metadata response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HubClientCaptureSnapshot {
+    pub session_id: SessionId,
+    pub rows: u16,
+    pub cols: u16,
+    pub payload_format: Option<String>,
+    pub payload_bytes: usize,
+}
+
+impl From<botster_core_daemon::CaptureSnapshotResult> for HubClientCaptureSnapshot {
+    fn from(result: botster_core_daemon::CaptureSnapshotResult) -> Self {
+        Self {
+            session_id: result.snapshot.session_id,
+            rows: result.snapshot.rows,
+            cols: result.snapshot.cols,
+            payload_format: result.payload.format,
+            payload_bytes: result.payload.bytes.len(),
+        }
+    }
 }
 
 /// Client event stream emitted from hub runtime output.
@@ -1641,11 +1685,6 @@ pub enum HubClientError {
         request_id: RequestId,
         operation: HubClientOperation,
         kind: HubClientRuntimeErrorKind,
-    },
-    UnsupportedDaemonOperation {
-        request_id: RequestId,
-        operation: HubClientOperation,
-        daemon_operation: &'static str,
     },
     PackageCapabilityDenied {
         request_id: RequestId,

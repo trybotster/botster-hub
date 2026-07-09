@@ -1599,6 +1599,27 @@ fn late_attach_receives_prior_terminal_history_before_later_live_output() {
         .expect("attach late subscription");
     logical_clock += 1;
 
+    let readback = late_api
+        .handle_request(
+            &mut runtime,
+            &packages,
+            HubClientRequest::ReadScreen {
+                request_id: request_id("late-history-readback-before-drain"),
+                session_id: session_id.clone(),
+                now_seconds: logical_clock,
+            },
+        )
+        .expect("read screen between late attach and first drain");
+    logical_clock += 1;
+    let HubClientResponseBody::ReadScreen(screen) = readback.body else {
+        panic!("read screen should return typed response");
+    };
+    assert!(
+        screen.text.contains("before-late"),
+        "readback before late drain should observe prior output, got {:?}",
+        screen.text
+    );
+
     first_api
         .handle_request(
             &mut runtime,
@@ -2128,30 +2149,53 @@ fn guarded_notification_write_is_hub_admitted_and_core_delivered() {
 }
 
 #[test]
-fn read_screen_and_snapshot_return_typed_unsupported_until_daemon_api_exists() {
+fn read_screen_and_snapshot_return_typed_daemon_readback_responses() {
     let api = HubClientApi::local_operator("local-client-api-test");
     let packages = empty_registry();
-    let mut runtime = explicit_runtime("unsupported-daemon-ops");
+    let mut runtime = explicit_runtime("daemon-readback-ops");
+    let session_id = SessionId("daemon-readback-session".to_string());
+    let mut logical_clock = 1;
 
-    let read_screen = api
-        .handle_request(
-            &mut runtime,
-            &packages,
-            HubClientRequest::ReadScreen {
-                request_id: request_id("read-screen"),
-                session_id: session_id(),
-                now_seconds: 1,
-            },
-        )
-        .expect_err("daemon-backed read_screen should be typed unsupported");
-    assert_eq!(
-        read_screen,
-        HubClientError::UnsupportedDaemonOperation {
-            request_id: request_id("read-screen"),
-            operation: HubClientOperation::ReadScreen,
-            daemon_operation: "read_screen",
+    api.handle_request(
+        &mut runtime,
+        &packages,
+        HubClientRequest::Spawn {
+            request_id: request_id("readback-spawn"),
+            session_id: session_id.clone(),
+            command: "printf 'screen-ready\\n'; sleep 5".to_string(),
+            now_seconds: logical_clock,
+        },
+    )
+    .expect("spawn readback session");
+    logical_clock += 1;
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let screen = loop {
+        let read_screen = api
+            .handle_request(
+                &mut runtime,
+                &packages,
+                HubClientRequest::ReadScreen {
+                    request_id: request_id("read-screen"),
+                    session_id: session_id.clone(),
+                    now_seconds: logical_clock,
+                },
+            )
+            .expect("daemon-backed read_screen should return typed response");
+        logical_clock += 1;
+        let HubClientResponseBody::ReadScreen(screen) = read_screen.body else {
+            panic!("read_screen should return readback body");
+        };
+        if screen.text.contains("screen-ready") {
+            break screen;
         }
-    );
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for screen-ready"
+        );
+        thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(screen.session_id, session_id);
 
     let capture_snapshot = api
         .handle_request(
@@ -2159,19 +2203,36 @@ fn read_screen_and_snapshot_return_typed_unsupported_until_daemon_api_exists() {
             &packages,
             HubClientRequest::CaptureSnapshot {
                 request_id: request_id("capture-snapshot"),
-                session_id: session_id(),
-                now_seconds: 1,
+                session_id: session_id.clone(),
+                now_seconds: logical_clock,
             },
         )
-        .expect_err("daemon-backed capture_snapshot should be typed unsupported");
-    assert_eq!(
-        capture_snapshot,
-        HubClientError::UnsupportedDaemonOperation {
-            request_id: request_id("capture-snapshot"),
-            operation: HubClientOperation::CaptureSnapshot,
-            daemon_operation: "capture_snapshot",
-        }
-    );
+        .expect("daemon-backed capture_snapshot should return typed response");
+    let HubClientResponseBody::CaptureSnapshot(snapshot) = capture_snapshot.body else {
+        panic!("capture_snapshot should return snapshot body");
+    };
+    assert_eq!(snapshot.session_id, session_id);
+    assert_eq!(snapshot.rows, 24);
+    assert_eq!(snapshot.cols, 80);
+    assert_eq!(snapshot.payload_format.as_deref(), Some("plain-opaque-v1"));
+    assert!(snapshot.payload_bytes > 0);
+
+    logical_clock += 1;
+    let shutdown = api
+        .handle_request(
+            &mut runtime,
+            &packages,
+            HubClientRequest::Shutdown {
+                request_id: request_id("readback-shutdown"),
+                session_id: session_id.clone(),
+                now_seconds: logical_clock,
+            },
+        )
+        .expect("shutdown readback session through client api");
+    let HubClientResponseBody::Events(events) = shutdown.body else {
+        panic!("shutdown should return events");
+    };
+    assert!(events.is_empty());
 }
 
 #[test]
