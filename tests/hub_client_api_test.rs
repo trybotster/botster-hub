@@ -2216,6 +2216,23 @@ fn read_screen_and_snapshot_return_typed_daemon_readback_responses() {
     assert_eq!(snapshot.cols, 80);
     assert_eq!(snapshot.payload_format.as_deref(), Some("plain-opaque-v1"));
     assert!(snapshot.payload_bytes > 0);
+
+    logical_clock += 1;
+    let shutdown = api
+        .handle_request(
+            &mut runtime,
+            &packages,
+            HubClientRequest::Shutdown {
+                request_id: request_id("readback-shutdown"),
+                session_id: session_id.clone(),
+                now_seconds: logical_clock,
+            },
+        )
+        .expect("shutdown readback session through client api");
+    let HubClientResponseBody::Events(events) = shutdown.body else {
+        panic!("shutdown should return events");
+    };
+    assert!(events.is_empty());
 }
 
 #[test]
