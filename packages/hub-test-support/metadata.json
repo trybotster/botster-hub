@@ -3,7 +3,7 @@
   "package_version": "0.1.2",
   "protocol": "botster-hub-daemon-v1",
   "protocol_version": 1,
-  "conformance_fixture_revision": 8,
+  "conformance_fixture_revision": 9,
   "generated_by": "cargo run -p botster-hub-test-support --example node_package_assets",
   "daemon_protocol": {
     "artifact_path": "daemon-protocol.ts",
@@ -25,7 +25,7 @@
       },
       {
         "path": "plugin.lua",
-        "sha256": "4fc3d982ac8c18792827a895a4d22f38081b625e69fbd771345f1281647a90a1"
+        "sha256": "5158b25143261c773a9aeaec6a52778c9e3524a4c59ba1dea05318e38ff54f9b"
       }
     ]
   },
@@ -39,12 +39,14 @@
     "primitive_kinds": [
       "button",
       "empty_state",
+      "form",
       "metric",
       "metric_grid",
       "panel",
       "section",
       "status_badge",
       "table",
+      "text_input",
       "toolbar"
     ]
   }

@@ -28,12 +28,14 @@ assert.deepEqual(metadata.application_primitives, {
   primitive_kinds: [
     "button",
     "empty_state",
+    "form",
     "metric",
     "metric_grid",
     "panel",
     "section",
     "status_badge",
     "table",
+    "text_input",
     "toolbar",
   ],
 });

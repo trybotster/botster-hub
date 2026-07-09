@@ -798,9 +798,10 @@ step, rather than mirroring the matrix or daemon event fields by hand in
 TypeScript.
 
 If a downstream client also wants to prove plugin surface/action dispatch,
-configuration, route descriptors, and failure diagnostics, copy the published
-fixture from `botster-hub-test-support` into a caller-owned temp directory and
-call `run_plugin_contract_matrix_conformance` with the copied package root:
+configuration, route descriptors, failure diagnostics, and the shared
+application primitive/form/action-feedback contract, copy the published fixture
+from `botster-hub-test-support` into a caller-owned temp directory and call
+`run_plugin_contract_matrix_conformance` with the copied package root:
 
 ```rust
 let fixture_root = tempfile::tempdir().expect("fixture tempdir");
@@ -841,6 +842,20 @@ Hub developers can run the full fixture proof from this repository with:
 ./test.sh --test hub_daemon_lifecycle_test daemon_plugin_contract_matrix_fixture_exercises_public_package_contracts
 ```
 
+Hub CI also runs the first-party package compatibility smoke:
+
+```bash
+./test.sh --test hub_daemon_lifecycle_test cli_dev_stack_first_party_plugin_dogfood_smoke_runs_contract_matrix_then_real_packages
+```
+
+That smoke runs the contract-matrix helper above for the hub-owned primitive
+inventory, then runs `run_project_pipelines_conformance` against the packaged
+Project Pipelines example to prove first-party external package enablement,
+`PluginSurfaceRender`, `ui_tree_snapshot` identity, form node structure, and
+`PluginSurfaceAction` field-error/action-failure feedback. Downstream plugin
+repos should consume these published helpers and fixture assets instead of
+inventing DTO fixtures or reading a stale sibling hub checkout.
+
 Web and TUI developers should run their renderer-specific tests against the
 same report fields. Producer contract failures are `ConformanceError` values
 classified as `ProducerContract`; local setup failures such as missing
@@ -849,11 +864,11 @@ classified as `EnvironmentSetup`; renderer mismatches are client-owned
 comparisons against `report.client_render_check` and classified as
 `ClientRendering`.
 
-First-party plugin developers should keep plugin contract tests pointed at this
-hub-owned fixture unless they need product-specific behavior. Product helpers
-such as `run_project_pipelines_conformance` can still cover product workflows,
-but the support matrix's plugin-surface claim is backed by the generic contract
-matrix fixture.
+First-party plugin developers should keep shared primitive/form/action contract
+tests pointed at this hub-owned fixture unless they need product-specific
+behavior. Product helpers such as `run_project_pipelines_conformance` cover
+package-specific render/action plumbing, but the support matrix's shared
+plugin-surface claim is backed by the generic contract matrix fixture.
 
 To prove foreground package app-open support without recreating hub launcher
 policy, call `run_foreground_terminal_app_open_conformance`. The helper installs

@@ -2705,14 +2705,17 @@ fn daemon_plugin_contract_matrix_fixture_exercises_public_package_contracts() {
         report.app_surface_node_kinds,
         vec![
             "button",
+            "button",
             "empty_state",
             "empty_state",
+            "form",
             "metric",
             "metric_grid",
             "panel",
             "section",
             "status_badge",
             "table",
+            "text_input",
             "toolbar",
         ]
     );
@@ -2748,6 +2751,17 @@ fn daemon_plugin_contract_matrix_fixture_exercises_public_package_contracts() {
         report.action_error_diagnostic_operation,
         "plugin_surface_action"
     );
+    assert_eq!(report.action_field_error_state, "error");
+    assert_eq!(
+        report.action_field_error_request_id,
+        "contract-action-field-error"
+    );
+    assert_eq!(report.action_field_error_diagnostic_kind, "action_failure");
+    assert_eq!(
+        report.action_field_error_diagnostic_operation,
+        "plugin_surface_action"
+    );
+    assert_eq!(report.action_field_error_message, "Message is required");
     assert_eq!(
         report.client_render_check.class,
         botster_hub_test_support::ConformanceFailureClass::ClientRendering
@@ -2939,8 +2953,33 @@ fn cli_dev_stack_first_party_plugin_dogfood_smoke_runs_contract_matrix_then_real
     )
     .expect("failure_class=plugin_producer run real Project Pipelines surface/action conformance");
     assert_eq!(project_report.package_state, "enabled");
+    assert_eq!(project_report.package_name, "project-pipelines");
+    assert_eq!(project_report.rendered_package_name, "project-pipelines");
+    assert_eq!(
+        project_report.rendered_surface_id,
+        "project-pipelines.create-ticket"
+    );
     assert_eq!(project_report.surface_kind, "panel");
     assert_eq!(project_report.surface_id, "project-pipelines-create-panel");
+    assert_eq!(
+        project_report.surface_node_kinds,
+        vec!["button", "form", "panel", "text_input", "text_input"]
+    );
+    assert_eq!(project_report.form_node_id, "project-pipelines-create-form");
+    assert_eq!(project_report.form_node_kind, "form");
+    assert_eq!(project_report.snapshot_package_name, "project-pipelines");
+    assert_eq!(
+        project_report.snapshot_surface_id,
+        "project-pipelines.create-ticket"
+    );
+    assert_eq!(
+        project_report.snapshot_node_id,
+        "project-pipelines-create-panel"
+    );
+    assert_eq!(
+        project_report.snapshot_node_kinds,
+        project_report.surface_node_kinds
+    );
     assert_eq!(project_report.invalid_action_status, "failure");
     assert_eq!(
         project_report.invalid_action_diagnostic_kind,
