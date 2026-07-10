@@ -659,8 +659,7 @@ pub struct ClientConformanceReport {
 }
 
 /// Stable failure stages for the joint many-PTY product-path proof.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ManyPtyConformanceStage {
     Spawn,
     Attach,
@@ -868,6 +867,8 @@ fn run_many_pty_client_attach_scenario(
     )?;
     let mut observed_events = attach.events;
 
+    // Re-confirm that the pre-attach marker remains readable after attach;
+    // the earlier wait is the readiness oracle for the marker itself.
     let screen = many_pty_request(
         connection,
         &DaemonRequest::ReadScreen {
@@ -1008,14 +1009,7 @@ fn run_many_pty_client_attach_scenario(
     }
     let live_index = many_pty_live_output_index(&observed_events).ok_or_else(|| {
         let output = many_pty_terminal_output(&observed_events);
-        let output_tail = output
-            .chars()
-            .rev()
-            .take(240)
-            .collect::<String>()
-            .chars()
-            .rev()
-            .collect::<String>();
+        let output_tail = many_pty_tail(&output);
         many_pty_error(
             ManyPtyConformanceStage::Drain,
             MANY_PTY_NOISY_SESSION_ID,
@@ -1163,14 +1157,7 @@ fn wait_for_many_pty_screen_marker(
         }
         thread::sleep(MANY_PTY_POLL_INTERVAL);
     }
-    let screen_tail = last_screen
-        .chars()
-        .rev()
-        .take(240)
-        .collect::<String>()
-        .chars()
-        .rev()
-        .collect::<String>();
+    let screen_tail = many_pty_tail(&last_screen);
     Err(many_pty_error(
         ManyPtyConformanceStage::History,
         MANY_PTY_NOISY_SESSION_ID,
@@ -1214,6 +1201,16 @@ fn many_pty_terminal_output(events: &[DaemonEvent]) -> String {
             } if subscription_id == MANY_PTY_SUBSCRIPTION_ID => Some(data.as_str()),
             _ => None,
         })
+        .collect()
+}
+
+fn many_pty_tail(text: &str) -> String {
+    text.chars()
+        .rev()
+        .take(240)
+        .collect::<String>()
+        .chars()
+        .rev()
         .collect()
 }
 

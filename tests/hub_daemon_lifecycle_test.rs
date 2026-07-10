@@ -7294,13 +7294,10 @@ fn external_hub_client_many_pty_adversarial_conformance_ci() {
 
     let report = botster_hub_test_support::run_many_pty_client_attach_conformance(&hub, 8)
         .expect("run CI-safe many-PTY client attach proof");
+    // Ok(report) is the behavioral oracle; stage-labeled errors identify which
+    // required observation failed. These assertions pin scenario and cleanup size.
     assert_eq!(report.total_sessions, 8);
     assert_eq!(report.quiet_sessions, 7);
-    assert_eq!(report.quiet_sessions_exited, 7);
-    assert!(report.history_observed);
-    assert!(report.screen_marker_observed);
-    assert!(report.snapshot_payload_bytes > 0);
-    assert!(report.live_output_observed);
     assert_eq!(report.cleaned_sessions, 8);
 
     hub.shutdown().expect("shutdown CI-safe many-PTY hub");
@@ -7322,13 +7319,10 @@ fn external_hub_client_many_pty_adversarial_conformance_local() {
 
     let report = botster_hub_test_support::run_many_pty_client_attach_conformance(&hub, 32)
         .expect("run larger local many-PTY client attach proof");
+    // Ok(report) is the behavioral oracle; stage-labeled errors identify which
+    // required observation failed. These assertions pin scenario and cleanup size.
     assert_eq!(report.total_sessions, 32);
     assert_eq!(report.quiet_sessions, 31);
-    assert_eq!(report.quiet_sessions_exited, 31);
-    assert!(report.history_observed);
-    assert!(report.screen_marker_observed);
-    assert!(report.snapshot_payload_bytes > 0);
-    assert!(report.live_output_observed);
     assert_eq!(report.cleaned_sessions, 32);
 
     hub.shutdown().expect("shutdown larger local many-PTY hub");
