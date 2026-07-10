@@ -1,9 +1,10 @@
 //! Public architecture facade for the `botster-hub` first-party host profile.
 //!
 //! `botster-hub` is a trusted profile over reusable `botster-core` mechanics.
-//! This crate defines profile-owned policy seams and a minimal runtime facade
-//! over `botster-core`; provider, cloud, Rails, WebRTC, and client transport
-//! implementations intentionally live outside this scaffold.
+//! This crate defines profile-owned policy surfaces and a runtime facade over
+//! `botster-core-daemon` (`CoreDaemon` + session worker). Provider, cloud,
+//! Rails, public WebRTC, and non-local client transport implementations live
+//! outside this host profile, not as parallel hub runtimes.
 //!
 //! ```
 //! let profile = botster_hub::host_profile();

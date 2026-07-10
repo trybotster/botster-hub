@@ -14,24 +14,111 @@ The accepted boundary model is documented in
 the hub is a first-party host profile/plugin bundle over `botster-core`, not a
 thick wrapper.
 
+## One production path
+
+There is one local product topology. Docs, operators, and clients should start
+here—not from parallel scaffold stories or in-process engine embeds:
+
+**explicit `--data-dir` → `HubDaemon` / `HubRuntime` → `CoreDaemon` → `botster-session-worker`**
+
+| Layer | Role on the product path |
+| --- | --- |
+| Hub host profile | Explicit data directory, package install/enable policy, capability grants, auth/admission, durable hub state, plugin lifecycle, CLI/MCP/socket adapters, and `HubClientApi`. |
+| `botster_core_daemon::CoreDaemon` | Durable session registry, worker supervision, spawn/list/attach/detach/input/resize/drain, adoption/restart release, guarded-write readiness, and **routed-envelope coordination** (publish/drain/ack). |
+| `botster-session-worker` | Owns live PTY handles so sessions can survive intentional hub daemon restart. |
+| `HubRuntime` | Host-profile facade that composes CoreDaemon with hub package, lifecycle, and capability policy. Not a second runtime engine and not a second coordination bus. |
+| `HubClientApi` | Stable local client request/response/event boundary over that facade (CLI, MCP, socket, TUI, and local browser bridge adapters frame this contract). |
+
+`DefaultBotsterEngine` is a **core library embed** path for tests, toys, and
+custom hosts that want in-process or worker-backed sessions without the hub
+product stack. Hub production sessions do **not** re-embed
+`DefaultBotsterEngine` as a parallel product runtime. Core documents that
+library path separately; this hub documents only the product host path above.
+
+### Start here
+
+```sh
+# Once per checkout: build the PTY worker that CoreDaemon supervises.
+cargo build --locked -p botster-core --bin botster-session-worker
+
+# Terminal 1: durable daemon over an explicit data directory.
+cargo run -- start --data-dir target/botster-hub-daemon-smoke-data
+
+# Terminal 2: spawn, attach, then shut down through the same data dir.
+cargo run -- sessions spawn --data-dir target/botster-hub-daemon-smoke-data \
+  --session-id demo -- "printf 'botster-hub-ok\n'; sleep 1"
+cargo run -- sessions list --data-dir target/botster-hub-daemon-smoke-data
+cargo run -- sessions attach --data-dir target/botster-hub-daemon-smoke-data demo
+cargo run -- shutdown --data-dir target/botster-hub-daemon-smoke-data
+```
+
+Daily first-party local stack (same topology, first-party packages enabled):
+
+```sh
+cargo run -- up --data-dir target/botster-hub-dev-stack-data
+```
+
+Keep one `--data-dir` for `up`/`start`, package commands, sessions, MCP, apps,
+and `down`/`shutdown`. That directory owns `hub-state.json`, package registry
+state, plugin data, and core daemon registry metadata.
+
+### Coordination owner
+
+After dual coordination kill, **CoreDaemon is the single product owner** of
+hub-native routed envelopes and guarded notification writes:
+
+- Native MCP/daemon tools: `HubClientApi` → `HubRuntime` →
+  `CoreDaemon::{publish,drain,acknowledge}_routed_envelope` and
+  `CoreDaemon::guarded_write`.
+- Lua plugins: `botster.coordination.*` uses the same CoreDaemon instance through
+  a narrow hub coordination bridge (no hub-local envelope inbox).
+- There is no parallel hub-local `RoutedEnvelopeRouter` product path.
+- Envelope queues are **process memory** in the hub/daemon process: they are not
+  restart-durable. Worker-backed sessions and file-backed hub/package state are
+  a different durability story.
+
+### Session history, screen, and snapshot (product surfaces)
+
+| Surface | Status on the product path |
+| --- | --- |
+| Attach + drain terminal egress | Product. Control ops ack through CoreDaemon; bytes arrive via drain/subscription. Late attach may replay prior output as Snapshot/Scrollback/TerminalOutput events when the worker path emits them. |
+| Hub `ReadScreen` / `CaptureSnapshot` | Product. Routes `HubClientApi` → `HubRuntime` → `CoreDaemon` readback. `ReadScreen` returns session text; `CaptureSnapshot` returns metadata only (rows/cols/format/byte count). Opaque snapshot bytes stay on the attach/drain data plane. |
+| Subscription history | Product. History and live terminal output flow through attach/drain events, not through readback responses. |
+| `report_delivery_*` pressure helpers | Still unfinished. Not exposed on the hub client product surface yet. |
+
+### Product today vs still unfinished
+
+**Product on this path:** explicit data-dir daemon lifecycle; worker-backed
+local PTY sessions (spawn/list/attach/input/resize/detach/session-shutdown);
+attach/drain history; hub client screen and snapshot readback through CoreDaemon;
+package install/enable/disable/reload and entrypoint supervision for local
+packages; `HubClientApi` + daemon socket protocol; native MCP coordination
+tools; Lua plugin runtime including constrained Project Pipelines; local
+capability runtimes; OS credential store for production secrets; durable
+`hub-state.json` package/provider policy; intentional restart adoption of
+worker-backed sessions.
+
+**Still unfinished / out of product claims:** delivery-pressure reporting
+(`report_delivery_*`); observed terminal readiness for always-delivered
+doorbells; restart-durable routed-envelope inboxes; uncoordinated full
+daemon/worker crash PTY recovery; marketplace fetch/update packaging UX;
+provider process supervision; cloud/Rails/public WebRTC/browser shell as hub
+builtins; broad monolith migration import.
+
 ## Responsibility split
 
 | Layer | Owns |
 | --- | --- |
-| `botster-core` | Policy-free reusable local engine mechanics and transport-neutral primitives: session spawning, PTY/process mechanics, lifecycle, activity, fanout, `TransportIngress`/`TransportEgress`, `SessionIo`, client stream contracts, notifications, plugin worker primitives, reusable crypto/identity mechanisms, package manifests, `Capability`, `CapabilitySurface`, host-profile admission contracts, and capability runtime primitives. |
+| `botster-core` / `botster-core-daemon` | Policy-free reusable local engine mechanics and transport-neutral primitives: session spawning, PTY/process mechanics (via worker path), lifecycle, activity, fanout, `TransportIngress`/`TransportEgress`, `SessionIo`, client stream contracts, notifications, **routed-envelope coordination**, plugin worker primitives, reusable crypto/identity mechanisms, package manifests, `Capability`, `CapabilitySurface`, host-profile admission contracts, and capability runtime primitives. Production supervisor: `CoreDaemon` + `botster-session-worker`. |
 | `botster-hub` | Trusted first-party host profile policy over core contracts: config locations, persistence policy, auth hooks, startup composition, admission/enforcement, package install/enable/pin/update policy, lifecycle ordering, timeout/failure policy, and audit hooks. |
 | CLI | Thin operator entrypoints that start, discover, or attach to a hub without owning profile policy. |
 | Clients | Browser, TUI, socket, and custom renderers that consume hub contracts. Clients do not own provider behavior. |
 | Plugins/providers | Installable behavior packages that declare capabilities, compatibility, entrypoints, provenance, checksums, enabled state, and update policy. |
 | External provider implementations | Cloud federation, signaling relay, browser shell, API, and other privileged integrations implemented outside the hub crate. |
 
-The host profile consumes `botster-core` through the typed core daemon API for
-the production local session path. `botster-core-daemon` owns the durable
-session registry metadata, worker-backed session supervision, PTY/process
-mechanics, subscription fanout, readiness-gated writes, adoption primitives, and
-delivery-state transitions. `HubRuntime` is the hub-owned host-profile facade
-over that daemon plus hub package, lifecycle, and capability policy; it is not a
-replacement runtime engine and it does not own live production PTY handles.
+`HubRuntime` is the hub-owned host-profile facade over CoreDaemon plus hub
+package, lifecycle, and capability policy. It is not a replacement runtime
+engine and it does not own live production PTY handles.
 
 ## HubRuntime facade audit
 
@@ -43,32 +130,32 @@ Client admission is host-profile policy over core admission and transport
 contracts, not a hub replacement for `TransportIngress`, `TransportEgress`,
 `SessionIo`, or client stream contracts.
 
-`HubClientApi` is the stable local client API boundary over this facade. It is
-transport-neutral and currently exercised in-process; socket, CLI, TUI, or local
-browser bridge adapters should frame the same request/response/event contract
-instead of bypassing hub admission or calling core routers directly. Attach is a
-subscription handshake only, so clients still explicitly pull status, packages,
-lifecycle status, or sessions when they need them. Hub code may start or embed
-the typed core daemon API; it must not shell out to the core daemon CLI or parse
-CLI output for session routing. Screen and snapshot requests route through
-`HubRuntime -> CoreDaemon` and return typed readback response DTOs. Snapshot
-readback returns metadata only; opaque snapshot bytes stay on the attach/drain
-data plane. Subscription history still flows through attach/drain events rather
-than through readback responses.
+`HubClientApi` is the stable local client API boundary over this facade. Socket,
+CLI, TUI, and local browser bridge adapters frame the same request/response/event
+contract instead of bypassing hub admission or calling raw core routers.
+Attach is a subscription handshake only, so clients still explicitly pull
+status, packages, lifecycle status, or sessions when they need them. Hub code
+embeds the typed CoreDaemon API; it must not shell out to the thin core daemon
+CLI or parse CLI output for session routing. Screen and snapshot requests route
+through `HubRuntime -> CoreDaemon` and return typed readback response DTOs.
+Snapshot readback returns metadata only; opaque snapshot bytes stay on the
+attach/drain data plane. Subscription history still flows through attach/drain
+events rather than through readback responses.
 
-| Core operation | HubRuntime decision | Reason |
+| Core / daemon operation | HubRuntime decision | Reason |
 | --- | --- | --- |
-| `execute_command(DefaultEngineCommand)` | Hidden | A generic command router would obscure hub admission and policy boundaries. |
+| `execute_command(DefaultEngineCommand)` | Hidden | Generic core router would obscure hub admission/policy. Not the product session path. |
 | `list_sessions` | Exposed | Host visibility over daemon-recorded sessions. |
-| `spawn_session` | Exposed | Host-admitted local session creation through the core daemon. |
+| `spawn_session` | Exposed | Host-admitted local session creation through CoreDaemon. |
 | `attach_client` | Exposed | Explicit client subscription handshake without global state hydration. |
-| `detach_client` | Exposed | Explicit client subscription teardown through the core daemon. |
-| `write_bytes` | Exposed | Explicit client terminal input path through the core daemon. |
-| `resize` | Exposed | Explicit client terminal resize path through the core daemon. |
-| `guarded_write` | Exposed | Hub admits the package/provider request, then core daemon owns readiness and delivery states. |
-| `release_sessions_for_restart` / `adoption_scan` / `adopt_session` | Exposed | Explicit daemon restart/adoption controls over worker-backed core sessions. |
-| `read_screen` / `capture_snapshot` | Exposed | Explicit daemon-backed terminal readback through `HubRuntime` and `CoreDaemon`; `capture_snapshot` returns metadata only, keeping opaque bytes on the attach/drain data plane. |
-| `report_delivery_*` | Deferred | Core daemon does not expose delivery-pressure reporting through the production hub path yet. |
+| `detach_client` | Exposed | Explicit client subscription teardown through CoreDaemon. |
+| `write_bytes` | Exposed | Explicit client terminal input path through CoreDaemon. |
+| `resize` | Exposed | Explicit client terminal resize path through CoreDaemon. |
+| `guarded_write` | Exposed | Hub admits the request; CoreDaemon owns readiness and delivery states. |
+| `publish` / `drain` / `acknowledge` routed envelope | Exposed | Single CoreDaemon coordination bus for native MCP and Lua. |
+| `release_sessions_for_restart` / `adoption_scan` / `adopt_session` | Exposed | Explicit daemon restart/adoption over worker-backed sessions. |
+| `read_screen` / `capture_snapshot` | Exposed | Daemon-backed terminal readback through `HubRuntime` and `CoreDaemon`; `capture_snapshot` returns metadata only, keeping opaque bytes on the attach/drain data plane. |
+| `report_delivery_*` | Deferred | Delivery-pressure reporting is not exposed on the production hub path yet. |
 | `PluginCapabilityRuntime::submit` | Exposed | Hub owns concrete local capability policy and submits through core request contracts. |
 | `PluginCapabilityRuntime::drain_events` | Exposed | Plugin capability completions and timer events are drained through a hub-owned path. |
 | `PluginCapabilityRuntime::cleanup_plugin` | Exposed | Capability resources are released during hub plugin reload and unload. |
@@ -114,41 +201,43 @@ resources do not survive replacement.
 src/lib.rs                 public facade over runtime and profile metadata
 src/client_api.rs          transport-neutral local client request/response/event API
 src/profile.rs             first-party host profile manifest and policy metadata
-src/main.rs                thin binary smoke path through the profile facade
-src/config.rs              hub-owned config policy seam
-src/daemon.rs              deterministic local daemon lifecycle over runtime/state
-src/persistence.rs         hub-owned persistence policy seam
-src/auth.rs                hub-owned auth hook seam
+src/main.rs                operator CLI and daemon binary entrypoints
+src/config.rs              hub-owned config resolution and defaults
+src/daemon.rs              local daemon lifecycle over runtime and durable state
+src/persistence.rs         hub-owned durable hub-state store
+src/auth.rs                hub-owned auth and admission hooks
 src/packages.rs            hub package policy over core package contracts
 src/lifecycle.rs           hub package lifecycle adapter over core plugin workers
 src/capabilities.rs        hub-owned local capability runtime policy
-src/runtime.rs             hub runtime facade over botster-core-daemon
+src/runtime.rs             HubRuntime facade over botster-core-daemon (CoreDaemon)
+src/mcp.rs                 daemon-backed MCP stdio surface
+src/lua_runtime.rs         Lua plugin runtime and CoreDaemon coordination bridge
 examples/project-pipelines/plugin.lua
                           first Project Pipelines Lua workflow plugin source
 ```
 
-This scaffold is intentionally shallow. The module tree makes the intended
-ownership boundaries compile-checked, but it is not a final API freeze and does
-not add a physical multi-crate split.
+These modules are real product host-profile surfaces for the local production
+path. The tree makes ownership boundaries compile-checked; it is not a frozen
+multi-crate split and not a placeholder “shallow scaffold.”
 
-## Scaffold-only exclusions
+## Out of product scope (not unfinished dual paths)
 
-This repo does not yet implement Rails, TryBotster Cloud, ActionCable, public
-WebRTC signaling servers, browser shells, API clients, OAuth/device-code flows,
-provider processes, persistence databases, marketplace fetches, or package
-installers. The hub does include local file-backed durable state for dogfood and
-a local installed-package WebRTC signaling/DataChannel adapter; database-backed
-persistence and cloud sync remain excluded.
+The following are intentionally **not** hub product surface today—they are not
+alternate local runtimes, and they do not compete with the CoreDaemon path:
 
-The exception in this scaffold is the constrained `examples/project-pipelines`
-local plugin package. The daemon loads that package through the real Lua plugin
-runtime; its entrypoint registers Project Pipelines MCP descriptors and workflow
-handlers with the Lua ABI. MCP tools are registered through the shared
-`mcp-serve` registry, dispatched over daemon transport to the owner thread,
-invoked through `PluginWorkerEngine`, and persisted through the PluginDb
-capability under `plugin-data/project-pipelines/`. The plugin README names
-unsupported monolith features and the no-in-flight-monolith-ticket cutover
-posture.
+Rails, TryBotster Cloud, ActionCable, public WebRTC signaling servers, browser
+shells as hub builtins, OAuth/device-code flows, provider process supervision,
+database-backed cloud sync, marketplace fetch/install packaging UX, and package
+installers that clone remote Git sources at enable time.
+
+What **is** product on this repo: local file-backed durable hub state, OS
+credential store for production secrets, local installed-package WebRTC
+signaling/DataChannel adapter for dogfood clients, local package path install
+and entrypoint supervision, and the constrained
+`examples/project-pipelines` local plugin package. That package loads through
+the real Lua plugin runtime; MCP tools register through `mcp-serve`, dispatch
+over daemon transport to the owner thread, invoke through `PluginWorkerEngine`,
+and persist through PluginDb under `plugin-data/project-pipelines/`.
 
 ## Durable hub state
 
@@ -228,16 +317,16 @@ an isolated daemon/session-worker subprocess, enables the checked-in
 `examples/project-pipelines` package plus a supplied local `botster-web` package
 through the daemon-owned package registry, supervises the `botster-web`
 `web-client` entrypoint in existing-hub attach mode, prints the bridge URL plus
-TUI/MCP/status/shutdown next steps, and shuts down through the daemon socket. The library-level test is
-the documented proof path for the lower scaffold. It starts an
-explicit `HubDaemon` with durable state, installs and enables the checked-in
-`examples/synthetic-plugin` fixture, persists and reloads `hub-state.json`,
-pulls status/package/lifecycle state through `HubClientApi`, resolves the
-package's Lua entrypoint path, loads the package, invokes a synthetic in-process
-plugin runtime through `HubRuntime`, spawns a local PTY session, attaches a
-client, sends input, drains the observed marker, and shuts down through the same
-local client API. Separate Lua runtime tests cover real Lua entrypoint
-execution. The PTY portion is Unix-only.
+TUI/MCP/status/shutdown next steps, and shuts down through the daemon socket.
+The library-level dogfood test is the lower-level product-path proof without the
+binary launcher: it starts an explicit `HubDaemon` with durable state, installs
+and enables the checked-in `examples/synthetic-plugin` fixture, persists and
+reloads `hub-state.json`, pulls status/package/lifecycle state through
+`HubClientApi`, resolves the package's Lua entrypoint path, loads the package,
+invokes a synthetic in-process plugin runtime through `HubRuntime`, spawns a
+local PTY session, attaches a client, sends input, drains the observed marker,
+and shuts down through the same local client API. Separate Lua runtime tests
+cover real Lua entrypoint execution. The PTY portion is Unix-only.
 
 For daily first-party local development from fresh main checkouts, use
 `botster-hub up` and `botster-hub down`. The expected local checkout set is this
@@ -593,9 +682,10 @@ Native tools route through the running daemon, not directly into hub state:
 
 The message/envelope tools use
 `daemon_transport_request -> serve_daemon -> HubClientApi -> HubRuntime ->
-CoreDaemon::{publish,drain,acknowledge}_routed_envelope`. Core assigns routed
-envelope cursors in memory; the current hub surface reports the cursor returned
-by core but does not claim restart-durable inbox state.
+CoreDaemon::{publish,drain,acknowledge}_routed_envelope`. That is the only
+product coordination path: CoreDaemon owns the router, cursors, and delivery
+state. Cursors are process memory; the hub surface reports the cursor returned
+by CoreDaemon and does not claim restart-durable inbox state.
 
 Tool listing and calling both route through `McpToolRegistry`. Native hub tools
 are provided by `NativeHubToolProvider`; Lua plugin tools use
@@ -607,9 +697,10 @@ in-process closure path.
 The native local coordination path uses no Lua or plugin tool execution:
 `whoami`, `post_message`, `receive_messages`, `ack_message`, and
 `notify_session` are native hub tools even when the binary also has the Lua
-plugin runtime available. Project Pipelines composes the same CoreDaemon-backed
-routed-envelope helper from `examples/project-pipelines/plugin.lua` through the
-Lua ABI.
+plugin runtime available. Project Pipelines uses the same CoreDaemon-owned
+routed-envelope bus from `examples/project-pipelines/plugin.lua` through
+`botster.coordination.*` (Lua bridge into the same CoreDaemon instance—not a
+second inbox).
 
 ## Project Pipelines Local Readiness
 
@@ -673,8 +764,8 @@ Dogfood-ready today: explicit local daemon lifecycle, file-backed hub/package
 state, local package admission from a manifest path, typed status/package reads,
 plugin lifecycle observation/invocation through the hub facade, daemon-backed
 PTY spawn/list/attach/input/resize/detach/session-shutdown through
-`HubClientApi`, and cross-process daemon transport proof for hub restart
-recovery.
+`HubClientApi`, attach/drain history plus screen/snapshot readback through
+CoreDaemon, and cross-process daemon transport proof for hub restart recovery.
 
 The production-shaped restart proof lives in `hub_daemon_lifecycle_test`: it
 starts the `botster-hub` binary, spawns a long-running worker-backed session
@@ -698,16 +789,19 @@ control-plane acknowledgements. Terminal egress is delivered by explicit
 from those control operations.
 
 Ready for daily local use today: explicit daemon lifecycle, daemon-backed local
-PTY session operations, minimal daemon-backed TUI attach/reconnect, native MCP
-coordination tools, and constrained Project Pipelines MCP workflow tools over
-the Lua plugin runtime.
+PTY session operations including attach/drain history and screen/snapshot
+readback, minimal daemon-backed TUI attach/reconnect, native MCP coordination
+tools, and constrained Project Pipelines MCP workflow tools over the Lua plugin
+runtime.
 
-Feature parity still pending: durable PTY recovery after daemon exit, provider
-process supervision, GitHub/PR automation, marketplace fetch/update packaging,
-cloud/Rails/WebRTC/browser surfaces, broad migration compatibility from the
-monolith, missing-public-socket self-heal after the socket path is externally
-removed, long-running attach signal handling, and uncoordinated crash PTY
-recovery.
+Still unfinished (not alternate production paths): delivery-pressure reporting
+(`report_delivery_*`), durable PTY recovery after uncoordinated daemon/worker
+crash, provider process supervision, GitHub/PR automation, marketplace
+fetch/update packaging, cloud/Rails/public WebRTC/browser-as-hub-builtin
+surfaces, broad migration compatibility from the monolith, missing-public-socket
+self-heal after the socket path is externally removed, long-running attach
+signal handling, restart-durable coordination inboxes, and observed readiness
+for always-delivered doorbells.
 
 ## Daily Dev Troubleshooting
 
@@ -748,7 +842,7 @@ Schema and consistency posture are documented in
 
 ## Dependency policy
 
-During development, this scaffold tracks `botster-core` from the `main` branch
+During development, this repo tracks `botster-core` from the `main` branch
 declared in `Cargo.toml`, with the resolved git revision committed in
 `Cargo.lock` for reproducibility. Refresh the lockfile intentionally when hub
 work needs current core behavior; stale lock drift is not a separate pinning
@@ -780,11 +874,12 @@ Its output is scrubbed to profile, host, session, marker, byte-count, and
 daemon-path facts so pipeline artifacts do not need local paths, environment
 dumps, keys, or fingerprints.
 
-The in-process `HubClientApi` local dogfood workflow supports status, session
-list, spawn, attach, input, resize, drain/output events, shutdown, guarded
-notification write, package queries, and plugin lifecycle status. The daemon
-socket and local WebRTC adapter route through this same API. Browser parity,
-TUI, and cloud transports remain outside the smoke command.
+The in-process `HubClientApi` product client workflow supports status, session
+list, spawn, attach, input, resize, drain/output events, screen and snapshot
+readback, shutdown, guarded notification write, routed-envelope publish/drain/ack,
+package queries, and plugin lifecycle status. The daemon socket and local WebRTC
+adapter route through this same API. Browser parity and cloud transports remain
+outside the smoke command; local TUI attaches through the same daemon socket.
 
 ## Package registry policy
 
