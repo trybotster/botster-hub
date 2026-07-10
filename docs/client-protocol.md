@@ -692,7 +692,11 @@ to the noisy session, drains renderable history, checks `ReadScreen` and
 the restored history. Every requested session receives an explicit
 `ShutdownSession` cleanup attempt. Failures use one of the stable labels
 `spawn`, `attach`, `drain`, `input`, `history`, or `cleanup`, with synthetic
-session IDs and path-neutral details.
+session IDs and path-neutral details. A label names the phase of the proof, not
+necessarily the daemon request that failed. In particular, quiet-session
+reconciliation maps `Drain` failures to `spawn`, the pre-attach screen wait maps
+`Drain` failures to `history`, and the post-input live-output loop maps `Drain`
+failures to `drain`.
 
 Run the CI-safe eight-session case with:
 
