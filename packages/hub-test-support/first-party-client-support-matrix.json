@@ -1,0 +1,95 @@
+{
+  "protocol": "botster-hub-daemon-v1",
+  "protocol_version": 1,
+  "conformance_fixture_revision": 10,
+  "required_features": [
+    "sessions",
+    "terminal_streaming",
+    "resize",
+    "plugin_surface_render",
+    "plugin_surface_action",
+    "package_routes",
+    "package_navigation",
+    "spawn_targets",
+    "worktrees",
+    "terminal_readback"
+  ],
+  "supported_features": [
+    "sessions",
+    "terminal_streaming",
+    "resize",
+    "plugin_surface_render",
+    "plugin_surface_action",
+    "package_routes",
+    "package_navigation",
+    "spawn_targets",
+    "worktrees",
+    "terminal_readback"
+  ],
+  "diagnostic_kinds": [
+    "connected",
+    "disconnected",
+    "compatibility_mismatch",
+    "unsupported_feature",
+    "terminal_stream_unavailable",
+    "action_failure",
+    "daemon_startup_failure",
+    "backpressure"
+  ],
+  "session_actions": [
+    "status",
+    "list_sessions",
+    "spawn",
+    "attach",
+    "drain",
+    "send_input",
+    "resize",
+    "shutdown_session"
+  ],
+  "terminal_streaming": {
+    "supported": true,
+    "feature": "terminal_streaming",
+    "helper": "botster_hub_client::stream_attach",
+    "held_open_stream": true,
+    "conformance_ready_output": "conformance-ready",
+    "conformance_echo_output": "echo:from-conformance",
+    "missing_session_diagnostic_kind": "terminal_stream_unavailable"
+  },
+  "resize": {
+    "supported": true,
+    "feature": "resize",
+    "action": "resize",
+    "conformance_output_prefix": "winsize:"
+  },
+  "plugin_surfaces": {
+    "render_supported": true,
+    "render_feature": "plugin_surface_render",
+    "action_supported": true,
+    "action_feature": "plugin_surface_action",
+    "package_name": "botster.plugin-contract-matrix",
+    "surface_id": "contract.app",
+    "rendered_surface_kind": "panel",
+    "rendered_surface_node_id": "contract-app-panel",
+    "invalid_action_diagnostic_kind": "action_failure"
+  },
+  "entity_actions": {
+    "supported_capabilities": [
+      "plugin_surface_json_actions"
+    ],
+    "unsupported_capabilities": [
+      "plugin_entity_frames"
+    ]
+  },
+  "late_attach_history": {
+    "supported": true,
+    "fixture_path": "botster_hub_test_support::late_attach_history_conformance_scenario",
+    "json_helper": "botster_hub_test_support::late_attach_history_conformance_fixture_json",
+    "event_type": "botster_hub_client::DaemonEvent",
+    "runtime_regression": "external_daemon_attach_replays_prior_history_with_renderable_byte_count"
+  },
+  "known_limitations": [
+    "The matrix is a test/docs contract, not a daemon runtime endpoint.",
+    "Full plugin entity-frame hydration is intentionally outside this conformance fixture.",
+    "Clients own renderer-specific presentation policy for diagnostics."
+  ]
+}
