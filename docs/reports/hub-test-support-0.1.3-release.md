@@ -139,7 +139,12 @@ Applied `implementer-playbook`, `botster-implementer-playbook`, the Botster
 architecture/CLI/SPA maps, source-derived support-matrix guidance, the external
 npm consumer smoke rule, the Rust test-wrapper rule, artifact/git-state rules,
 and the manual-only verification warning. No convention conflict was found.
-No missing durable guidance was discovered: the implementation applies the
-existing source-ownership, checksum, external-consumer, and automatic-signal
-rules. Asset filenames and API names are repo-specific release details rather
-than a new cross-project convention, so no new vault note was captured.
+Review exposed one missing explicit vault rule: every checked-in published copy
+of a generated artifact needs a source-equality guard in the generating crate's
+ordinary test suite. Existing source-derivation and automatic-signal notes each
+covered part of that rule but did not state the per-copy obligation. Review also
+confirmed that a Project Pipelines checklist creation timeout can be a
+client-side false negative, so agents should re-list checklists before using the
+artifact-only fallback. Both capture candidates are recorded in the durable
+Project Pipelines checklists; no vault file was written from this repo-scoped
+implementation step.
