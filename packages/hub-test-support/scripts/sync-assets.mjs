@@ -108,6 +108,16 @@ function metadataJson(originDir) {
       source_artifact_path: origin.daemon_protocol_source_artifact,
       sha256: sha256(join(originDir, "daemon-protocol.ts")),
     },
+    first_party_client_support_matrix: {
+      artifact_path: origin.first_party_client_support_matrix.artifact_path,
+      source_artifact_path: origin.first_party_client_support_matrix.source_artifact_path,
+      sha256: sha256(join(originDir, origin.first_party_client_support_matrix.artifact_path)),
+    },
+    late_attach_history_conformance_fixture: {
+      artifact_path: origin.late_attach_history_conformance_fixture.artifact_path,
+      source_artifact_path: origin.late_attach_history_conformance_fixture.source_artifact_path,
+      sha256: sha256(join(originDir, origin.late_attach_history_conformance_fixture.artifact_path)),
+    },
     plugin_contract_matrix: {
       package_name: origin.plugin_contract_matrix.package_name,
       artifact_path: origin.plugin_contract_matrix.artifact_path,
@@ -150,6 +160,16 @@ try {
   if (check) {
     const failures = [];
     compareFile("daemon-protocol.ts", join(originDir, "daemon-protocol.ts"), failures);
+    compareFile(
+      metadata.first_party_client_support_matrix.artifact_path,
+      join(originDir, metadata.first_party_client_support_matrix.artifact_path),
+      failures,
+    );
+    compareFile(
+      metadata.late_attach_history_conformance_fixture.artifact_path,
+      join(originDir, metadata.late_attach_history_conformance_fixture.artifact_path),
+      failures,
+    );
     const expectedMetadata = stableJson(metadata);
     const actualMetadataPath = join(packageRoot, "metadata.json");
     if (!existsSync(actualMetadataPath)) {
@@ -173,6 +193,14 @@ try {
     console.log("hub test-support package assets are current");
   } else {
     copyFileSync(join(originDir, "daemon-protocol.ts"), join(packageRoot, "daemon-protocol.ts"));
+    copyFileSync(
+      join(originDir, metadata.first_party_client_support_matrix.artifact_path),
+      join(packageRoot, metadata.first_party_client_support_matrix.artifact_path),
+    );
+    copyFileSync(
+      join(originDir, metadata.late_attach_history_conformance_fixture.artifact_path),
+      join(packageRoot, metadata.late_attach_history_conformance_fixture.artifact_path),
+    );
     rmSync(join(packageRoot, "fixtures", "plugin-contract-matrix"), { recursive: true, force: true });
     copyDirectory(
       join(originDir, metadata.plugin_contract_matrix.artifact_path),

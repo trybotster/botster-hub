@@ -51,6 +51,22 @@ export function readDaemonProtocolTypescript() {
   return readFileSync(daemonProtocolTypescriptPath(), "utf8");
 }
 
+export function firstPartyClientSupportMatrixPath() {
+  return packagePath(metadata.first_party_client_support_matrix.artifact_path);
+}
+
+export function readFirstPartyClientSupportMatrix() {
+  return readJson(metadata.first_party_client_support_matrix.artifact_path);
+}
+
+export function lateAttachHistoryConformanceFixturePath() {
+  return packagePath(metadata.late_attach_history_conformance_fixture.artifact_path);
+}
+
+export function readLateAttachHistoryConformanceFixture() {
+  return readJson(metadata.late_attach_history_conformance_fixture.artifact_path);
+}
+
 export function pluginContractMatrixFixturePath() {
   return packagePath(metadata.plugin_contract_matrix.artifact_path);
 }
@@ -80,6 +96,17 @@ export function verifyPackageAssets() {
     failures.push(`${metadata.daemon_protocol.artifact_path} is missing`);
   } else if (sha256File(metadata.daemon_protocol.artifact_path) !== metadata.daemon_protocol.sha256) {
     failures.push(`${metadata.daemon_protocol.artifact_path} checksum mismatch`);
+  }
+
+  for (const asset of [
+    metadata.first_party_client_support_matrix,
+    metadata.late_attach_history_conformance_fixture,
+  ]) {
+    if (!existsSync(packagePath(asset.artifact_path))) {
+      failures.push(`${asset.artifact_path} is missing`);
+    } else if (sha256File(asset.artifact_path) !== asset.sha256) {
+      failures.push(`${asset.artifact_path} checksum mismatch`);
+    }
   }
 
   for (const file of metadata.plugin_contract_matrix.files) {

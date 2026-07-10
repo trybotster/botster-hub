@@ -51,6 +51,8 @@ export type DaemonRequest =
   | { type: "resize"; session_id: string; rows: number; cols: number }
   | { type: "shutdown_session"; session_id: string }
   | { type: "drain"; session_id: string }
+  | { type: "read_screen"; session_id: string }
+  | { type: "capture_snapshot"; session_id: string }
   | { type: "list_session_templates" }
   | { type: "show_session_template"; template_id: string }
   | { type: "resolve_session_template"; template_id: string; request: DaemonSessionTemplateRequest }
@@ -106,6 +108,8 @@ export interface DaemonResponse {
   session_templates?: DaemonSessionTemplate[];
   resolved_session_template?: DaemonResolvedSessionTemplate | null;
   session_context?: DaemonSessionContext | null;
+  read_screen?: DaemonReadScreen | null;
+  capture_snapshot?: DaemonCaptureSnapshot | null;
   spawn_targets?: DaemonSpawnTarget[];
   spawn_target_validation?: DaemonSpawnTargetValidation | null;
   worktrees?: DaemonWorktree[];
@@ -130,6 +134,19 @@ export interface DaemonResponse {
   coordination: DaemonCoordination | null;
   error: DaemonOperatorError | null;
   diagnostics?: DaemonDiagnostic[];
+}
+
+export interface DaemonReadScreen {
+  session_id: string;
+  text: string;
+}
+
+export interface DaemonCaptureSnapshot {
+  session_id: string;
+  rows: number;
+  cols: number;
+  payload_format?: string | null;
+  payload_bytes: number;
 }
 
 export interface DaemonPluginSurface {
@@ -164,6 +181,8 @@ export type DaemonResponseKind =
   | "session_templates"
   | "resolved_session_template"
   | "session_context"
+  | "read_screen"
+  | "capture_snapshot"
   | "spawn_targets"
   | "spawn_target_validation"
   | "worktrees"

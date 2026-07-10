@@ -3755,6 +3755,18 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
+    fn node_package_asset(path: &str) -> String {
+        fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("..")
+                .join("packages")
+                .join("hub-test-support")
+                .join(path),
+        )
+        .unwrap_or_else(|error| panic!("read Node package asset {path}: {error}"))
+    }
+
     #[test]
     fn many_pty_failure_stage_labels_are_stable() {
         assert_eq!(
@@ -3899,6 +3911,42 @@ mod tests {
 
         assert_eq!(artifact.artifact_path, DAEMON_PROTOCOL_TYPESCRIPT_ARTIFACT);
         assert_eq!(artifact.contents, checked);
+    }
+
+    #[test]
+    fn daemon_protocol_typescript_artifact_matches_node_package_copy() {
+        assert_eq!(
+            daemon_protocol_typescript_artifact().contents,
+            node_package_asset("daemon-protocol.ts")
+        );
+    }
+
+    #[test]
+    fn first_party_client_support_matrix_matches_node_package_copy() {
+        let expected = format!(
+            "{}\n",
+            serde_json::to_string_pretty(&first_party_client_support_matrix())
+                .expect("serialize first-party client support matrix")
+        );
+
+        assert_eq!(
+            expected,
+            node_package_asset("first-party-client-support-matrix.json")
+        );
+    }
+
+    #[test]
+    fn late_attach_history_conformance_fixture_matches_node_package_copy() {
+        let expected = format!(
+            "{}\n",
+            serde_json::to_string_pretty(&late_attach_history_conformance_fixture_json())
+                .expect("serialize late-attach history conformance fixture")
+        );
+
+        assert_eq!(
+            expected,
+            node_package_asset("late-attach-history-conformance-fixture.json")
+        );
     }
 
     #[test]

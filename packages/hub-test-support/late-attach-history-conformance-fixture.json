@@ -1,0 +1,54 @@
+{
+  "conformance_fixture_revision": 10,
+  "history_then_live": [
+    {
+      "session_id": "late-attach-history-fixture-session",
+      "state": "attached",
+      "subscription_id": "late-attach-history-fixture-subscription",
+      "type": "attach_state"
+    },
+    {
+      "bytes": 21,
+      "data": "history-before-live\r\n",
+      "session_id": "late-attach-history-fixture-session",
+      "subscription_id": "late-attach-history-fixture-subscription",
+      "type": "snapshot"
+    },
+    {
+      "data": "live-after-attach\r\n",
+      "session_id": "late-attach-history-fixture-session",
+      "subscription_id": "late-attach-history-fixture-subscription",
+      "type": "terminal_output"
+    },
+    {
+      "code": 0,
+      "session_id": "late-attach-history-fixture-session",
+      "subscription_id": "late-attach-history-fixture-subscription",
+      "type": "process_exit"
+    }
+  ],
+  "no_history_session_id": "late-attach-no-history-fixture-session",
+  "no_history_subscription_id": "late-attach-no-history-fixture-subscription",
+  "no_history_then_live": [
+    {
+      "session_id": "late-attach-no-history-fixture-session",
+      "state": "attached",
+      "subscription_id": "late-attach-no-history-fixture-subscription",
+      "type": "attach_state"
+    },
+    {
+      "data": "live-without-history\r\n",
+      "session_id": "late-attach-no-history-fixture-session",
+      "subscription_id": "late-attach-no-history-fixture-subscription",
+      "type": "terminal_output"
+    },
+    {
+      "code": 0,
+      "session_id": "late-attach-no-history-fixture-session",
+      "subscription_id": "late-attach-no-history-fixture-subscription",
+      "type": "process_exit"
+    }
+  ],
+  "session_id": "late-attach-history-fixture-session",
+  "subscription_id": "late-attach-history-fixture-subscription"
+}
