@@ -675,6 +675,46 @@ The live runtime path remains covered by
 proves the daemon socket path emits matching public event semantics for restored
 history before later live output and for the no-history case.
 
+## Many-PTY client attach proof
+
+`botster_hub_test_support::run_many_pty_client_attach_conformance` composes the
+production path into one adversarial correctness proof. It starts many sessions
+through public `DaemonRequest::Spawn` calls on an isolated hub configured with
+the real session-worker binary. One noisy PTY remains interactive while the
+other PTYs exit. Public `Drain` requests advance lifecycle reconciliation for
+each quiet session without attaching it, then bounded public `ListSessions`
+polling must observe `exited`. The proof does not attach to quiet sessions or
+use a sleep as its success condition.
+
+After the quiet sessions exit, the same public client connection attaches late
+to the noisy session, drains renderable history, checks `ReadScreen` and
+`CaptureSnapshot`, sends labeled input, and observes the later live marker after
+the restored history. Every requested session receives an explicit
+`ShutdownSession` cleanup attempt. Failures use one of the stable labels
+`spawn`, `attach`, `drain`, `input`, `history`, or `cleanup`, with synthetic
+session IDs and path-neutral details. A label names the phase of the proof, not
+necessarily the daemon request that failed. In particular, quiet-session
+reconciliation maps `Drain` failures to `spawn`, the pre-attach screen wait maps
+`Drain` failures to `history`, and the post-input live-output loop maps `Drain`
+failures to `drain`.
+
+Run the CI-safe eight-session case with:
+
+```sh
+./test.sh --test hub_daemon_lifecycle_test external_hub_client_many_pty_adversarial_conformance_ci
+```
+
+Run the ignored 32-session local case with:
+
+```sh
+./test.sh --test hub_daemon_lifecycle_test external_hub_client_many_pty_adversarial_conformance_local -- --ignored --exact
+```
+
+Both commands exercise `botster-hub-client` over the daemon socket, then
+`daemon_transport -> HubClientApi -> HubRuntime -> CoreDaemon`, and finally the
+worker-backed `SessionIo`/`ClientWorker` terminal path. The session counts are
+bounded correctness cases, not performance targets or benchmark claims.
+
 The addition of required renderable `data` fields on `snapshot` and `scrollback`
 increments `CONFORMANCE_FIXTURE_REVISION`. `PROTOCOL_VERSION` remains unchanged
 because the daemon framing and request/response protocol are the same; clients
