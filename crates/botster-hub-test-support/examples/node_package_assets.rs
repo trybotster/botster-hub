@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use botster_hub_test_support::{
     application_primitives_fixture_descriptor, copy_plugin_contract_matrix_fixture,
     daemon_protocol_typescript_artifact, first_party_client_support_matrix,
-    plugin_contract_matrix_fixture_asset,
+    late_attach_history_conformance_fixture_json, plugin_contract_matrix_fixture_asset,
 };
 use serde_json::json;
 
@@ -38,11 +38,30 @@ fn main() -> Result<(), Box<dyn Error>> {
     let application_primitives = application_primitives_fixture_descriptor();
 
     let matrix = first_party_client_support_matrix();
+    fs::write(
+        output_dir.join("first-party-client-support-matrix.json"),
+        format!("{}\n", serde_json::to_string_pretty(&matrix)?),
+    )?;
+    fs::write(
+        output_dir.join("late-attach-history-conformance-fixture.json"),
+        format!(
+            "{}\n",
+            serde_json::to_string_pretty(&late_attach_history_conformance_fixture_json())?
+        ),
+    )?;
     let metadata = json!({
         "protocol": matrix.protocol,
         "protocol_version": matrix.protocol_version,
         "conformance_fixture_revision": matrix.conformance_fixture_revision,
         "daemon_protocol_source_artifact": protocol.artifact_path,
+        "first_party_client_support_matrix": {
+            "artifact_path": "first-party-client-support-matrix.json",
+            "source_artifact_path": "botster_hub_test_support::first_party_client_support_matrix()",
+        },
+        "late_attach_history_conformance_fixture": {
+            "artifact_path": "late-attach-history-conformance-fixture.json",
+            "source_artifact_path": "botster_hub_test_support::late_attach_history_conformance_fixture_json()",
+        },
         "plugin_contract_matrix": {
             "package_name": fixture.package_name,
             "artifact_path": fixture.artifact_path,

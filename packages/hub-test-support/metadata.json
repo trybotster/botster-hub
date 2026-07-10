@@ -1,14 +1,24 @@
 {
   "package_name": "@trybotster/hub-test-support",
-  "package_version": "0.1.2",
+  "package_version": "0.1.3",
   "protocol": "botster-hub-daemon-v1",
   "protocol_version": 1,
-  "conformance_fixture_revision": 9,
+  "conformance_fixture_revision": 10,
   "generated_by": "cargo run -p botster-hub-test-support --example node_package_assets",
   "daemon_protocol": {
     "artifact_path": "daemon-protocol.ts",
     "source_artifact_path": "crates/botster-hub-client/generated/daemon-protocol.ts",
-    "sha256": "dcde0ca82b7460a4055c74b6577881d0e8648cda4ea99cfd57a7e8725d99e4c3"
+    "sha256": "4396365b2328eb8a0767b05507dd14689e112b28b9d8aad41848b0445ff0236e"
+  },
+  "first_party_client_support_matrix": {
+    "artifact_path": "first-party-client-support-matrix.json",
+    "source_artifact_path": "botster_hub_test_support::first_party_client_support_matrix()",
+    "sha256": "700242438298915f431bd65fda5eae1f54693db60b232d720870bd8c80b717f6"
+  },
+  "late_attach_history_conformance_fixture": {
+    "artifact_path": "late-attach-history-conformance-fixture.json",
+    "source_artifact_path": "botster_hub_test_support::late_attach_history_conformance_fixture_json()",
+    "sha256": "2e7dca4921cb70d7d3722321d639ebbc34083fd9cda33b9f8e014da14133e992"
   },
   "plugin_contract_matrix": {
     "package_name": "botster.plugin-contract-matrix",

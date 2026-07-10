@@ -3255,6 +3255,21 @@ mod tests {
     }
 
     #[test]
+    fn daemon_protocol_typescript_artifact_matches_node_package_copy() {
+        let package_copy = fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("..")
+                .join("packages")
+                .join("hub-test-support")
+                .join("daemon-protocol.ts"),
+        )
+        .expect("read Node package daemon protocol");
+
+        assert_eq!(daemon_protocol_typescript_artifact().contents, package_copy);
+    }
+
+    #[test]
     fn support_matrix_entity_capabilities_are_disjoint_and_complete() {
         let matrix = first_party_client_support_matrix();
         let mut declared = matrix.entity_actions.supported_capabilities.clone();
