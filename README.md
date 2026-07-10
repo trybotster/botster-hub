@@ -38,6 +38,9 @@ library path separately; this hub documents only the product host path above.
 ### Start here
 
 ```sh
+# Once per checkout: build the PTY worker that CoreDaemon supervises.
+cargo build --locked -p botster-core --bin botster-session-worker
+
 # Terminal 1: durable daemon over an explicit data directory.
 cargo run -- start --data-dir target/botster-hub-daemon-smoke-data
 
