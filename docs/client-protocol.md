@@ -29,7 +29,7 @@ Node-based first-party clients can consume the same checked artifact without a
 sibling hub checkout through the package:
 
 ```sh
-npm install --save-dev @trybotster/hub-test-support@0.1.2
+npm install --save-dev @trybotster/hub-test-support@0.1.3
 ```
 
 ```js
@@ -38,12 +38,16 @@ import {
   materializePluginContractMatrixFixture,
   metadata,
   readDaemonProtocolTypescript,
+  readFirstPartyClientSupportMatrix,
+  readLateAttachHistoryConformanceFixture,
 } from "@trybotster/hub-test-support";
 
 const protocolSource = readDaemonProtocolTypescript();
 const fixturePath = materializePluginContractMatrixFixture(tempDirectory);
 const applicationPrimitivesPath = materializeApplicationPrimitivesFixture(tempDirectory);
 const applicationSurfaceId = metadata.application_primitives.surface_id;
+const supportMatrix = readFirstPartyClientSupportMatrix();
+const lateAttachFixture = readLateAttachHistoryConformanceFixture();
 
 console.log(
   metadata.protocol,
@@ -51,6 +55,8 @@ console.log(
   fixturePath,
   applicationPrimitivesPath,
   applicationSurfaceId,
+  supportMatrix.required_features,
+  lateAttachFixture.history_then_live,
 );
 ```
 
@@ -60,12 +66,10 @@ fixture revision are emitted by the Rust `botster-hub-test-support` asset
 generator instead of being maintained independently in JavaScript.
 
 For npm-based client repos such as botster-web, use the exact dependency spec
-`"@trybotster/hub-test-support": "0.1.2"` in `devDependencies` and let npm write
-the corresponding package-lock entry from the public npm registry. When the
-registry does not have `0.1.2` yet, install the tarball produced by `npm pack`
-from `packages/hub-test-support` with a `file:` dependency. The package is
-public, so registry install does not require a scoped `.npmrc` entry or CI auth
-token. After updating the lockfile, run the client smoke that imports the
+`"@trybotster/hub-test-support": "0.1.3"` in `devDependencies` and let npm write
+the corresponding package-lock entry from the public npm registry. The package
+is public, so registry install does not require a scoped `.npmrc` entry or CI
+auth token. After updating the lockfile, run the client smoke that imports the
 package, reads the daemon protocol artifact, calls `verifyPackageAssets()`, and
 materializes the application-primitives fixture.
 
@@ -653,6 +657,16 @@ tests that cannot depend on the Rust crate should mirror the stable JSON from
 `botster_hub_test_support::late_attach_history_conformance_fixture_json` and
 assert the same event ordering and classification. `AttachState` and
 `ProcessExit` are metadata/control events, not terminal bytes to render.
+
+Node clients can consume that exact JSON through
+`readLateAttachHistoryConformanceFixture()` from
+`@trybotster/hub-test-support@0.1.3`. The same package exposes
+`readFirstPartyClientSupportMatrix()`. Because the current hub-client helper
+uses one feature list for advertised and required compatibility, the published
+matrix includes `terminal_readback` in both `supported_features` and
+`required_features`. Downstream compatibility checks must therefore implement
+terminal readback; splitting required from supported is a separate protocol
+contract change.
 
 `DaemonEvent::WorktreeLifecycle` exposes hub-owned worktree CRUD lifecycle
 events to clients through the normal `DaemonResponse.events` field. The inner

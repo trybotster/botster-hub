@@ -15,6 +15,16 @@ export interface HubTestSupportMetadata {
     source_artifact_path: string;
     sha256: string;
   };
+  first_party_client_support_matrix: {
+    artifact_path: "first-party-client-support-matrix.json";
+    source_artifact_path: string;
+    sha256: string;
+  };
+  late_attach_history_conformance_fixture: {
+    artifact_path: "late-attach-history-conformance-fixture.json";
+    source_artifact_path: string;
+    sha256: string;
+  };
   plugin_contract_matrix: {
     package_name: string;
     artifact_path: "fixtures/plugin-contract-matrix";
@@ -36,6 +46,10 @@ export const metadata: HubTestSupportMetadata;
 
 export function daemonProtocolTypescriptPath(): string;
 export function readDaemonProtocolTypescript(): string;
+export function firstPartyClientSupportMatrixPath(): string;
+export function readFirstPartyClientSupportMatrix(): Record<string, unknown>;
+export function lateAttachHistoryConformanceFixturePath(): string;
+export function readLateAttachHistoryConformanceFixture(): Record<string, unknown>;
 export function pluginContractMatrixFixturePath(): string;
 export function materializePluginContractMatrixFixture(destination: string): string;
 export function applicationPrimitivesFixturePath(): string;
