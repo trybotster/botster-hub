@@ -17,10 +17,10 @@ identity, package, runtime, actor, entity, transport, UI, engine modules, and
 supervisor used by this hub: typed spawn/list/attach/detach/input/resize/drain,
 guarded-write, registry, health, adoption, and shutdown APIs.
 
-This ADR treats the existing hub scaffold as useful evidence, not gospel. The
-scaffold exposes shallow seams for config, auth, persistence, packages,
-providers, adapters, and the daemon-backed runtime facade. Those names are kept
-only where they line up with the accepted boundary model.
+This ADR treats the hub module layout as living product surface evidence, not a
+placeholder. Modules for config, auth, persistence, packages, lifecycle,
+daemon lifecycle, client API, and the CoreDaemon-backed runtime facade are real
+host-profile ownership boundaries on the single production path.
 
 ## Decision
 
@@ -45,7 +45,7 @@ processes, not by the hub process.
 | Tier | Owns | Does not own | Source evidence |
 | --- | --- | --- | --- |
 | Non-replaceable core mechanisms | `CoreDaemon`, daemon registry/adoption/guarded-write contracts, `BotsterEngine`, `DefaultBotsterEngine` when `local-runtime` is enabled, `MultiplexerEngine`, session/runtime traits, transport ingress/egress frames, actor mailbox contracts, bounded queue metadata, session I/O requests/events, client worker messages, plugin worker engine contracts, package manifest/capability types, entity frames, UI contract types, reusable crypto/envelope operations, and public device identity/fingerprint helpers. | Product startup policy, provider selection, auth/admission decisions, package install/update policy, cloud federation policy, browser shell delivery, or workflow-specific plugin behavior. | `crates/botster-core/src/lib.rs`, `crates/botster-core-daemon/src/lib.rs`, `src/engine/botster.rs`, `src/contract/actor.rs`, `src/contract/transport.rs`, `src/package/manifest.rs`, `src/package/capability.rs`, `src/contract/entity.rs`, `src/identity/crypto.rs`, `src/identity/device.rs` at the locked `botster-core` revision. |
-| Trusted host profile privileges | Startup composition, runtime config, host identity policy, client admission, provider enablement, capability grants, package install/enable/disable/pin/update policy, persistence locations, audit hooks, lifecycle ordering, timeout/failure policy, and wiring the default local runtime when this host wants local PTY execution. | Reimplementing core engine/session/actor contracts, owning raw terminal byte delivery, treating cloud/Rails/browser shell providers as hardcoded hub internals, or executing ordinary plugin callbacks inline as hub policy. | Hub scaffold `src/config.rs`, `src/runtime.rs`, `src/packages.rs`, `src/providers.rs`; vault notes `botster packages should enforce core hub cli plugin provider boundaries`, `botster cloud should be an installable privileged provider not a hub dependency`, and `botster-core local process runtime is feature-gated from contract-only embeds`. |
+| Trusted host profile privileges | Startup composition, runtime config, host identity policy, client admission, provider enablement, capability grants, package install/enable/disable/pin/update policy, persistence locations, audit hooks, lifecycle ordering, timeout/failure policy, and wiring the default local runtime when this host wants local PTY execution. | Reimplementing core engine/session/actor contracts, owning raw terminal byte delivery, treating cloud/Rails/browser shell providers as hardcoded hub internals, or executing ordinary plugin callbacks inline as hub policy. | Hub product modules `src/config.rs`, `src/runtime.rs`, `src/packages.rs`, `src/daemon.rs`, `src/client_api.rs`; vault notes `botster packages should enforce core hub cli plugin provider boundaries`, `botster cloud should be an installable privileged provider not a hub dependency`, and `botster-core local process runtime is feature-gated from contract-only embeds`. |
 | Ordinary user-installed plugins/providers | Declared behavior through package manifests, entrypoints, descriptors, handlers, plugin-owned entity families, MCP/tools/resources, session actions, UI surfaces, provider implementations, and provider-specific readiness/probing. Privileged providers may request capabilities such as secrets, crypto, client admission, pairing invites, signaling relay, hub presence, or browser shell. | Implicit hub internals, unpinned privileged authority, package manager policy, raw private key material, direct ownership of client admission without a grant, terminal data-plane ownership, or global client hydration. | `PackageManifest` and `CapabilitySurface` in core; `PluginWorkerRegistration` in `src/engine/plugin_worker.rs`; `PluginHandlerRef`, `PluginOwnedDescriptor`, `PluginResourceRef`, and `PluginInvocationRequest` in `src/contract/actor.rs`; vault notes `botster package manifests and lockfiles should declare capabilities and provenance`, `botster plugin runtime uses supervisor plus per plugin workers`, and `botster plugin entities are canonical for plugin-owned dynamic state`. |
 
 The hub profile can ship with first-party plugins and privileged providers, but
@@ -54,7 +54,7 @@ capabilities and provenance so they can later be pinned, audited, disabled,
 updated, or replaced through the same package policy as user-installed packages.
 
 `default_package_policy()` is the concrete hub-owned policy gate for that
-package layer in the current scaffold. It derives the grant set from
+package layer on the product path. It derives the grant set from
 `host_profile()` default capability grants, then uses `PackageRegistry` to store
 records around `botster_core::PackageManifest` values, keep hub-owned
 enabled/disabled/pin/provenance/update metadata, compare requested `Capability`
@@ -63,9 +63,9 @@ host-profile admission to `botster_core::admit_host_profile`. Provider packages
 without host-profile metadata are denied before enablement so provider authority
 cannot bypass core admission. Accepted and denied decisions carry audit reasons
 and deterministic package/action/state/classification context for operator
-review. Future package lifecycle loading should call this policy before
-executing plugin or provider code; this ADR does not make it a marketplace
-fetcher, lockfile persistence layer, or lifecycle runtime.
+review. Package lifecycle loading calls this policy before executing plugin or
+provider code; this ADR does not make it a marketplace fetcher or remote install
+runtime.
 
 ## Startup Ownership
 
@@ -73,9 +73,9 @@ Startup proceeds in this order:
 
 1. The host profile resolves explicit hub configuration: host identity, data
    directory, session defaults, plugin/provider directories, transport bindings,
-   and core engine knobs. The current scaffold for this is `src/config.rs`.
+   and core engine knobs (`src/config.rs`).
 2. The host profile initializes core mechanisms. For production local PTY
-   execution, the current hub path constructs `HubRuntime` with
+   execution, hub constructs `HubRuntime` with
    `botster_core_daemon::CoreDaemon` in `src/runtime.rs`, using the hub data
    directory for durable daemon registry metadata and the sibling
    `botster-session-worker` executable for worker-backed live sessions.
@@ -98,11 +98,11 @@ Startup proceeds in this order:
    supplied outside core, as stated in `crates/botster-core/src/engine/plugin_worker.rs`.
 5. Clients subscribe or attach through transport-neutral contracts. Subscription
    opens a transport path; it does not hydrate all global application state.
-   Opened views and UI bindings drive route, entity, and surface pulls. The
-   current scaffold exposes this for local dogfood clients through
-   `HubClientApi::handle_request`, an in-process request/response/event boundary
-   that routes status, session, package, lifecycle, and terminal control
-   requests through hub facades instead of raw core routers.
+   Opened views and UI bindings drive route, entity, and surface pulls. Local
+   product clients use `HubClientApi::handle_request`, a transport-neutral
+   request/response/event boundary that routes status, session, package,
+   lifecycle, coordination, and terminal control requests through hub facades
+   instead of raw core routers.
 
 The hub owns the control plane: topology, lifecycle, discovery, authorization,
 admission, routing decisions, recovery, cleanup, and provider/plugin
@@ -118,7 +118,7 @@ payloads, scrollback, or per-client egress. Core already names `SessionIo` and
 | Config | Host profile | Resolve config files, environment, data directories, plugin/provider dirs, local sockets, TCP bindings, and defaults before handing explicit requests to core. Core accepts policy-resolved requests and stable config-shaped primitives. |
 | Persistence | Host profile and plugin/provider packages | Hub chooses persistence locations and durability policy. Plugins own plugin data such as `plugin.db` through granted storage capabilities. Core may define storage-capability contracts but should not own product data policy. |
 | Auth and admission | Host profile plus privileged providers | Core owns reusable crypto, public identity metadata, fingerprints, envelopes, and operation contracts. Hub and enabled providers decide login, pairing, client admission, SSO, cloud federation, and audit policy. Providers receive scoped operations, not raw private key material. |
-| Providers | Trusted host profile policy over installable packages | Cloud, signaling relay, browser shell, registry, external APIs, and SSO are privileged provider packages. The hub owns capability vocabulary, grant policy, lifecycle ordering, timeout policy, and audit logging. Provider implementations live outside this scaffold. |
+| Providers | Trusted host profile policy over installable packages | Cloud, signaling relay, browser shell, registry, external APIs, and SSO are privileged provider packages. The hub owns capability vocabulary, grant policy, lifecycle ordering, timeout policy, and audit logging. Provider implementations live outside the hub crate. |
 | Marketplace and packages | Host profile policy over core contracts | Core owns manifest and capability declaration types such as `PackageManifest`, `PackageSource`, `Capability`, and `CapabilitySurface`. Hub owns install, enable, disable, pin, update, provenance checks, lockfile policy, compatibility checks, and marketplace/index resolution. |
 | Transport, signaling, and clients | Split control/data plane | Core owns transport-neutral ingress/egress frames and actor contracts. Hub owns admission, routing, peer lifecycle, relay provider selection, and cleanup policy. Client workers and session I/O actors own byte-bearing stream state; clients render and adapt concrete transports. |
 | Plugin lifecycle | Core worker mechanics plus host supervision | Core owns handler refs, descriptor refs, invocation/result contracts, bounded worker capacity, capability checks, cleanup scopes, and reload/unload mechanics. Hub supervises package selection, startup order, policy grants, and audit. Plugin code runs behind worker boundaries. |
@@ -160,38 +160,36 @@ payloads, scrollback, or per-client egress. Core already names `SessionIo` and
   after release/adopt, and no downtime scrollback continuity beyond core's
   current guarantees.
 
-## Migration Path For `botster-hub`
+## Production Path And Remaining Work
 
-1. Keep the current shallow crate as a host-profile scaffold. It is useful for
-   naming policy seams, but it is not the final authority.
-2. Make this ADR the public discovery point for core/host/plugin/provider
-   boundaries, linked from `README.md`.
-3. Audit current scaffold modules against this ADR:
-   `src/runtime.rs`, `src/config.rs`, `src/auth.rs`, `src/persistence.rs`,
-   `src/packages.rs`, `src/providers.rs`, and `src/adapters/*`.
-4. Keep runtime proof paths facade-backed. The current `HubRuntime` uses typed
-   core daemon verbs and worker-backed sessions for local session execution
-   rather than assembling `MultiplexerEngine` directly, owning PTY handles, or
-   parsing core daemon CLI output.
-5. Move product policy into host-profile/provider/plugin packages without
-   widening core. Cloud federation, signaling relays, browser shell delivery,
-   SSO, package indexes, marketplace UX, and workflow apps should compose core
-   mechanisms through explicit capability contracts.
-6. Treat package manifests and lockfiles as the installable expression of the
-   boundary. Add provenance, checksums/signatures, compatibility, grants,
-   enabled state, and update policy before privileged provider installation
-   becomes broad.
-7. Make plugin lifecycle boundaries enforceable: descriptor registries in the
-   parent hub, executable behavior in per-plugin workers, resource cleanup on
-   reload/unload, bounded queues, and timeout attribution.
-8. Keep client subscription lightweight. Browser, TUI, socket, and custom
-   clients should pull route registries, surfaces, and bound entity families
-   when views need them.
-9. Convert documented boundaries into compile-time/package/test enforcement
-   only after the ADR, README, current scaffold, and locked core surfaces agree.
+The production local session path is already real:
 
-This migration path is intentionally staged. The current scaffold now proves the
-production local session path through `HubRuntime -> CoreDaemon ->
-botster-session-worker`; later tickets can add socket transports, broader
-restart UX, and provider/client adapters without moving PTY ownership back into
-the hub.
+`HubRuntime -> CoreDaemon -> botster-session-worker`
+
+with explicit `--data-dir`, durable hub-state package policy, `HubClientApi`,
+daemon socket/CLI/MCP adapters, and CoreDaemon-owned routed-envelope
+coordination (no hub-local parallel inbox).
+
+`DefaultBotsterEngine` remains a core library embed detail. Hub does not treat
+it as a second product runtime for local sessions.
+
+Product terminal surfaces on that path already include attach/drain history and
+hub client `ReadScreen` / `CaptureSnapshot` through CoreDaemon. Remaining work
+is product gaps on the same path, not dual ownership stories:
+
+1. Expose delivery-pressure reporting (`report_delivery_*`) if core and clients
+   need it; still Deferred on the hub product surface today.
+2. Keep runtime proof paths facade-backed: typed CoreDaemon verbs and
+   worker-backed sessions—not assembling `MultiplexerEngine` in hub, owning PTY
+   handles in the hub process, or parsing core daemon CLI output.
+3. Keep product policy in host-profile/provider/plugin packages without widening
+   core (cloud, public signaling, browser shell delivery, marketplace UX).
+4. Treat package manifests and lockfiles as the installable expression of the
+   boundary for broader privileged provider install.
+5. Keep client subscription lightweight: pull routes, surfaces, and entities
+   when views need them rather than hydrate-on-attach.
+6. Convert remaining soft boundaries into package/test enforcement as the
+   locked core revision and hub surfaces stay aligned.
+
+Later tickets may deepen adapters and recovery UX without moving PTY ownership
+or coordination ownership back into the hub process.
