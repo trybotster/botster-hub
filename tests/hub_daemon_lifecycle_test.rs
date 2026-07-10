@@ -7280,6 +7280,55 @@ fn external_hub_test_support_drives_isolated_daemon_socket_protocol() {
 }
 
 #[test]
+fn external_hub_client_many_pty_adversarial_conformance_ci() {
+    let _guard = daemon_test_lock()
+        .lock()
+        .expect("serialize real daemon test");
+    let hub = botster_hub_test_support::IsolatedHubBuilder::new()
+        .hub_bin(env!("CARGO_BIN_EXE_botster-hub"))
+        .session_worker_bin(session_worker_binary_path())
+        .root(PathBuf::from("/tmp/bh-test-support"))
+        .name("many-pty-client-attach-ci")
+        .start()
+        .expect("start isolated hub for CI-safe many-PTY proof");
+
+    let report = botster_hub_test_support::run_many_pty_client_attach_conformance(&hub, 8)
+        .expect("run CI-safe many-PTY client attach proof");
+    // Ok(report) is the behavioral oracle; stage-labeled errors identify which
+    // required observation failed. These assertions pin scenario and cleanup size.
+    assert_eq!(report.total_sessions, 8);
+    assert_eq!(report.quiet_sessions, 7);
+    assert_eq!(report.cleaned_sessions, 8);
+
+    hub.shutdown().expect("shutdown CI-safe many-PTY hub");
+}
+
+#[test]
+#[ignore = "larger local adversarial proof; run explicitly with the documented command"]
+fn external_hub_client_many_pty_adversarial_conformance_local() {
+    let _guard = daemon_test_lock()
+        .lock()
+        .expect("serialize real daemon test");
+    let hub = botster_hub_test_support::IsolatedHubBuilder::new()
+        .hub_bin(env!("CARGO_BIN_EXE_botster-hub"))
+        .session_worker_bin(session_worker_binary_path())
+        .root(PathBuf::from("/tmp/bh-test-support"))
+        .name("many-pty-client-attach-local")
+        .start()
+        .expect("start isolated hub for larger local many-PTY proof");
+
+    let report = botster_hub_test_support::run_many_pty_client_attach_conformance(&hub, 32)
+        .expect("run larger local many-PTY client attach proof");
+    // Ok(report) is the behavioral oracle; stage-labeled errors identify which
+    // required observation failed. These assertions pin scenario and cleanup size.
+    assert_eq!(report.total_sessions, 32);
+    assert_eq!(report.quiet_sessions, 31);
+    assert_eq!(report.cleaned_sessions, 32);
+
+    hub.shutdown().expect("shutdown larger local many-PTY hub");
+}
+
+#[test]
 fn external_daemon_attach_replays_prior_history_with_renderable_byte_count() {
     let _guard = daemon_test_lock()
         .lock()
