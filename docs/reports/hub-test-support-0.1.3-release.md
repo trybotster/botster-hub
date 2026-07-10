@@ -61,6 +61,8 @@ All commands ran from the ticket worktree unless a disposable directory is
 named explicitly.
 
 - `cargo fmt --all -- --check` — passed.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` —
+  passed after the complete npm-copy guard was added.
 - `node packages/hub-test-support/scripts/sync-assets.mjs` — generated current
   npm assets from Rust sources.
 - `node packages/hub-test-support/scripts/sync-assets.mjs --check` — passed.
@@ -70,8 +72,10 @@ named explicitly.
   supported `terminal_readback`, restored-history-before-live ordering, UTF-8
   byte counts, and the no-history sequence.
 - `./test.sh -p botster-hub-client` — passed: 32 unit tests and 4 doc tests.
-- `./test.sh -p botster-hub-test-support` — passed: 22 unit tests and 3 doc
-  tests, including the new npm protocol-copy staleness guard.
+- `./test.sh -p botster-hub-test-support` — passed: 24 unit tests and 3 doc
+  tests, including source-equality guards for all three generated npm package
+  copies. Each new JSON guard was also shown to fail under deliberate asset
+  corruption before the checked asset was restored.
 - `./test.sh` — passed with no failures, including 73 library tests, 14 hub
   capability tests, 21 client API tests, 87 daemon lifecycle tests, 1 local
   dogfood test, 18 Lua runtime tests, 6 MCP tests, 6 plugin lifecycle tests, 7
@@ -107,8 +111,10 @@ named explicitly.
 - The approved plan did not pin asset filenames. Plan Review required fixed
   names and export-subpath resolution proof; both were added before editing and
   carried through implementation.
-- Plan Review requested a durable npm-copy staleness guard. A narrow Rust test
-  was added beside the existing checked-generated-file test.
+- Plan Review requested durable npm-copy staleness guards. Three narrow Rust
+  tests beside the existing checked-generated-file test now compare the daemon
+  protocol, support matrix, and late-attach fixture package copies to their
+  authoritative generated values.
 
 ## Residual risk and unverified behavior
 
@@ -123,6 +129,9 @@ named explicitly.
 - `terminal_readback` remains required as well as supported. This is existing
   hub-main behavior now made visible to npm consumers, not a new package-local
   decision.
+- The Rust suite guards the three source-generated npm copies. `metadata.json`
+  remains guarded transitively by package checksum verification and
+  `sync-assets.mjs --check`, which are part of the release verification path.
 
 ## Vault guidance disposition
 

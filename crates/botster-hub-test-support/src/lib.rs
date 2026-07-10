@@ -3124,6 +3124,18 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
+    fn node_package_asset(path: &str) -> String {
+        fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("..")
+                .join("packages")
+                .join("hub-test-support")
+                .join(path),
+        )
+        .unwrap_or_else(|error| panic!("read Node package asset {path}: {error}"))
+    }
+
     #[test]
     fn support_matrix_matches_current_compatibility_descriptor() {
         let matrix = first_party_client_support_matrix();
@@ -3256,17 +3268,38 @@ mod tests {
 
     #[test]
     fn daemon_protocol_typescript_artifact_matches_node_package_copy() {
-        let package_copy = fs::read_to_string(
-            Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("..")
-                .join("..")
-                .join("packages")
-                .join("hub-test-support")
-                .join("daemon-protocol.ts"),
-        )
-        .expect("read Node package daemon protocol");
+        assert_eq!(
+            daemon_protocol_typescript_artifact().contents,
+            node_package_asset("daemon-protocol.ts")
+        );
+    }
 
-        assert_eq!(daemon_protocol_typescript_artifact().contents, package_copy);
+    #[test]
+    fn first_party_client_support_matrix_matches_node_package_copy() {
+        let expected = format!(
+            "{}\n",
+            serde_json::to_string_pretty(&first_party_client_support_matrix())
+                .expect("serialize first-party client support matrix")
+        );
+
+        assert_eq!(
+            expected,
+            node_package_asset("first-party-client-support-matrix.json")
+        );
+    }
+
+    #[test]
+    fn late_attach_history_conformance_fixture_matches_node_package_copy() {
+        let expected = format!(
+            "{}\n",
+            serde_json::to_string_pretty(&late_attach_history_conformance_fixture_json())
+                .expect("serialize late-attach history conformance fixture")
+        );
+
+        assert_eq!(
+            expected,
+            node_package_asset("late-attach-history-conformance-fixture.json")
+        );
     }
 
     #[test]
