@@ -317,7 +317,10 @@ impl LocalWebrtcOfferPeer {
                     std::io::Error::other("local WebRTC data channel closed before response")
                 })?;
             maximum_frame_bytes = maximum_frame_bytes.max(response.len());
-            assert!(response.len() < 64 * 1024, "response frame exceeded 64 KiB");
+            assert!(
+                response.len() < botster_hub_client::LOCAL_WEBRTC_MAX_FRAME_BYTES,
+                "response frame exceeded 64 KiB"
+            );
             let chunk = serde_json::from_str::<botster_hub_client::DaemonLocalWebrtcResponseChunk>(
                 &response,
             )?;
@@ -6364,7 +6367,7 @@ fn local_webrtc_chunks_oversized_encrypted_daemon_response() {
         );
         assert!(metrics.envelope_bytes > 256 * 1024);
         assert!(metrics.chunk_count > 1);
-        assert!(metrics.maximum_frame_bytes < 64 * 1024);
+        assert!(metrics.maximum_frame_bytes < botster_hub_client::LOCAL_WEBRTC_MAX_FRAME_BYTES);
 
         let shutdown = offer_peer
             .encrypted_request(

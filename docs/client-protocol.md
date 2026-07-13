@@ -29,7 +29,7 @@ Node-based first-party clients can consume the same checked artifact without a
 sibling hub checkout through the package:
 
 ```sh
-npm install --save-dev @trybotster/hub-test-support@0.1.3
+npm install --save-dev @trybotster/hub-test-support@0.1.4
 ```
 
 ```js
@@ -66,7 +66,7 @@ fixture revision are emitted by the Rust `botster-hub-test-support` asset
 generator instead of being maintained independently in JavaScript.
 
 For npm-based client repos such as botster-web, use the exact dependency spec
-`"@trybotster/hub-test-support": "0.1.3"` in `devDependencies` and let npm write
+`"@trybotster/hub-test-support": "0.1.4"` in `devDependencies` and let npm write
 the corresponding package-lock entry from the public npm registry. The package
 is public, so registry install does not require a scoped `.npmrc` entry or CI
 auth token. After updating the lockfile, run the client smoke that imports the
@@ -420,18 +420,20 @@ operator-error response.
 The ordered channel and one-response-at-a-time handler preserve the existing
 request FIFO; `message_id` correlates all chunks of the current response. The
 sender applies fixed DataChannel watermarks (128 KiB high, 64 KiB low), queues
-at most 16 inbound requests consumed while paused, and fails closed on queue
-overflow, send error, disconnect, or a missing low-water event. A paused sender
-has one non-resetting five-second deadline, after which it closes the channel,
-cleans the peer and its subscription/request state, and emits no completion
-frame for the partial response.
+at most 16 inbound requests consumed while a response drains, and represents
+excess requests with one ordered encrypted operator-error response rather than
+dropping the peer. Send errors, disconnects, and a missing low-water event fail
+closed. A paused sender has one non-resetting five-second deadline, after which
+it closes the channel, cleans the peer and its subscription/request state, and
+emits no completion frame for the partial response.
 
 Invalid or unauthenticated request frames are not answered with a plaintext
 fallback. Clients must validate version, identity, contiguous indices, counts,
 declared bytes, frame bounds, and the 16 MiB assembly bound before concatenating
 payloads and decrypting the complete envelope. The checked
 `local-webrtc-response-chunk-conformance-fixture.json` artifact covers the
-single-chunk, multi-chunk, and over-budget-error shapes.
+single-chunk, multi-chunk, over-budget-error, and deterministic greater-than-256
+KiB reassembly shapes.
 The generated TypeScript artifact mirrors the browser-visible envelope as
 `AesGcmEnvelope` with `nonce`, `ciphertext`, and `version` fields while keeping
 the authoritative core Rust struct out of the `botster-hub-client` dependency
@@ -688,7 +690,7 @@ assert the same event ordering and classification. `AttachState` and
 
 Node clients can consume that exact JSON through
 `readLateAttachHistoryConformanceFixture()` from
-`@trybotster/hub-test-support@0.1.3`. The same package exposes
+`@trybotster/hub-test-support@0.1.4`. The same package exposes
 `readFirstPartyClientSupportMatrix()`. Because the current hub-client helper
 uses one feature list for advertised and required compatibility, the published
 matrix includes `terminal_readback` in both `supported_features` and

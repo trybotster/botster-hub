@@ -433,8 +433,8 @@ pub fn late_attach_history_conformance_fixture_json() -> serde_json::Value {
 pub fn local_webrtc_response_chunk_conformance_fixture_json() -> serde_json::Value {
     serde_json::json!({
         "version": botster_hub_client::LOCAL_WEBRTC_RESPONSE_CHUNK_VERSION,
-        "maximum_frame_bytes_exclusive": 65_536,
-        "maximum_response_bytes": 16_777_216,
+        "maximum_frame_bytes_exclusive": botster_hub_client::LOCAL_WEBRTC_MAX_FRAME_BYTES,
+        "maximum_response_bytes": botster_hub_client::LOCAL_WEBRTC_MAX_RESPONSE_BYTES,
         "scenarios": {
             "single_chunk": [{
                 "version": botster_hub_client::LOCAL_WEBRTC_RESPONSE_CHUNK_VERSION,
@@ -462,6 +462,15 @@ pub fn local_webrtc_response_chunk_conformance_fixture_json() -> serde_json::Val
                     "payload": "envelope"
                 }
             ],
+            "large_generated": {
+                "message_id": "response-large-generated",
+                "generator": "repeat_utf8_pattern",
+                "pattern": "botster-webrtc-chunk-fixture-",
+                "total_bytes": 262_145,
+                "chunk_payload_bytes": 12_288,
+                "expected_chunk_count": 22,
+                "reassembled_sha256": "06d24e206edb54bed524319b1127725b46e20ea4aae5934688599abd42fa4317"
+            },
             "over_budget_operator_error": [{
                 "version": botster_hub_client::LOCAL_WEBRTC_RESPONSE_CHUNK_VERSION,
                 "message_id": "response-over-budget",

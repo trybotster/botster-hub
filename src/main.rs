@@ -26,7 +26,8 @@ use botster_hub::{
 };
 use botster_hub_client::{
     DaemonDiagnostic, DaemonLocalWebrtcBootstrap, DaemonLocalWebrtcResponseChunk,
-    DaemonPackageUpdateStatus, LOCAL_WEBRTC_RESPONSE_CHUNK_VERSION,
+    DaemonPackageUpdateStatus, LOCAL_WEBRTC_MAX_FRAME_BYTES, LOCAL_WEBRTC_MAX_RESPONSE_BYTES,
+    LOCAL_WEBRTC_RESPONSE_CHUNK_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use webrtc::data_channel::{DataChannel, DataChannelEvent, RTCDataChannelInit};
@@ -991,7 +992,7 @@ impl LocalWebrtcOfferPeer {
                         "local WebRTC data channel closed before response".to_string(),
                     )
                 })?;
-            if response.len() >= 64 * 1024 {
+            if response.len() >= LOCAL_WEBRTC_MAX_FRAME_BYTES {
                 return Err(SmokeError::Webrtc(
                     "local WebRTC response chunk exceeded frame bound".to_string(),
                 ));
@@ -1000,7 +1001,7 @@ impl LocalWebrtcOfferPeer {
                 .map_err(|error| SmokeError::Webrtc(error.to_string()))?;
             if chunk.version != LOCAL_WEBRTC_RESPONSE_CHUNK_VERSION
                 || chunk.chunk_index != next_chunk_index
-                || chunk.total_bytes as usize > 16 * 1024 * 1024
+                || chunk.total_bytes as usize > LOCAL_WEBRTC_MAX_RESPONSE_BYTES
                 || message_id
                     .as_ref()
                     .is_some_and(|id| id != &chunk.message_id)

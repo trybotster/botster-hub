@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -22,7 +23,7 @@ import {
 } from "@trybotster/hub-test-support";
 
 assert.equal(metadata.package_name, "@trybotster/hub-test-support");
-assert.equal(metadata.package_version, "0.1.3");
+assert.equal(metadata.package_version, "0.1.4");
 assert.equal(metadata.protocol, "botster-hub-daemon-v1");
 assert.equal(Number.isInteger(metadata.protocol_version), true);
 assert.equal(Number.isInteger(metadata.conformance_fixture_revision), true);
@@ -86,6 +87,23 @@ assert.equal(chunkFixture.scenarios.multiple_chunks.length, 2);
 assert.equal(
   chunkFixture.scenarios.multiple_chunks.map((chunk) => chunk.payload).join(""),
   "encrypted-envelope",
+);
+const largeScenario = chunkFixture.scenarios.large_generated;
+assert.equal(largeScenario.generator, "repeat_utf8_pattern");
+assert.equal(largeScenario.total_bytes > 256 * 1024, true);
+const generatedLargePayload = largeScenario.pattern
+  .repeat(Math.ceil(largeScenario.total_bytes / largeScenario.pattern.length))
+  .slice(0, largeScenario.total_bytes);
+const generatedLargeChunks = [];
+for (let offset = 0; offset < generatedLargePayload.length; offset += largeScenario.chunk_payload_bytes) {
+  generatedLargeChunks.push(generatedLargePayload.slice(offset, offset + largeScenario.chunk_payload_bytes));
+}
+const reassembledLargePayload = generatedLargeChunks.join("");
+assert.equal(generatedLargeChunks.length, largeScenario.expected_chunk_count);
+assert.equal(reassembledLargePayload, generatedLargePayload);
+assert.equal(
+  createHash("sha256").update(reassembledLargePayload).digest("hex"),
+  largeScenario.reassembled_sha256,
 );
 const historyIndex = lateAttachFixture.history_then_live.findIndex(
   (event) => (event.type === "snapshot" || event.type === "scrollback") && event.data.length > 0,

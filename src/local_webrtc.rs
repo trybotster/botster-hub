@@ -15,8 +15,8 @@ use async_trait::async_trait;
 use botster_core::{AesGcmEnvelope, AesGcmKey, decrypt_aes_gcm, encrypt_aes_gcm};
 use botster_hub_client::{
     DaemonDiagnostic, DaemonLocalWebrtcAnswer, DaemonLocalWebrtcBootstrap,
-    DaemonLocalWebrtcResponseChunk, DaemonRequest, DaemonResponse,
-    LOCAL_WEBRTC_RESPONSE_CHUNK_VERSION,
+    DaemonLocalWebrtcResponseChunk, DaemonRequest, DaemonResponse, LOCAL_WEBRTC_MAX_FRAME_BYTES,
+    LOCAL_WEBRTC_MAX_RESPONSE_BYTES, LOCAL_WEBRTC_RESPONSE_CHUNK_VERSION,
 };
 use serde_json::Value;
 use webrtc::data_channel::{DataChannel, DataChannelEvent};
@@ -30,24 +30,22 @@ use crate::daemon_transport::ControlMessage;
 
 const GRANT_TTL_SECONDS: u64 = 120;
 const WEBRTC_SIGNAL_OPERATION: &str = "local_webrtc_signal";
-const LOCAL_WEBRTC_MAX_FRAME_BYTES: usize = 64 * 1024;
 // The current Rust WebRTC peer's message receive path is bounded at 16 KiB;
 // 12 KiB leaves transport and JSON framing headroom for every first-party peer.
 const LOCAL_WEBRTC_CHUNK_PAYLOAD_BYTES: usize = 12 * 1024;
-const LOCAL_WEBRTC_MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 const LOCAL_WEBRTC_PENDING_REQUESTS: usize = 16;
 const LOCAL_WEBRTC_FLOW_CONTROL_DEADLINE: Duration = Duration::from_secs(5);
-const LOCAL_WEBRTC_EVENT_PROBE: Duration = Duration::from_millis(5);
+const LOCAL_WEBRTC_EVENT_PROBE: Duration = Duration::ZERO;
 const LOCAL_WEBRTC_BUFFERED_AMOUNT_LOW: u32 = LOCAL_WEBRTC_MAX_FRAME_BYTES as u32;
 const LOCAL_WEBRTC_BUFFERED_AMOUNT_HIGH: u32 = (LOCAL_WEBRTC_MAX_FRAME_BYTES * 2) as u32;
 
 #[async_trait]
 trait LocalWebrtcDataChannel: Send + Sync {
-    async fn local_set_buffered_amount_low_threshold(&self, threshold: u32) -> bool;
-    async fn local_set_buffered_amount_high_threshold(&self, threshold: u32) -> bool;
-    async fn local_send_text(&self, text: &str) -> bool;
+    async fn local_set_buffered_amount_low_threshold(&self, threshold: u32) -> Result<(), String>;
+    async fn local_set_buffered_amount_high_threshold(&self, threshold: u32) -> Result<(), String>;
+    async fn local_send_text(&self, text: &str) -> Result<(), String>;
     async fn local_poll(&self) -> Option<DataChannelEvent>;
-    async fn local_close(&self);
+    async fn local_close(&self) -> Result<(), String>;
 }
 
 #[async_trait]
@@ -55,28 +53,30 @@ impl<T> LocalWebrtcDataChannel for T
 where
     T: DataChannel + ?Sized,
 {
-    async fn local_set_buffered_amount_low_threshold(&self, threshold: u32) -> bool {
+    async fn local_set_buffered_amount_low_threshold(&self, threshold: u32) -> Result<(), String> {
         self.set_buffered_amount_low_threshold(threshold)
             .await
-            .is_ok()
+            .map_err(|error| error.to_string())
     }
 
-    async fn local_set_buffered_amount_high_threshold(&self, threshold: u32) -> bool {
+    async fn local_set_buffered_amount_high_threshold(&self, threshold: u32) -> Result<(), String> {
         self.set_buffered_amount_high_threshold(threshold)
             .await
-            .is_ok()
+            .map_err(|error| error.to_string())
     }
 
-    async fn local_send_text(&self, text: &str) -> bool {
-        self.send_text(text).await.is_ok()
+    async fn local_send_text(&self, text: &str) -> Result<(), String> {
+        self.send_text(text)
+            .await
+            .map_err(|error| error.to_string())
     }
 
     async fn local_poll(&self) -> Option<DataChannelEvent> {
         self.poll().await
     }
 
-    async fn local_close(&self) {
-        let _ = self.close().await;
+    async fn local_close(&self) -> Result<(), String> {
+        self.close().await.map_err(|error| error.to_string())
     }
 }
 /// Ephemeral local WebRTC admission and peer registry.
@@ -291,6 +291,11 @@ struct LocalWebrtcPeerState {
     cleanup_sent: AtomicBool,
 }
 
+enum PendingLocalWebrtcRequest {
+    Request(Box<DaemonRequest>),
+    QueueOverflow,
+}
+
 impl LocalWebrtcPeerState {
     fn new(grant_id: String, runtime_tx: Sender<ControlMessage>) -> Self {
         Self {
@@ -370,14 +375,21 @@ impl PeerConnectionEventHandler for LocalWebrtcHandler {
         let runtime_tx = peer_state.runtime_tx.clone();
         let stream_key = self.stream_key.clone();
         self.runtime.spawn(Box::pin(async move {
-            if !data_channel
+            if let Err(error) = data_channel
                 .local_set_buffered_amount_low_threshold(LOCAL_WEBRTC_BUFFERED_AMOUNT_LOW)
                 .await
-                || !data_channel
-                    .local_set_buffered_amount_high_threshold(LOCAL_WEBRTC_BUFFERED_AMOUNT_HIGH)
-                    .await
             {
-                data_channel.local_close().await;
+                eprintln!("local WebRTC low-water threshold setup failed: {error}");
+                let _ = data_channel.local_close().await;
+                peer_state.cleanup_once();
+                return;
+            }
+            if let Err(error) = data_channel
+                .local_set_buffered_amount_high_threshold(LOCAL_WEBRTC_BUFFERED_AMOUNT_HIGH)
+                .await
+            {
+                eprintln!("local WebRTC high-water threshold setup failed: {error}");
+                let _ = data_channel.local_close().await;
                 peer_state.cleanup_once();
                 return;
             }
@@ -385,7 +397,7 @@ impl PeerConnectionEventHandler for LocalWebrtcHandler {
             let mut pending_requests = VecDeque::new();
             let mut open = true;
             while open {
-                let request = if let Some(request) = pending_requests.pop_front() {
+                let pending = if let Some(request) = pending_requests.pop_front() {
                     request
                 } else {
                     match data_channel.poll().await {
@@ -395,21 +407,33 @@ impl PeerConnectionEventHandler for LocalWebrtcHandler {
                             else {
                                 break;
                             };
-                            request
+                            PendingLocalWebrtcRequest::Request(Box::new(request))
                         }
                         Some(DataChannelEvent::OnClose | DataChannelEvent::OnError) | None => break,
                         Some(_) => continue,
                     }
                 };
 
+                let PendingLocalWebrtcRequest::Request(request) = pending else {
+                    let response = queued_request_overflow_response();
+                    let Ok(frames) = framed_daemon_response(&stream_key, &response) else {
+                        break;
+                    };
+                    open = send_response_frames(
+                        data_channel.as_ref(),
+                        &stream_key,
+                        &frames,
+                        &mut pending_requests,
+                    )
+                    .await;
+                    continue;
+                };
+
                 let subscription_change =
                     LocalWebrtcAttachedSubscriptionChange::from_request(&request);
                 let (reply_tx, reply_rx) = mpsc::channel();
                 if runtime_tx
-                    .send(ControlMessage::Request {
-                        request: Box::new(request),
-                        reply_tx,
-                    })
+                    .send(ControlMessage::Request { request, reply_tx })
                     .is_err()
                 {
                     break;
@@ -452,13 +476,15 @@ impl PeerConnectionEventHandler for LocalWebrtcHandler {
 
 async fn close_data_channel<D>(
     data_channel: &D,
-    pending_requests: &mut VecDeque<DaemonRequest>,
+    pending_requests: &mut VecDeque<PendingLocalWebrtcRequest>,
     peer_state: &LocalWebrtcPeerState,
 ) where
     D: LocalWebrtcDataChannel + ?Sized,
 {
     pending_requests.clear();
-    data_channel.local_close().await;
+    if let Err(error) = data_channel.local_close().await {
+        eprintln!("local WebRTC data channel close failed: {error}");
+    }
     peer_state.cleanup_once();
 }
 
@@ -466,7 +492,7 @@ async fn send_response_frames<D>(
     data_channel: &D,
     stream_key: &AesGcmKey,
     frames: &[String],
-    pending_requests: &mut VecDeque<DaemonRequest>,
+    pending_requests: &mut VecDeque<PendingLocalWebrtcRequest>,
 ) -> bool
 where
     D: LocalWebrtcDataChannel + ?Sized,
@@ -485,7 +511,7 @@ async fn send_response_frames_with_deadline<D>(
     data_channel: &D,
     stream_key: &AesGcmKey,
     frames: &[String],
-    pending_requests: &mut VecDeque<DaemonRequest>,
+    pending_requests: &mut VecDeque<PendingLocalWebrtcRequest>,
     flow_control_deadline: Duration,
 ) -> bool
 where
@@ -495,7 +521,8 @@ where
     let mut pause_deadline = None;
 
     for frame in frames {
-        if !data_channel.local_send_text(frame).await {
+        if let Err(error) = data_channel.local_send_text(frame).await {
+            eprintln!("local WebRTC response frame send failed: {error}");
             return false;
         }
 
@@ -544,7 +571,7 @@ where
 fn apply_data_channel_event(
     event: DataChannelEvent,
     stream_key: &AesGcmKey,
-    pending_requests: &mut VecDeque<DaemonRequest>,
+    pending_requests: &mut VecDeque<PendingLocalWebrtcRequest>,
     paused: &mut bool,
     pause_deadline: &mut Option<Instant>,
     flow_control_deadline: Duration,
@@ -563,13 +590,23 @@ fn apply_data_channel_event(
             true
         }
         DataChannelEvent::OnMessage(message) => {
-            if pending_requests.len() >= LOCAL_WEBRTC_PENDING_REQUESTS {
-                return false;
-            }
             let Some(request) = decrypt_daemon_request(stream_key, message.data.as_ref()) else {
                 return false;
             };
-            pending_requests.push_back(request);
+            let request_count = pending_requests
+                .iter()
+                .filter(|pending| matches!(pending, PendingLocalWebrtcRequest::Request(_)))
+                .count();
+            if request_count >= LOCAL_WEBRTC_PENDING_REQUESTS {
+                if !pending_requests
+                    .iter()
+                    .any(|pending| matches!(pending, PendingLocalWebrtcRequest::QueueOverflow))
+                {
+                    pending_requests.push_back(PendingLocalWebrtcRequest::QueueOverflow);
+                }
+                return true;
+            }
+            pending_requests.push_back(PendingLocalWebrtcRequest::Request(Box::new(request)));
             true
         }
         DataChannelEvent::OnClose | DataChannelEvent::OnError => false,
@@ -766,6 +803,13 @@ fn response_with_diagnostic(diagnostic: DaemonDiagnostic) -> DaemonResponse {
     }
 }
 
+fn queued_request_overflow_response() -> DaemonResponse {
+    response_with_diagnostic(DaemonDiagnostic::action_failure(
+        "local_webrtc_data_channel",
+        "inbound request queue capacity exceeded; request was rejected",
+    ))
+}
+
 fn expected_origin(environment: &BTreeMap<String, String>) -> String {
     environment
         .get("BOTSTER_WEB_DOGFOOD_BRIDGE_PORT")
@@ -872,6 +916,7 @@ impl Error for LocalWebrtcError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use webrtc::data_channel::RTCDataChannelMessage;
 
     #[derive(Default)]
     struct FakeDataChannel {
@@ -882,26 +927,46 @@ mod tests {
 
     #[async_trait]
     impl LocalWebrtcDataChannel for FakeDataChannel {
-        async fn local_set_buffered_amount_low_threshold(&self, _threshold: u32) -> bool {
-            true
+        async fn local_set_buffered_amount_low_threshold(
+            &self,
+            _threshold: u32,
+        ) -> Result<(), String> {
+            Ok(())
         }
 
-        async fn local_set_buffered_amount_high_threshold(&self, _threshold: u32) -> bool {
-            true
+        async fn local_set_buffered_amount_high_threshold(
+            &self,
+            _threshold: u32,
+        ) -> Result<(), String> {
+            Ok(())
         }
 
-        async fn local_send_text(&self, text: &str) -> bool {
+        async fn local_send_text(&self, text: &str) -> Result<(), String> {
             self.sent.lock().unwrap().push(text.to_string());
-            true
+            Ok(())
         }
 
         async fn local_poll(&self) -> Option<DataChannelEvent> {
-            self.events.lock().unwrap().pop_front()
+            if let Some(event) = self.events.lock().unwrap().pop_front() {
+                return Some(event);
+            }
+            std::future::pending().await
         }
 
-        async fn local_close(&self) {
+        async fn local_close(&self) -> Result<(), String> {
             self.closed.store(true, Ordering::Release);
+            Ok(())
         }
+    }
+
+    fn encrypted_request_event(key: &AesGcmKey, request: &DaemonRequest) -> DataChannelEvent {
+        let plaintext = serde_json::to_vec(request).unwrap();
+        let envelope = encrypt_aes_gcm(key, &plaintext, 1).unwrap();
+        let data = serde_json::to_vec(&envelope).unwrap();
+        DataChannelEvent::OnMessage(RTCDataChannelMessage {
+            is_string: true,
+            data: data.as_slice().into(),
+        })
     }
 
     #[test]
@@ -1024,7 +1089,9 @@ mod tests {
             .unwrap()
             .push_back(DataChannelEvent::OnBufferedAmountHigh);
         let key = AesGcmKey::from_slice(&[5; 32]).unwrap();
-        let mut pending = VecDeque::from([DaemonRequest::Status]);
+        let mut pending = VecDeque::from([PendingLocalWebrtcRequest::Request(Box::new(
+            DaemonRequest::Status,
+        ))]);
         let (runtime_tx, runtime_rx) = mpsc::channel();
         let peer_state = LocalWebrtcPeerState::new("grant-fixture".to_string(), runtime_tx);
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -1050,6 +1117,135 @@ mod tests {
             ControlMessage::LocalWebrtcPeerClosed { grant_id, .. }
                 if grant_id == "grant-fixture"
         ));
+    }
+
+    #[test]
+    fn high_then_low_water_resumes_and_completes_response_in_order() {
+        let data_channel = FakeDataChannel::default();
+        data_channel.events.lock().unwrap().extend([
+            DataChannelEvent::OnBufferedAmountHigh,
+            DataChannelEvent::OnBufferedAmountLow,
+        ]);
+        let key = AesGcmKey::from_slice(&[6; 32]).unwrap();
+        let mut pending = VecDeque::new();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let completed = runtime.block_on(send_response_frames_with_deadline(
+            &data_channel,
+            &key,
+            &["first".to_string(), "second".to_string()],
+            &mut pending,
+            Duration::from_secs(1),
+        ));
+
+        assert!(completed);
+        assert_eq!(
+            data_channel.sent.lock().unwrap().as_slice(),
+            &["first", "second"]
+        );
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn idle_open_channel_does_not_wait_between_response_frames() {
+        let data_channel = FakeDataChannel::default();
+        let key = AesGcmKey::from_slice(&[10; 32]).unwrap();
+        let mut pending = VecDeque::new();
+        let frames = (0..20)
+            .map(|index| format!("frame-{index}"))
+            .collect::<Vec<_>>();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let started = Instant::now();
+        let completed = runtime.block_on(send_response_frames_with_deadline(
+            &data_channel,
+            &key,
+            &frames,
+            &mut pending,
+            Duration::from_secs(1),
+        ));
+
+        assert!(completed);
+        assert_eq!(data_channel.sent.lock().unwrap().len(), frames.len());
+        assert!(
+            started.elapsed() < Duration::from_millis(50),
+            "idle event probes must not throttle response frames"
+        );
+    }
+
+    #[test]
+    fn inbound_request_during_response_is_retained_for_fifo_processing() {
+        let data_channel = FakeDataChannel::default();
+        let key = AesGcmKey::from_slice(&[7; 32]).unwrap();
+        data_channel
+            .events
+            .lock()
+            .unwrap()
+            .push_back(encrypted_request_event(&key, &DaemonRequest::Status));
+        let mut pending = VecDeque::new();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let completed = runtime.block_on(send_response_frames_with_deadline(
+            &data_channel,
+            &key,
+            &["first".to_string(), "second".to_string()],
+            &mut pending,
+            Duration::from_secs(1),
+        ));
+
+        assert!(completed);
+        assert_eq!(data_channel.sent.lock().unwrap().len(), 2);
+        assert!(matches!(
+            pending.pop_front(),
+            Some(PendingLocalWebrtcRequest::Request(request)) if *request == DaemonRequest::Status
+        ));
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn seventeenth_queued_request_becomes_bounded_operator_error() {
+        let key = AesGcmKey::from_slice(&[8; 32]).unwrap();
+        let mut pending = VecDeque::new();
+        let mut paused = false;
+        let mut deadline = None;
+
+        for _ in 0..=LOCAL_WEBRTC_PENDING_REQUESTS {
+            assert!(apply_data_channel_event(
+                encrypted_request_event(&key, &DaemonRequest::Status),
+                &key,
+                &mut pending,
+                &mut paused,
+                &mut deadline,
+                Duration::from_secs(1),
+            ));
+        }
+
+        assert_eq!(pending.len(), LOCAL_WEBRTC_PENDING_REQUESTS + 1);
+        assert!(matches!(
+            pending.back(),
+            Some(PendingLocalWebrtcRequest::QueueOverflow)
+        ));
+        let response = queued_request_overflow_response();
+        assert_eq!(
+            response.kind,
+            botster_hub_client::DaemonResponseKind::OperatorError
+        );
+        assert!(
+            response.diagnostics[0]
+                .message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("capacity exceeded")
+        );
     }
 
     #[test]
