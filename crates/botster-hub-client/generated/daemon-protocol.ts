@@ -10,6 +10,15 @@ export interface AesGcmEnvelope {
   version: number;
 }
 
+export interface DaemonLocalWebrtcResponseChunk {
+  version: number;
+  message_id: string;
+  chunk_index: number;
+  chunk_count: number;
+  total_bytes: number;
+  payload: string;
+}
+
 export interface DaemonHello {
   protocol: string;
   compatibility: DaemonCompatibilityRequirement;

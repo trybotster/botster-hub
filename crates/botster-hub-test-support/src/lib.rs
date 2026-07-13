@@ -428,6 +428,52 @@ pub fn late_attach_history_conformance_fixture_json() -> serde_json::Value {
         .expect("late attach history conformance fixture serializes")
 }
 
+/// Return deterministic local WebRTC response-chunk scenarios for downstream clients.
+#[must_use]
+pub fn local_webrtc_response_chunk_conformance_fixture_json() -> serde_json::Value {
+    serde_json::json!({
+        "version": botster_hub_client::LOCAL_WEBRTC_RESPONSE_CHUNK_VERSION,
+        "maximum_frame_bytes_exclusive": 65_536,
+        "maximum_response_bytes": 16_777_216,
+        "scenarios": {
+            "single_chunk": [{
+                "version": botster_hub_client::LOCAL_WEBRTC_RESPONSE_CHUNK_VERSION,
+                "message_id": "response-single",
+                "chunk_index": 0,
+                "chunk_count": 1,
+                "total_bytes": 18,
+                "payload": "encrypted-envelope"
+            }],
+            "multiple_chunks": [
+                {
+                    "version": botster_hub_client::LOCAL_WEBRTC_RESPONSE_CHUNK_VERSION,
+                    "message_id": "response-multiple",
+                    "chunk_index": 0,
+                    "chunk_count": 2,
+                    "total_bytes": 18,
+                    "payload": "encrypted-"
+                },
+                {
+                    "version": botster_hub_client::LOCAL_WEBRTC_RESPONSE_CHUNK_VERSION,
+                    "message_id": "response-multiple",
+                    "chunk_index": 1,
+                    "chunk_count": 2,
+                    "total_bytes": 18,
+                    "payload": "envelope"
+                }
+            ],
+            "over_budget_operator_error": [{
+                "version": botster_hub_client::LOCAL_WEBRTC_RESPONSE_CHUNK_VERSION,
+                "message_id": "response-over-budget",
+                "chunk_index": 0,
+                "chunk_count": 1,
+                "total_bytes": 24,
+                "payload": "encrypted-operator-error"
+            }]
+        }
+    })
+}
+
 /// Builder for one isolated local hub daemon test instance.
 ///
 /// # Example

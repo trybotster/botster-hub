@@ -9,6 +9,7 @@ import {
   daemonProtocolTypescriptPath,
   firstPartyClientSupportMatrixPath,
   lateAttachHistoryConformanceFixturePath,
+  localWebrtcResponseChunkConformanceFixturePath,
   materializeApplicationPrimitivesFixture,
   materializePluginContractMatrixFixture,
   metadata,
@@ -16,6 +17,7 @@ import {
   readDaemonProtocolTypescript,
   readFirstPartyClientSupportMatrix,
   readLateAttachHistoryConformanceFixture,
+  readLocalWebrtcResponseChunkConformanceFixture,
   verifyPackageAssets,
 } from "@trybotster/hub-test-support";
 
@@ -54,6 +56,7 @@ assert.match(protocol, /read_screen/);
 assert.match(protocol, /capture_snapshot/);
 assert.match(protocol, /export interface DaemonReadScreen/);
 assert.match(protocol, /export interface DaemonCaptureSnapshot/);
+assert.match(protocol, /export interface DaemonLocalWebrtcResponseChunk/);
 
 assert.equal(
   fileURLToPath(import.meta.resolve("@trybotster/hub-test-support/first-party-client-support-matrix")),
@@ -63,6 +66,10 @@ assert.equal(
   fileURLToPath(import.meta.resolve("@trybotster/hub-test-support/late-attach-history-conformance-fixture")),
   lateAttachHistoryConformanceFixturePath(),
 );
+assert.equal(
+  fileURLToPath(import.meta.resolve("@trybotster/hub-test-support/local-webrtc-response-chunk-conformance-fixture")),
+  localWebrtcResponseChunkConformanceFixturePath(),
+);
 
 const supportMatrix = readFirstPartyClientSupportMatrix();
 assert.equal(supportMatrix.late_attach_history.supported, true);
@@ -70,6 +77,16 @@ assert.equal(supportMatrix.required_features.includes("terminal_readback"), true
 assert.equal(supportMatrix.supported_features.includes("terminal_readback"), true);
 
 const lateAttachFixture = readLateAttachHistoryConformanceFixture();
+const chunkFixture = readLocalWebrtcResponseChunkConformanceFixture();
+assert.equal(chunkFixture.version, 1);
+assert.equal(chunkFixture.maximum_frame_bytes_exclusive, 65536);
+assert.equal(chunkFixture.maximum_response_bytes, 16777216);
+assert.equal(chunkFixture.scenarios.single_chunk.length, 1);
+assert.equal(chunkFixture.scenarios.multiple_chunks.length, 2);
+assert.equal(
+  chunkFixture.scenarios.multiple_chunks.map((chunk) => chunk.payload).join(""),
+  "encrypted-envelope",
+);
 const historyIndex = lateAttachFixture.history_then_live.findIndex(
   (event) => (event.type === "snapshot" || event.type === "scrollback") && event.data.length > 0,
 );
