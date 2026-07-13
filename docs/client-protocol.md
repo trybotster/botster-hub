@@ -422,12 +422,13 @@ request FIFO; `message_id` correlates all chunks of the current response. The
 sender applies fixed DataChannel watermarks (128 KiB high, 64 KiB low), queues
 at most 16 inbound request payloads consumed while a response drains, and
 represents each excess request with one ordered encrypted operator-error
-response using constant-memory counted queue state rather than dropping the
-peer or losing positional correlation. Send errors, disconnects, and a missing
-low-water event fail closed. A paused sender has one non-resetting five-second
-deadline, after which
-it closes the channel, cleans the peer and its subscription/request state, and
-emits no completion frame for the partial response.
+response using constant-memory counted queue state. Only contiguous overflow
+runs coalesce, preserving their position relative to later accepted requests
+rather than dropping the peer or losing positional correlation. Send errors,
+disconnects, and a missing low-water event fail closed. A paused sender has one
+non-resetting five-second deadline, after which it closes the channel, cleans
+the peer and its subscription/request state, and emits no completion frame for
+the partial response.
 
 Invalid or unauthenticated request frames are not answered with a plaintext
 fallback. Clients must validate version, identity, contiguous indices, counts,

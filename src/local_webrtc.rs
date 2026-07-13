@@ -614,9 +614,8 @@ fn apply_data_channel_event(
                 .filter(|pending| matches!(pending, PendingLocalWebrtcRequest::Request(_)))
                 .count();
             if request_count >= LOCAL_WEBRTC_PENDING_REQUESTS {
-                if let Some(PendingLocalWebrtcRequest::QueueOverflow(count)) = pending_requests
-                    .iter_mut()
-                    .find(|pending| matches!(pending, PendingLocalWebrtcRequest::QueueOverflow(_)))
+                if let Some(PendingLocalWebrtcRequest::QueueOverflow(count)) =
+                    pending_requests.back_mut()
                 {
                     let Some(next_count) = count.checked_add(1) else {
                         return false;
@@ -1273,6 +1272,67 @@ mod tests {
                 .unwrap_or_default()
                 .contains("capacity exceeded")
         );
+    }
+
+    #[test]
+    fn interleaved_overflow_runs_preserve_fifo_response_order() {
+        let key = AesGcmKey::from_slice(&[11; 32]).unwrap();
+        let mut pending = VecDeque::new();
+        let mut paused = false;
+        let mut deadline = None;
+        {
+            let mut apply_request = |request: &DaemonRequest| {
+                apply_data_channel_event(
+                    encrypted_request_event(&key, request),
+                    &key,
+                    &mut pending,
+                    &mut paused,
+                    &mut deadline,
+                    Duration::from_secs(1),
+                )
+            };
+
+            for _ in 0..LOCAL_WEBRTC_PENDING_REQUESTS {
+                assert!(apply_request(&DaemonRequest::Status));
+            }
+            assert!(apply_request(&DaemonRequest::Status));
+        }
+        assert!(matches!(
+            pop_pending_request(&mut pending),
+            Some(PendingLocalWebrtcRequest::Request(request)) if *request == DaemonRequest::Status
+        ));
+
+        assert!(apply_data_channel_event(
+            encrypted_request_event(&key, &DaemonRequest::ListSessions),
+            &key,
+            &mut pending,
+            &mut paused,
+            &mut deadline,
+            Duration::from_secs(1),
+        ));
+        assert!(apply_data_channel_event(
+            encrypted_request_event(&key, &DaemonRequest::Status),
+            &key,
+            &mut pending,
+            &mut paused,
+            &mut deadline,
+            Duration::from_secs(1),
+        ));
+
+        let emitted_order = std::iter::from_fn(|| pop_pending_request(&mut pending))
+            .map(|pending| match pending {
+                PendingLocalWebrtcRequest::Request(request)
+                    if *request == DaemonRequest::ListSessions =>
+                {
+                    "new-request"
+                }
+                PendingLocalWebrtcRequest::Request(_) => "status",
+                PendingLocalWebrtcRequest::QueueOverflow(_) => "overflow",
+            })
+            .collect::<Vec<_>>();
+        let mut expected_order = vec!["status"; LOCAL_WEBRTC_PENDING_REQUESTS - 1];
+        expected_order.extend(["overflow", "new-request", "overflow"]);
+        assert_eq!(emitted_order, expected_order);
     }
 
     #[test]
