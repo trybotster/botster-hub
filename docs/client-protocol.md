@@ -420,10 +420,12 @@ operator-error response.
 The ordered channel and one-response-at-a-time handler preserve the existing
 request FIFO; `message_id` correlates all chunks of the current response. The
 sender applies fixed DataChannel watermarks (128 KiB high, 64 KiB low), queues
-at most 16 inbound requests consumed while a response drains, and represents
-excess requests with one ordered encrypted operator-error response rather than
-dropping the peer. Send errors, disconnects, and a missing low-water event fail
-closed. A paused sender has one non-resetting five-second deadline, after which
+at most 16 inbound request payloads consumed while a response drains, and
+represents each excess request with one ordered encrypted operator-error
+response using constant-memory counted queue state rather than dropping the
+peer or losing positional correlation. Send errors, disconnects, and a missing
+low-water event fail closed. A paused sender has one non-resetting five-second
+deadline, after which
 it closes the channel, cleans the peer and its subscription/request state, and
 emits no completion frame for the partial response.
 
