@@ -23,6 +23,10 @@ pub const PROTOCOL_VERSION: u16 = 1;
 pub const CONFORMANCE_FIXTURE_REVISION: u16 = 11;
 /// Version of the local WebRTC daemon-response chunk framing protocol.
 pub const LOCAL_WEBRTC_RESPONSE_CHUNK_VERSION: u16 = 1;
+/// Serialized local WebRTC response frames must remain strictly below this size.
+pub const LOCAL_WEBRTC_MAX_FRAME_BYTES: usize = 64 * 1024;
+/// Maximum serialized encrypted response envelope accepted for reassembly.
+pub const LOCAL_WEBRTC_MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 pub const FEATURE_SESSIONS: &str = "sessions";
 pub const FEATURE_TERMINAL_STREAMING: &str = "terminal_streaming";
 pub const FEATURE_RESIZE: &str = "resize";
