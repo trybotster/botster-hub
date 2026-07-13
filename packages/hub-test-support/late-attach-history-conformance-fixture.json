@@ -1,9 +1,9 @@
 {
-  "conformance_fixture_revision": 10,
+  "conformance_fixture_revision": 11,
   "history_then_live": [
     {
       "session_id": "late-attach-history-fixture-session",
-      "state": "attached",
+      "state": "attaching",
       "subscription_id": "late-attach-history-fixture-subscription",
       "type": "attach_state"
     },
@@ -13,6 +13,12 @@
       "session_id": "late-attach-history-fixture-session",
       "subscription_id": "late-attach-history-fixture-subscription",
       "type": "snapshot"
+    },
+    {
+      "session_id": "late-attach-history-fixture-session",
+      "state": "attached",
+      "subscription_id": "late-attach-history-fixture-subscription",
+      "type": "attach_state"
     },
     {
       "data": "live-after-attach\r\n",
@@ -30,6 +36,12 @@
   "no_history_session_id": "late-attach-no-history-fixture-session",
   "no_history_subscription_id": "late-attach-no-history-fixture-subscription",
   "no_history_then_live": [
+    {
+      "session_id": "late-attach-no-history-fixture-session",
+      "state": "attaching",
+      "subscription_id": "late-attach-no-history-fixture-subscription",
+      "type": "attach_state"
+    },
     {
       "session_id": "late-attach-no-history-fixture-session",
       "state": "attached",

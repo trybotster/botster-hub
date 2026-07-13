@@ -355,7 +355,7 @@ dependencies = [
 [[package]]
 name = "botster-core"
 version = "0.1.0"
-source = "git+https://github.com/trybotster/botster-core?branch=main#b0f8b8e08fb2f80d90833fe2c33e6f4c1ca3187f"
+source = "git+https://github.com/trybotster/botster-core?branch=main#db69456c14d3c4ee870a24f0ffaba913ac945aca"
 dependencies = [
  "aes-gcm",
  "base64",
@@ -371,12 +371,23 @@ dependencies = [
 [[package]]
 name = "botster-core-daemon"
 version = "0.1.0"
-source = "git+https://github.com/trybotster/botster-core?branch=main#b0f8b8e08fb2f80d90833fe2c33e6f4c1ca3187f"
+source = "git+https://github.com/trybotster/botster-core?branch=main#db69456c14d3c4ee870a24f0ffaba913ac945aca"
+dependencies = [
+ "botster-core",
+ "botster-terminal-ghostty",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "botster-core-test-support"
+version = "0.1.0"
+source = "git+https://github.com/trybotster/botster-core?branch=main#db69456c14d3c4ee870a24f0ffaba913ac945aca"
 dependencies = [
  "botster-core",
  "serde",
  "serde_json",
- "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -386,6 +397,7 @@ dependencies = [
  "async-trait",
  "botster-core",
  "botster-core-daemon",
+ "botster-core-test-support",
  "botster-hub-client",
  "botster-hub-test-support",
  "getrandom 0.3.4",
@@ -415,6 +427,14 @@ dependencies = [
  "botster-hub-client",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "botster-terminal-ghostty"
+version = "0.1.0"
+source = "git+https://github.com/trybotster/botster-core?branch=main#db69456c14d3c4ee870a24f0ffaba913ac945aca"
+dependencies = [
+ "botster-core",
 ]
 
 [[package]]

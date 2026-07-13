@@ -7424,7 +7424,10 @@ fn external_daemon_attach_replays_prior_history_with_renderable_byte_count() {
     assert_eq!(snapshot.session_id, "late-history-session");
     assert_eq!(snapshot.rows, 24);
     assert_eq!(snapshot.cols, 80);
-    assert_eq!(snapshot.payload_format.as_deref(), Some("plain-opaque-v1"));
+    assert_eq!(
+        snapshot.payload_format.as_deref(),
+        Some("ghostty-terminal-snapshot-v1")
+    );
     assert!(snapshot.payload_bytes > 0);
 
     let send = connection
@@ -7461,9 +7464,22 @@ fn external_daemon_attach_replays_prior_history_with_renderable_byte_count() {
         thread::sleep(Duration::from_millis(30));
     }
 
-    let history_index = observed_events
+    let attaching_index = observed_events
         .iter()
         .position(|event| {
+            matches!(
+                event,
+                botster_hub::DaemonEvent::AttachState {
+                    subscription_id,
+                    state,
+                    ..
+                } if subscription_id == "late-history-late-subscription" && state == "attaching"
+            )
+        })
+        .expect("late subscription should enter attaching state on daemon socket");
+    let history_index = observed_events
+        .iter()
+        .rposition(|event| {
             matches!(
                 event,
                 botster_hub::DaemonEvent::Snapshot {
@@ -7478,11 +7494,13 @@ fn external_daemon_attach_replays_prior_history_with_renderable_byte_count() {
                     bytes,
                     ..
                 } if subscription_id == "late-history-late-subscription"
-                    && data.contains("before-late")
-                    && *bytes == data.len()
+                    && !data.is_empty()
+                    && *bytes > 0
             )
         })
-        .expect("late subscription should receive prior output history with bytes == data.len()");
+        .expect(
+            "late subscription should receive non-empty history with a positive raw byte count",
+        );
     let live_index = observed_events
         .iter()
         .position(|event| {
@@ -7497,9 +7515,24 @@ fn external_daemon_attach_replays_prior_history_with_renderable_byte_count() {
             )
         })
         .expect("late subscription should receive later live output");
+    let attached_index = observed_events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                botster_hub::DaemonEvent::AttachState {
+                    subscription_id,
+                    state,
+                    ..
+                } if subscription_id == "late-history-late-subscription" && state == "attached"
+            )
+        })
+        .expect("late subscription should become attached after history on daemon socket");
     assert!(
-        history_index < live_index,
-        "late history should precede later live output, got {observed_events:?}"
+        attaching_index < history_index
+            && history_index < attached_index
+            && attached_index < live_index,
+        "late subscription should observe attaching < history < attached < live, got {observed_events:?}"
     );
 
     let no_history_spawn = connection
@@ -7533,6 +7566,24 @@ fn external_daemon_attach_replays_prior_history_with_renderable_byte_count() {
     assert_eq!(
         late_no_history_attach.kind,
         botster_hub::DaemonResponseKind::Events
+    );
+
+    let no_history_read_screen = connection
+        .request(&botster_hub::DaemonRequest::ReadScreen {
+            session_id: "no-history-session".to_string(),
+        })
+        .expect("read blank screen before sending live output");
+    assert_eq!(
+        no_history_read_screen.kind,
+        botster_hub::DaemonResponseKind::ReadScreen
+    );
+    let no_history_screen = no_history_read_screen
+        .read_screen
+        .expect("blank read screen response body");
+    assert!(
+        no_history_screen.text.is_empty(),
+        "idle session should have no prior renderable output, got {:?}",
+        no_history_screen.text
     );
 
     let no_history_send = connection
@@ -7576,19 +7627,85 @@ fn external_daemon_attach_replays_prior_history_with_renderable_byte_count() {
         !no_history_events.iter().any(|event| {
             matches!(
                 event,
-                botster_hub::DaemonEvent::Snapshot {
+                botster_hub::DaemonEvent::Scrollback {
                     subscription_id,
-                    data,
                     ..
-                }
-                | botster_hub::DaemonEvent::Scrollback {
-                    subscription_id,
-                    data,
-                    ..
-                } if subscription_id == "no-history-late-subscription" && !data.is_empty()
+                } if subscription_id == "no-history-late-subscription"
             )
         }),
-        "late no-history subscription should not receive fabricated history, got {no_history_events:?}"
+        "idle subscription should not receive fabricated scrollback, got {no_history_events:?}"
+    );
+    let no_history_attaching_index = no_history_events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                botster_hub::DaemonEvent::AttachState {
+                    subscription_id,
+                    state,
+                    ..
+                } if subscription_id == "no-history-late-subscription" && state == "attaching"
+            )
+        })
+        .expect("late no-history subscription should enter attaching state");
+    let no_history_attached_index = no_history_events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                botster_hub::DaemonEvent::AttachState {
+                    subscription_id,
+                    state,
+                    ..
+                } if subscription_id == "no-history-late-subscription" && state == "attached"
+            )
+        })
+        .expect("late no-history subscription should become attached");
+    let no_history_live_index = no_history_events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                botster_hub::DaemonEvent::TerminalOutput {
+                    subscription_id,
+                    data,
+                    ..
+                } if subscription_id == "no-history-late-subscription"
+                    && data.contains("after:live-only")
+            )
+        })
+        .expect("late no-history subscription should receive live output");
+    let no_history_last_initial_state_index = no_history_events.iter().rposition(|event| {
+        matches!(
+            event,
+            botster_hub::DaemonEvent::Snapshot {
+                subscription_id,
+                ..
+            } | botster_hub::DaemonEvent::Scrollback {
+                subscription_id,
+                ..
+            } if subscription_id == "no-history-late-subscription"
+        )
+    });
+    let no_history_first_terminal_output_index = no_history_events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                botster_hub::DaemonEvent::TerminalOutput {
+                    subscription_id,
+                    ..
+                } if subscription_id == "no-history-late-subscription"
+            )
+        })
+        .expect("late no-history subscription should receive terminal output");
+    assert!(
+        no_history_attaching_index < no_history_attached_index
+            && no_history_last_initial_state_index
+                .is_none_or(|index| index < no_history_attached_index)
+            && no_history_attached_index < no_history_first_terminal_output_index
+            && no_history_attached_index < no_history_live_index,
+        "idle subscription should observe attaching < optional initial state < attached < live, got {no_history_events:?}"
     );
 
     let shutdown_session = connection
