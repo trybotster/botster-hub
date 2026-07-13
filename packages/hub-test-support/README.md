@@ -15,7 +15,7 @@ node packages/hub-test-support/scripts/sync-assets.mjs
 ## Usage
 
 ```sh
-npm install --save-dev @trybotster/hub-test-support@0.1.3
+npm install --save-dev @trybotster/hub-test-support@0.1.4
 ```
 
 ```js
@@ -53,20 +53,21 @@ Use this exact package spec in npm-based client repos:
 ```json
 {
   "devDependencies": {
-    "@trybotster/hub-test-support": "0.1.3"
+    "@trybotster/hub-test-support": "0.1.4"
   }
 }
 ```
 
-`@trybotster/hub-test-support@0.1.3` is published to the public npm registry,
-so no scoped `.npmrc` entry or CI auth token is required for install.
+After `@trybotster/hub-test-support@0.1.4` is published to the public npm
+registry, no scoped `.npmrc` entry or CI auth token is required for install.
 
 The support matrix is generated from the Rust compatibility descriptors. In
-0.1.3, `terminal_readback` appears in both `supported_features` and
+0.1.4, `terminal_readback` appears in both `supported_features` and
 `required_features`; downstream compatibility checks must implement it rather
 than treating it as optional. The late-attach fixture is generated from the
-Rust serde scenario and preserves restored-history-before-live ordering and the
-no-history case.
+Rust serde scenario and preserves `attaching -> optional initial state ->
+attached -> live` ordering. An opaque authoritative snapshot may represent a
+blank terminal; clients must not infer visible history from payload byte length.
 
 Botster web and TUI renderers should consume
 `metadata.application_primitives.surface_id` (`contract.app`) and render

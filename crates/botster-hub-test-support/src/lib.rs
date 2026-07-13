@@ -375,13 +375,18 @@ pub fn late_attach_history_events() -> Vec<DaemonEvent> {
         DaemonEvent::AttachState {
             session_id: LATE_ATTACH_HISTORY_SESSION_ID.to_string(),
             subscription_id: LATE_ATTACH_HISTORY_SUBSCRIPTION_ID.to_string(),
-            state: "attached".to_string(),
+            state: "attaching".to_string(),
         },
         DaemonEvent::Snapshot {
             session_id: LATE_ATTACH_HISTORY_SESSION_ID.to_string(),
             subscription_id: LATE_ATTACH_HISTORY_SUBSCRIPTION_ID.to_string(),
             data: LATE_ATTACH_HISTORY_DATA.to_string(),
             bytes: LATE_ATTACH_HISTORY_DATA.len(),
+        },
+        DaemonEvent::AttachState {
+            session_id: LATE_ATTACH_HISTORY_SESSION_ID.to_string(),
+            subscription_id: LATE_ATTACH_HISTORY_SUBSCRIPTION_ID.to_string(),
+            state: "attached".to_string(),
         },
         DaemonEvent::TerminalOutput {
             session_id: LATE_ATTACH_HISTORY_SESSION_ID.to_string(),
@@ -396,10 +401,18 @@ pub fn late_attach_history_events() -> Vec<DaemonEvent> {
     ]
 }
 
-/// Return a late attach sequence where no restored history is fabricated.
+/// Return an idle late-attach sequence without fabricated scrollback.
+///
+/// Production backends may emit an opaque authoritative blank snapshot between
+/// `attaching` and `attached`; that optional envelope is covered by live tests.
 #[must_use]
 pub fn late_attach_no_history_events() -> Vec<DaemonEvent> {
     vec![
+        DaemonEvent::AttachState {
+            session_id: LATE_ATTACH_NO_HISTORY_SESSION_ID.to_string(),
+            subscription_id: LATE_ATTACH_NO_HISTORY_SUBSCRIPTION_ID.to_string(),
+            state: "attaching".to_string(),
+        },
         DaemonEvent::AttachState {
             session_id: LATE_ATTACH_NO_HISTORY_SESSION_ID.to_string(),
             subscription_id: LATE_ATTACH_NO_HISTORY_SUBSCRIPTION_ID.to_string(),
@@ -919,12 +932,13 @@ fn run_many_pty_client_attach_scenario(
             "capture_snapshot response was missing its body",
         )
     })?;
-    if snapshot.payload_bytes == 0 || snapshot.payload_format.as_deref() != Some("plain-opaque-v1")
+    if snapshot.payload_bytes == 0
+        || snapshot.payload_format.as_deref() != Some("ghostty-terminal-snapshot-v1")
     {
         return Err(many_pty_error(
             ManyPtyConformanceStage::History,
             MANY_PTY_NOISY_SESSION_ID,
-            "capture_snapshot did not return a non-empty plain-opaque-v1 payload",
+            "capture_snapshot did not return a non-empty ghostty-terminal-snapshot-v1 payload",
         ));
     }
 
@@ -4097,6 +4111,13 @@ mod tests {
     fn late_attach_history_fixture_orders_history_before_live_output() {
         let scenario = late_attach_history_conformance_scenario();
 
+        let attaching_index = scenario
+            .history_then_live
+            .iter()
+            .position(|event| {
+                matches!(event, DaemonEvent::AttachState { state, .. } if state == "attaching")
+            })
+            .expect("fixture includes attaching state");
         let history_index = scenario
             .history_then_live
             .iter()
@@ -4119,26 +4140,32 @@ mod tests {
                 )
             })
             .expect("fixture includes later live output");
+        let attached_index = scenario
+            .history_then_live
+            .iter()
+            .position(|event| {
+                matches!(event, DaemonEvent::AttachState { state, .. } if state == "attached")
+            })
+            .expect("fixture includes attached state");
 
         assert!(
-            history_index < live_index,
-            "restored history must precede later live output"
+            attaching_index < history_index
+                && history_index < attached_index
+                && attached_index < live_index,
+            "fixture must preserve attaching < history < attached < live"
         );
     }
 
     #[test]
-    fn late_attach_history_fixture_does_not_fabricate_no_history_events() {
+    fn late_attach_history_fixture_idle_case_does_not_fabricate_scrollback() {
         let scenario = late_attach_history_conformance_scenario();
 
         assert!(
-            !scenario.no_history_then_live.iter().any(|event| {
-                matches!(
-                    event,
-                    DaemonEvent::Snapshot { data, .. } | DaemonEvent::Scrollback { data, .. }
-                        if !data.is_empty()
-                )
-            }),
-            "no-history fixture must not contain non-empty snapshot or scrollback events"
+            !scenario
+                .no_history_then_live
+                .iter()
+                .any(|event| { matches!(event, DaemonEvent::Scrollback { .. }) }),
+            "idle fixture must not fabricate scrollback"
         );
         assert!(
             scenario.no_history_then_live.iter().any(|event| {
@@ -4228,7 +4255,7 @@ mod tests {
                         "type": "attach_state",
                         "session_id": LATE_ATTACH_HISTORY_SESSION_ID,
                         "subscription_id": LATE_ATTACH_HISTORY_SUBSCRIPTION_ID,
-                        "state": "attached",
+                        "state": "attaching",
                     },
                     {
                         "type": "snapshot",
@@ -4236,6 +4263,12 @@ mod tests {
                         "subscription_id": LATE_ATTACH_HISTORY_SUBSCRIPTION_ID,
                         "data": LATE_ATTACH_HISTORY_DATA,
                         "bytes": LATE_ATTACH_HISTORY_DATA.len(),
+                    },
+                    {
+                        "type": "attach_state",
+                        "session_id": LATE_ATTACH_HISTORY_SESSION_ID,
+                        "subscription_id": LATE_ATTACH_HISTORY_SUBSCRIPTION_ID,
+                        "state": "attached",
                     },
                     {
                         "type": "terminal_output",
@@ -4251,6 +4284,12 @@ mod tests {
                     },
                 ],
                 "no_history_then_live": [
+                    {
+                        "type": "attach_state",
+                        "session_id": LATE_ATTACH_NO_HISTORY_SESSION_ID,
+                        "subscription_id": LATE_ATTACH_NO_HISTORY_SUBSCRIPTION_ID,
+                        "state": "attaching",
+                    },
                     {
                         "type": "attach_state",
                         "session_id": LATE_ATTACH_NO_HISTORY_SESSION_ID,

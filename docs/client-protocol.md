@@ -29,7 +29,7 @@ Node-based first-party clients can consume the same checked artifact without a
 sibling hub checkout through the package:
 
 ```sh
-npm install --save-dev @trybotster/hub-test-support@0.1.3
+npm install --save-dev @trybotster/hub-test-support@0.1.4
 ```
 
 ```js
@@ -66,7 +66,7 @@ fixture revision are emitted by the Rust `botster-hub-test-support` asset
 generator instead of being maintained independently in JavaScript.
 
 For npm-based client repos such as botster-web, use the exact dependency spec
-`"@trybotster/hub-test-support": "0.1.3"` in `devDependencies` and let npm write
+`"@trybotster/hub-test-support": "0.1.4"` in `devDependencies` and let npm write
 the corresponding package-lock entry from the public npm registry. The package
 is public, so registry install does not require a scoped `.npmrc` entry or CI
 auth token. After updating the lockfile, run the client smoke that imports the
@@ -623,11 +623,23 @@ defensive client implementations rather than the current serde shape.
 
 The attach/drain ordering contract is that explicit `Attach` enters the
 core-owned SessionIo/ClientWorker subscription path and requests initial
-terminal history for that subscription. Initial `snapshot` or `scrollback`
-history is delivered before later live `terminal_output` for that subscription.
-Clients should render the restored history payload first, then append subsequent
-live output. Empty core snapshots do not fabricate history, and the daemon does
-not maintain a separate scrollback cache. `stream_attach` writes only
+terminal history for that subscription. The guaranteed per-subscription order
+is `attaching`, optional `snapshot` or `scrollback` history, `attached`, then
+later live `terminal_output`. `attaching` means the subscription was requested
+but authoritative initial history has not been delivered. `attached` means
+initial snapshot delivery is complete and live output may flow. Initial history
+is therefore delivered before readiness and later live output.
+Clients should render supported restored history payloads first, then append
+subsequent live output. An idle terminal may produce `attaching`, an optional
+authoritative blank `snapshot`, then `attached`: opaque snapshot bytes can
+encode dimensions, parser state, and backend metadata without representing
+prior renderable terminal output. Clients must not infer visible history from
+the snapshot payload byte length. Empty history does not fabricate scrollback,
+and the daemon does not maintain a separate scrollback cache. The wire-defined
+`detached` state remains part of the client contract and clients must tolerate
+it, although no production core component emits it as of the core revision
+recorded in `Cargo.lock`.
+`stream_attach` writes only
 `TerminalOutput` data into its output writer; clients that need event kind,
 history payloads, history fallback handling, byte-count metadata, or ordering
 metadata should use `DaemonConnection` with `Attach` and `Drain`.
@@ -645,12 +657,13 @@ The reusable first-party fixture for this rendering contract lives in
 `botster_hub_test_support::late_attach_history_conformance_scenario`. It returns
 public `botster_hub_client::DaemonEvent` values only:
 
-- `history_then_live` includes attach metadata, non-empty `snapshot` or
-  `scrollback` history with `bytes == data.len()`, later `terminal_output`, and
+- `history_then_live` includes `attaching`, non-empty `snapshot` or `scrollback`
+  history with `bytes == data.len()`, `attached`, later `terminal_output`, and
   process-exit metadata;
-- `no_history_then_live` includes attach metadata, later live terminal output,
-  and process-exit metadata without fabricating non-empty `snapshot` or
-  `scrollback` history.
+- `no_history_then_live` includes `attaching`, then `attached`, then later live
+  terminal output and process-exit metadata without prior renderable output or
+  fabricated scrollback. Production backends may insert an opaque authoritative
+  blank `snapshot` before `attached`.
 
 Rust downstream tests can consume the typed scenario directly. Browser/TUI
 tests that cannot depend on the Rust crate should mirror the stable JSON from
@@ -660,7 +673,7 @@ assert the same event ordering and classification. `AttachState` and
 
 Node clients can consume that exact JSON through
 `readLateAttachHistoryConformanceFixture()` from
-`@trybotster/hub-test-support@0.1.3`. The same package exposes
+`@trybotster/hub-test-support@0.1.4`. The same package exposes
 `readFirstPartyClientSupportMatrix()`. Because the current hub-client helper
 uses one feature list for advertised and required compatibility, the published
 matrix includes `terminal_readback` in both `supported_features` and
@@ -734,6 +747,11 @@ increments `CONFORMANCE_FIXTURE_REVISION`. `PROTOCOL_VERSION` remains unchanged
 because the daemon framing and request/response protocol are the same; clients
 that depend on renderable history should require the current conformance fixture
 revision during the hello handshake.
+
+Aligning attach readiness with the core contract increments
+`CONFORMANCE_FIXTURE_REVISION` to 11. `PROTOCOL_VERSION` remains unchanged
+because the daemon framing and event shapes are unchanged; the fixture now
+guarantees `attaching -> optional initial state -> attached -> live output`.
 
 Adding `worktree_lifecycle` increments `CONFORMANCE_FIXTURE_REVISION`.
 `PROTOCOL_VERSION` remains unchanged because daemon framing and request issuance

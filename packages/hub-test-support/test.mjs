@@ -20,7 +20,7 @@ import {
 } from "@trybotster/hub-test-support";
 
 assert.equal(metadata.package_name, "@trybotster/hub-test-support");
-assert.equal(metadata.package_version, "0.1.3");
+assert.equal(metadata.package_version, "0.1.4");
 assert.equal(metadata.protocol, "botster-hub-daemon-v1");
 assert.equal(Number.isInteger(metadata.protocol_version), true);
 assert.equal(Number.isInteger(metadata.conformance_fixture_revision), true);
@@ -76,20 +76,49 @@ const historyIndex = lateAttachFixture.history_then_live.findIndex(
 const liveIndex = lateAttachFixture.history_then_live.findIndex(
   (event) => event.type === "terminal_output",
 );
+const attachingIndex = lateAttachFixture.history_then_live.findIndex(
+  (event) => event.type === "attach_state" && event.state === "attaching",
+);
+const attachedIndex = lateAttachFixture.history_then_live.findIndex(
+  (event) => event.type === "attach_state" && event.state === "attached",
+);
+assert.notEqual(attachingIndex, -1);
 assert.notEqual(historyIndex, -1);
-assert.equal(historyIndex < liveIndex, true);
+assert.notEqual(attachedIndex, -1);
+assert.equal(attachingIndex < historyIndex, true);
+assert.equal(historyIndex < attachedIndex, true);
+assert.equal(attachedIndex < liveIndex, true);
 for (const event of lateAttachFixture.history_then_live) {
   if (event.type === "snapshot" || event.type === "scrollback") {
     assert.equal(event.bytes, Buffer.byteLength(event.data));
   }
 }
+const noHistoryAttachingIndex = lateAttachFixture.no_history_then_live.findIndex(
+  (event) => event.type === "attach_state" && event.state === "attaching",
+);
+const noHistoryAttachedIndex = lateAttachFixture.no_history_then_live.findIndex(
+  (event) => event.type === "attach_state" && event.state === "attached",
+);
+const noHistoryLiveIndex = lateAttachFixture.no_history_then_live.findIndex(
+  (event) => event.type === "terminal_output",
+);
+const noHistoryLastInitialStateIndex = lateAttachFixture.no_history_then_live.findLastIndex(
+  (event) => event.type === "snapshot" || event.type === "scrollback",
+);
+const noHistoryFirstTerminalOutputIndex = lateAttachFixture.no_history_then_live.findIndex(
+  (event) => event.type === "terminal_output",
+);
 assert.equal(
-  lateAttachFixture.no_history_then_live.some(
-    (event) =>
-      (event.type === "snapshot" || event.type === "scrollback") && event.data.length > 0,
-  ),
+  lateAttachFixture.no_history_then_live.some((event) => event.type === "scrollback"),
   false,
 );
+assert.equal(noHistoryAttachingIndex < noHistoryAttachedIndex, true);
+assert.equal(
+  noHistoryLastInitialStateIndex === -1 || noHistoryLastInitialStateIndex < noHistoryAttachedIndex,
+  true,
+);
+assert.equal(noHistoryAttachedIndex < noHistoryFirstTerminalOutputIndex, true);
+assert.equal(noHistoryAttachedIndex < noHistoryLiveIndex, true);
 
 const verification = verifyPackageAssets();
 assert.deepEqual(verification, { ok: true, failures: [] });
