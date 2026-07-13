@@ -293,7 +293,20 @@ struct LocalWebrtcPeerState {
 
 enum PendingLocalWebrtcRequest {
     Request(Box<DaemonRequest>),
-    QueueOverflow,
+    QueueOverflow(usize),
+}
+
+fn pop_pending_request(
+    pending_requests: &mut VecDeque<PendingLocalWebrtcRequest>,
+) -> Option<PendingLocalWebrtcRequest> {
+    let pending = pending_requests.pop_front()?;
+    let PendingLocalWebrtcRequest::QueueOverflow(count) = pending else {
+        return Some(pending);
+    };
+    if count > 1 {
+        pending_requests.push_front(PendingLocalWebrtcRequest::QueueOverflow(count - 1));
+    }
+    Some(PendingLocalWebrtcRequest::QueueOverflow(1))
 }
 
 impl LocalWebrtcPeerState {
@@ -397,7 +410,7 @@ impl PeerConnectionEventHandler for LocalWebrtcHandler {
             let mut pending_requests = VecDeque::new();
             let mut open = true;
             while open {
-                let pending = if let Some(request) = pending_requests.pop_front() {
+                let pending = if let Some(request) = pop_pending_request(&mut pending_requests) {
                     request
                 } else {
                     match data_channel.poll().await {
@@ -414,19 +427,22 @@ impl PeerConnectionEventHandler for LocalWebrtcHandler {
                     }
                 };
 
-                let PendingLocalWebrtcRequest::Request(request) = pending else {
-                    let response = queued_request_overflow_response();
-                    let Ok(frames) = framed_daemon_response(&stream_key, &response) else {
-                        break;
-                    };
-                    open = send_response_frames(
-                        data_channel.as_ref(),
-                        &stream_key,
-                        &frames,
-                        &mut pending_requests,
-                    )
-                    .await;
-                    continue;
+                let request = match pending {
+                    PendingLocalWebrtcRequest::Request(request) => request,
+                    PendingLocalWebrtcRequest::QueueOverflow(_) => {
+                        let response = queued_request_overflow_response();
+                        let Ok(frames) = framed_daemon_response(&stream_key, &response) else {
+                            break;
+                        };
+                        open = send_response_frames(
+                            data_channel.as_ref(),
+                            &stream_key,
+                            &frames,
+                            &mut pending_requests,
+                        )
+                        .await;
+                        continue;
+                    }
                 };
 
                 let subscription_change =
@@ -598,11 +614,16 @@ fn apply_data_channel_event(
                 .filter(|pending| matches!(pending, PendingLocalWebrtcRequest::Request(_)))
                 .count();
             if request_count >= LOCAL_WEBRTC_PENDING_REQUESTS {
-                if !pending_requests
-                    .iter()
-                    .any(|pending| matches!(pending, PendingLocalWebrtcRequest::QueueOverflow))
+                if let Some(PendingLocalWebrtcRequest::QueueOverflow(count)) = pending_requests
+                    .iter_mut()
+                    .find(|pending| matches!(pending, PendingLocalWebrtcRequest::QueueOverflow(_)))
                 {
-                    pending_requests.push_back(PendingLocalWebrtcRequest::QueueOverflow);
+                    let Some(next_count) = count.checked_add(1) else {
+                        return false;
+                    };
+                    *count = next_count;
+                } else {
+                    pending_requests.push_back(PendingLocalWebrtcRequest::QueueOverflow(1));
                 }
                 return true;
             }
@@ -1212,13 +1233,14 @@ mod tests {
     }
 
     #[test]
-    fn seventeenth_queued_request_becomes_bounded_operator_error() {
+    fn overflowing_requests_each_preserve_one_fifo_operator_response() {
         let key = AesGcmKey::from_slice(&[8; 32]).unwrap();
         let mut pending = VecDeque::new();
         let mut paused = false;
         let mut deadline = None;
 
-        for _ in 0..=LOCAL_WEBRTC_PENDING_REQUESTS {
+        let inbound_requests = LOCAL_WEBRTC_PENDING_REQUESTS + 4;
+        for _ in 0..inbound_requests {
             assert!(apply_data_channel_event(
                 encrypted_request_event(&key, &DaemonRequest::Status),
                 &key,
@@ -1232,8 +1254,13 @@ mod tests {
         assert_eq!(pending.len(), LOCAL_WEBRTC_PENDING_REQUESTS + 1);
         assert!(matches!(
             pending.back(),
-            Some(PendingLocalWebrtcRequest::QueueOverflow)
+            Some(PendingLocalWebrtcRequest::QueueOverflow(4))
         ));
+        let mut responses_emitted = 0;
+        while pop_pending_request(&mut pending).is_some() {
+            responses_emitted += 1;
+        }
+        assert_eq!(responses_emitted, inbound_requests);
         let response = queued_request_overflow_response();
         assert_eq!(
             response.kind,
