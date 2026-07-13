@@ -1,6 +1,6 @@
 {
   "name": "@trybotster/hub-test-support",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Node-consumable Botster hub client protocol and plugin contract test assets",
   "license": "SEE LICENSE IN LICENSE",
   "type": "module",
@@ -15,6 +15,7 @@
     "./metadata": "./metadata.json",
     "./first-party-client-support-matrix": "./first-party-client-support-matrix.json",
     "./late-attach-history-conformance-fixture": "./late-attach-history-conformance-fixture.json",
+    "./local-webrtc-response-chunk-conformance-fixture": "./local-webrtc-response-chunk-conformance-fixture.json",
     "./fixtures/plugin-contract-matrix/*": "./fixtures/plugin-contract-matrix/*"
   },
   "files": [
@@ -26,6 +27,7 @@
     "daemon-protocol.ts",
     "first-party-client-support-matrix.json",
     "late-attach-history-conformance-fixture.json",
+    "local-webrtc-response-chunk-conformance-fixture.json",
     "fixtures/plugin-contract-matrix"
   ],
   "scripts": {

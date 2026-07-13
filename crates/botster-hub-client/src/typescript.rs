@@ -27,6 +27,18 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             ("version", "number"),
         ],
     );
+    emit_interface(
+        &mut output,
+        "DaemonLocalWebrtcResponseChunk",
+        &[
+            ("version", "number"),
+            ("message_id", "string"),
+            ("chunk_index", "number"),
+            ("chunk_count", "number"),
+            ("total_bytes", "number"),
+            ("payload", "string"),
+        ],
+    );
 
     emit_interface(
         &mut output,

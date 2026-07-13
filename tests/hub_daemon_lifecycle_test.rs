@@ -285,21 +285,84 @@ impl LocalWebrtcOfferPeer {
         key: &AesGcmKey,
         request: &botster_hub_client::DaemonRequest,
     ) -> Result<botster_hub_client::DaemonResponse, Box<dyn std::error::Error>> {
+        Ok(self.encrypted_request_with_metrics(key, request).await?.0)
+    }
+
+    async fn encrypted_request_with_metrics(
+        &mut self,
+        key: &AesGcmKey,
+        request: &botster_hub_client::DaemonRequest,
+    ) -> Result<
+        (
+            botster_hub_client::DaemonResponse,
+            LocalWebrtcResponseMetrics,
+        ),
+        Box<dyn std::error::Error>,
+    > {
         let plaintext = serde_json::to_vec(request)?;
         let envelope = encrypt_aes_gcm(key, &plaintext, 1)?;
         self.data_channel
             .send_text(&serde_json::to_string(&envelope)?)
             .await?;
-        let response = timeout(Duration::from_secs(10), self.data_channel_message_rx.recv())
-            .await
-            .map_err(|_| std::io::Error::other("timed out waiting for data channel response"))?
-            .ok_or_else(|| {
-                std::io::Error::other("local WebRTC data channel closed before response")
-            })?;
-        let envelope = serde_json::from_str::<AesGcmEnvelope>(&response)?;
+        let mut encrypted = String::new();
+        let mut message_id = None;
+        let mut expected_chunk_count = None;
+        let mut maximum_frame_bytes = 0;
+        let mut next_chunk_index = 0;
+        loop {
+            let response = timeout(Duration::from_secs(10), self.data_channel_message_rx.recv())
+                .await
+                .map_err(|_| std::io::Error::other("timed out waiting for data channel response"))?
+                .ok_or_else(|| {
+                    std::io::Error::other("local WebRTC data channel closed before response")
+                })?;
+            maximum_frame_bytes = maximum_frame_bytes.max(response.len());
+            assert!(
+                response.len() < botster_hub_client::LOCAL_WEBRTC_MAX_FRAME_BYTES,
+                "response frame exceeded 64 KiB"
+            );
+            let chunk = serde_json::from_str::<botster_hub_client::DaemonLocalWebrtcResponseChunk>(
+                &response,
+            )?;
+            assert_eq!(
+                chunk.version,
+                botster_hub_client::LOCAL_WEBRTC_RESPONSE_CHUNK_VERSION
+            );
+            assert_eq!(chunk.chunk_index, next_chunk_index);
+            if let Some(message_id) = &message_id {
+                assert_eq!(message_id, &chunk.message_id);
+            } else {
+                message_id = Some(chunk.message_id.clone());
+                expected_chunk_count = Some(chunk.chunk_count);
+            }
+            assert_eq!(expected_chunk_count, Some(chunk.chunk_count));
+            encrypted.push_str(&chunk.payload);
+            next_chunk_index += 1;
+            if chunk.chunk_index + 1 == chunk.chunk_count {
+                assert_eq!(encrypted.len(), chunk.total_bytes as usize);
+                break;
+            }
+        }
+        let envelope_bytes = encrypted.len();
+        let chunk_count = expected_chunk_count.unwrap_or(0) as usize;
+        let envelope = serde_json::from_str::<AesGcmEnvelope>(&encrypted)?;
         let plaintext = decrypt_aes_gcm(key, &envelope)?;
-        Ok(serde_json::from_slice(&plaintext)?)
+        Ok((
+            serde_json::from_slice(&plaintext)?,
+            LocalWebrtcResponseMetrics {
+                envelope_bytes,
+                chunk_count,
+                maximum_frame_bytes,
+            },
+        ))
     }
+}
+
+#[derive(Debug)]
+struct LocalWebrtcResponseMetrics {
+    envelope_bytes: usize,
+    chunk_count: usize,
+    maximum_frame_bytes: usize,
 }
 
 fn local_webrtc_stream_key(secret: &str) -> AesGcmKey {
@@ -6048,7 +6111,7 @@ fn external_hub_client_crate_drives_real_daemon_socket_protocol() {
 }
 
 #[test]
-fn installed_botster_web_launch_issues_local_webrtc_grant_and_data_channel_adapter() {
+fn local_webrtc_chunks_oversized_encrypted_daemon_response() {
     let _guard = daemon_test_lock()
         .lock()
         .expect("serialize real daemon test");
@@ -6265,6 +6328,46 @@ fn installed_botster_web_launch_issues_local_webrtc_grant_and_data_channel_adapt
             observed.contains("webrtc:from-local-webrtc"),
             "encrypted WebRTC data channel should drain session output, got {observed:?}"
         );
+
+        let created = botster_hub_client::request(
+            &endpoint,
+            botster_hub_client::DaemonRequest::CreateSpawnTarget {
+                target_id: Some("local-webrtc-large-target".to_string()),
+                label: Some("Local WebRTC oversized response".to_string()),
+                root: data_dir.clone(),
+                enabled: true,
+                kind: Some("directory".to_string()),
+                metadata: BTreeMap::from([("synthetic".to_string(), "x".repeat(300_000))]),
+            },
+        )
+        .expect("seed synthetic oversized response through daemon socket");
+        assert_eq!(
+            created.kind,
+            botster_hub_client::DaemonResponseKind::SpawnTargets
+        );
+        let (large_response, metrics) = offer_peer
+            .encrypted_request_with_metrics(
+                &stream_key,
+                &botster_hub_client::DaemonRequest::ListSpawnTargets,
+            )
+            .await
+            .expect("list oversized spawn-target response over encrypted WebRTC");
+        assert_eq!(
+            large_response.kind,
+            botster_hub_client::DaemonResponseKind::SpawnTargets
+        );
+        assert_eq!(
+            large_response
+                .spawn_targets
+                .iter()
+                .find(|target| target.target_id == "local-webrtc-large-target")
+                .and_then(|target| target.metadata.get("synthetic"))
+                .map(String::len),
+            Some(300_000)
+        );
+        assert!(metrics.envelope_bytes > 256 * 1024);
+        assert!(metrics.chunk_count > 1);
+        assert!(metrics.maximum_frame_bytes < botster_hub_client::LOCAL_WEBRTC_MAX_FRAME_BYTES);
 
         let shutdown = offer_peer
             .encrypted_request(
