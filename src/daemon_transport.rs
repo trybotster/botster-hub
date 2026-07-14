@@ -4833,9 +4833,7 @@ fn daemon_event_from_client(event: HubClientEvent) -> DaemonEvent {
         } => DaemonEvent::Snapshot {
             session_id: session_id.0,
             subscription_id: subscription_id.0,
-            bytes: data.len(),
-            payload: data,
-            payload_encoding: botster_hub_client::OPAQUE_TERMINAL_HISTORY_ENCODING.to_string(),
+            history: botster_hub_client::DaemonOpaqueHistoryPayload::from_bytes(&data),
         },
         HubClientEvent::Scrollback {
             session_id,
@@ -4844,9 +4842,7 @@ fn daemon_event_from_client(event: HubClientEvent) -> DaemonEvent {
         } => DaemonEvent::Scrollback {
             session_id: session_id.0,
             subscription_id: subscription_id.0,
-            bytes: data.len(),
-            payload: data,
-            payload_encoding: botster_hub_client::OPAQUE_TERMINAL_HISTORY_ENCODING.to_string(),
+            history: botster_hub_client::DaemonOpaqueHistoryPayload::from_bytes(&data),
         },
         HubClientEvent::ProcessExit {
             session_id,
@@ -5300,9 +5296,9 @@ mod tests {
             DaemonEvent::Snapshot {
                 session_id: "daemon-projection-session".to_string(),
                 subscription_id: "daemon-projection-subscription".to_string(),
-                payload: vec![b's', b'n', b'a', b'p', 0xff],
-                payload_encoding: botster_hub_client::OPAQUE_TERMINAL_HISTORY_ENCODING.to_string(),
-                bytes: 5,
+                history: botster_hub_client::DaemonOpaqueHistoryPayload::from_bytes(&[
+                    b's', b'n', b'a', b'p', 0xff,
+                ]),
             }
         );
         assert_eq!(
@@ -5310,9 +5306,7 @@ mod tests {
             DaemonEvent::Scrollback {
                 session_id: "daemon-projection-session".to_string(),
                 subscription_id: "daemon-projection-subscription".to_string(),
-                payload: b"scrollback".to_vec(),
-                payload_encoding: botster_hub_client::OPAQUE_TERMINAL_HISTORY_ENCODING.to_string(),
-                bytes: 10,
+                history: botster_hub_client::DaemonOpaqueHistoryPayload::from_bytes(b"scrollback"),
             }
         );
     }

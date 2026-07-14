@@ -3407,21 +3407,21 @@ fn print_daemon_events(events: &[DaemonEvent]) {
             DaemonEvent::Snapshot {
                 session_id,
                 subscription_id,
-                bytes,
-                ..
+                history,
             } => {
                 println!(
-                    "event=snapshot session_id={session_id} subscription_id={subscription_id} bytes={bytes}"
+                    "event=snapshot session_id={session_id} subscription_id={subscription_id} bytes={}",
+                    history.bytes
                 );
             }
             DaemonEvent::Scrollback {
                 session_id,
                 subscription_id,
-                bytes,
-                ..
+                history,
             } => {
                 println!(
-                    "event=scrollback session_id={session_id} subscription_id={subscription_id} bytes={bytes}"
+                    "event=scrollback session_id={session_id} subscription_id={subscription_id} bytes={}",
+                    history.bytes
                 );
             }
             DaemonEvent::ProcessExit {

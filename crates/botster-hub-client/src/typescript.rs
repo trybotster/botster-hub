@@ -1112,8 +1112,8 @@ pub(crate) fn daemon_protocol_typescript() -> String {
                 &[
                     ("session_id", "string"),
                     ("subscription_id", "string"),
-                    ("payload", "number[]"),
-                    ("payload_encoding", "string"),
+                    ("payload_base64", "string"),
+                    ("payload_encoding", "\"base64\""),
                     ("bytes", "number"),
                 ],
             ),
@@ -1122,8 +1122,8 @@ pub(crate) fn daemon_protocol_typescript() -> String {
                 &[
                     ("session_id", "string"),
                     ("subscription_id", "string"),
-                    ("payload", "number[]"),
-                    ("payload_encoding", "string"),
+                    ("payload_base64", "string"),
+                    ("payload_encoding", "\"base64\""),
                     ("bytes", "number"),
                 ],
             ),

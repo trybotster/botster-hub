@@ -385,9 +385,9 @@ pub fn late_attach_history_events() -> Vec<DaemonEvent> {
         DaemonEvent::Snapshot {
             session_id: LATE_ATTACH_HISTORY_SESSION_ID.to_string(),
             subscription_id: LATE_ATTACH_HISTORY_SUBSCRIPTION_ID.to_string(),
-            payload: LATE_ATTACH_HISTORY_PAYLOAD.to_vec(),
-            payload_encoding: botster_hub_client::OPAQUE_TERMINAL_HISTORY_ENCODING.to_string(),
-            bytes: LATE_ATTACH_HISTORY_PAYLOAD.len(),
+            history: botster_hub_client::DaemonOpaqueHistoryPayload::from_bytes(
+                LATE_ATTACH_HISTORY_PAYLOAD,
+            ),
         },
         DaemonEvent::AttachState {
             session_id: LATE_ATTACH_HISTORY_SESSION_ID.to_string(),
@@ -1067,14 +1067,14 @@ fn run_many_pty_client_attach_scenario(
         .rposition(|event| match event {
             DaemonEvent::Snapshot {
                 subscription_id,
-                bytes,
+                history,
                 ..
             }
             | DaemonEvent::Scrollback {
                 subscription_id,
-                bytes,
+                history,
                 ..
-            } if subscription_id == MANY_PTY_SUBSCRIPTION_ID => *bytes > 0,
+            } if subscription_id == MANY_PTY_SUBSCRIPTION_ID => history.bytes > 0,
             _ => false,
         })
         .ok_or_else(|| {
@@ -4226,9 +4226,9 @@ mod tests {
             .position(|event| {
                 matches!(
                     event,
-                    DaemonEvent::Snapshot { payload, .. }
-                        | DaemonEvent::Scrollback { payload, .. }
-                        if !payload.is_empty()
+                    DaemonEvent::Snapshot { history, .. }
+                        | DaemonEvent::Scrollback { history, .. }
+                        if history.bytes > 0
                 )
             })
             .expect("fixture includes opaque initial state");
@@ -4301,25 +4301,14 @@ mod tests {
             .chain(scenario.no_history_then_live.iter())
         {
             match event {
-                DaemonEvent::Snapshot {
-                    payload,
-                    payload_encoding,
-                    bytes,
-                    ..
-                }
-                | DaemonEvent::Scrollback {
-                    payload,
-                    payload_encoding,
-                    bytes,
-                    ..
-                } => {
-                    assert_eq!(*bytes, payload.len());
+                DaemonEvent::Snapshot { history, .. } | DaemonEvent::Scrollback { history, .. } => {
+                    let payload = history.decoded_bytes().expect("fixture payload decodes");
+                    assert_eq!(history.bytes, payload.len());
                     assert_eq!(
-                        payload_encoding,
-                        botster_hub_client::OPAQUE_TERMINAL_HISTORY_ENCODING
+                        history.payload_encoding,
+                        botster_hub_client::DaemonHistoryEncoding::Base64
                     );
                     assert!(!payload.is_empty());
-                    assert!(std::str::from_utf8(payload).is_err());
                 }
                 _ => {}
             }
@@ -4390,8 +4379,8 @@ mod tests {
                         "type": "snapshot",
                         "session_id": LATE_ATTACH_HISTORY_SESSION_ID,
                         "subscription_id": LATE_ATTACH_HISTORY_SUBSCRIPTION_ID,
-                        "payload": LATE_ATTACH_HISTORY_PAYLOAD,
-                        "payload_encoding": botster_hub_client::OPAQUE_TERMINAL_HISTORY_ENCODING,
+                        "payload_base64": "AP9HVFkB",
+                        "payload_encoding": "base64",
                         "bytes": LATE_ATTACH_HISTORY_PAYLOAD.len(),
                     },
                     {

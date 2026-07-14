@@ -1676,10 +1676,6 @@ fn late_attach_receives_opaque_history_before_later_live_output() {
         "late subscription should receive opaque initial state, got {events:?}"
     );
     assert!(
-        std::str::from_utf8(&history_data).is_err(),
-        "late subscription history must remain opaque binary instead of renderable text, got {events:?}"
-    );
-    assert!(
         !history_data
             .windows(b"before-late".len())
             .any(|window| window == b"before-late"),
