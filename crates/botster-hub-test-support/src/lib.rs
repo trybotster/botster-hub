@@ -441,6 +441,61 @@ pub fn late_attach_history_conformance_fixture_json() -> serde_json::Value {
         .expect("late attach history conformance fixture serializes")
 }
 
+/// Return deterministic local WebRTC response-chunk scenarios for downstream clients.
+#[must_use]
+pub fn local_webrtc_response_chunk_conformance_fixture_json() -> serde_json::Value {
+    serde_json::json!({
+        "version": botster_hub_client::LOCAL_WEBRTC_RESPONSE_CHUNK_VERSION,
+        "maximum_frame_bytes_exclusive": botster_hub_client::LOCAL_WEBRTC_MAX_FRAME_BYTES,
+        "maximum_response_bytes": botster_hub_client::LOCAL_WEBRTC_MAX_RESPONSE_BYTES,
+        "scenarios": {
+            "single_chunk": [{
+                "version": botster_hub_client::LOCAL_WEBRTC_RESPONSE_CHUNK_VERSION,
+                "message_id": "response-single",
+                "chunk_index": 0,
+                "chunk_count": 1,
+                "total_bytes": 18,
+                "payload": "encrypted-envelope"
+            }],
+            "multiple_chunks": [
+                {
+                    "version": botster_hub_client::LOCAL_WEBRTC_RESPONSE_CHUNK_VERSION,
+                    "message_id": "response-multiple",
+                    "chunk_index": 0,
+                    "chunk_count": 2,
+                    "total_bytes": 18,
+                    "payload": "encrypted-"
+                },
+                {
+                    "version": botster_hub_client::LOCAL_WEBRTC_RESPONSE_CHUNK_VERSION,
+                    "message_id": "response-multiple",
+                    "chunk_index": 1,
+                    "chunk_count": 2,
+                    "total_bytes": 18,
+                    "payload": "envelope"
+                }
+            ],
+            "large_generated": {
+                "message_id": "response-large-generated",
+                "generator": "repeat_utf8_pattern",
+                "pattern": "botster-webrtc-chunk-fixture-",
+                "total_bytes": 262_145,
+                "chunk_payload_bytes": 12_288,
+                "expected_chunk_count": 22,
+                "reassembled_sha256": "06d24e206edb54bed524319b1127725b46e20ea4aae5934688599abd42fa4317"
+            },
+            "over_budget_operator_error": [{
+                "version": botster_hub_client::LOCAL_WEBRTC_RESPONSE_CHUNK_VERSION,
+                "message_id": "response-over-budget",
+                "chunk_index": 0,
+                "chunk_count": 1,
+                "total_bytes": 24,
+                "payload": "encrypted-operator-error"
+            }]
+        }
+    })
+}
+
 /// Builder for one isolated local hub daemon test instance.
 ///
 /// # Example
@@ -979,46 +1034,85 @@ fn run_many_pty_client_attach_scenario(
         }
     }
 
+    let attaching_index = observed_events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                DaemonEvent::AttachState {
+                    subscription_id,
+                    state,
+                    ..
+                } if subscription_id == MANY_PTY_SUBSCRIPTION_ID && state == "attaching"
+            )
+        })
+        .ok_or_else(|| {
+            many_pty_error(
+                ManyPtyConformanceStage::History,
+                MANY_PTY_NOISY_SESSION_ID,
+                "late attach did not emit attaching for the exact subscription",
+            )
+        })?;
+    // ReadScreen above proves that the pre-attach marker is renderable. The
+    // initial event remains backend-opaque, so its payload bytes are ordering
+    // evidence rather than a second semantic-history oracle.
     let history_index = observed_events
         .iter()
-        .position(|event| match event {
+        .rposition(|event| match event {
             DaemonEvent::Snapshot {
                 subscription_id,
-                data,
                 bytes,
                 ..
             }
             | DaemonEvent::Scrollback {
                 subscription_id,
-                data,
                 bytes,
                 ..
-            } if subscription_id == MANY_PTY_SUBSCRIPTION_ID => {
-                !data.is_empty() && *bytes == data.len() && data.contains(MANY_PTY_HISTORY_MARKER)
-            }
+            } if subscription_id == MANY_PTY_SUBSCRIPTION_ID => *bytes > 0,
             _ => false,
         })
         .ok_or_else(|| {
             many_pty_error(
                 ManyPtyConformanceStage::History,
                 MANY_PTY_NOISY_SESSION_ID,
-                "late attach did not return renderable marker history with a matching byte count",
+                "late attach did not return non-empty authoritative initial state",
             )
         })?;
-    if observed_events.iter().any(|event| {
-        matches!(
-            event,
-            DaemonEvent::Snapshot { subscription_id, data, bytes, .. }
-                | DaemonEvent::Scrollback { subscription_id, data, bytes, .. }
-                if subscription_id == MANY_PTY_SUBSCRIPTION_ID && *bytes > 0 && data.is_empty()
-        )
-    }) {
-        return Err(many_pty_error(
-            ManyPtyConformanceStage::History,
-            MANY_PTY_NOISY_SESSION_ID,
-            "late attach returned opaque history without renderable data",
-        ));
-    }
+    let attached_index = observed_events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                DaemonEvent::AttachState {
+                    subscription_id,
+                    state,
+                    ..
+                } if subscription_id == MANY_PTY_SUBSCRIPTION_ID && state == "attached"
+            )
+        })
+        .ok_or_else(|| {
+            many_pty_error(
+                ManyPtyConformanceStage::History,
+                MANY_PTY_NOISY_SESSION_ID,
+                "late attach did not emit attached for the exact subscription",
+            )
+        })?;
+    let first_terminal_output_index = observed_events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                DaemonEvent::TerminalOutput { subscription_id, .. }
+                    if subscription_id == MANY_PTY_SUBSCRIPTION_ID
+            )
+        })
+        .ok_or_else(|| {
+            many_pty_error(
+                ManyPtyConformanceStage::Drain,
+                MANY_PTY_NOISY_SESSION_ID,
+                "late attach did not emit terminal output for the exact subscription",
+            )
+        })?;
     let live_index = many_pty_live_output_index(&observed_events).ok_or_else(|| {
         let output = many_pty_terminal_output(&observed_events);
         let output_tail = many_pty_tail(&output);
@@ -1030,11 +1124,15 @@ fn run_many_pty_client_attach_scenario(
             ),
         )
     })?;
-    if history_index >= live_index {
+    if !(attaching_index < history_index
+        && history_index < attached_index
+        && attached_index < first_terminal_output_index
+        && attached_index < live_index)
+    {
         return Err(many_pty_error(
             ManyPtyConformanceStage::History,
             MANY_PTY_NOISY_SESSION_ID,
-            "restored history was not ordered before later live output",
+            "late attach did not preserve attaching < initial state < attached < first/live output",
         ));
     }
 

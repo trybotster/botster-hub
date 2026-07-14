@@ -6,6 +6,7 @@ The package is a generated wrapper over `botster-hub-test-support` and
 `botster-hub-client`. Do not edit `daemon-protocol.ts`,
 `first-party-client-support-matrix.json`,
 `late-attach-history-conformance-fixture.json`,
+`local-webrtc-response-chunk-conformance-fixture.json`,
 `fixtures/plugin-contract-matrix`, or `metadata.json` by hand; run:
 
 ```sh
@@ -15,7 +16,7 @@ node packages/hub-test-support/scripts/sync-assets.mjs
 ## Usage
 
 ```sh
-npm install --save-dev @trybotster/hub-test-support@0.1.4
+npm install --save-dev @trybotster/hub-test-support@0.1.5
 ```
 
 ```js
@@ -26,6 +27,7 @@ import {
   readDaemonProtocolTypescript,
   readFirstPartyClientSupportMatrix,
   readLateAttachHistoryConformanceFixture,
+  readLocalWebrtcResponseChunkConformanceFixture,
 } from "@trybotster/hub-test-support";
 
 const protocolSource = readDaemonProtocolTypescript();
@@ -33,6 +35,7 @@ const fixturePath = materializePluginContractMatrixFixture(tempDirectory);
 const applicationPrimitivesPath = materializeApplicationPrimitivesFixture(tempDirectory);
 const supportMatrix = readFirstPartyClientSupportMatrix();
 const lateAttachFixture = readLateAttachHistoryConformanceFixture();
+const localWebrtcChunkFixture = readLocalWebrtcResponseChunkConformanceFixture();
 const applicationSurfaceId = metadata.application_primitives.surface_id;
 const rendererEntryPoint = metadata.application_primitives.renderer_entrypoint;
 
@@ -45,6 +48,7 @@ console.log(
   rendererEntryPoint,
   supportMatrix.required_features,
   lateAttachFixture.history_then_live,
+  localWebrtcChunkFixture.scenarios.large_generated,
 );
 ```
 
@@ -53,21 +57,23 @@ Use this exact package spec in npm-based client repos:
 ```json
 {
   "devDependencies": {
-    "@trybotster/hub-test-support": "0.1.4"
+    "@trybotster/hub-test-support": "0.1.5"
   }
 }
 ```
 
-After `@trybotster/hub-test-support@0.1.4` is published to the public npm
+After `@trybotster/hub-test-support@0.1.5` is published to the public npm
 registry, no scoped `.npmrc` entry or CI auth token is required for install.
 
 The support matrix is generated from the Rust compatibility descriptors. In
-0.1.4, `terminal_readback` appears in both `supported_features` and
+0.1.5, `terminal_readback` appears in both `supported_features` and
 `required_features`; downstream compatibility checks must implement it rather
 than treating it as optional. The late-attach fixture is generated from the
 Rust serde scenario and preserves `attaching -> optional initial state ->
 attached -> live` ordering. An opaque authoritative snapshot may represent a
 blank terminal; clients must not infer visible history from payload byte length.
+Version 0.1.4 / conformance revision 11 does not contain the corrected readiness
+fixture and must not be used as ordering authority.
 
 Botster web and TUI renderers should consume
 `metadata.application_primitives.surface_id` (`contract.app`) and render
