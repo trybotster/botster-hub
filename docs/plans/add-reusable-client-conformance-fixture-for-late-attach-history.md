@@ -1,5 +1,12 @@
 # Add Reusable Client Conformance Fixture For Late Attach History
 
+> **Superseded contract:** `docs/client-protocol.md` and conformance revision 14
+> are the current authority. The renderable `Snapshot.data` / `Scrollback.data`
+> semantics below, and commands for the removed
+> `external_daemon_attach_replays_prior_history_with_renderable_byte_count`
+> test, are retained only as historical planning context and must not guide
+> implementation or client adoption.
+
 Ticket: `ticket_1782241199_399036`
 Run: `run_1782246171_565810`
 Step: Plan
