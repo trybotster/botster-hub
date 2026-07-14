@@ -20,7 +20,9 @@ mod typescript;
 
 pub const PROTOCOL: &str = "botster-hub-daemon-v1";
 pub const PROTOCOL_VERSION: u16 = 1;
-pub const CONFORMANCE_FIXTURE_REVISION: u16 = 12;
+pub const CONFORMANCE_FIXTURE_REVISION: u16 = 13;
+/// Encoding label for opaque terminal history serialized as a JSON byte array.
+pub const OPAQUE_TERMINAL_HISTORY_ENCODING: &str = "opaque-byte-array-v1";
 /// Version of the local WebRTC daemon-response chunk framing protocol.
 pub const LOCAL_WEBRTC_RESPONSE_CHUNK_VERSION: u16 = 1;
 /// Serialized local WebRTC response frames must remain strictly below this size.
@@ -1705,19 +1707,18 @@ pub enum DaemonDiagnosticKind {
 
 /// Events returned by daemon attach and drain requests.
 ///
-/// `Snapshot` and `Scrollback` are history events for a terminal
-/// subscription. Their `data` field is the renderable UTF-8 terminal history,
-/// and `bytes` is metadata describing the original raw byte count before the
-/// hub decoded that history for clients. Clients should render history events
-/// in the order received before appending later `TerminalOutput` for the same
-/// subscription.
+/// `Snapshot` and `Scrollback` carry opaque binary engine state for a terminal
+/// subscription. Their payloads are not terminal text and must not be rendered.
+/// Clients use `ReadScreen` for backend-neutral restored text, then append later
+/// `TerminalOutput` for the same subscription.
 ///
 /// ```
 /// let snapshot = botster_hub_client::DaemonEvent::Snapshot {
 ///     session_id: "session".to_string(),
 ///     subscription_id: "subscription".to_string(),
-///     data: "restored history\r\n".to_string(),
-///     bytes: 18,
+///     payload: vec![0, 255, 71, 84, 89, 1],
+///     payload_encoding: botster_hub_client::OPAQUE_TERMINAL_HISTORY_ENCODING.to_string(),
+///     bytes: 6,
 /// };
 ///
 /// let live = botster_hub_client::DaemonEvent::TerminalOutput {
@@ -1742,28 +1743,26 @@ pub enum DaemonEvent {
         subscription_id: String,
         data: String,
     },
-    /// Initial renderable terminal history for a subscription.
+    /// Initial opaque engine state for a subscription.
     ///
-    /// `data` is the UTF-8 string clients render. `bytes` is the raw event data
-    /// length before decoding, not a second payload field. If an older hub or
-    /// unsupported history source reports a positive byte count without
-    /// renderable data, clients should surface an opaque-history/live-only
-    /// fallback instead of fabricating scrollback. The current DTO requires
-    /// `data`, so byte-only JSON does not deserialize as this variant.
+    /// `payload` is binary-safe and must not be rendered as terminal text.
+    /// Clients use `ReadScreen` when they need backend-neutral restored text.
     Snapshot {
         session_id: String,
         subscription_id: String,
-        data: String,
+        payload: Vec<u8>,
+        payload_encoding: String,
         bytes: usize,
     },
-    /// Additional renderable terminal history for a subscription.
+    /// Additional opaque engine state for a subscription.
     ///
-    /// Semantics match `Snapshot`: render `data` in event order before later
-    /// `TerminalOutput`, and treat `bytes` only as raw-length metadata.
+    /// Semantics match `Snapshot`; only `TerminalOutput` and `ReadScreen.text`
+    /// are renderable terminal text.
     Scrollback {
         session_id: String,
         subscription_id: String,
-        data: String,
+        payload: Vec<u8>,
+        payload_encoding: String,
         bytes: usize,
     },
     ProcessExit {
@@ -1957,19 +1956,21 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_and_scrollback_events_carry_renderable_data() {
+    fn snapshot_and_scrollback_events_round_trip_opaque_binary_payloads() {
         let events = vec![
             DaemonEvent::Snapshot {
                 session_id: "session".to_string(),
                 subscription_id: "subscription".to_string(),
-                data: "snapshot-data".to_string(),
-                bytes: 13,
+                payload: vec![0, 255, 1],
+                payload_encoding: OPAQUE_TERMINAL_HISTORY_ENCODING.to_string(),
+                bytes: 3,
             },
             DaemonEvent::Scrollback {
                 session_id: "session".to_string(),
                 subscription_id: "subscription".to_string(),
-                data: "scrollback-data".to_string(),
-                bytes: 15,
+                payload: vec![255, 0, 2],
+                payload_encoding: OPAQUE_TERMINAL_HISTORY_ENCODING.to_string(),
+                bytes: 3,
             },
         ];
 
@@ -1982,15 +1983,17 @@ mod tests {
                     "type": "snapshot",
                     "session_id": "session",
                     "subscription_id": "subscription",
-                    "data": "snapshot-data",
-                    "bytes": 13
+                    "payload": [0, 255, 1],
+                    "payload_encoding": "opaque-byte-array-v1",
+                    "bytes": 3
                 },
                 {
                     "type": "scrollback",
                     "session_id": "session",
                     "subscription_id": "subscription",
-                    "data": "scrollback-data",
-                    "bytes": 15
+                    "payload": [255, 0, 2],
+                    "payload_encoding": "opaque-byte-array-v1",
+                    "bytes": 3
                 }
             ])
         );
@@ -2001,21 +2004,46 @@ mod tests {
     }
 
     #[test]
+    fn terminal_writer_ignores_opaque_history_and_preserves_live_output() {
+        let events = vec![
+            DaemonEvent::Snapshot {
+                session_id: "session".to_string(),
+                subscription_id: "subscription".to_string(),
+                payload: b"must-not-render".to_vec(),
+                payload_encoding: OPAQUE_TERMINAL_HISTORY_ENCODING.to_string(),
+                bytes: 15,
+            },
+            DaemonEvent::TerminalOutput {
+                session_id: "session".to_string(),
+                subscription_id: "subscription".to_string(),
+                data: "live-output".to_string(),
+            },
+        ];
+        let mut output = Vec::new();
+
+        write_terminal_events(&events, &mut output).expect("terminal events write");
+
+        assert_eq!(output, b"live-output");
+    }
+
+    #[test]
     fn history_events_deserialize_before_later_terminal_output() {
         let value = serde_json::json!([
             {
                 "type": "snapshot",
                 "session_id": "session",
                 "subscription_id": "subscription",
-                "data": "snapshot-data",
-                "bytes": 13
+                "payload": [0, 255, 1],
+                "payload_encoding": "opaque-byte-array-v1",
+                "bytes": 3
             },
             {
                 "type": "scrollback",
                 "session_id": "session",
                 "subscription_id": "subscription",
-                "data": "scrollback-data",
-                "bytes": 15
+                "payload": [255, 0, 2],
+                "payload_encoding": "opaque-byte-array-v1",
+                "bytes": 3
             },
             {
                 "type": "terminal_output",
@@ -2034,7 +2062,7 @@ mod tests {
     }
 
     #[test]
-    fn byte_only_history_json_is_not_current_dto_shape() {
+    fn history_json_without_binary_payload_is_not_current_dto_shape() {
         let value = serde_json::json!({
             "type": "snapshot",
             "session_id": "session",
@@ -2043,10 +2071,10 @@ mod tests {
         });
 
         let error = serde_json::from_value::<DaemonEvent>(value)
-            .expect_err("current history events require renderable data");
+            .expect_err("current history events require an opaque payload");
         assert!(
-            error.to_string().contains("data"),
-            "missing data should fail loudly, got {error}"
+            error.to_string().contains("payload"),
+            "missing payload should fail loudly, got {error}"
         );
     }
 
@@ -3692,13 +3720,15 @@ mod tests {
             DaemonEvent::Snapshot {
                 session_id: "session".to_string(),
                 subscription_id: "subscription".to_string(),
-                data: "snapshot".to_string(),
+                payload: b"snapshot".to_vec(),
+                payload_encoding: OPAQUE_TERMINAL_HISTORY_ENCODING.to_string(),
                 bytes: 8,
             },
             DaemonEvent::Scrollback {
                 session_id: "session".to_string(),
                 subscription_id: "subscription".to_string(),
-                data: "scrollback".to_string(),
+                payload: b"scrollback".to_vec(),
+                payload_encoding: OPAQUE_TERMINAL_HISTORY_ENCODING.to_string(),
                 bytes: 10,
             },
             DaemonEvent::ProcessExit {

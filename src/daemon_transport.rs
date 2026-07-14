@@ -4834,7 +4834,8 @@ fn daemon_event_from_client(event: HubClientEvent) -> DaemonEvent {
             session_id: session_id.0,
             subscription_id: subscription_id.0,
             bytes: data.len(),
-            data: String::from_utf8_lossy(&data).to_string(),
+            payload: data,
+            payload_encoding: botster_hub_client::OPAQUE_TERMINAL_HISTORY_ENCODING.to_string(),
         },
         HubClientEvent::Scrollback {
             session_id,
@@ -4844,7 +4845,8 @@ fn daemon_event_from_client(event: HubClientEvent) -> DaemonEvent {
             session_id: session_id.0,
             subscription_id: subscription_id.0,
             bytes: data.len(),
-            data: String::from_utf8_lossy(&data).to_string(),
+            payload: data,
+            payload_encoding: botster_hub_client::OPAQUE_TERMINAL_HISTORY_ENCODING.to_string(),
         },
         HubClientEvent::ProcessExit {
             session_id,
@@ -5279,7 +5281,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn daemon_event_projection_decodes_history_data_and_keeps_raw_byte_counts() {
+    fn daemon_event_projection_round_trips_opaque_history_bytes_without_loss() {
         let session_id = SessionId("daemon-projection-session".to_string());
         let subscription_id = SubscriptionId("daemon-projection-subscription".to_string());
         let snapshot = daemon_event_from_client(HubClientEvent::Snapshot {
@@ -5298,7 +5300,8 @@ mod tests {
             DaemonEvent::Snapshot {
                 session_id: "daemon-projection-session".to_string(),
                 subscription_id: "daemon-projection-subscription".to_string(),
-                data: String::from_utf8_lossy(&[b's', b'n', b'a', b'p', 0xff]).to_string(),
+                payload: vec![b's', b'n', b'a', b'p', 0xff],
+                payload_encoding: botster_hub_client::OPAQUE_TERMINAL_HISTORY_ENCODING.to_string(),
                 bytes: 5,
             }
         );
@@ -5307,7 +5310,8 @@ mod tests {
             DaemonEvent::Scrollback {
                 session_id: "daemon-projection-session".to_string(),
                 subscription_id: "daemon-projection-subscription".to_string(),
-                data: "scrollback".to_string(),
+                payload: b"scrollback".to_vec(),
+                payload_encoding: botster_hub_client::OPAQUE_TERMINAL_HISTORY_ENCODING.to_string(),
                 bytes: 10,
             }
         );

@@ -23,10 +23,10 @@ import {
 } from "@trybotster/hub-test-support";
 
 assert.equal(metadata.package_name, "@trybotster/hub-test-support");
-assert.equal(metadata.package_version, "0.1.5");
+assert.equal(metadata.package_version, "0.1.6");
 assert.equal(metadata.protocol, "botster-hub-daemon-v1");
 assert.equal(metadata.protocol_version, 1);
-assert.equal(metadata.conformance_fixture_revision, 12);
+assert.equal(metadata.conformance_fixture_revision, 13);
 assert.deepEqual(metadata.application_primitives, {
   fixture_package_name: "botster.plugin-contract-matrix",
   artifact_path: "fixtures/plugin-contract-matrix",
@@ -106,7 +106,7 @@ assert.equal(
   largeScenario.reassembled_sha256,
 );
 const historyIndex = lateAttachFixture.history_then_live.findIndex(
-  (event) => (event.type === "snapshot" || event.type === "scrollback") && event.data.length > 0,
+  (event) => (event.type === "snapshot" || event.type === "scrollback") && event.payload.length > 0,
 );
 const liveIndex = lateAttachFixture.history_then_live.findIndex(
   (event) => event.type === "terminal_output",
@@ -125,9 +125,25 @@ assert.equal(historyIndex < attachedIndex, true);
 assert.equal(attachedIndex < liveIndex, true);
 for (const event of lateAttachFixture.history_then_live) {
   if (event.type === "snapshot" || event.type === "scrollback") {
-    assert.equal(event.bytes, Buffer.byteLength(event.data));
+    assert.equal(event.bytes, event.payload.length);
+    assert.equal(event.payload_encoding, "opaque-byte-array-v1");
+    assert.equal(Buffer.from(event.payload).toString("utf8").includes("history-before-live"), false);
   }
 }
+assert.equal(lateAttachFixture.read_screen_text.match(/history-before-live/g)?.length, 1);
+assert.equal(lateAttachFixture.no_history_read_screen_text, "");
+let restoredPresentation = lateAttachFixture.read_screen_text;
+const bufferedLive = lateAttachFixture.history_then_live
+  .filter((event) => event.type === "terminal_output")
+  .map((event) => event.data)
+  .join("");
+restoredPresentation += bufferedLive;
+assert.equal(restoredPresentation.includes("\u0000\ufffdGTY"), false);
+assert.equal(
+  restoredPresentation.indexOf("history-before-live") <
+    restoredPresentation.indexOf("live-after-attach"),
+  true,
+);
 const noHistoryAttachingIndex = lateAttachFixture.no_history_then_live.findIndex(
   (event) => event.type === "attach_state" && event.state === "attaching",
 );
