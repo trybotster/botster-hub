@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -9,6 +10,7 @@ import {
   daemonProtocolTypescriptPath,
   firstPartyClientSupportMatrixPath,
   lateAttachHistoryConformanceFixturePath,
+  localWebrtcResponseChunkConformanceFixturePath,
   materializeApplicationPrimitivesFixture,
   materializePluginContractMatrixFixture,
   metadata,
@@ -16,14 +18,15 @@ import {
   readDaemonProtocolTypescript,
   readFirstPartyClientSupportMatrix,
   readLateAttachHistoryConformanceFixture,
+  readLocalWebrtcResponseChunkConformanceFixture,
   verifyPackageAssets,
 } from "@trybotster/hub-test-support";
 
 assert.equal(metadata.package_name, "@trybotster/hub-test-support");
-assert.equal(metadata.package_version, "0.1.4");
+assert.equal(metadata.package_version, "0.1.5");
 assert.equal(metadata.protocol, "botster-hub-daemon-v1");
-assert.equal(Number.isInteger(metadata.protocol_version), true);
-assert.equal(Number.isInteger(metadata.conformance_fixture_revision), true);
+assert.equal(metadata.protocol_version, 1);
+assert.equal(metadata.conformance_fixture_revision, 12);
 assert.deepEqual(metadata.application_primitives, {
   fixture_package_name: "botster.plugin-contract-matrix",
   artifact_path: "fixtures/plugin-contract-matrix",
@@ -54,6 +57,7 @@ assert.match(protocol, /read_screen/);
 assert.match(protocol, /capture_snapshot/);
 assert.match(protocol, /export interface DaemonReadScreen/);
 assert.match(protocol, /export interface DaemonCaptureSnapshot/);
+assert.match(protocol, /export interface DaemonLocalWebrtcResponseChunk/);
 
 assert.equal(
   fileURLToPath(import.meta.resolve("@trybotster/hub-test-support/first-party-client-support-matrix")),
@@ -63,6 +67,10 @@ assert.equal(
   fileURLToPath(import.meta.resolve("@trybotster/hub-test-support/late-attach-history-conformance-fixture")),
   lateAttachHistoryConformanceFixturePath(),
 );
+assert.equal(
+  fileURLToPath(import.meta.resolve("@trybotster/hub-test-support/local-webrtc-response-chunk-conformance-fixture")),
+  localWebrtcResponseChunkConformanceFixturePath(),
+);
 
 const supportMatrix = readFirstPartyClientSupportMatrix();
 assert.equal(supportMatrix.late_attach_history.supported, true);
@@ -70,6 +78,33 @@ assert.equal(supportMatrix.required_features.includes("terminal_readback"), true
 assert.equal(supportMatrix.supported_features.includes("terminal_readback"), true);
 
 const lateAttachFixture = readLateAttachHistoryConformanceFixture();
+const chunkFixture = readLocalWebrtcResponseChunkConformanceFixture();
+assert.equal(chunkFixture.version, 1);
+assert.equal(chunkFixture.maximum_frame_bytes_exclusive, 65536);
+assert.equal(chunkFixture.maximum_response_bytes, 16777216);
+assert.equal(chunkFixture.scenarios.single_chunk.length, 1);
+assert.equal(chunkFixture.scenarios.multiple_chunks.length, 2);
+assert.equal(
+  chunkFixture.scenarios.multiple_chunks.map((chunk) => chunk.payload).join(""),
+  "encrypted-envelope",
+);
+const largeScenario = chunkFixture.scenarios.large_generated;
+assert.equal(largeScenario.generator, "repeat_utf8_pattern");
+assert.equal(largeScenario.total_bytes > 256 * 1024, true);
+const generatedLargePayload = largeScenario.pattern
+  .repeat(Math.ceil(largeScenario.total_bytes / largeScenario.pattern.length))
+  .slice(0, largeScenario.total_bytes);
+const generatedLargeChunks = [];
+for (let offset = 0; offset < generatedLargePayload.length; offset += largeScenario.chunk_payload_bytes) {
+  generatedLargeChunks.push(generatedLargePayload.slice(offset, offset + largeScenario.chunk_payload_bytes));
+}
+const reassembledLargePayload = generatedLargeChunks.join("");
+assert.equal(generatedLargeChunks.length, largeScenario.expected_chunk_count);
+assert.equal(reassembledLargePayload, generatedLargePayload);
+assert.equal(
+  createHash("sha256").update(reassembledLargePayload).digest("hex"),
+  largeScenario.reassembled_sha256,
+);
 const historyIndex = lateAttachFixture.history_then_live.findIndex(
   (event) => (event.type === "snapshot" || event.type === "scrollback") && event.data.length > 0,
 );

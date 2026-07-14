@@ -26,10 +26,10 @@ Downstream `botster-web` drift checks should point
 the hub checkout was not found is not protocol evidence.
 
 Node-based first-party clients can consume the same checked artifact without a
-sibling hub checkout through the package after version 0.1.4 is published:
+sibling hub checkout through the corrected package once version 0.1.5 is published:
 
 ```sh
-npm install --save-dev @trybotster/hub-test-support@0.1.4
+npm install --save-dev @trybotster/hub-test-support@0.1.5
 ```
 
 ```js
@@ -65,9 +65,9 @@ when checked assets are stale. The metadata's protocol version and conformance
 fixture revision are emitted by the Rust `botster-hub-test-support` asset
 generator instead of being maintained independently in JavaScript.
 
-After version 0.1.4 is available from the public npm registry, npm-based client
+After version 0.1.5 is available from the public npm registry, npm-based client
 repos such as botster-web should use the exact dependency spec
-`"@trybotster/hub-test-support": "0.1.4"` in `devDependencies` and let npm write
+`"@trybotster/hub-test-support": "0.1.5"` in `devDependencies` and let npm write
 the corresponding package-lock entry from the public npm registry. The package
 is public, so registry install does not require a scoped `.npmrc` entry or CI
 auth token. After updating the lockfile, run the client smoke that imports the
@@ -402,21 +402,54 @@ that the grant exists, has not expired, has not already been redeemed, has the
 expected secret, and matches the expected origin before creating a WebRTC answer.
 The origin check is defense in depth for same-device launches; the short-lived
 grant secret is the admission boundary.
-Accepted DataChannel messages are JSON serialized `botster_core::AesGcmEnvelope`
-values. The envelope plaintext is the existing daemon `DaemonRequest`, and the
-encrypted response plaintext is `DaemonResponse`; invalid or unauthenticated
-DataChannel frames are not answered with a plaintext fallback.
+Accepted client-to-hub DataChannel messages remain JSON serialized
+`botster_core::AesGcmEnvelope` values whose plaintext is the existing daemon
+`DaemonRequest`. Hub-to-client messages use only
+`DaemonLocalWebrtcResponseChunk`; the former direct `AesGcmEnvelope` response
+frame is intentionally deleted. This is a coordinated breaking upgrade, not a
+negotiated feature or compatibility path.
+
+The hub serializes and AES-GCM encrypts each `DaemonResponse` once, then slices
+the serialized encrypted envelope into ordered chunks. Every chunk carries
+protocol `version`, a hub-minted `message_id`, zero-based `chunk_index`,
+`chunk_count`, declared `total_bytes`, and a `payload` slice. Small responses
+use the identical contract with one chunk. Serialized frames are always below
+64 KiB and the declared encrypted response is capped at 16 MiB. An over-budget
+response is replaced before any of its bytes are sent by one bounded encrypted
+operator-error response.
+
+The ordered channel and one-response-at-a-time handler preserve the existing
+request FIFO; `message_id` correlates all chunks of the current response. The
+sender applies fixed DataChannel watermarks (128 KiB high, 64 KiB low), queues
+at most 16 inbound request payloads consumed while a response drains, and
+represents each excess request with one ordered encrypted operator-error
+response using constant-memory counted queue state. Only contiguous overflow
+runs coalesce, preserving their position relative to later accepted requests
+rather than dropping the peer or losing positional correlation. Send errors,
+disconnects, and a missing low-water event fail closed. A paused sender has one
+non-resetting five-second deadline, after which it closes the channel, cleans
+the peer and its subscription/request state, and emits no completion frame for
+the partial response.
+
+Invalid or unauthenticated request frames are not answered with a plaintext
+fallback. Clients must validate version, identity, contiguous indices, counts,
+declared bytes, frame bounds, and the 16 MiB assembly bound before concatenating
+payloads and decrypting the complete envelope. The checked
+`local-webrtc-response-chunk-conformance-fixture.json` artifact covers the
+single-chunk, multi-chunk, over-budget-error, and deterministic greater-than-256
+KiB reassembly shapes.
 The generated TypeScript artifact mirrors the browser-visible envelope as
 `AesGcmEnvelope` with `nonce`, `ciphertext`, and `version` fields while keeping
 the authoritative core Rust struct out of the `botster-hub-client` dependency
 boundary.
 
-The first hub-side harness uses a Rust WebRTC peer to prove localhost signaling,
+The hub-side harness uses a Rust WebRTC peer to prove localhost signaling,
 ordered/reliable DataChannel establishment, encrypted representative
-status/list/attach/input/resize/drain/session traffic, bounded grants, and no
-persistence of grant secrets. That proves the hub adapter and local signaling
-contract. Real browser `RTCPeerConnection` interop remains a botster-web parity
-follow-up while the HTTP/SSE dogfood bridge stays available.
+status/list/attach/input/resize/drain/session traffic, plus byte-exact
+reassembly of an encrypted response larger than 256 KiB with every frame below
+64 KiB. Browser reassembly lands in the coordinated botster-web ticket; there
+is deliberately no period where the old browser decoder can consume this new
+hub response wire.
 
 The runnable contract is intentionally adjacent to core package `entrypoints`.
 Core `entrypoints` remain the plugin/provider code-load ABI, while
@@ -674,7 +707,9 @@ assert the same event ordering and classification. `AttachState` and
 
 Node clients can consume that exact JSON through
 `readLateAttachHistoryConformanceFixture()` from
-`@trybotster/hub-test-support@0.1.4`. The same package exposes
+`@trybotster/hub-test-support@0.1.5`. Version 0.1.4 / conformance revision 11
+predates the corrected attach-readiness fixture and must not be used as evidence
+for this ordering. The same package exposes
 `readFirstPartyClientSupportMatrix()`. Because the current hub-client helper
 uses one feature list for advertised and required compatibility, the published
 matrix includes `terminal_readback` in both `supported_features` and
@@ -749,10 +784,12 @@ because the daemon framing and request/response protocol are the same; clients
 that depend on renderable history should require the current conformance fixture
 revision during the hello handshake.
 
-Aligning attach readiness with the core contract increments
-`CONFORMANCE_FIXTURE_REVISION` to 11. `PROTOCOL_VERSION` remains unchanged
-because the daemon framing and event shapes are unchanged; the fixture now
-guarantees `attaching -> optional initial state -> attached -> live output`.
+Aligning attach readiness with the core contract alongside the local WebRTC
+chunk fixture increments `CONFORMANCE_FIXTURE_REVISION` to 12.
+`PROTOCOL_VERSION` remains unchanged because the daemon framing and event shapes
+are unchanged; revision 12 guarantees
+`attaching -> optional initial state -> attached -> live output`. Revision 11
+does not identify the corrected readiness ordering.
 
 Adding `worktree_lifecycle` increments `CONFORMANCE_FIXTURE_REVISION`.
 `PROTOCOL_VERSION` remains unchanged because daemon framing and request issuance

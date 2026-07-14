@@ -118,6 +118,14 @@ function metadataJson(originDir) {
       source_artifact_path: origin.late_attach_history_conformance_fixture.source_artifact_path,
       sha256: sha256(join(originDir, origin.late_attach_history_conformance_fixture.artifact_path)),
     },
+    local_webrtc_response_chunk_conformance_fixture: {
+      artifact_path: origin.local_webrtc_response_chunk_conformance_fixture.artifact_path,
+      source_artifact_path:
+        origin.local_webrtc_response_chunk_conformance_fixture.source_artifact_path,
+      sha256: sha256(
+        join(originDir, origin.local_webrtc_response_chunk_conformance_fixture.artifact_path),
+      ),
+    },
     plugin_contract_matrix: {
       package_name: origin.plugin_contract_matrix.package_name,
       artifact_path: origin.plugin_contract_matrix.artifact_path,
@@ -170,6 +178,11 @@ try {
       join(originDir, metadata.late_attach_history_conformance_fixture.artifact_path),
       failures,
     );
+    compareFile(
+      metadata.local_webrtc_response_chunk_conformance_fixture.artifact_path,
+      join(originDir, metadata.local_webrtc_response_chunk_conformance_fixture.artifact_path),
+      failures,
+    );
     const expectedMetadata = stableJson(metadata);
     const actualMetadataPath = join(packageRoot, "metadata.json");
     if (!existsSync(actualMetadataPath)) {
@@ -200,6 +213,10 @@ try {
     copyFileSync(
       join(originDir, metadata.late_attach_history_conformance_fixture.artifact_path),
       join(packageRoot, metadata.late_attach_history_conformance_fixture.artifact_path),
+    );
+    copyFileSync(
+      join(originDir, metadata.local_webrtc_response_chunk_conformance_fixture.artifact_path),
+      join(packageRoot, metadata.local_webrtc_response_chunk_conformance_fixture.artifact_path),
     );
     rmSync(join(packageRoot, "fixtures", "plugin-contract-matrix"), { recursive: true, force: true });
     copyDirectory(

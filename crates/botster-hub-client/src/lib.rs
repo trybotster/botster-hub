@@ -20,7 +20,13 @@ mod typescript;
 
 pub const PROTOCOL: &str = "botster-hub-daemon-v1";
 pub const PROTOCOL_VERSION: u16 = 1;
-pub const CONFORMANCE_FIXTURE_REVISION: u16 = 11;
+pub const CONFORMANCE_FIXTURE_REVISION: u16 = 12;
+/// Version of the local WebRTC daemon-response chunk framing protocol.
+pub const LOCAL_WEBRTC_RESPONSE_CHUNK_VERSION: u16 = 1;
+/// Serialized local WebRTC response frames must remain strictly below this size.
+pub const LOCAL_WEBRTC_MAX_FRAME_BYTES: usize = 64 * 1024;
+/// Maximum serialized encrypted response envelope accepted for reassembly.
+pub const LOCAL_WEBRTC_MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 pub const FEATURE_SESSIONS: &str = "sessions";
 pub const FEATURE_TERMINAL_STREAMING: &str = "terminal_streaming";
 pub const FEATURE_RESIZE: &str = "resize";
@@ -32,6 +38,21 @@ pub const FEATURE_SPAWN_TARGETS: &str = "spawn_targets";
 pub const FEATURE_WORKTREES: &str = "worktrees";
 pub const FEATURE_TERMINAL_READBACK: &str = "terminal_readback";
 const ATTACH_DRAIN_INTERVAL: Duration = Duration::from_millis(25);
+
+/// One frame of an encrypted daemon response sent over the local WebRTC DataChannel.
+///
+/// `payload` is a contiguous UTF-8 slice of the serialized encrypted AES-GCM
+/// envelope. Clients must validate all declared bounds before concatenating the
+/// payloads and decrypt only after the complete envelope has been reassembled.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonLocalWebrtcResponseChunk {
+    pub version: u16,
+    pub message_id: String,
+    pub chunk_index: u32,
+    pub chunk_count: u32,
+    pub total_bytes: u32,
+    pub payload: String,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DaemonEndpoint {
@@ -3777,5 +3798,25 @@ mod tests {
         let error = read_daemon_response(&mut client).expect_err("malformed status should fail");
 
         assert!(matches!(error, DaemonTransportError::Json(_)));
+    }
+
+    #[test]
+    fn local_webrtc_response_chunk_is_serde_stable_and_generated() {
+        let chunk = DaemonLocalWebrtcResponseChunk {
+            version: LOCAL_WEBRTC_RESPONSE_CHUNK_VERSION,
+            message_id: "response-fixture".to_string(),
+            chunk_index: 1,
+            chunk_count: 3,
+            total_bytes: 123_456,
+            payload: "ciphertext-slice".to_string(),
+        };
+        assert_eq!(
+            serde_json::from_value::<DaemonLocalWebrtcResponseChunk>(
+                serde_json::to_value(&chunk).unwrap()
+            )
+            .unwrap(),
+            chunk
+        );
+        assert!(daemon_protocol_typescript().contains("interface DaemonLocalWebrtcResponseChunk"));
     }
 }
