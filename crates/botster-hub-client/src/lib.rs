@@ -3366,7 +3366,7 @@ mod tests {
                 session_id: "session".to_string(),
                 rows: 24,
                 cols: 80,
-                payload_format: Some("plain-opaque-v1".to_string()),
+                payload_format: Some("opaque-snapshot-example-v1".to_string()),
                 payload_bytes: 5,
             }),
             spawn_targets: vec![DaemonSpawnTarget {

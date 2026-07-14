@@ -1696,10 +1696,23 @@ fn late_attach_receives_prior_terminal_history_before_later_live_output() {
             )
         })
         .expect("late subscription should become attached after history");
+    let first_terminal_output_index = events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                HubClientEvent::TerminalOutput {
+                    subscription_id,
+                    ..
+                } if subscription_id == &late_subscription
+            )
+        })
+        .expect("late subscription should receive terminal output");
 
     assert!(
         attaching_index < history_index
             && history_index < attached_index
+            && attached_index < first_terminal_output_index
             && attached_index < live_index,
         "late subscription should observe attaching < history < attached < live, got {events:?}"
     );
