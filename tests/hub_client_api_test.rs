@@ -1487,7 +1487,7 @@ fn drain_events_until(
     );
 }
 
-fn history_data(event: &HubClientEvent) -> Option<(&SubscriptionId, &[u8])> {
+fn history_payload(event: &HubClientEvent) -> Option<(&SubscriptionId, &[u8])> {
     match event {
         HubClientEvent::Snapshot {
             subscription_id,
@@ -1540,7 +1540,7 @@ fn drain_events_for(
 }
 
 #[test]
-fn late_attach_receives_prior_terminal_history_before_later_live_output() {
+fn late_attach_receives_opaque_history_before_later_live_output() {
     let first_api = HubClientApi::local_operator("late-history-first-client");
     let late_api = HubClientApi::local_operator("late-history-late-client");
     let packages = empty_registry();
@@ -1615,9 +1615,10 @@ fn late_attach_receives_prior_terminal_history_before_later_live_output() {
     let HubClientResponseBody::ReadScreen(screen) = readback.body else {
         panic!("read screen should return typed response");
     };
-    assert!(
-        screen.text.contains("before-late"),
-        "readback before late drain should observe prior output, got {:?}",
+    assert_eq!(
+        screen.text.matches("before-late").count(),
+        1,
+        "readback before late drain should contain prior output exactly once, got {:?}",
         screen.text
     );
 
@@ -1657,16 +1658,43 @@ fn late_attach_receives_prior_terminal_history_before_later_live_output() {
             )
         })
         .expect("late subscription should enter attaching state");
-    let history_index = events
+    let history_events = events
         .iter()
-        .rposition(|event| {
-            history_data(event).is_some_and(|(subscription_id, data)| {
-                subscription_id == &late_subscription && !data.is_empty()
+        .enumerate()
+        .filter_map(|(index, event)| {
+            history_payload(event).and_then(|(subscription_id, data)| {
+                (subscription_id == &late_subscription).then_some((index, data))
             })
         })
+        .collect::<Vec<_>>();
+    let history_data = history_events
+        .iter()
+        .flat_map(|(_, data)| data.iter().copied())
+        .collect::<Vec<_>>();
+    assert!(
+        !history_data.is_empty(),
+        "late subscription should receive opaque initial state, got {events:?}"
+    );
+    assert!(
+        std::str::from_utf8(&history_data).is_err(),
+        "late subscription history must remain opaque binary instead of renderable text, got {events:?}"
+    );
+    assert!(
+        !history_data
+            .windows(b"before-late".len())
+            .any(|window| window == b"before-late"),
+        "opaque snapshot bytes must not be treated as the renderable ReadScreen marker"
+    );
+    let history_index = history_events
+        .first()
+        .map(|(index, _)| *index)
         .unwrap_or_else(|| {
-            panic!("late subscription should receive non-empty prior history, got {events:?}")
+            panic!("late subscription should receive prior history, got {events:?}")
         });
+    let last_history_index = history_events
+        .last()
+        .map(|(index, _)| *index)
+        .expect("history event should have a last index");
     let live_index = events
         .iter()
         .position(|event| {
@@ -1711,7 +1739,7 @@ fn late_attach_receives_prior_terminal_history_before_later_live_output() {
 
     assert!(
         attaching_index < history_index
-            && history_index < attached_index
+            && last_history_index < attached_index
             && attached_index < first_terminal_output_index
             && attached_index < live_index,
         "late subscription should observe attaching < history < attached < live, got {events:?}"

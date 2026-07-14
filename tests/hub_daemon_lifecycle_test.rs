@@ -4897,11 +4897,8 @@ fn cli_dev_stack_acceptance_smoke_exercises_first_party_plugins_project_pipeline
             })
             .expect("drain project-pipelines spawned session");
         for event in drain.events {
-            match event {
-                botster_hub::DaemonEvent::TerminalOutput { data, .. }
-                | botster_hub::DaemonEvent::Snapshot { data, .. }
-                | botster_hub::DaemonEvent::Scrollback { data, .. } => observed.push_str(&data),
-                _ => {}
+            if let botster_hub::DaemonEvent::TerminalOutput { data, .. } = event {
+                observed.push_str(&data);
             }
         }
         if observed.contains("project-pipelines-step:acceptance-input") {
@@ -7432,7 +7429,7 @@ fn external_hub_client_many_pty_adversarial_conformance_local() {
 }
 
 #[test]
-fn external_daemon_attach_replays_prior_history_with_renderable_byte_count() {
+fn external_daemon_same_session_reattach_replays_opaque_history_before_live_output() {
     let _guard = daemon_test_lock()
         .lock()
         .expect("serialize real daemon test");
@@ -7445,7 +7442,7 @@ fn external_daemon_attach_replays_prior_history_with_renderable_byte_count() {
     let spawn = connection
         .request(&botster_hub::DaemonRequest::Spawn {
             session_id: "late-history-session".to_string(),
-            command: "printf 'before-late\\n'; while IFS= read -r line; do printf 'after:%s\\n' \"$line\"; done".to_string(),
+            command: "printf 'retained-before-attach\\n'; while IFS= read -r line; do printf 'after:%s\\n' \"$line\"; done".to_string(),
         })
         .expect("spawn late-history session");
     assert_eq!(spawn.kind, botster_hub::DaemonResponseKind::Spawned);
@@ -7477,61 +7474,90 @@ fn external_daemon_attach_replays_prior_history_with_renderable_byte_count() {
                 first_observed.push_str(&data);
             }
         }
-        if first_observed.contains("before-late") {
+        if first_observed.contains("retained-before-attach") {
             break;
         }
         thread::sleep(Duration::from_millis(30));
     }
     assert!(
-        first_observed.contains("before-late"),
+        first_observed.contains("retained-before-attach"),
         "first subscription should observe initial output before late attach, got {first_observed:?}"
     );
 
+    let retained_after_attach = connection
+        .request(&botster_hub::DaemonRequest::SendInput {
+            session_id: "late-history-session".to_string(),
+            data: "retained-after-attach\n".to_string(),
+        })
+        .expect("send second retained marker before socket loss");
+    assert_eq!(
+        retained_after_attach.kind,
+        botster_hub::DaemonResponseKind::Events
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        let drain = connection
+            .request(&botster_hub::DaemonRequest::Drain {
+                session_id: "late-history-session".to_string(),
+            })
+            .expect("drain second retained marker on first subscription");
+        for event in drain.events {
+            if let botster_hub::DaemonEvent::TerminalOutput {
+                subscription_id,
+                data,
+                ..
+            } = event
+                && subscription_id == "late-history-first-subscription"
+            {
+                first_observed.push_str(&data);
+            }
+        }
+        if first_observed.contains("after:retained-after-attach") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(30));
+    }
+    assert!(
+        first_observed.contains("after:retained-after-attach"),
+        "first subscription should observe the second marker before socket loss, got {first_observed:?}"
+    );
+
+    drop(connection);
+    let mut connection =
+        botster_hub::DaemonConnection::connect(&config).expect("reconnect daemon socket");
     let late_attach = connection
         .request(&botster_hub::DaemonRequest::Attach {
             session_id: "late-history-session".to_string(),
-            subscription_id: "late-history-late-subscription".to_string(),
+            subscription_id: "late-history-reattach-subscription".to_string(),
         })
-        .expect("attach late subscription");
+        .expect("reattach same session with a fresh subscription id");
     assert_eq!(late_attach.kind, botster_hub::DaemonResponseKind::Events);
 
     let read_screen = connection
         .request(&botster_hub::DaemonRequest::ReadScreen {
             session_id: "late-history-session".to_string(),
         })
-        .expect("read screen between late attach and first drain");
+        .expect("read retained screen before later live output");
     assert_eq!(
         read_screen.kind,
         botster_hub::DaemonResponseKind::ReadScreen
     );
-    let screen = read_screen.read_screen.expect("read screen response body");
-    assert_eq!(screen.session_id, "late-history-session");
+    let screen_text = read_screen
+        .read_screen
+        .expect("retained screen response body")
+        .text;
+    for marker in ["retained-before-attach", "after:retained-after-attach"] {
+        assert_eq!(
+            screen_text.matches(marker).count(),
+            1,
+            "ReadScreen should contain {marker:?} exactly once, got {screen_text:?}"
+        );
+    }
     assert!(
-        screen.text.contains("before-late"),
-        "daemon read screen should observe prior output before late drain, got {:?}",
-        screen.text
+        screen_text.find("retained-before-attach")
+            < screen_text.find("after:retained-after-attach"),
+        "ReadScreen should preserve retained marker order, got {screen_text:?}"
     );
-
-    let snapshot = connection
-        .request(&botster_hub::DaemonRequest::CaptureSnapshot {
-            session_id: "late-history-session".to_string(),
-        })
-        .expect("capture snapshot through daemon socket");
-    assert_eq!(
-        snapshot.kind,
-        botster_hub::DaemonResponseKind::CaptureSnapshot
-    );
-    let snapshot = snapshot
-        .capture_snapshot
-        .expect("capture snapshot response body");
-    assert_eq!(snapshot.session_id, "late-history-session");
-    assert_eq!(snapshot.rows, 24);
-    assert_eq!(snapshot.cols, 80);
-    assert_eq!(
-        snapshot.payload_format.as_deref(),
-        Some("ghostty-terminal-snapshot-v1")
-    );
-    assert!(snapshot.payload_bytes > 0);
 
     let send = connection
         .request(&botster_hub::DaemonRequest::SendInput {
@@ -7557,7 +7583,7 @@ fn external_daemon_attach_replays_prior_history_with_renderable_byte_count() {
                     subscription_id,
                     data,
                     ..
-                } if subscription_id == "late-history-late-subscription"
+                } if subscription_id == "late-history-reattach-subscription"
                     && data.contains("after:live-after-late")
             )
         });
@@ -7576,38 +7602,62 @@ fn external_daemon_attach_replays_prior_history_with_renderable_byte_count() {
                     subscription_id,
                     state,
                     ..
-                } if subscription_id == "late-history-late-subscription" && state == "attaching"
+                } if subscription_id == "late-history-reattach-subscription" && state == "attaching"
             )
         })
         .expect("late subscription should enter attaching state on daemon socket");
-    let history_index = observed_events
+    let history_events = observed_events
         .iter()
-        .rposition(|event| {
-            matches!(
-                event,
-                botster_hub::DaemonEvent::Snapshot {
-                    subscription_id,
-                    data,
-                    bytes,
-                    ..
-                }
-                | botster_hub::DaemonEvent::Scrollback {
-                    subscription_id,
-                    data,
-                    bytes,
-                    ..
-                } if subscription_id == "late-history-late-subscription"
-                    && !data.is_empty()
-                    && *bytes > 0
-            )
+        .enumerate()
+        .filter_map(|(index, event)| match event {
+            botster_hub::DaemonEvent::Snapshot {
+                subscription_id,
+                payload,
+                payload_encoding,
+                bytes,
+                ..
+            }
+            | botster_hub::DaemonEvent::Scrollback {
+                subscription_id,
+                payload,
+                payload_encoding,
+                bytes,
+                ..
+            } if subscription_id == "late-history-reattach-subscription" => {
+                Some((index, payload, payload_encoding, bytes))
+            }
+            _ => None,
         })
-        .expect(
-            "late subscription should receive non-empty history with a positive raw byte count",
+        .collect::<Vec<_>>();
+    assert!(
+        !history_events.is_empty(),
+        "reattach should receive opaque history"
+    );
+    for (_, payload, payload_encoding, bytes) in &history_events {
+        assert_eq!(
+            payload_encoding.as_str(),
+            botster_hub_client::OPAQUE_TERMINAL_HISTORY_ENCODING
         );
-    // The daemon keeps snapshot payloads opaque. The ReadScreen assertion above
-    // proves the session contains the prior renderable marker; this event-level
-    // predicate proves that authoritative initial state reached the late
-    // subscription without treating payload length as visible-history evidence.
+        assert_eq!(**bytes, payload.len());
+        assert!(
+            !payload.is_empty(),
+            "opaque history payload must not be empty"
+        );
+        assert!(
+            std::str::from_utf8(payload).is_err(),
+            "real Ghostty history should remain binary rather than a lossy UTF-8 projection"
+        );
+    }
+    let history_index = history_events
+        .first()
+        .map(|(index, _, _, _)| *index)
+        .unwrap_or_else(|| {
+            panic!("reattach should receive retained history, got {observed_events:?}")
+        });
+    let last_history_index = history_events
+        .last()
+        .map(|(index, _, _, _)| *index)
+        .expect("reattach history should have a last event");
     let live_index = observed_events
         .iter()
         .position(|event| {
@@ -7617,7 +7667,7 @@ fn external_daemon_attach_replays_prior_history_with_renderable_byte_count() {
                     subscription_id,
                     data,
                     ..
-                } if subscription_id == "late-history-late-subscription"
+                } if subscription_id == "late-history-reattach-subscription"
                     && data.contains("after:live-after-late")
             )
         })
@@ -7631,7 +7681,7 @@ fn external_daemon_attach_replays_prior_history_with_renderable_byte_count() {
                     subscription_id,
                     state,
                     ..
-                } if subscription_id == "late-history-late-subscription" && state == "attached"
+                } if subscription_id == "late-history-reattach-subscription" && state == "attached"
             )
         })
         .expect("late subscription should become attached after history on daemon socket");
@@ -7643,16 +7693,30 @@ fn external_daemon_attach_replays_prior_history_with_renderable_byte_count() {
                 botster_hub::DaemonEvent::TerminalOutput {
                     subscription_id,
                     ..
-                } if subscription_id == "late-history-late-subscription"
+                } if subscription_id == "late-history-reattach-subscription"
             )
         })
         .expect("late subscription should receive terminal output on daemon socket");
     assert!(
         attaching_index < history_index
-            && history_index < attached_index
+            && last_history_index < attached_index
             && attached_index < first_terminal_output_index
             && attached_index < live_index,
-        "late subscription should observe attaching < history < attached < live, got {observed_events:?}"
+        "fresh reattach subscription should observe attaching < history < attached < live, got {observed_events:?}"
+    );
+    assert!(
+        !observed_events.iter().any(|event| {
+            matches!(
+                event,
+                botster_hub::DaemonEvent::TerminalOutput {
+                    subscription_id,
+                    data,
+                    ..
+                } if subscription_id == "late-history-first-subscription"
+                    && data.contains("after:live-after-late")
+            )
+        }),
+        "socket cleanup should detach the old subscription before later live output, got {observed_events:?}"
     );
 
     let no_history_spawn = connection
@@ -7677,12 +7741,15 @@ fn external_daemon_attach_replays_prior_history_with_renderable_byte_count() {
         botster_hub::DaemonResponseKind::Events
     );
 
+    drop(connection);
+    let mut connection =
+        botster_hub::DaemonConnection::connect(&config).expect("reconnect idle daemon socket");
     let late_no_history_attach = connection
         .request(&botster_hub::DaemonRequest::Attach {
             session_id: "no-history-session".to_string(),
-            subscription_id: "no-history-late-subscription".to_string(),
+            subscription_id: "no-history-reattach-subscription".to_string(),
         })
-        .expect("attach late no-history subscription");
+        .expect("reattach idle session with a fresh subscription id");
     assert_eq!(
         late_no_history_attach.kind,
         botster_hub::DaemonResponseKind::Events
@@ -7733,7 +7800,7 @@ fn external_daemon_attach_replays_prior_history_with_renderable_byte_count() {
                     subscription_id,
                     data,
                     ..
-                } if subscription_id == "no-history-late-subscription"
+                } if subscription_id == "no-history-reattach-subscription"
                     && data.contains("after:live-only")
             )
         });
@@ -7750,7 +7817,7 @@ fn external_daemon_attach_replays_prior_history_with_renderable_byte_count() {
                 botster_hub::DaemonEvent::Scrollback {
                     subscription_id,
                     ..
-                } if subscription_id == "no-history-late-subscription"
+                } if subscription_id == "no-history-reattach-subscription"
             )
         }),
         "idle subscription should not receive fabricated scrollback, got {no_history_events:?}"
@@ -7764,7 +7831,7 @@ fn external_daemon_attach_replays_prior_history_with_renderable_byte_count() {
                     subscription_id,
                     state,
                     ..
-                } if subscription_id == "no-history-late-subscription" && state == "attaching"
+                } if subscription_id == "no-history-reattach-subscription" && state == "attaching"
             )
         })
         .expect("late no-history subscription should enter attaching state");
@@ -7777,7 +7844,7 @@ fn external_daemon_attach_replays_prior_history_with_renderable_byte_count() {
                     subscription_id,
                     state,
                     ..
-                } if subscription_id == "no-history-late-subscription" && state == "attached"
+                } if subscription_id == "no-history-reattach-subscription" && state == "attached"
             )
         })
         .expect("late no-history subscription should become attached");
@@ -7790,7 +7857,7 @@ fn external_daemon_attach_replays_prior_history_with_renderable_byte_count() {
                     subscription_id,
                     data,
                     ..
-                } if subscription_id == "no-history-late-subscription"
+                } if subscription_id == "no-history-reattach-subscription"
                     && data.contains("after:live-only")
             )
         })
@@ -7804,7 +7871,7 @@ fn external_daemon_attach_replays_prior_history_with_renderable_byte_count() {
             } | botster_hub::DaemonEvent::Scrollback {
                 subscription_id,
                 ..
-            } if subscription_id == "no-history-late-subscription"
+            } if subscription_id == "no-history-reattach-subscription"
         )
     });
     let no_history_first_terminal_output_index = no_history_events
@@ -7815,7 +7882,7 @@ fn external_daemon_attach_replays_prior_history_with_renderable_byte_count() {
                 botster_hub::DaemonEvent::TerminalOutput {
                     subscription_id,
                     ..
-                } if subscription_id == "no-history-late-subscription"
+                } if subscription_id == "no-history-reattach-subscription"
             )
         })
         .expect("late no-history subscription should receive terminal output");
