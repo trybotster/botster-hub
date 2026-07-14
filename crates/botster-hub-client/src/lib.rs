@@ -20,7 +20,7 @@ mod typescript;
 
 pub const PROTOCOL: &str = "botster-hub-daemon-v1";
 pub const PROTOCOL_VERSION: u16 = 1;
-pub const CONFORMANCE_FIXTURE_REVISION: u16 = 11;
+pub const CONFORMANCE_FIXTURE_REVISION: u16 = 12;
 /// Version of the local WebRTC daemon-response chunk framing protocol.
 pub const LOCAL_WEBRTC_RESPONSE_CHUNK_VERSION: u16 = 1;
 /// Serialized local WebRTC response frames must remain strictly below this size.
@@ -3387,7 +3387,7 @@ mod tests {
                 session_id: "session".to_string(),
                 rows: 24,
                 cols: 80,
-                payload_format: Some("plain-opaque-v1".to_string()),
+                payload_format: Some("opaque-snapshot-example-v1".to_string()),
                 payload_bytes: 5,
             }),
             spawn_targets: vec![DaemonSpawnTarget {

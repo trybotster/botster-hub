@@ -12,6 +12,7 @@ use botster_core::{
     PackageDependency, PackageDependencyKind, PackageFeatureGate, PackageNavigationEntry,
     PackageNavigationTarget, PackageRequirement, PackageSurfaceDescriptor, PackageSurfaceKind,
     PackageSurfaceOperation, RequestId, SessionId, SessionLifecycleState, SubscriptionId,
+    TerminalAttachState,
 };
 use botster_core_daemon::{GuardedWriteDecision, GuardedWriteDeliveryState, ReadinessEvidence};
 use botster_hub::{
@@ -1643,18 +1644,28 @@ fn late_attach_receives_prior_terminal_history_before_later_live_output() {
         b"after:live-after-late",
         &mut logical_clock,
     );
-    let history_index = events
+    let attaching_index = events
         .iter()
         .position(|event| {
+            matches!(
+                event,
+                HubClientEvent::AttachState {
+                    subscription_id,
+                    state: TerminalAttachState::Attaching,
+                    ..
+                } if subscription_id == &late_subscription
+            )
+        })
+        .expect("late subscription should enter attaching state");
+    let history_index = events
+        .iter()
+        .rposition(|event| {
             history_data(event).is_some_and(|(subscription_id, data)| {
-                subscription_id == &late_subscription
-                    && data
-                        .windows(b"before-late".len())
-                        .any(|window| window == b"before-late")
+                subscription_id == &late_subscription && !data.is_empty()
             })
         })
         .unwrap_or_else(|| {
-            panic!("late subscription should receive prior output as history, got {events:?}")
+            panic!("late subscription should receive non-empty prior history, got {events:?}")
         });
     let live_index = events
         .iter()
@@ -1672,10 +1683,38 @@ fn late_attach_receives_prior_terminal_history_before_later_live_output() {
             )
         })
         .expect("late subscription should receive later live output");
+    let attached_index = events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                HubClientEvent::AttachState {
+                    subscription_id,
+                    state: TerminalAttachState::Attached,
+                    ..
+                } if subscription_id == &late_subscription
+            )
+        })
+        .expect("late subscription should become attached after history");
+    let first_terminal_output_index = events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                HubClientEvent::TerminalOutput {
+                    subscription_id,
+                    ..
+                } if subscription_id == &late_subscription
+            )
+        })
+        .expect("late subscription should receive terminal output");
 
     assert!(
-        history_index < live_index,
-        "late history should precede later live output, got {events:?}"
+        attaching_index < history_index
+            && history_index < attached_index
+            && attached_index < first_terminal_output_index
+            && attached_index < live_index,
+        "late subscription should observe attaching < history < attached < live, got {events:?}"
     );
 }
 
@@ -1733,6 +1772,27 @@ fn late_attach_without_prior_output_does_not_fabricate_history() {
         .expect("attach late no-history subscription");
     logical_clock += 1;
 
+    let readback = late_api
+        .handle_request(
+            &mut runtime,
+            &packages,
+            HubClientRequest::ReadScreen {
+                request_id: request_id("no-history-readback-before-input"),
+                session_id: session_id.clone(),
+                now_seconds: logical_clock,
+            },
+        )
+        .expect("read blank screen before sending live output");
+    logical_clock += 1;
+    let HubClientResponseBody::ReadScreen(screen) = readback.body else {
+        panic!("read screen should return typed response");
+    };
+    assert!(
+        screen.text.is_empty(),
+        "idle session should have no prior renderable output, got {:?}",
+        screen.text
+    );
+
     first_api
         .handle_request(
             &mut runtime,
@@ -1759,11 +1819,87 @@ fn late_attach_without_prior_output_does_not_fabricate_history() {
 
     assert!(
         !events.iter().any(|event| {
-            history_data(event).is_some_and(|(subscription_id, data)| {
-                subscription_id == &late_subscription && !data.is_empty()
-            })
+            matches!(
+                event,
+                HubClientEvent::Scrollback {
+                    subscription_id,
+                    ..
+                } if subscription_id == &late_subscription
+            )
         }),
-        "late no-history subscription should not receive fabricated history, got {events:?}"
+        "idle subscription should not receive fabricated scrollback, got {events:?}"
+    );
+    let attaching_index = events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                HubClientEvent::AttachState {
+                    subscription_id,
+                    state: TerminalAttachState::Attaching,
+                    ..
+                } if subscription_id == &late_subscription
+            )
+        })
+        .expect("late no-history subscription should enter attaching state");
+    let attached_index = events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                HubClientEvent::AttachState {
+                    subscription_id,
+                    state: TerminalAttachState::Attached,
+                    ..
+                } if subscription_id == &late_subscription
+            )
+        })
+        .expect("late no-history subscription should become attached");
+    let live_index = events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                HubClientEvent::TerminalOutput {
+                    subscription_id,
+                    data,
+                    ..
+                } if subscription_id == &late_subscription
+                    && data.windows(b"after:live-only".len())
+                        .any(|window| window == b"after:live-only")
+            )
+        })
+        .expect("late no-history subscription should receive live output");
+    let last_initial_state_index = events.iter().rposition(|event| {
+        matches!(
+            event,
+            HubClientEvent::Snapshot {
+                subscription_id,
+                ..
+            } | HubClientEvent::Scrollback {
+                subscription_id,
+                ..
+            } if subscription_id == &late_subscription
+        )
+    });
+    let first_terminal_output_index = events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                HubClientEvent::TerminalOutput {
+                    subscription_id,
+                    ..
+                } if subscription_id == &late_subscription
+            )
+        })
+        .expect("late no-history subscription should receive terminal output");
+    assert!(
+        attaching_index < attached_index
+            && last_initial_state_index.is_none_or(|index| index < attached_index)
+            && attached_index < first_terminal_output_index
+            && attached_index < live_index,
+        "idle subscription should observe attaching < optional initial state < attached < live, got {events:?}"
     );
 }
 
@@ -2214,7 +2350,10 @@ fn read_screen_and_snapshot_return_typed_daemon_readback_responses() {
     assert_eq!(snapshot.session_id, session_id);
     assert_eq!(snapshot.rows, 24);
     assert_eq!(snapshot.cols, 80);
-    assert_eq!(snapshot.payload_format.as_deref(), Some("plain-opaque-v1"));
+    assert_eq!(
+        snapshot.payload_format.as_deref(),
+        Some("ghostty-terminal-snapshot-v1")
+    );
     assert!(snapshot.payload_bytes > 0);
 
     logical_clock += 1;
