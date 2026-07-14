@@ -1,5 +1,5 @@
 {
-  "conformance_fixture_revision": 12,
+  "conformance_fixture_revision": 14,
   "history_then_live": [
     {
       "session_id": "late-attach-history-fixture-session",
@@ -8,8 +8,9 @@
       "type": "attach_state"
     },
     {
-      "bytes": 21,
-      "data": "history-before-live\r\n",
+      "bytes": 6,
+      "payload_base64": "AP9HVFkB",
+      "payload_encoding": "base64",
       "session_id": "late-attach-history-fixture-session",
       "subscription_id": "late-attach-history-fixture-subscription",
       "type": "snapshot"
@@ -33,6 +34,7 @@
       "type": "process_exit"
     }
   ],
+  "no_history_read_screen_text": "",
   "no_history_session_id": "late-attach-no-history-fixture-session",
   "no_history_subscription_id": "late-attach-no-history-fixture-subscription",
   "no_history_then_live": [
@@ -61,6 +63,7 @@
       "type": "process_exit"
     }
   ],
+  "read_screen_text": "history-before-live\r\n",
   "session_id": "late-attach-history-fixture-session",
   "subscription_id": "late-attach-history-fixture-subscription"
 }

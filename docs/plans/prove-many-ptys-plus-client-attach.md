@@ -1,5 +1,12 @@
 # Prove Many PTYs Plus Client Attach
 
+> **Superseded contract:** `docs/client-protocol.md` and conformance revision 14
+> are the current authority. The renderable `Snapshot.data` / `Scrollback.data`
+> semantics below, and commands for the removed
+> `external_daemon_attach_replays_prior_history_with_renderable_byte_count`
+> test, are retained only as historical planning context and must not guide
+> implementation or client adoption.
+
 ## Context loaded
 
 - Pipeline: ticket `ticket_1783552998_811867`, run `run_1783636084_849761`, Plan step `botster_plan`, gate `botster_plan_gate`. All three dependencies are closed. There are no prior artifacts, findings, reviews, questions, or answers to reconcile.

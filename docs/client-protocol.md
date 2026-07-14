@@ -26,10 +26,10 @@ Downstream `botster-web` drift checks should point
 the hub checkout was not found is not protocol evidence.
 
 Node-based first-party clients can consume the same checked artifact without a
-sibling hub checkout through the corrected package once version 0.1.5 is published:
+sibling hub checkout through the corrected package once version 0.1.7 is published:
 
 ```sh
-npm install --save-dev @trybotster/hub-test-support@0.1.5
+npm install --save-dev @trybotster/hub-test-support@0.1.7
 ```
 
 ```js
@@ -65,9 +65,9 @@ when checked assets are stale. The metadata's protocol version and conformance
 fixture revision are emitted by the Rust `botster-hub-test-support` asset
 generator instead of being maintained independently in JavaScript.
 
-After version 0.1.5 is available from the public npm registry, npm-based client
+After version 0.1.7 is available from the public npm registry, npm-based client
 repos such as botster-web should use the exact dependency spec
-`"@trybotster/hub-test-support": "0.1.5"` in `devDependencies` and let npm write
+`"@trybotster/hub-test-support": "0.1.7"` in `devDependencies` and let npm write
 the corresponding package-lock entry from the public npm registry. The package
 is public, so registry install does not require a scoped `.npmrc` entry or CI
 auth token. After updating the lockfile, run the client smoke that imports the
@@ -641,19 +641,15 @@ That helper still connects through the daemon socket, but terminal bytes are
 delivered by the hub-owned client/session actor data plane rather than by a
 private session-worker frame contract.
 
-`DaemonEvent::TerminalOutput`, `DaemonEvent::Snapshot`, and
-`DaemonEvent::Scrollback` expose renderable terminal data as a `data` string.
-The daemon converts raw terminal bytes with the same lossy UTF-8 decoding for
-all three event kinds. `Snapshot` and `Scrollback` also include `bytes`, which is
-the raw byte length before decoding, so clients can preserve existing size/count
-logic without deriving a possibly different decoded string length.
-
-If a client observes older-hub or non-current history evidence with a positive
-byte count but no renderable `data`, it must treat that history as opaque or
-unsupported and continue live-only. It must not synthesize terminal scrollback
-from the byte count. Current `botster-hub-client` `Snapshot` and `Scrollback`
-DTOs require `data`, so byte-only JSON is a compatibility/fallback signal for
-defensive client implementations rather than the current serde shape.
+`DaemonEvent::TerminalOutput.data` is renderable terminal text. In contrast,
+`DaemonEvent::Snapshot.payload_base64` and
+`DaemonEvent::Scrollback.payload_base64` are opaque binary engine state encoded
+as standard padded base64. Their `payload_encoding` is the literal `base64`,
+and `bytes` is the exact decoded payload length. The client DTO rejects invalid
+base64, unknown encodings, and mismatched lengths during deserialization. The
+hub preserves the decoded bytes without UTF-8 conversion.
+Clients must never append opaque payloads to a terminal, attempt backend-specific
+decoding, or infer visible history from byte length or non-emptiness.
 
 The attach/drain ordering contract is that explicit `Attach` enters the
 core-owned SessionIo/ClientWorker subscription path and requests initial
@@ -663,7 +659,8 @@ later live `terminal_output`. `attaching` means the subscription was requested
 but authoritative initial history has not been delivered. `attached` means
 initial snapshot delivery is complete and live output may flow. Initial history
 is therefore delivered before readiness and later live output.
-Clients should render supported restored history payloads first, then append
+Clients that restore visible content request `ReadScreen`, present its text,
+buffering any live terminal output until restoration is installed, then append
 subsequent live output. An idle terminal may produce `attaching`, an optional
 authoritative blank `snapshot`, then `attached`: opaque snapshot bytes can
 encode dimensions, parser state, and backend metadata without representing
@@ -675,8 +672,23 @@ it, although no production core component emits it as of the core revision
 recorded in `Cargo.lock`.
 `stream_attach` writes only
 `TerminalOutput` data into its output writer; clients that need event kind,
-history payloads, history fallback handling, byte-count metadata, or ordering
+opaque history payloads, byte-count metadata, or ordering
 metadata should use `DaemonConnection` with `Attach` and `Drain`.
+
+Each socket attach cycle owns a fresh transport-local `subscription_id`.
+When a persistent daemon socket closes without an explicit `Detach`, the hub
+detaches every subscription owned by that connection. Reconnecting clients
+attach the same running session with a new `subscription_id`; reusing a prior
+subscription ID across socket loss is not supported. The new subscription
+receives the session's opaque initial engine state before `attached`, then only
+later live output. The dropped subscription must not receive that later output.
+`ReadScreen.text` on the same running session is the backend-neutral semantic
+source for retained visible terminal markers.
+
+Attach `Snapshot`/`Scrollback` and `DaemonRequest::CaptureSnapshot` both describe
+backend-opaque state. Their payloads, formats, and byte counts must never be used
+as evidence that visible terminal history exists. Only `ReadScreen.text` and
+later `TerminalOutput.data` are renderable terminal text.
 
 `DaemonRequest::ReadScreen` and `DaemonRequest::CaptureSnapshot` are
 control-plane request/response readback operations for a running session. They
@@ -684,20 +696,21 @@ route through the same production path as other local clients:
 `daemon_transport -> HubClientApi -> HubRuntime -> CoreDaemon`. `ReadScreen`
 returns `DaemonReadScreen { session_id, text }`. `CaptureSnapshot` returns
 `DaemonCaptureSnapshot { session_id, rows, cols, payload_format, payload_bytes }`.
-The hub does not expose the opaque snapshot bytes in this response; terminal
-history and renderable output remain on the attach/drain event stream.
+The hub does not expose the opaque snapshot bytes in this response.
 
 The reusable first-party fixture for this rendering contract lives in
 `botster_hub_test_support::late_attach_history_conformance_scenario`. It returns
 public `botster_hub_client::DaemonEvent` values only:
 
-- `history_then_live` includes `attaching`, non-empty `snapshot` or `scrollback`
-  history with `bytes == data.len()`, `attached`, later `terminal_output`, and
-  process-exit metadata;
+- `read_screen_text` contains the visible restored-history marker;
+- `history_then_live` includes `attaching`, binary-safe `snapshot` or
+  `scrollback` whose decoded base64 length equals `bytes`, `attached`, later
+  `terminal_output`, and process-exit metadata;
 - `no_history_then_live` includes `attaching`, then `attached`, then later live
   terminal output and process-exit metadata without prior renderable output or
-  fabricated scrollback. Production backends may insert an opaque authoritative
-  blank `snapshot` before `attached`.
+  fabricated scrollback, while `no_history_read_screen_text` is empty.
+  Production backends may insert an opaque authoritative blank `snapshot`
+  before `attached`.
 
 Rust downstream tests can consume the typed scenario directly. Browser/TUI
 tests that cannot depend on the Rust crate should mirror the stable JSON from
@@ -707,9 +720,11 @@ assert the same event ordering and classification. `AttachState` and
 
 Node clients can consume that exact JSON through
 `readLateAttachHistoryConformanceFixture()` from
-`@trybotster/hub-test-support@0.1.5`. Version 0.1.4 / conformance revision 11
-predates the corrected attach-readiness fixture and must not be used as evidence
-for this ordering. The same package exposes
+`@trybotster/hub-test-support@0.1.7`. Version 0.1.6 / conformance revision 13
+uses JSON number arrays for opaque history and is superseded because that shape
+unnecessarily expands large Ghostty snapshots on the bounded WebRTC response
+path. Version 0.1.5 / revision 12 still exposes lossy string history. Neither is
+the current binary contract. The same package exposes
 `readFirstPartyClientSupportMatrix()`. Because the current hub-client helper
 uses one feature list for advertised and required compatibility, the published
 matrix includes `terminal_readback` in both `supported_features` and
@@ -734,9 +749,10 @@ separate worktree entity family in this protocol revision.
 
 The fixture is a client conformance contract, not a replacement daemon harness.
 The live runtime path remains covered by
-`external_daemon_attach_replays_prior_history_with_renderable_byte_count`, which
-proves the daemon socket path emits matching public event semantics for restored
-history before later live output and for the no-history case.
+`external_daemon_same_session_reattach_replays_opaque_history_before_live_output`,
+which proves socket-loss cleanup, fresh-subscription reattach, byte-exact opaque
+payload projection and ordering before later live output, `ReadScreen` marker
+fidelity, and the no-history case.
 
 ## Many-PTY client attach proof
 
@@ -750,7 +766,7 @@ polling must observe `exited`. The proof does not attach to quiet sessions or
 use a sleep as its success condition.
 
 After the quiet sessions exit, the same public client connection attaches late
-to the noisy session, drains renderable history, checks `ReadScreen` and
+to the noisy session, drains opaque initial state, checks `ReadScreen` and
 `CaptureSnapshot`, sends labeled input, and observes the later live marker after
 the restored history. Every requested session receives an explicit
 `ShutdownSession` cleanup attempt. Failures use one of the stable labels
@@ -778,11 +794,12 @@ Both commands exercise `botster-hub-client` over the daemon socket, then
 worker-backed `SessionIo`/`ClientWorker` terminal path. The session counts are
 bounded correctness cases, not performance targets or benchmark claims.
 
-The addition of required renderable `data` fields on `snapshot` and `scrollback`
-increments `CONFORMANCE_FIXTURE_REVISION`. `PROTOCOL_VERSION` remains unchanged
-because the daemon framing and request/response protocol are the same; clients
-that depend on renderable history should require the current conformance fixture
-revision during the hello handshake.
+Replacing revision-13 JSON byte arrays with validated `payload_base64`, literal
+`payload_encoding: "base64"`, and decoded `bytes` fields increments
+`CONFORMANCE_FIXTURE_REVISION` to 14. `PROTOCOL_VERSION` remains unchanged
+because daemon framing and request issuance are unchanged. Revision 14 retains
+the separate `read_screen_text` semantic restoration oracle. Revision 13 is
+superseded and revision 12 does not identify any binary-safe history DTO.
 
 Aligning attach readiness with the core contract alongside the local WebRTC
 chunk fixture increments `CONFORMANCE_FIXTURE_REVISION` to 12.

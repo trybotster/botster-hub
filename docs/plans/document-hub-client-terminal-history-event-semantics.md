@@ -1,5 +1,12 @@
 # Document hub-client terminal history event semantics
 
+> **Superseded contract:** `docs/client-protocol.md` and conformance revision 14
+> are the current authority. The renderable `Snapshot.data` / `Scrollback.data`
+> semantics below, and commands for the removed
+> `external_daemon_attach_replays_prior_history_with_renderable_byte_count`
+> test, are retained only as historical planning context and must not guide
+> implementation or client adoption.
+
 ## Context loaded
 
 - Pipeline context: `ticket_1782241198_638252`, run `run_1782241215_310058`, current step `botster_plan`, gate `botster_plan_gate`.
