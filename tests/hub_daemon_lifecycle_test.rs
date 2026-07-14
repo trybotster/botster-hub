@@ -7612,20 +7612,14 @@ fn external_daemon_same_session_reattach_replays_opaque_history_before_live_outp
         .filter_map(|(index, event)| match event {
             botster_hub::DaemonEvent::Snapshot {
                 subscription_id,
-                payload,
-                payload_encoding,
-                bytes,
+                history,
                 ..
             }
             | botster_hub::DaemonEvent::Scrollback {
                 subscription_id,
-                payload,
-                payload_encoding,
-                bytes,
+                history,
                 ..
-            } if subscription_id == "late-history-reattach-subscription" => {
-                Some((index, payload, payload_encoding, bytes))
-            }
+            } if subscription_id == "late-history-reattach-subscription" => Some((index, history)),
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -7633,30 +7627,29 @@ fn external_daemon_same_session_reattach_replays_opaque_history_before_live_outp
         !history_events.is_empty(),
         "reattach should receive opaque history"
     );
-    for (_, payload, payload_encoding, bytes) in &history_events {
+    for (_, history) in &history_events {
+        let payload = history
+            .decoded_bytes()
+            .expect("real daemon opaque history payload decodes");
         assert_eq!(
-            payload_encoding.as_str(),
-            botster_hub_client::OPAQUE_TERMINAL_HISTORY_ENCODING
+            history.payload_encoding,
+            botster_hub_client::DaemonHistoryEncoding::Base64
         );
-        assert_eq!(**bytes, payload.len());
+        assert_eq!(history.bytes, payload.len());
         assert!(
             !payload.is_empty(),
             "opaque history payload must not be empty"
         );
-        assert!(
-            std::str::from_utf8(payload).is_err(),
-            "real Ghostty history should remain binary rather than a lossy UTF-8 projection"
-        );
     }
     let history_index = history_events
         .first()
-        .map(|(index, _, _, _)| *index)
+        .map(|(index, _)| *index)
         .unwrap_or_else(|| {
             panic!("reattach should receive retained history, got {observed_events:?}")
         });
     let last_history_index = history_events
         .last()
-        .map(|(index, _, _, _)| *index)
+        .map(|(index, _)| *index)
         .expect("reattach history should have a last event");
     let live_index = observed_events
         .iter()

@@ -13,6 +13,7 @@ use std::path::PathBuf;
 use std::thread;
 use std::time::Duration;
 
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -20,9 +21,7 @@ mod typescript;
 
 pub const PROTOCOL: &str = "botster-hub-daemon-v1";
 pub const PROTOCOL_VERSION: u16 = 1;
-pub const CONFORMANCE_FIXTURE_REVISION: u16 = 13;
-/// Encoding label for opaque terminal history serialized as a JSON byte array.
-pub const OPAQUE_TERMINAL_HISTORY_ENCODING: &str = "opaque-byte-array-v1";
+pub const CONFORMANCE_FIXTURE_REVISION: u16 = 14;
 /// Version of the local WebRTC daemon-response chunk framing protocol.
 pub const LOCAL_WEBRTC_RESPONSE_CHUNK_VERSION: u16 = 1;
 /// Serialized local WebRTC response frames must remain strictly below this size.
@@ -1705,6 +1704,80 @@ pub enum DaemonDiagnosticKind {
     Backpressure,
 }
 
+/// Binary encoding used by opaque terminal history payloads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DaemonHistoryEncoding {
+    Base64,
+}
+
+/// Validated opaque terminal engine state serialized as flat daemon event fields.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DaemonOpaqueHistoryPayload {
+    pub payload_base64: String,
+    pub payload_encoding: DaemonHistoryEncoding,
+    pub bytes: usize,
+}
+
+#[derive(Deserialize)]
+struct UncheckedDaemonOpaqueHistoryPayload {
+    payload_base64: String,
+    payload_encoding: DaemonHistoryEncoding,
+    bytes: usize,
+}
+
+impl DaemonOpaqueHistoryPayload {
+    #[must_use]
+    pub fn from_bytes(payload: &[u8]) -> Self {
+        Self {
+            payload_base64: base64::engine::general_purpose::STANDARD.encode(payload),
+            payload_encoding: DaemonHistoryEncoding::Base64,
+            bytes: payload.len(),
+        }
+    }
+
+    /// Decode the opaque bytes after validating their declared length.
+    pub fn decoded_bytes(&self) -> Result<Vec<u8>, String> {
+        decode_history_payload(&self.payload_base64, self.bytes)
+    }
+}
+
+impl TryFrom<UncheckedDaemonOpaqueHistoryPayload> for DaemonOpaqueHistoryPayload {
+    type Error = String;
+
+    fn try_from(payload: UncheckedDaemonOpaqueHistoryPayload) -> Result<Self, Self::Error> {
+        decode_history_payload(&payload.payload_base64, payload.bytes)?;
+        Ok(Self {
+            payload_base64: payload.payload_base64,
+            payload_encoding: payload.payload_encoding,
+            bytes: payload.bytes,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for DaemonOpaqueHistoryPayload {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let payload = UncheckedDaemonOpaqueHistoryPayload::deserialize(deserializer)?;
+        Self::try_from(payload).map_err(serde::de::Error::custom)
+    }
+}
+
+fn decode_history_payload(payload_base64: &str, bytes: usize) -> Result<Vec<u8>, String> {
+    let payload = base64::engine::general_purpose::STANDARD
+        .decode(payload_base64)
+        .map_err(|error| format!("invalid opaque history base64: {error}"))?;
+    if payload.len() != bytes {
+        return Err(format!(
+            "opaque history byte length mismatch: declared {bytes}, decoded {}",
+            payload.len()
+        ));
+    }
+    Ok(payload)
+}
+
 /// Events returned by daemon attach and drain requests.
 ///
 /// `Snapshot` and `Scrollback` carry opaque binary engine state for a terminal
@@ -1716,9 +1789,9 @@ pub enum DaemonDiagnosticKind {
 /// let snapshot = botster_hub_client::DaemonEvent::Snapshot {
 ///     session_id: "session".to_string(),
 ///     subscription_id: "subscription".to_string(),
-///     payload: vec![0, 255, 71, 84, 89, 1],
-///     payload_encoding: botster_hub_client::OPAQUE_TERMINAL_HISTORY_ENCODING.to_string(),
-///     bytes: 6,
+///     history: botster_hub_client::DaemonOpaqueHistoryPayload::from_bytes(
+///         &[0, 255, 71, 84, 89, 1],
+///     ),
 /// };
 ///
 /// let live = botster_hub_client::DaemonEvent::TerminalOutput {
@@ -1745,14 +1818,13 @@ pub enum DaemonEvent {
     },
     /// Initial opaque engine state for a subscription.
     ///
-    /// `payload` is binary-safe and must not be rendered as terminal text.
+    /// `history` serializes to validated base64 fields and must not be rendered.
     /// Clients use `ReadScreen` when they need backend-neutral restored text.
     Snapshot {
         session_id: String,
         subscription_id: String,
-        payload: Vec<u8>,
-        payload_encoding: String,
-        bytes: usize,
+        #[serde(flatten)]
+        history: DaemonOpaqueHistoryPayload,
     },
     /// Additional opaque engine state for a subscription.
     ///
@@ -1761,9 +1833,8 @@ pub enum DaemonEvent {
     Scrollback {
         session_id: String,
         subscription_id: String,
-        payload: Vec<u8>,
-        payload_encoding: String,
-        bytes: usize,
+        #[serde(flatten)]
+        history: DaemonOpaqueHistoryPayload,
     },
     ProcessExit {
         session_id: String,
@@ -1961,16 +2032,12 @@ mod tests {
             DaemonEvent::Snapshot {
                 session_id: "session".to_string(),
                 subscription_id: "subscription".to_string(),
-                payload: vec![0, 255, 1],
-                payload_encoding: OPAQUE_TERMINAL_HISTORY_ENCODING.to_string(),
-                bytes: 3,
+                history: DaemonOpaqueHistoryPayload::from_bytes(&[0, 255, 1]),
             },
             DaemonEvent::Scrollback {
                 session_id: "session".to_string(),
                 subscription_id: "subscription".to_string(),
-                payload: vec![255, 0, 2],
-                payload_encoding: OPAQUE_TERMINAL_HISTORY_ENCODING.to_string(),
-                bytes: 3,
+                history: DaemonOpaqueHistoryPayload::from_bytes(&[255, 0, 2]),
             },
         ];
 
@@ -1983,16 +2050,16 @@ mod tests {
                     "type": "snapshot",
                     "session_id": "session",
                     "subscription_id": "subscription",
-                    "payload": [0, 255, 1],
-                    "payload_encoding": "opaque-byte-array-v1",
+                    "payload_base64": "AP8B",
+                    "payload_encoding": "base64",
                     "bytes": 3
                 },
                 {
                     "type": "scrollback",
                     "session_id": "session",
                     "subscription_id": "subscription",
-                    "payload": [255, 0, 2],
-                    "payload_encoding": "opaque-byte-array-v1",
+                    "payload_base64": "/wAC",
+                    "payload_encoding": "base64",
                     "bytes": 3
                 }
             ])
@@ -2004,14 +2071,37 @@ mod tests {
     }
 
     #[test]
+    fn opaque_history_rejects_invalid_base64_and_mismatched_length() {
+        for value in [
+            serde_json::json!({
+                "type": "snapshot",
+                "session_id": "session",
+                "subscription_id": "subscription",
+                "payload_base64": "not base64",
+                "payload_encoding": "base64",
+                "bytes": 3
+            }),
+            serde_json::json!({
+                "type": "snapshot",
+                "session_id": "session",
+                "subscription_id": "subscription",
+                "payload_base64": "AP8B",
+                "payload_encoding": "base64",
+                "bytes": 4
+            }),
+        ] {
+            serde_json::from_value::<DaemonEvent>(value)
+                .expect_err("invalid opaque history metadata must fail deserialization");
+        }
+    }
+
+    #[test]
     fn terminal_writer_ignores_opaque_history_and_preserves_live_output() {
         let events = vec![
             DaemonEvent::Snapshot {
                 session_id: "session".to_string(),
                 subscription_id: "subscription".to_string(),
-                payload: b"must-not-render".to_vec(),
-                payload_encoding: OPAQUE_TERMINAL_HISTORY_ENCODING.to_string(),
-                bytes: 15,
+                history: DaemonOpaqueHistoryPayload::from_bytes(b"must-not-render"),
             },
             DaemonEvent::TerminalOutput {
                 session_id: "session".to_string(),
@@ -2033,16 +2123,16 @@ mod tests {
                 "type": "snapshot",
                 "session_id": "session",
                 "subscription_id": "subscription",
-                "payload": [0, 255, 1],
-                "payload_encoding": "opaque-byte-array-v1",
+                "payload_base64": "AP8B",
+                "payload_encoding": "base64",
                 "bytes": 3
             },
             {
                 "type": "scrollback",
                 "session_id": "session",
                 "subscription_id": "subscription",
-                "payload": [255, 0, 2],
-                "payload_encoding": "opaque-byte-array-v1",
+                "payload_base64": "/wAC",
+                "payload_encoding": "base64",
                 "bytes": 3
             },
             {
@@ -3720,16 +3810,12 @@ mod tests {
             DaemonEvent::Snapshot {
                 session_id: "session".to_string(),
                 subscription_id: "subscription".to_string(),
-                payload: b"snapshot".to_vec(),
-                payload_encoding: OPAQUE_TERMINAL_HISTORY_ENCODING.to_string(),
-                bytes: 8,
+                history: DaemonOpaqueHistoryPayload::from_bytes(b"snapshot"),
             },
             DaemonEvent::Scrollback {
                 session_id: "session".to_string(),
                 subscription_id: "subscription".to_string(),
-                payload: b"scrollback".to_vec(),
-                payload_encoding: OPAQUE_TERMINAL_HISTORY_ENCODING.to_string(),
-                bytes: 10,
+                history: DaemonOpaqueHistoryPayload::from_bytes(b"scrollback"),
             },
             DaemonEvent::ProcessExit {
                 session_id: "session".to_string(),

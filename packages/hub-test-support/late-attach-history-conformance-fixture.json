@@ -1,5 +1,5 @@
 {
-  "conformance_fixture_revision": 13,
+  "conformance_fixture_revision": 14,
   "history_then_live": [
     {
       "session_id": "late-attach-history-fixture-session",
@@ -9,15 +9,8 @@
     },
     {
       "bytes": 6,
-      "payload": [
-        0,
-        255,
-        71,
-        84,
-        89,
-        1
-      ],
-      "payload_encoding": "opaque-byte-array-v1",
+      "payload_base64": "AP9HVFkB",
+      "payload_encoding": "base64",
       "session_id": "late-attach-history-fixture-session",
       "subscription_id": "late-attach-history-fixture-subscription",
       "type": "snapshot"

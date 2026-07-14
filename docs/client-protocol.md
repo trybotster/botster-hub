@@ -26,10 +26,10 @@ Downstream `botster-web` drift checks should point
 the hub checkout was not found is not protocol evidence.
 
 Node-based first-party clients can consume the same checked artifact without a
-sibling hub checkout through the corrected package once version 0.1.6 is published:
+sibling hub checkout through the corrected package once version 0.1.7 is published:
 
 ```sh
-npm install --save-dev @trybotster/hub-test-support@0.1.6
+npm install --save-dev @trybotster/hub-test-support@0.1.7
 ```
 
 ```js
@@ -65,9 +65,9 @@ when checked assets are stale. The metadata's protocol version and conformance
 fixture revision are emitted by the Rust `botster-hub-test-support` asset
 generator instead of being maintained independently in JavaScript.
 
-After version 0.1.6 is available from the public npm registry, npm-based client
+After version 0.1.7 is available from the public npm registry, npm-based client
 repos such as botster-web should use the exact dependency spec
-`"@trybotster/hub-test-support": "0.1.6"` in `devDependencies` and let npm write
+`"@trybotster/hub-test-support": "0.1.7"` in `devDependencies` and let npm write
 the corresponding package-lock entry from the public npm registry. The package
 is public, so registry install does not require a scoped `.npmrc` entry or CI
 auth token. After updating the lockfile, run the client smoke that imports the
@@ -642,10 +642,12 @@ delivered by the hub-owned client/session actor data plane rather than by a
 private session-worker frame contract.
 
 `DaemonEvent::TerminalOutput.data` is renderable terminal text. In contrast,
-`DaemonEvent::Snapshot.payload` and `DaemonEvent::Scrollback.payload` are opaque
-binary engine state represented as JSON byte arrays. Their
-`payload_encoding` is `opaque-byte-array-v1`, and `bytes` equals the exact
-payload length. The hub preserves these bytes without UTF-8 conversion.
+`DaemonEvent::Snapshot.payload_base64` and
+`DaemonEvent::Scrollback.payload_base64` are opaque binary engine state encoded
+as standard padded base64. Their `payload_encoding` is the literal `base64`,
+and `bytes` is the exact decoded payload length. The client DTO rejects invalid
+base64, unknown encodings, and mismatched lengths during deserialization. The
+hub preserves the decoded bytes without UTF-8 conversion.
 Clients must never append opaque payloads to a terminal, attempt backend-specific
 decoding, or infer visible history from byte length or non-emptiness.
 
@@ -702,7 +704,7 @@ public `botster_hub_client::DaemonEvent` values only:
 
 - `read_screen_text` contains the visible restored-history marker;
 - `history_then_live` includes `attaching`, binary-safe `snapshot` or
-  `scrollback` with `bytes == payload.length`, `attached`, later
+  `scrollback` whose decoded base64 length equals `bytes`, `attached`, later
   `terminal_output`, and process-exit metadata;
 - `no_history_then_live` includes `attaching`, then `attached`, then later live
   terminal output and process-exit metadata without prior renderable output or
@@ -718,9 +720,11 @@ assert the same event ordering and classification. `AttachState` and
 
 Node clients can consume that exact JSON through
 `readLateAttachHistoryConformanceFixture()` from
-`@trybotster/hub-test-support@0.1.6`. Version 0.1.5 / conformance revision 12
-still exposes lossy string history and must not be used for the corrected binary
-contract. The same package exposes
+`@trybotster/hub-test-support@0.1.7`. Version 0.1.6 / conformance revision 13
+uses JSON number arrays for opaque history and is superseded because that shape
+unnecessarily expands large Ghostty snapshots on the bounded WebRTC response
+path. Version 0.1.5 / revision 12 still exposes lossy string history. Neither is
+the current binary contract. The same package exposes
 `readFirstPartyClientSupportMatrix()`. Because the current hub-client helper
 uses one feature list for advertised and required compatibility, the published
 matrix includes `terminal_readback` in both `supported_features` and
@@ -790,12 +794,12 @@ Both commands exercise `botster-hub-client` over the daemon socket, then
 worker-backed `SessionIo`/`ClientWorker` terminal path. The session counts are
 bounded correctness cases, not performance targets or benchmark claims.
 
-Replacing lossy `Snapshot.data` and `Scrollback.data` strings with binary-safe
-`payload`, `payload_encoding`, and `bytes` fields increments
-`CONFORMANCE_FIXTURE_REVISION` to 13. `PROTOCOL_VERSION` remains unchanged
-because daemon framing and request issuance are unchanged. Revision 13 also
-publishes `read_screen_text` separately from opaque initial state. Revision 12
-does not identify the corrected history DTO.
+Replacing revision-13 JSON byte arrays with validated `payload_base64`, literal
+`payload_encoding: "base64"`, and decoded `bytes` fields increments
+`CONFORMANCE_FIXTURE_REVISION` to 14. `PROTOCOL_VERSION` remains unchanged
+because daemon framing and request issuance are unchanged. Revision 14 retains
+the separate `read_screen_text` semantic restoration oracle. Revision 13 is
+superseded and revision 12 does not identify any binary-safe history DTO.
 
 Aligning attach readiness with the core contract alongside the local WebRTC
 chunk fixture increments `CONFORMANCE_FIXTURE_REVISION` to 12.

@@ -16,7 +16,7 @@ node packages/hub-test-support/scripts/sync-assets.mjs
 ## Usage
 
 ```sh
-npm install --save-dev @trybotster/hub-test-support@0.1.6
+npm install --save-dev @trybotster/hub-test-support@0.1.7
 ```
 
 ```js
@@ -57,25 +57,26 @@ Use this exact package spec in npm-based client repos:
 ```json
 {
   "devDependencies": {
-    "@trybotster/hub-test-support": "0.1.6"
+    "@trybotster/hub-test-support": "0.1.7"
   }
 }
 ```
 
-After `@trybotster/hub-test-support@0.1.6` is published to the public npm
+After `@trybotster/hub-test-support@0.1.7` is published to the public npm
 registry, no scoped `.npmrc` entry or CI auth token is required for install.
 
 The support matrix is generated from the Rust compatibility descriptors. In
-0.1.6, `terminal_readback` appears in both `supported_features` and
+0.1.7, `terminal_readback` appears in both `supported_features` and
 `required_features`; downstream compatibility checks must implement it rather
 than treating it as optional. The late-attach fixture is generated from the
 Rust serde scenario and preserves `attaching -> optional initial state ->
 attached -> live` ordering. An opaque authoritative snapshot may represent a
 blank terminal; clients must not infer visible history from payload byte length.
 Only `read_screen_text` is renderable restored content; `snapshot` and
-`scrollback` payload byte arrays must never be appended as terminal text.
-Version 0.1.5 / conformance revision 12 still exposes lossy string history and
-must not be used as binary-history contract authority.
+`scrollback` base64 payloads must never be appended as terminal text. Version
+0.1.6 / conformance revision 13 uses superseded JSON number arrays, while
+version 0.1.5 / revision 12 exposes lossy string history. Neither is current
+binary-history contract authority.
 
 Botster web and TUI renderers should consume
 `metadata.application_primitives.surface_id` (`contract.app`) and render

@@ -1,5 +1,12 @@
 # Adopt Core Same-Session Reattach History Fix
 
+> **Superseded contract:** Human decision `question_1784062434_125317`
+> replaced this adoption-only plan with the cold-turkey binary-safe history DTO
+> correction. `docs/client-protocol.md` and conformance revision 14 are the
+> current authority. The renderable `Snapshot.data` / `Scrollback.data`
+> requirements below are retained only as historical planning context and must
+> not guide implementation or client adoption.
+
 ## Context loaded
 
 - Pipeline ticket: `ticket_1784052230_812754`, **Hub: adopt Core same-session reattach history fix and prove daemon path**.
