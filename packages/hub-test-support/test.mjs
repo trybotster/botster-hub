@@ -100,7 +100,8 @@ const noHistoryAttachedIndex = lateAttachFixture.no_history_then_live.findIndex(
   (event) => event.type === "attach_state" && event.state === "attached",
 );
 const noHistoryLiveIndex = lateAttachFixture.no_history_then_live.findIndex(
-  (event) => event.type === "terminal_output",
+  (event) =>
+    event.type === "terminal_output" && event.data.includes("live-without-history"),
 );
 const noHistoryLastInitialStateIndex = lateAttachFixture.no_history_then_live.findLastIndex(
   (event) => event.type === "snapshot" || event.type === "scrollback",

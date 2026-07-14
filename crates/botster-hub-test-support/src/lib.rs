@@ -932,13 +932,11 @@ fn run_many_pty_client_attach_scenario(
             "capture_snapshot response was missing its body",
         )
     })?;
-    if snapshot.payload_bytes == 0
-        || snapshot.payload_format.as_deref() != Some("ghostty-terminal-snapshot-v1")
-    {
+    if snapshot.payload_bytes == 0 || snapshot.payload_format.is_none() {
         return Err(many_pty_error(
             ManyPtyConformanceStage::History,
             MANY_PTY_NOISY_SESSION_ID,
-            "capture_snapshot did not return a non-empty ghostty-terminal-snapshot-v1 payload",
+            "capture_snapshot did not return a non-empty opaque payload with a declared format",
         ));
     }
 

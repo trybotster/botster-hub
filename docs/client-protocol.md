@@ -26,7 +26,7 @@ Downstream `botster-web` drift checks should point
 the hub checkout was not found is not protocol evidence.
 
 Node-based first-party clients can consume the same checked artifact without a
-sibling hub checkout through the package:
+sibling hub checkout through the package after version 0.1.4 is published:
 
 ```sh
 npm install --save-dev @trybotster/hub-test-support@0.1.4
@@ -65,7 +65,8 @@ when checked assets are stale. The metadata's protocol version and conformance
 fixture revision are emitted by the Rust `botster-hub-test-support` asset
 generator instead of being maintained independently in JavaScript.
 
-For npm-based client repos such as botster-web, use the exact dependency spec
+After version 0.1.4 is available from the public npm registry, npm-based client
+repos such as botster-web should use the exact dependency spec
 `"@trybotster/hub-test-support": "0.1.4"` in `devDependencies` and let npm write
 the corresponding package-lock entry from the public npm registry. The package
 is public, so registry install does not require a scoped `.npmrc` entry or CI

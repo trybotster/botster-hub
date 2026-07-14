@@ -7501,6 +7501,10 @@ fn external_daemon_attach_replays_prior_history_with_renderable_byte_count() {
         .expect(
             "late subscription should receive non-empty history with a positive raw byte count",
         );
+    // The daemon keeps snapshot payloads opaque. The ReadScreen assertion above
+    // proves the session contains the prior renderable marker; this event-level
+    // predicate proves that authoritative initial state reached the late
+    // subscription without treating payload length as visible-history evidence.
     let live_index = observed_events
         .iter()
         .position(|event| {
@@ -7528,9 +7532,22 @@ fn external_daemon_attach_replays_prior_history_with_renderable_byte_count() {
             )
         })
         .expect("late subscription should become attached after history on daemon socket");
+    let first_terminal_output_index = observed_events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                botster_hub::DaemonEvent::TerminalOutput {
+                    subscription_id,
+                    ..
+                } if subscription_id == "late-history-late-subscription"
+            )
+        })
+        .expect("late subscription should receive terminal output on daemon socket");
     assert!(
         attaching_index < history_index
             && history_index < attached_index
+            && attached_index < first_terminal_output_index
             && attached_index < live_index,
         "late subscription should observe attaching < history < attached < live, got {observed_events:?}"
     );
