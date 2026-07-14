@@ -32,7 +32,8 @@ const LATE_ATTACH_HISTORY_SESSION_ID: &str = "late-attach-history-fixture-sessio
 const LATE_ATTACH_HISTORY_SUBSCRIPTION_ID: &str = "late-attach-history-fixture-subscription";
 const LATE_ATTACH_NO_HISTORY_SESSION_ID: &str = "late-attach-no-history-fixture-session";
 const LATE_ATTACH_NO_HISTORY_SUBSCRIPTION_ID: &str = "late-attach-no-history-fixture-subscription";
-const LATE_ATTACH_HISTORY_DATA: &str = "history-before-live\r\n";
+const LATE_ATTACH_HISTORY_PAYLOAD: &[u8] = &[0x00, 0xff, 0x47, 0x54, 0x59, 0x01];
+const LATE_ATTACH_HISTORY_SCREEN_TEXT: &str = "history-before-live\r\n";
 const LATE_ATTACH_LIVE_DATA: &str = "live-after-attach\r\n";
 const LATE_ATTACH_NO_HISTORY_LIVE_DATA: &str = "live-without-history\r\n";
 const PROJECT_PIPELINES_PACKAGE: &str = "project-pipelines";
@@ -131,7 +132,7 @@ pub struct LateAttachHistorySupport {
     pub runtime_regression: String,
 }
 
-/// Public client-shaped scenario for late terminal attach history rendering.
+/// Public client-shaped scenario for late terminal attach state and screen restoration.
 ///
 /// The events use [`botster_hub_client::DaemonEvent`] values only, so
 /// downstream web/TUI tests can either consume this struct in Rust test code or
@@ -143,6 +144,8 @@ pub struct LateAttachHistoryConformanceScenario {
     pub subscription_id: String,
     pub no_history_session_id: String,
     pub no_history_subscription_id: String,
+    pub read_screen_text: String,
+    pub no_history_read_screen_text: String,
     pub history_then_live: Vec<DaemonEvent>,
     pub no_history_then_live: Vec<DaemonEvent>,
 }
@@ -342,7 +345,7 @@ pub fn first_party_client_support_matrix() -> FirstPartyClientSupportMatrix {
                 .to_string(),
             event_type: "botster_hub_client::DaemonEvent".to_string(),
             runtime_regression:
-                "external_daemon_attach_replays_prior_history_with_renderable_byte_count"
+                "external_daemon_same_session_reattach_replays_opaque_history_before_live_output"
                     .to_string(),
         },
         known_limitations: vec![
@@ -363,12 +366,14 @@ pub fn late_attach_history_conformance_scenario() -> LateAttachHistoryConformanc
         subscription_id: LATE_ATTACH_HISTORY_SUBSCRIPTION_ID.to_string(),
         no_history_session_id: LATE_ATTACH_NO_HISTORY_SESSION_ID.to_string(),
         no_history_subscription_id: LATE_ATTACH_NO_HISTORY_SUBSCRIPTION_ID.to_string(),
+        read_screen_text: LATE_ATTACH_HISTORY_SCREEN_TEXT.to_string(),
+        no_history_read_screen_text: String::new(),
         history_then_live: late_attach_history_events(),
         no_history_then_live: late_attach_no_history_events(),
     }
 }
 
-/// Return the positive late-attach sequence: metadata, restored history, live bytes, exit.
+/// Return the positive late-attach sequence: opaque engine state, live bytes, exit.
 #[must_use]
 pub fn late_attach_history_events() -> Vec<DaemonEvent> {
     vec![
@@ -380,8 +385,9 @@ pub fn late_attach_history_events() -> Vec<DaemonEvent> {
         DaemonEvent::Snapshot {
             session_id: LATE_ATTACH_HISTORY_SESSION_ID.to_string(),
             subscription_id: LATE_ATTACH_HISTORY_SUBSCRIPTION_ID.to_string(),
-            data: LATE_ATTACH_HISTORY_DATA.to_string(),
-            bytes: LATE_ATTACH_HISTORY_DATA.len(),
+            history: botster_hub_client::DaemonOpaqueHistoryPayload::from_bytes(
+                LATE_ATTACH_HISTORY_PAYLOAD,
+            ),
         },
         DaemonEvent::AttachState {
             session_id: LATE_ATTACH_HISTORY_SESSION_ID.to_string(),
@@ -1061,14 +1067,14 @@ fn run_many_pty_client_attach_scenario(
         .rposition(|event| match event {
             DaemonEvent::Snapshot {
                 subscription_id,
-                bytes,
+                history,
                 ..
             }
             | DaemonEvent::Scrollback {
                 subscription_id,
-                bytes,
+                history,
                 ..
-            } if subscription_id == MANY_PTY_SUBSCRIPTION_ID => *bytes > 0,
+            } if subscription_id == MANY_PTY_SUBSCRIPTION_ID => history.bytes > 0,
             _ => false,
         })
         .ok_or_else(|| {
@@ -4173,7 +4179,7 @@ mod tests {
                     "fixture_path": "botster_hub_test_support::late_attach_history_conformance_scenario",
                     "json_helper": "botster_hub_test_support::late_attach_history_conformance_fixture_json",
                     "event_type": "botster_hub_client::DaemonEvent",
-                    "runtime_regression": "external_daemon_attach_replays_prior_history_with_renderable_byte_count",
+                    "runtime_regression": "external_daemon_same_session_reattach_replays_opaque_history_before_live_output",
                 },
                 "known_limitations": [
                     "The matrix is a test/docs contract, not a daemon runtime endpoint.",
@@ -4220,11 +4226,12 @@ mod tests {
             .position(|event| {
                 matches!(
                     event,
-                    DaemonEvent::Snapshot { data, .. } | DaemonEvent::Scrollback { data, .. }
-                        if data.contains("history-before-live")
+                    DaemonEvent::Snapshot { history, .. }
+                        | DaemonEvent::Scrollback { history, .. }
+                        if history.bytes > 0
                 )
             })
-            .expect("fixture includes restored history");
+            .expect("fixture includes opaque initial state");
         let live_index = scenario
             .history_then_live
             .iter()
@@ -4250,6 +4257,14 @@ mod tests {
                 && attached_index < live_index,
             "fixture must preserve attaching < history < attached < live"
         );
+        assert_eq!(
+            scenario
+                .read_screen_text
+                .matches("history-before-live")
+                .count(),
+            1,
+            "ReadScreen fixture text is the semantic restored-history oracle"
+        );
     }
 
     #[test]
@@ -4263,6 +4278,7 @@ mod tests {
                 .any(|event| { matches!(event, DaemonEvent::Scrollback { .. }) }),
             "idle fixture must not fabricate scrollback"
         );
+        assert!(scenario.no_history_read_screen_text.is_empty());
         assert!(
             scenario.no_history_then_live.iter().any(|event| {
                 matches!(
@@ -4276,7 +4292,7 @@ mod tests {
     }
 
     #[test]
-    fn late_attach_history_fixture_byte_counts_match_renderable_data() {
+    fn late_attach_history_fixture_preserves_opaque_payload_bytes() {
         let scenario = late_attach_history_conformance_scenario();
 
         for event in scenario
@@ -4285,10 +4301,14 @@ mod tests {
             .chain(scenario.no_history_then_live.iter())
         {
             match event {
-                DaemonEvent::Snapshot { data, bytes, .. }
-                | DaemonEvent::Scrollback { data, bytes, .. } => {
-                    assert_eq!(*bytes, data.len());
-                    assert!(!data.is_empty());
+                DaemonEvent::Snapshot { history, .. } | DaemonEvent::Scrollback { history, .. } => {
+                    let payload = history.decoded_bytes().expect("fixture payload decodes");
+                    assert_eq!(history.bytes, payload.len());
+                    assert_eq!(
+                        history.payload_encoding,
+                        botster_hub_client::DaemonHistoryEncoding::Base64
+                    );
+                    assert!(!payload.is_empty());
                 }
                 _ => {}
             }
@@ -4346,6 +4366,8 @@ mod tests {
                 "subscription_id": LATE_ATTACH_HISTORY_SUBSCRIPTION_ID,
                 "no_history_session_id": LATE_ATTACH_NO_HISTORY_SESSION_ID,
                 "no_history_subscription_id": LATE_ATTACH_NO_HISTORY_SUBSCRIPTION_ID,
+                "read_screen_text": LATE_ATTACH_HISTORY_SCREEN_TEXT,
+                "no_history_read_screen_text": "",
                 "history_then_live": [
                     {
                         "type": "attach_state",
@@ -4357,8 +4379,9 @@ mod tests {
                         "type": "snapshot",
                         "session_id": LATE_ATTACH_HISTORY_SESSION_ID,
                         "subscription_id": LATE_ATTACH_HISTORY_SUBSCRIPTION_ID,
-                        "data": LATE_ATTACH_HISTORY_DATA,
-                        "bytes": LATE_ATTACH_HISTORY_DATA.len(),
+                        "payload_base64": "AP9HVFkB",
+                        "payload_encoding": "base64",
+                        "bytes": LATE_ATTACH_HISTORY_PAYLOAD.len(),
                     },
                     {
                         "type": "attach_state",

@@ -1,7 +1,7 @@
 {
   "protocol": "botster-hub-daemon-v1",
   "protocol_version": 1,
-  "conformance_fixture_revision": 12,
+  "conformance_fixture_revision": 14,
   "required_features": [
     "sessions",
     "terminal_streaming",
@@ -85,7 +85,7 @@
     "fixture_path": "botster_hub_test_support::late_attach_history_conformance_scenario",
     "json_helper": "botster_hub_test_support::late_attach_history_conformance_fixture_json",
     "event_type": "botster_hub_client::DaemonEvent",
-    "runtime_regression": "external_daemon_attach_replays_prior_history_with_renderable_byte_count"
+    "runtime_regression": "external_daemon_same_session_reattach_replays_opaque_history_before_live_output"
   },
   "known_limitations": [
     "The matrix is a test/docs contract, not a daemon runtime endpoint.",

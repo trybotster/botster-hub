@@ -710,8 +710,8 @@ export type DaemonDiagnosticKind =
 export type DaemonEvent =
   | { type: "session_lifecycle"; session_id: string; state: string }
   | { type: "terminal_output"; session_id: string; subscription_id: string; data: string }
-  | { type: "snapshot"; session_id: string; subscription_id: string; data: string; bytes: number }
-  | { type: "scrollback"; session_id: string; subscription_id: string; data: string; bytes: number }
+  | { type: "snapshot"; session_id: string; subscription_id: string; payload_base64: string; payload_encoding: "base64"; bytes: number }
+  | { type: "scrollback"; session_id: string; subscription_id: string; payload_base64: string; payload_encoding: "base64"; bytes: number }
   | { type: "process_exit"; session_id: string; subscription_id: string; code: number | null }
   | { type: "attach_state"; session_id: string; subscription_id: string; state: string }
   | { type: "runtime_observation"; kind: string }
