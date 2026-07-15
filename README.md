@@ -483,8 +483,7 @@ The dev-stack acceptance smoke is the test path, not the daily launcher:
 
 ```sh
 ./test.sh --test hub_daemon_lifecycle_test \
-  cli_dev_stack_acceptance_smoke_exercises_first_party_plugins_project_pipelines_session_templates_reload_and_shutdown \
-  -- --test-threads=1
+  cli_dev_stack_acceptance_smoke_exercises_first_party_plugins_project_pipelines_session_templates_reload_and_shutdown
 ```
 
 The first-party plugin dogfood smoke composes the generic plugin contract matrix
@@ -493,8 +492,7 @@ data dir:
 
 ```sh
 ./test.sh --test hub_daemon_lifecycle_test \
-  cli_dev_stack_first_party_plugin_dogfood_smoke_runs_contract_matrix_then_real_packages \
-  -- --test-threads=1
+  cli_dev_stack_first_party_plugin_dogfood_smoke_runs_contract_matrix_then_real_packages
 ```
 
 The CLI commands below exercise the daemon-backed workflow across separate

@@ -43,7 +43,10 @@ use webrtc::runtime::{
 const SMOKE_MARKER: &str = "botster-hub-smoke-ok";
 const SMOKE_TIMEOUT: Duration = Duration::from_secs(5);
 const DEV_STACK_DAEMON_METADATA_FILE: &str = ".botster-hub-dev-stack-daemon.json";
+const DEV_STACK_DAEMON_READINESS_BUDGET: Duration = Duration::from_secs(30);
 const TEST_INCOMPATIBLE_DAEMON_ENV: &str = "BOTSTER_HUB_TEST_INCOMPATIBLE_DAEMON";
+const TEST_DEV_STACK_READINESS_BUDGET_MS_ENV: &str =
+    "BOTSTER_HUB_TEST_DEV_STACK_READINESS_BUDGET_MS";
 
 fn main() {
     match env::args().nth(1).as_deref() {
@@ -1296,7 +1299,9 @@ fn spawn_dev_stack_daemon(
         return Err(error);
     }
 
-    if let Err(error) = wait_for_dev_stack_ready(config, &mut child) {
+    if let Err(error) =
+        wait_for_dev_stack_ready(config, &mut child, dev_stack_daemon_readiness_budget())
+    {
         let _ = remove_dev_stack_daemon_metadata(&options.data_directory);
         return Err(error);
     }
@@ -1306,19 +1311,57 @@ fn spawn_dev_stack_daemon(
 fn wait_for_dev_stack_ready(
     config: &botster_hub::HubConfig,
     child: &mut Child,
+    readiness_budget: Duration,
 ) -> Result<(), DevStackError> {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let started_at = Instant::now();
+    let deadline = started_at + readiness_budget;
+    let mut last_probe = "status probe not attempted".to_string();
     while Instant::now() < deadline {
         if let Some(status) = child.try_wait().map_err(DevStackError::PollDaemon)? {
-            return Err(DevStackError::DaemonExited(status.to_string()));
+            return Err(DevStackError::DaemonExited {
+                status: status.to_string(),
+                elapsed: started_at.elapsed(),
+                readiness_budget,
+                last_probe,
+            });
         }
-        if daemon_transport_request(config, DaemonRequest::Status).is_ok() {
-            return Ok(());
+        match daemon_transport_request(config, DaemonRequest::Status) {
+            Ok(_) => return Ok(()),
+            Err(error) => last_probe = error.to_string(),
         }
         thread::sleep(Duration::from_millis(50));
     }
 
-    Err(DevStackError::ReadinessTimeout)
+    let child_pid = child.id();
+    let child_status = terminate_owned_dev_stack_child(child)?;
+    Err(DevStackError::ReadinessTimeout {
+        elapsed: started_at.elapsed(),
+        readiness_budget,
+        last_probe,
+        child_pid,
+        child_status,
+    })
+}
+
+fn dev_stack_daemon_readiness_budget() -> Duration {
+    if env::var("BOTSTER_ENV").as_deref() == Ok("test")
+        && let Some(milliseconds) = env::var_os(TEST_DEV_STACK_READINESS_BUDGET_MS_ENV)
+            .and_then(|value| value.to_str().and_then(|value| value.parse::<u64>().ok()))
+    {
+        return Duration::from_millis(milliseconds);
+    }
+    DEV_STACK_DAEMON_READINESS_BUDGET
+}
+
+fn terminate_owned_dev_stack_child(child: &mut Child) -> Result<String, DevStackError> {
+    if let Some(status) = child.try_wait().map_err(DevStackError::PollDaemon)? {
+        return Ok(status.to_string());
+    }
+    child.kill().map_err(DevStackError::TerminateDaemon)?;
+    child
+        .wait()
+        .map(|status| status.to_string())
+        .map_err(DevStackError::TerminateDaemon)
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -5017,7 +5060,13 @@ enum DevStackError {
         source: io::Error,
     },
     PollDaemon(io::Error),
-    ReadinessTimeout,
+    ReadinessTimeout {
+        elapsed: Duration,
+        readiness_budget: Duration,
+        last_probe: String,
+        child_pid: u32,
+        child_status: String,
+    },
     MissingLocalSocket,
     WriteDaemonMetadata {
         path: PathBuf,
@@ -5055,7 +5104,12 @@ enum DevStackError {
     Operator(Box<OperatorError>),
     Dogfood(Box<DogfoodError>),
     IncompatibleDaemon(String),
-    DaemonExited(String),
+    DaemonExited {
+        status: String,
+        elapsed: Duration,
+        readiness_budget: Duration,
+        last_probe: String,
+    },
 }
 
 #[derive(Debug)]
@@ -5282,10 +5336,16 @@ impl fmt::Display for DevStackError {
                 )
             }
             Self::PollDaemon(error) => write!(formatter, "poll dev-stack daemon: {error}"),
-            Self::ReadinessTimeout => {
+            Self::ReadinessTimeout {
+                elapsed,
+                readiness_budget,
+                last_probe,
+                child_pid,
+                child_status,
+            } => {
                 write!(
                     formatter,
-                    "timed out waiting for dev-stack daemon readiness"
+                    "timed out waiting for dev-stack daemon readiness after {elapsed:?} (budget {readiness_budget:?}); last status probe: {last_probe}; terminated owned child_pid={child_pid} child_status={child_status}"
                 )
             }
             Self::MissingLocalSocket => write!(formatter, "local socket transport is disabled"),
@@ -5357,8 +5417,16 @@ impl fmt::Display for DevStackError {
                 formatter,
                 "running daemon is incompatible or stale: {message}; `botster-hub down` may fail against this daemon because shutdown uses the same protocol handshake. Stop the running botster-hub process directly, remove the stale local socket for this data dir if one remains, then retry `botster-hub up --data-dir <path>`"
             ),
-            Self::DaemonExited(status) => {
-                write!(formatter, "dev-stack daemon exited with {status}")
+            Self::DaemonExited {
+                status,
+                elapsed,
+                readiness_budget,
+                last_probe,
+            } => {
+                write!(
+                    formatter,
+                    "dev-stack daemon exited with {status} after {elapsed:?} (readiness budget {readiness_budget:?}); last status probe: {last_probe}"
+                )
             }
         }
     }
