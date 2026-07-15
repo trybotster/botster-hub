@@ -2,8 +2,9 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -44,6 +45,8 @@ use support::{
 
 static REAL_DAEMON_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 const CLI_DAEMON_READINESS_BUDGET: Duration = Duration::from_secs(30);
+const STALLED_ATTACH_MIN_BUFFERED_STDOUT_BYTES: usize = 8 * 1024;
+const STALLED_ATTACH_STABLE_SAMPLES: usize = 5;
 
 fn unique_test_dir(name: &str) -> PathBuf {
     let nanos = SystemTime::now()
@@ -2532,6 +2535,90 @@ fn run_command_with_timeout(mut command: Command, timeout: Duration) -> Output {
         "command timed out after {timeout:?}: stdout={} stderr={}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn wait_for_buffered_child_stdout(
+    child: &mut Child,
+    minimum_bytes: usize,
+    stable_samples_required: usize,
+    timeout: Duration,
+) -> Result<usize, String> {
+    let started_at = std::time::Instant::now();
+    let deadline = started_at + timeout;
+    let mut previous_bytes = None;
+    let mut stable_samples = 0;
+    let mut last_available_bytes = 0;
+
+    while std::time::Instant::now() < deadline {
+        if let Some(status) = child.try_wait().expect("poll buffered stdout child") {
+            let (stdout, stderr) = collect_child_output(child);
+            return Err(format!(
+                "child exited with {status} before stdout backpressure after {:?}: available_bytes={last_available_bytes} stdout={stdout:?} stderr={stderr:?}",
+                started_at.elapsed()
+            ));
+        }
+
+        let stdout = child.stdout.as_ref().expect("buffered stdout child pipe");
+        last_available_bytes = pipe_bytes_available(stdout)
+            .map_err(|error| format!("inspect buffered child stdout: {error}"))?;
+        if last_available_bytes >= minimum_bytes {
+            if previous_bytes == Some(last_available_bytes) {
+                stable_samples += 1;
+            } else {
+                stable_samples = 0;
+            }
+            if stable_samples >= stable_samples_required {
+                return Ok(last_available_bytes);
+            }
+        } else {
+            stable_samples = 0;
+        }
+        previous_bytes = Some(last_available_bytes);
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    let child_status = terminate_and_reap_child(child);
+    let (stdout, stderr) = collect_child_output(child);
+    Err(format!(
+        "stdout did not reach stable backpressure within {timeout:?}: minimum_bytes={minimum_bytes} stable_samples_required={stable_samples_required} last_available_bytes={last_available_bytes} child_status={child_status} stdout={stdout:?} stderr={stderr:?}"
+    ))
+}
+
+fn pipe_bytes_available(pipe: &impl AsRawFd) -> io::Result<usize> {
+    let mut available: libc::c_int = 0;
+    let result = unsafe { libc::ioctl(pipe.as_raw_fd(), libc::FIONREAD, &mut available) };
+    if result == -1 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(available.max(0) as usize)
+    }
+}
+
+#[test]
+fn buffered_child_stdout_wait_observes_backpressure_condition() {
+    let mut child = Command::new("sh")
+        .arg("-c")
+        .arg("exec yes buffered-output")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn buffered stdout fixture");
+
+    let buffered_bytes = wait_for_buffered_child_stdout(
+        &mut child,
+        STALLED_ATTACH_MIN_BUFFERED_STDOUT_BYTES,
+        STALLED_ATTACH_STABLE_SAMPLES,
+        Duration::from_secs(5),
+    )
+    .expect("observe child stdout backpressure");
+
+    terminate_and_reap_child(&mut child);
+    let _ = collect_child_output(&mut child);
+    assert!(
+        buffered_bytes >= STALLED_ATTACH_MIN_BUFFERED_STDOUT_BYTES,
+        "stdout backpressure should retain at least {} bytes, got {buffered_bytes}",
+        STALLED_ATTACH_MIN_BUFFERED_STDOUT_BYTES
     );
 }
 
@@ -8198,7 +8285,7 @@ fn stalled_attach_stdout_does_not_block_other_daemon_commands() {
         .arg(
             "i=0; while [ \"$i\" -lt 50000 ]; do printf 'flood-line-%05d\\n' \"$i\"; i=$((i + 1)); done; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done",
         );
-    let spawn = run_command_with_timeout(spawn_command, Duration::from_secs(3));
+    let spawn = run_command_with_timeout(spawn_command, CLI_DAEMON_READINESS_BUDGET);
     assert!(
         spawn.status.success(),
         "spawn failed: {}",
@@ -8215,7 +8302,18 @@ fn stalled_attach_stdout_does_not_block_other_daemon_commands() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn stalled attach");
-    thread::sleep(Duration::from_millis(500));
+    let buffered_attach_stdout = wait_for_buffered_child_stdout(
+        &mut attach_child,
+        STALLED_ATTACH_MIN_BUFFERED_STDOUT_BYTES,
+        STALLED_ATTACH_STABLE_SAMPLES,
+        CLI_DAEMON_READINESS_BUDGET,
+    )
+    .unwrap_or_else(|error| panic!("stalled attach did not reach stdout backpressure: {error}"));
+    assert!(
+        buffered_attach_stdout >= STALLED_ATTACH_MIN_BUFFERED_STDOUT_BYTES,
+        "stalled attach should retain at least {} unread stdout bytes, got {buffered_attach_stdout}",
+        STALLED_ATTACH_MIN_BUFFERED_STDOUT_BYTES
+    );
     assert!(
         attach_child
             .try_wait()
@@ -8230,7 +8328,7 @@ fn stalled_attach_stdout_does_not_block_other_daemon_commands() {
         .arg("list")
         .arg("--data-dir")
         .arg(&data_dir);
-    let list = run_command_with_timeout(list_command, Duration::from_secs(2));
+    let list = run_command_with_timeout(list_command, CLI_DAEMON_READINESS_BUDGET);
     assert!(
         list.status.success(),
         "list failed while attach stdout was blocked: {}",
@@ -8246,7 +8344,7 @@ fn stalled_attach_stdout_does_not_block_other_daemon_commands() {
         .arg("slow-consumer")
         .arg("--")
         .arg("still-responsive\r");
-    let send = run_command_with_timeout(send_command, Duration::from_secs(2));
+    let send = run_command_with_timeout(send_command, CLI_DAEMON_READINESS_BUDGET);
     assert!(
         send.status.success(),
         "send-input failed while attach stdout was blocked: {}",
@@ -8262,7 +8360,7 @@ fn stalled_attach_stdout_does_not_block_other_daemon_commands() {
         .arg("slow-consumer")
         .arg("32")
         .arg("120");
-    let resize = run_command_with_timeout(resize_command, Duration::from_secs(2));
+    let resize = run_command_with_timeout(resize_command, CLI_DAEMON_READINESS_BUDGET);
     assert!(
         resize.status.success(),
         "resize failed while attach stdout was blocked: {}",
@@ -8274,7 +8372,7 @@ fn stalled_attach_stdout_does_not_block_other_daemon_commands() {
         .arg("shutdown")
         .arg("--data-dir")
         .arg(&data_dir);
-    let shutdown = run_command_with_timeout(shutdown_command, Duration::from_secs(2));
+    let shutdown = run_command_with_timeout(shutdown_command, CLI_DAEMON_READINESS_BUDGET);
     assert!(
         shutdown.status.success(),
         "shutdown failed while attach stdout was blocked: {}",
