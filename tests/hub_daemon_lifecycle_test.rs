@@ -43,6 +43,7 @@ use support::{
 };
 
 static REAL_DAEMON_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+const CLI_DAEMON_READINESS_BUDGET: Duration = Duration::from_secs(30);
 
 fn unique_test_dir(name: &str) -> PathBuf {
     let nanos = SystemTime::now()
@@ -2202,18 +2203,25 @@ fn start_cli_daemon_with_session_worker(data_dir: &Path, session_worker_bin: &Pa
 }
 
 fn wait_for_status(data_dir: &Path, child: &mut Child) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    wait_for_status_with_budget(data_dir, child, CLI_DAEMON_READINESS_BUDGET)
+        .unwrap_or_else(|error| panic!("{error}"));
+}
+
+fn wait_for_status_with_budget(
+    data_dir: &Path,
+    child: &mut Child,
+    readiness_budget: Duration,
+) -> Result<(), String> {
+    let started_at = std::time::Instant::now();
+    let deadline = started_at + readiness_budget;
+    let mut last_status = "status probe not attempted".to_string();
     while std::time::Instant::now() < deadline {
         if let Some(status) = child.try_wait().expect("check daemon child") {
-            let mut stdout = String::new();
-            let mut stderr = String::new();
-            if let Some(mut pipe) = child.stdout.take() {
-                let _ = pipe.read_to_string(&mut stdout);
-            }
-            if let Some(mut pipe) = child.stderr.take() {
-                let _ = pipe.read_to_string(&mut stderr);
-            }
-            panic!("daemon exited before ready with {status}: stdout={stdout:?} stderr={stderr:?}");
+            let (stdout, stderr) = collect_child_output(child);
+            return Err(format!(
+                "daemon exited before ready with {status} after {:?} (readiness budget {readiness_budget:?}); last status output={last_status:?}; stdout={stdout:?} stderr={stderr:?}",
+                started_at.elapsed()
+            ));
         }
         let output = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
             .arg("status")
@@ -2221,12 +2229,86 @@ fn wait_for_status(data_dir: &Path, child: &mut Child) {
             .arg(data_dir)
             .output()
             .expect("run botster-hub status");
+        last_status = command_output_text(&output);
         if output.status.success() {
-            return;
+            return Ok(());
         }
         thread::sleep(Duration::from_millis(50));
     }
-    panic!("daemon did not become ready");
+
+    let child_status = terminate_and_reap_child(child);
+    let (stdout, stderr) = collect_child_output(child);
+    Err(format!(
+        "daemon did not become ready after {:?} (readiness budget {readiness_budget:?}); last status output={last_status:?}; child_status={child_status}; stdout={stdout:?} stderr={stderr:?}",
+        started_at.elapsed()
+    ))
+}
+
+fn terminate_and_reap_child(child: &mut Child) -> String {
+    if let Some(status) = child.try_wait().expect("check daemon child before cleanup") {
+        return status.to_string();
+    }
+    child
+        .kill()
+        .expect("kill daemon child after readiness failure");
+    child
+        .wait()
+        .expect("reap daemon child after readiness failure")
+        .to_string()
+}
+
+fn collect_child_output(child: &mut Child) -> (String, String) {
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    if let Some(mut pipe) = child.stdout.take() {
+        let _ = pipe.read_to_string(&mut stdout);
+    }
+    if let Some(mut pipe) = child.stderr.take() {
+        let _ = pipe.read_to_string(&mut stderr);
+    }
+    (stdout, stderr)
+}
+
+#[test]
+fn wait_for_status_timeout_reports_diagnostics_and_reaps_owned_child() {
+    let data_dir = unique_test_dir("wait-for-status-timeout");
+    let mut child = Command::new("sh")
+        .arg("-c")
+        .arg(
+            "printf 'daemon stdout marker\\n'; printf 'daemon stderr marker\\n' >&2; exec sleep 60",
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn never-ready daemon fixture");
+
+    let error = wait_for_status_with_budget(&data_dir, &mut child, Duration::from_millis(100))
+        .expect_err("never-ready child should time out");
+
+    assert!(error.contains("readiness budget 100ms"), "{error}");
+    assert!(error.contains("last status output="), "{error}");
+    assert!(error.contains("daemon stdout marker"), "{error}");
+    assert!(error.contains("daemon stderr marker"), "{error}");
+    assert!(error.contains("child_status="), "{error}");
+    assert!(
+        child
+            .try_wait()
+            .expect("confirm child was reaped")
+            .is_some(),
+        "owned child should be reaped after readiness timeout"
+    );
+
+    let status = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("status")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .output()
+        .expect("probe after readiness timeout");
+    assert!(
+        !status.status.success(),
+        "timed-out fixture must not answer status: {}",
+        command_output_text(&status)
+    );
 }
 
 fn shutdown_cli_daemon(data_dir: &Path, child: Child) -> Output {
@@ -4595,6 +4677,71 @@ fn cli_smoke_reports_missing_first_party_prerequisites() {
     let text = command_output_text(&output);
     assert!(text.contains("smoke=local_runtime"));
     assert!(text.contains("missing_prerequisite=project-pipelines"));
+}
+
+#[test]
+fn dev_stack_readiness_timeout_reports_last_probe_and_reaps_owned_daemon() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_test_dir("dev-stack-readiness-timeout");
+    ensure_session_worker_binary();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("dev-stack")
+        .arg("bootstrap")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("--session-worker-bin")
+        .arg(session_worker_binary_path())
+        .env("BOTSTER_HUB_TEST_INCOMPATIBLE_DAEMON", "1")
+        .env("BOTSTER_HUB_TEST_DEV_STACK_READINESS_BUDGET_MS", "150")
+        .output()
+        .expect("run dev-stack bootstrap against never-ready daemon fixture");
+
+    assert!(
+        !output.status.success(),
+        "never-ready dev-stack bootstrap unexpectedly succeeded"
+    );
+    let text = command_output_text(&output);
+    assert!(text.contains("budget 150ms"), "{text}");
+    assert!(text.contains("last status probe:"), "{text}");
+    assert!(
+        text.contains("incompatible") || text.contains("compatibility"),
+        "{text}"
+    );
+    assert!(text.contains("terminated owned child_pid="), "{text}");
+    assert!(text.contains("child_status="), "{text}");
+
+    let child_pid = text
+        .split("child_pid=")
+        .nth(1)
+        .and_then(|tail| tail.split_whitespace().next())
+        .and_then(|value| value.parse::<u32>().ok())
+        .expect("read terminated child pid from readiness diagnostics");
+    let process = Command::new("ps")
+        .arg("-p")
+        .arg(child_pid.to_string())
+        .output()
+        .expect("inspect timed-out dev-stack child");
+    assert!(
+        !process.status.success(),
+        "timed-out dev-stack child {child_pid} must be reaped"
+    );
+    assert!(
+        !data_dir.join(".botster-hub-dev-stack-daemon.json").exists(),
+        "timed-out dev-stack metadata should be removed"
+    );
+
+    let status = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("status")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .output()
+        .expect("probe dev-stack daemon after readiness timeout");
+    assert!(
+        !status.status.success(),
+        "timed-out dev-stack daemon must not answer status: {}",
+        command_output_text(&status)
+    );
 }
 
 #[test]
