@@ -16,10 +16,17 @@ use botster_hub::{
     SessionDefaults, TransportBindings,
 };
 
+mod support;
+use support::{recovering_mutex_guard, wait_for_cli_daemon_shutdown};
+
 static MCP_DAEMON_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 fn mcp_daemon_test_lock() -> &'static Mutex<()> {
     MCP_DAEMON_TEST_LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn mcp_daemon_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    recovering_mutex_guard(mcp_daemon_test_lock())
 }
 
 fn unique_test_dir(name: &str) -> PathBuf {
@@ -98,18 +105,7 @@ fn shutdown_cli_daemon(data_dir: &Path, child: Child) -> Output {
         .arg(data_dir)
         .output()
         .expect("run botster-hub shutdown");
-    assert!(
-        shutdown.status.success(),
-        "shutdown failed: {}",
-        String::from_utf8_lossy(&shutdown.stderr)
-    );
-    let output = child.wait_with_output().expect("wait for daemon child");
-    assert!(
-        output.status.success(),
-        "daemon failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    output
+    wait_for_cli_daemon_shutdown(&shutdown, child)
 }
 
 fn enable_project_pipelines_package(data_dir: &Path) {
@@ -255,7 +251,7 @@ fn enable_synthetic_package_by_name(data_dir: &Path) {
 
 #[test]
 fn mcp_serve_supports_initialize_list_and_native_status_over_stdio() {
-    let _guard = mcp_daemon_test_lock().lock().expect("lock MCP daemon test");
+    let _guard = mcp_daemon_test_guard();
     let data_dir = unique_test_dir("status-round-trip");
     let _ = fs::remove_dir_all(&data_dir);
     let daemon = start_cli_daemon(&data_dir);
@@ -323,7 +319,7 @@ fn mcp_serve_supports_initialize_list_and_native_status_over_stdio() {
 
 #[test]
 fn mcp_serve_lists_and_calls_loaded_lua_plugin_tool_through_daemon_runtime() {
-    let _guard = mcp_daemon_test_lock().lock().expect("lock MCP daemon test");
+    let _guard = mcp_daemon_test_guard();
     let data_dir = unique_test_dir("lua-plugin-tool");
     let _ = fs::remove_dir_all(&data_dir);
     let daemon = start_cli_daemon(&data_dir);
@@ -385,7 +381,7 @@ fn mcp_serve_lists_and_calls_loaded_lua_plugin_tool_through_daemon_runtime() {
 
 #[test]
 fn mcp_native_coordination_tools_route_messages_through_daemon_envelopes() {
-    let _guard = mcp_daemon_test_lock().lock().expect("lock MCP daemon test");
+    let _guard = mcp_daemon_test_guard();
     let data_dir = unique_test_dir("coordination-round-trip");
     let _ = fs::remove_dir_all(&data_dir);
     let daemon = start_cli_daemon(&data_dir);
@@ -617,7 +613,7 @@ fn mcp_native_coordination_tools_route_messages_through_daemon_envelopes() {
 
 #[test]
 fn mcp_routed_envelopes_are_not_restart_durable_today() {
-    let _guard = mcp_daemon_test_lock().lock().expect("lock MCP daemon test");
+    let _guard = mcp_daemon_test_guard();
     let data_dir = unique_test_dir("coordination-restart-loss");
     let _ = fs::remove_dir_all(&data_dir);
     let daemon = start_cli_daemon(&data_dir);
@@ -681,7 +677,7 @@ fn mcp_routed_envelopes_are_not_restart_durable_today() {
 
 #[test]
 fn mcp_serve_returns_structured_tool_error_when_daemon_is_unavailable() {
-    let _guard = mcp_daemon_test_lock().lock().expect("lock MCP daemon test");
+    let _guard = mcp_daemon_test_guard();
     let data_dir = unique_test_dir("daemon-unavailable");
     let _ = fs::remove_dir_all(&data_dir);
 
@@ -715,7 +711,7 @@ fn mcp_serve_returns_structured_tool_error_when_daemon_is_unavailable() {
 
 #[test]
 fn mcp_serve_lists_calls_and_reloads_project_pipelines_plugin_tools() {
-    let _guard = mcp_daemon_test_lock().lock().expect("lock MCP daemon test");
+    let _guard = mcp_daemon_test_guard();
     let data_dir = unique_test_dir("project-pipelines-plugin");
     let _ = fs::remove_dir_all(&data_dir);
     let daemon = start_cli_daemon(&data_dir);
