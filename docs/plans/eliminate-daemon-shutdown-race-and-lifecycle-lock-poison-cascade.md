@@ -13,7 +13,7 @@
 
 ## Scope
 
-1. Make `IsolatedHub::shutdown_inner` wait for and classify the owned daemon process even when the shutdown CLI exits nonzero because its connection closed at the shutdown boundary.
+1. Make `IsolatedHub::shutdown_inner` wait for and classify the owned daemon process when the shutdown CLI succeeds or exits nonzero with the exact `client disconnected` shutdown-boundary signature.
 2. Treat the shutdown CLI's exact `client disconnected` outcome as successful cleanup only when the owned daemon process itself exits successfully. Continue returning `ShutdownFailed` for other shutdown-command failures and `DaemonExited` for unsuccessful daemon exits.
 3. Add deterministic test-support coverage for the shutdown result matrix so the race-tolerant branch is exercised without depending on a timing flake: disconnect plus clean daemon exit succeeds, an unrelated shutdown-command failure remains an error, and a failed daemon process remains an error.
 4. Centralize acquisition of `REAL_DAEMON_TEST_LOCK` in a poison-recovering test helper and route every real-daemon lifecycle test through it. Recover the guard with the standard `PoisonError::into_inner` behavior so one root panic remains visible without releasing serialization or cascading into unrelated failures.
@@ -42,6 +42,7 @@
 - Assumption: the accepted stderr match should stay narrow to the production CLI's current shutdown prefix plus `client disconnected`, preferably after trimming trailing whitespace. If implementation discovers structured status or a typed error is available without changing production APIs, it may use that equivalent evidence, but must not broaden accepted failures.
 - Assumption: the existing `ShutdownFailed` and `DaemonExited` variants are sufficient; no public error variant or compatibility layer is needed.
 - Assumption: a small private lock-acquisition helper is preferable to repeating poison recovery at every test because it makes the invariant reviewable while retaining `std::sync::Mutex` and the existing process-wide lock.
+- Determined: the owned daemon is not assumed to exit after an arbitrary shutdown-command failure. A non-disconnect CLI failure must return `ShutdownFailed` immediately without taking the child, preserving ownership for the existing `Drop` kill-and-wait fallback. Only CLI success or the exact disconnect signature justifies blocking on the expected daemon exit.
 - Unknown until implementation: the cleanest deterministic unit-test setup may use a private result-classification seam or controlled child processes inside the crate's existing Unix-only tests. It must prove the behavioral matrix, not merely a string predicate.
 - Worktree/target assumption: all work remains in the pipeline-provided ticket worktree for target `tgt_7e208a0c76a44980a83b63af976b1f22`; no ambient checkout or second repository is involved.
 
@@ -54,16 +55,17 @@
 
 ## Implementation sequence
 
-1. Refactor isolated-hub cleanup so it records the shutdown command result, always takes and waits for the owned child once a shutdown command was launched, then classifies the combined command/process outcome. Preserve error detail and ensure `self.child` is cleared exactly once.
-2. Add deterministic crate-local tests for accepted disconnect-after-clean-exit and rejected non-disconnect/failed-child outcomes. Show the accepting regression test fails with the tolerance removed or otherwise capture an equivalent controlled negative proof.
+1. Refactor isolated-hub cleanup so it first classifies the shutdown command. On CLI success or the exact disconnect signature, take and wait for the owned child, accepting only a successful daemon exit and returning `DaemonExited` for a nonzero exit. On every other CLI failure, return `ShutdownFailed` immediately without taking the child so `Drop` retains its current kill-and-wait guarantee. Preserve error detail and clear `self.child` exactly once only on paths that take it.
+2. Add deterministic crate-local tests for accepted disconnect-after-clean-exit, disconnect-plus-failed-child, and unrelated shutdown-command failure. The unrelated-failure case must use a controlled still-running child and prove the call returns `ShutdownFailed` before a bounded deadline while leaving the child owned for Drop cleanup. Show the accepting regression test fails with the tolerance removed or otherwise capture an equivalent controlled negative proof.
 3. Add one private lifecycle-test guard function that locks `REAL_DAEMON_TEST_LOCK` and recovers a poisoned guard with `into_inner()`. Replace every direct real-daemon lock acquisition, including the two one-line variants, with that helper.
 4. Run focused test-support, originating cleanup, reconnect, entire daemon lifecycle, and full workspace checks at the repository's supported default concurrency. Use `--test-threads=1` only to isolate the first root failure if a run goes red.
 
 ## Risks
 
 - **False-success cleanup:** accepting any nonzero shutdown command could hide a missing daemon, incompatible protocol, or genuine operator failure. Mitigation: accept only the exact disconnect signature and only alongside a successful owned-child exit.
-- **Error-priority ambiguity:** both the shutdown command and daemon process can fail. Mitigation: preserve the daemon's nonzero exit as `DaemonExited`, because it proves cleanup did not complete successfully; retain command stderr for the clean-child/non-disconnect `ShutdownFailed` case.
-- **Child ownership regression:** taking the child too early or twice could prevent `Drop` from killing/waiting after an actual wait error. Mitigation: keep `Option<Child>` ownership transitions explicit and add failure-path coverage where practical.
+- **Error-priority ambiguity:** the disconnect race and daemon process can both report failure. Mitigation: after CLI success or exact disconnect, a nonzero daemon exit remains `DaemonExited`; unrelated CLI failures remain immediate `ShutdownFailed` without waiting for or reclassifying the live child.
+- **Unbounded cleanup wait:** waiting after a non-disconnect CLI failure can hang forever when the daemon remains alive. Mitigation: classify the command before taking the child; only CLI success or the exact disconnect shutdown-boundary signature enters `wait_with_output`, and a bounded live-child regression proves every other failure returns promptly.
+- **Child ownership regression:** taking the child too early or twice could prevent `Drop` from killing/waiting after an unrelated command failure or actual wait error. Mitigation: keep `Option<Child>` ownership transitions explicit, leave the child in `self.child` on non-disconnect command failures, and test that Drop still owns cleanup.
 - **Incomplete poison fix:** leaving one `.lock().expect(...)` site preserves a cascade path. Mitigation: scan the file for direct `daemon_test_lock`/`REAL_DAEMON_TEST_LOCK` acquisitions after the mechanical change.
 - **Serialization accidentally removed:** poison resistance must not permit real daemons to run concurrently. Mitigation: return and hold the same mutex guard for each complete test body; only the poisoned-state handling changes.
 - **Diagnostic command becomes a waiver:** a green `--test-threads=1` run would not prove the supported suite. Mitigation: require the lifecycle file and full `./test.sh` at default Cargo concurrency; isolate and report the first non-`PoisonError` failure if either fails.
@@ -73,7 +75,8 @@
 
 - Test-support behavior:
   - `./test.sh -p botster-hub-test-support` passes, including deterministic proof that shutdown-command `client disconnected` plus clean owned-daemon exit is accepted.
-  - The same test surface proves an unrelated shutdown CLI failure still returns `IsolatedHubError::ShutdownFailed` and a nonzero daemon exit still returns `IsolatedHubError::DaemonExited`.
+  - The same test surface proves `client disconnected` plus a nonzero daemon exit returns `IsolatedHubError::DaemonExited`.
+  - A deterministic bounded case uses an unrelated shutdown CLI failure with a still-running controlled child and proves `shutdown_inner` returns `IsolatedHubError::ShutdownFailed` before the deadline, leaves the child owned, and allows Drop to kill/wait it. This case must fail if implementation waits unconditionally after every shutdown-command failure.
   - Controlled negative evidence shows the disconnect/clean-exit regression fails when the new tolerance is removed or bypassed.
 - Originating production-path harness:
   - `./test.sh --test hub_daemon_lifecycle_test external_hub_test_support_drives_isolated_daemon_socket_protocol -- --nocapture` passes and exercises two explicit `IsolatedHub::shutdown` calls through the real daemon/CLI path.
@@ -99,7 +102,7 @@
 - Plan artifact: this file.
 - Plan gate evidence must include all seven required fields, identify the Rust hub/test-support layer, name the target/worktree assumption, and link checklist `checklist_1784074099_172547`.
 - Plan Review should reject production shutdown weakening, arbitrary string-error suppression, retries/sleeps, a final single-thread-only verification command, partial lock-site conversion, or any change to the parent ticket's history DTO/reconnect assertions.
-- Implementation evidence must include the deterministic cleanup decision-matrix test, the poison-recovery proof, exact default-concurrency lifecycle/full-suite commands and exit status, and the source scan for remaining poison-panicking lock sites.
+- Implementation evidence must include the deterministic cleanup decision-matrix test (including non-disconnect failure with a live child returning promptly), the poison-recovery proof, exact default-concurrency lifecycle/full-suite commands and exit status, and the source scan for remaining poison-panicking lock sites.
 - Review and Verify must attribute any red suite to the first non-`PoisonError` panic; cascade similarity on base is not a waiver.
 
 ## Vault gaps worth capturing
