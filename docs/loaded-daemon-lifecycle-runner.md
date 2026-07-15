@@ -6,9 +6,10 @@ a fresh GitHub-hosted `ubuntu-24.04` VM; it does not use a developer machine,
 production system, shared self-hosted runner, secret, or permanent resource.
 
 The workflow checks out its harness and the selected subject into separate
-directories. The subject must be a full commit SHA in this repository. The
-default, `20871abafdd227a1c145e07035731f916938ff28`, is the diagnostics commit
-for `stalled_attach_stdout_does_not_block_other_daemon_commands`.
+directories. The required subject must be a full commit SHA in this repository.
+For this investigation, use diagnostics commit
+`1c4af771d6ed9c09b4b6e0e6f1f8b0c906c79895` for
+`stalled_attach_stdout_does_not_block_other_daemon_commands`.
 
 ## Dispatch
 
@@ -24,7 +25,7 @@ The equivalent CLI dispatch is:
 ```sh
 gh workflow run loaded-daemon-lifecycle.yml \
   --ref main \
-  -f subject_sha=20871abafdd227a1c145e07035731f916938ff28 \
+  -f subject_sha=1c4af771d6ed9c09b4b6e0e6f1f8b0c906c79895 \
   -f test_target=lifecycle-suite \
   -F repetitions=20 \
   -f stress_profile=residual-tail
@@ -47,6 +48,13 @@ The label describes requested workers, not achieved contention. Use the recorded
 `resource-samples.log` (`/proc/loadavg`, CPU, memory, and process samples every
 five seconds) when comparing a run with the residual tail.
 
+The workflow precompiles the exact lifecycle test binary before starting those
+workers. The bounded run deadline therefore measures test execution under load,
+not a fresh dependency build competing with the load generators.
+
+GitHub Actions run `29439289277` proved that
+`botster-terminal-ghostty`'s `libghostty-vt` build requires Zig `0.15.2`.
+
 Each repetition has a 15-minute outer deadline. The campaign has a 330-minute
 inner deadline inside the 360-minute GitHub job timeout, leaving 30 minutes for
 process teardown and artifact upload. These deadlines do not change any timeout
@@ -59,8 +67,10 @@ copy into the artifact bundle. The bundle is named
 `loaded-daemon-lifecycle-<run-id>-<attempt>` and is retained for 14 days. It
 contains:
 
-- `metadata.txt`: requested/resolved subject, workflow commit, pinned Rust/Cargo,
-  runner image, architecture, CPU count, and selected inputs.
+- `metadata.txt`: requested/resolved subject, workflow commit, pinned Rust/Cargo
+  and Zig, runner image, architecture, CPU count, and selected inputs.
+- `precompile.log`: output from compiling the exact lifecycle test binary before
+  synthetic load starts, so the per-run deadline measures loaded test execution.
 - `commands.txt` and `campaign-status.tsv`: exact wrapper command, repetition,
   stage times, elapsed time, and exit status.
 - `run-NNN.log`: complete combined stdout/stderr, including assertion or panic.
