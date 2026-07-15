@@ -113,6 +113,12 @@ jobs:
             uname -a
           } | tee -a "$ARTIFACT_DIR/metadata.txt"
 
+      - name: Precompile lifecycle test binary
+        working-directory: subject
+        run: |
+          ./test.sh --test hub_daemon_lifecycle_test --no-run 2>&1 \
+            | tee "$ARTIFACT_DIR/precompile.log"
+
       - name: Run loaded real-daemon lifecycle campaign
         env:
           SUBJECT_SHA: ${{ inputs.subject_sha }}

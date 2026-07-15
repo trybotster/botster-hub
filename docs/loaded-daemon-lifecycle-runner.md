@@ -47,6 +47,10 @@ The label describes requested workers, not achieved contention. Use the recorded
 `resource-samples.log` (`/proc/loadavg`, CPU, memory, and process samples every
 five seconds) when comparing a run with the residual tail.
 
+The workflow precompiles the exact lifecycle test binary before starting those
+workers. The bounded run deadline therefore measures test execution under load,
+not a fresh dependency build competing with the load generators.
+
 Each repetition has a 15-minute outer deadline. The campaign has a 330-minute
 inner deadline inside the 360-minute GitHub job timeout, leaving 30 minutes for
 process teardown and artifact upload. These deadlines do not change any timeout
@@ -61,6 +65,8 @@ contains:
 
 - `metadata.txt`: requested/resolved subject, workflow commit, pinned Rust/Cargo
   and Zig, runner image, architecture, CPU count, and selected inputs.
+- `precompile.log`: output from compiling the exact lifecycle test binary before
+  synthetic load starts, so the per-run deadline measures loaded test execution.
 - `commands.txt` and `campaign-status.tsv`: exact wrapper command, repetition,
   stage times, elapsed time, and exit status.
 - `run-NNN.log`: complete combined stdout/stderr, including assertion or panic.
