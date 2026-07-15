@@ -687,9 +687,12 @@ impl IsolatedHub {
             .env("BOTSTER_ENV", "test")
             .output()
             .map_err(|source| IsolatedHubError::ShutdownCommand { source })?;
-        if !output.status.success() {
+        let shutdown_stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let disconnected_during_shutdown =
+            shutdown_stderr.trim() == "botster-hub shutdown error: client disconnected";
+        if !output.status.success() && !disconnected_during_shutdown {
             return Err(IsolatedHubError::ShutdownFailed {
-                stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+                stderr: shutdown_stderr,
             });
         }
 
@@ -4576,6 +4579,83 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn shutdown_accepts_client_disconnect_after_clean_daemon_exit() {
+        let root = unique_root("shutdown-disconnect-clean-exit");
+        let hub_bin = shutdown_script(
+            &root,
+            "printf 'botster-hub shutdown error: client disconnected\\n' >&2\nexit 1",
+        );
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg("exit 0")
+            .spawn()
+            .expect("spawn clean daemon child");
+        let mut hub = isolated_hub(hub_bin, root, child);
+
+        assert!(hub.shutdown_inner().is_ok());
+        assert!(hub.child.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_rejects_client_disconnect_after_failed_daemon_exit() {
+        let root = unique_root("shutdown-disconnect-failed-exit");
+        let hub_bin = shutdown_script(
+            &root,
+            "printf 'botster-hub shutdown error: client disconnected\\n' >&2\nexit 1",
+        );
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg("exit 42")
+            .spawn()
+            .expect("spawn failed daemon child");
+        let mut hub = isolated_hub(hub_bin, root, child);
+
+        let error = hub
+            .shutdown_inner()
+            .expect_err("failed daemon exit must not be accepted");
+
+        assert!(matches!(
+            error,
+            IsolatedHubError::DaemonExited { status, .. } if status.contains("42")
+        ));
+        assert!(hub.child.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_rejects_unrelated_failure_without_waiting_for_live_daemon() {
+        let root = unique_root("shutdown-unrelated-live-daemon");
+        let hub_bin = shutdown_script(
+            &root,
+            "printf 'botster-hub shutdown error: permission denied\\n' >&2\nexit 1",
+        );
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 2")
+            .spawn()
+            .expect("spawn live daemon child");
+        let pid = child.id();
+        let mut hub = isolated_hub(hub_bin, root, child);
+        let started = Instant::now();
+
+        let error = hub
+            .shutdown_inner()
+            .expect_err("unrelated shutdown failure must remain an error");
+
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(matches!(
+            error,
+            IsolatedHubError::ShutdownFailed { stderr }
+                if stderr.contains("permission denied")
+        ));
+        assert!(hub.child.is_some());
+        drop(hub);
+        assert_process_exits(pid);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn start_reports_daemon_exit_before_readiness() {
         let root = unique_root("daemon-exit");
         let worker = existing_file(&root, "botster-session-worker");
@@ -4647,6 +4727,25 @@ done
             .join(format!("{name}-{}-{now}", std::process::id()));
         fs::create_dir_all(&root).expect("create unique test root");
         root
+    }
+
+    #[cfg(unix)]
+    fn shutdown_script(root: &Path, shutdown_body: &str) -> PathBuf {
+        executable_script(
+            root,
+            "botster-hub",
+            &format!("#!/bin/sh\n{shutdown_body}\n"),
+        )
+    }
+
+    #[cfg(unix)]
+    fn isolated_hub(hub_bin: PathBuf, data_dir: PathBuf, child: Child) -> IsolatedHub {
+        IsolatedHub {
+            hub_bin,
+            endpoint: DaemonEndpoint::new(data_dir.join(DEFAULT_SOCKET_NAME)),
+            data_dir,
+            child: Some(child),
+        }
     }
 
     trait StartErrorExt {
