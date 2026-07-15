@@ -37,7 +37,10 @@ use webrtc::runtime::{
 };
 
 mod support;
-use support::ensure_session_worker_binary;
+use support::{
+    ensure_session_worker_binary, recovering_mutex_guard, validate_cli_daemon_shutdown,
+    wait_for_cli_daemon_shutdown,
+};
 
 static REAL_DAEMON_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -2048,6 +2051,39 @@ fn daemon_test_lock() -> &'static Mutex<()> {
     REAL_DAEMON_TEST_LOCK.get_or_init(|| Mutex::new(()))
 }
 
+fn daemon_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    recovering_mutex_guard(daemon_test_lock())
+}
+
+#[test]
+fn daemon_test_guard_recovers_poison_without_losing_mutual_exclusion() {
+    static PROBE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    let lock = PROBE_LOCK.get_or_init(|| Mutex::new(()));
+    let poisoner = thread::spawn(move || {
+        let _guard = recovering_mutex_guard(lock);
+        panic!("poison daemon test lock intentionally");
+    });
+    assert!(poisoner.join().is_err());
+
+    let guard = recovering_mutex_guard(lock);
+    let (acquired_tx, acquired_rx) = mpsc::channel();
+    let waiter = thread::spawn(move || {
+        let _guard = recovering_mutex_guard(lock);
+        acquired_tx.send(()).expect("report lock acquisition");
+    });
+
+    assert!(
+        acquired_rx
+            .recv_timeout(Duration::from_millis(100))
+            .is_err()
+    );
+    drop(guard);
+    acquired_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("waiting thread acquires recovered lock after guard drops");
+    waiter.join().expect("lock waiter exits cleanly");
+}
+
 fn start_cli_daemon(data_dir: &Path) -> Child {
     ensure_session_worker_binary();
     let mut child = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
@@ -2200,18 +2236,51 @@ fn shutdown_cli_daemon(data_dir: &Path, child: Child) -> Output {
         .arg(data_dir)
         .output()
         .expect("run botster-hub shutdown");
-    assert!(
-        shutdown.status.success(),
-        "shutdown failed: {}",
-        String::from_utf8_lossy(&shutdown.stderr)
-    );
-    let output = child.wait_with_output().expect("wait for daemon child");
-    assert!(
-        output.status.success(),
-        "daemon failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    output
+    wait_for_cli_daemon_shutdown(&shutdown, child)
+}
+
+#[test]
+fn cli_daemon_shutdown_accepts_exact_disconnect_after_clean_exit() {
+    let shutdown =
+        shell_output("printf 'botster-hub shutdown error: client disconnected\\n' >&2; exit 1");
+    let daemon = shell_output("exit 0");
+
+    assert!(validate_cli_daemon_shutdown(&shutdown, &daemon).is_ok());
+}
+
+#[test]
+fn cli_daemon_shutdown_rejects_unrelated_command_error_after_clean_exit() {
+    let shutdown =
+        shell_output("printf 'botster-hub shutdown error: permission denied\\n' >&2; exit 1");
+    let daemon = shell_output("exit 0");
+
+    let error = validate_cli_daemon_shutdown(&shutdown, &daemon)
+        .expect_err("unrelated shutdown error must be rejected");
+
+    assert!(error.contains("shutdown failed"));
+    assert!(error.contains("permission denied"));
+}
+
+#[test]
+fn cli_daemon_shutdown_rejects_unclean_exit_with_disconnect_diagnostics() {
+    let shutdown =
+        shell_output("printf 'botster-hub shutdown error: client disconnected\\n' >&2; exit 1");
+    let daemon = shell_output("printf 'daemon crash\\n' >&2; exit 42");
+
+    let error = validate_cli_daemon_shutdown(&shutdown, &daemon)
+        .expect_err("unclean daemon exit must be rejected");
+
+    assert!(error.contains("daemon failed"));
+    assert!(error.contains("daemon crash"));
+    assert!(error.contains("client disconnected"));
+}
+
+fn shell_output(script: &str) -> Output {
+    Command::new("sh")
+        .arg("-c")
+        .arg(script)
+        .output()
+        .expect("run shell fixture")
 }
 
 fn run_dev_stack_bootstrap(
@@ -2516,9 +2585,7 @@ fn wait_for_dogfood_output(
 
 #[test]
 fn daemon_package_dtos_expose_declared_surfaces_and_validate_surface_ids() {
-    let _guard = daemon_test_lock()
-        .lock()
-        .expect("serialize real daemon test");
+    let _guard = daemon_test_guard();
     let data_dir = unique_short_test_dir("package-surfaces");
     let surface_package_dir = unique_test_dir("daemon-declared-surface-package");
     let legacy_package_dir = unique_test_dir("daemon-legacy-surface-package");
@@ -2716,9 +2783,7 @@ fn daemon_package_dtos_expose_declared_surfaces_and_validate_surface_ids() {
 
 #[test]
 fn daemon_plugin_contract_matrix_fixture_exercises_public_package_contracts() {
-    let _guard = daemon_test_lock()
-        .lock()
-        .expect("serialize real daemon test");
+    let _guard = daemon_test_guard();
     let fixture_dir = botster_hub_test_support::copy_plugin_contract_matrix_fixture(
         unique_test_dir("daemon-plugin-contract-matrix-fixture"),
     )
@@ -2844,9 +2909,7 @@ fn daemon_plugin_contract_matrix_fixture_exercises_public_package_contracts() {
 
 #[test]
 fn cli_dev_stack_first_party_plugin_dogfood_smoke_runs_contract_matrix_then_real_packages() {
-    let _guard = daemon_test_lock()
-        .lock()
-        .expect("serialize real daemon test");
+    let _guard = daemon_test_guard();
     let fixture_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("fixtures")
         .join("plugins")
@@ -3112,9 +3175,7 @@ fn cli_dev_stack_first_party_plugin_dogfood_smoke_runs_contract_matrix_then_real
 
 #[test]
 fn cli_dogfood_launcher_starts_botster_web_in_existing_hub_mode_and_shuts_down() {
-    let _guard = daemon_test_lock()
-        .lock()
-        .expect("serialize real daemon test");
+    let _guard = daemon_test_guard();
     let data_dir = unique_test_dir("cli-dogfood-launcher");
     let web_package_dir = unique_test_dir("cli-dogfood-botster-web-package");
     write_botster_web_package(&web_package_dir);
@@ -3236,9 +3297,7 @@ fn cli_dogfood_launcher_starts_botster_web_in_existing_hub_mode_and_shuts_down()
 
 #[test]
 fn cli_dogfood_launcher_bridge_request_endpoint_uses_same_daemon_state() {
-    let _guard = daemon_test_lock()
-        .lock()
-        .expect("serialize real daemon test");
+    let _guard = daemon_test_guard();
     let data_dir = unique_short_test_dir("dogfood-bridge");
     let web_package_dir = unique_test_dir("cli-dogfood-bridge-botster-web-package");
     write_botster_web_package(&web_package_dir);
@@ -3457,9 +3516,7 @@ fn cli_dogfood_launcher_bridge_request_endpoint_uses_same_daemon_state() {
 
 #[test]
 fn cli_dogfood_launcher_uses_generated_data_dir_and_dynamic_bridge_port() {
-    let _guard = daemon_test_lock()
-        .lock()
-        .expect("serialize real daemon test");
+    let _guard = daemon_test_guard();
     let web_package_dir = unique_test_dir("cli-dogfood-default-botster-web-package");
     write_botster_web_package(&web_package_dir);
     let (mut child, rx) = spawn_dogfood_launcher(None, &web_package_dir, None);
@@ -3492,9 +3549,7 @@ fn cli_dogfood_launcher_uses_generated_data_dir_and_dynamic_bridge_port() {
 
 #[test]
 fn cli_dogfood_launcher_enables_local_tui_package_for_apps_open() {
-    let _guard = daemon_test_lock()
-        .lock()
-        .expect("serialize real daemon test");
+    let _guard = daemon_test_guard();
     let data_dir = unique_test_dir("cli-dogfood-tui");
     let web_package_dir = unique_test_dir("cli-dogfood-tui-botster-web-package");
     let tui_package_dir = unique_test_dir("cli-dogfood-tui-package");
@@ -3657,9 +3712,7 @@ fn cli_dogfood_launcher_enables_local_tui_package_for_apps_open() {
 
 #[test]
 fn cli_dev_stack_bootstrap_starts_daemon_enables_first_party_packages_and_prints_apps() {
-    let _guard = daemon_test_lock()
-        .lock()
-        .expect("serialize real daemon test");
+    let _guard = daemon_test_guard();
     let data_dir = unique_test_dir("cli-dev-stack-bootstrap");
     let project_pipelines_package_dir = unique_test_dir("cli-dev-stack-project-pipelines-package");
     let web_package_dir = unique_test_dir("cli-dev-stack-web-package");
@@ -3738,9 +3791,7 @@ fn cli_dev_stack_bootstrap_starts_daemon_enables_first_party_packages_and_prints
 
 #[test]
 fn cli_dev_stack_project_pipelines_configuration_schema_acceptance_target() {
-    let _guard = daemon_test_lock()
-        .lock()
-        .expect("serialize real daemon test");
+    let _guard = daemon_test_guard();
     let data_dir = unique_short_test_dir("cli-dev-stack-project-pipelines-config");
     let project_pipelines_package_dir = std::env::current_dir()
         .expect("current dir")
@@ -3883,9 +3934,7 @@ fn cli_dev_stack_project_pipelines_configuration_schema_acceptance_target() {
 
 #[test]
 fn cli_dev_stack_bootstrap_reuses_live_daemon_and_preserves_state_after_restart() {
-    let _guard = daemon_test_lock()
-        .lock()
-        .expect("serialize real daemon test");
+    let _guard = daemon_test_guard();
     let data_dir = unique_test_dir("cli-dev-stack-rerun");
     let project_pipelines_package_dir = unique_test_dir("cli-dev-stack-rerun-project-pipelines");
     let web_package_dir = unique_test_dir("cli-dev-stack-rerun-web");
@@ -3972,9 +4021,7 @@ fn cli_dev_stack_bootstrap_reuses_live_daemon_and_preserves_state_after_restart(
 
 #[test]
 fn cli_doctor_reports_stopped_runtime_with_remediation() {
-    let _guard = daemon_test_lock()
-        .lock()
-        .expect("serialize real daemon test");
+    let _guard = daemon_test_guard();
     let data_dir = unique_short_test_dir("cli-doctor-stopped");
 
     let output = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
@@ -3999,9 +4046,7 @@ fn cli_doctor_reports_stopped_runtime_with_remediation() {
 
 #[test]
 fn cli_local_runtime_up_starts_reuses_and_down_stops_runtime() {
-    let _guard = daemon_test_lock()
-        .lock()
-        .expect("serialize real daemon test");
+    let _guard = daemon_test_guard();
     let data_dir = unique_test_dir("cli-local-runtime-up");
     let project_pipelines_package_dir = unique_test_dir("cli-up-project-pipelines");
     let web_package_dir = unique_test_dir("cli-up-web");
@@ -4099,9 +4144,7 @@ fn cli_local_runtime_up_starts_reuses_and_down_stops_runtime() {
 
 #[test]
 fn cli_doctor_reports_healthy_runtime_checks() {
-    let _guard = daemon_test_lock()
-        .lock()
-        .expect("serialize real daemon test");
+    let _guard = daemon_test_guard();
     let data_dir = unique_test_dir("cli-doctor-healthy");
     let project_pipelines_package_dir = unique_test_dir("cli-doctor-project-pipelines");
     let web_package_dir = unique_test_dir("cli-doctor-web");
@@ -4161,9 +4204,7 @@ fn cli_doctor_reports_healthy_runtime_checks() {
 
 #[test]
 fn cli_local_runtime_up_recovers_owned_incompatible_daemon() {
-    let _guard = daemon_test_lock()
-        .lock()
-        .expect("serialize real daemon test");
+    let _guard = daemon_test_guard();
     let data_dir = unique_test_dir("cli-up-owned-incompat");
     let project_pipelines_package_dir = unique_test_dir("cli-up-owned-project-pipelines");
     let web_package_dir = unique_test_dir("cli-up-owned-web");
@@ -4203,9 +4244,7 @@ fn cli_local_runtime_up_recovers_owned_incompatible_daemon() {
 
 #[test]
 fn cli_local_runtime_down_recovers_owned_incompatible_daemon() {
-    let _guard = daemon_test_lock()
-        .lock()
-        .expect("serialize real daemon test");
+    let _guard = daemon_test_guard();
     let data_dir = unique_short_test_dir("cli-down-owned-incompat");
     let stale_child = start_owned_incompatible_dev_stack_daemon(&data_dir);
     let stale_pid = stale_child.id();
@@ -4242,9 +4281,7 @@ fn cli_local_runtime_down_recovers_owned_incompatible_daemon() {
 
 #[test]
 fn cli_local_runtime_recovery_removes_only_selected_data_dir_socket() {
-    let _guard = daemon_test_lock()
-        .lock()
-        .expect("serialize real daemon test");
+    let _guard = daemon_test_guard();
     let data_dir = unique_short_test_dir("cli-scoped-owned-incompat");
     let other_data_dir = unique_short_test_dir("cli-scoped-other-incompat");
     let stale_child = start_owned_incompatible_dev_stack_daemon(&data_dir);
@@ -4291,9 +4328,7 @@ fn cli_local_runtime_recovery_removes_only_selected_data_dir_socket() {
 
 #[test]
 fn cli_local_runtime_up_refuses_unowned_incompatible_daemon() {
-    let _guard = daemon_test_lock()
-        .lock()
-        .expect("serialize real daemon test");
+    let _guard = daemon_test_guard();
     let data_dir = unique_short_test_dir("cli-up-incompat");
     let config = explicit_config(&data_dir);
     let socket_path = config
@@ -4365,9 +4400,7 @@ fn cli_local_runtime_up_refuses_unowned_incompatible_daemon() {
 
 #[test]
 fn cli_local_runtime_refuses_forged_metadata_for_live_non_botster_pid() {
-    let _guard = daemon_test_lock()
-        .lock()
-        .expect("serialize real daemon test");
+    let _guard = daemon_test_guard();
     let data_dir = unique_short_test_dir("cli-forged-pid-incompat");
     let config = explicit_config(&data_dir);
     let socket_path = config
@@ -4443,9 +4476,7 @@ fn cli_local_runtime_refuses_forged_metadata_for_live_non_botster_pid() {
 
 #[test]
 fn cli_doctor_reports_incompatible_stale_daemon_without_deleting_socket() {
-    let _guard = daemon_test_lock()
-        .lock()
-        .expect("serialize real daemon test");
+    let _guard = daemon_test_guard();
     let data_dir = unique_short_test_dir("cli-doctor-incompat");
     let config = explicit_config(&data_dir);
     let socket_path = config
@@ -4496,9 +4527,7 @@ fn cli_doctor_reports_incompatible_stale_daemon_without_deleting_socket() {
 
 #[test]
 fn cli_smoke_proves_local_runtime_daemon_package_app_session_and_webrtc() {
-    let _guard = daemon_test_lock()
-        .lock()
-        .expect("serialize real daemon test");
+    let _guard = daemon_test_guard();
     let data_dir = unique_test_dir("cli-smoke-success");
     let project_pipelines_package_dir = unique_test_dir("cli-smoke-project-pipelines");
     let web_package_dir = unique_test_dir("cli-smoke-web");
@@ -4547,9 +4576,7 @@ fn cli_smoke_proves_local_runtime_daemon_package_app_session_and_webrtc() {
 
 #[test]
 fn cli_smoke_reports_missing_first_party_prerequisites() {
-    let _guard = daemon_test_lock()
-        .lock()
-        .expect("serialize real daemon test");
+    let _guard = daemon_test_guard();
     let data_dir = unique_short_test_dir("cli-smoke-missing");
 
     let output = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
@@ -4573,9 +4600,7 @@ fn cli_smoke_reports_missing_first_party_prerequisites() {
 #[test]
 fn cli_dev_stack_acceptance_smoke_exercises_first_party_plugins_project_pipelines_session_templates_reload_and_shutdown()
  {
-    let _guard = daemon_test_lock()
-        .lock()
-        .expect("serialize real daemon test");
+    let _guard = daemon_test_guard();
     let data_dir = unique_test_dir("cli-dev-stack-acceptance");
     let project_pipelines_package_dir = std::env::current_dir()
         .expect("current dir")
@@ -4970,9 +4995,7 @@ fn cli_dev_stack_acceptance_smoke_exercises_first_party_plugins_project_pipeline
 
 #[test]
 fn cli_dogfood_launcher_reruns_against_existing_explicit_data_dir() {
-    let _guard = daemon_test_lock()
-        .lock()
-        .expect("serialize real daemon test");
+    let _guard = daemon_test_guard();
     let data_dir = unique_test_dir("cli-dogfood-rerun");
     let web_package_dir = unique_test_dir("cli-dogfood-rerun-botster-web-package");
     write_botster_web_package(&web_package_dir);
@@ -5012,9 +5035,7 @@ fn cli_dogfood_launcher_reruns_against_existing_explicit_data_dir() {
 
 #[test]
 fn cli_dogfood_launcher_reports_failed_web_entrypoint_diagnostics() {
-    let _guard = daemon_test_lock()
-        .lock()
-        .expect("serialize real daemon test");
+    let _guard = daemon_test_guard();
     let data_dir = unique_test_dir("dogfood-web-fail");
     let web_package_dir = unique_test_dir("dogfood-web-fail-package");
     write_failing_botster_web_package(&web_package_dir);
@@ -5059,9 +5080,7 @@ fn cli_dogfood_launcher_reports_failed_web_entrypoint_diagnostics() {
 
 #[test]
 fn cli_dogfood_launcher_rejects_health_only_web_entrypoint() {
-    let _guard = daemon_test_lock()
-        .lock()
-        .expect("serialize real daemon test");
+    let _guard = daemon_test_guard();
     let data_dir = unique_test_dir("dogfood-web-health-only");
     let web_package_dir = unique_test_dir("dogfood-web-health-only-package");
     write_health_only_botster_web_package(&web_package_dir);
@@ -5468,9 +5487,7 @@ fn daemon_restores_existing_provider_policy_records_through_snapshot_admission()
 
 #[test]
 fn cli_start_requires_explicit_data_dir_and_prints_scrubbed_lifecycle_status() {
-    let _guard = daemon_test_lock()
-        .lock()
-        .expect("serialize real daemon test");
+    let _guard = daemon_test_guard();
     let data_dir = unique_test_dir("cli-start");
     let child = start_cli_daemon(&data_dir);
     let output = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
@@ -5524,9 +5541,7 @@ fn cli_status_uses_daemon_status_path_without_local_paths() {
 
 #[test]
 fn cli_sessions_spawn_and_list_route_through_client_api() {
-    let _guard = daemon_test_lock()
-        .lock()
-        .expect("serialize real daemon test");
+    let _guard = daemon_test_guard();
     let data_dir = unique_test_dir("cli-sessions");
     let child = start_cli_daemon(&data_dir);
     let spawn = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
@@ -5649,9 +5664,7 @@ fn cli_sessions_spawn_and_list_route_through_client_api() {
 
 #[test]
 fn cli_short_lived_session_shutdown_returns_structured_cleanup() {
-    let _guard = daemon_test_lock()
-        .lock()
-        .expect("serialize real daemon test");
+    let _guard = daemon_test_guard();
     let data_dir = unique_test_dir("cli-short-lived-shutdown");
     let child = start_cli_daemon(&data_dir);
 
@@ -5740,9 +5753,7 @@ fn cli_short_lived_session_shutdown_returns_structured_cleanup() {
 
 #[test]
 fn cli_request_level_runtime_error_returns_operator_frame_and_keeps_daemon_responsive() {
-    let _guard = daemon_test_lock()
-        .lock()
-        .expect("serialize real daemon test");
+    let _guard = daemon_test_guard();
     let data_dir = unique_test_dir("cli-operator-error");
     let child = start_cli_daemon(&data_dir);
 
@@ -5792,9 +5803,7 @@ fn cli_request_level_runtime_error_returns_operator_frame_and_keeps_daemon_respo
 
 #[test]
 fn cli_daemon_restart_recovers_worker_backed_session_through_transport() {
-    let _guard = daemon_test_lock()
-        .lock()
-        .expect("serialize real daemon test");
+    let _guard = daemon_test_guard();
     let data_dir = unique_test_dir("cli-restart-recover");
     let config = explicit_config(&data_dir);
     let session_id = "cli-restart-session";
@@ -5906,9 +5915,7 @@ fn cli_daemon_restart_recovers_worker_backed_session_through_transport() {
 
 #[test]
 fn external_hub_client_crate_drives_real_daemon_socket_protocol() {
-    let _guard = daemon_test_lock()
-        .lock()
-        .expect("serialize real daemon test");
+    let _guard = daemon_test_guard();
     let data_dir = unique_test_dir("external-hub-client");
     let config = explicit_config(&data_dir);
     let socket_path = config
@@ -6109,9 +6116,7 @@ fn external_hub_client_crate_drives_real_daemon_socket_protocol() {
 
 #[test]
 fn local_webrtc_chunks_oversized_encrypted_daemon_response() {
-    let _guard = daemon_test_lock()
-        .lock()
-        .expect("serialize real daemon test");
+    let _guard = daemon_test_guard();
     let data_dir = unique_short_test_dir("web-webrtc");
     let package_dir = unique_test_dir("web-webrtc-package");
     write_botster_web_package(&package_dir);
@@ -6412,9 +6417,7 @@ fn local_webrtc_chunks_oversized_encrypted_daemon_response() {
 
 #[test]
 fn botster_web_same_url_reload_issues_fresh_local_webrtc_bootstrap() {
-    let _guard = daemon_test_lock()
-        .lock()
-        .expect("serialize real daemon test");
+    let _guard = daemon_test_guard();
     let data_dir = unique_short_test_dir("web-webrtc-reload");
     let package_dir = unique_test_dir("web-webrtc-reload-package");
     write_botster_web_package(&package_dir);
@@ -6643,9 +6646,7 @@ fn botster_web_same_url_reload_issues_fresh_local_webrtc_bootstrap() {
 
 #[test]
 fn local_webrtc_peer_close_detaches_terminal_subscriptions() {
-    let _guard = daemon_test_lock()
-        .lock()
-        .expect("serialize real daemon test");
+    let _guard = daemon_test_guard();
     let data_dir = unique_short_test_dir("web-webrtc-close");
     let package_dir = unique_test_dir("web-webrtc-close-package");
     write_botster_web_package(&package_dir);
@@ -6812,9 +6813,7 @@ fn local_webrtc_peer_close_detaches_terminal_subscriptions() {
 
 #[test]
 fn external_hub_client_spawns_botster_web_dogfood_session_request_shape() {
-    let _guard = daemon_test_lock()
-        .lock()
-        .expect("serialize real daemon test");
+    let _guard = daemon_test_guard();
     let data_dir = unique_short_test_dir("web-spawn");
     let config = explicit_config(&data_dir);
     let socket_path = config
@@ -6911,9 +6910,7 @@ fn external_hub_client_spawns_botster_web_dogfood_session_request_shape() {
 
 #[test]
 fn external_hub_client_duplicate_botster_web_dogfood_spawn_is_rejected_without_cleanup() {
-    let _guard = daemon_test_lock()
-        .lock()
-        .expect("serialize real daemon test");
+    let _guard = daemon_test_guard();
     let data_dir = unique_short_test_dir("web-duplicate");
     let config = explicit_config(&data_dir);
     let socket_path = config
@@ -7033,9 +7030,7 @@ fn external_hub_client_duplicate_botster_web_dogfood_spawn_is_rejected_without_c
 
 #[test]
 fn external_hub_client_spawn_failure_returns_actionable_diagnostics() {
-    let _guard = daemon_test_lock()
-        .lock()
-        .expect("serialize real daemon test");
+    let _guard = daemon_test_guard();
     let data_dir = unique_short_test_dir("spawn-fail");
     let bad_worker = data_dir.join("missing-botster-session-worker");
     let config = explicit_config(&data_dir);
@@ -7099,9 +7094,7 @@ fn external_hub_client_spawn_failure_returns_actionable_diagnostics() {
 
 #[test]
 fn external_hub_client_reports_compatibility_descriptor_and_mismatch_diagnostics() {
-    let _guard = daemon_test_lock()
-        .lock()
-        .expect("serialize real daemon test");
+    let _guard = daemon_test_guard();
     let data_dir = unique_test_dir("compat");
     let config = explicit_config(&data_dir);
     let socket_path = config
@@ -7236,9 +7229,7 @@ fn external_hub_client_reports_compatibility_descriptor_and_mismatch_diagnostics
 
 #[test]
 fn external_hub_test_support_drives_isolated_daemon_socket_protocol() {
-    let _guard = daemon_test_lock()
-        .lock()
-        .expect("serialize real daemon test");
+    let _guard = daemon_test_guard();
     let first = botster_hub_test_support::IsolatedHubBuilder::new()
         .hub_bin(env!("CARGO_BIN_EXE_botster-hub"))
         .session_worker_bin(session_worker_binary_path())
@@ -7381,9 +7372,7 @@ fn external_hub_test_support_drives_isolated_daemon_socket_protocol() {
 
 #[test]
 fn external_hub_client_many_pty_adversarial_conformance_ci() {
-    let _guard = daemon_test_lock()
-        .lock()
-        .expect("serialize real daemon test");
+    let _guard = daemon_test_guard();
     let hub = botster_hub_test_support::IsolatedHubBuilder::new()
         .hub_bin(env!("CARGO_BIN_EXE_botster-hub"))
         .session_worker_bin(session_worker_binary_path())
@@ -7406,9 +7395,7 @@ fn external_hub_client_many_pty_adversarial_conformance_ci() {
 #[test]
 #[ignore = "larger local adversarial proof; run explicitly with the documented command"]
 fn external_hub_client_many_pty_adversarial_conformance_local() {
-    let _guard = daemon_test_lock()
-        .lock()
-        .expect("serialize real daemon test");
+    let _guard = daemon_test_guard();
     let hub = botster_hub_test_support::IsolatedHubBuilder::new()
         .hub_bin(env!("CARGO_BIN_EXE_botster-hub"))
         .session_worker_bin(session_worker_binary_path())
@@ -7430,9 +7417,7 @@ fn external_hub_client_many_pty_adversarial_conformance_local() {
 
 #[test]
 fn external_daemon_same_session_reattach_replays_opaque_history_before_live_output() {
-    let _guard = daemon_test_lock()
-        .lock()
-        .expect("serialize real daemon test");
+    let _guard = daemon_test_guard();
     let data_dir = unique_short_test_dir("late-history");
     let config = explicit_config(&data_dir);
     let child = start_cli_daemon(&data_dir);
@@ -7911,9 +7896,7 @@ fn external_daemon_same_session_reattach_replays_opaque_history_before_live_outp
 
 #[test]
 fn daemon_detaches_subscription_when_attach_connection_drops() {
-    let _guard = daemon_test_lock()
-        .lock()
-        .expect("serialize real daemon test");
+    let _guard = daemon_test_guard();
     let data_dir = unique_test_dir("cli-attach-eof");
     let config = explicit_config(&data_dir);
     let child = start_cli_daemon(&data_dir);
@@ -7984,9 +7967,7 @@ fn daemon_detaches_subscription_when_attach_connection_drops() {
 
 #[test]
 fn daemon_notify_session_defers_without_observed_readiness_over_socket() {
-    let _guard = daemon_test_lock()
-        .lock()
-        .expect("serialize real daemon test");
+    let _guard = daemon_test_guard();
     let data_dir = unique_test_dir("daemon-notify-session");
     let config = explicit_config(&data_dir);
     let child = start_cli_daemon(&data_dir);
@@ -8054,9 +8035,7 @@ fn daemon_notify_session_defers_without_observed_readiness_over_socket() {
 
 #[test]
 fn stalled_attach_stdout_does_not_block_other_daemon_commands() {
-    let _guard = daemon_test_lock()
-        .lock()
-        .expect("serialize real daemon test");
+    let _guard = daemon_test_guard();
     let data_dir = unique_test_dir("cli-stalled-attach");
     let child = start_cli_daemon(&data_dir);
 
@@ -8190,9 +8169,7 @@ fn cli_inspect_reports_not_found_for_fresh_in_process_daemon() {
 
 #[test]
 fn cli_packages_enable_local_path_routes_through_running_daemon_and_persists() {
-    let _guard = daemon_test_lock()
-        .lock()
-        .expect("serialize real daemon test");
+    let _guard = daemon_test_guard();
     let data_dir = unique_test_dir("cli-packages");
     let package_dir = unique_test_dir("local-package");
     write_local_plugin_package(&package_dir);
@@ -8322,9 +8299,7 @@ fn cli_packages_enable_local_path_routes_through_running_daemon_and_persists() {
 
 #[test]
 fn package_entrypoint_supervision_starts_and_reports_running() {
-    let _guard = daemon_test_lock()
-        .lock()
-        .expect("serialize real daemon test");
+    let _guard = daemon_test_guard();
     let data_dir = unique_test_dir("entrypoint-start");
     let package_dir = unique_test_dir("entrypoint-start-package");
     write_supervised_package(
@@ -8412,9 +8387,7 @@ fn package_entrypoint_supervision_starts_and_reports_running() {
 
 #[test]
 fn daemon_list_apps_projects_installed_package_entrypoints() {
-    let _guard = daemon_test_lock()
-        .lock()
-        .expect("serialize real daemon test");
+    let _guard = daemon_test_guard();
     let data_dir = unique_test_dir("list-apps");
     let package_dir = unique_test_dir("list-apps-package");
     write_app_registry_package(&package_dir);
@@ -8478,9 +8451,7 @@ fn daemon_list_apps_projects_installed_package_entrypoints() {
 
 #[test]
 fn daemon_spawns_session_template_and_script_reads_botster_context() {
-    let _guard = daemon_test_lock()
-        .lock()
-        .expect("serialize real daemon test");
+    let _guard = daemon_test_guard();
     let data_dir = unique_short_test_dir("session-template-context");
     let package_root = unique_test_dir("session-template-context-package");
     write_session_template_context_package(&package_root);
@@ -8574,7 +8545,7 @@ fn daemon_spawns_session_template_and_script_reads_botster_context() {
 
 #[test]
 fn daemon_spawn_target_crud_persists_plain_non_git_directory_and_cli_lists_it() {
-    let _guard = daemon_test_lock().lock().expect("daemon test lock");
+    let _guard = daemon_test_guard();
     let data_dir = unique_short_test_dir("spawn-target-crud");
     let target_root = unique_short_test_dir("plain-target");
     fs::create_dir_all(&target_root).expect("create plain target root");
@@ -8715,7 +8686,7 @@ fn daemon_spawn_target_crud_persists_plain_non_git_directory_and_cli_lists_it() 
 
 #[test]
 fn daemon_worktree_crud_scopes_paths_to_spawn_targets_without_requiring_git() {
-    let _guard = daemon_test_lock().lock().expect("daemon test lock");
+    let _guard = daemon_test_guard();
     let data_dir = unique_short_test_dir("worktree-crud");
     let target_root = unique_short_test_dir("worktree-target");
     let plain_worktree = target_root.join("plain");
@@ -8965,9 +8936,7 @@ fn daemon_worktree_crud_scopes_paths_to_spawn_targets_without_requiring_git() {
 
 #[test]
 fn daemon_spawns_repo_local_session_template_after_state_reload() {
-    let _guard = daemon_test_lock()
-        .lock()
-        .expect("serialize real daemon test");
+    let _guard = daemon_test_guard();
     let data_dir = unique_short_test_dir("repo-session-template");
     let package_root = unique_test_dir("repo-session-template-package");
     let repo_root = std::env::current_dir()
@@ -9076,9 +9045,7 @@ fn daemon_spawns_repo_local_session_template_after_state_reload() {
 
 #[test]
 fn daemon_resolves_terminal_app_foreground_launch_contract() {
-    let _guard = daemon_test_lock()
-        .lock()
-        .expect("serialize real daemon test");
+    let _guard = daemon_test_guard();
     let data_dir = unique_test_dir("resolve-terminal-app");
     let package_dir = unique_test_dir("resolve-terminal-app-package");
     write_botster_tui_package(&package_dir);
@@ -9185,9 +9152,7 @@ fn daemon_resolves_terminal_app_foreground_launch_contract() {
 
 #[test]
 fn cli_apps_list_show_and_open_web_use_structured_app_url() {
-    let _guard = daemon_test_lock()
-        .lock()
-        .expect("serialize real daemon test");
+    let _guard = daemon_test_guard();
     let data_dir = unique_test_dir("cli-apps-web");
     let package_dir = unique_test_dir("cli-apps-web-package");
     write_app_registry_package(&package_dir);
@@ -9260,9 +9225,7 @@ fn cli_apps_list_show_and_open_web_use_structured_app_url() {
 
 #[test]
 fn cli_apps_open_web_injects_hub_connection_environment() {
-    let _guard = daemon_test_lock()
-        .lock()
-        .expect("serialize real daemon test");
+    let _guard = daemon_test_guard();
     let data_dir = unique_test_dir("cli-apps-web-hub-env");
     let package_dir = unique_test_dir("cli-apps-web-hub-env-package");
     write_hub_env_web_app_package(&package_dir);
@@ -9307,9 +9270,7 @@ fn cli_apps_open_web_injects_hub_connection_environment() {
 
 #[test]
 fn cli_apps_open_terminal_uses_foreground_launch_contract() {
-    let _guard = daemon_test_lock()
-        .lock()
-        .expect("serialize real daemon test");
+    let _guard = daemon_test_guard();
     let data_dir = unique_test_dir("cli-apps-terminal");
     let package_dir = unique_test_dir("cli-apps-terminal-package");
     write_botster_tui_package(&package_dir);
@@ -9403,9 +9364,7 @@ fn cli_help_like_args_print_command_guidance_without_daemon() {
 
 #[test]
 fn package_entrypoint_supervision_passes_environment_overrides() {
-    let _guard = daemon_test_lock()
-        .lock()
-        .expect("serialize real daemon test");
+    let _guard = daemon_test_guard();
     let data_dir = unique_test_dir("entrypoint-env");
     let package_dir = unique_test_dir("entrypoint-env-package");
     let output_path = std::env::current_dir()
@@ -9457,9 +9416,7 @@ fn package_entrypoint_supervision_passes_environment_overrides() {
 
 #[test]
 fn package_entrypoint_supervision_reports_missing_command() {
-    let _guard = daemon_test_lock()
-        .lock()
-        .expect("serialize real daemon test");
+    let _guard = daemon_test_guard();
     let data_dir = unique_test_dir("entrypoint-missing-command");
     let package_dir = unique_test_dir("entrypoint-missing-command-package");
     write_supervised_package(
@@ -9497,9 +9454,7 @@ fn package_entrypoint_supervision_reports_missing_command() {
 
 #[test]
 fn package_entrypoint_supervision_reports_failed_command() {
-    let _guard = daemon_test_lock()
-        .lock()
-        .expect("serialize real daemon test");
+    let _guard = daemon_test_guard();
     let data_dir = unique_test_dir("entrypoint-failed-command");
     let package_dir = unique_test_dir("entrypoint-failed-command-package");
     write_supervised_package(
@@ -9546,9 +9501,7 @@ fn package_entrypoint_supervision_reports_failed_command() {
 
 #[test]
 fn package_entrypoint_supervision_stops_and_restarts() {
-    let _guard = daemon_test_lock()
-        .lock()
-        .expect("serialize real daemon test");
+    let _guard = daemon_test_guard();
     let data_dir = unique_test_dir("entrypoint-restart");
     let package_dir = unique_test_dir("entrypoint-restart-package");
     write_supervised_package(
@@ -9610,9 +9563,7 @@ fn package_entrypoint_supervision_stops_and_restarts() {
 
 #[test]
 fn package_entrypoint_supervision_cleans_up_on_disable_remove_and_shutdown() {
-    let _guard = daemon_test_lock()
-        .lock()
-        .expect("serialize real daemon test");
+    let _guard = daemon_test_guard();
     let data_dir = unique_test_dir("entrypoint-cleanup");
     let package_dir = unique_test_dir("entrypoint-cleanup-package");
     write_supervised_package(
@@ -9673,9 +9624,7 @@ fn package_entrypoint_supervision_cleans_up_on_disable_remove_and_shutdown() {
 
 #[test]
 fn package_entrypoint_supervision_cleans_up_on_daemon_signal() {
-    let _guard = daemon_test_lock()
-        .lock()
-        .expect("serialize real daemon test");
+    let _guard = daemon_test_guard();
     let data_dir = unique_test_dir("entrypoint-signal");
     let package_dir = unique_test_dir("entrypoint-signal-package");
     write_supervised_package(
@@ -9715,9 +9664,7 @@ fn package_entrypoint_supervision_cleans_up_on_daemon_signal() {
 
 #[test]
 fn cli_packages_local_path_install_enable_disable_remove_flow() {
-    let _guard = daemon_test_lock()
-        .lock()
-        .expect("serialize real daemon test");
+    let _guard = daemon_test_guard();
     let data_dir = unique_test_dir("cli-packages-flow");
     let package_dir = unique_test_dir("local-package-flow");
     write_local_plugin_package(&package_dir);
@@ -9862,9 +9809,7 @@ fn cli_packages_local_path_install_enable_disable_remove_flow() {
 
 #[test]
 fn daemon_packages_registry_fixture_preview_and_install_flow() {
-    let _guard = daemon_test_lock()
-        .lock()
-        .expect("serialize real daemon test");
+    let _guard = daemon_test_guard();
     let data_dir = unique_test_dir("daemon-registry-flow");
     let registry_dir = unique_test_dir("daemon-package-registry");
     let package_dir = registry_dir.join("packages").join("local");
@@ -10063,9 +10008,7 @@ fn daemon_packages_registry_fixture_preview_and_install_flow() {
 
 #[test]
 fn cli_packages_local_path_diagnostics_are_actionable() {
-    let _guard = daemon_test_lock()
-        .lock()
-        .expect("serialize real daemon test");
+    let _guard = daemon_test_guard();
     let data_dir = unique_test_dir("cli-packages-diagnostics");
     let invalid_dir = unique_test_dir("local-package-invalid");
     let incompatible_dir = unique_test_dir("local-package-incompatible");
@@ -10207,9 +10150,7 @@ fn cli_packages_local_path_diagnostics_are_actionable() {
 
 #[test]
 fn cli_packages_enable_botster_workspaces_first_party_plugin_db_namespace() {
-    let _guard = daemon_test_lock()
-        .lock()
-        .expect("serialize real daemon test");
+    let _guard = daemon_test_guard();
     let data_dir = unique_short_test_dir("cli-pkg-ws");
     let package_dir = unique_test_dir("botster-workspaces-package");
     write_botster_workspaces_local_package(&package_dir, "botster-workspaces");
@@ -10293,9 +10234,7 @@ fn cli_packages_enable_botster_workspaces_first_party_plugin_db_namespace() {
 
 #[test]
 fn cli_packages_deny_botster_workspaces_mismatched_plugin_db_namespace() {
-    let _guard = daemon_test_lock()
-        .lock()
-        .expect("serialize real daemon test");
+    let _guard = daemon_test_guard();
     let data_dir = unique_short_test_dir("cli-pkg-ws-denied");
     let package_dir = unique_test_dir("botster-workspaces-denied-package");
     write_botster_workspaces_local_package(&package_dir, "other-plugin");
@@ -10338,9 +10277,7 @@ fn cli_packages_deny_botster_workspaces_mismatched_plugin_db_namespace() {
 
 #[test]
 fn package_configuration_daemon_set_show_list_reload_and_cli_are_redacted() {
-    let _guard = daemon_test_lock()
-        .lock()
-        .expect("serialize real daemon test");
+    let _guard = daemon_test_guard();
     let data_dir = unique_test_dir("package-configuration-daemon");
     let package_dir = unique_test_dir("configurable-package");
     write_configurable_local_plugin_package(&package_dir);
@@ -10525,9 +10462,7 @@ fn package_configuration_daemon_set_show_list_reload_and_cli_are_redacted() {
 
 #[test]
 fn local_package_reload_rereads_manifest_restarts_running_app_and_cli_open_uses_refreshed_state() {
-    let _guard = daemon_test_lock()
-        .lock()
-        .expect("serialize real daemon test");
+    let _guard = daemon_test_guard();
     let data_dir = unique_test_dir("local-package-reload");
     let package_dir = unique_test_dir("reloadable-app-package");
     write_reloadable_app_package(&package_dir, "1.0.0", "http://127.0.0.1:49160");
@@ -10667,9 +10602,7 @@ fn local_package_reload_rereads_manifest_restarts_running_app_and_cli_open_uses_
 
 #[test]
 fn daemon_exposes_and_resolves_plugin_surface_and_settings_routes() {
-    let _guard = daemon_test_lock()
-        .lock()
-        .expect("serialize real daemon test");
+    let _guard = daemon_test_guard();
     let data_dir = unique_test_dir("package-route-descriptors");
     let package_dir = unique_test_dir("package-route-descriptors-package");
     write_configurable_local_plugin_package(&package_dir);
@@ -10816,9 +10749,7 @@ fn daemon_exposes_and_resolves_plugin_surface_and_settings_routes() {
 
 #[test]
 fn daemon_lists_admitted_package_navigation_with_default_app_surface_fallback() {
-    let _guard = daemon_test_lock()
-        .lock()
-        .expect("serialize real daemon test");
+    let _guard = daemon_test_guard();
     let data_dir = unique_test_dir("package-navigation-registry");
     let default_package_dir = unique_test_dir("package-navigation-default-package");
     let explicit_package_dir = unique_test_dir("package-navigation-explicit-package");
@@ -10921,9 +10852,7 @@ fn daemon_lists_admitted_package_navigation_with_default_app_surface_fallback() 
 
 #[test]
 fn local_package_reload_name_mismatch_returns_path_free_operator_error() {
-    let _guard = daemon_test_lock()
-        .lock()
-        .expect("serialize real daemon test");
+    let _guard = daemon_test_guard();
     let data_dir = unique_test_dir("reload-name-mismatch");
     let package_dir = unique_test_dir("reload-pkg-mismatch");
     write_reloadable_app_package(&package_dir, "1.0.0", "http://127.0.0.1:49162");
@@ -10969,9 +10898,7 @@ fn local_package_reload_name_mismatch_returns_path_free_operator_error() {
 
 #[test]
 fn daemon_package_list_exposes_dependency_and_feature_availability_matrix() {
-    let _guard = daemon_test_lock()
-        .lock()
-        .expect("serialize real daemon test");
+    let _guard = daemon_test_guard();
     let data_dir = unique_test_dir("package-availability-daemon");
     let package_dir = unique_test_dir("project-pipelines-availability-package");
     let blocked_package_dir = unique_test_dir("required-dependency-package");
@@ -11080,9 +11007,7 @@ fn daemon_package_list_exposes_dependency_and_feature_availability_matrix() {
 
 #[test]
 fn package_update_apply_preserves_configuration_and_pin_metadata() {
-    let _guard = daemon_test_lock()
-        .lock()
-        .expect("serialize real daemon test");
+    let _guard = daemon_test_guard();
     let data_dir = unique_test_dir("package-update-apply");
     let package_dir = unique_test_dir("configurable-package-update");
     write_configurable_local_plugin_package(&package_dir);
@@ -11194,9 +11119,7 @@ fn package_update_apply_preserves_configuration_and_pin_metadata() {
 
 #[test]
 fn package_update_unsupported_cases_return_structured_diagnostics() {
-    let _guard = daemon_test_lock()
-        .lock()
-        .expect("serialize real daemon test");
+    let _guard = daemon_test_guard();
     let data_dir = unique_test_dir("package-update-diagnostics");
     let package_dir = unique_test_dir("local-package-update-diagnostics");
     write_local_plugin_package(&package_dir);
@@ -11297,9 +11220,7 @@ fn package_update_unsupported_cases_return_structured_diagnostics() {
 
 #[test]
 fn cli_packages_enable_local_process_package_does_not_attempt_lua_load() {
-    let _guard = daemon_test_lock()
-        .lock()
-        .expect("serialize real daemon test");
+    let _guard = daemon_test_guard();
     let data_dir = unique_test_dir("cli-process-package");
     let package_dir = unique_test_dir("local-process-package");
     write_local_process_plugin_package(&package_dir);
