@@ -1,0 +1,446 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+readonly DEFAULT_RUN_TIMEOUT_SECONDS=900
+readonly DEFAULT_CAMPAIGN_TIMEOUT_SECONDS=19800
+readonly CLEANUP_GRACE_SECONDS=30
+
+MODE=run
+SUBJECT_DIR=
+ARTIFACT_DIR=
+SUBJECT_SHA=
+TEST_TARGET=
+REPETITIONS=
+STRESS_PROFILE=
+
+LOAD_PID=
+LOAD_PGID=
+SAMPLER_PID=
+SAMPLER_PGID=
+TEST_PID=
+TEST_PGID=
+RECORDED_PGID=
+FINALIZED=0
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  run-loaded-daemon-lifecycle --subject-dir DIR --artifact-dir DIR \
+    --subject-sha SHA --test-target TARGET --repetitions COUNT \
+    --stress-profile PROFILE
+  run-loaded-daemon-lifecycle --validate-only --artifact-dir DIR \
+    --subject-sha SHA --test-target TARGET --repetitions COUNT \
+    --stress-profile PROFILE
+  run-loaded-daemon-lifecycle --cleanup-only --artifact-dir DIR
+USAGE
+}
+
+while (($# > 0)); do
+  case "$1" in
+    --subject-dir) SUBJECT_DIR=${2-}; shift 2 ;;
+    --artifact-dir) ARTIFACT_DIR=${2-}; shift 2 ;;
+    --subject-sha) SUBJECT_SHA=${2-}; shift 2 ;;
+    --test-target) TEST_TARGET=${2-}; shift 2 ;;
+    --repetitions) REPETITIONS=${2-}; shift 2 ;;
+    --stress-profile) STRESS_PROFILE=${2-}; shift 2 ;;
+    --validate-only) MODE=validate; shift ;;
+    --cleanup-only) MODE=cleanup; shift ;;
+    --help|-h) usage; exit 0 ;;
+    *) printf 'unknown argument: %s\n' "$1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+if [[ -z "$ARTIFACT_DIR" ]]; then
+  printf '%s\n' '--artifact-dir is required' >&2
+  exit 2
+fi
+mkdir -p "$ARTIFACT_DIR"
+ARTIFACT_DIR=$(cd "$ARTIFACT_DIR" && pwd)
+readonly ARTIFACT_DIR
+readonly CLEANUP_LOG="$ARTIFACT_DIR/cleanup.log"
+readonly OWNERSHIP_FILE="$ARTIFACT_DIR/owned-pgids.tsv"
+readonly ACTIVE_OWNERSHIP_FILE="$ARTIFACT_DIR/active-pgids.tsv"
+
+log() {
+  printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" | tee -a "$ARTIFACT_DIR/harness.log"
+}
+
+cleanup_log() {
+  printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" | tee -a "$CLEANUP_LOG"
+}
+
+validate_inputs() {
+  local invalid=0
+
+  if [[ ! "$SUBJECT_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+    log "invalid subject_sha: expected a lowercase 40-character commit SHA"
+    invalid=1
+  fi
+  case "$TEST_TARGET" in
+    lifecycle-suite|focused-stalled-attach) ;;
+    *) log "invalid test_target: $TEST_TARGET"; invalid=1 ;;
+  esac
+  if [[ ! "$REPETITIONS" =~ ^[0-9]+$ ]] || ((10#$REPETITIONS < 1 || 10#$REPETITIONS > 100)); then
+    log "invalid repetitions: expected an integer from 1 through 100"
+    invalid=1
+  fi
+  case "$STRESS_PROFILE" in
+    residual-tail|moderate|none) ;;
+    *) log "invalid stress_profile: $STRESS_PROFILE"; invalid=1 ;;
+  esac
+
+  {
+    printf 'validated_at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf 'subject_sha=%s\n' "$SUBJECT_SHA"
+    printf 'test_target=%s\n' "$TEST_TARGET"
+    printf 'repetitions=%s\n' "$REPETITIONS"
+    printf 'stress_profile=%s\n' "$STRESS_PROFILE"
+  } >> "$ARTIFACT_DIR/metadata.txt"
+
+  if ((invalid != 0)); then
+    printf 'validation_status=invalid\n' >> "$ARTIFACT_DIR/metadata.txt"
+    return 2
+  fi
+  printf 'validation_status=valid\n' >> "$ARTIFACT_DIR/metadata.txt"
+}
+
+validate_linux_runner() {
+  local command_name
+  local invalid=0
+
+  for command_name in awk bash free nproc ps setsid tee timeout; do
+    if ! command -v "$command_name" >/dev/null 2>&1; then
+      log "missing required Linux runner command: $command_name"
+      invalid=1
+    fi
+  done
+  if [[ ! -r /proc/loadavg ]]; then
+    log "missing required Linux runner interface: /proc/loadavg"
+    invalid=1
+  fi
+  ((invalid == 0))
+}
+
+group_is_alive() {
+  local pgid=$1
+  kill -0 -- "-$pgid" 2>/dev/null
+}
+
+deactivate_group() {
+  local pid=$1
+  local pgid=$2
+  local temporary_file="$ACTIVE_OWNERSHIP_FILE.tmp.$$"
+
+  touch "$ACTIVE_OWNERSHIP_FILE"
+  awk -F '\t' -v pid="$pid" -v pgid="$pgid" \
+    '!(($2 == pid) && ($3 == pgid))' "$ACTIVE_OWNERSHIP_FILE" > "$temporary_file"
+  mv "$temporary_file" "$ACTIVE_OWNERSHIP_FILE"
+}
+
+cleanup_group() {
+  local role=$1
+  local pid=$2
+  local pgid=$3
+  local wait_direct=${4:-yes}
+  local deadline
+  local status=0
+
+  [[ "$pid" =~ ^[0-9]+$ && "$pgid" =~ ^[0-9]+$ ]] || return 0
+  if group_is_alive "$pgid"; then
+    cleanup_log "role=$role pid=$pid pgid=$pgid action=TERM"
+    kill -TERM -- "-$pgid" 2>/dev/null || true
+    deadline=$((SECONDS + CLEANUP_GRACE_SECONDS))
+    while group_is_alive "$pgid" && ((SECONDS < deadline)); do
+      sleep 1
+    done
+  fi
+  if group_is_alive "$pgid"; then
+    cleanup_log "role=$role pid=$pid pgid=$pgid action=KILL"
+    kill -KILL -- "-$pgid" 2>/dev/null || true
+    sleep 1
+  fi
+  if [[ "$wait_direct" == yes ]]; then
+    wait "$pid" 2>/dev/null || true
+    cleanup_log "role=$role pid=$pid pgid=$pgid action=waited"
+  fi
+  if group_is_alive "$pgid"; then
+    cleanup_log "role=$role pid=$pid pgid=$pgid post_clean=alive"
+    status=1
+  else
+    cleanup_log "role=$role pid=$pid pgid=$pgid post_clean=gone"
+    deactivate_group "$pid" "$pgid"
+  fi
+  return "$status"
+}
+
+cleanup_recorded_groups() {
+  local cleanup_status=0
+  local role pid pgid started_at
+
+  touch "$ACTIVE_OWNERSHIP_FILE"
+  while IFS=$'\t' read -r role pid pgid started_at; do
+    [[ -n "$role" ]] || continue
+    cleanup_group "$role" "$pid" "$pgid" no || cleanup_status=1
+  done < "$ACTIVE_OWNERSHIP_FILE"
+  return "$cleanup_status"
+}
+
+# Called through finalize's EXIT trap.
+# shellcheck disable=SC2329
+cleanup_active_groups() {
+  local cleanup_status=0
+
+  cleanup_group test "${TEST_PID:-}" "${TEST_PGID:-}" yes || cleanup_status=1
+  TEST_PID=
+  TEST_PGID=
+  cleanup_group sampler "${SAMPLER_PID:-}" "${SAMPLER_PGID:-}" yes || cleanup_status=1
+  SAMPLER_PID=
+  SAMPLER_PGID=
+  cleanup_group load "${LOAD_PID:-}" "${LOAD_PGID:-}" yes || cleanup_status=1
+  LOAD_PID=
+  LOAD_PGID=
+  return "$cleanup_status"
+}
+
+# Called by the EXIT trap installed after input parsing.
+# shellcheck disable=SC2329
+finalize() {
+  local incoming_status=$1
+  local cleanup_status=0
+
+  ((FINALIZED == 0)) || return
+  FINALIZED=1
+  trap - EXIT INT TERM HUP
+  cleanup_active_groups || cleanup_status=1
+  if ((incoming_status == 0 && cleanup_status != 0)); then
+    incoming_status=1
+  fi
+  printf 'finished_at=%s\nexit_status=%s\ncleanup_status=%s\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$incoming_status" "$cleanup_status" \
+    >> "$ARTIFACT_DIR/campaign-summary.txt"
+  log "campaign_exit_status=$incoming_status cleanup_status=$cleanup_status"
+  exit "$incoming_status"
+}
+
+record_group() {
+  local role=$1
+  local pid=$2
+  local pgid=
+
+  for _ in {1..100}; do
+    pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d '[:space:]')
+    [[ "$pgid" == "$pid" ]] && break
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.05
+  done
+  if [[ -z "$pgid" || "$pgid" != "$pid" ]]; then
+    log "failed to establish owned process group for role=$role pid=$pid pgid=${pgid:-missing}"
+    return 1
+  fi
+  printf '%s\t%s\t%s\t%s\n' "$role" "$pid" "$pgid" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$OWNERSHIP_FILE"
+  printf '%s\t%s\t%s\t%s\n' "$role" "$pid" "$pgid" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$ACTIVE_OWNERSHIP_FILE"
+  log "owned_group role=$role pid=$pid pgid=$pgid"
+  RECORDED_PGID=$pgid
+}
+
+terminate_unrecorded_process() {
+  local role=$1
+  local pid=$2
+  local pgid
+
+  pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d '[:space:]')
+  if [[ "$pgid" == "$pid" ]]; then
+    cleanup_group "$role" "$pid" "$pgid" yes || true
+  else
+    cleanup_log "role=$role pid=$pid pgid=${pgid:-missing} action=TERM-unrecorded"
+    kill -TERM "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+  fi
+}
+
+start_load() {
+  local cpu_count=$1
+  local workers=0
+
+  case "$STRESS_PROFILE" in
+    residual-tail) workers=$((cpu_count * 12)); ((workers > 64)) && workers=64 ;;
+    moderate) workers=$((cpu_count * 2)); ((workers > 16)) && workers=16 ;;
+    none) workers=0 ;;
+  esac
+  printf 'cpu_count=%s\nstress_workers=%s\n' "$cpu_count" "$workers" >> "$ARTIFACT_DIR/metadata.txt"
+  log "stress_profile=$STRESS_PROFILE cpu_count=$cpu_count workers=$workers"
+  ((workers > 0)) || return 0
+
+  # Variables in this single-quoted program expand inside the owned Bash group.
+  # shellcheck disable=SC2016
+  setsid bash -c '
+    workers=$1
+    for ((worker = 1; worker <= workers; worker++)); do
+      bash -c "while :; do :; done" &
+    done
+    wait
+  ' load "$workers" &
+  LOAD_PID=$!
+  if ! record_group load "$LOAD_PID"; then
+    terminate_unrecorded_process load "$LOAD_PID"
+    LOAD_PID=
+    return 1
+  fi
+  LOAD_PGID=$RECORDED_PGID
+}
+
+start_sampler() {
+  local samples_file=$1
+
+  # Variables in this single-quoted program expand inside the owned Bash group.
+  # shellcheck disable=SC2016
+  setsid bash -c '
+    samples_file=$1
+    while :; do
+      {
+        printf "sample_at=%s\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        printf "uptime_seconds=%s\n" "$SECONDS"
+        printf "loadavg="
+        cat /proc/loadavg
+        free -m
+        ps -eo pid,ppid,pgid,sid,stat,pcpu,pmem,etimes,comm,args --sort=-pcpu | head -80
+        printf "sample_end\n"
+      } | tee -a "$samples_file"
+      sleep 5
+    done
+  ' sampler "$samples_file" &
+  SAMPLER_PID=$!
+  if ! record_group sampler "$SAMPLER_PID"; then
+    terminate_unrecorded_process sampler "$SAMPLER_PID"
+    SAMPLER_PID=
+    return 1
+  fi
+  SAMPLER_PGID=$RECORDED_PGID
+}
+
+run_repetition() {
+  local repetition=$1
+  local timeout_seconds=$2
+  local run_log
+  local started_at=$SECONDS
+  local status
+  shift 2
+  local -a command=("$@")
+
+  run_log=$(printf '%s/run-%03d.log' "$ARTIFACT_DIR" "$repetition")
+  printf 'run=%s\tstarted_at=%s\ttimeout_seconds=%s\n' \
+    "$repetition" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$timeout_seconds" \
+    >> "$ARTIFACT_DIR/campaign-status.tsv"
+  {
+    printf 'run=%s command=' "$repetition"
+    printf '%q ' "${command[@]}"
+    printf '\n'
+  } >> "$ARTIFACT_DIR/commands.txt"
+  log "run=$repetition stage=test-start timeout_seconds=$timeout_seconds"
+
+  # Variables in this single-quoted program expand inside the owned Bash group.
+  # shellcheck disable=SC2016
+  setsid bash -c '
+    set -o pipefail
+    subject_dir=$1
+    run_log=$2
+    timeout_seconds=$3
+    shift 3
+    cd "$subject_dir"
+    timeout --signal=TERM --kill-after=30 "${timeout_seconds}s" "$@" 2>&1 | tee "$run_log"
+  ' test "$SUBJECT_DIR" "$run_log" "$timeout_seconds" "${command[@]}" &
+  TEST_PID=$!
+  if ! record_group test "$TEST_PID"; then
+    terminate_unrecorded_process test "$TEST_PID"
+    TEST_PID=
+    return 1
+  fi
+  TEST_PGID=$RECORDED_PGID
+  wait "$TEST_PID"
+  status=$?
+  cleanup_group test "$TEST_PID" "$TEST_PGID" no || status=1
+  TEST_PID=
+  TEST_PGID=
+
+  printf 'run=%s\tfinished_at=%s\telapsed_seconds=%s\texit_status=%s\n' \
+    "$repetition" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$((SECONDS - started_at))" "$status" \
+    >> "$ARTIFACT_DIR/campaign-status.tsv"
+  log "run=$repetition stage=test-finish elapsed_seconds=$((SECONDS - started_at)) exit_status=$status"
+  return "$status"
+}
+
+if [[ "$MODE" == cleanup ]]; then
+  cleanup_log "external_cleanup=start"
+  cleanup_recorded_groups
+  status=$?
+  cleanup_log "external_cleanup=finish status=$status"
+  exit "$status"
+fi
+
+trap 'finalize $?' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+
+validate_inputs || exit $?
+if [[ "$MODE" == validate ]]; then
+  cleanup_log "validation_only post_clean=no_processes_started"
+  exit 0
+fi
+if [[ -z "$SUBJECT_DIR" || ! -x "$SUBJECT_DIR/test.sh" ]]; then
+  log "subject checkout must contain an executable test.sh: ${SUBJECT_DIR:-missing}"
+  exit 2
+fi
+validate_linux_runner || exit 2
+SUBJECT_DIR=$(cd "$SUBJECT_DIR" && pwd)
+readonly SUBJECT_DIR
+
+RUN_TIMEOUT_SECONDS=${BOTSTER_LOADED_RUN_TIMEOUT_SECONDS:-$DEFAULT_RUN_TIMEOUT_SECONDS}
+CAMPAIGN_TIMEOUT_SECONDS=${BOTSTER_LOADED_CAMPAIGN_TIMEOUT_SECONDS:-$DEFAULT_CAMPAIGN_TIMEOUT_SECONDS}
+if [[ ! "$RUN_TIMEOUT_SECONDS" =~ ^[0-9]+$ ]] || ((RUN_TIMEOUT_SECONDS < 5 || RUN_TIMEOUT_SECONDS > 1800)); then
+  log "invalid BOTSTER_LOADED_RUN_TIMEOUT_SECONDS: expected 5-1800"
+  exit 2
+fi
+if [[ ! "$CAMPAIGN_TIMEOUT_SECONDS" =~ ^[0-9]+$ ]] || ((CAMPAIGN_TIMEOUT_SECONDS < RUN_TIMEOUT_SECONDS || CAMPAIGN_TIMEOUT_SECONDS > 20400)); then
+  log "invalid BOTSTER_LOADED_CAMPAIGN_TIMEOUT_SECONDS: expected run timeout through 20400"
+  exit 2
+fi
+readonly RUN_TIMEOUT_SECONDS CAMPAIGN_TIMEOUT_SECONDS
+
+case "$TEST_TARGET" in
+  lifecycle-suite)
+    TEST_COMMAND=(./test.sh --test hub_daemon_lifecycle_test -- --nocapture)
+    ;;
+  focused-stalled-attach)
+    TEST_COMMAND=(./test.sh --test hub_daemon_lifecycle_test stalled_attach_stdout_does_not_block_other_daemon_commands -- --exact --nocapture)
+    ;;
+esac
+readonly -a TEST_COMMAND
+
+touch "$OWNERSHIP_FILE" "$ACTIVE_OWNERSHIP_FILE" "$CLEANUP_LOG" "$ARTIFACT_DIR/campaign-status.tsv" "$ARTIFACT_DIR/commands.txt"
+printf 'started_at=%s\nrun_timeout_seconds=%s\ncampaign_timeout_seconds=%s\n' \
+  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$RUN_TIMEOUT_SECONDS" "$CAMPAIGN_TIMEOUT_SECONDS" \
+  >> "$ARTIFACT_DIR/campaign-summary.txt"
+
+cpu_count=$(nproc)
+start_load "$cpu_count" || exit 1
+start_sampler "$ARTIFACT_DIR/resource-samples.log" || exit 1
+
+campaign_deadline=$((SECONDS + CAMPAIGN_TIMEOUT_SECONDS))
+for ((run = 1; run <= 10#$REPETITIONS; run++)); do
+  remaining_seconds=$((campaign_deadline - SECONDS))
+  if ((remaining_seconds < 5)); then
+    log "campaign deadline reached before run=$run"
+    exit 124
+  fi
+  effective_timeout=$RUN_TIMEOUT_SECONDS
+  ((remaining_seconds < effective_timeout)) && effective_timeout=$remaining_seconds
+  run_repetition "$run" "$effective_timeout" "${TEST_COMMAND[@]}"
+  status=$?
+  if ((status != 0)); then
+    log "stopping at first red run=$run exit_status=$status"
+    exit "$status"
+  fi
+done
+
+exit 0
