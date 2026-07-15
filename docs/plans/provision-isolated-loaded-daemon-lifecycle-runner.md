@@ -247,7 +247,7 @@ commit SHA and never relies on an ambient checkout.
 ### Real workflow checks
 
 - Push the workflow branch and dispatch a one-repetition focused run against
-  `20871abafdd227a1c145e07035731f916938ff28`. Confirm the workflow log shows the
+  `1c4af771d6ed9c09b4b6e0e6f1f8b0c906c79895`. Confirm the workflow log shows the
   exact resolved SHA, Rust `1.97.0`, default Cargo parallelism, real
   `botster-hub`/socket lifecycle test execution, resource samples, exit status,
   and cleanup evidence.
