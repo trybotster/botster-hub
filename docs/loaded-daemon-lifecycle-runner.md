@@ -59,8 +59,8 @@ copy into the artifact bundle. The bundle is named
 `loaded-daemon-lifecycle-<run-id>-<attempt>` and is retained for 14 days. It
 contains:
 
-- `metadata.txt`: requested/resolved subject, workflow commit, pinned Rust/Cargo,
-  runner image, architecture, CPU count, and selected inputs.
+- `metadata.txt`: requested/resolved subject, workflow commit, pinned Rust/Cargo
+  and Zig, runner image, architecture, CPU count, and selected inputs.
 - `commands.txt` and `campaign-status.tsv`: exact wrapper command, repetition,
   stage times, elapsed time, and exit status.
 - `run-NNN.log`: complete combined stdout/stderr, including assertion or panic.
