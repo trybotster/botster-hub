@@ -1107,7 +1107,6 @@ const launchResult = process.env.BOTSTER_ENTRYPOINT_LAUNCH_RESULT;
 const mixedOwnership = Boolean(process.env.BOTSTER_WEB_DOGFOOD_DATA_DIR && (socket || dataDir));
 const source = socket ? 'socket' : (dataDir ? 'data_dir' : 'spawned');
 const mode = socket || dataDir ? 'existing_hub' : 'spawned_hub';
-const socketExists = socket ? fs.existsSync(socket) : false;
 const localWebrtcGrantPresent = Boolean(process.env.BOTSTER_LOCAL_WEBRTC_GRANT_ID);
 const localWebrtcSecretPresent = Boolean(process.env.BOTSTER_LOCAL_WEBRTC_GRANT_SECRET);
 const localWebrtcOriginPresent = Boolean(process.env.BOTSTER_LOCAL_WEBRTC_EXPECTED_ORIGIN);
@@ -1169,16 +1168,42 @@ async function connectDaemon() {
   }
   const stream = net.createConnection(socket);
   const connection = { stream, buffer: '' };
-  await new Promise((resolve, reject) => {
-    stream.once('connect', resolve);
-    stream.once('error', reject);
-  });
-  stream.write(JSON.stringify({
-    protocol: 'botster-hub-daemon-v1',
-    compatibility: currentRequirement(),
-  }) + '\n');
-  await readLine(connection);
-  return connection;
+  try {
+    await new Promise((resolve, reject) => {
+      stream.once('connect', resolve);
+      stream.once('error', reject);
+    });
+    stream.write(JSON.stringify({
+      protocol: 'botster-hub-daemon-v1',
+      compatibility: currentRequirement(),
+    }) + '\n');
+    const helloAck = JSON.parse(await readLine(connection));
+    if (helloAck.protocol !== 'botster-hub-daemon-v1' || !helloAck.compatibility) {
+      throw new Error(`unexpected daemon hello ack: ${JSON.stringify(helloAck)}`);
+    }
+    return connection;
+  } catch (error) {
+    stream.destroy();
+    throw error;
+  }
+}
+
+async function probeDaemon() {
+  let connection = null;
+  try {
+    connection = await connectDaemon();
+    connection.stream.write(JSON.stringify({ type: 'status' }) + '\n');
+    const response = JSON.parse(await readLine(connection));
+    if (response.kind !== 'status' || !response.status) {
+      throw new Error(`unexpected daemon status response: ${JSON.stringify(response)}`);
+    }
+  } finally {
+    connection?.stream.destroy();
+  }
+}
+
+function currentSocketExists() {
+  return socket ? fs.existsSync(socket) : false;
 }
 
 async function daemonRequest(payload) {
@@ -1258,7 +1283,7 @@ const server = http.createServer(async (request, response) => {
         mode,
         source,
         dataDir,
-        socketExists,
+        socketExists: currentSocketExists(),
         response: daemonResponse,
       }));
     } catch (error) {
@@ -1268,7 +1293,7 @@ const server = http.createServer(async (request, response) => {
         mode,
         source,
         dataDir,
-        socketExists,
+        socketExists: currentSocketExists(),
         error: String(error && error.message ? error.message : error),
       }));
     }
@@ -1279,18 +1304,30 @@ const server = http.createServer(async (request, response) => {
     response.end('not found');
     return;
   }
+  let daemonReady = false;
+  let error = null;
+  try {
+    await probeDaemon();
+    daemonReady = true;
+  } catch (probeError) {
+    error = String(probeError && probeError.message ? probeError.message : probeError).slice(0, 240);
+  }
+  const socketExists = currentSocketExists();
   response.writeHead(200, { 'content-type': 'application/json' });
-    response.end(JSON.stringify({
-    ok: mode === 'existing_hub' && source === 'socket' && socketExists && !mixedOwnership,
+  response.end(JSON.stringify({
+    ok: mode === 'existing_hub' && source === 'socket' && !mixedOwnership && daemonReady,
     mode,
     source,
     port,
     socketExists,
     mixedOwnership,
+    daemonReady,
+    error,
   }));
 });
 
 const listen = () => server.listen(port, '127.0.0.1', () => {
+  console.log(`bridge_listening=http://127.0.0.1:${port}`);
   if (launchResult) {
     fs.writeFileSync(launchResult, JSON.stringify({
       entrypoint_id: 'web-client',
@@ -1607,6 +1644,59 @@ impl Drop for ChildCleanup {
     }
 }
 
+#[test]
+fn botster_web_health_rejects_stale_daemon_socket_file() {
+    let data_dir = unique_short_test_dir("web-health-stale-socket");
+    let package_dir = unique_test_dir("web-health-stale-socket-package");
+    fs::create_dir_all(&data_dir).expect("create stale socket data directory");
+    write_botster_web_package(&package_dir);
+    let socket_path = data_dir.join("hub.sock");
+    let stale_listener = UnixListener::bind(&socket_path).expect("bind stale daemon socket");
+    drop(stale_listener);
+    assert!(
+        socket_path.exists(),
+        "stale daemon socket file should remain"
+    );
+
+    let bridge_port = unused_loopback_port();
+    let child = Command::new("node")
+        .arg("scripts/real-hub-dogfood-bridge.mjs")
+        .current_dir(&package_dir)
+        .env("BOTSTER_HUB_SOCKET", &socket_path)
+        .env("BOTSTER_HUB_DATA_DIR", &data_dir)
+        .env("BOTSTER_WEB_DOGFOOD_BRIDGE_PORT", bridge_port.to_string())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn botster-web bridge against stale socket");
+    let mut child = ChildCleanup { child };
+    let mut listening = String::new();
+    BufReader::new(
+        child
+            .child
+            .stdout
+            .take()
+            .expect("botster-web bridge stdout"),
+    )
+    .read_line(&mut listening)
+    .expect("read botster-web listening marker");
+    assert_eq!(
+        listening.trim(),
+        format!("bridge_listening=http://127.0.0.1:{bridge_port}")
+    );
+
+    let health = read_json_health(&format!("http://127.0.0.1:{bridge_port}"));
+    assert_eq!(health["ok"], false, "stale socket health: {health}");
+    assert_eq!(health["socketExists"], true);
+    assert_eq!(health["daemonReady"], false);
+    assert!(
+        health["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("ECONNREFUSED")),
+        "stale socket health should report protocol failure: {health}"
+    );
+}
+
 fn wait_for_process_exit(pid: u32) {
     for _ in 0..100 {
         if !process_exists(pid) {
@@ -1803,8 +1893,15 @@ fn probe_botster_web_health(bridge_url: &str) -> Result<serde_json::Value, Strin
         "port": port,
         "socketExists": true,
         "mixedOwnership": false,
+        "daemonReady": true,
+        "error": null,
     });
-    if health != expected {
+    if expected
+        .as_object()
+        .expect("expected health object")
+        .iter()
+        .any(|(key, value)| health.get(key) != Some(value))
+    {
         return Err(format!(
             "unexpected health response: {health}; expected={expected}"
         ));
@@ -3520,7 +3617,7 @@ fn cli_dev_stack_first_party_plugin_dogfood_smoke_runs_contract_matrix_then_real
 #[test]
 fn cli_dogfood_launcher_starts_botster_web_in_existing_hub_mode_and_shuts_down() {
     let _guard = daemon_test_guard();
-    let data_dir = unique_test_dir("cli-dogfood-launcher");
+    let data_dir = unique_short_test_dir("cli-dogfood-launcher");
     let web_package_dir = unique_test_dir("cli-dogfood-botster-web-package");
     write_botster_web_package(&web_package_dir);
     let web_bridge_port = unused_loopback_port();
@@ -3894,7 +3991,7 @@ fn cli_dogfood_launcher_uses_generated_data_dir_and_dynamic_bridge_port() {
 #[test]
 fn cli_dogfood_launcher_enables_local_tui_package_for_apps_open() {
     let _guard = daemon_test_guard();
-    let data_dir = unique_test_dir("cli-dogfood-tui");
+    let data_dir = unique_short_test_dir("cli-dogfood-tui");
     let web_package_dir = unique_test_dir("cli-dogfood-tui-botster-web-package");
     let tui_package_dir = unique_test_dir("cli-dogfood-tui-package");
     write_botster_web_package(&web_package_dir);
@@ -4057,7 +4154,7 @@ fn cli_dogfood_launcher_enables_local_tui_package_for_apps_open() {
 #[test]
 fn cli_dev_stack_bootstrap_starts_daemon_enables_first_party_packages_and_prints_apps() {
     let _guard = daemon_test_guard();
-    let data_dir = unique_test_dir("cli-dev-stack-bootstrap");
+    let data_dir = unique_short_test_dir("cli-dev-stack-bootstrap");
     let project_pipelines_package_dir = unique_test_dir("cli-dev-stack-project-pipelines-package");
     let web_package_dir = unique_test_dir("cli-dev-stack-web-package");
     let tui_package_dir = unique_test_dir("cli-dev-stack-tui-package");
@@ -4279,7 +4376,7 @@ fn cli_dev_stack_project_pipelines_configuration_schema_acceptance_target() {
 #[test]
 fn cli_dev_stack_bootstrap_reuses_live_daemon_and_preserves_state_after_restart() {
     let _guard = daemon_test_guard();
-    let data_dir = unique_test_dir("cli-dev-stack-rerun");
+    let data_dir = unique_short_test_dir("cli-dev-stack-rerun");
     let project_pipelines_package_dir = unique_test_dir("cli-dev-stack-rerun-project-pipelines");
     let web_package_dir = unique_test_dir("cli-dev-stack-rerun-web");
     let tui_package_dir = unique_test_dir("cli-dev-stack-rerun-tui");
@@ -4391,7 +4488,7 @@ fn cli_doctor_reports_stopped_runtime_with_remediation() {
 #[test]
 fn cli_local_runtime_up_starts_reuses_and_down_stops_runtime() {
     let _guard = daemon_test_guard();
-    let data_dir = unique_test_dir("cli-local-runtime-up");
+    let data_dir = unique_short_test_dir("cli-local-runtime-up");
     let project_pipelines_package_dir = unique_test_dir("cli-up-project-pipelines");
     let web_package_dir = unique_test_dir("cli-up-web");
     let tui_package_dir = unique_test_dir("cli-up-tui");
@@ -4508,7 +4605,7 @@ fn cli_local_runtime_up_starts_reuses_and_down_stops_runtime() {
 #[test]
 fn cli_doctor_reports_healthy_runtime_checks() {
     let _guard = daemon_test_guard();
-    let data_dir = unique_test_dir("cli-doctor-healthy");
+    let data_dir = unique_short_test_dir("cli-doctor-healthy");
     let project_pipelines_package_dir = unique_test_dir("cli-doctor-project-pipelines");
     let web_package_dir = unique_test_dir("cli-doctor-web");
     let tui_package_dir = unique_test_dir("cli-doctor-tui");
@@ -4568,7 +4665,7 @@ fn cli_doctor_reports_healthy_runtime_checks() {
 #[test]
 fn cli_local_runtime_up_recovers_owned_incompatible_daemon() {
     let _guard = daemon_test_guard();
-    let data_dir = unique_test_dir("cli-up-owned-incompat");
+    let data_dir = unique_short_test_dir("cli-up-owned-incompat");
     let project_pipelines_package_dir = unique_test_dir("cli-up-owned-project-pipelines");
     let web_package_dir = unique_test_dir("cli-up-owned-web");
     let tui_package_dir = unique_test_dir("cli-up-owned-tui");
@@ -4580,13 +4677,14 @@ fn cli_local_runtime_up_recovers_owned_incompatible_daemon() {
     let stale_child = start_owned_incompatible_dev_stack_daemon(&data_dir);
     let stale_pid = stale_child.id();
 
+    let web_bridge_port = unused_loopback_port();
     let output = run_local_runtime_up(
         &data_dir,
         &project_pipelines_package_dir,
         &web_package_dir,
         &tui_package_dir,
         &workspaces_package_dir,
-        unused_loopback_port(),
+        web_bridge_port,
     );
     assert!(
         output.status.success(),
@@ -4596,10 +4694,34 @@ fn cli_local_runtime_up_recovers_owned_incompatible_daemon() {
     let text = command_output_text(&output);
     assert!(text.contains("runtime=ready"));
     assert!(text.contains("daemon=started"));
+    let bridge_url = format!("http://127.0.0.1:{web_bridge_port}");
+    let health = read_json_health(&bridge_url);
+    assert_eq!(health["ok"], true, "replacement bridge health: {health}");
+    assert_eq!(health["daemonReady"], true);
+    let status = dogfood_bridge_request(
+        &bridge_url,
+        None,
+        &botster_hub_client::DaemonRequest::Status,
+    );
+    assert_eq!(status.kind, botster_hub_client::DaemonResponseKind::Status);
+    assert_eq!(
+        status.status.expect("bridge status body").lifecycle_state,
+        "running"
+    );
     let _ = stale_child.wait_with_output().expect("reap stale daemon");
     assert!(
         !process_exists(stale_pid),
         "stale incompatible daemon should be stopped"
+    );
+    assert!(
+        explicit_config(&data_dir)
+            .transports
+            .local_socket
+            .as_ref()
+            .expect("replacement socket binding")
+            .path
+            .exists(),
+        "replacement socket should remain after stale child exit"
     );
 
     shutdown_dev_stack_daemon(&data_dir);
@@ -4891,7 +5013,7 @@ fn cli_doctor_reports_incompatible_stale_daemon_without_deleting_socket() {
 #[test]
 fn cli_smoke_proves_local_runtime_daemon_package_app_session_and_webrtc() {
     let _guard = daemon_test_guard();
-    let data_dir = unique_test_dir("cli-smoke-success");
+    let data_dir = unique_short_test_dir("cli-smoke-success");
     let project_pipelines_package_dir = unique_test_dir("cli-smoke-project-pipelines");
     let web_package_dir = unique_test_dir("cli-smoke-web");
     let tui_package_dir = unique_test_dir("cli-smoke-tui");
@@ -5029,7 +5151,7 @@ fn dev_stack_readiness_timeout_reports_last_probe_and_reaps_owned_daemon() {
 fn cli_dev_stack_acceptance_smoke_exercises_first_party_plugins_project_pipelines_session_templates_reload_and_shutdown()
  {
     let _guard = daemon_test_guard();
-    let data_dir = unique_test_dir("cli-dev-stack-acceptance");
+    let data_dir = unique_short_test_dir("cli-dev-stack-acceptance");
     let project_pipelines_package_dir = std::env::current_dir()
         .expect("current dir")
         .join("examples/project-pipelines");
@@ -5424,7 +5546,7 @@ fn cli_dev_stack_acceptance_smoke_exercises_first_party_plugins_project_pipeline
 #[test]
 fn cli_dogfood_launcher_reruns_against_existing_explicit_data_dir() {
     let _guard = daemon_test_guard();
-    let data_dir = unique_test_dir("cli-dogfood-rerun");
+    let data_dir = unique_short_test_dir("cli-dogfood-rerun");
     let web_package_dir = unique_test_dir("cli-dogfood-rerun-botster-web-package");
     write_botster_web_package(&web_package_dir);
 
