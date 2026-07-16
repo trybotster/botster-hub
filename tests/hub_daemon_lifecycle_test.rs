@@ -4322,10 +4322,10 @@ fn cli_local_runtime_up_starts_reuses_and_down_stops_runtime() {
         .arg("--data-dir")
         .arg(&data_dir)
         .output()
-        .expect("run botster-hub status after down");
+        .expect("run botster-hub status after daemon shutdown");
     assert!(
         !status.status.success(),
-        "status should fail after down: {}",
+        "status should fail after daemon shutdown: {}",
         command_output_text(&status)
     );
 }
