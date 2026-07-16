@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use botster_core::{
     AesGcmEnvelope, AesGcmKey, Capability, CapabilitySurface, CoreSessionMetadata,
@@ -2457,6 +2457,11 @@ fn run_local_runtime_smoke(
 }
 
 fn shutdown_dev_stack_daemon(data_dir: &Path) {
+    let socket_path = explicit_config(data_dir)
+        .transports
+        .local_socket
+        .expect("dev-stack local socket binding")
+        .path;
     let output = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
         .arg("shutdown")
         .arg("--data-dir")
@@ -2467,6 +2472,15 @@ fn shutdown_dev_stack_daemon(data_dir: &Path) {
         output.status.success(),
         "dev-stack shutdown failed: {}",
         command_output_text(&output)
+    );
+
+    let deadline = Instant::now() + CLI_DAEMON_READINESS_BUDGET;
+    while socket_path.exists() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        !socket_path.exists(),
+        "dev-stack daemon socket remained after successful shutdown response"
     );
 }
 
