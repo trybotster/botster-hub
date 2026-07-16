@@ -688,25 +688,32 @@ impl IsolatedHub {
             .output()
             .map_err(|source| IsolatedHubError::ShutdownCommand { source })?;
         let shutdown_stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let shutdown_succeeded = output.status.success();
         let disconnected_during_shutdown =
             shutdown_stderr.trim() == "botster-hub shutdown error: client disconnected";
-        if !output.status.success() && !disconnected_during_shutdown {
+        if !shutdown_succeeded && !disconnected_during_shutdown {
             return Err(IsolatedHubError::ShutdownFailed {
                 stderr: shutdown_stderr,
             });
         }
 
         let child = self.child.take().expect("child exists after shutdown");
-        let output = child
+        let daemon_output = child
             .wait_with_output()
             .map_err(|source| IsolatedHubError::Wait { source })?;
-        if output.status.success() {
-            Ok(())
+        if daemon_output.status.success() {
+            if shutdown_succeeded {
+                Ok(())
+            } else {
+                Err(IsolatedHubError::ShutdownFailed {
+                    stderr: shutdown_stderr,
+                })
+            }
         } else {
             Err(IsolatedHubError::DaemonExited {
-                status: output.status.to_string(),
-                stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-                stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+                status: daemon_output.status.to_string(),
+                stdout: String::from_utf8_lossy(&daemon_output.stdout).to_string(),
+                stderr: String::from_utf8_lossy(&daemon_output.stderr).to_string(),
             })
         }
     }
@@ -4579,7 +4586,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn shutdown_accepts_client_disconnect_after_clean_daemon_exit() {
+    fn shutdown_rejects_client_disconnect_after_clean_daemon_exit() {
         let root = unique_root("shutdown-disconnect-clean-exit");
         let hub_bin = shutdown_script(
             &root,
@@ -4592,7 +4599,14 @@ mod tests {
             .expect("spawn clean daemon child");
         let mut hub = isolated_hub(hub_bin, root, child);
 
-        assert!(hub.shutdown_inner().is_ok());
+        let error = hub
+            .shutdown_inner()
+            .expect_err("shutdown disconnect must remain visible after clean daemon exit");
+        assert!(matches!(
+            error,
+            IsolatedHubError::ShutdownFailed { stderr }
+                if stderr.contains("client disconnected")
+        ));
         assert!(hub.child.is_none());
     }
 
