@@ -5060,6 +5060,160 @@ fn cli_smoke_proves_local_runtime_daemon_package_app_session_and_webrtc() {
 }
 
 #[test]
+fn fast_exit_attach_diagnostic_records_subscription_event_order() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_test_dir("fast-exit-attach-diagnostic");
+    let config = explicit_config(&data_dir);
+    let socket_path = config
+        .transports
+        .local_socket
+        .as_ref()
+        .expect("test config has local socket")
+        .path
+        .clone();
+    let endpoint = botster_hub_client::DaemonEndpoint::new(socket_path);
+    let child = start_cli_daemon(&data_dir);
+    let session_id = "fast-exit-diagnostic-session";
+    let subscription_id = "fast-exit-diagnostic-subscription";
+    let marker = "fast-exit-retained-marker";
+
+    let spawn = botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::Spawn {
+            session_id: session_id.to_string(),
+            command: format!("printf '{marker}\\n'"),
+        },
+    )
+    .expect("spawn immediate-output diagnostic session");
+    assert_eq!(spawn.kind, botster_hub_client::DaemonResponseKind::Spawned);
+
+    let mut connection = botster_hub_client::DaemonConnection::connect(&endpoint)
+        .expect("connect diagnostic client");
+    let mut response = connection
+        .request(&botster_hub_client::DaemonRequest::Attach {
+            session_id: session_id.to_string(),
+            subscription_id: subscription_id.to_string(),
+        })
+        .expect("attach diagnostic subscription");
+    let mut observed = String::new();
+    let mut saw_process_exit = false;
+    let mut ordered_observations = Vec::new();
+
+    for response_index in 0..=20 {
+        let request_kind = if response_index == 0 {
+            "attach"
+        } else {
+            "drain"
+        };
+        let mut response_observations = Vec::new();
+        let mut response_renderable_bytes = 0;
+        for event in &response.events {
+            let observation = match event {
+                botster_hub_client::DaemonEvent::SessionLifecycle {
+                    session_id: event_session_id,
+                    state,
+                } if event_session_id == session_id => format!("session_lifecycle:{state}"),
+                botster_hub_client::DaemonEvent::TerminalOutput {
+                    session_id: event_session_id,
+                    subscription_id: event_subscription_id,
+                    data,
+                } if event_session_id == session_id && event_subscription_id == subscription_id => {
+                    response_renderable_bytes += data.len();
+                    observed.push_str(data);
+                    format!("terminal_output:{}", data.len())
+                }
+                botster_hub_client::DaemonEvent::Snapshot {
+                    session_id: event_session_id,
+                    subscription_id: event_subscription_id,
+                    history,
+                } if event_session_id == session_id && event_subscription_id == subscription_id => {
+                    format!("snapshot:{}", history.bytes)
+                }
+                botster_hub_client::DaemonEvent::Scrollback {
+                    session_id: event_session_id,
+                    subscription_id: event_subscription_id,
+                    history,
+                } if event_session_id == session_id && event_subscription_id == subscription_id => {
+                    format!("scrollback:{}", history.bytes)
+                }
+                botster_hub_client::DaemonEvent::ProcessExit {
+                    session_id: event_session_id,
+                    subscription_id: event_subscription_id,
+                    code,
+                } if event_session_id == session_id && event_subscription_id == subscription_id => {
+                    saw_process_exit = true;
+                    format!("process_exit:{code:?}")
+                }
+                botster_hub_client::DaemonEvent::AttachState {
+                    session_id: event_session_id,
+                    subscription_id: event_subscription_id,
+                    state,
+                } if event_session_id == session_id && event_subscription_id == subscription_id => {
+                    format!("attach_state:{state}")
+                }
+                botster_hub_client::DaemonEvent::RuntimeObservation { kind } => {
+                    format!("runtime_observation:{kind}")
+                }
+                botster_hub_client::DaemonEvent::WorktreeLifecycle { .. } => {
+                    "worktree_lifecycle".to_string()
+                }
+                _ => "unscoped_event".to_string(),
+            };
+            response_observations.push(observation.clone());
+            ordered_observations.push(format!("{response_index}:{request_kind}:{observation}"));
+        }
+        println!(
+            "fast_exit_attach_diagnostic response={response_index} request={request_kind} events=[{}] renderable_bytes={response_renderable_bytes} cumulative_renderable_bytes={}",
+            response_observations.join(","),
+            observed.len()
+        );
+
+        if response_index < 20 {
+            thread::sleep(Duration::from_millis(25));
+            response = connection
+                .request(&botster_hub_client::DaemonRequest::Drain {
+                    session_id: session_id.to_string(),
+                })
+                .expect("drain diagnostic subscription");
+        }
+    }
+
+    let sessions = connection
+        .request(&botster_hub_client::DaemonRequest::ListSessions)
+        .expect("list sessions after diagnostic drains");
+    let lifecycle = sessions
+        .sessions
+        .iter()
+        .find(|session| session.session_id == session_id)
+        .map(|session| session.lifecycle.as_str())
+        .unwrap_or("missing");
+    println!(
+        "fast_exit_attach_diagnostic completion=quiescence lifecycle={lifecycle} process_exit={saw_process_exit} renderable_bytes={} event_order=[{}]",
+        observed.len(),
+        ordered_observations.join(",")
+    );
+
+    let detach = connection
+        .request(&botster_hub_client::DaemonRequest::Detach {
+            session_id: session_id.to_string(),
+            subscription_id: subscription_id.to_string(),
+        })
+        .expect("detach diagnostic subscription");
+    println!(
+        "fast_exit_attach_diagnostic detach_response={:?}",
+        detach.kind
+    );
+    assert!(saw_process_exit, "diagnostic should observe process exit");
+    assert!(
+        observed.contains(marker),
+        "diagnostic should observe retained marker; renderable_bytes={} event_order={ordered_observations:?}",
+        observed.len()
+    );
+
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
 fn cli_smoke_reports_missing_first_party_prerequisites() {
     let _guard = daemon_test_guard();
     let data_dir = unique_short_test_dir("cli-smoke-missing");
