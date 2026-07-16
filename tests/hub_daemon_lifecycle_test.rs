@@ -9769,15 +9769,29 @@ fn package_entrypoint_supervision_reports_failed_command() {
         },
     )
     .expect("start failing supervised entrypoint");
-    thread::sleep(Duration::from_millis(100));
-    let status = botster_hub::daemon_transport_request(
-        &explicit_config(&data_dir),
-        botster_hub::DaemonRequest::PackageEntrypointStatus {
-            package_name: "dogfood.failed-command".to_string(),
-            entrypoint_id: "web".to_string(),
-        },
-    )
-    .expect("status failing supervised entrypoint");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        let status = botster_hub::daemon_transport_request(
+            &explicit_config(&data_dir),
+            botster_hub::DaemonRequest::PackageEntrypointStatus {
+                package_name: "dogfood.failed-command".to_string(),
+                entrypoint_id: "web".to_string(),
+            },
+        )
+        .expect("status failing supervised entrypoint");
+        if package_entrypoint(&status, "dogfood.failed-command")
+            .process
+            .state
+            != "running"
+        {
+            break status;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "failing supervised entrypoint did not reach a terminal state"
+        );
+        thread::sleep(Duration::from_millis(20));
+    };
     let entrypoint = package_entrypoint(&status, "dogfood.failed-command");
     assert_eq!(entrypoint.process.state, "failed");
     assert_eq!(entrypoint.process.exit_status.as_deref(), Some("exit:42"));
@@ -9837,6 +9851,19 @@ fn package_entrypoint_supervision_stops_and_restarts() {
         "stopped"
     );
     wait_for_process_exit(first_pid);
+    // The deterministic pending-reader regression guard lives in
+    // stop_preserves_pending_terminal_launch_result_state; this exercises the app projection.
+    let stopped_apps = botster_hub::daemon_transport_request(
+        &explicit_config(&data_dir),
+        botster_hub::DaemonRequest::ListApps,
+    )
+    .expect("list apps after stopping restart fixture");
+    let stopped_app = app_row(&stopped_apps, "web");
+    assert_ne!(stopped_app.lifecycle_state, "running");
+    assert_eq!(
+        package_action(&stopped_app.actions, "start_package_entrypoint").status,
+        botster_hub::DaemonPackageActionStatus::Available
+    );
 
     let restart = botster_hub::daemon_transport_request(
         &explicit_config(&data_dir),
