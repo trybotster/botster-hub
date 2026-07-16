@@ -1,7 +1,7 @@
 # Eliminate stale-daemon recovery UI proxy readiness race
 
-Ticket: `ticket_1784168175_561269`  
-Run: `run_1784234857_352973`  
+Ticket: `ticket_1784168175_561269`
+Run: `run_1784234857_352973`
 Returned Plan step: `run_step_1784237920_358954`
 
 ## Context loaded
