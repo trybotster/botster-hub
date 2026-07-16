@@ -61,6 +61,10 @@ pub enum EntrypointSupervisorError {
         package_name: String,
         entrypoint_id: String,
     },
+    EntrypointFinalizing {
+        package_name: String,
+        entrypoint_id: String,
+    },
     Io(std::io::Error),
 }
 
@@ -87,6 +91,7 @@ impl EntrypointSupervisor {
             package_name: package_name.to_string(),
             entrypoint_id: entrypoint_id.to_string(),
         };
+        self.ensure_not_finalizing(&key)?;
         if let Some(process) = self.processes.get(&key)
             && process.is_running()
         {
@@ -176,8 +181,28 @@ impl EntrypointSupervisor {
         entrypoint_id: &str,
         environment_overrides: &BTreeMap<String, String>,
     ) -> EntrypointSupervisorResult<EntrypointProcessSnapshot> {
+        self.refresh();
+        let key = EntrypointKey {
+            package_name: package_name.to_string(),
+            entrypoint_id: entrypoint_id.to_string(),
+        };
+        self.ensure_not_finalizing(&key)?;
         let _ = self.stop(package_name, entrypoint_id);
         self.start(registry, package_name, entrypoint_id, environment_overrides)
+    }
+
+    fn ensure_not_finalizing(&self, key: &EntrypointKey) -> EntrypointSupervisorResult<()> {
+        if self
+            .processes
+            .get(key)
+            .is_some_and(SupervisedProcess::is_finalizing)
+        {
+            return Err(EntrypointSupervisorError::EntrypointFinalizing {
+                package_name: key.package_name.clone(),
+                entrypoint_id: key.entrypoint_id.clone(),
+            });
+        }
+        Ok(())
     }
 
     pub fn status(&mut self, package_name: &str, entrypoint_id: &str) -> EntrypointProcessSnapshot {
@@ -240,7 +265,11 @@ struct SupervisedProcess {
 
 impl SupervisedProcess {
     fn is_running(&self) -> bool {
-        matches!(self.state, ProcessState::Running)
+        self.exited_at.is_none()
+    }
+
+    fn is_finalizing(&self) -> bool {
+        self.pending_terminal_state.is_some()
     }
 
     fn refresh(&mut self) {
@@ -280,6 +309,7 @@ impl SupervisedProcess {
             return;
         }
         self.launch_result = Some(result);
+        // The child supplies result fields, but supervised process state comes from reaping.
         self.sync_launch_result_process_state();
     }
 
@@ -351,7 +381,10 @@ impl SupervisedProcess {
     }
 
     fn mark_stopped(&mut self) {
-        self.pending_terminal_state = None;
+        if let Some(state) = self.pending_terminal_state.take() {
+            self.state = state;
+            self.sync_launch_result_process_state();
+        }
         self.output_finalization_deadline = None;
         self.state = ProcessState::Stopped;
     }
@@ -668,6 +701,8 @@ mod tests {
         observe_child_exit(&mut process);
 
         assert!(matches!(process.state, ProcessState::Running));
+        assert!(process.is_finalizing());
+        assert!(!process.is_running());
         assert_eq!(process.exit_status.as_deref(), Some("exit:42"));
         assert!(
             process
@@ -704,8 +739,73 @@ mod tests {
     }
 
     #[test]
-    fn terminal_state_publishes_when_output_finalization_deadline_expires() {
+    fn terminal_state_waits_when_only_stderr_reader_completes() {
+        let (mut process, stdout_tx, stderr_tx) = controlled_failed_process();
+        observe_child_exit(&mut process);
+
+        stderr_tx
+            .send(b"fixture failure\n".to_vec())
+            .expect("settle stderr reader");
+        process.refresh();
+
+        assert!(process.stderr.is_none());
+        assert!(process.stdout.is_some());
+        assert!(matches!(process.state, ProcessState::Running));
+        assert!(process.diagnostics.iter().any(|diagnostic| {
+            diagnostic.kind == "stderr" && diagnostic.message == "fixture failure\n"
+        }));
+
+        stdout_tx.send(Vec::new()).expect("settle stdout reader");
+        process.refresh();
+        assert!(matches!(process.state, ProcessState::Failed));
+    }
+
+    #[test]
+    fn start_and_restart_are_rejected_while_output_is_finalizing() {
         let (mut process, _stdout_tx, _stderr_tx) = controlled_failed_process();
+        observe_child_exit(&mut process);
+        let key = EntrypointKey {
+            package_name: "fixture".to_string(),
+            entrypoint_id: "web".to_string(),
+        };
+        let supervisor = EntrypointSupervisor {
+            processes: BTreeMap::from([(key.clone(), process)]),
+            retained: BTreeMap::new(),
+        };
+
+        assert!(matches!(
+            supervisor.ensure_not_finalizing(&key),
+            Err(EntrypointSupervisorError::EntrypointFinalizing { .. })
+        ));
+    }
+
+    #[test]
+    fn stop_preserves_pending_terminal_launch_result_state() {
+        let (mut process, _stdout_tx, _stderr_tx) = controlled_failed_process();
+        observe_child_exit(&mut process);
+        assert!(matches!(
+            process
+                .launch_result
+                .as_ref()
+                .map(|result| &result.process_state),
+            Some(RunnableEntrypointProcessState::Running)
+        ));
+
+        process.stop();
+
+        assert!(matches!(process.state, ProcessState::Stopped));
+        assert!(matches!(
+            process
+                .launch_result
+                .as_ref()
+                .map(|result| &result.process_state),
+            Some(RunnableEntrypointProcessState::Failed)
+        ));
+    }
+
+    #[test]
+    fn terminal_state_publishes_when_output_finalization_deadline_expires() {
+        let (mut process, _stdout_tx, stderr_tx) = controlled_failed_process();
         observe_child_exit(&mut process);
         process.output_finalization_deadline = Some(Instant::now());
 
@@ -721,9 +821,24 @@ mod tests {
                 .pid
                 .is_none()
         );
+        stderr_tx
+            .send(b"late stderr\n".to_vec())
+            .expect("deliver stderr after terminal publication");
+        process.refresh();
+        assert!(matches!(process.state, ProcessState::Failed));
+        assert!(process.diagnostics.iter().any(|diagnostic| {
+            diagnostic.kind == "stderr" && diagnostic.message == "late stderr\n"
+        }));
         let started = Instant::now();
         process.stop();
         assert!(started.elapsed() < STOP_GRACE);
         assert!(matches!(process.state, ProcessState::Stopped));
+        assert!(matches!(
+            process
+                .launch_result
+                .as_ref()
+                .map(|result| &result.process_state),
+            Some(RunnableEntrypointProcessState::Failed)
+        ));
     }
 }

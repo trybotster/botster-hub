@@ -9802,6 +9802,17 @@ fn package_entrypoint_supervision_stops_and_restarts() {
         "stopped"
     );
     wait_for_process_exit(first_pid);
+    let stopped_apps = botster_hub::daemon_transport_request(
+        &explicit_config(&data_dir),
+        botster_hub::DaemonRequest::ListApps,
+    )
+    .expect("list apps after stopping restart fixture");
+    let stopped_app = app_row(&stopped_apps, "web");
+    assert_ne!(stopped_app.lifecycle_state, "running");
+    assert_eq!(
+        package_action(&stopped_app.actions, "start_package_entrypoint").status,
+        botster_hub::DaemonPackageActionStatus::Available
+    );
 
     let restart = botster_hub::daemon_transport_request(
         &explicit_config(&data_dir),

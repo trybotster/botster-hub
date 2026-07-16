@@ -1818,6 +1818,9 @@ fn apps_from_record(
                 .map(|result| runnable_process_state_label(&result.process_state).to_string())
                 .or_else(|| snapshot.map(|snapshot| snapshot.state.clone()))
                 .unwrap_or_else(|| "not_started".to_string());
+            let finalizing = snapshot.is_some_and(|snapshot| {
+                process_is_finalizing(&snapshot.state, snapshot.pid, snapshot.exited_at)
+            });
             let diagnostics: Vec<DaemonPackageDiagnostic> = snapshot
                 .map(|snapshot| {
                     snapshot
@@ -1837,6 +1840,7 @@ fn apps_from_record(
                 &entrypoint.id,
                 entrypoint,
                 &lifecycle_state,
+                finalizing,
             );
             DaemonApp {
                 package_name: record.manifest.name.clone(),
@@ -1901,6 +1905,7 @@ fn app_entrypoint_actions(
     entrypoint_id: &str,
     entrypoint: &crate::PackageRunnableEntrypoint,
     lifecycle_state: &str,
+    finalizing: bool,
 ) -> Vec<DaemonPackageActionState> {
     if !matches!(
         entrypoint.launch_mode,
@@ -1949,6 +1954,9 @@ fn app_entrypoint_actions(
             ),
         ];
     }
+    if finalizing {
+        return finalizing_entrypoint_actions(package_name, entrypoint_id);
+    }
     let running = lifecycle_state == "running";
     let mut actions = Vec::new();
     if running {
@@ -1977,6 +1985,32 @@ fn app_entrypoint_actions(
         request_for_entrypoint("restart_package_entrypoint", package_name, entrypoint_id),
     ));
     actions
+}
+
+fn process_is_finalizing(state: &str, pid: Option<u32>, exited_at: Option<u64>) -> bool {
+    state == "running" && pid.is_none() && exited_at.is_some()
+}
+
+fn finalizing_entrypoint_actions(
+    package_name: &str,
+    entrypoint_id: &str,
+) -> Vec<DaemonPackageActionState> {
+    vec![
+        unavailable_action(
+            "start_package_entrypoint",
+            "output_finalizing",
+            "entrypoint output is still finalizing",
+        ),
+        available_package_action(
+            "stop_package_entrypoint",
+            request_for_entrypoint("stop_package_entrypoint", package_name, entrypoint_id),
+        ),
+        unavailable_action(
+            "restart_package_entrypoint",
+            "output_finalizing",
+            "entrypoint output is still finalizing",
+        ),
+    ]
 }
 
 fn app_local_url(
@@ -4102,6 +4136,14 @@ fn entrypoint_actions(
         ];
     }
 
+    if process_is_finalizing(
+        &entrypoint.process.state,
+        entrypoint.process.pid,
+        entrypoint.process.exited_at,
+    ) {
+        return finalizing_entrypoint_actions(package_name, &entrypoint.id);
+    }
+
     let running = entrypoint.process.state == "running";
     let mut actions = Vec::new();
     if running {
@@ -4752,6 +4794,15 @@ fn daemon_operator_error_from_entrypoint(error: EntrypointSupervisorError) -> Da
             "entrypoint_not_supervisable",
             format!("package {package_name} entrypoint {entrypoint_id} is not marked supervisable"),
         ),
+        EntrypointSupervisorError::EntrypointFinalizing {
+            package_name,
+            entrypoint_id,
+        } => (
+            "entrypoint_output_finalizing",
+            format!(
+                "package {package_name} entrypoint {entrypoint_id} output is still finalizing; retry after terminal status is published"
+            ),
+        ),
         EntrypointSupervisorError::Io(error) => (
             "entrypoint_io_error",
             format!("entrypoint process error: {error}"),
@@ -5342,5 +5393,52 @@ mod tests {
         assert!(!debug.contains("private terminal payload"));
         assert!(!debug.contains("session-redacted"));
         assert!(!debug.contains("subscription-redacted"));
+    }
+
+    #[test]
+    fn finalizing_entrypoint_actions_block_start_and_restart_but_allow_stop() {
+        assert!(process_is_finalizing("running", None, Some(1)));
+        let actions = finalizing_entrypoint_actions("fixture", "web");
+        let action = |action_id: &str| {
+            actions
+                .iter()
+                .find(|action| action.action_id == action_id)
+                .expect("finalizing action")
+        };
+
+        assert_eq!(
+            action("start_package_entrypoint").status,
+            DaemonPackageActionStatus::Unavailable
+        );
+        assert_eq!(
+            action("start_package_entrypoint").reason.as_deref(),
+            Some("output_finalizing")
+        );
+        assert_eq!(
+            action("stop_package_entrypoint").status,
+            DaemonPackageActionStatus::Available
+        );
+        assert!(action("stop_package_entrypoint").request.is_some());
+        assert_eq!(
+            action("restart_package_entrypoint").status,
+            DaemonPackageActionStatus::Unavailable
+        );
+        assert_eq!(
+            action("restart_package_entrypoint").reason.as_deref(),
+            Some("output_finalizing")
+        );
+    }
+
+    #[test]
+    fn finalizing_entrypoint_error_is_an_explicit_transient_operator_error() {
+        let error = daemon_operator_error_from_entrypoint(
+            EntrypointSupervisorError::EntrypointFinalizing {
+                package_name: "fixture".to_string(),
+                entrypoint_id: "web".to_string(),
+            },
+        );
+
+        assert_eq!(error.code, "entrypoint_output_finalizing");
+        assert!(error.message.contains("retry after terminal status"));
     }
 }
