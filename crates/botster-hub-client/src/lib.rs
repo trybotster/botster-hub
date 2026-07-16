@@ -96,7 +96,7 @@ impl DaemonConnection {
     /// Connect to the daemon and complete the socket protocol handshake.
     pub fn connect(endpoint: &DaemonEndpoint) -> DaemonTransportResult<Self> {
         let stream = connect_and_hello(endpoint)?;
-        let reader = BufReader::new(stream.try_clone().map_err(DaemonTransportError::Io)?);
+        let reader = BufReader::new(stream.try_clone().map_err(normalize_socket_io_error)?);
         Ok(Self { stream, reader })
     }
 
@@ -216,7 +216,7 @@ pub fn connect_and_hello_with_requirement(
         ) {
             DaemonTransportError::NotRunning
         } else {
-            DaemonTransportError::Io(error)
+            normalize_socket_io_error(error)
         }
     })?;
     write_frame(
@@ -239,14 +239,16 @@ pub fn connect_and_hello_with_requirement(
 
 pub fn write_frame<T: Serialize>(stream: &mut UnixStream, frame: &T) -> DaemonTransportResult<()> {
     let bytes = serde_json::to_vec(frame).map_err(DaemonTransportError::Json)?;
-    stream.write_all(&bytes).map_err(DaemonTransportError::Io)?;
-    stream.write_all(b"\n").map_err(DaemonTransportError::Io)
+    stream
+        .write_all(&bytes)
+        .map_err(normalize_socket_io_error)?;
+    stream.write_all(b"\n").map_err(normalize_socket_io_error)
 }
 
 pub fn read_frame<T: for<'de> Deserialize<'de>>(
     stream: &mut UnixStream,
 ) -> DaemonTransportResult<T> {
-    let mut reader = BufReader::new(stream.try_clone().map_err(DaemonTransportError::Io)?);
+    let mut reader = BufReader::new(stream.try_clone().map_err(normalize_socket_io_error)?);
     read_frame_from_reader(&mut reader)
 }
 
@@ -261,7 +263,7 @@ fn read_frame_line(reader: &mut BufReader<UnixStream>) -> DaemonTransportResult<
     let mut line = String::new();
     let bytes = reader
         .read_line(&mut line)
-        .map_err(DaemonTransportError::Io)?;
+        .map_err(normalize_socket_io_error)?;
     if bytes == 0 {
         return Err(DaemonTransportError::ClientDisconnected);
     }
@@ -276,7 +278,7 @@ fn read_value_frame_from_reader(
 }
 
 fn read_hello_ack(stream: &mut UnixStream) -> DaemonTransportResult<DaemonHelloAck> {
-    let mut reader = BufReader::new(stream.try_clone().map_err(DaemonTransportError::Io)?);
+    let mut reader = BufReader::new(stream.try_clone().map_err(normalize_socket_io_error)?);
     let value = read_value_frame_from_reader(&mut reader)?;
     if hello_ack_missing_compatibility(&value) {
         return Err(precompatibility_hub_error());
@@ -285,7 +287,7 @@ fn read_hello_ack(stream: &mut UnixStream) -> DaemonTransportResult<DaemonHelloA
 }
 
 fn read_daemon_response(stream: &mut UnixStream) -> DaemonTransportResult<DaemonResponse> {
-    let mut reader = BufReader::new(stream.try_clone().map_err(DaemonTransportError::Io)?);
+    let mut reader = BufReader::new(stream.try_clone().map_err(normalize_socket_io_error)?);
     read_daemon_response_from_reader(&mut reader)
 }
 
@@ -297,6 +299,19 @@ fn read_daemon_response_from_reader(
         return Err(precompatibility_hub_error());
     }
     serde_json::from_value(value).map_err(DaemonTransportError::Json)
+}
+
+fn normalize_socket_io_error(error: std::io::Error) -> DaemonTransportError {
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::UnexpectedEof
+    ) {
+        DaemonTransportError::ClientDisconnected
+    } else {
+        DaemonTransportError::Io(error)
+    }
 }
 
 fn hello_ack_missing_compatibility(value: &Value) -> bool {
@@ -1920,6 +1935,28 @@ impl Error for DaemonTransportError {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn teardown_io_kinds_normalize_to_client_disconnected() {
+        for kind in [
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::BrokenPipe,
+            std::io::ErrorKind::UnexpectedEof,
+        ] {
+            assert!(matches!(
+                normalize_socket_io_error(std::io::Error::from(kind)),
+                DaemonTransportError::ClientDisconnected
+            ));
+        }
+
+        let error =
+            normalize_socket_io_error(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        assert!(matches!(
+            error,
+            DaemonTransportError::Io(error)
+                if error.kind() == std::io::ErrorKind::PermissionDenied
+        ));
+    }
 
     #[test]
     fn compatibility_accepts_current_descriptor() {

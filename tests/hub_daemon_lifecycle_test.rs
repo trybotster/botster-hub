@@ -4298,15 +4298,34 @@ fn cli_local_runtime_up_starts_reuses_and_down_stops_runtime() {
     let down_text = command_output_text(&down);
     assert!(down_text.contains("response=shutdown"));
 
+    let restarted = run_local_runtime_up(
+        &data_dir,
+        &project_pipelines_package_dir,
+        &web_package_dir,
+        &tui_package_dir,
+        &workspaces_package_dir,
+        unused_loopback_port(),
+    );
+    assert!(
+        restarted.status.success(),
+        "immediate up after down failed: {}",
+        command_output_text(&restarted)
+    );
+    let restarted_text = command_output_text(&restarted);
+    assert!(restarted_text.contains("runtime=ready"));
+    assert!(restarted_text.contains("daemon=started"));
+
+    shutdown_dev_stack_daemon(&data_dir);
+
     let status = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
         .arg("status")
         .arg("--data-dir")
         .arg(&data_dir)
         .output()
-        .expect("run botster-hub status after down");
+        .expect("run botster-hub status after daemon shutdown");
     assert!(
         !status.status.success(),
-        "status should fail after down: {}",
+        "status should fail after daemon shutdown: {}",
         command_output_text(&status)
     );
 }
