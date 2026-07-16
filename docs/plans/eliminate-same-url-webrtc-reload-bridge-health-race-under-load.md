@@ -69,11 +69,10 @@ Replace the fixed-iteration helper with a condition-driven wait whose success
 predicate is only a successful exact `/health` response. Each observation also
 requests `ListApps` for the exact `botster-web/web-client` row so the helper can
 fail immediately when the supervised process reaches a terminal/failed state
-and retain its process state, launch result, and diagnostics. Ordinary local/CI
-`./test.sh` uses a 60-second liveness backstop. The loaded workflow explicitly
-supplies an 840-second liveness backstop, leaving 60 seconds inside its unchanged
-900-second outer run deadline for failure reporting and teardown. Neither
-backstop is a readiness predicate or evidence of success; expiry is a
+and retain its process state, launch result, and diagnostics. Every path,
+including the loaded workflow, uses the same 60-second liveness backstop. The
+loaded runner separately retains its unchanged 900-second whole-run deadline.
+The backstop is never a readiness predicate or evidence of success; expiry is a
 live-yet-stuck diagnostic failure.
 
 After `/health` succeeds, require `ListApps` to publish the exact structured URL
@@ -101,8 +100,7 @@ issuance would broaden the ticket without evidence of a product defect.
 - In `tests/hub_daemon_lifecycle_test.rs`, replace
   `wait_for_botster_web_health` with a condition-driven helper that succeeds only
   on exact `/health`, fails immediately on supervised terminal state, and uses a
-  60-second default liveness backstop configurable only for the owned loaded
-  harness.
+  60-second liveness backstop on every path.
 - Preserve the exact health shape so the test proves the listener, existing-hub
   ownership, socket source, socket presence, and non-mixed ownership.
 - Add a fixture-only startup-delay environment override and set it above two
@@ -117,9 +115,6 @@ issuance would broaden the ticket without evidence of a product defect.
 - Timestamp daemon start, package enable, `StartPackageEntrypoint` return,
   listener health success, and `local_url` publication so a future red run
   attributes the ticket's unexplained 4m40s pre-readiness window.
-- In `.github/workflows/loaded-daemon-lifecycle.yml`, supply the explicit
-  840-second test liveness backstop only to the loaded lifecycle command. Do not
-  change the existing 900-second outer deadline or stress profile.
 - Keep the existing fresh-grant, wrong-origin, wrong-secret, first-peer,
   second-peer, session continuity, and cleanup assertions byte-for-byte unless a
   directly necessary signature adjustment is documented.
@@ -134,8 +129,10 @@ issuance would broaden the ticket without evidence of a product defect.
   semantics.
 - No changes to `script/run-loaded-daemon-lifecycle`, its residual-tail worker
   profile, workflow inputs, default parallelism, per-run/campaign deadlines, or
-  cleanup policy. The workflow-only test backstop environment is the sole loaded
-  harness change authorized by `question_1784235821_620334`.
+  cleanup policy. No workflow-only backstop override is added: Plan Review
+  findings `finding_1784236396_795918` and `finding_1784236396_343857` establish
+  that the proposed 840-second value could not fire before the whole-run deadline
+  and that no measurement justified a second configuration path.
 - No fixed product/test sleep used as readiness evidence, readiness-budget
   inflation, retry loop that reruns a red test,
   `--test-threads=1` acceptance run, ignored test, reduced load, assertion
@@ -159,9 +156,10 @@ issuance would broaden the ticket without evidence of a product defect.
   inside that callback and the supervisor exposes it only on a later refresh.
 - The two cited failures occur before any reload/bootstrap assertion. Therefore
   they do not support a production grant or peer-lifecycle change.
-- `question_1784235821_620334` authorizes a 60-second ordinary liveness backstop
-  and an 840-second loaded-test override below the unchanged 900-second outer
-  deadline. These bounds prevent hangs and never decide readiness.
+- `question_1784235821_620334` authorizes the 60-second liveness backstop and
+  conditionally permits a larger loaded value only if measurement establishes
+  need. No such evidence exists, so the implementation uses 60 seconds on every
+  path while leaving the loaded runner's 900-second whole-run deadline unchanged.
 - The implementation uses the assigned worktree and repo `./test.sh`; no ambient
   checkout or raw `cargo test` result is acceptable.
 
@@ -175,28 +173,27 @@ issuance would broaden the ticket without evidence of a product defect.
   launch-result state, or bridge stderr. The new diagnostics must distinguish
   not-listening, unhealthy response, terminal child, wrong URL, and liveness
   expiry.
-- The 840-second loaded override is deliberately below the 900-second command
-  deadline. If real evidence shows it leaves insufficient reporting/cleanup
-  margin, ask a human rather than changing either value silently.
+- The binding residual-tail campaign has not yet measured bridge readiness under
+  load. If phase timestamps show readiness approaching the 60-second liveness
+  backstop, ask a human before adding a measured loaded override or changing the
+  unchanged 900-second whole-run deadline.
 
 The ambiguity is resolved by human answer `question_1784235821_620334`. Ask
-again before changing production launch semantics, the 60/840-second liveness
+again before changing production launch semantics, the 60-second liveness
 contract, the loaded stress profile or 900-second outer deadline, or required
 negative-control/default-parallel acceptance evidence.
 
 ## Affected surfaces/files
 
 - `tests/hub_daemon_lifecycle_test.rs` — semantic bridge readiness, state-rich
-  diagnostics, fixture startup-delay injection, 60-second ordinary liveness
+  diagnostics, fixture startup-delay injection, 60-second liveness
   backstop, exact post-ready `local_url`, and preserved WebRTC assertions.
-- `.github/workflows/loaded-daemon-lifecycle.yml` — explicit 840-second test-only
-  liveness environment for the loaded lifecycle command; no outer deadline,
-  input, load, concurrency, or cleanup change.
 - `docs/plans/eliminate-same-url-webrtc-reload-bridge-health-race-under-load.md`
   — this reviewable plan artifact.
-- `script/run-loaded-daemon-lifecycle`, `src/entrypoint_supervisor.rs`,
-  `src/daemon_transport.rs`, and `src/local_webrtc.rs` — runtime and verification
-  surfaces inspected or invoked but expected to remain unchanged.
+
+Inspected or invoked but unchanged: `.github/workflows/loaded-daemon-lifecycle.yml`,
+`script/run-loaded-daemon-lifecycle`, `src/entrypoint_supervisor.rs`,
+`src/daemon_transport.rs`, and `src/local_webrtc.rs`.
 
 Required docs/plugin README updates: none. This changes internal regression
 synchronization and diagnostics, not a user-facing or plugin UI contract.
@@ -206,7 +203,7 @@ synchronization and diagnostics, not a user-facing or plugin UI contract.
 - **Later metadata is mistaken for listener health.** Only exact `/health`
   succeeds readiness; `local_url` is asserted afterward.
 - **The new wait hides a dead or stuck bridge.** Fail immediately on terminal
-  state and expire at the human-approved 60/840-second liveness backstop with
+  state and expire at the human-approved 60-second liveness backstop with
   app/daemon/process/HTTP diagnostics.
 - **A stale or wrong app row short-circuits readiness.** Match package,
   entrypoint, and exact expected URL. A published non-matching URL fails fast
@@ -239,12 +236,12 @@ synchronization and diagnostics, not a user-facing or plugin UI contract.
 1. Static scope checks:
    - `git diff --check` passes.
    - `git diff --stat main...HEAD` contains only the plan and the surgical test
-     file plus the loaded workflow's test-liveness environment unless an
-     implementation artifact explains a directly necessary addition.
-   - `rg` confirms the only timing changes are the 60-second default liveness
-     backstop, explicit 840-second loaded override, and fixture-only injected
-     delay; no workflow outer deadline, stress setting, Cargo concurrency flag,
-     WebRTC assertion, or production transport path changed.
+     file unless an implementation artifact explains a directly necessary
+     addition.
+   - `rg` confirms the only timing changes are the 60-second liveness
+     backstop and fixture-only injected delay; no workflow outer deadline,
+     stress setting, Cargo concurrency flag, WebRTC assertion, or production
+     transport path changed.
 2. Focused local behavior:
    - Run
      `./test.sh --test hub_daemon_lifecycle_test botster_web_same_url_reload_issues_fresh_local_webrtc_bootstrap -- --exact --nocapture`.
@@ -276,9 +273,9 @@ synchronization and diagnostics, not a user-facing or plugin UI contract.
    - Require the workflow to precompile the exact lifecycle target before load,
      execute `./test.sh --test hub_daemon_lifecycle_test -- --nocapture` at
      default parallelism, and stop at the first red run.
-   - Confirm the test receives the explicit 840-second liveness backstop while
-     the runner retains its existing 900-second outer deadline. Readiness must
-     still be reported only by exact `/health`, never by elapsed time.
+   - Confirm the test uses the 60-second liveness backstop while the runner
+     retains its existing 900-second whole-run deadline. Readiness must still be
+     reported only by exact `/health`, never by elapsed time.
    - Attach workflow URL, artifact metadata, exact SHA, completed repetition
      count, raw run logs, load samples, cleanup evidence, and all statuses. Every
      requested repetition must pass; any other first-root failure remains red
@@ -297,7 +294,8 @@ synchronization and diagnostics, not a user-facing or plugin UI contract.
 - Plan: attach this document with explicit assumptions and checklist evidence,
   submit `botster_plan_gate`, then request advancement.
 - Plan Review: reject readiness-budget inflation, liveness values other than the
-  human-approved 60/840 contract, production launch/transport changes,
+  human-approved 60-second contract without new measured evidence and human
+  approval, production launch/transport changes,
   metadata-only readiness, missing phase/process/daemon/HTTP diagnostics,
   weakened WebRTC assertions, or acceptance that omits deterministic
   negative-control and loaded proof.
