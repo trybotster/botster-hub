@@ -317,12 +317,28 @@ impl LocalWebrtcOfferPeer {
         let mut maximum_frame_bytes = 0;
         let mut next_chunk_index = 0;
         loop {
-            let response = timeout(Duration::from_secs(10), self.data_channel_message_rx.recv())
-                .await
-                .map_err(|_| std::io::Error::other("timed out waiting for data channel response"))?
-                .ok_or_else(|| {
-                    std::io::Error::other("local WebRTC data channel closed before response")
-                })?;
+            let response =
+                match timeout(Duration::from_secs(10), self.data_channel_message_rx.recv()).await {
+                    Ok(Some(response)) => response,
+                    Ok(None) => {
+                        return Err(local_webrtc_response_progress_error(
+                            "channel_closed",
+                            message_id.as_deref(),
+                            next_chunk_index,
+                            expected_chunk_count,
+                        )
+                        .into());
+                    }
+                    Err(_) => {
+                        return Err(local_webrtc_response_progress_error(
+                            "response_timeout",
+                            message_id.as_deref(),
+                            next_chunk_index,
+                            expected_chunk_count,
+                        )
+                        .into());
+                    }
+                };
             maximum_frame_bytes = maximum_frame_bytes.max(response.len());
             assert!(
                 response.len() < botster_hub_client::LOCAL_WEBRTC_MAX_FRAME_BYTES,
@@ -370,6 +386,20 @@ struct LocalWebrtcResponseMetrics {
     envelope_bytes: usize,
     chunk_count: usize,
     maximum_frame_bytes: usize,
+}
+
+fn local_webrtc_response_progress_error(
+    cause: &str,
+    message_id: Option<&str>,
+    next_chunk_index: u32,
+    expected_chunk_count: Option<u32>,
+) -> std::io::Error {
+    std::io::Error::other(format!(
+        "local WebRTC response incomplete: cause={cause} message_id={} next_chunk={} expected_chunks={}",
+        message_id.unwrap_or("pending"),
+        next_chunk_index,
+        expected_chunk_count.map_or_else(|| "pending".to_string(), |count| count.to_string()),
+    ))
 }
 
 fn local_webrtc_stream_key(secret: &str) -> AesGcmKey {
@@ -4298,15 +4328,34 @@ fn cli_local_runtime_up_starts_reuses_and_down_stops_runtime() {
     let down_text = command_output_text(&down);
     assert!(down_text.contains("response=shutdown"));
 
+    let restarted = run_local_runtime_up(
+        &data_dir,
+        &project_pipelines_package_dir,
+        &web_package_dir,
+        &tui_package_dir,
+        &workspaces_package_dir,
+        unused_loopback_port(),
+    );
+    assert!(
+        restarted.status.success(),
+        "immediate up after down failed: {}",
+        command_output_text(&restarted)
+    );
+    let restarted_text = command_output_text(&restarted);
+    assert!(restarted_text.contains("runtime=ready"));
+    assert!(restarted_text.contains("daemon=started"));
+
+    shutdown_dev_stack_daemon(&data_dir);
+
     let status = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
         .arg("status")
         .arg("--data-dir")
         .arg(&data_dir)
         .output()
-        .expect("run botster-hub status after down");
+        .expect("run botster-hub status after daemon shutdown");
     assert!(
         !status.status.success(),
-        "status should fail after down: {}",
+        "status should fail after daemon shutdown: {}",
         command_output_text(&status)
     );
 }
