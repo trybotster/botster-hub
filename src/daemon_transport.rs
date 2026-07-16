@@ -5284,7 +5284,7 @@ mod tests {
     use std::net::Shutdown;
 
     #[test]
-    fn client_disconnected_read_detaches_connection_subscriptions() {
+    fn client_eof_detaches_connection_subscriptions() {
         let (server, mut client) = UnixStream::pair().expect("create daemon socket pair");
         let (control_tx, control_rx) = mpsc::channel();
         let connection = thread::spawn(move || handle_connection(server, control_tx));
