@@ -4,8 +4,12 @@
 
 - Project Pipelines context for ticket `ticket_1784168176_753693`, run
   `run_1784222795_280840`, active Plan step `botster_plan`, run step
-  `run_step_1784222796_613436`, and gate `botster_plan_gate`. There are no prior
-  artifacts, findings, reviews, questions, answers, or blocking dependencies.
+  `run_step_1784223739_624518`, and gate `botster_plan_gate`. The first Plan
+  artifact is `artifact_1784223280_960220`. Plan Review
+  `review_1784223708_375099` returned changes required with three open findings:
+  bound finalization when descendants retain pipe FDs, preserve the field-level
+  `exited_at` contract, and update the existing one-shot failed-command test.
+  There are no questions, answers, or blocking dependencies.
 - Required planning context: [[identity]], [[goals]], [[planner-playbook]],
   [[botster-planner-playbook]], [[botster-architecture]], [[cli-patterns]], and
   [[spa-patterns]].
@@ -43,6 +47,12 @@
   publish `failed`, and return a snapshot while the reader threads still own the
   final stdout/stderr buffers. Under load, the dogfood readiness loop sees the
   terminal state and exits before a later status request can project stderr.
+- Corroborating test evidence: `package_entrypoint_supervision_reports_failed_command`
+  at `tests/hub_daemon_lifecycle_test.rs:9701` sleeps a fixed 100ms, performs one
+  status request, then asserts `failed`, `exit:42`, and exact stderr. It is
+  latently exposed to the same delayed-reader race and must observe the
+  asynchronous terminal transition with bounded polling before retaining its
+  exact diagnostic assertions.
 - Existing loaded verification surface: `.github/workflows/loaded-daemon-lifecycle.yml`
   and `script/run-loaded-daemon-lifecycle` precompile the exact lifecycle test,
   run the full test binary at default Cargo parallelism under the bounded
@@ -62,7 +72,10 @@
 - Make failed/exited supervised-entrypoint snapshots causally complete: a
   terminal process state must not become externally visible before the bounded
   stdout/stderr readers have delivered all captured bytes associated with that
-  exit.
+  exit, unless a dedicated 500ms supervisor-internal finalization grace expires.
+- Record the child-reaping facts (`exited_at`, `exit_status`, and absence of a
+  live PID) immediately when `try_wait` observes exit. Gate only publication of
+  the terminal `ProcessState` and structured launch-result process state.
 - Preserve the existing 4096-byte per-stream bound, path redaction, diagnostic
   kinds, exact exit status, and public package/app projection shapes.
 - Add a deterministic supervisor regression that controls delayed reader
@@ -76,8 +89,12 @@
 
 ### Non-scope
 
-- No weaker diagnostic assertion, retry loop, fixed sleep, timeout inflation,
-  test serialization, `--test-threads=1` acceptance, or suppression of a red run.
+- No weaker diagnostic assertion, retry that accepts a terminal row without the
+  required diagnostic, fixed-sleep synchronization, timeout inflation, test
+  serialization, `--test-threads=1` acceptance, or suppression of a red run.
+- Bounded polling is permitted only to observe the asynchronous transition from
+  running to terminal. Polling stops on the first terminal row, after which the
+  existing exit-status and diagnostic assertions remain exact and immediate.
 - No changes to dogfood health/UI polling policy, daemon shutdown response
   delivery, session-worker behavior, package manifests, app DTOs, public daemon
   protocol, WebRTC, SPA, TUI, Lua plugins, Rails relay, or Project Pipelines.
@@ -95,11 +112,18 @@
 - The ticket's required invariant is supervisor-owned ordering, not a CLI retry:
   every consumer of a terminal `EntrypointProcessSnapshot` should receive the
   same complete bounded diagnostics.
-- Reader completion is part of terminal-state reconciliation. The smallest safe
-  shape is to retain an observed `ExitStatus` internally while readers finish,
-  and publish `failed`/`exited` only after both output channels are complete.
-  This avoids blocking the daemon owner thread and avoids inventing a public
-  `finalizing` state.
+- Reader completion is part of terminal-state reconciliation, but it cannot be
+  an unbounded gate because process-group descendants may inherit the write-side
+  pipe FDs. The pinned shape is a private pending terminal state plus a dedicated
+  `OUTPUT_FINALIZATION_GRACE` of 500ms. Publish `failed`/`exited` when both output
+  channels complete or when that grace expires, whichever comes first. This
+  avoids blocking the daemon owner thread, avoids inventing a public `finalizing`
+  state, and cannot stall the dogfood health loop indefinitely.
+- `exited_at` and `exit_status` are internal reaping facts, not publication
+  gates. Set them immediately at `try_wait`; `snapshot()` must therefore report
+  `pid: None` during private finalization, and `stop()` must retain its immediate
+  already-exited fast path rather than spending `STOP_GRACE` signalling a dead
+  group leader.
 - While terminal output is finalizing, `start` must still regard the existing
   supervised process as owned so a second copy cannot spawn. The externally
   visible row may remain in its prior nonterminal state for this short internal
@@ -112,17 +136,13 @@
 
 ### Unknowns to resolve during implementation
 
-- Whether the cleanest internal representation is a pending exit status on
-  `SupervisedProcess` or a private finalizing enum variant. Choose the smaller
-  private change; do not expose a new client-visible state.
 - Whether stdout and stderr readers can complete on different refresh calls.
   The regression must cover one stream arriving after exit observation and
   require both streams to be settled before terminal publication.
-- Whether a launched command can leave descendants holding inherited pipe file
-  descriptors after the supervised child exits. The implementation must not add
-  an unbounded join/receive on the daemon owner thread. If the current reader
-  contract cannot signal bounded capture completion without blocking, stop and
-  ask a human before changing process-group shutdown semantics.
+- The exact private field names remain an implementation detail, but their
+  contracts are pinned: one pending terminal `ProcessState`, one monotonic
+  finalization deadline, immediate `exited_at`/`exit_status`, and no public state
+  addition.
 - The captured flake frequency is not a success criterion. One deterministic
   red-when-reverted test plus the required loaded full-target campaign is the
   evidence boundary.
@@ -130,16 +150,18 @@
 No human question blocks planning: the ticket names the exact missing output,
 forbids assertion/retry workarounds, and the production race has one narrow
 supervisor-owned interpretation. Any need to add a public lifecycle state,
-change process-group semantics, weaken the diagnostic, or alter the loaded
-campaign would be a scope-changing question rather than an implementation choice.
+change process-group semantics, weaken the diagnostic, change the pinned 500ms
+supervisor grace, or alter the loaded campaign would be a scope-changing question
+rather than an implementation choice.
 
 ## Affected surfaces/files
 
 - `src/entrypoint_supervisor.rs` — production fix and focused unit regression for
   exit/output reconciliation. Expected to be the only production code file.
-- `tests/hub_daemon_lifecycle_test.rs` — preserve the existing exact real-dogfood
-  assertion; touch only if a narrowly necessary barrier or additional assertion
-  is required to prove exit 42 and stderr through the binary/socket path.
+- `tests/hub_daemon_lifecycle_test.rs` — preserve the exact real-dogfood
+  assertion and replace the fixed 100ms/one-shot observation in
+  `package_entrypoint_supervision_reports_failed_command` with bounded polling
+  for terminal-state arrival before its existing exact exit/stderr assertions.
 - `docs/plans/preserve-failed-dogfood-entrypoint-diagnostics-under-load.md` — this
   Plan-stage artifact.
 - Read/execute only: `src/daemon_transport.rs`, `src/main.rs`, `test.sh`,
@@ -154,28 +176,36 @@ and loaded verification must bind the pushed implementation by exact commit SHA.
 
 ## Implementation plan
 
-1. Add private pending-terminal bookkeeping to `SupervisedProcess`. On refresh,
-   drain both reader channels, observe `try_wait` once, retain the `ExitStatus`,
-   and continue draining on later refreshes without publishing the terminal
-   state prematurely.
-2. Finalize the retained exit only after stdout and stderr capture are complete:
-   set `exited_at`, `exit_status`, process state, and structured launch-result
-   state together. Preserve the exact existing diagnostic order, byte bound, and
-   redaction behavior.
+1. Add private pending-terminal bookkeeping and a dedicated 500ms
+   `OUTPUT_FINALIZATION_GRACE` to `SupervisedProcess`. On refresh, drain both
+   reader channels, observe `try_wait` once, immediately record `exited_at` and
+   `exit_status`, retain the pending terminal `ProcessState`, and start a
+   monotonic finalization deadline.
+2. Publish the retained terminal process state and structured launch-result
+   state when both reader channels are complete or the deadline expires,
+   whichever comes first. Preserve the exact existing diagnostic order, byte
+   bound, and redaction behavior. Keep incomplete readers available for later
+   nonblocking drains after deadline publication so late bounded bytes can still
+   enrich later snapshots.
 3. Audit `start`, `status`, `snapshots`, `stop`, `restart`, `stop_package`, and
    `stop_all` against the private finalizing phase. Prevent duplicate starts,
    preserve normal stop cleanup, and avoid any owner-thread blocking wait. Do not
    retrofit unrelated lifecycle behavior.
-4. Add a deterministic unit regression in `src/entrypoint_supervisor.rs` that
+4. Add deterministic unit regressions in `src/entrypoint_supervisor.rs` that
    holds a reader sender open across exit observation, verifies no terminal
    snapshot is published yet, then delivers the exact stderr bytes and verifies
    the next snapshot is `failed`, `exit:42`, and contains the exact bounded
-   `stderr` diagnostic. Cover both-stream completion if one channel settles
-   earlier than the other.
-5. Keep the existing dogfood lifecycle test's exact diagnostic assertion. Add
-   only directly necessary exit-status/runtime-path coverage, then run it after
-   explicitly building the session-worker binary so the focused command does not
-   depend on another parallel test's setup.
+   `stderr` diagnostic. A second regression holds a sender open without sending,
+   forces the private deadline-expiry path without a wall-clock sleep, and proves
+   terminal state still publishes, `pid` is absent, and `stop()` does not spend
+   `STOP_GRACE` treating the reaped child as live.
+5. Replace the fixed 100ms sleep in
+   `package_entrypoint_supervision_reports_failed_command` with bounded polling
+   only while state remains `running`. Stop on the first terminal status, then
+   keep the existing exact `failed`, `exit:42`, and stderr assertions unchanged.
+   Keep the dogfood lifecycle test's exact diagnostic and path-redaction
+   assertions unchanged, and run it after explicitly building the session-worker
+   binary so the focused command does not depend on another parallel test's setup.
 6. Demonstrate the negative control: keep the new regression, temporarily revert
    only the production reconciliation change in an isolated copy or reversible
    patch, run the focused test, and record its nonzero result. Restore the fix and
@@ -191,16 +221,20 @@ and loaded verification must bind the pushed implementation by exact commit SHA.
   `try_wait` is still scheduler-dependent. Mitigation: terminal publication must
   be gated on explicit reader completion, not another opportunistic poll.
 - **Daemon owner thread blocks on inherited pipes.** Joining or receiving without
-  a completion guarantee can hang status and shutdown. Mitigation: keep capture
-  asynchronous and represent finalization privately; do not add an unbounded
-  wait on the request path.
+  a completion guarantee can hang status and shutdown, while even a nonblocking
+  unbounded publication gate can stall state forever. Mitigation: keep capture
+  asynchronous and cap private finalization at 500ms.
 - **A finalizing process is accidentally restarted.** If `is_running` checks only
   the public state, a start request could duplicate ownership. Mitigation: make
   the internal pending-exit phase count as supervisor-owned until finalized.
 - **Stop/restart drops the last bytes.** A stop request during finalization could
-  overwrite state before readers drain. Mitigation: cover stop/restart control
-  flow in the audit and add a focused assertion if the code path is not obviously
-  preserved.
+  overwrite state before readers drain. Mitigation: record reaping immediately,
+  retain the stop fast path, keep late reader drains nonblocking, and assert the
+  deadline path reports no dead PID or `STOP_GRACE` delay.
+- **Existing one-shot test becomes a new load flake.** Deferring public state can
+  leave the row running at its former 100ms observation point. Mitigation: poll
+  with a finite test deadline only until terminal state arrives, then assert the
+  exact diagnostic once; do not poll for diagnostic appearance after terminal.
 - **Output bounds or redaction regress.** Replacing the reader path could expose
   paths or unbounded output. Mitigation: reuse `OUTPUT_LIMIT_BYTES` and
   `bounded_message`; retain existing path-leak assertions in the dogfood test.
@@ -234,6 +268,11 @@ Use raw command output and exit statuses for all Rust gates.
    ./test.sh <exact-new-supervisor-regression-name> -- --exact --nocapture
    ```
 
+   Run the deadline regression separately. With a reader sender deliberately
+   left open and no bytes sent, it must publish the terminal state through the
+   forced expiry branch, report no PID, and preserve fast stop behavior. The test
+   should set the private monotonic deadline to expired rather than sleep 500ms.
+
 3. Prove the real user/runtime path without changing its assertion:
 
    ```sh
@@ -244,10 +283,14 @@ Use raw command output and exit statuses for all Rust gates.
    stderr `bridge bind failed: fixture` plus exit 42. The test must continue to
    reject local checkout/package paths in the rendered diagnostic.
 
-4. Run supervisor/package-entrypoint coverage and the complete lifecycle target
+4. Run `package_entrypoint_supervision_reports_failed_command` directly and prove
+   its bounded state polling reaches one terminal row before asserting the exact
+   exit 42 and stderr diagnostic. Then run supervisor/package-entrypoint coverage
+   and the complete lifecycle target
    at default Cargo parallelism:
 
    ```sh
+   ./test.sh --test hub_daemon_lifecycle_test package_entrypoint_supervision_reports_failed_command -- --exact --nocapture
    ./test.sh package_entrypoint_supervision -- --nocapture
    ./test.sh --test hub_daemon_lifecycle_test -- --nocapture
    ```
@@ -283,7 +326,8 @@ Use raw command output and exit statuses for all Rust gates.
 - Plan gate: attach this document with all required fields and the completed
   vault checklist evidence.
 - Plan Review: verify the supervisor—not CLI retries—owns the ordering invariant;
-  reject blocking waits, public state additions, weakened assertions, or missing
+  reject blocking or unbounded publication waits, public state additions,
+  weakened assertions, polling after terminal state, or missing
   red-when-reverted/loaded proof.
 - Implement: commit only the plan-traceable supervisor/test changes, attach a
   report separating behavior from any necessary merge cleanup, and link the PR.
@@ -296,9 +340,10 @@ Use raw command output and exit statuses for all Rust gates.
 ## Vault gaps worth capturing
 
 - The observed invariant is durable and not currently captured directly: a
-  supervisor must not publish terminal process state before its bounded output
-  capture has finalized. If implementation plus red-when-reverted proof confirms
-  the private finalizing-state solution, capture one atomic gotcha through the
+  supervisor should delay terminal process publication for bounded output
+  capture, while a deadline preserves liveness when descendants retain pipe FDs.
+  If implementation plus red-when-reverted proof confirms the private bounded
+  finalizing-state solution, capture one atomic gotcha through the
   vault inbox and connect it to [[botster runnable entrypoints are hub owned launch contracts]],
   [[installed apps are daemon app rows projected from package runnable entrypoints]],
   [[retention without a reachable flush is data loss]], [[botster-architecture]],
@@ -315,7 +360,8 @@ Use raw command output and exit statuses for all Rust gates.
 - Convention conflicts: none. The plan keeps ownership in the Rust hub
   supervisor, uses existing bounded readers and projections, drives the real
   dogfood entrypoint, uses `test.sh`, preserves default parallelism and exact
-  assertions, and adds no dependency or speculative abstraction.
+  assertions, permits bounded polling only for asynchronous state arrival, and
+  adds no dependency or speculative abstraction.
 - Verification evidence: the planning probe and its missing-worker prerequisite
   are recorded above; implementation evidence must follow **Acceptance
   checks/tests**, including red-when-reverted and the existing loaded runner.
