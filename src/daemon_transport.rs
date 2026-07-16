@@ -2578,16 +2578,22 @@ fn prepare_socket_path(path: &PathBuf) -> DaemonTransportResult<()> {
     }
     match UnixStream::connect(path) {
         Ok(mut stream) => {
-            write_frame(
+            let hello = write_frame(
                 &mut stream,
                 &DaemonHello {
                     protocol: PROTOCOL.to_string(),
                     compatibility: botster_hub_client::DaemonCompatibilityRequirement::current(),
                 },
-            )?;
-            let ack = read_frame::<DaemonHelloAck>(&mut stream);
-            if ack.is_ok() {
-                return Err(DaemonTransportError::AlreadyRunning);
+            );
+            match hello {
+                Ok(()) => {
+                    let ack = read_frame::<DaemonHelloAck>(&mut stream);
+                    if ack.is_ok() {
+                        return Err(DaemonTransportError::AlreadyRunning);
+                    }
+                }
+                Err(ClientDaemonTransportError::ClientDisconnected) => {}
+                Err(error) => return Err(error.into()),
             }
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -5275,6 +5281,69 @@ pub type DaemonTransportResult<T> = Result<T, DaemonTransportError>;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::Shutdown;
+
+    #[test]
+    fn client_disconnected_read_detaches_connection_subscriptions() {
+        let (server, mut client) = UnixStream::pair().expect("create daemon socket pair");
+        let (control_tx, control_rx) = mpsc::channel();
+        let connection = thread::spawn(move || handle_connection(server, control_tx));
+
+        write_frame(
+            &mut client,
+            &DaemonHello {
+                protocol: PROTOCOL.to_string(),
+                compatibility: botster_hub_client::DaemonCompatibilityRequirement::current(),
+            },
+        )
+        .expect("write daemon hello");
+        let _: DaemonHelloAck = read_frame(&mut client).expect("read daemon hello ack");
+
+        write_frame(
+            &mut client,
+            &DaemonRequest::Attach {
+                session_id: "session".to_string(),
+                subscription_id: "subscription".to_string(),
+            },
+        )
+        .expect("write attach request");
+        let ControlMessage::Request { request, reply_tx } = control_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("receive attach request")
+        else {
+            panic!("expected attach control request");
+        };
+        assert!(matches!(*request, DaemonRequest::Attach { .. }));
+        reply_tx
+            .send(Ok(daemon_events(Vec::new())))
+            .expect("reply to attach request");
+        let _: DaemonResponse = read_frame(&mut client).expect("read attach response");
+
+        client
+            .shutdown(Shutdown::Both)
+            .expect("disconnect daemon client");
+        let ControlMessage::Request { request, reply_tx } = control_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("receive disconnect detach request")
+        else {
+            panic!("expected detach control request");
+        };
+        assert!(matches!(
+            *request,
+            DaemonRequest::Detach {
+                ref session_id,
+                ref subscription_id,
+            } if session_id == "session" && subscription_id == "subscription"
+        ));
+        reply_tx
+            .send(Ok(daemon_events(Vec::new())))
+            .expect("reply to disconnect detach request");
+
+        connection
+            .join()
+            .expect("join daemon connection")
+            .expect("client disconnect is a clean connection close");
+    }
 
     #[test]
     fn daemon_event_projection_round_trips_opaque_history_bytes_without_loss() {
