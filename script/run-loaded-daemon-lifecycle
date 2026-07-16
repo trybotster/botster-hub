@@ -77,7 +77,7 @@ validate_inputs() {
     invalid=1
   fi
   case "$TEST_TARGET" in
-    lifecycle-suite|focused-stalled-attach) ;;
+    lifecycle-suite|focused-stalled-attach|focused-local-runtime-smoke-terminal) ;;
     *) log "invalid test_target: $TEST_TARGET"; invalid=1 ;;
   esac
   if [[ ! "$REPETITIONS" =~ ^[0-9]+$ ]] || ((10#$REPETITIONS < 1 || 10#$REPETITIONS > 100)); then
@@ -413,6 +413,9 @@ case "$TEST_TARGET" in
     ;;
   focused-stalled-attach)
     TEST_COMMAND=(./test.sh --test hub_daemon_lifecycle_test stalled_attach_stdout_does_not_block_other_daemon_commands -- --exact --nocapture)
+    ;;
+  focused-local-runtime-smoke-terminal)
+    TEST_COMMAND=(./test.sh --test hub_daemon_lifecycle_test fast_exit_attach_diagnostic_records_subscription_event_order -- --exact --nocapture)
     ;;
 esac
 readonly -a TEST_COMMAND
