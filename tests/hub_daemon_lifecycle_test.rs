@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use botster_core::{
     AesGcmEnvelope, AesGcmKey, Capability, CapabilitySurface, CoreSessionMetadata,
@@ -45,6 +45,8 @@ use support::{
 
 static REAL_DAEMON_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 const CLI_DAEMON_READINESS_BUDGET: Duration = Duration::from_secs(30);
+const BOTSTER_WEB_BRIDGE_LIVENESS_BACKSTOP: Duration = Duration::from_secs(60);
+const BOTSTER_WEB_BRIDGE_STARTUP_DELAY_MS: u64 = 3_000;
 const STALLED_ATTACH_MIN_BUFFERED_STDOUT_BYTES: usize = 8 * 1024;
 const STALLED_ATTACH_STABLE_SAMPLES: usize = 5;
 
@@ -1109,6 +1111,7 @@ const socketExists = socket ? fs.existsSync(socket) : false;
 const localWebrtcGrantPresent = Boolean(process.env.BOTSTER_LOCAL_WEBRTC_GRANT_ID);
 const localWebrtcSecretPresent = Boolean(process.env.BOTSTER_LOCAL_WEBRTC_GRANT_SECRET);
 const localWebrtcOriginPresent = Boolean(process.env.BOTSTER_LOCAL_WEBRTC_EXPECTED_ORIGIN);
+const startupDelayMs = Number(process.env.BOTSTER_WEB_TEST_STARTUP_DELAY_MS || '0');
 const connections = new Map();
 
 function currentRequirement() {
@@ -1212,7 +1215,7 @@ function readBody(request) {
   });
 }
 
-http.createServer(async (request, response) => {
+const server = http.createServer(async (request, response) => {
   if (request.url === '/?dogfood=real-hub') {
     try {
       let bootstrap = null;
@@ -1285,7 +1288,9 @@ http.createServer(async (request, response) => {
     socketExists,
     mixedOwnership,
   }));
-}).listen(port, '127.0.0.1', () => {
+});
+
+const listen = () => server.listen(port, '127.0.0.1', () => {
   if (launchResult) {
     fs.writeFileSync(launchResult, JSON.stringify({
       entrypoint_id: 'web-client',
@@ -1297,6 +1302,12 @@ http.createServer(async (request, response) => {
     }));
   }
 });
+
+if (startupDelayMs > 0) {
+  setTimeout(listen, startupDelayMs);
+} else {
+  listen();
+}
 "#,
     )
     .expect("write botster-web bridge script");
@@ -1323,7 +1334,8 @@ http.createServer(async (request, response) => {
                 { "name": "BOTSTER_LOCAL_WEBRTC_GRANT_ID", "required": false },
                 { "name": "BOTSTER_LOCAL_WEBRTC_GRANT_SECRET", "required": false },
                 { "name": "BOTSTER_LOCAL_WEBRTC_SIGNALING_TRANSPORT", "required": false },
-                { "name": "BOTSTER_LOCAL_WEBRTC_EXPECTED_ORIGIN", "required": false }
+                { "name": "BOTSTER_LOCAL_WEBRTC_EXPECTED_ORIGIN", "required": false },
+                { "name": "BOTSTER_WEB_TEST_STARTUP_DELAY_MS", "required": false }
             ],
             "launch_mode": "background",
             "readiness": { "result_fields": ["local_url"] },
@@ -1736,22 +1748,155 @@ fn botster_web_page_bootstrap(bridge_url: &str) -> botster_hub_client::DaemonLoc
     serde_json::from_str(&rest[..end]).expect("HTML bootstrap JSON")
 }
 
-fn wait_for_botster_web_health(bridge_url: &str) {
+fn log_botster_web_phase(test_started: Instant, phase: &str) {
+    let unix_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time after epoch")
+        .as_millis();
+    eprintln!(
+        "botster_web_reload_phase phase={phase} unix_ms={unix_ms} elapsed_ms={}",
+        test_started.elapsed().as_millis()
+    );
+}
+
+fn probe_botster_web_health(bridge_url: &str) -> Result<serde_json::Value, String> {
     let port = bridge_url
         .strip_prefix("http://127.0.0.1:")
         .expect("local HTTP URL")
         .parse::<u16>()
         .expect("HTTP port");
-    for _ in 0..100 {
-        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            let health = read_json_health(bridge_url);
-            if health["ok"] == true {
-                return;
+
+    let mut stream = TcpStream::connect(("127.0.0.1", port))
+        .map_err(|error| format!("connect error: {error}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .map_err(|error| format!("set read timeout: {error}"))?;
+    let request =
+        format!("GET /health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|error| format!("write error: {error}"))?;
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .map_err(|error| format!("read error: {error}"))?;
+    let (headers, body) = response
+        .split_once("\r\n\r\n")
+        .ok_or_else(|| format!("missing HTTP response body: {response:?}"))?;
+    let body = if headers
+        .to_ascii_lowercase()
+        .contains("transfer-encoding: chunked")
+    {
+        decode_chunked_http_body(body)
+    } else {
+        body.to_string()
+    };
+    if !headers.starts_with("HTTP/1.1 200") && !headers.starts_with("HTTP/1.0 200") {
+        return Err(format!("non-200 response: {headers} body={body}"));
+    }
+    let health: serde_json::Value = serde_json::from_str(body.trim())
+        .map_err(|error| format!("invalid health JSON: {error}; body={body}"))?;
+    let expected = serde_json::json!({
+        "ok": true,
+        "mode": "existing_hub",
+        "source": "socket",
+        "port": port,
+        "socketExists": true,
+        "mixedOwnership": false,
+    });
+    if health != expected {
+        return Err(format!(
+            "unexpected health response: {health}; expected={expected}"
+        ));
+    }
+    Ok(health)
+}
+
+fn wait_for_botster_web_readiness(
+    endpoint: &botster_hub_client::DaemonEndpoint,
+    bridge_url: &str,
+    expected_local_url: &str,
+    test_started: Instant,
+) -> botster_hub_client::DaemonResponse {
+    let wait_started = Instant::now();
+    let mut health_ready = false;
+    let mut last_health = "not probed".to_string();
+    let mut last_apps: String;
+
+    loop {
+        match botster_hub_client::request(endpoint, botster_hub_client::DaemonRequest::ListApps) {
+            Ok(response) => {
+                last_apps = format!("{response:#?}");
+                if let Some(app) = response.apps.iter().find(|app| {
+                    app.package_name == "botster-web" && app.entrypoint_id == "web-client"
+                }) {
+                    if matches!(
+                        app.lifecycle_state.as_str(),
+                        "exited" | "failed" | "stopped"
+                    ) {
+                        let entrypoint_status = botster_hub_client::request(
+                            endpoint,
+                            botster_hub_client::DaemonRequest::PackageEntrypointStatus {
+                                package_name: "botster-web".to_string(),
+                                entrypoint_id: "web-client".to_string(),
+                            },
+                        );
+                        let daemon_status = botster_hub_client::request(
+                            endpoint,
+                            botster_hub_client::DaemonRequest::Status,
+                        );
+                        panic!(
+                            "botster-web bridge reached terminal state while waiting for readiness; elapsed_ms={} expected_local_url={expected_local_url} app={app:#?} entrypoint_status={entrypoint_status:#?} daemon_status={daemon_status:#?} last_health={last_health}",
+                            wait_started.elapsed().as_millis()
+                        );
+                    }
+                    if let Some(actual_url) = app.launch_target.local_url.as_deref() {
+                        assert_eq!(
+                            actual_url,
+                            expected_local_url,
+                            "botster-web app published unexpected local_url after {}ms; app={app:#?}",
+                            wait_started.elapsed().as_millis()
+                        );
+                        if health_ready {
+                            log_botster_web_phase(test_started, "local_url_published");
+                            return response;
+                        }
+                    }
+                }
             }
+            Err(error) => {
+                last_apps = format!("ListApps request error: {error:#?}");
+            }
+        }
+
+        if !health_ready {
+            match probe_botster_web_health(bridge_url) {
+                Ok(health) => {
+                    health_ready = true;
+                    last_health = health.to_string();
+                    log_botster_web_phase(test_started, "health_ready");
+                }
+                Err(error) => last_health = error,
+            }
+        }
+
+        if wait_started.elapsed() >= BOTSTER_WEB_BRIDGE_LIVENESS_BACKSTOP {
+            let entrypoint_status = botster_hub_client::request(
+                endpoint,
+                botster_hub_client::DaemonRequest::PackageEntrypointStatus {
+                    package_name: "botster-web".to_string(),
+                    entrypoint_id: "web-client".to_string(),
+                },
+            );
+            let daemon_status =
+                botster_hub_client::request(endpoint, botster_hub_client::DaemonRequest::Status);
+            panic!(
+                "botster-web bridge liveness backstop expired without readiness; elapsed_ms={} health_ready={health_ready} expected_local_url={expected_local_url} last_health={last_health} last_apps={last_apps} entrypoint_status={entrypoint_status:#?} daemon_status={daemon_status:#?}",
+                wait_started.elapsed().as_millis()
+            );
         }
         thread::sleep(Duration::from_millis(20));
     }
-    panic!("botster-web bridge health did not become ready");
 }
 
 fn unused_loopback_port() -> u16 {
@@ -6701,9 +6846,11 @@ fn local_webrtc_chunks_oversized_encrypted_daemon_response() {
 #[test]
 fn botster_web_same_url_reload_issues_fresh_local_webrtc_bootstrap() {
     let _guard = daemon_test_guard();
+    let test_started = Instant::now();
     let data_dir = unique_short_test_dir("web-webrtc-reload");
     let package_dir = unique_test_dir("web-webrtc-reload-package");
     write_botster_web_package(&package_dir);
+    log_botster_web_phase(test_started, "fixture_built");
     let config = explicit_config(&data_dir);
     let socket_path = config
         .transports
@@ -6714,7 +6861,9 @@ fn botster_web_same_url_reload_issues_fresh_local_webrtc_bootstrap() {
         .clone();
     let endpoint = botster_hub_client::DaemonEndpoint::new(socket_path);
     let child = start_cli_daemon(&data_dir);
+    log_botster_web_phase(test_started, "daemon_started");
     enable_supervised_package(&data_dir, &package_dir);
+    log_botster_web_phase(test_started, "package_enabled");
 
     let web_bridge_port = unused_loopback_port();
     let start = botster_hub_client::request(
@@ -6722,10 +6871,16 @@ fn botster_web_same_url_reload_issues_fresh_local_webrtc_bootstrap() {
         botster_hub_client::DaemonRequest::StartPackageEntrypoint {
             package_name: "botster-web".to_string(),
             entrypoint_id: "web-client".to_string(),
-            environment_overrides: BTreeMap::from([(
-                "BOTSTER_WEB_DOGFOOD_BRIDGE_PORT".to_string(),
-                web_bridge_port.to_string(),
-            )]),
+            environment_overrides: BTreeMap::from([
+                (
+                    "BOTSTER_WEB_DOGFOOD_BRIDGE_PORT".to_string(),
+                    web_bridge_port.to_string(),
+                ),
+                (
+                    "BOTSTER_WEB_TEST_STARTUP_DELAY_MS".to_string(),
+                    BOTSTER_WEB_BRIDGE_STARTUP_DELAY_MS.to_string(),
+                ),
+            ]),
         },
     )
     .expect("start botster-web entrypoint");
@@ -6733,8 +6888,18 @@ fn botster_web_same_url_reload_issues_fresh_local_webrtc_bootstrap() {
         start.kind,
         botster_hub_client::DaemonResponseKind::LocalWebrtcBootstrap
     );
+    log_botster_web_phase(test_started, "entrypoint_start_returned");
     let bridge_url = format!("http://127.0.0.1:{web_bridge_port}");
-    wait_for_botster_web_health(&bridge_url);
+    let expected_local_url = format!("{bridge_url}/?dogfood=real-hub");
+    let apps =
+        wait_for_botster_web_readiness(&endpoint, &bridge_url, &expected_local_url, test_started);
+    assert_eq!(
+        app_row(&apps, "web-client")
+            .launch_target
+            .local_url
+            .as_deref(),
+        Some(expected_local_url.as_str())
+    );
 
     let wrong_origin = botster_hub_client::request(
         &endpoint,
