@@ -2325,12 +2325,16 @@ fn shutdown_cli_daemon(data_dir: &Path, child: Child) -> Output {
 }
 
 #[test]
-fn cli_daemon_shutdown_accepts_exact_disconnect_after_clean_exit() {
+fn cli_daemon_shutdown_rejects_exact_disconnect_after_clean_exit() {
     let shutdown =
         shell_output("printf 'botster-hub shutdown error: client disconnected\\n' >&2; exit 1");
     let daemon = shell_output("exit 0");
 
-    assert!(validate_cli_daemon_shutdown(&shutdown, &daemon).is_ok());
+    let error = validate_cli_daemon_shutdown(&shutdown, &daemon)
+        .expect_err("shutdown disconnect must remain visible after a clean daemon exit");
+
+    assert!(error.contains("shutdown failed"));
+    assert!(error.contains("client disconnected"));
 }
 
 #[test]

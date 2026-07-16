@@ -208,18 +208,29 @@ fn handle_connection(
         };
         let (reply_tx, reply_rx) = mpsc::channel();
         let close_after_response = matches!(request, DaemonRequest::DaemonShutdown);
+        let (response_written_tx, response_written_rx) = if close_after_response {
+            let (tx, rx) = mpsc::channel();
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
         let active_change = AttachedSubscriptionChange::from_request(&request);
         control_tx
             .send(ControlMessage::Request {
                 request: Box::new(request),
                 reply_tx,
+                response_written_rx,
             })
             .map_err(|_| DaemonTransportError::ControlThreadStopped)?;
         let response = reply_rx
             .recv()
             .map_err(|_| DaemonTransportError::ControlThreadStopped)??;
         apply_attached_subscription_change(&mut attached_subscriptions, active_change);
-        if let Err(error) = write_frame(&mut stream, &response) {
+        let write_result = write_frame(&mut stream, &response);
+        if let Some(response_written_tx) = response_written_tx {
+            let _ = response_written_tx.send(());
+        }
+        if let Err(error) = write_result {
             let _ = control_tx.send(ControlMessage::EgressWriteFailed {
                 delivery_kind: daemon_delivery_kind(&response),
             });
@@ -246,6 +257,7 @@ fn detach_connection_subscriptions(
                     subscription_id: subscription.subscription_id.clone(),
                 }),
                 reply_tx,
+                response_written_rx: None,
             })
             .is_ok()
         {
@@ -280,7 +292,11 @@ fn handle_control_message(
     message: ControlMessage,
 ) -> bool {
     match message {
-        ControlMessage::Request { request, reply_tx } => {
+        ControlMessage::Request {
+            request,
+            reply_tx,
+            response_written_rx,
+        } => {
             let response = handle_control_request(
                 daemon,
                 logical_clock,
@@ -299,15 +315,7 @@ fn handle_control_message(
                 DaemonTransportError::LocalWebrtc(error) => Ok(daemon_local_webrtc_error(error)),
                 error => Err(error),
             });
-            let should_stop = matches!(
-                response,
-                Ok(DaemonResponse {
-                    kind: DaemonResponseKind::Shutdown,
-                    ..
-                })
-            );
-            let _ = reply_tx.send(response);
-            should_stop
+            send_control_response(reply_tx, response, response_written_rx)
         }
         ControlMessage::LocalWebrtcPeerClosed {
             grant_id,
@@ -329,6 +337,28 @@ fn handle_control_message(
             false
         }
     }
+}
+
+fn send_control_response(
+    reply_tx: Sender<DaemonTransportResult<DaemonResponse>>,
+    response: DaemonTransportResult<DaemonResponse>,
+    response_written_rx: Option<mpsc::Receiver<()>>,
+) -> bool {
+    let should_stop = matches!(
+        response,
+        Ok(DaemonResponse {
+            kind: DaemonResponseKind::Shutdown,
+            ..
+        })
+    );
+    let response_received = reply_tx.send(response).is_ok();
+    if should_stop
+        && response_received
+        && let Some(response_written_rx) = response_written_rx
+    {
+        let _ = response_written_rx.recv();
+    }
+    should_stop
 }
 
 fn detach_local_webrtc_subscriptions(
@@ -2566,6 +2596,7 @@ fn install_signal_forwarder(control_tx: Sender<ControlMessage>) -> DaemonTranspo
             let _ = control_tx.send(ControlMessage::Request {
                 request: Box::new(DaemonRequest::DaemonShutdown),
                 reply_tx,
+                response_written_rx: None,
             });
         }
     });
@@ -2618,6 +2649,7 @@ pub(crate) enum ControlMessage {
     Request {
         request: Box<DaemonRequest>,
         reply_tx: Sender<DaemonTransportResult<DaemonResponse>>,
+        response_written_rx: Option<mpsc::Receiver<()>>,
     },
     EgressWriteFailed {
         delivery_kind: DaemonDeliveryKind,
@@ -5342,5 +5374,40 @@ mod tests {
         assert!(!debug.contains("private terminal payload"));
         assert!(!debug.contains("session-redacted"));
         assert!(!debug.contains("subscription-redacted"));
+    }
+
+    #[test]
+    fn daemon_shutdown_waits_for_response_write_before_stopping() {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        let (response_written_tx, response_written_rx) = mpsc::channel();
+        let (stopped_tx, stopped_rx) = mpsc::channel();
+
+        thread::spawn(move || {
+            let should_stop = send_control_response(
+                reply_tx,
+                Ok(daemon_response_base(DaemonResponseKind::Shutdown)),
+                Some(response_written_rx),
+            );
+            let _ = stopped_tx.send(should_stop);
+        });
+
+        let response = reply_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("shutdown response reaches connection thread")
+            .expect("shutdown response succeeds");
+        assert_eq!(response.kind, DaemonResponseKind::Shutdown);
+        assert!(
+            stopped_rx.try_recv().is_err(),
+            "daemon must remain alive until the connection writes the shutdown response"
+        );
+
+        response_written_tx
+            .send(())
+            .expect("acknowledge shutdown response write");
+        assert!(
+            stopped_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("daemon stop decision after response write")
+        );
     }
 }

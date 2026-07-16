@@ -448,8 +448,19 @@ impl PeerConnectionEventHandler for LocalWebrtcHandler {
                 let subscription_change =
                     LocalWebrtcAttachedSubscriptionChange::from_request(&request);
                 let (reply_tx, reply_rx) = mpsc::channel();
+                let (response_written_tx, response_written_rx) =
+                    if matches!(*request, DaemonRequest::DaemonShutdown) {
+                        let (tx, rx) = mpsc::channel();
+                        (Some(tx), Some(rx))
+                    } else {
+                        (None, None)
+                    };
                 if runtime_tx
-                    .send(ControlMessage::Request { request, reply_tx })
+                    .send(ControlMessage::Request {
+                        request,
+                        reply_tx,
+                        response_written_rx,
+                    })
                     .is_err()
                 {
                     break;
@@ -479,6 +490,9 @@ impl PeerConnectionEventHandler for LocalWebrtcHandler {
                     &mut pending_requests,
                 )
                 .await;
+                if let Some(response_written_tx) = response_written_tx {
+                    let _ = response_written_tx.send(());
+                }
             }
             close_data_channel(
                 data_channel.as_ref(),
