@@ -302,7 +302,16 @@ fn read_daemon_response_from_reader(
 }
 
 fn normalize_socket_io_error(error: std::io::Error) -> DaemonTransportError {
-    DaemonTransportError::Io(error)
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::UnexpectedEof
+    ) {
+        DaemonTransportError::ClientDisconnected
+    } else {
+        DaemonTransportError::Io(error)
+    }
 }
 
 fn hello_ack_missing_compatibility(value: &Value) -> bool {
