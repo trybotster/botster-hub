@@ -9802,6 +9802,8 @@ fn package_entrypoint_supervision_stops_and_restarts() {
         "stopped"
     );
     wait_for_process_exit(first_pid);
+    // The deterministic pending-reader regression guard lives in
+    // stop_preserves_pending_terminal_launch_result_state; this exercises the app projection.
     let stopped_apps = botster_hub::daemon_transport_request(
         &explicit_config(&data_dir),
         botster_hub::DaemonRequest::ListApps,
