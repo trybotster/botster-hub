@@ -139,6 +139,7 @@ fn stream_attach_connected(
         return Ok(());
     }
     let mut idle_drains = 0;
+    let mut lifecycle_exited = false;
 
     loop {
         thread::sleep(ATTACH_DRAIN_INTERVAL);
@@ -155,7 +156,7 @@ fn stream_attach_connected(
             idle_drains = 0;
         }
         write_terminal_events(&response.events, output)?;
-        if response.events.iter().any(DaemonEvent::is_process_exit) {
+        if response.events.iter().any(DaemonEvent::is_process_exit) || lifecycle_exited {
             return Ok(());
         }
         if idle_drains >= 20 {
@@ -166,7 +167,7 @@ fn stream_attach_connected(
                 .iter()
                 .any(|session| session.session_id == session_id && session.lifecycle == "exited")
             {
-                return Ok(());
+                lifecycle_exited = true;
             }
             idle_drains = 0;
         }
@@ -2056,6 +2057,20 @@ mod tests {
                 ),
             )
             .expect("write exited lifecycle response");
+
+            expect_request(&mut server, &drain);
+            write_frame(
+                &mut server,
+                &empty_test_response(
+                    Vec::new(),
+                    vec![DaemonEvent::TerminalOutput {
+                        session_id: "session".to_string(),
+                        subscription_id: "subscription".to_string(),
+                        data: "final-output".to_string(),
+                    }],
+                ),
+            )
+            .expect("write final drain response");
         });
         let mut output = Vec::new();
 
@@ -2064,7 +2079,7 @@ mod tests {
         drop(client);
         server_handle.join().expect("scripted server completes");
 
-        assert!(output.is_empty());
+        assert_eq!(output, b"final-output");
     }
 
     #[test]

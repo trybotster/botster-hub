@@ -21,7 +21,7 @@ This is a production-path correction, not test-only masking: the helper's public
 ## Scope
 
 1. Add a focused `botster-hub-client` regression that scripts an attached session through at least the current idle-drain threshold, reports the session still running, then emits terminal output plus process exit. Assert the helper remains attached and returns the late output. The test must fail when the fix is reverted.
-2. Change `stream_attach_connected` so an idle lifecycle readback only completes attachment when the session is actually exited. A running session continues draining; completion remains driven by `ProcessExit`, exited lifecycle readback, or transport closure/error. Do not increase the threshold or add another elapsed-time escape hatch.
+2. Change `stream_attach_connected` so an idle lifecycle readback only completes attachment when the session is actually exited. A running session continues draining. An exited lifecycle readback authorizes one final drain so already-enqueued terminal egress is written before completion; normal completion remains driven by `ProcessExit`, the post-exit final drain, or transport closure/error. Do not increase the threshold or add another elapsed-time escape hatch.
 3. Update both lifecycle tests that behaviorally depend on the undocumented idle return. `cli_daemon_restart_recovers_worker_backed_session_through_transport` must explicitly terminate the recovered session before joining and still prove the post-restart echo was delivered. `cli_sessions_spawn_and_list_route_through_client_api` must send terminating input and assert the shell-produced `dogfood:from-cli` output before attach completes.
 4. Keep the existing external `run_client_conformance` assertions strict: ready, echo, and exact `winsize:33 102` must all arrive through the real isolated daemon path.
 
@@ -52,7 +52,7 @@ This is a production-path correction, not test-only masking: the helper's public
 ## Implementation sequence
 
 1. Write the deterministic client regression first and record it red against the current unconditional idle return.
-2. Make the smallest branch correction: continue draining when lifecycle readback says the session is running; retain existing exit and transport-error completion paths.
+2. Make the smallest branch correction: continue draining when lifecycle readback says the session is running, and perform one final drain after an exited readback before returning; retain existing process-exit and transport-error completion paths.
 3. Correct the two lifecycle tests that relied on idle completion: make the restart fixture exit after its asserted echo, and make the CLI sessions fixture establish attachment before sending terminating input and asserting its shell-produced echo.
 4. Run focused crate and real-daemon tests, prove red on revert, restore the fix, and run the unchanged loaded campaign at the exact fixed SHA.
 
@@ -65,7 +65,7 @@ This is a production-path correction, not test-only masking: the helper's public
 
 ## Acceptance checks/tests
 
-1. `cargo test -p botster-hub-client` passes, including a regression proving late terminal output after the current idle window is retained while lifecycle remains running.
+1. `cargo test -p botster-hub-client` passes, including regressions proving late terminal output after the current idle window is retained while lifecycle remains running and that an exited lifecycle readback performs a final output drain before returning.
 2. Red-on-revert proof: revert only the lifecycle decision while keeping the focused regression; the regression fails because attach returns before the late terminal output. Restore the fix and rerun green.
 3. `./test.sh --test hub_daemon_lifecycle_test cli_daemon_restart_recovers_worker_backed_session_through_transport -- --nocapture` passes with explicit session exit before attach join, and `./test.sh --test hub_daemon_lifecycle_test cli_sessions_spawn_and_list_route_through_client_api -- --nocapture` passes with terminating input plus `dogfood:from-cli` output proof.
 4. `./test.sh --test hub_daemon_lifecycle_test external_hub_test_support_drives_isolated_daemon_socket_protocol -- --nocapture` passes through real binaries and preserves exact `winsize:33 102`, ready, and echo assertions.
