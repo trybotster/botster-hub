@@ -2587,13 +2587,16 @@ fn wait_for_status_timeout_reports_diagnostics_and_reaps_owned_child() {
 }
 
 fn shutdown_cli_daemon(data_dir: &Path, child: Child) -> Output {
-    let shutdown = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+    let shutdown = request_cli_daemon_shutdown(data_dir).expect("run botster-hub shutdown");
+    wait_for_cli_daemon_shutdown(&shutdown, child)
+}
+
+fn request_cli_daemon_shutdown(data_dir: &Path) -> io::Result<Output> {
+    Command::new(env!("CARGO_BIN_EXE_botster-hub"))
         .arg("shutdown")
         .arg("--data-dir")
         .arg(data_dir)
         .output()
-        .expect("run botster-hub shutdown");
-    wait_for_cli_daemon_shutdown(&shutdown, child)
 }
 
 fn local_webrtc_sender_failure(stderr: &[u8]) -> Option<&str> {
@@ -2602,6 +2605,76 @@ fn local_webrtc_sender_failure(stderr: &[u8]) -> Option<&str> {
         .lines()
         .rev()
         .find(|line| line.starts_with("local WebRTC response delivery failed:"))
+}
+
+fn local_webrtc_bounded_stderr_tail(stderr: &[u8], data_dir: &Path) -> String {
+    const MAX_LINES: usize = 20;
+    const MAX_CHARS_PER_LINE: usize = 512;
+
+    let stderr = String::from_utf8_lossy(stderr);
+    let mut lines = stderr.lines().rev().take(MAX_LINES).collect::<Vec<_>>();
+    lines.reverse();
+    let mut tail = lines
+        .into_iter()
+        .map(|line| {
+            let mut bounded = line.chars().take(MAX_CHARS_PER_LINE).collect::<String>();
+            if line.chars().count() > MAX_CHARS_PER_LINE {
+                bounded.push_str("<truncated>");
+            }
+            bounded
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    for (path, replacement) in [
+        (Some(data_dir.to_path_buf()), "<data-dir>"),
+        (
+            Some(PathBuf::from(env!("CARGO_MANIFEST_DIR"))),
+            "<workspace>",
+        ),
+        (std::env::var_os("HOME").map(PathBuf::from), "<home>"),
+        (Some(std::env::temp_dir()), "<temp>"),
+    ] {
+        if let Some(path) = path.and_then(|path| path.to_str().map(str::to_owned))
+            && !path.is_empty()
+        {
+            tail = tail.replace(&path, replacement);
+        }
+    }
+
+    if tail.is_empty() {
+        "<empty>".to_string()
+    } else {
+        tail
+    }
+}
+
+#[test]
+fn local_webrtc_diagnostic_stderr_tail_is_bounded_and_redacts_paths() {
+    let data_dir = std::env::temp_dir().join("local-webrtc-diagnostic-data");
+    let mut lines = (0..25)
+        .map(|index| format!("diagnostic line {index}"))
+        .collect::<Vec<_>>();
+    lines[23] = "x".repeat(600);
+    lines[24] = format!(
+        "data={} workspace={} home={} temp={}",
+        data_dir.display(),
+        env!("CARGO_MANIFEST_DIR"),
+        std::env::var("HOME").unwrap_or_default(),
+        std::env::temp_dir().display()
+    );
+
+    let tail = local_webrtc_bounded_stderr_tail(lines.join("\n").as_bytes(), &data_dir);
+
+    assert!(!tail.contains("diagnostic line 4"));
+    assert!(tail.contains("diagnostic line 5"));
+    assert!(tail.contains("<truncated>"));
+    assert!(tail.contains("<data-dir>"));
+    assert!(tail.contains("<workspace>"));
+    assert!(tail.contains("<home>"));
+    assert!(tail.contains("<temp>"));
+    assert!(!tail.contains(&data_dir.display().to_string()));
+    assert!(!tail.contains(env!("CARGO_MANIFEST_DIR")));
 }
 
 struct LocalWebrtcDiagnosticDaemon {
@@ -2625,15 +2698,41 @@ impl LocalWebrtcDiagnosticDaemon {
 
 impl Drop for LocalWebrtcDiagnosticDaemon {
     fn drop(&mut self) {
-        let Some(child) = self.child.take() else {
+        let Some(mut child) = self.child.take() else {
             return;
         };
-        let daemon = shutdown_cli_daemon(&self.data_dir, child);
-        if std::thread::panicking() {
-            eprintln!(
-                "local WebRTC target sender evidence: {}",
-                local_webrtc_sender_failure(&daemon.stderr).unwrap_or("unavailable")
-            );
+
+        if !std::thread::panicking() {
+            shutdown_cli_daemon(&self.data_dir, child);
+            return;
+        }
+
+        let shutdown = request_cli_daemon_shutdown(&self.data_dir);
+        let shutdown_failed = shutdown.as_ref().map_or(true, |output| {
+            !output.status.success()
+                && String::from_utf8_lossy(&output.stderr).trim()
+                    != "botster-hub shutdown error: client disconnected"
+        });
+        if shutdown_failed && child.try_wait().ok().flatten().is_none() {
+            let _ = child.kill();
+        }
+
+        match child.wait_with_output() {
+            Ok(daemon) => {
+                if let Some(failure) = local_webrtc_sender_failure(&daemon.stderr) {
+                    eprintln!("local WebRTC target sender evidence: {failure}");
+                } else {
+                    eprintln!(
+                        "local WebRTC target sender evidence: unavailable; daemon_status={}; daemon_stderr_tail={:?}",
+                        daemon.status,
+                        local_webrtc_bounded_stderr_tail(&daemon.stderr, &self.data_dir)
+                    );
+                }
+            }
+            Err(error) => eprintln!(
+                "local WebRTC target sender evidence: unavailable; daemon_status=unavailable; daemon_wait_error_kind={:?}",
+                error.kind()
+            ),
         }
     }
 }
