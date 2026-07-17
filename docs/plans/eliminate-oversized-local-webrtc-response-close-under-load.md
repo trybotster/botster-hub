@@ -13,6 +13,7 @@
 - Test path inspected: the real offer peer sends encrypted requests, receives ordered chunks, and reports `channel_closed` versus `response_timeout` with chunk progress. The spawned daemon's stderr is piped but is not surfaced when this test panics, so run `29539022952` does not reveal whether the sender ended on `pressure_deadline`, `send_text`, `OnClose`, `OnError`, or ended polling.
 - Plan-time repository state: the pipeline worktree is clean at `2ff2246` and is an ancestor of current `origin/main` `e864567`. Implement must first update this ticket branch to current `origin/main`; relevant production code is unchanged on main, while sibling lifecycle-test changes must be preserved.
 - Plan Review verified the ancestry, production trace, and existing bounded sender log, then identified a blocker in the first revision: `on_connection_state_change` cleans peer state on `Disconnected`, `Failed`, or `Closed` but cannot wake a task parked in `local_poll()`. Removing the deadline without carrying that peer-connection signal into the channel loop would leak the sender task. Review also identified three existing deadline-policy tests whose disposition must be explicit.
+- Implement diagnostic SHA `5debb14b6718c20b33da4b82fb0a04e9b54d4952` made the target surface the existing bounded sender terminal record on panic. Loaded run `29547216544` tested that exact SHA under the residual-tail lifecycle suite: the WebRTC target passed, then three sibling-owned failures stopped repetition 1 with `cleanup_status=0`, so no sender record was emitted. Human answer `question_1784252862_238103` therefore requires a narrowly focused oversized-WebRTC runner target before any production pressure repair.
 
 ## Scope
 
@@ -20,14 +21,15 @@ Botster layer: Rust hub local-WebRTC data-plane delivery plus the real-daemon li
 
 1. Update the ticket branch to current `origin/main` before editing so the reopened fix is tested with the same sibling changes and base as the recurrence campaign.
 2. Make the target test surface the bounded sender terminal record already emitted by `run_data_channel_with_deadline`: message id, next/last/total chunk, pressure state, and typed cause. This is a harness-only diagnostic change; do not add duplicate production logging, payloads, secrets, absolute paths, or unbounded daemon output.
-3. Reproduce the proven sender cause with the existing fake `LocalWebrtcDataChannel` seam. Model an oversized multi-chunk response that reaches high water mid-response and whose low-water event is scheduler-delayed while the channel remains open. The deterministic oracle is delivery/lifecycle state, not elapsed wall time.
-4. Repair only the confirmed branch in `src/local_webrtc.rs`:
+3. Add `focused-oversized-webrtc` as an exact filter over the existing `local_webrtc_chunks_oversized_encrypted_daemon_response` test. Run it repeatedly under the unchanged residual-tail load, per-run/campaign deadlines, stop-at-first-red behavior, diagnostics, and cleanup. This is a selector-only runner extension: preserve the test body, assertions, channel limits, and no-retry semantics, and leave `lifecycle-suite` unchanged.
+4. After the focused real path captures a sender cause, reproduce that proven cause with the existing fake `LocalWebrtcDataChannel` seam. Model the evidenced multi-chunk lifecycle state. The deterministic oracle is delivery/lifecycle state, not elapsed wall time.
+5. Repair only the confirmed branch in `src/local_webrtc.rs`:
    - If the sender record is `pressure_deadline` as expected, replace the deadline with a concrete peer-liveness signal, not an unbounded bare `local_poll()`. Use Tokio's existing `watch` primitive (already available through the configured `tokio` dependency) from `LocalWebrtcPeerState`: `on_connection_state_change` publishes the first terminal `Disconnected`, `Failed`, or `Closed` state, and every blocking channel-loop wait selects between the DataChannel event and that watched peer termination. A terminal peer state returns a distinct typed send failure carrying the specific connection state, then follows the existing close and exactly-once cleanup path.
    - Apply this consistently to both active mid-response pressure and idle pressure between responses. Scheduler delay alone must close neither path; low water resumes delivery, while DataChannel close/error/end, send failure, or watched peer termination ends it. Remove the pressure-deadline constant/state/helper and deadline-suffixed function vocabulary cold turkey so no dual elapsed/liveness policy remains.
    - Preserve the bounded FIFO while waits consume inbound requests. Do not send another frame while pressure is active, and do not treat receiver-side timeouts as hub-task cancellation.
    - If the record proves a different typed cause, repair that exact send or lifecycle branch and update this plan artifact before implementation proceeds. Do not silently apply the pressure hypothesis.
-5. Preserve the production protocol and real acceptance path: encrypted framing, ordered reliable data channel, exact payload equality, chunk ordering/count, frame ceiling, same-peer follow-up request, grant cleanup, and idempotent peer cleanup.
-6. Prove red when the focused lifecycle fix is reverted, then prove the exact fixed SHA under the existing residual-tail default-parallel campaign.
+6. Preserve the production protocol and real acceptance path: encrypted framing, ordered reliable data channel, exact payload equality, chunk ordering/count, frame ceiling, same-peer follow-up request, grant cleanup, and idempotent peer cleanup.
+7. Prove red when the focused lifecycle fix is reverted, then prove the exact fixed SHA under the focused residual-tail campaign. Final suite-wide 20x green remains owned by the convergence ticket.
 
 Every changed line must provide sender evidence, correct the confirmed mid-response lifecycle decision, exercise that decision, or record required verification.
 
@@ -37,7 +39,7 @@ Every changed line must provide sender evidence, correct the confirmed mid-respo
 - No response framing, encryption, chunk size/count, response assembly cap, DTO, TypeScript, browser, SPA, TUI, Lua/plugin, Rails, or conformance-fixture changes.
 - No WebRTC dependency upgrade or patch, configurable watermarks/deadlines, generic transport abstraction, background send queue, concurrent response tasks, or adjacent cleanup.
 - No fixes for the other failures in run `29539022952`. Each must be mapped to its existing sibling ticket with run/artifact evidence; if any root lacks an owner, create one before this ticket advances.
-- No rewrite of the loaded runner or workflow. Those files are verification inputs unless exact evidence shows they cannot execute the focused path; that would require Plan Review or human re-scope.
+- No general loaded-runner rewrite or change to ordinary full-suite behavior. Human answer `question_1784252862_238103` authorizes only the exact focused target selector needed to bypass unrelated first-red failures during diagnosis.
 
 ## Assumptions and unknowns
 
@@ -55,7 +57,7 @@ Every changed line must provide sender evidence, correct the confirmed mid-respo
 - `src/local_webrtc.rs` — channel-owned flow/lifecycle policy, typed terminal diagnostics, and deterministic fake-channel regression tests.
 - `tests/hub_daemon_lifecycle_test.rs` — target-scoped sender diagnostic capture plus preservation of exact chunk/payload/continuity assertions on the real daemon and real peer.
 - `docs/plans/eliminate-oversized-local-webrtc-response-close-under-load.md` — reopened regression plan and evidence contract.
-- `.github/workflows/loaded-daemon-lifecycle.yml`, `script/run-loaded-daemon-lifecycle`, and `docs/loaded-daemon-lifecycle-runner.md` — verification inputs only, not planned edits.
+- `.github/workflows/loaded-daemon-lifecycle.yml`, `script/run-loaded-daemon-lifecycle`, and `docs/loaded-daemon-lifecycle-runner.md` — selector-only `focused-oversized-webrtc` addition; existing targets, execution, load, deadlines, and cleanup stay unchanged.
 
 Production wiring that must be proven, not merely compiled:
 
@@ -95,8 +97,9 @@ Current entry path: `LocalWebrtcHandler::on_data_channel` -> `run_data_channel_w
 4. Adjacent local-WebRTC coverage: run the focused `src/local_webrtc.rs` tests and peer-close/subscription cleanup tests via `./test.sh`. A single-threaded diagnostic run may identify a first root but is not acceptance evidence.
 5. Negative control: with diagnostics/tests retained, revert only the new lifecycle behavior and show the deterministic mid-response test fails for the expected pressured-close/partial-delivery state. Preserve the red command/output and reverted subject SHA or commit.
 6. Quality gates: `cargo fmt --check`, repository-configured strict Clippy, and `./test.sh`. Record exact commands, SHAs, and results; investigate every failure rather than claiming a blanket pre-existing failure.
-7. Loaded proof: dispatch the existing workflow for the exact fixed SHA with `test_target=lifecycle-suite`, `stress_profile=residual-tail`, at least 20 repetitions, and default parallelism. The target test must pass every requested repetition with unchanged assertions and cleanup must report zero owned process groups. Map every other first-root failure to an existing sibling ticket with artifact/run evidence, per the prior human answer.
-8. Diff/artifact audit: verify every changed line traces to the ticket and scan committed artifacts for secrets, personal data, and absolute home/worktree paths.
+7. Focused cause gate: dispatch the workflow for the diagnostics SHA with `test_target=focused-oversized-webrtc`, `stress_profile=residual-tail`, and 20 repetitions. If a real failure occurs, require the bounded sender record, chunk progress, and `cleanup_status=0`; repair only that cause. If all 20 pass, preserve diagnostics and report the unresolved evidence without changing production behavior.
+8. Focused fixed-SHA proof: after an evidenced repair, repeat the same focused target, stress profile, and 20 repetitions with unchanged test assertions and clean process-group teardown. Final suite-wide 20x green remains owned by the convergence ticket per `question_1784252862_238103`.
+9. Diff/artifact audit: verify every changed line traces to the ticket and scan committed artifacts for secrets, personal data, and absolute home/worktree paths.
 
 ## Pipeline gates and checklist evidence
 
