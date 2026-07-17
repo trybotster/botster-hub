@@ -2596,6 +2596,48 @@ fn shutdown_cli_daemon(data_dir: &Path, child: Child) -> Output {
     wait_for_cli_daemon_shutdown(&shutdown, child)
 }
 
+fn local_webrtc_sender_failure(stderr: &[u8]) -> Option<&str> {
+    std::str::from_utf8(stderr)
+        .ok()?
+        .lines()
+        .rev()
+        .find(|line| line.starts_with("local WebRTC response delivery failed:"))
+}
+
+struct LocalWebrtcDiagnosticDaemon {
+    data_dir: PathBuf,
+    child: Option<Child>,
+}
+
+impl LocalWebrtcDiagnosticDaemon {
+    fn start(data_dir: &Path) -> Self {
+        Self {
+            data_dir: data_dir.to_path_buf(),
+            child: Some(start_cli_daemon(data_dir)),
+        }
+    }
+
+    fn shutdown(mut self) {
+        let child = self.child.take().expect("local WebRTC daemon child");
+        shutdown_cli_daemon(&self.data_dir, child);
+    }
+}
+
+impl Drop for LocalWebrtcDiagnosticDaemon {
+    fn drop(&mut self) {
+        let Some(child) = self.child.take() else {
+            return;
+        };
+        let daemon = shutdown_cli_daemon(&self.data_dir, child);
+        if std::thread::panicking() {
+            eprintln!(
+                "local WebRTC target sender evidence: {}",
+                local_webrtc_sender_failure(&daemon.stderr).unwrap_or("unavailable")
+            );
+        }
+    }
+}
+
 #[test]
 fn cli_daemon_shutdown_accepts_exact_disconnect_after_clean_exit() {
     let shutdown =
@@ -7049,7 +7091,7 @@ fn local_webrtc_chunks_oversized_encrypted_daemon_response() {
         .path
         .clone();
     let endpoint = botster_hub_client::DaemonEndpoint::new(socket_path);
-    let child = start_cli_daemon(&data_dir);
+    let child = LocalWebrtcDiagnosticDaemon::start(&data_dir);
     enable_supervised_package(&data_dir, &package_dir);
 
     let web_bridge_port = unused_loopback_port();
@@ -7331,8 +7373,7 @@ fn local_webrtc_chunks_oversized_encrypted_daemon_response() {
     assert!(!persisted_state.contains(&bootstrap.grant_id));
     assert!(!persisted_state.contains(&bootstrap.grant_secret));
     assert!(!persisted_state.contains("grant_secret"));
-
-    shutdown_cli_daemon(&data_dir, child);
+    child.shutdown();
 }
 
 #[test]
