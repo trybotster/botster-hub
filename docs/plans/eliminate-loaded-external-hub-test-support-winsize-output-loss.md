@@ -39,6 +39,7 @@ This is a production-path correction, not test-only masking: the helper's public
 - Assumption: no compatibility boundary requires preserving the undocumented “return after roughly 500 ms of idle while still running” behavior; it contradicts the helper's documented contract and the CLI attach behavior.
 - Unknown to settle during implementation: whether the focused scripted socket test can reuse existing frame helpers and DTO fixtures without adding test-only production API. Prefer private module-test helpers.
 - Settled during implementation: raw Rust call-site search found only the conformance flow and restart lifecycle test in addition to production CLI wiring, but the full-suite diagnostic exposed a behavioral caller through the `botster-hub sessions attach` subprocess. Human answer `question_1784253614_313027` authorized updating `cli_sessions_spawn_and_list_route_through_client_api` so its fixture owns deterministic termination and output proof.
+- Settled during review response: human answer `question_1784261748_279126` kept the dogfood stderr-tail occurrence out of this leaf unless focused same-load evidence proved it branch-only. The exact test passed 20 residual-tail repetitions on both code SHA `27851a088ef4b14fca7576a099bcf6e7f65d2346` and base SHA `f5e839476152f9bed52a9d17e994a65568de2840`, so the full-suite occurrence remains unresolved on reopened owner `ticket_1784168176_753693`; it is neither waived nor treated as fixed here.
 - If evidence shows resize/input ordering is not preserved at the pinned worker boundary, stop and ask for re-scope rather than adding synchronization policy to this ticket.
 
 ## Affected surfaces/files
@@ -62,6 +63,7 @@ This is a production-path correction, not test-only masking: the helper's public
 - A missed `ProcessExit` could leave attachment open. Mitigation: preserve the existing lifecycle readback and test the `running` versus `exited` decision explicitly; do not replace it with a longer timeout.
 - Concurrent lifecycle state could flip after an empty drain. Continuing while `running` is safe; the next drain/readback must observe terminal egress or exit rather than silently detaching.
 - Loaded campaign noise includes sibling failures. Require exact evidence for every first red and do not call unrelated failures ticket-owned without matching the signature and path.
+- A full loaded suite reproduced missing dogfood stderr while focused residual-tail branch/base runs both passed 20/20. Keep that occurrence as unresolved residual evidence on `ticket_1784168176_753693`, and require the final convergence campaign to exercise it rather than calling it waived, fixed, or causally introduced by this leaf.
 
 ## Acceptance checks/tests
 
