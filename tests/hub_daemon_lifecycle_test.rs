@@ -6177,6 +6177,28 @@ fn cli_sessions_spawn_and_list_route_through_client_api() {
         String::from_utf8_lossy(&detach.stderr)
     );
 
+    let mut attach_child = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("sessions")
+        .arg("attach")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("dogfood-session")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn botster-hub sessions attach");
+    let mut attach_stdout = BufReader::new(
+        attach_child
+            .stdout
+            .take()
+            .expect("attach child stdout is piped"),
+    );
+    let mut stdout = String::new();
+    attach_stdout
+        .read_line(&mut stdout)
+        .expect("read initial attach output");
+    assert!(stdout.contains("dogfood-ok"));
+
     let send = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
         .arg("sessions")
         .arg("send-input")
@@ -6193,21 +6215,20 @@ fn cli_sessions_spawn_and_list_route_through_client_api() {
         String::from_utf8_lossy(&send.stderr)
     );
 
-    let attach = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
-        .arg("sessions")
-        .arg("attach")
-        .arg("--data-dir")
-        .arg(&data_dir)
-        .arg("dogfood-session")
-        .output()
-        .expect("run botster-hub sessions attach");
-    assert!(
-        attach.status.success(),
-        "attach failed: {}",
-        String::from_utf8_lossy(&attach.stderr)
-    );
-    let stdout = String::from_utf8(attach.stdout).expect("attach stdout is utf8");
+    let attach_status = attach_child.wait().expect("wait for attach child");
+    attach_stdout
+        .read_to_string(&mut stdout)
+        .expect("read remaining attach output");
+    let mut stderr = String::new();
+    attach_child
+        .stderr
+        .take()
+        .expect("attach child stderr is piped")
+        .read_to_string(&mut stderr)
+        .expect("read attach stderr");
+    assert!(attach_status.success(), "attach failed: {}", stderr);
     assert!(stdout.contains("dogfood-ok"));
+    assert!(stdout.contains("dogfood:from-cli"));
 
     shutdown_cli_daemon(&data_dir, child);
 }
@@ -6363,7 +6384,7 @@ fn cli_daemon_restart_recovers_worker_backed_session_through_transport() {
         &config,
         botster_hub::DaemonRequest::Spawn {
             session_id: session_id.to_string(),
-            command: "printf 'restart-ready\\n'; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done".to_string(),
+            command: "printf 'restart-ready\\n'; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; if [ \"$line\" = after-restart ]; then exit 0; fi; done".to_string(),
         },
     )
     .expect("spawn restart recovery session through daemon transport");
@@ -6440,6 +6461,7 @@ fn cli_daemon_restart_recovers_worker_backed_session_through_transport() {
     )
     .expect("send input after daemon restart");
     assert_eq!(send.kind, botster_hub::DaemonResponseKind::Events);
+
     let attached_output = attach_handle
         .join()
         .expect("stream attach thread should complete");
@@ -6447,18 +6469,6 @@ fn cli_daemon_restart_recovers_worker_backed_session_through_transport() {
     assert!(
         attached_output.contains("echo:after-restart"),
         "stream attach should observe post-restart echo, got {attached_output:?}"
-    );
-
-    let shutdown_session = botster_hub::daemon_transport_request(
-        &config,
-        botster_hub::DaemonRequest::ShutdownSession {
-            session_id: session_id.to_string(),
-        },
-    )
-    .expect("shutdown recovered session through daemon transport");
-    assert_eq!(
-        shutdown_session.kind,
-        botster_hub::DaemonResponseKind::Events
     );
     shutdown_cli_daemon(&data_dir, restarted_child);
 }

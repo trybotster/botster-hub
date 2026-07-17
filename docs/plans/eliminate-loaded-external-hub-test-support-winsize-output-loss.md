@@ -22,7 +22,7 @@ This is a production-path correction, not test-only masking: the helper's public
 
 1. Add a focused `botster-hub-client` regression that scripts an attached session through at least the current idle-drain threshold, reports the session still running, then emits terminal output plus process exit. Assert the helper remains attached and returns the late output. The test must fail when the fix is reverted.
 2. Change `stream_attach_connected` so an idle lifecycle readback only completes attachment when the session is actually exited. A running session continues draining; completion remains driven by `ProcessExit`, exited lifecycle readback, or transport closure/error. Do not increase the threshold or add another elapsed-time escape hatch.
-3. Update `cli_daemon_restart_recovers_worker_backed_session_through_transport`, which currently joins a still-running attach only because of the undocumented idle return, so it explicitly terminates the recovered session before joining and still proves the post-restart echo was delivered.
+3. Update both lifecycle tests that behaviorally depend on the undocumented idle return. `cli_daemon_restart_recovers_worker_backed_session_through_transport` must explicitly terminate the recovered session before joining and still prove the post-restart echo was delivered. `cli_sessions_spawn_and_list_route_through_client_api` must send terminating input and assert the shell-produced `dogfood:from-cli` output before attach completes.
 4. Keep the existing external `run_client_conformance` assertions strict: ready, echo, and exact `winsize:33 102` must all arrive through the real isolated daemon path.
 
 ## Non-scope
@@ -38,13 +38,13 @@ This is a production-path correction, not test-only masking: the helper's public
 - Assumption: `ProcessExit` remains the normal completion signal and the existing lifecycle readback is only a fallback for an already-exited session.
 - Assumption: no compatibility boundary requires preserving the undocumented “return after roughly 500 ms of idle while still running” behavior; it contradicts the helper's documented contract and the CLI attach behavior.
 - Unknown to settle during implementation: whether the focused scripted socket test can reuse existing frame helpers and DTO fixtures without adding test-only production API. Prefer private module-test helpers.
-- Unknown to verify, not silently assume: whether any other test or caller relies on idle return. Current Rust call-site search finds only the conformance flow and the restart lifecycle test in addition to production CLI wiring.
+- Settled during implementation: raw Rust call-site search found only the conformance flow and restart lifecycle test in addition to production CLI wiring, but the full-suite diagnostic exposed a behavioral caller through the `botster-hub sessions attach` subprocess. Human answer `question_1784253614_313027` authorized updating `cli_sessions_spawn_and_list_route_through_client_api` so its fixture owns deterministic termination and output proof.
 - If evidence shows resize/input ordering is not preserved at the pinned worker boundary, stop and ask for re-scope rather than adding synchronization policy to this ticket.
 
 ## Affected surfaces/files
 
 - `crates/botster-hub-client/src/lib.rs` — production `stream_attach_connected` lifecycle rule and focused regression test.
-- `tests/hub_daemon_lifecycle_test.rs` — necessary correction to the recovered-session test's explicit exit/join ordering; existing external conformance test remains the real runtime acceptance entry point.
+- `tests/hub_daemon_lifecycle_test.rs` — necessary corrections to the recovered-session test's explicit exit/join ordering and the CLI sessions test's active-attach, terminating-input, and output proof; existing external conformance test remains the real runtime acceptance entry point.
 - `crates/botster-hub-test-support/src/lib.rs` — inspected and exercised, but no planned assertion or timing change.
 - `src/daemon_transport.rs`, `src/client_api.rs`, `src/runtime.rs`, `Cargo.lock`, `.github/workflows/loaded-daemon-lifecycle.yml`, `script/run-loaded-daemon-lifecycle`, and `docs/loaded-daemon-lifecycle-runner.md` — inspected verification/production-path evidence, not planned edits.
 - This plan document is the reviewable Plan artifact.
@@ -53,7 +53,7 @@ This is a production-path correction, not test-only masking: the helper's public
 
 1. Write the deterministic client regression first and record it red against the current unconditional idle return.
 2. Make the smallest branch correction: continue draining when lifecycle readback says the session is running; retain existing exit and transport-error completion paths.
-3. Correct the adjacent restart lifecycle test to explicitly end the session before joining its attach thread, then preserve its echo and cleanup assertions.
+3. Correct the two lifecycle tests that relied on idle completion: make the restart fixture exit after its asserted echo, and make the CLI sessions fixture establish attachment before sending terminating input and asserting its shell-produced echo.
 4. Run focused crate and real-daemon tests, prove red on revert, restore the fix, and run the unchanged loaded campaign at the exact fixed SHA.
 
 ## Risks
@@ -67,10 +67,10 @@ This is a production-path correction, not test-only masking: the helper's public
 
 1. `cargo test -p botster-hub-client` passes, including a regression proving late terminal output after the current idle window is retained while lifecycle remains running.
 2. Red-on-revert proof: revert only the lifecycle decision while keeping the focused regression; the regression fails because attach returns before the late terminal output. Restore the fix and rerun green.
-3. `./test.sh --test hub_daemon_lifecycle_test cli_daemon_restart_recovers_worker_backed_session_through_transport -- --nocapture` passes with explicit session exit before attach join.
+3. `./test.sh --test hub_daemon_lifecycle_test cli_daemon_restart_recovers_worker_backed_session_through_transport -- --nocapture` passes with explicit session exit before attach join, and `./test.sh --test hub_daemon_lifecycle_test cli_sessions_spawn_and_list_route_through_client_api -- --nocapture` passes with terminating input plus `dogfood:from-cli` output proof.
 4. `./test.sh --test hub_daemon_lifecycle_test external_hub_test_support_drives_isolated_daemon_socket_protocol -- --nocapture` passes through real binaries and preserves exact `winsize:33 102`, ready, and echo assertions.
 5. Run the complete repo-approved test wrapper required by the implementation/review gate; record any failure with exact test, command, and why it is related or unrelated.
-6. Dispatch `.github/workflows/loaded-daemon-lifecycle.yml` at the exact fixed subject SHA with `test_target=lifecycle-suite`, `repetitions=20`, and `stress_profile=residual-tail`. Preserve default Cargo parallelism, existing budgets, first-red behavior, artifacts, resource samples, and owned-process cleanup. The ticket-owned external hub-test-support test must pass in every completed repetition; no new unmapped first-root failure is acceptable.
+6. Dispatch `.github/workflows/loaded-daemon-lifecycle.yml` at the exact fixed subject SHA with `test_target=lifecycle-suite`, `repetitions=20`, and `stress_profile=residual-tail`. Preserve default Cargo parallelism, existing budgets, first-red behavior, artifacts, resource samples, and owned-process cleanup. The existing per-test and campaign timeouts bound the post-fix wait; a hang or timeout in `external_hub_test_support_drives_isolated_daemon_socket_protocol` is a ticket-owned first red requiring investigation, not unrelated infrastructure noise. The ticket-owned external hub-test-support test must pass in every completed repetition; no new unmapped first-root failure is acceptable.
 7. Verify repository wiring with `rg -n "stream_attach|external_hub_test_support_drives_isolated_daemon_socket_protocol|cli_daemon_restart_recovers_worker_backed_session_through_transport" crates src tests docs` and confirm the changed helper remains the production CLI/test-support entry point.
 
 ## Pipeline gates and artifacts
