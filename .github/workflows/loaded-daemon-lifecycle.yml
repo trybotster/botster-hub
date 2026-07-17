@@ -16,6 +16,7 @@ on:
           - lifecycle-suite
           - focused-stalled-attach
           - focused-fast-exit-attach-diagnostic
+          - focused-oversized-webrtc
       repetitions:
         description: Number of repetitions (1-100)
         required: true
