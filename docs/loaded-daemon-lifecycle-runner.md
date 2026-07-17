@@ -43,6 +43,16 @@ This target exists only to capture the bounded sender terminal record when
 unrelated lifecycle-suite failures would otherwise stop the campaign first. It
 does not replace full-suite acceptance.
 
+Use `focused-cli-smoke` to repeat the exact
+`cli_smoke_proves_local_runtime_daemon_package_app_session_and_webrtc` test
+under the selected stress profile. This keeps the smoke-owned daemon
+start/stop path and its daemon-gone assertion while bypassing unrelated
+first-red lifecycle tests. On a red, the test requires bounded client progress
+and the matching fixed-schema sender terminal record from the smoke data
+directory; missing, stale, malformed, mismatched, or oversized evidence remains
+a test failure. This selector is diagnostic evidence only and does not replace
+the default-parallel lifecycle-suite campaign.
+
 ## Bounded stress and time budgets
 
 The profiles start only job-local CPU workers:
