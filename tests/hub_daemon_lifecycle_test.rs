@@ -5060,6 +5060,376 @@ fn cli_smoke_proves_local_runtime_daemon_package_app_session_and_webrtc() {
 }
 
 #[test]
+fn fast_exit_attach_diagnostic_records_subscription_event_order() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_test_dir("fast-exit-attach-diagnostic");
+    let config = explicit_config(&data_dir);
+    let socket_path = config
+        .transports
+        .local_socket
+        .as_ref()
+        .expect("test config has local socket")
+        .path
+        .clone();
+    let endpoint = botster_hub_client::DaemonEndpoint::new(socket_path);
+    let child = start_cli_daemon(&data_dir);
+    let session_id = format!(
+        "smoke-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time after epoch")
+            .as_nanos()
+    );
+    let subscription_id = format!("{session_id}-subscription");
+    let marker = "botster-smoke-terminal-ok";
+    let expected = format!("smoke:{marker}");
+
+    let spawn = botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::Spawn {
+            session_id: session_id.clone(),
+            command: format!("printf 'smoke:{marker}\\n'"),
+        },
+    )
+    .expect("spawn immediate-output diagnostic session");
+    assert_eq!(spawn.kind, botster_hub_client::DaemonResponseKind::Spawned);
+
+    // Mirrors stream_attach_connected in crates/botster-hub-client/src/lib.rs:123-172.
+    // Any production boundary change there must update this diagnostic mirror.
+    let mut connection = botster_hub_client::DaemonConnection::connect(&endpoint)
+        .expect("connect diagnostic client");
+    let mut response = connection
+        .request(&botster_hub_client::DaemonRequest::Attach {
+            session_id: session_id.clone(),
+            subscription_id: subscription_id.clone(),
+        })
+        .expect("attach diagnostic subscription");
+    let started_at = Instant::now();
+    let mut observed = String::new();
+    let mut matching_observed = String::new();
+    let mut mismatched_marker = false;
+    let mut opaque_history_bytes = 0;
+    let mut saw_process_exit = false;
+    let mut ordered_observations = Vec::new();
+    let mut response_index = 0;
+    let mut request_kind = "attach";
+    let mut idle_drains = 0;
+
+    let boundary_reason = loop {
+        let mut response_observations = Vec::new();
+        let mut response_renderable_bytes = 0;
+        for event in &response.events {
+            let observation = match event {
+                botster_hub_client::DaemonEvent::SessionLifecycle {
+                    session_id: event_session_id,
+                    state,
+                } => format!("session_lifecycle:session={event_session_id}:state={state}"),
+                botster_hub_client::DaemonEvent::TerminalOutput {
+                    session_id: event_session_id,
+                    subscription_id: event_subscription_id,
+                    data,
+                } => {
+                    response_renderable_bytes += data.len();
+                    observed.push_str(data);
+                    if event_session_id == &session_id && event_subscription_id == &subscription_id
+                    {
+                        matching_observed.push_str(data);
+                    } else if data.contains(&expected) {
+                        mismatched_marker = true;
+                    }
+                    format!(
+                        "terminal_output:session={event_session_id}:subscription={event_subscription_id}:bytes={}",
+                        data.len()
+                    )
+                }
+                botster_hub_client::DaemonEvent::Snapshot {
+                    session_id: event_session_id,
+                    subscription_id: event_subscription_id,
+                    history,
+                } => {
+                    opaque_history_bytes += history.bytes;
+                    format!(
+                        "snapshot:session={event_session_id}:subscription={event_subscription_id}:bytes={}",
+                        history.bytes
+                    )
+                }
+                botster_hub_client::DaemonEvent::Scrollback {
+                    session_id: event_session_id,
+                    subscription_id: event_subscription_id,
+                    history,
+                } => {
+                    opaque_history_bytes += history.bytes;
+                    format!(
+                        "scrollback:session={event_session_id}:subscription={event_subscription_id}:bytes={}",
+                        history.bytes
+                    )
+                }
+                botster_hub_client::DaemonEvent::ProcessExit {
+                    session_id: event_session_id,
+                    subscription_id: event_subscription_id,
+                    code,
+                } => {
+                    saw_process_exit = true;
+                    format!(
+                        "process_exit:session={event_session_id}:subscription={event_subscription_id}:code={code:?}"
+                    )
+                }
+                botster_hub_client::DaemonEvent::AttachState {
+                    session_id: event_session_id,
+                    subscription_id: event_subscription_id,
+                    state,
+                } => {
+                    format!(
+                        "attach_state:session={event_session_id}:subscription={event_subscription_id}:state={state}"
+                    )
+                }
+                botster_hub_client::DaemonEvent::RuntimeObservation { kind } => {
+                    format!("runtime_observation:{kind}")
+                }
+                botster_hub_client::DaemonEvent::WorktreeLifecycle { .. } => {
+                    "worktree_lifecycle".to_string()
+                }
+            };
+            response_observations.push(observation.clone());
+            ordered_observations.push(format!(
+                "elapsed_us={}:response={response_index}:request={request_kind}:event={}:{}",
+                started_at.elapsed().as_micros(),
+                response_observations.len() - 1,
+                observation
+            ));
+        }
+        println!(
+            "fast_exit_attach_diagnostic elapsed_us={} response={response_index} request={request_kind} events=[{}] renderable_bytes={response_renderable_bytes} cumulative_renderable_bytes={}",
+            started_at.elapsed().as_micros(),
+            response_observations.join(","),
+            observed.len()
+        );
+
+        if saw_process_exit {
+            break "process_exit";
+        }
+        if request_kind == "drain" {
+            if response.events.is_empty() {
+                idle_drains += 1;
+            } else {
+                idle_drains = 0;
+            }
+            if idle_drains >= 20 {
+                break "idle_quiescence";
+            }
+        }
+
+        thread::sleep(Duration::from_millis(25));
+        response = connection
+            .request(&botster_hub_client::DaemonRequest::Drain {
+                session_id: session_id.clone(),
+            })
+            .expect("drain diagnostic subscription before production boundary");
+        response_index += 1;
+        request_kind = "drain";
+    };
+
+    let renderable_bytes_at_boundary = observed.len();
+    let matching_bytes_at_boundary = matching_observed.len();
+    let marker_at_boundary = observed.contains(&expected);
+    println!(
+        "fast_exit_attach_diagnostic boundary elapsed_us={} reason={boundary_reason} response={response_index} input_bytes=0 renderable_bytes_at_boundary={renderable_bytes_at_boundary} matching_bytes_at_boundary={matching_bytes_at_boundary} marker_at_boundary={marker_at_boundary} idle_drains={idle_drains}",
+        started_at.elapsed().as_micros()
+    );
+
+    let mut tail_matching_observed = String::new();
+    let mut tail_error = None;
+    if !marker_at_boundary {
+        let mut tail_idle_drains = 0;
+        while tail_idle_drains < 20 {
+            thread::sleep(Duration::from_millis(25));
+            let tail_response =
+                match connection.request(&botster_hub_client::DaemonRequest::Drain {
+                    session_id: session_id.clone(),
+                }) {
+                    Ok(response) => response,
+                    Err(error) => {
+                        tail_error = Some(error.to_string());
+                        break;
+                    }
+                };
+            response_index += 1;
+            if tail_response.events.is_empty() {
+                tail_idle_drains += 1;
+            } else {
+                tail_idle_drains = 0;
+            }
+            for (event_index, event) in tail_response.events.iter().enumerate() {
+                let elapsed_us = started_at.elapsed().as_micros();
+                match event {
+                    botster_hub_client::DaemonEvent::TerminalOutput {
+                        session_id: event_session_id,
+                        subscription_id: event_subscription_id,
+                        data,
+                    } => {
+                        if event_session_id == &session_id
+                            && event_subscription_id == &subscription_id
+                        {
+                            tail_matching_observed.push_str(data);
+                        } else if data.contains(&expected) {
+                            mismatched_marker = true;
+                        }
+                        println!(
+                            "fast_exit_attach_tail_event elapsed_us={elapsed_us} response={response_index} event={event_index} type=terminal_output session={event_session_id} subscription={event_subscription_id} bytes={}",
+                            data.len()
+                        );
+                    }
+                    botster_hub_client::DaemonEvent::Snapshot {
+                        session_id: event_session_id,
+                        subscription_id: event_subscription_id,
+                        history,
+                    } => {
+                        opaque_history_bytes += history.bytes;
+                        println!(
+                            "fast_exit_attach_tail_event elapsed_us={elapsed_us} response={response_index} event={event_index} type=snapshot session={event_session_id} subscription={event_subscription_id} bytes={}",
+                            history.bytes
+                        );
+                    }
+                    botster_hub_client::DaemonEvent::Scrollback {
+                        session_id: event_session_id,
+                        subscription_id: event_subscription_id,
+                        history,
+                    } => {
+                        opaque_history_bytes += history.bytes;
+                        println!(
+                            "fast_exit_attach_tail_event elapsed_us={elapsed_us} response={response_index} event={event_index} type=scrollback session={event_session_id} subscription={event_subscription_id} bytes={}",
+                            history.bytes
+                        );
+                    }
+                    botster_hub_client::DaemonEvent::ProcessExit {
+                        session_id: event_session_id,
+                        subscription_id: event_subscription_id,
+                        code,
+                    } => println!(
+                        "fast_exit_attach_tail_event elapsed_us={elapsed_us} response={response_index} event={event_index} type=process_exit session={event_session_id} subscription={event_subscription_id} code={code:?} bytes=0"
+                    ),
+                    botster_hub_client::DaemonEvent::AttachState {
+                        session_id: event_session_id,
+                        subscription_id: event_subscription_id,
+                        state,
+                    } => println!(
+                        "fast_exit_attach_tail_event elapsed_us={elapsed_us} response={response_index} event={event_index} type=attach_state session={event_session_id} subscription={event_subscription_id} state={state} bytes=0"
+                    ),
+                    botster_hub_client::DaemonEvent::SessionLifecycle {
+                        session_id: event_session_id,
+                        state,
+                    } => println!(
+                        "fast_exit_attach_tail_event elapsed_us={elapsed_us} response={response_index} event={event_index} type=session_lifecycle session={event_session_id} subscription=none state={state} bytes=0"
+                    ),
+                    botster_hub_client::DaemonEvent::RuntimeObservation { kind } => println!(
+                        "fast_exit_attach_tail_event elapsed_us={elapsed_us} response={response_index} event={event_index} type=runtime_observation session=none subscription=none kind={kind} bytes=0"
+                    ),
+                    botster_hub_client::DaemonEvent::WorktreeLifecycle { .. } => println!(
+                        "fast_exit_attach_tail_event elapsed_us={elapsed_us} response={response_index} event={event_index} type=worktree_lifecycle session=none subscription=none bytes=0"
+                    ),
+                }
+            }
+        }
+    }
+
+    let (read_screen_bytes, read_screen_marker, read_screen_error) = if marker_at_boundary {
+        (0, false, None)
+    } else {
+        match connection.request(&botster_hub_client::DaemonRequest::ReadScreen {
+            session_id: session_id.clone(),
+        }) {
+            Ok(response) => match response.read_screen {
+                Some(screen) => (screen.text.len(), screen.text.contains(&expected), None),
+                None => (0, false, Some("missing_read_screen_body".to_string())),
+            },
+            Err(error) => (0, false, Some(error.to_string())),
+        }
+    };
+
+    let status = connection.request(&botster_hub_client::DaemonRequest::Status);
+    let daemon_lifecycle = status
+        .as_ref()
+        .ok()
+        .and_then(|response| response.status.as_ref())
+        .map(|status| status.lifecycle_state.as_str())
+        .unwrap_or("missing");
+
+    let sessions = connection
+        .request(&botster_hub_client::DaemonRequest::ListSessions)
+        .expect("list sessions after frozen production boundary");
+    let session_lifecycle = sessions
+        .sessions
+        .iter()
+        .find(|session| session.session_id == session_id)
+        .map(|session| session.lifecycle.as_str())
+        .unwrap_or("missing");
+    let tail_matching_marker = tail_matching_observed.contains(&expected);
+    println!(
+        "fast_exit_attach_diagnostic state elapsed_us={} daemon_lifecycle={daemon_lifecycle} session_lifecycle={session_lifecycle} process_exit={saw_process_exit} renderable_bytes_at_boundary={renderable_bytes_at_boundary} matching_bytes_at_boundary={matching_bytes_at_boundary} tail_matching_bytes={} tail_matching_marker={tail_matching_marker} mismatched_marker={mismatched_marker} opaque_history_bytes={opaque_history_bytes} read_screen_bytes={read_screen_bytes} read_screen_marker={read_screen_marker} read_screen_error={read_screen_error:?} tail_error={tail_error:?} event_order=[{}]",
+        started_at.elapsed().as_micros(),
+        tail_matching_observed.len(),
+        ordered_observations.join(",")
+    );
+
+    let detach = connection.request(&botster_hub_client::DaemonRequest::Detach {
+        session_id: session_id.clone(),
+        subscription_id: subscription_id.clone(),
+    });
+    println!(
+        "fast_exit_attach_diagnostic cleanup elapsed_us={} detach_response={detach:?}",
+        started_at.elapsed().as_micros()
+    );
+    let _ = connection.request(&botster_hub_client::DaemonRequest::ShutdownSession {
+        session_id: session_id.clone(),
+    });
+
+    let shutdown = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("shutdown")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .output()
+        .expect("run botster-hub shutdown after fast-exit diagnostic");
+    let daemon = child
+        .wait_with_output()
+        .expect("wait for diagnostic daemon child");
+    let shutdown_validation = validate_cli_daemon_shutdown(&shutdown, &daemon);
+
+    if !marker_at_boundary {
+        let classification = if mismatched_marker && tail_matching_marker {
+            "ambiguous_subscription_mismatch_and_output_queued_after_harness_stop"
+        } else if mismatched_marker {
+            "subscription_mismatch"
+        } else if tail_matching_marker {
+            "output_queued_after_harness_stop"
+        } else if read_screen_marker {
+            "output_produced_not_routed"
+        } else if read_screen_error.is_some() {
+            "retained_history_or_readback_failure"
+        } else if tail_error.is_some() {
+            "unclassified_diagnostic_transport_failure"
+        } else {
+            "output_never_produced"
+        };
+        println!(
+            "fast_exit_attach_failure classification={classification} boundary_reason={boundary_reason} input_bytes=0 renderable_bytes_at_boundary={renderable_bytes_at_boundary} matching_bytes_at_boundary={matching_bytes_at_boundary} opaque_history_bytes={opaque_history_bytes} daemon_exit_status={} shutdown_status={} daemon_stdout_begin\n{}\ndaemon_stdout_end daemon_stderr_begin\n{}\ndaemon_stderr_end test_stdout_stderr=run_log",
+            daemon.status,
+            shutdown.status,
+            String::from_utf8_lossy(&daemon.stdout),
+            String::from_utf8_lossy(&daemon.stderr)
+        );
+    }
+
+    assert!(
+        shutdown_validation.is_ok(),
+        "diagnostic daemon cleanup failed: {shutdown_validation:?}"
+    );
+    assert!(
+        marker_at_boundary,
+        "fast-exit marker missing at production boundary; renderable_bytes_at_boundary={renderable_bytes_at_boundary} matching_bytes_at_boundary={matching_bytes_at_boundary} tail_matching_marker={tail_matching_marker} mismatched_marker={mismatched_marker} read_screen_marker={read_screen_marker} read_screen_error={read_screen_error:?} tail_error={tail_error:?}"
+    );
+}
+
+#[test]
 fn cli_smoke_reports_missing_first_party_prerequisites() {
     let _guard = daemon_test_guard();
     let data_dir = unique_short_test_dir("cli-smoke-missing");
