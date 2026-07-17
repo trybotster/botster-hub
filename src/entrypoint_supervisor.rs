@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use botster_core::{
     PackageSource, RunnableEntrypointLaunchMode, RunnableEntrypointLaunchResult,
@@ -19,6 +19,7 @@ use botster_core::{
 use crate::{PackageRecord, PackageRegistry, PackageRunnableEntrypoint, PackageState};
 
 const OUTPUT_LIMIT_BYTES: usize = 4096;
+const OUTPUT_FINALIZATION_GRACE: Duration = Duration::from_millis(500);
 const STOP_GRACE: Duration = Duration::from_millis(500);
 const LAUNCH_RESULT_ENV: &str = "BOTSTER_ENTRYPOINT_LAUNCH_RESULT";
 
@@ -142,6 +143,8 @@ impl EntrypointSupervisor {
             }),
             launch_result_path,
             state: ProcessState::Running,
+            pending_terminal_state: None,
+            output_finalization_deadline: None,
         };
         let snapshot = process.snapshot(&key);
         self.retained.insert(key.clone(), snapshot.clone());
@@ -231,11 +234,13 @@ struct SupervisedProcess {
     launch_result: Option<RunnableEntrypointLaunchResult>,
     launch_result_path: Option<PathBuf>,
     state: ProcessState,
+    pending_terminal_state: Option<ProcessState>,
+    output_finalization_deadline: Option<Instant>,
 }
 
 impl SupervisedProcess {
     fn is_running(&self) -> bool {
-        matches!(self.state, ProcessState::Running)
+        self.exited_at.is_none()
     }
 
     fn refresh(&mut self) {
@@ -247,11 +252,8 @@ impl SupervisedProcess {
                 Ok(Some(status)) => self.mark_exit(status),
                 Ok(None) => {}
                 Err(error) => {
-                    self.state = ProcessState::Failed;
                     self.exited_at = Some(now_seconds());
-                    if let Some(result) = &mut self.launch_result {
-                        result.process_state = RunnableEntrypointProcessState::Failed;
-                    }
+                    self.begin_terminal_finalization(ProcessState::Failed);
                     self.diagnostics.push(EntrypointDiagnostic {
                         kind: "wait_error".to_string(),
                         message: bounded_message(error.to_string()),
@@ -259,6 +261,7 @@ impl SupervisedProcess {
                 }
             }
         }
+        self.publish_terminal_state_if_ready();
     }
 
     fn refresh_launch_result(&mut self) {
@@ -277,12 +280,14 @@ impl SupervisedProcess {
             return;
         }
         self.launch_result = Some(result);
+        // The child supplies result fields, but supervised process state comes from reaping.
+        self.sync_launch_result_process_state();
     }
 
     fn stop(&mut self) {
         self.refresh();
         if self.exited_at.is_some() {
-            self.state = ProcessState::Stopped;
+            self.mark_stopped();
             return;
         }
         kill_process_group(self.child.id(), libc::SIGTERM);
@@ -290,32 +295,69 @@ impl SupervisedProcess {
         while std::time::Instant::now() < deadline {
             self.refresh();
             if self.exited_at.is_some() {
-                self.state = ProcessState::Stopped;
+                self.mark_stopped();
                 return;
             }
             thread::sleep(Duration::from_millis(20));
         }
         kill_process_group(self.child.id(), libc::SIGKILL);
         let _ = self.child.wait().map(|status| self.mark_exit(status));
-        self.state = ProcessState::Stopped;
+        self.mark_stopped();
         self.refresh();
     }
 
     fn mark_exit(&mut self, status: ExitStatus) {
         self.exited_at = Some(now_seconds());
         self.exit_status = Some(exit_status_label(status));
-        self.state = if status.success() {
+        let state = if status.success() {
             ProcessState::Exited
         } else {
             ProcessState::Failed
         };
+        self.begin_terminal_finalization(state);
+    }
+
+    fn begin_terminal_finalization(&mut self, state: ProcessState) {
+        self.pending_terminal_state = Some(state);
+        self.output_finalization_deadline = Some(Instant::now() + OUTPUT_FINALIZATION_GRACE);
+    }
+
+    fn publish_terminal_state_if_ready(&mut self) {
+        let Some(state) = self.pending_terminal_state else {
+            return;
+        };
+        let readers_complete = self.stdout.is_none() && self.stderr.is_none();
+        let deadline_expired = self
+            .output_finalization_deadline
+            .is_some_and(|deadline| Instant::now() >= deadline);
+        if !readers_complete && !deadline_expired {
+            return;
+        }
+
+        self.pending_terminal_state = None;
+        self.output_finalization_deadline = None;
+        self.state = state;
+        self.sync_launch_result_process_state();
+    }
+
+    fn sync_launch_result_process_state(&mut self) {
         if let Some(result) = &mut self.launch_result {
-            result.process_state = if status.success() {
-                RunnableEntrypointProcessState::Exited
-            } else {
-                RunnableEntrypointProcessState::Failed
+            result.process_state = match self.state {
+                ProcessState::Running => RunnableEntrypointProcessState::Running,
+                ProcessState::Exited => RunnableEntrypointProcessState::Exited,
+                ProcessState::Failed => RunnableEntrypointProcessState::Failed,
+                ProcessState::Stopped => return,
             };
         }
+    }
+
+    fn mark_stopped(&mut self) {
+        if let Some(state) = self.pending_terminal_state.take() {
+            self.state = state;
+            self.sync_launch_result_process_state();
+        }
+        self.output_finalization_deadline = None;
+        self.state = ProcessState::Stopped;
     }
 
     fn snapshot(&self, key: &EntrypointKey) -> EntrypointProcessSnapshot {
@@ -574,5 +616,180 @@ fn failed_snapshot(
             process_state: RunnableEntrypointProcessState::Failed,
             local_url: None,
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc::Sender;
+
+    fn controlled_failed_process() -> (SupervisedProcess, Sender<Vec<u8>>, Sender<Vec<u8>>) {
+        let child = Command::new("sh")
+            .args(["-c", "exit 42"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn controlled failing child");
+        let (stdout_tx, stdout) = mpsc::channel();
+        let (stderr_tx, stderr) = mpsc::channel();
+        (
+            SupervisedProcess {
+                child,
+                started_at: now_seconds(),
+                exited_at: None,
+                exit_status: None,
+                stdout: Some(stdout),
+                stderr: Some(stderr),
+                diagnostics: Vec::new(),
+                launch_result: Some(RunnableEntrypointLaunchResult {
+                    entrypoint_id: "web".to_string(),
+                    process_state: RunnableEntrypointProcessState::Running,
+                    local_url: None,
+                }),
+                launch_result_path: None,
+                state: ProcessState::Running,
+                pending_terminal_state: None,
+                output_finalization_deadline: None,
+            },
+            stdout_tx,
+            stderr_tx,
+        )
+    }
+
+    fn observe_child_exit(process: &mut SupervisedProcess) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while process.exited_at.is_none() && Instant::now() < deadline {
+            process.refresh();
+            thread::yield_now();
+        }
+        assert!(process.exited_at.is_some(), "controlled child did not exit");
+    }
+
+    #[test]
+    fn terminal_state_waits_for_both_output_readers() {
+        let (mut process, stdout_tx, stderr_tx) = controlled_failed_process();
+        observe_child_exit(&mut process);
+
+        assert!(matches!(process.state, ProcessState::Running));
+        assert!(!process.is_running());
+        assert_eq!(process.exit_status.as_deref(), Some("exit:42"));
+        assert!(
+            process
+                .snapshot(&EntrypointKey {
+                    package_name: "fixture".to_string(),
+                    entrypoint_id: "web".to_string(),
+                })
+                .pid
+                .is_none()
+        );
+
+        stdout_tx.send(Vec::new()).expect("settle stdout reader");
+        process.refresh();
+        assert!(process.stdout.is_none());
+        assert!(process.stderr.is_some());
+        assert!(matches!(process.state, ProcessState::Running));
+
+        stderr_tx
+            .send(b"fixture failure\n".to_vec())
+            .expect("settle stderr reader");
+        process.refresh();
+
+        assert!(matches!(process.state, ProcessState::Failed));
+        assert!(process.diagnostics.iter().any(|diagnostic| {
+            diagnostic.kind == "stderr" && diagnostic.message == "fixture failure\n"
+        }));
+        assert!(matches!(
+            process
+                .launch_result
+                .as_ref()
+                .map(|result| &result.process_state),
+            Some(RunnableEntrypointProcessState::Failed)
+        ));
+    }
+
+    #[test]
+    fn terminal_state_waits_when_only_stderr_reader_completes() {
+        let (mut process, stdout_tx, stderr_tx) = controlled_failed_process();
+        observe_child_exit(&mut process);
+
+        stderr_tx
+            .send(b"fixture failure\n".to_vec())
+            .expect("settle stderr reader");
+        process.refresh();
+
+        assert!(process.stderr.is_none());
+        assert!(process.stdout.is_some());
+        assert!(matches!(process.state, ProcessState::Running));
+        assert!(process.diagnostics.iter().any(|diagnostic| {
+            diagnostic.kind == "stderr" && diagnostic.message == "fixture failure\n"
+        }));
+
+        stdout_tx.send(Vec::new()).expect("settle stdout reader");
+        process.refresh();
+        assert!(matches!(process.state, ProcessState::Failed));
+    }
+
+    #[test]
+    fn stop_preserves_pending_terminal_launch_result_state() {
+        let (mut process, _stdout_tx, _stderr_tx) = controlled_failed_process();
+        observe_child_exit(&mut process);
+        assert!(matches!(
+            process
+                .launch_result
+                .as_ref()
+                .map(|result| &result.process_state),
+            Some(RunnableEntrypointProcessState::Running)
+        ));
+
+        process.stop();
+
+        assert!(matches!(process.state, ProcessState::Stopped));
+        assert!(matches!(
+            process
+                .launch_result
+                .as_ref()
+                .map(|result| &result.process_state),
+            Some(RunnableEntrypointProcessState::Failed)
+        ));
+    }
+
+    #[test]
+    fn terminal_state_publishes_when_output_finalization_deadline_expires() {
+        let (mut process, _stdout_tx, stderr_tx) = controlled_failed_process();
+        observe_child_exit(&mut process);
+        process.output_finalization_deadline = Some(Instant::now());
+
+        process.refresh();
+
+        assert!(matches!(process.state, ProcessState::Failed));
+        assert!(
+            process
+                .snapshot(&EntrypointKey {
+                    package_name: "fixture".to_string(),
+                    entrypoint_id: "web".to_string(),
+                })
+                .pid
+                .is_none()
+        );
+        stderr_tx
+            .send(b"late stderr\n".to_vec())
+            .expect("deliver stderr after terminal publication");
+        process.refresh();
+        assert!(matches!(process.state, ProcessState::Failed));
+        assert!(process.diagnostics.iter().any(|diagnostic| {
+            diagnostic.kind == "stderr" && diagnostic.message == "late stderr\n"
+        }));
+        let started = Instant::now();
+        process.stop();
+        assert!(started.elapsed() < STOP_GRACE);
+        assert!(matches!(process.state, ProcessState::Stopped));
+        assert!(matches!(
+            process
+                .launch_result
+                .as_ref()
+                .map(|result| &result.process_state),
+            Some(RunnableEntrypointProcessState::Failed)
+        ));
     }
 }

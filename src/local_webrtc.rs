@@ -296,6 +296,72 @@ enum PendingLocalWebrtcRequest {
     QueueOverflow(usize),
 }
 
+#[derive(Debug, Default)]
+struct LocalWebrtcFlowControl {
+    pressured: bool,
+    pending_delivery_deadline: Option<Instant>,
+}
+
+impl LocalWebrtcFlowControl {
+    fn pending_delivery_deadline(&mut self, duration: Duration) -> Instant {
+        *self
+            .pending_delivery_deadline
+            .get_or_insert_with(|| Instant::now() + duration)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalWebrtcSendFailureCause {
+    SendText,
+    ChannelClosed,
+    ChannelError,
+    PollEnded,
+    PressureDeadline,
+    InvalidRequest,
+    RequestQueueOverflow,
+}
+
+impl fmt::Display for LocalWebrtcSendFailureCause {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let cause = match self {
+            Self::SendText => "send_text",
+            Self::ChannelClosed => "channel_closed",
+            Self::ChannelError => "channel_error",
+            Self::PollEnded => "poll_ended",
+            Self::PressureDeadline => "pressure_deadline",
+            Self::InvalidRequest => "invalid_request",
+            Self::RequestQueueOverflow => "request_queue_overflow",
+        };
+        formatter.write_str(cause)
+    }
+}
+
+#[derive(Debug)]
+struct LocalWebrtcSendFailure {
+    message_id: String,
+    next_chunk_index: usize,
+    last_sent_chunk_index: Option<usize>,
+    total_chunks: usize,
+    pressured: bool,
+    cause: LocalWebrtcSendFailureCause,
+}
+
+impl fmt::Display for LocalWebrtcSendFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "local WebRTC response delivery failed: message_id={} next_chunk={} last_sent_chunk={} total_chunks={} pressured={} cause={}",
+            self.message_id,
+            self.next_chunk_index,
+            self.last_sent_chunk_index
+                .map_or_else(|| "none".to_string(), |index| index.to_string()),
+            self.total_chunks,
+            self.pressured,
+            self.cause,
+        )
+    }
+}
+
 fn pop_pending_request(
     pending_requests: &mut VecDeque<PendingLocalWebrtcRequest>,
 ) -> Option<PendingLocalWebrtcRequest> {
@@ -407,101 +473,149 @@ impl PeerConnectionEventHandler for LocalWebrtcHandler {
                 return;
             }
 
-            let mut pending_requests = VecDeque::new();
-            let mut open = true;
-            while open {
-                let pending = if let Some(request) = pop_pending_request(&mut pending_requests) {
-                    request
-                } else {
-                    match data_channel.poll().await {
-                        Some(DataChannelEvent::OnMessage(message)) => {
-                            let Some(request) =
-                                decrypt_daemon_request(&stream_key, message.data.as_ref())
-                            else {
-                                break;
-                            };
-                            PendingLocalWebrtcRequest::Request(Box::new(request))
-                        }
-                        Some(DataChannelEvent::OnClose | DataChannelEvent::OnError) | None => break,
-                        Some(_) => continue,
-                    }
-                };
-
-                let request = match pending {
-                    PendingLocalWebrtcRequest::Request(request) => request,
-                    PendingLocalWebrtcRequest::QueueOverflow(_) => {
-                        let response = queued_request_overflow_response();
-                        let Ok(frames) = framed_daemon_response(&stream_key, &response) else {
-                            break;
-                        };
-                        open = send_response_frames(
-                            data_channel.as_ref(),
-                            &stream_key,
-                            &frames,
-                            &mut pending_requests,
-                        )
-                        .await;
-                        continue;
-                    }
-                };
-
-                let subscription_change =
-                    LocalWebrtcAttachedSubscriptionChange::from_request(&request);
-                let (reply_tx, reply_rx) = mpsc::channel();
-                let (response_written_tx, response_written_rx) =
-                    if matches!(*request, DaemonRequest::DaemonShutdown) {
-                        let (tx, rx) = mpsc::channel();
-                        (Some(tx), Some(rx))
-                    } else {
-                        (None, None)
-                    };
-                if runtime_tx
-                    .send(ControlMessage::Request {
-                        request,
-                        reply_tx,
-                        response_written_rx,
-                    })
-                    .is_err()
-                {
-                    break;
-                }
-                let response = reply_rx
-                    .recv_timeout(Duration::from_secs(5))
-                    .unwrap_or_else(|_| {
-                        Ok(response_with_diagnostic(DaemonDiagnostic::action_failure(
-                            "local_webrtc_data_channel",
-                            "runtime request timed out",
-                        )))
-                    })
-                    .unwrap_or_else(|error| {
-                        response_with_diagnostic(DaemonDiagnostic::action_failure(
-                            "local_webrtc_data_channel",
-                            error.to_string(),
-                        ))
-                    });
-                peer_state.apply_subscription_change(subscription_change);
-                let Ok(frames) = framed_daemon_response(&stream_key, &response) else {
-                    break;
-                };
-                open = send_response_frames(
-                    data_channel.as_ref(),
-                    &stream_key,
-                    &frames,
-                    &mut pending_requests,
-                )
-                .await;
-                if let Some(response_written_tx) = response_written_tx {
-                    let _ = response_written_tx.send(());
-                }
-            }
-            close_data_channel(
+            let _ = run_data_channel_with_deadline(
                 data_channel.as_ref(),
-                &mut pending_requests,
+                &stream_key,
                 peer_state.as_ref(),
+                &runtime_tx,
+                LOCAL_WEBRTC_FLOW_CONTROL_DEADLINE,
             )
             .await;
         }));
     }
+}
+
+async fn run_data_channel_with_deadline<D>(
+    data_channel: &D,
+    stream_key: &AesGcmKey,
+    peer_state: &LocalWebrtcPeerState,
+    runtime_tx: &Sender<ControlMessage>,
+    flow_control_deadline: Duration,
+) -> Option<LocalWebrtcSendFailure>
+where
+    D: LocalWebrtcDataChannel + ?Sized,
+{
+    let mut pending_requests = VecDeque::new();
+    let mut flow_control = LocalWebrtcFlowControl::default();
+    let mut send_failure = None;
+    let mut open = true;
+    while open {
+        let pending = if let Some(request) = pop_pending_request(&mut pending_requests) {
+            request
+        } else {
+            match data_channel.local_poll().await {
+                Some(DataChannelEvent::OnMessage(message)) => {
+                    let Some(request) = decrypt_daemon_request(stream_key, message.data.as_ref())
+                    else {
+                        break;
+                    };
+                    PendingLocalWebrtcRequest::Request(Box::new(request))
+                }
+                Some(DataChannelEvent::OnClose | DataChannelEvent::OnError) | None => break,
+                Some(
+                    event @ (DataChannelEvent::OnBufferedAmountHigh
+                    | DataChannelEvent::OnBufferedAmountLow),
+                ) => {
+                    let _ = apply_data_channel_event(
+                        event,
+                        stream_key,
+                        &mut pending_requests,
+                        &mut flow_control,
+                    );
+                    continue;
+                }
+                Some(_) => continue,
+            }
+        };
+
+        let request = match pending {
+            PendingLocalWebrtcRequest::Request(request) => request,
+            PendingLocalWebrtcRequest::QueueOverflow(_) => {
+                let response = queued_request_overflow_response();
+                let Ok(frames) = framed_daemon_response(stream_key, &response) else {
+                    break;
+                };
+                match send_response_frames_with_deadline(
+                    data_channel,
+                    stream_key,
+                    &frames,
+                    &mut pending_requests,
+                    &mut flow_control,
+                    flow_control_deadline,
+                )
+                .await
+                {
+                    Ok(()) => open = true,
+                    Err(failure) => {
+                        eprintln!("{failure}");
+                        send_failure = Some(failure);
+                        open = false;
+                    }
+                }
+                continue;
+            }
+        };
+
+        let subscription_change = LocalWebrtcAttachedSubscriptionChange::from_request(&request);
+        let (reply_tx, reply_rx) = mpsc::channel();
+        let (response_written_tx, response_written_rx) =
+            if matches!(*request, DaemonRequest::DaemonShutdown) {
+                let (tx, rx) = mpsc::channel();
+                (Some(tx), Some(rx))
+            } else {
+                (None, None)
+            };
+        if runtime_tx
+            .send(ControlMessage::Request {
+                request,
+                reply_tx,
+                response_written_rx,
+            })
+            .is_err()
+        {
+            break;
+        }
+        let response = reply_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap_or_else(|_| {
+                Ok(response_with_diagnostic(DaemonDiagnostic::action_failure(
+                    "local_webrtc_data_channel",
+                    "runtime request timed out",
+                )))
+            })
+            .unwrap_or_else(|error| {
+                response_with_diagnostic(DaemonDiagnostic::action_failure(
+                    "local_webrtc_data_channel",
+                    error.to_string(),
+                ))
+            });
+        peer_state.apply_subscription_change(subscription_change);
+        let Ok(frames) = framed_daemon_response(stream_key, &response) else {
+            break;
+        };
+        let send_result = send_response_frames_with_deadline(
+            data_channel,
+            stream_key,
+            &frames,
+            &mut pending_requests,
+            &mut flow_control,
+            flow_control_deadline,
+        )
+        .await;
+        if let Some(response_written_tx) = response_written_tx {
+            let _ = response_written_tx.send(());
+        }
+        match send_result {
+            Ok(()) => open = true,
+            Err(failure) => {
+                eprintln!("{failure}");
+                send_failure = Some(failure);
+                open = false;
+            }
+        }
+    }
+    close_data_channel(data_channel, &mut pending_requests, peer_state).await;
+    send_failure
 }
 
 async fn close_data_channel<D>(
@@ -518,110 +632,112 @@ async fn close_data_channel<D>(
     peer_state.cleanup_once();
 }
 
-async fn send_response_frames<D>(
-    data_channel: &D,
-    stream_key: &AesGcmKey,
-    frames: &[String],
-    pending_requests: &mut VecDeque<PendingLocalWebrtcRequest>,
-) -> bool
-where
-    D: LocalWebrtcDataChannel + ?Sized,
-{
-    send_response_frames_with_deadline(
-        data_channel,
-        stream_key,
-        frames,
-        pending_requests,
-        LOCAL_WEBRTC_FLOW_CONTROL_DEADLINE,
-    )
-    .await
-}
-
 async fn send_response_frames_with_deadline<D>(
     data_channel: &D,
     stream_key: &AesGcmKey,
     frames: &[String],
     pending_requests: &mut VecDeque<PendingLocalWebrtcRequest>,
+    flow_control: &mut LocalWebrtcFlowControl,
     flow_control_deadline: Duration,
-) -> bool
+) -> Result<(), LocalWebrtcSendFailure>
 where
     D: LocalWebrtcDataChannel + ?Sized,
 {
-    let mut paused = false;
-    let mut pause_deadline = None;
+    let total_chunks = frames.len();
 
-    for frame in frames {
-        if let Err(error) = data_channel.local_send_text(frame).await {
-            eprintln!("local WebRTC response frame send failed: {error}");
-            return false;
+    let failure =
+        |next_chunk_index, cause, flow_control: &LocalWebrtcFlowControl| LocalWebrtcSendFailure {
+            message_id: frames
+                .first()
+                .and_then(|frame| {
+                    serde_json::from_str::<DaemonLocalWebrtcResponseChunk>(frame).ok()
+                })
+                .map_or_else(|| "unavailable".to_string(), |chunk| chunk.message_id),
+            next_chunk_index,
+            last_sent_chunk_index: next_chunk_index.checked_sub(1),
+            total_chunks,
+            pressured: flow_control.pressured,
+            cause,
+        };
+
+    for (chunk_index, frame) in frames.iter().enumerate() {
+        while flow_control.pressured {
+            let deadline = flow_control.pending_delivery_deadline(flow_control_deadline);
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return Err(failure(
+                    chunk_index,
+                    LocalWebrtcSendFailureCause::PressureDeadline,
+                    flow_control,
+                ));
+            };
+            match timeout(remaining, data_channel.local_poll()).await {
+                Ok(Some(event)) => {
+                    apply_data_channel_event(event, stream_key, pending_requests, flow_control)
+                        .map_err(|cause| failure(chunk_index, cause, flow_control))?
+                }
+                Ok(None) => {
+                    return Err(failure(
+                        chunk_index,
+                        LocalWebrtcSendFailureCause::PollEnded,
+                        flow_control,
+                    ));
+                }
+                Err(_) => {
+                    return Err(failure(
+                        chunk_index,
+                        LocalWebrtcSendFailureCause::PressureDeadline,
+                        flow_control,
+                    ));
+                }
+            }
+        }
+
+        if data_channel.local_send_text(frame).await.is_err() {
+            return Err(failure(
+                chunk_index,
+                LocalWebrtcSendFailureCause::SendText,
+                flow_control,
+            ));
         }
 
         match timeout(LOCAL_WEBRTC_EVENT_PROBE, data_channel.local_poll()).await {
             Ok(Some(event)) => {
-                if !apply_data_channel_event(
-                    event,
-                    stream_key,
-                    pending_requests,
-                    &mut paused,
-                    &mut pause_deadline,
-                    flow_control_deadline,
-                ) {
-                    return false;
-                }
+                apply_data_channel_event(event, stream_key, pending_requests, flow_control)
+                    .map_err(|cause| failure(chunk_index + 1, cause, flow_control))?;
             }
-            Ok(None) => return false,
+            Ok(None) => {
+                return Err(failure(
+                    chunk_index + 1,
+                    LocalWebrtcSendFailureCause::PollEnded,
+                    flow_control,
+                ));
+            }
             Err(_) => {}
         }
-
-        while paused {
-            let deadline = pause_deadline.expect("paused response has a deadline");
-            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-                return false;
-            };
-            match timeout(remaining, data_channel.local_poll()).await {
-                Ok(Some(event)) => {
-                    if !apply_data_channel_event(
-                        event,
-                        stream_key,
-                        pending_requests,
-                        &mut paused,
-                        &mut pause_deadline,
-                        flow_control_deadline,
-                    ) {
-                        return false;
-                    }
-                }
-                Ok(None) | Err(_) => return false,
-            }
-        }
     }
-    true
+    flow_control.pending_delivery_deadline = None;
+    Ok(())
 }
 
 fn apply_data_channel_event(
     event: DataChannelEvent,
     stream_key: &AesGcmKey,
     pending_requests: &mut VecDeque<PendingLocalWebrtcRequest>,
-    paused: &mut bool,
-    pause_deadline: &mut Option<Instant>,
-    flow_control_deadline: Duration,
-) -> bool {
+    flow_control: &mut LocalWebrtcFlowControl,
+) -> Result<(), LocalWebrtcSendFailureCause> {
     match event {
         DataChannelEvent::OnBufferedAmountHigh => {
-            if !*paused {
-                *paused = true;
-                *pause_deadline = Some(Instant::now() + flow_control_deadline);
-            }
-            true
+            flow_control.pressured = true;
+            Ok(())
         }
         DataChannelEvent::OnBufferedAmountLow => {
-            *paused = false;
-            *pause_deadline = None;
-            true
+            flow_control.pressured = false;
+            flow_control.pending_delivery_deadline = None;
+            Ok(())
         }
         DataChannelEvent::OnMessage(message) => {
             let Some(request) = decrypt_daemon_request(stream_key, message.data.as_ref()) else {
-                return false;
+                return Err(LocalWebrtcSendFailureCause::InvalidRequest);
             };
             let request_count = pending_requests
                 .iter()
@@ -632,19 +748,20 @@ fn apply_data_channel_event(
                     pending_requests.back_mut()
                 {
                     let Some(next_count) = count.checked_add(1) else {
-                        return false;
+                        return Err(LocalWebrtcSendFailureCause::RequestQueueOverflow);
                     };
                     *count = next_count;
                 } else {
                     pending_requests.push_back(PendingLocalWebrtcRequest::QueueOverflow(1));
                 }
-                return true;
+                return Ok(());
             }
             pending_requests.push_back(PendingLocalWebrtcRequest::Request(Box::new(request)));
-            true
+            Ok(())
         }
-        DataChannelEvent::OnClose | DataChannelEvent::OnError => false,
-        _ => true,
+        DataChannelEvent::OnClose => Err(LocalWebrtcSendFailureCause::ChannelClosed),
+        DataChannelEvent::OnError => Err(LocalWebrtcSendFailureCause::ChannelError),
+        _ => Ok(()),
     }
 }
 
@@ -957,6 +1074,10 @@ mod tests {
         events: Mutex<VecDeque<DataChannelEvent>>,
         sent: Mutex<Vec<String>>,
         closed: AtomicBool,
+        send_attempted: AtomicBool,
+        send_fails: AtomicBool,
+        sent_before_low_water: AtomicBool,
+        poll_ends: AtomicBool,
     }
 
     #[async_trait]
@@ -976,6 +1097,19 @@ mod tests {
         }
 
         async fn local_send_text(&self, text: &str) -> Result<(), String> {
+            self.send_attempted.store(true, Ordering::Release);
+            if self.send_fails.load(Ordering::Acquire) {
+                return Err("fixture send failure".to_string());
+            }
+            if self
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| matches!(event, DataChannelEvent::OnBufferedAmountLow))
+            {
+                self.sent_before_low_water.store(true, Ordering::Release);
+            }
             self.sent.lock().unwrap().push(text.to_string());
             Ok(())
         }
@@ -983,6 +1117,9 @@ mod tests {
         async fn local_poll(&self) -> Option<DataChannelEvent> {
             if let Some(event) = self.events.lock().unwrap().pop_front() {
                 return Some(event);
+            }
+            if self.poll_ends.load(Ordering::Acquire) {
+                return None;
             }
             std::future::pending().await
         }
@@ -1001,6 +1138,153 @@ mod tests {
             is_string: true,
             data: data.as_slice().into(),
         })
+    }
+
+    fn run_idle_pressure_case(
+        low_water_arrives: bool,
+    ) -> (FakeDataChannel, Option<LocalWebrtcSendFailure>) {
+        let key = AesGcmKey::from_slice(&[15; 32]).unwrap();
+        let data_channel = FakeDataChannel::default();
+        {
+            let mut events = data_channel.events.lock().unwrap();
+            events.push_back(DataChannelEvent::OnBufferedAmountHigh);
+            events.push_back(encrypted_request_event(&key, &DaemonRequest::Status));
+            if low_water_arrives {
+                events.push_back(DataChannelEvent::OnBufferedAmountLow);
+                events.push_back(DataChannelEvent::OnClose);
+            }
+        }
+        let (runtime_tx, runtime_rx) = mpsc::channel();
+        let peer_state = LocalWebrtcPeerState::new("grant-idle-pressure".to_string(), runtime_tx);
+        let responder = std::thread::spawn(move || {
+            let ControlMessage::Request {
+                request, reply_tx, ..
+            } = runtime_rx.recv().unwrap()
+            else {
+                panic!("expected daemon request before peer cleanup");
+            };
+            assert_eq!(*request, DaemonRequest::Status);
+            reply_tx
+                .send(Ok(response_with_diagnostic(DaemonDiagnostic::connected(
+                    "fixture",
+                ))))
+                .unwrap();
+            assert!(matches!(
+                runtime_rx.recv().unwrap(),
+                ControlMessage::LocalWebrtcPeerClosed { grant_id, .. }
+                    if grant_id == "grant-idle-pressure"
+            ));
+        });
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let deadline = if low_water_arrives {
+            Duration::from_secs(1)
+        } else {
+            Duration::ZERO
+        };
+        let runtime_sender = peer_state.runtime_tx.clone();
+        let failure = runtime
+            .block_on(timeout(
+                Duration::from_millis(250),
+                run_data_channel_with_deadline(
+                    &data_channel,
+                    &key,
+                    &peer_state,
+                    &runtime_sender,
+                    deadline,
+                ),
+            ))
+            .expect("outer data-channel loop must finish on close or delivery deadline");
+        responder.join().unwrap();
+        (data_channel, failure)
+    }
+
+    #[test]
+    fn shutdown_acknowledges_failed_response_send_attempt() {
+        let key = AesGcmKey::from_slice(&[16; 32]).unwrap();
+        let data_channel = Arc::new(FakeDataChannel::default());
+        data_channel.send_fails.store(true, Ordering::Release);
+        data_channel
+            .events
+            .lock()
+            .unwrap()
+            .push_back(encrypted_request_event(
+                &key,
+                &DaemonRequest::DaemonShutdown,
+            ));
+
+        let (runtime_tx, runtime_rx) = mpsc::channel();
+        let peer_state = LocalWebrtcPeerState::new("grant-shutdown-send".to_string(), runtime_tx);
+        let attempted = data_channel.clone();
+        let responder = std::thread::spawn(move || {
+            let ControlMessage::Request {
+                request,
+                reply_tx,
+                response_written_rx,
+            } = runtime_rx.recv().unwrap()
+            else {
+                panic!("expected shutdown request before peer cleanup");
+            };
+            assert_eq!(*request, DaemonRequest::DaemonShutdown);
+            reply_tx
+                .send(Ok(response_with_diagnostic(DaemonDiagnostic::connected(
+                    "fixture",
+                ))))
+                .unwrap();
+            response_written_rx
+                .expect("shutdown response write acknowledgement")
+                .recv_timeout(Duration::from_secs(1))
+                .expect("failed response send releases shutdown waiter");
+            assert!(
+                attempted.send_attempted.load(Ordering::Acquire),
+                "shutdown acknowledgement must follow the response send attempt"
+            );
+            assert!(matches!(
+                runtime_rx.recv().unwrap(),
+                ControlMessage::LocalWebrtcPeerClosed { grant_id, .. }
+                    if grant_id == "grant-shutdown-send"
+            ));
+        });
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let runtime_sender = peer_state.runtime_tx.clone();
+        let failure = runtime.block_on(run_data_channel_with_deadline(
+            data_channel.as_ref(),
+            &key,
+            &peer_state,
+            &runtime_sender,
+            Duration::ZERO,
+        ));
+        assert_eq!(
+            failure.unwrap().cause,
+            LocalWebrtcSendFailureCause::SendText
+        );
+        responder.join().unwrap();
+    }
+
+    #[test]
+    fn outer_loop_routes_idle_pressure_before_next_request_delivery() {
+        let (resumed_channel, _) = run_idle_pressure_case(true);
+        assert!(
+            !resumed_channel
+                .sent_before_low_water
+                .load(Ordering::Acquire)
+        );
+        assert_eq!(resumed_channel.sent.lock().unwrap().len(), 1);
+        assert!(resumed_channel.closed.load(Ordering::Acquire));
+
+        let (timed_out_channel, failure) = run_idle_pressure_case(false);
+        assert_eq!(
+            failure.unwrap().cause,
+            LocalWebrtcSendFailureCause::PressureDeadline
+        );
+        assert!(timed_out_channel.sent.lock().unwrap().is_empty());
+        assert!(timed_out_channel.closed.load(Ordering::Acquire));
     }
 
     #[test]
@@ -1077,41 +1361,48 @@ mod tests {
     fn flow_control_pause_deadline_is_bounded_and_not_reset_by_other_events() {
         let key = AesGcmKey::from_slice(&[9; 32]).unwrap();
         let mut pending = VecDeque::new();
-        let mut paused = false;
-        let mut deadline = None;
-        assert!(apply_data_channel_event(
-            DataChannelEvent::OnBufferedAmountHigh,
-            &key,
-            &mut pending,
-            &mut paused,
-            &mut deadline,
-            Duration::ZERO,
-        ));
-        let original_deadline = deadline;
-        assert!(paused);
-        assert!(original_deadline.unwrap() <= Instant::now());
+        let mut flow_control = LocalWebrtcFlowControl::default();
+        assert!(
+            apply_data_channel_event(
+                DataChannelEvent::OnBufferedAmountHigh,
+                &key,
+                &mut pending,
+                &mut flow_control,
+            )
+            .is_ok()
+        );
+        assert!(flow_control.pressured);
+        assert_eq!(flow_control.pending_delivery_deadline, None);
 
-        assert!(apply_data_channel_event(
-            DataChannelEvent::OnOpen,
-            &key,
-            &mut pending,
-            &mut paused,
-            &mut deadline,
-            Duration::from_secs(60),
-        ));
-        assert_eq!(deadline, original_deadline);
-        assert!(paused);
+        let original_deadline = flow_control.pending_delivery_deadline(Duration::ZERO);
+        assert!(original_deadline <= Instant::now());
 
-        assert!(apply_data_channel_event(
-            DataChannelEvent::OnBufferedAmountLow,
-            &key,
-            &mut pending,
-            &mut paused,
-            &mut deadline,
-            Duration::ZERO,
-        ));
-        assert!(!paused);
-        assert_eq!(deadline, None);
+        assert!(
+            apply_data_channel_event(
+                DataChannelEvent::OnOpen,
+                &key,
+                &mut pending,
+                &mut flow_control,
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            flow_control.pending_delivery_deadline(Duration::from_secs(60)),
+            original_deadline
+        );
+        assert!(flow_control.pressured);
+
+        assert!(
+            apply_data_channel_event(
+                DataChannelEvent::OnBufferedAmountLow,
+                &key,
+                &mut pending,
+                &mut flow_control,
+            )
+            .is_ok()
+        );
+        assert!(!flow_control.pressured);
+        assert_eq!(flow_control.pending_delivery_deadline, None);
     }
 
     #[test]
@@ -1132,15 +1423,23 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
+        let mut flow_control = LocalWebrtcFlowControl::default();
 
-        let completed = runtime.block_on(send_response_frames_with_deadline(
-            &data_channel,
-            &key,
-            &["partial".to_string(), "completion".to_string()],
-            &mut pending,
-            Duration::ZERO,
-        ));
-        assert!(!completed);
+        let failure = runtime
+            .block_on(send_response_frames_with_deadline(
+                &data_channel,
+                &key,
+                &["partial".to_string(), "completion".to_string()],
+                &mut pending,
+                &mut flow_control,
+                Duration::ZERO,
+            ))
+            .expect_err("missing low water must terminate pending delivery");
+        assert_eq!(failure.cause, LocalWebrtcSendFailureCause::PressureDeadline);
+        assert_eq!(failure.next_chunk_index, 1);
+        assert_eq!(failure.last_sent_chunk_index, Some(0));
+        assert_eq!(failure.total_chunks, 2);
+        assert!(failure.pressured);
         assert_eq!(data_channel.sent.lock().unwrap().as_slice(), &["partial"]);
 
         runtime.block_on(close_data_channel(&data_channel, &mut pending, &peer_state));
@@ -1166,21 +1465,200 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
+        let mut flow_control = LocalWebrtcFlowControl::default();
 
         let completed = runtime.block_on(send_response_frames_with_deadline(
             &data_channel,
             &key,
             &["first".to_string(), "second".to_string()],
             &mut pending,
+            &mut flow_control,
             Duration::from_secs(1),
         ));
 
-        assert!(completed);
+        assert!(completed.is_ok());
         assert_eq!(
             data_channel.sent.lock().unwrap().as_slice(),
             &["first", "second"]
         );
         assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn post_final_high_water_survives_response_boundary_and_idle_low_clears_it() {
+        let data_channel = FakeDataChannel::default();
+        data_channel
+            .events
+            .lock()
+            .unwrap()
+            .push_back(DataChannelEvent::OnBufferedAmountHigh);
+        let key = AesGcmKey::from_slice(&[12; 32]).unwrap();
+        let mut pending = VecDeque::new();
+        let mut flow_control = LocalWebrtcFlowControl::default();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let first = runtime.block_on(send_response_frames_with_deadline(
+            &data_channel,
+            &key,
+            &["response-one".to_string()],
+            &mut pending,
+            &mut flow_control,
+            Duration::ZERO,
+        ));
+        assert!(first.is_ok());
+        assert!(flow_control.pressured);
+        assert_eq!(flow_control.pending_delivery_deadline, None);
+
+        assert!(
+            apply_data_channel_event(
+                DataChannelEvent::OnBufferedAmountLow,
+                &key,
+                &mut pending,
+                &mut flow_control,
+            )
+            .is_ok()
+        );
+        let second = runtime.block_on(send_response_frames_with_deadline(
+            &data_channel,
+            &key,
+            &["response-two".to_string()],
+            &mut pending,
+            &mut flow_control,
+            Duration::ZERO,
+        ));
+
+        assert!(second.is_ok());
+        assert!(!flow_control.pressured);
+        assert_eq!(
+            data_channel.sent.lock().unwrap().as_slice(),
+            &["response-one", "response-two"]
+        );
+    }
+
+    #[test]
+    fn next_response_starts_deadline_only_when_pressure_blocks_its_first_frame() {
+        let data_channel = FakeDataChannel::default();
+        data_channel
+            .events
+            .lock()
+            .unwrap()
+            .push_back(DataChannelEvent::OnBufferedAmountHigh);
+        let key = AesGcmKey::from_slice(&[13; 32]).unwrap();
+        let mut pending = VecDeque::new();
+        let mut flow_control = LocalWebrtcFlowControl::default();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        assert!(
+            runtime
+                .block_on(send_response_frames_with_deadline(
+                    &data_channel,
+                    &key,
+                    &["response-one".to_string()],
+                    &mut pending,
+                    &mut flow_control,
+                    Duration::ZERO,
+                ))
+                .is_ok()
+        );
+        assert_eq!(flow_control.pending_delivery_deadline, None);
+
+        let failure = runtime
+            .block_on(send_response_frames_with_deadline(
+                &data_channel,
+                &key,
+                &["response-two".to_string()],
+                &mut pending,
+                &mut flow_control,
+                Duration::ZERO,
+            ))
+            .expect_err("pressured next response must retain the pending-delivery bound");
+
+        assert_eq!(failure.cause, LocalWebrtcSendFailureCause::PressureDeadline);
+        assert_eq!(failure.next_chunk_index, 0);
+        assert_eq!(failure.last_sent_chunk_index, None);
+        assert!(flow_control.pending_delivery_deadline.is_some());
+        assert_eq!(
+            data_channel.sent.lock().unwrap().as_slice(),
+            &["response-one"]
+        );
+    }
+
+    #[test]
+    fn send_failures_report_distinct_bounded_terminal_causes() {
+        let key = AesGcmKey::from_slice(&[14; 32]).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        for (event, expected_cause) in [
+            (
+                DataChannelEvent::OnClose,
+                LocalWebrtcSendFailureCause::ChannelClosed,
+            ),
+            (
+                DataChannelEvent::OnError,
+                LocalWebrtcSendFailureCause::ChannelError,
+            ),
+        ] {
+            let data_channel = FakeDataChannel::default();
+            data_channel.events.lock().unwrap().push_back(event);
+            let mut pending = VecDeque::new();
+            let mut flow_control = LocalWebrtcFlowControl::default();
+            let failure = runtime
+                .block_on(send_response_frames_with_deadline(
+                    &data_channel,
+                    &key,
+                    &["response".to_string()],
+                    &mut pending,
+                    &mut flow_control,
+                    Duration::ZERO,
+                ))
+                .expect_err("terminal channel event must fail response delivery");
+            assert_eq!(failure.cause, expected_cause);
+            assert_eq!(failure.next_chunk_index, 1);
+            assert_eq!(failure.total_chunks, 1);
+        }
+
+        let ended_channel = FakeDataChannel::default();
+        ended_channel.poll_ends.store(true, Ordering::Release);
+        let mut pending = VecDeque::new();
+        let mut flow_control = LocalWebrtcFlowControl::default();
+        let ended = runtime
+            .block_on(send_response_frames_with_deadline(
+                &ended_channel,
+                &key,
+                &["response".to_string()],
+                &mut pending,
+                &mut flow_control,
+                Duration::ZERO,
+            ))
+            .expect_err("ended polling must fail response delivery");
+        assert_eq!(ended.cause, LocalWebrtcSendFailureCause::PollEnded);
+
+        let failed_channel = FakeDataChannel::default();
+        failed_channel.send_fails.store(true, Ordering::Release);
+        let mut pending = VecDeque::new();
+        let mut flow_control = LocalWebrtcFlowControl::default();
+        let send = runtime
+            .block_on(send_response_frames_with_deadline(
+                &failed_channel,
+                &key,
+                &["response".to_string()],
+                &mut pending,
+                &mut flow_control,
+                Duration::ZERO,
+            ))
+            .expect_err("send_text failure must fail response delivery");
+        assert_eq!(send.cause, LocalWebrtcSendFailureCause::SendText);
+        assert_eq!(send.next_chunk_index, 0);
+        assert_eq!(send.last_sent_chunk_index, None);
     }
 
     #[test]
@@ -1195,6 +1673,7 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
+        let mut flow_control = LocalWebrtcFlowControl::default();
 
         let started = Instant::now();
         let completed = runtime.block_on(send_response_frames_with_deadline(
@@ -1202,10 +1681,11 @@ mod tests {
             &key,
             &frames,
             &mut pending,
+            &mut flow_control,
             Duration::from_secs(1),
         ));
 
-        assert!(completed);
+        assert!(completed.is_ok());
         assert_eq!(data_channel.sent.lock().unwrap().len(), frames.len());
         assert!(
             started.elapsed() < Duration::from_millis(50),
@@ -1227,16 +1707,18 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
+        let mut flow_control = LocalWebrtcFlowControl::default();
 
         let completed = runtime.block_on(send_response_frames_with_deadline(
             &data_channel,
             &key,
             &["first".to_string(), "second".to_string()],
             &mut pending,
+            &mut flow_control,
             Duration::from_secs(1),
         ));
 
-        assert!(completed);
+        assert!(completed.is_ok());
         assert_eq!(data_channel.sent.lock().unwrap().len(), 2);
         assert!(matches!(
             pending.pop_front(),
@@ -1249,19 +1731,19 @@ mod tests {
     fn overflowing_requests_each_preserve_one_fifo_operator_response() {
         let key = AesGcmKey::from_slice(&[8; 32]).unwrap();
         let mut pending = VecDeque::new();
-        let mut paused = false;
-        let mut deadline = None;
+        let mut flow_control = LocalWebrtcFlowControl::default();
 
         let inbound_requests = LOCAL_WEBRTC_PENDING_REQUESTS + 4;
         for _ in 0..inbound_requests {
-            assert!(apply_data_channel_event(
-                encrypted_request_event(&key, &DaemonRequest::Status),
-                &key,
-                &mut pending,
-                &mut paused,
-                &mut deadline,
-                Duration::from_secs(1),
-            ));
+            assert!(
+                apply_data_channel_event(
+                    encrypted_request_event(&key, &DaemonRequest::Status),
+                    &key,
+                    &mut pending,
+                    &mut flow_control,
+                )
+                .is_ok()
+            );
         }
 
         assert_eq!(pending.len(), LOCAL_WEBRTC_PENDING_REQUESTS + 1);
@@ -1292,46 +1774,45 @@ mod tests {
     fn interleaved_overflow_runs_preserve_fifo_response_order() {
         let key = AesGcmKey::from_slice(&[11; 32]).unwrap();
         let mut pending = VecDeque::new();
-        let mut paused = false;
-        let mut deadline = None;
+        let mut flow_control = LocalWebrtcFlowControl::default();
         {
             let mut apply_request = |request: &DaemonRequest| {
                 apply_data_channel_event(
                     encrypted_request_event(&key, request),
                     &key,
                     &mut pending,
-                    &mut paused,
-                    &mut deadline,
-                    Duration::from_secs(1),
+                    &mut flow_control,
                 )
             };
 
             for _ in 0..LOCAL_WEBRTC_PENDING_REQUESTS {
-                assert!(apply_request(&DaemonRequest::Status));
+                assert!(apply_request(&DaemonRequest::Status).is_ok());
             }
-            assert!(apply_request(&DaemonRequest::Status));
+            assert!(apply_request(&DaemonRequest::Status).is_ok());
         }
         assert!(matches!(
             pop_pending_request(&mut pending),
             Some(PendingLocalWebrtcRequest::Request(request)) if *request == DaemonRequest::Status
         ));
 
-        assert!(apply_data_channel_event(
-            encrypted_request_event(&key, &DaemonRequest::ListSessions),
-            &key,
-            &mut pending,
-            &mut paused,
-            &mut deadline,
-            Duration::from_secs(1),
-        ));
-        assert!(apply_data_channel_event(
-            encrypted_request_event(&key, &DaemonRequest::Status),
-            &key,
-            &mut pending,
-            &mut paused,
-            &mut deadline,
-            Duration::from_secs(1),
-        ));
+        assert!(
+            apply_data_channel_event(
+                encrypted_request_event(&key, &DaemonRequest::ListSessions),
+                &key,
+                &mut pending,
+                &mut flow_control,
+            )
+            .is_ok()
+        );
+        assert!(
+            apply_data_channel_event(
+                encrypted_request_event(&key, &DaemonRequest::Status),
+                &key,
+                &mut pending,
+                &mut flow_control,
+            )
+            .is_ok()
+        );
 
         let emitted_order = std::iter::from_fn(|| pop_pending_request(&mut pending))
             .map(|pending| match pending {

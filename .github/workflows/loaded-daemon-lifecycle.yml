@@ -1,0 +1,155 @@
+name: Loaded daemon lifecycle diagnostics
+
+on:
+  workflow_dispatch:
+    inputs:
+      subject_sha:
+        description: Full 40-character commit SHA to test
+        required: true
+        type: string
+      test_target:
+        description: Test surface (focused runs do not satisfy the 20-run campaign)
+        required: true
+        default: lifecycle-suite
+        type: choice
+        options:
+          - lifecycle-suite
+          - focused-stalled-attach
+          - focused-fast-exit-attach-diagnostic
+          - focused-oversized-webrtc
+      repetitions:
+        description: Number of repetitions (1-100)
+        required: true
+        default: 20
+        type: number
+      stress_profile:
+        description: Bounded job-local CPU stress profile
+        required: true
+        default: residual-tail
+        type: choice
+        options:
+          - residual-tail
+          - moderate
+          - none
+
+permissions:
+  contents: read
+
+concurrency:
+  group: loaded-daemon-lifecycle-diagnostics
+  cancel-in-progress: false
+
+jobs:
+  loaded-daemon-lifecycle:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    defaults:
+      run:
+        shell: bash
+    env:
+      ARTIFACT_DIR: ${{ github.workspace }}/loaded-daemon-lifecycle-artifacts
+      BOTSTER_LOADED_CAMPAIGN_TIMEOUT_SECONDS: "19800"
+      BOTSTER_LOADED_RUN_TIMEOUT_SECONDS: "900"
+    steps:
+      - name: Check out workflow harness
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          path: workflow-harness
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Validate bounded inputs
+        env:
+          SUBJECT_SHA: ${{ inputs.subject_sha }}
+          REPETITIONS: ${{ inputs.repetitions }}
+          TEST_TARGET: ${{ inputs.test_target }}
+          STRESS_PROFILE: ${{ inputs.stress_profile }}
+        run: |
+          workflow-harness/script/run-loaded-daemon-lifecycle \
+            --validate-only \
+            --artifact-dir "$ARTIFACT_DIR" \
+            --subject-sha "$SUBJECT_SHA" \
+            --test-target "$TEST_TARGET" \
+            --repetitions "$REPETITIONS" \
+            --stress-profile "$STRESS_PROFILE"
+
+      - name: Check out exact subject commit
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          path: subject
+          ref: ${{ inputs.subject_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify exact subject commit
+        env:
+          SUBJECT_SHA: ${{ inputs.subject_sha }}
+        run: |
+          resolved_sha="$(git -C subject rev-parse HEAD)"
+          printf 'requested_sha=%s\nresolved_sha=%s\n' "$SUBJECT_SHA" "$resolved_sha" | tee -a "$ARTIFACT_DIR/metadata.txt"
+          if [[ "$resolved_sha" != "$SUBJECT_SHA" ]]; then
+            printf 'subject checkout mismatch\n' | tee -a "$ARTIFACT_DIR/metadata.txt"
+            exit 1
+          fi
+
+      - name: Install pinned Zig toolchain
+        # botster-terminal-ghostty's libghostty-vt build requires Zig 0.15.2.
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.15.2
+          use-cache: false
+
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup toolchain install 1.97.0 --profile minimal
+          rustup default 1.97.0
+          {
+            printf 'workflow_sha=%s\n' "$GITHUB_SHA"
+            printf 'runner_image=%s\n' "${ImageOS:-unknown} ${ImageVersion:-unknown}"
+            printf 'runner_arch=%s\n' "$RUNNER_ARCH"
+            printf 'cpu_count=%s\n' "$(nproc)"
+            rustc --version
+            cargo --version
+            rustup show active-toolchain
+            zig version
+            uname -a
+          } | tee -a "$ARTIFACT_DIR/metadata.txt"
+
+      - name: Precompile lifecycle test binary
+        working-directory: subject
+        run: |
+          ./test.sh --test hub_daemon_lifecycle_test --no-run 2>&1 \
+            | tee "$ARTIFACT_DIR/precompile.log"
+
+      - name: Run loaded real-daemon lifecycle campaign
+        env:
+          SUBJECT_SHA: ${{ inputs.subject_sha }}
+          REPETITIONS: ${{ inputs.repetitions }}
+          TEST_TARGET: ${{ inputs.test_target }}
+          STRESS_PROFILE: ${{ inputs.stress_profile }}
+        run: |
+          workflow-harness/script/run-loaded-daemon-lifecycle \
+            --subject-dir "$GITHUB_WORKSPACE/subject" \
+            --artifact-dir "$ARTIFACT_DIR" \
+            --subject-sha "$SUBJECT_SHA" \
+            --test-target "$TEST_TARGET" \
+            --repetitions "$REPETITIONS" \
+            --stress-profile "$STRESS_PROFILE"
+
+      - name: Enforce owned-process teardown
+        if: ${{ always() }}
+        run: |
+          if [[ -x workflow-harness/script/run-loaded-daemon-lifecycle ]]; then
+            workflow-harness/script/run-loaded-daemon-lifecycle \
+              --cleanup-only \
+              --artifact-dir "$ARTIFACT_DIR"
+          fi
+
+      - name: Upload complete diagnostics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: loaded-daemon-lifecycle-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.ARTIFACT_DIR }}
+          if-no-files-found: error
+          retention-days: 14
