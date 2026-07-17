@@ -15,7 +15,7 @@ on:
         options:
           - lifecycle-suite
           - focused-stalled-attach
-          - focused-local-runtime-smoke-terminal
+          - focused-fast-exit-attach-diagnostic
       repetitions:
         description: Number of repetitions (1-100)
         required: true
