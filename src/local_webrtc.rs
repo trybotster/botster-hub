@@ -558,8 +558,19 @@ where
 
         let subscription_change = LocalWebrtcAttachedSubscriptionChange::from_request(&request);
         let (reply_tx, reply_rx) = mpsc::channel();
+        let (response_written_tx, response_written_rx) =
+            if matches!(*request, DaemonRequest::DaemonShutdown) {
+                let (tx, rx) = mpsc::channel();
+                (Some(tx), Some(rx))
+            } else {
+                (None, None)
+            };
         if runtime_tx
-            .send(ControlMessage::Request { request, reply_tx })
+            .send(ControlMessage::Request {
+                request,
+                reply_tx,
+                response_written_rx,
+            })
             .is_err()
         {
             break;
@@ -582,7 +593,7 @@ where
         let Ok(frames) = framed_daemon_response(stream_key, &response) else {
             break;
         };
-        match send_response_frames_with_deadline(
+        let send_result = send_response_frames_with_deadline(
             data_channel,
             stream_key,
             &frames,
@@ -590,8 +601,11 @@ where
             &mut flow_control,
             flow_control_deadline,
         )
-        .await
-        {
+        .await;
+        if let Some(response_written_tx) = response_written_tx {
+            let _ = response_written_tx.send(());
+        }
+        match send_result {
             Ok(()) => open = true,
             Err(failure) => {
                 eprintln!("{failure}");
@@ -1060,6 +1074,7 @@ mod tests {
         events: Mutex<VecDeque<DataChannelEvent>>,
         sent: Mutex<Vec<String>>,
         closed: AtomicBool,
+        send_attempted: AtomicBool,
         send_fails: AtomicBool,
         sent_before_low_water: AtomicBool,
         poll_ends: AtomicBool,
@@ -1082,6 +1097,7 @@ mod tests {
         }
 
         async fn local_send_text(&self, text: &str) -> Result<(), String> {
+            self.send_attempted.store(true, Ordering::Release);
             if self.send_fails.load(Ordering::Acquire) {
                 return Err("fixture send failure".to_string());
             }
@@ -1141,7 +1157,10 @@ mod tests {
         let (runtime_tx, runtime_rx) = mpsc::channel();
         let peer_state = LocalWebrtcPeerState::new("grant-idle-pressure".to_string(), runtime_tx);
         let responder = std::thread::spawn(move || {
-            let ControlMessage::Request { request, reply_tx } = runtime_rx.recv().unwrap() else {
+            let ControlMessage::Request {
+                request, reply_tx, ..
+            } = runtime_rx.recv().unwrap()
+            else {
                 panic!("expected daemon request before peer cleanup");
             };
             assert_eq!(*request, DaemonRequest::Status);
@@ -1180,6 +1199,72 @@ mod tests {
             .expect("outer data-channel loop must finish on close or delivery deadline");
         responder.join().unwrap();
         (data_channel, failure)
+    }
+
+    #[test]
+    fn shutdown_acknowledges_failed_response_send_attempt() {
+        let key = AesGcmKey::from_slice(&[16; 32]).unwrap();
+        let data_channel = Arc::new(FakeDataChannel::default());
+        data_channel.send_fails.store(true, Ordering::Release);
+        data_channel
+            .events
+            .lock()
+            .unwrap()
+            .push_back(encrypted_request_event(
+                &key,
+                &DaemonRequest::DaemonShutdown,
+            ));
+
+        let (runtime_tx, runtime_rx) = mpsc::channel();
+        let peer_state = LocalWebrtcPeerState::new("grant-shutdown-send".to_string(), runtime_tx);
+        let attempted = data_channel.clone();
+        let responder = std::thread::spawn(move || {
+            let ControlMessage::Request {
+                request,
+                reply_tx,
+                response_written_rx,
+            } = runtime_rx.recv().unwrap()
+            else {
+                panic!("expected shutdown request before peer cleanup");
+            };
+            assert_eq!(*request, DaemonRequest::DaemonShutdown);
+            reply_tx
+                .send(Ok(response_with_diagnostic(DaemonDiagnostic::connected(
+                    "fixture",
+                ))))
+                .unwrap();
+            response_written_rx
+                .expect("shutdown response write acknowledgement")
+                .recv_timeout(Duration::from_secs(1))
+                .expect("failed response send releases shutdown waiter");
+            assert!(
+                attempted.send_attempted.load(Ordering::Acquire),
+                "shutdown acknowledgement must follow the response send attempt"
+            );
+            assert!(matches!(
+                runtime_rx.recv().unwrap(),
+                ControlMessage::LocalWebrtcPeerClosed { grant_id, .. }
+                    if grant_id == "grant-shutdown-send"
+            ));
+        });
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let runtime_sender = peer_state.runtime_tx.clone();
+        let failure = runtime.block_on(run_data_channel_with_deadline(
+            data_channel.as_ref(),
+            &key,
+            &peer_state,
+            &runtime_sender,
+            Duration::ZERO,
+        ));
+        assert_eq!(
+            failure.unwrap().cause,
+            LocalWebrtcSendFailureCause::SendText
+        );
+        responder.join().unwrap();
     }
 
     #[test]
