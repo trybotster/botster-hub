@@ -36,6 +36,13 @@ triage. A focused run does not satisfy the required 20-or-more default-parallel
 lifecycle-suite campaign. The runner stops at the first red repetition so the
 failure remains easy to locate and no later retry can hide it.
 
+Use `focused-oversized-webrtc` to repeat the existing
+`local_webrtc_chunks_oversized_encrypted_daemon_response` test under the selected
+stress profile without changing its body, assertions, deadlines, or cleanup.
+This target exists only to capture the bounded sender terminal record when
+unrelated lifecycle-suite failures would otherwise stop the campaign first. It
+does not replace full-suite acceptance.
+
 ## Bounded stress and time budgets
 
 The profiles start only job-local CPU workers:
