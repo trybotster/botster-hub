@@ -109,6 +109,12 @@ Current entry path: `LocalWebrtcHandler::on_data_channel` -> `run_data_channel_w
 - Project Pipelines checklist `checklist_1784249926_382722` records context loading, runtime-path tracing, bounded scope, and acceptance discipline.
 - Vault checklist `checklist_1784249931_202805` records notes loaded, convention conflict result (`none`), verification evidence, and capture disposition. Its creation calls timed out client-side but both checklist records persisted and were reconciled before advancement.
 
+## Implement outcome
+
+- Focused run `29548861532` tested exact SHA `33fc0a1ec25679fe97c09f822b62d64d19b41c68` with `focused-oversized-webrtc`, 20 repetitions, and `residual-tail`. All 20 exact target runs passed unchanged; observed one-minute load reached `57.43`, every test process group was gone, the active ownership ledger was empty, and campaign `exit_status=0` / `cleanup_status=0`.
+- No bounded sender failure was emitted, so the reopened real failure's terminal cause remains unresolved. Per human answer `question_1784252862_238103`, Implement did not modify `src/local_webrtc.rs`, did not add the speculative watch repair, and did not claim a production lifecycle fix.
+- The durable deliverable is diagnostic: the target now surfaces an existing bounded sender record on panic, and the loaded runner can isolate this exact production-path test without changing full-suite behavior. A future reproduced red can establish the mechanism before production policy changes.
+
 ## Vault gaps worth capturing
 
 - If confirmed, capture that reliable local-WebRTC backpressure should wait on transport progress/lifecycle signals rather than a scheduler-sensitive response deadline; wall-clock starvation alone must not close a live peer.
