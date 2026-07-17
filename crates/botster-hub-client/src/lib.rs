@@ -1958,7 +1958,7 @@ mod tests {
     }
 
     #[test]
-    fn stream_attach_retains_late_output_while_session_is_running() {
+    fn stream_attach_retains_late_output_across_running_lifecycle_readbacks() {
         let (mut server, mut client) = UnixStream::pair().expect("pair unix streams");
         let server_handle = thread::spawn(move || {
             let attach = DaemonRequest::Attach {
@@ -1990,6 +1990,25 @@ mod tests {
                 ),
             )
             .expect("write running lifecycle response");
+
+            for _ in 0..20 {
+                expect_request(&mut server, &drain);
+                write_frame(&mut server, &empty_test_response(Vec::new(), Vec::new()))
+                    .expect("write empty drain response");
+            }
+
+            expect_request(&mut server, &DaemonRequest::ListSessions);
+            write_frame(
+                &mut server,
+                &empty_test_response(
+                    vec![DaemonSession {
+                        session_id: "session".to_string(),
+                        lifecycle: "running".to_string(),
+                    }],
+                    Vec::new(),
+                ),
+            )
+            .expect("write second running lifecycle response");
 
             expect_request(&mut server, &drain);
             write_frame(
