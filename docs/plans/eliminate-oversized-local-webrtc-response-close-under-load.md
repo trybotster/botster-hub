@@ -5,7 +5,8 @@
 - Project Pipelines context loaded for ticket `ticket_1784168176_163113`, run
   `run_1784325316_726684`, active Plan step `botster_plan`, required
   `botster_plan_gate`, the post-PR #145 recurrence artifact, both prior human
-  answers, questions, events, and the absence of open findings or dependencies.
+  answers, questions, events, the three open Plan Review findings, and the
+  absence of blocking dependencies.
 - The binding human decisions remain: diagnose a real loaded failure before
   changing production pressure policy; do not add retries, timeout inflation,
   serialization, or weaker assertions; and leave the final suite-wide 20-run
@@ -51,6 +52,12 @@
   the oversized test's directly owned daemon. Run `29615143681` therefore
   cannot distinguish `pressure_deadline`, send failure, channel/peer teardown,
   polling end, framing/request failure, or cleanup initiated elsewhere.
+- Plan Review `review_1784326164_270373` rejected the first revision's proposal
+  to run smoke against a reused test-owned daemon. That would change the
+  smoke-owned process tree, startup timing, cleanup ownership, and the existing
+  assertion that smoke stops the daemon it started. This revision preserves the
+  exact smoke-owned daemon lifecycle and makes the daemon persist its bounded
+  terminal record under the explicit data directory.
 
 ## Scope
 
@@ -58,32 +65,45 @@ Botster layers: Rust hub local-WebRTC data-plane delivery, the production
 `botster-hub smoke` client path, the real-daemon lifecycle test harness, and the
 existing loaded lifecycle workflow.
 
-1. Strengthen the existing production-path smoke test without replacing its
-   body or assertions. Start its daemon through the existing
-   `LocalWebrtcDiagnosticDaemon` guard, then run the unchanged `botster-hub
-   smoke` command against that reused real daemon. On panic, the guard must
-   complete bounded cleanup and surface the daemon's sender terminal record.
+1. Preserve the exact production `botster-hub smoke` ownership path:
+   `ensure_dev_stack_daemon` must still start the daemon with the same process
+   tree and timing, `SmokeRuntimeCleanup` must still stop that daemon, and the
+   existing test must still assert that the smoke-owned daemon is gone. Do not
+   substitute a prestarted or reused test-owned daemon.
 2. Make the smoke client's response-close and response-timeout errors identify
    the current daemon request operation and bounded receive progress: message
    id when known, next chunk, expected chunk count, and terminal client cause.
    Do not include request bodies, encrypted payloads, grant secrets, or local
    paths.
 3. Extend the existing sender terminal record only as far as needed to classify
-   every exit exercised by this smoke path: request operation, message/chunk
-   progress, pressure state, latest peer-connection state, channel terminal
-   signal, typed cause, and whether peer cleanup was newly sent or already
-   complete. Keep one bounded record and the existing exactly-once cleanup
-   owner; do not add a diagnostics subsystem or duplicate transport path.
-4. Add one selector-only loaded target for the existing
+   every exit exercised by this smoke path: grant id for run correlation,
+   request operation, message/chunk progress, pressure state, latest
+   peer-connection state, channel terminal signal, typed cause, and whether
+   peer cleanup was newly sent or already complete. Keep one fixed-schema,
+   size-bounded record and the existing exactly-once cleanup owner.
+4. Deliver that record to the existing daemon owner through `ControlMessage`
+   before peer cleanup. The owner writes one latest-record JSON artifact to a
+   fixed filename under the `HubConfig.data_directory` retained by
+   `serve_daemon`, using Rust filesystem primitives and same-directory replace
+   semantics. Do not add data-directory state to `LocalWebrtcTransport` or a
+   new storage abstraction. The record must survive the smoke-owned daemon's
+   shutdown, contain no payloads/secrets/absolute paths, and be correlated to
+   the failing smoke grant so stale records cannot satisfy the test. Continue
+   the current bounded `eprintln!` as immediate fallback, but do not rely on
+   stderr for the loaded evidence.
+5. Add one selector-only loaded target for the existing
    `cli_smoke_proves_local_runtime_daemon_package_app_session_and_webrtc` test.
    It must reuse the current precompile, residual-tail workers, default test
    semantics, per-run/campaign bounds, stop-at-first-red behavior, artifacts,
    and process-group cleanup. Leave `lifecycle-suite`,
    `focused-oversized-webrtc`, and every other target unchanged.
-5. Run that exact smoke target repeatedly under residual-tail load before
+6. Run that exact smoke target repeatedly under residual-tail load before
    changing local-WebRTC lifecycle policy. A real red must retain both client
-   progress and the sender terminal record with `cleanup_status=0`.
-6. Repair only the mechanism named by that record, then resynchronize this plan
+   progress and the matching persisted sender terminal record with
+   `cleanup_status=0`. A reproduced red with a missing, stale, malformed, or
+   `unavailable` sender record fails the diagnostic gate and must be fixed
+   before another production hypothesis or repair proceeds.
+7. Repair only the mechanism named by that record, then resynchronize this plan
    if it differs from the branches below:
    - If `pressure_deadline` closes an otherwise live pressured peer, replace
      elapsed-time transport death with an explicit peer-liveness signal. Use
@@ -99,7 +119,7 @@ existing loaded lifecycle workflow.
    - If the focused target does not reproduce, retain the bounded diagnostics,
      report the unresolved evidence, and make no speculative production
      lifecycle change.
-7. Preserve encrypted chunk framing, ordered reliable delivery, FIFO request
+8. Preserve encrypted chunk framing, ordered reliable delivery, FIFO request
    handling, queue bounds, frame/assembly limits, same-peer multi-request use,
    grant cleanup, subscription cleanup, and exactly-once peer cleanup.
 
@@ -119,7 +139,9 @@ verification.
   changes unless the captured cause directly proves one of those contracts is
   defective and the plan is returned for review.
 - No WebRTC dependency change, configurable deadline/watermark, generic sender
-  abstraction, background queue, concurrent response task, or adjacent cleanup.
+  abstraction, logging framework, diagnostic database, background queue,
+  concurrent response task, or adjacent cleanup. The single fixed data-directory
+  artifact is the complete new diagnostic persistence surface.
 - No loaded-runner framework rewrite and no change to ordinary lifecycle-suite
   acceptance. The new selector exists only to bypass sibling first-reds while
   reproducing this exact production smoke.
@@ -144,6 +166,13 @@ verification.
 - Assumption: one channel task remains the sole owner of response order, flow
   state, and sends. No fix may introduce concurrent senders or unbounded
   buffering.
+- Assumption: the existing daemon-owner `ControlMessage` queue is the smallest
+  ordering boundary for persisting the record before the same sender requests
+  peer cleanup. The sender task must not perform blocking filesystem work.
+- Assumption: the smoke test's fresh explicit data directory plus matching
+  ephemeral grant id distinguishes this attempt's terminal record from stale
+  artifacts. A record for another peer or grant is equivalent to unavailable
+  evidence.
 - Assumption: if the terminal record proves pressure without a channel or peer
   terminal signal, an ordered reliable channel remains live and low water is
   the delivery-resume condition. A deterministic fake-channel regression and
@@ -154,13 +183,19 @@ verification.
 ## Affected surfaces and files
 
 - `src/main.rs` — production `botster-hub smoke` request-progress diagnostics;
-  no alternate smoke flow.
+  preserve smoke-owned daemon startup/shutdown and expose the fixed diagnostic
+  artifact path to the test without an alternate smoke flow.
 - `src/local_webrtc.rs` — bounded sender terminal classification and, only
   after a real record, the evidenced lifecycle repair plus deterministic unit
   regression.
-- `tests/hub_daemon_lifecycle_test.rs` — reuse the existing panic-safe daemon
-  guard around the exact CLI smoke and preserve the existing oversized,
-  same-peer, payload, and cleanup assertions.
+- `src/daemon_transport.rs` — retain the configured data-directory diagnostic
+  path in `serve_daemon`, receive the typed terminal record on the existing
+  daemon-owner control queue, and persist one bounded latest-record artifact
+  before peer cleanup.
+- `tests/hub_daemon_lifecycle_test.rs` — read and validate the persisted,
+  grant-correlated sender record after the unchanged smoke-owned daemon path
+  fails; preserve the daemon-gone assertion plus existing oversized, same-peer,
+  payload, and cleanup assertions.
 - `script/run-loaded-daemon-lifecycle`,
   `.github/workflows/loaded-daemon-lifecycle.yml`, and
   `docs/loaded-daemon-lifecycle-runner.md` — one exact smoke selector and its
@@ -176,9 +211,19 @@ process, spawned daemon, real DataChannel, and cleanup path are wired together.
 
 - **Wrong root cause:** client `channel_closed` is downstream evidence only.
   Require the sender record before production behavior changes.
-- **Diagnostic still disappears:** the smoke command normally starts a detached
-  daemon with discarded stderr. Reuse the directly owned diagnostic daemon in
-  the test and prove panic-time output and cleanup.
+- **Diagnostic still disappears:** the smoke command starts a detached daemon
+  with discarded stderr. Persist the fixed record through the daemon owner
+  before cleanup, then require the smoke test to read the matching artifact
+  after the owned daemon stops.
+- **Changed reproduction topology:** substituting a reused diagnostic daemon
+  would alter the process tree, startup contention, and cleanup ownership that
+  failed in run `29615143681`. Keep the smoke-owned spawn/stop path and its
+  daemon-gone assertion byte-for-byte in intent; diagnostics must observe that
+  path rather than replace it.
+- **Stale or partial artifact:** a previous peer record or interrupted write can
+  masquerade as this attempt. Correlate by grant id, use a fixed bounded schema
+  and same-directory replacement, and treat missing/malformed/mismatched data
+  as a failed evidence gate.
 - **Silent non-send exit:** current structured evidence covers response-send
   failures but not every outer-loop break. Classify the actual loop exit without
   inventing duplicate lifecycle ownership.
@@ -203,20 +248,30 @@ process, spawned daemon, real DataChannel, and cleanup path are wired together.
 ## Acceptance checks and tests
 
 1. Diagnostic wiring:
-   - force the exact CLI smoke to fail after the daemon is running and prove the
-     test exits nonzero without aborting;
+   - force the exact smoke-owned daemon path to fail after its local WebRTC peer
+     is running and prove the test exits nonzero without aborting;
+   - prove smoke still starts and stops its own daemon, retains the existing
+     post-smoke daemon-gone assertion, and does not attach to a prestarted
+     daemon;
    - require a bounded client record with request operation and chunk progress;
-   - require a bounded sender record with typed cause, peer/channel state,
-     pressure/chunk progress, and cleanup disposition, or an explicit bounded
-     `unavailable` record;
+   - require a persisted sender record for the same grant with typed cause,
+     peer/channel state, pressure/chunk progress, and cleanup disposition;
+   - prove fixed schema/size limits, same-directory replacement, stale-grant
+     rejection, malformed/truncated-record rejection, and path/payload/secret
+     exclusion;
+   - treat a reproduced red with an absent, mismatched, malformed, or
+     `unavailable` record as a failing diagnostic gate, never successful
+     evidence;
    - verify daemon, session-worker, package entrypoint, sampler, test, and load
      processes are gone; and
    - scan output for secrets, payload bodies, usernames, and absolute paths.
 2. Focused loaded cause gate: dispatch the exact CLI-smoke selector for the
    diagnostics SHA with `residual-tail` and 20 repetitions. On red, preserve
-   full subject SHA, request/chunk and sender records, achieved load,
-   `campaign_exit_status`, and `cleanup_status=0`. On 20 green repetitions,
-   stop after diagnostics and report the unresolved evidence.
+   full subject SHA, request/chunk record, matching persisted sender record,
+   achieved load, `campaign_exit_status`, and `cleanup_status=0`. If a red lacks
+   the record, stop and repair the diagnostic path before another loaded
+   campaign. On 20 green repetitions, stop after diagnostics and report the
+   unresolved evidence.
 3. Deterministic regression after a recorded cause:
    - reproduce the exact terminal state through the current fake
      `LocalWebrtcDataChannel` seam;
@@ -268,7 +323,8 @@ process, spawned daemon, real DataChannel, and cleanup path are wired together.
 - The recurrence exposes a durable observability gap: a production smoke command
   can own a detached daemon yet discard the daemon-side terminal cause needed
   to diagnose its own failure. Capture a general note only after the bounded
-  reused-daemon diagnostic pattern proves useful.
+  data-directory terminal artifact proves useful without changing daemon
+  ownership.
 - Existing local-WebRTC notes describe cleanup and chunk flow but do not yet
   state whether peer-connection state must be a wakeable input to a pressured
   DataChannel sender. Capture that rule only if a real failure and regression
