@@ -2,7 +2,7 @@
 
 ## Context loaded
 
-- Current Project Pipelines context: run `run_1784249675_657712`, Plan step `botster_plan`, run step `run_step_1784249676_225074`, ticket `ticket_1784168176_163113`, required plan gate, no current-run artifacts/findings/reviews/dependencies, and the durable prior human answer were loaded with `project_pipelines_current_context`.
+- Current Project Pipelines context: run `run_1784249675_657712`, returned Plan step `botster_plan`, active run step `run_step_1784250432_534001`, ticket `ticket_1784168176_163113`, required plan gate, prior plan artifact/gate/checklists, Plan Review `review_1784250383_314307` and its four findings, no dependencies, and the durable prior human answer were loaded with `project_pipelines_current_context`.
 - The prior human answer remains binding: accept focused target-path success for this leaf ticket, map independent lifecycle-suite roots to their sibling tickets, and do not add retries, timeout increases, serialization, or unrelated fixes. The umbrella stalled-attach ticket owns eventual suite-wide green.
 - Required planning authority loaded: [[identity]], [[goals]], [[planner-playbook]], [[botster-planner-playbook]], [[botster-architecture]], [[cli-patterns]], [[spa-patterns]], and every note in the Botster planner overlay's Must Load list. No convention conflicts were found.
 - The previous plan and implementation are already in history. PR #139 merged commit `0c38b76`; its subject commits `1e96eff` and `2ff2246` preserve flow state across responses and route idle high/low-water events through the production channel loop. The tested recurrence subject `11407a41eceb8497786b722b5d23d23ed35f3f69` contains that merge.
@@ -12,16 +12,19 @@
 - Runtime-library contract inspected: `webrtc 0.20.0-rc.1` exposes high/low-water events but not current buffered bytes through the public `DataChannel` trait. Its own flow-control example waits for low water while the channel remains open; Botster's five-second pressure-expiry policy is local policy, not a dependency requirement.
 - Test path inspected: the real offer peer sends encrypted requests, receives ordered chunks, and reports `channel_closed` versus `response_timeout` with chunk progress. The spawned daemon's stderr is piped but is not surfaced when this test panics, so run `29539022952` does not reveal whether the sender ended on `pressure_deadline`, `send_text`, `OnClose`, `OnError`, or ended polling.
 - Plan-time repository state: the pipeline worktree is clean at `2ff2246` and is an ancestor of current `origin/main` `e864567`. Implement must first update this ticket branch to current `origin/main`; relevant production code is unchanged on main, while sibling lifecycle-test changes must be preserved.
+- Plan Review verified the ancestry, production trace, and existing bounded sender log, then identified a blocker in the first revision: `on_connection_state_change` cleans peer state on `Disconnected`, `Failed`, or `Closed` but cannot wake a task parked in `local_poll()`. Removing the deadline without carrying that peer-connection signal into the channel loop would leak the sender task. Review also identified three existing deadline-policy tests whose disposition must be explicit.
 
 ## Scope
 
 Botster layer: Rust hub local-WebRTC data-plane delivery plus the real-daemon lifecycle harness and existing loaded verification campaign.
 
 1. Update the ticket branch to current `origin/main` before editing so the reopened fix is tested with the same sibling changes and base as the recurrence campaign.
-2. Make the target test surface the bounded sender terminal record on failure: message id, next/last/total chunk, pressure state, and typed cause, without payloads, secrets, absolute paths, or unbounded daemon logs. Limit harness changes to the target test or a directly reusable existing child-output seam.
+2. Make the target test surface the bounded sender terminal record already emitted by `run_data_channel_with_deadline`: message id, next/last/total chunk, pressure state, and typed cause. This is a harness-only diagnostic change; do not add duplicate production logging, payloads, secrets, absolute paths, or unbounded daemon output.
 3. Reproduce the proven sender cause with the existing fake `LocalWebrtcDataChannel` seam. Model an oversized multi-chunk response that reaches high water mid-response and whose low-water event is scheduler-delayed while the channel remains open. The deterministic oracle is delivery/lifecycle state, not elapsed wall time.
 4. Repair only the confirmed branch in `src/local_webrtc.rs`:
-   - If the sender record is `pressure_deadline` as expected, stop treating scheduler delay alone as proof that an open, reliable channel is dead. Keep the sender paused, continue polling lifecycle/flow/request events, and resume the next unsent chunk on low water. Do not replace five seconds with a larger number; remove that elapsed close decision from active delivery while retaining explicit `OnClose`, `OnError`, ended-poll, `send_text`, bounded request FIFO, and receiver/request-level failure bounds.
+   - If the sender record is `pressure_deadline` as expected, replace the deadline with a concrete peer-liveness signal, not an unbounded bare `local_poll()`. Use Tokio's existing `watch` primitive (already available through the configured `tokio` dependency) from `LocalWebrtcPeerState`: `on_connection_state_change` publishes the first terminal `Disconnected`, `Failed`, or `Closed` state, and every blocking channel-loop wait selects between the DataChannel event and that watched peer termination. A terminal peer state returns a distinct typed send failure carrying the specific connection state, then follows the existing close and exactly-once cleanup path.
+   - Apply this consistently to both active mid-response pressure and idle pressure between responses. Scheduler delay alone must close neither path; low water resumes delivery, while DataChannel close/error/end, send failure, or watched peer termination ends it. Remove the pressure-deadline constant/state/helper and deadline-suffixed function vocabulary cold turkey so no dual elapsed/liveness policy remains.
+   - Preserve the bounded FIFO while waits consume inbound requests. Do not send another frame while pressure is active, and do not treat receiver-side timeouts as hub-task cancellation.
    - If the record proves a different typed cause, repair that exact send or lifecycle branch and update this plan artifact before implementation proceeds. Do not silently apply the pressure hypothesis.
 5. Preserve the production protocol and real acceptance path: encrypted framing, ordered reliable data channel, exact payload equality, chunk ordering/count, frame ceiling, same-peer follow-up request, grant cleanup, and idempotent peer cleanup.
 6. Prove red when the focused lifecycle fix is reverted, then prove the exact fixed SHA under the existing residual-tail default-parallel campaign.
@@ -42,8 +45,9 @@ Every changed line must provide sender evidence, correct the confirmed mid-respo
 - Unknown: the exact sender cause in run `29539022952`; the target harness currently loses the daemon stderr record on panic. Capturing this is the first implementation gate.
 - Unknown: why the failing `Drain` response contained 85 chunks. The plan does not assume this is malformed; exact response kind, encrypted/frame byte counts, and sender message id should establish whether it is legitimate accumulated terminal output or response-correlation drift before behavior changes.
 - Assumption: one channel task remains the sole owner of ordered requests, pressure state, and response sends. The repair must not introduce concurrent senders or unbounded buffering.
-- Assumption: an ordered reliable DataChannel that is pressured but has emitted no close/error/end signal is still live; a scheduler-dependent wall-clock expiry is not transport failure evidence. This assumption must be proven by the fake-channel red/green test and loaded real path.
-- Assumption: the existing receiver's per-chunk timeout and daemon request bounds remain unchanged and provide bounded test/application failure reporting; removing an internal pressure-triggered close is not permission to make callers wait forever.
+- Assumption: an ordered reliable DataChannel that is pressured but has emitted no DataChannel or peer-connection terminal signal is still live; scheduler-dependent wall-clock expiry is not transport failure evidence. This assumption must be proven by the fake-channel red/green test and loaded real path.
+- Assumption: `tokio::sync::watch` is the smallest race-safe existing primitive because it preserves the latest peer terminal state for a channel task that subscribes after termination. No new dependency or generic cancellation abstraction is needed.
+- Assumption: the existing receiver's per-chunk timeout and daemon request bounds remain unchanged for caller failure reporting, but they are not hub-task liveness controls. Hub task termination is bounded by explicit DataChannel or watched peer-connection lifecycle signals.
 - Worktree/target: only the pipeline-provided worktree on target `tgt_7e208a0c76a44980a83b63af976b1f22` is authorized. The branch must incorporate current `origin/main` without dropping sibling-ticket changes.
 
 ## Affected surfaces and files
@@ -55,18 +59,25 @@ Every changed line must provide sender evidence, correct the confirmed mid-respo
 
 Production wiring that must be proven, not merely compiled:
 
-`LocalWebrtcHandler::on_data_channel` -> `run_data_channel_with_deadline` -> daemon response -> `framed_daemon_response` -> channel-owned pressure/lifecycle loop -> real `DataChannel::send_text` -> `LocalWebrtcOfferPeer` ordered reassembly -> subsequent encrypted request on the same peer.
+Current entry path: `LocalWebrtcHandler::on_data_channel` -> `run_data_channel_with_deadline` -> daemon response -> `framed_daemon_response` -> channel-owned pressure loop -> real `DataChannel::send_text` -> `LocalWebrtcOfferPeer` ordered reassembly -> subsequent encrypted request on the same peer. The planned production change inserts the peer-owned watched terminal state into every blocking channel-loop wait on that path; compilation-only evidence is insufficient.
 
 ## Risks
 
 - **Wrong root cause:** receiver `channel_closed` does not identify the sender branch. Mitigation: require the bounded sender record before changing policy; update the plan if it contradicts `pressure_deadline`.
-- **Immortal dead peer:** removing elapsed pressure expiry without preserving close/error/end/send-failure handling could leak peers. Mitigation: retain explicit lifecycle termination and idempotent cleanup tests; only scheduler delay loses authority to declare failure.
+- **Immortal dead peer:** peer-connection death may not emit a DataChannel close/error and would leave a bare poll parked. Mitigation: publish `Disconnected`/`Failed`/`Closed` through peer-owned watch state, select it at every blocking channel wait, return a typed peer-termination cause, and prove the task exits with exactly-once cleanup in both active and idle pressure cases.
 - **Unbounded buffering:** ignoring high water could enqueue the whole response. Mitigation: remain paused after high water and resume only on low water; do not bypass flow control.
 - **Request starvation or reordering:** polling for low water can also consume inbound requests. Mitigation: preserve the bounded FIFO and one-response-at-a-time order, including overflow responses.
 - **Diagnostic deadlock/noise:** unread child pipes or full payload dumps can hide the cause or block the daemon. Mitigation: surface one bounded typed terminal record and never log encrypted frames or whole child output.
 - **Correlation bug hidden as pressure:** the failing response was a `Drain` and unexpectedly large. Mitigation: capture response kind/message id/total chunks and retain exact ordered reassembly before deciding the pressure hypothesis is sufficient.
 - **False confidence from focused passes:** the defect requires heavy scheduler starvation. Mitigation: deterministic state-machine negative control plus exact-SHA residual-tail default-parallel evidence; neither substitutes for the other.
 - **Independent suite failures:** unrelated roots can obscure result interpretation. Mitigation: identify first non-cascade failures and map each to a sibling ticket, following the prior human scope disposition rather than waiving them generically.
+
+## Existing test disposition
+
+- Rewrite `missing_low_water_event_terminates_partial_response_and_cleans_peer` as the active-pressure peer-death regression: after the first chunk raises high water, publish peer `Failed` without DataChannel close/error/low-water; require a typed peer-connection failure, unchanged next/last/total progress, no second send, task completion, channel close, and exactly-once cleanup.
+- Rewrite `next_response_starts_deadline_only_when_pressure_blocks_its_first_frame` as the response-boundary pressure regression: response one may complete under high water, response two must send nothing before low water, and low water must resume its first frame. This carries forward the merged guarantee without retaining elapsed deadline policy.
+- Split the negative half of `outer_loop_routes_idle_pressure_before_next_request_delivery`: retain the current idle high-then-low ordering assertion; replace its no-low-water `PressureDeadline` expectation with peer `Failed` and require no send, typed termination, no parked task, channel close, and exactly-once cleanup.
+- Retain `post_final_high_water_survives_response_boundary_and_idle_low_clears_it`, `high_then_low_water_resumes_and_completes_response_in_order`, FIFO/overflow coverage, and distinct DataChannel close/error/end/send-failure coverage. Update names/signatures mechanically only where removal of deadline vocabulary requires it; do not weaken their behavioral assertions.
 
 ## Acceptance checks and tests
 
@@ -75,6 +86,8 @@ Production wiring that must be proven, not merely compiled:
    - high water mid-response pauses before the next unsent frame;
    - scheduler-delayed low water on an otherwise open channel resumes ordered delivery without closing;
    - elapsed time alone cannot turn that live pressured state into peer cleanup;
+   - peer `Failed` while pressured mid-response, with no DataChannel close/error, wakes the sender, reports the specific typed peer-connection cause and chunk progress, leaves no parked task, closes once, and cleans up exactly once;
+   - peer `Failed` while idle-pressured before the next response provides the same bounded termination and sends no premature frame;
    - `OnClose`, `OnError`, ended polling, and `send_text` failure still terminate with distinct typed causes and exactly-once cleanup;
    - requests received while paused remain bounded and FIFO, including overflow responses;
    - post-final pressure and idle low water still preserve the already-merged response-boundary behavior.
