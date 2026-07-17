@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use botster_core::{
     AesGcmEnvelope, AesGcmKey, Capability, CapabilitySurface, CoreSessionMetadata,
@@ -45,6 +45,8 @@ use support::{
 
 static REAL_DAEMON_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 const CLI_DAEMON_READINESS_BUDGET: Duration = Duration::from_secs(30);
+const BOTSTER_WEB_BRIDGE_LIVENESS_BACKSTOP: Duration = Duration::from_secs(60);
+const BOTSTER_WEB_BRIDGE_STARTUP_DELAY_MS: u64 = 3_000;
 const STALLED_ATTACH_MIN_BUFFERED_STDOUT_BYTES: usize = 8 * 1024;
 const STALLED_ATTACH_STABLE_SAMPLES: usize = 5;
 
@@ -317,12 +319,28 @@ impl LocalWebrtcOfferPeer {
         let mut maximum_frame_bytes = 0;
         let mut next_chunk_index = 0;
         loop {
-            let response = timeout(Duration::from_secs(10), self.data_channel_message_rx.recv())
-                .await
-                .map_err(|_| std::io::Error::other("timed out waiting for data channel response"))?
-                .ok_or_else(|| {
-                    std::io::Error::other("local WebRTC data channel closed before response")
-                })?;
+            let response =
+                match timeout(Duration::from_secs(10), self.data_channel_message_rx.recv()).await {
+                    Ok(Some(response)) => response,
+                    Ok(None) => {
+                        return Err(local_webrtc_response_progress_error(
+                            "channel_closed",
+                            message_id.as_deref(),
+                            next_chunk_index,
+                            expected_chunk_count,
+                        )
+                        .into());
+                    }
+                    Err(_) => {
+                        return Err(local_webrtc_response_progress_error(
+                            "response_timeout",
+                            message_id.as_deref(),
+                            next_chunk_index,
+                            expected_chunk_count,
+                        )
+                        .into());
+                    }
+                };
             maximum_frame_bytes = maximum_frame_bytes.max(response.len());
             assert!(
                 response.len() < botster_hub_client::LOCAL_WEBRTC_MAX_FRAME_BYTES,
@@ -370,6 +388,20 @@ struct LocalWebrtcResponseMetrics {
     envelope_bytes: usize,
     chunk_count: usize,
     maximum_frame_bytes: usize,
+}
+
+fn local_webrtc_response_progress_error(
+    cause: &str,
+    message_id: Option<&str>,
+    next_chunk_index: u32,
+    expected_chunk_count: Option<u32>,
+) -> std::io::Error {
+    std::io::Error::other(format!(
+        "local WebRTC response incomplete: cause={cause} message_id={} next_chunk={} expected_chunks={}",
+        message_id.unwrap_or("pending"),
+        next_chunk_index,
+        expected_chunk_count.map_or_else(|| "pending".to_string(), |count| count.to_string()),
+    ))
 }
 
 fn local_webrtc_stream_key(secret: &str) -> AesGcmKey {
@@ -1075,10 +1107,10 @@ const launchResult = process.env.BOTSTER_ENTRYPOINT_LAUNCH_RESULT;
 const mixedOwnership = Boolean(process.env.BOTSTER_WEB_DOGFOOD_DATA_DIR && (socket || dataDir));
 const source = socket ? 'socket' : (dataDir ? 'data_dir' : 'spawned');
 const mode = socket || dataDir ? 'existing_hub' : 'spawned_hub';
-const socketExists = socket ? fs.existsSync(socket) : false;
 const localWebrtcGrantPresent = Boolean(process.env.BOTSTER_LOCAL_WEBRTC_GRANT_ID);
 const localWebrtcSecretPresent = Boolean(process.env.BOTSTER_LOCAL_WEBRTC_GRANT_SECRET);
 const localWebrtcOriginPresent = Boolean(process.env.BOTSTER_LOCAL_WEBRTC_EXPECTED_ORIGIN);
+const startupDelayMs = Number(process.env.BOTSTER_WEB_TEST_STARTUP_DELAY_MS || '0');
 const connections = new Map();
 
 function currentRequirement() {
@@ -1136,16 +1168,42 @@ async function connectDaemon() {
   }
   const stream = net.createConnection(socket);
   const connection = { stream, buffer: '' };
-  await new Promise((resolve, reject) => {
-    stream.once('connect', resolve);
-    stream.once('error', reject);
-  });
-  stream.write(JSON.stringify({
-    protocol: 'botster-hub-daemon-v1',
-    compatibility: currentRequirement(),
-  }) + '\n');
-  await readLine(connection);
-  return connection;
+  try {
+    await new Promise((resolve, reject) => {
+      stream.once('connect', resolve);
+      stream.once('error', reject);
+    });
+    stream.write(JSON.stringify({
+      protocol: 'botster-hub-daemon-v1',
+      compatibility: currentRequirement(),
+    }) + '\n');
+    const helloAck = JSON.parse(await readLine(connection));
+    if (helloAck.protocol !== 'botster-hub-daemon-v1' || !helloAck.compatibility) {
+      throw new Error(`unexpected daemon hello ack: ${JSON.stringify(helloAck)}`);
+    }
+    return connection;
+  } catch (error) {
+    stream.destroy();
+    throw error;
+  }
+}
+
+async function probeDaemon() {
+  let connection = null;
+  try {
+    connection = await connectDaemon();
+    connection.stream.write(JSON.stringify({ type: 'status' }) + '\n');
+    const response = JSON.parse(await readLine(connection));
+    if (response.kind !== 'status' || !response.status) {
+      throw new Error(`unexpected daemon status response: ${JSON.stringify(response)}`);
+    }
+  } finally {
+    connection?.stream.destroy();
+  }
+}
+
+function currentSocketExists() {
+  return socket ? fs.existsSync(socket) : false;
 }
 
 async function daemonRequest(payload) {
@@ -1182,7 +1240,7 @@ function readBody(request) {
   });
 }
 
-http.createServer(async (request, response) => {
+const server = http.createServer(async (request, response) => {
   if (request.url === '/?dogfood=real-hub') {
     try {
       let bootstrap = null;
@@ -1225,7 +1283,7 @@ http.createServer(async (request, response) => {
         mode,
         source,
         dataDir,
-        socketExists,
+        socketExists: currentSocketExists(),
         response: daemonResponse,
       }));
     } catch (error) {
@@ -1235,7 +1293,7 @@ http.createServer(async (request, response) => {
         mode,
         source,
         dataDir,
-        socketExists,
+        socketExists: currentSocketExists(),
         error: String(error && error.message ? error.message : error),
       }));
     }
@@ -1246,16 +1304,30 @@ http.createServer(async (request, response) => {
     response.end('not found');
     return;
   }
+  let daemonReady = false;
+  let error = null;
+  try {
+    await probeDaemon();
+    daemonReady = true;
+  } catch (probeError) {
+    error = String(probeError && probeError.message ? probeError.message : probeError).slice(0, 240);
+  }
+  const socketExists = currentSocketExists();
   response.writeHead(200, { 'content-type': 'application/json' });
-    response.end(JSON.stringify({
-    ok: mode === 'existing_hub' && source === 'socket' && socketExists && !mixedOwnership,
+  response.end(JSON.stringify({
+    ok: mode === 'existing_hub' && source === 'socket' && !mixedOwnership && daemonReady,
     mode,
     source,
     port,
     socketExists,
     mixedOwnership,
+    daemonReady,
+    error,
   }));
-}).listen(port, '127.0.0.1', () => {
+});
+
+const listen = () => server.listen(port, '127.0.0.1', () => {
+  console.log(`bridge_listening=http://127.0.0.1:${port}`);
   if (launchResult) {
     fs.writeFileSync(launchResult, JSON.stringify({
       entrypoint_id: 'web-client',
@@ -1267,6 +1339,12 @@ http.createServer(async (request, response) => {
     }));
   }
 });
+
+if (startupDelayMs > 0) {
+  setTimeout(listen, startupDelayMs);
+} else {
+  listen();
+}
 "#,
     )
     .expect("write botster-web bridge script");
@@ -1293,7 +1371,8 @@ http.createServer(async (request, response) => {
                 { "name": "BOTSTER_LOCAL_WEBRTC_GRANT_ID", "required": false },
                 { "name": "BOTSTER_LOCAL_WEBRTC_GRANT_SECRET", "required": false },
                 { "name": "BOTSTER_LOCAL_WEBRTC_SIGNALING_TRANSPORT", "required": false },
-                { "name": "BOTSTER_LOCAL_WEBRTC_EXPECTED_ORIGIN", "required": false }
+                { "name": "BOTSTER_LOCAL_WEBRTC_EXPECTED_ORIGIN", "required": false },
+                { "name": "BOTSTER_WEB_TEST_STARTUP_DELAY_MS", "required": false }
             ],
             "launch_mode": "background",
             "readiness": { "result_fields": ["local_url"] },
@@ -1565,6 +1644,59 @@ impl Drop for ChildCleanup {
     }
 }
 
+#[test]
+fn botster_web_health_rejects_stale_daemon_socket_file() {
+    let data_dir = unique_short_test_dir("web-health-stale-socket");
+    let package_dir = unique_test_dir("web-health-stale-socket-package");
+    fs::create_dir_all(&data_dir).expect("create stale socket data directory");
+    write_botster_web_package(&package_dir);
+    let socket_path = data_dir.join("hub.sock");
+    let stale_listener = UnixListener::bind(&socket_path).expect("bind stale daemon socket");
+    drop(stale_listener);
+    assert!(
+        socket_path.exists(),
+        "stale daemon socket file should remain"
+    );
+
+    let bridge_port = unused_loopback_port();
+    let child = Command::new("node")
+        .arg("scripts/real-hub-dogfood-bridge.mjs")
+        .current_dir(&package_dir)
+        .env("BOTSTER_HUB_SOCKET", &socket_path)
+        .env("BOTSTER_HUB_DATA_DIR", &data_dir)
+        .env("BOTSTER_WEB_DOGFOOD_BRIDGE_PORT", bridge_port.to_string())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn botster-web bridge against stale socket");
+    let mut child = ChildCleanup { child };
+    let mut listening = String::new();
+    BufReader::new(
+        child
+            .child
+            .stdout
+            .take()
+            .expect("botster-web bridge stdout"),
+    )
+    .read_line(&mut listening)
+    .expect("read botster-web listening marker");
+    assert_eq!(
+        listening.trim(),
+        format!("bridge_listening=http://127.0.0.1:{bridge_port}")
+    );
+
+    let health = read_json_health(&format!("http://127.0.0.1:{bridge_port}"));
+    assert_eq!(health["ok"], false, "stale socket health: {health}");
+    assert_eq!(health["socketExists"], true);
+    assert_eq!(health["daemonReady"], false);
+    assert!(
+        health["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("ECONNREFUSED")),
+        "stale socket health should report protocol failure: {health}"
+    );
+}
+
 fn wait_for_process_exit(pid: u32) {
     for _ in 0..100 {
         if !process_exists(pid) {
@@ -1706,22 +1838,162 @@ fn botster_web_page_bootstrap(bridge_url: &str) -> botster_hub_client::DaemonLoc
     serde_json::from_str(&rest[..end]).expect("HTML bootstrap JSON")
 }
 
-fn wait_for_botster_web_health(bridge_url: &str) {
+fn log_botster_web_phase(test_started: Instant, phase: &str) {
+    let unix_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time after epoch")
+        .as_millis();
+    eprintln!(
+        "botster_web_reload_phase phase={phase} unix_ms={unix_ms} elapsed_ms={}",
+        test_started.elapsed().as_millis()
+    );
+}
+
+fn probe_botster_web_health(bridge_url: &str) -> Result<serde_json::Value, String> {
     let port = bridge_url
         .strip_prefix("http://127.0.0.1:")
         .expect("local HTTP URL")
         .parse::<u16>()
         .expect("HTTP port");
-    for _ in 0..100 {
-        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            let health = read_json_health(bridge_url);
-            if health["ok"] == true {
-                return;
+
+    let mut stream = TcpStream::connect(("127.0.0.1", port))
+        .map_err(|error| format!("connect error: {error}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .map_err(|error| format!("set read timeout: {error}"))?;
+    let request =
+        format!("GET /health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|error| format!("write error: {error}"))?;
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .map_err(|error| format!("read error: {error}"))?;
+    let (headers, body) = response
+        .split_once("\r\n\r\n")
+        .ok_or_else(|| format!("missing HTTP response body: {response:?}"))?;
+    let body = if headers
+        .to_ascii_lowercase()
+        .contains("transfer-encoding: chunked")
+    {
+        decode_chunked_http_body(body)
+    } else {
+        body.to_string()
+    };
+    if !headers.starts_with("HTTP/1.1 200") && !headers.starts_with("HTTP/1.0 200") {
+        return Err(format!("non-200 response: {headers} body={body}"));
+    }
+    let health: serde_json::Value = serde_json::from_str(body.trim())
+        .map_err(|error| format!("invalid health JSON: {error}; body={body}"))?;
+    let expected = serde_json::json!({
+        "ok": true,
+        "mode": "existing_hub",
+        "source": "socket",
+        "port": port,
+        "socketExists": true,
+        "mixedOwnership": false,
+        "daemonReady": true,
+        "error": null,
+    });
+    if expected
+        .as_object()
+        .expect("expected health object")
+        .iter()
+        .any(|(key, value)| health.get(key) != Some(value))
+    {
+        return Err(format!(
+            "unexpected health response: {health}; expected={expected}"
+        ));
+    }
+    Ok(health)
+}
+
+fn wait_for_botster_web_readiness(
+    endpoint: &botster_hub_client::DaemonEndpoint,
+    bridge_url: &str,
+    expected_local_url: &str,
+    test_started: Instant,
+) -> botster_hub_client::DaemonResponse {
+    let wait_started = Instant::now();
+    let mut health_ready = false;
+    let mut last_health = "not probed".to_string();
+    let mut last_apps: String;
+
+    loop {
+        match botster_hub_client::request(endpoint, botster_hub_client::DaemonRequest::ListApps) {
+            Ok(response) => {
+                last_apps = format!("{response:#?}");
+                if let Some(app) = response.apps.iter().find(|app| {
+                    app.package_name == "botster-web" && app.entrypoint_id == "web-client"
+                }) {
+                    if matches!(
+                        app.lifecycle_state.as_str(),
+                        "exited" | "failed" | "stopped"
+                    ) {
+                        let entrypoint_status = botster_hub_client::request(
+                            endpoint,
+                            botster_hub_client::DaemonRequest::PackageEntrypointStatus {
+                                package_name: "botster-web".to_string(),
+                                entrypoint_id: "web-client".to_string(),
+                            },
+                        );
+                        let daemon_status = botster_hub_client::request(
+                            endpoint,
+                            botster_hub_client::DaemonRequest::Status,
+                        );
+                        panic!(
+                            "botster-web bridge reached terminal state while waiting for readiness; elapsed_ms={} expected_local_url={expected_local_url} app={app:#?} entrypoint_status={entrypoint_status:#?} daemon_status={daemon_status:#?} last_health={last_health}",
+                            wait_started.elapsed().as_millis()
+                        );
+                    }
+                    if let Some(actual_url) = app.launch_target.local_url.as_deref() {
+                        assert_eq!(
+                            actual_url,
+                            expected_local_url,
+                            "botster-web app published unexpected local_url after {}ms; app={app:#?}",
+                            wait_started.elapsed().as_millis()
+                        );
+                        if health_ready {
+                            log_botster_web_phase(test_started, "local_url_published");
+                            return response;
+                        }
+                    }
+                }
             }
+            Err(error) => {
+                last_apps = format!("ListApps request error: {error:#?}");
+            }
+        }
+
+        if !health_ready {
+            match probe_botster_web_health(bridge_url) {
+                Ok(health) => {
+                    health_ready = true;
+                    last_health = health.to_string();
+                    log_botster_web_phase(test_started, "health_ready");
+                }
+                Err(error) => last_health = error,
+            }
+        }
+
+        if wait_started.elapsed() >= BOTSTER_WEB_BRIDGE_LIVENESS_BACKSTOP {
+            let entrypoint_status = botster_hub_client::request(
+                endpoint,
+                botster_hub_client::DaemonRequest::PackageEntrypointStatus {
+                    package_name: "botster-web".to_string(),
+                    entrypoint_id: "web-client".to_string(),
+                },
+            );
+            let daemon_status =
+                botster_hub_client::request(endpoint, botster_hub_client::DaemonRequest::Status);
+            panic!(
+                "botster-web bridge liveness backstop expired without readiness; elapsed_ms={} health_ready={health_ready} expected_local_url={expected_local_url} last_health={last_health} last_apps={last_apps} entrypoint_status={entrypoint_status:#?} daemon_status={daemon_status:#?}",
+                wait_started.elapsed().as_millis()
+            );
         }
         thread::sleep(Duration::from_millis(20));
     }
-    panic!("botster-web bridge health did not become ready");
 }
 
 fn unused_loopback_port() -> u16 {
@@ -2315,13 +2587,154 @@ fn wait_for_status_timeout_reports_diagnostics_and_reaps_owned_child() {
 }
 
 fn shutdown_cli_daemon(data_dir: &Path, child: Child) -> Output {
-    let shutdown = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+    let shutdown = request_cli_daemon_shutdown(data_dir).expect("run botster-hub shutdown");
+    wait_for_cli_daemon_shutdown(&shutdown, child)
+}
+
+fn request_cli_daemon_shutdown(data_dir: &Path) -> io::Result<Output> {
+    Command::new(env!("CARGO_BIN_EXE_botster-hub"))
         .arg("shutdown")
         .arg("--data-dir")
         .arg(data_dir)
         .output()
-        .expect("run botster-hub shutdown");
-    wait_for_cli_daemon_shutdown(&shutdown, child)
+}
+
+fn local_webrtc_sender_failure(stderr: &[u8]) -> Option<&str> {
+    std::str::from_utf8(stderr)
+        .ok()?
+        .lines()
+        .rev()
+        .find(|line| line.starts_with("local WebRTC response delivery failed:"))
+}
+
+fn local_webrtc_bounded_stderr_tail(stderr: &[u8], data_dir: &Path) -> String {
+    const MAX_LINES: usize = 20;
+    const MAX_CHARS_PER_LINE: usize = 512;
+
+    let stderr = String::from_utf8_lossy(stderr);
+    let mut lines = stderr.lines().rev().take(MAX_LINES).collect::<Vec<_>>();
+    lines.reverse();
+    let mut tail = lines
+        .into_iter()
+        .map(|line| {
+            let mut bounded = line.chars().take(MAX_CHARS_PER_LINE).collect::<String>();
+            if line.chars().count() > MAX_CHARS_PER_LINE {
+                bounded.push_str("<truncated>");
+            }
+            bounded
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    for (path, replacement) in [
+        (Some(data_dir.to_path_buf()), "<data-dir>"),
+        (
+            Some(PathBuf::from(env!("CARGO_MANIFEST_DIR"))),
+            "<workspace>",
+        ),
+        (std::env::var_os("HOME").map(PathBuf::from), "<home>"),
+        (Some(std::env::temp_dir()), "<temp>"),
+    ] {
+        if let Some(path) = path.and_then(|path| path.to_str().map(str::to_owned))
+            && !path.is_empty()
+        {
+            tail = tail.replace(&path, replacement);
+        }
+    }
+
+    if tail.is_empty() {
+        "<empty>".to_string()
+    } else {
+        tail
+    }
+}
+
+#[test]
+fn local_webrtc_diagnostic_stderr_tail_is_bounded_and_redacts_paths() {
+    let data_dir = std::env::temp_dir().join("local-webrtc-diagnostic-data");
+    let mut lines = (0..25)
+        .map(|index| format!("diagnostic line {index}"))
+        .collect::<Vec<_>>();
+    lines[23] = "x".repeat(600);
+    lines[24] = format!(
+        "data={} workspace={} home={} temp={}",
+        data_dir.display(),
+        env!("CARGO_MANIFEST_DIR"),
+        std::env::var("HOME").unwrap_or_default(),
+        std::env::temp_dir().display()
+    );
+
+    let tail = local_webrtc_bounded_stderr_tail(lines.join("\n").as_bytes(), &data_dir);
+
+    assert!(!tail.contains("diagnostic line 4"));
+    assert!(tail.contains("diagnostic line 5"));
+    assert!(tail.contains("<truncated>"));
+    assert!(tail.contains("<data-dir>"));
+    assert!(tail.contains("<workspace>"));
+    assert!(tail.contains("<home>"));
+    assert!(tail.contains("<temp>"));
+    assert!(!tail.contains(&data_dir.display().to_string()));
+    assert!(!tail.contains(env!("CARGO_MANIFEST_DIR")));
+}
+
+struct LocalWebrtcDiagnosticDaemon {
+    data_dir: PathBuf,
+    child: Option<Child>,
+}
+
+impl LocalWebrtcDiagnosticDaemon {
+    fn start(data_dir: &Path) -> Self {
+        Self {
+            data_dir: data_dir.to_path_buf(),
+            child: Some(start_cli_daemon(data_dir)),
+        }
+    }
+
+    fn shutdown(mut self) {
+        let child = self.child.take().expect("local WebRTC daemon child");
+        shutdown_cli_daemon(&self.data_dir, child);
+    }
+}
+
+impl Drop for LocalWebrtcDiagnosticDaemon {
+    fn drop(&mut self) {
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+
+        if !std::thread::panicking() {
+            shutdown_cli_daemon(&self.data_dir, child);
+            return;
+        }
+
+        let shutdown = request_cli_daemon_shutdown(&self.data_dir);
+        let shutdown_failed = shutdown.as_ref().map_or(true, |output| {
+            !output.status.success()
+                && String::from_utf8_lossy(&output.stderr).trim()
+                    != "botster-hub shutdown error: client disconnected"
+        });
+        if shutdown_failed && child.try_wait().ok().flatten().is_none() {
+            let _ = child.kill();
+        }
+
+        match child.wait_with_output() {
+            Ok(daemon) => {
+                if let Some(failure) = local_webrtc_sender_failure(&daemon.stderr) {
+                    eprintln!("local WebRTC target sender evidence: {failure}");
+                } else {
+                    eprintln!(
+                        "local WebRTC target sender evidence: unavailable; daemon_status={}; daemon_stderr_tail={:?}",
+                        daemon.status,
+                        local_webrtc_bounded_stderr_tail(&daemon.stderr, &self.data_dir)
+                    );
+                }
+            }
+            Err(error) => eprintln!(
+                "local WebRTC target sender evidence: unavailable; daemon_status=unavailable; daemon_wait_error_kind={:?}",
+                error.kind()
+            ),
+        }
+    }
 }
 
 #[test]
@@ -3409,7 +3822,7 @@ fn cli_dev_stack_first_party_plugin_dogfood_smoke_runs_contract_matrix_then_real
 #[test]
 fn cli_dogfood_launcher_starts_botster_web_in_existing_hub_mode_and_shuts_down() {
     let _guard = daemon_test_guard();
-    let data_dir = unique_test_dir("cli-dogfood-launcher");
+    let data_dir = unique_short_test_dir("cli-dogfood-launcher");
     let web_package_dir = unique_test_dir("cli-dogfood-botster-web-package");
     write_botster_web_package(&web_package_dir);
     let web_bridge_port = unused_loopback_port();
@@ -3783,7 +4196,7 @@ fn cli_dogfood_launcher_uses_generated_data_dir_and_dynamic_bridge_port() {
 #[test]
 fn cli_dogfood_launcher_enables_local_tui_package_for_apps_open() {
     let _guard = daemon_test_guard();
-    let data_dir = unique_test_dir("cli-dogfood-tui");
+    let data_dir = unique_short_test_dir("cli-dogfood-tui");
     let web_package_dir = unique_test_dir("cli-dogfood-tui-botster-web-package");
     let tui_package_dir = unique_test_dir("cli-dogfood-tui-package");
     write_botster_web_package(&web_package_dir);
@@ -3946,7 +4359,7 @@ fn cli_dogfood_launcher_enables_local_tui_package_for_apps_open() {
 #[test]
 fn cli_dev_stack_bootstrap_starts_daemon_enables_first_party_packages_and_prints_apps() {
     let _guard = daemon_test_guard();
-    let data_dir = unique_test_dir("cli-dev-stack-bootstrap");
+    let data_dir = unique_short_test_dir("cli-dev-stack-bootstrap");
     let project_pipelines_package_dir = unique_test_dir("cli-dev-stack-project-pipelines-package");
     let web_package_dir = unique_test_dir("cli-dev-stack-web-package");
     let tui_package_dir = unique_test_dir("cli-dev-stack-tui-package");
@@ -4168,7 +4581,7 @@ fn cli_dev_stack_project_pipelines_configuration_schema_acceptance_target() {
 #[test]
 fn cli_dev_stack_bootstrap_reuses_live_daemon_and_preserves_state_after_restart() {
     let _guard = daemon_test_guard();
-    let data_dir = unique_test_dir("cli-dev-stack-rerun");
+    let data_dir = unique_short_test_dir("cli-dev-stack-rerun");
     let project_pipelines_package_dir = unique_test_dir("cli-dev-stack-rerun-project-pipelines");
     let web_package_dir = unique_test_dir("cli-dev-stack-rerun-web");
     let tui_package_dir = unique_test_dir("cli-dev-stack-rerun-tui");
@@ -4280,7 +4693,7 @@ fn cli_doctor_reports_stopped_runtime_with_remediation() {
 #[test]
 fn cli_local_runtime_up_starts_reuses_and_down_stops_runtime() {
     let _guard = daemon_test_guard();
-    let data_dir = unique_test_dir("cli-local-runtime-up");
+    let data_dir = unique_short_test_dir("cli-local-runtime-up");
     let project_pipelines_package_dir = unique_test_dir("cli-up-project-pipelines");
     let web_package_dir = unique_test_dir("cli-up-web");
     let tui_package_dir = unique_test_dir("cli-up-tui");
@@ -4362,15 +4775,34 @@ fn cli_local_runtime_up_starts_reuses_and_down_stops_runtime() {
     let down_text = command_output_text(&down);
     assert!(down_text.contains("response=shutdown"));
 
+    let restarted = run_local_runtime_up(
+        &data_dir,
+        &project_pipelines_package_dir,
+        &web_package_dir,
+        &tui_package_dir,
+        &workspaces_package_dir,
+        unused_loopback_port(),
+    );
+    assert!(
+        restarted.status.success(),
+        "immediate up after down failed: {}",
+        command_output_text(&restarted)
+    );
+    let restarted_text = command_output_text(&restarted);
+    assert!(restarted_text.contains("runtime=ready"));
+    assert!(restarted_text.contains("daemon=started"));
+
+    shutdown_dev_stack_daemon(&data_dir);
+
     let status = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
         .arg("status")
         .arg("--data-dir")
         .arg(&data_dir)
         .output()
-        .expect("run botster-hub status after down");
+        .expect("run botster-hub status after daemon shutdown");
     assert!(
         !status.status.success(),
-        "status should fail after down: {}",
+        "status should fail after daemon shutdown: {}",
         command_output_text(&status)
     );
 }
@@ -4378,7 +4810,7 @@ fn cli_local_runtime_up_starts_reuses_and_down_stops_runtime() {
 #[test]
 fn cli_doctor_reports_healthy_runtime_checks() {
     let _guard = daemon_test_guard();
-    let data_dir = unique_test_dir("cli-doctor-healthy");
+    let data_dir = unique_short_test_dir("cli-doctor-healthy");
     let project_pipelines_package_dir = unique_test_dir("cli-doctor-project-pipelines");
     let web_package_dir = unique_test_dir("cli-doctor-web");
     let tui_package_dir = unique_test_dir("cli-doctor-tui");
@@ -4438,7 +4870,7 @@ fn cli_doctor_reports_healthy_runtime_checks() {
 #[test]
 fn cli_local_runtime_up_recovers_owned_incompatible_daemon() {
     let _guard = daemon_test_guard();
-    let data_dir = unique_test_dir("cli-up-owned-incompat");
+    let data_dir = unique_short_test_dir("cli-up-owned-incompat");
     let project_pipelines_package_dir = unique_test_dir("cli-up-owned-project-pipelines");
     let web_package_dir = unique_test_dir("cli-up-owned-web");
     let tui_package_dir = unique_test_dir("cli-up-owned-tui");
@@ -4450,13 +4882,14 @@ fn cli_local_runtime_up_recovers_owned_incompatible_daemon() {
     let stale_child = start_owned_incompatible_dev_stack_daemon(&data_dir);
     let stale_pid = stale_child.id();
 
+    let web_bridge_port = unused_loopback_port();
     let output = run_local_runtime_up(
         &data_dir,
         &project_pipelines_package_dir,
         &web_package_dir,
         &tui_package_dir,
         &workspaces_package_dir,
-        unused_loopback_port(),
+        web_bridge_port,
     );
     assert!(
         output.status.success(),
@@ -4466,10 +4899,34 @@ fn cli_local_runtime_up_recovers_owned_incompatible_daemon() {
     let text = command_output_text(&output);
     assert!(text.contains("runtime=ready"));
     assert!(text.contains("daemon=started"));
+    let bridge_url = format!("http://127.0.0.1:{web_bridge_port}");
+    let health = read_json_health(&bridge_url);
+    assert_eq!(health["ok"], true, "replacement bridge health: {health}");
+    assert_eq!(health["daemonReady"], true);
+    let status = dogfood_bridge_request(
+        &bridge_url,
+        None,
+        &botster_hub_client::DaemonRequest::Status,
+    );
+    assert_eq!(status.kind, botster_hub_client::DaemonResponseKind::Status);
+    assert_eq!(
+        status.status.expect("bridge status body").lifecycle_state,
+        "running"
+    );
     let _ = stale_child.wait_with_output().expect("reap stale daemon");
     assert!(
         !process_exists(stale_pid),
         "stale incompatible daemon should be stopped"
+    );
+    assert!(
+        explicit_config(&data_dir)
+            .transports
+            .local_socket
+            .as_ref()
+            .expect("replacement socket binding")
+            .path
+            .exists(),
+        "replacement socket should remain after stale child exit"
     );
 
     shutdown_dev_stack_daemon(&data_dir);
@@ -4761,7 +5218,7 @@ fn cli_doctor_reports_incompatible_stale_daemon_without_deleting_socket() {
 #[test]
 fn cli_smoke_proves_local_runtime_daemon_package_app_session_and_webrtc() {
     let _guard = daemon_test_guard();
-    let data_dir = unique_test_dir("cli-smoke-success");
+    let data_dir = unique_short_test_dir("cli-smoke-success");
     let project_pipelines_package_dir = unique_test_dir("cli-smoke-project-pipelines");
     let web_package_dir = unique_test_dir("cli-smoke-web");
     let tui_package_dir = unique_test_dir("cli-smoke-tui");
@@ -4804,6 +5261,376 @@ fn cli_smoke_proves_local_runtime_daemon_package_app_session_and_webrtc() {
         !status.status.success(),
         "smoke should stop the daemon it started: {}",
         command_output_text(&status)
+    );
+}
+
+#[test]
+fn fast_exit_attach_diagnostic_records_subscription_event_order() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_test_dir("fast-exit-attach-diagnostic");
+    let config = explicit_config(&data_dir);
+    let socket_path = config
+        .transports
+        .local_socket
+        .as_ref()
+        .expect("test config has local socket")
+        .path
+        .clone();
+    let endpoint = botster_hub_client::DaemonEndpoint::new(socket_path);
+    let child = start_cli_daemon(&data_dir);
+    let session_id = format!(
+        "smoke-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time after epoch")
+            .as_nanos()
+    );
+    let subscription_id = format!("{session_id}-subscription");
+    let marker = "botster-smoke-terminal-ok";
+    let expected = format!("smoke:{marker}");
+
+    let spawn = botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::Spawn {
+            session_id: session_id.clone(),
+            command: format!("printf 'smoke:{marker}\\n'"),
+        },
+    )
+    .expect("spawn immediate-output diagnostic session");
+    assert_eq!(spawn.kind, botster_hub_client::DaemonResponseKind::Spawned);
+
+    // Mirrors stream_attach_connected in crates/botster-hub-client/src/lib.rs:123-172.
+    // Any production boundary change there must update this diagnostic mirror.
+    let mut connection = botster_hub_client::DaemonConnection::connect(&endpoint)
+        .expect("connect diagnostic client");
+    let mut response = connection
+        .request(&botster_hub_client::DaemonRequest::Attach {
+            session_id: session_id.clone(),
+            subscription_id: subscription_id.clone(),
+        })
+        .expect("attach diagnostic subscription");
+    let started_at = Instant::now();
+    let mut observed = String::new();
+    let mut matching_observed = String::new();
+    let mut mismatched_marker = false;
+    let mut opaque_history_bytes = 0;
+    let mut saw_process_exit = false;
+    let mut ordered_observations = Vec::new();
+    let mut response_index = 0;
+    let mut request_kind = "attach";
+    let mut idle_drains = 0;
+
+    let boundary_reason = loop {
+        let mut response_observations = Vec::new();
+        let mut response_renderable_bytes = 0;
+        for event in &response.events {
+            let observation = match event {
+                botster_hub_client::DaemonEvent::SessionLifecycle {
+                    session_id: event_session_id,
+                    state,
+                } => format!("session_lifecycle:session={event_session_id}:state={state}"),
+                botster_hub_client::DaemonEvent::TerminalOutput {
+                    session_id: event_session_id,
+                    subscription_id: event_subscription_id,
+                    data,
+                } => {
+                    response_renderable_bytes += data.len();
+                    observed.push_str(data);
+                    if event_session_id == &session_id && event_subscription_id == &subscription_id
+                    {
+                        matching_observed.push_str(data);
+                    } else if data.contains(&expected) {
+                        mismatched_marker = true;
+                    }
+                    format!(
+                        "terminal_output:session={event_session_id}:subscription={event_subscription_id}:bytes={}",
+                        data.len()
+                    )
+                }
+                botster_hub_client::DaemonEvent::Snapshot {
+                    session_id: event_session_id,
+                    subscription_id: event_subscription_id,
+                    history,
+                } => {
+                    opaque_history_bytes += history.bytes;
+                    format!(
+                        "snapshot:session={event_session_id}:subscription={event_subscription_id}:bytes={}",
+                        history.bytes
+                    )
+                }
+                botster_hub_client::DaemonEvent::Scrollback {
+                    session_id: event_session_id,
+                    subscription_id: event_subscription_id,
+                    history,
+                } => {
+                    opaque_history_bytes += history.bytes;
+                    format!(
+                        "scrollback:session={event_session_id}:subscription={event_subscription_id}:bytes={}",
+                        history.bytes
+                    )
+                }
+                botster_hub_client::DaemonEvent::ProcessExit {
+                    session_id: event_session_id,
+                    subscription_id: event_subscription_id,
+                    code,
+                } => {
+                    saw_process_exit = true;
+                    format!(
+                        "process_exit:session={event_session_id}:subscription={event_subscription_id}:code={code:?}"
+                    )
+                }
+                botster_hub_client::DaemonEvent::AttachState {
+                    session_id: event_session_id,
+                    subscription_id: event_subscription_id,
+                    state,
+                } => {
+                    format!(
+                        "attach_state:session={event_session_id}:subscription={event_subscription_id}:state={state}"
+                    )
+                }
+                botster_hub_client::DaemonEvent::RuntimeObservation { kind } => {
+                    format!("runtime_observation:{kind}")
+                }
+                botster_hub_client::DaemonEvent::WorktreeLifecycle { .. } => {
+                    "worktree_lifecycle".to_string()
+                }
+            };
+            response_observations.push(observation.clone());
+            ordered_observations.push(format!(
+                "elapsed_us={}:response={response_index}:request={request_kind}:event={}:{}",
+                started_at.elapsed().as_micros(),
+                response_observations.len() - 1,
+                observation
+            ));
+        }
+        println!(
+            "fast_exit_attach_diagnostic elapsed_us={} response={response_index} request={request_kind} events=[{}] renderable_bytes={response_renderable_bytes} cumulative_renderable_bytes={}",
+            started_at.elapsed().as_micros(),
+            response_observations.join(","),
+            observed.len()
+        );
+
+        if saw_process_exit {
+            break "process_exit";
+        }
+        if request_kind == "drain" {
+            if response.events.is_empty() {
+                idle_drains += 1;
+            } else {
+                idle_drains = 0;
+            }
+            if idle_drains >= 20 {
+                break "idle_quiescence";
+            }
+        }
+
+        thread::sleep(Duration::from_millis(25));
+        response = connection
+            .request(&botster_hub_client::DaemonRequest::Drain {
+                session_id: session_id.clone(),
+            })
+            .expect("drain diagnostic subscription before production boundary");
+        response_index += 1;
+        request_kind = "drain";
+    };
+
+    let renderable_bytes_at_boundary = observed.len();
+    let matching_bytes_at_boundary = matching_observed.len();
+    let marker_at_boundary = observed.contains(&expected);
+    println!(
+        "fast_exit_attach_diagnostic boundary elapsed_us={} reason={boundary_reason} response={response_index} input_bytes=0 renderable_bytes_at_boundary={renderable_bytes_at_boundary} matching_bytes_at_boundary={matching_bytes_at_boundary} marker_at_boundary={marker_at_boundary} idle_drains={idle_drains}",
+        started_at.elapsed().as_micros()
+    );
+
+    let mut tail_matching_observed = String::new();
+    let mut tail_error = None;
+    if !marker_at_boundary {
+        let mut tail_idle_drains = 0;
+        while tail_idle_drains < 20 {
+            thread::sleep(Duration::from_millis(25));
+            let tail_response =
+                match connection.request(&botster_hub_client::DaemonRequest::Drain {
+                    session_id: session_id.clone(),
+                }) {
+                    Ok(response) => response,
+                    Err(error) => {
+                        tail_error = Some(error.to_string());
+                        break;
+                    }
+                };
+            response_index += 1;
+            if tail_response.events.is_empty() {
+                tail_idle_drains += 1;
+            } else {
+                tail_idle_drains = 0;
+            }
+            for (event_index, event) in tail_response.events.iter().enumerate() {
+                let elapsed_us = started_at.elapsed().as_micros();
+                match event {
+                    botster_hub_client::DaemonEvent::TerminalOutput {
+                        session_id: event_session_id,
+                        subscription_id: event_subscription_id,
+                        data,
+                    } => {
+                        if event_session_id == &session_id
+                            && event_subscription_id == &subscription_id
+                        {
+                            tail_matching_observed.push_str(data);
+                        } else if data.contains(&expected) {
+                            mismatched_marker = true;
+                        }
+                        println!(
+                            "fast_exit_attach_tail_event elapsed_us={elapsed_us} response={response_index} event={event_index} type=terminal_output session={event_session_id} subscription={event_subscription_id} bytes={}",
+                            data.len()
+                        );
+                    }
+                    botster_hub_client::DaemonEvent::Snapshot {
+                        session_id: event_session_id,
+                        subscription_id: event_subscription_id,
+                        history,
+                    } => {
+                        opaque_history_bytes += history.bytes;
+                        println!(
+                            "fast_exit_attach_tail_event elapsed_us={elapsed_us} response={response_index} event={event_index} type=snapshot session={event_session_id} subscription={event_subscription_id} bytes={}",
+                            history.bytes
+                        );
+                    }
+                    botster_hub_client::DaemonEvent::Scrollback {
+                        session_id: event_session_id,
+                        subscription_id: event_subscription_id,
+                        history,
+                    } => {
+                        opaque_history_bytes += history.bytes;
+                        println!(
+                            "fast_exit_attach_tail_event elapsed_us={elapsed_us} response={response_index} event={event_index} type=scrollback session={event_session_id} subscription={event_subscription_id} bytes={}",
+                            history.bytes
+                        );
+                    }
+                    botster_hub_client::DaemonEvent::ProcessExit {
+                        session_id: event_session_id,
+                        subscription_id: event_subscription_id,
+                        code,
+                    } => println!(
+                        "fast_exit_attach_tail_event elapsed_us={elapsed_us} response={response_index} event={event_index} type=process_exit session={event_session_id} subscription={event_subscription_id} code={code:?} bytes=0"
+                    ),
+                    botster_hub_client::DaemonEvent::AttachState {
+                        session_id: event_session_id,
+                        subscription_id: event_subscription_id,
+                        state,
+                    } => println!(
+                        "fast_exit_attach_tail_event elapsed_us={elapsed_us} response={response_index} event={event_index} type=attach_state session={event_session_id} subscription={event_subscription_id} state={state} bytes=0"
+                    ),
+                    botster_hub_client::DaemonEvent::SessionLifecycle {
+                        session_id: event_session_id,
+                        state,
+                    } => println!(
+                        "fast_exit_attach_tail_event elapsed_us={elapsed_us} response={response_index} event={event_index} type=session_lifecycle session={event_session_id} subscription=none state={state} bytes=0"
+                    ),
+                    botster_hub_client::DaemonEvent::RuntimeObservation { kind } => println!(
+                        "fast_exit_attach_tail_event elapsed_us={elapsed_us} response={response_index} event={event_index} type=runtime_observation session=none subscription=none kind={kind} bytes=0"
+                    ),
+                    botster_hub_client::DaemonEvent::WorktreeLifecycle { .. } => println!(
+                        "fast_exit_attach_tail_event elapsed_us={elapsed_us} response={response_index} event={event_index} type=worktree_lifecycle session=none subscription=none bytes=0"
+                    ),
+                }
+            }
+        }
+    }
+
+    let (read_screen_bytes, read_screen_marker, read_screen_error) = if marker_at_boundary {
+        (0, false, None)
+    } else {
+        match connection.request(&botster_hub_client::DaemonRequest::ReadScreen {
+            session_id: session_id.clone(),
+        }) {
+            Ok(response) => match response.read_screen {
+                Some(screen) => (screen.text.len(), screen.text.contains(&expected), None),
+                None => (0, false, Some("missing_read_screen_body".to_string())),
+            },
+            Err(error) => (0, false, Some(error.to_string())),
+        }
+    };
+
+    let status = connection.request(&botster_hub_client::DaemonRequest::Status);
+    let daemon_lifecycle = status
+        .as_ref()
+        .ok()
+        .and_then(|response| response.status.as_ref())
+        .map(|status| status.lifecycle_state.as_str())
+        .unwrap_or("missing");
+
+    let sessions = connection
+        .request(&botster_hub_client::DaemonRequest::ListSessions)
+        .expect("list sessions after frozen production boundary");
+    let session_lifecycle = sessions
+        .sessions
+        .iter()
+        .find(|session| session.session_id == session_id)
+        .map(|session| session.lifecycle.as_str())
+        .unwrap_or("missing");
+    let tail_matching_marker = tail_matching_observed.contains(&expected);
+    println!(
+        "fast_exit_attach_diagnostic state elapsed_us={} daemon_lifecycle={daemon_lifecycle} session_lifecycle={session_lifecycle} process_exit={saw_process_exit} renderable_bytes_at_boundary={renderable_bytes_at_boundary} matching_bytes_at_boundary={matching_bytes_at_boundary} tail_matching_bytes={} tail_matching_marker={tail_matching_marker} mismatched_marker={mismatched_marker} opaque_history_bytes={opaque_history_bytes} read_screen_bytes={read_screen_bytes} read_screen_marker={read_screen_marker} read_screen_error={read_screen_error:?} tail_error={tail_error:?} event_order=[{}]",
+        started_at.elapsed().as_micros(),
+        tail_matching_observed.len(),
+        ordered_observations.join(",")
+    );
+
+    let detach = connection.request(&botster_hub_client::DaemonRequest::Detach {
+        session_id: session_id.clone(),
+        subscription_id: subscription_id.clone(),
+    });
+    println!(
+        "fast_exit_attach_diagnostic cleanup elapsed_us={} detach_response={detach:?}",
+        started_at.elapsed().as_micros()
+    );
+    let _ = connection.request(&botster_hub_client::DaemonRequest::ShutdownSession {
+        session_id: session_id.clone(),
+    });
+
+    let shutdown = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("shutdown")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .output()
+        .expect("run botster-hub shutdown after fast-exit diagnostic");
+    let daemon = child
+        .wait_with_output()
+        .expect("wait for diagnostic daemon child");
+    let shutdown_validation = validate_cli_daemon_shutdown(&shutdown, &daemon);
+
+    if !marker_at_boundary {
+        let classification = if mismatched_marker && tail_matching_marker {
+            "ambiguous_subscription_mismatch_and_output_queued_after_harness_stop"
+        } else if mismatched_marker {
+            "subscription_mismatch"
+        } else if tail_matching_marker {
+            "output_queued_after_harness_stop"
+        } else if read_screen_marker {
+            "output_produced_not_routed"
+        } else if read_screen_error.is_some() {
+            "retained_history_or_readback_failure"
+        } else if tail_error.is_some() {
+            "unclassified_diagnostic_transport_failure"
+        } else {
+            "output_never_produced"
+        };
+        println!(
+            "fast_exit_attach_failure classification={classification} boundary_reason={boundary_reason} input_bytes=0 renderable_bytes_at_boundary={renderable_bytes_at_boundary} matching_bytes_at_boundary={matching_bytes_at_boundary} opaque_history_bytes={opaque_history_bytes} daemon_exit_status={} shutdown_status={} daemon_stdout_begin\n{}\ndaemon_stdout_end daemon_stderr_begin\n{}\ndaemon_stderr_end test_stdout_stderr=run_log",
+            daemon.status,
+            shutdown.status,
+            String::from_utf8_lossy(&daemon.stdout),
+            String::from_utf8_lossy(&daemon.stderr)
+        );
+    }
+
+    assert!(
+        shutdown_validation.is_ok(),
+        "diagnostic daemon cleanup failed: {shutdown_validation:?}"
+    );
+    assert!(
+        marker_at_boundary,
+        "fast-exit marker missing at production boundary; renderable_bytes_at_boundary={renderable_bytes_at_boundary} matching_bytes_at_boundary={matching_bytes_at_boundary} tail_matching_marker={tail_matching_marker} mismatched_marker={mismatched_marker} read_screen_marker={read_screen_marker} read_screen_error={read_screen_error:?} tail_error={tail_error:?}"
     );
 }
 
@@ -4899,7 +5726,7 @@ fn dev_stack_readiness_timeout_reports_last_probe_and_reaps_owned_daemon() {
 fn cli_dev_stack_acceptance_smoke_exercises_first_party_plugins_project_pipelines_session_templates_reload_and_shutdown()
  {
     let _guard = daemon_test_guard();
-    let data_dir = unique_test_dir("cli-dev-stack-acceptance");
+    let data_dir = unique_short_test_dir("cli-dev-stack-acceptance");
     let project_pipelines_package_dir = std::env::current_dir()
         .expect("current dir")
         .join("examples/project-pipelines");
@@ -5294,7 +6121,7 @@ fn cli_dev_stack_acceptance_smoke_exercises_first_party_plugins_project_pipeline
 #[test]
 fn cli_dogfood_launcher_reruns_against_existing_explicit_data_dir() {
     let _guard = daemon_test_guard();
-    let data_dir = unique_test_dir("cli-dogfood-rerun");
+    let data_dir = unique_short_test_dir("cli-dogfood-rerun");
     let web_package_dir = unique_test_dir("cli-dogfood-rerun-botster-web-package");
     write_botster_web_package(&web_package_dir);
 
@@ -5925,6 +6752,28 @@ fn cli_sessions_spawn_and_list_route_through_client_api() {
         String::from_utf8_lossy(&detach.stderr)
     );
 
+    let mut attach_child = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("sessions")
+        .arg("attach")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("dogfood-session")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn botster-hub sessions attach");
+    let mut attach_stdout = BufReader::new(
+        attach_child
+            .stdout
+            .take()
+            .expect("attach child stdout is piped"),
+    );
+    let mut stdout = String::new();
+    attach_stdout
+        .read_line(&mut stdout)
+        .expect("read initial attach output");
+    assert!(stdout.contains("dogfood-ok"));
+
     let send = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
         .arg("sessions")
         .arg("send-input")
@@ -5941,21 +6790,20 @@ fn cli_sessions_spawn_and_list_route_through_client_api() {
         String::from_utf8_lossy(&send.stderr)
     );
 
-    let attach = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
-        .arg("sessions")
-        .arg("attach")
-        .arg("--data-dir")
-        .arg(&data_dir)
-        .arg("dogfood-session")
-        .output()
-        .expect("run botster-hub sessions attach");
-    assert!(
-        attach.status.success(),
-        "attach failed: {}",
-        String::from_utf8_lossy(&attach.stderr)
-    );
-    let stdout = String::from_utf8(attach.stdout).expect("attach stdout is utf8");
+    let attach_status = attach_child.wait().expect("wait for attach child");
+    attach_stdout
+        .read_to_string(&mut stdout)
+        .expect("read remaining attach output");
+    let mut stderr = String::new();
+    attach_child
+        .stderr
+        .take()
+        .expect("attach child stderr is piped")
+        .read_to_string(&mut stderr)
+        .expect("read attach stderr");
+    assert!(attach_status.success(), "attach failed: {}", stderr);
     assert!(stdout.contains("dogfood-ok"));
+    assert!(stdout.contains("dogfood:from-cli"));
 
     shutdown_cli_daemon(&data_dir, child);
 }
@@ -6111,7 +6959,7 @@ fn cli_daemon_restart_recovers_worker_backed_session_through_transport() {
         &config,
         botster_hub::DaemonRequest::Spawn {
             session_id: session_id.to_string(),
-            command: "printf 'restart-ready\\n'; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done".to_string(),
+            command: "printf 'restart-ready\\n'; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; if [ \"$line\" = after-restart ]; then exit 0; fi; done".to_string(),
         },
     )
     .expect("spawn restart recovery session through daemon transport");
@@ -6188,6 +7036,7 @@ fn cli_daemon_restart_recovers_worker_backed_session_through_transport() {
     )
     .expect("send input after daemon restart");
     assert_eq!(send.kind, botster_hub::DaemonResponseKind::Events);
+
     let attached_output = attach_handle
         .join()
         .expect("stream attach thread should complete");
@@ -6195,18 +7044,6 @@ fn cli_daemon_restart_recovers_worker_backed_session_through_transport() {
     assert!(
         attached_output.contains("echo:after-restart"),
         "stream attach should observe post-restart echo, got {attached_output:?}"
-    );
-
-    let shutdown_session = botster_hub::daemon_transport_request(
-        &config,
-        botster_hub::DaemonRequest::ShutdownSession {
-            session_id: session_id.to_string(),
-        },
-    )
-    .expect("shutdown recovered session through daemon transport");
-    assert_eq!(
-        shutdown_session.kind,
-        botster_hub::DaemonResponseKind::Events
     );
     shutdown_cli_daemon(&data_dir, restarted_child);
 }
@@ -6427,7 +7264,7 @@ fn local_webrtc_chunks_oversized_encrypted_daemon_response() {
         .path
         .clone();
     let endpoint = botster_hub_client::DaemonEndpoint::new(socket_path);
-    let child = start_cli_daemon(&data_dir);
+    let child = LocalWebrtcDiagnosticDaemon::start(&data_dir);
     enable_supervised_package(&data_dir, &package_dir);
 
     let web_bridge_port = unused_loopback_port();
@@ -6709,16 +7546,17 @@ fn local_webrtc_chunks_oversized_encrypted_daemon_response() {
     assert!(!persisted_state.contains(&bootstrap.grant_id));
     assert!(!persisted_state.contains(&bootstrap.grant_secret));
     assert!(!persisted_state.contains("grant_secret"));
-
-    shutdown_cli_daemon(&data_dir, child);
+    child.shutdown();
 }
 
 #[test]
 fn botster_web_same_url_reload_issues_fresh_local_webrtc_bootstrap() {
     let _guard = daemon_test_guard();
+    let test_started = Instant::now();
     let data_dir = unique_short_test_dir("web-webrtc-reload");
     let package_dir = unique_test_dir("web-webrtc-reload-package");
     write_botster_web_package(&package_dir);
+    log_botster_web_phase(test_started, "fixture_built");
     let config = explicit_config(&data_dir);
     let socket_path = config
         .transports
@@ -6729,7 +7567,9 @@ fn botster_web_same_url_reload_issues_fresh_local_webrtc_bootstrap() {
         .clone();
     let endpoint = botster_hub_client::DaemonEndpoint::new(socket_path);
     let child = start_cli_daemon(&data_dir);
+    log_botster_web_phase(test_started, "daemon_started");
     enable_supervised_package(&data_dir, &package_dir);
+    log_botster_web_phase(test_started, "package_enabled");
 
     let web_bridge_port = unused_loopback_port();
     let start = botster_hub_client::request(
@@ -6737,10 +7577,16 @@ fn botster_web_same_url_reload_issues_fresh_local_webrtc_bootstrap() {
         botster_hub_client::DaemonRequest::StartPackageEntrypoint {
             package_name: "botster-web".to_string(),
             entrypoint_id: "web-client".to_string(),
-            environment_overrides: BTreeMap::from([(
-                "BOTSTER_WEB_DOGFOOD_BRIDGE_PORT".to_string(),
-                web_bridge_port.to_string(),
-            )]),
+            environment_overrides: BTreeMap::from([
+                (
+                    "BOTSTER_WEB_DOGFOOD_BRIDGE_PORT".to_string(),
+                    web_bridge_port.to_string(),
+                ),
+                (
+                    "BOTSTER_WEB_TEST_STARTUP_DELAY_MS".to_string(),
+                    BOTSTER_WEB_BRIDGE_STARTUP_DELAY_MS.to_string(),
+                ),
+            ]),
         },
     )
     .expect("start botster-web entrypoint");
@@ -6748,8 +7594,18 @@ fn botster_web_same_url_reload_issues_fresh_local_webrtc_bootstrap() {
         start.kind,
         botster_hub_client::DaemonResponseKind::LocalWebrtcBootstrap
     );
+    log_botster_web_phase(test_started, "entrypoint_start_returned");
     let bridge_url = format!("http://127.0.0.1:{web_bridge_port}");
-    wait_for_botster_web_health(&bridge_url);
+    let expected_local_url = format!("{bridge_url}/?dogfood=real-hub");
+    let apps =
+        wait_for_botster_web_readiness(&endpoint, &bridge_url, &expected_local_url, test_started);
+    assert_eq!(
+        app_row(&apps, "web-client")
+            .launch_target
+            .local_url
+            .as_deref(),
+        Some(expected_local_url.as_str())
+    );
 
     let wrong_origin = botster_hub_client::request(
         &endpoint,
@@ -9802,15 +10658,29 @@ fn package_entrypoint_supervision_reports_failed_command() {
         },
     )
     .expect("start failing supervised entrypoint");
-    thread::sleep(Duration::from_millis(100));
-    let status = botster_hub::daemon_transport_request(
-        &explicit_config(&data_dir),
-        botster_hub::DaemonRequest::PackageEntrypointStatus {
-            package_name: "dogfood.failed-command".to_string(),
-            entrypoint_id: "web".to_string(),
-        },
-    )
-    .expect("status failing supervised entrypoint");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        let status = botster_hub::daemon_transport_request(
+            &explicit_config(&data_dir),
+            botster_hub::DaemonRequest::PackageEntrypointStatus {
+                package_name: "dogfood.failed-command".to_string(),
+                entrypoint_id: "web".to_string(),
+            },
+        )
+        .expect("status failing supervised entrypoint");
+        if package_entrypoint(&status, "dogfood.failed-command")
+            .process
+            .state
+            != "running"
+        {
+            break status;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "failing supervised entrypoint did not reach a terminal state"
+        );
+        thread::sleep(Duration::from_millis(20));
+    };
     let entrypoint = package_entrypoint(&status, "dogfood.failed-command");
     assert_eq!(entrypoint.process.state, "failed");
     assert_eq!(entrypoint.process.exit_status.as_deref(), Some("exit:42"));
@@ -9870,6 +10740,19 @@ fn package_entrypoint_supervision_stops_and_restarts() {
         "stopped"
     );
     wait_for_process_exit(first_pid);
+    // The deterministic pending-reader regression guard lives in
+    // stop_preserves_pending_terminal_launch_result_state; this exercises the app projection.
+    let stopped_apps = botster_hub::daemon_transport_request(
+        &explicit_config(&data_dir),
+        botster_hub::DaemonRequest::ListApps,
+    )
+    .expect("list apps after stopping restart fixture");
+    let stopped_app = app_row(&stopped_apps, "web");
+    assert_ne!(stopped_app.lifecycle_state, "running");
+    assert_eq!(
+        package_action(&stopped_app.actions, "start_package_entrypoint").status,
+        botster_hub::DaemonPackageActionStatus::Available
+    );
 
     let restart = botster_hub::daemon_transport_request(
         &explicit_config(&data_dir),
