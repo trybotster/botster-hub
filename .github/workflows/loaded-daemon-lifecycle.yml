@@ -17,6 +17,7 @@ on:
           - focused-stalled-attach
           - focused-fast-exit-attach-diagnostic
           - focused-oversized-webrtc
+          - focused-cli-smoke
       repetitions:
         description: Number of repetitions (1-100)
         required: true

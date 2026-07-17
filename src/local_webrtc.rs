@@ -18,6 +18,7 @@ use botster_hub_client::{
     DaemonLocalWebrtcResponseChunk, DaemonRequest, DaemonResponse, LOCAL_WEBRTC_MAX_FRAME_BYTES,
     LOCAL_WEBRTC_MAX_RESPONSE_BYTES, LOCAL_WEBRTC_RESPONSE_CHUNK_VERSION,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use webrtc::data_channel::{DataChannel, DataChannelEvent};
 use webrtc::peer_connection::{
@@ -38,6 +39,10 @@ const LOCAL_WEBRTC_FLOW_CONTROL_DEADLINE: Duration = Duration::from_secs(5);
 const LOCAL_WEBRTC_EVENT_PROBE: Duration = Duration::ZERO;
 const LOCAL_WEBRTC_BUFFERED_AMOUNT_LOW: u32 = LOCAL_WEBRTC_MAX_FRAME_BYTES as u32;
 const LOCAL_WEBRTC_BUFFERED_AMOUNT_HIGH: u32 = (LOCAL_WEBRTC_MAX_FRAME_BYTES * 2) as u32;
+const TEST_CLOSE_LOCAL_WEBRTC_OPERATION_ENV: &str = "BOTSTER_HUB_TEST_CLOSE_LOCAL_WEBRTC_OPERATION";
+pub(crate) const LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_FILE: &str =
+    "local-webrtc-sender-terminal.json";
+pub(crate) const LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_MAX_BYTES: usize = 4096;
 
 #[async_trait]
 trait LocalWebrtcDataChannel: Send + Sync {
@@ -288,6 +293,7 @@ struct LocalWebrtcPeerState {
     grant_id: String,
     runtime_tx: Sender<ControlMessage>,
     attached_subscriptions: Mutex<Vec<LocalWebrtcAttachedSubscription>>,
+    terminal_state: Mutex<LocalWebrtcTerminalState>,
     cleanup_sent: AtomicBool,
 }
 
@@ -310,8 +316,9 @@ impl LocalWebrtcFlowControl {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LocalWebrtcSendFailureCause {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum LocalWebrtcTerminalCause {
     SendText,
     ChannelClosed,
     ChannelError,
@@ -319,9 +326,17 @@ enum LocalWebrtcSendFailureCause {
     PressureDeadline,
     InvalidRequest,
     RequestQueueOverflow,
+    InvalidEncryptedRequest,
+    RuntimeQueueClosed,
+    ResponseFraming,
+    LowWaterThresholdSetup,
+    HighWaterThresholdSetup,
+    PeerDisconnected,
+    PeerFailed,
+    PeerClosed,
 }
 
-impl fmt::Display for LocalWebrtcSendFailureCause {
+impl fmt::Display for LocalWebrtcTerminalCause {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let cause = match self {
             Self::SendText => "send_text",
@@ -331,6 +346,14 @@ impl fmt::Display for LocalWebrtcSendFailureCause {
             Self::PressureDeadline => "pressure_deadline",
             Self::InvalidRequest => "invalid_request",
             Self::RequestQueueOverflow => "request_queue_overflow",
+            Self::InvalidEncryptedRequest => "invalid_encrypted_request",
+            Self::RuntimeQueueClosed => "runtime_queue_closed",
+            Self::ResponseFraming => "response_framing",
+            Self::LowWaterThresholdSetup => "low_water_threshold_setup",
+            Self::HighWaterThresholdSetup => "high_water_threshold_setup",
+            Self::PeerDisconnected => "peer_disconnected",
+            Self::PeerFailed => "peer_failed",
+            Self::PeerClosed => "peer_closed",
         };
         formatter.write_str(cause)
     }
@@ -343,7 +366,7 @@ struct LocalWebrtcSendFailure {
     last_sent_chunk_index: Option<usize>,
     total_chunks: usize,
     pressured: bool,
-    cause: LocalWebrtcSendFailureCause,
+    cause: LocalWebrtcTerminalCause,
 }
 
 impl fmt::Display for LocalWebrtcSendFailure {
@@ -359,6 +382,64 @@ impl fmt::Display for LocalWebrtcSendFailure {
             self.pressured,
             self.cause,
         )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum LocalWebrtcChannelTerminalSignal {
+    None,
+    OnClose,
+    OnError,
+    PollEnded,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum LocalWebrtcCleanupDisposition {
+    NewlySent,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct LocalWebrtcSenderTerminalRecord {
+    pub schema_version: u32,
+    pub grant_id: String,
+    pub request_operation: String,
+    pub message_id: Option<String>,
+    pub next_chunk_index: usize,
+    pub last_sent_chunk_index: Option<usize>,
+    pub total_chunks: usize,
+    pub pressured: bool,
+    pub peer_connection_state: String,
+    pub channel_terminal_signal: LocalWebrtcChannelTerminalSignal,
+    pub cause: LocalWebrtcTerminalCause,
+    pub cleanup_disposition: LocalWebrtcCleanupDisposition,
+}
+
+#[derive(Debug)]
+struct LocalWebrtcTerminalState {
+    request_operation: String,
+    message_id: Option<String>,
+    next_chunk_index: usize,
+    last_sent_chunk_index: Option<usize>,
+    total_chunks: usize,
+    pressured: bool,
+    peer_connection_state: String,
+    channel_terminal_signal: LocalWebrtcChannelTerminalSignal,
+}
+
+impl Default for LocalWebrtcTerminalState {
+    fn default() -> Self {
+        Self {
+            request_operation: "none".to_string(),
+            message_id: None,
+            next_chunk_index: 0,
+            last_sent_chunk_index: None,
+            total_chunks: 0,
+            pressured: false,
+            peer_connection_state: "new".to_string(),
+            channel_terminal_signal: LocalWebrtcChannelTerminalSignal::None,
+        }
     }
 }
 
@@ -381,6 +462,7 @@ impl LocalWebrtcPeerState {
             grant_id,
             runtime_tx,
             attached_subscriptions: Mutex::new(Vec::new()),
+            terminal_state: Mutex::new(LocalWebrtcTerminalState::default()),
             cleanup_sent: AtomicBool::new(false),
         }
     }
@@ -405,10 +487,84 @@ impl LocalWebrtcPeerState {
         }
     }
 
-    fn cleanup_once(&self) {
+    fn begin_request(&self, request: &DaemonRequest) {
+        let mut terminal_state = self
+            .terminal_state
+            .lock()
+            .expect("local WebRTC terminal state mutex");
+        terminal_state.request_operation = local_webrtc_request_operation(request).to_string();
+        terminal_state.message_id = None;
+        terminal_state.next_chunk_index = 0;
+        terminal_state.last_sent_chunk_index = None;
+        terminal_state.total_chunks = 0;
+        terminal_state.pressured = false;
+    }
+
+    fn record_response_progress(
+        &self,
+        frames: &[String],
+        next_chunk_index: usize,
+        pressured: bool,
+    ) {
+        let mut terminal_state = self
+            .terminal_state
+            .lock()
+            .expect("local WebRTC terminal state mutex");
+        terminal_state.message_id = frames.first().and_then(|frame| {
+            serde_json::from_str::<DaemonLocalWebrtcResponseChunk>(frame)
+                .ok()
+                .map(|chunk| chunk.message_id)
+        });
+        terminal_state.next_chunk_index = next_chunk_index;
+        terminal_state.last_sent_chunk_index = next_chunk_index.checked_sub(1);
+        terminal_state.total_chunks = frames.len();
+        terminal_state.pressured = pressured;
+    }
+
+    fn set_peer_connection_state(&self, state: RTCPeerConnectionState) {
+        self.terminal_state
+            .lock()
+            .expect("local WebRTC terminal state mutex")
+            .peer_connection_state = local_webrtc_peer_connection_state(state).to_string();
+    }
+
+    fn cleanup_once(&self, cause: LocalWebrtcTerminalCause) {
+        {
+            let mut terminal_state = self
+                .terminal_state
+                .lock()
+                .expect("local WebRTC terminal state mutex");
+            terminal_state.channel_terminal_signal = match cause {
+                LocalWebrtcTerminalCause::ChannelClosed => {
+                    LocalWebrtcChannelTerminalSignal::OnClose
+                }
+                LocalWebrtcTerminalCause::ChannelError => LocalWebrtcChannelTerminalSignal::OnError,
+                LocalWebrtcTerminalCause::PollEnded => LocalWebrtcChannelTerminalSignal::PollEnded,
+                _ => terminal_state.channel_terminal_signal,
+            };
+        }
         if self.cleanup_sent.swap(true, Ordering::AcqRel) {
             return;
         }
+        let terminal_state = self
+            .terminal_state
+            .lock()
+            .expect("local WebRTC terminal state mutex");
+        let terminal_record = LocalWebrtcSenderTerminalRecord {
+            schema_version: 1,
+            grant_id: self.grant_id.clone(),
+            request_operation: terminal_state.request_operation.clone(),
+            message_id: terminal_state.message_id.clone(),
+            next_chunk_index: terminal_state.next_chunk_index,
+            last_sent_chunk_index: terminal_state.last_sent_chunk_index,
+            total_chunks: terminal_state.total_chunks,
+            pressured: terminal_state.pressured,
+            peer_connection_state: terminal_state.peer_connection_state.clone(),
+            channel_terminal_signal: terminal_state.channel_terminal_signal,
+            cause,
+            cleanup_disposition: LocalWebrtcCleanupDisposition::NewlySent,
+        };
+        drop(terminal_state);
         let attached_subscriptions = self
             .attached_subscriptions
             .lock()
@@ -417,7 +573,32 @@ impl LocalWebrtcPeerState {
         let _ = self.runtime_tx.send(ControlMessage::LocalWebrtcPeerClosed {
             grant_id: self.grant_id.clone(),
             attached_subscriptions,
+            terminal_record,
         });
+    }
+}
+
+fn local_webrtc_request_operation(request: &DaemonRequest) -> &'static str {
+    match request {
+        DaemonRequest::Status => "status",
+        DaemonRequest::Spawn { .. } => "spawn",
+        DaemonRequest::Attach { .. } => "attach",
+        DaemonRequest::SendInput { .. } => "send_input",
+        DaemonRequest::Drain { .. } => "drain",
+        DaemonRequest::ShutdownSession { .. } => "shutdown_session",
+        _ => "other",
+    }
+}
+
+fn local_webrtc_peer_connection_state(state: RTCPeerConnectionState) -> &'static str {
+    match state {
+        RTCPeerConnectionState::Unspecified => "unspecified",
+        RTCPeerConnectionState::New => "new",
+        RTCPeerConnectionState::Connecting => "connecting",
+        RTCPeerConnectionState::Connected => "connected",
+        RTCPeerConnectionState::Disconnected => "disconnected",
+        RTCPeerConnectionState::Failed => "failed",
+        RTCPeerConnectionState::Closed => "closed",
     }
 }
 
@@ -438,6 +619,7 @@ impl PeerConnectionEventHandler for LocalWebrtcHandler {
     }
 
     async fn on_connection_state_change(&self, state: RTCPeerConnectionState) {
+        self.peer_state.set_peer_connection_state(state);
         if matches!(
             state,
             RTCPeerConnectionState::Disconnected
@@ -445,7 +627,13 @@ impl PeerConnectionEventHandler for LocalWebrtcHandler {
                 | RTCPeerConnectionState::Closed
         ) {
             let _ = self.gather_complete_tx.try_send(());
-            self.peer_state.cleanup_once();
+            let cause = match state {
+                RTCPeerConnectionState::Disconnected => LocalWebrtcTerminalCause::PeerDisconnected,
+                RTCPeerConnectionState::Failed => LocalWebrtcTerminalCause::PeerFailed,
+                RTCPeerConnectionState::Closed => LocalWebrtcTerminalCause::PeerClosed,
+                _ => unreachable!("terminal peer state matched above"),
+            };
+            self.peer_state.cleanup_once(cause);
         }
     }
 
@@ -460,7 +648,7 @@ impl PeerConnectionEventHandler for LocalWebrtcHandler {
             {
                 eprintln!("local WebRTC low-water threshold setup failed: {error}");
                 let _ = data_channel.local_close().await;
-                peer_state.cleanup_once();
+                peer_state.cleanup_once(LocalWebrtcTerminalCause::LowWaterThresholdSetup);
                 return;
             }
             if let Err(error) = data_channel
@@ -469,7 +657,7 @@ impl PeerConnectionEventHandler for LocalWebrtcHandler {
             {
                 eprintln!("local WebRTC high-water threshold setup failed: {error}");
                 let _ = data_channel.local_close().await;
-                peer_state.cleanup_once();
+                peer_state.cleanup_once(LocalWebrtcTerminalCause::HighWaterThresholdSetup);
                 return;
             }
 
@@ -498,6 +686,7 @@ where
     let mut pending_requests = VecDeque::new();
     let mut flow_control = LocalWebrtcFlowControl::default();
     let mut send_failure = None;
+    let mut terminal_cause = LocalWebrtcTerminalCause::PollEnded;
     let mut open = true;
     while open {
         let pending = if let Some(request) = pop_pending_request(&mut pending_requests) {
@@ -507,11 +696,23 @@ where
                 Some(DataChannelEvent::OnMessage(message)) => {
                     let Some(request) = decrypt_daemon_request(stream_key, message.data.as_ref())
                     else {
+                        terminal_cause = LocalWebrtcTerminalCause::InvalidEncryptedRequest;
                         break;
                     };
                     PendingLocalWebrtcRequest::Request(Box::new(request))
                 }
-                Some(DataChannelEvent::OnClose | DataChannelEvent::OnError) | None => break,
+                Some(DataChannelEvent::OnClose) => {
+                    terminal_cause = LocalWebrtcTerminalCause::ChannelClosed;
+                    break;
+                }
+                Some(DataChannelEvent::OnError) => {
+                    terminal_cause = LocalWebrtcTerminalCause::ChannelError;
+                    break;
+                }
+                None => {
+                    terminal_cause = LocalWebrtcTerminalCause::PollEnded;
+                    break;
+                }
                 Some(
                     event @ (DataChannelEvent::OnBufferedAmountHigh
                     | DataChannelEvent::OnBufferedAmountLow),
@@ -531,23 +732,32 @@ where
         let request = match pending {
             PendingLocalWebrtcRequest::Request(request) => request,
             PendingLocalWebrtcRequest::QueueOverflow(_) => {
+                peer_state.begin_request(&DaemonRequest::Status);
+                peer_state
+                    .terminal_state
+                    .lock()
+                    .expect("local WebRTC terminal state mutex")
+                    .request_operation = "request_queue_overflow".to_string();
                 let response = queued_request_overflow_response();
                 let Ok(frames) = framed_daemon_response(stream_key, &response) else {
+                    terminal_cause = LocalWebrtcTerminalCause::ResponseFraming;
                     break;
                 };
-                match send_response_frames_with_deadline(
+                match send_response_frames_with_deadline_tracked(
                     data_channel,
                     stream_key,
                     &frames,
                     &mut pending_requests,
                     &mut flow_control,
                     flow_control_deadline,
+                    peer_state,
                 )
                 .await
                 {
                     Ok(()) => open = true,
                     Err(failure) => {
                         eprintln!("{failure}");
+                        terminal_cause = failure.cause;
                         send_failure = Some(failure);
                         open = false;
                     }
@@ -556,12 +766,21 @@ where
             }
         };
 
+        peer_state.begin_request(&request);
+        if std::env::var(TEST_CLOSE_LOCAL_WEBRTC_OPERATION_ENV).as_deref()
+            == Ok(local_webrtc_request_operation(&request))
+        {
+            let _ = data_channel.local_close().await;
+            terminal_cause = LocalWebrtcTerminalCause::ChannelClosed;
+            break;
+        }
         let subscription_change = LocalWebrtcAttachedSubscriptionChange::from_request(&request);
         let (reply_tx, reply_rx) = mpsc::channel();
         if runtime_tx
             .send(ControlMessage::Request { request, reply_tx })
             .is_err()
         {
+            terminal_cause = LocalWebrtcTerminalCause::RuntimeQueueClosed;
             break;
         }
         let response = reply_rx
@@ -580,27 +799,36 @@ where
             });
         peer_state.apply_subscription_change(subscription_change);
         let Ok(frames) = framed_daemon_response(stream_key, &response) else {
+            terminal_cause = LocalWebrtcTerminalCause::ResponseFraming;
             break;
         };
-        match send_response_frames_with_deadline(
+        match send_response_frames_with_deadline_tracked(
             data_channel,
             stream_key,
             &frames,
             &mut pending_requests,
             &mut flow_control,
             flow_control_deadline,
+            peer_state,
         )
         .await
         {
             Ok(()) => open = true,
             Err(failure) => {
                 eprintln!("{failure}");
+                terminal_cause = failure.cause;
                 send_failure = Some(failure);
                 open = false;
             }
         }
     }
-    close_data_channel(data_channel, &mut pending_requests, peer_state).await;
+    close_data_channel(
+        data_channel,
+        &mut pending_requests,
+        peer_state,
+        terminal_cause,
+    )
+    .await;
     send_failure
 }
 
@@ -608,6 +836,7 @@ async fn close_data_channel<D>(
     data_channel: &D,
     pending_requests: &mut VecDeque<PendingLocalWebrtcRequest>,
     peer_state: &LocalWebrtcPeerState,
+    cause: LocalWebrtcTerminalCause,
 ) where
     D: LocalWebrtcDataChannel + ?Sized,
 {
@@ -615,9 +844,10 @@ async fn close_data_channel<D>(
     if let Err(error) = data_channel.local_close().await {
         eprintln!("local WebRTC data channel close failed: {error}");
     }
-    peer_state.cleanup_once();
+    peer_state.cleanup_once(cause);
 }
 
+#[cfg(test)]
 async fn send_response_frames_with_deadline<D>(
     data_channel: &D,
     stream_key: &AesGcmKey,
@@ -625,6 +855,54 @@ async fn send_response_frames_with_deadline<D>(
     pending_requests: &mut VecDeque<PendingLocalWebrtcRequest>,
     flow_control: &mut LocalWebrtcFlowControl,
     flow_control_deadline: Duration,
+) -> Result<(), LocalWebrtcSendFailure>
+where
+    D: LocalWebrtcDataChannel + ?Sized,
+{
+    send_response_frames_with_deadline_inner(
+        data_channel,
+        stream_key,
+        frames,
+        pending_requests,
+        flow_control,
+        flow_control_deadline,
+        None,
+    )
+    .await
+}
+
+async fn send_response_frames_with_deadline_tracked<D>(
+    data_channel: &D,
+    stream_key: &AesGcmKey,
+    frames: &[String],
+    pending_requests: &mut VecDeque<PendingLocalWebrtcRequest>,
+    flow_control: &mut LocalWebrtcFlowControl,
+    flow_control_deadline: Duration,
+    peer_state: &LocalWebrtcPeerState,
+) -> Result<(), LocalWebrtcSendFailure>
+where
+    D: LocalWebrtcDataChannel + ?Sized,
+{
+    send_response_frames_with_deadline_inner(
+        data_channel,
+        stream_key,
+        frames,
+        pending_requests,
+        flow_control,
+        flow_control_deadline,
+        Some(peer_state),
+    )
+    .await
+}
+
+async fn send_response_frames_with_deadline_inner<D>(
+    data_channel: &D,
+    stream_key: &AesGcmKey,
+    frames: &[String],
+    pending_requests: &mut VecDeque<PendingLocalWebrtcRequest>,
+    flow_control: &mut LocalWebrtcFlowControl,
+    flow_control_deadline: Duration,
+    peer_state: Option<&LocalWebrtcPeerState>,
 ) -> Result<(), LocalWebrtcSendFailure>
 where
     D: LocalWebrtcDataChannel + ?Sized,
@@ -647,12 +925,15 @@ where
         };
 
     for (chunk_index, frame) in frames.iter().enumerate() {
+        if let Some(peer_state) = peer_state {
+            peer_state.record_response_progress(frames, chunk_index, flow_control.pressured);
+        }
         while flow_control.pressured {
             let deadline = flow_control.pending_delivery_deadline(flow_control_deadline);
             let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
                 return Err(failure(
                     chunk_index,
-                    LocalWebrtcSendFailureCause::PressureDeadline,
+                    LocalWebrtcTerminalCause::PressureDeadline,
                     flow_control,
                 ));
             };
@@ -664,14 +945,14 @@ where
                 Ok(None) => {
                     return Err(failure(
                         chunk_index,
-                        LocalWebrtcSendFailureCause::PollEnded,
+                        LocalWebrtcTerminalCause::PollEnded,
                         flow_control,
                     ));
                 }
                 Err(_) => {
                     return Err(failure(
                         chunk_index,
-                        LocalWebrtcSendFailureCause::PressureDeadline,
+                        LocalWebrtcTerminalCause::PressureDeadline,
                         flow_control,
                     ));
                 }
@@ -681,9 +962,12 @@ where
         if data_channel.local_send_text(frame).await.is_err() {
             return Err(failure(
                 chunk_index,
-                LocalWebrtcSendFailureCause::SendText,
+                LocalWebrtcTerminalCause::SendText,
                 flow_control,
             ));
+        }
+        if let Some(peer_state) = peer_state {
+            peer_state.record_response_progress(frames, chunk_index + 1, flow_control.pressured);
         }
 
         match timeout(LOCAL_WEBRTC_EVENT_PROBE, data_channel.local_poll()).await {
@@ -694,7 +978,7 @@ where
             Ok(None) => {
                 return Err(failure(
                     chunk_index + 1,
-                    LocalWebrtcSendFailureCause::PollEnded,
+                    LocalWebrtcTerminalCause::PollEnded,
                     flow_control,
                 ));
             }
@@ -710,7 +994,7 @@ fn apply_data_channel_event(
     stream_key: &AesGcmKey,
     pending_requests: &mut VecDeque<PendingLocalWebrtcRequest>,
     flow_control: &mut LocalWebrtcFlowControl,
-) -> Result<(), LocalWebrtcSendFailureCause> {
+) -> Result<(), LocalWebrtcTerminalCause> {
     match event {
         DataChannelEvent::OnBufferedAmountHigh => {
             flow_control.pressured = true;
@@ -723,7 +1007,7 @@ fn apply_data_channel_event(
         }
         DataChannelEvent::OnMessage(message) => {
             let Some(request) = decrypt_daemon_request(stream_key, message.data.as_ref()) else {
-                return Err(LocalWebrtcSendFailureCause::InvalidRequest);
+                return Err(LocalWebrtcTerminalCause::InvalidRequest);
             };
             let request_count = pending_requests
                 .iter()
@@ -734,7 +1018,7 @@ fn apply_data_channel_event(
                     pending_requests.back_mut()
                 {
                     let Some(next_count) = count.checked_add(1) else {
-                        return Err(LocalWebrtcSendFailureCause::RequestQueueOverflow);
+                        return Err(LocalWebrtcTerminalCause::RequestQueueOverflow);
                     };
                     *count = next_count;
                 } else {
@@ -745,8 +1029,8 @@ fn apply_data_channel_event(
             pending_requests.push_back(PendingLocalWebrtcRequest::Request(Box::new(request)));
             Ok(())
         }
-        DataChannelEvent::OnClose => Err(LocalWebrtcSendFailureCause::ChannelClosed),
-        DataChannelEvent::OnError => Err(LocalWebrtcSendFailureCause::ChannelError),
+        DataChannelEvent::OnClose => Err(LocalWebrtcTerminalCause::ChannelClosed),
+        DataChannelEvent::OnError => Err(LocalWebrtcTerminalCause::ChannelError),
         _ => Ok(()),
     }
 }
@@ -1196,7 +1480,7 @@ mod tests {
         let (timed_out_channel, failure) = run_idle_pressure_case(false);
         assert_eq!(
             failure.unwrap().cause,
-            LocalWebrtcSendFailureCause::PressureDeadline
+            LocalWebrtcTerminalCause::PressureDeadline
         );
         assert!(timed_out_channel.sent.lock().unwrap().is_empty());
         assert!(timed_out_channel.closed.load(Ordering::Acquire));
@@ -1350,14 +1634,19 @@ mod tests {
                 Duration::ZERO,
             ))
             .expect_err("missing low water must terminate pending delivery");
-        assert_eq!(failure.cause, LocalWebrtcSendFailureCause::PressureDeadline);
+        assert_eq!(failure.cause, LocalWebrtcTerminalCause::PressureDeadline);
         assert_eq!(failure.next_chunk_index, 1);
         assert_eq!(failure.last_sent_chunk_index, Some(0));
         assert_eq!(failure.total_chunks, 2);
         assert!(failure.pressured);
         assert_eq!(data_channel.sent.lock().unwrap().as_slice(), &["partial"]);
 
-        runtime.block_on(close_data_channel(&data_channel, &mut pending, &peer_state));
+        runtime.block_on(close_data_channel(
+            &data_channel,
+            &mut pending,
+            &peer_state,
+            LocalWebrtcTerminalCause::PressureDeadline,
+        ));
         assert!(pending.is_empty());
         assert!(data_channel.closed.load(Ordering::Acquire));
         assert!(matches!(
@@ -1494,7 +1783,7 @@ mod tests {
             ))
             .expect_err("pressured next response must retain the pending-delivery bound");
 
-        assert_eq!(failure.cause, LocalWebrtcSendFailureCause::PressureDeadline);
+        assert_eq!(failure.cause, LocalWebrtcTerminalCause::PressureDeadline);
         assert_eq!(failure.next_chunk_index, 0);
         assert_eq!(failure.last_sent_chunk_index, None);
         assert!(flow_control.pending_delivery_deadline.is_some());
@@ -1515,11 +1804,11 @@ mod tests {
         for (event, expected_cause) in [
             (
                 DataChannelEvent::OnClose,
-                LocalWebrtcSendFailureCause::ChannelClosed,
+                LocalWebrtcTerminalCause::ChannelClosed,
             ),
             (
                 DataChannelEvent::OnError,
-                LocalWebrtcSendFailureCause::ChannelError,
+                LocalWebrtcTerminalCause::ChannelError,
             ),
         ] {
             let data_channel = FakeDataChannel::default();
@@ -1555,7 +1844,7 @@ mod tests {
                 Duration::ZERO,
             ))
             .expect_err("ended polling must fail response delivery");
-        assert_eq!(ended.cause, LocalWebrtcSendFailureCause::PollEnded);
+        assert_eq!(ended.cause, LocalWebrtcTerminalCause::PollEnded);
 
         let failed_channel = FakeDataChannel::default();
         failed_channel.send_fails.store(true, Ordering::Release);
@@ -1571,7 +1860,7 @@ mod tests {
                 Duration::ZERO,
             ))
             .expect_err("send_text failure must fail response delivery");
-        assert_eq!(send.cause, LocalWebrtcSendFailureCause::SendText);
+        assert_eq!(send.cause, LocalWebrtcTerminalCause::SendText);
         assert_eq!(send.next_chunk_index, 0);
         assert_eq!(send.last_sent_chunk_index, None);
     }
