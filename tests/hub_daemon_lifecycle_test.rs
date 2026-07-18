@@ -2610,13 +2610,12 @@ fn local_webrtc_sender_failure(stderr: &[u8]) -> Option<&str> {
         .find(|line| line.starts_with("local WebRTC response delivery failed:"))
 }
 
-fn local_webrtc_grant_id(output: &Output) -> String {
+fn local_webrtc_grant_id(output: &Output) -> Option<String> {
     command_output_text(output)
         .lines()
         .find_map(|line| line.strip_prefix("local_webrtc_grant_id="))
         .filter(|grant_id| !grant_id.is_empty() && grant_id.len() <= 128)
-        .expect("smoke output includes bounded local WebRTC grant id")
-        .to_string()
+        .map(str::to_string)
 }
 
 fn local_webrtc_sender_terminal_record(
@@ -2744,6 +2743,21 @@ fn local_webrtc_sender_terminal_record(
         "sender terminal record contains its data-directory path"
     );
     record
+}
+
+fn local_webrtc_smoke_failure_evidence(output: &Output, data_dir: &Path) -> String {
+    let text = command_output_text(output);
+    let Some(grant_id) = local_webrtc_grant_id(output) else {
+        return format!("smoke failed before local WebRTC bootstrap: {text}");
+    };
+    let record_path = data_dir.join(LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_FILE);
+    if !record_path.is_file() {
+        return format!(
+            "smoke failed: {text}; sender_record=missing file={LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_FILE}"
+        );
+    }
+    let terminal_record = local_webrtc_sender_terminal_record(data_dir, &grant_id);
+    format!("smoke failed: {text}; sender_record={terminal_record}")
 }
 
 #[test]
@@ -5407,9 +5421,10 @@ fn cli_smoke_proves_local_runtime_daemon_package_app_session_and_webrtc() {
     let text = command_output_text(&output);
     assert_smoke_owned_daemon_gone(&data_dir);
     if !output.status.success() {
-        let grant_id = local_webrtc_grant_id(&output);
-        let terminal_record = local_webrtc_sender_terminal_record(&data_dir, &grant_id);
-        panic!("smoke failed: {text}; sender_record={terminal_record}");
+        panic!(
+            "{}",
+            local_webrtc_smoke_failure_evidence(&output, &data_dir)
+        );
     }
     assert!(text.contains("smoke=local_runtime"));
     assert!(text.contains("check name=daemon status=pass"));
@@ -5451,7 +5466,8 @@ fn cli_smoke_persists_matching_sender_record_when_webrtc_response_closes() {
     assert!(text.contains(
         "local_webrtc=local WebRTC response incomplete: operation=status cause=channel_closed message_id=pending next_chunk=0 expected_chunks=pending"
     ));
-    let grant_id = local_webrtc_grant_id(&output);
+    let grant_id =
+        local_webrtc_grant_id(&output).expect("faulted smoke reached local WebRTC bootstrap");
     let terminal_record = local_webrtc_sender_terminal_record(&data_dir, &grant_id);
     assert_eq!(terminal_record["request_operation"], "status");
     assert_eq!(terminal_record["next_chunk_index"], 0);
@@ -5863,6 +5879,9 @@ fn cli_smoke_reports_missing_first_party_prerequisites() {
     let text = command_output_text(&output);
     assert!(text.contains("smoke=local_runtime"));
     assert!(text.contains("missing_prerequisite=project-pipelines"));
+    let failure = local_webrtc_smoke_failure_evidence(&output, &data_dir);
+    assert!(failure.contains("smoke failed before local WebRTC bootstrap"));
+    assert!(failure.contains("missing_prerequisite=project-pipelines"));
 }
 
 #[test]

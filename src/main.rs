@@ -44,6 +44,8 @@ const SMOKE_MARKER: &str = "botster-hub-smoke-ok";
 const SMOKE_TIMEOUT: Duration = Duration::from_secs(5);
 const DEV_STACK_DAEMON_METADATA_FILE: &str = ".botster-hub-dev-stack-daemon.json";
 const DEV_STACK_DAEMON_READINESS_BUDGET: Duration = Duration::from_secs(30);
+const LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_FILE: &str = "local-webrtc-sender-terminal.json";
+const LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_WAIT: Duration = Duration::from_secs(2);
 const TEST_INCOMPATIBLE_DAEMON_ENV: &str = "BOTSTER_HUB_TEST_INCOMPATIBLE_DAEMON";
 const TEST_DEV_STACK_READINESS_BUDGET_MS_ENV: &str =
     "BOTSTER_HUB_TEST_DEV_STACK_READINESS_BUDGET_MS";
@@ -834,8 +836,40 @@ fn smoke_local_webrtc_round_trip(
             )))
         }
     });
-    let _ = daemon_transport_request(config, DaemonRequest::Status);
+    if result.is_err() {
+        wait_for_local_webrtc_sender_terminal_record(config, &bootstrap.grant_id);
+    }
     result
+}
+
+fn wait_for_local_webrtc_sender_terminal_record(
+    config: &botster_hub::HubConfig,
+    expected_grant_id: &str,
+) {
+    let path = config
+        .data_directory
+        .join(LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_FILE);
+    let deadline = Instant::now() + LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_WAIT;
+    loop {
+        if std::fs::read(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .and_then(|record| {
+                record
+                    .get("grant_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            })
+            .as_deref()
+            == Some(expected_grant_id)
+        {
+            return;
+        }
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return;
+        };
+        thread::sleep(remaining.min(Duration::from_millis(10)));
+    }
 }
 
 struct LocalWebrtcOffererHandler {

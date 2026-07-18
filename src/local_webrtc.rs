@@ -488,11 +488,19 @@ impl LocalWebrtcPeerState {
     }
 
     fn begin_request(&self, request: &DaemonRequest) {
+        self.begin_operation(local_webrtc_request_operation(request));
+    }
+
+    fn begin_overflow_response(&self) {
+        self.begin_operation("request_queue_overflow");
+    }
+
+    fn begin_operation(&self, operation: &str) {
         let mut terminal_state = self
             .terminal_state
             .lock()
             .expect("local WebRTC terminal state mutex");
-        terminal_state.request_operation = local_webrtc_request_operation(request).to_string();
+        terminal_state.request_operation = operation.to_string();
         terminal_state.message_id = None;
         terminal_state.next_chunk_index = 0;
         terminal_state.last_sent_chunk_index = None;
@@ -500,24 +508,25 @@ impl LocalWebrtcPeerState {
         terminal_state.pressured = false;
     }
 
-    fn record_response_progress(
-        &self,
-        frames: &[String],
-        next_chunk_index: usize,
-        pressured: bool,
-    ) {
+    fn begin_response(&self, message_id: Option<String>, total_chunks: usize, pressured: bool) {
         let mut terminal_state = self
             .terminal_state
             .lock()
             .expect("local WebRTC terminal state mutex");
-        terminal_state.message_id = frames.first().and_then(|frame| {
-            serde_json::from_str::<DaemonLocalWebrtcResponseChunk>(frame)
-                .ok()
-                .map(|chunk| chunk.message_id)
-        });
+        terminal_state.message_id = message_id;
+        terminal_state.next_chunk_index = 0;
+        terminal_state.last_sent_chunk_index = None;
+        terminal_state.total_chunks = total_chunks;
+        terminal_state.pressured = pressured;
+    }
+
+    fn record_response_progress(&self, next_chunk_index: usize, pressured: bool) {
+        let mut terminal_state = self
+            .terminal_state
+            .lock()
+            .expect("local WebRTC terminal state mutex");
         terminal_state.next_chunk_index = next_chunk_index;
         terminal_state.last_sent_chunk_index = next_chunk_index.checked_sub(1);
-        terminal_state.total_chunks = frames.len();
         terminal_state.pressured = pressured;
     }
 
@@ -732,18 +741,13 @@ where
         let request = match pending {
             PendingLocalWebrtcRequest::Request(request) => request,
             PendingLocalWebrtcRequest::QueueOverflow(_) => {
-                peer_state.begin_request(&DaemonRequest::Status);
-                peer_state
-                    .terminal_state
-                    .lock()
-                    .expect("local WebRTC terminal state mutex")
-                    .request_operation = "request_queue_overflow".to_string();
+                peer_state.begin_overflow_response();
                 let response = queued_request_overflow_response();
                 let Ok(frames) = framed_daemon_response(stream_key, &response) else {
                     terminal_cause = LocalWebrtcTerminalCause::ResponseFraming;
                     break;
                 };
-                match send_response_frames_with_deadline_tracked(
+                match send_response_frames_with_deadline(
                     data_channel,
                     stream_key,
                     &frames,
@@ -802,7 +806,7 @@ where
             terminal_cause = LocalWebrtcTerminalCause::ResponseFraming;
             break;
         };
-        match send_response_frames_with_deadline_tracked(
+        match send_response_frames_with_deadline(
             data_channel,
             stream_key,
             &frames,
@@ -847,31 +851,7 @@ async fn close_data_channel<D>(
     peer_state.cleanup_once(cause);
 }
 
-#[cfg(test)]
 async fn send_response_frames_with_deadline<D>(
-    data_channel: &D,
-    stream_key: &AesGcmKey,
-    frames: &[String],
-    pending_requests: &mut VecDeque<PendingLocalWebrtcRequest>,
-    flow_control: &mut LocalWebrtcFlowControl,
-    flow_control_deadline: Duration,
-) -> Result<(), LocalWebrtcSendFailure>
-where
-    D: LocalWebrtcDataChannel + ?Sized,
-{
-    send_response_frames_with_deadline_inner(
-        data_channel,
-        stream_key,
-        frames,
-        pending_requests,
-        flow_control,
-        flow_control_deadline,
-        None,
-    )
-    .await
-}
-
-async fn send_response_frames_with_deadline_tracked<D>(
     data_channel: &D,
     stream_key: &AesGcmKey,
     frames: &[String],
@@ -883,40 +863,19 @@ async fn send_response_frames_with_deadline_tracked<D>(
 where
     D: LocalWebrtcDataChannel + ?Sized,
 {
-    send_response_frames_with_deadline_inner(
-        data_channel,
-        stream_key,
-        frames,
-        pending_requests,
-        flow_control,
-        flow_control_deadline,
-        Some(peer_state),
-    )
-    .await
-}
-
-async fn send_response_frames_with_deadline_inner<D>(
-    data_channel: &D,
-    stream_key: &AesGcmKey,
-    frames: &[String],
-    pending_requests: &mut VecDeque<PendingLocalWebrtcRequest>,
-    flow_control: &mut LocalWebrtcFlowControl,
-    flow_control_deadline: Duration,
-    peer_state: Option<&LocalWebrtcPeerState>,
-) -> Result<(), LocalWebrtcSendFailure>
-where
-    D: LocalWebrtcDataChannel + ?Sized,
-{
     let total_chunks = frames.len();
+    let message_id = frames.first().and_then(|frame| {
+        serde_json::from_str::<DaemonLocalWebrtcResponseChunk>(frame)
+            .ok()
+            .map(|chunk| chunk.message_id)
+    });
+    peer_state.begin_response(message_id.clone(), total_chunks, flow_control.pressured);
 
     let failure =
         |next_chunk_index, cause, flow_control: &LocalWebrtcFlowControl| LocalWebrtcSendFailure {
-            message_id: frames
-                .first()
-                .and_then(|frame| {
-                    serde_json::from_str::<DaemonLocalWebrtcResponseChunk>(frame).ok()
-                })
-                .map_or_else(|| "unavailable".to_string(), |chunk| chunk.message_id),
+            message_id: message_id
+                .clone()
+                .unwrap_or_else(|| "unavailable".to_string()),
             next_chunk_index,
             last_sent_chunk_index: next_chunk_index.checked_sub(1),
             total_chunks,
@@ -925,9 +884,7 @@ where
         };
 
     for (chunk_index, frame) in frames.iter().enumerate() {
-        if let Some(peer_state) = peer_state {
-            peer_state.record_response_progress(frames, chunk_index, flow_control.pressured);
-        }
+        peer_state.record_response_progress(chunk_index, flow_control.pressured);
         while flow_control.pressured {
             let deadline = flow_control.pending_delivery_deadline(flow_control_deadline);
             let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
@@ -966,9 +923,7 @@ where
                 flow_control,
             ));
         }
-        if let Some(peer_state) = peer_state {
-            peer_state.record_response_progress(frames, chunk_index + 1, flow_control.pressured);
-        }
+        peer_state.record_response_progress(chunk_index + 1, flow_control.pressured);
 
         match timeout(LOCAL_WEBRTC_EVENT_PROBE, data_channel.local_poll()).await {
             Ok(Some(event)) => {
@@ -1408,6 +1363,11 @@ mod tests {
         })
     }
 
+    fn test_peer_state(grant_id: &str) -> LocalWebrtcPeerState {
+        let (runtime_tx, _runtime_rx) = mpsc::channel();
+        LocalWebrtcPeerState::new(grant_id.to_string(), runtime_tx)
+    }
+
     fn run_idle_pressure_case(
         low_water_arrives: bool,
     ) -> (FakeDataChannel, Option<LocalWebrtcSendFailure>) {
@@ -1632,6 +1592,7 @@ mod tests {
                 &mut pending,
                 &mut flow_control,
                 Duration::ZERO,
+                &peer_state,
             ))
             .expect_err("missing low water must terminate pending delivery");
         assert_eq!(failure.cause, LocalWebrtcTerminalCause::PressureDeadline);
@@ -1657,6 +1618,66 @@ mod tests {
     }
 
     #[test]
+    fn partial_chunked_response_records_message_and_nonzero_progress() {
+        let data_channel = FakeDataChannel::default();
+        data_channel
+            .events
+            .lock()
+            .unwrap()
+            .push_back(DataChannelEvent::OnBufferedAmountHigh);
+        let key = AesGcmKey::from_slice(&[16; 32]).unwrap();
+        let frames =
+            frame_encrypted_daemon_response("response-progress", &"a".repeat(256 * 1024)).unwrap();
+        assert!(frames.len() > 1);
+        let mut pending = VecDeque::new();
+        let (runtime_tx, runtime_rx) = mpsc::channel();
+        let peer_state = LocalWebrtcPeerState::new("grant-progress".to_string(), runtime_tx);
+        peer_state.begin_request(&DaemonRequest::Status);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut flow_control = LocalWebrtcFlowControl::default();
+
+        let failure = runtime
+            .block_on(send_response_frames_with_deadline(
+                &data_channel,
+                &key,
+                &frames,
+                &mut pending,
+                &mut flow_control,
+                Duration::ZERO,
+                &peer_state,
+            ))
+            .expect_err("high water after the first chunk must retain partial progress");
+        assert_eq!(failure.cause, LocalWebrtcTerminalCause::PressureDeadline);
+        assert_eq!(failure.message_id, "response-progress");
+        assert_eq!(failure.next_chunk_index, 1);
+        assert_eq!(failure.total_chunks, frames.len());
+
+        runtime.block_on(close_data_channel(
+            &data_channel,
+            &mut pending,
+            &peer_state,
+            failure.cause,
+        ));
+        let ControlMessage::LocalWebrtcPeerClosed {
+            terminal_record, ..
+        } = runtime_rx.recv().unwrap()
+        else {
+            panic!("expected terminal record after partial response");
+        };
+        assert_eq!(
+            terminal_record.message_id.as_deref(),
+            Some("response-progress")
+        );
+        assert_eq!(terminal_record.next_chunk_index, 1);
+        assert_eq!(terminal_record.last_sent_chunk_index, Some(0));
+        assert_eq!(terminal_record.total_chunks, frames.len());
+        assert!(terminal_record.pressured);
+    }
+
+    #[test]
     fn high_then_low_water_resumes_and_completes_response_in_order() {
         let data_channel = FakeDataChannel::default();
         data_channel.events.lock().unwrap().extend([
@@ -1670,6 +1691,7 @@ mod tests {
             .build()
             .unwrap();
         let mut flow_control = LocalWebrtcFlowControl::default();
+        let peer_state = test_peer_state("grant-high-low");
 
         let completed = runtime.block_on(send_response_frames_with_deadline(
             &data_channel,
@@ -1678,6 +1700,7 @@ mod tests {
             &mut pending,
             &mut flow_control,
             Duration::from_secs(1),
+            &peer_state,
         ));
 
         assert!(completed.is_ok());
@@ -1703,6 +1726,7 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
+        let peer_state = test_peer_state("grant-response-boundary");
 
         let first = runtime.block_on(send_response_frames_with_deadline(
             &data_channel,
@@ -1711,6 +1735,7 @@ mod tests {
             &mut pending,
             &mut flow_control,
             Duration::ZERO,
+            &peer_state,
         ));
         assert!(first.is_ok());
         assert!(flow_control.pressured);
@@ -1732,6 +1757,7 @@ mod tests {
             &mut pending,
             &mut flow_control,
             Duration::ZERO,
+            &peer_state,
         ));
 
         assert!(second.is_ok());
@@ -1757,6 +1783,7 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
+        let peer_state = test_peer_state("grant-next-response");
 
         assert!(
             runtime
@@ -1767,6 +1794,7 @@ mod tests {
                     &mut pending,
                     &mut flow_control,
                     Duration::ZERO,
+                    &peer_state,
                 ))
                 .is_ok()
         );
@@ -1780,6 +1808,7 @@ mod tests {
                 &mut pending,
                 &mut flow_control,
                 Duration::ZERO,
+                &peer_state,
             ))
             .expect_err("pressured next response must retain the pending-delivery bound");
 
@@ -1800,6 +1829,7 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
+        let peer_state = test_peer_state("grant-send-failures");
 
         for (event, expected_cause) in [
             (
@@ -1823,6 +1853,7 @@ mod tests {
                     &mut pending,
                     &mut flow_control,
                     Duration::ZERO,
+                    &peer_state,
                 ))
                 .expect_err("terminal channel event must fail response delivery");
             assert_eq!(failure.cause, expected_cause);
@@ -1842,6 +1873,7 @@ mod tests {
                 &mut pending,
                 &mut flow_control,
                 Duration::ZERO,
+                &peer_state,
             ))
             .expect_err("ended polling must fail response delivery");
         assert_eq!(ended.cause, LocalWebrtcTerminalCause::PollEnded);
@@ -1858,6 +1890,7 @@ mod tests {
                 &mut pending,
                 &mut flow_control,
                 Duration::ZERO,
+                &peer_state,
             ))
             .expect_err("send_text failure must fail response delivery");
         assert_eq!(send.cause, LocalWebrtcTerminalCause::SendText);
@@ -1878,6 +1911,7 @@ mod tests {
             .build()
             .unwrap();
         let mut flow_control = LocalWebrtcFlowControl::default();
+        let peer_state = test_peer_state("grant-idle-open");
 
         let started = Instant::now();
         let completed = runtime.block_on(send_response_frames_with_deadline(
@@ -1887,6 +1921,7 @@ mod tests {
             &mut pending,
             &mut flow_control,
             Duration::from_secs(1),
+            &peer_state,
         ));
 
         assert!(completed.is_ok());
@@ -1912,6 +1947,7 @@ mod tests {
             .build()
             .unwrap();
         let mut flow_control = LocalWebrtcFlowControl::default();
+        let peer_state = test_peer_state("grant-inbound-request");
 
         let completed = runtime.block_on(send_response_frames_with_deadline(
             &data_channel,
@@ -1920,6 +1956,7 @@ mod tests {
             &mut pending,
             &mut flow_control,
             Duration::from_secs(1),
+            &peer_state,
         ));
 
         assert!(completed.is_ok());
