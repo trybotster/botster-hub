@@ -331,3 +331,34 @@ process, spawned daemon, real DataChannel, and cleanup path are wired together.
   prove it.
 - No vault write is justified during Plan. The current evidence is a symptom
   plus an observability gap, not a proven lifecycle decision.
+
+## Implement evidence
+
+- Diagnostic implementation SHA:
+  `44f878d291bdfa0dca32880da3c58ef49a994b73`.
+- Fixed-SHA loaded cause gate:
+  [GitHub Actions run 29619164321](https://github.com/trybotster/botster-hub/actions/runs/29619164321)
+  ran `focused-cli-smoke` for 20 repetitions with the `residual-tail` profile
+  and 48 load workers. All 20 repetitions exited 0, the campaign exited 0,
+  owned-process cleanup exited 0, and the complete diagnostics artifact was
+  uploaded.
+- The reported close did not recur in the approved cause gate. Per the
+  diagnostic-first decision rule, implementation stops with the bounded,
+  grant-correlated terminal evidence path retained and makes no production
+  pressure deadline or peer-lifecycle policy change.
+- Deterministic fault injection on the unchanged smoke-owned daemon topology
+  proved a matching sender record is persisted and consumed before the
+  existing daemon-gone assertion. Healthy exact smoke and oversized-response
+  targets each passed five consecutive local repetitions.
+- The full repository suite passed with 266 compiled tests plus one doctest
+  green and the one documented larger local adversarial test ignored.
+  Formatting, strict Clippy, local
+  WebRTC unit tests, record validation, peer-close cleanup, and diagnostic
+  redaction checks also passed.
+- Residual risk: the original load-sensitive sender cause remains unresolved
+  because it did not reproduce. A future red must supply a valid matching
+  terminal record before any production lifecycle repair is selected.
+- Durable vault capture remains deferred: the new artifact was proven
+  functional by deterministic fault injection, but no real loaded failure
+  established a reusable lifecycle rule beyond the observability pattern
+  already recorded here.
