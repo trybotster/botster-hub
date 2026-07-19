@@ -42,9 +42,9 @@
 - Production path inspected:
   `local_runtime_smoke` -> `smoke_local_webrtc_round_trip` ->
   `LocalWebrtcOfferPeer::encrypted_request` -> daemon local-WebRTC signaling ->
-  `LocalWebrtcHandler::on_data_channel` -> `run_data_channel_with_deadline` ->
+  `LocalWebrtcHandler::on_data_channel` -> `run_data_channel` ->
   daemon `ControlMessage::Request` -> `framed_daemon_response` ->
-  `send_response_frames_with_deadline` -> real ordered
+  `send_response_frames` -> real ordered
   `DataChannel::send_text`.
 - Diagnostic gap inspected: the smoke client drops request identity, message id,
   and chunk progress when its response receiver closes; `spawn_dev_stack_daemon`
@@ -343,9 +343,26 @@ process, spawned daemon, real DataChannel, and cleanup path are wired together.
   owned-process cleanup exited 0, and the complete diagnostics artifact was
   uploaded.
 - The reported close did not recur in the approved cause gate. Per the
-  diagnostic-first decision rule, implementation stops with the bounded,
-  grant-correlated terminal evidence path retained and makes no production
-  pressure deadline or peer-lifecycle policy change.
+  diagnostic-first decision rule, that Implement pass stopped with the bounded,
+  grant-correlated terminal evidence path retained and made no speculative
+  lifecycle change.
+- Review hardening SHA
+  `d97f566dd4127e5bfe56f95b7ced2ae0e83f3c36` removed diagnostic-path
+  masking and instrumentation overhead. A subsequent fixed-SHA
+  `focused-cli-smoke` residual-tail campaign
+  [GitHub Actions run 29665295517](https://github.com/trybotster/botster-hub/actions/runs/29665295517)
+  reproduced on repetition 1 with `campaign_exit_status=101` and
+  `cleanup_status=0`. The client stopped at chunk 62 of 85 with
+  `channel_closed`; its matching grant-correlated sender record named
+  `pressure_deadline`, peer state `connected`, pressure active, last sent chunk
+  61, and no channel terminal signal. This enters the approved
+  peer-liveness-repair branch.
+- The repair removes the five-second delivery deadline, its state, terminal
+  cause, and deadline-named functions. `LocalWebrtcPeerState` now publishes
+  only the first peer `Disconnected`, `Failed`, or `Closed` state through a
+  Tokio watch channel. Both the idle request loop and active pressured response
+  loop select blocking DataChannel polls against that signal. Low water resumes
+  FIFO ordered delivery; scheduler delay alone has no transport-death path.
 - Deterministic fault injection on the unchanged smoke-owned daemon topology
   proved a matching sender record is persisted and consumed before the
   existing daemon-gone assertion. Healthy exact smoke and oversized-response
@@ -355,10 +372,8 @@ process, spawned daemon, real DataChannel, and cleanup path are wired together.
   Formatting, strict Clippy, local
   WebRTC unit tests, record validation, peer-close cleanup, and diagnostic
   redaction checks also passed.
-- Residual risk: the original load-sensitive sender cause remains unresolved
-  because it did not reproduce. A future red must supply a valid matching
-  terminal record before any production lifecycle repair is selected.
-- Durable vault capture remains deferred: the new artifact was proven
-  functional by deterministic fault injection, but no real loaded failure
-  established a reusable lifecycle rule beyond the observability pattern
-  already recorded here.
+- Final fixed-SHA loaded proof, negative-control evidence, and final repository
+  verification are recorded in the returned Implement report after completion.
+- The loaded evidence establishes the durable lifecycle rule that elapsed
+  scheduler time is not peer liveness: pressured senders require a wakeable
+  terminal peer-state input.
