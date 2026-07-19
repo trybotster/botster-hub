@@ -2709,7 +2709,6 @@ fn local_webrtc_sender_terminal_record(
                     | "channel_closed"
                     | "channel_error"
                     | "poll_ended"
-                    | "pressure_deadline"
                     | "invalid_request"
                     | "request_queue_overflow"
                     | "invalid_encrypted_request"
