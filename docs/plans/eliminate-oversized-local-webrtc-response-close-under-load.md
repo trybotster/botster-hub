@@ -1,122 +1,379 @@
-# Eliminate oversized local WebRTC response close under load
+# Eliminate local WebRTC response close under load
 
 ## Context loaded
 
-- Current Project Pipelines context: run `run_1784249675_657712`, returned Plan step `botster_plan`, active run step `run_step_1784250432_534001`, ticket `ticket_1784168176_163113`, required plan gate, prior plan artifact/gate/checklists, Plan Review `review_1784250383_314307` and its four findings, no dependencies, and the durable prior human answer were loaded with `project_pipelines_current_context`.
-- The prior human answer remains binding: accept focused target-path success for this leaf ticket, map independent lifecycle-suite roots to their sibling tickets, and do not add retries, timeout increases, serialization, or unrelated fixes. The umbrella stalled-attach ticket owns eventual suite-wide green.
-- Required planning authority loaded: [[identity]], [[goals]], [[planner-playbook]], [[botster-planner-playbook]], [[botster-architecture]], [[cli-patterns]], [[spa-patterns]], and every note in the Botster planner overlay's Must Load list. No convention conflicts were found.
-- The previous plan and implementation are already in history. PR #139 merged commit `0c38b76`; its subject commits `1e96eff` and `2ff2246` preserve flow state across responses and route idle high/low-water events through the production channel loop. The tested recurrence subject `11407a41eceb8497786b722b5d23d23ed35f3f69` contains that merge.
-- Reopened evidence: GitHub Actions run `29539022952` ran the exact subject with `test_target=lifecycle-suite`, `stress_profile=residual-tail`, 20 requested repetitions, and default test parallelism. Run 1 failed at load average `73.76`; `local_webrtc_chunks_oversized_encrypted_daemon_response` received 58 of 85 ordered chunks before `channel_closed`. The campaign stopped at the first red, cleaned the test/sampler/load process groups, and ended with `campaign_exit_status=101`, `cleanup_status=0`.
-- This is materially different from the original post-response symptom. It is a mid-response close, so the merged response-boundary fix cannot be assumed to address the active root.
-- Production path inspected: `LocalWebrtcHandler::on_data_channel` -> `run_data_channel_with_deadline` -> daemon `ControlMessage::Request` -> `framed_daemon_response` -> `send_response_frames_with_deadline` -> real `DataChannel::send_text`. High water sets channel-owned `pressured`; the next unsent chunk starts a five-second absolute pressure deadline; expiry becomes a typed send failure and unconditionally closes the data channel and cleans up the peer.
-- Runtime-library contract inspected: `webrtc 0.20.0-rc.1` exposes high/low-water events but not current buffered bytes through the public `DataChannel` trait. Its own flow-control example waits for low water while the channel remains open; Botster's five-second pressure-expiry policy is local policy, not a dependency requirement.
-- Test path inspected: the real offer peer sends encrypted requests, receives ordered chunks, and reports `channel_closed` versus `response_timeout` with chunk progress. The spawned daemon's stderr is piped but is not surfaced when this test panics, so run `29539022952` does not reveal whether the sender ended on `pressure_deadline`, `send_text`, `OnClose`, `OnError`, or ended polling.
-- Plan-time repository state: the pipeline worktree is clean at `2ff2246` and is an ancestor of current `origin/main` `e864567`. Implement must first update this ticket branch to current `origin/main`; relevant production code is unchanged on main, while sibling lifecycle-test changes must be preserved.
-- Plan Review verified the ancestry, production trace, and existing bounded sender log, then identified a blocker in the first revision: `on_connection_state_change` cleans peer state on `Disconnected`, `Failed`, or `Closed` but cannot wake a task parked in `local_poll()`. Removing the deadline without carrying that peer-connection signal into the channel loop would leak the sender task. Review also identified three existing deadline-policy tests whose disposition must be explicit.
-- Implement diagnostic SHA `5debb14b6718c20b33da4b82fb0a04e9b54d4952` added a guard intended to surface the existing bounded sender terminal record on panic. Loaded run `29547216544` tested that exact SHA under the residual-tail lifecycle suite: the WebRTC target passed, then three sibling-owned failures stopped repetition 1 with `cleanup_status=0`, so no sender record was emitted. Review later forced this branch red and found that strict shutdown validation could panic during unwind; the repaired guard now keeps strict validation only on the success path and reports non-panicking bounded fallback evidence on failure. Human answer `question_1784252862_238103` requires a narrowly focused oversized-WebRTC runner target before any production pressure repair.
+- Project Pipelines context loaded for ticket `ticket_1784168176_163113`, run
+  `run_1784325316_726684`, active Plan step `botster_plan`, required
+  `botster_plan_gate`, the post-PR #145 recurrence artifact, both prior human
+  answers, questions, events, the three open Plan Review findings, and the
+  absence of blocking dependencies.
+- The binding human decisions remain: diagnose a real loaded failure before
+  changing production pressure policy; do not add retries, timeout inflation,
+  serialization, or weaker assertions; and leave the final suite-wide 20-run
+  campaign to the convergence ticket.
+- Planning authority loaded: [[identity]], [[goals]], [[planner-playbook]],
+  [[botster-planner-playbook]], [[botster-architecture]], [[cli-patterns]],
+  [[spa-patterns]], and the Botster planner overlay's required notes. Targeted
+  testing constraints also loaded: [[suite wide acceptance criteria make every
+  observed test failure in scope]], [[a regression test must be shown to go red
+  with the fix reverted]], [[narrow ablation at the enforcement point is the
+  cleanest regression negative control]], [[webrtc peer cleanup removes every
+  per peer owner together]], [[conformance harnesses gate on deterministic
+  invariants not timing]], [[loaded lifecycle ci precompiles the exact test
+  target before synthetic cpu stress]], and [[pre existing failure waivers must
+  isolate the first non cascade failure on base]]. No convention conflicts were
+  found.
+- The ticket branch was clean at the merged PR #145 head and was fast-forwarded
+  to current `origin/main` commit `319f7ff` before this plan was refreshed.
+- GitHub Actions run `29615143681` tested exact subject
+  `c84337845165565f7ed059dcb650061ad0f14d76` with the default-parallel
+  lifecycle suite, residual-tail load, and 20 requested repetitions. Repetition
+  1 stopped at the first red with load average above 60,
+  `campaign_exit_status=101`, and `cleanup_status=0`.
+- The failure was
+  `cli_smoke_proves_local_runtime_daemon_package_app_session_and_webrtc`, whose
+  production `botster-hub smoke` process reported
+  `local WebRTC data channel closed before response`. The original
+  `local_webrtc_chunks_oversized_encrypted_daemon_response` target passed later
+  in the same loaded suite, as did its bounded-diagnostic test and peer-close
+  cleanup test. The refreshed plan therefore cannot treat the original
+  oversized target or the old `pressure_deadline` hypothesis as the reproduced
+  cause.
+- Production path inspected:
+  `local_runtime_smoke` -> `smoke_local_webrtc_round_trip` ->
+  `LocalWebrtcOfferPeer::encrypted_request` -> daemon local-WebRTC signaling ->
+  `LocalWebrtcHandler::on_data_channel` -> `run_data_channel` ->
+  daemon `ControlMessage::Request` -> `framed_daemon_response` ->
+  `send_response_frames` -> real ordered
+  `DataChannel::send_text`.
+- Diagnostic gap inspected: the smoke client drops request identity, message id,
+  and chunk progress when its response receiver closes; `spawn_dev_stack_daemon`
+  sends daemon stderr to `Stdio::null`; and the PR #145 panic guard wraps only
+  the oversized test's directly owned daemon. Run `29615143681` therefore
+  cannot distinguish `pressure_deadline`, send failure, channel/peer teardown,
+  polling end, framing/request failure, or cleanup initiated elsewhere.
+- Plan Review `review_1784326164_270373` rejected the first revision's proposal
+  to run smoke against a reused test-owned daemon. That would change the
+  smoke-owned process tree, startup timing, cleanup ownership, and the existing
+  assertion that smoke stops the daemon it started. This revision preserves the
+  exact smoke-owned daemon lifecycle and makes the daemon persist its bounded
+  terminal record under the explicit data directory.
 
 ## Scope
 
-Botster layer: Rust hub local-WebRTC data-plane delivery plus the real-daemon lifecycle harness and existing loaded verification campaign.
+Botster layers: Rust hub local-WebRTC data-plane delivery, the production
+`botster-hub smoke` client path, the real-daemon lifecycle test harness, and the
+existing loaded lifecycle workflow.
 
-1. Update the ticket branch to current `origin/main` before editing so the reopened fix is tested with the same sibling changes and base as the recurrence campaign.
-2. Make the target test surface the bounded sender terminal record already emitted by `run_data_channel_with_deadline`: message id, next/last/total chunk, pressure state, and typed cause. This is a harness-only diagnostic change; do not add duplicate production logging, payloads, secrets, absolute paths, or unbounded daemon output.
-3. Add `focused-oversized-webrtc` as an exact filter over the existing `local_webrtc_chunks_oversized_encrypted_daemon_response` test. Run it repeatedly under the unchanged residual-tail load, per-run/campaign deadlines, stop-at-first-red behavior, diagnostics, and cleanup. This is a selector-only runner extension: preserve the test body, assertions, channel limits, and no-retry semantics, and leave `lifecycle-suite` unchanged.
-4. After the focused real path captures a sender cause, reproduce that proven cause with the existing fake `LocalWebrtcDataChannel` seam. Model the evidenced multi-chunk lifecycle state. The deterministic oracle is delivery/lifecycle state, not elapsed wall time.
-5. Repair only the confirmed branch in `src/local_webrtc.rs`:
-   - If the sender record is `pressure_deadline` as expected, replace the deadline with a concrete peer-liveness signal, not an unbounded bare `local_poll()`. Use Tokio's existing `watch` primitive (already available through the configured `tokio` dependency) from `LocalWebrtcPeerState`: `on_connection_state_change` publishes the first terminal `Disconnected`, `Failed`, or `Closed` state, and every blocking channel-loop wait selects between the DataChannel event and that watched peer termination. A terminal peer state returns a distinct typed send failure carrying the specific connection state, then follows the existing close and exactly-once cleanup path.
-   - Apply this consistently to both active mid-response pressure and idle pressure between responses. Scheduler delay alone must close neither path; low water resumes delivery, while DataChannel close/error/end, send failure, or watched peer termination ends it. Remove the pressure-deadline constant/state/helper and deadline-suffixed function vocabulary cold turkey so no dual elapsed/liveness policy remains.
-   - Preserve the bounded FIFO while waits consume inbound requests. Do not send another frame while pressure is active, and do not treat receiver-side timeouts as hub-task cancellation.
-   - If the record proves a different typed cause, repair that exact send or lifecycle branch and update this plan artifact before implementation proceeds. Do not silently apply the pressure hypothesis.
-6. Preserve the production protocol and real acceptance path: encrypted framing, ordered reliable data channel, exact payload equality, chunk ordering/count, frame ceiling, same-peer follow-up request, grant cleanup, and idempotent peer cleanup.
-7. Prove red when the focused lifecycle fix is reverted, then prove the exact fixed SHA under the focused residual-tail campaign. Final suite-wide 20x green remains owned by the convergence ticket.
+1. Preserve the exact production `botster-hub smoke` ownership path:
+   `ensure_dev_stack_daemon` must still start the daemon with the same process
+   tree and timing, `SmokeRuntimeCleanup` must still stop that daemon, and the
+   existing test must still assert that the smoke-owned daemon is gone. Do not
+   substitute a prestarted or reused test-owned daemon.
+2. Make the smoke client's response-close and response-timeout errors identify
+   the current daemon request operation and bounded receive progress: message
+   id when known, next chunk, expected chunk count, and terminal client cause.
+   Do not include request bodies, encrypted payloads, grant secrets, or local
+   paths.
+3. Extend the existing sender terminal record only as far as needed to classify
+   every exit exercised by this smoke path: grant id for run correlation,
+   request operation, message/chunk progress, pressure state, latest
+   peer-connection state, channel terminal signal, typed cause, and whether
+   peer cleanup was newly sent or already complete. Keep one fixed-schema,
+   size-bounded record and the existing exactly-once cleanup owner.
+4. Deliver that record to the existing daemon owner through `ControlMessage`
+   before peer cleanup. The owner writes one latest-record JSON artifact to a
+   fixed filename under the `HubConfig.data_directory` retained by
+   `serve_daemon`, using Rust filesystem primitives and same-directory replace
+   semantics. Do not add data-directory state to `LocalWebrtcTransport` or a
+   new storage abstraction. The record must survive the smoke-owned daemon's
+   shutdown, contain no payloads/secrets/absolute paths, and be correlated to
+   the failing smoke grant so stale records cannot satisfy the test. Continue
+   the current bounded `eprintln!` as immediate fallback, but do not rely on
+   stderr for the loaded evidence.
+5. Add one selector-only loaded target for the existing
+   `cli_smoke_proves_local_runtime_daemon_package_app_session_and_webrtc` test.
+   It must reuse the current precompile, residual-tail workers, default test
+   semantics, per-run/campaign bounds, stop-at-first-red behavior, artifacts,
+   and process-group cleanup. Leave `lifecycle-suite`,
+   `focused-oversized-webrtc`, and every other target unchanged.
+6. Run that exact smoke target repeatedly under residual-tail load before
+   changing local-WebRTC lifecycle policy. A real red must retain both client
+   progress and the matching persisted sender terminal record with
+   `cleanup_status=0`. A reproduced red with a missing, stale, malformed, or
+   `unavailable` sender record fails the diagnostic gate and must be fixed
+   before another production hypothesis or repair proceeds.
+7. Repair only the mechanism named by that record, then resynchronize this plan
+   if it differs from the branches below:
+   - If `pressure_deadline` closes an otherwise live pressured peer, replace
+     elapsed-time transport death with an explicit peer-liveness signal. Use
+     Tokio's existing `watch` primitive from `LocalWebrtcPeerState`; publish the
+     first `Disconnected`, `Failed`, or `Closed` state and select it alongside
+     every blocking channel poll. Low water resumes ordered delivery; scheduler
+     delay alone does not close a live channel. Remove deadline policy and names
+     cold turkey so no dual elapsed/liveness path remains.
+   - If the record identifies channel closure, peer teardown, send failure,
+     request dispatch/reply failure, framing, or another cause, repair that
+     evidenced branch instead and add the smallest deterministic regression at
+     its current seam.
+   - If the focused target does not reproduce, retain the bounded diagnostics,
+     report the unresolved evidence, and make no speculative production
+     lifecycle change.
+8. Preserve encrypted chunk framing, ordered reliable delivery, FIFO request
+   handling, queue bounds, frame/assembly limits, same-peer multi-request use,
+   grant cleanup, subscription cleanup, and exactly-once peer cleanup.
 
-Every changed line must provide sender evidence, correct the confirmed mid-response lifecycle decision, exercise that decision, or record required verification.
+Every changed line must either expose the observed smoke failure, repair its
+recorded cause, prove the real production path, or document the required
+verification.
 
 ## Non-scope
 
-- No retries, timeout inflation, fixed sleeps, reduced stress, test serialization, `--test-threads=1` acceptance substitute, or weaker payload/chunk/frame assertions.
-- No response framing, encryption, chunk size/count, response assembly cap, DTO, TypeScript, browser, SPA, TUI, Lua/plugin, Rails, or conformance-fixture changes.
-- No WebRTC dependency upgrade or patch, configurable watermarks/deadlines, generic transport abstraction, background send queue, concurrent response tasks, or adjacent cleanup.
-- No fixes for the other failures in run `29539022952`. Each must be mapped to its existing sibling ticket with run/artifact evidence; if any root lacks an owner, create one before this ticket advances.
-- No general loaded-runner rewrite or change to ordinary full-suite behavior. Human answer `question_1784252862_238103` authorizes only the exact focused target selector needed to bypass unrelated first-red failures during diagnosis.
+- No retries, timeout increases, fixed sleeps, reduced load, test
+  serialization, `--test-threads=1` acceptance substitute, or weaker response,
+  chunk, frame, terminal-output, or cleanup assertions.
+- No assumption that the passing oversized test disproves the smoke recurrence,
+  or that the recurrence proves the old pressure hypothesis.
+- No response codec, encryption, chunk-size/count, response-cap, DTO,
+  TypeScript, browser, SPA, TUI, Lua/plugin, Rails, or conformance-fixture
+  changes unless the captured cause directly proves one of those contracts is
+  defective and the plan is returned for review.
+- No WebRTC dependency change, configurable deadline/watermark, generic sender
+  abstraction, logging framework, diagnostic database, background queue,
+  concurrent response task, or adjacent cleanup. The single fixed data-directory
+  artifact is the complete new diagnostic persistence surface.
+- No loaded-runner framework rewrite and no change to ordinary lifecycle-suite
+  acceptance. The new selector exists only to bypass sibling first-reds while
+  reproducing this exact production smoke.
+- No fixes for independent lifecycle roots. Their sibling tickets and the
+  umbrella convergence run retain ownership.
 
 ## Assumptions and unknowns
 
-- Strong hypothesis, not yet fact: Botster's five-second `pressure_deadline` fired while the reliable channel and receiver were still viable but starved, and Botster then caused the observed `channel_closed` through `close_data_channel`.
-- Unknown: the exact sender cause in run `29539022952`; the target harness currently loses the daemon stderr record on panic. Capturing this is the first implementation gate.
-- Unknown: why the failing `Drain` response contained 85 chunks. The plan does not assume this is malformed; exact response kind, encrypted/frame byte counts, and sender message id should establish whether it is legitimate accumulated terminal output or response-correlation drift before behavior changes.
-- Assumption: one channel task remains the sole owner of ordered requests, pressure state, and response sends. The repair must not introduce concurrent senders or unbounded buffering.
-- Assumption: an ordered reliable DataChannel that is pressured but has emitted no DataChannel or peer-connection terminal signal is still live; scheduler-dependent wall-clock expiry is not transport failure evidence. This assumption must be proven by the fake-channel red/green test and loaded real path.
-- Assumption: `tokio::sync::watch` is the smallest race-safe existing primitive because it preserves the latest peer terminal state for a channel task that subscribes after termination. No new dependency or generic cancellation abstraction is needed.
-- Assumption: the existing receiver's per-chunk timeout and daemon request bounds remain unchanged for caller failure reporting, but they are not hub-task liveness controls. Hub task termination is bounded by explicit DataChannel or watched peer-connection lifecycle signals.
-- Worktree/target: only the pipeline-provided worktree on target `tgt_7e208a0c76a44980a83b63af976b1f22` is authorized. The branch must incorporate current `origin/main` without dropping sibling-ticket changes.
+- Assumption: the new recurrence belongs to this ticket because it is the same
+  local WebRTC response-close invariant on the real CLI smoke path, and the
+  reopening artifact explicitly assigns diagnosis here. It does not authorize
+  unrelated smoke or package changes.
+- Unknown: which request was active when the channel closed. The smoke sequence
+  includes `Status`, `Spawn`, `Attach`, `SendInput`, repeated `Drain`, and
+  shutdown; current output does not identify the failing operation.
+- Unknown: whether any response chunk arrived, whether sender and client message
+  ids agree, and whether the sender ended through pressure, channel/peer state,
+  send failure, polling end, request/reply failure, or framing.
+- Unknown: whether the focused exact test will recreate the default-parallel
+  contention needed for the failure. A focused green is diagnostic evidence,
+  not proof that the full lifecycle suite is healthy.
+- Assumption: one channel task remains the sole owner of response order, flow
+  state, and sends. No fix may introduce concurrent senders or unbounded
+  buffering.
+- Assumption: the existing daemon-owner `ControlMessage` queue is the smallest
+  ordering boundary for persisting the record before the same sender requests
+  peer cleanup. The sender task must not perform blocking filesystem work.
+- Assumption: the smoke test's fresh explicit data directory plus matching
+  ephemeral grant id distinguishes this attempt's terminal record from stale
+  artifacts. A record for another peer or grant is equivalent to unavailable
+  evidence.
+- Assumption: if the terminal record proves pressure without a channel or peer
+  terminal signal, an ordered reliable channel remains live and low water is
+  the delivery-resume condition. A deterministic fake-channel regression and
+  the real loaded path must prove that assumption before policy changes.
+- Worktree/target: only this pipeline worktree on explicit target
+  `tgt_7e208a0c76a44980a83b63af976b1f22` is authorized.
 
 ## Affected surfaces and files
 
-- `src/local_webrtc.rs` — channel-owned flow/lifecycle policy, typed terminal diagnostics, and deterministic fake-channel regression tests.
-- `tests/hub_daemon_lifecycle_test.rs` — target-scoped sender diagnostic capture plus preservation of exact chunk/payload/continuity assertions on the real daemon and real peer.
-- `docs/plans/eliminate-oversized-local-webrtc-response-close-under-load.md` — reopened regression plan and evidence contract.
-- `.github/workflows/loaded-daemon-lifecycle.yml`, `script/run-loaded-daemon-lifecycle`, and `docs/loaded-daemon-lifecycle-runner.md` — selector-only `focused-oversized-webrtc` addition; existing targets, execution, load, deadlines, and cleanup stay unchanged.
+- `src/main.rs` — production `botster-hub smoke` request-progress diagnostics;
+  preserve smoke-owned daemon startup/shutdown and expose the fixed diagnostic
+  artifact path to the test without an alternate smoke flow.
+- `src/local_webrtc.rs` — bounded sender terminal classification and, only
+  after a real record, the evidenced lifecycle repair plus deterministic unit
+  regression.
+- `src/daemon_transport.rs` — retain the configured data-directory diagnostic
+  path in `serve_daemon`, receive the typed terminal record on the existing
+  daemon-owner control queue, and persist one bounded latest-record artifact
+  before peer cleanup.
+- `tests/hub_daemon_lifecycle_test.rs` — read and validate the persisted,
+  grant-correlated sender record after the unchanged smoke-owned daemon path
+  fails; preserve the daemon-gone assertion plus existing oversized, same-peer,
+  payload, and cleanup assertions.
+- `script/run-loaded-daemon-lifecycle`,
+  `.github/workflows/loaded-daemon-lifecycle.yml`, and
+  `docs/loaded-daemon-lifecycle-runner.md` — one exact smoke selector and its
+  operator contract.
+- `docs/plans/eliminate-oversized-local-webrtc-response-close-under-load.md` —
+  this reviewable handoff and later cause/evidence updates.
 
-Production wiring that must be proven, not merely compiled:
-
-Current entry path: `LocalWebrtcHandler::on_data_channel` -> `run_data_channel_with_deadline` -> daemon response -> `framed_daemon_response` -> channel-owned pressure loop -> real `DataChannel::send_text` -> `LocalWebrtcOfferPeer` ordered reassembly -> subsequent encrypted request on the same peer. The planned production change inserts the peer-owned watched terminal state into every blocking channel-loop wait on that path; compilation-only evidence is insufficient.
+Runtime proof must cross the production entry point listed in Context loaded.
+Unit tests or the mere presence of diagnostic code do not prove the smoke
+process, spawned daemon, real DataChannel, and cleanup path are wired together.
 
 ## Risks
 
-- **Wrong root cause:** receiver `channel_closed` does not identify the sender branch. Mitigation: require the bounded sender record before changing policy; update the plan if it contradicts `pressure_deadline`.
-- **Immortal dead peer:** peer-connection death may not emit a DataChannel close/error and would leave a bare poll parked. Mitigation: publish `Disconnected`/`Failed`/`Closed` through peer-owned watch state, select it at every blocking channel wait, return a typed peer-termination cause, and prove the task exits with exactly-once cleanup in both active and idle pressure cases.
-- **Unbounded buffering:** ignoring high water could enqueue the whole response. Mitigation: remain paused after high water and resume only on low water; do not bypass flow control.
-- **Request starvation or reordering:** polling for low water can also consume inbound requests. Mitigation: preserve the bounded FIFO and one-response-at-a-time order, including overflow responses.
-- **Diagnostic deadlock/noise:** unread child pipes or full payload dumps can hide the cause or block the daemon. Mitigation: surface one bounded typed terminal record and never log encrypted frames or whole child output.
-- **Correlation bug hidden as pressure:** the failing response was a `Drain` and unexpectedly large. Mitigation: capture response kind/message id/total chunks and retain exact ordered reassembly before deciding the pressure hypothesis is sufficient.
-- **False confidence from focused passes:** the defect requires heavy scheduler starvation. Mitigation: deterministic state-machine negative control plus exact-SHA residual-tail default-parallel evidence; neither substitutes for the other.
-- **Independent suite failures:** unrelated roots can obscure result interpretation. Mitigation: identify first non-cascade failures and map each to a sibling ticket, following the prior human scope disposition rather than waiving them generically.
-
-## Existing test disposition
-
-- Rewrite `missing_low_water_event_terminates_partial_response_and_cleans_peer` as the active-pressure peer-death regression: after the first chunk raises high water, publish peer `Failed` without DataChannel close/error/low-water; require a typed peer-connection failure, unchanged next/last/total progress, no second send, task completion, channel close, and exactly-once cleanup.
-- Rewrite `next_response_starts_deadline_only_when_pressure_blocks_its_first_frame` as the response-boundary pressure regression: response one may complete under high water, response two must send nothing before low water, and low water must resume its first frame. This carries forward the merged guarantee without retaining elapsed deadline policy.
-- Split the negative half of `outer_loop_routes_idle_pressure_before_next_request_delivery`: retain the current idle high-then-low ordering assertion; replace its no-low-water `PressureDeadline` expectation with peer `Failed` and require no send, typed termination, no parked task, channel close, and exactly-once cleanup.
-- Retain `post_final_high_water_survives_response_boundary_and_idle_low_clears_it`, `high_then_low_water_resumes_and_completes_response_in_order`, FIFO/overflow coverage, and distinct DataChannel close/error/end/send-failure coverage. Update names/signatures mechanically only where removal of deadline vocabulary requires it; do not weaken their behavioral assertions.
+- **Wrong root cause:** client `channel_closed` is downstream evidence only.
+  Require the sender record before production behavior changes.
+- **Diagnostic still disappears:** the smoke command starts a detached daemon
+  with discarded stderr. Persist the fixed record through the daemon owner
+  before cleanup, then require the smoke test to read the matching artifact
+  after the owned daemon stops.
+- **Changed reproduction topology:** substituting a reused diagnostic daemon
+  would alter the process tree, startup contention, and cleanup ownership that
+  failed in run `29615143681`. Keep the smoke-owned spawn/stop path and its
+  daemon-gone assertion byte-for-byte in intent; diagnostics must observe that
+  path rather than replace it.
+- **Stale or partial artifact:** a previous peer record or interrupted write can
+  masquerade as this attempt. Correlate by grant id, use a fixed bounded schema
+  and same-directory replacement, and treat missing/malformed/mismatched data
+  as a failed evidence gate.
+- **Silent non-send exit:** current structured evidence covers response-send
+  failures but not every outer-loop break. Classify the actual loop exit without
+  inventing duplicate lifecycle ownership.
+- **Diagnostic leakage or blockage:** keep one bounded structured line, redact
+  paths, and exclude secrets, request bodies, response bodies, and encrypted
+  frames.
+- **Immortal peer after removing a deadline:** if pressure is the cause, a bare
+  `local_poll()` can park after peer death. Carry peer terminal state through a
+  race-safe watched value and prove it wakes both active and idle pressure.
+- **Buffer growth or reordering:** never bypass high/low-water flow control,
+  the bounded pending-request FIFO, or one-response-at-a-time ordering.
+- **Cleanup races:** sender, peer callback, smoke cleanup, and test panic may all
+  converge. Preserve `cleanup_once`, record whether cleanup was already sent,
+  and prove no owned process group survives.
+- **False confidence from focused green:** the exact target removes sibling
+  test contention. Report achieved load and keep suite-wide convergence
+  acceptance separate.
+- **Plan drift after diagnosis:** a terminal cause other than the conditional
+  pressure design requires this artifact and its acceptance checks to be
+  updated before implementation continues.
 
 ## Acceptance checks and tests
 
-1. Sender-evidence gate: force the strengthened target path red with both a healthy daemon and a daemon killed before unwind. Both probes must exit 101 rather than abort; an existing sender terminal record is printed unchanged when present, while the no-record case prints daemon status plus a stderr tail bounded to 20 lines and 512 characters per line. The test's receive error retains chunk progress. The fallback redacts data-directory, workspace, home, and temp roots and must contain no secrets or payload bodies. Restore both probes and confirm the worktree contains only intended changes.
-2. Deterministic `src/local_webrtc.rs` tests prove:
-   - high water mid-response pauses before the next unsent frame;
-   - scheduler-delayed low water on an otherwise open channel resumes ordered delivery without closing;
-   - elapsed time alone cannot turn that live pressured state into peer cleanup;
-   - peer `Failed` while pressured mid-response, with no DataChannel close/error, wakes the sender, reports the specific typed peer-connection cause and chunk progress, leaves no parked task, closes once, and cleans up exactly once;
-   - peer `Failed` while idle-pressured before the next response provides the same bounded termination and sends no premature frame;
-   - `OnClose`, `OnError`, ended polling, and `send_text` failure still terminate with distinct typed causes and exactly-once cleanup;
-   - requests received while paused remain bounded and FIFO, including overflow responses;
-   - post-final pressure and idle low water still preserve the already-merged response-boundary behavior.
-3. Focused real path: run `for run in 1 2 3 4 5; do ./test.sh local_webrtc_chunks_oversized_encrypted_daemon_response -- --nocapture || exit 1; done`. All five runs must preserve the 300,000-byte payload equality, response kind, ordered chunk count, maximum frame size, same-peer follow-up request, grant cleanup, and peer cleanup.
-4. Adjacent local-WebRTC coverage: run the focused `src/local_webrtc.rs` tests and peer-close/subscription cleanup tests via `./test.sh`. A single-threaded diagnostic run may identify a first root but is not acceptance evidence.
-5. Negative control: with diagnostics/tests retained, revert only the new lifecycle behavior and show the deterministic mid-response test fails for the expected pressured-close/partial-delivery state. Preserve the red command/output and reverted subject SHA or commit.
-6. Quality gates: `cargo fmt --check`, repository-configured strict Clippy, and `./test.sh`. Record exact commands, SHAs, and results; investigate every failure rather than claiming a blanket pre-existing failure.
-7. Focused cause gate: dispatch the workflow for the diagnostics SHA with `test_target=focused-oversized-webrtc`, `stress_profile=residual-tail`, and 20 repetitions. If a real failure occurs, require the bounded sender record, chunk progress, and `cleanup_status=0`; repair only that cause. If all 20 pass, preserve diagnostics and report the unresolved evidence without changing production behavior.
-8. Focused fixed-SHA proof: after an evidenced repair, repeat the same focused target, stress profile, and 20 repetitions with unchanged test assertions and clean process-group teardown. Final suite-wide 20x green remains owned by the convergence ticket per `question_1784252862_238103`.
-9. Diff/artifact audit: verify every changed line traces to the ticket and scan committed artifacts for secrets, personal data, and absolute home/worktree paths.
+1. Diagnostic wiring:
+   - force the exact smoke-owned daemon path to fail after its local WebRTC peer
+     is running and prove the test exits nonzero without aborting;
+   - prove smoke still starts and stops its own daemon, retains the existing
+     post-smoke daemon-gone assertion, and does not attach to a prestarted
+     daemon;
+   - require a bounded client record with request operation and chunk progress;
+   - require a persisted sender record for the same grant with typed cause,
+     peer/channel state, pressure/chunk progress, and cleanup disposition;
+   - prove fixed schema/size limits, same-directory replacement, stale-grant
+     rejection, malformed/truncated-record rejection, and path/payload/secret
+     exclusion;
+   - treat a reproduced red with an absent, mismatched, malformed, or
+     `unavailable` record as a failing diagnostic gate, never successful
+     evidence;
+   - verify daemon, session-worker, package entrypoint, sampler, test, and load
+     processes are gone; and
+   - scan output for secrets, payload bodies, usernames, and absolute paths.
+2. Focused loaded cause gate: dispatch the exact CLI-smoke selector for the
+   diagnostics SHA with `residual-tail` and 20 repetitions. On red, preserve
+   full subject SHA, request/chunk record, matching persisted sender record,
+   achieved load, `campaign_exit_status`, and `cleanup_status=0`. If a red lacks
+   the record, stop and repair the diagnostic path before another loaded
+   campaign. On 20 green repetitions, stop after diagnostics and report the
+   unresolved evidence.
+3. Deterministic regression after a recorded cause:
+   - reproduce the exact terminal state through the current fake
+     `LocalWebrtcDataChannel` seam;
+   - prove ordering, bounded pending requests, no premature send, task
+     termination, channel close, and exactly-once cleanup;
+   - if pressure is confirmed, prove delayed low water resumes all chunks while
+     elapsed scheduler time alone does not close the peer, and peer
+     `Disconnected`/`Failed`/`Closed` wakes active and idle pressure with a
+     distinct typed cause;
+   - preserve distinct `OnClose`, `OnError`, poll-end, send-failure, invalid
+     request, and queue-overflow behavior.
+4. Negative control: ablate only the repaired enforcement decision while
+   retaining diagnostics and run the full relevant local-WebRTC filter. Record
+   the nonzero command, expected red tests, independent green tests, and
+   restoration with unchanged `HEAD`.
+5. Real-path local checks:
+   - run the exact CLI smoke five consecutive times through `./test.sh`;
+   - run `local_webrtc_chunks_oversized_encrypted_daemon_response` five
+     consecutive times and preserve its 300,000-byte equality, response kind,
+     ordered chunks, frame ceiling, same-peer follow-up, grant cleanup, and peer
+     cleanup;
+   - run adjacent `src/local_webrtc.rs` and peer-close/subscription tests.
+6. Repository gates: `cargo fmt --check`, the repository-configured strict
+   Clippy command, and `./test.sh`. Record exact commands, SHAs, exit codes, and
+   investigate every failure rather than applying a blanket pre-existing-failure
+   label.
+7. Fixed-SHA loaded proof: after an evidenced repair, rerun the exact focused
+   CLI smoke for 20 residual-tail repetitions with unchanged assertions and
+   clean teardown. The umbrella convergence ticket still owns renewed
+   suite-wide 20-run default-parallel acceptance.
+8. Diff/artifact audit: every changed line traces to the ticket, the committed
+   plan and PR body contain no personal or absolute worktree paths, and no
+   deprecated or unwired code path remains.
 
-## Pipeline gates and checklist evidence
+## Project Pipelines and vault checklist evidence
 
-- Plan artifact: this committed repo document plus the Project Pipelines artifact/gate evidence carries all required plan sections and the explicit sender-cause unknown.
-- Implement handoff: attach current-main integration evidence, bounded sender record, deterministic red/green proof, focused real-path results, exact fixed SHA, and the sibling-ticket map for other observed roots.
-- Review/Verify handoff: attach local quality-gate output, complete diff audit, loaded workflow URL/artifact id, target-test result for every repetition, first-root disposition, and cleanup interpretation.
-- Project Pipelines checklist `checklist_1784249926_382722` records context loading, runtime-path tracing, bounded scope, and acceptance discipline.
-- Vault checklist `checklist_1784249931_202805` records notes loaded, convention conflict result (`none`), verification evidence, and capture disposition. Its creation calls timed out client-side but both checklist records persisted and were reconciled before advancement.
-
-## Implement outcome
-
-- Focused run `29548861532` tested exact SHA `33fc0a1ec25679fe97c09f822b62d64d19b41c68` with `focused-oversized-webrtc`, 20 repetitions, and `residual-tail`. All 20 exact target runs passed unchanged; observed one-minute load reached `57.43`, every test process group was gone, the active ownership ledger was empty, and campaign `exit_status=0` / `cleanup_status=0`. This isolates one test and is materially weaker than recurrence run `29539022952`, where the default-parallel lifecycle suite had roughly 93 other tests contending and one-minute load reached `73.76`; therefore the focused green campaign proves only that this weaker profile did not reproduce a red, not that the recurrence conditions are healthy. The convergence ticket owns renewed suite-wide evidence once sibling first-reds no longer mask this target.
-- No bounded sender failure was emitted, so the reopened real failure's terminal cause remains unresolved. Per human answer `question_1784252862_238103`, Implement did not modify `src/local_webrtc.rs`, did not add the speculative watch repair, and did not claim a production lifecycle fix.
-- The durable deliverable is diagnostic: forced-red probes now prove that panic teardown exits with an ordinary test failure for both a clean daemon (`daemon_status=exit status: 0`) and a crashed daemon (`daemon_status=signal: 9 (SIGKILL)`) instead of aborting the test binary. The guard prints the existing typed sender record when one exists and otherwise prints status plus a bounded, path-redacted stderr tail. The exact five-iteration local target loop also passed. The loaded runner can isolate this production-path test without changing full-suite behavior; a future reproduced red can establish the mechanism before production policy changes.
+- The standard run-scoped vault checklist records notes loaded, no convention
+  conflicts, Plan-time repository and Actions evidence, and deferred durable
+  capture disposition.
+- The Plan workflow checklist records context loading, bounded scope,
+  production-entry-point proof, explicit unknown cause, acceptance/negative
+  controls, and artifact/gate submission.
+- Implement handoff must attach the diagnostic SHA and loaded cause run before
+  claiming a production fix. Review and Verify must compare the implemented
+  cause with this artifact and reject speculative branches.
 
 ## Vault gaps worth capturing
 
-- If confirmed, capture that reliable local-WebRTC backpressure should wait on transport progress/lifecycle signals rather than a scheduler-sensitive response deadline; wall-clock starvation alone must not close a live peer.
-- Capture the harness gotcha that piped daemon stderr must be surfaced on target-test failure or typed production diagnostics disappear precisely when loaded evidence is needed.
-- If the 85-chunk `Drain` response reveals a separate correlation or retained-output invariant, capture it only after code and red/green evidence establish the mechanism; otherwise do not create a speculative note.
+- The recurrence exposes a durable observability gap: a production smoke command
+  can own a detached daemon yet discard the daemon-side terminal cause needed
+  to diagnose its own failure. Capture a general note only after the bounded
+  data-directory terminal artifact proves useful without changing daemon
+  ownership.
+- Existing local-WebRTC notes describe cleanup and chunk flow but do not yet
+  state whether peer-connection state must be a wakeable input to a pressured
+  DataChannel sender. Capture that rule only if a real failure and regression
+  prove it.
+- No vault write is justified during Plan. The current evidence is a symptom
+  plus an observability gap, not a proven lifecycle decision.
+
+## Implement evidence
+
+- Diagnostic implementation SHA:
+  `44f878d291bdfa0dca32880da3c58ef49a994b73`.
+- Fixed-SHA loaded cause gate:
+  [GitHub Actions run 29619164321](https://github.com/trybotster/botster-hub/actions/runs/29619164321)
+  ran `focused-cli-smoke` for 20 repetitions with the `residual-tail` profile
+  and 48 load workers. All 20 repetitions exited 0, the campaign exited 0,
+  owned-process cleanup exited 0, and the complete diagnostics artifact was
+  uploaded.
+- The reported close did not recur in the approved cause gate. Per the
+  diagnostic-first decision rule, that Implement pass stopped with the bounded,
+  grant-correlated terminal evidence path retained and made no speculative
+  lifecycle change.
+- Review hardening SHA
+  `d97f566dd4127e5bfe56f95b7ced2ae0e83f3c36` removed diagnostic-path
+  masking and instrumentation overhead. A subsequent fixed-SHA
+  `focused-cli-smoke` residual-tail campaign
+  [GitHub Actions run 29665295517](https://github.com/trybotster/botster-hub/actions/runs/29665295517)
+  reproduced on repetition 1 with `campaign_exit_status=101` and
+  `cleanup_status=0`. The client stopped at chunk 62 of 85 with
+  `channel_closed`; its matching grant-correlated sender record named
+  `pressure_deadline`, peer state `connected`, pressure active, last sent chunk
+  61, and no channel terminal signal. This enters the approved
+  peer-liveness-repair branch.
+- The repair removes the five-second delivery deadline, its state, terminal
+  cause, and deadline-named functions. `LocalWebrtcPeerState` now publishes
+  only the first peer `Disconnected`, `Failed`, or `Closed` state through a
+  Tokio watch channel. Both the idle request loop and active pressured response
+  loop select blocking DataChannel polls against that signal. Low water resumes
+  FIFO ordered delivery; scheduler delay alone has no transport-death path.
+- Deterministic fault injection on the unchanged smoke-owned daemon topology
+  proved a matching sender record is persisted and consumed before the
+  existing daemon-gone assertion. Healthy exact smoke and oversized-response
+  targets each passed five consecutive local repetitions.
+- The full repository suite passed with 266 compiled tests plus one doctest
+  green and the one documented larger local adversarial test ignored.
+  Formatting, strict Clippy, local
+  WebRTC unit tests, record validation, peer-close cleanup, and diagnostic
+  redaction checks also passed.
+- Final fixed-SHA loaded proof, negative-control evidence, and final repository
+  verification are recorded in the returned Implement report after completion.
+- The loaded evidence establishes the durable lifecycle rule that elapsed
+  scheduler time is not peer liveness: pressured senders require a wakeable
+  terminal peer-state input.

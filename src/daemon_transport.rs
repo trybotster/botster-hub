@@ -10,7 +10,7 @@ use std::fmt;
 use std::fs;
 use std::io::{BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Sender};
 use std::thread;
 use std::time::Duration;
@@ -54,7 +54,10 @@ use serde_json::Value;
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
 
-use crate::local_webrtc::{LocalWebrtcAttachedSubscription, LocalWebrtcSignalRequest};
+use crate::local_webrtc::{
+    LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_FILE, LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_MAX_BYTES,
+    LocalWebrtcAttachedSubscription, LocalWebrtcSenderTerminalRecord, LocalWebrtcSignalRequest,
+};
 use crate::{
     AvailablePackage, AvailablePackageState, FileHubStateStore, HubClientApi,
     HubClientCaptureSnapshot, HubClientEvent, HubClientPackage, HubClientPackageAvailabilityReason,
@@ -81,6 +84,9 @@ const DAEMON_CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Run the local daemon socket until a shutdown request is received.
 pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus> {
     let socket_path = socket_path(&config)?;
+    let local_webrtc_terminal_record_path = config
+        .data_directory
+        .join(LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_FILE);
     prepare_socket_path(&socket_path)?;
     let listener = UnixListener::bind(&socket_path).map_err(DaemonTransportError::Io)?;
     listener
@@ -111,6 +117,7 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
                         &mut logical_clock,
                         &mut drain_cursors,
                         &mut egress_diagnostics,
+                        &local_webrtc_terminal_record_path,
                         control_tx.clone(),
                         message,
                     ) {
@@ -276,6 +283,7 @@ fn handle_control_message(
     logical_clock: &mut u64,
     drain_cursors: &mut BTreeMap<String, u64>,
     egress_diagnostics: &mut DaemonEgressDiagnostics,
+    local_webrtc_terminal_record_path: &Path,
     control_tx: Sender<ControlMessage>,
     message: ControlMessage,
 ) -> bool {
@@ -312,7 +320,17 @@ fn handle_control_message(
         ControlMessage::LocalWebrtcPeerClosed {
             grant_id,
             attached_subscriptions,
+            terminal_record,
         } => {
+            if let Err(error) = persist_local_webrtc_terminal_record(
+                local_webrtc_terminal_record_path,
+                &terminal_record,
+            ) {
+                eprintln!(
+                    "local WebRTC sender terminal record persistence failed: kind={:?}",
+                    error.kind()
+                );
+            }
             daemon.local_webrtc().remove_peer(&grant_id);
             detach_local_webrtc_subscriptions(
                 daemon,
@@ -329,6 +347,27 @@ fn handle_control_message(
             false
         }
     }
+}
+
+fn persist_local_webrtc_terminal_record(
+    path: &Path,
+    record: &LocalWebrtcSenderTerminalRecord,
+) -> std::io::Result<()> {
+    let bytes = serde_json::to_vec(record)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    if bytes.len() > LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_MAX_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "local WebRTC sender terminal record exceeded size bound",
+        ));
+    }
+    let temporary_path = path.with_extension("json.tmp");
+    fs::write(&temporary_path, bytes)?;
+    if let Err(error) = fs::rename(&temporary_path, path) {
+        let _ = fs::remove_file(&temporary_path);
+        return Err(error);
+    }
+    Ok(())
 }
 
 fn detach_local_webrtc_subscriptions(
@@ -2631,6 +2670,7 @@ pub(crate) enum ControlMessage {
     LocalWebrtcPeerClosed {
         grant_id: String,
         attached_subscriptions: Vec<LocalWebrtcAttachedSubscription>,
+        terminal_record: LocalWebrtcSenderTerminalRecord,
     },
 }
 
