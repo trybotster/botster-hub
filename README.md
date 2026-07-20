@@ -82,7 +82,7 @@ hub-native routed envelopes and guarded notification writes:
 | Surface | Status on the product path |
 | --- | --- |
 | Attach + drain terminal egress | Product. Control ops ack through CoreDaemon; bytes arrive via drain/subscription. Late attach may replay prior output as Snapshot/Scrollback/TerminalOutput events when the worker path emits them. |
-| Hub `ReadScreen` / `CaptureSnapshot` | Product. Routes `HubClientApi` → `HubRuntime` → `CoreDaemon` readback. `ReadScreen` returns session text; `CaptureSnapshot` returns metadata only (rows/cols/format/byte count). Opaque snapshot bytes stay on the attach/drain data plane. |
+| Hub `ReadScreen` / `ReadModeFlags` / `CaptureSnapshot` | Product. Routes `HubClientApi` → `HubRuntime` → `CoreDaemon` readback. `ReadScreen` returns session text; targeted `ReadModeFlags` returns the authoritative session id and exact `mouse_mode: u8`; `CaptureSnapshot` returns metadata only (rows/cols/format/byte count). Errors stay errors rather than fabricated mouse-off results, and mode readback has no pushed event. Opaque snapshot bytes stay on the attach/drain data plane. |
 | Subscription history | Product. History and live terminal output flow through attach/drain events, not through readback responses. |
 | `report_delivery_*` pressure helpers | Still unfinished. Not exposed on the hub client product surface yet. |
 
@@ -90,7 +90,7 @@ hub-native routed envelopes and guarded notification writes:
 
 **Product on this path:** explicit data-dir daemon lifecycle; worker-backed
 local PTY sessions (spawn/list/attach/input/resize/detach/session-shutdown);
-attach/drain history; hub client screen and snapshot readback through CoreDaemon;
+attach/drain history; hub client screen, mode-flags, and snapshot readback through CoreDaemon;
 package install/enable/disable/reload and entrypoint supervision for local
 packages; `HubClientApi` + daemon socket protocol; native MCP coordination
 tools; Lua plugin runtime including constrained Project Pipelines; local
@@ -154,7 +154,7 @@ events rather than through readback responses.
 | `guarded_write` | Exposed | Hub admits the request; CoreDaemon owns readiness and delivery states. |
 | `publish` / `drain` / `acknowledge` routed envelope | Exposed | Single CoreDaemon coordination bus for native MCP and Lua. |
 | `release_sessions_for_restart` / `adoption_scan` / `adopt_session` | Exposed | Explicit daemon restart/adoption over worker-backed sessions. |
-| `read_screen` / `capture_snapshot` | Exposed | Daemon-backed terminal readback through `HubRuntime` and `CoreDaemon`; `capture_snapshot` returns metadata only, keeping opaque bytes on the attach/drain data plane. |
+| `read_screen` / `read_mode_flags` / `capture_snapshot` | Exposed | Daemon-backed terminal readback through `HubRuntime` and `CoreDaemon`; `read_mode_flags` returns only authoritative `session_id` plus exact `mouse_mode: u8` and preserves errors; `capture_snapshot` returns metadata only, keeping opaque bytes on the attach/drain data plane. |
 | `report_delivery_*` | Deferred | Delivery-pressure reporting is not exposed on the production hub path yet. |
 | `PluginCapabilityRuntime::submit` | Exposed | Hub owns concrete local capability policy and submits through core request contracts. |
 | `PluginCapabilityRuntime::drain_events` | Exposed | Plugin capability completions and timer events are drained through a hub-owned path. |

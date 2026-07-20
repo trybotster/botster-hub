@@ -30,6 +30,11 @@ export interface HubTestSupportMetadata {
     source_artifact_path: string;
     sha256: string;
   };
+  mode_flags_conformance_fixture: {
+    artifact_path: "mode-flags-conformance-fixture.json";
+    source_artifact_path: string;
+    sha256: string;
+  };
   plugin_contract_matrix: {
     package_name: string;
     artifact_path: "fixtures/plugin-contract-matrix";
@@ -57,6 +62,8 @@ export function lateAttachHistoryConformanceFixturePath(): string;
 export function readLateAttachHistoryConformanceFixture(): Record<string, unknown>;
 export function localWebrtcResponseChunkConformanceFixturePath(): string;
 export function readLocalWebrtcResponseChunkConformanceFixture(): Record<string, unknown>;
+export function modeFlagsConformanceFixturePath(): string;
+export function readModeFlagsConformanceFixture(): Record<string, unknown>;
 export function pluginContractMatrixFixturePath(): string;
 export function materializePluginContractMatrixFixture(destination: string): string;
 export function applicationPrimitivesFixturePath(): string;

@@ -58,7 +58,7 @@ pub use botster_core::{
 pub use capabilities::HubCapabilityRuntime;
 pub use client_api::{
     HubClientAdmission, HubClientApi, HubClientCapability, HubClientCaptureSnapshot,
-    HubClientError, HubClientEvent, HubClientGuardedWrite, HubClientIdentity,
+    HubClientError, HubClientEvent, HubClientGuardedWrite, HubClientIdentity, HubClientModeFlags,
     HubClientObservationKind, HubClientOperation, HubClientPackage, HubClientPackageAvailability,
     HubClientPackageAvailabilityReason, HubClientPackageAvailabilityState,
     HubClientPackageClassification, HubClientPackageConfiguration,
@@ -87,8 +87,8 @@ pub use daemon::{
 pub use daemon_transport::{
     DaemonApp, DaemonAppLaunchTarget, DaemonAvailablePackage, DaemonCapability,
     DaemonCompatibility, DaemonConnection, DaemonCoordination, DaemonEnvelope, DaemonEnvelopeAck,
-    DaemonEnvelopeDelivery, DaemonEnvelopePublish, DaemonEvent, DaemonIdentity, DaemonNotify,
-    DaemonOperatorError, DaemonPackage, DaemonPackageActionRequest,
+    DaemonEnvelopeDelivery, DaemonEnvelopePublish, DaemonEvent, DaemonIdentity, DaemonModeFlags,
+    DaemonNotify, DaemonOperatorError, DaemonPackage, DaemonPackageActionRequest,
     DaemonPackageActionRequiredReference, DaemonPackageActionState, DaemonPackageActionStatus,
     DaemonPackageAvailability, DaemonPackageAvailabilityReason, DaemonPackageAvailabilityState,
     DaemonPackageCompatibility, DaemonPackageConfiguration, DaemonPackageDecision,

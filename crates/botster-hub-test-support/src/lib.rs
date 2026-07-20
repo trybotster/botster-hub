@@ -18,8 +18,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use botster_hub_client::{
     DaemonCompatibility, DaemonCompatibilityRequirement, DaemonConnection, DaemonDiagnostic,
-    DaemonDiagnosticKind, DaemonEndpoint, DaemonEvent, DaemonOperatorError, DaemonRequest,
-    DaemonResponse, DaemonResponseKind, DaemonTransportError, ensure_compatible,
+    DaemonDiagnosticKind, DaemonEndpoint, DaemonEvent, DaemonModeFlags, DaemonOperatorError,
+    DaemonRequest, DaemonResponse, DaemonResponseKind, DaemonTransportError, ensure_compatible,
 };
 use serde::{Deserialize, Serialize};
 
@@ -82,6 +82,7 @@ pub struct FirstPartyClientSupportMatrix {
     pub plugin_surfaces: PluginSurfaceSupport,
     pub entity_actions: EntityActionSupport,
     pub late_attach_history: LateAttachHistorySupport,
+    pub terminal_mode_flags: TerminalModeFlagsSupport,
     pub known_limitations: Vec<String>,
 }
 
@@ -132,6 +133,16 @@ pub struct LateAttachHistorySupport {
     pub runtime_regression: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalModeFlagsSupport {
+    pub supported: bool,
+    pub feature: String,
+    pub fixture_path: String,
+    pub json_helper: String,
+    pub request_type: String,
+    pub response_kind: String,
+}
+
 /// Public client-shaped scenario for late terminal attach state and screen restoration.
 ///
 /// The events use [`botster_hub_client::DaemonEvent`] values only, so
@@ -148,6 +159,31 @@ pub struct LateAttachHistoryConformanceScenario {
     pub no_history_read_screen_text: String,
     pub history_then_live: Vec<DaemonEvent>,
     pub no_history_then_live: Vec<DaemonEvent>,
+}
+
+/// Public request/response conformance scenarios for authoritative terminal mode readback.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ModeFlagsConformanceScenario {
+    pub conformance_fixture_revision: u16,
+    pub request: DaemonRequest,
+    pub mouse_off: ModeFlagsConformanceSuccess,
+    pub mouse_on: ModeFlagsConformanceSuccess,
+    pub unknown_session: ModeFlagsConformanceFailure,
+    pub backend_failure: ModeFlagsConformanceFailure,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModeFlagsConformanceSuccess {
+    pub response_kind: DaemonResponseKind,
+    pub mode_flags: DaemonModeFlags,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModeFlagsConformanceFailure {
+    pub response_kind: DaemonResponseKind,
+    pub error_code: String,
+    pub operation: String,
+    pub mode_flags: Option<DaemonModeFlags>,
 }
 
 /// A stable file published by `botster-hub-test-support` for downstream tests.
@@ -348,6 +384,15 @@ pub fn first_party_client_support_matrix() -> FirstPartyClientSupportMatrix {
                 "external_daemon_same_session_reattach_replays_opaque_history_before_live_output"
                     .to_string(),
         },
+        terminal_mode_flags: TerminalModeFlagsSupport {
+            supported: true,
+            feature: botster_hub_client::FEATURE_TERMINAL_READBACK.to_string(),
+            fixture_path: "botster_hub_test_support::mode_flags_conformance_scenario".to_string(),
+            json_helper: "botster_hub_test_support::mode_flags_conformance_fixture_json"
+                .to_string(),
+            request_type: "read_mode_flags".to_string(),
+            response_kind: "read_mode_flags".to_string(),
+        },
         known_limitations: vec![
             "The matrix is a test/docs contract, not a daemon runtime endpoint.".to_string(),
             "Full plugin entity-frame hydration is intentionally outside this conformance fixture."
@@ -370,6 +415,45 @@ pub fn late_attach_history_conformance_scenario() -> LateAttachHistoryConformanc
         no_history_read_screen_text: String::new(),
         history_then_live: late_attach_history_events(),
         no_history_then_live: late_attach_no_history_events(),
+    }
+}
+
+/// Return deterministic exact-value and error-preservation mode readback scenarios.
+#[must_use]
+pub fn mode_flags_conformance_scenario() -> ModeFlagsConformanceScenario {
+    const SESSION_ID: &str = "mode-flags-fixture-session";
+
+    ModeFlagsConformanceScenario {
+        conformance_fixture_revision: botster_hub_client::CONFORMANCE_FIXTURE_REVISION,
+        request: DaemonRequest::ReadModeFlags {
+            session_id: SESSION_ID.to_string(),
+        },
+        mouse_off: ModeFlagsConformanceSuccess {
+            response_kind: DaemonResponseKind::ReadModeFlags,
+            mode_flags: DaemonModeFlags {
+                session_id: SESSION_ID.to_string(),
+                mouse_mode: 0,
+            },
+        },
+        mouse_on: ModeFlagsConformanceSuccess {
+            response_kind: DaemonResponseKind::ReadModeFlags,
+            mode_flags: DaemonModeFlags {
+                session_id: SESSION_ID.to_string(),
+                mouse_mode: 9,
+            },
+        },
+        unknown_session: ModeFlagsConformanceFailure {
+            response_kind: DaemonResponseKind::OperatorError,
+            error_code: "unknown_session".to_string(),
+            operation: "read_mode_flags".to_string(),
+            mode_flags: None,
+        },
+        backend_failure: ModeFlagsConformanceFailure {
+            response_kind: DaemonResponseKind::OperatorError,
+            error_code: "runtime_error".to_string(),
+            operation: "read_mode_flags".to_string(),
+            mode_flags: None,
+        },
     }
 }
 
@@ -445,6 +529,13 @@ pub fn late_attach_no_history_events() -> Vec<DaemonEvent> {
 pub fn late_attach_history_conformance_fixture_json() -> serde_json::Value {
     serde_json::to_value(late_attach_history_conformance_scenario())
         .expect("late attach history conformance fixture serializes")
+}
+
+/// Return stable serde JSON for downstream mode readback client tests.
+#[must_use]
+pub fn mode_flags_conformance_fixture_json() -> serde_json::Value {
+    serde_json::to_value(mode_flags_conformance_scenario())
+        .expect("mode flags conformance fixture serializes")
 }
 
 /// Return deterministic local WebRTC response-chunk scenarios for downstream clients.
@@ -4069,6 +4160,20 @@ mod tests {
     }
 
     #[test]
+    fn mode_flags_conformance_fixture_matches_node_package_copy() {
+        let expected = format!(
+            "{}\n",
+            serde_json::to_string_pretty(&mode_flags_conformance_fixture_json())
+                .expect("serialize mode-flags conformance fixture")
+        );
+
+        assert_eq!(
+            expected,
+            node_package_asset("mode-flags-conformance-fixture.json")
+        );
+    }
+
+    #[test]
     fn support_matrix_entity_capabilities_are_disjoint_and_complete() {
         let matrix = first_party_client_support_matrix();
         let mut declared = matrix.entity_actions.supported_capabilities.clone();
@@ -4184,6 +4289,14 @@ mod tests {
                     "event_type": "botster_hub_client::DaemonEvent",
                     "runtime_regression": "external_daemon_same_session_reattach_replays_opaque_history_before_live_output",
                 },
+                "terminal_mode_flags": {
+                    "supported": true,
+                    "feature": botster_hub_client::FEATURE_TERMINAL_READBACK,
+                    "fixture_path": "botster_hub_test_support::mode_flags_conformance_scenario",
+                    "json_helper": "botster_hub_test_support::mode_flags_conformance_fixture_json",
+                    "request_type": "read_mode_flags",
+                    "response_kind": "read_mode_flags",
+                },
                 "known_limitations": [
                     "The matrix is a test/docs contract, not a daemon runtime endpoint.",
                     "Full plugin entity-frame hydration is intentionally outside this conformance fixture.",
@@ -4210,6 +4323,40 @@ mod tests {
             matrix.late_attach_history.event_type,
             "botster_hub_client::DaemonEvent"
         );
+    }
+
+    #[test]
+    fn mode_flags_fixture_preserves_exact_values_attribution_and_errors() {
+        let scenario = mode_flags_conformance_scenario();
+
+        assert_eq!(
+            scenario.request,
+            DaemonRequest::ReadModeFlags {
+                session_id: "mode-flags-fixture-session".to_string(),
+            }
+        );
+        assert_eq!(scenario.mouse_off.mode_flags.mouse_mode, 0);
+        assert_eq!(scenario.mouse_on.mode_flags.mouse_mode, 9);
+        assert_eq!(
+            scenario.mouse_off.mode_flags.session_id,
+            "mode-flags-fixture-session"
+        );
+        assert_eq!(
+            scenario.mouse_on.mode_flags.session_id,
+            "mode-flags-fixture-session"
+        );
+        assert_eq!(
+            scenario.unknown_session.response_kind,
+            DaemonResponseKind::OperatorError
+        );
+        assert_eq!(scenario.unknown_session.error_code, "unknown_session");
+        assert!(scenario.unknown_session.mode_flags.is_none());
+        assert_eq!(
+            scenario.backend_failure.response_kind,
+            DaemonResponseKind::OperatorError
+        );
+        assert_eq!(scenario.backend_failure.error_code, "runtime_error");
+        assert!(scenario.backend_failure.mode_flags.is_none());
     }
 
     #[test]

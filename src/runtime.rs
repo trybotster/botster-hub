@@ -17,9 +17,10 @@ use botster_core::{
 use botster_core_daemon::{
     AcknowledgeRoutedEnvelopeRequest, CaptureSnapshotRequest, CaptureSnapshotResult, CoreDaemon,
     CoreDaemonConfig, CoreDaemonError, DaemonSession, DrainResult, DrainRoutedEnvelopesRequest,
-    GuardedWriteRequest, GuardedWriteResult, PublishRoutedEnvelopeRequest, ReadScreenRequest,
-    ReadScreenResult, RegistrySessionState, RoutedEnvelopeDeliveryStateResult,
-    SessionAdoptionReport, SessionAdoptionState, SpawnSessionRequest,
+    GuardedWriteRequest, GuardedWriteResult, PublishRoutedEnvelopeRequest, ReadModeFlagsRequest,
+    ReadModeFlagsResult, ReadScreenRequest, ReadScreenResult, RegistrySessionState,
+    RoutedEnvelopeDeliveryStateResult, SessionAdoptionReport, SessionAdoptionState,
+    SpawnSessionRequest,
 };
 use std::collections::{BTreeMap, VecDeque};
 use std::error::Error;
@@ -995,6 +996,23 @@ impl HubRuntime {
             .lock()
             .expect("core daemon mutex")
             .read_screen(ReadScreenRequest {
+                request_id,
+                session_id,
+                now_seconds,
+            })
+    }
+
+    /// Read authoritative terminal mode flags through the production core path.
+    pub fn read_mode_flags(
+        &mut self,
+        request_id: RequestId,
+        session_id: SessionId,
+        now_seconds: u64,
+    ) -> Result<ReadModeFlagsResult, CoreDaemonError> {
+        self.core_daemon
+            .lock()
+            .expect("core daemon mutex")
+            .read_mode_flags(ReadModeFlagsRequest {
                 request_id,
                 session_id,
                 now_seconds,

@@ -7275,7 +7275,7 @@ fn cli_daemon_restart_recovers_worker_backed_session_through_transport() {
 }
 
 #[test]
-fn external_hub_client_crate_drives_real_daemon_socket_protocol() {
+fn external_hub_client_read_mode_flags_drives_real_daemon_socket_protocol() {
     let _guard = daemon_test_guard();
     let data_dir = unique_test_dir("external-hub-client");
     let config = explicit_config(&data_dir);
@@ -7316,7 +7316,7 @@ fn external_hub_client_crate_drives_real_daemon_socket_protocol() {
         botster_hub_client::DaemonRequest::Spawn {
             session_id: "external-client-session".to_string(),
             command:
-                "printf 'external-ready\\n'; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done"
+                "printf '\\033[?1000h\\033[?1006h'; printf 'external-ready\\n'; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done"
                     .to_string(),
         },
     )
@@ -7380,6 +7380,31 @@ fn external_hub_client_crate_drives_real_daemon_socket_protocol() {
         "external client should drain terminal output through the hub protocol, got {observed:?}"
     );
 
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mode_flags = loop {
+        let response = connection
+            .request(&botster_hub_client::DaemonRequest::ReadModeFlags {
+                session_id: "external-client-session".to_string(),
+            })
+            .expect("external read_mode_flags request");
+        assert_eq!(
+            response.kind,
+            botster_hub_client::DaemonResponseKind::ReadModeFlags
+        );
+        let mode_flags = response.mode_flags.expect("read_mode_flags response body");
+        if mode_flags.mouse_mode == 9 {
+            break mode_flags;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for exact combined mouse mode, last value {}",
+            mode_flags.mouse_mode
+        );
+        thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(mode_flags.session_id, "external-client-session");
+    assert_eq!(mode_flags.mouse_mode, 9);
+
     let detach = connection
         .request(&botster_hub_client::DaemonRequest::Detach {
             session_id: "external-client-session".to_string(),
@@ -7429,6 +7454,33 @@ fn external_hub_client_crate_drives_real_daemon_socket_protocol() {
         .expect("connection stays usable after read_screen error");
     assert_eq!(
         status_after_read_error.kind,
+        botster_hub_client::DaemonResponseKind::Status
+    );
+
+    let missing_mode_flags = connection
+        .request(&botster_hub_client::DaemonRequest::ReadModeFlags {
+            session_id: "missing-external-client-session".to_string(),
+        })
+        .expect("missing read_mode_flags returns operator response");
+    assert_eq!(
+        missing_mode_flags.kind,
+        botster_hub_client::DaemonResponseKind::OperatorError
+    );
+    assert!(
+        missing_mode_flags.mode_flags.is_none(),
+        "unknown session must not fabricate a successful mouse-off body"
+    );
+    let error = missing_mode_flags
+        .error
+        .expect("read_mode_flags error frame");
+    assert_eq!(error.code, "unknown_session");
+    assert_eq!(error.operation, "read_mode_flags");
+
+    let status_after_mode_error = connection
+        .request(&botster_hub_client::DaemonRequest::Status)
+        .expect("connection stays usable after read_mode_flags error");
+    assert_eq!(
+        status_after_mode_error.kind,
         botster_hub_client::DaemonResponseKind::Status
     );
 
