@@ -17,7 +17,7 @@ node packages/hub-test-support/scripts/sync-assets.mjs
 ## Usage
 
 ```sh
-npm install --save-dev @trybotster/hub-test-support@0.1.7
+npm install --save-dev @trybotster/hub-test-support@0.1.8
 ```
 
 ```js
@@ -61,16 +61,16 @@ Use this exact package spec in npm-based client repos:
 ```json
 {
   "devDependencies": {
-    "@trybotster/hub-test-support": "0.1.7"
+    "@trybotster/hub-test-support": "0.1.8"
   }
 }
 ```
 
-After `@trybotster/hub-test-support@0.1.7` is published to the public npm
+After `@trybotster/hub-test-support@0.1.8` is published to the public npm
 registry, no scoped `.npmrc` entry or CI auth token is required for install.
 
 The support matrix is generated from the Rust compatibility descriptors. In
-0.1.7, `terminal_readback` appears in both `supported_features` and
+0.1.8, `terminal_readback` appears in both `supported_features` and
 `required_features`; downstream compatibility checks must implement it rather
 than treating it as optional. The late-attach fixture is generated from the
 Rust serde scenario and preserves `attaching -> optional initial state ->
