@@ -198,10 +198,10 @@ unchanged; no adjacent cleanup is authorized.
 5. Extend TypeScript generation and serde drift tests, regenerate the
    authoritative artifact, then extend/sync hub-test-support fixtures and Node
    package assets. Bump only the conformance fixture revision.
-6. Add a source/contract guard proving no pushed mode event was introduced,
-   scoped to event enums and transport variants so legitimate synced
-   `ModeFlags` types remain allowed.
-7. Update public docs, format, and run focused then workspace gates.
+6. Update public docs, format, and run focused then workspace gates. Confirm
+   the committed diff introduces no pushed mode event; the exhaustive
+   `DaemonEvent` match plus serde/TypeScript drift tests remain the contract
+   guard.
 
 ## Risks
 
@@ -224,8 +224,6 @@ unchanged; no adjacent cleanup is authorized.
   bytes require one conformance revision bump. Failing to update metadata,
   support matrices, hashes, exports, and docs together leaves downstream
   clients on conflicting authority.
-- **Over-broad event guard:** a crate-wide ban on `ModeFlags` would reject the
-  legitimate request/response state type. Guard only pushed-event variants.
 - **Dependency over-update:** a broad `cargo update` could introduce unrelated
   lockfile churn. Restrict and review the core dependency update.
 - **Test-only abstraction pressure:** forcing backend failure through a new
@@ -256,7 +254,7 @@ Focused behavior and contract checks:
    - committed generated TypeScript equals generator output.
 4. `./test.sh -p botster-hub-test-support`
    - typed fixture and generated JSON assert exact 0/9, attribution, unknown
-     session, backend failure, and no pushed mode event.
+     session, and backend failure without a successful default body.
 5. `./test.sh --test hub_test_support_conformance_test`
    - Rust fixtures, metadata, support matrix, and checked Node assets agree.
 6. `npm test --prefix packages/hub-test-support`

@@ -3262,6 +3262,13 @@ fn print_daemon_response(response: DaemonResponse) -> Result<(), OperatorError> 
                 println!("text={}", screen.text);
             }
         }
+        DaemonResponseKind::ReadModeFlags => {
+            println!("response=read_mode_flags");
+            if let Some(mode_flags) = response.mode_flags {
+                println!("session_id={}", mode_flags.session_id);
+                println!("mouse_mode={}", mode_flags.mouse_mode);
+            }
+        }
         DaemonResponseKind::CaptureSnapshot => {
             println!("response=capture_snapshot");
             if let Some(snapshot) = response.capture_snapshot {

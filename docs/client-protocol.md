@@ -690,13 +690,21 @@ backend-opaque state. Their payloads, formats, and byte counts must never be use
 as evidence that visible terminal history exists. Only `ReadScreen.text` and
 later `TerminalOutput.data` are renderable terminal text.
 
-`DaemonRequest::ReadScreen` and `DaemonRequest::CaptureSnapshot` are
-control-plane request/response readback operations for a running session. They
-route through the same production path as other local clients:
+`DaemonRequest::ReadScreen`, `DaemonRequest::ReadModeFlags`, and
+`DaemonRequest::CaptureSnapshot` are control-plane request/response readback
+operations for a running session. They route through the same production path
+as other local clients:
 `daemon_transport -> HubClientApi -> HubRuntime -> CoreDaemon`. `ReadScreen`
-returns `DaemonReadScreen { session_id, text }`. `CaptureSnapshot` returns
-`DaemonCaptureSnapshot { session_id, rows, cols, payload_format, payload_bytes }`.
-The hub does not expose the opaque snapshot bytes in this response.
+returns `DaemonReadScreen { session_id, text }`. `ReadModeFlags` returns
+`DaemonModeFlags { session_id, mouse_mode }`, where `mouse_mode` is the exact
+authoritative `u8` bitmask (`0` is off and combined tracking plus SGR reporting
+is `9`). The other core mode booleans are not authoritative and are not exposed.
+Unknown sessions and backend failures return `operator_error` with no
+`mode_flags` body; clients must not substitute a successful zero value.
+`CaptureSnapshot` returns `DaemonCaptureSnapshot { session_id, rows, cols,
+payload_format, payload_bytes }`. The hub does not expose the opaque snapshot
+bytes in this response. Mode flags are probed on demand and never arrive as a
+server-pushed mode-change event.
 
 The reusable first-party fixture for this rendering contract lives in
 `botster_hub_test_support::late_attach_history_conformance_scenario`. It returns
@@ -731,6 +739,13 @@ matrix includes `terminal_readback` in both `supported_features` and
 `required_features`. Downstream compatibility checks must therefore implement
 terminal readback; splitting required from supported is a separate protocol
 contract change.
+
+The targeted mode readback fixture lives in
+`botster_hub_test_support::mode_flags_conformance_scenario`, with stable JSON
+from `mode_flags_conformance_fixture_json`. The checked Node package exports it
+through `readModeFlagsConformanceFixture()`. It covers exact off (`0`) and
+combined-on (`9`) values, response session attribution, unknown-session error,
+and backend failure without a default success body.
 
 `DaemonEvent::WorktreeLifecycle` exposes hub-owned worktree CRUD lifecycle
 events to clients through the normal `DaemonResponse.events` field. The inner
@@ -800,6 +815,13 @@ Replacing revision-13 JSON byte arrays with validated `payload_base64`, literal
 because daemon framing and request issuance are unchanged. Revision 14 retains
 the separate `read_screen_text` semantic restoration oracle. Revision 13 is
 superseded and revision 12 does not identify any binary-safe history DTO.
+
+Adding targeted `read_mode_flags`, its authoritative `DaemonModeFlags` body,
+and the mode-flags conformance fixture increments
+`CONFORMANCE_FIXTURE_REVISION` to 15. `PROTOCOL_VERSION` remains 1 because this
+is an additive request/response operation under the existing
+`terminal_readback` compatibility feature. Revision 14 does not identify the
+mode readback DTO or exact-value/error fixture.
 
 Aligning attach readiness with the core contract alongside the local WebRTC
 chunk fixture increments `CONFORMANCE_FIXTURE_REVISION` to 12.

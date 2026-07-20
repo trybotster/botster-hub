@@ -21,7 +21,7 @@ mod typescript;
 
 pub const PROTOCOL: &str = "botster-hub-daemon-v1";
 pub const PROTOCOL_VERSION: u16 = 1;
-pub const CONFORMANCE_FIXTURE_REVISION: u16 = 14;
+pub const CONFORMANCE_FIXTURE_REVISION: u16 = 15;
 /// Version of the local WebRTC daemon-response chunk framing protocol.
 pub const LOCAL_WEBRTC_RESPONSE_CHUNK_VERSION: u16 = 1;
 /// Serialized local WebRTC response frames must remain strictly below this size.
@@ -620,6 +620,9 @@ pub enum DaemonRequest {
     ReadScreen {
         session_id: String,
     },
+    ReadModeFlags {
+        session_id: String,
+    },
     CaptureSnapshot {
         session_id: String,
     },
@@ -824,6 +827,8 @@ pub struct DaemonResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub read_screen: Option<DaemonReadScreen>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode_flags: Option<DaemonModeFlags>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capture_snapshot: Option<DaemonCaptureSnapshot>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub spawn_targets: Vec<DaemonSpawnTarget>,
@@ -895,6 +900,7 @@ pub enum DaemonResponseKind {
     ResolvedSessionTemplate,
     SessionContext,
     ReadScreen,
+    ReadModeFlags,
     CaptureSnapshot,
     SpawnTargets,
     SpawnTargetValidation,
@@ -929,6 +935,12 @@ pub enum DaemonResponseKind {
 pub struct DaemonReadScreen {
     pub session_id: String,
     pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonModeFlags {
+    pub session_id: String,
+    pub mouse_mode: u8,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2571,6 +2583,45 @@ mod tests {
     }
 
     #[test]
+    fn mode_flags_protocol_is_serde_stable_and_generated() {
+        let request = DaemonRequest::ReadModeFlags {
+            session_id: "mode-session".to_string(),
+        };
+        assert_eq!(
+            serde_json::to_value(&request).expect("mode request serializes"),
+            serde_json::json!({
+                "type": "read_mode_flags",
+                "session_id": "mode-session",
+            })
+        );
+
+        let response = DaemonResponse {
+            kind: DaemonResponseKind::ReadModeFlags,
+            mode_flags: Some(DaemonModeFlags {
+                session_id: "mode-session".to_string(),
+                mouse_mode: 9,
+            }),
+            ..daemon_response_example(DaemonResponseKind::ReadModeFlags)
+        };
+        let value = serde_json::to_value(response).expect("mode response serializes");
+        assert_eq!(
+            value["mode_flags"],
+            serde_json::json!({
+                "session_id": "mode-session",
+                "mouse_mode": 9,
+            })
+        );
+
+        let generated = daemon_protocol_typescript();
+        assert!(generated.contains(r#"| { type: "read_mode_flags"; session_id: string }"#));
+        assert!(generated.contains("mode_flags?: DaemonModeFlags | null;"));
+        assert_eq!(
+            generated_interface("DaemonModeFlags"),
+            "export interface DaemonModeFlags {\n  session_id: string;\n  mouse_mode: number;\n}\n"
+        );
+    }
+
+    #[test]
     fn generated_typescript_marks_vec_skip_diagnostics_fields_optional() {
         let hello_ack = DaemonHelloAck {
             protocol: PROTOCOL.to_string(),
@@ -3313,6 +3364,9 @@ mod tests {
             DaemonRequest::ReadScreen {
                 session_id: "session".to_string(),
             },
+            DaemonRequest::ReadModeFlags {
+                session_id: "session".to_string(),
+            },
             DaemonRequest::CaptureSnapshot {
                 session_id: "session".to_string(),
             },
@@ -3500,6 +3554,7 @@ mod tests {
             DaemonRequest::ShutdownSession { .. } => "shutdown_session",
             DaemonRequest::Drain { .. } => "drain",
             DaemonRequest::ReadScreen { .. } => "read_screen",
+            DaemonRequest::ReadModeFlags { .. } => "read_mode_flags",
             DaemonRequest::CaptureSnapshot { .. } => "capture_snapshot",
             DaemonRequest::ListSessionTemplates => "list_session_templates",
             DaemonRequest::ShowSessionTemplate { .. } => "show_session_template",
@@ -3560,6 +3615,9 @@ mod tests {
             DaemonResponseKind::SessionTemplates,
             DaemonResponseKind::ResolvedSessionTemplate,
             DaemonResponseKind::SessionContext,
+            DaemonResponseKind::ReadScreen,
+            DaemonResponseKind::ReadModeFlags,
+            DaemonResponseKind::CaptureSnapshot,
             DaemonResponseKind::SpawnTargets,
             DaemonResponseKind::SpawnTargetValidation,
             DaemonResponseKind::Worktrees,
@@ -3600,6 +3658,7 @@ mod tests {
             DaemonResponseKind::ResolvedSessionTemplate => "resolved_session_template",
             DaemonResponseKind::SessionContext => "session_context",
             DaemonResponseKind::ReadScreen => "read_screen",
+            DaemonResponseKind::ReadModeFlags => "read_mode_flags",
             DaemonResponseKind::CaptureSnapshot => "capture_snapshot",
             DaemonResponseKind::SpawnTargets => "spawn_targets",
             DaemonResponseKind::SpawnTargetValidation => "spawn_target_validation",
@@ -3702,6 +3761,10 @@ mod tests {
             read_screen: Some(DaemonReadScreen {
                 session_id: "session".to_string(),
                 text: "ready".to_string(),
+            }),
+            mode_flags: Some(DaemonModeFlags {
+                session_id: "session".to_string(),
+                mouse_mode: 9,
             }),
             capture_snapshot: Some(DaemonCaptureSnapshot {
                 session_id: "session".to_string(),
