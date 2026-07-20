@@ -53,3 +53,31 @@ fn hub_late_attach_fixture_matches_core_snapshot_before_live_ordering() {
 
     assert_eq!(hub, core);
 }
+
+#[test]
+fn hub_mode_flags_fixture_matches_public_request_response_contract() {
+    let scenario = botster_hub_test_support::mode_flags_conformance_scenario();
+
+    assert_eq!(
+        scenario.request,
+        botster_hub_client::DaemonRequest::ReadModeFlags {
+            session_id: scenario.mouse_on.mode_flags.session_id.clone(),
+        }
+    );
+    assert_eq!(scenario.mouse_off.mode_flags.mouse_mode, 0);
+    assert_eq!(scenario.mouse_on.mode_flags.mouse_mode, 9);
+    assert_eq!(
+        scenario.mouse_off.mode_flags.session_id,
+        scenario.mouse_on.mode_flags.session_id
+    );
+    assert!(scenario.unknown_session.mode_flags.is_none());
+    assert!(scenario.backend_failure.mode_flags.is_none());
+    assert_eq!(
+        scenario.unknown_session.response_kind,
+        botster_hub_client::DaemonResponseKind::OperatorError
+    );
+    assert_eq!(
+        scenario.backend_failure.response_kind,
+        botster_hub_client::DaemonResponseKind::OperatorError
+    );
+}

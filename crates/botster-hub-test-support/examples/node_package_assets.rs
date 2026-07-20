@@ -7,7 +7,8 @@ use botster_hub_test_support::{
     application_primitives_fixture_descriptor, copy_plugin_contract_matrix_fixture,
     daemon_protocol_typescript_artifact, first_party_client_support_matrix,
     late_attach_history_conformance_fixture_json,
-    local_webrtc_response_chunk_conformance_fixture_json, plugin_contract_matrix_fixture_asset,
+    local_webrtc_response_chunk_conformance_fixture_json, mode_flags_conformance_fixture_json,
+    plugin_contract_matrix_fixture_asset,
 };
 use serde_json::json;
 
@@ -57,6 +58,13 @@ fn main() -> Result<(), Box<dyn Error>> {
             serde_json::to_string_pretty(&local_webrtc_response_chunk_conformance_fixture_json())?
         ),
     )?;
+    fs::write(
+        output_dir.join("mode-flags-conformance-fixture.json"),
+        format!(
+            "{}\n",
+            serde_json::to_string_pretty(&mode_flags_conformance_fixture_json())?
+        ),
+    )?;
     let metadata = json!({
         "protocol": matrix.protocol,
         "protocol_version": matrix.protocol_version,
@@ -73,6 +81,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         "local_webrtc_response_chunk_conformance_fixture": {
             "artifact_path": "local-webrtc-response-chunk-conformance-fixture.json",
             "source_artifact_path": "botster_hub_test_support::local_webrtc_response_chunk_conformance_fixture_json()",
+        },
+        "mode_flags_conformance_fixture": {
+            "artifact_path": "mode-flags-conformance-fixture.json",
+            "source_artifact_path": "botster_hub_test_support::mode_flags_conformance_fixture_json()",
         },
         "plugin_contract_matrix": {
             "package_name": fixture.package_name,

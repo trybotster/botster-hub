@@ -289,6 +289,15 @@ impl HubClientApi {
                     .read_screen(read_request_id, session_id, now_seconds)
                     .map_err(|error| runtime_error(request_id.clone(), operation, error))?,
             )),
+            HubClientRequest::ReadModeFlags {
+                request_id: read_request_id,
+                session_id,
+                now_seconds,
+            } => HubClientResponseBody::ModeFlags(HubClientModeFlags::from(
+                runtime
+                    .read_mode_flags(read_request_id, session_id, now_seconds)
+                    .map_err(|error| runtime_error(request_id.clone(), operation, error))?,
+            )),
             HubClientRequest::CaptureSnapshot {
                 request_id: snapshot_request_id,
                 session_id,
@@ -543,6 +552,7 @@ impl HubClientAdmission {
             | HubClientOperation::DrainRoutedEnvelopes
             | HubClientOperation::AcknowledgeRoutedEnvelope
             | HubClientOperation::ReadScreen
+            | HubClientOperation::ReadModeFlags
             | HubClientOperation::CaptureSnapshot => self.allow_runtime,
             HubClientOperation::ListPackages | HubClientOperation::ListPackageNavigation => {
                 self.allow_packages
@@ -656,6 +666,12 @@ pub enum HubClientRequest {
         session_id: SessionId,
         now_seconds: u64,
     },
+    /// Request authoritative terminal mode flags where the daemon API supports it.
+    ReadModeFlags {
+        request_id: RequestId,
+        session_id: SessionId,
+        now_seconds: u64,
+    },
     /// Request a snapshot where the daemon API supports it.
     CaptureSnapshot {
         request_id: RequestId,
@@ -730,6 +746,7 @@ impl HubClientRequest {
             | Self::DrainRoutedEnvelopes { request_id, .. }
             | Self::AcknowledgeRoutedEnvelope { request_id, .. }
             | Self::ReadScreen { request_id, .. }
+            | Self::ReadModeFlags { request_id, .. }
             | Self::CaptureSnapshot { request_id, .. }
             | Self::ListPackages { request_id }
             | Self::ListPackageNavigation { request_id }
@@ -761,6 +778,7 @@ impl HubClientRequest {
             Self::DrainRoutedEnvelopes { .. } => HubClientOperation::DrainRoutedEnvelopes,
             Self::AcknowledgeRoutedEnvelope { .. } => HubClientOperation::AcknowledgeRoutedEnvelope,
             Self::ReadScreen { .. } => HubClientOperation::ReadScreen,
+            Self::ReadModeFlags { .. } => HubClientOperation::ReadModeFlags,
             Self::CaptureSnapshot { .. } => HubClientOperation::CaptureSnapshot,
             Self::ListPackages { .. } => HubClientOperation::ListPackages,
             Self::ListPackageNavigation { .. } => HubClientOperation::ListPackageNavigation,
@@ -794,6 +812,7 @@ pub enum HubClientOperation {
     DrainRoutedEnvelopes,
     AcknowledgeRoutedEnvelope,
     ReadScreen,
+    ReadModeFlags,
     CaptureSnapshot,
     ListPackages,
     ListPackageNavigation,
@@ -828,6 +847,7 @@ pub enum HubClientResponseBody {
     RoutedEnvelopeDrain(HubClientRoutedEnvelopeDrain),
     RoutedEnvelopeAck(HubClientRoutedEnvelopeAck),
     ReadScreen(HubClientReadScreen),
+    ModeFlags(HubClientModeFlags),
     CaptureSnapshot(HubClientCaptureSnapshot),
     Packages(Vec<HubClientPackage>),
     PackageNavigation(Vec<HubClientPackageNavigationEntry>),
@@ -942,6 +962,22 @@ impl From<botster_core_daemon::ReadScreenResult> for HubClientReadScreen {
         Self {
             session_id: result.screen.session_id,
             text: result.screen.text,
+        }
+    }
+}
+
+/// Client-facing authoritative terminal mode response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HubClientModeFlags {
+    pub session_id: SessionId,
+    pub mouse_mode: u8,
+}
+
+impl From<botster_core_daemon::ReadModeFlagsResult> for HubClientModeFlags {
+    fn from(result: botster_core_daemon::ReadModeFlagsResult) -> Self {
+        Self {
+            session_id: result.mode_flags.session_id,
+            mouse_mode: result.mode_flags.mode_flags.mouse_mode,
         }
     }
 }

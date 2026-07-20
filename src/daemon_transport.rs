@@ -31,8 +31,8 @@ pub use botster_hub_client::{
     DaemonCaptureSnapshot, DaemonCompatibility, DaemonConnection as ClientDaemonConnection,
     DaemonCoordination, DaemonDiagnostic, DaemonEndpoint, DaemonEnvelope, DaemonEnvelopeAck,
     DaemonEnvelopeDelivery, DaemonEnvelopePublish, DaemonEvent, DaemonHello, DaemonHelloAck,
-    DaemonIdentity, DaemonLocalWebrtcAnswer, DaemonLocalWebrtcBootstrap, DaemonNotify,
-    DaemonOperatorError, DaemonPackage, DaemonPackageActionRequest,
+    DaemonIdentity, DaemonLocalWebrtcAnswer, DaemonLocalWebrtcBootstrap, DaemonModeFlags,
+    DaemonNotify, DaemonOperatorError, DaemonPackage, DaemonPackageActionRequest,
     DaemonPackageActionRequiredReference, DaemonPackageActionState, DaemonPackageActionStatus,
     DaemonPackageAvailability, DaemonPackageAvailabilityReason, DaemonPackageAvailabilityState,
     DaemonPackageCompatibility, DaemonPackageConfiguration, DaemonPackageDecision,
@@ -60,16 +60,16 @@ use crate::local_webrtc::{
 };
 use crate::{
     AvailablePackage, AvailablePackageState, FileHubStateStore, HubClientApi,
-    HubClientCaptureSnapshot, HubClientEvent, HubClientPackage, HubClientPackageAvailabilityReason,
-    HubClientPackageAvailabilityState, HubClientPackageClassification,
-    HubClientPackageNavigationEntry, HubClientPackageNavigationTarget, HubClientPluginLifecycle,
-    HubClientPluginSurface, HubClientReadScreen, HubClientRequest, HubClientResponseBody,
-    HubClientSession, HubConfig, HubDaemon, HubDaemonStatus, HubStateLoadSource, HubStateStore,
-    McpToolDescriptor, PackageAction, PackageAdmissionReason, PackageCompatibilityResult,
-    PackageDecision, PackageInstallPlan, PackagePin, PackageRegistry,
-    PackageRegistryEntrySourceKind, PackageRegistryError, PackageState, PackageUpdatePolicy,
-    ResolvedSessionTemplate, SessionTemplateContextInput, SessionTemplateRequest,
-    resolve_foreground_launch_contract,
+    HubClientCaptureSnapshot, HubClientEvent, HubClientModeFlags, HubClientPackage,
+    HubClientPackageAvailabilityReason, HubClientPackageAvailabilityState,
+    HubClientPackageClassification, HubClientPackageNavigationEntry,
+    HubClientPackageNavigationTarget, HubClientPluginLifecycle, HubClientPluginSurface,
+    HubClientReadScreen, HubClientRequest, HubClientResponseBody, HubClientSession, HubConfig,
+    HubDaemon, HubDaemonStatus, HubStateLoadSource, HubStateStore, McpToolDescriptor,
+    PackageAction, PackageAdmissionReason, PackageCompatibilityResult, PackageDecision,
+    PackageInstallPlan, PackagePin, PackageRegistry, PackageRegistryEntrySourceKind,
+    PackageRegistryError, PackageState, PackageUpdatePolicy, ResolvedSessionTemplate,
+    SessionTemplateContextInput, SessionTemplateRequest, resolve_foreground_launch_contract,
 };
 use crate::{EntrypointProcessSnapshot, EntrypointSupervisorError};
 use crate::{
@@ -993,6 +993,21 @@ fn handle_runtime_control_request(
             };
             Ok(daemon_read_screen(screen))
         }
+        DaemonRequest::ReadModeFlags { session_id } => {
+            let response = api.handle_request(
+                runtime,
+                &packages,
+                HubClientRequest::ReadModeFlags {
+                    request_id: request_id("daemon-sessions-read-mode-flags"),
+                    session_id: SessionId(session_id),
+                    now_seconds: tick(logical_clock),
+                },
+            )?;
+            let HubClientResponseBody::ModeFlags(mode_flags) = response.body else {
+                return Err(DaemonTransportError::UnexpectedResponse);
+            };
+            Ok(daemon_mode_flags(mode_flags))
+        }
         DaemonRequest::CaptureSnapshot { session_id } => {
             let response = api.handle_request(
                 runtime,
@@ -1313,6 +1328,7 @@ fn handle_runtime_control_request(
             resolved_session_template: None,
             session_context: None,
             read_screen: None,
+            mode_flags: None,
             capture_snapshot: None,
             spawn_targets: Vec::new(),
             spawn_target_validation: None,
@@ -2795,6 +2811,7 @@ fn daemon_response_base(kind: DaemonResponseKind) -> DaemonResponse {
         resolved_session_template: None,
         session_context: None,
         read_screen: None,
+        mode_flags: None,
         capture_snapshot: None,
         spawn_targets: Vec::new(),
         spawn_target_validation: None,
@@ -2866,6 +2883,15 @@ fn daemon_read_screen(screen: HubClientReadScreen) -> DaemonResponse {
     response.read_screen = Some(DaemonReadScreen {
         session_id: screen.session_id.0,
         text: screen.text,
+    });
+    response
+}
+
+fn daemon_mode_flags(mode_flags: HubClientModeFlags) -> DaemonResponse {
+    let mut response = daemon_response_base(DaemonResponseKind::ReadModeFlags);
+    response.mode_flags = Some(DaemonModeFlags {
+        session_id: mode_flags.session_id.0,
+        mouse_mode: mode_flags.mouse_mode,
     });
     response
 }
@@ -5025,6 +5051,7 @@ fn operation_label(operation: crate::HubClientOperation) -> &'static str {
         crate::HubClientOperation::DrainRoutedEnvelopes => "drain_routed_envelopes",
         crate::HubClientOperation::AcknowledgeRoutedEnvelope => "acknowledge_routed_envelope",
         crate::HubClientOperation::ReadScreen => "read_screen",
+        crate::HubClientOperation::ReadModeFlags => "read_mode_flags",
         crate::HubClientOperation::CaptureSnapshot => "capture_snapshot",
         crate::HubClientOperation::ListPackages => "list_packages",
         crate::HubClientOperation::ListPackageNavigation => "list_package_navigation",
@@ -5322,6 +5349,21 @@ pub type DaemonTransportResult<T> = Result<T, DaemonTransportError>;
 mod tests {
     use super::*;
     use std::net::Shutdown;
+
+    #[test]
+    fn read_mode_flags_runtime_failure_projects_operator_error_without_default_body() {
+        let response = daemon_operator_error(crate::HubClientError::Runtime {
+            request_id: RequestId("mode-flags-backend-failure".to_string()),
+            operation: crate::HubClientOperation::ReadModeFlags,
+            kind: crate::HubClientRuntimeErrorKind::Runtime,
+        });
+
+        assert_eq!(response.kind, DaemonResponseKind::OperatorError);
+        assert!(response.mode_flags.is_none());
+        let error = response.error.expect("operator error body");
+        assert_eq!(error.code, "runtime_error");
+        assert_eq!(error.operation, "read_mode_flags");
+    }
 
     #[test]
     fn client_eof_detaches_connection_subscriptions() {
