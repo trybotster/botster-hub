@@ -44,6 +44,8 @@ const SMOKE_MARKER: &str = "botster-hub-smoke-ok";
 const SMOKE_TIMEOUT: Duration = Duration::from_secs(5);
 const DEV_STACK_DAEMON_METADATA_FILE: &str = ".botster-hub-dev-stack-daemon.json";
 const DEV_STACK_DAEMON_READINESS_BUDGET: Duration = Duration::from_secs(30);
+const LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_FILE: &str = "local-webrtc-sender-terminal.json";
+const LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_WAIT: Duration = Duration::from_secs(2);
 const TEST_INCOMPATIBLE_DAEMON_ENV: &str = "BOTSTER_HUB_TEST_INCOMPATIBLE_DAEMON";
 const TEST_DEV_STACK_READINESS_BUDGET_MS_ENV: &str =
     "BOTSTER_HUB_TEST_DEV_STACK_READINESS_BUDGET_MS";
@@ -666,6 +668,7 @@ fn local_runtime_smoke(args: Vec<String>) -> Result<(), SmokeError> {
     if bootstrap.data_plane != "webrtc_data_channel" {
         return Err(SmokeError::MissingPrerequisite("webrtc_data_channel"));
     }
+    println!("local_webrtc_grant_id={}", bootstrap.grant_id);
     smoke_local_webrtc_round_trip(&outcome.config, bootstrap)?;
     print_runtime_check(
         "webrtc",
@@ -744,7 +747,7 @@ fn smoke_local_webrtc_round_trip(
     bootstrap: &DaemonLocalWebrtcBootstrap,
 ) -> Result<(), SmokeError> {
     let stream_key = local_webrtc_stream_key(&bootstrap.grant_secret)?;
-    block_on(async {
+    let result = block_on(async {
         let (mut offer_peer, offer) = LocalWebrtcOfferPeer::create_offer().await?;
         let signal = daemon_transport_request(
             config,
@@ -832,7 +835,41 @@ fn smoke_local_webrtc_round_trip(
                 observed.len()
             )))
         }
-    })
+    });
+    if result.is_err() {
+        wait_for_local_webrtc_sender_terminal_record(config, &bootstrap.grant_id);
+    }
+    result
+}
+
+fn wait_for_local_webrtc_sender_terminal_record(
+    config: &botster_hub::HubConfig,
+    expected_grant_id: &str,
+) {
+    let path = config
+        .data_directory
+        .join(LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_FILE);
+    let deadline = Instant::now() + LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_WAIT;
+    loop {
+        if std::fs::read(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .and_then(|record| {
+                record
+                    .get("grant_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            })
+            .as_deref()
+            == Some(expected_grant_id)
+        {
+            return;
+        }
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return;
+        };
+        thread::sleep(remaining.min(Duration::from_millis(10)));
+    }
 }
 
 struct LocalWebrtcOffererHandler {
@@ -969,6 +1006,7 @@ impl LocalWebrtcOfferPeer {
         key: &AesGcmKey,
         request: &DaemonRequest,
     ) -> Result<DaemonResponse, SmokeError> {
+        let operation = smoke_local_webrtc_request_operation(request);
         let plaintext =
             serde_json::to_vec(request).map_err(|error| SmokeError::Webrtc(error.to_string()))?;
         let envelope = encrypt_aes_gcm(key, &plaintext, 1)
@@ -988,12 +1026,22 @@ impl LocalWebrtcOfferPeer {
             let response = timeout(Duration::from_secs(10), self.data_channel_message_rx.recv())
                 .await
                 .map_err(|_| {
-                    SmokeError::Webrtc("timed out waiting for data channel response".to_string())
+                    SmokeError::Webrtc(local_webrtc_response_progress_error(
+                        operation,
+                        "response_timeout",
+                        message_id.as_deref(),
+                        next_chunk_index,
+                        chunk_count,
+                    ))
                 })?
                 .ok_or_else(|| {
-                    SmokeError::Webrtc(
-                        "local WebRTC data channel closed before response".to_string(),
-                    )
+                    SmokeError::Webrtc(local_webrtc_response_progress_error(
+                        operation,
+                        "channel_closed",
+                        message_id.as_deref(),
+                        next_chunk_index,
+                        chunk_count,
+                    ))
                 })?;
             if response.len() >= LOCAL_WEBRTC_MAX_FRAME_BYTES {
                 return Err(SmokeError::Webrtc(
@@ -1033,6 +1081,33 @@ impl LocalWebrtcOfferPeer {
             .map_err(|error| SmokeError::Webrtc(error.to_string()))?;
         serde_json::from_slice(&plaintext).map_err(|error| SmokeError::Webrtc(error.to_string()))
     }
+}
+
+fn smoke_local_webrtc_request_operation(request: &DaemonRequest) -> &'static str {
+    match request {
+        DaemonRequest::Status => "status",
+        DaemonRequest::Spawn { .. } => "spawn",
+        DaemonRequest::Attach { .. } => "attach",
+        DaemonRequest::SendInput { .. } => "send_input",
+        DaemonRequest::Drain { .. } => "drain",
+        DaemonRequest::ShutdownSession { .. } => "shutdown_session",
+        _ => "other",
+    }
+}
+
+fn local_webrtc_response_progress_error(
+    operation: &str,
+    cause: &str,
+    message_id: Option<&str>,
+    next_chunk_index: u32,
+    expected_chunk_count: Option<u32>,
+) -> String {
+    format!(
+        "local WebRTC response incomplete: operation={operation} cause={cause} message_id={} next_chunk={} expected_chunks={}",
+        message_id.unwrap_or("pending"),
+        next_chunk_index,
+        expected_chunk_count.map_or_else(|| "pending".to_string(), |count| count.to_string()),
+    )
 }
 
 fn local_webrtc_stream_key(secret: &str) -> Result<AesGcmKey, SmokeError> {

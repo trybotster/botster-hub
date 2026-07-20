@@ -49,6 +49,9 @@ const BOTSTER_WEB_BRIDGE_LIVENESS_BACKSTOP: Duration = Duration::from_secs(60);
 const BOTSTER_WEB_BRIDGE_STARTUP_DELAY_MS: u64 = 3_000;
 const STALLED_ATTACH_MIN_BUFFERED_STDOUT_BYTES: usize = 8 * 1024;
 const STALLED_ATTACH_STABLE_SAMPLES: usize = 5;
+const LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_FILE: &str = "local-webrtc-sender-terminal.json";
+const LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_MAX_BYTES: usize = 4096;
+const TEST_CLOSE_LOCAL_WEBRTC_OPERATION_ENV: &str = "BOTSTER_HUB_TEST_CLOSE_LOCAL_WEBRTC_OPERATION";
 
 fn unique_test_dir(name: &str) -> PathBuf {
     let nanos = SystemTime::now()
@@ -2607,6 +2610,211 @@ fn local_webrtc_sender_failure(stderr: &[u8]) -> Option<&str> {
         .find(|line| line.starts_with("local WebRTC response delivery failed:"))
 }
 
+fn local_webrtc_grant_id(output: &Output) -> Option<String> {
+    command_output_text(output)
+        .lines()
+        .find_map(|line| line.strip_prefix("local_webrtc_grant_id="))
+        .filter(|grant_id| !grant_id.is_empty() && grant_id.len() <= 128)
+        .map(str::to_string)
+}
+
+fn local_webrtc_sender_terminal_record(
+    data_dir: &Path,
+    expected_grant_id: &str,
+) -> serde_json::Value {
+    let path = data_dir.join(LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_FILE);
+    assert!(
+        !path.with_extension("json.tmp").exists(),
+        "same-directory replacement must not leave a temporary sender record"
+    );
+    let bytes = fs::read(&path).expect("read persisted local WebRTC sender terminal record");
+    assert!(
+        bytes.len() <= LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_MAX_BYTES,
+        "sender terminal record exceeded fixed size bound"
+    );
+    let record: serde_json::Value = serde_json::from_slice(&bytes)
+        .expect("parse persisted local WebRTC sender terminal record");
+    let object = record
+        .as_object()
+        .expect("sender terminal record has a fixed JSON object schema");
+    let mut actual_fields = object.keys().map(String::as_str).collect::<Vec<_>>();
+    actual_fields.sort_unstable();
+    let mut expected_fields = vec![
+        "schema_version",
+        "grant_id",
+        "request_operation",
+        "message_id",
+        "next_chunk_index",
+        "last_sent_chunk_index",
+        "total_chunks",
+        "pressured",
+        "peer_connection_state",
+        "channel_terminal_signal",
+        "cause",
+        "cleanup_disposition",
+    ];
+    expected_fields.sort_unstable();
+    assert_eq!(actual_fields, expected_fields);
+    assert_eq!(record["schema_version"], 1);
+    assert_eq!(record["grant_id"], expected_grant_id);
+    assert!(
+        matches!(
+            record["request_operation"].as_str(),
+            Some(
+                "status"
+                    | "spawn"
+                    | "attach"
+                    | "send_input"
+                    | "drain"
+                    | "shutdown_session"
+                    | "request_queue_overflow"
+                    | "none"
+                    | "other"
+            )
+        ),
+        "sender record has a typed request operation: {record}"
+    );
+    assert!(record["message_id"].is_null() || record["message_id"].is_string());
+    assert!(record["next_chunk_index"].is_u64());
+    assert!(record["last_sent_chunk_index"].is_null() || record["last_sent_chunk_index"].is_u64());
+    assert!(record["total_chunks"].is_u64());
+    assert!(record["pressured"].is_boolean());
+    assert!(
+        matches!(
+            record["peer_connection_state"].as_str(),
+            Some(
+                "unspecified"
+                    | "new"
+                    | "connecting"
+                    | "connected"
+                    | "disconnected"
+                    | "failed"
+                    | "closed"
+            )
+        ),
+        "sender record has a typed peer state: {record}"
+    );
+    assert!(
+        matches!(
+            record["channel_terminal_signal"].as_str(),
+            Some("none" | "on_close" | "on_error" | "poll_ended")
+        ),
+        "sender record has a typed channel signal: {record}"
+    );
+    assert!(
+        matches!(
+            record["cause"].as_str(),
+            Some(
+                "send_text"
+                    | "channel_closed"
+                    | "channel_error"
+                    | "poll_ended"
+                    | "invalid_request"
+                    | "request_queue_overflow"
+                    | "invalid_encrypted_request"
+                    | "runtime_queue_closed"
+                    | "response_framing"
+                    | "low_water_threshold_setup"
+                    | "high_water_threshold_setup"
+                    | "peer_disconnected"
+                    | "peer_failed"
+                    | "peer_closed"
+            )
+        ),
+        "sender record has a typed terminal cause: {record}"
+    );
+    assert_eq!(record["cleanup_disposition"], "newly_sent");
+    let text = String::from_utf8(bytes).expect("sender terminal record is UTF-8 JSON");
+    for forbidden in [
+        "grant_secret",
+        "payload",
+        "request_body",
+        "response_body",
+        env!("CARGO_MANIFEST_DIR"),
+    ] {
+        assert!(
+            !text.contains(forbidden),
+            "sender terminal record contains forbidden data {forbidden:?}: {text}"
+        );
+    }
+    assert!(
+        !text.contains(&data_dir.display().to_string()),
+        "sender terminal record contains its data-directory path"
+    );
+    record
+}
+
+fn local_webrtc_smoke_failure_evidence(output: &Output, data_dir: &Path) -> String {
+    let text = command_output_text(output);
+    let Some(grant_id) = local_webrtc_grant_id(output) else {
+        return format!("smoke failed before local WebRTC bootstrap: {text}");
+    };
+    let record_path = data_dir.join(LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_FILE);
+    if !record_path.is_file() {
+        return format!(
+            "smoke failed: {text}; sender_record=missing file={LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_FILE}"
+        );
+    }
+    let terminal_record = local_webrtc_sender_terminal_record(data_dir, &grant_id);
+    format!("smoke failed: {text}; sender_record={terminal_record}")
+}
+
+#[test]
+fn local_webrtc_sender_terminal_record_rejects_stale_malformed_and_oversized_evidence() {
+    let data_dir = unique_test_dir("local-webrtc-terminal-record-validation");
+    fs::create_dir_all(&data_dir).expect("create terminal record validation directory");
+    let path = data_dir.join(LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_FILE);
+    let valid_record = serde_json::json!({
+        "schema_version": 1,
+        "grant_id": "grant-current",
+        "request_operation": "status",
+        "message_id": null,
+        "next_chunk_index": 0,
+        "last_sent_chunk_index": null,
+        "total_chunks": 0,
+        "pressured": false,
+        "peer_connection_state": "closed",
+        "channel_terminal_signal": "on_close",
+        "cause": "channel_closed",
+        "cleanup_disposition": "newly_sent",
+    });
+
+    fs::write(
+        &path,
+        serde_json::to_vec(&valid_record).expect("serialize validation fixture"),
+    )
+    .expect("write stale validation fixture");
+    assert!(
+        std::panic::catch_unwind(|| {
+            local_webrtc_sender_terminal_record(&data_dir, "grant-other")
+        })
+        .is_err(),
+        "a record for another grant must not satisfy the evidence gate"
+    );
+
+    fs::write(&path, b"{\"schema_version\":1").expect("write truncated validation fixture");
+    assert!(
+        std::panic::catch_unwind(|| {
+            local_webrtc_sender_terminal_record(&data_dir, "grant-current")
+        })
+        .is_err(),
+        "a truncated record must not satisfy the evidence gate"
+    );
+
+    fs::write(
+        &path,
+        vec![b'x'; LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_MAX_BYTES + 1],
+    )
+    .expect("write oversized validation fixture");
+    assert!(
+        std::panic::catch_unwind(|| {
+            local_webrtc_sender_terminal_record(&data_dir, "grant-current")
+        })
+        .is_err(),
+        "an oversized record must not satisfy the evidence gate"
+    );
+}
+
 fn local_webrtc_bounded_stderr_tail(stderr: &[u8], data_dir: &Path) -> String {
     const MAX_LINES: usize = 20;
     const MAX_CHARS_PER_LINE: usize = 512;
@@ -2848,8 +3056,29 @@ fn run_local_runtime_smoke(
     workspaces_package_path: &Path,
     web_bridge_port: u16,
 ) -> Output {
+    run_local_runtime_smoke_with_fault(
+        data_dir,
+        project_pipelines_package_path,
+        web_package_path,
+        tui_package_path,
+        workspaces_package_path,
+        web_bridge_port,
+        None,
+    )
+}
+
+fn run_local_runtime_smoke_with_fault(
+    data_dir: &Path,
+    project_pipelines_package_path: &Path,
+    web_package_path: &Path,
+    tui_package_path: &Path,
+    workspaces_package_path: &Path,
+    web_bridge_port: u16,
+    close_operation: Option<&str>,
+) -> Output {
     ensure_session_worker_binary();
-    Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_botster-hub"));
+    command
         .arg("smoke")
         .arg("--data-dir")
         .arg(data_dir)
@@ -2864,9 +3093,25 @@ fn run_local_runtime_smoke(
         .arg("--workspaces-package-path")
         .arg(workspaces_package_path)
         .arg("--web-bridge-port")
-        .arg(web_bridge_port.to_string())
+        .arg(web_bridge_port.to_string());
+    if let Some(operation) = close_operation {
+        command.env(TEST_CLOSE_LOCAL_WEBRTC_OPERATION_ENV, operation);
+    }
+    command.output().expect("run botster-hub smoke")
+}
+
+fn assert_smoke_owned_daemon_gone(data_dir: &Path) {
+    let status = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("status")
+        .arg("--data-dir")
+        .arg(data_dir)
         .output()
-        .expect("run botster-hub smoke")
+        .expect("run botster-hub status after smoke-owned daemon cleanup");
+    assert!(
+        !status.status.success(),
+        "smoke should stop the daemon it started: {}",
+        command_output_text(&status)
+    );
 }
 
 fn shutdown_dev_stack_daemon(data_dir: &Path) {
@@ -5172,12 +5417,14 @@ fn cli_smoke_proves_local_runtime_daemon_package_app_session_and_webrtc() {
         &workspaces_package_dir,
         unused_loopback_port(),
     );
-    assert!(
-        output.status.success(),
-        "smoke failed: {}",
-        command_output_text(&output)
-    );
     let text = command_output_text(&output);
+    assert_smoke_owned_daemon_gone(&data_dir);
+    if !output.status.success() {
+        panic!(
+            "{}",
+            local_webrtc_smoke_failure_evidence(&output, &data_dir)
+        );
+    }
     assert!(text.contains("smoke=local_runtime"));
     assert!(text.contains("check name=daemon status=pass"));
     assert!(text.contains("check name=core status=pass"));
@@ -5186,18 +5433,58 @@ fn cli_smoke_proves_local_runtime_daemon_package_app_session_and_webrtc() {
     assert!(text.contains("check name=session_terminal status=pass"));
     assert!(text.contains("check name=webrtc status=pass"));
     assert!(text.contains("smoke_result=pass"));
+}
 
-    let status = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
-        .arg("status")
-        .arg("--data-dir")
-        .arg(&data_dir)
-        .output()
-        .expect("run botster-hub status after smoke-owned daemon cleanup");
-    assert!(
-        !status.status.success(),
-        "smoke should stop the daemon it started: {}",
-        command_output_text(&status)
+#[test]
+fn cli_smoke_persists_matching_sender_record_when_webrtc_response_closes() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_short_test_dir("cli-smoke-webrtc-close");
+    let project_pipelines_package_dir = unique_test_dir("cli-smoke-close-project-pipelines");
+    let web_package_dir = unique_test_dir("cli-smoke-close-web");
+    let tui_package_dir = unique_test_dir("cli-smoke-close-tui");
+    let workspaces_package_dir = unique_test_dir("cli-smoke-close-workspaces");
+    write_project_pipelines_availability_package(&project_pipelines_package_dir);
+    write_botster_web_package(&web_package_dir);
+    write_botster_tui_package(&tui_package_dir);
+    write_botster_workspaces_local_package(&workspaces_package_dir, "botster-workspaces");
+
+    let output = run_local_runtime_smoke_with_fault(
+        &data_dir,
+        &project_pipelines_package_dir,
+        &web_package_dir,
+        &tui_package_dir,
+        &workspaces_package_dir,
+        unused_loopback_port(),
+        Some("status"),
     );
+    let text = command_output_text(&output);
+    assert!(
+        !output.status.success(),
+        "faulted smoke unexpectedly passed: {text}"
+    );
+    assert!(text.contains(
+        "local_webrtc=local WebRTC response incomplete: operation=status cause=channel_closed message_id=pending next_chunk=0 expected_chunks=pending"
+    ));
+    let grant_id =
+        local_webrtc_grant_id(&output).expect("faulted smoke reached local WebRTC bootstrap");
+    let terminal_record = local_webrtc_sender_terminal_record(&data_dir, &grant_id);
+    assert_eq!(terminal_record["request_operation"], "status");
+    assert_eq!(terminal_record["next_chunk_index"], 0);
+    assert_eq!(terminal_record["total_chunks"], 0);
+    assert!(
+        matches!(
+            terminal_record["cause"].as_str(),
+            Some(
+                "channel_closed"
+                    | "poll_ended"
+                    | "peer_disconnected"
+                    | "peer_failed"
+                    | "peer_closed"
+            )
+        ),
+        "faulted smoke must retain a usable sender terminal cause: {terminal_record}"
+    );
+    assert_smoke_owned_daemon_gone(&data_dir);
 }
 
 #[test]
@@ -5591,6 +5878,9 @@ fn cli_smoke_reports_missing_first_party_prerequisites() {
     let text = command_output_text(&output);
     assert!(text.contains("smoke=local_runtime"));
     assert!(text.contains("missing_prerequisite=project-pipelines"));
+    let failure = local_webrtc_smoke_failure_evidence(&output, &data_dir);
+    assert!(failure.contains("smoke failed before local WebRTC bootstrap"));
+    assert!(failure.contains("missing_prerequisite=project-pipelines"));
 }
 
 #[test]
