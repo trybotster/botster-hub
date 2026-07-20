@@ -11,6 +11,7 @@ import {
   firstPartyClientSupportMatrixPath,
   lateAttachHistoryConformanceFixturePath,
   localWebrtcResponseChunkConformanceFixturePath,
+  modeFlagsConformanceFixturePath,
   materializeApplicationPrimitivesFixture,
   materializePluginContractMatrixFixture,
   metadata,
@@ -19,6 +20,7 @@ import {
   readFirstPartyClientSupportMatrix,
   readLateAttachHistoryConformanceFixture,
   readLocalWebrtcResponseChunkConformanceFixture,
+  readModeFlagsConformanceFixture,
   verifyPackageAssets,
 } from "@trybotster/hub-test-support";
 
@@ -26,7 +28,7 @@ assert.equal(metadata.package_name, "@trybotster/hub-test-support");
 assert.equal(metadata.package_version, "0.1.7");
 assert.equal(metadata.protocol, "botster-hub-daemon-v1");
 assert.equal(metadata.protocol_version, 1);
-assert.equal(metadata.conformance_fixture_revision, 14);
+assert.equal(metadata.conformance_fixture_revision, 15);
 assert.deepEqual(metadata.application_primitives, {
   fixture_package_name: "botster.plugin-contract-matrix",
   artifact_path: "fixtures/plugin-contract-matrix",
@@ -54,8 +56,10 @@ assert.equal(protocol, readFileSync(daemonProtocolTypescriptPath(), "utf8"));
 assert.match(protocol, /export type DaemonRequest/);
 assert.match(protocol, /export interface DaemonCompatibility/);
 assert.match(protocol, /read_screen/);
+assert.match(protocol, /read_mode_flags/);
 assert.match(protocol, /capture_snapshot/);
 assert.match(protocol, /export interface DaemonReadScreen/);
+assert.match(protocol, /export interface DaemonModeFlags/);
 assert.match(protocol, /export interface DaemonCaptureSnapshot/);
 assert.match(protocol, /export interface DaemonLocalWebrtcResponseChunk/);
 
@@ -71,6 +75,10 @@ assert.equal(
   fileURLToPath(import.meta.resolve("@trybotster/hub-test-support/local-webrtc-response-chunk-conformance-fixture")),
   localWebrtcResponseChunkConformanceFixturePath(),
 );
+assert.equal(
+  fileURLToPath(import.meta.resolve("@trybotster/hub-test-support/mode-flags-conformance-fixture")),
+  modeFlagsConformanceFixturePath(),
+);
 
 const supportMatrix = readFirstPartyClientSupportMatrix();
 assert.equal(supportMatrix.late_attach_history.supported, true);
@@ -79,6 +87,23 @@ assert.equal(supportMatrix.supported_features.includes("terminal_readback"), tru
 
 const lateAttachFixture = readLateAttachHistoryConformanceFixture();
 const chunkFixture = readLocalWebrtcResponseChunkConformanceFixture();
+const modeFlagsFixture = readModeFlagsConformanceFixture();
+assert.deepEqual(modeFlagsFixture.request, {
+  type: "read_mode_flags",
+  session_id: "mode-flags-fixture-session",
+});
+assert.equal(modeFlagsFixture.mouse_off.mode_flags.mouse_mode, 0);
+assert.equal(modeFlagsFixture.mouse_on.mode_flags.mouse_mode, 9);
+assert.equal(modeFlagsFixture.mouse_off.mode_flags.session_id, "mode-flags-fixture-session");
+assert.equal(modeFlagsFixture.mouse_on.mode_flags.session_id, "mode-flags-fixture-session");
+assert.equal(modeFlagsFixture.unknown_session.response_kind, "operator_error");
+assert.equal(modeFlagsFixture.unknown_session.error_code, "unknown_session");
+assert.equal(modeFlagsFixture.unknown_session.operation, "read_mode_flags");
+assert.equal(modeFlagsFixture.unknown_session.mode_flags, null);
+assert.equal(modeFlagsFixture.backend_failure.response_kind, "operator_error");
+assert.equal(modeFlagsFixture.backend_failure.error_code, "runtime_error");
+assert.equal(modeFlagsFixture.backend_failure.operation, "read_mode_flags");
+assert.equal(modeFlagsFixture.backend_failure.mode_flags, null);
 assert.equal(chunkFixture.version, 1);
 assert.equal(chunkFixture.maximum_frame_bytes_exclusive, 65536);
 assert.equal(chunkFixture.maximum_response_bytes, 16777216);

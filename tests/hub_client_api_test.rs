@@ -2399,6 +2399,105 @@ fn read_screen_and_snapshot_return_typed_daemon_readback_responses() {
 }
 
 #[test]
+fn read_mode_flags_returns_exact_authoritative_values_and_session_attribution() {
+    let api = HubClientApi::local_operator("mode-flags-client-api-test");
+    let packages = empty_registry();
+    let mut runtime = explicit_runtime("mode-flags-readback");
+    let off_session_id = SessionId("mode-flags-off-session".to_string());
+    let on_session_id = SessionId("mode-flags-on-session".to_string());
+    let mut logical_clock = 1;
+
+    for (session_id, command) in [
+        (off_session_id.clone(), "sleep 5"),
+        (
+            on_session_id.clone(),
+            "printf '\\033[?1000h\\033[?1006h'; sleep 5",
+        ),
+    ] {
+        api.handle_request(
+            &mut runtime,
+            &packages,
+            HubClientRequest::Spawn {
+                request_id: request_id(&format!("spawn-{}", session_id.0)),
+                session_id,
+                command: command.to_string(),
+                now_seconds: logical_clock,
+            },
+        )
+        .expect("spawn mode-flags session");
+        logical_clock += 1;
+    }
+
+    let off = api
+        .handle_request(
+            &mut runtime,
+            &packages,
+            HubClientRequest::ReadModeFlags {
+                request_id: request_id("read-mode-flags-off"),
+                session_id: off_session_id.clone(),
+                now_seconds: logical_clock,
+            },
+        )
+        .expect("read authoritative mouse-off flags");
+    logical_clock += 1;
+    let HubClientResponseBody::ModeFlags(off) = off.body else {
+        panic!("read_mode_flags should return a typed mode body");
+    };
+    assert_eq!(off.session_id, off_session_id);
+    assert_eq!(off.mouse_mode, 0);
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let on = loop {
+        let response = api
+            .handle_request(
+                &mut runtime,
+                &packages,
+                HubClientRequest::ReadModeFlags {
+                    request_id: request_id("read-mode-flags-on"),
+                    session_id: on_session_id.clone(),
+                    now_seconds: logical_clock,
+                },
+            )
+            .expect("read authoritative mouse-on flags");
+        logical_clock += 1;
+        let HubClientResponseBody::ModeFlags(mode_flags) = response.body else {
+            panic!("read_mode_flags should return a typed mode body");
+        };
+        if mode_flags.mouse_mode == 9 {
+            break mode_flags;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for exact combined mouse mode, last value {}",
+            mode_flags.mouse_mode
+        );
+        thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(on.session_id, on_session_id);
+    assert_eq!(on.mouse_mode, 9);
+
+    let missing = api
+        .handle_request(
+            &mut runtime,
+            &packages,
+            HubClientRequest::ReadModeFlags {
+                request_id: request_id("read-mode-flags-missing"),
+                session_id: SessionId("missing-mode-flags-session".to_string()),
+                now_seconds: logical_clock,
+            },
+        )
+        .expect_err("unknown session must not default to mouse-off");
+    assert_eq!(
+        missing,
+        HubClientError::Runtime {
+            request_id: request_id("read-mode-flags-missing"),
+            operation: HubClientOperation::ReadModeFlags,
+            kind: botster_hub::HubClientRuntimeErrorKind::UnknownSession,
+        }
+    );
+}
+
+#[test]
 fn package_and_lifecycle_queries_are_sanitized_and_explicitly_pulled() {
     let api = HubClientApi::local_operator("local-client-api-test");
     let mut runtime = explicit_runtime("packages");

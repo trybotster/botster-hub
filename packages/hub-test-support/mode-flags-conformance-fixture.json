@@ -1,0 +1,33 @@
+{
+  "backend_failure": {
+    "error_code": "runtime_error",
+    "mode_flags": null,
+    "operation": "read_mode_flags",
+    "response_kind": "operator_error"
+  },
+  "conformance_fixture_revision": 15,
+  "mouse_off": {
+    "mode_flags": {
+      "mouse_mode": 0,
+      "session_id": "mode-flags-fixture-session"
+    },
+    "response_kind": "read_mode_flags"
+  },
+  "mouse_on": {
+    "mode_flags": {
+      "mouse_mode": 9,
+      "session_id": "mode-flags-fixture-session"
+    },
+    "response_kind": "read_mode_flags"
+  },
+  "request": {
+    "session_id": "mode-flags-fixture-session",
+    "type": "read_mode_flags"
+  },
+  "unknown_session": {
+    "error_code": "unknown_session",
+    "mode_flags": null,
+    "operation": "read_mode_flags",
+    "response_kind": "operator_error"
+  }
+}

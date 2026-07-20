@@ -3,27 +3,32 @@
   "package_version": "0.1.7",
   "protocol": "botster-hub-daemon-v1",
   "protocol_version": 1,
-  "conformance_fixture_revision": 14,
+  "conformance_fixture_revision": 15,
   "generated_by": "cargo run -p botster-hub-test-support --example node_package_assets",
   "daemon_protocol": {
     "artifact_path": "daemon-protocol.ts",
     "source_artifact_path": "crates/botster-hub-client/generated/daemon-protocol.ts",
-    "sha256": "7c35cefe3020024c81e8ba3d345d4dc8cf7d9c4738cefd11679facac6832dee9"
+    "sha256": "5b13c8f337d7cf420aa8badce34d3d469e28ef5d1e7536068ba1cb4be6eb55a7"
   },
   "first_party_client_support_matrix": {
     "artifact_path": "first-party-client-support-matrix.json",
     "source_artifact_path": "botster_hub_test_support::first_party_client_support_matrix()",
-    "sha256": "18a9ce461c895866bc4851cba19adc7d6b02e06c5f31b8650aca4df2cd042cda"
+    "sha256": "e1dcd20c9e7c789e867930920e34fb2cfedcbdfb5dbc0258c197b562a2eb8e06"
   },
   "late_attach_history_conformance_fixture": {
     "artifact_path": "late-attach-history-conformance-fixture.json",
     "source_artifact_path": "botster_hub_test_support::late_attach_history_conformance_fixture_json()",
-    "sha256": "4cfd39c7e12bf81e6dabe48b7451ece8ba31f46f9047771d795e9e2fb55043e1"
+    "sha256": "ed4129777c69c4e6d770596a12094bafecf1c02c5e2f7febd22d9e52cd1c56ef"
   },
   "local_webrtc_response_chunk_conformance_fixture": {
     "artifact_path": "local-webrtc-response-chunk-conformance-fixture.json",
     "source_artifact_path": "botster_hub_test_support::local_webrtc_response_chunk_conformance_fixture_json()",
     "sha256": "5e74575f2e077c27983aae3f8dc2d8412b4bc4632ce8878415462c9dcd65613e"
+  },
+  "mode_flags_conformance_fixture": {
+    "artifact_path": "mode-flags-conformance-fixture.json",
+    "source_artifact_path": "botster_hub_test_support::mode_flags_conformance_fixture_json()",
+    "sha256": "c3cca0fd3788d111719fa9a00a763f31a72cea2723092c9d74ef9653d4a93ab8"
   },
   "plugin_contract_matrix": {
     "package_name": "botster.plugin-contract-matrix",

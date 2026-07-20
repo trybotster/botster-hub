@@ -7,6 +7,7 @@ The package is a generated wrapper over `botster-hub-test-support` and
 `first-party-client-support-matrix.json`,
 `late-attach-history-conformance-fixture.json`,
 `local-webrtc-response-chunk-conformance-fixture.json`,
+`mode-flags-conformance-fixture.json`,
 `fixtures/plugin-contract-matrix`, or `metadata.json` by hand; run:
 
 ```sh
@@ -28,6 +29,7 @@ import {
   readFirstPartyClientSupportMatrix,
   readLateAttachHistoryConformanceFixture,
   readLocalWebrtcResponseChunkConformanceFixture,
+  readModeFlagsConformanceFixture,
 } from "@trybotster/hub-test-support";
 
 const protocolSource = readDaemonProtocolTypescript();
@@ -36,6 +38,7 @@ const applicationPrimitivesPath = materializeApplicationPrimitivesFixture(tempDi
 const supportMatrix = readFirstPartyClientSupportMatrix();
 const lateAttachFixture = readLateAttachHistoryConformanceFixture();
 const localWebrtcChunkFixture = readLocalWebrtcResponseChunkConformanceFixture();
+const modeFlagsFixture = readModeFlagsConformanceFixture();
 const applicationSurfaceId = metadata.application_primitives.surface_id;
 const rendererEntryPoint = metadata.application_primitives.renderer_entrypoint;
 
@@ -49,6 +52,7 @@ console.log(
   supportMatrix.required_features,
   lateAttachFixture.history_then_live,
   localWebrtcChunkFixture.scenarios.large_generated,
+  modeFlagsFixture.mouse_on.mode_flags.mouse_mode,
 );
 ```
 
@@ -77,6 +81,13 @@ Only `read_screen_text` is renderable restored content; `snapshot` and
 0.1.6 / conformance revision 13 uses superseded JSON number arrays, while
 version 0.1.5 / revision 12 exposes lossy string history. Neither is current
 binary-history contract authority.
+
+The mode-flags fixture covers the targeted `read_mode_flags` request/response
+contract. It preserves exact authoritative mouse values (`0` for off and `9`
+for combined tracking plus SGR reporting), attributes both successes to the
+requested session, and records unknown-session and backend failures as
+`operator_error` responses with no successful mode body. Mode flags are
+readback-only; clients must not expect a pushed mode-change event.
 
 Botster web and TUI renderers should consume
 `metadata.application_primitives.surface_id` (`contract.app`) and render

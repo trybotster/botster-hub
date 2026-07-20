@@ -61,6 +61,7 @@ export type DaemonRequest =
   | { type: "shutdown_session"; session_id: string }
   | { type: "drain"; session_id: string }
   | { type: "read_screen"; session_id: string }
+  | { type: "read_mode_flags"; session_id: string }
   | { type: "capture_snapshot"; session_id: string }
   | { type: "list_session_templates" }
   | { type: "show_session_template"; template_id: string }
@@ -118,6 +119,7 @@ export interface DaemonResponse {
   resolved_session_template?: DaemonResolvedSessionTemplate | null;
   session_context?: DaemonSessionContext | null;
   read_screen?: DaemonReadScreen | null;
+  mode_flags?: DaemonModeFlags | null;
   capture_snapshot?: DaemonCaptureSnapshot | null;
   spawn_targets?: DaemonSpawnTarget[];
   spawn_target_validation?: DaemonSpawnTargetValidation | null;
@@ -148,6 +150,11 @@ export interface DaemonResponse {
 export interface DaemonReadScreen {
   session_id: string;
   text: string;
+}
+
+export interface DaemonModeFlags {
+  session_id: string;
+  mouse_mode: number;
 }
 
 export interface DaemonCaptureSnapshot {
@@ -191,6 +198,7 @@ export type DaemonResponseKind =
   | "resolved_session_template"
   | "session_context"
   | "read_screen"
+  | "read_mode_flags"
   | "capture_snapshot"
   | "spawn_targets"
   | "spawn_target_validation"
