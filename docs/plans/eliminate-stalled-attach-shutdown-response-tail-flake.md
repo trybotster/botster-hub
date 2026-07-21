@@ -2,19 +2,19 @@
 
 ## Context loaded
 
-- Pipeline context: ticket `ticket_1784087788_242994`, run `run_1784309706_728656`, active Plan step `botster_plan`, gate `botster_plan_gate`, no current-run artifacts, findings, reviews, or open questions, and nine closed prerequisite tickets.
+- Pipeline context: ticket `ticket_1784087788_242994`, run `run_1784592795_631788`, active Plan step `botster_plan` (`run_step_1784592796_294140`), gate `botster_plan_gate`, no current-run artifacts, findings, reviews, or open questions, and nine closed prerequisite tickets.
 - Durable human rulings: do not generate host-wide load on a shared machine; deterministic test-owned fault injection is acceptable capture evidence when it goes red with the fix removed; the captured target failure is the shutdown stage returning `botster-hub shutdown error: client disconnected` while `attach_child` remained running; and the final fix still requires the merged isolated runner's loaded acceptance campaign. Timeout inflation, serialization, retry masking, and weakened concurrency assertions are forbidden.
 - Required planning authority: [[planner-playbook]], [[botster-planner-playbook]], [[botster-architecture]], [[cli-patterns]], [[spa-patterns]], and the Botster pipeline/worktree notes required by the overlay.
 - Controlling test context: [[full suite hangs need source and behavior proof before unrelated waivers]], [[a poisoned test lock is a symptom not a waiver]], [[suite wide acceptance criteria make every observed test failure in scope]], [[botster test sh forwards arguments to cargo not custom unit flags]], and [[plan agents must author vault context as wikilinks not home paths]].
-- Repository baseline: the ticket branch is clean at `e6ed8fa` and already contains prior diagnostics commit `1c4af77` plus an unreviewed response-ordering attempt. Current `origin/main` is `319f7ff`, includes all closed prerequisite work and the isolated loaded-runner workflow, and is ahead of/diverged from the ticket branch. Implementation must integrate current main before judging or carrying forward the old branch patch.
+- Repository baseline: the ticket worktree is clean at merge commit `c843378`. Its ticket-owned inputs remain diagnostics commit `1c4af77`, unreviewed response-ordering implementation `e6ed8fa`, and prior plan `93ac234`; `c843378` merges current `origin/main` at `afbf412`. Main now includes every closed prerequisite, including the reopened WebRTC owner fix merged by PR #148, plus the isolated loaded-runner workflow. Implementation must review the ticket commits against this refreshed base and rerun the binding campaign rather than carry forward stale failure premises.
 - Captured runtime evidence: the diagnostic campaign identified the assertion in `stalled_attach_stdout_does_not_block_other_daemon_commands` at the shutdown command, with status 1, stderr `botster-hub shutdown error: client disconnected`, and the intentionally stalled attach child still alive.
 - Production path inspected: `src/main.rs::operator_shutdown` sends `DaemonRequest::DaemonShutdown`; `serve_daemon` accepts the Unix connection; `handle_connection` sends the request to the control loop; `handle_control_message` creates the shutdown response; and `serve_daemon` calls `daemon.stop()` when that handler returns `true`. On current main, the control loop can choose to stop immediately after handing the response to the connection thread, before that thread completes `write_frame`.
 - Runner path inspected on current main: `.github/workflows/loaded-daemon-lifecycle.yml` checks out an exact subject SHA on a fresh `ubuntu-24.04` VM and `script/run-loaded-daemon-lifecycle` runs the lifecycle suite at default test concurrency under bounded `residual-tail` CPU stress, stopping at the first red and retaining full diagnostics.
-- Workflow discipline: run checklists `Plan vault discipline` and `Plan workflow discipline` record loaded context, repository inspection, convention fit, verification expectations, and gate handoff. Checklist creation timeouts were reconciled by listing persisted checklists before retrying.
+- Workflow discipline: run checklists `Plan vault discipline` (`checklist_1784592948_874053`) and `Plan workflow discipline` (`checklist_1784592954_201106`) record loaded context, repository inspection, convention fit, verification expectations, and gate handoff. Both creation calls timed out after persisting; listing the run checklists recovered their durable ids without creating duplicates.
 
 ## Scope
 
-1. Integrate current `origin/main` into the ticket branch so every closed prerequisite and the merged loaded-runner harness are present before the target fix is evaluated.
+1. Confirm the existing `origin/main` integration remains current before implementation and merge/rebase again only if main advances, so every closed prerequisite and the merged loaded-runner harness are present before the target fix is evaluated.
 2. Preserve or reapply only the ticket-owned stage diagnostics needed to report backpressure samples, command elapsed/status/stdout/stderr, and attach-child state at each assertion boundary.
 3. Change the production daemon shutdown ordering so a successful shutdown response does not allow `serve_daemon` to stop the daemon until the originating transport handler has attempted to deliver that response.
 4. Apply the ordering contract to both current producers of `ControlMessage::Request`: the local Unix socket handler used by the failing CLI path and the local WebRTC handler that shares the same shutdown request/control-loop contract. Signal-initiated shutdown remains response-less.
@@ -47,7 +47,7 @@
 - Unknown until implementation review: whether the existing branch attempt guarantees acknowledgement on every success, write-error, channel-close, and WebRTC close path. A missing acknowledgement could strand the single control loop; implementation must audit and test cancellation/error paths before retaining that shape.
 - Assumption: signal-forwarded shutdown supplies no delivery waiter because there is no requesting client response to preserve.
 - Assumption: reversing the earlier test-support tolerance is required ticket cleanup, not unrelated behavior expansion, because accepting the exact captured error would mask regression of the production guarantee.
-- Worktree/target binding: all work stays in the pipeline-provided worktree for target `tgt_7e208a0c76a44980a83b63af976b1f22`. The old ticket-branch commits are inputs for review, not authority over current main.
+- Worktree/target binding: all work stays in the pipeline-provided worktree for target `tgt_7e208a0c76a44980a83b63af976b1f22`. Ticket commits `1c4af77` and `e6ed8fa` are inputs for review, not authority over current main.
 - No human question is needed at Plan time: the captured assertion and human rulings select one production ordering defect and explicitly constrain the repair.
 
 ## Affected surfaces and files
@@ -74,7 +74,7 @@
 
 ## Implementation sequence
 
-1. Integrate current `origin/main`, inspect conflicts in the five Rust surfaces above, and confirm that all nine closed prerequisites and the loaded runner remain present. Recompute the branch diff from current main before making further edits.
+1. Verify `origin/main` has not advanced beyond the integrated `afbf412`; if it has, integrate it first. Inspect the five Rust surfaces above, confirm all nine closed prerequisites and the loaded runner remain present, and recompute the ticket-owned diff before making further edits.
 2. Restore the captured test diagnostics without overwriting newer sibling-test fixes. Keep diagnostic helpers private to the integration test and behavior-neutral.
 3. Implement the shutdown-only response-delivery acknowledgement in the existing `ControlMessage::Request` path. Ensure the Unix and WebRTC handlers signal after the write/send attempt on both success and error, while signal shutdown uses no waiter.
 4. Add a deterministic ordering test that blocks the acknowledgement, proves the shutdown response reaches the transport handler while the daemon stop decision remains pending, then acknowledges delivery and proves the stop decision completes. Capture a temporary ablation run showing this test red when the wait is removed, then restore the production code and rerun green.
@@ -101,7 +101,7 @@ The deterministic unit test proves the ordering primitive, but it is not suffici
 ## Acceptance checks and tests
 
 - Freshness and diff discipline:
-  - Confirm the implementation is based on current `origin/main` and contains the merged loaded-runner files plus all closed prerequisite fixes.
+  - Confirm the implementation is based on current `origin/main` (integrated `afbf412` at Plan time) and contains the merged loaded-runner files plus all closed prerequisite fixes, including PR #148's pressured-WebRTC close repair.
   - `git diff --check` passes.
   - Final production/test diff is limited to the five named Rust surfaces plus this plan unless a required current-main conflict is documented.
 - Deterministic ordering and negative control:
