@@ -5,6 +5,7 @@ readonly RUNNER=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/run-loaded-daemon-
 SELFTEST_DIR=$(mktemp -d)
 FIXTURE_PID=
 DECOY_PID=
+ESCAPED_PID=
 
 cleanup_selftest() {
   if [[ -n "$FIXTURE_PID" ]]; then
@@ -13,8 +14,12 @@ cleanup_selftest() {
   if [[ -n "$DECOY_PID" ]]; then
     kill -TERM -- "-$DECOY_PID" 2>/dev/null || true
   fi
+  if [[ -n "$ESCAPED_PID" ]]; then
+    kill -TERM -- "-$ESCAPED_PID" 2>/dev/null || true
+  fi
   wait "${FIXTURE_PID:-}" 2>/dev/null || true
   wait "${DECOY_PID:-}" 2>/dev/null || true
+  wait "${ESCAPED_PID:-}" 2>/dev/null || true
   rm -rf "$SELFTEST_DIR"
 }
 trap cleanup_selftest EXIT INT TERM HUP
@@ -39,8 +44,11 @@ OWNERSHIP_FILE="$ARTIFACT_DIR/owned-pgids.tsv"
 ACTIVE_OWNERSHIP_FILE="$ARTIFACT_DIR/active-pgids.tsv"
 SESSION_OWNERSHIP_FILE="$ARTIFACT_DIR/owned-sessions.tsv"
 ACTIVE_SESSION_OWNERSHIP_FILE="$ARTIFACT_DIR/active-sessions.tsv"
+TOKEN_OWNERSHIP_FILE="$ARTIFACT_DIR/owned-run-tokens.tsv"
+ACTIVE_TOKEN_OWNERSHIP_FILE="$ARTIFACT_DIR/active-run-tokens.tsv"
 touch "$CLEANUP_LOG" "$OWNERSHIP_FILE" "$ACTIVE_OWNERSHIP_FILE" \
-  "$SESSION_OWNERSHIP_FILE" "$ACTIVE_SESSION_OWNERSHIP_FILE"
+  "$SESSION_OWNERSHIP_FILE" "$ACTIVE_SESSION_OWNERSHIP_FILE" \
+  "$TOKEN_OWNERSHIP_FILE" "$ACTIVE_TOKEN_OWNERSHIP_FILE"
 
 setsid bash -c 'exit 0' &
 finished_pid=$!
@@ -51,6 +59,41 @@ capture_session_survivors selftest "$finished_pid" "$no_survivor_evidence" \
 [[ $(wc -l < "$no_survivor_evidence") -eq 1 ]] \
   || fail "no-survivor evidence should contain only its header"
 pass "no-survivor session is green"
+
+escaped_token="botster-loaded-selftest-escaped-$$"
+escaped_pid_file="$ARTIFACT_DIR/escaped.pid"
+BOTSTER_LOADED_RUN_TOKEN="$escaped_token" setsid bash -c '
+  setsid sleep 300 </dev/null >/dev/null 2>&1 &
+  printf "%s\n" "$!" > "$1"
+' fixture "$escaped_pid_file" &
+escaped_parent_pid=$!
+wait "$escaped_parent_pid"
+ESCAPED_PID=$(cat "$escaped_pid_file")
+
+escaped_ready=0
+for _ in {1..100}; do
+  if [[ -n "$(run_token_process_rows "$escaped_token")" ]]; then
+    escaped_ready=1
+    break
+  fi
+  sleep 0.05
+done
+((escaped_ready == 1)) || fail "setsid child that escaped its parent session was not found"
+escaped_sid=$(ps -o sid= -p "$ESCAPED_PID" | tr -d '[:space:]')
+[[ "$escaped_sid" == "$ESCAPED_PID" ]] || fail "escaped fixture did not enter its own session"
+
+record_run_token selftest "$escaped_token" || fail "record escaped run token"
+escaped_evidence="$ARTIFACT_DIR/escaped-owned-survivors.tsv"
+if capture_run_token_survivors selftest "$escaped_token" "$escaped_evidence"; then
+  fail "setsid child outside its parent session was classified clean"
+fi
+if verify_and_cleanup_run_token selftest "$escaped_token" "$escaped_evidence"; then
+  fail "escaped setsid survivor did not produce a nonzero leak verdict"
+fi
+[[ -z "$(run_token_process_rows "$escaped_token")" ]] \
+  || fail "escaped setsid survivor remained after exact token cleanup"
+ESCAPED_PID=
+pass "run-token ownership detects and cleans a child that escapes into its own session"
 
 setsid sleep 300 &
 DECOY_PID=$!

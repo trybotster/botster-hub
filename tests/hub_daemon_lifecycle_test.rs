@@ -9405,6 +9405,17 @@ fn daemon_detaches_subscription_when_attach_connection_drops() {
         shutdown_session.kind,
         botster_hub::DaemonResponseKind::Events
     );
+    let sessions_after_shutdown =
+        botster_hub::daemon_transport_request(&config, botster_hub::DaemonRequest::ListSessions)
+            .expect("list sessions after eof test session shutdown");
+    assert!(
+        sessions_after_shutdown
+            .sessions
+            .iter()
+            .any(|session| session.session_id == "eof-session" && session.lifecycle == "exited"),
+        "eof-session should be exited after shutdown: {:?}",
+        sessions_after_shutdown.sessions
+    );
     shutdown_cli_daemon(&data_dir, child);
 }
 
@@ -9481,6 +9492,16 @@ fn daemon_notify_session_defers_without_observed_readiness_over_socket() {
     assert_eq!(
         shutdown_session.kind,
         botster_hub::DaemonResponseKind::Events
+    );
+    let sessions_after_shutdown = connection
+        .request(&botster_hub::DaemonRequest::ListSessions)
+        .expect("list sessions after guarded socket session shutdown");
+    assert!(
+        sessions_after_shutdown.sessions.iter().any(|session| {
+            session.session_id == "notify-socket-session" && session.lifecycle == "exited"
+        }),
+        "notify-socket-session should be exited after shutdown: {:?}",
+        sessions_after_shutdown.sessions
     );
     shutdown_cli_daemon(&data_dir, child);
 }

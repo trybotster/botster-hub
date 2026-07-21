@@ -92,13 +92,21 @@ contains:
   stage times, elapsed time, and exit status.
 - `run-NNN.log`: complete combined stdout/stderr, including assertion or panic.
 - `resource-samples.log`: observed load, CPU, memory, and process data.
-- `owned-pgids.tsv`, `owned-sessions.tsv`, `cleanup.log`, and
-  `campaign-summary.txt`: ownership, TERM/KILL/wait decisions, post-clean
-  checks, and final statuses.
+- `owned-pgids.tsv`, `owned-sessions.tsv`, `owned-run-tokens.tsv`, their active
+  ledgers, `cleanup.log`, and `campaign-summary.txt`: ownership,
+  TERM/KILL/wait decisions, post-clean checks, and final statuses. Each test
+  repetition exports a unique run token inherited by its descendants, including
+  PTY workers that call `setsid`, so ownership remains detectable after
+  reparenting or session changes.
 - `run-NNN-session-survivors.tsv`: a bounded census of non-zombie processes
   still inside the recorded test session after the test leader exits. A
   survivor makes that repetition fail even when exact owned-session cleanup
   succeeds afterward.
+- `run-NNN-owned-survivors.tsv`: a bounded census of non-zombie descendants
+  still carrying the repetition's exact run token after the test leader exits.
+  This is the no-surviving-owned-process gate for workers that enter their own
+  sessions; any survivor makes the repetition fail before exact token-owned
+  process-group cleanup.
 
 Download from the run's **Artifacts** section or with:
 
@@ -114,13 +122,14 @@ also streams test and cleanup evidence to the durable workflow log.
 ## Cancellation, timeout, and teardown
 
 Cancel from the Actions run page or with `gh run cancel RUN_ID`. The harness
-traps termination, resolves every process group inside its recorded test
-session, sends TERM only to those owned groups plus the sampler and load groups,
-waits up to 30 seconds, escalates to KILL, reaps its direct children, and records
-whether the complete session is gone. An `always()` workflow step repeats the
-recorded session and process-group cleanup as a second boundary. GitHub then
-destroys the fresh VM, which is the final isolation boundary even after a forced
-runner stop.
+traps termination, resolves every process group carrying a recorded run token
+and every process group inside its recorded test session, sends TERM only to
+those owned groups plus the sampler and load groups, waits up to 30 seconds,
+escalates to KILL, reaps its direct children, and records whether the token and
+complete session are gone. An `always()` workflow step repeats recorded-token,
+session, and process-group cleanup as a second boundary. GitHub then destroys
+the fresh VM, which is the final isolation boundary even after a forced runner
+stop.
 
 There is no runner to deprovision after a run and no recurring idle resource.
 For another attempt, dispatch a new run with the same exact subject SHA and
