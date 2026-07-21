@@ -311,6 +311,29 @@ planned to change.
    unrelated cleanup. Every changed line must map to test-owned session teardown,
    truthful owned-process verification, its tests/docs, or this plan ledger.
 
+## Implementation reconciliation after merging current main
+
+- Exact merged-SHA campaign `29872611368` passed all 100 active lifecycle tests
+  but failed the owned-process oracle on repetition 1. The survivor was PID
+  23507, `node scripts/real-hub-dogfood-bridge.mjs`, reparented to PID 1; the
+  resource samples identify its original parent data directory as
+  `dogfood-web-health-only`, owned by
+  `cli_dogfood_launcher_rejects_health_only_web_entrypoint`.
+- Current main deliberately delivers the shutdown response before stopping the
+  daemon. The dogfood launcher's error cleanup requested graceful shutdown and
+  then immediately killed its owned daemon child, creating a scheduler race in
+  which the daemon could die before its supervisor stopped the Node process.
+- Under the existing suite-wide-root rule, the narrow additional scope is
+  `src/main.rs`: after a shutdown request, allow the owned daemon a bounded
+  graceful-exit window before retaining hard-kill fallback. The health-only
+  negative-path test additionally requires its bridge listener to be closed.
+  Production WebRTC, test concurrency, workflow inputs, and response assertions
+  remain unchanged.
+- Reconciled acceptance adds the focused health-only test, all dogfood launcher
+  tests, the full lifecycle target, the repository-wide wrapper, formatting,
+  strict workspace Clippy, and a new exact-SHA 20-run campaign whose token and
+  SID survivor ledgers must both be empty.
+
 ## Project Pipelines gates and checklists
 
 - Plan artifact: this file, with assumptions explicitly separated from proven

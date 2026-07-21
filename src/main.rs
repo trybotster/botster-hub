@@ -42,6 +42,7 @@ use webrtc::runtime::{
 
 const SMOKE_MARKER: &str = "botster-hub-smoke-ok";
 const SMOKE_TIMEOUT: Duration = Duration::from_secs(5);
+const DOGFOOD_DAEMON_SHUTDOWN_BUDGET: Duration = Duration::from_secs(5);
 const DEV_STACK_DAEMON_METADATA_FILE: &str = ".botster-hub-dev-stack-daemon.json";
 const DEV_STACK_DAEMON_READINESS_BUDGET: Duration = Duration::from_secs(30);
 const LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_FILE: &str = "local-webrtc-sender-terminal.json";
@@ -301,7 +302,7 @@ fn dogfood(args: Vec<String>) -> Result<(), DogfoodError> {
     let config = explicit_config(data_directory.clone())?;
     if let Err(error) = verify_dogfood_session_worker(&config) {
         let _ = daemon_transport_request(&config, DaemonRequest::DaemonShutdown);
-        cleanup_dogfood_child(&mut child);
+        cleanup_dogfood_child_after_shutdown(&mut child);
         return Err(error);
     }
 
@@ -309,7 +310,7 @@ fn dogfood(args: Vec<String>) -> Result<(), DogfoodError> {
         enable_dogfood_package(&config, "project-pipelines", options.package_path())?;
     if project_pipelines.kind == DaemonResponseKind::OperatorError {
         let _ = daemon_transport_request(&config, DaemonRequest::DaemonShutdown);
-        cleanup_dogfood_child(&mut child);
+        cleanup_dogfood_child_after_shutdown(&mut child);
         return Err(DogfoodError::PackageEnable(
             project_pipelines
                 .error
@@ -328,7 +329,7 @@ fn dogfood(args: Vec<String>) -> Result<(), DogfoodError> {
         Some(path) => path,
         None => {
             let _ = daemon_transport_request(&config, DaemonRequest::DaemonShutdown);
-            cleanup_dogfood_child(&mut child);
+            cleanup_dogfood_child_after_shutdown(&mut child);
             return Err(DogfoodError::MissingWebPackagePath);
         }
     };
@@ -342,7 +343,7 @@ fn dogfood(args: Vec<String>) -> Result<(), DogfoodError> {
         Ok(web) => web,
         Err(error) => {
             let _ = daemon_transport_request(&config, DaemonRequest::DaemonShutdown);
-            cleanup_dogfood_child(&mut child);
+            cleanup_dogfood_child_after_shutdown(&mut child);
             return Err(error);
         }
     };
@@ -350,7 +351,7 @@ fn dogfood(args: Vec<String>) -> Result<(), DogfoodError> {
         && let Err(error) = enable_botster_tui_dogfood(&config, tui_package_path)
     {
         let _ = daemon_transport_request(&config, DaemonRequest::DaemonShutdown);
-        cleanup_dogfood_child(&mut child);
+        cleanup_dogfood_child_after_shutdown(&mut child);
         return Err(error);
     }
 
@@ -2156,6 +2157,18 @@ fn wait_for_dogfood_ready(data_directory: &Path, child: &mut Child) -> Result<()
 fn cleanup_dogfood_child(child: &mut Child) {
     let _ = child.kill();
     let _ = child.wait();
+}
+
+fn cleanup_dogfood_child_after_shutdown(child: &mut Child) {
+    let deadline = Instant::now() + DOGFOOD_DAEMON_SHUTDOWN_BUDGET;
+    while Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) => thread::sleep(Duration::from_millis(20)),
+            Err(_) => break,
+        }
+    }
+    cleanup_dogfood_child(child);
 }
 
 fn print_dogfood_ready(
