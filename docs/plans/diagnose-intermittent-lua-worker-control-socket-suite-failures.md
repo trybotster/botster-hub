@@ -1,0 +1,122 @@
+# Diagnose Intermittent Lua Worker Control-Socket Suite Failures
+
+## Context loaded
+
+- Project Pipelines context: ticket `ticket_1784506652_117691`, run `run_1784592808_567657`, active Plan step `run_step_1784592808_723262`, required gate `botster_plan_gate`, and no current-run artifacts, findings, reviews, questions, answers, or blocking dependencies.
+- Origin evidence: implementation artifact `artifact_1784505601_765453` records two Lua worker control-socket failures in the first default-concurrency `./test.sh` run at Hub SHA `2b4ffe0872563f2335cca89c90679c66c13304cc`; isolated reruns and a later full-suite rerun passed. Review finding `finding_1784506048_919030` created this ticket because the first raw failure output and test names were not retained. Verify then ran one fresh full suite on the same SHA and it passed, confirming intermittent rather than resolved behavior.
+- Required role context: [[planner-playbook]], [[botster-planner-playbook]], [[botster-architecture]], [[cli-patterns]], and [[spa-patterns]], plus the Project Pipelines plugin/target/worktree notes required by the Botster overlay.
+- Targeted vault constraints: [[test script required for rust tests not cargo test]], [[poisoned rust mutex test locks cascade one failure across parallel suite]], [[subprocess harnesses must kill child on failed readiness]], [[botster session worker requires explicit build in dogfood launchers]], [[coredaemon embedding without worker path creates in process sessions]], and [[external client hub tests use subprocess spawned hub test support]].
+- Repository guidance and prior art: `README.md` defines the production path as `HubRuntime -> CoreDaemon -> botster-session-worker`; `docs/plans/` is the mainline plan-artifact location; `docs/plans/do-not-fail-daemon-startup-on-stale-worker-adoption-sockets.md` preserves the core/hub worker-ownership boundary; and the existing loaded lifecycle workflow provides exact-SHA, bounded-load, first-red, full-log, and owned-process cleanup evidence.
+- Repository/runtime trace: the likely originating tests are `real_lua_plugin_spawns_session_template_through_worker_capability` and `session_template_spawn_helper_works_from_non_mcp_plugin_invocation_path` in `tests/hub_lua_runtime_test.rs`, because they are the two Lua tests that spawn real worker-backed PTY sessions. Both flow through `HubRuntime` and `CoreDaemon` into `WorkerProcessRuntime::spawn_session` at the Hub-pinned core revision `7ce1f705952407a1e4f76bcc83cbc6da2efc7efb`.
+- Current socket startup mechanics: core spawns `botster-session-worker` with stderr discarded, the worker creates/removes/binds its Unix listener, and the parent polls `UnixStream::connect` for two seconds before returning `connect worker control socket failed`. The original artifact does not establish whether the child was CPU-starved, exited, failed socket setup, or collided with stale ownership; that is an explicit unknown, not a root-cause claim.
+- Workflow discipline: run checklists `checklist_1784592886_900127` (vault) and `checklist_1784592891_396191` (planning workflow) own the note coverage, convention-fit, verification, capture, runtime-trace, artifact, and gate evidence for this step. Both checklist creation calls timed out at the worker boundary but committed; listing before retry found them and avoided duplicates.
+
+## Scope
+
+1. Preserve the first non-cascade recurrence before rerunning anything: exact test name, full parent error chain, OS error kind/code, worker PID/status, socket path state, bounded child stderr, elapsed startup milestones, subject SHA, test concurrency, and cleanup/process-survivor evidence.
+2. Add a focused loaded target for the unchanged default-parallel `hub_lua_runtime_test` binary to the existing exact-SHA diagnostics harness. Precompile that exact binary before synthetic load, stop on the first red repetition, retain the full log/resource samples, and clean every owned process group. This is a diagnostic target; the ordinary full `./test.sh` suite remains the final Hub acceptance path.
+3. Localize the failure at the existing ownership boundary. Hub-side evidence must distinguish worker-not-scheduled/socket-not-yet-created, child exit, bind/setup failure, connection refusal, wrong/stale listener, and post-connect handshake failure rather than collapsing them into one connect string.
+4. If recurrence confirms a `botster-core` worker startup/lifecycle defect, create and register a blocking core ticket against target `tgt_1f7bce66eb304881980f9b4a2a5ae3fe`. Put the primitive repair and deterministic regression in core, where `WorkerProcessRuntime` and `botster-session-worker` are owned. Do not implement a Hub retry or alternate worker path.
+5. Consume the merged core repair through the Hub's normal `Cargo.lock` update, retain `Cargo.toml`'s branch-based dependency policy, and prove the production caller still traverses `HubRuntime -> CoreDaemon -> WorkerProcessRuntime -> botster-session-worker`.
+6. Add Hub-level regression coverage only where it proves the real Lua MCP and non-MCP session-template callers consume the repaired worker lifecycle. Keep their capability, payload, and session-ownership assertions intact.
+7. Record the diagnosis, chosen repair, deterministic red-on-revert proof, exact core revision, Hub consumption proof, and loaded/full-suite evidence in this plan artifact and Project Pipelines artifacts.
+
+## Non-scope
+
+- No timeout inflation, fixed sleeps, rerun-until-green acceptance, suite serialization, reduced concurrency/load, ignored tests, or weakened Lua/session assertions.
+- No speculative repair before a captured recurrence or deterministic reproduction identifies the failing lifecycle branch.
+- No Hub-owned replacement for core worker spawning, Unix-socket readiness, handshake, cleanup, or adoption mechanics; no fallback to in-process PTY ownership.
+- No new generic process supervisor, logging framework, optional runtime knob, retry abstraction, or parallel control channel.
+- No Lua plugin behavior, capability policy, Project Pipelines workflow policy, TUI, React SPA, Rails relay, MCP protocol, WebRTC, or unrelated daemon lifecycle changes.
+- No broad retrofit of neighboring integration tests or loaded-runner targets beyond the selector/precompile/artifact changes necessary to diagnose this ticket.
+- No vault write during Plan. A durable note is conditional on proving a reusable worker-readiness/lifecycle rule rather than merely restating an unverified two-second-timeout hypothesis.
+
+## Botster layers touched
+
+- Rust Hub integration-test harness: Lua session-template callers and focused loaded reproduction.
+- Rust core/session-worker dependency: worker spawn, Unix control-socket readiness/handshake, child failure evidence, and deterministic primitive regression, only through a formally registered blocking core ticket if evidence locates the defect there.
+- CI diagnostics and docs: exact-SHA loaded selector, artifacts, cleanup, and this reviewable plan.
+- No plugin, TUI, SPA, Rails relay, or product MCP contract changes.
+
+## Assumptions and unknowns
+
+- Assumption: the two unpreserved failures were the two real session-template spawn tests named above. This is the strongest source-based match, not recovered fact. The first new recurrence must record actual test names and supersedes this assumption.
+- Assumption: the Hub-pinned core revision is the relevant implementation baseline because `Cargo.lock` resolves all three core packages to `7ce1f705952407a1e4f76bcc83cbc6da2efc7efb`.
+- Assumption: the existing loaded lifecycle harness is the smallest professional reproduction mechanism; adding one enumerated Lua target is smaller than creating another workflow or running unbounded loops on a developer host.
+- Assumption: any production readiness repair belongs in core. Hub changes should be limited to reproduction, dependency consumption, and end-to-end regression proof.
+- Unknown: the original OS error, failing test names, worker exit status, stderr, and socket filesystem state were not preserved.
+- Unknown: whether the two-second parent connect deadline is causal. Under starvation it is suspicious, but changing its value without child-state evidence would violate the ticket.
+- Unknown: whether the race is delayed scheduling, early worker exit, bind/remove ownership, stale-socket collision, or a later handshake failure. Diagnostics must classify these branches before repair selection.
+- Unknown: whether the deterministic regression can be expressed entirely in core with an injected socket-readiness/process seam or needs a real subprocess test. Prefer existing process/filesystem primitives and a controlled observable barrier; do not expose test timing knobs as production API.
+- Worktree/target assumption: Hub work stays in this pipeline-provided worktree on target `tgt_7e208a0c76a44980a83b63af976b1f22`. Any core implementation must run in a separately assigned Project Pipelines worktree for target `tgt_1f7bce66eb304881980f9b4a2a5ae3fe`, never in the Cargo checkout or an ambient repository.
+
+## Affected surfaces and files
+
+- `tests/hub_lua_runtime_test.rs`: preserve the two real Lua session-template caller paths; add only end-to-end assertions or diagnostic fixture wiring required by the evidenced repair.
+- `tests/support/mod.rs`: possible test-only worker build/launch evidence seam if needed; do not make `ensure_session_worker_binary` serialize runtime execution or hide worker startup behavior.
+- `script/run-loaded-daemon-lifecycle`: add one bounded `hub_lua_runtime_test` selector using the unchanged default-parallel test binary and existing first-red/process-group cleanup behavior.
+- `.github/workflows/loaded-daemon-lifecycle.yml`: expose the selector and precompile the selected integration test binary rather than always precompiling only `hub_daemon_lifecycle_test`.
+- `docs/loaded-daemon-lifecycle-runner.md`: document the focused Lua-worker target as diagnostic evidence, not a replacement for full-suite acceptance.
+- `Cargo.lock`: consume the merged core revision after upstream repair. `Cargo.toml` is context only unless the existing dependency declaration itself must change, which is not expected.
+- `docs/plans/diagnose-intermittent-lua-worker-control-socket-suite-failures.md`: keep assumptions, cross-repo dependency, findings, and verification evidence synchronized.
+- Expected upstream core surfaces, owned by a separate blocking ticket if confirmed: `crates/botster-core/src/runtime/worker_process.rs`, `crates/botster-core/src/bin/botster-session-worker.rs`, and focused worker-process tests. Exact files must follow the core repo's own plan and evidence rather than being edited from this worktree.
+
+## Implementation sequence
+
+1. Extend the existing loaded harness with a `focused-lua-worker-suite` target that precompiles and runs `./test.sh --test hub_lua_runtime_test -- --nocapture` at default test concurrency under the selected bounded stress profile. Preserve first-red stopping, exact SHA validation, complete logs/resource samples, and owned-process teardown.
+2. Run a fixed-SHA diagnostic campaign against an exact committed Hub revision. On the first red, do not rerun before saving the artifact. Extract the first non-cascade failure, actual test name, error chain, worker/socket/process facts, and cleanup result. If later failures are consequences of a shared panic or leaked process, label them cascade evidence rather than independent roots.
+3. Add the narrowest bounded diagnostic at the owner that can distinguish child lifecycle branches. The parent must retain or report bounded worker stderr and child status on startup failure without leaking paths, environment, payloads, or secrets; successful startup remains quiet. Prove the diagnostic path with deterministic worker exit and delayed/readiness fixtures before relying on another loaded recurrence.
+4. Once evidence identifies the defective lifecycle transition, create a core ticket/branch and register it as a blocking dependency of this Hub ticket. Repair only that transition using an observable readiness/liveness condition. Keep socket naming, handshake protocol, worker-backed ownership, reconnect/adoption behavior, and cleanup semantics unchanged unless the evidence directly implicates one of them.
+5. In core, add a deterministic regression that controls the failing interleaving and fails when the repair is narrowly reverted. Pair it with a negative control proving unrelated spawn/handshake behavior still passes. Use real subprocess/socket coverage when the race depends on OS process scheduling or filesystem socket ownership; use unit seams only for branch control, not as the sole production-path proof.
+6. After the core fix is merged, update Hub `Cargo.lock`, run the two exact Lua caller tests, the whole default-parallel `hub_lua_runtime_test` binary, adjacent worker adoption/restart coverage, strict formatting/lints, and `./test.sh`.
+7. Run fixed-SHA loaded proof for the focused Lua target. Require a meaningful repetition campaign with unchanged concurrency/assertions and clean teardown; then run at least one ordinary full default-concurrency suite on the same SHA. A green focused campaign alone is not resolution.
+8. Update this artifact and Project Pipelines with the exact diagnosis, upstream ticket/commit, red-on-revert evidence, commands, repetitions, full-suite result, and any remaining unverified tail. Capture a vault note only if the result establishes a reusable control-socket readiness/lifecycle rule.
+
+## Risks
+
+- Misattribution: the source-based identification of the two Lua tests may be wrong because the initial report omitted names. Acceptance must follow the first preserved raw failure, not this inference.
+- Observer effect: repeated JSON parsing, filesystem polling, synchronous logging, or unbounded stderr capture in the startup loop could change the scheduling race. Diagnostics must be bounded and off the healthy hot path where possible.
+- Timeout masking: merely increasing two seconds can make a loaded sample green while preserving the lifecycle ambiguity. Repair must use the evidenced child/socket state and include red-on-revert proof.
+- Cross-repo drift: changing only Hub tests cannot fix a core-owned worker race; changing core without updating Hub's lockfile cannot change the actual Hub runtime path.
+- Wrong-worktree risk: a core fix made in Cargo's read-only checkout or the Hub worktree would be unauditable and unmergeable. Use the explicit core target and assigned worktree.
+- Stale/wrong listener risk: a filesystem path existing or accepting a connection does not alone prove it is the newly spawned worker. If evidence points here, regression must prove protocol/session identity, not path presence.
+- Cleanup leak: a parent startup error before runtime ownership transfer may leave the child worker or PTY process alive. Every diagnostic and deterministic failure path must prove the specific owned child is killed/waited or intentionally retained by a valid lifecycle owner.
+- False confidence: isolated tests and a focused loaded target remove unrelated contention topology. Final acceptance therefore includes the default-parallel Lua binary and full repository suite on the same fixed SHA.
+- Platform variance: Unix socket behavior and scheduler starvation differ between macOS development and Ubuntu CI. The deterministic regression should own the interleaving; fixed-SHA CI is corroborating real-path evidence.
+
+## Acceptance checks and tests
+
+- Artifact gate: the first recurrence is retained before any rerun with actual test name, complete first non-cascade error, subject SHA, concurrency, elapsed milestones, bounded child status/stderr, socket state, resource samples, and cleanup evidence. Missing child evidence after a reproduced red fails the diagnostic phase.
+- Harness checks: validate the new selector, prove it precompiles `hub_lua_runtime_test`, stops at the first red, uploads logs on failure, and leaves all recorded process groups gone. Existing lifecycle selectors must remain byte-for-byte equivalent in command selection.
+- Exact caller checks:
+  - `./test.sh --test hub_lua_runtime_test real_lua_plugin_spawns_session_template_through_worker_capability -- --exact --nocapture`
+  - `./test.sh --test hub_lua_runtime_test session_template_spawn_helper_works_from_non_mcp_plugin_invocation_path -- --exact --nocapture`
+- Default-parallel Lua check: `./test.sh --test hub_lua_runtime_test -- --nocapture` passes without serialization and retains both MCP and non-MCP real-worker session ownership assertions.
+- Core regression: the separately owned core test deterministically controls the evidenced startup interleaving, passes with the repair, and fails under a narrow repair ablation while an independent worker spawn/handshake control stays green.
+- Adjacent real-path checks: Hub worker-backed spawn/adoption/restart tests pass, including `hub_runtime_uses_worker_backed_sessions_and_adopts_after_daemon_restart` and the narrowest daemon transport restart test selected by implementation. This proves the repair did not trade startup reliability for broken reconnectability.
+- Static gates: `cargo fmt --check`, repository strict workspace Clippy with warnings denied, and `git diff --check` pass in each changed repository.
+- Hub suite gate: `./test.sh` passes at default concurrency on the exact Hub SHA consuming the repaired core revision. Any red requires exact first-root attribution; a rerun is evidence gathering, not acceptance.
+- Loaded gate: the exact fixed Hub SHA completes the focused Lua-worker campaign under the selected bounded stress profile for the approved repetition count with unchanged assertions/concurrency and `cleanup_status=0`. The implementation report must state what load was actually observed.
+- Production path proof: the final report identifies the changed runtime path as `Lua MCP/UI action -> HubSessionTemplateSpawner -> HubRuntime::spawn_session -> CoreDaemon -> WorkerProcessRuntime -> botster-session-worker control socket/handshake`; code presence or a unit-only test is insufficient.
+- Dependency proof: if core changes are required, this ticket cannot advance to final verification until the core ticket is merged, `Cargo.lock` resolves that commit, and the Hub checks above execute against it.
+
+## Pipeline gates and artifacts
+
+- Plan gate: attach this committed plan with all required fields and the two run checklists.
+- Diagnostic artifact: exact SHA, harness revision, test command, first-red raw log, child/socket/process classification, resource samples, and cleanup result.
+- Cross-repo dependency artifact: core ticket id, target id, assigned worktree, merged commit, deterministic regression, ablation result, and core verification commands.
+- Hub implementation artifact: files changed, dependency lock transition, exact caller/default-parallel/full-suite results, production entry-path proof, deviations, and residual risk.
+- Loaded verification artifact: workflow URL/run id, exact resolved SHA, repetition count, stress profile and observed load, first-red-or-all-green disposition, and owned-process cleanup.
+- Advancement rule: no waiver or rerun-until-green. If the diagnostic campaign remains green, retain the harness and evidence but return the ticket to an explicitly unverified state; do not invent a repair or claim resolution.
+
+## Vault gaps worth capturing
+
+- Candidate after proof: a child-process readiness deadline is not lifecycle evidence; worker startup should distinguish not-scheduled, exited, bind-failed, wrong-listener, and handshake-failed states with bounded diagnostics.
+- Candidate after proof: reconnectable Unix-socket workers need protocol/session identity before a pathname or successful connect is accepted as the intended new child.
+- Candidate after proof: parent-side spawn failure must retain bounded child exit/stderr evidence and clean up the child before ownership transfer.
+- No Plan-time vault capture: these are hypotheses already partially covered by subprocess cleanup and protocol-liveness notes. Capture only the rule that the deterministic regression and real loaded evidence establish.
+
+## Convention fit
+
+- No conflict with loaded conventions. The plan uses the repository wrapper, preserves the single production path and worker-backed architecture, assigns core mechanics to core and Hub policy/tests to Hub, uses the existing filesystem/process/CI harness, and avoids speculative abstractions or product-layer changes.
+- The Rails conventions supplied to the session do not govern this Rust Hub/core ticket; no Rails files, gems, services, or frontend build paths are touched.
