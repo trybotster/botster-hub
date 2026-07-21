@@ -68,6 +68,14 @@ reproduction can continue without discarding the unrelated first-red artifact.
 This selector is diagnostic-only: it does not satisfy the required full
 `focused-lua-worker-suite` campaign.
 
+Use `full-suite-contention` only after the 20-repetition
+`focused-lua-worker-suite` campaign completes without a control-socket failure.
+It runs the ordinary, unchanged, default-concurrency `./test.sh` command under
+the selected stress profile, preserving the original contention topology. The
+bounded exhaustion budget is five repetitions with `residual-tail`. Five green
+repetitions mean the failure was not reproduced under that exact budget; they do
+not establish a deterministic regression or prove the defect resolved.
+
 ## Bounded stress and time budgets
 
 The profiles start only job-local CPU workers:

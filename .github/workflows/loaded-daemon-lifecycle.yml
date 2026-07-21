@@ -8,7 +8,7 @@ on:
         required: true
         type: string
       test_target:
-        description: Test surface (focused runs do not satisfy the 20-run campaign)
+        description: Test surface (focused runs do not satisfy broader acceptance campaigns)
         required: true
         default: lifecycle-suite
         type: choice
@@ -20,6 +20,7 @@ on:
           - focused-cli-smoke
           - focused-lua-worker-suite
           - focused-lua-session-worker-callers
+          - full-suite-contention
       repetitions:
         description: Number of repetitions (1-100)
         required: true
@@ -118,24 +119,26 @@ jobs:
             uname -a
           } | tee -a "$ARTIFACT_DIR/metadata.txt"
 
-      - name: Select exact test binary
-        id: test-binary
+      - name: Precompile selected test surface
+        working-directory: subject
         env:
           TEST_TARGET: ${{ inputs.test_target }}
         run: |
           case "$TEST_TARGET" in
-            focused-lua-worker-suite|focused-lua-session-worker-callers) test_binary=hub_lua_runtime_test ;;
-            *) test_binary=hub_daemon_lifecycle_test ;;
+            focused-lua-worker-suite|focused-lua-session-worker-callers)
+              test_args=(--test hub_lua_runtime_test --no-run)
+              ;;
+            full-suite-contention)
+              test_args=(--no-run)
+              ;;
+            *)
+              test_args=(--test hub_daemon_lifecycle_test --no-run)
+              ;;
           esac
-          printf 'test_binary=%s\n' "$test_binary" | tee -a "$ARTIFACT_DIR/metadata.txt"
-          printf 'test_binary=%s\n' "$test_binary" >> "$GITHUB_OUTPUT"
-
-      - name: Precompile selected test binary
-        working-directory: subject
-        env:
-          TEST_BINARY: ${{ steps.test-binary.outputs.test_binary }}
-        run: |
-          ./test.sh --test "$TEST_BINARY" --no-run 2>&1 \
+          printf 'precompile_args=' | tee -a "$ARTIFACT_DIR/metadata.txt"
+          printf '%q ' "${test_args[@]}" | tee -a "$ARTIFACT_DIR/metadata.txt"
+          printf '\n' | tee -a "$ARTIFACT_DIR/metadata.txt"
+          ./test.sh "${test_args[@]}" 2>&1 \
             | tee "$ARTIFACT_DIR/precompile.log"
 
       - name: Run loaded real-daemon lifecycle campaign
