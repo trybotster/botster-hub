@@ -13,16 +13,15 @@ use std::thread;
 use std::time::Duration;
 
 use botster_core::{
-    BoundaryJson, CapabilityOperation, CapabilityOperationId, CapabilityOperationResult,
-    CapabilityRuntimeErrorKind, CapabilityRuntimeEvent, CapabilityRuntimeRequest, EndpointId,
-    EnvelopeCursor, EnvelopeId, EnvelopeTarget, PluginCancellationToken, PluginCapabilityRuntime,
-    PluginDescriptorKind, PluginDescriptorRef, PluginHandlerKind, PluginHandlerRef,
-    PluginHandlerRegistration, PluginInvocationFailure, PluginInvocationFailureKind,
-    PluginInvocationRequest, PluginInvocationResult, PluginInvocationSuccess, PluginKey,
-    PluginOwnedDescriptor, PluginResourceKind, PluginResourceRef, PluginRuntime,
-    PluginStoreCapabilityRequest, PluginStoreKey, PluginStoreOperation, RoutedEnvelope,
-    RoutedEnvelopeDrainOutcome, RoutedEnvelopePayload, RoutedEnvelopePublishOutcome,
-    TimerCapabilityRequest,
+    BoundaryJson, CapabilityOperation, CapabilityOperationId, CapabilityRuntimeErrorKind,
+    CapabilityRuntimeRequest, EndpointId, EnvelopeCursor, EnvelopeId, EnvelopeTarget,
+    PluginCancellationToken, PluginCapabilityRuntime, PluginDescriptorKind, PluginDescriptorRef,
+    PluginHandlerKind, PluginHandlerRef, PluginHandlerRegistration, PluginInvocationFailure,
+    PluginInvocationFailureKind, PluginInvocationRequest, PluginInvocationResult,
+    PluginInvocationSuccess, PluginKey, PluginOwnedDescriptor, PluginResourceKind,
+    PluginResourceRef, PluginRuntime, PluginStoreCapabilityRequest, PluginStoreKey,
+    PluginStoreOperation, RoutedEnvelope, RoutedEnvelopeDrainOutcome, RoutedEnvelopePayload,
+    RoutedEnvelopePublishOutcome, TimerCapabilityRequest,
 };
 use botster_core_daemon::RoutedEnvelopeDeliveryStateResult;
 use mlua::{Function, HookTriggers, Lua, LuaOptions, LuaSerdeExt, StdLib, Table, Value, VmState};
@@ -35,9 +34,7 @@ use crate::runtime::{SharedSessionTemplateSpawner, SharedSpawnTargets, SharedWor
 use crate::session_templates::{SessionTemplateContextInput, SessionTemplateRequest};
 
 const DEFAULT_INSTRUCTION_BUDGET: u64 = 500_000;
-const PLUGIN_DB_TIMEOUT_MS: u64 = 1_000;
 const COORDINATION_REQUEST_TIMEOUT_MS: u64 = 1_000;
-static LUA_OPERATION_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 /// Shared host capability runtime used by Lua capability helpers.
 pub type SharedHubCapabilityRuntime = Arc<Mutex<HubCapabilityRuntime>>;
 
@@ -897,7 +894,7 @@ fn plugin_db_table(
             name,
             lua.create_function(move |lua, args: Value| {
                 let operation = plugin_store_operation_from_lua(lua, action, args)?;
-                submit_plugin_store_and_wait(lua, runtime.clone(), key.clone(), operation, action)
+                execute_plugin_store_for_lua(lua, runtime.clone(), key.clone(), operation, action)
             })?,
         )?;
     }
@@ -959,87 +956,40 @@ fn plugin_store_operation_from_lua(
     }
 }
 
-fn submit_plugin_store_and_wait(
+fn execute_plugin_store_for_lua(
     lua: &Lua,
     capabilities: SharedHubCapabilityRuntime,
     plugin_key: PluginKey,
     operation: PluginStoreOperation,
     action: &str,
 ) -> Result<Value, mlua::Error> {
-    let sequence = LUA_OPERATION_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let operation_id = CapabilityOperationId(format!("lua-plugin-db-{action}-{sequence}"));
-    let request = CapabilityRuntimeRequest {
-        plugin_key: plugin_key.clone(),
-        operation_id: operation_id.clone(),
-        operation: CapabilityOperation::PluginStore(PluginStoreCapabilityRequest {
-            namespace: plugin_key.0.clone(),
-            operation,
-        }),
-        timeout_ms: PLUGIN_DB_TIMEOUT_MS,
-        callback: None,
-    };
-    {
-        let mut runtime = capabilities.lock().map_err(|_| {
+    let prepared = {
+        let runtime = capabilities.lock().map_err(|_| {
             mlua::Error::RuntimeError("capability runtime lock poisoned".to_string())
         })?;
         runtime
-            .submit(request)
-            .map_err(|error| mlua::Error::RuntimeError(error.to_string()))?;
-    }
+            .prepare_plugin_store(
+                &plugin_key,
+                PluginStoreCapabilityRequest {
+                    namespace: plugin_key.0.clone(),
+                    operation,
+                },
+            )
+            .map_err(|error| mlua::Error::RuntimeError(error.to_string()))?
+    };
 
-    for _ in 0..PLUGIN_DB_TIMEOUT_MS {
-        let events = {
-            let mut runtime = capabilities.lock().map_err(|_| {
-                mlua::Error::RuntimeError("capability runtime lock poisoned".to_string())
-            })?;
-            runtime
-                .drain_events(&plugin_key)
-                .map_err(|error| mlua::Error::RuntimeError(error.to_string()))?
-        };
-        if let Some(value) = plugin_store_event_to_lua(lua, action, &operation_id, events)? {
-            return Ok(value);
+    match prepared.execute() {
+        Ok(result) => lua.to_value(&result),
+        Err(error)
+            if action == "get" && error.kind == CapabilityRuntimeErrorKind::StoreNotFound =>
+        {
+            lua.to_value(&json!({ "kind": "record" }))
         }
-        thread::sleep(Duration::from_millis(1));
+        Err(error) => Err(mlua::Error::RuntimeError(format!(
+            "plugin_db operation failed: {}",
+            error.message
+        ))),
     }
-
-    Err(mlua::Error::RuntimeError(
-        "plugin_db operation did not complete before timeout".to_string(),
-    ))
-}
-
-fn plugin_store_event_to_lua(
-    lua: &Lua,
-    action: &str,
-    operation_id: &CapabilityOperationId,
-    events: Vec<CapabilityRuntimeEvent>,
-) -> Result<Option<Value>, mlua::Error> {
-    for event in events {
-        match event {
-            CapabilityRuntimeEvent::Completed(completed)
-                if completed.operation_id == *operation_id =>
-            {
-                let Some(CapabilityOperationResult::PluginStore(result)) = completed.result else {
-                    return Err(mlua::Error::RuntimeError(
-                        "plugin_db operation returned unexpected capability result".to_string(),
-                    ));
-                };
-                return lua.to_value(&result).map(Some);
-            }
-            CapabilityRuntimeEvent::Failed(failure) if failure.operation_id == *operation_id => {
-                if action == "get"
-                    && failure.error_kind == CapabilityRuntimeErrorKind::StoreNotFound
-                {
-                    return lua.to_value(&json!({ "kind": "record" })).map(Some);
-                }
-                return Err(mlua::Error::RuntimeError(format!(
-                    "plugin_db operation failed: {}",
-                    failure.reason
-                )));
-            }
-            _ => {}
-        }
-    }
-    Ok(None)
 }
 
 fn coordination_table(
