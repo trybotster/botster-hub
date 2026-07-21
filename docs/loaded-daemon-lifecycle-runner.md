@@ -53,6 +53,14 @@ directory; missing, stale, malformed, mismatched, or oversized evidence remains
 a test failure. This selector is diagnostic evidence only and does not replace
 the default-parallel lifecycle-suite campaign.
 
+Use `focused-lua-worker-suite` to run the unchanged, default-parallel
+`hub_lua_runtime_test` binary while preserving the first control-socket failure.
+For the Lua worker investigation, the fixed diagnostic budget is 20 repetitions
+with `residual-tail`. The runner stops on the first red; save that artifact before
+any rerun. If all 20 repetitions pass, report the defect as not reproduced under
+that exact budget, not resolved, and move reproduction to whole-suite contention
+before proposing a lifecycle repair.
+
 ## Bounded stress and time budgets
 
 The profiles start only job-local CPU workers:
@@ -65,7 +73,7 @@ The label describes requested workers, not achieved contention. Use the recorded
 `resource-samples.log` (`/proc/loadavg`, CPU, memory, and process samples every
 five seconds) when comparing a run with the residual tail.
 
-The workflow precompiles the exact lifecycle test binary before starting those
+The workflow precompiles the exact selected test binary before starting those
 workers. The bounded run deadline therefore measures test execution under load,
 not a fresh dependency build competing with the load generators.
 

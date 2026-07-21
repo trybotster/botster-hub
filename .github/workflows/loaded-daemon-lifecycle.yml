@@ -18,6 +18,7 @@ on:
           - focused-fast-exit-attach-diagnostic
           - focused-oversized-webrtc
           - focused-cli-smoke
+          - focused-lua-worker-suite
       repetitions:
         description: Number of repetitions (1-100)
         required: true
@@ -116,10 +117,24 @@ jobs:
             uname -a
           } | tee -a "$ARTIFACT_DIR/metadata.txt"
 
-      - name: Precompile lifecycle test binary
-        working-directory: subject
+      - name: Select exact test binary
+        id: test-binary
+        env:
+          TEST_TARGET: ${{ inputs.test_target }}
         run: |
-          ./test.sh --test hub_daemon_lifecycle_test --no-run 2>&1 \
+          case "$TEST_TARGET" in
+            focused-lua-worker-suite) test_binary=hub_lua_runtime_test ;;
+            *) test_binary=hub_daemon_lifecycle_test ;;
+          esac
+          printf 'test_binary=%s\n' "$test_binary" | tee -a "$ARTIFACT_DIR/metadata.txt"
+          printf 'test_binary=%s\n' "$test_binary" >> "$GITHUB_OUTPUT"
+
+      - name: Precompile selected test binary
+        working-directory: subject
+        env:
+          TEST_BINARY: ${{ steps.test-binary.outputs.test_binary }}
+        run: |
+          ./test.sh --test "$TEST_BINARY" --no-run 2>&1 \
             | tee "$ARTIFACT_DIR/precompile.log"
 
       - name: Run loaded real-daemon lifecycle campaign
