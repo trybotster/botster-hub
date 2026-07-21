@@ -112,6 +112,13 @@
 - Loaded verification artifact: workflow URL/run id, exact resolved SHA, repetition count, stress profile and observed load, first-red-or-all-green disposition, and owned-process cleanup.
 - Advancement rule: no waiver or rerun-until-green. If the diagnostic campaign remains green, retain the harness and evidence but return the ticket to an explicitly unverified state; do not invent a repair or claim resolution.
 
+## Implementation evidence
+
+- Commit `c3b104df5769d63c24c5ec2f1ef9ed6d6cd4dd8e` added the full Lua-binary selector. Run `29790592442` preserved its first red at repetition 8 under `residual-tail`: `plugin_db_missing_get_returns_absent_record_shape_and_preserves_success_shape` timed out waiting for a plugin DB operation, while both real session-template callers passed. Cleanup completed with no active process groups. Diagnostic artifact: `artifact_1784595261_941285`.
+- Human answer `question_1784595267_687574` classified that signature as a distinct sibling concern. Ticket `ticket_1784595368_465499` now blocks final acceptance of this ticket; no plugin DB repair is in this branch.
+- Commit `324d6786d3c2315e7ea539f2ecb7887b16331708` added the diagnostic-only session-template selector. Run `29791873796` completed all 20 `residual-tail` repetitions (three existing `session_template` tests each, default libtest parallelism) without a control-socket recurrence. Observed one-minute load averaged 52.61 and peaked at 68.70 on four CPUs with 48 stress workers; cleanup status was zero with an empty active ownership ledger. Diagnostic artifact: `artifact_1784597033_468312`.
+- Disposition: the control-socket defect is not reproduced under the targeted 20-run budget and is not resolved. The full Lua-binary campaign remains interrupted and must rerun after the blocking sibling lands.
+
 ## Vault gaps worth capturing
 
 - Candidate after proof: a child-process readiness deadline is not lifecycle evidence; worker startup should distinguish not-scheduled, exited, bind-failed, wrong-listener, and handshake-failed states with bounded diagnostics.
