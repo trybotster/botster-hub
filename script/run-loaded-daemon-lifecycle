@@ -21,6 +21,7 @@ SAMPLER_PGID=
 TEST_PID=
 TEST_PGID=
 TEST_SID=
+TEST_RUN_TOKEN=
 RECORDED_PGID=
 RECORDED_SID=
 FINALIZED=0
@@ -29,6 +30,8 @@ OWNERSHIP_FILE=
 ACTIVE_OWNERSHIP_FILE=
 SESSION_OWNERSHIP_FILE=
 ACTIVE_SESSION_OWNERSHIP_FILE=
+TOKEN_OWNERSHIP_FILE=
+ACTIVE_TOKEN_OWNERSHIP_FILE=
 
 usage() {
   cat <<'USAGE'
@@ -131,6 +134,16 @@ deactivate_session() {
   mv "$temporary_file" "$ACTIVE_SESSION_OWNERSHIP_FILE"
 }
 
+deactivate_run_token() {
+  local token=$1
+  local temporary_file="$ACTIVE_TOKEN_OWNERSHIP_FILE.tmp.$$"
+
+  touch "$ACTIVE_TOKEN_OWNERSHIP_FILE"
+  awk -F '\t' -v token="$token" '$2 != token' \
+    "$ACTIVE_TOKEN_OWNERSHIP_FILE" > "$temporary_file"
+  mv "$temporary_file" "$ACTIVE_TOKEN_OWNERSHIP_FILE"
+}
+
 session_process_rows() {
   local sid=$1
 
@@ -142,6 +155,62 @@ session_process_rows() {
           printf "\n"
         }
       '
+}
+
+process_has_run_token() {
+  local environment_file=$1
+  local token=$2
+  local entry
+
+  while IFS= read -r -d '' entry; do
+    [[ "$entry" == "BOTSTER_LOADED_RUN_TOKEN=$token" ]] && return 0
+  done < "$environment_file"
+  return 1
+}
+
+run_token_process_rows() {
+  local token=$1
+  local environment_file pid
+
+  for environment_file in /proc/[0-9]*/environ; do
+    [[ -r "$environment_file" ]] || continue
+    process_has_run_token "$environment_file" "$token" 2>/dev/null || continue
+    pid=${environment_file#/proc/}
+    pid=${pid%/environ}
+    ps -o pid=,ppid=,pgid=,sid=,stat=,comm=,args= -p "$pid" 2>/dev/null \
+      | awk '$5 !~ /^Z/ {
+          printf "%s\t%s\t%s\t%s\t%s\t%s", $1, $2, $3, $4, $5, $6
+          for (field = 7; field <= NF; field++) printf "\t%s", $field
+          printf "\n"
+        }'
+  done
+}
+
+capture_run_token_survivors() {
+  local role=$1
+  local token=$2
+  local evidence_file=$3
+  local rows_file="$ARTIFACT_DIR/run-token-rows.$$.tmp"
+  local survivor_count
+
+  run_token_process_rows "$token" > "$rows_file"
+  survivor_count=$(awk 'END { print NR + 0 }' "$rows_file")
+  {
+    printf 'role\tpid\tppid\tpgid\tsid\tstat\tcomm\targs\n'
+    awk -v role="$role" -v limit="$SURVIVOR_EVIDENCE_LIMIT" \
+      'NR <= limit { print role "\t" $0 }' "$rows_file"
+    if ((survivor_count > SURVIVOR_EVIDENCE_LIMIT)); then
+      printf 'truncated\t%s\tlimit=%s\n' "$survivor_count" "$SURVIVOR_EVIDENCE_LIMIT"
+    fi
+  } > "$evidence_file"
+  rm -f "$rows_file"
+
+  if ((survivor_count > 0)); then
+    cleanup_log "role=$role run_token=$token survivor_count=$survivor_count evidence=$(basename "$evidence_file")"
+    return 1
+  fi
+  cleanup_log "role=$role run_token=$token survivor_count=0 evidence=$(basename "$evidence_file")"
+  return 0
 }
 
 capture_session_survivors() {
@@ -216,6 +285,49 @@ verify_and_cleanup_session() {
   return 1
 }
 
+cleanup_run_token() {
+  local role=$1
+  local token=$2
+  local rows_file="$ARTIFACT_DIR/run-token-cleanup-rows.$$.tmp"
+  local groups_file="$ARTIFACT_DIR/run-token-cleanup-groups.$$.tmp"
+  local cleanup_pass representative_pid pgid
+  local cleanup_status=0
+
+  [[ -n "$token" ]] || return 0
+  for cleanup_pass in {1..3}; do
+    run_token_process_rows "$token" > "$rows_file"
+    [[ -s "$rows_file" ]] || break
+    awk -F '\t' '!seen[$3]++ { print $1 "\t" $3 }' "$rows_file" > "$groups_file"
+    while IFS=$'\t' read -r representative_pid pgid; do
+      [[ -n "$pgid" ]] || continue
+      cleanup_group "$role-token" "$representative_pid" "$pgid" no || true
+    done < "$groups_file"
+  done
+  rm -f "$rows_file" "$groups_file"
+
+  if [[ -n "$(run_token_process_rows "$token")" ]]; then
+    cleanup_log "role=$role run_token=$token post_clean=alive"
+    cleanup_status=1
+  else
+    cleanup_log "role=$role run_token=$token post_clean=gone"
+    deactivate_run_token "$token"
+  fi
+  return "$cleanup_status"
+}
+
+verify_and_cleanup_run_token() {
+  local role=$1
+  local token=$2
+  local evidence_file=$3
+
+  if capture_run_token_survivors "$role" "$token" "$evidence_file"; then
+    deactivate_run_token "$token"
+    return 0
+  fi
+  cleanup_run_token "$role" "$token" || true
+  return 1
+}
+
 cleanup_group() {
   local role=$1
   local pid=$2
@@ -276,11 +388,26 @@ cleanup_recorded_sessions() {
   return "$cleanup_status"
 }
 
+cleanup_recorded_run_tokens() {
+  local cleanup_status=0
+  local role token started_at
+
+  touch "$ACTIVE_TOKEN_OWNERSHIP_FILE"
+  while IFS=$'\t' read -r role token started_at; do
+    [[ -n "$role" ]] || continue
+    cleanup_run_token "$role" "$token" || cleanup_status=1
+  done < "$ACTIVE_TOKEN_OWNERSHIP_FILE"
+  return "$cleanup_status"
+}
+
 # Called through finalize's EXIT trap.
 # shellcheck disable=SC2329
 cleanup_active_groups() {
   local cleanup_status=0
 
+  cleanup_run_token test "${TEST_RUN_TOKEN:-}" || cleanup_status=1
+  TEST_RUN_TOKEN=
+  cleanup_recorded_run_tokens || cleanup_status=1
   cleanup_session test "${TEST_PID:-}" "${TEST_SID:-}" || cleanup_status=1
   TEST_SID=
   cleanup_recorded_sessions || cleanup_status=1
@@ -356,6 +483,18 @@ record_session() {
   printf '%s\t%s\t%s\t%s\n' "$role" "$pid" "$sid" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$ACTIVE_SESSION_OWNERSHIP_FILE"
   log "owned_session role=$role pid=$pid sid=$sid"
   RECORDED_SID=$sid
+}
+
+record_run_token() {
+  local role=$1
+  local token=$2
+  local started_at
+
+  [[ "$token" =~ ^[a-zA-Z0-9._:-]+$ ]] || return 1
+  started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  printf '%s\t%s\t%s\n' "$role" "$token" "$started_at" >> "$TOKEN_OWNERSHIP_FILE"
+  printf '%s\t%s\t%s\n' "$role" "$token" "$started_at" >> "$ACTIVE_TOKEN_OWNERSHIP_FILE"
+  log "owned_run_token role=$role token=$token"
 }
 
 terminate_unrecorded_process() {
@@ -438,6 +577,8 @@ run_repetition() {
   local timeout_seconds=$2
   local run_log
   local survivor_evidence
+  local owned_survivor_evidence
+  local run_token
   local started_at=$SECONDS
   local status
   shift 2
@@ -454,6 +595,10 @@ run_repetition() {
   } >> "$ARTIFACT_DIR/commands.txt"
   log "run=$repetition stage=test-start timeout_seconds=$timeout_seconds"
 
+  run_token="botster-loaded-${SUBJECT_SHA}-${repetition}-$$-$RANDOM"
+  record_run_token test "$run_token" || return 1
+  TEST_RUN_TOKEN=$run_token
+
   # Variables in this single-quoted program expand inside the owned Bash group.
   # shellcheck disable=SC2016
   setsid bash -c '
@@ -461,10 +606,12 @@ run_repetition() {
     subject_dir=$1
     run_log=$2
     timeout_seconds=$3
-    shift 3
+    run_token=$4
+    shift 4
+    export BOTSTER_LOADED_RUN_TOKEN="$run_token"
     cd "$subject_dir"
     timeout --signal=TERM --kill-after=30 "${timeout_seconds}s" "$@" 2>&1 | tee "$run_log"
-  ' test "$SUBJECT_DIR" "$run_log" "$timeout_seconds" "${command[@]}" &
+  ' test "$SUBJECT_DIR" "$run_log" "$timeout_seconds" "$run_token" "${command[@]}" &
   TEST_PID=$!
   if ! record_group test "$TEST_PID"; then
     terminate_unrecorded_process test "$TEST_PID"
@@ -481,6 +628,9 @@ run_repetition() {
   TEST_SID=$RECORDED_SID
   wait "$TEST_PID"
   status=$?
+  owned_survivor_evidence=$(printf '%s/run-%03d-owned-survivors.tsv' "$ARTIFACT_DIR" "$repetition")
+  verify_and_cleanup_run_token test "$TEST_RUN_TOKEN" "$owned_survivor_evidence" || status=1
+  TEST_RUN_TOKEN=
   survivor_evidence=$(printf '%s/run-%03d-session-survivors.tsv' "$ARTIFACT_DIR" "$repetition")
   verify_and_cleanup_session test "$TEST_PID" "$TEST_SID" "$survivor_evidence" || status=1
   TEST_SID=
@@ -526,11 +676,15 @@ main() {
   ACTIVE_OWNERSHIP_FILE="$ARTIFACT_DIR/active-pgids.tsv"
   SESSION_OWNERSHIP_FILE="$ARTIFACT_DIR/owned-sessions.tsv"
   ACTIVE_SESSION_OWNERSHIP_FILE="$ARTIFACT_DIR/active-sessions.tsv"
+  TOKEN_OWNERSHIP_FILE="$ARTIFACT_DIR/owned-run-tokens.tsv"
+  ACTIVE_TOKEN_OWNERSHIP_FILE="$ARTIFACT_DIR/active-run-tokens.tsv"
   touch "$OWNERSHIP_FILE" "$ACTIVE_OWNERSHIP_FILE" "$SESSION_OWNERSHIP_FILE" \
-    "$ACTIVE_SESSION_OWNERSHIP_FILE" "$CLEANUP_LOG"
+    "$ACTIVE_SESSION_OWNERSHIP_FILE" "$TOKEN_OWNERSHIP_FILE" \
+    "$ACTIVE_TOKEN_OWNERSHIP_FILE" "$CLEANUP_LOG"
 
   if [[ "$MODE" == cleanup ]]; then
     cleanup_log "external_cleanup=start"
+    cleanup_recorded_run_tokens || status=1
     cleanup_recorded_sessions || status=1
     cleanup_recorded_groups || status=1
     cleanup_log "external_cleanup=finish status=$status"
