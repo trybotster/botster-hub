@@ -370,13 +370,23 @@ fn send_control_response(
         })
     );
     let response_received = reply_tx.send(response).is_ok();
+    wait_for_response_delivery(should_stop, response_received, response_delivery_rx);
+    should_stop
+}
+
+fn wait_for_response_delivery(
+    should_stop: bool,
+    response_received: bool,
+    response_delivery_rx: Option<mpsc::Receiver<()>>,
+) -> bool {
     if should_stop
         && response_received
         && let Some(response_delivery_rx) = response_delivery_rx
     {
         let _ = response_delivery_rx.recv();
+        return true;
     }
-    should_stop
+    false
 }
 
 fn persist_local_webrtc_terminal_record(
@@ -5533,6 +5543,15 @@ mod tests {
 
     #[test]
     fn daemon_shutdown_waits_for_response_delivery_before_stopping() {
+        let (completed_delivery_tx, completed_delivery_rx) = mpsc::channel();
+        completed_delivery_tx
+            .send(())
+            .expect("pre-signal completed shutdown response delivery");
+        assert!(
+            wait_for_response_delivery(true, true, Some(completed_delivery_rx)),
+            "shutdown response delivery must pass through the wait enforcement seam"
+        );
+
         let (reply_tx, reply_rx) = mpsc::channel();
         let (response_delivery_tx, response_delivery_rx) = mpsc::channel();
         let (stopped_tx, stopped_rx) = mpsc::channel();
@@ -5609,6 +5628,7 @@ mod tests {
     #[test]
     fn daemon_shutdown_write_failure_releases_stop_and_preserves_error() {
         let (server, mut client) = UnixStream::pair().expect("create daemon socket pair");
+        let server_control = server.try_clone().expect("clone daemon server socket");
         let (control_tx, control_rx) = mpsc::channel();
         let connection = thread::spawn(move || handle_connection(server, control_tx));
 
@@ -5636,6 +5656,9 @@ mod tests {
         };
         assert!(matches!(*request, DaemonRequest::DaemonShutdown));
         let response_delivery_rx = response_delivery_rx.expect("shutdown has delivery receiver");
+        server_control
+            .shutdown(Shutdown::Write)
+            .expect("fail daemon shutdown response write");
         let (stopped_tx, stopped_rx) = mpsc::channel();
         thread::spawn(move || {
             let should_stop = send_control_response(
@@ -5646,7 +5669,6 @@ mod tests {
             let _ = stopped_tx.send(should_stop);
         });
 
-        drop(client);
         assert!(
             connection.join().expect("join daemon connection").is_err(),
             "failed shutdown response write remains a transport error"
