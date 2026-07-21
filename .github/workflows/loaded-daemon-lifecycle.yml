@@ -19,6 +19,7 @@ on:
           - focused-oversized-webrtc
           - focused-cli-smoke
           - focused-lua-worker-suite
+          - focused-lua-session-worker-callers
       repetitions:
         description: Number of repetitions (1-100)
         required: true
@@ -123,7 +124,7 @@ jobs:
           TEST_TARGET: ${{ inputs.test_target }}
         run: |
           case "$TEST_TARGET" in
-            focused-lua-worker-suite) test_binary=hub_lua_runtime_test ;;
+            focused-lua-worker-suite|focused-lua-session-worker-callers) test_binary=hub_lua_runtime_test ;;
             *) test_binary=hub_daemon_lifecycle_test ;;
           esac
           printf 'test_binary=%s\n' "$test_binary" | tee -a "$ARTIFACT_DIR/metadata.txt"

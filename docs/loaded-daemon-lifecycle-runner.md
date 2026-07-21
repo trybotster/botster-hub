@@ -61,6 +61,13 @@ any rerun. If all 20 repetitions pass, report the defect as not reproduced under
 that exact budget, not resolved, and move reproduction to whole-suite contention
 before proposing a lifecycle repair.
 
+Use `focused-lua-session-worker-callers` only after a distinct first red in the
+full Lua binary has been preserved and durably assigned elsewhere. It runs the
+existing `session_template` test subset at default parallelism so control-socket
+reproduction can continue without discarding the unrelated first-red artifact.
+This selector is diagnostic-only: it does not satisfy the required full
+`focused-lua-worker-suite` campaign.
+
 ## Bounded stress and time budgets
 
 The profiles start only job-local CPU workers:
