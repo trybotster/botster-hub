@@ -5382,6 +5382,54 @@ mod tests {
     }
 
     #[test]
+    fn daemon_shutdown_write_error_releases_response_waiter() {
+        let (server, mut client) = UnixStream::pair().expect("create daemon socket pair");
+        let server_shutdown = server.try_clone().expect("clone daemon socket");
+        let (control_tx, control_rx) = mpsc::channel();
+        let connection = thread::spawn(move || handle_connection(server, control_tx));
+
+        write_frame(
+            &mut client,
+            &DaemonHello {
+                protocol: PROTOCOL.to_string(),
+                compatibility: botster_hub_client::DaemonCompatibilityRequirement::current(),
+            },
+        )
+        .expect("write daemon hello");
+        let _: DaemonHelloAck = read_frame(&mut client).expect("read daemon hello ack");
+
+        write_frame(&mut client, &DaemonRequest::DaemonShutdown)
+            .expect("write daemon shutdown request");
+        let ControlMessage::Request {
+            request,
+            reply_tx,
+            response_written_rx,
+        } = control_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("receive daemon shutdown request")
+        else {
+            panic!("expected shutdown control request");
+        };
+        assert_eq!(*request, DaemonRequest::DaemonShutdown);
+
+        server_shutdown
+            .shutdown(Shutdown::Write)
+            .expect("fail daemon socket writes before shutdown response");
+        reply_tx
+            .send(Ok(daemon_response_base(DaemonResponseKind::Shutdown)))
+            .expect("reply to daemon shutdown request");
+
+        response_written_rx
+            .expect("shutdown response write acknowledgement")
+            .recv_timeout(Duration::from_secs(1))
+            .expect("failed socket write releases shutdown waiter");
+        assert!(
+            connection.join().expect("join daemon connection").is_err(),
+            "disconnected shutdown client must surface a response write error"
+        );
+    }
+
+    #[test]
     fn daemon_event_projection_round_trips_opaque_history_bytes_without_loss() {
         let session_id = SessionId("daemon-projection-session".to_string());
         let subscription_id = SubscriptionId("daemon-projection-subscription".to_string());
