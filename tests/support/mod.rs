@@ -34,8 +34,6 @@ pub fn wait_for_cli_daemon_shutdown(shutdown: &Output, child: Child) -> Output {
 pub fn validate_cli_daemon_shutdown(shutdown: &Output, daemon: &Output) -> Result<(), String> {
     let shutdown_stdout = String::from_utf8_lossy(&shutdown.stdout);
     let shutdown_stderr = String::from_utf8_lossy(&shutdown.stderr);
-    let disconnected_during_shutdown =
-        shutdown_stderr.trim() == "botster-hub shutdown error: client disconnected";
 
     if !daemon.status.success() {
         return Err(format!(
@@ -49,7 +47,7 @@ pub fn validate_cli_daemon_shutdown(shutdown: &Output, daemon: &Output) -> Resul
         ));
     }
 
-    if shutdown.status.success() || disconnected_during_shutdown {
+    if shutdown.status.success() {
         Ok(())
     } else {
         Err(format!(
