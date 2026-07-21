@@ -814,8 +814,19 @@ where
         }
         let subscription_change = LocalWebrtcAttachedSubscriptionChange::from_request(&request);
         let (reply_tx, reply_rx) = mpsc::channel();
+        let (response_delivery_tx, response_delivery_rx) =
+            if matches!(*request, DaemonRequest::DaemonShutdown) {
+                let (tx, rx) = mpsc::channel();
+                (Some(tx), Some(rx))
+            } else {
+                (None, None)
+            };
         if runtime_tx
-            .send(ControlMessage::Request { request, reply_tx })
+            .send(ControlMessage::Request {
+                request,
+                reply_tx,
+                response_delivery_rx,
+            })
             .is_err()
         {
             terminal_cause = LocalWebrtcTerminalCause::RuntimeQueueClosed;
@@ -837,10 +848,13 @@ where
             });
         peer_state.apply_subscription_change(subscription_change);
         let Ok(frames) = framed_daemon_response(stream_key, &response) else {
+            if let Some(response_delivery_tx) = response_delivery_tx {
+                let _ = response_delivery_tx.send(());
+            }
             terminal_cause = LocalWebrtcTerminalCause::ResponseFraming;
             break;
         };
-        match send_response_frames(
+        let delivery = send_response_frames(
             data_channel,
             stream_key,
             &frames,
@@ -848,8 +862,11 @@ where
             &mut flow_control,
             peer_state,
         )
-        .await
-        {
+        .await;
+        if let Some(response_delivery_tx) = response_delivery_tx {
+            let _ = response_delivery_tx.send(());
+        }
+        match delivery {
             Ok(()) => open = true,
             Err(failure) => {
                 eprintln!("{failure}");
@@ -1408,7 +1425,10 @@ mod tests {
             runtime_tx,
         ));
         let responder = std::thread::spawn(move || {
-            let ControlMessage::Request { request, reply_tx } = runtime_rx.recv().unwrap() else {
+            let ControlMessage::Request {
+                request, reply_tx, ..
+            } = runtime_rx.recv().unwrap()
+            else {
                 panic!("expected daemon request before peer cleanup");
             };
             assert_eq!(*request, DaemonRequest::Status);
@@ -1447,6 +1467,80 @@ mod tests {
         });
         responder.join().unwrap();
         (data_channel, failure)
+    }
+
+    fn run_shutdown_response_delivery_case(
+        send_fails: bool,
+    ) -> (FakeDataChannel, Option<LocalWebrtcSendFailure>) {
+        let key = AesGcmKey::from_slice(&[16; 32]).unwrap();
+        let data_channel = FakeDataChannel::default();
+        data_channel.send_fails.store(send_fails, Ordering::Release);
+        {
+            let mut events = data_channel.events.lock().unwrap();
+            events.push_back(encrypted_request_event(
+                &key,
+                &DaemonRequest::DaemonShutdown,
+            ));
+        }
+        let (runtime_tx, runtime_rx) = mpsc::channel();
+        let peer_state = Arc::new(LocalWebrtcPeerState::new(
+            "grant-shutdown-delivery".to_string(),
+            runtime_tx,
+        ));
+        let responder_peer_state = peer_state.clone();
+        let responder = std::thread::spawn(move || {
+            let ControlMessage::Request {
+                request,
+                reply_tx,
+                response_delivery_rx,
+            } = runtime_rx.recv().unwrap()
+            else {
+                panic!("expected daemon shutdown request");
+            };
+            assert_eq!(*request, DaemonRequest::DaemonShutdown);
+            let response_delivery_rx =
+                response_delivery_rx.expect("WebRTC shutdown has delivery receiver");
+            reply_tx
+                .send(Ok(response_with_diagnostic(DaemonDiagnostic::connected(
+                    "shutdown-fixture",
+                ))))
+                .unwrap();
+            response_delivery_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("WebRTC delivery outcome releases shutdown completion");
+            responder_peer_state.publish_peer_terminal(LocalWebrtcTerminalCause::PeerClosed);
+        });
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let runtime_sender = peer_state.runtime_tx.clone();
+        let failure = runtime.block_on(run_data_channel(
+            &data_channel,
+            &key,
+            peer_state.as_ref(),
+            &runtime_sender,
+        ));
+        responder.join().unwrap();
+        (data_channel, failure)
+    }
+
+    #[test]
+    fn local_webrtc_shutdown_success_releases_delivery_completion() {
+        let (data_channel, failure) = run_shutdown_response_delivery_case(false);
+
+        assert!(failure.is_none());
+        assert!(!data_channel.sent.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn local_webrtc_shutdown_send_failure_releases_delivery_completion() {
+        let (_data_channel, failure) = run_shutdown_response_delivery_case(true);
+
+        assert_eq!(
+            failure.expect("send failure remains visible").cause,
+            LocalWebrtcTerminalCause::SendText
+        );
     }
 
     #[test]

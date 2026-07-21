@@ -215,18 +215,29 @@ fn handle_connection(
         };
         let (reply_tx, reply_rx) = mpsc::channel();
         let close_after_response = matches!(request, DaemonRequest::DaemonShutdown);
+        let (response_delivery_tx, response_delivery_rx) = if close_after_response {
+            let (tx, rx) = mpsc::channel();
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
         let active_change = AttachedSubscriptionChange::from_request(&request);
         control_tx
             .send(ControlMessage::Request {
                 request: Box::new(request),
                 reply_tx,
+                response_delivery_rx,
             })
             .map_err(|_| DaemonTransportError::ControlThreadStopped)?;
         let response = reply_rx
             .recv()
             .map_err(|_| DaemonTransportError::ControlThreadStopped)??;
         apply_attached_subscription_change(&mut attached_subscriptions, active_change);
-        if let Err(error) = write_frame(&mut stream, &response) {
+        let write_result = write_frame(&mut stream, &response);
+        if let Some(response_delivery_tx) = response_delivery_tx {
+            let _ = response_delivery_tx.send(());
+        }
+        if let Err(error) = write_result {
             let _ = control_tx.send(ControlMessage::EgressWriteFailed {
                 delivery_kind: daemon_delivery_kind(&response),
             });
@@ -253,6 +264,7 @@ fn detach_connection_subscriptions(
                     subscription_id: subscription.subscription_id.clone(),
                 }),
                 reply_tx,
+                response_delivery_rx: None,
             })
             .is_ok()
         {
@@ -288,7 +300,11 @@ fn handle_control_message(
     message: ControlMessage,
 ) -> bool {
     match message {
-        ControlMessage::Request { request, reply_tx } => {
+        ControlMessage::Request {
+            request,
+            reply_tx,
+            response_delivery_rx,
+        } => {
             let response = handle_control_request(
                 daemon,
                 logical_clock,
@@ -307,15 +323,7 @@ fn handle_control_message(
                 DaemonTransportError::LocalWebrtc(error) => Ok(daemon_local_webrtc_error(error)),
                 error => Err(error),
             });
-            let should_stop = matches!(
-                response,
-                Ok(DaemonResponse {
-                    kind: DaemonResponseKind::Shutdown,
-                    ..
-                })
-            );
-            let _ = reply_tx.send(response);
-            should_stop
+            send_control_response(reply_tx, response, response_delivery_rx)
         }
         ControlMessage::LocalWebrtcPeerClosed {
             grant_id,
@@ -347,6 +355,38 @@ fn handle_control_message(
             false
         }
     }
+}
+
+fn send_control_response(
+    reply_tx: Sender<DaemonTransportResult<DaemonResponse>>,
+    response: DaemonTransportResult<DaemonResponse>,
+    response_delivery_rx: Option<mpsc::Receiver<()>>,
+) -> bool {
+    let should_stop = matches!(
+        response,
+        Ok(DaemonResponse {
+            kind: DaemonResponseKind::Shutdown,
+            ..
+        })
+    );
+    let response_received = reply_tx.send(response).is_ok();
+    wait_for_response_delivery(should_stop, response_received, response_delivery_rx);
+    should_stop
+}
+
+fn wait_for_response_delivery(
+    should_stop: bool,
+    response_received: bool,
+    response_delivery_rx: Option<mpsc::Receiver<()>>,
+) -> bool {
+    if should_stop
+        && response_received
+        && let Some(response_delivery_rx) = response_delivery_rx
+    {
+        let _ = response_delivery_rx.recv();
+        return true;
+    }
+    false
 }
 
 fn persist_local_webrtc_terminal_record(
@@ -2621,6 +2661,7 @@ fn install_signal_forwarder(control_tx: Sender<ControlMessage>) -> DaemonTranspo
             let _ = control_tx.send(ControlMessage::Request {
                 request: Box::new(DaemonRequest::DaemonShutdown),
                 reply_tx,
+                response_delivery_rx: None,
             });
         }
     });
@@ -2679,6 +2720,7 @@ pub(crate) enum ControlMessage {
     Request {
         request: Box<DaemonRequest>,
         reply_tx: Sender<DaemonTransportResult<DaemonResponse>>,
+        response_delivery_rx: Option<mpsc::Receiver<()>>,
     },
     EgressWriteFailed {
         delivery_kind: DaemonDeliveryKind,
@@ -5389,7 +5431,9 @@ mod tests {
             },
         )
         .expect("write attach request");
-        let ControlMessage::Request { request, reply_tx } = control_rx
+        let ControlMessage::Request {
+            request, reply_tx, ..
+        } = control_rx
             .recv_timeout(Duration::from_secs(1))
             .expect("receive attach request")
         else {
@@ -5404,7 +5448,9 @@ mod tests {
         client
             .shutdown(Shutdown::Both)
             .expect("disconnect daemon client");
-        let ControlMessage::Request { request, reply_tx } = control_rx
+        let ControlMessage::Request {
+            request, reply_tx, ..
+        } = control_rx
             .recv_timeout(Duration::from_secs(1))
             .expect("receive disconnect detach request")
         else {
@@ -5493,5 +5539,144 @@ mod tests {
         assert!(!debug.contains("private terminal payload"));
         assert!(!debug.contains("session-redacted"));
         assert!(!debug.contains("subscription-redacted"));
+    }
+
+    #[test]
+    fn daemon_shutdown_waits_for_response_delivery_before_stopping() {
+        let (completed_delivery_tx, completed_delivery_rx) = mpsc::channel();
+        completed_delivery_tx
+            .send(())
+            .expect("pre-signal completed shutdown response delivery");
+        assert!(
+            wait_for_response_delivery(true, true, Some(completed_delivery_rx)),
+            "shutdown response delivery must pass through the wait enforcement seam"
+        );
+
+        let (reply_tx, reply_rx) = mpsc::channel();
+        let (response_delivery_tx, response_delivery_rx) = mpsc::channel();
+        let (stopped_tx, stopped_rx) = mpsc::channel();
+
+        thread::spawn(move || {
+            let should_stop = send_control_response(
+                reply_tx,
+                Ok(daemon_response_base(DaemonResponseKind::Shutdown)),
+                Some(response_delivery_rx),
+            );
+            let _ = stopped_tx.send(should_stop);
+        });
+
+        let response = reply_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("shutdown response reaches transport")
+            .expect("shutdown response succeeds");
+        assert_eq!(response.kind, DaemonResponseKind::Shutdown);
+        assert!(
+            stopped_rx.try_recv().is_err(),
+            "daemon must remain alive until the transport attempts delivery"
+        );
+
+        response_delivery_tx
+            .send(())
+            .expect("report shutdown response delivery attempt");
+        assert!(
+            stopped_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("daemon stop decision follows delivery attempt")
+        );
+    }
+
+    #[test]
+    fn daemon_shutdown_releases_when_delivery_owner_drops() {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        let (response_delivery_tx, response_delivery_rx) = mpsc::channel();
+        let (stopped_tx, stopped_rx) = mpsc::channel();
+
+        thread::spawn(move || {
+            let should_stop = send_control_response(
+                reply_tx,
+                Ok(daemon_response_base(DaemonResponseKind::Shutdown)),
+                Some(response_delivery_rx),
+            );
+            let _ = stopped_tx.send(should_stop);
+        });
+
+        let _ = reply_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("shutdown response reaches transport");
+        drop(response_delivery_tx);
+
+        assert!(
+            stopped_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("dropped delivery owner releases daemon stop")
+        );
+    }
+
+    #[test]
+    fn daemon_shutdown_releases_when_response_receiver_drops() {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        let (_response_delivery_tx, response_delivery_rx) = mpsc::channel();
+        drop(reply_rx);
+
+        assert!(send_control_response(
+            reply_tx,
+            Ok(daemon_response_base(DaemonResponseKind::Shutdown)),
+            Some(response_delivery_rx),
+        ));
+    }
+
+    #[test]
+    fn daemon_shutdown_write_failure_releases_stop_and_preserves_error() {
+        let (server, mut client) = UnixStream::pair().expect("create daemon socket pair");
+        let server_control = server.try_clone().expect("clone daemon server socket");
+        let (control_tx, control_rx) = mpsc::channel();
+        let connection = thread::spawn(move || handle_connection(server, control_tx));
+
+        write_frame(
+            &mut client,
+            &DaemonHello {
+                protocol: PROTOCOL.to_string(),
+                compatibility: botster_hub_client::DaemonCompatibilityRequirement::current(),
+            },
+        )
+        .expect("write daemon hello");
+        let _: DaemonHelloAck = read_frame(&mut client).expect("read daemon hello ack");
+        write_frame(&mut client, &DaemonRequest::DaemonShutdown)
+            .expect("write daemon shutdown request");
+
+        let ControlMessage::Request {
+            request,
+            reply_tx,
+            response_delivery_rx,
+        } = control_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("receive daemon shutdown request")
+        else {
+            panic!("expected shutdown control request");
+        };
+        assert!(matches!(*request, DaemonRequest::DaemonShutdown));
+        let response_delivery_rx = response_delivery_rx.expect("shutdown has delivery receiver");
+        server_control
+            .shutdown(Shutdown::Write)
+            .expect("fail daemon shutdown response write");
+        let (stopped_tx, stopped_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let should_stop = send_control_response(
+                reply_tx,
+                Ok(daemon_response_base(DaemonResponseKind::Shutdown)),
+                Some(response_delivery_rx),
+            );
+            let _ = stopped_tx.send(should_stop);
+        });
+
+        assert!(
+            connection.join().expect("join daemon connection").is_err(),
+            "failed shutdown response write remains a transport error"
+        );
+        assert!(
+            stopped_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("failed response delivery releases daemon stop")
+        );
     }
 }
