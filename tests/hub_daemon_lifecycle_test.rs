@@ -9627,24 +9627,7 @@ fn stalled_attach_stdout_does_not_block_other_daemon_commands() {
     let _ = attach_child.kill();
     let _ = attach_child.wait_with_output();
 
-    let mut shutdown_command = Command::new(env!("CARGO_BIN_EXE_botster-hub"));
-    shutdown_command
-        .arg("shutdown")
-        .arg("--data-dir")
-        .arg(&data_dir);
-    let shutdown = run_command_with_timeout(shutdown_command, CLI_DAEMON_READINESS_BUDGET);
-    assert!(
-        shutdown.status.success(),
-        "shutdown failed while attach stdout was blocked: {}",
-        String::from_utf8_lossy(&shutdown.stderr)
-    );
-
-    let output = child.wait_with_output().expect("wait for daemon child");
-    assert!(
-        output.status.success(),
-        "daemon failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    shutdown_cli_daemon(&data_dir, child);
 }
 
 #[test]
