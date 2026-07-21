@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+readonly RUNNER=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/run-loaded-daemon-lifecycle
+SELFTEST_DIR=$(mktemp -d)
+FIXTURE_PID=
+DECOY_PID=
+
+cleanup_selftest() {
+  if [[ -n "$FIXTURE_PID" ]]; then
+    kill -TERM -- "-$FIXTURE_PID" 2>/dev/null || true
+  fi
+  if [[ -n "$DECOY_PID" ]]; then
+    kill -TERM -- "-$DECOY_PID" 2>/dev/null || true
+  fi
+  wait "${FIXTURE_PID:-}" 2>/dev/null || true
+  wait "${DECOY_PID:-}" 2>/dev/null || true
+  rm -rf "$SELFTEST_DIR"
+}
+trap cleanup_selftest EXIT INT TERM HUP
+
+fail() {
+  printf 'not ok - %s\n' "$*" >&2
+  exit 1
+}
+
+pass() {
+  printf 'ok - %s\n' "$*"
+}
+
+source "$RUNNER" --artifact-dir "$SELFTEST_DIR/source-must-not-run"
+[[ ! -e "$SELFTEST_DIR/source-must-not-run" ]] || fail "sourcing executed runner main"
+pass "runner sources without CLI or campaign side effects"
+
+ARTIFACT_DIR="$SELFTEST_DIR/artifacts"
+mkdir -p "$ARTIFACT_DIR"
+CLEANUP_LOG="$ARTIFACT_DIR/cleanup.log"
+OWNERSHIP_FILE="$ARTIFACT_DIR/owned-pgids.tsv"
+ACTIVE_OWNERSHIP_FILE="$ARTIFACT_DIR/active-pgids.tsv"
+SESSION_OWNERSHIP_FILE="$ARTIFACT_DIR/owned-sessions.tsv"
+ACTIVE_SESSION_OWNERSHIP_FILE="$ARTIFACT_DIR/active-sessions.tsv"
+touch "$CLEANUP_LOG" "$OWNERSHIP_FILE" "$ACTIVE_OWNERSHIP_FILE" \
+  "$SESSION_OWNERSHIP_FILE" "$ACTIVE_SESSION_OWNERSHIP_FILE"
+
+setsid bash -c 'exit 0' &
+finished_pid=$!
+wait "$finished_pid"
+no_survivor_evidence="$ARTIFACT_DIR/no-survivors.tsv"
+capture_session_survivors selftest "$finished_pid" "$no_survivor_evidence" \
+  || fail "finished session reported a survivor"
+[[ $(wc -l < "$no_survivor_evidence") -eq 1 ]] \
+  || fail "no-survivor evidence should contain only its header"
+pass "no-survivor session is green"
+
+setsid sleep 300 &
+DECOY_PID=$!
+
+setsid bash -c '
+  set -m
+  trap "exit 0" TERM INT HUP
+  bash -c '\''
+    trap "exit 0" TERM INT HUP
+    for ((worker = 1; worker <= 85; worker++)); do
+      sleep 300 &
+    done
+    wait
+  '\'' &
+  wait
+' &
+FIXTURE_PID=$!
+
+fixture_ready=0
+for _ in {1..100}; do
+  fixture_rows=$(session_process_rows "$FIXTURE_PID")
+  fixture_count=$(printf '%s\n' "$fixture_rows" | awk 'NF { count++ } END { print count + 0 }')
+  nested_pgid=$(printf '%s\n' "$fixture_rows" \
+    | awk -F '\t' -v sid="$FIXTURE_PID" '$3 != sid { print $3; exit }')
+  if ((fixture_count > SURVIVOR_EVIDENCE_LIMIT)) && [[ -n "$nested_pgid" ]]; then
+    fixture_ready=1
+    break
+  fi
+  sleep 0.05
+done
+((fixture_ready == 1)) || fail "nested child process group fixture did not become ready"
+pass "nested child process group is visible inside the owned session"
+
+record_session selftest "$FIXTURE_PID" || fail "record fixture session"
+[[ "$RECORDED_SID" == "$FIXTURE_PID" ]] || fail "recorded SID differs from fixture leader"
+
+survivor_evidence="$ARTIFACT_DIR/session-survivors.tsv"
+if capture_session_survivors selftest "$FIXTURE_PID" "$survivor_evidence"; then
+  fail "live fixture session was classified clean"
+fi
+grep -q $'^truncated\t' "$survivor_evidence" || fail "bounded evidence lacks truncation marker"
+evidence_lines=$(wc -l < "$survivor_evidence")
+((evidence_lines <= SURVIVOR_EVIDENCE_LIMIT + 2)) \
+  || fail "survivor evidence exceeded its bound"
+pass "survivor evidence is bounded"
+
+if verify_and_cleanup_session selftest "$FIXTURE_PID" "$FIXTURE_PID" "$survivor_evidence"; then
+  fail "detected survivor did not produce a nonzero leak verdict"
+fi
+pass "detected survivor produces a nonzero verdict"
+
+wait "$FIXTURE_PID" 2>/dev/null || true
+FIXTURE_PID=
+[[ -z "$(session_process_rows "$RECORDED_SID")" ]] || fail "owned session survived cleanup"
+kill -0 "$DECOY_PID" 2>/dev/null || fail "cleanup killed a process outside the owned session"
+pass "cleanup removes only the owned session"
+
+cleanup_session selftest "$RECORDED_SID" "$RECORDED_SID" \
+  || fail "second cleanup was not idempotent"
+kill -0 "$DECOY_PID" 2>/dev/null || fail "idempotent cleanup killed the decoy"
+pass "second cleanup is idempotent"
+
+printf 'loaded daemon lifecycle selftest passed\n'

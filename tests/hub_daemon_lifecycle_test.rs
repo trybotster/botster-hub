@@ -9394,6 +9394,17 @@ fn daemon_detaches_subscription_when_attach_connection_drops() {
         "dropped attach subscription received later terminal output: {observed_events:?}"
     );
 
+    let shutdown_session = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::ShutdownSession {
+            session_id: "eof-session".to_string(),
+        },
+    )
+    .expect("shutdown eof test session");
+    assert_eq!(
+        shutdown_session.kind,
+        botster_hub::DaemonResponseKind::Events
+    );
     shutdown_cli_daemon(&data_dir, child);
 }
 
@@ -9462,6 +9473,15 @@ fn daemon_notify_session_defers_without_observed_readiness_over_socket() {
         "notify session without observed readiness should not reach PTY input path, got {observed:?}"
     );
 
+    let shutdown_session = connection
+        .request(&botster_hub::DaemonRequest::ShutdownSession {
+            session_id: "notify-socket-session".to_string(),
+        })
+        .expect("shutdown guarded socket session");
+    assert_eq!(
+        shutdown_session.kind,
+        botster_hub::DaemonResponseKind::Events
+    );
     shutdown_cli_daemon(&data_dir, child);
 }
 
@@ -9565,6 +9585,48 @@ fn stalled_attach_stdout_does_not_block_other_daemon_commands() {
         String::from_utf8_lossy(&resize.stderr)
     );
 
+    let shutdown_session = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("sessions")
+        .arg("shutdown")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("slow-consumer")
+        .output()
+        .expect("run botster-hub sessions shutdown while attach stdout is blocked");
+    assert!(
+        shutdown_session.status.success(),
+        "session shutdown failed while attach stdout was blocked: {}",
+        String::from_utf8_lossy(&shutdown_session.stderr)
+    );
+    let shutdown_session_stdout =
+        String::from_utf8(shutdown_session.stdout).expect("session shutdown stdout is utf8");
+    assert!(
+        shutdown_session_stdout.contains("response=events"),
+        "active session shutdown should return structured events: {shutdown_session_stdout:?}"
+    );
+
+    let sessions_after_shutdown = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("sessions")
+        .arg("list")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .output()
+        .expect("list sessions after slow-consumer shutdown");
+    assert!(
+        sessions_after_shutdown.status.success(),
+        "list failed after slow-consumer shutdown: {}",
+        String::from_utf8_lossy(&sessions_after_shutdown.stderr)
+    );
+    let sessions_after_shutdown_stdout = String::from_utf8(sessions_after_shutdown.stdout)
+        .expect("sessions after shutdown stdout is utf8");
+    assert!(
+        !sessions_after_shutdown_stdout.contains("session_id=slow-consumer"),
+        "slow-consumer should be absent after session shutdown: {sessions_after_shutdown_stdout:?}"
+    );
+
+    let _ = attach_child.kill();
+    let _ = attach_child.wait_with_output();
+
     let mut shutdown_command = Command::new(env!("CARGO_BIN_EXE_botster-hub"));
     shutdown_command
         .arg("shutdown")
@@ -9577,8 +9639,6 @@ fn stalled_attach_stdout_does_not_block_other_daemon_commands() {
         String::from_utf8_lossy(&shutdown.stderr)
     );
 
-    let _ = attach_child.kill();
-    let _ = attach_child.wait_with_output();
     let output = child.wait_with_output().expect("wait for daemon child");
     assert!(
         output.status.success(),
