@@ -334,6 +334,35 @@ planned to change.
   strict workspace Clippy, and a new exact-SHA 20-run campaign whose token and
   SID survivor ledgers must both be empty.
 
+## Cost-capped transport-root reconciliation
+
+- Human answer `question_1784674764_414124` replaces the future 20-run GitHub
+  requirement with staged evidence: deterministic red-on-revert seam coverage,
+  20/20 local four-CPU Linux repetitions using the unchanged default-concurrent
+  lifecycle suite and residual-tail profile, then exactly three final GitHub
+  repetitions with first-red stop and an approximately 20-minute ceiling. No
+  further 20-run GitHub campaign is authorized without new human approval.
+- Exact merged-SHA campaign `29874185072` at `df036b8c...` stopped first-red on
+  repetition 1. The 300,000-byte response completed and passed its equality,
+  chunk-count, and frame-size assertions; the same peer then closed before the
+  encrypted `ShutdownSession`. The ownership oracle found only the resulting
+  unclosed `local-webrtc-session` worker and shell, and exact cleanup succeeded.
+- The pinned `rtc` peer-state contract says `Disconnected` may recover to
+  `Connected`, while `Failed` is permanent and `Closed` is terminal. Botster's
+  current connection-state handler instead publishes terminal cleanup for all
+  three states. This explains the observed peer-completed-response to
+  `ShutdownSession` failure under scheduler pressure without relying on the
+  earlier process-residue hypothesis.
+- Additional production scope is limited to `src/local_webrtc.rs`: preserve
+  connection-state diagnostics for `Disconnected`, but publish terminal cleanup
+  only for `Failed` and `Closed`. Add a deterministic two-request state-machine
+  test that injects `Disconnected` after the first completed response and proves
+  the following `ShutdownSession` is processed; the unmodified terminal mapping
+  must make that test fail.
+- Current `origin/main` remains `3a93079c...`, already integrated by merge commit
+  `320abd9`; PR #154's branch contains that exact base. Recheck mergeability
+  after the transport fix, then run the approved staged evidence only.
+
 ## Project Pipelines gates and checklists
 
 - Plan artifact: this file, with assumptions explicitly separated from proven
