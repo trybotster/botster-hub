@@ -1,216 +1,308 @@
-# Verify the oversized local WebRTC repair under load
+# Eliminate loaded oversized-WebRTC peer disconnect under suite pressure
 
 ## Context loaded
 
-- Project Pipelines ticket `ticket_1784168176_163113`, run
-  `run_1784596374_444453`, active Plan step `botster_plan`, required
-  `botster_plan_gate`, prior artifacts, questions, answers, and the absence of
-  open findings or blocking dependencies.
-- Planning authority: [[identity]], [[goals]], [[planner-playbook]],
-  [[botster-planner-playbook]], [[botster-architecture]], [[cli-patterns]],
-  [[spa-patterns]], [[loaded lifecycle ci precompiles the exact test target
-  before synthetic cpu stress]], [[webrtc peer registry owns production data
-  plane receivers]], and [[webrtc peer cleanup removes every per peer owner
-  together]].
-- Repository placement authority: the existing plan at this path and current
-  `docs/plans/` prior art. No repository README redirects this plan elsewhere.
-- Current branch was clean and fast-forwarded to merged main
-  `afbf412c5db9ef3538155ca6fec6637f4cb1726c`, a descendant of PR #148 merge
-  `2cd58291e0da56dc6ac190fc48ccd665f96b7332` and repair commit
-  `2b4ffe0872563f2335cca89c90679c66c13304cc`.
-- The ticket's claimed second post-merge recurrence is invalid attribution.
-  Failing subject `b95b038c0324e47de6f268a19cbe020a6e2a3d4c`
-  has merge-base `319f7ffd76740a521f7ddb0883af945079aaf746` with
-  `2b4ffe0`, still contains the removed `PressureDeadline` branch, and is not a
-  descendant of PR #148. Its `pressure_deadline` failure therefore cannot
-  establish recurrence of the repaired code.
-- Human answer `question_1784596936_977126` directs a verification-first plan:
-  pin the existing focused oversized-WebRTC residual-tail campaign to a true
-  PR #148 descendant, preserve current assertions and diagnostics, and make no
-  code change unless that repaired path actually recurs.
-- Production path inspected:
-  `local_webrtc_chunks_oversized_encrypted_daemon_response` starts the real
-  daemon and botster-web entrypoint, signals a real local WebRTC peer, and sends
-  an encrypted oversized daemon request through `run_data_channel` and
-  `send_response_frames`. The repaired sender waits for low water while
-  selecting the Tokio peer-terminal watch; elapsed scheduler time no longer
-  closes an otherwise live pressured channel.
-- Existing loaded entry point inspected: workflow dispatch
-  `.github/workflows/loaded-daemon-lifecycle.yml` selects
-  `focused-oversized-webrtc`; `script/run-loaded-daemon-lifecycle` precompiles
-  and repeatedly runs the exact lifecycle test under `residual-tail`, stops at
-  the first red, and records bounded run and cleanup evidence.
+- Project Pipelines ticket `ticket_1784651055_336867`, run
+  `run_1784651972_646458`, active Plan step `botster_plan`, required gate
+  `botster_plan_gate`, and no prior artifacts, findings, reviews, questions,
+  answers, or blocking dependencies.
+- Ticket provenance: this is the residual owner carved from shutdown-convergence
+  ticket `ticket_1784608438_764334`. The captured subject is exact commit
+  `16ae5fd6348e79b46cc7302bbb6ba2f77b0b7ec2`, which contains the shutdown
+  response-ordering repair and its deterministic ablation.
+- Planning authority: [[planner-playbook]], [[botster-planner-playbook]],
+  [[botster-architecture]], [[cli-patterns]], [[spa-patterns]], [[test script
+  required for rust tests not cargo test]], [[suite wide acceptance criteria
+  make every observed test failure in scope]], [[loaded lifecycle ci precompiles
+  the exact test target before synthetic cpu stress]], [[a regression test must
+  be shown to go red with the fix reverted]], and [[narrow ablation at the
+  enforcement point is the cleanest regression negative control]].
+- Repository placement authority: the existing artifact at this path and the
+  current `docs/plans/` hierarchy. `README.md` does not redirect plans elsewhere.
+- Current clean planning worktree: target
+  `tgt_7e208a0c76a44980a83b63af976b1f22`, branch
+  `project-pipelines/ticket_1784651055_336867`, base/main
+  `a0b61235b21824814f86e540912988ef8e3ec932`.
+- Retained full-suite run
+  `https://github.com/trybotster/botster-hub/actions/runs/29842263908` checked out
+  exact subject `16ae5fd...`, precompiled `hub_daemon_lifecycle_test`, used
+  `lifecycle-suite`, default Cargo concurrency, 48 residual-tail CPU workers on
+  four CPUs, and stopped first-red on repetition 3. Repetitions 1-2 passed all
+  100 active tests. Repetition 3 failed only
+  `local_webrtc_chunks_oversized_encrypted_daemon_response` after 31 of 33
+  chunks: client `channel_closed`, sender `pressured=true` and
+  `peer_disconnected`; suite result 99 passed/1 failed/1 ignored, campaign 101.
+- Retained focused run
+  `https://github.com/trybotster/botster-hub/actions/runs/29844262812` used the
+  same exact SHA and residual-tail profile and passed the unchanged oversized
+  test 10/10 with clean teardown. This rules out an intrinsic focused failure
+  and makes full-suite concurrency/repetition residue part of the causal path.
+- Artifact process samples map durable workers to three concrete tests. Each
+  full-suite repetition leaves `botster-session-worker` processes for
+  `eof-session`, `notify-socket-session`, and `slow-consumer`; by repetition 3,
+  workers from prior repetitions remain reparented to PID 1 in child process
+  groups within each recorded test session. Source inspection confirms all
+  three tests stop the daemon without first sending `ShutdownSession` for their
+  intentionally long-lived session.
+- The current runner records and cleans only the outer test process group.
+  `cleanup_status=0` therefore does not prove that child process groups in the
+  same owned test session are gone. The run artifact contains those survivors
+  after the corresponding outer groups were reported `post_clean=gone`.
+- Production path inspected: the oversized lifecycle test starts the real hub
+  daemon and botster-web entrypoint, signals a real local WebRTC peer, sends the
+  encrypted 300,000-byte response through `run_data_channel` and
+  `send_response_frames`, checks ordered bounded chunks and a same-peer
+  follow-up, and shuts down through product APIs.
 
 ## Scope
 
-Botster layers touched are the Project Pipelines plan artifact and the existing
-Rust hub lifecycle verification path. The first implementation action is
-evidence collection, not source modification.
-
-1. Record the exact true-descendant subject SHA. Use
-   `afbf412c5db9ef3538155ca6fec6637f4cb1726c` unless Implement advances to a
-   later main commit and records both its full SHA and ancestry proof against
-   `2cd5829`.
-2. Dispatch the existing `focused-oversized-webrtc` target for 20 repetitions
-   with `stress_profile=residual-tail`. Do not change the workflow, runner,
-   selector, test body, assertions, deadlines, or cleanup before this campaign.
-3. Preserve the complete campaign evidence: requested and resolved subject
-   SHAs, ancestry check, exact command, precompile result, each repetition log,
-   resource samples, chunk/peer/pressure diagnostics on failure,
-   `campaign_exit_status`, and cleanup proof.
-4. If all 20 repetitions pass, make no production or test code change. Attach
-   the run as verification evidence and report `b95b038` as an invalidly
-   attributed pre-repair failure for ticket close or human re-disposition.
-5. If a repetition fails, stop at the first red and require the newly captured
-   true-descendant client and sender records to identify message/chunk progress,
-   pressure state, peer/channel state, typed terminal cause, and cleanup status.
-   Return the plan for review with that evidence before changing behavior.
-6. Any later repair must target only the newly evidenced mechanism and add the
-   smallest deterministic regression at the existing
-   `LocalWebrtcDataChannel` seam plus red-when-reverted proof.
-
-Every implementation change must trace to the loaded campaign result. A green
-campaign authorizes evidence updates only; it does not authorize speculative
-hardening.
+1. Make the three named lifecycle tests explicitly shut down the sessions they
+   spawn before shutting down their daemon. Preserve every behavioral assertion
+   that gives each test meaning; this is teardown completion, not serialization
+   or a reduced workload.
+2. Strengthen the Linux loaded runner's ownership accounting at the existing
+   `setsid` boundary. After each repetition, inspect the explicitly recorded
+   test session for surviving descendant process groups, record bounded process
+   evidence, clean only those resolved owned groups, and make the repetition
+   fail if any survivor existed. A zero cleanup result must mean no process in
+   that owned session remains, not merely that its outer group leader exited.
+3. Add deterministic coverage for the runner's survivor classification and
+   cleanup using fixture processes in one explicitly created session with a
+   child process group. Prove it red with only the session-shutdown cleanup
+   removed from the three lifecycle tests (or the survivor enforcement bypassed
+   at its narrow decision), then restore exactly and prove green.
+4. Keep `.github/workflows/loaded-daemon-lifecycle.yml` on the existing exact
+   subject checkout, exact-target precompile, default test concurrency,
+   residual-tail stress, first-red stop, artifact upload, and always-run cleanup
+   path.
+5. Run the final committed 40-character SHA through the binding 20-repetition
+   `lifecycle-suite`/`residual-tail` campaign. Require all repetitions green and
+   require the per-repetition ownership evidence to show no surviving test,
+   daemon, entrypoint, session-worker, sampler, or load process.
+6. If the same oversized-WebRTC failure recurs after the deterministic leak
+   oracle is green, stop at the first red and re-plan from correlated
+   client/sender/process evidence. Only that new evidence may authorize a
+   production WebRTC change.
 
 ## Non-scope
 
-- No production Rust change, test change, runner change, workflow change, or
-  dependency update before a true-descendant recurrence is captured.
-- No retries, timeout inflation, sleeps, reduced load, serialization,
-  `--test-threads=1`, response-size reduction, or weaker payload, chunk,
-  encryption, ordering, follow-up-request, grant-cleanup, peer-cleanup, or
-  process-cleanup assertions.
-- No second repair for `pressure_deadline`; PR #148 already removed that policy
-  cold turkey from the actual descendant under test.
-- No CLI smoke, browser, SPA, TUI, Lua/plugin, Rails relay, response codec,
-  framing, queue-bound, or adjacent lifecycle work without a newly captured
-  failure that identifies that surface and a reviewed plan amendment.
-- No full lifecycle-suite convergence campaign. The focused leaf verification
-  proves this ticket target; the umbrella convergence ticket retains ownership
-  of suite-wide 20-run acceptance and sibling failures.
+- No retry, timeout increase, fixed sleep, `--test-threads=1`, test
+  serialization, reduced residual-tail load, response-size reduction, partial
+  chunk acceptance, weakened byte/order/encryption/cleanup assertions, or
+  pre-existing-failure waiver.
+- No speculative ICE-consent, scheduler, WebRTC flow-control, chunk framing,
+  peer registry, daemon, session-worker production, or dependency change. ICE
+  consent starvation remains an unproven explanation of why leaked suite
+  pressure ends the peer, not an authorized repair target.
+- No change to the product guarantee that worker-backed sessions survive daemon
+  restart or daemon shutdown. Tests that create live sessions own explicit
+  session cleanup; production daemon shutdown must not begin killing durable
+  sessions globally.
+- No broad process-name kill, `pkill botster-session-worker`, runner-wide sweep,
+  or cleanup outside the exact PID/session/process-group identities created and
+  recorded by this campaign.
+- No Lua/plugin, MCP, TUI, React SPA, Rails relay, docs restructuring,
+  dependency update, optional configuration, or adjacent lifecycle cleanup.
+- No claim that the historical focused 10/10 run satisfies acceptance. It is a
+  diagnostic contrast only; the ticket binds the full default-concurrency
+  lifecycle suite for 20 consecutive repetitions.
 
 ## Assumptions and unknowns
 
-- Assumption: `afbf412` is the intended initial verification subject. Git
-  history proves it descends from PR #148; a later subject is acceptable only
-  with the same explicit ancestry and full-SHA evidence.
-- Assumption: the existing `focused-oversized-webrtc` selector preserves the
-  target's production daemon, package entrypoint, real DataChannel, encrypted
-  300,000-byte payload, chunk ordering, same-peer follow-up, and cleanup path.
-- Assumption: focused target success is sufficient for this leaf ticket under
-  the prior human scope disposition; it is not suite-wide health evidence.
-- Unknown: whether the repaired path recurs under the bounded residual-tail
-  campaign. This is intentionally answered before code is changed.
-- Unknown: if it recurs, whether the cause is peer-terminal publication,
-  DataChannel closure/error, send failure, poll end, framing, runtime reply, or
-  another branch. The terminal record, not the historical pre-repair run, must
-  decide the next scope.
-- Worktree/target assumption: work is confined to this pipeline worktree on
-  explicit target `tgt_7e208a0c76a44980a83b63af976b1f22`; the remote Actions
-  run must check out the recorded full subject SHA.
-- There are no convention conflicts after the human correction. The
-  verification-first scope is the smallest surgical response to the actual
-  repository history.
+- Fact, not assumption: three named session-worker families survive each full
+  suite repetition because their owner tests omit `ShutdownSession`; artifact
+  PIDs, control-socket arguments, sessions/process groups, and source endings
+  agree.
+- Assumption to test: accumulated test-owned workers are the suite-repetition
+  pressure necessary for the observed peer disconnect. Their correlation is
+  strong but not yet causal proof. Red-on-revert survivor evidence plus a green
+  exact-SHA 20-run full campaign is the required causal bridge.
+- Unknown: whether worker thread/process residue alone, its PTY children, or its
+  interaction with the 48 CPU workers and parallel lifecycle tests causes ICE
+  consent/scheduler loss. This distinction does not justify a production fix
+  unless the failure remains after cleanup.
+- Assumption: `ShutdownSession` is the existing product primitive for these test
+  fixtures and completes the worker cleanup path. The implementation must
+  assert its response and use bounded process evidence rather than inserting a
+  delay.
+- Assumption: on the Linux runner, the `setsid` test leader's session ID is a
+  stable ownership boundary even when session workers create child process
+  groups. The runner fixture must prove this against the actual `ps` fields used.
+- Unknown: the smallest script organization for session census/cleanup. Prefer
+  shell functions and universal process tools already used by the runner; do
+  not introduce a Rust artifact manager or dependency.
+- Worktree/target assumption: implementation remains in this pipeline worktree
+  for explicit target `tgt_7e208a0c76a44980a83b63af976b1f22`; loaded CI must
+  test the final committed SHA, not ambient branch HEAD.
+- Convention conflicts: none. Explicit test-owned cleanup and universal
+  process/session accounting preserve production durability and follow the
+  smallest surgical path.
 
 ## Affected surfaces and files
 
-- `docs/plans/eliminate-oversized-local-webrtc-response-close-under-load.md` —
-  corrected plan and evidence ledger; this is the only planned repository edit
-  before campaign results exist.
-- `.github/workflows/loaded-daemon-lifecycle.yml` — unchanged production
-  dispatch entry point used with `focused-oversized-webrtc`.
-- `script/run-loaded-daemon-lifecycle` — unchanged precompile, residual-load,
-  exact-selector, stop-at-first-red, artifact, and cleanup harness.
-- `tests/hub_daemon_lifecycle_test.rs` — unchanged production-path target
-  `local_webrtc_chunks_oversized_encrypted_daemon_response`.
-- `src/local_webrtc.rs` — unchanged repaired sender and deterministic unit-test
-  seam unless a true-descendant failure later proves a defect.
+- `tests/hub_daemon_lifecycle_test.rs`
+  - Add explicit `ShutdownSession` plus response assertions for `eof-session`
+    and `notify-socket-session` before daemon shutdown.
+  - End `slow-consumer` through the existing session-shutdown CLI path and reap
+    the stalled attach before daemon shutdown, while preserving its blocked
+    stdout and concurrent list/input/resize assertions.
+  - Add no shared abstraction unless repetition in the touched teardown makes a
+    tiny existing-style helper clearly simpler.
+- `script/run-loaded-daemon-lifecycle`
+  - Track the owned test session in addition to the outer process group.
+  - Detect, log, and clean resolved survivor process groups after every
+    repetition; return nonzero when the test leaked any process even if its test
+    assertions passed.
+  - Preserve stop-at-first-red and idempotent outer cleanup semantics.
+- `script/` test coverage or the repository's existing shell-test surface,
+  selected from mainline prior art during implementation
+  - Deterministically create an owned session with a child process group and
+    prove census, bounded evidence, cleanup, and nonzero leak verdict.
+- `docs/loaded-daemon-lifecycle-runner.md`
+  - Document that cleanup is session-complete and that a detected survivor is a
+    failing repetition, including the artifact evidence field.
+- `docs/plans/eliminate-oversized-local-webrtc-response-close-under-load.md`
+  - This superseding plan and later exact verification ledger.
+- Inspection/acceptance only, not expected edits:
+  `.github/workflows/loaded-daemon-lifecycle.yml`, `src/local_webrtc.rs`,
+  `src/daemon_transport.rs`, and `test.sh`.
 
-The runtime proof is the workflow invoking the repository wrapper, which runs
-the exact real-daemon lifecycle test through the production local-WebRTC sender.
-The existence of watch-based code or isolated unit tests alone is not acceptance
-evidence.
+Botster layers touched are the Rust real-daemon lifecycle test harness and the
+Linux loaded-campaign harness/docs. No production Botster runtime layer is
+planned to change.
+
+## Implementation sequence
+
+1. Reconfirm a clean worktree, exact base, and the three leaking source endings.
+   From retained artifacts, record one PID/SID/PGID/control-socket row for each
+   named family and at least one cross-repetition survivor row.
+2. Add explicit session shutdown to each named test at its natural teardown
+   boundary. Assert the existing structured response; do not sleep or weaken the
+   scenario. Run each exact test separately through `./test.sh` and confirm it
+   exits without its named control socket/worker surviving.
+3. Extend the runner's explicit ownership record/census and add a deterministic
+   nested-process-group fixture. Detection must happen before cleanup so a leak
+   cannot be reported as a green repetition; cleanup must remain idempotent for
+   the trap and workflow's outer always-run pass.
+4. Perform a narrow negative control: remove only the three explicit session
+   shutdowns, or bypass only the runner survivor-verdict decision while leaving
+   census and cleanup intact. Run the full relevant filter, require a nonzero
+   status with the named survivor evidence, restore exactly, and rerun green.
+5. Run focused lifecycle tests, runner validation/tests, the complete
+   default-concurrency lifecycle target, formatting, strict lint, full workspace
+   tests, whitespace checks, and a final diff/artifact privacy audit.
+6. Commit the implementation and dispatch the unchanged loaded workflow for the
+   exact 40-character commit with `test_target=lifecycle-suite`,
+   `repetitions=20`, and `stress_profile=residual-tail`.
+7. Stop at the first red. Any new full-suite root remains blocking until fixed,
+   consumed from a merged owner and rerun, or explicitly re-scoped by a human.
+   A repeated oversized-WebRTC disconnect after leak cleanup requires a reviewed
+   plan amendment before touching production transport behavior.
 
 ## Risks
 
-- **Testing the wrong code:** a branch can claim to include a repair while its
-  subject predates the merge. Require a full SHA and
-  `git merge-base --is-ancestor 2cd5829 <subject>` before dispatch.
-- **Speculative churn:** the invalid `b95b038` attribution could prompt a second
-  fix for code that was never exercised. Green means no code change.
-- **Focused-run overclaim:** a focused campaign removes sibling-test
-  contention. Treat it as leaf verification only and leave suite convergence
-  to its owner.
-- **Missing causal evidence on red:** `channel_closed` at the client is not a
-  root cause. A red without bounded sender/chunk/peer evidence is a diagnostic
-  failure and cannot authorize behavior changes.
-- **Load not achieved:** requested workers are not proof of contention. Review
-  `resource-samples.log` and report observed load with the verdict.
-- **Cleanup masking:** a useful red still fails acceptance if owned test, daemon,
-  session-worker, entrypoint, sampler, or load process groups survive.
-- **Stale plan after a red:** any newly evidenced cause changes affected files,
-  risks, and tests. Return the artifact for Plan Review rather than silently
-  choosing a repair.
+- **Correlation mistaken for cause:** fixing obvious leaks may not eliminate the
+  peer disconnect. Keep the production path unchanged and let the binding
+  campaign decide; do not call a local leak test sufficient.
+- **Destroying product durability:** changing daemon shutdown to kill session
+  workers would violate the production contract. Cleanup belongs in the three
+  tests that created the sessions.
+- **False-clean runner result:** outer PGID disappearance misses worker child
+  groups. Census the recorded SID and fail on any survivor before cleanup.
+- **Overbroad cleanup:** process-name matching could kill unrelated agents or
+  ambient hubs. Resolve only processes inside the campaign-recorded session and
+  record PID/PGID/SID before signalling.
+- **Cleanup race or zombie classification:** inspect process state, wait/reap
+  where owned, use bounded TERM/KILL behavior already present, and test success,
+  already-gone, and child-group cases.
+- **Masking the regression:** automatically cleaning a leaked child while
+  returning success would make later repetitions green for the wrong reason.
+  Survivor discovery itself must fail the repetition.
+- **Changing stalled-attach semantics:** ending the session too early could
+  remove the stdout backpressure condition under test. Perform session teardown
+  only after list, input, resize, and attach-liveness assertions complete.
+- **Suite-wide newly exposed roots:** every first non-cascade failure in the
+  promised 20-run campaign remains blocking; no blanket “pre-existing” claim is
+  acceptable.
 
 ## Acceptance checks and tests
 
-1. Pre-dispatch identity gate:
-   - `git rev-parse <subject>` resolves the recorded 40-character SHA;
-   - `git merge-base --is-ancestor 2cd58291e0da56dc6ac190fc48ccd665f96b7332 <subject>` exits 0;
-   - `git show <subject>:src/local_webrtc.rs` contains the peer-terminal watch
-     path and does not contain the `PressureDeadline` variant.
-2. Dispatch the unchanged campaign:
+1. Historical evidence ledger preserves both exact-SHA run URLs, target/profile,
+   default concurrency, 48-worker load, repetition results, chunk 31/33 client
+   and sender causes, and the mapped cross-repetition survivor rows.
+2. Focused test-owned cleanup through the repository wrapper:
+
+   ```sh
+   ./test.sh --test hub_daemon_lifecycle_test daemon_detaches_subscription_when_attach_connection_drops -- --exact --nocapture
+   ./test.sh --test hub_daemon_lifecycle_test daemon_notify_session_defers_without_observed_readiness_over_socket -- --exact --nocapture
+   ./test.sh --test hub_daemon_lifecycle_test stalled_attach_stdout_does_not_block_other_daemon_commands -- --exact --nocapture
+   ```
+
+   Each must preserve its behavioral assertions, assert session shutdown, and
+   leave no named worker/control socket.
+3. Runner regression coverage executes the actual Linux census/cleanup path and
+   proves: no-survivor green, child-process-group detection, bounded evidence,
+   nonzero leak verdict, exact owned cleanup, and idempotent second cleanup.
+4. Negative-control evidence records the exact enforcement lines removed or
+   bypassed, the valid `./test.sh`/runner command, its nonzero exit status, named
+   survivors detected, exact restoration, and the same command green. No
+   ablation diff may remain.
+5. Local gates:
+   - `./test.sh --test hub_daemon_lifecycle_test` at default concurrency;
+   - the repository-approved runner validation/test command discovered from
+     current script prior art;
+   - `./test.sh`;
+   - `cargo fmt --all -- --check`;
+   - strict workspace Clippy using the current `Cargo.toml` lint policy;
+   - `git diff --check`, clean status after commit, and final diff review.
+6. Runtime proof: dispatch the unchanged workflow against the final exact SHA:
 
    ```sh
    gh workflow run loaded-daemon-lifecycle.yml \
-     --ref main \
-     -f subject_sha=afbf412c5db9ef3538155ca6fec6637f4cb1726c \
-     -f test_target=focused-oversized-webrtc \
+     --ref <branch-containing-final-commit> \
+     -f subject_sha=<final-40-character-sha> \
+     -f test_target=lifecycle-suite \
      -F repetitions=20 \
      -f stress_profile=residual-tail
    ```
 
-3. Inspect the completed run and artifact. Require exact-target precompile
-   success, actual execution of
-   `local_webrtc_chunks_oversized_encrypted_daemon_response`, achieved load
-   evidence, and `cleanup_status=0` with all owned process groups gone.
-4. Green branch: require 20/20 exit-zero repetitions with the existing exact
-   300,000-byte response equality, encrypted ordered chunk delivery, response
-   kind, frame ceiling, same-peer follow-up, grant cleanup, and peer cleanup.
-   Attach the run URL and full SHA; make no source change.
-5. Red branch: preserve the first failing repetition and require correlated
-   client/sender progress, `next_chunk`, `expected_chunks`, pressure, peer and
-   channel state, typed cause, and cleanup disposition. Do not rerun to replace
-   the red. Amend and review the plan before implementation.
-6. Only if a true-descendant defect is repaired: run the relevant
-   `src/local_webrtc.rs` unit filter, the exact oversized test five consecutive
-   local repetitions through `./test.sh`, red-when-reverted ablation at the
-   repaired enforcement point, `cargo fmt --check`, repository strict Clippy,
-   and `./test.sh`; then repeat the fixed-SHA loaded campaign.
-7. Audit the final diff and artifacts for secrets, payload bodies, usernames,
-   absolute local paths, unwired code, deprecated branches, and unrelated
-   cleanup. Every changed line must map to the corrected evidence scope.
+   Require exact checkout, exact-target precompile, 20/20 suite-green at default
+   concurrency, the unchanged oversized response equality/chunk/frame/follow-up
+   assertions every repetition, achieved load evidence, no detected owned
+   survivor after any repetition, `campaign_exit_status=0`, and
+   `cleanup_status=0` with empty active ownership.
+7. Audit committed files and retained artifacts for secrets, response payloads,
+   usernames, absolute local paths, dead/unwired code, deprecated branches, and
+   unrelated cleanup. Every changed line must map to test-owned session teardown,
+   truthful owned-process verification, its tests/docs, or this plan ledger.
 
-## Project Pipelines gates and artifacts
+## Project Pipelines gates and checklists
 
-- Plan artifact: this committed document, with the corrected ancestry premise,
-  explicit green/red branches, and no silent production assumption.
-- Implement green artifact: exact subject ancestry, workflow run URL, 20-run
-  result, achieved-load summary, assertion preservation, and cleanup result.
-- Implement red artifact: the above plus the first correlated terminal record
-  and a reviewed plan amendment naming the evidenced repair.
-- Vault checklist: notes loaded, convention conflicts (`none` after human
-  disposition), verification commands/evidence, and capture disposition.
-- Workflow checklist: context, repo/runtime inspection, resolved human question,
-  attached plan, gate submission, and advancement request.
+- Plan artifact: this file, with assumptions explicitly separated from proven
+  facts and a conditional re-plan boundary for any post-cleanup recurrence.
+- Plan gate evidence: context loaded, bounded scope/non-scope, assumptions and
+  unknowns, affected files, risks, acceptance tests, and vault gaps.
+- Workflow checklist: current context loaded; repository/runtime and retained
+  campaigns inspected; plan attached; gate submitted; advancement requested
+  only after evidence submission.
+- Vault checklist: notes read; convention conflicts (`none`); planning evidence
+  commands and retained run evidence; durable capture disposition.
+- Implement artifact must include red/green survivor oracle, exact commands and
+  statuses, final diff, final SHA, workflow URL/artifact, 20-run table, achieved
+  load, and process-cleanup census.
 
 ## Vault gaps worth capturing
 
-- The history check reveals a durable campaign rule worth capturing after this
-  run: statements that a diagnostic SHA includes a repair must be backed by an
-  explicit ancestry check, not branch chronology or nearby merge timing.
-- If the verification campaign passes and the invalid attribution is formally
-  dispositioned, capture that rule through the inbox-first vault pipeline.
-- No transport lifecycle note should be added unless a true-descendant failure
-  proves new behavior beyond the existing peer-terminal watch convention.
+- The retained artifact exposes a durable gotcha not yet stated precisely in the
+  vault: killing an owned outer process group does not clean child process groups
+  that remain inside its `setsid` session, so `cleanup_status=0` can be false
+  assurance unless ownership is verified at the session boundary.
+- After implementation proves the mechanism and command shape, capture that
+  claim through the inbox-first vault pipeline and connect it to [[loaded
+  lifecycle ci precompiles the exact test target before synthetic cpu stress]]
+  and the existing graceful-cleanup notes.
+- If explicit `ShutdownSession` plus truthful SID census makes the exact-SHA
+  campaign pass, capture the test convention that real-daemon fixtures creating
+  durable sessions must close those sessions explicitly before daemon teardown.
+- Do not capture ICE-consent starvation as knowledge unless a post-cleanup red
+  provides exact evidence; it is currently only an advisor hypothesis.
