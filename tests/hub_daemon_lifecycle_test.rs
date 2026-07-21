@@ -1710,6 +1710,16 @@ fn wait_for_process_exit(pid: u32) {
     panic!("process {pid} still exists");
 }
 
+fn wait_for_loopback_port_closed(port: u16) {
+    for _ in 0..100 {
+        if TcpStream::connect(("127.0.0.1", port)).is_err() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    panic!("loopback port {port} is still accepting connections");
+}
+
 fn read_json_health(url: &str) -> serde_json::Value {
     let (_, body) = read_http_path(url, "/health");
     serde_json::from_str(body.trim()).expect("health JSON")
@@ -6533,6 +6543,7 @@ fn cli_dogfood_launcher_rejects_health_only_web_entrypoint() {
         )
     );
     assert!(!text.contains(web_package_dir.to_string_lossy().as_ref()));
+    wait_for_loopback_port_closed(web_bridge_port);
 }
 
 #[test]
