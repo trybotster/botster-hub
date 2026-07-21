@@ -53,6 +53,24 @@ pub struct HubCapabilityRuntime {
     event_capacity: usize,
 }
 
+pub(crate) struct PreparedPluginStoreOperation {
+    backend: Arc<LocalPluginStoreBackend>,
+    plugin_key: PluginKey,
+    operation: PluginStoreOperation,
+    limits: PluginStoreLimits,
+}
+
+impl PreparedPluginStoreOperation {
+    pub(crate) fn execute(self) -> Result<PluginStoreResult, CapabilityRuntimeError> {
+        execute_plugin_store(
+            self.backend.as_ref(),
+            &self.plugin_key,
+            self.operation,
+            self.limits,
+        )
+    }
+}
+
 impl HubCapabilityRuntime {
     /// Build the local concrete runtime from explicit hub config.
     #[must_use]
@@ -212,21 +230,18 @@ impl HubCapabilityRuntime {
         store: PluginStoreCapabilityRequest,
     ) -> Result<CapabilityRuntimeHandle, CapabilityRuntimeError> {
         self.ensure_runtime_capacity(&request)?;
-        self.ensure_plugin_namespace_grant(&request.plugin_key, &store.namespace)?;
-        validate_store_operation(&store.operation)?;
+        let prepared = self.prepare_plugin_store(&request.plugin_key, store)?;
 
         let operation_id = request.operation_id.clone();
         let plugin_key = request.plugin_key.clone();
         let resource = request.resource_ref(CapabilityResourceId(operation_id.0.clone()));
-        let backend = self.plugin_store.clone();
-        let limits = self.plugin_store_limits;
         let sender = self.completions_sender.clone();
         std::thread::Builder::new()
             .name("botster-hub-plugin-store-capability".to_string())
             .spawn(move || {
-                let result =
-                    execute_plugin_store(backend.as_ref(), &plugin_key, store.operation, limits)
-                        .map(CapabilityOperationResult::PluginStore);
+                let result = prepared
+                    .execute()
+                    .map(CapabilityOperationResult::PluginStore);
                 let _ = sender.send(HubCapabilityCompletion {
                     plugin_key,
                     operation_id,
@@ -246,6 +261,22 @@ impl HubCapabilityRuntime {
             operation_id: request.operation_id,
             resource: Some(resource),
             required_capability,
+        })
+    }
+
+    pub(crate) fn prepare_plugin_store(
+        &self,
+        plugin_key: &PluginKey,
+        store: PluginStoreCapabilityRequest,
+    ) -> Result<PreparedPluginStoreOperation, CapabilityRuntimeError> {
+        self.ensure_plugin_namespace_grant(plugin_key, &store.namespace)?;
+        validate_store_operation(&store.operation)?;
+
+        Ok(PreparedPluginStoreOperation {
+            backend: self.plugin_store.clone(),
+            plugin_key: plugin_key.clone(),
+            operation: store.operation,
+            limits: self.plugin_store_limits,
         })
     }
 
