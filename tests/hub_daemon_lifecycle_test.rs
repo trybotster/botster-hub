@@ -1,6 +1,6 @@
 #![cfg(unix)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -2946,12 +2946,16 @@ impl Drop for LocalWebrtcDiagnosticDaemon {
 }
 
 #[test]
-fn cli_daemon_shutdown_accepts_exact_disconnect_after_clean_exit() {
+fn cli_daemon_shutdown_rejects_exact_disconnect_after_clean_exit() {
     let shutdown =
         shell_output("printf 'botster-hub shutdown error: client disconnected\\n' >&2; exit 1");
     let daemon = shell_output("exit 0");
 
-    assert!(validate_cli_daemon_shutdown(&shutdown, &daemon).is_ok());
+    let error = validate_cli_daemon_shutdown(&shutdown, &daemon)
+        .expect_err("shutdown disconnect must remain visible after a clean daemon exit");
+
+    assert!(error.contains("shutdown failed"));
+    assert!(error.contains("client disconnected"));
 }
 
 #[test]
@@ -3172,17 +3176,56 @@ fn session_worker_binary_path() -> PathBuf {
         .join("botster-session-worker")
 }
 
-fn run_command_with_timeout(mut command: Command, timeout: Duration) -> Output {
+fn run_command_with_timeout(command: Command, timeout: Duration) -> Output {
+    run_command_with_timeout_diagnostics("command", command, timeout).output
+}
+
+struct TimedCommandOutput {
+    output: Output,
+    elapsed: Duration,
+}
+
+impl TimedCommandOutput {
+    fn diagnostics(&self) -> String {
+        format!(
+            "elapsed={:?} status={} stdout={:?} stderr={:?}",
+            self.elapsed,
+            self.output.status,
+            String::from_utf8_lossy(&self.output.stdout),
+            String::from_utf8_lossy(&self.output.stderr),
+        )
+    }
+}
+
+fn child_state_diagnostics(child: &mut Child) -> String {
+    match child.try_wait().expect("poll child for diagnostics") {
+        None => "running".to_string(),
+        Some(status) => {
+            let (stdout, stderr) = collect_child_output(child);
+            format!("exited status={status} stdout={stdout:?} stderr={stderr:?}")
+        }
+    }
+}
+
+fn run_command_with_timeout_diagnostics(
+    stage: &str,
+    mut command: Command,
+    timeout: Duration,
+) -> TimedCommandOutput {
+    let started_at = std::time::Instant::now();
     let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn timed command");
-    let deadline = std::time::Instant::now() + timeout;
+    let deadline = started_at + timeout;
 
     while std::time::Instant::now() < deadline {
         if child.try_wait().expect("poll timed command").is_some() {
-            return child.wait_with_output().expect("collect timed command");
+            return TimedCommandOutput {
+                output: child.wait_with_output().expect("collect timed command"),
+                elapsed: started_at.elapsed(),
+            };
         }
         thread::sleep(Duration::from_millis(20));
     }
@@ -3190,10 +3233,19 @@ fn run_command_with_timeout(mut command: Command, timeout: Duration) -> Output {
     let _ = child.kill();
     let output = child.wait_with_output().expect("collect timed out command");
     panic!(
-        "command timed out after {timeout:?}: stdout={} stderr={}",
+        "{stage} timed out after {:?} (budget {timeout:?}): status={} stdout={:?} stderr={:?}",
+        started_at.elapsed(),
+        output.status,
         String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+        String::from_utf8_lossy(&output.stderr),
     );
+}
+
+#[derive(Debug)]
+struct BufferedStdoutObservation {
+    available_bytes: usize,
+    elapsed: Duration,
+    recent_samples: VecDeque<(Duration, usize)>,
 }
 
 fn wait_for_buffered_child_stdout(
@@ -3201,18 +3253,19 @@ fn wait_for_buffered_child_stdout(
     minimum_bytes: usize,
     stable_samples_required: usize,
     timeout: Duration,
-) -> Result<usize, String> {
+) -> Result<BufferedStdoutObservation, String> {
     let started_at = std::time::Instant::now();
     let deadline = started_at + timeout;
     let mut previous_bytes = None;
     let mut stable_samples = 0;
     let mut last_available_bytes = 0;
+    let mut recent_samples = VecDeque::with_capacity(25);
 
     while std::time::Instant::now() < deadline {
         if let Some(status) = child.try_wait().expect("poll buffered stdout child") {
             let (stdout, stderr) = collect_child_output(child);
             return Err(format!(
-                "child exited with {status} before stdout backpressure after {:?}: available_bytes={last_available_bytes} stdout={stdout:?} stderr={stderr:?}",
+                "child exited with {status} before stdout backpressure after {:?}: available_bytes={last_available_bytes} recent_samples={recent_samples:?} stdout={stdout:?} stderr={stderr:?}",
                 started_at.elapsed()
             ));
         }
@@ -3220,6 +3273,10 @@ fn wait_for_buffered_child_stdout(
         let stdout = child.stdout.as_ref().expect("buffered stdout child pipe");
         last_available_bytes = pipe_bytes_available(stdout)
             .map_err(|error| format!("inspect buffered child stdout: {error}"))?;
+        if recent_samples.len() == recent_samples.capacity() {
+            recent_samples.pop_front();
+        }
+        recent_samples.push_back((started_at.elapsed(), last_available_bytes));
         if last_available_bytes >= minimum_bytes {
             if previous_bytes == Some(last_available_bytes) {
                 stable_samples += 1;
@@ -3227,7 +3284,11 @@ fn wait_for_buffered_child_stdout(
                 stable_samples = 0;
             }
             if stable_samples >= stable_samples_required {
-                return Ok(last_available_bytes);
+                return Ok(BufferedStdoutObservation {
+                    available_bytes: last_available_bytes,
+                    elapsed: started_at.elapsed(),
+                    recent_samples,
+                });
             }
         } else {
             stable_samples = 0;
@@ -3239,7 +3300,7 @@ fn wait_for_buffered_child_stdout(
     let child_status = terminate_and_reap_child(child);
     let (stdout, stderr) = collect_child_output(child);
     Err(format!(
-        "stdout did not reach stable backpressure within {timeout:?}: minimum_bytes={minimum_bytes} stable_samples_required={stable_samples_required} last_available_bytes={last_available_bytes} child_status={child_status} stdout={stdout:?} stderr={stderr:?}"
+        "stdout did not reach stable backpressure within {timeout:?}: minimum_bytes={minimum_bytes} stable_samples_required={stable_samples_required} last_available_bytes={last_available_bytes} recent_samples={recent_samples:?} child_status={child_status} stdout={stdout:?} stderr={stderr:?}"
     ))
 }
 
@@ -3263,7 +3324,7 @@ fn buffered_child_stdout_wait_observes_backpressure_condition() {
         .spawn()
         .expect("spawn buffered stdout fixture");
 
-    let buffered_bytes = wait_for_buffered_child_stdout(
+    let observation = wait_for_buffered_child_stdout(
         &mut child,
         STALLED_ATTACH_MIN_BUFFERED_STDOUT_BYTES,
         STALLED_ATTACH_STABLE_SAMPLES,
@@ -3274,9 +3335,12 @@ fn buffered_child_stdout_wait_observes_backpressure_condition() {
     terminate_and_reap_child(&mut child);
     let _ = collect_child_output(&mut child);
     assert!(
-        buffered_bytes >= STALLED_ATTACH_MIN_BUFFERED_STDOUT_BYTES,
-        "stdout backpressure should retain at least {} bytes, got {buffered_bytes}",
-        STALLED_ATTACH_MIN_BUFFERED_STDOUT_BYTES
+        observation.available_bytes >= STALLED_ATTACH_MIN_BUFFERED_STDOUT_BYTES,
+        "stdout backpressure should retain at least {} bytes, got {} after {:?}; recent_samples={:?}",
+        STALLED_ATTACH_MIN_BUFFERED_STDOUT_BYTES,
+        observation.available_bytes,
+        observation.elapsed,
+        observation.recent_samples,
     );
 }
 
@@ -9524,11 +9588,12 @@ fn stalled_attach_stdout_does_not_block_other_daemon_commands() {
         .arg(
             "i=0; while [ \"$i\" -lt 50000 ]; do printf 'flood-line-%05d\\n' \"$i\"; i=$((i + 1)); done; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done",
         );
-    let spawn = run_command_with_timeout(spawn_command, CLI_DAEMON_READINESS_BUDGET);
+    let spawn =
+        run_command_with_timeout_diagnostics("spawn", spawn_command, CLI_DAEMON_READINESS_BUDGET);
     assert!(
-        spawn.status.success(),
+        spawn.output.status.success(),
         "spawn failed: {}",
-        String::from_utf8_lossy(&spawn.stderr)
+        spawn.diagnostics(),
     );
 
     let mut attach_child = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
@@ -9549,17 +9614,20 @@ fn stalled_attach_stdout_does_not_block_other_daemon_commands() {
     )
     .unwrap_or_else(|error| panic!("stalled attach did not reach stdout backpressure: {error}"));
     assert!(
-        buffered_attach_stdout >= STALLED_ATTACH_MIN_BUFFERED_STDOUT_BYTES,
-        "stalled attach should retain at least {} unread stdout bytes, got {buffered_attach_stdout}",
-        STALLED_ATTACH_MIN_BUFFERED_STDOUT_BYTES
+        buffered_attach_stdout.available_bytes >= STALLED_ATTACH_MIN_BUFFERED_STDOUT_BYTES,
+        "stalled attach should retain at least {} unread stdout bytes, got {} after {:?}; recent_samples={:?}",
+        STALLED_ATTACH_MIN_BUFFERED_STDOUT_BYTES,
+        buffered_attach_stdout.available_bytes,
+        buffered_attach_stdout.elapsed,
+        buffered_attach_stdout.recent_samples,
     );
-    assert!(
-        attach_child
-            .try_wait()
-            .expect("poll stalled attach")
-            .is_none(),
-        "attach exited before the slow-consumer check"
-    );
+    if let Some(status) = attach_child.try_wait().expect("poll stalled attach") {
+        let (stdout, stderr) = collect_child_output(&mut attach_child);
+        panic!(
+            "attach exited before the slow-consumer check after {:?}: status={status} backpressure={buffered_attach_stdout:?} stdout={stdout:?} stderr={stderr:?}",
+            buffered_attach_stdout.elapsed,
+        );
+    }
 
     let mut list_command = Command::new(env!("CARGO_BIN_EXE_botster-hub"));
     list_command
@@ -9567,11 +9635,13 @@ fn stalled_attach_stdout_does_not_block_other_daemon_commands() {
         .arg("list")
         .arg("--data-dir")
         .arg(&data_dir);
-    let list = run_command_with_timeout(list_command, CLI_DAEMON_READINESS_BUDGET);
+    let list =
+        run_command_with_timeout_diagnostics("list", list_command, CLI_DAEMON_READINESS_BUDGET);
     assert!(
-        list.status.success(),
-        "list failed while attach stdout was blocked: {}",
-        String::from_utf8_lossy(&list.stderr)
+        list.output.status.success(),
+        "list failed while attach stdout was blocked: {}; attach_child={}",
+        list.diagnostics(),
+        child_state_diagnostics(&mut attach_child),
     );
 
     let mut send_command = Command::new(env!("CARGO_BIN_EXE_botster-hub"));
@@ -9583,11 +9653,16 @@ fn stalled_attach_stdout_does_not_block_other_daemon_commands() {
         .arg("slow-consumer")
         .arg("--")
         .arg("still-responsive\r");
-    let send = run_command_with_timeout(send_command, CLI_DAEMON_READINESS_BUDGET);
+    let send = run_command_with_timeout_diagnostics(
+        "send-input",
+        send_command,
+        CLI_DAEMON_READINESS_BUDGET,
+    );
     assert!(
-        send.status.success(),
-        "send-input failed while attach stdout was blocked: {}",
-        String::from_utf8_lossy(&send.stderr)
+        send.output.status.success(),
+        "send-input failed while attach stdout was blocked: {}; attach_child={}",
+        send.diagnostics(),
+        child_state_diagnostics(&mut attach_child),
     );
 
     let mut resize_command = Command::new(env!("CARGO_BIN_EXE_botster-hub"));
@@ -9599,13 +9674,42 @@ fn stalled_attach_stdout_does_not_block_other_daemon_commands() {
         .arg("slow-consumer")
         .arg("32")
         .arg("120");
-    let resize = run_command_with_timeout(resize_command, CLI_DAEMON_READINESS_BUDGET);
+    let resize =
+        run_command_with_timeout_diagnostics("resize", resize_command, CLI_DAEMON_READINESS_BUDGET);
     assert!(
-        resize.status.success(),
-        "resize failed while attach stdout was blocked: {}",
-        String::from_utf8_lossy(&resize.stderr)
+        resize.output.status.success(),
+        "resize failed while attach stdout was blocked: {}; attach_child={}",
+        resize.diagnostics(),
+        child_state_diagnostics(&mut attach_child),
     );
 
+    let mut shutdown_command = Command::new(env!("CARGO_BIN_EXE_botster-hub"));
+    shutdown_command
+        .arg("shutdown")
+        .arg("--data-dir")
+        .arg(&data_dir);
+    let shutdown = run_command_with_timeout_diagnostics(
+        "shutdown",
+        shutdown_command,
+        CLI_DAEMON_READINESS_BUDGET,
+    );
+    assert!(
+        shutdown.output.status.success(),
+        "shutdown failed while attach stdout was blocked: {}; attach_child={}",
+        shutdown.diagnostics(),
+        child_state_diagnostics(&mut attach_child),
+    );
+
+    let _ = attach_child.kill();
+    let _ = attach_child.wait_with_output();
+    let output = child.wait_with_output().expect("wait for daemon child");
+    assert!(
+        output.status.success(),
+        "daemon failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let cleanup_child = start_cli_daemon(&data_dir);
     let shutdown_session = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
         .arg("sessions")
         .arg("shutdown")
@@ -9613,17 +9717,17 @@ fn stalled_attach_stdout_does_not_block_other_daemon_commands() {
         .arg(&data_dir)
         .arg("slow-consumer")
         .output()
-        .expect("run botster-hub sessions shutdown while attach stdout is blocked");
+        .expect("shut down recovered slow-consumer session");
     assert!(
         shutdown_session.status.success(),
-        "session shutdown failed while attach stdout was blocked: {}",
+        "recovered session shutdown failed: {}",
         String::from_utf8_lossy(&shutdown_session.stderr)
     );
     let shutdown_session_stdout =
         String::from_utf8(shutdown_session.stdout).expect("session shutdown stdout is utf8");
     assert!(
         shutdown_session_stdout.contains("response=events"),
-        "active session shutdown should return structured events: {shutdown_session_stdout:?}"
+        "recovered session shutdown should return structured events: {shutdown_session_stdout:?}"
     );
 
     let sessions_after_shutdown = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
@@ -9632,23 +9736,20 @@ fn stalled_attach_stdout_does_not_block_other_daemon_commands() {
         .arg("--data-dir")
         .arg(&data_dir)
         .output()
-        .expect("list sessions after slow-consumer shutdown");
+        .expect("list sessions after recovered slow-consumer shutdown");
     assert!(
         sessions_after_shutdown.status.success(),
-        "list failed after slow-consumer shutdown: {}",
+        "list failed after recovered slow-consumer shutdown: {}",
         String::from_utf8_lossy(&sessions_after_shutdown.stderr)
     );
     let sessions_after_shutdown_stdout = String::from_utf8(sessions_after_shutdown.stdout)
         .expect("sessions after shutdown stdout is utf8");
     assert!(
         !sessions_after_shutdown_stdout.contains("session_id=slow-consumer"),
-        "slow-consumer should be absent after session shutdown: {sessions_after_shutdown_stdout:?}"
+        "slow-consumer should be absent after recovered session shutdown: {sessions_after_shutdown_stdout:?}"
     );
 
-    let _ = attach_child.kill();
-    let _ = attach_child.wait_with_output();
-
-    shutdown_cli_daemon(&data_dir, child);
+    shutdown_cli_daemon(&data_dir, cleanup_child);
 }
 
 #[test]
