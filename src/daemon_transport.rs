@@ -4,7 +4,7 @@
 //! mutable `HubRuntime` on the accept/control thread; socket threads submit discrete
 //! requests and never hold runtime access while writing to a client.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 use std::fs;
@@ -132,7 +132,7 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
                     &mut daemon,
                     &mut control_state.logical_clock,
                     &mut control_state.drain_cursors,
-                    &mut control_state.pending_runtime_events,
+                    &mut control_state.pending_runtime,
                     &mut control_state.entity_subscriptions,
                 );
                 if !socket_path.exists() {
@@ -467,7 +467,7 @@ fn handle_control_message(
                 daemon,
                 &mut state.logical_clock,
                 &mut state.drain_cursors,
-                &mut state.pending_runtime_events,
+                &mut state.pending_runtime,
                 &state.egress_diagnostics,
                 control_tx,
                 *request,
@@ -503,6 +503,7 @@ fn handle_control_message(
                 daemon,
                 &mut state.logical_clock,
                 &mut state.drain_cursors,
+                &mut state.pending_runtime,
                 control_tx,
                 &mut state.egress_diagnostics,
                 attached_subscriptions,
@@ -573,17 +574,17 @@ fn detach_local_webrtc_subscriptions(
     daemon: &mut HubDaemon,
     logical_clock: &mut u64,
     drain_cursors: &mut BTreeMap<String, u64>,
+    pending_runtime: &mut PendingRuntimeState,
     control_tx: Sender<ControlMessage>,
     egress_diagnostics: &mut DaemonEgressDiagnostics,
     attached_subscriptions: Vec<LocalWebrtcAttachedSubscription>,
 ) {
-    let mut pending_runtime_events = BTreeMap::new();
     for subscription in attached_subscriptions {
         let _ = handle_control_request(
             daemon,
             logical_clock,
             drain_cursors,
-            &mut pending_runtime_events,
+            pending_runtime,
             egress_diagnostics,
             control_tx.clone(),
             DaemonRequest::Detach {
@@ -598,7 +599,7 @@ fn handle_control_request(
     daemon: &mut HubDaemon,
     logical_clock: &mut u64,
     drain_cursors: &mut BTreeMap<String, u64>,
-    pending_runtime_events: &mut BTreeMap<String, Vec<HubClientEvent>>,
+    pending_runtime: &mut PendingRuntimeState,
     egress_diagnostics: &DaemonEgressDiagnostics,
     control_tx: Sender<ControlMessage>,
     request: DaemonRequest,
@@ -976,7 +977,7 @@ fn handle_control_request(
             daemon,
             logical_clock,
             drain_cursors,
-            pending_runtime_events,
+            pending_runtime,
             egress_diagnostics,
             other,
         ),
@@ -987,7 +988,7 @@ fn handle_runtime_control_request(
     daemon: &mut HubDaemon,
     logical_clock: &mut u64,
     drain_cursors: &mut BTreeMap<String, u64>,
-    pending_runtime_events: &mut BTreeMap<String, Vec<HubClientEvent>>,
+    pending_runtime: &mut PendingRuntimeState,
     egress_diagnostics: &DaemonEgressDiagnostics,
     request: DaemonRequest,
 ) -> DaemonTransportResult<DaemonResponse> {
@@ -1083,6 +1084,8 @@ fn handle_runtime_control_request(
             subscription_id,
         } => {
             let now = tick(logical_clock);
+            let tracked_session_id = session_id.clone();
+            let tracked_subscription_id = subscription_id.clone();
             let response = api.handle_request(
                 runtime,
                 &packages,
@@ -1093,6 +1096,11 @@ fn handle_runtime_control_request(
                     now_seconds: now,
                 },
             )?;
+            pending_runtime
+                .active_subscriptions
+                .entry(tracked_session_id)
+                .or_default()
+                .insert(tracked_subscription_id);
             events_response(response.body)
         }
         DaemonRequest::Detach {
@@ -1100,6 +1108,8 @@ fn handle_runtime_control_request(
             subscription_id,
         } => {
             let now = tick(logical_clock);
+            let tracked_session_id = session_id.clone();
+            let tracked_subscription_id = subscription_id.clone();
             let response = api.handle_request(
                 runtime,
                 &packages,
@@ -1110,6 +1120,18 @@ fn handle_runtime_control_request(
                     now_seconds: now,
                 },
             )?;
+            if let Some(subscriptions) = pending_runtime
+                .active_subscriptions
+                .get_mut(&tracked_session_id)
+            {
+                subscriptions.remove(&tracked_subscription_id);
+                if subscriptions.is_empty() {
+                    pending_runtime
+                        .active_subscriptions
+                        .remove(&tracked_session_id);
+                    pending_runtime.events.remove(&tracked_session_id);
+                }
+            }
             events_response(response.body)
         }
         DaemonRequest::SendInput { session_id, data } => {
@@ -1203,7 +1225,7 @@ fn handle_runtime_control_request(
                 },
             )?;
             let mut response = events_response(response.body)?;
-            if let Some(pending) = pending_runtime_events.remove(&session_id) {
+            if let Some(pending) = pending_runtime.events.remove(&session_id) {
                 let mut pending = pending
                     .into_iter()
                     .map(daemon_event_from_client)
@@ -2945,13 +2967,19 @@ struct EntitySubscriptionState {
     resync_reason: Option<String>,
 }
 
+#[derive(Debug, Default)]
+struct PendingRuntimeState {
+    events: BTreeMap<String, Vec<HubClientEvent>>,
+    active_subscriptions: BTreeMap<String, BTreeSet<String>>,
+}
+
 #[derive(Debug)]
 struct DaemonControlState {
     logical_clock: u64,
     drain_cursors: BTreeMap<String, u64>,
     egress_diagnostics: DaemonEgressDiagnostics,
     entity_subscriptions: BTreeMap<String, EntitySubscriptionState>,
-    pending_runtime_events: BTreeMap<String, Vec<HubClientEvent>>,
+    pending_runtime: PendingRuntimeState,
 }
 
 impl Default for DaemonControlState {
@@ -2961,7 +2989,7 @@ impl Default for DaemonControlState {
             drain_cursors: BTreeMap::new(),
             egress_diagnostics: DaemonEgressDiagnostics::default(),
             entity_subscriptions: BTreeMap::new(),
-            pending_runtime_events: BTreeMap::new(),
+            pending_runtime: PendingRuntimeState::default(),
         }
     }
 }
@@ -3134,7 +3162,7 @@ fn drive_entity_subscriptions(
     daemon: &mut HubDaemon,
     logical_clock: &mut u64,
     drain_cursors: &mut BTreeMap<String, u64>,
-    pending_runtime_events: &mut BTreeMap<String, Vec<HubClientEvent>>,
+    pending_runtime: &mut PendingRuntimeState,
     subscriptions: &mut BTreeMap<String, EntitySubscriptionState>,
 ) {
     if subscriptions.is_empty() {
@@ -3151,7 +3179,12 @@ fn drive_entity_subscriptions(
             .iter()
             .map(|record| record.session.session_id.0.clone())
             .collect::<std::collections::BTreeSet<_>>();
-        pending_runtime_events.retain(|session_id, _| active_session_ids.contains(session_id));
+        pending_runtime.events.retain(|session_id, _| {
+            active_session_ids.contains(session_id)
+                && pending_runtime
+                    .active_subscriptions
+                    .contains_key(session_id)
+        });
         for record in &baseline.sessions {
             let session_id = record.session.session_id.0.clone();
             if record.lifecycle.as_ref().is_some_and(|state| {
@@ -3159,7 +3192,7 @@ fn drive_entity_subscriptions(
                     state,
                     SessionLifecycleState::Exited { .. } | SessionLifecycleState::Failed { .. }
                 )
-            }) || pending_runtime_events.contains_key(&session_id)
+            }) || pending_runtime.events.contains_key(&session_id)
             {
                 continue;
             }
@@ -3172,7 +3205,7 @@ fn drive_entity_subscriptions(
                 let events = crate::client_api::events_from_drain(output);
                 if has_client_egress && !events.is_empty() {
                     *cursor = tick(logical_clock);
-                    pending_runtime_events.insert(session_id, events);
+                    pending_runtime.events.insert(session_id, events);
                 }
             }
         }

@@ -7997,6 +7997,100 @@ fn session_entity_subscription_observes_natural_exit_without_terminal_attach() {
 }
 
 #[test]
+fn session_entity_subscription_recovers_after_terminal_disconnect_with_pending_egress() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_test_dir("entity-drop");
+    let config = explicit_config(&data_dir);
+    let endpoint = botster_hub_client::DaemonEndpoint::new(
+        config
+            .transports
+            .local_socket
+            .as_ref()
+            .expect("test config has local socket")
+            .path
+            .clone(),
+    );
+    let child = start_cli_daemon(&data_dir);
+    let mut subscription =
+        botster_hub_client::subscribe_session_entities(&endpoint, "entities-terminal-disconnect")
+            .expect("subscribe before terminal disconnect");
+    subscription
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("bound entity reads");
+    let _ = subscription.next_frame().expect("initial snapshot");
+
+    botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::Spawn {
+            session_id: "entity-terminal-disconnect".to_string(),
+            command: "sleep 0.3; printf 'orphaned-output\\n'; sleep 0.6; exit 7".to_string(),
+        },
+    )
+    .expect("spawn terminal disconnect session");
+    assert!(matches!(
+        subscription.next_frame().expect("spawn upsert"),
+        botster_hub_client::DaemonEntityFrame::Upsert { ref id, .. }
+            if id == "entity-terminal-disconnect"
+    ));
+
+    let mut terminal =
+        botster_hub_client::DaemonConnection::connect(&endpoint).expect("terminal connection");
+    terminal
+        .request(&botster_hub_client::DaemonRequest::Attach {
+            session_id: "entity-terminal-disconnect".to_string(),
+            subscription_id: "terminal-disconnect".to_string(),
+        })
+        .expect("attach terminal before ungraceful disconnect");
+    thread::sleep(Duration::from_millis(500));
+    drop(terminal);
+
+    let exit_sequence = loop {
+        match subscription
+            .next_frame()
+            .expect("exit delta after terminal disconnect")
+        {
+            botster_hub_client::DaemonEntityFrame::Patch {
+                snapshot_seq,
+                patch,
+                ..
+            } if patch.get("lifecycle").and_then(serde_json::Value::as_str) == Some("exited") => {
+                assert_eq!(
+                    patch.get("exit_code").and_then(serde_json::Value::as_i64),
+                    Some(7)
+                );
+                break snapshot_seq;
+            }
+            _ => {}
+        }
+    };
+
+    let removed = botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::RemoveSession {
+            session_id: "entity-terminal-disconnect".to_string(),
+        },
+    )
+    .expect("remove session after disconnected terminal exit");
+    assert_eq!(
+        removed.kind,
+        botster_hub_client::DaemonResponseKind::SessionRemoved
+    );
+    assert!(matches!(
+        subscription.next_frame().expect("remove delta"),
+        botster_hub_client::DaemonEntityFrame::Remove {
+            snapshot_seq,
+            ref id,
+            ..
+        } if id == "entity-terminal-disconnect" && snapshot_seq > exit_sequence
+    ));
+
+    subscription
+        .unsubscribe()
+        .expect("unsubscribe entity stream");
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
 fn local_webrtc_chunks_oversized_encrypted_daemon_response() {
     let _guard = daemon_test_guard();
     let data_dir = unique_short_test_dir("web-webrtc");
