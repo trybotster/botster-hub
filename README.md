@@ -445,7 +445,9 @@ The supervised `botster-web` process receives `BOTSTER_HUB_SOCKET` and
 `BOTSTER_HUB_DATA_DIR` because the daemon-owned entrypoint launch injects hub
 connection environment. Foreground terminal apps run through `botster-hub apps
 open`, which asks the daemon for the resolved launch contract and then starts
-the child with inherited stdio.
+the child with inherited stdio. Both injected runtime paths are absolute host
+paths, so they continue to identify the selected daemon after the child changes
+to its package working directory.
 
 For lower-level package diagnostics, the daily flow maps to the daemon-owned
 package commands:
@@ -603,6 +605,8 @@ When a `botster-tui` terminal app package is installed and enabled,
 UI over the same daemon socket and `botster-hub-client` protocol path as the
 operator CLI. The hub resolves the foreground command, working directory, and
 allowlisted environment; the CLI only spawns that contract with inherited stdio.
+The injected `BOTSTER_HUB_SOCKET` and `BOTSTER_HUB_DATA_DIR` values are absolute
+and must not be resolved relative to the package working directory.
 
 ```sh
 # Terminal 1: leave the daemon running.

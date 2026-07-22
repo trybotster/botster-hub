@@ -623,6 +623,7 @@ pub struct IsolatedHubBuilder {
     hub_bin: Option<PathBuf>,
     session_worker_bin: Option<PathBuf>,
     root: Option<PathBuf>,
+    working_directory: Option<PathBuf>,
     name: String,
     ready_timeout: Duration,
 }
@@ -633,6 +634,7 @@ impl Default for IsolatedHubBuilder {
             hub_bin: None,
             session_worker_bin: None,
             root: None,
+            working_directory: None,
             name: "external-client".to_string(),
             ready_timeout: READY_TIMEOUT,
         }
@@ -667,6 +669,13 @@ impl IsolatedHubBuilder {
         self
     }
 
+    /// Set the working directory inherited by the spawned daemon.
+    #[must_use]
+    pub fn working_directory(mut self, path: impl Into<PathBuf>) -> Self {
+        self.working_directory = Some(path.into());
+        self
+    }
+
     /// Set a stable label segment for the disposable data directory.
     #[must_use]
     pub fn name(mut self, name: impl Into<String>) -> Self {
@@ -682,7 +691,15 @@ impl IsolatedHubBuilder {
 
     /// Start the isolated daemon and wait for the real socket protocol to respond.
     pub fn start(self) -> Result<IsolatedHub, IsolatedHubError> {
-        let data_dir = self.data_dir()?;
+        let selected_data_dir = self.data_dir()?;
+        let working_directory = self
+            .working_directory
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        let data_dir = if selected_data_dir.is_absolute() {
+            selected_data_dir.clone()
+        } else {
+            working_directory.join(&selected_data_dir)
+        };
         let hub_bin = explicit_path(self.hub_bin, "BOTSTER_HUB_BIN")?;
         let session_worker_bin =
             explicit_path(self.session_worker_bin, "BOTSTER_SESSION_WORKER_BIN")?;
@@ -699,9 +716,10 @@ impl IsolatedHubBuilder {
         command
             .arg("start")
             .arg("--data-dir")
-            .arg(&data_dir)
+            .arg(&selected_data_dir)
             .arg("--session-worker-bin")
             .arg(&session_worker_bin)
+            .current_dir(&working_directory)
             .env("BOTSTER_ENV", "test")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -720,6 +738,7 @@ impl IsolatedHubBuilder {
         Ok(IsolatedHub {
             hub_bin,
             data_dir,
+            working_directory,
             endpoint,
             child: Some(child),
         })
@@ -745,6 +764,7 @@ impl IsolatedHubBuilder {
 pub struct IsolatedHub {
     hub_bin: PathBuf,
     data_dir: PathBuf,
+    working_directory: PathBuf,
     endpoint: DaemonEndpoint,
     child: Option<Child>,
 }
@@ -760,6 +780,12 @@ impl IsolatedHub {
     #[must_use]
     pub const fn data_dir(&self) -> &PathBuf {
         &self.data_dir
+    }
+
+    /// Working directory inherited by the spawned daemon.
+    #[must_use]
+    pub const fn working_directory(&self) -> &PathBuf {
+        &self.working_directory
     }
 
     /// Stop the daemon through the operator command and wait for the process.
@@ -1630,6 +1656,10 @@ pub struct ForegroundTerminalAppOpenConformanceReport {
     pub resolved_command: String,
     pub hub_socket_env_present: bool,
     pub hub_data_dir_env_present: bool,
+    pub hub_socket_env_absolute: bool,
+    pub hub_data_dir_env_absolute: bool,
+    pub launch_working_directory_is_package_root: bool,
+    pub launch_working_directory_differs_from_daemon_cwd: bool,
     pub real_hub_action_operation: String,
     pub real_hub_action_result: String,
     pub exit_code: Option<i32>,
@@ -2958,6 +2988,15 @@ pub fn run_foreground_terminal_app_open_conformance(
             name: "BOTSTER_HUB_DATA_DIR",
         });
     }
+    let hub_socket_env_absolute =
+        Path::new(&launch.environment["BOTSTER_HUB_SOCKET"]).is_absolute();
+    let hub_data_dir_env_absolute =
+        Path::new(&launch.environment["BOTSTER_HUB_DATA_DIR"]).is_absolute();
+    let launch_working_directory_is_package_root = fs::canonicalize(&package_path)
+        .map(|package_root| launch.working_directory == package_root)
+        .unwrap_or(false);
+    let launch_working_directory_differs_from_daemon_cwd =
+        launch.working_directory != *hub.working_directory();
 
     let output = Command::new(&launch.command)
         .args(&launch.args)
@@ -2996,6 +3035,10 @@ pub fn run_foreground_terminal_app_open_conformance(
         resolved_command: launch.command,
         hub_socket_env_present,
         hub_data_dir_env_present,
+        hub_socket_env_absolute,
+        hub_data_dir_env_absolute,
+        launch_working_directory_is_package_root,
+        launch_working_directory_differs_from_daemon_cwd,
         real_hub_action_operation: "status".to_string(),
         real_hub_action_result,
         exit_code,
@@ -4905,6 +4948,7 @@ done
             hub_bin,
             endpoint: DaemonEndpoint::new(data_dir.join(DEFAULT_SOCKET_NAME)),
             data_dir,
+            working_directory: std::env::current_dir().expect("read test working directory"),
             child: Some(child),
         }
     }

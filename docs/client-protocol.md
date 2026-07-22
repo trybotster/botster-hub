@@ -368,8 +368,10 @@ to avoid path and environment leakage.
 
 Foreground terminal launch contracts currently inject `BOTSTER_HUB_SOCKET` and
 `BOTSTER_HUB_DATA_DIR`. These are the canonical same-device connection and
-runtime data directory values for terminal clients; clients should not expect the
-older example names `BOTSTER_HUB_CONNECTION` or `BOTSTER_PACKAGE_DATA_DIR`.
+runtime data directory values for terminal clients. The daemon resolves both as
+absolute host paths before returning the contract, so clients must not reinterpret
+them relative to the package working directory. Clients should not expect the older
+example names `BOTSTER_HUB_CONNECTION` or `BOTSTER_PACKAGE_DATA_DIR`.
 
 Supervised entrypoints are local development processes, not a production
 installer or sandbox. The daemon stops them on explicit stop/restart, package
@@ -1040,7 +1042,8 @@ a local `terminal_app` / `foreground_stdio` package, discovers it through
 command with the daemon-provided working directory and environment, and has the
 child process perform a real `Status` request through `BOTSTER_HUB_SOCKET`. Its
 report asserts the canonical `BOTSTER_HUB_SOCKET` and `BOTSTER_HUB_DATA_DIR`
-environment values were present and that the child exited with code 0.
+environment values were present and absolute, and that the child exited with code
+0 after completing the real daemon request from its package working directory.
 
 The matrix currently marks JSON plugin surface render/action dispatch as
 supported through the contract-matrix fixture and full plugin entity-frame
