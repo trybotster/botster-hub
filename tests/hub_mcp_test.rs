@@ -1011,6 +1011,20 @@ fn mcp_serve_lists_calls_and_reloads_project_pipelines_plugin_tools() {
         "acknowledged"
     );
 
+    let shutdown_session = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("sessions")
+        .arg("shutdown")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("project-pipelines-step-1")
+        .output()
+        .expect("shut down adopted project-pipelines session");
+    assert!(
+        shutdown_session.status.success(),
+        "adopted project-pipelines session shutdown failed: {}",
+        String::from_utf8_lossy(&shutdown_session.stderr)
+    );
+
     disable_project_pipelines_package(&data_dir);
     let output = run_mcp_serve(
         &data_dir,
