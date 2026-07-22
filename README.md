@@ -348,20 +348,30 @@ app/operator commands for the same data directory:
 
 ```sh
 cargo run -- up \
-  --data-dir target/botster-hub-dev-stack-data \
   --project-pipelines-package-path examples/project-pipelines \
   --web-package-path ../botster-web \
   --tui-package-path ../botster-tui \
   --workspaces-package-path ../botster-workspaces
+
+botster-hub status
+botster-hub doctor
+botster-hub open web
+botster-hub open tui
+botster-hub smoke
+botster-hub down
 ```
 
 `botster-hub up` defaults to `target/botster-hub-dev-stack-data`, discovers
 `examples/project-pipelines`, `../botster-web`, `../botster-tui`, and
 `../botster-workspaces` when those package manifests exist, and accepts explicit
 package path flags for CI worktrees or non-sibling checkouts. Keep the same
-`--data-dir` for `up`, `apps`, `mcp-serve`, `status`, package reloads, and
-`down`. That directory persists `hub-state.json`, package
-registry state, plugin data, and Project Pipelines state.
+checkout as the working directory for the daily commands so they resolve the
+same default. Pass `--data-dir <path>` to any daily command when an isolated
+runtime is needed; the explicit path always overrides the default. Lower-level
+`apps`, `packages`, `sessions`, `start`, `shutdown`, and `mcp-serve` operations
+continue to require `--data-dir`. The selected directory persists
+`hub-state.json`, package registry state, plugin data, and Project Pipelines
+state.
 
 The command is idempotent: rerunning it against a live daemon reuses that daemon,
 and rerunning after shutdown reloads the persisted package registry from
@@ -390,25 +400,26 @@ down=botster-hub down --data-dir target/botster-hub-dev-stack-data
 existing output contract. `start`, `shutdown`, `packages`, and `apps` remain the
 lower-level operator surfaces.
 
-`botster-hub doctor --data-dir <path>` is the non-mutating diagnostic path for a
-selected local runtime. It reports stable check rows such as daemon running,
-daemon compatibility, core initialization, package registry counts, first-party
-package state, and the `botster-web` app URL state. Stopped runtimes and
-stale/incompatible daemons exit nonzero with a remediation command instead of
-leaking raw protocol errors.
+`botster-hub doctor [--data-dir <path>]` is the non-mutating diagnostic path for
+the daily runtime or an explicitly selected runtime. It reports stable check
+rows such as daemon running, daemon compatibility, core initialization, package
+registry counts, first-party package state, and the `botster-web` app URL state.
+Stopped runtimes and stale/incompatible daemons exit nonzero with a remediation
+command instead of leaking raw protocol errors.
 
-`botster-hub smoke --data-dir <path>` is the explicit end-to-end local runtime
-proof. It requires an explicit data dir because it may start or reuse the daemon,
-enable first-party local packages, start package entrypoints, and create a
-disposable smoke session. When the first-party package prerequisites are not
-available, it exits nonzero with a named `missing_prerequisite=...` diagnostic.
+`botster-hub smoke [--data-dir <path>]` is the end-to-end local runtime proof.
+It uses the same daily default unless an override is provided, may start or reuse
+the daemon, enables first-party local packages, starts package entrypoints, and
+creates a disposable smoke session. When the first-party package prerequisites
+are not available, it exits nonzero with a named `missing_prerequisite=...`
+diagnostic.
 
 The daily aliases are only shortcuts over the lower-level daemon-backed
 commands:
 
 ```sh
-botster-hub open web --data-dir target/botster-hub-dev-stack-data
-botster-hub open tui --data-dir target/botster-hub-dev-stack-data
+botster-hub open web
+botster-hub open tui
 botster-hub reload botster-web --data-dir target/botster-hub-dev-stack-data
 ```
 
