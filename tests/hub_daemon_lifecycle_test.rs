@@ -8987,6 +8987,10 @@ fn external_hub_test_support_drives_isolated_daemon_socket_protocol() {
     assert_eq!(terminal_app_report.launch_mode, "foreground_stdio");
     assert!(terminal_app_report.hub_socket_env_present);
     assert!(terminal_app_report.hub_data_dir_env_present);
+    assert!(terminal_app_report.hub_socket_env_absolute);
+    assert!(terminal_app_report.hub_data_dir_env_absolute);
+    assert!(terminal_app_report.launch_working_directory_is_package_root);
+    assert!(terminal_app_report.launch_working_directory_differs_from_daemon_cwd);
     assert_eq!(terminal_app_report.real_hub_action_operation, "status");
     assert_eq!(terminal_app_report.real_hub_action_result, "running");
     assert_eq!(terminal_app_report.exit_code, Some(0));
@@ -9014,6 +9018,36 @@ fn external_hub_test_support_drives_isolated_daemon_socket_protocol() {
         botster_hub_test_support::run_client_conformance(&second).expect("rerun conformance");
     assert_eq!(second_report, first_report);
     second.shutdown().expect("shutdown second isolated hub");
+}
+
+#[test]
+fn foreground_terminal_app_open_absolutizes_relative_runtime_paths() {
+    let _guard = daemon_test_guard();
+    let daemon_working_directory = PathBuf::from("/tmp");
+    let hub = botster_hub_test_support::IsolatedHubBuilder::new()
+        .hub_bin(env!("CARGO_BIN_EXE_botster-hub"))
+        .session_worker_bin(session_worker_binary_path())
+        .root(PathBuf::from("bh-relative-runtime"))
+        .working_directory(&daemon_working_directory)
+        .name("package-cwd")
+        .start()
+        .expect("start isolated hub with relative runtime root");
+    assert!(
+        hub.data_dir()
+            .starts_with(daemon_working_directory.join("bh-relative-runtime"))
+    );
+
+    let report = botster_hub_test_support::run_foreground_terminal_app_open_conformance(&hub)
+        .expect("launch package-root child through daemon-resolved foreground contract");
+    assert!(report.hub_socket_env_absolute);
+    assert!(report.hub_data_dir_env_absolute);
+    assert!(report.launch_working_directory_is_package_root);
+    assert!(report.launch_working_directory_differs_from_daemon_cwd);
+    assert_eq!(report.real_hub_action_operation, "status");
+    assert_eq!(report.real_hub_action_result, "running");
+    assert_eq!(report.exit_code, Some(0));
+
+    hub.shutdown().expect("shutdown relative-root isolated hub");
 }
 
 #[test]

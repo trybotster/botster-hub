@@ -1680,7 +1680,8 @@ fn resolve_app_launch_response(
         .ok_or(DaemonTransportError::DaemonNotRunning)?
         .config()
         .clone();
-    let socket = socket_path(&config)?;
+    let data_directory = runtime_path(config.data_directory.clone());
+    let socket = runtime_path(socket_path(&config)?);
     let registry = daemon.package_registry();
     let Some(record) = registry.package(package_name) else {
         return Ok(daemon_app_launch_error(
@@ -1729,22 +1730,18 @@ fn resolve_app_launch_response(
             "terminal app must use foreground_stdio launch mode",
         ));
     }
-    let launch = match resolve_foreground_launch_contract(
-        record,
-        entrypoint,
-        &config.data_directory,
-        &socket,
-    ) {
-        Ok(launch) => launch,
-        Err(message) => {
-            return Ok(daemon_app_launch_error(
-                package_name,
-                entrypoint_id,
-                "launch_contract_unavailable",
-                message,
-            ));
-        }
-    };
+    let launch =
+        match resolve_foreground_launch_contract(record, entrypoint, &data_directory, &socket) {
+            Ok(launch) => launch,
+            Err(message) => {
+                return Ok(daemon_app_launch_error(
+                    package_name,
+                    entrypoint_id,
+                    "launch_contract_unavailable",
+                    message,
+                ));
+            }
+        };
 
     Ok(daemon_resolved_app_launch(DaemonResolvedAppLaunch {
         package_name: record.manifest.name.clone(),
