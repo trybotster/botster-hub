@@ -533,6 +533,21 @@ impl LocalWebrtcPeerState {
             .peer_connection_state = local_webrtc_peer_connection_state(state).to_string();
     }
 
+    fn observe_peer_connection_state(
+        &self,
+        state: RTCPeerConnectionState,
+    ) -> Option<LocalWebrtcTerminalCause> {
+        self.set_peer_connection_state(state);
+        let cause = match state {
+            RTCPeerConnectionState::Failed => LocalWebrtcTerminalCause::PeerFailed,
+            RTCPeerConnectionState::Closed => LocalWebrtcTerminalCause::PeerClosed,
+            _ => return None,
+        };
+        self.publish_peer_terminal(cause);
+        self.cleanup_once(cause);
+        Some(cause)
+    }
+
     fn subscribe_peer_terminal(&self) -> watch::Receiver<Option<LocalWebrtcTerminalCause>> {
         self.peer_terminal_tx.subscribe()
     }
@@ -638,22 +653,12 @@ impl PeerConnectionEventHandler for LocalWebrtcHandler {
     }
 
     async fn on_connection_state_change(&self, state: RTCPeerConnectionState) {
-        self.peer_state.set_peer_connection_state(state);
-        if matches!(
-            state,
-            RTCPeerConnectionState::Disconnected
-                | RTCPeerConnectionState::Failed
-                | RTCPeerConnectionState::Closed
-        ) {
+        if self
+            .peer_state
+            .observe_peer_connection_state(state)
+            .is_some()
+        {
             let _ = self.gather_complete_tx.try_send(());
-            let cause = match state {
-                RTCPeerConnectionState::Disconnected => LocalWebrtcTerminalCause::PeerDisconnected,
-                RTCPeerConnectionState::Failed => LocalWebrtcTerminalCause::PeerFailed,
-                RTCPeerConnectionState::Closed => LocalWebrtcTerminalCause::PeerClosed,
-                _ => unreachable!("terminal peer state matched above"),
-            };
-            self.peer_state.publish_peer_terminal(cause);
-            self.peer_state.cleanup_once(cause);
         }
     }
 
@@ -1541,6 +1546,103 @@ mod tests {
             failure.expect("send failure remains visible").cause,
             LocalWebrtcTerminalCause::SendText
         );
+    }
+
+    #[test]
+    fn recoverable_disconnect_after_response_preserves_followup_shutdown() {
+        let key = AesGcmKey::from_slice(&[17; 32]).unwrap();
+        let data_channel = Arc::new(FakeDataChannel::default());
+        {
+            let mut events = data_channel.events.lock().unwrap();
+            events.push_back(encrypted_request_event(&key, &DaemonRequest::Status));
+            events.push_back(encrypted_request_event(
+                &key,
+                &DaemonRequest::ShutdownSession {
+                    session_id: "recoverable-disconnect-session".to_string(),
+                },
+            ));
+        }
+        let (runtime_tx, runtime_rx) = mpsc::channel();
+        let peer_state = Arc::new(LocalWebrtcPeerState::new(
+            "grant-recoverable-disconnect".to_string(),
+            runtime_tx,
+        ));
+        let responder_peer_state = peer_state.clone();
+        let responder_data_channel = data_channel.clone();
+        let responder = std::thread::spawn(move || {
+            let ControlMessage::Request {
+                request, reply_tx, ..
+            } = runtime_rx.recv().unwrap()
+            else {
+                panic!("expected status request");
+            };
+            assert_eq!(*request, DaemonRequest::Status);
+            reply_tx
+                .send(Ok(response_with_diagnostic(DaemonDiagnostic::connected(
+                    "completed-response",
+                ))))
+                .unwrap();
+
+            assert_eq!(
+                responder_peer_state
+                    .observe_peer_connection_state(RTCPeerConnectionState::Disconnected),
+                None,
+                "disconnected is recoverable and must not terminate the peer"
+            );
+
+            let ControlMessage::Request {
+                request, reply_tx, ..
+            } = runtime_rx.recv_timeout(Duration::from_secs(1)).unwrap()
+            else {
+                panic!("expected shutdown-session request after recoverable disconnect");
+            };
+            assert_eq!(
+                *request,
+                DaemonRequest::ShutdownSession {
+                    session_id: "recoverable-disconnect-session".to_string(),
+                }
+            );
+            reply_tx
+                .send(Ok(response_with_diagnostic(DaemonDiagnostic::connected(
+                    "followup-shutdown",
+                ))))
+                .unwrap();
+
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while responder_data_channel.sent.lock().unwrap().len() < 2 {
+                assert!(
+                    Instant::now() < deadline,
+                    "both responses must complete before terminal close"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert_eq!(
+                responder_peer_state.observe_peer_connection_state(RTCPeerConnectionState::Closed),
+                Some(LocalWebrtcTerminalCause::PeerClosed)
+            );
+            assert!(matches!(
+                runtime_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+                ControlMessage::LocalWebrtcPeerClosed { grant_id, .. }
+                    if grant_id == "grant-recoverable-disconnect"
+            ));
+        });
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let runtime_sender = peer_state.runtime_tx.clone();
+        let failure = runtime.block_on(run_data_channel(
+            data_channel.as_ref(),
+            &key,
+            peer_state.as_ref(),
+            &runtime_sender,
+        ));
+
+        responder.join().unwrap();
+        assert!(failure.is_none());
+        assert_eq!(data_channel.sent.lock().unwrap().len(), 2);
+        assert!(data_channel.closed.load(Ordering::Acquire));
     }
 
     #[test]
