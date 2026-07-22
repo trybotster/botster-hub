@@ -9736,10 +9736,9 @@ fn stalled_attach_stdout_does_not_block_other_daemon_commands() {
     );
     let shutdown_session_stdout =
         String::from_utf8(shutdown_session.stdout).expect("session shutdown stdout is utf8");
-    assert!(
-        shutdown_session_stdout.contains("response=events"),
-        "recovered session shutdown should return structured events: {shutdown_session_stdout:?}"
-    );
+    assert!(shutdown_session_stdout.contains("response=session_cleanup"));
+    assert!(shutdown_session_stdout.contains("session_id=slow-consumer"));
+    assert!(shutdown_session_stdout.contains("outcome=already_exited"));
 
     let sessions_after_shutdown = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
         .arg("sessions")
