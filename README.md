@@ -133,8 +133,11 @@ contracts, not a hub replacement for `TransportIngress`, `TransportEgress`,
 `HubClientApi` is the stable local client API boundary over this facade. Socket,
 CLI, TUI, and local browser bridge adapters frame the same request/response/event
 contract instead of bypassing hub admission or calling raw core routers.
-Attach is a subscription handshake only, so clients still explicitly pull
-status, packages, lifecycle status, or sessions when they need them. Hub code
+Terminal attach is a terminal-stream handshake only. Session-list reads remain
+an operator/query API; stateful clients use the explicit held-open `session`
+entity subscription for an authoritative snapshot followed by ordered deltas.
+That subscription hydrates no status, package, worktree, target, or plugin state.
+Hub code
 embeds the typed CoreDaemon API; it must not shell out to the thin core daemon
 CLI or parse CLI output for session routing. Screen and snapshot requests route
 through `HubRuntime -> CoreDaemon` and return typed readback response DTOs.
@@ -146,6 +149,8 @@ events rather than through readback responses.
 | --- | --- | --- |
 | `execute_command(DefaultEngineCommand)` | Hidden | Generic core router would obscure hub admission/policy. Not the product session path. |
 | `list_sessions` | Exposed | Host visibility over daemon-recorded sessions. |
+| `lifecycle_baseline` / `lifecycle_changes` | Exposed through session entity subscriptions | CoreDaemon remains lifecycle authority; Hub owns the sanitized projection, bounded delivery, and reconnect baseline. |
+| `remove_session` | Exposed for terminal sessions | Explicit host retention policy produces an ordered `entity_remove`; shutdown does not imply forgetting. |
 | `spawn_session` | Exposed | Host-admitted local session creation through CoreDaemon. |
 | `attach_client` | Exposed | Explicit client subscription handshake without global state hydration. |
 | `detach_client` | Exposed | Explicit client subscription teardown through CoreDaemon. |

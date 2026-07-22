@@ -3233,6 +3233,9 @@ fn print_daemon_response(response: DaemonResponse) -> Result<(), OperatorError> 
                 print_daemon_session(&session);
             }
         }
+        DaemonResponseKind::EntitySubscribed => println!("response=entity_subscribed"),
+        DaemonResponseKind::EntityUnsubscribed => println!("response=entity_unsubscribed"),
+        DaemonResponseKind::SessionRemoved => println!("response=session_removed"),
         DaemonResponseKind::Spawned => {
             println!("response=spawned");
             if let Some(session) = response.sessions.first() {
