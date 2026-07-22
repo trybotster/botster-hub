@@ -2165,26 +2165,32 @@ mod tests {
             .collect::<Vec<_>>();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
+            .start_paused(true)
             .build()
             .unwrap();
         let mut flow_control = LocalWebrtcFlowControl::default();
         let peer_state = test_peer_state("grant-idle-open");
 
-        let started = Instant::now();
-        let completed = runtime.block_on(send_response_frames(
-            &data_channel,
-            &key,
-            &frames,
-            &mut pending,
-            &mut flow_control,
-            &peer_state,
-        ));
+        let (elapsed, completed) = runtime.block_on(async {
+            let started = tokio::time::Instant::now();
+            let completed = send_response_frames(
+                &data_channel,
+                &key,
+                &frames,
+                &mut pending,
+                &mut flow_control,
+                &peer_state,
+            )
+            .await;
+            (started.elapsed(), completed)
+        });
 
         assert!(completed.is_ok());
         assert_eq!(data_channel.sent.lock().unwrap().len(), frames.len());
         assert!(
-            started.elapsed() < Duration::from_millis(50),
-            "idle event probes must not throttle response frames"
+            elapsed.is_zero(),
+            "idle event probes must not throttle response frames: {:?}",
+            elapsed
         );
     }
 
