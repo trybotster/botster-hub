@@ -4976,7 +4976,10 @@ fn cli_local_runtime_up_starts_reuses_and_down_stops_runtime() {
     assert!(first_text.contains("runtime=ready"));
     assert!(first_text.contains("daemon=started"));
     assert!(first_text.contains("protocol=botster-hub-daemon-v1"));
-    assert!(first_text.contains("protocol_version=1"));
+    assert!(first_text.contains(&format!(
+        "protocol_version={}",
+        botster_hub_client::PROTOCOL_VERSION
+    )));
     assert!(first_text.contains("conformance_fixture_revision="));
     assert!(first_text.contains("package_count=4"));
     assert!(first_text.contains("enabled_package_count=4"));
@@ -7742,6 +7745,352 @@ fn external_hub_client_read_mode_flags_drives_real_daemon_socket_protocol() {
 }
 
 #[test]
+fn session_entity_subscription_pushes_snapshot_ordered_deltas_and_fresh_reconnect() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_test_dir("session-entity-subscription");
+    let config = explicit_config(&data_dir);
+    let endpoint = botster_hub_client::DaemonEndpoint::new(
+        config
+            .transports
+            .local_socket
+            .as_ref()
+            .expect("test config has local socket")
+            .path
+            .clone(),
+    );
+    let child = start_cli_daemon(&data_dir);
+
+    let mut first = botster_hub_client::subscribe_session_entities(&endpoint, "entities-first")
+        .expect("subscribe first session entity stream");
+    first
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("bound first entity reads");
+    let initial = first.next_frame().expect("initial authoritative snapshot");
+    assert!(matches!(
+        initial,
+        botster_hub_client::DaemonEntityFrame::Snapshot {
+            snapshot_seq: 0,
+            ref items,
+            resync_reason: None,
+            ..
+        } if items.is_empty()
+    ));
+
+    let mut second = botster_hub_client::subscribe_session_entities(&endpoint, "entities-second")
+        .expect("subscribe independent session entity stream");
+    second
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("bound second entity reads");
+    assert!(matches!(
+        second.next_frame().expect("second authoritative snapshot"),
+        botster_hub_client::DaemonEntityFrame::Snapshot { .. }
+    ));
+
+    let spawn = botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::Spawn {
+            session_id: "entity-session".to_string(),
+            command: "printf 'entity-before\\n'; sleep 0.15; printf 'entity-after\\n'; sleep 0.25"
+                .to_string(),
+        },
+    )
+    .expect("spawn entity session");
+    assert_eq!(spawn.kind, botster_hub_client::DaemonResponseKind::Spawned);
+
+    let first_upsert = first.next_frame().expect("first subscriber upsert");
+    let second_upsert = second.next_frame().expect("second subscriber upsert");
+    let upsert_sequence = match first_upsert {
+        botster_hub_client::DaemonEntityFrame::Upsert {
+            snapshot_seq,
+            ref id,
+            ..
+        } if id == "entity-session" => snapshot_seq,
+        other => panic!("expected first upsert, got {other:?}"),
+    };
+    assert!(matches!(
+        second_upsert,
+        botster_hub_client::DaemonEntityFrame::Upsert {
+            snapshot_seq,
+            ref id,
+            ..
+        } if id == "entity-session" && snapshot_seq == upsert_sequence
+    ));
+
+    let mut terminal =
+        botster_hub_client::DaemonConnection::connect(&endpoint).expect("terminal connection");
+    terminal
+        .request(&botster_hub_client::DaemonRequest::Attach {
+            session_id: "entity-session".to_string(),
+            subscription_id: "terminal-alongside-entities".to_string(),
+        })
+        .expect("attach while entity pump is active");
+    let terminal_deadline = Instant::now() + Duration::from_secs(5);
+    let mut terminal_output = String::new();
+    while Instant::now() < terminal_deadline && !terminal_output.contains("entity-after") {
+        let drain = terminal
+            .request(&botster_hub_client::DaemonRequest::Drain {
+                session_id: "entity-session".to_string(),
+            })
+            .expect("drain terminal output alongside entity pump");
+        for event in drain.events {
+            if let botster_hub_client::DaemonEvent::TerminalOutput { data, .. } = event {
+                terminal_output.push_str(&data);
+            }
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        terminal_output.contains("entity-after"),
+        "entity lifecycle pumping must retain terminal egress, got {terminal_output:?}"
+    );
+
+    botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::Resize {
+            session_id: "entity-session".to_string(),
+            rows: 31,
+            cols: 101,
+        },
+    )
+    .expect("resize entity session");
+    let resize_patch = first.next_frame().expect("resize patch");
+    let resize_sequence = match resize_patch {
+        botster_hub_client::DaemonEntityFrame::Patch {
+            snapshot_seq,
+            patch,
+            ..
+        } => {
+            assert_eq!(
+                patch.get("rows").and_then(serde_json::Value::as_u64),
+                Some(31)
+            );
+            assert_eq!(
+                patch.get("cols").and_then(serde_json::Value::as_u64),
+                Some(101)
+            );
+            snapshot_seq
+        }
+        other => panic!("expected resize patch, got {other:?}"),
+    };
+    assert!(resize_sequence > upsert_sequence);
+    let _ = second.next_frame().expect("second subscriber resize patch");
+
+    let exit_sequence = loop {
+        match first.next_frame().expect("natural exit patch") {
+            botster_hub_client::DaemonEntityFrame::Patch {
+                snapshot_seq,
+                patch,
+                ..
+            } if patch.get("lifecycle").and_then(serde_json::Value::as_str) == Some("exited") => {
+                break snapshot_seq;
+            }
+            _ => {}
+        }
+    };
+    assert!(exit_sequence > resize_sequence);
+
+    let removed = botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::RemoveSession {
+            session_id: "entity-session".to_string(),
+        },
+    )
+    .expect("remove terminal entity session");
+    assert_eq!(
+        removed.kind,
+        botster_hub_client::DaemonResponseKind::SessionRemoved
+    );
+    assert!(matches!(
+        first.next_frame().expect("remove delta"),
+        botster_hub_client::DaemonEntityFrame::Remove {
+            snapshot_seq,
+            ref id,
+            ..
+        } if id == "entity-session" && snapshot_seq > exit_sequence
+    ));
+
+    drop(first);
+    let cleanup_deadline = Instant::now() + Duration::from_secs(2);
+    let cleanup_probe = loop {
+        match botster_hub_client::subscribe_session_entities(&endpoint, "entities-first") {
+            Ok(subscription) => break subscription,
+            Err(_) if Instant::now() < cleanup_deadline => {
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => panic!("socket EOF should release the old subscription: {error}"),
+        }
+    };
+    cleanup_probe
+        .unsubscribe()
+        .expect("unsubscribe cleanup probe stream");
+    let mut reconnected =
+        botster_hub_client::subscribe_session_entities(&endpoint, "entities-reconnected")
+            .expect("fresh reconnect subscription");
+    reconnected
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("bound reconnect entity reads");
+    assert!(matches!(
+        reconnected.next_frame().expect("fresh reconnect snapshot"),
+        botster_hub_client::DaemonEntityFrame::Snapshot {
+            ref subscription_id,
+            ref items,
+            ..
+        } if subscription_id == "entities-reconnected" && items.is_empty()
+    ));
+    reconnected
+        .unsubscribe()
+        .expect("unsubscribe reconnect stream");
+    second.unsubscribe().expect("unsubscribe second stream");
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
+fn session_entity_subscription_observes_natural_exit_without_terminal_attach() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_test_dir("session-entity-no-terminal");
+    let config = explicit_config(&data_dir);
+    let endpoint = botster_hub_client::DaemonEndpoint::new(
+        config
+            .transports
+            .local_socket
+            .as_ref()
+            .expect("test config has local socket")
+            .path
+            .clone(),
+    );
+    let child = start_cli_daemon(&data_dir);
+    let mut subscription =
+        botster_hub_client::subscribe_session_entities(&endpoint, "entities-no-terminal")
+            .expect("subscribe without terminal attach");
+    subscription
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("bound entity read");
+    let _ = subscription.next_frame().expect("initial snapshot");
+
+    botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::Spawn {
+            session_id: "entity-no-terminal".to_string(),
+            command: "sleep 0.1".to_string(),
+        },
+    )
+    .expect("spawn session without terminal attach");
+    assert!(matches!(
+        subscription.next_frame().expect("spawn upsert"),
+        botster_hub_client::DaemonEntityFrame::Upsert { ref id, .. }
+            if id == "entity-no-terminal"
+    ));
+    loop {
+        match subscription.next_frame().expect("natural exit delta") {
+            botster_hub_client::DaemonEntityFrame::Patch { patch, .. }
+                if patch.get("lifecycle").and_then(serde_json::Value::as_str) == Some("exited") =>
+            {
+                break;
+            }
+            _ => {}
+        }
+    }
+    subscription
+        .unsubscribe()
+        .expect("unsubscribe entity stream");
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
+fn session_entity_subscription_recovers_after_terminal_disconnect_with_pending_egress() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_test_dir("entity-drop");
+    let config = explicit_config(&data_dir);
+    let endpoint = botster_hub_client::DaemonEndpoint::new(
+        config
+            .transports
+            .local_socket
+            .as_ref()
+            .expect("test config has local socket")
+            .path
+            .clone(),
+    );
+    let child = start_cli_daemon(&data_dir);
+    let mut subscription =
+        botster_hub_client::subscribe_session_entities(&endpoint, "entities-terminal-disconnect")
+            .expect("subscribe before terminal disconnect");
+    subscription
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("bound entity reads");
+    let _ = subscription.next_frame().expect("initial snapshot");
+
+    botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::Spawn {
+            session_id: "entity-terminal-disconnect".to_string(),
+            command: "sleep 0.3; printf 'orphaned-output\\n'; sleep 0.6; exit 7".to_string(),
+        },
+    )
+    .expect("spawn terminal disconnect session");
+    assert!(matches!(
+        subscription.next_frame().expect("spawn upsert"),
+        botster_hub_client::DaemonEntityFrame::Upsert { ref id, .. }
+            if id == "entity-terminal-disconnect"
+    ));
+
+    let mut terminal =
+        botster_hub_client::DaemonConnection::connect(&endpoint).expect("terminal connection");
+    terminal
+        .request(&botster_hub_client::DaemonRequest::Attach {
+            session_id: "entity-terminal-disconnect".to_string(),
+            subscription_id: "terminal-disconnect".to_string(),
+        })
+        .expect("attach terminal before ungraceful disconnect");
+    thread::sleep(Duration::from_millis(500));
+    drop(terminal);
+
+    let exit_sequence = loop {
+        match subscription
+            .next_frame()
+            .expect("exit delta after terminal disconnect")
+        {
+            botster_hub_client::DaemonEntityFrame::Patch {
+                snapshot_seq,
+                patch,
+                ..
+            } if patch.get("lifecycle").and_then(serde_json::Value::as_str) == Some("exited") => {
+                assert_eq!(
+                    patch.get("exit_code").and_then(serde_json::Value::as_i64),
+                    Some(7)
+                );
+                break snapshot_seq;
+            }
+            _ => {}
+        }
+    };
+
+    let removed = botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::RemoveSession {
+            session_id: "entity-terminal-disconnect".to_string(),
+        },
+    )
+    .expect("remove session after disconnected terminal exit");
+    assert_eq!(
+        removed.kind,
+        botster_hub_client::DaemonResponseKind::SessionRemoved
+    );
+    assert!(matches!(
+        subscription.next_frame().expect("remove delta"),
+        botster_hub_client::DaemonEntityFrame::Remove {
+            snapshot_seq,
+            ref id,
+            ..
+        } if id == "entity-terminal-disconnect" && snapshot_seq > exit_sequence
+    ));
+
+    subscription
+        .unsubscribe()
+        .expect("unsubscribe entity stream");
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
 fn local_webrtc_chunks_oversized_encrypted_daemon_response() {
     let _guard = daemon_test_guard();
     let data_dir = unique_short_test_dir("web-webrtc");
@@ -8896,6 +9245,9 @@ fn external_hub_test_support_drives_isolated_daemon_socket_protocol() {
         vec![
             "status",
             "list_sessions",
+            "subscribe_entities",
+            "unsubscribe_entities",
+            "remove_session",
             "spawn",
             "attach",
             "drain",

@@ -85,6 +85,12 @@ pub(crate) fn daemon_protocol_typescript() -> String {
         &[
             ("status", &[]),
             ("list_sessions", &[]),
+            (
+                "subscribe_entities",
+                &[("entity_type", "string"), ("subscription_id", "string")],
+            ),
+            ("unsubscribe_entities", &[("subscription_id", "string")]),
+            ("remove_session", &[("session_id", "string")]),
             ("whoami", &[("caller_session_id", "string | null")]),
             (
                 "post_message",
@@ -423,6 +429,9 @@ pub(crate) fn daemon_protocol_typescript() -> String {
         &[
             "status",
             "sessions",
+            "entity_subscribed",
+            "entity_unsubscribed",
+            "session_removed",
             "spawned",
             "events",
             "session_templates",
@@ -1057,6 +1066,65 @@ pub(crate) fn daemon_protocol_typescript() -> String {
         &mut output,
         "DaemonSession",
         &[("session_id", "string"), ("lifecycle", "string")],
+    );
+    emit_interface(
+        &mut output,
+        "DaemonSessionEntity",
+        &[
+            ("session_uuid", "string"),
+            ("registry_state", "string"),
+            ("lifecycle?", "string | null"),
+            ("rows", "number"),
+            ("cols", "number"),
+            ("updated_at", "number"),
+            ("exit_code?", "number | null"),
+            ("failure_reason?", "string | null"),
+        ],
+    );
+    emit_union(
+        &mut output,
+        "DaemonEntityFrame",
+        &[
+            (
+                "entity_snapshot",
+                &[
+                    ("subscription_id", "string"),
+                    ("entity_type", "string"),
+                    ("snapshot_seq", "number"),
+                    ("items", "DaemonSessionEntity[]"),
+                    ("resync_reason?", "string | null"),
+                ],
+            ),
+            (
+                "entity_upsert",
+                &[
+                    ("subscription_id", "string"),
+                    ("entity_type", "string"),
+                    ("snapshot_seq", "number"),
+                    ("id", "string"),
+                    ("entity", "DaemonSessionEntity"),
+                ],
+            ),
+            (
+                "entity_patch",
+                &[
+                    ("subscription_id", "string"),
+                    ("entity_type", "string"),
+                    ("snapshot_seq", "number"),
+                    ("id", "string"),
+                    ("patch", "JsonValue"),
+                ],
+            ),
+            (
+                "entity_remove",
+                &[
+                    ("subscription_id", "string"),
+                    ("entity_type", "string"),
+                    ("snapshot_seq", "number"),
+                    ("id", "string"),
+                ],
+            ),
+        ],
     );
     emit_interface(
         &mut output,
