@@ -5063,6 +5063,143 @@ fn cli_local_runtime_up_starts_reuses_and_down_stops_runtime() {
 }
 
 #[test]
+fn cli_daily_commands_share_canonical_default_data_directory() {
+    let _guard = daemon_test_guard();
+    let checkout = unique_short_test_dir("daily");
+    let data_dir = checkout.join("target/botster-hub-dev-stack-data");
+    let project_pipelines_package_dir =
+        unique_short_test_dir("cli-daily-default-project-pipelines");
+    let web_package_dir = unique_short_test_dir("cli-daily-default-web");
+    let tui_package_dir = unique_short_test_dir("cli-daily-default-tui");
+    let workspaces_package_dir = unique_short_test_dir("cli-daily-default-workspaces");
+    fs::create_dir_all(&checkout).expect("create daily command checkout");
+    write_project_pipelines_availability_package(&project_pipelines_package_dir);
+    write_botster_web_package(&web_package_dir);
+    write_botster_tui_package(&tui_package_dir);
+    write_botster_workspaces_local_package(&workspaces_package_dir, "botster-workspaces");
+    ensure_session_worker_binary();
+
+    let web_bridge_port = unused_loopback_port();
+    let mut up_command = Command::new(env!("CARGO_BIN_EXE_botster-hub"));
+    up_command
+        .current_dir(&checkout)
+        .arg("up")
+        .arg("--session-worker-bin")
+        .arg(session_worker_binary_path())
+        .arg("--project-pipelines-package-path")
+        .arg(&project_pipelines_package_dir)
+        .arg("--web-package-path")
+        .arg(&web_package_dir)
+        .arg("--tui-package-path")
+        .arg(&tui_package_dir)
+        .arg("--workspaces-package-path")
+        .arg(&workspaces_package_dir)
+        .arg("--web-bridge-port")
+        .arg(web_bridge_port.to_string());
+    let up = up_command.output().expect("run default botster-hub up");
+    assert!(
+        up.status.success(),
+        "default up failed: {}",
+        command_output_text(&up)
+    );
+    assert!(command_output_text(&up).contains("data_dir=stable:target/botster-hub-dev-stack-data"));
+
+    let run_daily = |command: &str, args: &[&str]| {
+        let mut process = Command::new(env!("CARGO_BIN_EXE_botster-hub"));
+        process.current_dir(&checkout).arg(command).args(args);
+        process.output().expect("run daily command")
+    };
+
+    let status = run_daily("status", &[]);
+    assert!(
+        status.status.success(),
+        "default status failed: {}",
+        command_output_text(&status)
+    );
+    assert!(command_output_text(&status).contains("lifecycle_state=running"));
+
+    let doctor = run_daily("doctor", &[]);
+    assert!(
+        doctor.status.success(),
+        "default doctor failed: {}",
+        command_output_text(&doctor)
+    );
+    let doctor_text = command_output_text(&doctor);
+    assert!(doctor_text.contains("data_dir=stable:target/botster-hub-dev-stack-data"));
+    assert!(doctor_text.contains("check name=daemon_running status=pass"));
+
+    let open_web = run_daily("open", &["web"]);
+    assert!(
+        open_web.status.success(),
+        "default open web failed: {}",
+        command_output_text(&open_web)
+    );
+    assert!(command_output_text(&open_web).contains(&format!(
+        "app_url=http://127.0.0.1:{web_bridge_port}/?dogfood=real-hub"
+    )));
+
+    let open_tui = run_daily("open", &["tui"]);
+    assert!(
+        open_tui.status.success(),
+        "default open tui failed: {}",
+        command_output_text(&open_tui)
+    );
+    assert!(command_output_text(&open_tui).contains("botster-tui-fixture"));
+
+    let mut smoke_command = Command::new(env!("CARGO_BIN_EXE_botster-hub"));
+    smoke_command
+        .current_dir(&checkout)
+        .arg("smoke")
+        .arg("--session-worker-bin")
+        .arg(session_worker_binary_path())
+        .arg("--project-pipelines-package-path")
+        .arg(&project_pipelines_package_dir)
+        .arg("--web-package-path")
+        .arg(&web_package_dir)
+        .arg("--tui-package-path")
+        .arg(&tui_package_dir)
+        .arg("--workspaces-package-path")
+        .arg(&workspaces_package_dir)
+        .arg("--web-bridge-port")
+        .arg(web_bridge_port.to_string());
+    let smoke = smoke_command
+        .output()
+        .expect("run default botster-hub smoke");
+    if !smoke.status.success() {
+        panic!("{}", local_webrtc_smoke_failure_evidence(&smoke, &data_dir));
+    }
+    let smoke_text = command_output_text(&smoke);
+    assert!(smoke_text.contains("data_dir=stable:target/botster-hub-dev-stack-data"));
+    assert!(
+        smoke_text.contains("check name=daemon status=pass message=daemon reused"),
+        "smoke must reuse the daemon started by up: {smoke_text}"
+    );
+    assert!(smoke_text.contains("smoke_result=pass"));
+
+    let status_after_smoke = run_daily("status", &[]);
+    assert!(
+        status_after_smoke.status.success(),
+        "reused smoke must leave the default daemon running: {}",
+        command_output_text(&status_after_smoke)
+    );
+
+    let down = run_daily("down", &[]);
+    assert!(
+        down.status.success(),
+        "default down failed: {}",
+        command_output_text(&down)
+    );
+    assert!(command_output_text(&down).contains("response=shutdown"));
+
+    let stopped = run_daily("status", &[]);
+    assert!(
+        !stopped.status.success(),
+        "default status should fail after down: {}",
+        command_output_text(&stopped)
+    );
+}
+
+#[test]
 fn cli_doctor_reports_healthy_runtime_checks() {
     let _guard = daemon_test_guard();
     let data_dir = unique_short_test_dir("cli-doctor-healthy");
@@ -5101,6 +5238,7 @@ fn cli_doctor_reports_healthy_runtime_checks() {
         command_output_text(&doctor)
     );
     let text = command_output_text(&doctor);
+    assert!(text.contains("data_dir=explicit"));
     assert!(text.contains("check name=daemon_running status=pass"));
     assert!(text.contains("check name=daemon_compatible status=pass"));
     assert!(text.contains("conformance_fixture_revision="));
@@ -5500,6 +5638,7 @@ fn cli_smoke_proves_local_runtime_daemon_package_app_session_and_webrtc() {
         );
     }
     assert!(text.contains("smoke=local_runtime"));
+    assert!(text.contains("data_dir=explicit"));
     assert!(text.contains("check name=daemon status=pass"));
     assert!(text.contains("check name=core status=pass"));
     assert!(text.contains("check name=packages status=pass"));
@@ -10948,7 +11087,7 @@ fn cli_no_arg_prints_host_profile_boot_summary() {
     let text = command_output_text(&summary);
     assert!(text.contains("first-party host profile ready"));
     assert!(text.contains("Daily runtime commands:"));
-    assert!(text.contains("botster-hub open web --data-dir <path>"));
+    assert!(text.contains("botster-hub open web [--data-dir <path>]"));
     assert!(text.contains(
         "botster-hub packages available --data-dir <path> --registry <registry-dir-or-file>"
     ));
@@ -10971,6 +11110,13 @@ fn cli_help_like_args_print_command_guidance_without_daemon() {
         let text = command_output_text(&help);
         assert!(text.contains("Daily runtime commands:"));
         assert!(text.contains("botster-hub up [--data-dir <path>]"));
+        assert!(text.contains("botster-hub down [--data-dir <path>]"));
+        assert!(text.contains("botster-hub status [--data-dir <path>]"));
+        assert!(text.contains("botster-hub doctor [--data-dir <path>]"));
+        assert!(text.contains("botster-hub smoke [--data-dir <path>]"));
+        assert!(text.contains("botster-hub open web [--data-dir <path>]"));
+        assert!(text.contains("botster-hub open tui [--data-dir <path>]"));
+        assert!(text.contains("botster-hub mcp-serve --data-dir <path>"));
         assert!(text.contains("botster-hub apps open --data-dir <path> <app|package/app>"));
         assert!(
             text.contains(
