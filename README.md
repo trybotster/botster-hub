@@ -379,7 +379,7 @@ and rerunning after shutdown reloads the persisted package registry from
 
 ```sh
 runtime=ready
-data_dir=target/botster-hub-dev-stack-data
+data_dir=stable:target/botster-hub-dev-stack-data
 daemon=started
 protocol=botster-hub-daemon-v1
 protocol_version=1
