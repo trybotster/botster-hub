@@ -408,7 +408,7 @@ fn local_runtime_up(args: Vec<String>) -> Result<(), DevStackError> {
 }
 
 fn local_runtime_down(args: Vec<String>) -> Result<(), DevStackError> {
-    let options = LocalRuntimeDownOptions::parse(args)?;
+    let options = DailyDataDirOptions::parse(args).ok_or(DevStackError::Usage)?;
     let config = explicit_config(options.data_directory.clone())?;
     let response = match daemon_transport_request(&config, DaemonRequest::DaemonShutdown) {
         Ok(response) => response,
@@ -433,10 +433,10 @@ fn local_runtime_down(args: Vec<String>) -> Result<(), DevStackError> {
 }
 
 fn local_runtime_doctor(args: Vec<String>) -> Result<(), OperatorError> {
-    let options = DataDirOptions::parse(args, "doctor")?;
+    let options = DailyDataDirOptions::parse(args).ok_or(OperatorError::Usage("doctor"))?;
     let config = explicit_config(options.data_directory.clone())?;
     println!("doctor=local_runtime");
-    println!("data_dir=explicit");
+    options.print_source();
 
     let status_response = match daemon_transport_request(&config, DaemonRequest::Status) {
         Ok(response) => response,
@@ -587,7 +587,14 @@ fn local_runtime_doctor(args: Vec<String>) -> Result<(), OperatorError> {
 fn local_runtime_smoke(args: Vec<String>) -> Result<(), SmokeError> {
     let options = SmokeOptions::parse(args)?;
     println!("smoke=local_runtime");
-    println!("data_dir=explicit");
+    if options.dev_stack.default_data_dir {
+        println!(
+            "data_dir=stable:{}",
+            options.dev_stack.data_directory.display()
+        );
+    } else {
+        println!("data_dir=explicit");
+    }
     preflight_smoke_packages(&options.dev_stack)?;
 
     let outcome = prepare_local_runtime(options.dev_stack)?;
@@ -2197,7 +2204,7 @@ fn print_dogfood_ready(
 }
 
 fn operator_status(args: Vec<String>) -> Result<(), OperatorError> {
-    let options = DataDirOptions::parse(args, "status")?;
+    let options = DailyDataDirOptions::parse(args).ok_or(OperatorError::Usage("status"))?;
     let config = explicit_config(options.data_directory)?;
     let response = daemon_transport_request(&config, DaemonRequest::Status)?;
     let Some(status) = response.status else {
@@ -2683,15 +2690,16 @@ fn mcp_serve(args: Vec<String>) -> Result<(), McpCliError> {
 }
 
 fn operator_open_alias(args: Vec<String>) -> Result<(), OperatorError> {
-    if args.len() != 3 {
+    let Some(alias) = args.first() else {
         return Err(OperatorError::Usage("open"));
-    }
-    let selector = match args[0].as_str() {
+    };
+    let selector = match alias.as_str() {
         "web" => "botster-web/web-client",
         "tui" => "botster-tui",
         _ => return Err(OperatorError::Usage("open")),
     };
-    let options = DataDirOptions::parse(args[1..3].to_vec(), "open")?;
+    let options =
+        DailyDataDirOptions::parse(args[1..].to_vec()).ok_or(OperatorError::Usage("open"))?;
     open_app_by_selector(options.data_directory, selector)
 }
 
@@ -3882,6 +3890,39 @@ impl DataDirOptions {
     }
 }
 
+struct DailyDataDirOptions {
+    data_directory: PathBuf,
+    default_data_dir: bool,
+}
+
+impl DailyDataDirOptions {
+    fn parse(args: Vec<String>) -> Option<Self> {
+        match args.as_slice() {
+            [] => Some(Self::from_override(None)),
+            [flag, value] if flag == "--data-dir" => {
+                Some(Self::from_override(Some(PathBuf::from(value))))
+            }
+            _ => None,
+        }
+    }
+
+    fn from_override(data_directory: Option<PathBuf>) -> Self {
+        let default_data_dir = data_directory.is_none();
+        Self {
+            data_directory: data_directory.unwrap_or_else(default_dev_stack_data_dir),
+            default_data_dir,
+        }
+    }
+
+    fn print_source(&self) {
+        if self.default_data_dir {
+            println!("data_dir=stable:{}", self.data_directory.display());
+        } else {
+            println!("data_dir=explicit");
+        }
+    }
+}
+
 struct StartOptions {
     data_directory: PathBuf,
     session_worker_bin: Option<PathBuf>,
@@ -3943,24 +3984,6 @@ struct DevStackOptions {
 
 struct SmokeOptions {
     dev_stack: DevStackOptions,
-}
-
-struct LocalRuntimeDownOptions {
-    data_directory: PathBuf,
-}
-
-impl LocalRuntimeDownOptions {
-    fn parse(args: Vec<String>) -> Result<Self, DevStackError> {
-        match args.as_slice() {
-            [] => Ok(Self {
-                data_directory: default_dev_stack_data_dir(),
-            }),
-            [flag, value] if flag == "--data-dir" => Ok(Self {
-                data_directory: PathBuf::from(value),
-            }),
-            _ => Err(DevStackError::Usage),
-        }
-    }
 }
 
 impl DevStackOptions {
@@ -4029,10 +4052,10 @@ impl DevStackOptions {
             }
         }
 
-        let default_data_dir = data_directory.is_none();
+        let daily_data_dir = DailyDataDirOptions::from_override(data_directory);
         Ok(Self {
-            data_directory: data_directory.unwrap_or_else(default_dev_stack_data_dir),
-            default_data_dir,
+            data_directory: daily_data_dir.data_directory,
+            default_data_dir: daily_data_dir.default_data_dir,
             session_worker_bin,
             project_pipelines_package_path,
             web_package_path,
@@ -4098,11 +4121,9 @@ impl DevStackOptions {
 
 impl SmokeOptions {
     fn parse(args: Vec<String>) -> Result<Self, SmokeError> {
-        let dev_stack = DevStackOptions::parse(args)?;
-        if dev_stack.default_data_dir {
-            return Err(SmokeError::Usage);
-        }
-        Ok(Self { dev_stack })
+        Ok(Self {
+            dev_stack: DevStackOptions::parse(args)?,
+        })
     }
 }
 
@@ -5638,9 +5659,11 @@ fn usage_for(command: &str) -> &'static str {
 Daily runtime commands:
   botster-hub up [--data-dir <path>] [...]
   botster-hub down [--data-dir <path>]
-  botster-hub status --data-dir <path>
-  botster-hub open web --data-dir <path>
-  botster-hub open tui --data-dir <path>
+  botster-hub status [--data-dir <path>]
+  botster-hub doctor [--data-dir <path>]
+  botster-hub smoke [--data-dir <path>] [...]
+  botster-hub open web [--data-dir <path>]
+  botster-hub open tui [--data-dir <path>]
   botster-hub mcp-serve --data-dir <path>
 
 Apps:
@@ -5689,11 +5712,11 @@ Packages:
             "usage: botster-hub up [--data-dir <path>] [--session-worker-bin <path>] [--project-pipelines-package-path <path>] [--web-package-path <path>] [--tui-package-path <path>] [--workspaces-package-path <path>] [--web-bridge-port <port>]"
         }
         "down" => "usage: botster-hub down [--data-dir <path>]",
-        "doctor" => "usage: botster-hub doctor --data-dir <path>",
+        "doctor" => "usage: botster-hub doctor [--data-dir <path>]",
         "smoke" => {
-            "usage: botster-hub smoke --data-dir <path> [--session-worker-bin <path>] [--project-pipelines-package-path <path>] [--web-package-path <path>] [--tui-package-path <path>] [--workspaces-package-path <path>] [--web-bridge-port <port>]"
+            "usage: botster-hub smoke [--data-dir <path>] [--session-worker-bin <path>] [--project-pipelines-package-path <path>] [--web-package-path <path>] [--tui-package-path <path>] [--workspaces-package-path <path>] [--web-bridge-port <port>]"
         }
-        "status" => "usage: botster-hub status --data-dir <path>",
+        "status" => "usage: botster-hub status [--data-dir <path>]",
         "sessions" => {
             "usage: botster-hub sessions <list|spawn|attach|send-input|resize|detach|shutdown> ..."
         }
@@ -5750,7 +5773,7 @@ Packages:
         }
         "shutdown" => "usage: botster-hub shutdown --data-dir <path>",
         "mcp-serve" => "usage: botster-hub mcp-serve --data-dir <path>",
-        "open" => "usage: botster-hub open <web|tui> --data-dir <path>",
+        "open" => "usage: botster-hub open <web|tui> [--data-dir <path>]",
         "apps" => "usage: botster-hub apps <list|show|open> ...",
         "apps list" => "usage: botster-hub apps list --data-dir <path>",
         "apps show" => "usage: botster-hub apps show --data-dir <path> <app|package/app>",
