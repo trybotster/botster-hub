@@ -78,6 +78,7 @@ pub struct FirstPartyClientSupportMatrix {
     pub diagnostic_kinds: Vec<String>,
     pub session_actions: Vec<String>,
     pub terminal_streaming: TerminalStreamingSupport,
+    pub session_entities: SessionEntitySubscriptionSupport,
     pub resize: ResizeSupport,
     pub plugin_surfaces: PluginSurfaceSupport,
     pub entity_actions: EntityActionSupport,
@@ -95,6 +96,17 @@ pub struct TerminalStreamingSupport {
     pub conformance_ready_output: String,
     pub conformance_echo_output: String,
     pub missing_session_diagnostic_kind: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionEntitySubscriptionSupport {
+    pub supported: bool,
+    pub feature: String,
+    pub helper: String,
+    pub frame_type: String,
+    pub bounded_delivery: bool,
+    pub explicit_snapshot_resync: bool,
+    pub runtime_regression: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -330,6 +342,9 @@ pub fn first_party_client_support_matrix() -> FirstPartyClientSupportMatrix {
         session_actions: vec![
             "status".to_string(),
             "list_sessions".to_string(),
+            "subscribe_entities".to_string(),
+            "unsubscribe_entities".to_string(),
+            "remove_session".to_string(),
             "spawn".to_string(),
             "attach".to_string(),
             "drain".to_string(),
@@ -348,6 +363,17 @@ pub fn first_party_client_support_matrix() -> FirstPartyClientSupportMatrix {
                 DaemonDiagnosticKind::TerminalStreamUnavailable,
             )
             .to_string(),
+        },
+        session_entities: SessionEntitySubscriptionSupport {
+            supported: true,
+            feature: botster_hub_client::FEATURE_SESSION_ENTITY_SUBSCRIPTIONS.to_string(),
+            helper: "botster_hub_client::subscribe_session_entities".to_string(),
+            frame_type: "botster_hub_client::DaemonEntityFrame".to_string(),
+            bounded_delivery: true,
+            explicit_snapshot_resync: true,
+            runtime_regression:
+                "session_entity_subscription_pushes_snapshot_ordered_deltas_and_fresh_reconnect"
+                    .to_string(),
         },
         resize: ResizeSupport {
             supported: true,
@@ -4269,6 +4295,7 @@ mod tests {
                     botster_hub_client::FEATURE_SPAWN_TARGETS,
                     botster_hub_client::FEATURE_WORKTREES,
                     botster_hub_client::FEATURE_TERMINAL_READBACK,
+                    botster_hub_client::FEATURE_SESSION_ENTITY_SUBSCRIPTIONS,
                 ],
                 "supported_features": [
                     botster_hub_client::FEATURE_SESSIONS,
@@ -4281,6 +4308,7 @@ mod tests {
                     botster_hub_client::FEATURE_SPAWN_TARGETS,
                     botster_hub_client::FEATURE_WORKTREES,
                     botster_hub_client::FEATURE_TERMINAL_READBACK,
+                    botster_hub_client::FEATURE_SESSION_ENTITY_SUBSCRIPTIONS,
                 ],
                 "diagnostic_kinds": [
                     "connected",
@@ -4295,6 +4323,9 @@ mod tests {
                 "session_actions": [
                     "status",
                     "list_sessions",
+                    "subscribe_entities",
+                    "unsubscribe_entities",
+                    "remove_session",
                     "spawn",
                     "attach",
                     "drain",
@@ -4310,6 +4341,15 @@ mod tests {
                     "conformance_ready_output": CONFORMANCE_READY,
                     "conformance_echo_output": CONFORMANCE_ECHO,
                     "missing_session_diagnostic_kind": "terminal_stream_unavailable",
+                },
+                "session_entities": {
+                    "supported": true,
+                    "feature": botster_hub_client::FEATURE_SESSION_ENTITY_SUBSCRIPTIONS,
+                    "helper": "botster_hub_client::subscribe_session_entities",
+                    "frame_type": "botster_hub_client::DaemonEntityFrame",
+                    "bounded_delivery": true,
+                    "explicit_snapshot_resync": true,
+                    "runtime_regression": "session_entity_subscription_pushes_snapshot_ordered_deltas_and_fresh_reconnect",
                 },
                 "resize": {
                     "supported": true,

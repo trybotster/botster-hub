@@ -48,6 +48,9 @@ export interface DaemonCompatibilityRequirement {
 export type DaemonRequest =
   | { type: "status" }
   | { type: "list_sessions" }
+  | { type: "subscribe_entities"; entity_type: string; subscription_id: string }
+  | { type: "unsubscribe_entities"; subscription_id: string }
+  | { type: "remove_session"; session_id: string }
   | { type: "whoami"; caller_session_id: string | null }
   | { type: "post_message"; caller_session_id: string | null; target_session_id: string; envelope_id: string | null; body: string }
   | { type: "receive_messages"; caller_session_id: string; after: number | null; limit: number }
@@ -192,6 +195,9 @@ export interface DaemonWorktreeLifecycleEvent {
 export type DaemonResponseKind =
   | "status"
   | "sessions"
+  | "entity_subscribed"
+  | "entity_unsubscribed"
+  | "session_removed"
   | "spawned"
   | "events"
   | "session_templates"
@@ -684,6 +690,23 @@ export interface DaemonSession {
   session_id: string;
   lifecycle: string;
 }
+
+export interface DaemonSessionEntity {
+  session_uuid: string;
+  registry_state: string;
+  lifecycle?: string | null;
+  rows: number;
+  cols: number;
+  updated_at: number;
+  exit_code?: number | null;
+  failure_reason?: string | null;
+}
+
+export type DaemonEntityFrame =
+  | { type: "entity_snapshot"; subscription_id: string; entity_type: string; snapshot_seq: number; items: DaemonSessionEntity[]; resync_reason?: string | null }
+  | { type: "entity_upsert"; subscription_id: string; entity_type: string; snapshot_seq: number; id: string; entity: DaemonSessionEntity }
+  | { type: "entity_patch"; subscription_id: string; entity_type: string; snapshot_seq: number; id: string; patch: JsonValue }
+  | { type: "entity_remove"; subscription_id: string; entity_type: string; snapshot_seq: number; id: string };
 
 export interface DaemonSessionCleanup {
   session_id: string;

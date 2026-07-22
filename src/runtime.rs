@@ -20,7 +20,7 @@ use botster_core_daemon::{
     GuardedWriteRequest, GuardedWriteResult, PublishRoutedEnvelopeRequest, ReadModeFlagsRequest,
     ReadModeFlagsResult, ReadScreenRequest, ReadScreenResult, RegistrySessionState,
     RoutedEnvelopeDeliveryStateResult, SessionAdoptionReport, SessionAdoptionState,
-    SpawnSessionRequest,
+    SessionLifecycleBaseline, SessionLifecycleChanges, SessionLifecycleCursor, SpawnSessionRequest,
 };
 use std::collections::{BTreeMap, VecDeque};
 use std::error::Error;
@@ -863,6 +863,37 @@ impl HubRuntime {
     /// Return daemon-recorded sessions for host visibility without exposing core's command router.
     pub fn list_sessions(&self) -> Result<Vec<DaemonSession>, CoreDaemonError> {
         self.core_daemon.lock().expect("core daemon mutex").list()
+    }
+
+    /// Return CoreDaemon's authoritative session lifecycle baseline.
+    pub fn session_lifecycle_baseline(&self) -> Result<SessionLifecycleBaseline, CoreDaemonError> {
+        self.core_daemon
+            .lock()
+            .expect("core daemon mutex")
+            .lifecycle_baseline()
+    }
+
+    /// Return ordered lifecycle changes after one CoreDaemon cursor.
+    #[must_use]
+    pub fn session_lifecycle_changes(
+        &self,
+        after: &SessionLifecycleCursor,
+    ) -> SessionLifecycleChanges {
+        self.core_daemon
+            .lock()
+            .expect("core daemon mutex")
+            .lifecycle_changes(after)
+    }
+
+    /// Forget one terminal session through CoreDaemon's lifecycle authority.
+    pub fn remove_terminal_session(
+        &mut self,
+        session_id: &SessionId,
+    ) -> Result<bool, CoreDaemonError> {
+        self.core_daemon
+            .lock()
+            .expect("core daemon mutex")
+            .remove_session(session_id)
     }
 
     /// Spawn a daemon-owned session through core from a host-owned request.

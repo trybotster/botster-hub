@@ -95,7 +95,7 @@ operator UIs can show protocol diagnostics without opening a special endpoint.
 The current descriptor includes:
 
 - protocol name and version;
-- supported features: sessions, terminal streaming, resize, terminal readback,
+- supported features: sessions, session entity subscriptions, terminal streaming, resize, terminal readback,
   plugin surface render, plugin surface action dispatch, package navigation
   discovery, and hub-owned spawn targets;
 - conformance fixture revision.
@@ -144,6 +144,35 @@ connection error instead of continuing into session or terminal operations.
 `botster-web` should perform the same check in its local hub bridge/status path
 before relying on sessions, terminal streaming, resize, or plugin surface/action
 dispatch, and show the diagnostic in the hub connection state.
+
+## Session entity subscriptions
+
+`subscribe_session_entities` opens a dedicated held-open connection for the
+built-in `session` family. The first pushed frame is an authoritative,
+stable-id-ordered `entity_snapshot`; later `entity_upsert`, sparse
+`entity_patch`, and `entity_remove` frames carry strictly increasing sequence
+values from CoreDaemon's lifecycle cursor. Every frame includes the caller's
+connection-scoped `subscription_id` and `entity_type: "session"`.
+
+The sanitized row contains `session_uuid`, registry/lifecycle state, terminal
+dimensions, update time, and optional exit/failure detail. It never contains
+worker control sockets, environment variables, host filesystem paths, or raw
+Core implementation types. Subscribing does not hydrate status, packages,
+worktrees, spawn targets, plugin entities, or UI trees.
+
+Delivery is bounded independently per subscriber. Queue overflow or a stale,
+foreign, or future Core cursor requires a fresh `entity_snapshot` with
+`resync_reason` before later deltas; if that snapshot cannot be delivered, the
+subscription closes instead of silently presenting stale state. Socket EOF,
+write failure, explicit `unsubscribe`, and daemon shutdown release the
+connection-owned subscription. Reconnect with a new subscription id and treat
+its first snapshot as the sole baseline; frames from a prior connection are not
+replayed.
+
+`RemoveSession` forgets only an already-terminal session and produces the
+ordered remove delta. `ListSessions` remains available for operator queries,
+but normal client reconciliation must not poll it or maintain a list-refresh
+fallback beside the entity stream.
 
 ## Spawn Targets
 

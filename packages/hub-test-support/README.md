@@ -82,6 +82,13 @@ Only `read_screen_text` is renderable restored content; `snapshot` and
 version 0.1.5 / revision 12 exposes lossy string history. Neither is current
 binary-history contract authority.
 
+The current repository artifact also advertises
+`session_entity_subscriptions` and describes the held-open
+`subscribe_session_entities` helper, existing entity-frame vocabulary,
+independent bounded delivery, and explicit snapshot resync. Publishing that
+new protocol/revision is a separate release action; the public 0.1.8 tarball
+remains protocol version 1 and conformance revision 15 until then.
+
 The mode-flags fixture covers the targeted `read_mode_flags` request/response
 contract. It preserves exact authoritative mouse values (`0` for off and `9`
 for combined tracking plus SGR reporting), attributes both successes to the

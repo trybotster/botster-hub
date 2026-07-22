@@ -1,7 +1,7 @@
 {
   "protocol": "botster-hub-daemon-v1",
-  "protocol_version": 1,
-  "conformance_fixture_revision": 15,
+  "protocol_version": 2,
+  "conformance_fixture_revision": 16,
   "required_features": [
     "sessions",
     "terminal_streaming",
@@ -12,7 +12,8 @@
     "package_navigation",
     "spawn_targets",
     "worktrees",
-    "terminal_readback"
+    "terminal_readback",
+    "session_entity_subscriptions"
   ],
   "supported_features": [
     "sessions",
@@ -24,7 +25,8 @@
     "package_navigation",
     "spawn_targets",
     "worktrees",
-    "terminal_readback"
+    "terminal_readback",
+    "session_entity_subscriptions"
   ],
   "diagnostic_kinds": [
     "connected",
@@ -39,6 +41,9 @@
   "session_actions": [
     "status",
     "list_sessions",
+    "subscribe_entities",
+    "unsubscribe_entities",
+    "remove_session",
     "spawn",
     "attach",
     "drain",
@@ -54,6 +59,15 @@
     "conformance_ready_output": "conformance-ready",
     "conformance_echo_output": "echo:from-conformance",
     "missing_session_diagnostic_kind": "terminal_stream_unavailable"
+  },
+  "session_entities": {
+    "supported": true,
+    "feature": "session_entity_subscriptions",
+    "helper": "botster_hub_client::subscribe_session_entities",
+    "frame_type": "botster_hub_client::DaemonEntityFrame",
+    "bounded_delivery": true,
+    "explicit_snapshot_resync": true,
+    "runtime_regression": "session_entity_subscription_pushes_snapshot_ordered_deltas_and_fresh_reconnect"
   },
   "resize": {
     "supported": true,
