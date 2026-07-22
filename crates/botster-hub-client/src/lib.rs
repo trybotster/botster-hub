@@ -20,8 +20,8 @@ use serde_json::Value;
 mod typescript;
 
 pub const PROTOCOL: &str = "botster-hub-daemon-v1";
-pub const PROTOCOL_VERSION: u16 = 1;
-pub const CONFORMANCE_FIXTURE_REVISION: u16 = 15;
+pub const PROTOCOL_VERSION: u16 = 2;
+pub const CONFORMANCE_FIXTURE_REVISION: u16 = 16;
 /// Version of the local WebRTC daemon-response chunk framing protocol.
 pub const LOCAL_WEBRTC_RESPONSE_CHUNK_VERSION: u16 = 1;
 /// Serialized local WebRTC response frames must remain strictly below this size.
@@ -38,6 +38,7 @@ pub const FEATURE_PACKAGE_NAVIGATION: &str = "package_navigation";
 pub const FEATURE_SPAWN_TARGETS: &str = "spawn_targets";
 pub const FEATURE_WORKTREES: &str = "worktrees";
 pub const FEATURE_TERMINAL_READBACK: &str = "terminal_readback";
+pub const FEATURE_SESSION_ENTITY_SUBSCRIPTIONS: &str = "session_entity_subscriptions";
 const ATTACH_DRAIN_INTERVAL: Duration = Duration::from_millis(25);
 
 /// One frame of an encrypted daemon response sent over the local WebRTC DataChannel.
@@ -105,6 +106,81 @@ impl DaemonConnection {
         write_frame(&mut self.stream, request)?;
         read_daemon_response_from_reader(&mut self.reader)
     }
+}
+
+/// One held-open, connection-scoped session entity subscription.
+pub struct DaemonEntitySubscription {
+    stream: UnixStream,
+    reader: BufReader<UnixStream>,
+    subscription_id: String,
+}
+
+impl DaemonEntitySubscription {
+    /// Bound how long a caller waits for the next pushed frame.
+    pub fn set_read_timeout(&self, timeout: Option<Duration>) -> DaemonTransportResult<()> {
+        self.stream
+            .set_read_timeout(timeout)
+            .map_err(normalize_socket_io_error)
+    }
+
+    /// Read the next authoritative snapshot or ordered entity delta.
+    pub fn next_frame(&mut self) -> DaemonTransportResult<DaemonEntityFrame> {
+        read_frame_from_reader(&mut self.reader)
+    }
+
+    /// Explicitly end this connection-owned subscription.
+    pub fn unsubscribe(mut self) -> DaemonTransportResult<()> {
+        write_frame(
+            &mut self.stream,
+            &DaemonRequest::UnsubscribeEntities {
+                subscription_id: self.subscription_id.clone(),
+            },
+        )?;
+        loop {
+            let value = read_value_frame_from_reader(&mut self.reader)?;
+            if value.get("kind").is_none() {
+                let _: DaemonEntityFrame =
+                    serde_json::from_value(value).map_err(DaemonTransportError::Json)?;
+                continue;
+            }
+            let response: DaemonResponse =
+                serde_json::from_value(value).map_err(DaemonTransportError::Json)?;
+            if response.kind != DaemonResponseKind::EntityUnsubscribed {
+                return Err(DaemonTransportError::Protocol(
+                    "unexpected entity unsubscribe response",
+                ));
+            }
+            return Ok(());
+        }
+    }
+}
+
+/// Open a fresh held-open subscription for the built-in session entity family.
+pub fn subscribe_session_entities(
+    endpoint: &DaemonEndpoint,
+    subscription_id: impl Into<String>,
+) -> DaemonTransportResult<DaemonEntitySubscription> {
+    let subscription_id = subscription_id.into();
+    let mut stream = connect_and_hello(endpoint)?;
+    let mut reader = BufReader::new(stream.try_clone().map_err(normalize_socket_io_error)?);
+    write_frame(
+        &mut stream,
+        &DaemonRequest::SubscribeEntities {
+            entity_type: "session".to_string(),
+            subscription_id: subscription_id.clone(),
+        },
+    )?;
+    let response = read_daemon_response_from_reader(&mut reader)?;
+    if response.kind != DaemonResponseKind::EntitySubscribed {
+        return Err(DaemonTransportError::Protocol(
+            "session entity subscription was not accepted",
+        ));
+    }
+    Ok(DaemonEntitySubscription {
+        stream,
+        reader,
+        subscription_id,
+    })
 }
 
 /// Attach and stream terminal bytes until the session exits or the connection closes.
@@ -559,6 +635,7 @@ fn current_feature_list() -> Vec<&'static str> {
         FEATURE_SPAWN_TARGETS,
         FEATURE_WORKTREES,
         FEATURE_TERMINAL_READBACK,
+        FEATURE_SESSION_ENTITY_SUBSCRIPTIONS,
     ]
 }
 
@@ -568,6 +645,16 @@ fn current_feature_list() -> Vec<&'static str> {
 pub enum DaemonRequest {
     Status,
     ListSessions,
+    SubscribeEntities {
+        entity_type: String,
+        subscription_id: String,
+    },
+    UnsubscribeEntities {
+        subscription_id: String,
+    },
+    RemoveSession {
+        session_id: String,
+    },
     Whoami {
         caller_session_id: Option<String>,
     },
@@ -894,6 +981,9 @@ pub struct DaemonUiTreeSnapshot {
 pub enum DaemonResponseKind {
     Status,
     Sessions,
+    EntitySubscribed,
+    EntityUnsubscribed,
+    SessionRemoved,
     Spawned,
     Events,
     SessionTemplates,
@@ -1601,6 +1691,60 @@ pub struct DaemonSession {
     pub lifecycle: String,
 }
 
+/// Sanitized authoritative row for the built-in `session` entity family.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonSessionEntity {
+    pub session_uuid: String,
+    pub registry_state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle: Option<String>,
+    pub rows: u16,
+    pub cols: u16,
+    pub updated_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_reason: Option<String>,
+}
+
+/// Existing entity-frame vocabulary scoped to one daemon subscription.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum DaemonEntityFrame {
+    #[serde(rename = "entity_snapshot")]
+    Snapshot {
+        subscription_id: String,
+        entity_type: String,
+        snapshot_seq: u64,
+        items: Vec<DaemonSessionEntity>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resync_reason: Option<String>,
+    },
+    #[serde(rename = "entity_upsert")]
+    Upsert {
+        subscription_id: String,
+        entity_type: String,
+        snapshot_seq: u64,
+        id: String,
+        entity: DaemonSessionEntity,
+    },
+    #[serde(rename = "entity_patch")]
+    Patch {
+        subscription_id: String,
+        entity_type: String,
+        snapshot_seq: u64,
+        id: String,
+        patch: Value,
+    },
+    #[serde(rename = "entity_remove")]
+    Remove {
+        subscription_id: String,
+        entity_type: String,
+        snapshot_seq: u64,
+        id: String,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DaemonSessionCleanup {
     pub session_id: String,
@@ -1949,6 +2093,59 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
 
+    #[test]
+    fn session_entity_frames_round_trip_existing_wire_vocabulary() {
+        let entity = DaemonSessionEntity {
+            session_uuid: "session".to_string(),
+            registry_state: "running".to_string(),
+            lifecycle: Some("running".to_string()),
+            rows: 24,
+            cols: 80,
+            updated_at: 7,
+            exit_code: None,
+            failure_reason: None,
+        };
+        let frames = vec![
+            DaemonEntityFrame::Snapshot {
+                subscription_id: "subscription".to_string(),
+                entity_type: "session".to_string(),
+                snapshot_seq: 1,
+                items: vec![entity.clone()],
+                resync_reason: None,
+            },
+            DaemonEntityFrame::Upsert {
+                subscription_id: "subscription".to_string(),
+                entity_type: "session".to_string(),
+                snapshot_seq: 2,
+                id: "session".to_string(),
+                entity,
+            },
+            DaemonEntityFrame::Patch {
+                subscription_id: "subscription".to_string(),
+                entity_type: "session".to_string(),
+                snapshot_seq: 3,
+                id: "session".to_string(),
+                patch: serde_json::json!({"lifecycle": "exited", "exit_code": 0}),
+            },
+            DaemonEntityFrame::Remove {
+                subscription_id: "subscription".to_string(),
+                entity_type: "session".to_string(),
+                snapshot_seq: 4,
+                id: "session".to_string(),
+            },
+        ];
+
+        for frame in frames {
+            let value = serde_json::to_value(&frame).expect("serialize entity frame");
+            assert!(value.get("type").is_some());
+            assert_eq!(
+                serde_json::from_value::<DaemonEntityFrame>(value)
+                    .expect("deserialize entity frame"),
+                frame
+            );
+        }
+    }
+
     fn empty_test_response(sessions: Vec<DaemonSession>, events: Vec<DaemonEvent>) -> Value {
         serde_json::json!({
             "kind": "events",
@@ -2154,11 +2351,10 @@ mod tests {
             .expect_err("newer client requirement should fail against current hub");
 
         assert!(error.diagnostic.contains("version-test-client"));
-        assert!(
-            error
-                .diagnostic
-                .contains("unsupported protocol version 1; requires at least 2")
-        );
+        assert!(error.diagnostic.contains(&format!(
+            "unsupported protocol version {PROTOCOL_VERSION}; requires at least {}",
+            PROTOCOL_VERSION + 1
+        )));
     }
 
     #[test]
@@ -3312,6 +3508,16 @@ mod tests {
         vec![
             DaemonRequest::Status,
             DaemonRequest::ListSessions,
+            DaemonRequest::SubscribeEntities {
+                entity_type: "session".to_string(),
+                subscription_id: "entities".to_string(),
+            },
+            DaemonRequest::UnsubscribeEntities {
+                subscription_id: "entities".to_string(),
+            },
+            DaemonRequest::RemoveSession {
+                session_id: "session".to_string(),
+            },
             DaemonRequest::Whoami {
                 caller_session_id: Some("caller".to_string()),
             },
@@ -3541,6 +3747,9 @@ mod tests {
         match request {
             DaemonRequest::Status => "status",
             DaemonRequest::ListSessions => "list_sessions",
+            DaemonRequest::SubscribeEntities { .. } => "subscribe_entities",
+            DaemonRequest::UnsubscribeEntities { .. } => "unsubscribe_entities",
+            DaemonRequest::RemoveSession { .. } => "remove_session",
             DaemonRequest::Whoami { .. } => "whoami",
             DaemonRequest::PostMessage { .. } => "post_message",
             DaemonRequest::ReceiveMessages { .. } => "receive_messages",
@@ -3610,6 +3819,9 @@ mod tests {
         vec![
             DaemonResponseKind::Status,
             DaemonResponseKind::Sessions,
+            DaemonResponseKind::EntitySubscribed,
+            DaemonResponseKind::EntityUnsubscribed,
+            DaemonResponseKind::SessionRemoved,
             DaemonResponseKind::Spawned,
             DaemonResponseKind::Events,
             DaemonResponseKind::SessionTemplates,
@@ -3652,6 +3864,9 @@ mod tests {
         match kind {
             DaemonResponseKind::Status => "status",
             DaemonResponseKind::Sessions => "sessions",
+            DaemonResponseKind::EntitySubscribed => "entity_subscribed",
+            DaemonResponseKind::EntityUnsubscribed => "entity_unsubscribed",
+            DaemonResponseKind::SessionRemoved => "session_removed",
             DaemonResponseKind::Spawned => "spawned",
             DaemonResponseKind::Events => "events",
             DaemonResponseKind::SessionTemplates => "session_templates",

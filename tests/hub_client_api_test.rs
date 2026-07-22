@@ -73,6 +73,48 @@ fn empty_registry() -> PackageRegistry {
     PackageRegistry::new(Vec::<Capability>::new().into_iter().collect())
 }
 
+#[test]
+fn session_entity_subscription_uses_core_baseline_and_rejects_other_families() {
+    let mut runtime = explicit_runtime("session-entity-subscription");
+    let api = HubClientApi::local_operator("session-entity-client");
+    let packages = empty_registry();
+
+    let response = api
+        .handle_request(
+            &mut runtime,
+            &packages,
+            HubClientRequest::SubscribeEntities {
+                request_id: request_id("subscribe-sessions"),
+                entity_type: "session".to_string(),
+                subscription_id: "session-entities".to_string(),
+            },
+        )
+        .expect("session entity family is admitted");
+    let HubClientResponseBody::SessionLifecycleBaseline(baseline) = response.body else {
+        panic!("expected CoreDaemon lifecycle baseline");
+    };
+    assert!(baseline.sessions.is_empty());
+
+    let error = api
+        .handle_request(
+            &mut runtime,
+            &packages,
+            HubClientRequest::SubscribeEntities {
+                request_id: request_id("subscribe-unrelated"),
+                entity_type: "package".to_string(),
+                subscription_id: "unrelated".to_string(),
+            },
+        )
+        .expect_err("unrelated families must not be hydrated");
+    assert!(matches!(
+        error,
+        HubClientError::InvalidRequest {
+            operation: HubClientOperation::SubscribeEntities,
+            ..
+        }
+    ));
+}
+
 fn write_session_template_package(root: &std::path::Path) {
     write_named_session_template_package(root, "session-template.plugin");
 }

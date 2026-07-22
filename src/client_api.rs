@@ -18,7 +18,7 @@ use botster_core::{
 };
 use botster_core_daemon::{
     GuardedWriteDecision, GuardedWriteDeliveryState, GuardedWriteRequest, GuardedWriteResult,
-    ReadinessEvidence,
+    ReadinessEvidence, SessionLifecycleBaseline,
 };
 
 use crate::lifecycle::HubPluginLifecycleStatus;
@@ -103,6 +103,29 @@ impl HubClientApi {
                     .map(HubClientSession::from)
                     .collect(),
             ),
+            HubClientRequest::SubscribeEntities { entity_type, .. } => {
+                if entity_type != "session" {
+                    return Err(HubClientError::InvalidRequest {
+                        request_id,
+                        operation,
+                        message: format!("unsupported entity type: {entity_type}"),
+                    });
+                }
+                HubClientResponseBody::SessionLifecycleBaseline(
+                    runtime
+                        .session_lifecycle_baseline()
+                        .map_err(|error| runtime_error(request_id.clone(), operation, error))?,
+                )
+            }
+            HubClientRequest::UnsubscribeEntities { .. } => {
+                HubClientResponseBody::Events(Vec::new())
+            }
+            HubClientRequest::RemoveSession { session_id, .. } => {
+                let removed = runtime
+                    .remove_terminal_session(&session_id)
+                    .map_err(|error| runtime_error(request_id.clone(), operation, error))?;
+                HubClientResponseBody::SessionRemoved(removed)
+            }
             HubClientRequest::Spawn {
                 session_id,
                 command,
@@ -540,6 +563,9 @@ impl HubClientAdmission {
         match operation {
             HubClientOperation::Status | HubClientOperation::ListSessions => self.allow_status,
             HubClientOperation::Spawn
+            | HubClientOperation::SubscribeEntities
+            | HubClientOperation::UnsubscribeEntities
+            | HubClientOperation::RemoveSession
             | HubClientOperation::Attach
             | HubClientOperation::Detach
             | HubClientOperation::Input
@@ -577,6 +603,22 @@ pub enum HubClientRequest {
     Status { request_id: RequestId },
     /// Return current core-recorded sessions.
     ListSessions { request_id: RequestId },
+    /// Subscribe to one explicitly requested entity family.
+    SubscribeEntities {
+        request_id: RequestId,
+        entity_type: String,
+        subscription_id: String,
+    },
+    /// End one connection-owned entity subscription.
+    UnsubscribeEntities {
+        request_id: RequestId,
+        subscription_id: String,
+    },
+    /// Forget one terminal session through CoreDaemon.
+    RemoveSession {
+        request_id: RequestId,
+        session_id: SessionId,
+    },
     /// Spawn a session from hub defaults, without client-supplied host paths.
     Spawn {
         request_id: RequestId,
@@ -733,6 +775,9 @@ impl HubClientRequest {
         match self {
             Self::Status { request_id }
             | Self::ListSessions { request_id }
+            | Self::SubscribeEntities { request_id, .. }
+            | Self::UnsubscribeEntities { request_id, .. }
+            | Self::RemoveSession { request_id, .. }
             | Self::Spawn { request_id, .. }
             | Self::Attach { request_id, .. }
             | Self::Detach { request_id, .. }
@@ -765,6 +810,9 @@ impl HubClientRequest {
         match self {
             Self::Status { .. } => HubClientOperation::Status,
             Self::ListSessions { .. } => HubClientOperation::ListSessions,
+            Self::SubscribeEntities { .. } => HubClientOperation::SubscribeEntities,
+            Self::UnsubscribeEntities { .. } => HubClientOperation::UnsubscribeEntities,
+            Self::RemoveSession { .. } => HubClientOperation::RemoveSession,
             Self::Spawn { .. } => HubClientOperation::Spawn,
             Self::Attach { .. } => HubClientOperation::Attach,
             Self::Detach { .. } => HubClientOperation::Detach,
@@ -799,6 +847,9 @@ impl HubClientRequest {
 pub enum HubClientOperation {
     Status,
     ListSessions,
+    SubscribeEntities,
+    UnsubscribeEntities,
+    RemoveSession,
     Spawn,
     Attach,
     Detach,
@@ -840,6 +891,8 @@ pub struct HubClientResponse {
 pub enum HubClientResponseBody {
     Status(HubClientStatus),
     Sessions(Vec<HubClientSession>),
+    SessionLifecycleBaseline(SessionLifecycleBaseline),
+    SessionRemoved(bool),
     Spawned(HubClientSpawned),
     Events(Vec<HubClientEvent>),
     GuardedWrite(HubClientGuardedWrite),
@@ -1712,6 +1765,11 @@ impl From<HubPluginLifecycleStatus> for HubClientPluginLifecycle {
 /// Client API error.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HubClientError {
+    InvalidRequest {
+        request_id: RequestId,
+        operation: HubClientOperation,
+        message: String,
+    },
     AdmissionDenied {
         request_id: RequestId,
         operation: HubClientOperation,
@@ -1840,7 +1898,7 @@ fn client_session_metadata() -> CoreSessionMetadata {
     )]))
 }
 
-fn events_from_drain(output: botster_core_daemon::DrainResult) -> Vec<HubClientEvent> {
+pub(crate) fn events_from_drain(output: botster_core_daemon::DrainResult) -> Vec<HubClientEvent> {
     let mut events = Vec::new();
 
     events.extend(

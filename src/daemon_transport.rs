@@ -9,9 +9,10 @@ use std::error::Error;
 use std::fmt;
 use std::fs;
 use std::io::{BufReader, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Sender};
+use std::sync::mpsc::{self, Sender, SyncSender, TrySendError};
 use std::thread;
 use std::time::Duration;
 
@@ -24,15 +25,17 @@ use botster_core::{
 };
 use botster_core_daemon::{
     GuardedWriteDecision, GuardedWriteDeliveryState, ReadinessEvidence, RegistrySessionState,
+    SessionLifecycleBaseline, SessionLifecycleChangeKind, SessionLifecycleCursor,
+    SessionLifecycleRecord,
 };
 use botster_hub_client::DaemonTransportError as ClientDaemonTransportError;
 pub use botster_hub_client::{
     DaemonApp, DaemonAppLaunchTarget, DaemonAvailablePackage, DaemonCapability,
     DaemonCaptureSnapshot, DaemonCompatibility, DaemonConnection as ClientDaemonConnection,
-    DaemonCoordination, DaemonDiagnostic, DaemonEndpoint, DaemonEnvelope, DaemonEnvelopeAck,
-    DaemonEnvelopeDelivery, DaemonEnvelopePublish, DaemonEvent, DaemonHello, DaemonHelloAck,
-    DaemonIdentity, DaemonLocalWebrtcAnswer, DaemonLocalWebrtcBootstrap, DaemonModeFlags,
-    DaemonNotify, DaemonOperatorError, DaemonPackage, DaemonPackageActionRequest,
+    DaemonCoordination, DaemonDiagnostic, DaemonEndpoint, DaemonEntityFrame, DaemonEnvelope,
+    DaemonEnvelopeAck, DaemonEnvelopeDelivery, DaemonEnvelopePublish, DaemonEvent, DaemonHello,
+    DaemonHelloAck, DaemonIdentity, DaemonLocalWebrtcAnswer, DaemonLocalWebrtcBootstrap,
+    DaemonModeFlags, DaemonNotify, DaemonOperatorError, DaemonPackage, DaemonPackageActionRequest,
     DaemonPackageActionRequiredReference, DaemonPackageActionState, DaemonPackageActionStatus,
     DaemonPackageAvailability, DaemonPackageAvailabilityReason, DaemonPackageAvailabilityState,
     DaemonPackageCompatibility, DaemonPackageConfiguration, DaemonPackageDecision,
@@ -44,11 +47,12 @@ pub use botster_hub_client::{
     DaemonPackageSurfaceDescriptor, DaemonPackageUpdateStatus, DaemonPackageWorkingDirectory,
     DaemonPluginLifecycle, DaemonPluginSurface, DaemonReadScreen, DaemonRequest,
     DaemonResolvedAppLaunch, DaemonResolvedSessionTemplate, DaemonResponse, DaemonResponseKind,
-    DaemonSession, DaemonSessionCleanup, DaemonSessionContext, DaemonSessionTemplate,
-    DaemonSessionTemplateContextInput, DaemonSessionTemplateRequest, DaemonSpawnTarget,
-    DaemonSpawnTargetValidation, DaemonStatus, DaemonUiTreeSnapshot, DaemonWorktree,
-    DaemonWorktreeGitMetadata, DaemonWorktreeLifecycleEvent, FEATURE_PLUGIN_SURFACE_ACTION,
-    FEATURE_PLUGIN_SURFACE_RENDER, PROTOCOL, read_frame, read_frame_from_reader, write_frame,
+    DaemonSession, DaemonSessionCleanup, DaemonSessionContext, DaemonSessionEntity,
+    DaemonSessionTemplate, DaemonSessionTemplateContextInput, DaemonSessionTemplateRequest,
+    DaemonSpawnTarget, DaemonSpawnTargetValidation, DaemonStatus, DaemonUiTreeSnapshot,
+    DaemonWorktree, DaemonWorktreeGitMetadata, DaemonWorktreeLifecycleEvent,
+    FEATURE_PLUGIN_SURFACE_ACTION, FEATURE_PLUGIN_SURFACE_RENDER, PROTOCOL, read_frame,
+    read_frame_from_reader, write_frame,
 };
 use serde_json::Value;
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
@@ -80,6 +84,8 @@ use crate::{Worktree, WorktreeCreate, WorktreeError};
 const MESSAGE_CONTENT_TYPE: &str = "application/vnd.botster.coordination.message+text";
 const WEBRTC_SIGNAL_OPERATION: &str = "local_webrtc_signal";
 const DAEMON_CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+const ENTITY_SUBSCRIPTION_QUEUE_CAPACITY: usize = 64;
+const ENTITY_STREAM_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 /// Run the local daemon socket until a shutdown request is received.
 pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus> {
@@ -96,9 +102,7 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
     let (control_tx, control_rx) = mpsc::channel();
     install_signal_forwarder(control_tx.clone())?;
     let mut daemon = HubDaemon::start(config)?;
-    let mut logical_clock = 1;
-    let mut drain_cursors = BTreeMap::<String, u64>::new();
-    let mut egress_diagnostics = DaemonEgressDiagnostics::default();
+    let mut control_state = DaemonControlState::default();
 
     loop {
         match listener.accept() {
@@ -114,9 +118,7 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
                 while let Ok(message) = control_rx.try_recv() {
                     if handle_control_message(
                         &mut daemon,
-                        &mut logical_clock,
-                        &mut drain_cursors,
-                        &mut egress_diagnostics,
+                        &mut control_state,
                         &local_webrtc_terminal_record_path,
                         control_tx.clone(),
                         message,
@@ -126,6 +128,13 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
                         return Ok(status);
                     }
                 }
+                drive_entity_subscriptions(
+                    &mut daemon,
+                    &mut control_state.logical_clock,
+                    &mut control_state.drain_cursors,
+                    &mut control_state.pending_runtime_events,
+                    &mut control_state.entity_subscriptions,
+                );
                 if !socket_path.exists() {
                     rebind_missing_socket_path(&socket_path);
                 }
@@ -213,6 +222,20 @@ fn handle_connection(
             }
             Err(error) => return Err(error.into()),
         };
+        if let DaemonRequest::SubscribeEntities {
+            entity_type,
+            subscription_id,
+        } = request
+        {
+            detach_connection_subscriptions(&control_tx, &attached_subscriptions);
+            return handle_entity_subscription(
+                stream,
+                reader,
+                control_tx,
+                entity_type,
+                subscription_id,
+            );
+        }
         let (reply_tx, reply_rx) = mpsc::channel();
         let close_after_response = matches!(request, DaemonRequest::DaemonShutdown);
         let (response_delivery_tx, response_delivery_rx) = if close_after_response {
@@ -248,6 +271,115 @@ fn handle_connection(
             detach_connection_subscriptions(&control_tx, &attached_subscriptions);
             return Ok(());
         }
+    }
+}
+
+fn handle_entity_subscription(
+    mut stream: UnixStream,
+    mut reader: BufReader<UnixStream>,
+    control_tx: Sender<ControlMessage>,
+    entity_type: String,
+    subscription_id: String,
+) -> DaemonTransportResult<()> {
+    let (frame_tx, frame_rx) = mpsc::sync_channel(ENTITY_SUBSCRIPTION_QUEUE_CAPACITY);
+    let (reply_tx, reply_rx) = mpsc::channel();
+    control_tx
+        .send(ControlMessage::SubscribeEntities {
+            entity_type,
+            subscription_id: subscription_id.clone(),
+            frame_tx,
+            reply_tx,
+        })
+        .map_err(|_| DaemonTransportError::ControlThreadStopped)?;
+    let response = reply_rx
+        .recv()
+        .map_err(|_| DaemonTransportError::ControlThreadStopped)??;
+    write_frame(&mut stream, &response)?;
+    if response.kind != DaemonResponseKind::EntitySubscribed {
+        return Ok(());
+    }
+
+    loop {
+        match frame_rx.recv_timeout(ENTITY_STREAM_POLL_INTERVAL) {
+            Ok(frame) => {
+                if let Err(error) = write_frame(&mut stream, &frame) {
+                    let _ = control_tx.send(ControlMessage::EgressWriteFailed {
+                        delivery_kind: DaemonDeliveryKind::Control,
+                    });
+                    unsubscribe_entity_connection(&control_tx, &subscription_id);
+                    return Err(error.into());
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+
+        match socket_readiness(&stream)? {
+            SocketReadiness::Idle => {}
+            SocketReadiness::Closed => {
+                unsubscribe_entity_connection(&control_tx, &subscription_id);
+                return Ok(());
+            }
+            SocketReadiness::Readable => {
+                let request = read_frame_from_reader::<DaemonRequest>(&mut reader)?;
+                if !matches!(
+                    request,
+                    DaemonRequest::UnsubscribeEntities { subscription_id: ref requested }
+                        if requested == &subscription_id
+                ) {
+                    unsubscribe_entity_connection(&control_tx, &subscription_id);
+                    return Err(DaemonTransportError::Protocol(
+                        "entity stream accepts only its matching unsubscribe request",
+                    ));
+                }
+                let (reply_tx, reply_rx) = mpsc::channel();
+                control_tx
+                    .send(ControlMessage::UnsubscribeEntities {
+                        subscription_id: subscription_id.clone(),
+                        reply_tx: Some(reply_tx),
+                    })
+                    .map_err(|_| DaemonTransportError::ControlThreadStopped)?;
+                let response = reply_rx
+                    .recv()
+                    .map_err(|_| DaemonTransportError::ControlThreadStopped)??;
+                write_frame(&mut stream, &response)?;
+                return Ok(());
+            }
+        }
+    }
+}
+
+fn unsubscribe_entity_connection(control_tx: &Sender<ControlMessage>, subscription_id: &str) {
+    let _ = control_tx.send(ControlMessage::UnsubscribeEntities {
+        subscription_id: subscription_id.to_string(),
+        reply_tx: None,
+    });
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SocketReadiness {
+    Idle,
+    Readable,
+    Closed,
+}
+
+fn socket_readiness(stream: &UnixStream) -> DaemonTransportResult<SocketReadiness> {
+    let mut descriptor = libc::pollfd {
+        fd: stream.as_raw_fd(),
+        events: libc::POLLIN | libc::POLLHUP | libc::POLLERR,
+        revents: 0,
+    };
+    // SAFETY: `descriptor` references one valid pollfd for this call only.
+    let result = unsafe { libc::poll(&mut descriptor, 1, 0) };
+    if result < 0 {
+        return Err(DaemonTransportError::Io(std::io::Error::last_os_error()));
+    }
+    if descriptor.revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+        Ok(SocketReadiness::Closed)
+    } else if descriptor.revents & libc::POLLIN != 0 {
+        Ok(SocketReadiness::Readable)
+    } else {
+        Ok(SocketReadiness::Idle)
     }
 }
 
@@ -292,14 +424,40 @@ fn apply_attached_subscription_change(
 
 fn handle_control_message(
     daemon: &mut HubDaemon,
-    logical_clock: &mut u64,
-    drain_cursors: &mut BTreeMap<String, u64>,
-    egress_diagnostics: &mut DaemonEgressDiagnostics,
+    state: &mut DaemonControlState,
     local_webrtc_terminal_record_path: &Path,
     control_tx: Sender<ControlMessage>,
     message: ControlMessage,
 ) -> bool {
     match message {
+        ControlMessage::SubscribeEntities {
+            entity_type,
+            subscription_id,
+            frame_tx,
+            reply_tx,
+        } => {
+            let response = register_entity_subscription(
+                daemon,
+                &mut state.entity_subscriptions,
+                entity_type,
+                subscription_id,
+                frame_tx,
+            );
+            let _ = reply_tx.send(response);
+            false
+        }
+        ControlMessage::UnsubscribeEntities {
+            subscription_id,
+            reply_tx,
+        } => {
+            state.entity_subscriptions.remove(&subscription_id);
+            if let Some(reply_tx) = reply_tx {
+                let _ = reply_tx.send(Ok(daemon_response_base(
+                    DaemonResponseKind::EntityUnsubscribed,
+                )));
+            }
+            false
+        }
         ControlMessage::Request {
             request,
             reply_tx,
@@ -307,9 +465,10 @@ fn handle_control_message(
         } => {
             let response = handle_control_request(
                 daemon,
-                logical_clock,
-                drain_cursors,
-                egress_diagnostics,
+                &mut state.logical_clock,
+                &mut state.drain_cursors,
+                &mut state.pending_runtime_events,
+                &state.egress_diagnostics,
                 control_tx,
                 *request,
             )
@@ -342,16 +501,16 @@ fn handle_control_message(
             daemon.local_webrtc().remove_peer(&grant_id);
             detach_local_webrtc_subscriptions(
                 daemon,
-                logical_clock,
-                drain_cursors,
+                &mut state.logical_clock,
+                &mut state.drain_cursors,
                 control_tx,
-                egress_diagnostics,
+                &mut state.egress_diagnostics,
                 attached_subscriptions,
             );
             false
         }
         ControlMessage::EgressWriteFailed { delivery_kind } => {
-            egress_diagnostics.record_write_failure(delivery_kind);
+            state.egress_diagnostics.record_write_failure(delivery_kind);
             false
         }
     }
@@ -418,11 +577,13 @@ fn detach_local_webrtc_subscriptions(
     egress_diagnostics: &mut DaemonEgressDiagnostics,
     attached_subscriptions: Vec<LocalWebrtcAttachedSubscription>,
 ) {
+    let mut pending_runtime_events = BTreeMap::new();
     for subscription in attached_subscriptions {
         let _ = handle_control_request(
             daemon,
             logical_clock,
             drain_cursors,
+            &mut pending_runtime_events,
             egress_diagnostics,
             control_tx.clone(),
             DaemonRequest::Detach {
@@ -437,6 +598,7 @@ fn handle_control_request(
     daemon: &mut HubDaemon,
     logical_clock: &mut u64,
     drain_cursors: &mut BTreeMap<String, u64>,
+    pending_runtime_events: &mut BTreeMap<String, Vec<HubClientEvent>>,
     egress_diagnostics: &DaemonEgressDiagnostics,
     control_tx: Sender<ControlMessage>,
     request: DaemonRequest,
@@ -814,6 +976,7 @@ fn handle_control_request(
             daemon,
             logical_clock,
             drain_cursors,
+            pending_runtime_events,
             egress_diagnostics,
             other,
         ),
@@ -824,6 +987,7 @@ fn handle_runtime_control_request(
     daemon: &mut HubDaemon,
     logical_clock: &mut u64,
     drain_cursors: &mut BTreeMap<String, u64>,
+    pending_runtime_events: &mut BTreeMap<String, Vec<HubClientEvent>>,
     egress_diagnostics: &DaemonEgressDiagnostics,
     request: DaemonRequest,
 ) -> DaemonTransportResult<DaemonResponse> {
@@ -835,6 +999,32 @@ fn handle_runtime_control_request(
     };
 
     match request {
+        DaemonRequest::SubscribeEntities { .. } | DaemonRequest::UnsubscribeEntities { .. } => {
+            Err(DaemonTransportError::Protocol(
+                "entity subscriptions require the held-open stream handler",
+            ))
+        }
+        DaemonRequest::RemoveSession { session_id } => {
+            let response = api.handle_request(
+                runtime,
+                &packages,
+                HubClientRequest::RemoveSession {
+                    request_id: request_id("daemon-session-remove"),
+                    session_id: SessionId(session_id.clone()),
+                },
+            )?;
+            let HubClientResponseBody::SessionRemoved(removed) = response.body else {
+                return Err(DaemonTransportError::UnexpectedResponse);
+            };
+            if !removed {
+                return Ok(entity_subscription_error(
+                    "session_not_terminal",
+                    "daemon-session-remove",
+                    "session must be terminal before it can be removed",
+                ));
+            }
+            Ok(daemon_response_base(DaemonResponseKind::SessionRemoved))
+        }
         DaemonRequest::Status => {
             let response = api.handle_request(
                 runtime,
@@ -1008,11 +1198,19 @@ fn handle_runtime_control_request(
                 &packages,
                 HubClientRequest::DrainRuntime {
                     request_id: request_id("daemon-sessions-drain"),
-                    session_id: SessionId(session_id),
+                    session_id: SessionId(session_id.clone()),
                     last_output_at: *cursor,
                 },
             )?;
-            let response = events_response(response.body)?;
+            let mut response = events_response(response.body)?;
+            if let Some(pending) = pending_runtime_events.remove(&session_id) {
+                let mut pending = pending
+                    .into_iter()
+                    .map(daemon_event_from_client)
+                    .collect::<Vec<_>>();
+                pending.extend(response.events);
+                response.events = pending;
+            }
             if !response.events.is_empty() {
                 *cursor = tick(logical_clock);
             }
@@ -2714,6 +2912,16 @@ fn events_from_client(events: Vec<HubClientEvent>) -> Vec<DaemonEvent> {
 
 #[derive(Debug)]
 pub(crate) enum ControlMessage {
+    SubscribeEntities {
+        entity_type: String,
+        subscription_id: String,
+        frame_tx: SyncSender<DaemonEntityFrame>,
+        reply_tx: Sender<DaemonTransportResult<DaemonResponse>>,
+    },
+    UnsubscribeEntities {
+        subscription_id: String,
+        reply_tx: Option<Sender<DaemonTransportResult<DaemonResponse>>>,
+    },
     Request {
         request: Box<DaemonRequest>,
         reply_tx: Sender<DaemonTransportResult<DaemonResponse>>,
@@ -2727,6 +2935,35 @@ pub(crate) enum ControlMessage {
         attached_subscriptions: Vec<LocalWebrtcAttachedSubscription>,
         terminal_record: LocalWebrtcSenderTerminalRecord,
     },
+}
+
+#[derive(Debug)]
+struct EntitySubscriptionState {
+    sender: SyncSender<DaemonEntityFrame>,
+    cursor: SessionLifecycleCursor,
+    entities: BTreeMap<String, DaemonSessionEntity>,
+    resync_reason: Option<String>,
+}
+
+#[derive(Debug)]
+struct DaemonControlState {
+    logical_clock: u64,
+    drain_cursors: BTreeMap<String, u64>,
+    egress_diagnostics: DaemonEgressDiagnostics,
+    entity_subscriptions: BTreeMap<String, EntitySubscriptionState>,
+    pending_runtime_events: BTreeMap<String, Vec<HubClientEvent>>,
+}
+
+impl Default for DaemonControlState {
+    fn default() -> Self {
+        Self {
+            logical_clock: 1,
+            drain_cursors: BTreeMap::new(),
+            egress_diagnostics: DaemonEgressDiagnostics::default(),
+            entity_subscriptions: BTreeMap::new(),
+            pending_runtime_events: BTreeMap::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2839,6 +3076,276 @@ impl AttachedSubscriptionChange {
             _ => None,
         }
     }
+}
+
+fn register_entity_subscription(
+    daemon: &mut HubDaemon,
+    subscriptions: &mut BTreeMap<String, EntitySubscriptionState>,
+    entity_type: String,
+    subscription_id: String,
+    sender: SyncSender<DaemonEntityFrame>,
+) -> DaemonTransportResult<DaemonResponse> {
+    if subscriptions.contains_key(&subscription_id) {
+        return Ok(entity_subscription_error(
+            "duplicate_entity_subscription",
+            &subscription_id,
+            "entity subscription id is already active",
+        ));
+    }
+    let packages = daemon.package_registry().clone();
+    let runtime = daemon
+        .runtime_mut()
+        .ok_or(DaemonTransportError::DaemonNotRunning)?;
+    let api = HubClientApi::local_operator("botster-hub-daemon-entity-stream");
+    let response = api.handle_request(
+        runtime,
+        &packages,
+        HubClientRequest::SubscribeEntities {
+            request_id: request_id("daemon-entity-subscribe"),
+            entity_type,
+            subscription_id: subscription_id.clone(),
+        },
+    );
+    let response = match response {
+        Ok(response) => response,
+        Err(error) => return Ok(daemon_operator_error(error)),
+    };
+    let HubClientResponseBody::SessionLifecycleBaseline(baseline) = response.body else {
+        return Err(DaemonTransportError::UnexpectedResponse);
+    };
+    let cursor = baseline.cursor.clone();
+    let (entities, snapshot) = entity_snapshot(&subscription_id, baseline, None);
+    sender
+        .try_send(snapshot)
+        .map_err(|_| DaemonTransportError::ControlThreadStopped)?;
+    subscriptions.insert(
+        subscription_id,
+        EntitySubscriptionState {
+            sender,
+            cursor,
+            entities,
+            resync_reason: None,
+        },
+    );
+    Ok(daemon_response_base(DaemonResponseKind::EntitySubscribed))
+}
+
+fn drive_entity_subscriptions(
+    daemon: &mut HubDaemon,
+    logical_clock: &mut u64,
+    drain_cursors: &mut BTreeMap<String, u64>,
+    pending_runtime_events: &mut BTreeMap<String, Vec<HubClientEvent>>,
+    subscriptions: &mut BTreeMap<String, EntitySubscriptionState>,
+) {
+    if subscriptions.is_empty() {
+        return;
+    }
+    let Some(runtime) = daemon.runtime_mut() else {
+        subscriptions.clear();
+        return;
+    };
+
+    if let Ok(baseline) = runtime.session_lifecycle_baseline() {
+        let active_session_ids = baseline
+            .sessions
+            .iter()
+            .map(|record| record.session.session_id.0.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        pending_runtime_events.retain(|session_id, _| active_session_ids.contains(session_id));
+        for record in &baseline.sessions {
+            let session_id = record.session.session_id.0.clone();
+            if record.lifecycle.as_ref().is_some_and(|state| {
+                matches!(
+                    state,
+                    SessionLifecycleState::Exited { .. } | SessionLifecycleState::Failed { .. }
+                )
+            }) || pending_runtime_events.contains_key(&session_id)
+            {
+                continue;
+            }
+            let cursor = drain_cursors
+                .entry(session_id.clone())
+                .or_insert_with(|| tick(logical_clock));
+            if let Ok(output) = runtime.drain_runtime_once(&SessionId(session_id.clone()), *cursor)
+            {
+                let has_client_egress = !output.client_egress.is_empty();
+                let events = crate::client_api::events_from_drain(output);
+                if has_client_egress && !events.is_empty() {
+                    *cursor = tick(logical_clock);
+                    pending_runtime_events.insert(session_id, events);
+                }
+            }
+        }
+    }
+
+    subscriptions.retain(|subscription_id, state| {
+        if let Some(reason) = state.resync_reason.clone() {
+            let Ok(baseline) = runtime.session_lifecycle_baseline() else {
+                return true;
+            };
+            return try_resync_subscription(subscription_id, state, baseline, reason);
+        }
+
+        let changes = runtime.session_lifecycle_changes(&state.cursor);
+        if let Some(reason) = changes.resync_required {
+            state.resync_reason = Some(format!("core_{reason:?}").to_lowercase());
+            return true;
+        }
+        for change in changes.changes {
+            let sequence = change.cursor.sequence;
+            let frame = match change.kind {
+                SessionLifecycleChangeKind::Upsert { record } => {
+                    let entity = project_session_entity(&record);
+                    let id = entity.session_uuid.clone();
+                    match state.entities.insert(id.clone(), entity.clone()) {
+                        None => DaemonEntityFrame::Upsert {
+                            subscription_id: subscription_id.clone(),
+                            entity_type: "session".to_string(),
+                            snapshot_seq: sequence,
+                            id,
+                            entity,
+                        },
+                        Some(previous) => {
+                            let patch = session_entity_patch(&previous, &entity);
+                            if patch.as_object().is_some_and(serde_json::Map::is_empty) {
+                                state.cursor = change.cursor;
+                                continue;
+                            }
+                            DaemonEntityFrame::Patch {
+                                subscription_id: subscription_id.clone(),
+                                entity_type: "session".to_string(),
+                                snapshot_seq: sequence,
+                                id,
+                                patch,
+                            }
+                        }
+                    }
+                }
+                SessionLifecycleChangeKind::Removed { session_id } => {
+                    state.entities.remove(&session_id.0);
+                    DaemonEntityFrame::Remove {
+                        subscription_id: subscription_id.clone(),
+                        entity_type: "session".to_string(),
+                        snapshot_seq: sequence,
+                        id: session_id.0,
+                    }
+                }
+                _ => {
+                    state.resync_reason = Some("unknown_core_change".to_string());
+                    return true;
+                }
+            };
+            match state.sender.try_send(frame) {
+                Ok(()) => state.cursor = change.cursor,
+                Err(TrySendError::Full(_)) => {
+                    state.resync_reason = Some("subscriber_overflow".to_string());
+                    return true;
+                }
+                Err(TrySendError::Disconnected(_)) => return false,
+            }
+        }
+        state.cursor = changes.cursor;
+        true
+    });
+}
+
+fn try_resync_subscription(
+    subscription_id: &str,
+    state: &mut EntitySubscriptionState,
+    baseline: SessionLifecycleBaseline,
+    reason: String,
+) -> bool {
+    let cursor = baseline.cursor.clone();
+    let (entities, snapshot) = entity_snapshot(subscription_id, baseline, Some(reason));
+    match state.sender.try_send(snapshot) {
+        Ok(()) => {
+            state.cursor = cursor;
+            state.entities = entities;
+            state.resync_reason = None;
+            true
+        }
+        Err(TrySendError::Full(_)) => true,
+        Err(TrySendError::Disconnected(_)) => false,
+    }
+}
+
+fn entity_snapshot(
+    subscription_id: &str,
+    baseline: SessionLifecycleBaseline,
+    resync_reason: Option<String>,
+) -> (BTreeMap<String, DaemonSessionEntity>, DaemonEntityFrame) {
+    let entities = baseline
+        .sessions
+        .iter()
+        .map(project_session_entity)
+        .map(|entity| (entity.session_uuid.clone(), entity))
+        .collect::<BTreeMap<_, _>>();
+    let frame = DaemonEntityFrame::Snapshot {
+        subscription_id: subscription_id.to_string(),
+        entity_type: "session".to_string(),
+        snapshot_seq: baseline.cursor.sequence,
+        items: entities.values().cloned().collect(),
+        resync_reason,
+    };
+    (entities, frame)
+}
+
+fn project_session_entity(record: &SessionLifecycleRecord) -> DaemonSessionEntity {
+    let (lifecycle, exit_code, failure_reason) = match &record.lifecycle {
+        Some(SessionLifecycleState::Starting) => (Some("starting".to_string()), None, None),
+        Some(SessionLifecycleState::Running) => (Some("running".to_string()), None, None),
+        Some(SessionLifecycleState::Stopping) => (Some("stopping".to_string()), None, None),
+        Some(SessionLifecycleState::Exited { code }) => (Some("exited".to_string()), *code, None),
+        Some(SessionLifecycleState::Failed { reason }) => {
+            (Some("failed".to_string()), None, Some(reason.clone()))
+        }
+        None => (None, None, None),
+    };
+    DaemonSessionEntity {
+        session_uuid: record.session.session_id.0.clone(),
+        registry_state: match record.session.registry_state {
+            RegistrySessionState::Running => "running",
+            RegistrySessionState::Stopping => "stopping",
+            RegistrySessionState::Exited => "exited",
+            RegistrySessionState::Stale => "stale",
+        }
+        .to_string(),
+        lifecycle,
+        rows: record.session.size.rows,
+        cols: record.session.size.cols,
+        updated_at: record.session.updated_at,
+        exit_code,
+        failure_reason,
+    }
+}
+
+fn session_entity_patch(previous: &DaemonSessionEntity, current: &DaemonSessionEntity) -> Value {
+    let previous = serde_json::to_value(previous).expect("serialize previous session entity");
+    let current = serde_json::to_value(current).expect("serialize current session entity");
+    let previous = previous.as_object().expect("session entity object");
+    let current = current.as_object().expect("session entity object");
+    Value::Object(
+        current
+            .iter()
+            .filter(|(key, value)| previous.get(*key) != Some(*value))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+    )
+}
+
+fn entity_subscription_error(code: &str, subscription_id: &str, message: &str) -> DaemonResponse {
+    let mut response = daemon_response_base(DaemonResponseKind::OperatorError);
+    response.error = Some(DaemonOperatorError {
+        code: code.to_string(),
+        request_id: subscription_id.to_string(),
+        operation: "subscribe_entities".to_string(),
+        message: message.to_string(),
+        diagnostics: vec![DaemonDiagnostic::action_failure(
+            "subscribe_entities",
+            message,
+        )],
+    });
+    response
 }
 
 fn daemon_response_base(kind: DaemonResponseKind) -> DaemonResponse {
@@ -4695,6 +5202,20 @@ fn daemon_session_from_client(session: HubClientSession) -> DaemonSession {
 
 fn daemon_operator_error_from_client(error: crate::HubClientError) -> DaemonOperatorError {
     match error {
+        crate::HubClientError::InvalidRequest {
+            request_id,
+            operation,
+            message,
+        } => DaemonOperatorError {
+            code: "invalid_request".to_string(),
+            request_id: request_id.0,
+            operation: operation_label(operation).to_string(),
+            diagnostics: vec![DaemonDiagnostic::action_failure(
+                operation_label(operation),
+                &message,
+            )],
+            message,
+        },
         crate::HubClientError::AdmissionDenied {
             request_id,
             operation,
@@ -5077,6 +5598,9 @@ fn operation_label(operation: crate::HubClientOperation) -> &'static str {
     match operation {
         crate::HubClientOperation::Status => "status",
         crate::HubClientOperation::ListSessions => "list_sessions",
+        crate::HubClientOperation::SubscribeEntities => "subscribe_entities",
+        crate::HubClientOperation::UnsubscribeEntities => "unsubscribe_entities",
+        crate::HubClientOperation::RemoveSession => "remove_session",
         crate::HubClientOperation::Spawn => "spawn",
         crate::HubClientOperation::Attach => "attach",
         crate::HubClientOperation::Detach => "detach",
@@ -5675,5 +6199,70 @@ mod tests {
                 .recv_timeout(Duration::from_secs(1))
                 .expect("failed response delivery releases daemon stop")
         );
+    }
+
+    #[test]
+    fn entity_overflow_requires_empty_snapshot_resync_and_failed_delivery_disconnects() {
+        let cursor = SessionLifecycleCursor {
+            source_id: botster_core_daemon::SessionLifecycleSourceId("source".to_string()),
+            sequence: 9,
+        };
+        let baseline = || SessionLifecycleBaseline {
+            cursor: cursor.clone(),
+            sessions: Vec::new(),
+        };
+        let (sender, receiver) = mpsc::sync_channel(1);
+        sender
+            .try_send(DaemonEntityFrame::Snapshot {
+                subscription_id: "subscription".to_string(),
+                entity_type: "session".to_string(),
+                snapshot_seq: 8,
+                items: Vec::new(),
+                resync_reason: None,
+            })
+            .expect("fill bounded subscriber queue");
+        let mut state = EntitySubscriptionState {
+            sender,
+            cursor: SessionLifecycleCursor {
+                source_id: botster_core_daemon::SessionLifecycleSourceId("source".to_string()),
+                sequence: 8,
+            },
+            entities: BTreeMap::new(),
+            resync_reason: Some("subscriber_overflow".to_string()),
+        };
+
+        assert!(try_resync_subscription(
+            "subscription",
+            &mut state,
+            baseline(),
+            "subscriber_overflow".to_string(),
+        ));
+        assert_eq!(state.resync_reason.as_deref(), Some("subscriber_overflow"));
+        let _ = receiver.recv().expect("drain stale queued frame");
+        assert!(try_resync_subscription(
+            "subscription",
+            &mut state,
+            baseline(),
+            "subscriber_overflow".to_string(),
+        ));
+        assert!(state.resync_reason.is_none());
+        assert!(matches!(
+            receiver.recv().expect("receive empty resync snapshot"),
+            DaemonEntityFrame::Snapshot {
+                snapshot_seq: 9,
+                ref items,
+                resync_reason: Some(ref reason),
+                ..
+            } if items.is_empty() && reason == "subscriber_overflow"
+        ));
+
+        drop(receiver);
+        state.resync_reason = Some("subscriber_overflow".to_string());
+        assert!(!try_resync_subscription(
+            "subscription",
+            &mut state,
+            baseline(),
+            "subscriber_overflow".to_string(),
+        ));
     }
 }

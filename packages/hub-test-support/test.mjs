@@ -27,8 +27,8 @@ import {
 assert.equal(metadata.package_name, "@trybotster/hub-test-support");
 assert.equal(metadata.package_version, "0.1.8");
 assert.equal(metadata.protocol, "botster-hub-daemon-v1");
-assert.equal(metadata.protocol_version, 1);
-assert.equal(metadata.conformance_fixture_revision, 15);
+assert.equal(metadata.protocol_version, 2);
+assert.equal(metadata.conformance_fixture_revision, 16);
 assert.deepEqual(metadata.application_primitives, {
   fixture_package_name: "botster.plugin-contract-matrix",
   artifact_path: "fixtures/plugin-contract-matrix",
@@ -83,6 +83,10 @@ assert.equal(
 const supportMatrix = readFirstPartyClientSupportMatrix();
 assert.equal(supportMatrix.late_attach_history.supported, true);
 assert.equal(supportMatrix.required_features.includes("terminal_readback"), true);
+assert.equal(supportMatrix.required_features.includes("session_entity_subscriptions"), true);
+assert.equal(supportMatrix.session_entities.supported, true);
+assert.equal(supportMatrix.session_entities.bounded_delivery, true);
+assert.equal(supportMatrix.session_entities.explicit_snapshot_resync, true);
 assert.equal(supportMatrix.supported_features.includes("terminal_readback"), true);
 
 const lateAttachFixture = readLateAttachHistoryConformanceFixture();
