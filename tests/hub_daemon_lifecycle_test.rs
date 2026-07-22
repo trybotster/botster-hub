@@ -1710,6 +1710,16 @@ fn wait_for_process_exit(pid: u32) {
     panic!("process {pid} still exists");
 }
 
+fn wait_for_loopback_port_closed(port: u16) {
+    for _ in 0..100 {
+        if TcpStream::connect(("127.0.0.1", port)).is_err() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    panic!("loopback port {port} is still accepting connections");
+}
+
 fn read_json_health(url: &str) -> serde_json::Value {
     let (_, body) = read_http_path(url, "/health");
     serde_json::from_str(body.trim()).expect("health JSON")
@@ -6533,6 +6543,7 @@ fn cli_dogfood_launcher_rejects_health_only_web_entrypoint() {
         )
     );
     assert!(!text.contains(web_package_dir.to_string_lossy().as_ref()));
+    wait_for_loopback_port_closed(web_bridge_port);
 }
 
 #[test]
@@ -9458,6 +9469,28 @@ fn daemon_detaches_subscription_when_attach_connection_drops() {
         "dropped attach subscription received later terminal output: {observed_events:?}"
     );
 
+    let shutdown_session = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::ShutdownSession {
+            session_id: "eof-session".to_string(),
+        },
+    )
+    .expect("shutdown eof test session");
+    assert_eq!(
+        shutdown_session.kind,
+        botster_hub::DaemonResponseKind::Events
+    );
+    let sessions_after_shutdown =
+        botster_hub::daemon_transport_request(&config, botster_hub::DaemonRequest::ListSessions)
+            .expect("list sessions after eof test session shutdown");
+    assert!(
+        sessions_after_shutdown
+            .sessions
+            .iter()
+            .any(|session| session.session_id == "eof-session" && session.lifecycle == "exited"),
+        "eof-session should be exited after shutdown: {:?}",
+        sessions_after_shutdown.sessions
+    );
     shutdown_cli_daemon(&data_dir, child);
 }
 
@@ -9526,6 +9559,25 @@ fn daemon_notify_session_defers_without_observed_readiness_over_socket() {
         "notify session without observed readiness should not reach PTY input path, got {observed:?}"
     );
 
+    let shutdown_session = connection
+        .request(&botster_hub::DaemonRequest::ShutdownSession {
+            session_id: "notify-socket-session".to_string(),
+        })
+        .expect("shutdown guarded socket session");
+    assert_eq!(
+        shutdown_session.kind,
+        botster_hub::DaemonResponseKind::Events
+    );
+    let sessions_after_shutdown = connection
+        .request(&botster_hub::DaemonRequest::ListSessions)
+        .expect("list sessions after guarded socket session shutdown");
+    assert!(
+        sessions_after_shutdown.sessions.iter().any(|session| {
+            session.session_id == "notify-socket-session" && session.lifecycle == "exited"
+        }),
+        "notify-socket-session should be exited after shutdown: {:?}",
+        sessions_after_shutdown.sessions
+    );
     shutdown_cli_daemon(&data_dir, child);
 }
 
@@ -9667,6 +9719,48 @@ fn stalled_attach_stdout_does_not_block_other_daemon_commands() {
         "daemon failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+
+    let cleanup_child = start_cli_daemon(&data_dir);
+    let shutdown_session = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("sessions")
+        .arg("shutdown")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("slow-consumer")
+        .output()
+        .expect("shut down recovered slow-consumer session");
+    assert!(
+        shutdown_session.status.success(),
+        "recovered session shutdown failed: {}",
+        String::from_utf8_lossy(&shutdown_session.stderr)
+    );
+    let shutdown_session_stdout =
+        String::from_utf8(shutdown_session.stdout).expect("session shutdown stdout is utf8");
+    assert!(
+        shutdown_session_stdout.contains("response=events"),
+        "recovered session shutdown should return structured events: {shutdown_session_stdout:?}"
+    );
+
+    let sessions_after_shutdown = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("sessions")
+        .arg("list")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .output()
+        .expect("list sessions after recovered slow-consumer shutdown");
+    assert!(
+        sessions_after_shutdown.status.success(),
+        "list failed after recovered slow-consumer shutdown: {}",
+        String::from_utf8_lossy(&sessions_after_shutdown.stderr)
+    );
+    let sessions_after_shutdown_stdout = String::from_utf8(sessions_after_shutdown.stdout)
+        .expect("sessions after shutdown stdout is utf8");
+    assert!(
+        !sessions_after_shutdown_stdout.contains("session_id=slow-consumer"),
+        "slow-consumer should be absent after recovered session shutdown: {sessions_after_shutdown_stdout:?}"
+    );
+
+    shutdown_cli_daemon(&data_dir, cleanup_child);
 }
 
 #[test]
