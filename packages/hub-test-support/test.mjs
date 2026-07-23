@@ -10,7 +10,7 @@ import {
   daemonProtocolTypescriptPath,
   firstPartyClientSupportMatrixPath,
   lateAttachHistoryConformanceFixturePath,
-  localWebrtcResponseChunkConformanceFixturePath,
+  localWebrtcDeliveryChunkConformanceFixturePath,
   modeFlagsConformanceFixturePath,
   materializeApplicationPrimitivesFixture,
   materializePluginContractMatrixFixture,
@@ -19,7 +19,7 @@ import {
   readDaemonProtocolTypescript,
   readFirstPartyClientSupportMatrix,
   readLateAttachHistoryConformanceFixture,
-  readLocalWebrtcResponseChunkConformanceFixture,
+  readLocalWebrtcDeliveryChunkConformanceFixture,
   readModeFlagsConformanceFixture,
   readSessionLifecycleSubscriptionConformanceFixture,
   sessionLifecycleSubscriptionConformanceFixturePath,
@@ -27,10 +27,10 @@ import {
 } from "@trybotster/hub-test-support";
 
 assert.equal(metadata.package_name, "@trybotster/hub-test-support");
-assert.equal(metadata.package_version, "0.1.9");
+assert.equal(metadata.package_version, "0.1.10");
 assert.equal(metadata.protocol, "botster-hub-daemon-v1");
 assert.equal(metadata.protocol_version, 2);
-assert.equal(metadata.conformance_fixture_revision, 16);
+assert.equal(metadata.conformance_fixture_revision, 17);
 assert.deepEqual(metadata.application_primitives, {
   fixture_package_name: "botster.plugin-contract-matrix",
   artifact_path: "fixtures/plugin-contract-matrix",
@@ -63,7 +63,8 @@ assert.match(protocol, /capture_snapshot/);
 assert.match(protocol, /export interface DaemonReadScreen/);
 assert.match(protocol, /export interface DaemonModeFlags/);
 assert.match(protocol, /export interface DaemonCaptureSnapshot/);
-assert.match(protocol, /export interface DaemonLocalWebrtcResponseChunk/);
+assert.match(protocol, /export interface DaemonLocalWebrtcDeliveryChunk/);
+assert.match(protocol, /DaemonLocalWebrtcDeliveryKind/);
 assert.match(protocol, /subscribe_entities/);
 assert.match(protocol, /entity_snapshot/);
 assert.match(protocol, /entity_upsert/);
@@ -84,8 +85,8 @@ assert.equal(
   lateAttachHistoryConformanceFixturePath(),
 );
 assert.equal(
-  fileURLToPath(import.meta.resolve("@trybotster/hub-test-support/local-webrtc-response-chunk-conformance-fixture")),
-  localWebrtcResponseChunkConformanceFixturePath(),
+  fileURLToPath(import.meta.resolve("@trybotster/hub-test-support/local-webrtc-delivery-chunk-conformance-fixture")),
+  localWebrtcDeliveryChunkConformanceFixturePath(),
 );
 assert.equal(
   fileURLToPath(import.meta.resolve("@trybotster/hub-test-support/mode-flags-conformance-fixture")),
@@ -110,7 +111,7 @@ assert.equal(
 );
 assert.equal(supportMatrix.supported_features.includes("terminal_readback"), true);
 
-assert.equal(sessionLifecycleFixture.conformance_fixture_revision, 16);
+assert.equal(sessionLifecycleFixture.conformance_fixture_revision, 17);
 assert.equal(sessionLifecycleFixture.entity_type, "session");
 assert.deepEqual(
   sessionLifecycleFixture.normalized_frames.map((frame) => frame.type),
@@ -135,7 +136,7 @@ assert.equal(sessionLifecycleFixture.overflow.snapshot_precedes_later_deltas, tr
 assert.equal(sessionLifecycleFixture.overflow.failed_snapshot_delivery_closes_subscription, true);
 
 const lateAttachFixture = readLateAttachHistoryConformanceFixture();
-const chunkFixture = readLocalWebrtcResponseChunkConformanceFixture();
+const chunkFixture = readLocalWebrtcDeliveryChunkConformanceFixture();
 const modeFlagsFixture = readModeFlagsConformanceFixture();
 assert.deepEqual(modeFlagsFixture.request, {
   type: "read_mode_flags",
@@ -153,13 +154,15 @@ assert.equal(modeFlagsFixture.backend_failure.response_kind, "operator_error");
 assert.equal(modeFlagsFixture.backend_failure.error_code, "runtime_error");
 assert.equal(modeFlagsFixture.backend_failure.operation, "read_mode_flags");
 assert.equal(modeFlagsFixture.backend_failure.mode_flags, null);
-assert.equal(chunkFixture.version, 1);
+assert.equal(chunkFixture.version, 2);
 assert.equal(chunkFixture.maximum_frame_bytes_exclusive, 65536);
-assert.equal(chunkFixture.maximum_response_bytes, 16777216);
-assert.equal(chunkFixture.scenarios.single_chunk.length, 1);
-assert.equal(chunkFixture.scenarios.multiple_chunks.length, 2);
+assert.equal(chunkFixture.maximum_delivery_bytes, 16777216);
+assert.equal(chunkFixture.scenarios.daemon_response.length, 1);
+assert.equal(chunkFixture.scenarios.daemon_response[0].delivery_kind, "daemon_response");
+assert.equal(chunkFixture.scenarios.daemon_entity_frame.length, 2);
+assert.equal(chunkFixture.scenarios.daemon_entity_frame[0].delivery_kind, "daemon_entity_frame");
 assert.equal(
-  chunkFixture.scenarios.multiple_chunks.map((chunk) => chunk.payload).join(""),
+  chunkFixture.scenarios.daemon_entity_frame.map((chunk) => chunk.payload).join(""),
   "encrypted-envelope",
 );
 const largeScenario = chunkFixture.scenarios.large_generated;
