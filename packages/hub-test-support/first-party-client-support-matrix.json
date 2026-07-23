@@ -67,6 +67,9 @@
     "frame_type": "botster_hub_client::DaemonEntityFrame",
     "bounded_delivery": true,
     "explicit_snapshot_resync": true,
+    "fixture_path": "botster_hub_test_support::session_lifecycle_subscription_conformance_scenario",
+    "json_helper": "botster_hub_test_support::session_lifecycle_subscription_conformance_fixture_json",
+    "runtime_runner": "botster_hub_test_support::run_session_lifecycle_subscription_conformance",
     "runtime_regression": "session_entity_subscription_pushes_snapshot_ordered_deltas_and_fresh_reconnect"
   },
   "resize": {
