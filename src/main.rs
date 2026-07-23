@@ -6,7 +6,7 @@ use std::net::{TcpListener, TcpStream};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{self, Child, Command, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -1282,6 +1282,7 @@ fn prepare_local_runtime(options: DevStackOptions) -> Result<LocalRuntimeOutcome
     let hub_bin = env::current_exe().map_err(DevStackError::CurrentExe)?;
     let config = explicit_config(options.data_directory.clone())?;
     let daemon_ownership = ensure_dev_stack_daemon(&hub_bin, &options, &config)?;
+    daemon_transport_request(&config, DaemonRequest::RefreshLocalPackages)?;
 
     let project_pipelines = enable_dev_stack_package(
         &config,
@@ -1367,13 +1368,21 @@ fn spawn_dev_stack_daemon(
         .arg("--session-worker-bin")
         .arg(session_worker_bin)
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stderr(Stdio::piped());
     let mut child = command
         .spawn()
         .map_err(|source| DevStackError::SpawnDaemon {
             path: hub_bin.to_path_buf(),
             source,
         })?;
+    let (stderr_tx, stderr_rx) = mpsc::channel();
+    if let Some(stderr) = child.stderr.take() {
+        thread::spawn(move || {
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                let _ = stderr_tx.send(line);
+            }
+        });
+    }
 
     if let Err(error) =
         write_dev_stack_daemon_metadata(&options.data_directory, config, hub_bin, child.id())
@@ -1383,9 +1392,12 @@ fn spawn_dev_stack_daemon(
         return Err(error);
     }
 
-    if let Err(error) =
-        wait_for_dev_stack_ready(config, &mut child, dev_stack_daemon_readiness_budget())
-    {
+    if let Err(error) = wait_for_dev_stack_ready(
+        config,
+        &mut child,
+        dev_stack_daemon_readiness_budget(),
+        &stderr_rx,
+    ) {
         let _ = remove_dev_stack_daemon_metadata(&options.data_directory);
         return Err(error);
     }
@@ -1396,17 +1408,23 @@ fn wait_for_dev_stack_ready(
     config: &botster_hub::HubConfig,
     child: &mut Child,
     readiness_budget: Duration,
+    stderr_rx: &mpsc::Receiver<String>,
 ) -> Result<(), DevStackError> {
     let started_at = Instant::now();
     let deadline = started_at + readiness_budget;
     let mut last_probe = "status probe not attempted".to_string();
+    let mut stderr_tail = String::new();
     while Instant::now() < deadline {
+        drain_dev_stack_stderr(stderr_rx, &mut stderr_tail);
         if let Some(status) = child.try_wait().map_err(DevStackError::PollDaemon)? {
+            thread::sleep(Duration::from_millis(20));
+            drain_dev_stack_stderr(stderr_rx, &mut stderr_tail);
             return Err(DevStackError::DaemonExited {
                 status: status.to_string(),
                 elapsed: started_at.elapsed(),
                 readiness_budget,
                 last_probe,
+                stderr_tail,
             });
         }
         match daemon_transport_request(config, DaemonRequest::Status) {
@@ -1425,6 +1443,19 @@ fn wait_for_dev_stack_ready(
         child_pid,
         child_status,
     })
+}
+
+fn drain_dev_stack_stderr(stderr_rx: &mpsc::Receiver<String>, stderr_tail: &mut String) {
+    for line in stderr_rx.try_iter() {
+        if !stderr_tail.is_empty() {
+            stderr_tail.push(' ');
+        }
+        stderr_tail.push_str(&sanitize_runtime_message(&line));
+        if stderr_tail.len() > 8_192 {
+            let keep_from = stderr_tail.len() - 8_192;
+            stderr_tail.drain(..keep_from);
+        }
+    }
 }
 
 fn dev_stack_daemon_readiness_budget() -> Duration {
@@ -5229,6 +5260,7 @@ enum DevStackError {
         elapsed: Duration,
         readiness_budget: Duration,
         last_probe: String,
+        stderr_tail: String,
     },
 }
 
@@ -5542,10 +5574,11 @@ impl fmt::Display for DevStackError {
                 elapsed,
                 readiness_budget,
                 last_probe,
+                stderr_tail,
             } => {
                 write!(
                     formatter,
-                    "dev-stack daemon exited with {status} after {elapsed:?} (readiness budget {readiness_budget:?}); last status probe: {last_probe}"
+                    "dev-stack daemon exited with {status} after {elapsed:?} (readiness budget {readiness_budget:?}); last status probe: {last_probe}; daemon error: {stderr_tail}"
                 )
             }
         }

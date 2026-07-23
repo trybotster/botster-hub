@@ -256,6 +256,7 @@ pub(crate) fn daemon_protocol_typescript() -> String {
                 ],
             ),
             ("reload_package", &[("package_name", "string")]),
+            ("refresh_local_packages", &[]),
             ("enable_package_local_path", &[("path", "string")]),
             ("enable_package", &[("package_name", "string")]),
             ("disable_package", &[("package_name", "string")]),
