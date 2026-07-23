@@ -20,6 +20,11 @@ export interface HubTestSupportMetadata {
     source_artifact_path: string;
     sha256: string;
   };
+  session_lifecycle_subscription_conformance_fixture: {
+    artifact_path: "session-lifecycle-subscription-conformance-fixture.json";
+    source_artifact_path: string;
+    sha256: string;
+  };
   late_attach_history_conformance_fixture: {
     artifact_path: "late-attach-history-conformance-fixture.json";
     source_artifact_path: string;
@@ -58,6 +63,8 @@ export function daemonProtocolTypescriptPath(): string;
 export function readDaemonProtocolTypescript(): string;
 export function firstPartyClientSupportMatrixPath(): string;
 export function readFirstPartyClientSupportMatrix(): Record<string, unknown>;
+export function sessionLifecycleSubscriptionConformanceFixturePath(): string;
+export function readSessionLifecycleSubscriptionConformanceFixture(): Record<string, unknown>;
 export function lateAttachHistoryConformanceFixturePath(): string;
 export function readLateAttachHistoryConformanceFixture(): Record<string, unknown>;
 export function localWebrtcResponseChunkConformanceFixturePath(): string;
