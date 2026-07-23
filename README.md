@@ -136,6 +136,10 @@ contract instead of bypassing hub admission or calling raw core routers.
 Terminal attach is a terminal-stream handshake only. Session-list reads remain
 an operator/query API; stateful clients use the explicit held-open `session`
 entity subscription for an authoritative snapshot followed by ordered deltas.
+The reusable revision-16 contract ships in
+`@trybotster/hub-test-support@0.1.9` as a source-derived JSON fixture and a Rust
+`run_session_lifecycle_subscription_conformance` runner over the real isolated
+Hub/Core/session-worker topology.
 That subscription hydrates no status, package, worktree, target, or plugin state.
 Hub code
 embeds the typed CoreDaemon API; it must not shell out to the thin core daemon

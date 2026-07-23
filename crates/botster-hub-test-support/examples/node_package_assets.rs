@@ -8,7 +8,7 @@ use botster_hub_test_support::{
     daemon_protocol_typescript_artifact, first_party_client_support_matrix,
     late_attach_history_conformance_fixture_json,
     local_webrtc_response_chunk_conformance_fixture_json, mode_flags_conformance_fixture_json,
-    plugin_contract_matrix_fixture_asset,
+    plugin_contract_matrix_fixture_asset, session_lifecycle_subscription_conformance_fixture_json,
 };
 use serde_json::json;
 
@@ -45,6 +45,15 @@ fn main() -> Result<(), Box<dyn Error>> {
         format!("{}\n", serde_json::to_string_pretty(&matrix)?),
     )?;
     fs::write(
+        output_dir.join("session-lifecycle-subscription-conformance-fixture.json"),
+        format!(
+            "{}\n",
+            serde_json::to_string_pretty(
+                &session_lifecycle_subscription_conformance_fixture_json()
+            )?
+        ),
+    )?;
+    fs::write(
         output_dir.join("late-attach-history-conformance-fixture.json"),
         format!(
             "{}\n",
@@ -73,6 +82,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         "first_party_client_support_matrix": {
             "artifact_path": "first-party-client-support-matrix.json",
             "source_artifact_path": "botster_hub_test_support::first_party_client_support_matrix()",
+        },
+        "session_lifecycle_subscription_conformance_fixture": {
+            "artifact_path": "session-lifecycle-subscription-conformance-fixture.json",
+            "source_artifact_path": "botster_hub_test_support::session_lifecycle_subscription_conformance_fixture_json()",
         },
         "late_attach_history_conformance_fixture": {
             "artifact_path": "late-attach-history-conformance-fixture.json",

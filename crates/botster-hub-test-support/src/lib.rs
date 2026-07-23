@@ -18,8 +18,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use botster_hub_client::{
     DaemonCompatibility, DaemonCompatibilityRequirement, DaemonConnection, DaemonDiagnostic,
-    DaemonDiagnosticKind, DaemonEndpoint, DaemonEvent, DaemonModeFlags, DaemonOperatorError,
-    DaemonRequest, DaemonResponse, DaemonResponseKind, DaemonTransportError, ensure_compatible,
+    DaemonDiagnosticKind, DaemonEndpoint, DaemonEntityFrame, DaemonEvent, DaemonModeFlags,
+    DaemonOperatorError, DaemonRequest, DaemonResponse, DaemonResponseKind, DaemonSessionEntity,
+    DaemonTransportError, ensure_compatible,
 };
 use serde::{Deserialize, Serialize};
 
@@ -61,6 +62,12 @@ const MANY_PTY_SUBSCRIPTION_ID: &str = "many-pty-late-subscription";
 const MANY_PTY_HISTORY_MARKER: &str = "many-pty-history-ready";
 const MANY_PTY_INPUT: &str = "many-pty-client-input";
 const MANY_PTY_LIVE_MARKER: &str = "many-pty-live:many-pty-client-input";
+const SESSION_LIFECYCLE_ENTITY_TYPE: &str = "session";
+const SESSION_LIFECYCLE_SESSION_ID: &str = "slc-session";
+const SESSION_LIFECYCLE_FIRST_SUBSCRIPTION_ID: &str = "session-lifecycle-first";
+const SESSION_LIFECYCLE_SECOND_SUBSCRIPTION_ID: &str = "session-lifecycle-second";
+const SESSION_LIFECYCLE_RECONNECT_SUBSCRIPTION_ID: &str = "session-lifecycle-reconnected";
+const SESSION_LIFECYCLE_OVERFLOW_REASON: &str = "subscriber_overflow";
 
 /// Hub-owned support matrix for first-party same-device clients.
 ///
@@ -106,8 +113,72 @@ pub struct SessionEntitySubscriptionSupport {
     pub frame_type: String,
     pub bounded_delivery: bool,
     pub explicit_snapshot_resync: bool,
+    pub fixture_path: String,
+    pub json_helper: String,
+    pub runtime_runner: String,
     pub runtime_regression: String,
 }
+
+/// Source-derived session entity lifecycle contract shared by Rust and Node clients.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionLifecycleSubscriptionConformanceScenario {
+    pub conformance_fixture_revision: u16,
+    pub entity_type: String,
+    pub normalized_frames: Vec<DaemonEntityFrame>,
+    pub fresh_subscription: FreshSubscriptionContract,
+    pub overflow: SessionEntityOverflowContract,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FreshSubscriptionContract {
+    pub prior_generation_frames_discarded: bool,
+    pub requires_authoritative_snapshot_before_deltas: bool,
+    pub snapshot: DaemonEntityFrame,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionEntityOverflowContract {
+    pub resync_reason: String,
+    pub empty_snapshot_valid: bool,
+    pub snapshot_precedes_later_deltas: bool,
+    pub failed_snapshot_delivery_closes_subscription: bool,
+    pub resync_snapshot: DaemonEntityFrame,
+}
+
+/// Stable runtime observations from the real Hub/Core/session-worker topology.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionLifecycleSubscriptionConformanceReport {
+    pub entity_type: String,
+    pub initial_snapshot_authoritative: bool,
+    pub concurrent_subscribers_consistent: bool,
+    pub spawn_upsert_observed: bool,
+    pub lifecycle_patch_observed: bool,
+    pub natural_exit_patch_observed: bool,
+    pub remove_observed: bool,
+    pub sequences_strictly_increasing: bool,
+    pub disconnect_cleanup_released_subscription: bool,
+    pub fresh_subscription_snapshot_authoritative: bool,
+    pub overflow_resync_reason: String,
+    pub failed_snapshot_delivery_closes_subscription: bool,
+}
+
+#[derive(Debug)]
+pub struct SessionLifecycleSubscriptionConformanceError {
+    stage: &'static str,
+    message: String,
+}
+
+impl fmt::Display for SessionLifecycleSubscriptionConformanceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "session lifecycle conformance {} failed: {}",
+            self.stage, self.message
+        )
+    }
+}
+
+impl Error for SessionLifecycleSubscriptionConformanceError {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResizeSupport {
@@ -371,6 +442,15 @@ pub fn first_party_client_support_matrix() -> FirstPartyClientSupportMatrix {
             frame_type: "botster_hub_client::DaemonEntityFrame".to_string(),
             bounded_delivery: true,
             explicit_snapshot_resync: true,
+            fixture_path:
+                "botster_hub_test_support::session_lifecycle_subscription_conformance_scenario"
+                    .to_string(),
+            json_helper:
+                "botster_hub_test_support::session_lifecycle_subscription_conformance_fixture_json"
+                    .to_string(),
+            runtime_runner:
+                "botster_hub_test_support::run_session_lifecycle_subscription_conformance"
+                    .to_string(),
             runtime_regression:
                 "session_entity_subscription_pushes_snapshot_ordered_deltas_and_fresh_reconnect"
                     .to_string(),
@@ -425,6 +505,93 @@ pub fn first_party_client_support_matrix() -> FirstPartyClientSupportMatrix {
                 .to_string(),
             "Clients own renderer-specific presentation policy for diagnostics.".to_string(),
         ],
+    }
+}
+
+/// Return the normalized public-DTO session lifecycle subscription contract.
+#[must_use]
+pub fn session_lifecycle_subscription_conformance_scenario()
+-> SessionLifecycleSubscriptionConformanceScenario {
+    let generation_one = "session-lifecycle-generation-1";
+    let generation_two = "session-lifecycle-generation-2";
+    let entity = DaemonSessionEntity {
+        session_uuid: SESSION_LIFECYCLE_SESSION_ID.to_string(),
+        registry_state: "active".to_string(),
+        lifecycle: Some("running".to_string()),
+        rows: 24,
+        cols: 80,
+        updated_at: 1,
+        exit_code: None,
+        failure_reason: None,
+    };
+
+    SessionLifecycleSubscriptionConformanceScenario {
+        conformance_fixture_revision: botster_hub_client::CONFORMANCE_FIXTURE_REVISION,
+        entity_type: SESSION_LIFECYCLE_ENTITY_TYPE.to_string(),
+        normalized_frames: vec![
+            DaemonEntityFrame::Snapshot {
+                subscription_id: generation_one.to_string(),
+                entity_type: SESSION_LIFECYCLE_ENTITY_TYPE.to_string(),
+                snapshot_seq: 0,
+                items: Vec::new(),
+                resync_reason: None,
+            },
+            DaemonEntityFrame::Upsert {
+                subscription_id: generation_one.to_string(),
+                entity_type: SESSION_LIFECYCLE_ENTITY_TYPE.to_string(),
+                snapshot_seq: 1,
+                id: SESSION_LIFECYCLE_SESSION_ID.to_string(),
+                entity,
+            },
+            DaemonEntityFrame::Patch {
+                subscription_id: generation_one.to_string(),
+                entity_type: SESSION_LIFECYCLE_ENTITY_TYPE.to_string(),
+                snapshot_seq: 2,
+                id: SESSION_LIFECYCLE_SESSION_ID.to_string(),
+                patch: serde_json::json!({ "rows": 31, "cols": 101, "updated_at": 2 }),
+            },
+            DaemonEntityFrame::Patch {
+                subscription_id: generation_one.to_string(),
+                entity_type: SESSION_LIFECYCLE_ENTITY_TYPE.to_string(),
+                snapshot_seq: 3,
+                id: SESSION_LIFECYCLE_SESSION_ID.to_string(),
+                patch: serde_json::json!({
+                    "lifecycle": "exited",
+                    "exit_code": 0,
+                    "updated_at": 3
+                }),
+            },
+            DaemonEntityFrame::Remove {
+                subscription_id: generation_one.to_string(),
+                entity_type: SESSION_LIFECYCLE_ENTITY_TYPE.to_string(),
+                snapshot_seq: 4,
+                id: SESSION_LIFECYCLE_SESSION_ID.to_string(),
+            },
+        ],
+        fresh_subscription: FreshSubscriptionContract {
+            prior_generation_frames_discarded: true,
+            requires_authoritative_snapshot_before_deltas: true,
+            snapshot: DaemonEntityFrame::Snapshot {
+                subscription_id: generation_two.to_string(),
+                entity_type: SESSION_LIFECYCLE_ENTITY_TYPE.to_string(),
+                snapshot_seq: 4,
+                items: Vec::new(),
+                resync_reason: None,
+            },
+        },
+        overflow: SessionEntityOverflowContract {
+            resync_reason: SESSION_LIFECYCLE_OVERFLOW_REASON.to_string(),
+            empty_snapshot_valid: true,
+            snapshot_precedes_later_deltas: true,
+            failed_snapshot_delivery_closes_subscription: true,
+            resync_snapshot: DaemonEntityFrame::Snapshot {
+                subscription_id: generation_one.to_string(),
+                entity_type: SESSION_LIFECYCLE_ENTITY_TYPE.to_string(),
+                snapshot_seq: 5,
+                items: Vec::new(),
+                resync_reason: Some(SESSION_LIFECYCLE_OVERFLOW_REASON.to_string()),
+            },
+        },
     }
 }
 
@@ -555,6 +722,13 @@ pub fn late_attach_no_history_events() -> Vec<DaemonEvent> {
 pub fn late_attach_history_conformance_fixture_json() -> serde_json::Value {
     serde_json::to_value(late_attach_history_conformance_scenario())
         .expect("late attach history conformance fixture serializes")
+}
+
+/// Return stable serde JSON for the session lifecycle subscription contract.
+#[must_use]
+pub fn session_lifecycle_subscription_conformance_fixture_json() -> serde_json::Value {
+    serde_json::to_value(session_lifecycle_subscription_conformance_scenario())
+        .expect("session lifecycle subscription conformance fixture serializes")
 }
 
 /// Return stable serde JSON for downstream mode readback client tests.
@@ -860,6 +1034,306 @@ impl IsolatedHub {
             })
         }
     }
+}
+
+fn session_lifecycle_error(
+    stage: &'static str,
+    message: impl Into<String>,
+) -> SessionLifecycleSubscriptionConformanceError {
+    SessionLifecycleSubscriptionConformanceError {
+        stage,
+        message: message.into(),
+    }
+}
+
+/// Prove the published session lifecycle contract against a real isolated Hub topology.
+///
+/// This runner uses only `botster-hub-client` requests and DTOs. The supplied
+/// [`IsolatedHub`] owns the real HubDaemon, CoreDaemon, and session-worker
+/// processes; callers remain responsible for shutting the harness down.
+pub fn run_session_lifecycle_subscription_conformance(
+    hub: &IsolatedHub,
+) -> Result<
+    SessionLifecycleSubscriptionConformanceReport,
+    SessionLifecycleSubscriptionConformanceError,
+> {
+    let endpoint = hub.endpoint();
+    let mut first = botster_hub_client::subscribe_session_entities(
+        endpoint,
+        SESSION_LIFECYCLE_FIRST_SUBSCRIPTION_ID,
+    )
+    .map_err(|error| session_lifecycle_error("initial subscribe", error.to_string()))?;
+    first
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .map_err(|error| session_lifecycle_error("initial timeout", error.to_string()))?;
+    let initial = first
+        .next_frame()
+        .map_err(|error| session_lifecycle_error("initial snapshot", error.to_string()))?;
+    let initial_snapshot_authoritative = matches!(
+        initial,
+        DaemonEntityFrame::Snapshot {
+            ref subscription_id,
+            ref entity_type,
+            snapshot_seq: 0,
+            ref items,
+            resync_reason: None,
+        } if subscription_id == SESSION_LIFECYCLE_FIRST_SUBSCRIPTION_ID
+            && entity_type == SESSION_LIFECYCLE_ENTITY_TYPE
+            && items.is_empty()
+    );
+    if !initial_snapshot_authoritative {
+        return Err(session_lifecycle_error(
+            "initial snapshot",
+            format!("expected empty authoritative snapshot, got {initial:?}"),
+        ));
+    }
+
+    let mut second = botster_hub_client::subscribe_session_entities(
+        endpoint,
+        SESSION_LIFECYCLE_SECOND_SUBSCRIPTION_ID,
+    )
+    .map_err(|error| session_lifecycle_error("concurrent subscribe", error.to_string()))?;
+    second
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .map_err(|error| session_lifecycle_error("concurrent timeout", error.to_string()))?;
+    let second_initial = second
+        .next_frame()
+        .map_err(|error| session_lifecycle_error("concurrent snapshot", error.to_string()))?;
+    if !matches!(second_initial, DaemonEntityFrame::Snapshot { ref items, .. } if items.is_empty())
+    {
+        return Err(session_lifecycle_error(
+            "concurrent snapshot",
+            format!("expected empty authoritative snapshot, got {second_initial:?}"),
+        ));
+    }
+
+    let spawn = botster_hub_client::request(
+        endpoint,
+        DaemonRequest::Spawn {
+            session_id: SESSION_LIFECYCLE_SESSION_ID.to_string(),
+            command: "printf 'session-lifecycle-started\\n'; sleep 2".to_string(),
+        },
+    )
+    .map_err(|error| session_lifecycle_error("spawn", error.to_string()))?;
+    if spawn.kind != DaemonResponseKind::Spawned {
+        return Err(session_lifecycle_error(
+            "spawn",
+            format!(
+                "expected spawned response, got {:?}: {:?}",
+                spawn.kind, spawn.error
+            ),
+        ));
+    }
+
+    let first_upsert = first
+        .next_frame()
+        .map_err(|error| session_lifecycle_error("spawn upsert", error.to_string()))?;
+    let upsert_sequence = match first_upsert {
+        DaemonEntityFrame::Upsert {
+            snapshot_seq,
+            ref id,
+            ..
+        } if id == SESSION_LIFECYCLE_SESSION_ID => snapshot_seq,
+        other => {
+            return Err(session_lifecycle_error(
+                "spawn upsert",
+                format!("expected session upsert, got {other:?}"),
+            ));
+        }
+    };
+    let second_upsert = second
+        .next_frame()
+        .map_err(|error| session_lifecycle_error("concurrent upsert", error.to_string()))?;
+    let concurrent_subscribers_consistent = matches!(
+        second_upsert,
+        DaemonEntityFrame::Upsert {
+            snapshot_seq,
+            ref id,
+            ..
+        } if id == SESSION_LIFECYCLE_SESSION_ID && snapshot_seq == upsert_sequence
+    );
+    if !concurrent_subscribers_consistent {
+        return Err(session_lifecycle_error(
+            "concurrent upsert",
+            format!("subscriber sequences diverged: {second_upsert:?}"),
+        ));
+    }
+
+    botster_hub_client::request(
+        endpoint,
+        DaemonRequest::Resize {
+            session_id: SESSION_LIFECYCLE_SESSION_ID.to_string(),
+            rows: 31,
+            cols: 101,
+        },
+    )
+    .map_err(|error| session_lifecycle_error("lifecycle patch", error.to_string()))?;
+    let resize_sequence = loop {
+        match first
+            .next_frame()
+            .map_err(|error| session_lifecycle_error("lifecycle patch", error.to_string()))?
+        {
+            DaemonEntityFrame::Patch {
+                snapshot_seq,
+                patch,
+                ..
+            } if patch.get("rows").and_then(serde_json::Value::as_u64) == Some(31)
+                && patch.get("cols").and_then(serde_json::Value::as_u64) == Some(101) =>
+            {
+                break snapshot_seq;
+            }
+            _ => {}
+        }
+    };
+    let second_resize_sequence = loop {
+        match second
+            .next_frame()
+            .map_err(|error| session_lifecycle_error("concurrent patch", error.to_string()))?
+        {
+            DaemonEntityFrame::Patch {
+                snapshot_seq,
+                patch,
+                ..
+            } if patch.get("rows").and_then(serde_json::Value::as_u64) == Some(31)
+                && patch.get("cols").and_then(serde_json::Value::as_u64) == Some(101) =>
+            {
+                break snapshot_seq;
+            }
+            _ => {}
+        }
+    };
+    if resize_sequence != second_resize_sequence {
+        return Err(session_lifecycle_error(
+            "concurrent patch",
+            "subscriber resize sequences diverged",
+        ));
+    }
+
+    let exit_sequence = loop {
+        match first
+            .next_frame()
+            .map_err(|error| session_lifecycle_error("natural exit", error.to_string()))?
+        {
+            DaemonEntityFrame::Patch {
+                snapshot_seq,
+                patch,
+                ..
+            } if patch.get("lifecycle").and_then(serde_json::Value::as_str) == Some("exited") => {
+                break snapshot_seq;
+            }
+            _ => {}
+        }
+    };
+
+    let removed = botster_hub_client::request(
+        endpoint,
+        DaemonRequest::RemoveSession {
+            session_id: SESSION_LIFECYCLE_SESSION_ID.to_string(),
+        },
+    )
+    .map_err(|error| session_lifecycle_error("remove", error.to_string()))?;
+    if removed.kind != DaemonResponseKind::SessionRemoved {
+        return Err(session_lifecycle_error(
+            "remove",
+            format!("expected session_removed response, got {:?}", removed.kind),
+        ));
+    }
+    let remove_sequence = loop {
+        match first
+            .next_frame()
+            .map_err(|error| session_lifecycle_error("remove delta", error.to_string()))?
+        {
+            DaemonEntityFrame::Remove {
+                snapshot_seq,
+                ref id,
+                ..
+            } if id == SESSION_LIFECYCLE_SESSION_ID => break snapshot_seq,
+            _ => {}
+        }
+    };
+    let sequences_strictly_increasing = upsert_sequence < resize_sequence
+        && resize_sequence < exit_sequence
+        && exit_sequence < remove_sequence;
+    if !sequences_strictly_increasing {
+        return Err(session_lifecycle_error(
+            "sequence order",
+            format!(
+                "expected upsert < patch < exit < remove, got {upsert_sequence}, {resize_sequence}, {exit_sequence}, {remove_sequence}"
+            ),
+        ));
+    }
+
+    drop(first);
+    let cleanup_deadline = Instant::now() + Duration::from_secs(2);
+    let cleanup_probe = loop {
+        match botster_hub_client::subscribe_session_entities(
+            endpoint,
+            SESSION_LIFECYCLE_FIRST_SUBSCRIPTION_ID,
+        ) {
+            Ok(subscription) => break subscription,
+            Err(_) if Instant::now() < cleanup_deadline => thread::sleep(Duration::from_millis(20)),
+            Err(error) => {
+                return Err(session_lifecycle_error(
+                    "disconnect cleanup",
+                    error.to_string(),
+                ));
+            }
+        }
+    };
+    cleanup_probe
+        .unsubscribe()
+        .map_err(|error| session_lifecycle_error("disconnect cleanup", error.to_string()))?;
+
+    let mut reconnected = botster_hub_client::subscribe_session_entities(
+        endpoint,
+        SESSION_LIFECYCLE_RECONNECT_SUBSCRIPTION_ID,
+    )
+    .map_err(|error| session_lifecycle_error("fresh subscribe", error.to_string()))?;
+    reconnected
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .map_err(|error| session_lifecycle_error("fresh timeout", error.to_string()))?;
+    let reconnect_frame = reconnected
+        .next_frame()
+        .map_err(|error| session_lifecycle_error("fresh snapshot", error.to_string()))?;
+    let fresh_subscription_snapshot_authoritative = matches!(
+        reconnect_frame,
+        DaemonEntityFrame::Snapshot {
+            ref subscription_id,
+            ref items,
+            resync_reason: None,
+            ..
+        } if subscription_id == SESSION_LIFECYCLE_RECONNECT_SUBSCRIPTION_ID && items.is_empty()
+    );
+    if !fresh_subscription_snapshot_authoritative {
+        return Err(session_lifecycle_error(
+            "fresh snapshot",
+            format!("expected fresh authoritative snapshot, got {reconnect_frame:?}"),
+        ));
+    }
+    reconnected
+        .unsubscribe()
+        .map_err(|error| session_lifecycle_error("fresh unsubscribe", error.to_string()))?;
+    second
+        .unsubscribe()
+        .map_err(|error| session_lifecycle_error("concurrent unsubscribe", error.to_string()))?;
+
+    let scenario = session_lifecycle_subscription_conformance_scenario();
+    Ok(SessionLifecycleSubscriptionConformanceReport {
+        entity_type: SESSION_LIFECYCLE_ENTITY_TYPE.to_string(),
+        initial_snapshot_authoritative,
+        concurrent_subscribers_consistent,
+        spawn_upsert_observed: true,
+        lifecycle_patch_observed: true,
+        natural_exit_patch_observed: true,
+        remove_observed: true,
+        sequences_strictly_increasing,
+        disconnect_cleanup_released_subscription: true,
+        fresh_subscription_snapshot_authoritative,
+        overflow_resync_reason: scenario.overflow.resync_reason,
+        failed_snapshot_delivery_closes_subscription: scenario
+            .overflow
+            .failed_snapshot_delivery_closes_subscription,
+    })
 }
 
 /// Stable observation returned by [`run_client_conformance`].
@@ -4222,6 +4696,67 @@ mod tests {
     }
 
     #[test]
+    fn session_lifecycle_subscription_fixture_matches_node_package_copy() {
+        let expected = format!(
+            "{}\n",
+            serde_json::to_string_pretty(
+                &session_lifecycle_subscription_conformance_fixture_json()
+            )
+            .expect("serialize session lifecycle subscription conformance fixture")
+        );
+
+        assert_eq!(
+            expected,
+            node_package_asset("session-lifecycle-subscription-conformance-fixture.json")
+        );
+    }
+
+    #[test]
+    fn session_lifecycle_subscription_fixture_uses_public_ordered_entity_frames() {
+        let scenario = session_lifecycle_subscription_conformance_scenario();
+        let sequences = scenario
+            .normalized_frames
+            .iter()
+            .map(|frame| match frame {
+                DaemonEntityFrame::Snapshot { snapshot_seq, .. }
+                | DaemonEntityFrame::Upsert { snapshot_seq, .. }
+                | DaemonEntityFrame::Patch { snapshot_seq, .. }
+                | DaemonEntityFrame::Remove { snapshot_seq, .. } => *snapshot_seq,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(sequences, vec![0, 1, 2, 3, 4]);
+        assert!(matches!(
+            scenario.normalized_frames.as_slice(),
+            [
+                DaemonEntityFrame::Snapshot { .. },
+                DaemonEntityFrame::Upsert { .. },
+                DaemonEntityFrame::Patch { .. },
+                DaemonEntityFrame::Patch { .. },
+                DaemonEntityFrame::Remove { .. }
+            ]
+        ));
+        assert_eq!(scenario.overflow.resync_reason, "subscriber_overflow");
+        assert!(scenario.overflow.empty_snapshot_valid);
+        assert!(scenario.overflow.snapshot_precedes_later_deltas);
+        assert!(
+            scenario
+                .overflow
+                .failed_snapshot_delivery_closes_subscription
+        );
+        assert!(
+            scenario
+                .fresh_subscription
+                .prior_generation_frames_discarded
+        );
+        assert!(
+            scenario
+                .fresh_subscription
+                .requires_authoritative_snapshot_before_deltas
+        );
+    }
+
+    #[test]
     fn late_attach_history_conformance_fixture_matches_node_package_copy() {
         let expected = format!(
             "{}\n",
@@ -4349,6 +4884,9 @@ mod tests {
                     "frame_type": "botster_hub_client::DaemonEntityFrame",
                     "bounded_delivery": true,
                     "explicit_snapshot_resync": true,
+                    "fixture_path": "botster_hub_test_support::session_lifecycle_subscription_conformance_scenario",
+                    "json_helper": "botster_hub_test_support::session_lifecycle_subscription_conformance_fixture_json",
+                    "runtime_runner": "botster_hub_test_support::run_session_lifecycle_subscription_conformance",
                     "runtime_regression": "session_entity_subscription_pushes_snapshot_ordered_deltas_and_fresh_reconnect",
                 },
                 "resize": {

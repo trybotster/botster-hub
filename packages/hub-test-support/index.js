@@ -59,6 +59,14 @@ export function readFirstPartyClientSupportMatrix() {
   return readJson(metadata.first_party_client_support_matrix.artifact_path);
 }
 
+export function sessionLifecycleSubscriptionConformanceFixturePath() {
+  return packagePath(metadata.session_lifecycle_subscription_conformance_fixture.artifact_path);
+}
+
+export function readSessionLifecycleSubscriptionConformanceFixture() {
+  return readJson(metadata.session_lifecycle_subscription_conformance_fixture.artifact_path);
+}
+
 export function lateAttachHistoryConformanceFixturePath() {
   return packagePath(metadata.late_attach_history_conformance_fixture.artifact_path);
 }
@@ -116,6 +124,7 @@ export function verifyPackageAssets() {
 
   for (const asset of [
     metadata.first_party_client_support_matrix,
+    metadata.session_lifecycle_subscription_conformance_fixture,
     metadata.late_attach_history_conformance_fixture,
     metadata.local_webrtc_response_chunk_conformance_fixture,
     metadata.mode_flags_conformance_fixture,

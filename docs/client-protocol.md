@@ -26,10 +26,10 @@ Downstream `botster-web` drift checks should point
 the hub checkout was not found is not protocol evidence.
 
 Node-based first-party clients can consume the same checked artifact without a
-sibling hub checkout through the corrected package once version 0.1.7 is published:
+sibling hub checkout through the public package:
 
 ```sh
-npm install --save-dev @trybotster/hub-test-support@0.1.7
+npm install --save-dev @trybotster/hub-test-support@0.1.9
 ```
 
 ```js
@@ -40,6 +40,7 @@ import {
   readDaemonProtocolTypescript,
   readFirstPartyClientSupportMatrix,
   readLateAttachHistoryConformanceFixture,
+  readSessionLifecycleSubscriptionConformanceFixture,
 } from "@trybotster/hub-test-support";
 
 const protocolSource = readDaemonProtocolTypescript();
@@ -48,6 +49,7 @@ const applicationPrimitivesPath = materializeApplicationPrimitivesFixture(tempDi
 const applicationSurfaceId = metadata.application_primitives.surface_id;
 const supportMatrix = readFirstPartyClientSupportMatrix();
 const lateAttachFixture = readLateAttachHistoryConformanceFixture();
+const sessionLifecycleFixture = readSessionLifecycleSubscriptionConformanceFixture();
 
 console.log(
   metadata.protocol,
@@ -57,6 +59,7 @@ console.log(
   applicationSurfaceId,
   supportMatrix.required_features,
   lateAttachFixture.history_then_live,
+  sessionLifecycleFixture.normalized_frames,
 );
 ```
 
@@ -65,9 +68,9 @@ when checked assets are stale. The metadata's protocol version and conformance
 fixture revision are emitted by the Rust `botster-hub-test-support` asset
 generator instead of being maintained independently in JavaScript.
 
-After version 0.1.7 is available from the public npm registry, npm-based client
+For version 0.1.9 from the public npm registry, npm-based client
 repos such as botster-web should use the exact dependency spec
-`"@trybotster/hub-test-support": "0.1.7"` in `devDependencies` and let npm write
+`"@trybotster/hub-test-support": "0.1.9"` in `devDependencies` and let npm write
 the corresponding package-lock entry from the public npm registry. The package
 is public, so registry install does not require a scoped `.npmrc` entry or CI
 auth token. After updating the lockfile, run the client smoke that imports the
@@ -173,6 +176,19 @@ replayed.
 ordered remove delta. `ListSessions` remains available for operator queries,
 but normal client reconciliation must not poll it or maintain a list-refresh
 fallback beside the entity stream.
+
+The shared revision-16 contract is published by
+`@trybotster/hub-test-support@0.1.9` as
+`session-lifecycle-subscription-conformance-fixture.json` and through
+`readSessionLifecycleSubscriptionConformanceFixture()`. The fixture serializes
+the public `DaemonEntityFrame` DTOs and normalizes only timestamps and sequence
+values. Rust clients can run
+`botster_hub_test_support::run_session_lifecycle_subscription_conformance`
+against an `IsolatedHub`; it proves snapshot, ordered upsert/patch/remove,
+independent concurrent delivery, socket-loss cleanup, and a fresh reconnect
+snapshot through the real HubDaemon/CoreDaemon/session-worker topology. Web and
+TUI consumers must use these same semantics and must not add polling or
+list-refresh fallbacks.
 
 ## Spawn Targets
 
@@ -759,7 +775,7 @@ assert the same event ordering and classification. `AttachState` and
 
 Node clients can consume that exact JSON through
 `readLateAttachHistoryConformanceFixture()` from
-`@trybotster/hub-test-support@0.1.7`. Version 0.1.6 / conformance revision 13
+`@trybotster/hub-test-support@0.1.9`. Version 0.1.6 / conformance revision 13
 uses JSON number arrays for opaque history and is superseded because that shape
 unnecessarily expands large Ghostty snapshots on the bounded WebRTC response
 path. Version 0.1.5 / revision 12 still exposes lossy string history. Neither is

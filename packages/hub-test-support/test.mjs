@@ -21,11 +21,13 @@ import {
   readLateAttachHistoryConformanceFixture,
   readLocalWebrtcResponseChunkConformanceFixture,
   readModeFlagsConformanceFixture,
+  readSessionLifecycleSubscriptionConformanceFixture,
+  sessionLifecycleSubscriptionConformanceFixturePath,
   verifyPackageAssets,
 } from "@trybotster/hub-test-support";
 
 assert.equal(metadata.package_name, "@trybotster/hub-test-support");
-assert.equal(metadata.package_version, "0.1.8");
+assert.equal(metadata.package_version, "0.1.9");
 assert.equal(metadata.protocol, "botster-hub-daemon-v1");
 assert.equal(metadata.protocol_version, 2);
 assert.equal(metadata.conformance_fixture_revision, 16);
@@ -62,7 +64,17 @@ assert.match(protocol, /export interface DaemonReadScreen/);
 assert.match(protocol, /export interface DaemonModeFlags/);
 assert.match(protocol, /export interface DaemonCaptureSnapshot/);
 assert.match(protocol, /export interface DaemonLocalWebrtcResponseChunk/);
+assert.match(protocol, /subscribe_entities/);
+assert.match(protocol, /entity_snapshot/);
+assert.match(protocol, /entity_upsert/);
+assert.match(protocol, /entity_patch/);
+assert.match(protocol, /entity_remove/);
+assert.match(protocol, /resync_reason/);
 
+assert.equal(
+  fileURLToPath(import.meta.resolve("@trybotster/hub-test-support/session-lifecycle-subscription-conformance-fixture")),
+  sessionLifecycleSubscriptionConformanceFixturePath(),
+);
 assert.equal(
   fileURLToPath(import.meta.resolve("@trybotster/hub-test-support/first-party-client-support-matrix")),
   firstPartyClientSupportMatrixPath(),
@@ -81,13 +93,46 @@ assert.equal(
 );
 
 const supportMatrix = readFirstPartyClientSupportMatrix();
+const sessionLifecycleFixture = readSessionLifecycleSubscriptionConformanceFixture();
 assert.equal(supportMatrix.late_attach_history.supported, true);
 assert.equal(supportMatrix.required_features.includes("terminal_readback"), true);
 assert.equal(supportMatrix.required_features.includes("session_entity_subscriptions"), true);
 assert.equal(supportMatrix.session_entities.supported, true);
 assert.equal(supportMatrix.session_entities.bounded_delivery, true);
 assert.equal(supportMatrix.session_entities.explicit_snapshot_resync, true);
+assert.equal(
+  supportMatrix.session_entities.runtime_runner,
+  "botster_hub_test_support::run_session_lifecycle_subscription_conformance",
+);
+assert.equal(
+  supportMatrix.session_entities.json_helper,
+  "botster_hub_test_support::session_lifecycle_subscription_conformance_fixture_json",
+);
 assert.equal(supportMatrix.supported_features.includes("terminal_readback"), true);
+
+assert.equal(sessionLifecycleFixture.conformance_fixture_revision, 16);
+assert.equal(sessionLifecycleFixture.entity_type, "session");
+assert.deepEqual(
+  sessionLifecycleFixture.normalized_frames.map((frame) => frame.type),
+  ["entity_snapshot", "entity_upsert", "entity_patch", "entity_patch", "entity_remove"],
+);
+assert.deepEqual(
+  sessionLifecycleFixture.normalized_frames.map((frame) => frame.snapshot_seq),
+  [0, 1, 2, 3, 4],
+);
+assert.equal(
+  sessionLifecycleFixture.fresh_subscription.requires_authoritative_snapshot_before_deltas,
+  true,
+);
+assert.equal(sessionLifecycleFixture.fresh_subscription.prior_generation_frames_discarded, true);
+assert.equal(sessionLifecycleFixture.overflow.resync_reason, "subscriber_overflow");
+assert.equal(sessionLifecycleFixture.overflow.resync_snapshot.type, "entity_snapshot");
+assert.equal(
+  sessionLifecycleFixture.overflow.resync_snapshot.resync_reason,
+  "subscriber_overflow",
+);
+assert.equal(sessionLifecycleFixture.overflow.snapshot_precedes_later_deltas, true);
+assert.equal(sessionLifecycleFixture.overflow.failed_snapshot_delivery_closes_subscription, true);
 
 const lateAttachFixture = readLateAttachHistoryConformanceFixture();
 const chunkFixture = readLocalWebrtcResponseChunkConformanceFixture();
