@@ -29,7 +29,7 @@ Node-based first-party clients can consume the same checked artifact without a
 sibling hub checkout through the public package:
 
 ```sh
-npm install --save-dev @trybotster/hub-test-support@0.1.9
+npm install --save-dev @trybotster/hub-test-support@0.1.10
 ```
 
 ```js
@@ -68,9 +68,9 @@ when checked assets are stale. The metadata's protocol version and conformance
 fixture revision are emitted by the Rust `botster-hub-test-support` asset
 generator instead of being maintained independently in JavaScript.
 
-For version 0.1.9 from the public npm registry, npm-based client
+For version 0.1.10 from the public npm registry, npm-based client
 repos such as botster-web should use the exact dependency spec
-`"@trybotster/hub-test-support": "0.1.9"` in `devDependencies` and let npm write
+`"@trybotster/hub-test-support": "0.1.10"` in `devDependencies` and let npm write
 the corresponding package-lock entry from the public npm registry. The package
 is public, so registry install does not require a scoped `.npmrc` entry or CI
 auth token. After updating the lockfile, run the client smoke that imports the
@@ -178,7 +178,7 @@ but normal client reconciliation must not poll it or maintain a list-refresh
 fallback beside the entity stream.
 
 The shared revision-16 contract is published by
-`@trybotster/hub-test-support@0.1.9` as
+`@trybotster/hub-test-support@0.1.10` as
 `session-lifecycle-subscription-conformance-fixture.json` and through
 `readSessionLifecycleSubscriptionConformanceFixture()`. The fixture serializes
 the public `DaemonEntityFrame` DTOs and normalizes only timestamps and sequence
@@ -452,21 +452,27 @@ grant secret is the admission boundary.
 Accepted client-to-hub DataChannel messages remain JSON serialized
 `botster_core::AesGcmEnvelope` values whose plaintext is the existing daemon
 `DaemonRequest`. Hub-to-client messages use only
-`DaemonLocalWebrtcResponseChunk`; the former direct `AesGcmEnvelope` response
+`DaemonLocalWebrtcDeliveryChunk`; the former response-only chunk and direct
+`AesGcmEnvelope` response
 frame is intentionally deleted. This is a coordinated breaking upgrade, not a
 negotiated feature or compatibility path.
 
-The hub serializes and AES-GCM encrypts each `DaemonResponse` once, then slices
-the serialized encrypted envelope into ordered chunks. Every chunk carries
-protocol `version`, a hub-minted `message_id`, zero-based `chunk_index`,
+The hub serializes and AES-GCM encrypts each `DaemonResponse` or
+`DaemonEntityFrame` once, then slices the serialized encrypted envelope into
+ordered chunks. Every chunk carries protocol `version`, `delivery_kind`, a
+hub-minted `message_id`, zero-based `chunk_index`,
 `chunk_count`, declared `total_bytes`, and a `payload` slice. Small responses
 use the identical contract with one chunk. Serialized frames are always below
-64 KiB and the declared encrypted response is capped at 16 MiB. An over-budget
+64 KiB and the declared encrypted delivery is capped at 16 MiB. An over-budget
 response is replaced before any of its bytes are sent by one bounded encrypted
 operator-error response.
 
 The ordered channel and one-response-at-a-time handler preserve the existing
-request FIFO; `message_id` correlates all chunks of the current response. The
+request FIFO; `message_id` correlates all chunks of the current logical delivery.
+Response and entity chunks never interleave within a logical message. Entity
+subscribe is registered through the daemon owner's bounded session registry;
+the correlated `entity_subscribed` response completes before its queued
+authoritative snapshot is eligible for delivery. The
 sender applies fixed DataChannel watermarks (128 KiB high, 64 KiB low), queues
 at most 16 inbound request payloads consumed while a response drains, and
 represents each excess request with one ordered encrypted operator-error
@@ -482,9 +488,11 @@ Invalid or unauthenticated request frames are not answered with a plaintext
 fallback. Clients must validate version, identity, contiguous indices, counts,
 declared bytes, frame bounds, and the 16 MiB assembly bound before concatenating
 payloads and decrypting the complete envelope. The checked
-`local-webrtc-response-chunk-conformance-fixture.json` artifact covers the
-single-chunk, multi-chunk, over-budget-error, and deterministic greater-than-256
-KiB reassembly shapes.
+`local-webrtc-delivery-chunk-conformance-fixture.json` artifact covers response
+and entity kinds, single-chunk, multi-chunk, over-budget-error, and deterministic
+greater-than-256 KiB reassembly shapes. Peer teardown unsubscribes every
+peer-owned entity id; a replacement peer uses a fresh grant, subscription id,
+and authoritative snapshot. There is no SSE or polling fallback.
 The generated TypeScript artifact mirrors the browser-visible envelope as
 `AesGcmEnvelope` with `nonce`, `ciphertext`, and `version` fields while keeping
 the authoritative core Rust struct out of the `botster-hub-client` dependency
@@ -775,7 +783,7 @@ assert the same event ordering and classification. `AttachState` and
 
 Node clients can consume that exact JSON through
 `readLateAttachHistoryConformanceFixture()` from
-`@trybotster/hub-test-support@0.1.9`. Version 0.1.6 / conformance revision 13
+`@trybotster/hub-test-support@0.1.10`. Version 0.1.6 / conformance revision 13
 uses JSON number arrays for opaque history and is superseded because that shape
 unnecessarily expands large Ghostty snapshots on the bounded WebRTC response
 path. Version 0.1.5 / revision 12 still exposes lossy string history. Neither is

@@ -7,7 +7,7 @@ The package is a generated wrapper over `botster-hub-test-support` and
 `first-party-client-support-matrix.json`,
 `session-lifecycle-subscription-conformance-fixture.json`,
 `late-attach-history-conformance-fixture.json`,
-`local-webrtc-response-chunk-conformance-fixture.json`,
+`local-webrtc-delivery-chunk-conformance-fixture.json`,
 `mode-flags-conformance-fixture.json`,
 `fixtures/plugin-contract-matrix`, or `metadata.json` by hand; run:
 
@@ -18,7 +18,7 @@ node packages/hub-test-support/scripts/sync-assets.mjs
 ## Usage
 
 ```sh
-npm install --save-dev @trybotster/hub-test-support@0.1.9
+npm install --save-dev @trybotster/hub-test-support@0.1.10
 ```
 
 ```js
@@ -29,7 +29,7 @@ import {
   readDaemonProtocolTypescript,
   readFirstPartyClientSupportMatrix,
   readLateAttachHistoryConformanceFixture,
-  readLocalWebrtcResponseChunkConformanceFixture,
+  readLocalWebrtcDeliveryChunkConformanceFixture,
   readModeFlagsConformanceFixture,
   readSessionLifecycleSubscriptionConformanceFixture,
 } from "@trybotster/hub-test-support";
@@ -39,7 +39,7 @@ const fixturePath = materializePluginContractMatrixFixture(tempDirectory);
 const applicationPrimitivesPath = materializeApplicationPrimitivesFixture(tempDirectory);
 const supportMatrix = readFirstPartyClientSupportMatrix();
 const lateAttachFixture = readLateAttachHistoryConformanceFixture();
-const localWebrtcChunkFixture = readLocalWebrtcResponseChunkConformanceFixture();
+const localWebrtcChunkFixture = readLocalWebrtcDeliveryChunkConformanceFixture();
 const modeFlagsFixture = readModeFlagsConformanceFixture();
 const sessionLifecycleFixture = readSessionLifecycleSubscriptionConformanceFixture();
 const applicationSurfaceId = metadata.application_primitives.surface_id;
@@ -65,16 +65,16 @@ Use this exact package spec in npm-based client repos:
 ```json
 {
   "devDependencies": {
-    "@trybotster/hub-test-support": "0.1.9"
+    "@trybotster/hub-test-support": "0.1.10"
   }
 }
 ```
 
-After `@trybotster/hub-test-support@0.1.9` is published to the public npm
+After `@trybotster/hub-test-support@0.1.10` is published to the public npm
 registry, no scoped `.npmrc` entry or CI auth token is required for install.
 
 The support matrix is generated from the Rust compatibility descriptors. In
-0.1.9, `terminal_readback` appears in both `supported_features` and
+0.1.10, `terminal_readback` appears in both `supported_features` and
 `required_features`; downstream compatibility checks must implement it rather
 than treating it as optional. The late-attach fixture is generated from the
 Rust serde scenario and preserves `attaching -> optional initial state ->
@@ -86,7 +86,8 @@ Only `read_screen_text` is renderable restored content; `snapshot` and
 version 0.1.5 / revision 12 exposes lossy string history. Neither is current
 binary-history contract authority.
 
-Version 0.1.9 publishes protocol version 2 / conformance revision 16 and the
+Version 0.1.10 publishes protocol version 2 / conformance revision 17, the
+authenticated local-WebRTC delivery-kind fixture, and the
 source-derived session lifecycle subscription fixture. Its normalized public
 `DaemonEntityFrame` sequence is authoritative snapshot, spawn upsert,
 lifecycle patches, and remove. A fresh connection discards prior-generation

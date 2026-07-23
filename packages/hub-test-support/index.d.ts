@@ -30,8 +30,8 @@ export interface HubTestSupportMetadata {
     source_artifact_path: string;
     sha256: string;
   };
-  local_webrtc_response_chunk_conformance_fixture: {
-    artifact_path: "local-webrtc-response-chunk-conformance-fixture.json";
+  local_webrtc_delivery_chunk_conformance_fixture: {
+    artifact_path: "local-webrtc-delivery-chunk-conformance-fixture.json";
     source_artifact_path: string;
     sha256: string;
   };
@@ -67,8 +67,8 @@ export function sessionLifecycleSubscriptionConformanceFixturePath(): string;
 export function readSessionLifecycleSubscriptionConformanceFixture(): Record<string, unknown>;
 export function lateAttachHistoryConformanceFixturePath(): string;
 export function readLateAttachHistoryConformanceFixture(): Record<string, unknown>;
-export function localWebrtcResponseChunkConformanceFixturePath(): string;
-export function readLocalWebrtcResponseChunkConformanceFixture(): Record<string, unknown>;
+export function localWebrtcDeliveryChunkConformanceFixturePath(): string;
+export function readLocalWebrtcDeliveryChunkConformanceFixture(): Record<string, unknown>;
 export function modeFlagsConformanceFixturePath(): string;
 export function readModeFlagsConformanceFixture(): Record<string, unknown>;
 export function pluginContractMatrixFixturePath(): string;

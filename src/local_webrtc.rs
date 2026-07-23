@@ -1,6 +1,6 @@
 //! Local WebRTC signaling and DataChannel adapter for installed browser packages.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
@@ -16,13 +16,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use botster_core::{AesGcmEnvelope, AesGcmKey, decrypt_aes_gcm, encrypt_aes_gcm};
 use botster_hub_client::{
-    DaemonDiagnostic, DaemonLocalWebrtcAnswer, DaemonLocalWebrtcBootstrap,
-    DaemonLocalWebrtcResponseChunk, DaemonRequest, DaemonResponse, LOCAL_WEBRTC_MAX_FRAME_BYTES,
-    LOCAL_WEBRTC_MAX_RESPONSE_BYTES, LOCAL_WEBRTC_RESPONSE_CHUNK_VERSION,
+    DaemonDiagnostic, DaemonEntityFrame, DaemonLocalWebrtcAnswer, DaemonLocalWebrtcBootstrap,
+    DaemonLocalWebrtcDeliveryChunk, DaemonLocalWebrtcDeliveryKind, DaemonRequest, DaemonResponse,
+    LOCAL_WEBRTC_DELIVERY_CHUNK_VERSION, LOCAL_WEBRTC_MAX_DELIVERY_BYTES,
+    LOCAL_WEBRTC_MAX_FRAME_BYTES,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::watch;
+use tokio::sync::{mpsc as tokio_mpsc, watch};
 use webrtc::data_channel::{DataChannel, DataChannelEvent};
 use webrtc::peer_connection::{
     PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler, RTCIceGatheringState,
@@ -30,7 +31,9 @@ use webrtc::peer_connection::{
 };
 use webrtc::runtime::{Runtime, Sender as AsyncSender, channel, default_runtime, timeout};
 
-use crate::daemon_transport::ControlMessage;
+use crate::daemon_transport::{
+    ControlMessage, ENTITY_SUBSCRIPTION_QUEUE_CAPACITY, EntityFrameSender,
+};
 
 const GRANT_TTL_SECONDS: u64 = 120;
 const WEBRTC_SIGNAL_OPERATION: &str = "local_webrtc_signal";
@@ -295,6 +298,7 @@ struct LocalWebrtcPeerState {
     grant_id: String,
     runtime_tx: Sender<ControlMessage>,
     attached_subscriptions: Mutex<Vec<LocalWebrtcAttachedSubscription>>,
+    entity_subscription_ids: Mutex<BTreeSet<String>>,
     terminal_state: Mutex<LocalWebrtcTerminalState>,
     peer_terminal_tx: watch::Sender<Option<LocalWebrtcTerminalCause>>,
     peer_terminal_published: AtomicBool,
@@ -303,7 +307,13 @@ struct LocalWebrtcPeerState {
 
 enum PendingLocalWebrtcRequest {
     Request(Box<DaemonRequest>),
+    EntityFrame(DaemonEntityFrame),
     QueueOverflow(usize),
+}
+
+enum LocalWebrtcInbound {
+    Channel(Result<Option<DataChannelEvent>, LocalWebrtcTerminalCause>),
+    Entity(DaemonEntityFrame),
 }
 
 #[derive(Debug, Default)]
@@ -456,6 +466,7 @@ impl LocalWebrtcPeerState {
             grant_id,
             runtime_tx,
             attached_subscriptions: Mutex::new(Vec::new()),
+            entity_subscription_ids: Mutex::new(BTreeSet::new()),
             terminal_state: Mutex::new(LocalWebrtcTerminalState::default()),
             peer_terminal_tx,
             peer_terminal_published: AtomicBool::new(false),
@@ -481,6 +492,27 @@ impl LocalWebrtcPeerState {
                 attached_subscriptions.retain(|attached| attached != &subscription);
             }
         }
+    }
+
+    fn add_entity_subscription(&self, subscription_id: String) {
+        self.entity_subscription_ids
+            .lock()
+            .expect("local WebRTC entity subscription mutex")
+            .insert(subscription_id);
+    }
+
+    fn remove_entity_subscription(&self, subscription_id: &str) {
+        self.entity_subscription_ids
+            .lock()
+            .expect("local WebRTC entity subscription mutex")
+            .remove(subscription_id);
+    }
+
+    fn owns_entity_subscription(&self, subscription_id: &str) -> bool {
+        self.entity_subscription_ids
+            .lock()
+            .expect("local WebRTC entity subscription mutex")
+            .contains(subscription_id)
     }
 
     fn begin_request(&self, request: &DaemonRequest) {
@@ -604,9 +636,17 @@ impl LocalWebrtcPeerState {
             .lock()
             .expect("local WebRTC peer subscription mutex")
             .clone();
+        let entity_subscription_ids = self
+            .entity_subscription_ids
+            .lock()
+            .expect("local WebRTC entity subscription mutex")
+            .iter()
+            .cloned()
+            .collect();
         let _ = self.runtime_tx.send(ControlMessage::LocalWebrtcPeerClosed {
             grant_id: self.grant_id.clone(),
             attached_subscriptions,
+            entity_subscription_ids,
             terminal_record,
         });
     }
@@ -666,6 +706,8 @@ impl PeerConnectionEventHandler for LocalWebrtcHandler {
         let peer_state = self.peer_state.clone();
         let runtime_tx = peer_state.runtime_tx.clone();
         let stream_key = self.stream_key.clone();
+        let (entity_frame_tx, entity_frame_rx) =
+            tokio_mpsc::channel(ENTITY_SUBSCRIPTION_QUEUE_CAPACITY);
         self.runtime.spawn(Box::pin(async move {
             if let Err(error) = data_channel
                 .local_set_buffered_amount_low_threshold(LOCAL_WEBRTC_BUFFERED_AMOUNT_LOW)
@@ -691,6 +733,8 @@ impl PeerConnectionEventHandler for LocalWebrtcHandler {
                 &stream_key,
                 peer_state.as_ref(),
                 &runtime_tx,
+                entity_frame_tx,
+                entity_frame_rx,
             )
             .await;
         }));
@@ -723,6 +767,8 @@ async fn run_data_channel<D>(
     stream_key: &AesGcmKey,
     peer_state: &LocalWebrtcPeerState,
     runtime_tx: &Sender<ControlMessage>,
+    entity_frame_tx: tokio_mpsc::Sender<DaemonEntityFrame>,
+    mut entity_frame_rx: tokio_mpsc::Receiver<DaemonEntityFrame>,
 ) -> Option<LocalWebrtcSendFailure>
 where
     D: LocalWebrtcDataChannel + ?Sized,
@@ -737,12 +783,28 @@ where
         let pending = if let Some(request) = pop_pending_request(&mut pending_requests) {
             request
         } else {
-            match poll_data_channel_or_peer_terminal(data_channel, &mut peer_terminal_rx).await {
-                Err(cause) => {
+            let inbound = tokio::select! {
+                channel = poll_data_channel_or_peer_terminal(data_channel, &mut peer_terminal_rx) => {
+                    LocalWebrtcInbound::Channel(channel)
+                }
+                frame = entity_frame_rx.recv() => {
+                    LocalWebrtcInbound::Entity(
+                        frame.expect("local WebRTC peer owns its entity subscription sender")
+                    )
+                }
+            };
+            match inbound {
+                LocalWebrtcInbound::Entity(frame) => {
+                    if !peer_state.owns_entity_subscription(entity_frame_subscription_id(&frame)) {
+                        continue;
+                    }
+                    PendingLocalWebrtcRequest::EntityFrame(frame)
+                }
+                LocalWebrtcInbound::Channel(Err(cause)) => {
                     terminal_cause = cause;
                     break;
                 }
-                Ok(Some(DataChannelEvent::OnMessage(message))) => {
+                LocalWebrtcInbound::Channel(Ok(Some(DataChannelEvent::OnMessage(message)))) => {
                     let Some(request) = decrypt_daemon_request(stream_key, message.data.as_ref())
                     else {
                         terminal_cause = LocalWebrtcTerminalCause::InvalidEncryptedRequest;
@@ -750,22 +812,22 @@ where
                     };
                     PendingLocalWebrtcRequest::Request(Box::new(request))
                 }
-                Ok(Some(DataChannelEvent::OnClose)) => {
+                LocalWebrtcInbound::Channel(Ok(Some(DataChannelEvent::OnClose))) => {
                     terminal_cause = LocalWebrtcTerminalCause::ChannelClosed;
                     break;
                 }
-                Ok(Some(DataChannelEvent::OnError)) => {
+                LocalWebrtcInbound::Channel(Ok(Some(DataChannelEvent::OnError))) => {
                     terminal_cause = LocalWebrtcTerminalCause::ChannelError;
                     break;
                 }
-                Ok(None) => {
+                LocalWebrtcInbound::Channel(Ok(None)) => {
                     terminal_cause = LocalWebrtcTerminalCause::PollEnded;
                     break;
                 }
-                Ok(Some(
+                LocalWebrtcInbound::Channel(Ok(Some(
                     event @ (DataChannelEvent::OnBufferedAmountHigh
                     | DataChannelEvent::OnBufferedAmountLow),
-                )) => {
+                ))) => {
                     let _ = apply_data_channel_event(
                         event,
                         stream_key,
@@ -774,12 +836,39 @@ where
                     );
                     continue;
                 }
-                Ok(Some(_)) => continue,
+                LocalWebrtcInbound::Channel(Ok(Some(_))) => continue,
             }
         };
 
+        if let PendingLocalWebrtcRequest::EntityFrame(frame) = &pending {
+            peer_state.begin_operation("entity_delivery");
+            let Ok(frames) = framed_daemon_entity_frame(stream_key, frame) else {
+                terminal_cause = LocalWebrtcTerminalCause::ResponseFraming;
+                break;
+            };
+            match send_response_frames(
+                data_channel,
+                stream_key,
+                &frames,
+                &mut pending_requests,
+                &mut flow_control,
+                peer_state,
+            )
+            .await
+            {
+                Ok(()) => continue,
+                Err(failure) => {
+                    eprintln!("{failure}");
+                    terminal_cause = failure.cause;
+                    send_failure = Some(failure);
+                    break;
+                }
+            }
+        }
+
         let request = match pending {
             PendingLocalWebrtcRequest::Request(request) => request,
+            PendingLocalWebrtcRequest::EntityFrame(_) => unreachable!("entity frame handled above"),
             PendingLocalWebrtcRequest::QueueOverflow(_) => {
                 peer_state.begin_overflow_response();
                 let response = queued_request_overflow_response();
@@ -818,6 +907,15 @@ where
             break;
         }
         let subscription_change = LocalWebrtcAttachedSubscriptionChange::from_request(&request);
+        let entity_subscription_change = match request.as_ref() {
+            DaemonRequest::SubscribeEntities {
+                subscription_id, ..
+            } => Some((true, subscription_id.clone())),
+            DaemonRequest::UnsubscribeEntities { subscription_id } => {
+                Some((false, subscription_id.clone()))
+            }
+            _ => None,
+        };
         let (reply_tx, reply_rx) = mpsc::channel();
         let (response_delivery_tx, response_delivery_rx) =
             if matches!(*request, DaemonRequest::DaemonShutdown) {
@@ -826,14 +924,29 @@ where
             } else {
                 (None, None)
             };
-        if runtime_tx
-            .send(ControlMessage::Request {
-                request,
+        let request_sent = match *request {
+            DaemonRequest::SubscribeEntities {
+                entity_type,
+                subscription_id,
+            } => runtime_tx.send(ControlMessage::SubscribeEntities {
+                entity_type,
+                subscription_id,
+                frame_tx: EntityFrameSender::Async(entity_frame_tx.clone()),
+                reply_tx,
+            }),
+            DaemonRequest::UnsubscribeEntities { subscription_id } => {
+                runtime_tx.send(ControlMessage::UnsubscribeEntities {
+                    subscription_id,
+                    reply_tx: Some(reply_tx),
+                })
+            }
+            request => runtime_tx.send(ControlMessage::Request {
+                request: Box::new(request),
                 reply_tx,
                 response_delivery_rx,
-            })
-            .is_err()
-        {
+            }),
+        };
+        if request_sent.is_err() {
             terminal_cause = LocalWebrtcTerminalCause::RuntimeQueueClosed;
             break;
         }
@@ -852,6 +965,17 @@ where
                 ))
             });
         peer_state.apply_subscription_change(subscription_change);
+        if let Some((subscribed, subscription_id)) = entity_subscription_change {
+            if subscribed
+                && response.kind == botster_hub_client::DaemonResponseKind::EntitySubscribed
+            {
+                peer_state.add_entity_subscription(subscription_id);
+            } else if !subscribed
+                && response.kind == botster_hub_client::DaemonResponseKind::EntityUnsubscribed
+            {
+                peer_state.remove_entity_subscription(&subscription_id);
+            }
+        }
         let Ok(frames) = framed_daemon_response(stream_key, &response) else {
             if let Some(response_delivery_tx) = response_delivery_tx {
                 let _ = response_delivery_tx.send(());
@@ -920,7 +1044,7 @@ where
     let mut peer_terminal_rx = peer_state.subscribe_peer_terminal();
     let total_chunks = frames.len();
     let message_id = frames.first().and_then(|frame| {
-        serde_json::from_str::<DaemonLocalWebrtcResponseChunk>(frame)
+        serde_json::from_str::<DaemonLocalWebrtcDeliveryChunk>(frame)
             .ok()
             .map(|chunk| chunk.message_id)
     });
@@ -1097,19 +1221,30 @@ fn encrypt_daemon_response(
     serde_json::to_string(&envelope).map_err(|error| LocalWebrtcError::Webrtc(error.to_string()))
 }
 
+fn encrypt_daemon_entity_frame(
+    key: &AesGcmKey,
+    frame: &DaemonEntityFrame,
+) -> LocalWebrtcResult<String> {
+    let plaintext =
+        serde_json::to_vec(frame).map_err(|error| LocalWebrtcError::Webrtc(error.to_string()))?;
+    let envelope = encrypt_aes_gcm(key, &plaintext, 1)
+        .map_err(|error| LocalWebrtcError::Webrtc(error.to_string()))?;
+    serde_json::to_string(&envelope).map_err(|error| LocalWebrtcError::Webrtc(error.to_string()))
+}
+
 fn framed_daemon_response(
     key: &AesGcmKey,
     response: &DaemonResponse,
 ) -> LocalWebrtcResult<Vec<String>> {
     let encrypted = encrypt_daemon_response(key, response)?;
-    let encrypted = if encrypted.len() > LOCAL_WEBRTC_MAX_RESPONSE_BYTES {
+    let encrypted = if encrypted.len() > LOCAL_WEBRTC_MAX_DELIVERY_BYTES {
         encrypt_daemon_response(
             key,
             &response_with_diagnostic(DaemonDiagnostic::action_failure(
                 "local_webrtc_data_channel",
                 format!(
                     "encrypted daemon response exceeded {} byte limit",
-                    LOCAL_WEBRTC_MAX_RESPONSE_BYTES
+                    LOCAL_WEBRTC_MAX_DELIVERY_BYTES
                 ),
             )),
         )?
@@ -1117,16 +1252,39 @@ fn framed_daemon_response(
         encrypted
     };
     let message_id = random_token("response")?;
-    frame_encrypted_daemon_response(&message_id, &encrypted)
+    frame_encrypted_daemon_delivery(
+        DaemonLocalWebrtcDeliveryKind::DaemonResponse,
+        &message_id,
+        &encrypted,
+    )
 }
 
-fn frame_encrypted_daemon_response(
+fn framed_daemon_entity_frame(
+    key: &AesGcmKey,
+    frame: &DaemonEntityFrame,
+) -> LocalWebrtcResult<Vec<String>> {
+    let encrypted = encrypt_daemon_entity_frame(key, frame)?;
+    if encrypted.len() > LOCAL_WEBRTC_MAX_DELIVERY_BYTES {
+        return Err(LocalWebrtcError::Webrtc(format!(
+            "encrypted daemon entity frame exceeded {LOCAL_WEBRTC_MAX_DELIVERY_BYTES} byte limit"
+        )));
+    }
+    let message_id = random_token("entity")?;
+    frame_encrypted_daemon_delivery(
+        DaemonLocalWebrtcDeliveryKind::DaemonEntityFrame,
+        &message_id,
+        &encrypted,
+    )
+}
+
+fn frame_encrypted_daemon_delivery(
+    delivery_kind: DaemonLocalWebrtcDeliveryKind,
     message_id: &str,
     encrypted: &str,
 ) -> LocalWebrtcResult<Vec<String>> {
-    if encrypted.len() > LOCAL_WEBRTC_MAX_RESPONSE_BYTES {
+    if encrypted.len() > LOCAL_WEBRTC_MAX_DELIVERY_BYTES {
         return Err(LocalWebrtcError::Webrtc(format!(
-            "encrypted daemon response exceeded {LOCAL_WEBRTC_MAX_RESPONSE_BYTES} byte limit"
+            "encrypted daemon delivery exceeded {LOCAL_WEBRTC_MAX_DELIVERY_BYTES} byte limit"
         )));
     }
     let total_bytes = u32::try_from(encrypted.len())
@@ -1146,8 +1304,9 @@ fn frame_encrypted_daemon_response(
     {
         let payload = std::str::from_utf8(payload)
             .map_err(|error| LocalWebrtcError::Webrtc(error.to_string()))?;
-        let frame = DaemonLocalWebrtcResponseChunk {
-            version: LOCAL_WEBRTC_RESPONSE_CHUNK_VERSION,
+        let frame = DaemonLocalWebrtcDeliveryChunk {
+            version: LOCAL_WEBRTC_DELIVERY_CHUNK_VERSION,
+            delivery_kind,
             message_id: message_id.to_string(),
             chunk_index: u32::try_from(chunk_index).map_err(|_| {
                 LocalWebrtcError::Webrtc("response chunk index overflow".to_string())
@@ -1167,8 +1326,9 @@ fn frame_encrypted_daemon_response(
         frames.push(serialized);
     }
     if frames.is_empty() {
-        let frame = DaemonLocalWebrtcResponseChunk {
-            version: LOCAL_WEBRTC_RESPONSE_CHUNK_VERSION,
+        let frame = DaemonLocalWebrtcDeliveryChunk {
+            version: LOCAL_WEBRTC_DELIVERY_CHUNK_VERSION,
+            delivery_kind,
             message_id: message_id.to_string(),
             chunk_index: 0,
             chunk_count: 1,
@@ -1181,6 +1341,23 @@ fn frame_encrypted_daemon_response(
         );
     }
     Ok(frames)
+}
+
+fn entity_frame_subscription_id(frame: &DaemonEntityFrame) -> &str {
+    match frame {
+        DaemonEntityFrame::Snapshot {
+            subscription_id, ..
+        }
+        | DaemonEntityFrame::Upsert {
+            subscription_id, ..
+        }
+        | DaemonEntityFrame::Patch {
+            subscription_id, ..
+        }
+        | DaemonEntityFrame::Remove {
+            subscription_id, ..
+        } => subscription_id,
+    }
 }
 
 fn response_with_diagnostic(diagnostic: DaemonDiagnostic) -> DaemonResponse {
@@ -1453,9 +1630,17 @@ mod tests {
             .build()
             .unwrap();
         let runtime_sender = peer_state.runtime_tx.clone();
+        let (entity_frame_tx, entity_frame_rx) =
+            tokio_mpsc::channel(ENTITY_SUBSCRIPTION_QUEUE_CAPACITY);
         let failure = runtime.block_on(async {
-            let delivery =
-                run_data_channel(&data_channel, &key, peer_state.as_ref(), &runtime_sender);
+            let delivery = run_data_channel(
+                &data_channel,
+                &key,
+                peer_state.as_ref(),
+                &runtime_sender,
+                entity_frame_tx,
+                entity_frame_rx,
+            );
             tokio::pin!(delivery);
             if let Some(cause) = terminal_cause {
                 assert!(
@@ -1520,11 +1705,15 @@ mod tests {
             .build()
             .unwrap();
         let runtime_sender = peer_state.runtime_tx.clone();
+        let (entity_frame_tx, entity_frame_rx) =
+            tokio_mpsc::channel(ENTITY_SUBSCRIPTION_QUEUE_CAPACITY);
         let failure = runtime.block_on(run_data_channel(
             &data_channel,
             &key,
             peer_state.as_ref(),
             &runtime_sender,
+            entity_frame_tx,
+            entity_frame_rx,
         ));
         responder.join().unwrap();
         (data_channel, failure)
@@ -1536,6 +1725,127 @@ mod tests {
 
         assert!(failure.is_none());
         assert!(!data_channel.sent.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn entity_subscription_multiplexes_after_ack_and_cleans_up_with_peer() {
+        let key = AesGcmKey::from_slice(&[21; 32]).unwrap();
+        let data_channel = Arc::new(FakeDataChannel::default());
+        {
+            let mut events = data_channel.events.lock().unwrap();
+            events.push_back(encrypted_request_event(
+                &key,
+                &DaemonRequest::SubscribeEntities {
+                    entity_type: "session".to_string(),
+                    subscription_id: "entity-fixture".to_string(),
+                },
+            ));
+            events.push_back(encrypted_request_event(&key, &DaemonRequest::Status));
+        }
+        let (runtime_tx, runtime_rx) = mpsc::channel();
+        let peer_state = Arc::new(LocalWebrtcPeerState::new(
+            "grant-entity-fixture".to_string(),
+            runtime_tx,
+        ));
+        let responder_peer_state = peer_state.clone();
+        let responder_data_channel = data_channel.clone();
+        let responder = std::thread::spawn(move || {
+            let ControlMessage::SubscribeEntities {
+                entity_type,
+                subscription_id,
+                frame_tx,
+                reply_tx,
+            } = runtime_rx.recv().unwrap()
+            else {
+                panic!("expected WebRTC entity subscription registration");
+            };
+            assert_eq!(entity_type, "session");
+            assert_eq!(subscription_id, "entity-fixture");
+            let mut subscribed = response_with_diagnostic(DaemonDiagnostic::connected("fixture"));
+            subscribed.kind = botster_hub_client::DaemonResponseKind::EntitySubscribed;
+            reply_tx.send(Ok(subscribed)).unwrap();
+            frame_tx
+                .try_send(DaemonEntityFrame::Snapshot {
+                    subscription_id: "entity-fixture".to_string(),
+                    entity_type: "session".to_string(),
+                    snapshot_seq: 1,
+                    items: Vec::new(),
+                    resync_reason: None,
+                })
+                .unwrap();
+
+            let ControlMessage::Request {
+                request, reply_tx, ..
+            } = runtime_rx.recv().unwrap()
+            else {
+                panic!("expected ordinary request while entity subscription is active");
+            };
+            assert_eq!(*request, DaemonRequest::Status);
+            let mut status = response_with_diagnostic(DaemonDiagnostic::connected("fixture"));
+            status.kind = botster_hub_client::DaemonResponseKind::Status;
+            reply_tx.send(Ok(status)).unwrap();
+
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while responder_data_channel.sent.lock().unwrap().len() < 3 {
+                assert!(
+                    Instant::now() < deadline,
+                    "all multiplexed deliveries complete"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            responder_peer_state.publish_peer_terminal(LocalWebrtcTerminalCause::PeerClosed);
+            let ControlMessage::LocalWebrtcPeerClosed {
+                entity_subscription_ids,
+                ..
+            } = runtime_rx.recv().unwrap()
+            else {
+                panic!("expected peer cleanup");
+            };
+            assert_eq!(entity_subscription_ids, vec!["entity-fixture"]);
+        });
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let runtime_sender = peer_state.runtime_tx.clone();
+        let (entity_frame_tx, entity_frame_rx) =
+            tokio_mpsc::channel(ENTITY_SUBSCRIPTION_QUEUE_CAPACITY);
+        let failure = runtime.block_on(run_data_channel(
+            data_channel.as_ref(),
+            &key,
+            peer_state.as_ref(),
+            &runtime_sender,
+            entity_frame_tx,
+            entity_frame_rx,
+        ));
+        responder.join().unwrap();
+        assert!(failure.is_none());
+
+        let deliveries = data_channel
+            .sent
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|serialized| {
+                let chunk =
+                    serde_json::from_str::<DaemonLocalWebrtcDeliveryChunk>(serialized).unwrap();
+                assert_eq!(chunk.chunk_count, 1);
+                let envelope = serde_json::from_str::<AesGcmEnvelope>(&chunk.payload).unwrap();
+                let plaintext = decrypt_aes_gcm(&key, &envelope).unwrap();
+                (chunk.delivery_kind, plaintext)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            deliveries.iter().map(|(kind, _)| *kind).collect::<Vec<_>>(),
+            vec![
+                DaemonLocalWebrtcDeliveryKind::DaemonResponse,
+                DaemonLocalWebrtcDeliveryKind::DaemonResponse,
+                DaemonLocalWebrtcDeliveryKind::DaemonEntityFrame,
+            ]
+        );
+        let snapshot: DaemonEntityFrame = serde_json::from_slice(&deliveries[2].1).unwrap();
+        assert_eq!(entity_frame_subscription_id(&snapshot), "entity-fixture");
     }
 
     #[test]
@@ -1632,11 +1942,15 @@ mod tests {
             .build()
             .unwrap();
         let runtime_sender = peer_state.runtime_tx.clone();
+        let (entity_frame_tx, entity_frame_rx) =
+            tokio_mpsc::channel(ENTITY_SUBSCRIPTION_QUEUE_CAPACITY);
         let failure = runtime.block_on(run_data_channel(
             data_channel.as_ref(),
             &key,
             peer_state.as_ref(),
             &runtime_sender,
+            entity_frame_tx,
+            entity_frame_rx,
         ));
 
         responder.join().unwrap();
@@ -1673,10 +1987,19 @@ mod tests {
 
     #[test]
     fn response_frames_use_one_bounded_protocol_for_small_and_large_envelopes() {
-        let small = frame_encrypted_daemon_response("response-small", "encrypted").unwrap();
+        let small = frame_encrypted_daemon_delivery(
+            DaemonLocalWebrtcDeliveryKind::DaemonResponse,
+            "response-small",
+            "encrypted",
+        )
+        .unwrap();
         assert_eq!(small.len(), 1);
-        let small: DaemonLocalWebrtcResponseChunk = serde_json::from_str(&small[0]).unwrap();
-        assert_eq!(small.version, LOCAL_WEBRTC_RESPONSE_CHUNK_VERSION);
+        let small: DaemonLocalWebrtcDeliveryChunk = serde_json::from_str(&small[0]).unwrap();
+        assert_eq!(small.version, LOCAL_WEBRTC_DELIVERY_CHUNK_VERSION);
+        assert_eq!(
+            small.delivery_kind,
+            DaemonLocalWebrtcDeliveryKind::DaemonResponse
+        );
         assert_eq!(small.message_id, "response-small");
         assert_eq!(small.chunk_index, 0);
         assert_eq!(small.chunk_count, 1);
@@ -1684,13 +2007,18 @@ mod tests {
         assert_eq!(small.payload, "encrypted");
 
         let encrypted = "a".repeat(256 * 1024 + 1);
-        let frames = frame_encrypted_daemon_response("response-large", &encrypted).unwrap();
+        let frames = frame_encrypted_daemon_delivery(
+            DaemonLocalWebrtcDeliveryKind::DaemonResponse,
+            "response-large",
+            &encrypted,
+        )
+        .unwrap();
         assert!(frames.len() > 1);
         let chunks = frames
             .iter()
             .map(|frame| {
                 assert!(frame.len() < LOCAL_WEBRTC_MAX_FRAME_BYTES);
-                serde_json::from_str::<DaemonLocalWebrtcResponseChunk>(frame).unwrap()
+                serde_json::from_str::<DaemonLocalWebrtcDeliveryChunk>(frame).unwrap()
             })
             .collect::<Vec<_>>();
         assert!(chunks.iter().all(|chunk| {
@@ -1709,9 +2037,13 @@ mod tests {
 
     #[test]
     fn response_frames_reject_encrypted_envelopes_over_the_assembly_budget() {
-        let encrypted = "a".repeat(LOCAL_WEBRTC_MAX_RESPONSE_BYTES + 1);
-        let error = frame_encrypted_daemon_response("response-over-budget", &encrypted)
-            .expect_err("over-budget response must fail before framing");
+        let encrypted = "a".repeat(LOCAL_WEBRTC_MAX_DELIVERY_BYTES + 1);
+        let error = frame_encrypted_daemon_delivery(
+            DaemonLocalWebrtcDeliveryKind::DaemonResponse,
+            "response-over-budget",
+            &encrypted,
+        )
+        .expect_err("over-budget response must fail before framing");
         assert!(error.to_string().contains("exceeded 16777216 byte limit"));
     }
 
@@ -1719,11 +2051,11 @@ mod tests {
     fn over_budget_response_is_replaced_before_any_rejected_payload_is_framed() {
         let key = AesGcmKey::from_slice(&[7; 32]).unwrap();
         let mut response = response_with_diagnostic(DaemonDiagnostic::connected("fixture"));
-        response.plugin_tool_result = Value::String("x".repeat(LOCAL_WEBRTC_MAX_RESPONSE_BYTES));
+        response.plugin_tool_result = Value::String("x".repeat(LOCAL_WEBRTC_MAX_DELIVERY_BYTES));
 
         let frames = framed_daemon_response(&key, &response).unwrap();
         assert_eq!(frames.len(), 1);
-        let chunk: DaemonLocalWebrtcResponseChunk = serde_json::from_str(&frames[0]).unwrap();
+        let chunk: DaemonLocalWebrtcDeliveryChunk = serde_json::from_str(&frames[0]).unwrap();
         assert!(!chunk.payload.contains(&"x".repeat(1024)));
         let envelope: AesGcmEnvelope = serde_json::from_str(&chunk.payload).unwrap();
         let plaintext = decrypt_aes_gcm(&key, &envelope).unwrap();
@@ -1880,8 +2212,12 @@ mod tests {
             .unwrap()
             .push_back(DataChannelEvent::OnBufferedAmountHigh);
         let key = AesGcmKey::from_slice(&[16; 32]).unwrap();
-        let frames =
-            frame_encrypted_daemon_response("response-progress", &"a".repeat(256 * 1024)).unwrap();
+        let frames = frame_encrypted_daemon_delivery(
+            DaemonLocalWebrtcDeliveryKind::DaemonResponse,
+            "response-progress",
+            &"a".repeat(256 * 1024),
+        )
+        .unwrap();
         assert!(frames.len() > 1);
         let mut pending = VecDeque::new();
         let (runtime_tx, runtime_rx) = mpsc::channel();
@@ -2324,6 +2660,7 @@ mod tests {
                     "new-request"
                 }
                 PendingLocalWebrtcRequest::Request(_) => "status",
+                PendingLocalWebrtcRequest::EntityFrame(_) => "entity",
                 PendingLocalWebrtcRequest::QueueOverflow(_) => "overflow",
             })
             .collect::<Vec<_>>();

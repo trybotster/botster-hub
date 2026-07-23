@@ -1,0 +1,58 @@
+{
+  "maximum_delivery_bytes": 16777216,
+  "maximum_frame_bytes_exclusive": 65536,
+  "scenarios": {
+    "daemon_entity_frame": [
+      {
+        "chunk_count": 2,
+        "chunk_index": 0,
+        "delivery_kind": "daemon_entity_frame",
+        "message_id": "entity-multiple",
+        "payload": "encrypted-",
+        "total_bytes": 18,
+        "version": 2
+      },
+      {
+        "chunk_count": 2,
+        "chunk_index": 1,
+        "delivery_kind": "daemon_entity_frame",
+        "message_id": "entity-multiple",
+        "payload": "envelope",
+        "total_bytes": 18,
+        "version": 2
+      }
+    ],
+    "daemon_response": [
+      {
+        "chunk_count": 1,
+        "chunk_index": 0,
+        "delivery_kind": "daemon_response",
+        "message_id": "response-single",
+        "payload": "encrypted-envelope",
+        "total_bytes": 18,
+        "version": 2
+      }
+    ],
+    "large_generated": {
+      "chunk_payload_bytes": 12288,
+      "expected_chunk_count": 22,
+      "generator": "repeat_utf8_pattern",
+      "message_id": "response-large-generated",
+      "pattern": "botster-webrtc-chunk-fixture-",
+      "reassembled_sha256": "06d24e206edb54bed524319b1127725b46e20ea4aae5934688599abd42fa4317",
+      "total_bytes": 262145
+    },
+    "over_budget_operator_error": [
+      {
+        "chunk_count": 1,
+        "chunk_index": 0,
+        "delivery_kind": "daemon_response",
+        "message_id": "response-over-budget",
+        "payload": "encrypted-operator-error",
+        "total_bytes": 24,
+        "version": 2
+      }
+    ]
+  },
+  "version": 2
+}
