@@ -1521,6 +1521,7 @@ mod tests {
         send_fails: AtomicBool,
         sent_before_low_water: AtomicBool,
         poll_ends: AtomicBool,
+        event_notify: tokio::sync::Notify,
     }
 
     #[async_trait]
@@ -1557,13 +1558,16 @@ mod tests {
         }
 
         async fn local_poll(&self) -> Option<DataChannelEvent> {
-            if let Some(event) = self.events.lock().unwrap().pop_front() {
-                return Some(event);
+            loop {
+                let notified = self.event_notify.notified();
+                if let Some(event) = self.events.lock().unwrap().pop_front() {
+                    return Some(event);
+                }
+                if self.poll_ends.load(Ordering::Acquire) {
+                    return None;
+                }
+                notified.await;
             }
-            if self.poll_ends.load(Ordering::Acquire) {
-                return None;
-            }
-            std::future::pending().await
         }
 
         async fn local_close(&self) -> Result<(), String> {
@@ -1740,7 +1744,6 @@ mod tests {
                     subscription_id: "entity-fixture".to_string(),
                 },
             ));
-            events.push_back(encrypted_request_event(&key, &DaemonRequest::Status));
         }
         let (runtime_tx, runtime_rx) = mpsc::channel();
         let peer_state = Arc::new(LocalWebrtcPeerState::new(
@@ -1749,6 +1752,7 @@ mod tests {
         ));
         let responder_peer_state = peer_state.clone();
         let responder_data_channel = data_channel.clone();
+        let responder_key = key.clone();
         let responder = std::thread::spawn(move || {
             let ControlMessage::SubscribeEntities {
                 entity_type,
@@ -1773,6 +1777,33 @@ mod tests {
                     resync_reason: None,
                 })
                 .unwrap();
+            frame_tx
+                .try_send(DaemonEntityFrame::Snapshot {
+                    subscription_id: "entity-fixture".to_string(),
+                    entity_type: "session".to_string(),
+                    snapshot_seq: 2,
+                    items: Vec::new(),
+                    resync_reason: Some("subscriber_overflow".to_string()),
+                })
+                .unwrap();
+
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while responder_data_channel.sent.lock().unwrap().len() < 3 {
+                assert!(
+                    Instant::now() < deadline,
+                    "subscribe ack and encrypted overflow recovery must complete"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            responder_data_channel
+                .events
+                .lock()
+                .unwrap()
+                .push_back(encrypted_request_event(
+                    &responder_key,
+                    &DaemonRequest::Status,
+                ));
+            responder_data_channel.event_notify.notify_one();
 
             let ControlMessage::Request {
                 request, reply_tx, ..
@@ -1786,7 +1817,7 @@ mod tests {
             reply_tx.send(Ok(status)).unwrap();
 
             let deadline = Instant::now() + Duration::from_secs(1);
-            while responder_data_channel.sent.lock().unwrap().len() < 3 {
+            while responder_data_channel.sent.lock().unwrap().len() < 4 {
                 assert!(
                     Instant::now() < deadline,
                     "all multiplexed deliveries complete"
@@ -1840,12 +1871,100 @@ mod tests {
             deliveries.iter().map(|(kind, _)| *kind).collect::<Vec<_>>(),
             vec![
                 DaemonLocalWebrtcDeliveryKind::DaemonResponse,
-                DaemonLocalWebrtcDeliveryKind::DaemonResponse,
                 DaemonLocalWebrtcDeliveryKind::DaemonEntityFrame,
+                DaemonLocalWebrtcDeliveryKind::DaemonEntityFrame,
+                DaemonLocalWebrtcDeliveryKind::DaemonResponse,
             ]
         );
-        let snapshot: DaemonEntityFrame = serde_json::from_slice(&deliveries[2].1).unwrap();
+        let snapshot: DaemonEntityFrame = serde_json::from_slice(&deliveries[1].1).unwrap();
         assert_eq!(entity_frame_subscription_id(&snapshot), "entity-fixture");
+        let resync: DaemonEntityFrame = serde_json::from_slice(&deliveries[2].1).unwrap();
+        assert!(matches!(
+            resync,
+            DaemonEntityFrame::Snapshot {
+                snapshot_seq: 2,
+                ref items,
+                resync_reason: Some(ref reason),
+                ..
+            } if items.is_empty() && reason == "subscriber_overflow"
+        ));
+    }
+
+    #[test]
+    fn replacement_peer_rejects_prior_generation_frames_and_delivers_current_generation() {
+        let key = AesGcmKey::from_slice(&[22; 32]).unwrap();
+        let data_channel = Arc::new(FakeDataChannel::default());
+        let (runtime_tx, runtime_rx) = mpsc::channel();
+        let peer_state = Arc::new(LocalWebrtcPeerState::new(
+            "replacement-grant".to_string(),
+            runtime_tx,
+        ));
+        peer_state.add_entity_subscription("generation-2".to_string());
+        let responder_peer_state = peer_state.clone();
+        let responder_data_channel = data_channel.clone();
+        let runtime_sender = peer_state.runtime_tx.clone();
+        let (entity_frame_tx, entity_frame_rx) = tokio_mpsc::channel(2);
+        entity_frame_tx
+            .try_send(DaemonEntityFrame::Snapshot {
+                subscription_id: "generation-1".to_string(),
+                entity_type: "session".to_string(),
+                snapshot_seq: 1,
+                items: Vec::new(),
+                resync_reason: None,
+            })
+            .unwrap();
+        entity_frame_tx
+            .try_send(DaemonEntityFrame::Snapshot {
+                subscription_id: "generation-2".to_string(),
+                entity_type: "session".to_string(),
+                snapshot_seq: 2,
+                items: Vec::new(),
+                resync_reason: None,
+            })
+            .unwrap();
+        let responder = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while responder_data_channel.sent.lock().unwrap().is_empty() {
+                assert!(
+                    Instant::now() < deadline,
+                    "current-generation frame is delivered"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            responder_peer_state.publish_peer_terminal(LocalWebrtcTerminalCause::PeerClosed);
+            assert!(matches!(
+                runtime_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+                ControlMessage::LocalWebrtcPeerClosed { grant_id, .. }
+                    if grant_id == "replacement-grant"
+            ));
+        });
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let failure = runtime.block_on(run_data_channel(
+            data_channel.as_ref(),
+            &key,
+            peer_state.as_ref(),
+            &runtime_sender,
+            entity_frame_tx,
+            entity_frame_rx,
+        ));
+        responder.join().unwrap();
+        assert!(failure.is_none());
+
+        let sent = data_channel.sent.lock().unwrap();
+        assert_eq!(sent.len(), 1, "the prior-generation frame must be dropped");
+        let chunk: DaemonLocalWebrtcDeliveryChunk = serde_json::from_str(&sent[0]).unwrap();
+        assert_eq!(
+            chunk.delivery_kind,
+            DaemonLocalWebrtcDeliveryKind::DaemonEntityFrame
+        );
+        let envelope: AesGcmEnvelope = serde_json::from_str(&chunk.payload).unwrap();
+        let plaintext = decrypt_aes_gcm(&key, &envelope).unwrap();
+        let frame: DaemonEntityFrame = serde_json::from_slice(&plaintext).unwrap();
+        assert_eq!(entity_frame_subscription_id(&frame), "generation-2");
     }
 
     #[test]

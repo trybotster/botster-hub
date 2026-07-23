@@ -6345,4 +6345,74 @@ mod tests {
             overflow_reason,
         ));
     }
+
+    #[test]
+    fn async_entity_overflow_requires_empty_snapshot_resync_and_closed_delivery_disconnects() {
+        let overflow_reason = "subscriber_overflow".to_string();
+        let cursor = SessionLifecycleCursor {
+            source_id: botster_core_daemon::SessionLifecycleSourceId("source".to_string()),
+            sequence: 9,
+        };
+        let baseline = || SessionLifecycleBaseline {
+            cursor: cursor.clone(),
+            sessions: Vec::new(),
+        };
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        sender
+            .try_send(DaemonEntityFrame::Snapshot {
+                subscription_id: "async-subscription".to_string(),
+                entity_type: "session".to_string(),
+                snapshot_seq: 8,
+                items: Vec::new(),
+                resync_reason: None,
+            })
+            .expect("fill bounded async subscriber queue");
+        let mut state = EntitySubscriptionState {
+            sender: EntityFrameSender::Async(sender),
+            cursor: SessionLifecycleCursor {
+                source_id: botster_core_daemon::SessionLifecycleSourceId("source".to_string()),
+                sequence: 8,
+            },
+            entities: BTreeMap::new(),
+            resync_reason: Some(overflow_reason.clone()),
+        };
+
+        assert!(try_resync_subscription(
+            "async-subscription",
+            &mut state,
+            baseline(),
+            overflow_reason.clone(),
+        ));
+        assert_eq!(
+            state.resync_reason.as_deref(),
+            Some(overflow_reason.as_str()),
+            "a full production WebRTC queue must retain its pending resync"
+        );
+        let _ = receiver.try_recv().expect("drain stale async frame");
+        assert!(try_resync_subscription(
+            "async-subscription",
+            &mut state,
+            baseline(),
+            overflow_reason.clone(),
+        ));
+        assert!(state.resync_reason.is_none());
+        assert!(matches!(
+            receiver.try_recv().expect("receive async resync snapshot"),
+            DaemonEntityFrame::Snapshot {
+                snapshot_seq: 9,
+                ref items,
+                resync_reason: Some(ref reason),
+                ..
+            } if items.is_empty() && reason == &overflow_reason
+        ));
+
+        drop(receiver);
+        state.resync_reason = Some(overflow_reason.clone());
+        assert!(!try_resync_subscription(
+            "async-subscription",
+            &mut state,
+            baseline(),
+            overflow_reason,
+        ));
+    }
 }

@@ -8756,6 +8756,38 @@ fn botster_web_same_url_reload_issues_fresh_local_webrtc_bootstrap() {
             botster_hub_client::DaemonEntityFrame::Snapshot { ref items, .. }
                 if items.iter().any(|item| item.session_uuid == "local-webrtc-reload-session")
         ));
+        let generation_two_shutdown = reload_peer
+            .encrypted_request(
+                &reload_key,
+                &botster_hub_client::DaemonRequest::ShutdownSession {
+                    session_id: "local-webrtc-reload-session".to_string(),
+                },
+            )
+            .await
+            .expect("emit a lifecycle delta on the second WebRTC generation");
+        assert_eq!(
+            generation_two_shutdown.kind,
+            botster_hub_client::DaemonResponseKind::Events
+        );
+        loop {
+            if matches!(
+                reload_peer
+                    .next_entity_frame(&reload_key)
+                    .await
+                    .expect("current second-generation lifecycle delta"),
+                botster_hub_client::DaemonEntityFrame::Patch {
+                    ref subscription_id,
+                    ref id,
+                    ref patch,
+                    ..
+                } if subscription_id == "reload-entities-generation-2"
+                    && id == "local-webrtc-reload-session"
+                    && patch.get("lifecycle").and_then(serde_json::Value::as_str)
+                        == Some("exited")
+            ) {
+                break;
+            }
+        }
         let sessions = reload_peer
             .encrypted_request(
                 &reload_key,
@@ -8774,54 +8806,6 @@ fn botster_web_same_url_reload_issues_fresh_local_webrtc_bootstrap() {
                 .any(|session| session.session_id == "local-webrtc-reload-session"),
             "reload DataChannel should hydrate existing sessions"
         );
-        let attach = reload_peer
-            .encrypted_request(
-                &reload_key,
-                &botster_hub_client::DaemonRequest::Attach {
-                    session_id: "local-webrtc-reload-session".to_string(),
-                    subscription_id: "local-webrtc-reload-subscription".to_string(),
-                },
-            )
-            .await
-            .expect("attach over reload encrypted WebRTC data channel");
-        assert_eq!(attach.kind, botster_hub_client::DaemonResponseKind::Events);
-        let send = reload_peer
-            .encrypted_request(
-                &reload_key,
-                &botster_hub_client::DaemonRequest::SendInput {
-                    session_id: "local-webrtc-reload-session".to_string(),
-                    data: "after-reload\n".to_string(),
-                },
-            )
-            .await
-            .expect("send input over reload encrypted WebRTC data channel");
-        assert_eq!(send.kind, botster_hub_client::DaemonResponseKind::Events);
-        let mut observed = String::new();
-        for _ in 0..120 {
-            let drain = reload_peer
-                .encrypted_request(
-                    &reload_key,
-                    &botster_hub_client::DaemonRequest::Drain {
-                        session_id: "local-webrtc-reload-session".to_string(),
-                    },
-                )
-                .await
-                .expect("drain over reload encrypted WebRTC data channel");
-            for event in drain.events {
-                if let botster_hub_client::DaemonEvent::TerminalOutput { data, .. } = event {
-                    observed.push_str(&data);
-                }
-            }
-            if observed.contains("reload:after-reload") {
-                break;
-            }
-            sleep(Duration::from_millis(30)).await;
-        }
-        assert!(
-            observed.contains("reload:after-reload"),
-            "reload encrypted WebRTC data channel should drain session output, got {observed:?}"
-        );
-
         reload_peer
             .data_channel
             .close()
@@ -8852,24 +8836,40 @@ fn botster_web_same_url_reload_issues_fresh_local_webrtc_bootstrap() {
             botster_hub_client::DaemonEntityFrame::Snapshot { ref items, .. }
                 if items.iter().any(|item| item.session_uuid == "local-webrtc-reload-session")
         ));
+        let current_generation_remove = final_peer
+            .encrypted_request(
+                &final_key,
+                &botster_hub_client::DaemonRequest::RemoveSession {
+                    session_id: "local-webrtc-reload-session".to_string(),
+                },
+            )
+            .await
+            .expect("emit a lifecycle delta on the third WebRTC generation");
+        assert_eq!(
+            current_generation_remove.kind,
+            botster_hub_client::DaemonResponseKind::SessionRemoved
+        );
+        loop {
+            if matches!(
+                final_peer
+                    .next_entity_frame(&final_key)
+                    .await
+                    .expect("current third-generation lifecycle delta"),
+                botster_hub_client::DaemonEntityFrame::Remove {
+                    ref subscription_id,
+                    ref id,
+                    ..
+                } if subscription_id == "reload-entities-generation-3"
+                    && id == "local-webrtc-reload-session"
+            ) {
+                break;
+            }
+        }
         let status = final_peer
             .encrypted_request(&final_key, &botster_hub_client::DaemonRequest::Status)
             .await
             .expect("ordinary request on third WebRTC generation");
         assert_eq!(status.kind, botster_hub_client::DaemonResponseKind::Status);
-        let shutdown = final_peer
-            .encrypted_request(
-                &final_key,
-                &botster_hub_client::DaemonRequest::ShutdownSession {
-                    session_id: "local-webrtc-reload-session".to_string(),
-                },
-            )
-            .await
-            .expect("shutdown over reload encrypted WebRTC data channel");
-        assert_eq!(
-            shutdown.kind,
-            botster_hub_client::DaemonResponseKind::Events
-        );
         final_peer
             .data_channel
             .close()
