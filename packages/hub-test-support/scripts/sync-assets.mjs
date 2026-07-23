@@ -129,12 +129,12 @@ function metadataJson(originDir) {
       source_artifact_path: origin.late_attach_history_conformance_fixture.source_artifact_path,
       sha256: sha256(join(originDir, origin.late_attach_history_conformance_fixture.artifact_path)),
     },
-    local_webrtc_response_chunk_conformance_fixture: {
-      artifact_path: origin.local_webrtc_response_chunk_conformance_fixture.artifact_path,
+    local_webrtc_delivery_chunk_conformance_fixture: {
+      artifact_path: origin.local_webrtc_delivery_chunk_conformance_fixture.artifact_path,
       source_artifact_path:
-        origin.local_webrtc_response_chunk_conformance_fixture.source_artifact_path,
+        origin.local_webrtc_delivery_chunk_conformance_fixture.source_artifact_path,
       sha256: sha256(
-        join(originDir, origin.local_webrtc_response_chunk_conformance_fixture.artifact_path),
+        join(originDir, origin.local_webrtc_delivery_chunk_conformance_fixture.artifact_path),
       ),
     },
     mode_flags_conformance_fixture: {
@@ -203,8 +203,8 @@ try {
       failures,
     );
     compareFile(
-      metadata.local_webrtc_response_chunk_conformance_fixture.artifact_path,
-      join(originDir, metadata.local_webrtc_response_chunk_conformance_fixture.artifact_path),
+      metadata.local_webrtc_delivery_chunk_conformance_fixture.artifact_path,
+      join(originDir, metadata.local_webrtc_delivery_chunk_conformance_fixture.artifact_path),
       failures,
     );
     compareFile(
@@ -251,8 +251,8 @@ try {
       join(packageRoot, metadata.late_attach_history_conformance_fixture.artifact_path),
     );
     copyFileSync(
-      join(originDir, metadata.local_webrtc_response_chunk_conformance_fixture.artifact_path),
-      join(packageRoot, metadata.local_webrtc_response_chunk_conformance_fixture.artifact_path),
+      join(originDir, metadata.local_webrtc_delivery_chunk_conformance_fixture.artifact_path),
+      join(packageRoot, metadata.local_webrtc_delivery_chunk_conformance_fixture.artifact_path),
     );
     copyFileSync(
       join(originDir, metadata.mode_flags_conformance_fixture.artifact_path),

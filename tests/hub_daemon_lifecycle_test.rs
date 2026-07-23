@@ -199,6 +199,7 @@ struct LocalWebrtcOfferPeer {
     connected_rx: AsyncReceiver<()>,
     data_channel_open_rx: AsyncReceiver<()>,
     data_channel_message_rx: AsyncReceiver<String>,
+    pending_entity_frames: VecDeque<botster_hub_client::DaemonEntityFrame>,
 }
 
 impl LocalWebrtcOfferPeer {
@@ -272,6 +273,7 @@ impl LocalWebrtcOfferPeer {
                 connected_rx,
                 data_channel_open_rx,
                 data_channel_message_rx,
+                pending_entity_frames: VecDeque::new(),
             },
             offer,
         ))
@@ -316,7 +318,54 @@ impl LocalWebrtcOfferPeer {
         self.data_channel
             .send_text(&serde_json::to_string(&envelope)?)
             .await?;
+        loop {
+            let (delivery_kind, plaintext, metrics) = self.receive_delivery(key).await?;
+            match delivery_kind {
+                botster_hub_client::DaemonLocalWebrtcDeliveryKind::DaemonResponse => {
+                    return Ok((serde_json::from_slice(&plaintext)?, metrics));
+                }
+                botster_hub_client::DaemonLocalWebrtcDeliveryKind::DaemonEntityFrame => {
+                    self.pending_entity_frames
+                        .push_back(serde_json::from_slice(&plaintext)?);
+                }
+            }
+        }
+    }
+
+    async fn next_entity_frame(
+        &mut self,
+        key: &AesGcmKey,
+    ) -> Result<botster_hub_client::DaemonEntityFrame, Box<dyn std::error::Error>> {
+        if let Some(frame) = self.pending_entity_frames.pop_front() {
+            return Ok(frame);
+        }
+        let (delivery_kind, plaintext, _) = self.receive_delivery(key).await?;
+        match delivery_kind {
+            botster_hub_client::DaemonLocalWebrtcDeliveryKind::DaemonEntityFrame => {
+                Ok(serde_json::from_slice(&plaintext)?)
+            }
+            botster_hub_client::DaemonLocalWebrtcDeliveryKind::DaemonResponse => {
+                Err(std::io::Error::other(
+                    "received uncorrelated daemon response while waiting for entity frame",
+                )
+                .into())
+            }
+        }
+    }
+
+    async fn receive_delivery(
+        &mut self,
+        key: &AesGcmKey,
+    ) -> Result<
+        (
+            botster_hub_client::DaemonLocalWebrtcDeliveryKind,
+            Vec<u8>,
+            LocalWebrtcResponseMetrics,
+        ),
+        Box<dyn std::error::Error>,
+    > {
         let mut encrypted = String::new();
+        let mut delivery_kind = None;
         let mut message_id = None;
         let mut expected_chunk_count = None;
         let mut maximum_frame_bytes = 0;
@@ -349,13 +398,18 @@ impl LocalWebrtcOfferPeer {
                 response.len() < botster_hub_client::LOCAL_WEBRTC_MAX_FRAME_BYTES,
                 "response frame exceeded 64 KiB"
             );
-            let chunk = serde_json::from_str::<botster_hub_client::DaemonLocalWebrtcResponseChunk>(
+            let chunk = serde_json::from_str::<botster_hub_client::DaemonLocalWebrtcDeliveryChunk>(
                 &response,
             )?;
             assert_eq!(
                 chunk.version,
-                botster_hub_client::LOCAL_WEBRTC_RESPONSE_CHUNK_VERSION
+                botster_hub_client::LOCAL_WEBRTC_DELIVERY_CHUNK_VERSION
             );
+            if let Some(delivery_kind) = delivery_kind {
+                assert_eq!(delivery_kind, chunk.delivery_kind);
+            } else {
+                delivery_kind = Some(chunk.delivery_kind);
+            }
             assert_eq!(chunk.chunk_index, next_chunk_index);
             if let Some(message_id) = &message_id {
                 assert_eq!(message_id, &chunk.message_id);
@@ -376,7 +430,8 @@ impl LocalWebrtcOfferPeer {
         let envelope = serde_json::from_str::<AesGcmEnvelope>(&encrypted)?;
         let plaintext = decrypt_aes_gcm(key, &envelope)?;
         Ok((
-            serde_json::from_slice(&plaintext)?,
+            delivery_kind.expect("complete delivery declares a kind"),
+            plaintext,
             LocalWebrtcResponseMetrics {
                 envelope_bytes,
                 chunk_count,
@@ -8260,17 +8315,49 @@ fn local_webrtc_chunks_oversized_encrypted_daemon_response() {
             .expect("list sessions over encrypted WebRTC data channel");
         assert_eq!(list.kind, botster_hub_client::DaemonResponseKind::Sessions);
 
-        let spawn = offer_peer
+        let subscribed = offer_peer
             .encrypted_request(
                 &stream_key,
-                &botster_hub_client::DaemonRequest::Spawn {
-                    session_id: "local-webrtc-session".to_string(),
-                    command: "printf 'local-webrtc-ready\\n'; while IFS= read -r line; do printf 'webrtc:%s\\n' \"$line\"; done".to_string(),
+                &botster_hub_client::DaemonRequest::SubscribeEntities {
+                    entity_type: "session".to_string(),
+                    subscription_id: "local-webrtc-entities".to_string(),
                 },
             )
             .await
-            .expect("spawn over encrypted WebRTC data channel");
+            .expect("subscribe to session entities over encrypted WebRTC data channel");
+        assert_eq!(
+            subscribed.kind,
+            botster_hub_client::DaemonResponseKind::EntitySubscribed
+        );
+        assert!(matches!(
+            offer_peer
+                .next_entity_frame(&stream_key)
+                .await
+                .expect("initial WebRTC entity snapshot"),
+            botster_hub_client::DaemonEntityFrame::Snapshot {
+                ref subscription_id,
+                ref items,
+                ..
+            } if subscription_id == "local-webrtc-entities" && items.is_empty()
+        ));
+
+        let spawn = botster_hub_client::request(
+            &endpoint,
+            botster_hub_client::DaemonRequest::Spawn {
+                session_id: "local-webrtc-session".to_string(),
+                command: "printf 'local-webrtc-ready\\n'; while IFS= read -r line; do printf 'webrtc:%s\\n' \"$line\"; done".to_string(),
+            },
+        )
+        .expect("external daemon client spawns a session visible over WebRTC");
         assert_eq!(spawn.kind, botster_hub_client::DaemonResponseKind::Spawned);
+        assert!(matches!(
+            offer_peer
+                .next_entity_frame(&stream_key)
+                .await
+                .expect("spawn upsert over WebRTC entity delivery"),
+            botster_hub_client::DaemonEntityFrame::Upsert { ref id, .. }
+                if id == "local-webrtc-session"
+        ));
 
         let attach = offer_peer
             .encrypted_request(
@@ -8388,8 +8475,74 @@ fn local_webrtc_chunks_oversized_encrypted_daemon_response() {
             shutdown.kind,
             botster_hub_client::DaemonResponseKind::Events
         );
+        loop {
+            if matches!(
+                offer_peer
+                    .next_entity_frame(&stream_key)
+                    .await
+                    .expect("lifecycle patch over WebRTC entity delivery"),
+                botster_hub_client::DaemonEntityFrame::Patch {
+                    ref id,
+                    ref patch,
+                    ..
+                } if id == "local-webrtc-session"
+                    && patch.get("lifecycle").and_then(serde_json::Value::as_str)
+                        == Some("exited")
+            ) {
+                break;
+            }
+        }
+        let removed = offer_peer
+            .encrypted_request(
+                &stream_key,
+                &botster_hub_client::DaemonRequest::RemoveSession {
+                    session_id: "local-webrtc-session".to_string(),
+                },
+            )
+            .await
+            .expect("remove session while WebRTC entity subscription is active");
+        assert_eq!(
+            removed.kind,
+            botster_hub_client::DaemonResponseKind::SessionRemoved
+        );
+        loop {
+            if matches!(
+                offer_peer
+                    .next_entity_frame(&stream_key)
+                    .await
+                    .expect("remove frame over WebRTC entity delivery"),
+                botster_hub_client::DaemonEntityFrame::Remove { ref id, .. }
+                    if id == "local-webrtc-session"
+            ) {
+                break;
+            }
+        }
+        offer_peer
+            .data_channel
+            .send_text("invalid-encrypted-request")
+            .await
+            .expect("send terminal invalid request to prove fail-closed cleanup");
+        sleep(Duration::from_millis(100)).await;
+        let _ = offer_peer.data_channel.close().await;
         offer_peer.peer.close().await.expect("close offer peer");
     });
+
+    let cleanup_deadline = Instant::now() + Duration::from_secs(5);
+    let cleanup_subscription = loop {
+        match botster_hub_client::subscribe_session_entities(&endpoint, "local-webrtc-entities") {
+            Ok(subscription) => break subscription,
+            Err(error) if Instant::now() < cleanup_deadline => {
+                let _ = error;
+                thread::sleep(Duration::from_millis(25));
+            }
+            Err(error) => {
+                panic!("WebRTC peer cleanup did not release entity subscription: {error}")
+            }
+        }
+    };
+    cleanup_subscription
+        .unsubscribe()
+        .expect("cleanup proof subscription unsubscribes");
 
     let reused = botster_hub_client::request(
         &endpoint,
@@ -8496,12 +8649,15 @@ fn botster_web_same_url_reload_issues_fresh_local_webrtc_bootstrap() {
 
     let bootstrap_a = botster_web_page_bootstrap(&bridge_url);
     let bootstrap_b = botster_web_page_bootstrap(&bridge_url);
+    let bootstrap_c = botster_web_page_bootstrap(&bridge_url);
     assert_eq!(bootstrap_a.package_name, "botster-web");
     assert_eq!(bootstrap_a.entrypoint_id, "web-client");
     assert_eq!(bootstrap_a.expected_origin, bridge_url);
     assert_eq!(bootstrap_b.expected_origin, bootstrap_a.expected_origin);
     assert_ne!(bootstrap_a.grant_id, bootstrap_b.grant_id);
     assert_ne!(bootstrap_a.grant_secret, bootstrap_b.grant_secret);
+    assert_ne!(bootstrap_b.grant_id, bootstrap_c.grant_id);
+    assert_ne!(bootstrap_b.grant_secret, bootstrap_c.grant_secret);
 
     block_on(async {
         let (mut first_peer, first_key) = open_local_webrtc_peer(&endpoint, &bootstrap_a).await;
@@ -8510,6 +8666,28 @@ fn botster_web_same_url_reload_issues_fresh_local_webrtc_bootstrap() {
             .await
             .expect("status over first encrypted WebRTC data channel");
         assert_eq!(status.kind, botster_hub_client::DaemonResponseKind::Status);
+        let subscribed = first_peer
+            .encrypted_request(
+                &first_key,
+                &botster_hub_client::DaemonRequest::SubscribeEntities {
+                    entity_type: "session".to_string(),
+                    subscription_id: "reload-entities-generation-1".to_string(),
+                },
+            )
+            .await
+            .expect("subscribe on first WebRTC generation");
+        assert_eq!(
+            subscribed.kind,
+            botster_hub_client::DaemonResponseKind::EntitySubscribed
+        );
+        assert!(matches!(
+            first_peer
+                .next_entity_frame(&first_key)
+                .await
+                .expect("first generation snapshot"),
+            botster_hub_client::DaemonEntityFrame::Snapshot { ref items, .. }
+                if items.is_empty()
+        ));
         let spawn = first_peer
             .encrypted_request(
                 &first_key,
@@ -8521,6 +8699,11 @@ fn botster_web_same_url_reload_issues_fresh_local_webrtc_bootstrap() {
             .await
             .expect("spawn over first encrypted WebRTC data channel");
         assert_eq!(spawn.kind, botster_hub_client::DaemonResponseKind::Spawned);
+        first_peer
+            .data_channel
+            .close()
+            .await
+            .expect("close first generation data channel");
         first_peer.peer.close().await.expect("close first peer");
 
         let rejected_secret = botster_hub_client::request(
@@ -8551,6 +8734,28 @@ fn botster_web_same_url_reload_issues_fresh_local_webrtc_bootstrap() {
             .await
             .expect("status over reload encrypted WebRTC data channel");
         assert_eq!(status.kind, botster_hub_client::DaemonResponseKind::Status);
+        let subscribed = reload_peer
+            .encrypted_request(
+                &reload_key,
+                &botster_hub_client::DaemonRequest::SubscribeEntities {
+                    entity_type: "session".to_string(),
+                    subscription_id: "reload-entities-generation-2".to_string(),
+                },
+            )
+            .await
+            .expect("subscribe on second WebRTC generation");
+        assert_eq!(
+            subscribed.kind,
+            botster_hub_client::DaemonResponseKind::EntitySubscribed
+        );
+        assert!(matches!(
+            reload_peer
+                .next_entity_frame(&reload_key)
+                .await
+                .expect("second generation fresh snapshot"),
+            botster_hub_client::DaemonEntityFrame::Snapshot { ref items, .. }
+                if items.iter().any(|item| item.session_uuid == "local-webrtc-reload-session")
+        ));
         let sessions = reload_peer
             .encrypted_request(
                 &reload_key,
@@ -8617,9 +8822,44 @@ fn botster_web_same_url_reload_issues_fresh_local_webrtc_bootstrap() {
             "reload encrypted WebRTC data channel should drain session output, got {observed:?}"
         );
 
-        let shutdown = reload_peer
+        reload_peer
+            .data_channel
+            .close()
+            .await
+            .expect("close second generation data channel");
+        reload_peer.peer.close().await.expect("close reload peer");
+
+        let (mut final_peer, final_key) = open_local_webrtc_peer(&endpoint, &bootstrap_c).await;
+        let subscribed = final_peer
             .encrypted_request(
-                &reload_key,
+                &final_key,
+                &botster_hub_client::DaemonRequest::SubscribeEntities {
+                    entity_type: "session".to_string(),
+                    subscription_id: "reload-entities-generation-3".to_string(),
+                },
+            )
+            .await
+            .expect("subscribe on third WebRTC generation");
+        assert_eq!(
+            subscribed.kind,
+            botster_hub_client::DaemonResponseKind::EntitySubscribed
+        );
+        assert!(matches!(
+            final_peer
+                .next_entity_frame(&final_key)
+                .await
+                .expect("third generation fresh snapshot"),
+            botster_hub_client::DaemonEntityFrame::Snapshot { ref items, .. }
+                if items.iter().any(|item| item.session_uuid == "local-webrtc-reload-session")
+        ));
+        let status = final_peer
+            .encrypted_request(&final_key, &botster_hub_client::DaemonRequest::Status)
+            .await
+            .expect("ordinary request on third WebRTC generation");
+        assert_eq!(status.kind, botster_hub_client::DaemonResponseKind::Status);
+        let shutdown = final_peer
+            .encrypted_request(
+                &final_key,
                 &botster_hub_client::DaemonRequest::ShutdownSession {
                     session_id: "local-webrtc-reload-session".to_string(),
                 },
@@ -8630,7 +8870,12 @@ fn botster_web_same_url_reload_issues_fresh_local_webrtc_bootstrap() {
             shutdown.kind,
             botster_hub_client::DaemonResponseKind::Events
         );
-        reload_peer.peer.close().await.expect("close reload peer");
+        final_peer
+            .data_channel
+            .close()
+            .await
+            .expect("close third generation data channel");
+        final_peer.peer.close().await.expect("close final peer");
     });
 
     let reused = botster_hub_client::request(
@@ -8659,6 +8904,8 @@ fn botster_web_same_url_reload_issues_fresh_local_webrtc_bootstrap() {
         bootstrap_a.grant_secret.as_str(),
         bootstrap_b.grant_id.as_str(),
         bootstrap_b.grant_secret.as_str(),
+        bootstrap_c.grant_id.as_str(),
+        bootstrap_c.grant_secret.as_str(),
     ] {
         assert!(!persisted_state.contains(secret));
     }

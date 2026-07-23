@@ -10,14 +10,19 @@ export interface AesGcmEnvelope {
   version: number;
 }
 
-export interface DaemonLocalWebrtcResponseChunk {
+export interface DaemonLocalWebrtcDeliveryChunk {
   version: number;
+  delivery_kind: DaemonLocalWebrtcDeliveryKind;
   message_id: string;
   chunk_index: number;
   chunk_count: number;
   total_bytes: number;
   payload: string;
 }
+
+export type DaemonLocalWebrtcDeliveryKind =
+  | "daemon_response"
+  | "daemon_entity_frame";
 
 export interface DaemonHello {
   protocol: string;

@@ -21,13 +21,13 @@ mod typescript;
 
 pub const PROTOCOL: &str = "botster-hub-daemon-v1";
 pub const PROTOCOL_VERSION: u16 = 2;
-pub const CONFORMANCE_FIXTURE_REVISION: u16 = 16;
-/// Version of the local WebRTC daemon-response chunk framing protocol.
-pub const LOCAL_WEBRTC_RESPONSE_CHUNK_VERSION: u16 = 1;
-/// Serialized local WebRTC response frames must remain strictly below this size.
+pub const CONFORMANCE_FIXTURE_REVISION: u16 = 17;
+/// Version of the local WebRTC delivery chunk framing protocol.
+pub const LOCAL_WEBRTC_DELIVERY_CHUNK_VERSION: u16 = 2;
+/// Serialized local WebRTC delivery frames must remain strictly below this size.
 pub const LOCAL_WEBRTC_MAX_FRAME_BYTES: usize = 64 * 1024;
-/// Maximum serialized encrypted response envelope accepted for reassembly.
-pub const LOCAL_WEBRTC_MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+/// Maximum serialized encrypted delivery envelope accepted for reassembly.
+pub const LOCAL_WEBRTC_MAX_DELIVERY_BYTES: usize = 16 * 1024 * 1024;
 pub const FEATURE_SESSIONS: &str = "sessions";
 pub const FEATURE_TERMINAL_STREAMING: &str = "terminal_streaming";
 pub const FEATURE_RESIZE: &str = "resize";
@@ -41,14 +41,23 @@ pub const FEATURE_TERMINAL_READBACK: &str = "terminal_readback";
 pub const FEATURE_SESSION_ENTITY_SUBSCRIPTIONS: &str = "session_entity_subscriptions";
 const ATTACH_DRAIN_INTERVAL: Duration = Duration::from_millis(25);
 
-/// One frame of an encrypted daemon response sent over the local WebRTC DataChannel.
+/// Authenticated plaintext carried by one complete local WebRTC delivery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DaemonLocalWebrtcDeliveryKind {
+    DaemonResponse,
+    DaemonEntityFrame,
+}
+
+/// One frame of an encrypted daemon delivery sent over the local WebRTC DataChannel.
 ///
 /// `payload` is a contiguous UTF-8 slice of the serialized encrypted AES-GCM
 /// envelope. Clients must validate all declared bounds before concatenating the
 /// payloads and decrypt only after the complete envelope has been reassembled.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DaemonLocalWebrtcResponseChunk {
+pub struct DaemonLocalWebrtcDeliveryChunk {
     pub version: u16,
+    pub delivery_kind: DaemonLocalWebrtcDeliveryKind,
     pub message_id: String,
     pub chunk_index: u32,
     pub chunk_count: u32,
@@ -4397,9 +4406,10 @@ mod tests {
     }
 
     #[test]
-    fn local_webrtc_response_chunk_is_serde_stable_and_generated() {
-        let chunk = DaemonLocalWebrtcResponseChunk {
-            version: LOCAL_WEBRTC_RESPONSE_CHUNK_VERSION,
+    fn local_webrtc_delivery_chunk_is_serde_stable_and_generated() {
+        let chunk = DaemonLocalWebrtcDeliveryChunk {
+            version: LOCAL_WEBRTC_DELIVERY_CHUNK_VERSION,
+            delivery_kind: DaemonLocalWebrtcDeliveryKind::DaemonEntityFrame,
             message_id: "response-fixture".to_string(),
             chunk_index: 1,
             chunk_count: 3,
@@ -4407,12 +4417,13 @@ mod tests {
             payload: "ciphertext-slice".to_string(),
         };
         assert_eq!(
-            serde_json::from_value::<DaemonLocalWebrtcResponseChunk>(
+            serde_json::from_value::<DaemonLocalWebrtcDeliveryChunk>(
                 serde_json::to_value(&chunk).unwrap()
             )
             .unwrap(),
             chunk
         );
-        assert!(daemon_protocol_typescript().contains("interface DaemonLocalWebrtcResponseChunk"));
+        assert!(daemon_protocol_typescript().contains("type DaemonLocalWebrtcDeliveryKind"));
+        assert!(daemon_protocol_typescript().contains("interface DaemonLocalWebrtcDeliveryChunk"));
     }
 }

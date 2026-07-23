@@ -738,34 +738,37 @@ pub fn mode_flags_conformance_fixture_json() -> serde_json::Value {
         .expect("mode flags conformance fixture serializes")
 }
 
-/// Return deterministic local WebRTC response-chunk scenarios for downstream clients.
+/// Return deterministic local WebRTC delivery-chunk scenarios for downstream clients.
 #[must_use]
-pub fn local_webrtc_response_chunk_conformance_fixture_json() -> serde_json::Value {
+pub fn local_webrtc_delivery_chunk_conformance_fixture_json() -> serde_json::Value {
     serde_json::json!({
-        "version": botster_hub_client::LOCAL_WEBRTC_RESPONSE_CHUNK_VERSION,
+        "version": botster_hub_client::LOCAL_WEBRTC_DELIVERY_CHUNK_VERSION,
         "maximum_frame_bytes_exclusive": botster_hub_client::LOCAL_WEBRTC_MAX_FRAME_BYTES,
-        "maximum_response_bytes": botster_hub_client::LOCAL_WEBRTC_MAX_RESPONSE_BYTES,
+        "maximum_delivery_bytes": botster_hub_client::LOCAL_WEBRTC_MAX_DELIVERY_BYTES,
         "scenarios": {
-            "single_chunk": [{
-                "version": botster_hub_client::LOCAL_WEBRTC_RESPONSE_CHUNK_VERSION,
+            "daemon_response": [{
+                "version": botster_hub_client::LOCAL_WEBRTC_DELIVERY_CHUNK_VERSION,
+                "delivery_kind": "daemon_response",
                 "message_id": "response-single",
                 "chunk_index": 0,
                 "chunk_count": 1,
                 "total_bytes": 18,
                 "payload": "encrypted-envelope"
             }],
-            "multiple_chunks": [
+            "daemon_entity_frame": [
                 {
-                    "version": botster_hub_client::LOCAL_WEBRTC_RESPONSE_CHUNK_VERSION,
-                    "message_id": "response-multiple",
+                    "version": botster_hub_client::LOCAL_WEBRTC_DELIVERY_CHUNK_VERSION,
+                    "delivery_kind": "daemon_entity_frame",
+                    "message_id": "entity-multiple",
                     "chunk_index": 0,
                     "chunk_count": 2,
                     "total_bytes": 18,
                     "payload": "encrypted-"
                 },
                 {
-                    "version": botster_hub_client::LOCAL_WEBRTC_RESPONSE_CHUNK_VERSION,
-                    "message_id": "response-multiple",
+                    "version": botster_hub_client::LOCAL_WEBRTC_DELIVERY_CHUNK_VERSION,
+                    "delivery_kind": "daemon_entity_frame",
+                    "message_id": "entity-multiple",
                     "chunk_index": 1,
                     "chunk_count": 2,
                     "total_bytes": 18,
@@ -782,7 +785,8 @@ pub fn local_webrtc_response_chunk_conformance_fixture_json() -> serde_json::Val
                 "reassembled_sha256": "06d24e206edb54bed524319b1127725b46e20ea4aae5934688599abd42fa4317"
             },
             "over_budget_operator_error": [{
-                "version": botster_hub_client::LOCAL_WEBRTC_RESPONSE_CHUNK_VERSION,
+                "version": botster_hub_client::LOCAL_WEBRTC_DELIVERY_CHUNK_VERSION,
+                "delivery_kind": "daemon_response",
                 "message_id": "response-over-budget",
                 "chunk_index": 0,
                 "chunk_count": 1,
