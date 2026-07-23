@@ -130,6 +130,7 @@ impl EntrypointSupervisor {
         let stderr = child.stderr.take().map(spawn_reader);
         let process = SupervisedProcess {
             child,
+            environment: environment_overrides.clone(),
             started_at: now_seconds(),
             exited_at: None,
             exit_status: None,
@@ -180,6 +181,24 @@ impl EntrypointSupervisor {
         self.start(registry, package_name, entrypoint_id, environment_overrides)
     }
 
+    pub fn restart_preserving_environment(
+        &mut self,
+        registry: &PackageRegistry,
+        package_name: &str,
+        entrypoint_id: &str,
+    ) -> EntrypointSupervisorResult<EntrypointProcessSnapshot> {
+        let key = EntrypointKey {
+            package_name: package_name.to_string(),
+            entrypoint_id: entrypoint_id.to_string(),
+        };
+        let environment = self
+            .processes
+            .get(&key)
+            .map(|process| process.environment.clone())
+            .unwrap_or_default();
+        self.restart(registry, package_name, entrypoint_id, &environment)
+    }
+
     pub fn status(&mut self, package_name: &str, entrypoint_id: &str) -> EntrypointProcessSnapshot {
         self.refresh();
         let key = EntrypointKey {
@@ -225,6 +244,7 @@ impl EntrypointSupervisor {
 
 struct SupervisedProcess {
     child: Child,
+    environment: BTreeMap<String, String>,
     started_at: u64,
     exited_at: Option<u64>,
     exit_status: Option<String>,
@@ -636,6 +656,7 @@ mod tests {
         (
             SupervisedProcess {
                 child,
+                environment: BTreeMap::new(),
                 started_at: now_seconds(),
                 exited_at: None,
                 exit_status: None,

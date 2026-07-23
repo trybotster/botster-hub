@@ -102,6 +102,7 @@ export type DaemonRequest =
   | { type: "show_package"; package_name: string }
   | { type: "set_package_configuration"; package_name: string; values: Record<string, JsonValue> }
   | { type: "reload_package"; package_name: string }
+  | { type: "refresh_local_packages" }
   | { type: "enable_package_local_path"; path: string }
   | { type: "enable_package"; package_name: string }
   | { type: "disable_package"; package_name: string }

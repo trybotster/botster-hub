@@ -17,7 +17,7 @@ use crate::local_webrtc::LocalWebrtcTransport;
 use crate::packages::{
     PackageClassification, PackageRegistry, PackageRegistrySnapshotError, PackageState,
 };
-use crate::persistence::{FileHubStateStore, HubState, HubStateStoreError};
+use crate::persistence::{FileHubStateStore, HubState, HubStateStore, HubStateStoreError};
 use crate::runtime::{HubRuntime, HubRuntimeError};
 
 /// Local daemon lifecycle state.
@@ -93,8 +93,17 @@ impl HubDaemon {
             HubStateLoadSource::Initialized
         };
         let mut runtime = HubRuntime::load_from_store(config.clone(), &store)?;
-        let state = runtime.state().clone();
+        let mut state = runtime.state().clone();
         let package_registry = PackageRegistry::from_snapshot(state.package_registry.clone())?;
+        let (package_registry, decisions) = package_registry
+            .refreshed_local_packages("daemon startup refresh local package registrations")?;
+        if !decisions.is_empty() {
+            let snapshot = package_registry.snapshot();
+            state = store.update(&config, |state| {
+                state.package_registry = snapshot;
+            })?;
+            runtime.replace_state(state.clone());
+        }
         load_enabled_local_plugins(&mut runtime, &package_registry)?;
 
         Ok(Self {
@@ -138,6 +147,11 @@ impl HubDaemon {
     /// Return the mutable package registry restored for this daemon lifecycle.
     pub const fn package_registry_mut(&mut self) -> &mut PackageRegistry {
         &mut self.package_registry
+    }
+
+    /// Replace the daemon-owned package registry after a durable commit.
+    pub fn replace_package_registry(&mut self, package_registry: PackageRegistry) {
+        self.package_registry = package_registry;
     }
 
     /// Return the local package entrypoint supervisor.

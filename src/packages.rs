@@ -308,7 +308,69 @@ impl PackageRegistry {
         package_name: &str,
         audit_reason: impl Into<String>,
     ) -> PackageRegistryResult<PackageDecision> {
+        let (candidate, decision) =
+            self.refreshed_local_package(package_name, audit_reason.into())?;
+        *self = candidate;
+        Ok(decision)
+    }
+
+    /// Prepare a refreshed copy of every directly installed local path package.
+    ///
+    /// The returned registry is only produced after every selected package has
+    /// been re-read and admitted, so callers can persist and activate it as one
+    /// coherent operation.
+    pub fn refreshed_local_packages(
+        &self,
+        audit_reason: impl Into<String>,
+    ) -> PackageRegistryResult<(Self, Vec<PackageDecision>)> {
         let audit_reason = audit_reason.into();
+        let package_names = self
+            .records
+            .values()
+            .filter(|record| is_direct_local_path_package(record))
+            .map(|record| record.manifest.name.clone())
+            .collect::<Vec<_>>();
+        let mut candidate = self.clone();
+        let mut decisions = Vec::with_capacity(package_names.len());
+        for package_name in package_names {
+            decisions
+                .push(candidate.refresh_local_package_record(&package_name, audit_reason.clone())?);
+        }
+        Ok((candidate, decisions))
+    }
+
+    /// Prepare a refreshed copy of one directly installed local path package.
+    pub fn refreshed_local_package(
+        &self,
+        package_name: &str,
+        audit_reason: impl Into<String>,
+    ) -> PackageRegistryResult<(Self, PackageDecision)> {
+        let audit_reason = audit_reason.into();
+        let current = self
+            .record(package_name, PackageAction::Reload, audit_reason.clone())?
+            .clone();
+        if !is_direct_local_path_package(&current) {
+            return Err(PackageRegistryError::with_record(
+                package_name,
+                PackageAction::Reload,
+                PackageAdmissionReason::UnsafeLocalPath(
+                    "package is not a directly installed local path package".to_string(),
+                ),
+                current.state,
+                current.classification,
+                audit_reason,
+            ));
+        }
+        let mut candidate = self.clone();
+        let decision = candidate.refresh_local_package_record(package_name, audit_reason)?;
+        Ok((candidate, decision))
+    }
+
+    fn refresh_local_package_record(
+        &mut self,
+        package_name: &str,
+        audit_reason: String,
+    ) -> PackageRegistryResult<PackageDecision> {
         let current = self
             .record(package_name, PackageAction::Reload, audit_reason.clone())?
             .clone();
@@ -323,8 +385,15 @@ impl PackageRegistry {
                 audit_reason.clone(),
             )
         })?;
-        let local_source = LocalPackageSource::resolve(&package_root, audit_reason.clone())?;
-        let local_manifest = local_source.read_manifest(audit_reason.clone())?;
+        let local_source = LocalPackageSource::resolve(&package_root, audit_reason.clone())
+            .map_err(|error| {
+                contextualize_refresh_error(error, &current, &package_root, audit_reason.clone())
+            })?;
+        let local_manifest = local_source
+            .read_manifest(audit_reason.clone())
+            .map_err(|error| {
+                contextualize_refresh_error(error, &current, &package_root, audit_reason.clone())
+            })?;
         let mut manifest = local_manifest.manifest;
         if manifest.name != package_name {
             return Err(PackageRegistryError::with_record(
@@ -339,11 +408,21 @@ impl PackageRegistry {
                 audit_reason,
             ));
         }
-        local_source.validate_manifest_entrypoints(&manifest, audit_reason.clone())?;
+        local_source
+            .validate_manifest_entrypoints(&manifest, audit_reason.clone())
+            .map_err(|error| {
+                contextualize_refresh_error(error, &current, &package_root, audit_reason.clone())
+            })?;
         validate_runnable_entrypoints(
             &manifest.name,
             &local_manifest.runnable_entrypoints,
             PackageAction::Reload,
+            audit_reason.clone(),
+        )?;
+        validate_runnable_entrypoint_outputs(
+            &manifest.name,
+            &local_source.package_root,
+            &local_manifest.runnable_entrypoints,
             audit_reason.clone(),
         )?;
         validate_session_templates(&local_manifest.session_templates).map_err(|reason| {
@@ -373,8 +452,7 @@ impl PackageRegistry {
         }
 
         let classification = PackageClassification::from_kind(&manifest.kind);
-        let mut candidate = self.clone();
-        candidate.records.insert(
+        self.records.insert(
             package_name.to_string(),
             PackageRecord {
                 manifest,
@@ -397,10 +475,10 @@ impl PackageRegistry {
             },
         );
         if was_enabled {
-            candidate.enable(package_name, audit_reason.clone())?;
+            self.enable(package_name, audit_reason.clone())?;
         }
 
-        let refreshed = candidate
+        let refreshed = self
             .records
             .get(package_name)
             .expect("candidate reload record should exist");
@@ -412,7 +490,6 @@ impl PackageRegistry {
             admitted_host_profile: refreshed.admitted_host_profile.clone(),
             audit_reason,
         };
-        self.records = candidate.records;
         Ok(decision)
     }
 
@@ -1250,6 +1327,12 @@ fn package_root(record: &PackageRecord) -> Result<PathBuf, String> {
         Some(PackageSource::Path { path }) => Ok(PathBuf::from(path)),
         _ => Err("package source is not a local path".to_string()),
     }
+}
+
+fn is_direct_local_path_package(record: &PackageRecord) -> bool {
+    matches!(record.manifest.source, Some(PackageSource::Path { .. }))
+        && record.source_metadata.is_none()
+        && record.provenance.source.starts_with("local:")
 }
 
 fn resolve_command_path(package_root: &Path, command: &str) -> PathBuf {
@@ -2744,6 +2827,72 @@ fn validate_runnable_entrypoints(
     })
 }
 
+fn validate_runnable_entrypoint_outputs(
+    package_name: &str,
+    package_root: &Path,
+    entrypoints: &[PackageRunnableEntrypoint],
+    audit_reason: String,
+) -> PackageRegistryResult<()> {
+    for entrypoint in entrypoints {
+        let command = Path::new(&entrypoint.command);
+        if command.components().count() == 1 {
+            continue;
+        }
+        let output = package_root.join(command);
+        if output.is_file() {
+            continue;
+        }
+        return Err(PackageRegistryError::without_record(
+            package_name,
+            PackageAction::Reload,
+            PackageAdmissionReason::UnsafeEntrypoint(format!(
+                "declared build output {} is missing for local package at {}; rebuild the package before running `botster-hub up` or `packages reload`",
+                output.display(),
+                package_root.display()
+            )),
+            audit_reason,
+        ));
+    }
+    Ok(())
+}
+
+fn contextualize_refresh_error(
+    error: PackageRegistryError,
+    current: &PackageRecord,
+    package_root: &Path,
+    audit_reason: String,
+) -> PackageRegistryError {
+    let reason = match error.reason {
+        PackageAdmissionReason::UnsafeLocalPath(message) => {
+            PackageAdmissionReason::UnsafeLocalPath(format!(
+                "local package path {} could not be refreshed: {message}",
+                package_root.display()
+            ))
+        }
+        PackageAdmissionReason::InvalidLocalManifest(message) => {
+            PackageAdmissionReason::InvalidLocalManifest(format!(
+                "local package manifest at {} could not be refreshed: {message}",
+                package_root.display()
+            ))
+        }
+        PackageAdmissionReason::UnsafeEntrypoint(message) => {
+            PackageAdmissionReason::UnsafeEntrypoint(format!(
+                "declared package entrypoint under {} is missing or invalid: {message}; rebuild the package before running `botster-hub up` or `packages reload`",
+                package_root.display()
+            ))
+        }
+        reason => reason,
+    };
+    PackageRegistryError::with_record(
+        current.manifest.name.clone(),
+        PackageAction::Reload,
+        reason,
+        current.state,
+        current.classification,
+        audit_reason,
+    )
+}
+
 fn validate_runnable_entrypoints_for_snapshot(
     package_name: &str,
     entrypoints: &[PackageRunnableEntrypoint],
@@ -3663,6 +3812,236 @@ mod tests {
             .expect("install package directory");
 
         assert!(registry.package("directory.plugin").is_some());
+    }
+
+    #[test]
+    fn refresh_local_packages_prepares_all_direct_packages_without_mutating_original() {
+        let root = test_root("refresh-all-direct-local-packages");
+        let alpha_root = root.join("alpha");
+        let beta_root = root.join("beta");
+        for package_root in [&alpha_root, &beta_root] {
+            fs::create_dir_all(package_root).expect("create package root");
+            fs::write(package_root.join("plugin.lua"), "return {}\n").expect("write plugin");
+        }
+        write_manifest(&alpha_root, &local_manifest("alpha.local", "plugin.lua"));
+        write_manifest(&beta_root, &local_manifest("beta.local", "plugin.lua"));
+        let mut registry =
+            PackageRegistry::new(grants(vec![capability(CapabilitySurface::Surfaces, None)]));
+        registry
+            .install_local_path(&alpha_root, "install alpha")
+            .expect("install alpha");
+        registry
+            .install_local_path(&beta_root, "install beta")
+            .expect("install beta");
+        registry
+            .enable("alpha.local", "enable alpha")
+            .expect("enable alpha");
+
+        let mut alpha_manifest = local_manifest("alpha.local", "plugin.lua");
+        alpha_manifest.version = "2.0.0".to_string();
+        write_manifest(&alpha_root, &alpha_manifest);
+        let mut beta_manifest = local_manifest("beta.local", "plugin.lua");
+        beta_manifest.version = "3.0.0".to_string();
+        write_manifest(&beta_root, &beta_manifest);
+
+        let (refreshed, decisions) = registry
+            .refreshed_local_packages("refresh direct packages")
+            .expect("refresh all direct packages");
+
+        assert_eq!(decisions.len(), 2);
+        assert_eq!(
+            registry
+                .package("alpha.local")
+                .expect("original alpha")
+                .manifest
+                .version,
+            "1.0.0"
+        );
+        assert_eq!(
+            refreshed
+                .package("alpha.local")
+                .expect("refreshed alpha")
+                .manifest
+                .version,
+            "2.0.0"
+        );
+        assert_eq!(
+            refreshed
+                .package("alpha.local")
+                .expect("refreshed alpha")
+                .state,
+            PackageState::Enabled
+        );
+        assert_eq!(
+            refreshed
+                .package("beta.local")
+                .expect("refreshed beta")
+                .manifest
+                .version,
+            "3.0.0"
+        );
+    }
+
+    #[test]
+    fn refresh_local_packages_is_atomic_when_any_package_fails_validation() {
+        let root = test_root("refresh-local-packages-atomic-failure");
+        let alpha_root = root.join("alpha");
+        let beta_root = root.join("beta");
+        for package_root in [&alpha_root, &beta_root] {
+            fs::create_dir_all(package_root).expect("create package root");
+            fs::write(package_root.join("plugin.lua"), "return {}\n").expect("write plugin");
+        }
+        write_manifest(&alpha_root, &local_manifest("alpha.local", "plugin.lua"));
+        write_manifest(&beta_root, &local_manifest("beta.local", "plugin.lua"));
+        let mut registry =
+            PackageRegistry::new(grants(vec![capability(CapabilitySurface::Surfaces, None)]));
+        registry
+            .install_local_path(&alpha_root, "install alpha")
+            .expect("install alpha");
+        registry
+            .install_local_path(&beta_root, "install beta")
+            .expect("install beta");
+
+        let mut alpha_manifest = local_manifest("alpha.local", "plugin.lua");
+        alpha_manifest.version = "2.0.0".to_string();
+        write_manifest(&alpha_root, &alpha_manifest);
+        fs::remove_file(beta_root.join("plugin.lua")).expect("remove beta entrypoint");
+
+        let error = registry
+            .refreshed_local_packages("refresh direct packages")
+            .expect_err("invalid beta should reject the complete candidate");
+
+        assert_eq!(error.package_name, "beta.local");
+        assert_eq!(
+            registry
+                .package("alpha.local")
+                .expect("original alpha")
+                .manifest
+                .version,
+            "1.0.0"
+        );
+        assert_eq!(
+            registry
+                .package("beta.local")
+                .expect("original beta")
+                .manifest
+                .version,
+            "1.0.0"
+        );
+    }
+
+    #[test]
+    fn refresh_local_packages_leaves_registry_installed_local_paths_pinned() {
+        let root = test_root("refresh-skips-registry-local-path");
+        let package_root = root.join("catalog");
+        fs::create_dir_all(&package_root).expect("create catalog package");
+        fs::write(package_root.join("plugin.lua"), "return {}\n").expect("write plugin");
+        write_manifest(
+            &package_root,
+            &local_manifest("catalog.local", "plugin.lua"),
+        );
+        fs::write(
+            root.join(LOCAL_PACKAGE_REGISTRY_FILE),
+            r#"{
+  "source": { "id": "fixture", "kind": "local_path", "label": "Fixture" },
+  "entries": [{
+    "id": "catalog-local",
+    "first_party": true,
+    "source": { "type": "local_path", "path": "catalog" }
+  }]
+}"#,
+        )
+        .expect("write registry");
+        let mut registry =
+            PackageRegistry::new(grants(vec![capability(CapabilitySurface::Surfaces, None)]));
+        registry
+            .install_registry_entry(&root, "catalog-local", "install catalog package")
+            .expect("install catalog package");
+
+        let mut changed = local_manifest("catalog.local", "plugin.lua");
+        changed.version = "9.0.0".to_string();
+        write_manifest(&package_root, &changed);
+
+        let (refreshed, decisions) = registry
+            .refreshed_local_packages("refresh direct packages")
+            .expect("refresh direct packages");
+
+        assert!(decisions.is_empty());
+        assert_eq!(
+            refreshed
+                .package("catalog.local")
+                .expect("catalog package")
+                .manifest
+                .version,
+            "1.0.0"
+        );
+    }
+
+    #[test]
+    fn refresh_local_packages_reports_missing_checkout_with_name_and_path() {
+        let root = test_root("refresh-missing-local-checkout");
+        fs::write(root.join("plugin.lua"), "return {}\n").expect("write plugin");
+        write_manifest(&root, &local_manifest("missing.local", "plugin.lua"));
+        let mut registry =
+            PackageRegistry::new(grants(vec![capability(CapabilitySurface::Surfaces, None)]));
+        registry
+            .install_local_path(&root, "install local package")
+            .expect("install local package");
+        fs::remove_dir_all(&root).expect("remove local checkout");
+
+        let error = registry
+            .refreshed_local_packages("refresh direct packages")
+            .expect_err("missing checkout should fail refresh");
+
+        assert_eq!(error.package_name, "missing.local");
+        assert!(matches!(
+            error.reason,
+            PackageAdmissionReason::UnsafeLocalPath(ref message)
+                if message.contains(root.to_str().expect("utf8 root"))
+        ));
+    }
+
+    #[test]
+    fn refresh_local_packages_reports_missing_build_output_with_rebuild_guidance() {
+        let root = test_root("refresh-missing-build-output");
+        fs::create_dir_all(root.join("scripts")).expect("create scripts");
+        fs::write(root.join("plugin.lua"), "return {}\n").expect("write plugin");
+        fs::write(root.join("scripts").join("server"), "#!/bin/sh\n").expect("write server");
+        write_manifest_json(
+            &root,
+            r#"{
+  "name": "build.local",
+  "version": "1.0.0",
+  "kind": "plugin",
+  "botster": ">=0.1.0",
+  "capabilities": [{ "surface": "surfaces" }],
+  "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }],
+  "runnable_entrypoints": [{
+    "id": "web",
+    "kind": "web_app",
+    "launch_mode": "background",
+    "command": "scripts/server"
+  }]
+}"#,
+        );
+        let mut registry =
+            PackageRegistry::new(grants(vec![capability(CapabilitySurface::Surfaces, None)]));
+        registry
+            .install_local_path(&root, "install local package")
+            .expect("install local package");
+        fs::remove_file(root.join("scripts").join("server")).expect("remove build output");
+
+        let error = registry
+            .refreshed_local_packages("refresh direct packages")
+            .expect_err("missing output should fail refresh");
+
+        assert_eq!(error.package_name, "build.local");
+        assert!(matches!(
+            error.reason,
+            PackageAdmissionReason::UnsafeEntrypoint(ref message)
+                if message.contains(root.to_str().expect("utf8 root"))
+                    && message.contains("rebuild")
+        ));
     }
 
     #[test]
