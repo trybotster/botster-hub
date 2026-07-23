@@ -8080,6 +8080,135 @@ fn session_entity_subscription_observes_natural_exit_without_terminal_attach() {
 }
 
 #[test]
+fn session_entity_subscription_observes_attached_natural_exit_with_pending_egress() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_test_dir("session-entity-attached-exit");
+    let config = explicit_config(&data_dir);
+    let endpoint = botster_hub_client::DaemonEndpoint::new(
+        config
+            .transports
+            .local_socket
+            .as_ref()
+            .expect("test config has local socket")
+            .path
+            .clone(),
+    );
+    let child = start_cli_daemon(&data_dir);
+    let mut subscription =
+        botster_hub_client::subscribe_session_entities(&endpoint, "entities-attached-exit")
+            .expect("subscribe before attached natural exit");
+    subscription
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("bound entity reads");
+    let _ = subscription.next_frame().expect("initial snapshot");
+
+    botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::Spawn {
+            session_id: "entity-attached-exit".to_string(),
+            command: "sleep 0.15; printf 'pending-first\\n'; sleep 0.15; printf 'pending-second\\n'; exit 7"
+                .to_string(),
+        },
+    )
+    .expect("spawn attached natural-exit session");
+    assert!(matches!(
+        subscription.next_frame().expect("spawn upsert"),
+        botster_hub_client::DaemonEntityFrame::Upsert { ref id, .. }
+            if id == "entity-attached-exit"
+    ));
+
+    let mut terminal =
+        botster_hub_client::DaemonConnection::connect(&endpoint).expect("terminal connection");
+    terminal
+        .request(&botster_hub_client::DaemonRequest::Attach {
+            session_id: "entity-attached-exit".to_string(),
+            subscription_id: "terminal-attached-exit".to_string(),
+        })
+        .expect("attach before output becomes pending");
+
+    let exit_sequence = loop {
+        match subscription
+            .next_frame()
+            .expect("natural exit delta with pending terminal egress")
+        {
+            botster_hub_client::DaemonEntityFrame::Patch {
+                snapshot_seq,
+                id,
+                patch,
+                ..
+            } if id == "entity-attached-exit"
+                && patch.get("lifecycle").and_then(serde_json::Value::as_str) == Some("exited") =>
+            {
+                assert_eq!(
+                    patch.get("exit_code").and_then(serde_json::Value::as_i64),
+                    Some(7)
+                );
+                break snapshot_seq;
+            }
+            _ => {}
+        }
+    };
+    assert!(exit_sequence > 0);
+
+    let retained = terminal
+        .request(&botster_hub_client::DaemonRequest::Drain {
+            session_id: "entity-attached-exit".to_string(),
+        })
+        .expect("drain retained terminal output after exit patch");
+    let retained_output = retained
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            botster_hub_client::DaemonEvent::TerminalOutput { data, .. } => Some(data.as_str()),
+            _ => None,
+        })
+        .collect::<String>();
+    assert_eq!(retained_output.matches("pending-first").count(), 1);
+    assert_eq!(retained_output.matches("pending-second").count(), 1);
+    assert!(
+        retained_output.find("pending-first") < retained_output.find("pending-second"),
+        "retained terminal output must preserve production order, got {retained_output:?}"
+    );
+    assert_eq!(
+        retained
+            .events
+            .iter()
+            .filter(|event| matches!(
+                event,
+                botster_hub_client::DaemonEvent::ProcessExit { code: Some(7), .. }
+            ))
+            .count(),
+        1,
+        "retained terminal events must include the process exit exactly once"
+    );
+
+    let drained_again = terminal
+        .request(&botster_hub_client::DaemonRequest::Drain {
+            session_id: "entity-attached-exit".to_string(),
+        })
+        .expect("second terminal drain after retained batch");
+    assert!(
+        drained_again.events.iter().all(|event| {
+            !matches!(
+                event,
+                botster_hub_client::DaemonEvent::TerminalOutput { data, .. }
+                    if data.contains("pending-first") || data.contains("pending-second")
+            ) && !matches!(
+                event,
+                botster_hub_client::DaemonEvent::ProcessExit { code: Some(7), .. }
+            )
+        }),
+        "retained terminal events must only be delivered once, got {:?}",
+        drained_again.events
+    );
+
+    subscription
+        .unsubscribe()
+        .expect("unsubscribe entity stream");
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
 fn session_entity_subscription_recovers_after_terminal_disconnect_with_pending_egress() {
     let _guard = daemon_test_guard();
     let data_dir = unique_test_dir("entity-drop");

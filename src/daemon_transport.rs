@@ -3226,8 +3226,7 @@ fn drive_entity_subscriptions(
                     state,
                     SessionLifecycleState::Exited { .. } | SessionLifecycleState::Failed { .. }
                 )
-            }) || pending_runtime.events.contains_key(&session_id)
-            {
+            }) {
                 continue;
             }
             let cursor = drain_cursors
@@ -3239,7 +3238,11 @@ fn drive_entity_subscriptions(
                 let events = crate::client_api::events_from_drain(output);
                 if has_client_egress && !events.is_empty() {
                     *cursor = tick(logical_clock);
-                    pending_runtime.events.insert(session_id, events);
+                    pending_runtime
+                        .events
+                        .entry(session_id)
+                        .or_default()
+                        .extend(events);
                 }
             }
         }
