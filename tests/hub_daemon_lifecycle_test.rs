@@ -7747,6 +7747,34 @@ fn external_hub_client_read_mode_flags_drives_real_daemon_socket_protocol() {
 #[test]
 fn session_entity_subscription_pushes_snapshot_ordered_deltas_and_fresh_reconnect() {
     let _guard = daemon_test_guard();
+    let conformance_hub = botster_hub_test_support::IsolatedHubBuilder::new()
+        .hub_bin(env!("CARGO_BIN_EXE_botster-hub"))
+        .session_worker_bin(session_worker_binary_path())
+        .root(PathBuf::from("/tmp/bh-slc"))
+        .name("published-runner")
+        .start()
+        .expect("start isolated hub for published session lifecycle conformance");
+    let conformance_report =
+        botster_hub_test_support::run_session_lifecycle_subscription_conformance(&conformance_hub)
+            .expect("run published session lifecycle conformance against real topology");
+    assert!(conformance_report.initial_snapshot_authoritative);
+    assert!(conformance_report.concurrent_subscribers_consistent);
+    assert!(conformance_report.spawn_upsert_observed);
+    assert!(conformance_report.lifecycle_patch_observed);
+    assert!(conformance_report.natural_exit_patch_observed);
+    assert!(conformance_report.remove_observed);
+    assert!(conformance_report.sequences_strictly_increasing);
+    assert!(conformance_report.disconnect_cleanup_released_subscription);
+    assert!(conformance_report.fresh_subscription_snapshot_authoritative);
+    assert_eq!(
+        conformance_report.overflow_resync_reason,
+        "subscriber_overflow"
+    );
+    assert!(conformance_report.failed_snapshot_delivery_closes_subscription);
+    conformance_hub
+        .shutdown()
+        .expect("shutdown published session lifecycle conformance hub");
+
     let data_dir = unique_test_dir("session-entity-subscription");
     let config = explicit_config(&data_dir);
     let endpoint = botster_hub_client::DaemonEndpoint::new(

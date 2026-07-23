@@ -5,6 +5,7 @@ Node-consumable Botster hub test-support assets for first-party web clients.
 The package is a generated wrapper over `botster-hub-test-support` and
 `botster-hub-client`. Do not edit `daemon-protocol.ts`,
 `first-party-client-support-matrix.json`,
+`session-lifecycle-subscription-conformance-fixture.json`,
 `late-attach-history-conformance-fixture.json`,
 `local-webrtc-response-chunk-conformance-fixture.json`,
 `mode-flags-conformance-fixture.json`,
@@ -17,7 +18,7 @@ node packages/hub-test-support/scripts/sync-assets.mjs
 ## Usage
 
 ```sh
-npm install --save-dev @trybotster/hub-test-support@0.1.8
+npm install --save-dev @trybotster/hub-test-support@0.1.9
 ```
 
 ```js
@@ -30,6 +31,7 @@ import {
   readLateAttachHistoryConformanceFixture,
   readLocalWebrtcResponseChunkConformanceFixture,
   readModeFlagsConformanceFixture,
+  readSessionLifecycleSubscriptionConformanceFixture,
 } from "@trybotster/hub-test-support";
 
 const protocolSource = readDaemonProtocolTypescript();
@@ -39,6 +41,7 @@ const supportMatrix = readFirstPartyClientSupportMatrix();
 const lateAttachFixture = readLateAttachHistoryConformanceFixture();
 const localWebrtcChunkFixture = readLocalWebrtcResponseChunkConformanceFixture();
 const modeFlagsFixture = readModeFlagsConformanceFixture();
+const sessionLifecycleFixture = readSessionLifecycleSubscriptionConformanceFixture();
 const applicationSurfaceId = metadata.application_primitives.surface_id;
 const rendererEntryPoint = metadata.application_primitives.renderer_entrypoint;
 
@@ -53,6 +56,7 @@ console.log(
   lateAttachFixture.history_then_live,
   localWebrtcChunkFixture.scenarios.large_generated,
   modeFlagsFixture.mouse_on.mode_flags.mouse_mode,
+  sessionLifecycleFixture.normalized_frames,
 );
 ```
 
@@ -61,16 +65,16 @@ Use this exact package spec in npm-based client repos:
 ```json
 {
   "devDependencies": {
-    "@trybotster/hub-test-support": "0.1.8"
+    "@trybotster/hub-test-support": "0.1.9"
   }
 }
 ```
 
-After `@trybotster/hub-test-support@0.1.8` is published to the public npm
+After `@trybotster/hub-test-support@0.1.9` is published to the public npm
 registry, no scoped `.npmrc` entry or CI auth token is required for install.
 
 The support matrix is generated from the Rust compatibility descriptors. In
-0.1.8, `terminal_readback` appears in both `supported_features` and
+0.1.9, `terminal_readback` appears in both `supported_features` and
 `required_features`; downstream compatibility checks must implement it rather
 than treating it as optional. The late-attach fixture is generated from the
 Rust serde scenario and preserves `attaching -> optional initial state ->
@@ -82,12 +86,16 @@ Only `read_screen_text` is renderable restored content; `snapshot` and
 version 0.1.5 / revision 12 exposes lossy string history. Neither is current
 binary-history contract authority.
 
-The current repository artifact also advertises
-`session_entity_subscriptions` and describes the held-open
-`subscribe_session_entities` helper, existing entity-frame vocabulary,
-independent bounded delivery, and explicit snapshot resync. Publishing that
-new protocol/revision is a separate release action; the public 0.1.8 tarball
-remains protocol version 1 and conformance revision 15 until then.
+Version 0.1.9 publishes protocol version 2 / conformance revision 16 and the
+source-derived session lifecycle subscription fixture. Its normalized public
+`DaemonEntityFrame` sequence is authoritative snapshot, spawn upsert,
+lifecycle patches, and remove. A fresh connection discards prior-generation
+frames and requires a new authoritative snapshot before accepting deltas.
+Overflow recovery is an authoritative snapshot with
+`resync_reason: "subscriber_overflow"`; a failed resync snapshot closes the
+subscription instead of concealing a delta gap. Rust consumers can run
+`run_session_lifecycle_subscription_conformance` against an `IsolatedHub` to
+prove the same contract through the real Hub/Core/session-worker topology.
 
 The mode-flags fixture covers the targeted `read_mode_flags` request/response
 contract. It preserves exact authoritative mouse values (`0` for off and `9`

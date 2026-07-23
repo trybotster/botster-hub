@@ -113,6 +113,17 @@ function metadataJson(originDir) {
       source_artifact_path: origin.first_party_client_support_matrix.source_artifact_path,
       sha256: sha256(join(originDir, origin.first_party_client_support_matrix.artifact_path)),
     },
+    session_lifecycle_subscription_conformance_fixture: {
+      artifact_path: origin.session_lifecycle_subscription_conformance_fixture.artifact_path,
+      source_artifact_path:
+        origin.session_lifecycle_subscription_conformance_fixture.source_artifact_path,
+      sha256: sha256(
+        join(
+          originDir,
+          origin.session_lifecycle_subscription_conformance_fixture.artifact_path,
+        ),
+      ),
+    },
     late_attach_history_conformance_fixture: {
       artifact_path: origin.late_attach_history_conformance_fixture.artifact_path,
       source_artifact_path: origin.late_attach_history_conformance_fixture.source_artifact_path,
@@ -179,6 +190,14 @@ try {
       failures,
     );
     compareFile(
+      metadata.session_lifecycle_subscription_conformance_fixture.artifact_path,
+      join(
+        originDir,
+        metadata.session_lifecycle_subscription_conformance_fixture.artifact_path,
+      ),
+      failures,
+    );
+    compareFile(
       metadata.late_attach_history_conformance_fixture.artifact_path,
       join(originDir, metadata.late_attach_history_conformance_fixture.artifact_path),
       failures,
@@ -219,6 +238,13 @@ try {
     copyFileSync(
       join(originDir, metadata.first_party_client_support_matrix.artifact_path),
       join(packageRoot, metadata.first_party_client_support_matrix.artifact_path),
+    );
+    copyFileSync(
+      join(
+        originDir,
+        metadata.session_lifecycle_subscription_conformance_fixture.artifact_path,
+      ),
+      join(packageRoot, metadata.session_lifecycle_subscription_conformance_fixture.artifact_path),
     );
     copyFileSync(
       join(originDir, metadata.late_attach_history_conformance_fixture.artifact_path),

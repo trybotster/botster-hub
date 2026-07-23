@@ -1,0 +1,84 @@
+{
+  "conformance_fixture_revision": 16,
+  "entity_type": "session",
+  "fresh_subscription": {
+    "prior_generation_frames_discarded": true,
+    "requires_authoritative_snapshot_before_deltas": true,
+    "snapshot": {
+      "entity_type": "session",
+      "items": [],
+      "snapshot_seq": 4,
+      "subscription_id": "session-lifecycle-generation-2",
+      "type": "entity_snapshot"
+    }
+  },
+  "normalized_frames": [
+    {
+      "entity_type": "session",
+      "items": [],
+      "snapshot_seq": 0,
+      "subscription_id": "session-lifecycle-generation-1",
+      "type": "entity_snapshot"
+    },
+    {
+      "entity": {
+        "cols": 80,
+        "lifecycle": "running",
+        "registry_state": "active",
+        "rows": 24,
+        "session_uuid": "slc-session",
+        "updated_at": 1
+      },
+      "entity_type": "session",
+      "id": "slc-session",
+      "snapshot_seq": 1,
+      "subscription_id": "session-lifecycle-generation-1",
+      "type": "entity_upsert"
+    },
+    {
+      "entity_type": "session",
+      "id": "slc-session",
+      "patch": {
+        "cols": 101,
+        "rows": 31,
+        "updated_at": 2
+      },
+      "snapshot_seq": 2,
+      "subscription_id": "session-lifecycle-generation-1",
+      "type": "entity_patch"
+    },
+    {
+      "entity_type": "session",
+      "id": "slc-session",
+      "patch": {
+        "exit_code": 0,
+        "lifecycle": "exited",
+        "updated_at": 3
+      },
+      "snapshot_seq": 3,
+      "subscription_id": "session-lifecycle-generation-1",
+      "type": "entity_patch"
+    },
+    {
+      "entity_type": "session",
+      "id": "slc-session",
+      "snapshot_seq": 4,
+      "subscription_id": "session-lifecycle-generation-1",
+      "type": "entity_remove"
+    }
+  ],
+  "overflow": {
+    "empty_snapshot_valid": true,
+    "failed_snapshot_delivery_closes_subscription": true,
+    "resync_reason": "subscriber_overflow",
+    "resync_snapshot": {
+      "entity_type": "session",
+      "items": [],
+      "resync_reason": "subscriber_overflow",
+      "snapshot_seq": 5,
+      "subscription_id": "session-lifecycle-generation-1",
+      "type": "entity_snapshot"
+    },
+    "snapshot_precedes_later_deltas": true
+  }
+}

@@ -6236,6 +6236,16 @@ mod tests {
 
     #[test]
     fn entity_overflow_requires_empty_snapshot_resync_and_failed_delivery_disconnects() {
+        let fixture =
+            botster_hub_test_support::session_lifecycle_subscription_conformance_scenario();
+        let overflow_reason = fixture.overflow.resync_reason.clone();
+        assert!(fixture.overflow.empty_snapshot_valid);
+        assert!(fixture.overflow.snapshot_precedes_later_deltas);
+        assert!(
+            fixture
+                .overflow
+                .failed_snapshot_delivery_closes_subscription
+        );
         let cursor = SessionLifecycleCursor {
             source_id: botster_core_daemon::SessionLifecycleSourceId("source".to_string()),
             sequence: 9,
@@ -6261,22 +6271,25 @@ mod tests {
                 sequence: 8,
             },
             entities: BTreeMap::new(),
-            resync_reason: Some("subscriber_overflow".to_string()),
+            resync_reason: Some(overflow_reason.clone()),
         };
 
         assert!(try_resync_subscription(
             "subscription",
             &mut state,
             baseline(),
-            "subscriber_overflow".to_string(),
+            overflow_reason.clone(),
         ));
-        assert_eq!(state.resync_reason.as_deref(), Some("subscriber_overflow"));
+        assert_eq!(
+            state.resync_reason.as_deref(),
+            Some(overflow_reason.as_str())
+        );
         let _ = receiver.recv().expect("drain stale queued frame");
         assert!(try_resync_subscription(
             "subscription",
             &mut state,
             baseline(),
-            "subscriber_overflow".to_string(),
+            overflow_reason.clone(),
         ));
         assert!(state.resync_reason.is_none());
         assert!(matches!(
@@ -6286,16 +6299,16 @@ mod tests {
                 ref items,
                 resync_reason: Some(ref reason),
                 ..
-            } if items.is_empty() && reason == "subscriber_overflow"
+            } if items.is_empty() && reason == &overflow_reason
         ));
 
         drop(receiver);
-        state.resync_reason = Some("subscriber_overflow".to_string());
+        state.resync_reason = Some(overflow_reason.clone());
         assert!(!try_resync_subscription(
             "subscription",
             &mut state,
             baseline(),
-            "subscriber_overflow".to_string(),
+            overflow_reason,
         ));
     }
 }
