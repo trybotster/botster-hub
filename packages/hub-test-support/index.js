@@ -75,12 +75,12 @@ export function readLateAttachHistoryConformanceFixture() {
   return readJson(metadata.late_attach_history_conformance_fixture.artifact_path);
 }
 
-export function localWebrtcResponseChunkConformanceFixturePath() {
-  return packagePath(metadata.local_webrtc_response_chunk_conformance_fixture.artifact_path);
+export function localWebrtcDeliveryChunkConformanceFixturePath() {
+  return packagePath(metadata.local_webrtc_delivery_chunk_conformance_fixture.artifact_path);
 }
 
-export function readLocalWebrtcResponseChunkConformanceFixture() {
-  return readJson(metadata.local_webrtc_response_chunk_conformance_fixture.artifact_path);
+export function readLocalWebrtcDeliveryChunkConformanceFixture() {
+  return readJson(metadata.local_webrtc_delivery_chunk_conformance_fixture.artifact_path);
 }
 
 export function modeFlagsConformanceFixturePath() {
@@ -126,7 +126,7 @@ export function verifyPackageAssets() {
     metadata.first_party_client_support_matrix,
     metadata.session_lifecycle_subscription_conformance_fixture,
     metadata.late_attach_history_conformance_fixture,
-    metadata.local_webrtc_response_chunk_conformance_fixture,
+    metadata.local_webrtc_delivery_chunk_conformance_fixture,
     metadata.mode_flags_conformance_fixture,
   ]) {
     if (!existsSync(packagePath(asset.artifact_path))) {

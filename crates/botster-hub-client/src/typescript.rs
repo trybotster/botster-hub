@@ -29,15 +29,21 @@ pub(crate) fn daemon_protocol_typescript() -> String {
     );
     emit_interface(
         &mut output,
-        "DaemonLocalWebrtcResponseChunk",
+        "DaemonLocalWebrtcDeliveryChunk",
         &[
             ("version", "number"),
+            ("delivery_kind", "DaemonLocalWebrtcDeliveryKind"),
             ("message_id", "string"),
             ("chunk_index", "number"),
             ("chunk_count", "number"),
             ("total_bytes", "number"),
             ("payload", "string"),
         ],
+    );
+    emit_string_union(
+        &mut output,
+        "DaemonLocalWebrtcDeliveryKind",
+        &["daemon_response", "daemon_entity_frame"],
     );
 
     emit_interface(

@@ -12,7 +12,7 @@ use std::io::{BufReader, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Sender, SyncSender, TrySendError};
+use std::sync::mpsc::{self, Sender, SyncSender};
 use std::thread;
 use std::time::Duration;
 
@@ -84,7 +84,7 @@ use crate::{Worktree, WorktreeCreate, WorktreeError};
 const MESSAGE_CONTENT_TYPE: &str = "application/vnd.botster.coordination.message+text";
 const WEBRTC_SIGNAL_OPERATION: &str = "local_webrtc_signal";
 const DAEMON_CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
-const ENTITY_SUBSCRIPTION_QUEUE_CAPACITY: usize = 64;
+pub(crate) const ENTITY_SUBSCRIPTION_QUEUE_CAPACITY: usize = 64;
 const ENTITY_STREAM_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 /// Run the local daemon socket until a shutdown request is received.
@@ -287,7 +287,7 @@ fn handle_entity_subscription(
         .send(ControlMessage::SubscribeEntities {
             entity_type,
             subscription_id: subscription_id.clone(),
-            frame_tx,
+            frame_tx: EntityFrameSender::Blocking(frame_tx),
             reply_tx,
         })
         .map_err(|_| DaemonTransportError::ControlThreadStopped)?;
@@ -487,6 +487,7 @@ fn handle_control_message(
         ControlMessage::LocalWebrtcPeerClosed {
             grant_id,
             attached_subscriptions,
+            entity_subscription_ids,
             terminal_record,
         } => {
             if let Err(error) = persist_local_webrtc_terminal_record(
@@ -499,6 +500,9 @@ fn handle_control_message(
                 );
             }
             daemon.local_webrtc().remove_peer(&grant_id);
+            for subscription_id in entity_subscription_ids {
+                state.entity_subscriptions.remove(&subscription_id);
+            }
             detach_local_webrtc_subscriptions(
                 daemon,
                 &mut state.logical_clock,
@@ -2937,7 +2941,7 @@ pub(crate) enum ControlMessage {
     SubscribeEntities {
         entity_type: String,
         subscription_id: String,
-        frame_tx: SyncSender<DaemonEntityFrame>,
+        frame_tx: EntityFrameSender,
         reply_tx: Sender<DaemonTransportResult<DaemonResponse>>,
     },
     UnsubscribeEntities {
@@ -2955,13 +2959,43 @@ pub(crate) enum ControlMessage {
     LocalWebrtcPeerClosed {
         grant_id: String,
         attached_subscriptions: Vec<LocalWebrtcAttachedSubscription>,
+        entity_subscription_ids: Vec<String>,
         terminal_record: LocalWebrtcSenderTerminalRecord,
     },
 }
 
 #[derive(Debug)]
+pub(crate) enum EntityFrameSender {
+    Blocking(SyncSender<DaemonEntityFrame>),
+    Async(tokio::sync::mpsc::Sender<DaemonEntityFrame>),
+}
+
+#[derive(Debug)]
+pub(crate) enum EntityFrameTrySendError {
+    Full,
+    Disconnected,
+}
+
+impl EntityFrameSender {
+    pub(crate) fn try_send(&self, frame: DaemonEntityFrame) -> Result<(), EntityFrameTrySendError> {
+        match self {
+            Self::Blocking(sender) => sender.try_send(frame).map_err(|error| match error {
+                mpsc::TrySendError::Full(_) => EntityFrameTrySendError::Full,
+                mpsc::TrySendError::Disconnected(_) => EntityFrameTrySendError::Disconnected,
+            }),
+            Self::Async(sender) => sender.try_send(frame).map_err(|error| match error {
+                tokio::sync::mpsc::error::TrySendError::Full(_) => EntityFrameTrySendError::Full,
+                tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+                    EntityFrameTrySendError::Disconnected
+                }
+            }),
+        }
+    }
+}
+
+#[derive(Debug)]
 struct EntitySubscriptionState {
-    sender: SyncSender<DaemonEntityFrame>,
+    sender: EntityFrameSender,
     cursor: SessionLifecycleCursor,
     entities: BTreeMap<String, DaemonSessionEntity>,
     resync_reason: Option<String>,
@@ -3111,7 +3145,7 @@ fn register_entity_subscription(
     subscriptions: &mut BTreeMap<String, EntitySubscriptionState>,
     entity_type: String,
     subscription_id: String,
-    sender: SyncSender<DaemonEntityFrame>,
+    sender: EntityFrameSender,
 ) -> DaemonTransportResult<DaemonResponse> {
     if subscriptions.contains_key(&subscription_id) {
         return Ok(entity_subscription_error(
@@ -3270,11 +3304,11 @@ fn drive_entity_subscriptions(
             };
             match state.sender.try_send(frame) {
                 Ok(()) => state.cursor = change.cursor,
-                Err(TrySendError::Full(_)) => {
+                Err(EntityFrameTrySendError::Full) => {
                     state.resync_reason = Some("subscriber_overflow".to_string());
                     return true;
                 }
-                Err(TrySendError::Disconnected(_)) => return false,
+                Err(EntityFrameTrySendError::Disconnected) => return false,
             }
         }
         state.cursor = changes.cursor;
@@ -3297,8 +3331,8 @@ fn try_resync_subscription(
             state.resync_reason = None;
             true
         }
-        Err(TrySendError::Full(_)) => true,
-        Err(TrySendError::Disconnected(_)) => false,
+        Err(EntityFrameTrySendError::Full) => true,
+        Err(EntityFrameTrySendError::Disconnected) => false,
     }
 }
 
@@ -6265,7 +6299,7 @@ mod tests {
             })
             .expect("fill bounded subscriber queue");
         let mut state = EntitySubscriptionState {
-            sender,
+            sender: EntityFrameSender::Blocking(sender),
             cursor: SessionLifecycleCursor {
                 source_id: botster_core_daemon::SessionLifecycleSourceId("source".to_string()),
                 sequence: 8,
@@ -6306,6 +6340,76 @@ mod tests {
         state.resync_reason = Some(overflow_reason.clone());
         assert!(!try_resync_subscription(
             "subscription",
+            &mut state,
+            baseline(),
+            overflow_reason,
+        ));
+    }
+
+    #[test]
+    fn async_entity_overflow_requires_empty_snapshot_resync_and_closed_delivery_disconnects() {
+        let overflow_reason = "subscriber_overflow".to_string();
+        let cursor = SessionLifecycleCursor {
+            source_id: botster_core_daemon::SessionLifecycleSourceId("source".to_string()),
+            sequence: 9,
+        };
+        let baseline = || SessionLifecycleBaseline {
+            cursor: cursor.clone(),
+            sessions: Vec::new(),
+        };
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        sender
+            .try_send(DaemonEntityFrame::Snapshot {
+                subscription_id: "async-subscription".to_string(),
+                entity_type: "session".to_string(),
+                snapshot_seq: 8,
+                items: Vec::new(),
+                resync_reason: None,
+            })
+            .expect("fill bounded async subscriber queue");
+        let mut state = EntitySubscriptionState {
+            sender: EntityFrameSender::Async(sender),
+            cursor: SessionLifecycleCursor {
+                source_id: botster_core_daemon::SessionLifecycleSourceId("source".to_string()),
+                sequence: 8,
+            },
+            entities: BTreeMap::new(),
+            resync_reason: Some(overflow_reason.clone()),
+        };
+
+        assert!(try_resync_subscription(
+            "async-subscription",
+            &mut state,
+            baseline(),
+            overflow_reason.clone(),
+        ));
+        assert_eq!(
+            state.resync_reason.as_deref(),
+            Some(overflow_reason.as_str()),
+            "a full production WebRTC queue must retain its pending resync"
+        );
+        let _ = receiver.try_recv().expect("drain stale async frame");
+        assert!(try_resync_subscription(
+            "async-subscription",
+            &mut state,
+            baseline(),
+            overflow_reason.clone(),
+        ));
+        assert!(state.resync_reason.is_none());
+        assert!(matches!(
+            receiver.try_recv().expect("receive async resync snapshot"),
+            DaemonEntityFrame::Snapshot {
+                snapshot_seq: 9,
+                ref items,
+                resync_reason: Some(ref reason),
+                ..
+            } if items.is_empty() && reason == &overflow_reason
+        ));
+
+        drop(receiver);
+        state.resync_reason = Some(overflow_reason.clone());
+        assert!(!try_resync_subscription(
+            "async-subscription",
             &mut state,
             baseline(),
             overflow_reason,
