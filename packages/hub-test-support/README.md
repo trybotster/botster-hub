@@ -18,7 +18,7 @@ node packages/hub-test-support/scripts/sync-assets.mjs
 ## Usage
 
 ```sh
-npm install --save-dev @trybotster/hub-test-support@0.1.10
+npm install --save-dev @trybotster/hub-test-support@0.1.11
 ```
 
 ```js
@@ -65,16 +65,16 @@ Use this exact package spec in npm-based client repos:
 ```json
 {
   "devDependencies": {
-    "@trybotster/hub-test-support": "0.1.10"
+    "@trybotster/hub-test-support": "0.1.11"
   }
 }
 ```
 
-After `@trybotster/hub-test-support@0.1.10` is published to the public npm
+After `@trybotster/hub-test-support@0.1.11` is published to the public npm
 registry, no scoped `.npmrc` entry or CI auth token is required for install.
 
-The support matrix is generated from the Rust compatibility descriptors. In
-0.1.10, `terminal_readback` appears in both `supported_features` and
+The support matrix is generated from the Rust compatibility descriptors.
+`terminal_readback` appears in both `supported_features` and
 `required_features`; downstream compatibility checks must implement it rather
 than treating it as optional. The late-attach fixture is generated from the
 Rust serde scenario and preserves `attaching -> optional initial state ->
@@ -86,7 +86,8 @@ Only `read_screen_text` is renderable restored content; `snapshot` and
 version 0.1.5 / revision 12 exposes lossy string history. Neither is current
 binary-history contract authority.
 
-Version 0.1.10 publishes protocol version 2 / conformance revision 17, the
+Version 0.1.11 publishes protocol version 3 / conformance revision 18, the
+`refresh_local_packages` daemon request,
 authenticated local-WebRTC delivery-kind fixture, and the
 source-derived session lifecycle subscription fixture. Its normalized public
 `DaemonEntityFrame` sequence is authoritative snapshot, spawn upsert,
