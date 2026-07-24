@@ -4,7 +4,8 @@
 
 - Target repository: `trybotster/botster-hub`
 - Target id: `tgt_7e208a0c76a44980a83b63af976b1f22`
-- Pipeline ticket: `ticket_1784912420_977096`
+- Preparation ticket: `ticket_1784912420_977096`
+- Publication ticket: `ticket_1784916883_931144`
 - Pipeline run: `run_1784912505_507667`
 - Preparation branch: `project-pipelines/ticket_1784912420_977096`
 - Preparation base: `origin/main` at
@@ -17,8 +18,9 @@ The public registry preflight returned npm `latest` and `dist-tags.latest` as
 `0.1.10`. Source preflight found protocol version `2` and conformance fixture
 revision `17`, so `0.1.11` / `3` / `18` were unused next identities.
 
-This branch did **not** run `npm publish`. Publication remains owned by a
-post-merge Hub child run pinned to the exact merge commit.
+This branch did **not** run `npm publish`. Publication remains owned by
+`ticket_1784916883_931144`; after merge, the product orchestrator starts that
+ticket's run pinned to the exact merge commit.
 
 ## Generated path and changed behavior
 
@@ -122,15 +124,22 @@ proof.
 - No `botster-core`, botster-web, botster-tui, Project Pipelines package, or
   Project Pipelines plugin source was changed.
 - Existing Web consumer work remains ticket `ticket_1784912421_508855` on the
-  botster-web target. No duplicate consumer ticket was created.
+  botster-web target. It now depends on publication ticket
+  `ticket_1784916883_931144`. Final integration ticket
+  `ticket_1784854143_789468` also depends on the publication ticket. No
+  duplicate consumer ticket was created.
 - No sibling checkout or
   `BOTSTER_HUB_CLIENT_DAEMON_PROTOCOL` override was used as evidence.
 
-There were no implementation deviations from the approved plan.
+The implementation follows the approved code plan. The sequencing contract was
+clarified by human answer `question_1784914707_524559`: this ticket is
+preparation-only and may auto-close with its PR; publication ticket
+`ticket_1784916883_931144` was created before merge, and the product
+orchestrator starts its exact-merge-SHA run after this ticket closes.
 
 ## Post-merge publication commands and residual risk
 
-From a clean child checkout pinned to the exact merge commit:
+From the clean publication-ticket checkout pinned to the exact merge commit:
 
 ```sh
 git rev-parse HEAD origin/main
@@ -144,7 +153,7 @@ npm publish --access public
 npm view @trybotster/hub-test-support@0.1.11 version dist.tarball dist.integrity --json
 ```
 
-The child must also capture real Hub `up`/status output, install the public
+The publication run must also capture real Hub `up`/status output, install the public
 coordinate in a new external consumer, repeat the identity/token/fixture
 assertions, and prove the installed public protocol hash equals the
 authoritative merge-commit hash.
