@@ -631,8 +631,11 @@ fn provider_manifest() -> PackageManifest {
 
 fn write_local_plugin_package(root: &Path) {
     fs::create_dir_all(root).expect("create local package root");
+    fs::create_dir_all(root.join("bin")).expect("create local package bin");
     fs::write(root.join("plugin.lua"), "return botster.register({})\n")
         .expect("write plugin entrypoint");
+    fs::write(root.join("bin/botster-web"), "#!/bin/sh\n")
+        .expect("write runnable package entrypoint");
     fs::write(
         root.join("botster-package.json"),
         r#"{
@@ -1443,6 +1446,41 @@ if (startupDelayMs > 0) {
         serde_json::to_string_pretty(&manifest).expect("serialize botster-web manifest"),
     )
     .expect("write botster-web manifest");
+}
+
+fn rewrite_botster_web_entrypoint(
+    root: &Path,
+    version: &str,
+    script_name: &str,
+    marker_name: &str,
+) {
+    let original = fs::read_to_string(root.join("scripts/real-hub-dogfood-bridge.mjs"))
+        .expect("read original botster-web entrypoint");
+    let marker = format!(
+        "fs.writeFileSync(new URL('../{marker_name}', import.meta.url), 'refreshed');\nconst port ="
+    );
+    let refreshed = format!(
+        "#!/usr/bin/env node\n{}",
+        original.replacen("const port =", &marker, 1)
+    );
+    let script_path = root.join("scripts").join(script_name);
+    fs::write(&script_path, refreshed).expect("write refreshed botster-web entrypoint");
+    fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755))
+        .expect("make refreshed botster-web entrypoint executable");
+
+    let manifest_path = root.join("botster-package.json");
+    let mut manifest: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(&manifest_path).expect("read botster-web manifest"),
+    )
+    .expect("parse botster-web manifest");
+    manifest["version"] = serde_json::Value::String(version.to_string());
+    manifest["runnable_entrypoints"][0]["command"] =
+        serde_json::Value::String(format!("scripts/{script_name}"));
+    fs::write(
+        manifest_path,
+        serde_json::to_string_pretty(&manifest).expect("serialize refreshed botster-web manifest"),
+    )
+    .expect("write refreshed botster-web manifest");
 }
 
 fn write_health_only_botster_web_package(root: &Path) {
@@ -5059,6 +5097,12 @@ fn cli_local_runtime_up_starts_reuses_and_down_stops_runtime() {
         );
     }
 
+    rewrite_botster_web_entrypoint(
+        &web_package_dir,
+        "1.1.0",
+        "local-package-server.mjs",
+        "reused-up.marker",
+    );
     let second = run_local_runtime_up(
         &data_dir,
         &project_pipelines_package_dir,
@@ -5073,6 +5117,23 @@ fn cli_local_runtime_up_starts_reuses_and_down_stops_runtime() {
         command_output_text(&second)
     );
     assert!(command_output_text(&second).contains("daemon=reused"));
+    assert!(
+        web_package_dir.join("reused-up.marker").is_file(),
+        "reused-daemon up should launch the refreshed package entrypoint"
+    );
+    let config = explicit_config(&data_dir);
+    let packages =
+        botster_hub::daemon_transport_request(&config, botster_hub::DaemonRequest::ListPackages)
+            .expect("list packages after reused up refresh");
+    assert_eq!(
+        packages
+            .packages
+            .iter()
+            .find(|package| package.package_name == "botster-web")
+            .expect("botster-web package after reused up")
+            .version,
+        "1.1.0"
+    );
 
     let down = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
         .arg("down")
@@ -5088,6 +5149,12 @@ fn cli_local_runtime_up_starts_reuses_and_down_stops_runtime() {
     let down_text = command_output_text(&down);
     assert!(down_text.contains("response=shutdown"));
 
+    rewrite_botster_web_entrypoint(
+        &web_package_dir,
+        "1.2.0",
+        "startup-local-package-server.mjs",
+        "startup-up.marker",
+    );
     let restarted = run_local_runtime_up(
         &data_dir,
         &project_pipelines_package_dir,
@@ -5104,6 +5171,22 @@ fn cli_local_runtime_up_starts_reuses_and_down_stops_runtime() {
     let restarted_text = command_output_text(&restarted);
     assert!(restarted_text.contains("runtime=ready"));
     assert!(restarted_text.contains("daemon=started"));
+    assert!(
+        web_package_dir.join("startup-up.marker").is_file(),
+        "fresh-daemon up should launch the refreshed package entrypoint"
+    );
+    let packages =
+        botster_hub::daemon_transport_request(&config, botster_hub::DaemonRequest::ListPackages)
+            .expect("list packages after startup up refresh");
+    assert_eq!(
+        packages
+            .packages
+            .iter()
+            .find(|package| package.package_name == "botster-web")
+            .expect("botster-web package after startup up")
+            .version,
+        "1.2.0"
+    );
 
     shutdown_dev_stack_daemon(&data_dir);
 
@@ -5117,6 +5200,55 @@ fn cli_local_runtime_up_starts_reuses_and_down_stops_runtime() {
         !status.status.success(),
         "status should fail after daemon shutdown: {}",
         command_output_text(&status)
+    );
+}
+
+#[test]
+fn cli_local_runtime_up_reports_missing_installed_checkout_before_launch() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_short_test_dir("cli-up-missing-checkout");
+    let project_pipelines_package_dir = unique_test_dir("cli-up-missing-project-pipelines");
+    let web_package_dir = unique_test_dir("cli-up-missing-web");
+    let tui_package_dir = unique_test_dir("cli-up-missing-tui");
+    let workspaces_package_dir = unique_test_dir("cli-up-missing-workspaces");
+    write_project_pipelines_availability_package(&project_pipelines_package_dir);
+    write_botster_web_package(&web_package_dir);
+    write_botster_tui_package(&tui_package_dir);
+    write_botster_workspaces_local_package(&workspaces_package_dir, "botster-workspaces");
+
+    let first = run_local_runtime_up(
+        &data_dir,
+        &project_pipelines_package_dir,
+        &web_package_dir,
+        &tui_package_dir,
+        &workspaces_package_dir,
+        unused_loopback_port(),
+    );
+    assert!(
+        first.status.success(),
+        "initial up failed: {}",
+        command_output_text(&first)
+    );
+    shutdown_dev_stack_daemon(&data_dir);
+    fs::remove_dir_all(&web_package_dir).expect("remove installed web checkout");
+
+    let failed = run_local_runtime_up(
+        &data_dir,
+        &project_pipelines_package_dir,
+        &web_package_dir,
+        &tui_package_dir,
+        &workspaces_package_dir,
+        unused_loopback_port(),
+    );
+    assert!(
+        !failed.status.success(),
+        "up should fail for missing installed checkout"
+    );
+    let text = command_output_text(&failed);
+    assert!(text.contains("botster-web"), "{text}");
+    assert!(
+        text.contains(web_package_dir.to_string_lossy().as_ref()),
+        "{text}"
     );
 }
 
@@ -13182,6 +13314,76 @@ fn local_package_reload_rereads_manifest_restarts_running_app_and_cli_open_uses_
     assert!(alias_text.contains("version=1.1.0"));
     assert!(!alias_text.contains(package_dir.to_string_lossy().as_ref()));
     assert!(!alias_text.contains(data_dir.to_string_lossy().as_ref()));
+
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
+fn daemon_batch_local_refresh_rejects_mixed_registration_set_on_validation_failure() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_test_dir("batch-local-refresh-atomic");
+    let alpha_dir = unique_test_dir("batch-local-refresh-alpha");
+    let beta_dir = unique_test_dir("batch-local-refresh-beta");
+    write_reloadable_app_package_named(
+        &alpha_dir,
+        "refresh.alpha",
+        "1.0.0",
+        "http://127.0.0.1:49164",
+    );
+    write_reloadable_app_package_named(
+        &beta_dir,
+        "refresh.beta",
+        "1.0.0",
+        "http://127.0.0.1:49165",
+    );
+    let config = explicit_config(&data_dir);
+    let child = start_cli_daemon(&data_dir);
+
+    for package_dir in [&alpha_dir, &beta_dir] {
+        botster_hub::daemon_transport_request(
+            &config,
+            botster_hub::DaemonRequest::InstallPackageLocalPath {
+                path: package_dir.clone(),
+            },
+        )
+        .expect("install local package");
+    }
+
+    write_reloadable_app_package_named(
+        &alpha_dir,
+        "refresh.alpha",
+        "2.0.0",
+        "http://127.0.0.1:49166",
+    );
+    fs::remove_file(beta_dir.join("plugin.lua")).expect("remove beta entrypoint");
+
+    let refresh = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::RefreshLocalPackages,
+    )
+    .expect("failed refresh should return an operator frame");
+    assert_eq!(refresh.kind, botster_hub::DaemonResponseKind::OperatorError);
+    let error = refresh.error.expect("refresh operator error");
+    assert!(error.message.contains("refresh.beta"));
+    assert!(error.message.contains(beta_dir.to_string_lossy().as_ref()));
+
+    let packages =
+        botster_hub::daemon_transport_request(&config, botster_hub::DaemonRequest::ListPackages)
+            .expect("list packages after failed refresh");
+    for package_name in ["refresh.alpha", "refresh.beta"] {
+        assert_eq!(
+            packages
+                .packages
+                .iter()
+                .find(|package| package.package_name == package_name)
+                .expect("installed package")
+                .version,
+            "1.0.0"
+        );
+    }
+    let state_json =
+        fs::read_to_string(data_dir.join("hub-state.json")).expect("read durable hub state");
+    assert!(!state_json.contains("\"version\": \"2.0.0\""));
 
     shutdown_cli_daemon(&data_dir, child);
 }

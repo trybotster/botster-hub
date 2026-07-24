@@ -351,9 +351,13 @@ package app entrypoints must already exist in their package roots before `apps
 open` can launch them.
 
 `botster-hub up` starts or reuses a daemon over a stable data directory,
-installs and enables the first-party packages as ordinary local packages, starts
-the `botster-web` app entrypoint through daemon supervision, and prints the
-app/operator commands for the same data directory:
+transactionally re-reads every directly installed local path package, installs
+and enables the first-party packages as ordinary local packages, starts the
+`botster-web` app entrypoint through daemon supervision, and prints the
+app/operator commands for the same data directory. The refresh completes before
+any enabled entrypoint launches; one invalid local package rejects the complete
+refresh without mixing old and new registrations. Registry-installed packages
+remain pinned and are not implicitly refreshed:
 
 ```sh
 cargo run -- up \
@@ -434,8 +438,10 @@ botster-hub reload botster-web --data-dir target/botster-hub-dev-stack-data
 
 `open web` resolves the first-party `botster-web/web-client` app through the
 same `apps open` path. `open tui` resolves `botster-tui` through the daemon's
-terminal launch contract. `reload <package>` is a package reload alias; it does
-not mean entrypoint restart.
+terminal launch contract. `reload <package>` remains an explicit package reload
+alias backed by the same local-package refresh implementation as `up`; it
+restarts that package's already-running entrypoints after the refreshed
+registration is durably committed.
 
 Command layers:
 
@@ -477,9 +483,10 @@ botster-hub packages reload --data-dir target/botster-hub-dev-stack-data botster
 first-party local packages. `packages check-update`, `preview-update`, and
 `apply-update` exercise the hub's update metadata path; they do not fetch local
 package code or rebuild a sibling repo for you. After editing an installed local
-package, rebuild that package's own output when needed, then run `packages
-reload` to re-read its manifest and restart any running entrypoints for that
-package.
+package, rebuild that package's own output when needed, then run bare
+`botster-hub up`; it re-reads all direct local manifests before launch and
+restarts entrypoints that were already running. Use `packages reload` when an
+operator needs to refresh one package without running the daily `up` flow.
 
 From another terminal, the composed local client app path should be visible
 through the same stable data directory:
@@ -828,10 +835,12 @@ for always-delivered doorbells.
 ## Daily Dev Troubleshooting
 
 Stale package build output: rebuild the edited sibling package with its own
-repo's build command, then run `botster-hub packages reload --data-dir
-target/botster-hub-dev-stack-data <package-name>`. Package reload re-reads the
-manifest and restarts running entrypoints, but it does not rebuild sibling repo
-artifacts or fetch updated code.
+repo's build command, then rerun `botster-hub up`. The daily command re-reads
+direct local manifests but does not build sibling artifacts; a missing declared
+package-relative command fails before launch with the package name, local path,
+and rebuild remediation. `botster-hub packages reload --data-dir
+target/botster-hub-dev-stack-data <package-name>` remains available for an
+explicit one-package refresh.
 
 Missing app or Lua entrypoints: run `botster-hub packages show --data-dir
 target/botster-hub-dev-stack-data <package-name>` and `botster-hub apps list
