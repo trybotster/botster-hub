@@ -1,9 +1,9 @@
 //! Isolated daemon harness for external `botster-hub-client` integration tests.
 //!
-//! This crate intentionally depends only on the client protocol crate and starts
-//! the `botster-hub` binary as a subprocess. Downstream tests must supply the
-//! hub and session-worker binary paths explicitly, or via `BOTSTER_HUB_BIN` and
-//! `BOTSTER_SESSION_WORKER_BIN`.
+//! This crate starts the `botster-hub` binary as a subprocess and consumes the
+//! Core runnable-entrypoint connection DTO plus the public client protocol.
+//! Downstream tests must supply the hub and session-worker binary paths
+//! explicitly, or via `BOTSTER_HUB_BIN` and `BOTSTER_SESSION_WORKER_BIN`.
 
 use std::collections::BTreeMap;
 use std::env;
@@ -16,6 +16,7 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use botster_core::{RunnableEntrypointHubConnection, RunnableEntrypointHubConnectionTransport};
 use botster_hub_client::{
     DaemonCompatibility, DaemonCompatibilityRequirement, DaemonConnection, DaemonDiagnostic,
     DaemonDiagnosticKind, DaemonEndpoint, DaemonEntityFrame, DaemonEvent, DaemonModeFlags,
@@ -2158,9 +2159,10 @@ pub struct ForegroundTerminalAppOpenConformanceReport {
     pub app_kind: String,
     pub launch_mode: String,
     pub resolved_command: String,
-    pub hub_socket_env_present: bool,
+    pub hub_connection_env_present: bool,
+    pub hub_connection_transport: String,
+    pub hub_connection_socket_path_absolute: bool,
     pub hub_data_dir_env_present: bool,
-    pub hub_socket_env_absolute: bool,
     pub hub_data_dir_env_absolute: bool,
     pub launch_working_directory_is_package_root: bool,
     pub launch_working_directory_differs_from_daemon_cwd: bool,
@@ -3413,9 +3415,9 @@ pub fn run_plugin_contract_matrix_conformance(
 /// The helper installs a local package with a `terminal_app` / `foreground_stdio`
 /// runnable entrypoint, discovers it through `ListApps`, resolves it through
 /// `ResolveAppLaunch`, then executes the daemon-resolved command with the
-/// daemon-provided working directory and environment. The child process uses
-/// `BOTSTER_HUB_SOCKET` to perform a real `Status` daemon request before
-/// exiting.
+/// daemon-provided working directory and environment. The child process decodes
+/// Core's structured Hub connection descriptor and uses its Unix socket
+/// transport to perform a real `Status` daemon request before exiting.
 pub fn run_foreground_terminal_app_open_conformance(
     hub: &IsolatedHub,
 ) -> Result<ForegroundTerminalAppOpenConformanceReport, ConformanceError> {
@@ -3478,12 +3480,12 @@ pub fn run_foreground_terminal_app_open_conformance(
             operation: "resolve_app_launch",
             field: "resolved_app_launch",
         })?;
-    let hub_socket_env_present = launch.environment.contains_key("BOTSTER_HUB_SOCKET");
+    let hub_connection_env_present = launch.environment.contains_key("BOTSTER_HUB_CONNECTION");
     let hub_data_dir_env_present = launch.environment.contains_key("BOTSTER_HUB_DATA_DIR");
-    if !hub_socket_env_present {
+    if !hub_connection_env_present {
         return Err(ConformanceError::MissingEnvironment {
             operation: "resolve_app_launch",
-            name: "BOTSTER_HUB_SOCKET",
+            name: "BOTSTER_HUB_CONNECTION",
         });
     }
     if !hub_data_dir_env_present {
@@ -3492,8 +3494,29 @@ pub fn run_foreground_terminal_app_open_conformance(
             name: "BOTSTER_HUB_DATA_DIR",
         });
     }
-    let hub_socket_env_absolute =
-        Path::new(&launch.environment["BOTSTER_HUB_SOCKET"]).is_absolute();
+    let hub_connection: RunnableEntrypointHubConnection =
+        serde_json::from_str(&launch.environment["BOTSTER_HUB_CONNECTION"]).map_err(|error| {
+            ConformanceError::UnexpectedValue {
+                operation: "resolve_app_launch",
+                field: "BOTSTER_HUB_CONNECTION",
+                expected: "Core RunnableEntrypointHubConnection JSON".to_string(),
+                actual: error.to_string(),
+            }
+        })?;
+    hub_connection
+        .validate()
+        .map_err(|error| ConformanceError::UnexpectedValue {
+            operation: "resolve_app_launch",
+            field: "BOTSTER_HUB_CONNECTION",
+            expected: "valid Core RunnableEntrypointHubConnection".to_string(),
+            actual: error.to_string(),
+        })?;
+    let (hub_connection_transport, hub_connection_socket_path_absolute) =
+        match &hub_connection.transport {
+            RunnableEntrypointHubConnectionTransport::UnixSocket { path } => {
+                ("unix_socket".to_string(), Path::new(path).is_absolute())
+            }
+        };
     let hub_data_dir_env_absolute =
         Path::new(&launch.environment["BOTSTER_HUB_DATA_DIR"]).is_absolute();
     let launch_working_directory_is_package_root = fs::canonicalize(&package_path)
@@ -3537,9 +3560,10 @@ pub fn run_foreground_terminal_app_open_conformance(
         app_kind: app.kind,
         launch_mode: app.launch_mode,
         resolved_command: launch.command,
-        hub_socket_env_present,
+        hub_connection_env_present,
+        hub_connection_transport,
+        hub_connection_socket_path_absolute,
         hub_data_dir_env_present,
-        hub_socket_env_absolute,
         hub_data_dir_env_absolute,
         launch_working_directory_is_package_root,
         launch_working_directory_differs_from_daemon_cwd,
@@ -3571,11 +3595,20 @@ fn write_foreground_terminal_app_package(package_path: &Path) -> Result<(), Conf
 import fs from 'fs';
 import net from 'net';
 
-const socket = process.env.BOTSTER_HUB_SOCKET;
+let hubConnection;
+try {
+  hubConnection = JSON.parse(process.env.BOTSTER_HUB_CONNECTION || 'null');
+} catch (error) {
+  console.error(`invalid BOTSTER_HUB_CONNECTION: ${error}`);
+  process.exit(42);
+}
+const socket = hubConnection?.transport?.type === 'unix_socket'
+  ? hubConnection.transport.path
+  : undefined;
 const dataDir = process.env.BOTSTER_HUB_DATA_DIR;
 
 if (!socket) {
-  console.error('missing BOTSTER_HUB_SOCKET');
+  console.error('BOTSTER_HUB_CONNECTION does not contain a Unix socket');
   process.exit(42);
 }
 if (!dataDir) {
@@ -3583,7 +3616,7 @@ if (!dataDir) {
   process.exit(43);
 }
 if (!fs.existsSync(socket)) {
-  console.error('BOTSTER_HUB_SOCKET is not a socket path that exists');
+  console.error('BOTSTER_HUB_CONNECTION Unix socket path does not exist');
   process.exit(44);
 }
 if (!fs.existsSync(dataDir) || !fs.statSync(dataDir).isDirectory()) {
@@ -3651,7 +3684,9 @@ if (response.kind !== 'status' || !response.status) {
   process.exit(46);
 }
 
-console.log(`hub_socket_present=${Boolean(socket)}`);
+console.log(`hub_connection_present=${Boolean(hubConnection)}`);
+console.log(`hub_connection_transport=${hubConnection.transport.type}`);
+console.log(`hub_connection_socket_absolute=${socket.startsWith('/')}`);
 console.log(`hub_data_dir_present=${Boolean(dataDir)}`);
 console.log(`daemon_status=${response.status.lifecycle_state}`);
 "#,
@@ -3676,10 +3711,25 @@ console.log(`daemon_status=${response.status.lifecycle_state}`);
             "command": "node",
             "args": ["scripts/foreground-terminal-client.mjs"],
             "working_directory": { "policy": "package_root" },
-            "environment": [
-                { "name": "BOTSTER_HUB_SOCKET", "required": false },
-                { "name": "BOTSTER_HUB_DATA_DIR", "required": false }
+            "injections": [
+                {
+                    "kind": "hub_connection",
+                    "target": {
+                        "type": "environment",
+                        "name": "BOTSTER_HUB_CONNECTION"
+                    },
+                    "required": true
+                },
+                {
+                    "kind": "data_dir",
+                    "target": {
+                        "type": "environment",
+                        "name": "BOTSTER_HUB_DATA_DIR"
+                    },
+                    "required": true
+                }
             ],
+            "environment": [],
             "launch_mode": "foreground_stdio"
         }]
     });

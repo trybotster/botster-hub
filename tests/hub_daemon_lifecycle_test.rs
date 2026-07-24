@@ -7876,9 +7876,10 @@ fn external_hub_test_support_drives_isolated_daemon_socket_protocol() {
     assert_eq!(terminal_app_report.entrypoint_id, "tui");
     assert_eq!(terminal_app_report.app_kind, "terminal_app");
     assert_eq!(terminal_app_report.launch_mode, "foreground_stdio");
-    assert!(terminal_app_report.hub_socket_env_present);
+    assert!(terminal_app_report.hub_connection_env_present);
+    assert_eq!(terminal_app_report.hub_connection_transport, "unix_socket");
+    assert!(terminal_app_report.hub_connection_socket_path_absolute);
     assert!(terminal_app_report.hub_data_dir_env_present);
-    assert!(terminal_app_report.hub_socket_env_absolute);
     assert!(terminal_app_report.hub_data_dir_env_absolute);
     assert!(terminal_app_report.launch_working_directory_is_package_root);
     assert!(terminal_app_report.launch_working_directory_differs_from_daemon_cwd);
@@ -7888,7 +7889,17 @@ fn external_hub_test_support_drives_isolated_daemon_socket_protocol() {
     assert!(
         terminal_app_report
             .stdout
-            .contains("hub_socket_present=true")
+            .contains("hub_connection_present=true")
+    );
+    assert!(
+        terminal_app_report
+            .stdout
+            .contains("hub_connection_transport=unix_socket")
+    );
+    assert!(
+        terminal_app_report
+            .stdout
+            .contains("hub_connection_socket_absolute=true")
     );
     assert!(
         terminal_app_report
@@ -7930,7 +7941,7 @@ fn foreground_terminal_app_open_absolutizes_relative_runtime_paths() {
 
     let report = botster_hub_test_support::run_foreground_terminal_app_open_conformance(&hub)
         .expect("launch package-root child through daemon-resolved foreground contract");
-    assert!(report.hub_socket_env_absolute);
+    assert!(report.hub_connection_socket_path_absolute);
     assert!(report.hub_data_dir_env_absolute);
     assert!(report.launch_working_directory_is_package_root);
     assert!(report.launch_working_directory_differs_from_daemon_cwd);
