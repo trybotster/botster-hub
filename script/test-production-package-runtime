@@ -524,14 +524,23 @@ down_runtime_leg() {
 assert_failed_up_cleanup() {
   failed_data_dir=$1
   failed_metadata=$failed_data_dir/.botster-hub-runtime-daemon.json
-  [ -e "$failed_metadata" ] || return 0
-  failed_pid=$(ruby -rjson -e 'print JSON.parse(File.read(ARGV.fetch(0))).fetch("pid")' "$failed_metadata")
-  failed_socket=$(ruby -rjson -e 'print JSON.parse(File.read(ARGV.fetch(0))).fetch("socket_path")' "$failed_metadata")
+  failed_socket=$failed_data_dir/botster-hub.sock
+  failed_pid=
+  if [ -e "$failed_metadata" ]; then
+    failed_pid=$(ruby -rjson -e 'print JSON.parse(File.read(ARGV.fetch(0))).fetch("pid")' "$failed_metadata")
+    failed_socket=$(ruby -rjson -e 'print JSON.parse(File.read(ARGV.fetch(0))).fetch("socket_path")' "$failed_metadata")
+  fi
+  failed_cleanup_attempts=0
+  while [ -e "$failed_socket" ]; do
+    failed_cleanup_attempts=$((failed_cleanup_attempts + 1))
+    [ "$failed_cleanup_attempts" -lt 100 ] || break
+    sleep 0.02
+  done
   [ ! -e "$failed_socket" ] || {
     echo "failed up left an owned socket: $failed_socket" >&2
     exit 1
   }
-  if kill -0 "$failed_pid" >/dev/null 2>&1; then
+  if [ -n "$failed_pid" ] && kill -0 "$failed_pid" >/dev/null 2>&1; then
     echo "failed up left an owned Hub process: $failed_pid" >&2
     exit 1
   fi

@@ -24,6 +24,10 @@
 - `script/test-production-package-runtime`: seven-repository fresh/upgrade
   runtime campaign, explicit Ruby preflight, dynamic/explicit/invalid Web port
   proof, and bounded cleanup.
+- `src/main.rs`: shut down a newly started owned daemon when `up` fails during
+  package refresh/admission/launch.
+- `tests/hub_daemon_lifecycle_test.rs`: regression proof that failed startup
+  leaves neither a responding daemon nor an owned socket.
 - This report.
 
 ## Ownership And Cross-Repository Routing
@@ -46,6 +50,9 @@ as a blocking dependency instead of adding an integration workaround.
   extensions, failed-launch cleanup assertions, operator-root coverage, and a
   shell matcher control. Those proof defects were corrected without changing
   product runtime ownership.
+- The new failed-launch assertion exposed a Hub-owned lifecycle defect rather
+  than a harness-only gap. The committed plan now records the runtime and test
+  changes permitted by its “actual Hub-owned defect” clause.
 
 ## Verification
 
