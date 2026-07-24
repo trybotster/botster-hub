@@ -320,14 +320,46 @@ The end-to-end local production runtime proofs are:
 ./test.sh --test hub_local_runtime_test
 ./test.sh --test hub_daemon_lifecycle_test cli_daemon_restart_recovers_worker_backed_session_through_transport
 script/test-production-package-runtime \
-  --web-package-path /path/to/botster-web \
-  --tui-package-path /path/to/botster-tui
+  --hub-repo /path/to/botster-hub --hub-revision <sha> \
+  --core-repo /path/to/botster-core --core-revision <sha> \
+  --web-repo /path/to/botster-web --web-revision <sha> \
+  --tui-repo /path/to/botster-tui --tui-revision <sha> \
+  --tui-kit-repo /path/to/botster-tui-kit --tui-kit-revision <sha> \
+  --workspaces-repo /path/to/botster-workspaces --workspaces-revision <sha> \
+  --project-pipelines-repo /path/to/botster-project-pipelines \
+  --project-pipelines-revision <sha> \
+  --pre-cutover-hub-revision <sha> \
+  --pre-cutover-web-revision <sha> \
+  --pre-cutover-tui-revision <sha> \
+  --pre-cutover-workspaces-revision <sha> \
+  --pre-cutover-project-pipelines-revision <sha> \
+  --evidence-dir /path/to/new-evidence-directory
 ```
 
-The first test proves the persisted-package CLI path. The explicit-path script
-records the Hub, Web, and TUI revisions and exercises real package manifests,
-dynamic Web readiness, page-load WebRTC bootstrap, the foreground TUI launch
-contract, smoke, and clean shutdown.
+The first test proves the persisted-package CLI path. The explicit-coordinate
+script rejects dirty or revision-mismatched repositories before starting a
+process. It first installs Web's declared Hub test-support release in a clean
+external consumer and requires its metadata, generated protocol bytes,
+conformance revision, and packaged fixture checksums to match both the exact Hub
+source and Web's vendored protocol.
+
+The default `--mode all` then runs fresh and upgrade acceptance. The fresh leg
+installs and enables Web, TUI, Workspaces, and Project Pipelines through the
+public package commands. It proves structured dynamic Web readiness while the
+historical fixed port is occupied, browser/WebRTC session and reconnect
+behavior, the package-launched headless TUI path, registered plugin tools,
+status, doctor, smoke, and owned-process cleanup. The upgrade leg creates its
+fixture with exact pre-cutover revisions in temporary Git worktrees, advances
+only those package worktrees, and lets current `up` refresh the untouched
+durable state without a manual reload. It also proves daemon restart and
+worker-backed session adoption.
+
+The new evidence directory contains path-neutral revisions, commands, artifact
+hashes, operator-state before/after manifests, fresh and upgrade endpoints,
+runtime output, and the seven-repository product-surface audit. Retained
+`docs/plans/**`, `docs/reports/**`, and Git history are excluded from that audit;
+current source, tests, executable scripts, manifests, README files, supported
+examples, and current architecture/operator documentation remain in scope.
 
 For daily first-party local development, install and enable `botster-web` and
 `botster-tui` once through the ordinary package commands, then use
@@ -451,7 +483,7 @@ package commands:
 
 ```sh
 botster-hub packages install --data-dir target/botster-hub-runtime-data \
-  --path ../botster-web
+  --path /path/to/botster-web
 botster-hub packages enable --data-dir target/botster-hub-runtime-data botster-web
 botster-hub packages check-update --data-dir target/botster-hub-runtime-data botster-web
 botster-hub packages preview-update --data-dir target/botster-hub-runtime-data \

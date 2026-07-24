@@ -1,0 +1,284 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "digest"
+require "json"
+require "open3"
+require "pathname"
+
+def abort_with(message)
+  warn(message)
+  exit(1)
+end
+
+def read_json(path)
+  JSON.parse(File.read(path))
+rescue Errno::ENOENT, JSON::ParserError => error
+  abort_with("#{path}: #{error.message}")
+end
+
+def sha256(path)
+  Digest::SHA256.file(path).hexdigest
+rescue Errno::ENOENT => error
+  abort_with(error.message)
+end
+
+def write_json(path, value)
+  File.write(path, "#{JSON.pretty_generate(value)}\n")
+end
+
+def relative_manifest(root)
+  root = Pathname.new(root).expand_path
+  return { "exists" => false, "entries" => [] } unless root.exist?
+
+  entries = root.find.reject { |path| path == root }.map do |path|
+    stat = path.lstat
+    relative = path.relative_path_from(root).to_s
+    entry = {
+      "path" => relative,
+      "type" => if stat.symlink?
+                  "symlink"
+                elsif stat.directory?
+                  "directory"
+                elsif stat.file?
+                  "file"
+                else
+                  "other"
+                end,
+      "mode" => format("%04o", stat.mode & 0o7777),
+      "mtime_ns" => stat.mtime.to_i * 1_000_000_000 + stat.mtime.nsec
+    }
+    entry["size"] = stat.size if stat.file?
+    entry["sha256"] = sha256(path) if stat.file?
+    entry["target"] = path.readlink.to_s if stat.symlink?
+    entry
+  end
+
+  { "exists" => true, "entries" => entries.sort_by { |entry| entry.fetch("path") } }
+end
+
+def command_output(*command)
+  output, status = Open3.capture2e(*command)
+  abort_with("#{command.join(" ")} failed (#{status.exitstatus}):\n#{output}") unless status.success?
+  output
+end
+
+def tracked_files(repo)
+  output = command_output("git", "-C", repo, "ls-files", "-z")
+  output.split("\0").reject(&:empty?)
+end
+
+def product_surface?(repo, relative)
+  return false if relative.start_with?("docs/plans/", "docs/reports/")
+
+  absolute = File.join(repo, relative)
+  return true if File.file?(absolute) && File.executable?(absolute)
+  return true if relative.match?(%r{\A(?:src|test|tests|script|scripts|examples|docs)/})
+  return true if File.basename(relative).match?(/\A(?:README|Cargo|package|botster-package)/i)
+
+  relative.match?(/\.(?:rs|lua|js|mjs|cjs|ts|tsx|json|toml|md|sh|rb|py)\z/i)
+end
+
+def scan_text(path, pattern)
+  File.binread(path).force_encoding(Encoding::UTF_8).scrub.each_line.with_index.filter_map do |line, index|
+    next unless line.match?(pattern)
+
+    { "line" => index + 1, "text" => line.strip }
+  end
+end
+
+case ARGV.shift
+when "snapshot"
+  root, output = ARGV
+  abort_with("usage: #{$PROGRAM_NAME} snapshot ROOT OUTPUT") unless root && output
+  write_json(output, relative_manifest(root))
+when "compare-snapshots"
+  before_path, after_path = ARGV
+  abort_with("usage: #{$PROGRAM_NAME} compare-snapshots BEFORE AFTER") unless before_path && after_path
+  before = read_json(before_path)
+  after = read_json(after_path)
+  abort_with("operator state changed between #{before_path} and #{after_path}") unless before == after
+when "redact"
+  input, output, *coordinates = ARGV
+  abort_with("usage: #{$PROGRAM_NAME} redact INPUT OUTPUT PLACEHOLDER=VALUE [...]") unless input && output
+  text = File.binread(input)
+  coordinates.each do |coordinate|
+    placeholder, value = coordinate.split("=", 2)
+    abort_with("invalid redaction coordinate #{coordinate.inspect}") unless placeholder && value
+    text = text.gsub(value, placeholder)
+  end
+  File.binwrite(output, text)
+when "artifact-gate"
+  hub_repo, web_repo, package_root, output = ARGV
+  unless hub_repo && web_repo && package_root && output
+    abort_with("usage: #{$PROGRAM_NAME} artifact-gate HUB_REPO WEB_REPO PACKAGE_ROOT OUTPUT")
+  end
+
+  web_package = read_json(File.join(web_repo, "package.json"))
+  declared_version = web_package.dig("devDependencies", "@trybotster/hub-test-support")
+  abort_with("botster-web must declare an exact @trybotster/hub-test-support version") unless declared_version&.match?(/\A\d+\.\d+\.\d+\z/)
+
+  installed_package = read_json(File.join(package_root, "package.json"))
+  metadata = read_json(File.join(package_root, "metadata.json"))
+  source_protocol = File.join(hub_repo, "crates/botster-hub-client/generated/daemon-protocol.ts")
+  installed_protocol = File.join(package_root, "daemon-protocol.ts")
+  vendored_protocol = File.join(web_repo, "src/botster/generated/daemon-protocol.ts")
+  revision_source = File.read(File.join(hub_repo, "crates/botster-hub-client/src/lib.rs"))
+  revision_match = revision_source.match(/pub const CONFORMANCE_FIXTURE_REVISION:\s*u16\s*=\s*(\d+);/)
+  abort_with("cannot resolve CONFORMANCE_FIXTURE_REVISION from Hub source") unless revision_match
+
+  source_hash = sha256(source_protocol)
+  installed_hash = sha256(installed_protocol)
+  vendored_hash = sha256(vendored_protocol)
+  metadata_hash = metadata.dig("daemon_protocol", "sha256")
+  expected_revision = Integer(revision_match[1], 10)
+
+  checks = {
+    "installed_package_name" => installed_package["name"] == "@trybotster/hub-test-support",
+    "declared_version_matches_package" => installed_package["version"] == declared_version,
+    "declared_version_matches_metadata" => metadata["package_version"] == declared_version,
+    "metadata_hash_matches_source" => metadata_hash == source_hash,
+    "installed_bytes_match_source" => installed_hash == source_hash,
+    "vendored_bytes_match_source" => vendored_hash == source_hash,
+    "fixture_revision_matches_source" => metadata["conformance_fixture_revision"] == expected_revision
+  }
+
+  result = {
+    "coordinate" => "@trybotster/hub-test-support@#{declared_version}",
+    "declared_version" => declared_version,
+    "installed_version" => installed_package["version"],
+    "metadata_version" => metadata["package_version"],
+    "source_sha256" => source_hash,
+    "metadata_sha256" => metadata_hash,
+    "installed_sha256" => installed_hash,
+    "web_vendored_sha256" => vendored_hash,
+    "source_conformance_fixture_revision" => expected_revision,
+    "installed_conformance_fixture_revision" => metadata["conformance_fixture_revision"],
+    "checks" => checks,
+    "ok" => checks.values.all?
+  }
+  write_json(output, result)
+  abort_with("installed Hub test-support artifact does not match exact Hub source and Web vendored bytes") unless result["ok"]
+when "audit"
+  output = ARGV.shift
+  abort_with("usage: #{$PROGRAM_NAME} audit OUTPUT NAME=REPO [...]") unless output && !ARGV.empty?
+
+  retired_word = "dog" "food"
+  retired_environment = "BOTSTER_WEB_" "DOG" "FOOD_"
+  retired_vite_environment = "VITE_BOTSTER_REAL_HUB_" "DOG" "FOOD"
+  retired_query = "?dog" "food="
+  sibling_checkout = "../" "botster-"
+  retired_dev_mode = "dev" "-stack"
+  patterns = {
+    "retired_runtime_vocabulary" => Regexp.new(retired_word, Regexp::IGNORECASE),
+    "retired_environment_or_query" => Regexp.new(
+      "#{retired_environment}|#{retired_vite_environment}|#{Regexp.escape(retired_query)}",
+      Regexp::IGNORECASE
+    ),
+    "retired_mode_or_alias" => Regexp.new(
+      "(?:--#{retired_word}\\b|\\b#{retired_word}[_-](?:stack|mode|runtime)\\b|\\b#{retired_dev_mode}\\b)",
+      Regexp::IGNORECASE
+    ),
+    "sibling_checkout_discovery" => Regexp.new(
+      "(?:\\A|[\\s\"'=])#{Regexp.escape(sibling_checkout)}",
+      Regexp::IGNORECASE
+    )
+  }
+  positive_text = [
+    retired_word,
+    "--#{retired_word}",
+    retired_dev_mode,
+    "#{sibling_checkout}web",
+    retired_query,
+    "#{retired_environment}X"
+  ].join(" ")
+  controls = patterns.transform_values { |pattern| positive_text.match?(pattern) }
+  abort_with("an audit matcher failed its known-positive control") unless controls.values.all?
+
+  findings = []
+  repositories = {}
+  ARGV.each do |coordinate|
+    name, repo = coordinate.split("=", 2)
+    abort_with("invalid repository coordinate #{coordinate.inspect}") unless name && repo && File.directory?(repo)
+
+    selected = tracked_files(repo).select { |relative| product_surface?(repo, relative) }
+    repositories[name] = { "revision" => command_output("git", "-C", repo, "rev-parse", "HEAD").strip, "files_scanned" => selected.length }
+    selected.each do |relative|
+      absolute = File.join(repo, relative)
+      patterns.each do |rule, pattern|
+        scan_text(absolute, pattern).each do |match|
+          if rule == "sibling_checkout_discovery"
+            token = match.fetch("text")[%r{\.\./botster-[A-Za-z0-9_-]+}]
+            resolved = File.expand_path(token, File.dirname(absolute)) if token
+            next if resolved && (resolved == repo || resolved.start_with?("#{repo}/"))
+          end
+          findings << match.merge("repository" => name, "path" => relative, "rule" => rule)
+        end
+      rescue ArgumentError
+        next
+      end
+    end
+  end
+
+  result = {
+    "known_positive_controls" => controls,
+    "excluded" => ["docs/plans/**", "docs/reports/**", "Git history"],
+    "repositories" => repositories,
+    "findings" => findings,
+    "ok" => findings.empty?
+  }
+  write_json(output, result)
+  abort_with("product-surface audit found retired runtime vocabulary or checkout discovery") unless result["ok"]
+when "revision-manifest"
+  output = ARGV.shift
+  abort_with("usage: #{$PROGRAM_NAME} revision-manifest OUTPUT NAME=REPO [...]") unless output && !ARGV.empty?
+  repositories = ARGV.to_h do |coordinate|
+    name, repo = coordinate.split("=", 2)
+    abort_with("invalid repository coordinate #{coordinate.inspect}") unless name && repo
+    revision = command_output("git", "-C", repo, "rev-parse", "HEAD").strip
+    status = command_output("git", "-C", repo, "status", "--porcelain", "--untracked-files=all")
+    [name, { "revision" => revision, "clean" => status.empty? }]
+  end
+  write_json(output, { "repositories" => repositories })
+when "pii-scan"
+  output = ARGV.shift
+  abort_with("usage: #{$PROGRAM_NAME} pii-scan OUTPUT PATH [...]") unless output && !ARGV.empty?
+  mac_home_prefix = "/" "Users/"
+  unix_home_prefix = "/" "home/"
+  patterns = {
+    "mac_home" => Regexp.new("#{Regexp.escape(mac_home_prefix)}[^/<\\s]+/"),
+    "unix_home" => Regexp.new("#{Regexp.escape(unix_home_prefix)}[^/<\\s]+/"),
+    "email" => /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/,
+    "assigned_secret" => /(?:TOKEN|SECRET|PASSWORD|API_KEY)\s*=\s*[^\s<]+/i
+  }
+  controls = {
+    "mac_home" => "#{mac_home_prefix}example/project".match?(patterns.fetch("mac_home")),
+    "unix_home" => "#{unix_home_prefix}example/project".match?(patterns.fetch("unix_home")),
+    "email" => ("person" "@" "example.invalid").match?(patterns.fetch("email")),
+    "assigned_secret" => ("API" "_KEY" "=" "not-a-real-value").match?(patterns.fetch("assigned_secret"))
+  }
+  abort_with("a PII matcher failed its known-positive control") unless controls.values.all?
+
+  findings = []
+  ARGV.each do |root|
+    paths = File.directory?(root) ? Pathname.new(root).find.select(&:file?).map(&:to_s) : [root]
+    paths.each do |path|
+      patterns.each do |rule, pattern|
+        scan_text(path, pattern).each do |match|
+          findings << match.merge("path" => Pathname.new(path).basename.to_s, "rule" => rule)
+        end
+      rescue ArgumentError
+        next
+      end
+    end
+  end
+  result = {
+    "known_positive_controls" => controls,
+    "findings" => findings,
+    "ok" => findings.empty?
+  }
+  write_json(output, result)
+  abort_with("PII or secret-shaped content found in durable evidence") unless result["ok"]
+else
+  abort_with("usage: #{$PROGRAM_NAME} <snapshot|compare-snapshots|redact|artifact-gate|audit|revision-manifest|pii-scan> ...")
+end
