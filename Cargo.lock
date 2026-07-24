@@ -426,6 +426,7 @@ dependencies = [
 name = "botster-hub-test-support"
 version = "0.1.0"
 dependencies = [
+ "botster-core",
  "botster-hub-client",
  "serde",
  "serde_json",
