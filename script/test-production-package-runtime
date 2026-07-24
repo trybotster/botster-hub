@@ -146,6 +146,11 @@ raw_commands=$runtime_root/commands.raw
 : >"$raw_commands"
 setup_pid=
 fixed_port_pid=
+cargo_home_root=${CARGO_HOME:-$HOME/.cargo}
+npm_cache_root=$(npm config get cache) || {
+  echo "npm cache root could not be resolved" >&2
+  exit 69
+}
 
 cleanup() {
   while IFS= read -r data_dir; do
@@ -174,6 +179,8 @@ trap 'exit 143' TERM
 
 redact_file() {
   "$evidence_helper" redact "$1" "$2" \
+    '<cargo-home>='"$cargo_home_root" \
+    '<npm-cache>='"$npm_cache_root" \
     '<hub-repo>='"$hub_repo" \
     '<core-repo>='"$core_repo" \
     '<web-repo>='"$web_repo" \
@@ -182,7 +189,8 @@ redact_file() {
     '<workspaces-repo>='"$workspaces_repo" \
     '<project-pipelines-repo>='"$project_pipelines_repo" \
     '<runtime-root>='"$runtime_root" \
-    '<evidence-dir>='"$evidence_dir"
+    '<evidence-dir>='"$evidence_dir" \
+    '<home>='"$HOME"
 }
 
 refresh_command_log() {
@@ -303,8 +311,26 @@ grep -q "$core_revision" "$hub_repo/Cargo.lock" || {
   botster-workspaces="$workspaces_repo" \
   botster-project-pipelines="$project_pipelines_repo"
 
-operator_data_dir=$hub_repo/target/botster-hub-runtime-data
-"$evidence_helper" snapshot "$operator_data_dir" "$evidence_dir/operator-state-before.json"
+operator_worktree_data_dir=$hub_repo/target/botster-hub-runtime-data
+if [ -n "${BOTSTER_HUB_DATA_DIR:-}" ]; then
+  operator_home_data_dir=$BOTSTER_HUB_DATA_DIR
+elif [ -n "${XDG_DATA_HOME:-}" ]; then
+  operator_home_data_dir=$XDG_DATA_HOME/botster-hub
+else
+  operator_home_data_dir=$HOME/.local/share/botster-hub
+fi
+"$evidence_helper" snapshot "$operator_worktree_data_dir" "$evidence_dir/operator-worktree-state-before.json"
+"$evidence_helper" snapshot "$operator_home_data_dir" "$evidence_dir/operator-home-state-before.json"
+snapshot_control=$runtime_root/snapshot-control
+mkdir -p "$snapshot_control"
+"$evidence_helper" snapshot "$snapshot_control" "$runtime_root/snapshot-control-before.json"
+printf 'known-positive\n' >"$snapshot_control/sentinel"
+"$evidence_helper" snapshot "$snapshot_control" "$runtime_root/snapshot-control-after.json"
+if "$evidence_helper" compare-snapshots \
+  "$runtime_root/snapshot-control-before.json" "$runtime_root/snapshot-control-after.json" >/dev/null 2>&1; then
+  echo "snapshot comparator accepted a known changed fixture" >&2
+  exit 1
+fi
 
 declared_support_version=$(ruby -rjson -e \
   'print JSON.parse(File.read(ARGV.fetch(0))).dig("devDependencies", "@trybotster/hub-test-support")' \
@@ -411,7 +437,7 @@ assert_owned_socket() {
     "$socket_data_dir"/*) ;;
     *) echo "runtime socket escaped fixture data directory: $owned_socket_path" >&2; exit 1 ;;
   esac
-  [ "$owned_socket_path" != "$operator_data_dir/botster-hub.sock" ] || {
+  [ "$owned_socket_path" != "$operator_worktree_data_dir/botster-hub.sock" ] || {
     echo "fixture resolved the operator default socket" >&2
     exit 1
   }
@@ -495,6 +521,22 @@ down_runtime_leg() {
   fi
 }
 
+assert_failed_up_cleanup() {
+  failed_data_dir=$1
+  failed_metadata=$failed_data_dir/.botster-hub-runtime-daemon.json
+  [ -e "$failed_metadata" ] || return 0
+  failed_pid=$(ruby -rjson -e 'print JSON.parse(File.read(ARGV.fetch(0))).fetch("pid")' "$failed_metadata")
+  failed_socket=$(ruby -rjson -e 'print JSON.parse(File.read(ARGV.fetch(0))).fetch("socket_path")' "$failed_metadata")
+  [ ! -e "$failed_socket" ] || {
+    echo "failed up left an owned socket: $failed_socket" >&2
+    exit 1
+  }
+  if kill -0 "$failed_pid" >/dev/null 2>&1; then
+    echo "failed up left an owned Hub process: $failed_pid" >&2
+    exit 1
+  fi
+}
+
 if [ "$mode" = fresh ] || [ "$mode" = all ]; then
   retired_fixed_port=41739
   ruby -rsocket -e 'server = TCPServer.new("127.0.0.1", Integer(ARGV.fetch(0))); loop { socket = server.accept; socket.close }' \
@@ -539,11 +581,22 @@ if [ "$mode" = fresh ] || [ "$mode" = all ]; then
   assert_owned_socket "$second_data" >/dev/null
   down_runtime_leg dynamic-port "$second_data"
 
-  explicit_port=$(ruby -rsocket -e 'server = TCPServer.new("127.0.0.1", 0); print server.addr[1]; server.close')
   explicit_data=$runtime_root/explicit-port-data
   install_current_packages explicit-port "$explicit_data" "$web_repo" "$tui_repo" "$workspaces_repo" "$project_pipelines_repo"
-  capture explicit-port-up env BOTSTER_WEB_PACKAGE_SERVER_PORT="$explicit_port" \
-    "$hub_bin" up --data-dir "$explicit_data" --session-worker-bin "$session_worker_bin"
+  explicit_attempt=0
+  while :; do
+    explicit_attempt=$((explicit_attempt + 1))
+    explicit_port=$(ruby -rsocket -e 'server = TCPServer.new("127.0.0.1", 0); print server.addr[1]; server.close')
+    if capture explicit-port-up env BOTSTER_WEB_PACKAGE_SERVER_PORT="$explicit_port" \
+      "$hub_bin" up --data-dir "$explicit_data" --session-worker-bin "$session_worker_bin"; then
+      break
+    fi
+    "$hub_bin" down --data-dir "$explicit_data" >/dev/null 2>&1 || true
+    [ "$explicit_attempt" -lt 5 ] || {
+      echo "Web explicit-port launch failed after $explicit_attempt bounded port selections; last port=$explicit_port" >&2
+      exit 1
+    }
+  done
   explicit_web_url=$(sed -n 's/^web=//p' "$runtime_root/explicit-port-up.raw" | tail -1)
   explicit_web_port=$(printf '%s' "$explicit_web_url" | sed -E 's#^https?://[^:]+:([0-9]+).*$#\1#')
   [ "$explicit_web_port" = "$explicit_port" ] || {
@@ -565,6 +618,7 @@ if [ "$mode" = fresh ] || [ "$mode" = all ]; then
   capture_expected_failure invalid-port-up invalid_package_server_port \
     env BOTSTER_WEB_PACKAGE_SERVER_PORT=not-a-port \
     "$hub_bin" up --data-dir "$invalid_port_data" --session-worker-bin "$session_worker_bin"
+  assert_failed_up_cleanup "$invalid_port_data"
 
   capture_in web-live-browser "$web_repo" env \
     BOTSTER_HUB_BIN="$hub_bin" \
@@ -655,6 +709,10 @@ if [ "$mode" = upgrade ] || [ "$mode" = all ]; then
   run_runtime_leg upgrade "$upgrade_data" "$old_web" "$old_tui" "$old_workspaces" "$old_pipelines" refresh
   capture upgrade-session-spawn "$hub_bin" sessions spawn --data-dir "$upgrade_data" \
     --session-id upgrade-survivor -- cat
+  capture upgrade-session-list "$hub_bin" sessions list --data-dir "$upgrade_data"
+  grep -q 'upgrade-survivor' "$runtime_root/upgrade-session-list.raw"
+  capture upgrade-session-resize "$hub_bin" sessions resize --data-dir "$upgrade_data" \
+    upgrade-survivor 30 100
   capture upgrade-restart "$hub_bin" shutdown --data-dir "$upgrade_data"
   capture upgrade-restart-up "$hub_bin" up --data-dir "$upgrade_data" --session-worker-bin "$session_worker_bin"
   capture upgrade-restart-status "$hub_bin" status --data-dir "$upgrade_data"
@@ -673,7 +731,12 @@ fi
   botster-workspaces="$workspaces_repo" \
   botster-project-pipelines="$project_pipelines_repo"
 
-if grep -nE 'packages reload|(^|[[:space:]])reload[[:space:]]' "$evidence_dir/commands.log" \
+manual_reload_pattern='packages reload|(^|[[:space:]])reload[[:space:]]'
+printf 'packages reload\n' | grep -qE "$manual_reload_pattern" || {
+  echo "manual reload audit known-positive control did not match" >&2
+  exit 1
+}
+if grep -nE "$manual_reload_pattern" "$evidence_dir/commands.log" \
   >"$runtime_root/manual-reload.raw"; then
   redact_file "$runtime_root/manual-reload.raw" "$evidence_dir/manual-reload-findings.log"
   echo "acceptance used a hidden manual package reload" >&2
@@ -682,11 +745,14 @@ elif [ "$?" -gt 1 ]; then
   echo "manual reload audit failed to execute" >&2
   exit 1
 fi
-printf 'known_positive=packages reload\nresult=no_manual_reload\n' >"$evidence_dir/manual-reload-audit.txt"
+printf 'known_positive_observed=true\nresult=no_manual_reload_command\n' >"$evidence_dir/manual-reload-audit.txt"
 
-"$evidence_helper" snapshot "$operator_data_dir" "$evidence_dir/operator-state-after.json"
+"$evidence_helper" snapshot "$operator_worktree_data_dir" "$evidence_dir/operator-worktree-state-after.json"
+"$evidence_helper" snapshot "$operator_home_data_dir" "$evidence_dir/operator-home-state-after.json"
 "$evidence_helper" compare-snapshots \
-  "$evidence_dir/operator-state-before.json" "$evidence_dir/operator-state-after.json"
+  "$evidence_dir/operator-worktree-state-before.json" "$evidence_dir/operator-worktree-state-after.json"
+"$evidence_helper" compare-snapshots \
+  "$evidence_dir/operator-home-state-before.json" "$evidence_dir/operator-home-state-after.json"
 
 capture_in committed-diff "$hub_repo" git show --format= --no-ext-diff HEAD
 refresh_command_log
