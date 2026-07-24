@@ -78,7 +78,7 @@ named explicitly.
   corruption before the checked asset was restored.
 - `./test.sh` — passed with no failures, including 73 library tests, 14 hub
   capability tests, 21 client API tests, 87 daemon lifecycle tests, 1 local
-  dogfood test, 18 Lua runtime tests, 6 MCP tests, 6 plugin lifecycle tests, 7
+  production runtime test, 18 Lua runtime tests, 6 MCP tests, 6 plugin lifecycle tests, 7
   hub runtime tests, and doc tests.
 - `npm pack --dry-run --json` — passed and listed all 12 expected package files.
 - `npm pack --json` — produced SHA-1 and integrity identical to the public

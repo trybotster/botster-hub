@@ -4,7 +4,7 @@
 
 - Project Pipelines context for `ticket_1781065921_836565`, `run_1781065926_490279`, step `botster_plan`, gate `botster_plan_gate`.
 - Vault notes: [[planner-playbook]], [[botster-planner-playbook]], [[botster-architecture]], [[cli-patterns]], [[spa-patterns]], [[project pipeline orchestration belongs in a device-level botster plugin]], [[project pipelines needs an operator workbench not more primitives]], [[project pipelines ui contract belongs in the plugin readme]], [[botster orchestration should spawn agents with explicit target ids]], [[botster orchestration prompts must bind agents to explicit worktrees]].
-- Repo code: `src/tui.rs`, `src/main.rs`, `src/daemon_transport.rs`, `crates/botster-hub-client/src/lib.rs`, `tests/hub_daemon_lifecycle_test.rs`, `tests/hub_local_dogfood_test.rs`.
+- Repo code: `src/tui.rs`, `src/main.rs`, `src/daemon_transport.rs`, `crates/botster-hub-client/src/lib.rs`, `tests/hub_daemon_lifecycle_test.rs`, `tests/hub_local_runtime_test.rs`.
 - Checklist attempt: `project_pipelines_create_vault_checklist` and `project_pipelines_create_checklist` both timed out in the plugin worker. Per [[project pipelines checklist worker timeouts require artifact evidence fallback]], this plan and gate evidence preserve the checklist facts.
 
 ## Scope
@@ -21,7 +21,7 @@
   - mouse double-select attach path
 - Preserve running-session attach, detach, input, resize, and daemon reconnect behavior.
 - Preserve the existing drain-time `UnknownSession` recovery path that detaches, refreshes, and records one actionable diagnostic.
-- Add focused tests covering the exited `dogfood-worker-smoke` scenario, attach guard, running-session attach still works, and no repeated duplicate UnknownSession diagnostic loop.
+- Add focused tests covering the exited `legacy-runtime-worker-smoke` scenario, attach guard, running-session attach still works, and no repeated duplicate UnknownSession diagnostic loop.
 
 ## Non-Scope
 
@@ -34,7 +34,7 @@
 ## Assumptions And Unknowns
 
 - The daemon session list lifecycle string is the authoritative local TUI guard input; current code already checks `"running"` on reconnect and renderer tests use `"exited"`.
-- The manual bug came from `botster-hub dogfood` creating an exited `dogfood-worker-smoke` session that remains listed, then `botster-hub tui --data-dir <dir>` selecting or activating it.
+- The manual bug came from the removed legacy launcher creating an exited `legacy-runtime-worker-smoke` session that remains listed, then `botster-hub tui --data-dir <dir>` selecting or activating it.
 - The correct UX is visible but inert: show the row and diagnostic, but leave `active_session_id` and `subscription_id` unset.
 - Unknown: whether initial selection should skip exited sessions when a running session is also present. The smallest ticket-satisfying behavior is to keep selection as-is and guard attach; skipping selection would be a broader navigation policy change.
 - Unknown: exact wording of the diagnostic can be finalized by implementation, but it must be clear and test-pinned.
@@ -48,7 +48,7 @@
 - Existing daemon behavior read for context: `src/daemon_transport.rs` and `crates/botster-hub-client/src/lib.rs`.
 - Focused integration tests: `tests/hub_daemon_lifecycle_test.rs`.
 - Possible unit/render tests: `src/tui.rs` test module.
-- Dogfood reference path: `src/main.rs` dogfood smoke setup and `tests/hub_local_dogfood_test.rs`.
+- Production runtime reference path: `src/main.rs` production runtime smoke setup and `tests/hub_local_runtime_test.rs`.
 
 ## Implementation Shape
 
@@ -69,7 +69,7 @@
 
 ## Acceptance Checks And Tests
 
-- Add or update an integration test in `tests/hub_daemon_lifecycle_test.rs` that creates or observes an exited `dogfood-worker-smoke` session, connects `ScriptedTuiDriver`, selects it, calls `attach_selected`, and asserts:
+- Add or update an integration test in `tests/hub_daemon_lifecycle_test.rs` that creates or observes an exited `legacy-runtime-worker-smoke` session, connects `ScriptedTuiDriver`, selects it, calls `attach_selected`, and asserts:
   - attach is rejected or returns an actionable error
   - `active_session_id()` remains `None`
   - `subscription_id()` remains `None`

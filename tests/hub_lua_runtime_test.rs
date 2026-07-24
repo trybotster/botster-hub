@@ -62,7 +62,7 @@ fn install_fixture_registry() -> PackageRegistry {
         )
         .expect("install local lua package");
     policy
-        .enable("dogfood.synthetic-plugin", "enable synthetic lua plugin")
+        .enable("runtime.synthetic-plugin", "enable synthetic lua plugin")
         .expect("enable local lua package");
     policy.registry().clone()
 }
@@ -78,7 +78,7 @@ fn configured_fixture_registry() -> PackageRegistry {
     policy
         .registry_mut()
         .set_configuration(
-            "dogfood.synthetic-plugin",
+            "runtime.synthetic-plugin",
             [
                 (
                     "endpoint".to_string(),
@@ -99,7 +99,7 @@ fn configured_fixture_registry() -> PackageRegistry {
         )
         .expect("set package configuration");
     policy
-        .enable("dogfood.synthetic-plugin", "enable synthetic lua plugin")
+        .enable("runtime.synthetic-plugin", "enable synthetic lua plugin")
         .expect("enable local lua package");
     policy.registry().clone()
 }
@@ -804,16 +804,16 @@ fn real_lua_plugin_loads_invokes_tool_and_uses_hub_capability_runtime() {
     let mut hub = explicit_runtime("fixture");
 
     let plugin_key = hub
-        .load_lua_plugin_package(&registry, "dogfood.synthetic-plugin")
+        .load_lua_plugin_package(&registry, "runtime.synthetic-plugin")
         .expect("load real lua plugin package");
 
     assert_eq!(
         plugin_key,
-        PluginKey("dogfood.synthetic-plugin".to_string())
+        PluginKey("runtime.synthetic-plugin".to_string())
     );
     let tools = hub.list_plugin_mcp_tools();
     assert_eq!(tools.len(), 1);
-    assert_eq!(tools[0].name, "dogfood.synthetic.echo");
+    assert_eq!(tools[0].name, "runtime.synthetic.echo");
 
     let handler = PluginHandlerRef {
         plugin_key,
@@ -1012,7 +1012,7 @@ fn real_lua_plugin_reads_operator_config_and_redacted_secret_from_own_package_on
     let mut hub = explicit_runtime("configured-fixture");
 
     let plugin_key = hub
-        .load_lua_plugin_package(&registry, "dogfood.synthetic-plugin")
+        .load_lua_plugin_package(&registry, "runtime.synthetic-plugin")
         .expect("load real lua plugin package");
     let handler = PluginHandlerRef {
         plugin_key,
@@ -1049,12 +1049,12 @@ fn real_lua_plugin_reads_operator_config_and_redacted_secret_from_own_package_on
 fn plugin_mcp_call_uses_loaded_runtime_and_returns_structured_payload() {
     let registry = install_fixture_registry();
     let mut hub = explicit_runtime("mcp-call");
-    hub.load_lua_plugin_package(&registry, "dogfood.synthetic-plugin")
+    hub.load_lua_plugin_package(&registry, "runtime.synthetic-plugin")
         .expect("load real lua plugin package");
 
     let result = hub
         .call_plugin_mcp_tool(botster_hub::McpCallRequest {
-            name: "dogfood.synthetic.echo".to_string(),
+            name: "runtime.synthetic.echo".to_string(),
             arguments: serde_json::json!({ "message": "from-mcp" }),
         })
         .expect("call plugin MCP tool");
@@ -1279,7 +1279,7 @@ fn project_pipelines_surface_action_round_trip_uses_client_api_and_plugin_worker
                 action_id: "project_pipelines.create_ticket".to_string(),
                 payload: serde_json::json!({
                     "request_id": "valid-project-pipelines-action",
-                    "title": "  Dogfood ticket  ",
+                    "title": "  Runtime ticket  ",
                     "pipeline_id": "local.pipeline",
                 }),
             },
@@ -1292,7 +1292,7 @@ fn project_pipelines_surface_action_round_trip_uses_client_api_and_plugin_worker
     assert_eq!(valid.surface_id.0, "project-pipelines.create-ticket");
     assert_eq!(
         valid.normalized_values.as_ref().unwrap().0["title"],
-        "Dogfood ticket"
+        "Runtime ticket"
     );
 
     let context = hub
@@ -1302,7 +1302,7 @@ fn project_pipelines_surface_action_round_trip_uses_client_api_and_plugin_worker
         })
         .expect("read current context after plugin action");
     assert_eq!(context["tickets"].as_array().unwrap().len(), 1);
-    assert_eq!(context["tickets"][0]["title"], "Dogfood ticket");
+    assert_eq!(context["tickets"][0]["title"], "Runtime ticket");
 }
 
 #[test]
@@ -1614,11 +1614,11 @@ fn invoking_after_unload_fails_through_worker_stopped_path() {
     let registry = install_fixture_registry();
     let mut hub = explicit_runtime("unload");
     let plugin_key = hub
-        .load_lua_plugin_package(&registry, "dogfood.synthetic-plugin")
+        .load_lua_plugin_package(&registry, "runtime.synthetic-plugin")
         .expect("load real lua plugin package");
     let _ = hub.unload_plugin_package(
         RequestId("unload-lua".to_string()),
-        "dogfood.synthetic-plugin",
+        "runtime.synthetic-plugin",
     );
 
     let outcome = hub.invoke_plugin(invocation(

@@ -2,10 +2,10 @@
 
 ## Context loaded
 
-- Project Pipelines context: ticket `ticket_1782761720_817254`, run `run_1782772580_535804`, step `botster_plan`, gate `botster_plan_gate`. No prior artifacts, findings, reviews, open questions, or question answers. One closed dependency: "Add persistent dev-stack bootstrap for local first-party packages".
+- Project Pipelines context: ticket `ticket_1782761720_817254`, run `run_1782772580_535804`, step `botster_plan`, gate `botster_plan_gate`. No prior artifacts, findings, reviews, open questions, or question answers. One closed dependency: "Add persistent local runtime bootstrap for local first-party packages".
 - Required playbooks: [[planner-playbook]] and [[botster-planner-playbook]].
 - Botster vault context: [[botster-architecture]], [[cli-patterns]], [[spa-patterns]], [[project pipeline orchestration belongs in a device-level botster plugin]], [[project pipelines needs an operator workbench not more primitives]], [[project pipelines ui contract belongs in the plugin readme]], [[botster orchestration should spawn agents with explicit target ids]], [[botster orchestration prompts must bind agents to explicit worktrees]], [[plan steps need reviewable plan artifacts]], and [[project pipelines checklist worker timeouts require artifact evidence fallback]].
-- Repo context inspected: `src/packages.rs`, `src/daemon_transport.rs`, `src/entrypoint_supervisor.rs`, `src/main.rs`, `crates/botster-hub-client/src/lib.rs`, `tests/hub_daemon_lifecycle_test.rs`, and prior dev-stack/app/package plans and reports.
+- Repo context inspected: `src/packages.rs`, `src/daemon_transport.rs`, `src/entrypoint_supervisor.rs`, `src/main.rs`, `crates/botster-hub-client/src/lib.rs`, `tests/hub_daemon_lifecycle_test.rs`, and prior local runtime/app/package plans and reports.
 - Checklist discipline: `project_pipelines_create_vault_checklist` was attempted for this run and timed out in the Project Pipelines plugin worker. Per [[project pipelines checklist worker timeouts require artifact evidence fallback]], this plan and gate evidence carry notes read, convention result, verification plan, and capture decision.
 
 ## Current repo shape
@@ -14,13 +14,13 @@
 - Local package install parses `botster-package.json` through `PackageRegistry::install_local_path` in `src/packages.rs`, validates manifest, runnable entrypoints, and session templates, then persists through the hub state snapshot.
 - Enabled local Lua packages are loaded through `load_package_after_enable`, and package lifecycle reload already exists in `src/lifecycle.rs`, but there is no daemon/CLI reload request that re-reads an installed local package path.
 - Runnable app state is exposed by `ListApps`, projected from package `runnable_entrypoints` plus `EntrypointSupervisor` snapshots. `apps open` starts app entrypoints through `StartPackageEntrypoint`.
-- The dev-stack bootstrap path from the closed dependency enables first-party local packages and starts `botster-web`, but currently re-running bootstrap does not provide a targeted "I edited this package, reload it" user path.
+- The local runtime bootstrap path from the closed dependency enables first-party local packages and starts `botster-web`, but currently re-running bootstrap does not provide a targeted "I edited this package, reload it" user path.
 
 ## Botster layers touched
 
 - Rust hub package registry/policy: refresh installed local package records from their persisted source path.
 - Daemon protocol and transport: add a reload request/response path through the live daemon owner.
-- CLI: add a thin `packages reload <name>` command and dev-stack-facing follow-up text if useful.
+- CLI: add a thin `packages reload <name>` command and local runtime-facing follow-up text if useful.
 - Entrypoint supervisor: stop/restart only affected package entrypoints when the reload changes a package with running app processes.
 - Generated/client DTO surface: update `botster-hub-client` request/action names and generated TypeScript protocol if the public daemon request enum changes.
 - Tests/docs: focused daemon lifecycle tests plus README or command usage text.
@@ -35,7 +35,7 @@
 - Keep diagnostics sanitized: package names, action names, diagnostic kinds, and bounded messages are fine; raw local package paths should not be printed in normal status output.
 - Add CLI affordance: `botster-hub packages reload --data-dir <dir> <package-name>` or equivalent parser shape consistent with existing `packages` commands.
 - Add or adjust package/app action descriptors so `packages show/list`, `apps list`, and `apps open` expose the refreshed state and available reload/restart actions.
-- Update docs/usage only where needed to make the local dev-mode reload path discoverable from the persistent dev-stack workflow.
+- Update docs/usage only where needed to make the local dev-mode reload path discoverable from the persistent local runtime workflow.
 
 ## Non-scope
 
@@ -70,7 +70,7 @@
 - `src/main.rs`
   - parse and dispatch `packages reload <name>`; update usage and print bounded diagnostics/action output.
 - `README.md`
-  - optional narrow docs for dev-stack local reload if command usage alone is insufficient.
+  - optional narrow docs for local runtime local reload if command usage alone is insufficient.
 - `tests/hub_daemon_lifecycle_test.rs`
   - add real daemon tests for local package reload, app projection, entrypoint restart, and diagnostic failures.
 
@@ -91,7 +91,7 @@
 3. Wire CLI DX.
    - Add `packages reload <name>` to `PackageCommand::parse`.
    - Keep output consistent with `packages show` and existing package diagnostics.
-   - Update usage text and, if useful, dev-stack ready output to point developers at `packages reload --data-dir <dir> <package>`.
+   - Update usage text and, if useful, local runtime ready output to point developers at `packages reload --data-dir <dir> <package>`.
 
 4. Prove the actual user path.
    - Real daemon test: enable a local package, mutate its manifest/runnable entrypoint/surface metadata at the same path, run `packages reload`, then assert `packages show/list` and `apps list` reflect the new package state.
@@ -112,7 +112,7 @@
 - `./test.sh --test hub_daemon_lifecycle_test <new_reload_test_name> -- --test-threads=1`
 - `./test.sh --test hub_daemon_lifecycle_test <new_reload_running_entrypoint_test_name> -- --test-threads=1`
 - `./test.sh --test hub_daemon_lifecycle_test <new_reload_failure_diagnostics_test_name> -- --test-threads=1`
-- `./test.sh --test hub_daemon_lifecycle_test cli_dev_stack_bootstrap_starts_daemon_enables_first_party_packages_and_prints_apps -- --test-threads=1`
+- `./test.sh --test hub_daemon_lifecycle_test cli_local_runtime_bootstrap_starts_daemon_enables_first_party_packages_and_prints_apps -- --test-threads=1`
 - `./test.sh --test hub_daemon_lifecycle_test package_entrypoint_supervision_restarts_running_processes -- --test-threads=1`
 - If protocol structs change: run the botster-hub-client protocol/type generation or drift test used by this repo, and update `crates/botster-hub-client/generated/daemon-protocol.ts`.
 - Static leak scan before review: search committed artifacts for absolute home paths, session worktree paths, and user-identifying strings.

@@ -14,7 +14,7 @@
 - `src/packages.rs` already owns manifest parsing, local path canonicalization, compatibility checks, capability admission, disabled/enabled states, durable snapshots, and local Lua entrypoint preparation.
 - `src/daemon_transport.rs` already routes package mutations through the running daemon owner, persists `hub-state.json`, refreshes package reads after mutation, and loads/unloads Lua plugin packages.
 - `src/main.rs` exposes a thin `packages` and `providers` CLI over daemon transport. Current verbs are `list`, `enable --path`, `enable <name>`, and `disable <name>`.
-- `README.md` documents the current daemon-backed dogfood path, but only for combined install+enable through `packages enable --path`.
+- `README.md` documents the current daemon-backed production runtime path, but only for combined install+enable through `packages enable --path`.
 - `tests/hub_daemon_lifecycle_test.rs` already proves `packages enable --path` persists and loads a local package through the running daemon.
 
 ## Scope
@@ -31,7 +31,7 @@
 - Extend typed daemon/client DTOs only as needed for install, remove, and show/status. Keep the CLI a thin adapter.
 - Emit structured diagnostics/events for install success, validation failure, compatibility mismatch, capability denial, enable/disable/remove, and load failure using existing `DaemonDiagnostic`, `DaemonOperatorError`, `PackageDecision`, and package error shapes where possible.
 - Add or refine automated tests for the real user path from an isolated local package path and disposable data dir.
-- Update manual dogfood docs with exact install, list, show, enable, disable, remove commands.
+- Update manual production runtime docs with exact install, list, show, enable, disable, remove commands.
 - Keep the checked-in `examples/synthetic-plugin` or another minimal local fixture suitable for manual testing.
 
 ## Non-Scope
@@ -80,7 +80,7 @@
 - `examples/synthetic-plugin/`
   - Keep as the manual first-party/local fixture; adjust manifest only if required by current contracts.
 - `README.md`
-  - Update Local dogfood operator CLI with exact commands for explicit install, show, enable, disable, remove.
+  - Update Local production runtime operator CLI with exact commands for explicit install, show, enable, disable, remove.
 
 ## Risks
 

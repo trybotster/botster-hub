@@ -44,7 +44,7 @@
 - Architecture facade audit: `src/lib.rs`.
 - Docs: `README.md`, likely `docs/client-protocol.md`.
 - Tests: `tests/hub_client_api_test.rs`, `tests/hub_daemon_lifecycle_test.rs` or another daemon transport integration test, and hub-client protocol serde/generation tests in `crates/botster-hub-client/src/lib.rs`.
-- Read for precedent, not expected to change: `tests/support/mod.rs` (`ensure_session_worker_binary`, already called by both test files above) and `tests/hub_local_dogfood_test.rs` (`spawn_attach_input_and_drain`, the existing worker-backed spawn/attach/drain flow through `HubClientApi`).
+- Read for precedent, not expected to change: `tests/support/mod.rs` (`ensure_session_worker_binary`, already called by both test files above) and `tests/hub_local_runtime_test.rs` (`spawn_attach_input_and_drain`, the existing worker-backed spawn/attach/drain flow through `HubClientApi`).
 
 ## Implementation Shape
 
@@ -72,7 +72,7 @@
 - `./test.sh hub_client_api_test`
 - `./test.sh hub_daemon_lifecycle_test` or a more focused daemon transport test name that exercises the new daemon request variants.
 - `cargo test -p botster-hub-client` for serde/TypeScript protocol drift tests.
-- A focused integration proves: call `support::ensure_session_worker_binary()` and let `session_worker_path` discovery resolve the worker (no explicit `session_worker_path` config needed), spawn a session, attach once, produce output, attach a late subscription through the hub API/daemon path, drain, and observe NON-EMPTY renderable history strictly before the first live output. Follow the existing worker-backed precedent in `tests/hub_local_dogfood_test.rs:228` `spawn_attach_input_and_drain`; do not hand-roll a second worker-config path.
+- A focused integration proves: call `support::ensure_session_worker_binary()` and let `session_worker_path` discovery resolve the worker (no explicit `session_worker_path` config needed), spawn a session, attach once, produce output, attach a late subscription through the hub API/daemon path, drain, and observe NON-EMPTY renderable history strictly before the first live output. Follow the existing worker-backed precedent in `tests/hub_local_runtime_test.rs:228` `spawn_attach_input_and_drain`; do not hand-roll a second worker-config path.
 - A focused client API test proves `ReadScreen` and `CaptureSnapshot` no longer return `UnsupportedDaemonOperation`.
 - A regression test proves `ReadScreen` or `CaptureSnapshot` issued between attach and first drain does not drop or reorder retained history relative to live output.
 - Docs/assertions prove `architecture_summary().facade_decisions()` marks `read_screen/capture_snapshot` as `Exposed` and `report_delivery_*` as still `Deferred`.

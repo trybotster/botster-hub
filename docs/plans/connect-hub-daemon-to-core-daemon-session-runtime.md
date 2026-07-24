@@ -18,7 +18,7 @@ Ticket: `ticket_1780532739_854865`
   - `src/daemon.rs` starts an in-process `HubRuntime` and restores hub package policy, but does not discover or connect to a separate core daemon.
   - `src/runtime.rs` wraps `DefaultBotsterEngine` directly for spawn/list/attach/input/resize/drain/snapshot/shutdown.
   - `src/client_api.rs` routes local client requests through `HubRuntime`, still in-process.
-  - `tests/hub_runtime_test.rs`, `tests/hub_client_api_test.rs`, `tests/hub_daemon_lifecycle_test.rs`, and `tests/hub_local_dogfood_test.rs` prove the current embedded runtime path.
+  - `tests/hub_runtime_test.rs`, `tests/hub_client_api_test.rs`, `tests/hub_daemon_lifecycle_test.rs`, and `tests/hub_local_runtime_test.rs` prove the current embedded runtime path.
   - `README.md` currently documents the in-process scaffold and explicitly says cross-process live session continuity is not supported.
 - Locked core dependency context inspected from Cargo's git checkout:
   - `DefaultBotsterEngine` exposes session operations over `ManagedSessionRuntime<LocalProcessRuntime>`.
@@ -110,7 +110,7 @@ Expected production changes:
   - Add only the narrow grant/admission wiring needed to allow/deny plugin/provider guarded notification writes.
   - Do not define a parallel capability primitive if core already owns it.
 - `src/main.rs`
-  - Keep CLI thin and route dogfood session commands through hub's typed local API, which must now use the core daemon path.
+  - Keep CLI thin and route production runtime session commands through hub's typed local API, which must now use the core daemon path.
   - Remove or relabel output that implies separate CLI invocations cannot share live sessions if the daemon-backed path now supports continuity.
 - `src/lib.rs`
   - Export new narrow daemon/client types and update architecture audit strings only as needed.
@@ -122,7 +122,7 @@ Expected production changes:
 Expected tests:
 
 - `tests/hub_core_daemon_session_runtime_test.rs` or focused additions to existing hub daemon/client tests.
-- Update `tests/hub_local_dogfood_test.rs` to prove the dogfood path now survives the daemon-backed production boundary or explicitly document any remaining scaffold-only pieces.
+- Update `tests/hub_local_runtime_test.rs` to prove the production runtime path now survives the daemon-backed production boundary or explicitly document any remaining scaffold-only pieces.
 - Existing embedded-runtime tests should be renamed or scoped if they are retained for dev/test-only behavior.
 
 Likely unchanged unless compile fixes require it:
@@ -177,7 +177,7 @@ Required verification after implementation:
 - Focused daemon/session tests, for example:
   - `cargo test --test hub_core_daemon_session_runtime_test`
   - `cargo test --test hub_client_api_test`
-  - `cargo test --test hub_local_dogfood_test`
+  - `cargo test --test hub_local_runtime_test`
 - Full crate regression:
   - `cargo test`
 - Strict lint if the repo policy remains warning-clean:
@@ -201,7 +201,7 @@ Acceptance assertions:
 - Hub policy can deny the same guarded write before core delivery is requested.
 - Semantic hints are passed as metadata only; tests or code structure show core owns delivery state transitions.
 - Docs explicitly state hub is a host profile/control plane over core daemon/session workers and that core daemon CLI parsing is not allowed.
-- Existing dogfood smoke behavior keeps working through the daemon-backed path or is intentionally replaced with a documented daemon-backed proof.
+- Existing production runtime smoke behavior keeps working through the daemon-backed path or is intentionally replaced with a documented daemon-backed proof.
 
 ## Pipeline Gates And Artifacts
 

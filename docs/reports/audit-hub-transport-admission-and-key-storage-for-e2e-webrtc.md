@@ -20,10 +20,10 @@ Assumptions applied:
 | Surface | Entry Points | Classification | Current Evidence | Production Browser Verdict |
 | --- | --- | --- | --- | --- |
 | Local daemon Unix socket | `botster-hub-client::DaemonConnection`, `request`, `stream_attach`; server in `src/daemon_transport.rs` | Production same-device control plane; terminal attach ingress into shared client data plane | `serve_daemon` binds `TransportBindings.local_socket`; `handle_connection` performs daemon hello, frames `DaemonRequest`, and submits to the hub owner thread | Production candidate for same-device operator clients, not browser WebRTC |
-| CLI commands | `src/main.rs` commands using `daemon_transport_request` | Operator control plane over daemon socket | Package, session, status, app, dogfood, and dev-stack commands frame public `DaemonRequest` values | Not browser transport |
+| CLI commands | `src/main.rs` commands using `daemon_transport_request` | Operator control plane over daemon socket | Package, session, status, app, `up`, `down`, `doctor`, and `smoke` commands frame public `DaemonRequest` values | Not browser transport |
 | TUI / same-device attach | `stream_attach`, `Attach`, `SendInput`, `Resize`, `Drain` | Same-device client over hub daemon protocol; terminal data path enters core `SessionIo` / `ClientWorker` abstractions | `handle_runtime_control_request` constructs `HubClientApi::local_operator`, then calls `HubClientApi::handle_request`; attach/input/resize flow into `HubRuntime` | Correct data-plane shape to reuse behind a future transport adapter |
 | Package app launch | `DaemonRequest::StartPackageEntrypoint`, `ListApps`, `ResolveAppLaunch`; `EntrypointSupervisor` | Hub-owned local/dev process launch contract | `StartPackageEntrypoint` builds supervised environment and starts the package; `ListApps` projects runnable entrypoints plus supervisor snapshots | Useful for local installed app bootstrap, not a browser data plane |
-| `botster-web` dogfood bridge | `botster-hub dogfood`, `dev-stack bootstrap`, printed `bridge=` / `web=` URLs | Dev harness / package app surface over localhost HTTP | `start_botster_web_dogfood` enables `botster-web`, injects `BOTSTER_HUB_SOCKET`, `BOTSTER_HUB_DATA_DIR`, and `BOTSTER_WEB_DOGFOOD_BRIDGE_PORT`, then requires structured `local_url` and verified HTML shell. When no port is supplied, dogfood selects an ephemeral `127.0.0.1:0` port with `TcpListener`; that is bridge port probing, not `TransportBindings.tcp`. | Must not be treated as production browser WebRTC |
+| `botster-web` local package server | `botster-hub up` and the structured `web=` URL | Package app surface over localhost HTTP | Hub starts the installed `botster-web/web-client` entrypoint with generic host injections, waits for child-authored structured `local_url`, and verifies health/UI from that URL. Web owns listener binding; Hub allocates no Web port. | Must not be treated as the admitted encrypted browser WebRTC data plane |
 | Plugin HTTP capability runtime | `HubCapabilityRuntime` HTTP runtime in `src/capabilities.rs` | Plugin capability surface after package admission | Hub policy grants localhost/http(s) capability operations to plugins | Not client browser transport |
 | Plugin WebSocket capability runtime | `InMemoryWebSocketCapabilityRuntime` in `src/capabilities.rs` | Plugin network capability surface | Runtime accepts plugin network operations through core capability contracts | Not client browser WebRTC |
 | TCP binding config | `TransportBindings.tcp` in `src/config.rs` | Config shape only | Config validates host/port, but repo inspection found no daemon listener using TCP bindings | Scaffold only; not a production transport today |
@@ -143,9 +143,9 @@ Acceptance check for future implementation work: the transport audit and impleme
 
 ## Non-Invasive Guard Added
 
-`docs/client-protocol.md` now states that supervised web app `local_url` / dogfood bridge URLs are local package app/dev harness outputs, not production browser transport or an E2E WebRTC substitute. It also states that production browser transport must be a separate admitted encrypted WebRTC stream over one ordered/reliable DataChannel.
+`docs/client-protocol.md` now states that supervised web app `local_url` / production runtime bridge URLs are local package app/dev harness outputs, not production browser transport or an E2E WebRTC substitute. It also states that production browser transport must be a separate admitted encrypted WebRTC stream over one ordered/reliable DataChannel.
 
-No Rust guard was added because there is no production WebRTC code path to assert yet. The existing bridge regression test `cli_dogfood_launcher_bridge_request_endpoint_uses_same_daemon_state` remains useful for daemon consistency, but it proves only the supervised local bridge harness.
+No Rust guard was added because there is no production WebRTC code path to assert yet. The existing bridge regression test `removed_legacy_launcher_launcher_bridge_request_endpoint_uses_same_daemon_state` remains useful for daemon consistency, but it proves only the supervised local bridge harness.
 
 ## Ticket-Ready Follow-Up Plan
 
@@ -162,7 +162,7 @@ No Rust guard was added because there is no production WebRTC code path to asser
 Commands and inspections used for this report:
 
 - `project_pipelines_current_context`: loaded ticket, run, approved plan revision, Plan Review approval, findings, answered question, gates, and existing checklist evidence.
-- Vault notes: loaded required Implement playbooks and Botster overlay notes, plus governing crypto/WebRTC/pairing/dogfood bridge notes.
+- Vault notes: loaded required Implement playbooks and Botster overlay notes, plus governing crypto/WebRTC/pairing/production runtime bridge notes.
 - `rg` inventory over `src`, `crates`, `docs`, `tests`, `examples`, and `Cargo.toml` for transport, bridge, identity, credential, secret, bootstrap, admission, WebRTC, and app launch terms.
 - `Cargo.lock`: confirmed `botster-core` / `botster-core-daemon` source revision `42538009bc6f6291872c5657bedbe7370f504f8d`.
 - Cargo git checkout at `42538009bc6f6291872c5657bedbe7370f504f8d`: inspected `identity/keyring.rs`, `identity/crypto.rs`, `identity/device.rs`, and `lib.rs` re-exports.
@@ -171,7 +171,7 @@ Commands and inspections used for this report:
 
 ## Residual Risk
 
-- This report does not verify a real botster-web production bridge because this repo contains only the hub-side package/dogfood harness and tests.
+- This report does not verify a real botster-web production bridge because this repo contains only the hub-side package/production runtime harness and tests.
 - `TransportBindings.tcp` remains a config shape without a production listener in this repo; future TCP work should either wire it or document it as scaffold-only.
 - Browser-side operation gates, reconnect replay, and pairing UI behavior are referenced from vault guidance but not implemented or tested here.
 - Checklist creation for the Implement step timed out in the Project Pipelines plugin worker; the same vault/checklist evidence is recorded in this durable report and gate evidence instead.
@@ -181,6 +181,6 @@ Commands and inspections used for this report:
 
 - Hub browser admission vocabulary: local bootstrap grant vs remote device/account approval, converging on one encrypted stream.
 - Hub credential-store wiring owner split over existing core primitives.
-- Dogfood HTTP bridge classification as dev harness, not production browser transport.
+- Production runtime HTTP bridge classification as dev harness, not production browser transport.
 - Single ordered/reliable DataChannel plus detection-only sequence/transcript rule as a reusable WebRTC planning constraint.
 - OSC/side-band metadata spam lane as a required Botster transport-audit dimension: classify, coalesce/latest-win/rate-limit/drop before DataChannel enqueue while protecting terminal bytes and critical control frames.

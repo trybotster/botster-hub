@@ -2,7 +2,7 @@
 //!
 //! The hub persists product and policy state here while `botster-core` remains
 //! the owner of reusable session, transport, package, and admission mechanics.
-//! Version 1 is a single local JSON file intended for local dogfood. It is a
+//! Version 1 is a single local JSON file intended for the local runtime. It is a
 //! single-writer store: atomic rename keeps the previous committed file intact
 //! when a write fails before rename, but concurrent hub processes can still
 //! produce last-writer-wins updates.

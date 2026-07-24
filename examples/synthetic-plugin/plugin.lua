@@ -1,4 +1,4 @@
--- Local-only synthetic package fixture for the botster-hub dogfood proof.
+-- Local-only synthetic package fixture for the botster-hub runtime proof.
 events.on("worktree_created", function(event)
   return {
     observed = "worktree_created",
@@ -10,7 +10,7 @@ end)
 return botster.register({
   tools = {
     {
-      name = "dogfood.synthetic.echo",
+      name = "runtime.synthetic.echo",
       description = "Echo test input and prove a hub capability primitive.",
       input_schema = {
         type = "object",

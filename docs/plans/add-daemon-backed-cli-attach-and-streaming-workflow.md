@@ -28,7 +28,7 @@
   - `sessions resize --data-dir <path> <session-id> <rows> <cols>`: resize through `HubClientApi::Resize`.
   - `sessions detach --data-dir <path> <session-id> [--subscription-id <id>]`: detach without shutting down the session.
   - `shutdown --data-dir <path>`: ask the daemon to stop cleanly.
-- Make attach streaming observable for a command that prints `dogfood-ok`, through the attach/stream path rather than `run-one`.
+- Make attach streaming observable for a command that prints `production runtime-ok`, through the attach/stream path rather than `run-one`.
 - Update docs to remove the old limitation that live sessions are unavailable across separate CLI invocations, and replace it with current daemon-backed behavior and limitations.
 
 ## Non-scope
@@ -76,8 +76,8 @@ No Project Pipelines plugin, SPA, TUI, Rails relay, or MCP surface should change
   - Add cross-process CLI tests for start/status/spawn/list/attach/send-input/resize/detach/shutdown.
 - `tests/hub_client_api_test.rs`
   - Keep as in-process contract coverage; add only if transport changes require a new client API variant.
-- `tests/hub_local_dogfood_test.rs`
-  - Preserve existing production-shaped in-process dogfood proof unless the new daemon transport becomes the better dogfood proof.
+- `tests/hub_local_runtime_test.rs`
+  - Preserve existing production-shaped in-process production runtime proof unless the new daemon transport becomes the better production runtime proof.
 - `README.md`
   - Document daemon-backed CLI behavior, attach/detach workflow, slow-consumer limitation/backpressure behavior, and current non-goals.
 
@@ -139,9 +139,9 @@ No Project Pipelines plugin, SPA, TUI, Rails relay, or MCP surface should change
   - Serializes real daemon/socket tests with a process-wide mutex/lock or an equivalent harness guard, per [[pty integration tests that spawn botster start must be serialized to avoid socket-path races]].
   - Starts `botster-hub start --data-dir <tmp>` as a long-running process.
   - `botster-hub status --data-dir <same>` proves socket liveness through `hello` / `hello_ack` and reports running typed scrubbed status.
-  - `botster-hub sessions spawn --data-dir <same> --session-id dogfood-session -- <command>` creates a daemon-owned session.
+  - `botster-hub sessions spawn --data-dir <same> --session-id runtime-session -- <command>` creates a daemon-owned session.
   - A separate `sessions list` invocation reports that session as live.
-  - `sessions attach` observes `dogfood-ok` from the daemon-backed stream path, not `run-one`.
+  - `sessions attach` observes `production runtime-ok` from the daemon-backed stream path, not `run-one`.
   - `sessions send-input` across multiple separate invocations produces ordered later markers observed by attach/streaming, proving daemon-authoritative clock/cursor behavior.
   - `sessions resize` returns a typed success/event path.
   - `sessions detach` stops delivery for that subscription while another attached/reattached stream remains valid if tested.
@@ -151,18 +151,18 @@ No Project Pipelines plugin, SPA, TUI, Rails relay, or MCP surface should change
   - `shutdown --data-dir <same>` stops the daemon and a later `status` reports not running or fails with a typed not-running error.
 - `./test.sh --test hub_client_api_test`
   - Existing in-process API contract still covers status, spawn, attach, input, resize, detach, shutdown, package/lifecycle queries, and admission.
-- `./test.sh --test hub_local_dogfood_test local_dogfood_runs_daemon_package_lifecycle_session_and_clean_shutdown`
-  - Existing dogfood proof stays green unless superseded by a stronger daemon-backed dogfood test.
-- `cargo run -- start --data-dir target/botster-hub-daemon-dogfood-data`
+- `./test.sh --test hub_local_runtime_test local_runtime_runs_daemon_package_lifecycle_session_and_clean_shutdown`
+  - Existing production runtime proof stays green unless superseded by a stronger daemon-backed production runtime test.
+- `cargo run -- start --data-dir target/botster-hub-daemon-runtime-data`
   - Manual run in one terminal.
 - In separate terminals:
-  - `cargo run -- status --data-dir target/botster-hub-daemon-dogfood-data`
-  - `cargo run -- sessions spawn --data-dir target/botster-hub-daemon-dogfood-data --session-id dogfood-session -- "printf 'dogfood-ok\n'; while IFS= read -r line; do printf 'dogfood:%s\n' \"$line\"; done"`
-  - `cargo run -- sessions list --data-dir target/botster-hub-daemon-dogfood-data`
-  - `cargo run -- sessions attach --data-dir target/botster-hub-daemon-dogfood-data dogfood-session`
-  - `cargo run -- sessions send-input --data-dir target/botster-hub-daemon-dogfood-data dogfood-session -- "from-cli\n"`
-  - `cargo run -- sessions detach --data-dir target/botster-hub-daemon-dogfood-data dogfood-session`
-  - `cargo run -- shutdown --data-dir target/botster-hub-daemon-dogfood-data`
+  - `cargo run -- status --data-dir target/botster-hub-daemon-runtime-data`
+  - `cargo run -- sessions spawn --data-dir target/botster-hub-daemon-runtime-data --session-id runtime-session -- "printf 'production runtime-ok\n'; while IFS= read -r line; do printf 'runtime:%s\n' \"$line\"; done"`
+  - `cargo run -- sessions list --data-dir target/botster-hub-daemon-runtime-data`
+  - `cargo run -- sessions attach --data-dir target/botster-hub-daemon-runtime-data runtime-session`
+  - `cargo run -- sessions send-input --data-dir target/botster-hub-daemon-runtime-data runtime-session -- "from-cli\n"`
+  - `cargo run -- sessions detach --data-dir target/botster-hub-daemon-runtime-data runtime-session`
+  - `cargo run -- shutdown --data-dir target/botster-hub-daemon-runtime-data`
 
 ## Pipeline gates and artifacts
 
@@ -177,7 +177,7 @@ No Project Pipelines plugin, SPA, TUI, Rails relay, or MCP surface should change
   - exact production entry point evidence showing CLI commands connect to the long-running daemon,
   - evidence of the runtime ownership model and clock stamping path used by daemon requests,
   - test command outputs for the daemon-backed CLI flow,
-  - manual dogfood commands or an explanation if automated tests fully cover the path,
+  - manual production runtime commands or an explanation if automated tests fully cover the path,
   - docs diff for README limitations.
 - Review should reject code-only evidence that does not prove separate CLI invocation continuity.
 

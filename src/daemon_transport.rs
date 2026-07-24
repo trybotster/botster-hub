@@ -888,32 +888,20 @@ fn handle_control_request(
                 .config()
                 .clone();
             let packages = daemon.package_registry().clone();
-            let mut environment = supervised_launch_environment(
+            let environment = supervised_launch_environment(
                 &config,
                 &packages,
                 &package_name,
                 &entrypoint_id,
                 &environment_overrides,
             )?;
-            let local_webrtc_bootstrap = if package_name == "botster-web" {
-                daemon
-                    .local_webrtc()
-                    .issue_botster_web_bootstrap(&entrypoint_id, &mut environment)?
-            } else {
-                None
-            };
             daemon.entrypoint_supervisor().start(
                 &packages,
                 &package_name,
                 &entrypoint_id,
                 &environment,
             )?;
-            let mut response = show_package_response(daemon, &package_name)?;
-            if let Some(bootstrap) = local_webrtc_bootstrap {
-                response.kind = DaemonResponseKind::LocalWebrtcBootstrap;
-                response.local_webrtc_bootstrap = Some(bootstrap);
-            }
-            Ok(response)
+            show_package_response(daemon, &package_name)
         }
         DaemonRequest::IssueLocalWebrtcBootstrap {
             package_name,
@@ -5500,6 +5488,30 @@ fn daemon_operator_error_from_entrypoint(error: EntrypointSupervisorError) -> Da
         } => (
             "entrypoint_not_supervisable",
             format!("package {package_name} entrypoint {entrypoint_id} is not marked supervisable"),
+        ),
+        EntrypointSupervisorError::ReadinessFailed {
+            package_name,
+            entrypoint_id,
+            details,
+        } => (
+            "entrypoint_readiness_failed",
+            format!(
+                "package {package_name} entrypoint {entrypoint_id} exited before publishing structured readiness: {details}"
+            ),
+        ),
+        EntrypointSupervisorError::ReadinessTimeout {
+            package_name,
+            entrypoint_id,
+            details,
+        } => (
+            "entrypoint_readiness_timeout",
+            format!(
+                "package {package_name} entrypoint {entrypoint_id} did not publish structured readiness before the liveness deadline: {details}"
+            ),
+        ),
+        EntrypointSupervisorError::Watch(message) => (
+            "entrypoint_readiness_watch_error",
+            format!("entrypoint launch-result watch failed: {message}"),
         ),
         EntrypointSupervisorError::Io(error) => (
             "entrypoint_io_error",
