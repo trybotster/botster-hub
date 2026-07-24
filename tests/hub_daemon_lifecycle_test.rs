@@ -3845,12 +3845,30 @@ fn cli_local_runtime_up_reports_missing_installed_checkout_before_launch() {
         command_output_text(&first)
     );
     shutdown_local_runtime_daemon(&data_dir);
+    let socket_path = data_dir.join("botster-hub.sock");
+    for _ in 0..100 {
+        if !socket_path.exists() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        !socket_path.exists(),
+        "initial daemon socket should be gone before failed-start cleanup proof"
+    );
+    let failed_data_dir = unique_short_test_dir("cli-up-failed-cleanup");
+    fs::create_dir_all(&failed_data_dir).expect("create failed-start data directory");
+    fs::copy(
+        data_dir.join("hub-state.json"),
+        failed_data_dir.join("hub-state.json"),
+    )
+    .expect("copy installed package state into fresh failed-start directory");
     fs::remove_dir_all(&web_package_dir).expect("remove installed web checkout");
 
     let failed = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
         .arg("up")
         .arg("--data-dir")
-        .arg(&data_dir)
+        .arg(&failed_data_dir)
         .arg("--session-worker-bin")
         .arg(session_worker_binary_path())
         .output()
@@ -3864,6 +3882,27 @@ fn cli_local_runtime_up_reports_missing_installed_checkout_before_launch() {
     assert!(
         text.contains(web_package_dir.to_string_lossy().as_ref()),
         "{text}"
+    );
+    let config = explicit_config(failed_data_dir.clone());
+    let status = botster_hub::daemon_transport_request(&config, botster_hub::DaemonRequest::Status);
+    assert!(
+        matches!(
+            status,
+            Err(botster_hub::DaemonTransportError::NotRunning)
+                | Err(botster_hub::DaemonTransportError::ClientDisconnected)
+        ),
+        "failed startup should stop the daemon it started: {status:?}"
+    );
+    let failed_socket_path = failed_data_dir.join("botster-hub.sock");
+    for _ in 0..100 {
+        if !failed_socket_path.exists() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        !failed_socket_path.exists(),
+        "failed startup left its owned socket: {text}"
     );
 }
 

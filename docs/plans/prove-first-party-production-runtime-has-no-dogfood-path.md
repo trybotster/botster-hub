@@ -377,14 +377,19 @@ Implementation-stage artifact still required:
   - implementation-stage exact revisions, commands, results, deviations, and
   residual risks.
 
-Expected unchanged unless the acceptance run finds an actual Hub-owned defect:
+Changed after the acceptance run found an actual Hub-owned defect:
 
 - `src/main.rs`
+- `tests/hub_daemon_lifecycle_test.rs`
+  - a failed `up` that started a new daemon must shut down that owned daemon
+    and remove its socket before returning the launch error.
+
+Expected unchanged:
+
 - `src/daemon.rs`
 - `src/daemon_transport.rs`
 - `src/entrypoint_supervisor.rs`
 - `src/packages.rs`
-- `tests/hub_daemon_lifecycle_test.rs`
 
 ## Risks
 
