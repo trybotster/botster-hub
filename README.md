@@ -437,13 +437,14 @@ Command layers:
 - Plugin configuration: `packages config` reads configuration and
   `packages config set` writes configuration JSON for an installed package.
 
-The supervised `botster-web` process receives `BOTSTER_HUB_SOCKET` and
-`BOTSTER_HUB_DATA_DIR` because the daemon-owned entrypoint launch injects hub
-connection environment. Foreground terminal apps run through `botster-hub apps
-open`, which asks the daemon for the resolved launch contract and then starts
-the child with inherited stdio. Both injected runtime paths are absolute host
-paths, so they continue to identify the selected daemon after the child changes
-to its package working directory.
+The daemon constructs Core's typed Hub connection descriptor from its absolute
+Unix socket path and serializes it into each runnable entrypoint's
+manifest-declared `hub_connection` target. Package data paths are likewise
+injected only through declared `data_dir` targets. Foreground terminal apps run
+through `botster-hub apps open`, which asks the daemon for the resolved launch
+contract and then starts the child with inherited stdio. Host-owned injections
+remain authoritative after environment overrides and package working-directory
+changes.
 
 For lower-level package diagnostics, the daily flow maps to the daemon-owned
 package commands:
@@ -581,8 +582,10 @@ When a `botster-tui` terminal app package is installed and enabled,
 UI over the same daemon socket and `botster-hub-client` protocol path as the
 operator CLI. The hub resolves the foreground command, working directory, and
 allowlisted environment; the CLI only spawns that contract with inherited stdio.
-The injected `BOTSTER_HUB_SOCKET` and `BOTSTER_HUB_DATA_DIR` values are absolute
-and must not be resolved relative to the package working directory.
+The package manifest chooses the environment or argument targets for the typed
+Hub connection descriptor and package data directory. The descriptor's Unix
+socket path and the data directory are absolute and must not be resolved
+relative to the package working directory.
 
 ```sh
 # Terminal 1: leave the daemon running.
