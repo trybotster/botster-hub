@@ -6,7 +6,7 @@
 - Ticket intent: fix the pre-existing main-branch deadlock where `daemon_startup_reconciliation_marks_stale_adoption_socket_and_continues` hangs during daemon startup reconciliation over a stale worker adoption socket.
 - Review correction accepted: the bug is not a missing stale-socket recovery branch. That branch, the helper, and the named test already exist on `origin/main`; the existing branch deadlocks because it re-locks the same non-reentrant `std::sync::Mutex`.
 - Vault/playbook context loaded: [[identity]], [[goals]], [[planner-playbook]], [[botster-planner-playbook]], [[botster-architecture]], [[cli-patterns]], [[spa-patterns]], [[project pipeline orchestration belongs in a device-level botster plugin]], [[project pipelines needs an operator workbench not more primitives]], [[project pipelines ui contract belongs in the plugin readme]], [[botster orchestration should spawn agents with explicit target ids]], [[botster orchestration prompts must bind agents to explicit worktrees]], [[plan agents must author vault context as wikilinks not home paths]], [[adoption restart evidence must come from real protocol primitives not defaults]], [[broker reconnect snapshot reads must be timeout bounded to avoid startup stalls]], and [[full suite hangs need source and behavior proof before unrelated waivers]].
-- Repo context inspected: `src/runtime.rs`, `src/daemon.rs`, `tests/hub_daemon_lifecycle_test.rs`, `docs/adr/local-runtime-dogfood-readiness.md`, and this plan artifact.
+- Repo context inspected: `src/runtime.rs`, `src/daemon.rs`, `tests/hub_daemon_lifecycle_test.rs`, `docs/adr/local-runtime-production-readiness.md`, and this plan artifact.
 - Existing checklist: `checklist_1782926655_993745` updated with vault notes loaded, no convention conflicts, plan-stage verification evidence, and no plan-time durable capture.
 
 ## Root Cause
@@ -30,7 +30,7 @@ That match scrutinee holds the `MutexGuard` temporary for the whole `match`. Whe
 - Keep the existing stale worker-control-socket classification helper unless implementation proves a narrower structured dependency error is available.
 - Preserve existing behavior: valid worker-backed sessions are adopted and listed in `recovered_sessions`; stale, unhealthy, duplicate, terminal-running, and missing-evidence records are marked stale and listed in `stale_sessions`.
 - Keep the production entry point wired through `HubDaemon::start` -> `HubRuntime::load_from_store` -> `reconcile_sessions`.
-- Correct `docs/adr/local-runtime-dogfood-readiness.md` so it no longer claims stale adoption socket behavior is proven until the deadlock fix and named test completion evidence exist.
+- Correct `docs/adr/local-runtime-production-readiness.md` so it no longer claims stale adoption socket behavior is proven until the deadlock fix and named test completion evidence exist.
 
 ## Non-Scope
 
@@ -46,14 +46,14 @@ That match scrutinee holds the `MutexGuard` temporary for the whole `match`. Whe
 - Assumption: a single-lock restructure is also acceptable if it stays smaller and clearer, but it must not hold mutable core-daemon state while mutating hub-side reconciliation vectors in a way that widens ownership or borrow scope unnecessarily.
 - Assumption: the named test already exercises the production path because it calls `HubDaemon::start(config)`.
 - Unknown: whether adding an explicit in-test timeout/watchdog is needed, or whether test-runner-level bounded completion evidence is enough for this ticket. At minimum, acceptance must include wall-clock completion through `./test.sh ... -- --test-threads=1`; if the implementation changes the test harness, it must avoid leaving child processes or sockets behind on timeout.
-- Unknown: whether `docs/adr/local-runtime-dogfood-readiness.md` should be corrected before or after implementation evidence. The implementation pass should choose the least misleading wording: either mark the stale adoption socket row as temporarily unproven until tests pass, or update it alongside the verified fix.
+- Unknown: whether `docs/adr/local-runtime-production-readiness.md` should be corrected before or after implementation evidence. The implementation pass should choose the least misleading wording: either mark the stale adoption socket row as temporarily unproven until tests pass, or update it alongside the verified fix.
 
 ## Affected Surfaces / Files
 
 - `src/runtime.rs`: primary production fix in `HubRuntime::reconcile_sessions`; ensure `CoreDaemon` mutex guard lifetime ends before stale recovery re-locking, or avoid re-locking.
 - `src/daemon.rs`: production entry point context only; `HubDaemon::start` should continue to use `HubRuntime::load_from_store` and status should continue reporting `stale_sessions`.
 - `tests/hub_daemon_lifecycle_test.rs`: named regression must complete and retain assertions that startup reports the stale session and can spawn a fresh session afterward.
-- `docs/adr/local-runtime-dogfood-readiness.md`: correct the false "proven" readiness claim for stale adoption socket reconciliation.
+- `docs/adr/local-runtime-production-readiness.md`: correct the false "proven" readiness claim for stale adoption socket reconciliation.
 - `test.sh`: no expected change; use it for acceptance because Botster tests require the repo wrapper.
 
 ## Implementation Plan
@@ -71,7 +71,7 @@ That match scrutinee holds the `MutexGuard` temporary for the whole `match`. Whe
    - Existing non-adoptable stale branches remain unchanged unless compiler refactoring requires local movement.
 
 3. Correct readiness documentation.
-   - Update the stale adoption socket row in `docs/adr/local-runtime-dogfood-readiness.md` so it does not cite a hanging test as already proven without qualification.
+   - Update the stale adoption socket row in `docs/adr/local-runtime-production-readiness.md` so it does not cite a hanging test as already proven without qualification.
    - After implementation verification, the row may claim proof only with the bounded-completion command evidence.
 
 4. Verify runtime path and liveness.
@@ -94,7 +94,7 @@ That match scrutinee holds the `MutexGuard` temporary for the whole `match`. Whe
 - Startup reconciliation regression: `./test.sh daemon_startup_reconciliation_marks_stale_and_recovers_missing_live_sessions -- --test-threads=1` passes.
 - Live worker recovery regression: run `./test.sh cli_daemon_restart_recovers_worker_backed_session_through_transport -- --test-threads=1`, or if too expensive/environment-blocked, run the narrowest existing runtime adoption test and document why it proves valid worker-backed sessions are still adopted.
 - Full-suite disposition: run `./test.sh` when practical. If it cannot complete, provide exact evidence that any remaining failure/hang is unrelated to `daemon_startup_reconciliation_marks_stale_adoption_socket_and_continues`.
-- Documentation check: `docs/adr/local-runtime-dogfood-readiness.md` no longer contains a false stale-adoption-socket "proven" claim that cites a hanging test.
+- Documentation check: `docs/adr/local-runtime-production-readiness.md` no longer contains a false stale-adoption-socket "proven" claim that cites a hanging test.
 - Production path proof: implementation report must identify `HubDaemon::start` -> `HubRuntime::load_from_store` -> `reconcile_sessions` as the path changed by the mutex lifetime fix.
 
 ## Vault Gaps Worth Capturing

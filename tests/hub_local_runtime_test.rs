@@ -17,19 +17,19 @@ use botster_hub::{
 mod support;
 use support::ensure_session_worker_binary;
 
-const DOGFOOD_PACKAGE: &str = "dogfood.synthetic-plugin";
-const DOGFOOD_SESSION: &str = "dogfood-local-session";
-const DOGFOOD_SUBSCRIPTION: &str = "dogfood-local-subscription";
-const INPUT_MARKER: &[u8] = b"dogfood:from-input";
+const RUNTIME_PACKAGE: &str = "runtime.synthetic-plugin";
+const RUNTIME_SESSION: &str = "runtime-local-session";
+const RUNTIME_SUBSCRIPTION: &str = "runtime-local-subscription";
+const INPUT_MARKER: &[u8] = b"runtime:from-input";
 
 #[test]
-fn local_dogfood_runs_daemon_package_lifecycle_session_and_clean_shutdown() {
-    run_local_dogfood();
+fn local_runtime_runs_daemon_package_lifecycle_session_and_clean_shutdown() {
+    run_local_runtime();
 }
 
-fn run_local_dogfood() {
+fn run_local_runtime() {
     ensure_session_worker_binary();
-    let data_dir = unique_test_dir("dogfood");
+    let data_dir = unique_test_dir("runtime");
     let config = explicit_config(&data_dir);
     let store = FileHubStateStore::for_data_directory(&config.data_directory);
     let package_dir = PathBuf::from("examples").join("synthetic-plugin");
@@ -38,7 +38,7 @@ fn run_local_dogfood() {
         "documented synthetic package fixture must exist"
     );
 
-    let mut daemon = HubDaemon::start(config.clone()).expect("start dogfood daemon");
+    let mut daemon = HubDaemon::start(config.clone()).expect("start runtime daemon");
     let startup_status = daemon.status();
     assert_eq!(startup_status.state_source, HubStateLoadSource::Initialized);
     assert!(startup_status.core_initialized);
@@ -47,19 +47,19 @@ fn run_local_dogfood() {
     let installed_name = {
         let record = daemon
             .package_registry_mut()
-            .install_local_path(&package_dir, "dogfood install local synthetic package")
+            .install_local_path(&package_dir, "runtime install local synthetic package")
             .expect("install synthetic local package");
         record.manifest.name.clone()
     };
-    assert_eq!(installed_name, DOGFOOD_PACKAGE);
+    assert_eq!(installed_name, RUNTIME_PACKAGE);
     daemon
         .package_registry_mut()
-        .enable(DOGFOOD_PACKAGE, "dogfood enable synthetic package")
+        .enable(RUNTIME_PACKAGE, "runtime enable synthetic package")
         .expect("enable synthetic local package");
     persist_package_registry(&daemon);
 
     let packages = daemon.package_registry().clone();
-    let api = HubClientApi::local_operator("dogfood-local-client");
+    let api = HubClientApi::local_operator("runtime-local-client");
     assert_status_and_packages(
         &api,
         daemon.runtime_mut().expect("runtime initialized"),
@@ -68,7 +68,7 @@ fn run_local_dogfood() {
     );
 
     daemon.stop();
-    let mut reloaded = HubDaemon::start(config).expect("reload dogfood daemon");
+    let mut reloaded = HubDaemon::start(config).expect("reload runtime daemon");
     let reloaded_status = reloaded.status();
     assert_eq!(reloaded_status.state_source, HubStateLoadSource::Loaded);
     assert_eq!(reloaded_status.package_count, 1);
@@ -76,9 +76,9 @@ fn run_local_dogfood() {
 
     let prepared = reloaded
         .package_registry()
-        .prepare_local_package(DOGFOOD_PACKAGE, "dogfood prepare local package")
+        .prepare_local_package(RUNTIME_PACKAGE, "runtime prepare local package")
         .expect("prepare enabled local package");
-    assert_eq!(prepared.package_name, DOGFOOD_PACKAGE);
+    assert_eq!(prepared.package_name, RUNTIME_PACKAGE);
     assert!(
         prepared
             .selected_entrypoint_path
@@ -94,7 +94,7 @@ fn run_local_dogfood() {
             reloaded.runtime_mut().expect("runtime initialized"),
             &lifecycle_registry,
             HubClientRequest::PluginLifecycleStatus {
-                request_id: request_id("dogfood-plugin-lifecycle"),
+                request_id: request_id("runtime-plugin-lifecycle"),
             },
         )
         .expect("pull plugin lifecycle through client api");
@@ -102,7 +102,7 @@ fn run_local_dogfood() {
         panic!("plugin lifecycle response expected");
     };
     assert_eq!(records.len(), 1);
-    assert_eq!(records[0].package_name, DOGFOOD_PACKAGE);
+    assert_eq!(records[0].package_name, RUNTIME_PACKAGE);
     assert!(records[0].loaded);
 
     let tools = reloaded
@@ -112,22 +112,22 @@ fn run_local_dogfood() {
     assert!(
         tools
             .iter()
-            .any(|tool| tool.name == "dogfood.synthetic.echo")
+            .any(|tool| tool.name == "runtime.synthetic.echo")
     );
     let result = reloaded
         .runtime_mut()
         .expect("runtime initialized")
         .call_plugin_mcp_tool(botster_hub::McpCallRequest {
-            name: "dogfood.synthetic.echo".to_string(),
-            arguments: serde_json::json!({ "message": "dogfood" }),
+            name: "runtime.synthetic.echo".to_string(),
+            arguments: serde_json::json!({ "message": "runtime" }),
         })
         .expect("call real synthetic Lua MCP tool");
-    assert_eq!(result["message"], "dogfood");
+    assert_eq!(result["message"], "runtime");
     assert_eq!(result["ambient"]["os"], true);
 
     let mut session_started = false;
-    let session_id = SessionId(DOGFOOD_SESSION.to_string());
-    let subscription_id = SubscriptionId(DOGFOOD_SUBSCRIPTION.to_string());
+    let session_id = SessionId(RUNTIME_SESSION.to_string());
+    let subscription_id = SubscriptionId(RUNTIME_SUBSCRIPTION.to_string());
     let mut logical_clock = 10;
     let flow_registry = reloaded.package_registry().clone();
     let flow = panic::catch_unwind(AssertUnwindSafe(|| {
@@ -150,7 +150,7 @@ fn run_local_dogfood() {
                 .expect("runtime initialized for cleanup"),
             &cleanup_registry,
             HubClientRequest::Shutdown {
-                request_id: request_id("dogfood-cleanup-shutdown"),
+                request_id: request_id("runtime-cleanup-shutdown"),
                 session_id: session_id.clone(),
                 now_seconds: logical_clock,
             },
@@ -166,7 +166,7 @@ fn run_local_dogfood() {
             reloaded.runtime_mut().expect("runtime initialized"),
             &shutdown_registry,
             HubClientRequest::Shutdown {
-                request_id: request_id("dogfood-shutdown"),
+                request_id: request_id("runtime-shutdown"),
                 session_id,
                 now_seconds: logical_clock,
             },
@@ -191,7 +191,7 @@ fn assert_status_and_packages(
             runtime,
             packages,
             HubClientRequest::Status {
-                request_id: request_id("dogfood-status"),
+                request_id: request_id("runtime-status"),
             },
         )
         .expect("status through client api");
@@ -205,7 +205,7 @@ fn assert_status_and_packages(
             runtime,
             packages,
             HubClientRequest::ListPackages {
-                request_id: request_id("dogfood-list-packages"),
+                request_id: request_id("runtime-list-packages"),
             },
         )
         .expect("packages through client api");
@@ -213,7 +213,7 @@ fn assert_status_and_packages(
         panic!("package response expected");
     };
     assert_eq!(records.len(), expected_package_count);
-    assert_eq!(records[0].package_name, DOGFOOD_PACKAGE);
+    assert_eq!(records[0].package_name, RUNTIME_PACKAGE);
     assert_eq!(
         records[0].classification,
         HubClientPackageClassification::Plugin
@@ -238,9 +238,9 @@ fn spawn_attach_input_and_drain(
             runtime,
             packages,
             HubClientRequest::Spawn {
-                request_id: request_id("dogfood-spawn"),
+                request_id: request_id("runtime-spawn"),
                 session_id: session_id.clone(),
-                command: "printf 'dogfood:ready\\n'; while IFS= read -r line; do printf 'dogfood:%s\\n' \"$line\"; done".to_string(),
+                command: "printf 'runtime:ready\\n'; while IFS= read -r line; do printf 'runtime:%s\\n' \"$line\"; done".to_string(),
                 now_seconds: *logical_clock,
             },
         )
@@ -255,7 +255,7 @@ fn spawn_attach_input_and_drain(
         runtime,
         packages,
         HubClientRequest::Attach {
-            request_id: request_id("dogfood-attach"),
+            request_id: request_id("runtime-attach"),
             session_id: session_id.clone(),
             subscription_id: subscription_id.clone(),
             now_seconds: *logical_clock,
@@ -268,7 +268,7 @@ fn spawn_attach_input_and_drain(
         api,
         packages,
         &session_id,
-        b"dogfood:ready",
+        b"runtime:ready",
         logical_clock,
     );
 
@@ -276,7 +276,7 @@ fn spawn_attach_input_and_drain(
         runtime,
         packages,
         HubClientRequest::Input {
-            request_id: request_id("dogfood-input"),
+            request_id: request_id("runtime-input"),
             session_id: session_id.clone(),
             data: b"from-input\n".to_vec(),
             now_seconds: *logical_clock,
@@ -318,7 +318,7 @@ fn drain_until(
                 runtime,
                 packages,
                 HubClientRequest::DrainRuntime {
-                    request_id: request_id("dogfood-drain"),
+                    request_id: request_id("runtime-drain"),
                     session_id: session_id.clone(),
                     last_output_at: *logical_clock,
                 },
@@ -355,8 +355,8 @@ fn drain_until(
 fn explicit_config(data_directory: &Path) -> botster_hub::HubConfig {
     HubStartupOptions {
         host: HostIdentityOptions {
-            id: "local-dogfood-test".to_string(),
-            display_name: "Local Dogfood Test".to_string(),
+            id: "local-runtime-test".to_string(),
+            display_name: "Local Runtime Test".to_string(),
             fingerprint: None,
         },
         data_directory: DataDirectoryOption::Explicit(data_directory.to_path_buf()),
@@ -373,7 +373,7 @@ fn explicit_config(data_directory: &Path) -> botster_hub::HubConfig {
         ..HubStartupOptions::default()
     }
     .build_config_for_environment(&RuntimeEnvironment::from_values(None, None, None))
-    .expect("explicit dogfood config should build")
+    .expect("explicit runtime config should build")
 }
 
 fn persist_package_registry(daemon: &HubDaemon) {
@@ -385,7 +385,7 @@ fn persist_package_registry(daemon: &HubDaemon) {
         .update(&config, |state| {
             state.package_registry = snapshot;
         })
-        .expect("persist dogfood package registry");
+        .expect("persist runtime package registry");
 }
 
 fn request_id(value: &str) -> RequestId {
@@ -399,9 +399,9 @@ fn unique_test_dir(name: &str) -> PathBuf {
         .as_nanos();
     let root = PathBuf::from("target")
         .join("botster-hub-test-data")
-        .join("local-dogfood")
+        .join("local-runtime")
         .join(name)
         .join(nanos.to_string());
-    fs::create_dir_all(&root).expect("create dogfood data directory");
+    fs::create_dir_all(&root).expect("create runtime data directory");
     root
 }

@@ -15,12 +15,14 @@ use botster_core::{
     PackageSource, RunnableEntrypointLaunchMode, RunnableEntrypointLaunchResult,
     RunnableEntrypointProcessState, RunnableEntrypointResultField,
 };
+use notify::{RecursiveMode, Watcher};
 
 use crate::{PackageRecord, PackageRegistry, PackageRunnableEntrypoint, PackageState};
 
 const OUTPUT_LIMIT_BYTES: usize = 4096;
 const OUTPUT_FINALIZATION_GRACE: Duration = Duration::from_millis(500);
 const STOP_GRACE: Duration = Duration::from_millis(500);
+const LAUNCH_RESULT_READINESS_BUDGET: Duration = Duration::from_secs(15);
 const LAUNCH_RESULT_ENV: &str = "BOTSTER_ENTRYPOINT_LAUNCH_RESULT";
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -61,6 +63,17 @@ pub enum EntrypointSupervisorError {
         package_name: String,
         entrypoint_id: String,
     },
+    ReadinessFailed {
+        package_name: String,
+        entrypoint_id: String,
+        details: String,
+    },
+    ReadinessTimeout {
+        package_name: String,
+        entrypoint_id: String,
+        details: String,
+    },
+    Watch(String),
     Io(std::io::Error),
 }
 
@@ -95,6 +108,10 @@ impl EntrypointSupervisor {
 
         let launch_result_path = entrypoint_declares_launch_result(entrypoint)
             .then(|| launch_result_path(&key.package_name, &key.entrypoint_id, now_seconds()));
+        let launch_result_watcher = launch_result_path
+            .as_ref()
+            .map(|path| watch_launch_result_parent(path))
+            .transpose()?;
         let command_path = resolve_command(&package_root, entrypoint.command.as_str());
         let working_directory = resolve_working_directory(&package_root, entrypoint)?;
         let mut command = Command::new(command_path);
@@ -149,9 +166,13 @@ impl EntrypointSupervisor {
         };
         let snapshot = process.snapshot(&key);
         self.retained.insert(key.clone(), snapshot.clone());
-        self.processes.insert(key, process);
+        self.processes.insert(key.clone(), process);
         let _ = record;
-        Ok(snapshot)
+        if let Some((_watcher, events)) = launch_result_watcher {
+            self.wait_for_launch_result(&key, &events)
+        } else {
+            Ok(snapshot)
+        }
     }
 
     pub fn stop(&mut self, package_name: &str, entrypoint_id: &str) -> EntrypointProcessSnapshot {
@@ -240,6 +261,78 @@ impl EntrypointSupervisor {
             process.refresh();
         }
     }
+
+    fn wait_for_launch_result(
+        &mut self,
+        key: &EntrypointKey,
+        events: &Receiver<notify::Result<notify::Event>>,
+    ) -> EntrypointSupervisorResult<EntrypointProcessSnapshot> {
+        let deadline = Instant::now() + LAUNCH_RESULT_READINESS_BUDGET;
+        let launch_result_path = self
+            .processes
+            .get(key)
+            .and_then(|process| process.launch_result_path.clone())
+            .expect("readiness wait requires a launch-result path");
+        let mut launch_result_may_have_changed = true;
+        loop {
+            let process = self
+                .processes
+                .get_mut(key)
+                .expect("entrypoint was inserted before readiness wait");
+            if launch_result_may_have_changed {
+                process.refresh();
+            } else {
+                process.refresh_process_state();
+            }
+            let snapshot = process.snapshot(key);
+            self.retained.insert(key.clone(), snapshot.clone());
+
+            if snapshot
+                .launch_result
+                .as_ref()
+                .and_then(|result| result.local_url.as_deref())
+                .is_some_and(|url| !url.trim().is_empty())
+            {
+                return Ok(snapshot);
+            }
+            if process.exited_at.is_some() {
+                return Err(EntrypointSupervisorError::ReadinessFailed {
+                    package_name: key.package_name.clone(),
+                    entrypoint_id: key.entrypoint_id.clone(),
+                    details: readiness_details(&snapshot),
+                });
+            }
+
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(EntrypointSupervisorError::ReadinessTimeout {
+                    package_name: key.package_name.clone(),
+                    entrypoint_id: key.entrypoint_id.clone(),
+                    details: readiness_details(&snapshot),
+                });
+            }
+            let wait = (deadline - now).min(Duration::from_millis(50));
+            match events.recv_timeout(wait) {
+                Ok(Ok(event)) => {
+                    launch_result_may_have_changed = event
+                        .paths
+                        .iter()
+                        .any(|path| path.file_name() == launch_result_path.file_name());
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    launch_result_may_have_changed = false;
+                }
+                Ok(Err(error)) => {
+                    return Err(EntrypointSupervisorError::Watch(error.to_string()));
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(EntrypointSupervisorError::Watch(
+                        "launch-result watcher disconnected".to_string(),
+                    ));
+                }
+            }
+        }
+    }
 }
 
 struct SupervisedProcess {
@@ -264,9 +357,13 @@ impl SupervisedProcess {
     }
 
     fn refresh(&mut self) {
+        self.refresh_launch_result();
+        self.refresh_process_state();
+    }
+
+    fn refresh_process_state(&mut self) {
         drain_output("stdout", &mut self.stdout, &mut self.diagnostics);
         drain_output("stderr", &mut self.stderr, &mut self.diagnostics);
-        self.refresh_launch_result();
         if self.exited_at.is_none() {
             match self.child.try_wait() {
                 Ok(Some(status)) => self.mark_exit(status),
@@ -500,6 +597,39 @@ fn launch_result_path(package_name: &str, entrypoint_id: &str, started_at: u64) 
         sanitized_path_component(entrypoint_id)
     );
     std::env::temp_dir().join(file_name)
+}
+
+fn watch_launch_result_parent(
+    launch_result_path: &Path,
+) -> EntrypointSupervisorResult<(
+    notify::RecommendedWatcher,
+    Receiver<notify::Result<notify::Event>>,
+)> {
+    let (tx, rx) = mpsc::channel();
+    let mut watcher = notify::recommended_watcher(tx)
+        .map_err(|error| EntrypointSupervisorError::Watch(error.to_string()))?;
+    let parent = launch_result_path.parent().ok_or_else(|| {
+        EntrypointSupervisorError::Watch("launch-result path has no parent".to_string())
+    })?;
+    watcher
+        .watch(parent, RecursiveMode::NonRecursive)
+        .map_err(|error| EntrypointSupervisorError::Watch(error.to_string()))?;
+    Ok((watcher, rx))
+}
+
+fn readiness_details(snapshot: &EntrypointProcessSnapshot) -> String {
+    let mut details = format!("process_state={}", snapshot.state);
+    if let Some(exit_status) = &snapshot.exit_status {
+        details.push_str(&format!(" exit_status={exit_status}"));
+    }
+    for diagnostic in snapshot.diagnostics.iter().take(4) {
+        details.push_str(&format!(
+            "; {}={}",
+            diagnostic.kind,
+            bounded_message(diagnostic.message.clone())
+        ));
+    }
+    details
 }
 
 fn sanitized_path_component(value: &str) -> String {

@@ -422,14 +422,16 @@ Supervised entrypoints are local development processes, not a production
 installer or sandbox. The daemon stops them on explicit stop/restart, package
 disable/remove, `DaemonShutdown`, and daemon SIGINT/SIGTERM cleanup.
 
-Web app `local_url` values, including `botster-web` dogfood `bridge=` / `web=`
-URLs, are supervised local package app outputs. They remain health and dev
-bridge surfaces, not the terminal/session data plane.
+Web app `local_url` values are child-authored supervised package app outputs.
+Hub uses the exact returned URL for health/UI verification; it does not derive
+the URL from a configured port or a second bridge owner.
 
 For the installed `botster-web` `web-client` entrypoint, `StartPackageEntrypoint`
-also returns `local_webrtc_bootstrap` when it mints a short-lived local browser
-grant. The bootstrap contains the grant id/secret, expected same-device origin,
-expiry, signaling transport (`daemon_request`), data plane
+returns package state only after structured readiness. A page-load
+`IssueLocalWebrtcBootstrap` request mints the short-lived local browser grant
+after the app URL is known and validates its origin against `local_url`. The
+bootstrap contains the grant id/secret, expected same-device origin, expiry,
+signaling transport (`daemon_request`), data plane
 (`webrtc_data_channel`), and the required DataChannel reliability contract:
 ordered `true`, no `max_retransmits`, no `max_packet_lifetime_ms`, and no hub
 application reorder buffer.
@@ -674,7 +676,7 @@ CLI operators can inspect package configuration with:
 botster-hub packages config --data-dir <path> <package>
 ```
 
-The checked-in dev-stack acceptance target is `project-pipelines` at
+The checked-in local runtime acceptance target is `project-pipelines` at
 `examples/project-pipelines`. Its manifest exposes deterministic
 `operator_endpoint`, `pipeline_mode`, and `api_token` configuration fields
 through the same `DaemonPackage.configuration` DTO used by first-party clients.
@@ -1060,16 +1062,16 @@ Hub developers can run the full fixture proof from this repository with:
 ./test.sh --test hub_daemon_lifecycle_test daemon_plugin_contract_matrix_fixture_exercises_public_package_contracts
 ```
 
-Hub CI also runs the first-party package compatibility smoke:
+Hub CI also runs the persisted-package runtime smoke:
 
 ```bash
-./test.sh --test hub_daemon_lifecycle_test cli_dev_stack_first_party_plugin_dogfood_smoke_runs_contract_matrix_then_real_packages
+./test.sh --test hub_daemon_lifecycle_test cli_smoke_proves_local_runtime_daemon_package_app_session_and_webrtc
 ```
 
-That smoke runs the contract-matrix helper above for the hub-owned primitive
-inventory, then runs `run_project_pipelines_conformance` against the packaged
-Project Pipelines example to prove first-party external package enablement,
-`PluginSurfaceRender`, `ui_tree_snapshot` identity, form node structure, and
+Separate contract-matrix coverage runs `run_project_pipelines_conformance`
+against the packaged Project Pipelines example to prove first-party external
+package enablement, `PluginSurfaceRender`, `ui_tree_snapshot` identity, form
+node structure, and
 `PluginSurfaceAction` field-error/action-failure feedback. Downstream plugin
 repos should consume these published helpers and fixture assets instead of
 inventing DTO fixtures or reading a stale sibling hub checkout.

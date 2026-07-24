@@ -25,7 +25,7 @@
   - list/validate spawn target refs through `botster.capabilities.spawn_targets`;
   - return useful statuses for valid, disabled, and missing target ids;
   - keep workspace records plugin-owned and only reference hub target ids.
-- Strengthen the existing dev-stack acceptance smoke to create a spawn target and hub worktree through public daemon requests before invoking first-party plugins, then prove:
+- Strengthen the existing local runtime acceptance smoke to create a spawn target and hub worktree through public daemon requests before invoking first-party plugins, then prove:
   - Project Pipelines `start` consumes the hub worktree id and spawns the session template with the resolved context path;
   - Workspaces validates valid/invalid target refs through plugin results;
   - no plugin code hardcodes the raw worktree path string.
@@ -60,19 +60,19 @@
 - `examples/project-pipelines/botster-package.json`: update tool schema and session template context metadata keys if the fixture records `worktree_id`.
 - `examples/project-pipelines/README.md`: document explicit target id plus hub worktree id usage and list separate plugin-repo follow-ups.
 - `tests/hub_lua_runtime_test.rs`: add real Lua plugin coverage for worktree list/show and absence of mutation methods.
-- `tests/hub_daemon_lifecycle_test.rs`: update `write_botster_workspaces_local_package` to validate target refs; update the dev-stack acceptance smoke to create target/worktree through `DaemonRequest`, then call Project Pipelines and Workspaces through plugin MCP.
+- `tests/hub_daemon_lifecycle_test.rs`: update `write_botster_workspaces_local_package` to validate target refs; update the local runtime acceptance smoke to create target/worktree through `DaemonRequest`, then call Project Pipelines and Workspaces through plugin MCP.
 - `tests/hub_mcp_test.rs`: migrate Project Pipelines MCP fixture calls from raw `worktree` to `worktree_id` if the example schema changes.
 - `crates/botster-hub-test-support/src/lib.rs`: optionally extend `run_project_pipelines_conformance` only if it should assert the changed start/worktree path. Do not add broad test-support abstractions.
 - `docs/client-protocol.md` or `docs/lua-plugin-abi.md`: update only if the Lua worktree capability becomes a public plugin ABI surface requiring docs.
 
 ## Risks
 
-- Unwired proof risk: a test that only creates DTOs would not prove the production path. Mitigation: dev-stack smoke must create records through `DaemonRequest`, then consume them through live plugin MCP calls and a spawned session template.
+- Unwired proof risk: a test that only creates DTOs would not prove the production path. Mitigation: local runtime smoke must create records through `DaemonRequest`, then consume them through live plugin MCP calls and a spawned session template.
 - API creep risk: adding plugin mutation methods for worktrees would blur hub ownership. Mitigation: expose list/show only and assert mutation methods are absent.
 - Raw path regression risk: Project Pipelines could still accept or persist caller-supplied raw worktree strings. Mitigation: migrate tests and schema to `worktree_id`, then scan example/test fixture references for legacy raw `worktree` helper paths.
 - Diagnostics risk: Workspaces validation could collapse disabled and missing targets into the same failure. Mitigation: assert returned statuses for `ok`, `disabled`, and `not_found`.
 - Ownership drift risk: Workspaces or Project Pipelines could start storing hub-owned target/worktree records as their own authority. Mitigation: fixture records store references and plugin-owned workflow/workspace state only.
-- Test runtime risk: the existing dev-stack smoke is already broad and daemon-backed. Mitigation: add focused Lua/runtime tests for capability shape so failures localize before the heavy smoke runs.
+- Test runtime risk: the existing local runtime smoke is already broad and daemon-backed. Mitigation: add focused Lua/runtime tests for capability shape so failures localize before the heavy smoke runs.
 
 ## Acceptance Checks And Tests
 
@@ -100,7 +100,7 @@
   - scan `examples/project-pipelines`, `tests/hub_daemon_lifecycle_test.rs`, and `tests/hub_mcp_test.rs` for legacy `worktree` raw-input paths after migration.
 - Final verification commands:
   - `./test.sh --test hub_lua_runtime_test worktree`
-  - `./test.sh --test hub_daemon_lifecycle_test cli_dev_stack_acceptance_smoke_exercises_first_party_plugins_project_pipelines_session_templates_reload_and_shutdown`
+  - `./test.sh --test hub_daemon_lifecycle_test cli_local_runtime_acceptance_smoke_exercises_first_party_plugins_project_pipelines_session_templates_reload_and_shutdown`
   - `./test.sh --test hub_mcp_test project_pipelines`
   - `cargo fmt`
   - `cargo clippy --all-targets --all-features -- -D warnings`

@@ -537,7 +537,7 @@ pub struct HubClientAdmission {
 }
 
 impl HubClientAdmission {
-    /// Admission for trusted local dogfood clients.
+    /// Admission for trusted local production clients.
     #[must_use]
     pub const fn local_operator() -> Self {
         Self {

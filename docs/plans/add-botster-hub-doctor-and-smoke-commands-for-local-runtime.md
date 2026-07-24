@@ -4,10 +4,10 @@
 
 - Ticket: `ticket_1783032083_582448`, "Add botster-hub doctor and smoke commands for local runtime".
 - Run/step: `run_1783047971_614814`, `botster_plan`, with no open findings, questions, prior answers, or artifacts in the current context.
-- Dependency context: the prerequisite "Add botster-hub up/down local runtime commands" is closed. Current repo already has `botster-hub up`, `down`, `dev-stack bootstrap`, `dogfood`, `status`, `apps`, `packages`, `sessions`, `run-one`, daemon compatibility descriptors, local WebRTC signaling, and package entrypoint supervision.
+- Dependency context: the prerequisite "Add botster-hub up/down local runtime commands" is closed. Current repo already has `botster-hub up`, `down`, the removed bootstrap command, `production runtime`, `status`, `apps`, `packages`, `sessions`, `run-one`, daemon compatibility descriptors, local WebRTC signaling, and package entrypoint supervision.
 - Vault/playbook context: [[identity]], [[goals]], [[planner-playbook]], [[botster-planner-playbook]], [[botster-architecture]], [[cli-patterns]], [[spa-patterns]], [[project pipeline orchestration belongs in a device-level botster plugin]], [[project pipelines needs an operator workbench not more primitives]], [[project pipelines ui contract belongs in the plugin readme]], [[botster orchestration should spawn agents with explicit target ids]], and [[botster orchestration prompts must bind agents to explicit worktrees]].
 - Skill context: `botster-customize-hub` applies because this adds top-level hub commands. The relevant rule is to keep hub/CLI orchestration in the hub runtime path, use real client transport or internal client APIs, and avoid side-channel command events.
-- Repo evidence inspected: `src/main.rs`, `src/daemon.rs`, `src/daemon_transport.rs`, `crates/botster-hub-client/src/lib.rs`, `crates/botster-hub-test-support/src/lib.rs`, `tests/hub_daemon_lifecycle_test.rs`, `tests/hub_local_dogfood_test.rs`, `tests/hub_client_api_test.rs`, `README.md`, and existing `docs/plans/*` around daemon status, dogfood, dev stack, app registry, WebRTC, compatibility, and local runtime.
+- Repo evidence inspected: `src/main.rs`, `src/daemon.rs`, `src/daemon_transport.rs`, `crates/botster-hub-client/src/lib.rs`, `crates/botster-hub-test-support/src/lib.rs`, `tests/hub_daemon_lifecycle_test.rs`, `tests/hub_local_runtime_test.rs`, `tests/hub_client_api_test.rs`, `README.md`, and existing `docs/plans/*` around daemon status, production runtime, local runtime, app registry, WebRTC, compatibility, and local runtime.
 - Workflow note: Project Pipelines checklist creation timed out in the plugin worker. Preserve checklist evidence in the gate submission per [[project pipelines checklist worker timeouts require artifact evidence fallback]].
 
 ## Scope
@@ -24,7 +24,7 @@
 
 ## Non-Scope
 
-- No removal or renaming of lower-level commands (`status`, `sessions`, `apps`, `packages`, `dogfood`, `dev-stack`, `run-one`, `up`, `down`).
+- No removal or renaming of lower-level commands (`status`, `sessions`, `apps`, `packages`, `production runtime`, `local runtime`, `run-one`, `up`, `down`).
 - No new browser harness ownership if existing package/hub mechanics can drive botster-web. Invoke or reuse the package path rather than duplicating botster-web internals.
 - No cloud/WebRTC relay, remote pairing, OAuth, marketplace fetch, hosted registry, or browser UI changes.
 - No generic health-check framework, plugin policy engine, or broad daemon refactor.
@@ -43,8 +43,8 @@
 
 - Assumption: `doctor` is diagnostic and should not start, stop, install, enable, reload, or rebuild packages. It can report missing prerequisites and remediation commands.
 - Assumption: `smoke` may be mutating because it is a proof command. It can start/reuse the daemon, enable first-party local packages, start package entrypoints, spawn a disposable session, exercise the transport path, and then clean up its own session/processes where it owns them.
-- Assumption: `smoke` should share as much code as practical with `up`/`dev-stack bootstrap` and existing WebRTC tests, but its CLI output should be purpose-built: `smoke=pass` or `smoke=fail` plus named proof rows.
-- Assumption: first-party package discovery can follow the current `DevStackOptions` defaults and flags. Missing sibling packages should produce `missing_prerequisite` diagnostics, not fallback to fake success.
+- Assumption: `smoke` should share as much code as practical with `up`/the removed bootstrap command and existing WebRTC tests, but its CLI output should be purpose-built: `smoke=pass` or `smoke=fail` plus named proof rows.
+- Assumption: first-party package discovery can follow the current `LocalRuntimeOptions` defaults and flags. Missing sibling packages should produce `missing_prerequisite` diagnostics, not fallback to fake success.
 - Unknown: whether the common-case `smoke` should default to the same stable data dir as `up` or require explicit `--data-dir`. The ticket acceptance names `--data-dir <dir>`, so prefer requiring/parsing it first unless current `up` default behavior is intentionally shared.
 - Unknown: whether a full browser-driven botster-web smoke is available in this repo without duplicating downstream harness code. Prefer hub-side local WebRTC/DataChannel proof through existing Rust test machinery and package launch DTOs; only invoke external browser harnesses if they already have a documented command.
 - Unknown: exact output vocabulary. Prefer stable key/value lines matching existing CLI style (`check name=... status=...`) over JSON unless implementation finds an existing structured output convention to reuse.
@@ -53,7 +53,7 @@
 
 - `src/main.rs`
   - Add `doctor` and `smoke` dispatch arms.
-  - Add options structs for `doctor` and `smoke`, likely reusing `DataDirOptions` and `DevStackOptions` parsing patterns.
+  - Add options structs for `doctor` and `smoke`, likely reusing `DataDirOptions` and `LocalRuntimeOptions` parsing patterns.
   - Add small diagnostic/check row rendering helpers.
   - Add doctor implementation using `daemon_transport_request(Status)`, `ListPackages`, `ListApps`, and package entrypoint status where reachable.
   - Add smoke implementation by composing `prepare_local_runtime`, app/package checks, session spawn/attach/input/drain cleanup, and local WebRTC proof helpers where available.
@@ -69,7 +69,7 @@
 - `tests/hub_daemon_lifecycle_test.rs`
   - Add CLI tests for doctor healthy, stopped, stale/incompatible.
   - Add CLI smoke test for success with local first-party fixtures and missing-prerequisite failure.
-- `tests/hub_client_api_test.rs` or `tests/hub_local_dogfood_test.rs`
+- `tests/hub_client_api_test.rs` or `tests/hub_local_runtime_test.rs`
   - Touch only for lower-level regression coverage if new helper behavior is introduced below the CLI layer.
 - `README.md`
   - Document `doctor` and `smoke` in the local runtime section.
@@ -120,7 +120,7 @@
 - Existing focused regressions:
   - `./test.sh --test hub_daemon_lifecycle_test cli_local_runtime_up_starts_reuses_and_down_stops_runtime -- --test-threads=1`
   - `./test.sh --test hub_daemon_lifecycle_test cli_local_runtime_up_reports_incompatible_daemon_without_deleting_socket -- --test-threads=1`
-  - `./test.sh --test hub_daemon_lifecycle_test cli_dev_stack_acceptance_smoke_exercises_first_party_plugins_project_pipelines_session_templates_reload_and_shutdown -- --test-threads=1`
+  - `./test.sh --test hub_daemon_lifecycle_test cli_local_runtime_acceptance_smoke_exercises_first_party_plugins_project_pipelines_session_templates_reload_and_shutdown -- --test-threads=1`
   - `./test.sh --test hub_daemon_lifecycle_test external_hub_client_reports_compatibility_descriptor_and_mismatch_diagnostics -- --test-threads=1`
 - If client DTOs or generated protocol change:
   - `./test.sh --test hub_client_api_test`
@@ -140,4 +140,4 @@ None found. The plan follows the loaded Botster conventions: CLI remains thin, h
 
 - Capture the final `doctor` output vocabulary and stale-daemon remediation contract if implementation settles a reusable pattern for health checks.
 - Capture the final `smoke` proof boundary: whether WebRTC is proven through a Rust local DataChannel peer, an invoked first-party browser harness, or a documented missing-prerequisite diagnostic.
-- Capture any new cleanup convention if smoke introduces ownership rules for started/reused daemons or package entrypoints beyond existing `up`/`dev-stack` behavior.
+- Capture any new cleanup convention if smoke introduces ownership rules for started/reused daemons or package entrypoints beyond existing `up`/`local runtime` behavior.

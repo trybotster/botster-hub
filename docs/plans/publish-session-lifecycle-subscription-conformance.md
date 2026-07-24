@@ -25,7 +25,7 @@
   [[botster hub events use bounded priority lanes instead of unbounded queue fuses]],
   [[botster hub client crate is the external client boundary]],
   [[external client hub tests use subprocess spawned hub test support]],
-  [[botster session worker requires explicit build in dogfood launchers]],
+  [[botster session worker requires explicit build in production runtime launchers]],
   [[botster first party client support matrices belong in hub test support]],
   [[published capability matrices must derive enumerations from source]],
   [[daemon event shape changes bump conformance fixture revision not protocol version]],

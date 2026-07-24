@@ -3,21 +3,21 @@
 ## Context Loaded
 
 - Project Pipelines current context loaded for ticket `ticket_1782761743_997138`, run `run_1782790423_797589`, run step `run_step_1782790423_263515`, step `botster_plan`, gate `botster_plan_gate`.
-- Ticket: document the intended daily local workflow for the new multi-repo Botster stack: required repos, build prerequisites, persistent data dir, first-party local package install/update/reload, opening web and TUI clients, workspace/session-template conventions, running Project Pipelines, and the dev acceptance smoke. Docs must distinguish dev workflow from dogfood/bootstrap tests and must not imply embedded hub TUI or old monolith behavior. Include troubleshooting for stale package build output, missing entrypoints, missing provider config, session-template spawn failure, and terminal attach/scrollback issues. No PII.
+- Ticket: document the intended daily local workflow for the new multi-repo Botster stack: required repos, build prerequisites, persistent data dir, first-party local package install/update/reload, opening web and TUI clients, workspace/session-template conventions, running Project Pipelines, and the dev acceptance smoke. Docs must distinguish dev workflow from production runtime/bootstrap tests and must not imply embedded hub TUI or old monolith behavior. Include troubleshooting for stale package build output, missing entrypoints, missing provider config, session-template spawn failure, and terminal attach/scrollback issues. No PII.
 - Current pipeline context has no prior artifacts, findings, reviews, open questions, or prior answers.
-- Closed dependency loaded from context: `ticket_1782761743_112870` / "Add real dev-stack acceptance smoke for first-party plugins".
+- Closed dependency loaded from context: `ticket_1782761743_112870` / "Add real local runtime acceptance smoke for first-party plugins".
 - Required playbooks loaded: [[planner-playbook]] and [[botster-planner-playbook]].
 - Required Botster/vault context loaded: [[identity]], [[goals]], [[botster-architecture]], [[cli-patterns]], [[spa-patterns]], [[project pipeline orchestration belongs in a device-level botster plugin]], [[project pipelines needs an operator workbench not more primitives]], [[project pipelines ui contract belongs in the plugin readme]], [[botster orchestration should spawn agents with explicit target ids]], [[botster orchestration prompts must bind agents to explicit worktrees]], [[botster hub daemon startup requires explicit data dir]], [[botster plugins reload through mcp not file watching]], and [[botster runnable entrypoints are hub owned launch contracts]].
 - Project Pipelines checklist discipline loaded with `project_pipelines_checklist_instructions`; run checklist `checklist_1782790459_598067` was created and updated for context loading.
-- Repo context inspected: `README.md`, `examples/project-pipelines/README.md`, `examples/project-pipelines/botster-package.json`, `examples/project-pipelines/plugin.lua`, `docs/lua-plugin-abi.md`, `docs/client-protocol.md`, `docs/reports/add-persistent-dev-stack-bootstrap-implement-report.md`, `docs/plans/add-real-dev-stack-acceptance-smoke-first-party-plugins.md`, `docs/plans/add-local-package-reload-and-update-dx-for-dev-mode-packages.md`, `docs/plans/document-and-test-standalone-botster-tui-dogfood-flow-from-hub.md`, `docs/plans/add-hub-owned-session-templates-and-botster-context-injection.md`, and relevant `src/main.rs` / test references.
+- Repo context inspected: `README.md`, `examples/project-pipelines/README.md`, `examples/project-pipelines/botster-package.json`, `examples/project-pipelines/plugin.lua`, `docs/lua-plugin-abi.md`, `docs/client-protocol.md`, `docs/reports/add-persistent-local runtime-bootstrap-implement-report.md`, `docs/plans/add-real-local runtime-acceptance-smoke-first-party-plugins.md`, `docs/plans/add-local-package-reload-and-update-dx-for-dev-mode-packages.md`, `docs/plans/document-and-test-standalone-botster-tui-production runtime-flow-from-hub.md`, `docs/plans/add-hub-owned-session-templates-and-botster-context-injection.md`, and relevant `src/main.rs` / test references.
 
 ## Scope
 
 - Update the repo-visible daily-use documentation, primarily `README.md`, so a new Botster developer can run the new multi-repo stack without reading scattered historical plans.
-- Reframe the existing "Local dogfood operator CLI" area into a clearer separation:
-  - daily persistent dev stack;
+- Reframe the existing "Local production runtime operator CLI" area into a clearer separation:
+  - daily persistent local runtime;
   - lower-level daemon/package/session commands;
-  - dogfood/bootstrap/test launchers and when to use them.
+  - production runtime/bootstrap/test launchers and when to use them.
 - Document required local repos and package paths:
   - `botster-hub` as this repo;
   - checked-in `examples/project-pipelines`;
@@ -27,11 +27,11 @@
   - provide or build a co-located `botster-session-worker`, or pass `--session-worker-bin`;
   - ensure first-party package entrypoints exist in their package roots before expecting app launches to work.
 - Make the persistent data-dir contract explicit:
-  - daily path defaults to `target/botster-hub-dev-stack-data`;
+  - daily path defaults to `target/botster-hub-runtime-data`;
   - it persists `hub-state.json`, package registry state, plugin data, and Project Pipelines state;
-  - use the same `--data-dir` for `dev-stack bootstrap`, `apps`, `mcp-serve`, `status`, package reload, and shutdown.
+  - use the same `--data-dir` for the removed bootstrap command, `apps`, `mcp-serve`, `status`, package reload, and shutdown.
 - Document the daily workflow commands:
-  - `cargo run -- dev-stack bootstrap ...`;
+  - `cargo run -- local runtime bootstrap ...`;
   - use printed `web=`, `tui=`, `mcp=`, `status=`, `apps=`, and `shutdown=` lines;
   - `botster-hub apps open --data-dir <dir> botster-web/web-client`;
   - `botster-hub apps open --data-dir <dir> botster-tui`;
@@ -52,7 +52,7 @@
   - missing provider/config/auth for optional features;
   - session-template spawn failure;
   - terminal attach, late scrollback, and scrollback payload expectations.
-- Add or update a short acceptance-smoke section that points to the real dev-stack smoke and focused commands, without making the smoke the daily workflow.
+- Add or update a short acceptance-smoke section that points to the real local runtime smoke and focused commands, without making the smoke the daily workflow.
 
 ## Non-Scope
 
@@ -65,14 +65,14 @@
 
 ## Assumptions And Unknowns
 
-- Assumption: this is a documentation-only ticket. The current code already contains `dev-stack bootstrap`, local package reload, app open, session templates, Project Pipelines MCP tools, and the first-party dev-stack smoke.
-- Assumption: the canonical daily data dir should remain `target/botster-hub-dev-stack-data` because `src/main.rs` and README already document that default.
+- Assumption: this is a documentation-only ticket. The current code already contains the removed bootstrap command, local package reload, app open, session templates, Project Pipelines MCP tools, and the first-party local runtime smoke.
+- Assumption: the canonical daily data dir should remain `target/botster-hub-runtime-data` because `src/main.rs` and README already document that default.
 - Assumption: package path examples may remain relative (`../botster-web`, `../botster-tui`, `../botster-workspaces`) because they avoid PII and match current discovery behavior.
 - Assumption: `botster-hub apps open --data-dir <dir> botster-tui` is the correct TUI path; docs must not mention an embedded hub TUI or `botster-hub tui` as daily use.
 - Assumption: "new Botster" means the hub/plugin/client/package stack in this repo, not the old TryBotster monolith.
 - Unknown: whether `botster-workspaces` currently has a fully user-facing workflow beyond package enablement. Plan should document it as a first-party local package included in bootstrap and avoid claiming unsupported workspace UI behavior.
 - Unknown: whether sibling repo prerequisites need exact binary build commands. If the README cannot verify downstream commands from this repo, document the generic requirement that package manifests and entrypoints exist, and point to the downstream repos for their own build commands.
-- Unknown: the exact final name of the dev-stack acceptance smoke after the closed dependency. Implementation should inspect current tests and cite the exact test names that exist.
+- Unknown: the exact final name of the local runtime acceptance smoke after the closed dependency. Implementation should inspect current tests and cite the exact test names that exist.
 - Worktree/target assumption: downstream agents must work in this assigned pipeline worktree for target `tgt_7e208a0c76a44980a83b63af976b1f22`; no ambient checkout paths should appear in docs or gate evidence.
 
 ## Botster Layers Touched
@@ -87,7 +87,7 @@
 ## Affected Surfaces And Files
 
 - `README.md`
-  - Primary implementation target. Add/restructure daily workflow, dev-stack, package reload, client launch, Project Pipelines, troubleshooting, and acceptance-smoke sections.
+  - Primary implementation target. Add/restructure daily workflow, local runtime, package reload, client launch, Project Pipelines, troubleshooting, and acceptance-smoke sections.
   - Fix stale Project Pipelines `session_uuid` statement.
   - Keep normal examples path-neutral and PII-free.
 - `examples/project-pipelines/README.md`
@@ -100,7 +100,7 @@
 
 ## Risks
 
-- Stale-doc risk: README currently mixes old dogfood, daily dev-stack, and Project Pipelines readiness language. Implementation must reconcile against current code and tests, not only rearrange old paragraphs.
+- Stale-doc risk: README currently mixes old production runtime, daily local runtime, and Project Pipelines readiness language. Implementation must reconcile against current code and tests, not only rearrange old paragraphs.
 - Overclaim risk: docs could imply `botster-workspaces`, provider/GitHub automation, or monolith import is complete. Keep those as package/config/cutover caveats unless current code proves them.
 - Embedded-TUI regression risk: any daily path mentioning `botster-hub tui` or an embedded renderer contradicts the ticket. Daily TUI launch must go through `apps open botster-tui`.
 - Runtime-proof risk: documentation-only changes still need verification against actual command names, usage text, package manifest fields, and current tests.
@@ -111,13 +111,13 @@
 ## Acceptance Checks / Tests
 
 - Documentation content checks:
-  - README includes daily dev-stack workflow, required repos/package paths, build/session-worker prerequisite, persistent data-dir contract, package reload, web/TUI app open commands, Project Pipelines MCP/start workflow, workspace/session-template conventions, dogfood-vs-dev distinction, and troubleshooting for all named failures.
+  - README includes daily local runtime workflow, required repos/package paths, build/session-worker prerequisite, persistent data-dir contract, package reload, web/TUI app open commands, Project Pipelines MCP/start workflow, workspace/session-template conventions, production runtime-vs-dev distinction, and troubleshooting for all named failures.
   - README does not imply embedded hub TUI, old monolith Project Pipelines behavior, imported monolith state, or file-watcher hot reload.
   - README Project Pipelines wording matches current plugin behavior: start uses explicit `target_id` and worktree and records spawned session-template fields.
 - Static verification:
   - `rg -n "session_uuid is intentionally absent|embedded hub TUI|old monolith|file-watcher|file watcher|botster-hub tui" README.md examples/project-pipelines/README.md docs/client-protocol.md docs/lua-plugin-abi.md`
   - Expected result: no stale claims in changed docs; historical/cutover mentions only where explicitly labeled unsupported.
-  - `rg -n "dev-stack bootstrap|packages reload|apps open --data-dir|botster-tui|mcp-serve|session_templates|project_pipelines.start|target_id|worktree|scrollback" README.md`
+  - `rg -n "local runtime bootstrap|packages reload|apps open --data-dir|botster-tui|mcp-serve|session_templates|project_pipelines.start|target_id|worktree|scrollback" README.md`
   - Expected result: daily workflow and troubleshooting paths are discoverable from README.
   - `rg -n "[/]Users/|[/]home/|botster[-]sessions|sess-[0-9]|run_[0-9]" README.md docs/plans/document-daily-use-dev-workflow-new-botster.md examples/project-pipelines/README.md`
   - Expected result: no PII/run-specific path leaks in changed docs, except this plan's generic run id if reviewers accept pipeline ids in plan artifacts. If not, remove run ids before implementation handoff.
@@ -126,7 +126,7 @@
   - If only Markdown changes: no Rust test is required, but implementation should identify the exact existing acceptance smoke from `tests/hub_daemon_lifecycle_test.rs`.
   - If any code or command help changes unexpectedly: run the focused affected test with `./test.sh --test hub_daemon_lifecycle_test <test_name> -- --test-threads=1`.
 - Runtime/user-path proof expected in the implementation report:
-  - Show the README command sequence maps to actual CLI branches in `src/main.rs`: `dev-stack bootstrap`, `packages reload`, `apps open`, `mcp-serve`, session-template commands, and shutdown.
+  - Show the README command sequence maps to actual CLI branches in `src/main.rs`: the removed bootstrap command, `packages reload`, `apps open`, `mcp-serve`, session-template commands, and shutdown.
   - Show Project Pipelines docs map to `examples/project-pipelines/plugin.lua` and `botster-package.json`, not stale monolith behavior.
 
 ## Pipeline Gates And Artifacts
@@ -137,7 +137,7 @@
 - Review should reject:
   - broad code changes;
   - documentation that claims unimplemented behavior;
-  - daily workflow text that points to dogfood/bootstrap tests as the normal path;
+  - daily workflow text that points to production runtime/bootstrap tests as the normal path;
   - mentions of embedded hub TUI or old monolith behavior as supported.
 - Verify should run the static doc checks and confirm all named ticket bullets are visible in README.
 
@@ -147,7 +147,7 @@ None found. The plan follows the loaded Botster conventions: product workflow po
 
 ## Vault Gaps Worth Capturing
 
-- Capture after implementation if the README establishes `dev-stack bootstrap` as the durable canonical daily workflow label across Botster repos.
+- Capture after implementation if the README establishes the removed bootstrap command as the durable canonical daily workflow label across Botster repos.
 - Capture after implementation if the troubleshooting section settles a reusable convention for documenting stale local package build output versus package manifest reload.
 - Capture after implementation if the docs define a stable boundary for what Project Pipelines local mode can claim about spawned session templates versus future agent supervision.
 - No new vault note is needed at Plan time for explicit data dirs, Project Pipelines target/worktree binding, plugin reload, or standalone TUI boundaries; existing notes already cover those constraints.

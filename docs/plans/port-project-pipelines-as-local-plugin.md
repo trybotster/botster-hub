@@ -62,7 +62,7 @@
   - `./test.sh --test hub_capability_runtime_test`
   - `./test.sh --test hub_daemon_lifecycle_test`
   - `./test.sh --test hub_plugin_lifecycle_test`
-  - `./test.sh --test hub_local_dogfood_test`
+  - `./test.sh --test hub_local_runtime_test`
   - `./test.sh --test hub_runtime_test`
   - `./test.sh --test hub_lua_runtime_test`
 - Re-read the Project Pipelines README, root README, and cutover/residual-risk wording against main's Lua runtime and plugin ABI docs. Correct stale claims, or record why each limitation still holds.
@@ -80,12 +80,12 @@
 - Vault/playbooks: [[planner-playbook]], [[botster-planner-playbook]], [[botster-architecture]], [[cli-patterns]], [[spa-patterns]], [[project pipeline orchestration belongs in a device-level botster plugin]], [[project pipelines needs an operator workbench not more primitives]], [[project pipelines ui contract belongs in the plugin readme]], [[botster orchestration should spawn agents with explicit target ids]], [[botster orchestration prompts must bind agents to explicit worktrees]].
 - Review-required vault constraints added: [[hub daemon runtime stays on one owner thread while socket handlers submit requests]], [[package mutations require the running daemon owner]], [[adoption restart evidence must come from real protocol primitives not defaults]].
 - Skill context: `botster-customize-plugin`, because this ticket is a Botster Lua plugin with MCP tools, plugin.db/plugin-store persistence, timers, HTTP, and agent orchestration.
-- Repo context inspected: `src/mcp.rs`, `src/runtime.rs`, `src/lifecycle.rs`, `src/capabilities.rs`, `src/packages.rs`, `src/persistence.rs`, `src/lib.rs`, `src/main.rs`, `src/daemon.rs`, `src/daemon_transport.rs`, `tests/hub_mcp_test.rs`, `tests/hub_plugin_lifecycle_test.rs`, `tests/hub_capability_runtime_test.rs`, `tests/hub_local_dogfood_test.rs`, `examples/synthetic-plugin/*`, `README.md`, `Cargo.toml`.
+- Repo context inspected: `src/mcp.rs`, `src/runtime.rs`, `src/lifecycle.rs`, `src/capabilities.rs`, `src/packages.rs`, `src/persistence.rs`, `src/lib.rs`, `src/main.rs`, `src/daemon.rs`, `src/daemon_transport.rs`, `tests/hub_mcp_test.rs`, `tests/hub_plugin_lifecycle_test.rs`, `tests/hub_capability_runtime_test.rs`, `tests/hub_local_runtime_test.rs`, `examples/synthetic-plugin/*`, `README.md`, `Cargo.toml`.
 - Checklist evidence: run checklist `checklist_1780688579_245011` exists and was updated for this revised Plan pass.
 
 ## Scope
 
-- Add a first real local Project Pipelines plugin package fixture under a repo-owned plugin path, replacing the synthetic example as the meaningful dogfood plugin.
+- Add a first real local Project Pipelines plugin package fixture under a repo-owned plugin path, replacing the synthetic example as the meaningful production runtime plugin.
 - Define a constrained Project Pipelines data model in plugin-owned durable state through the new plugin store/capability runtime. Minimum workflow records should cover pipelines, tickets, runs, run steps, gate evidence, events, questions/answers, and agent/session correlation fields needed by MCP context and advancement.
 - Expose Project Pipelines MCP tools through `tools/list` and `tools/call` using the shared `McpToolRegistry`, not a parallel MCP server. The constrained set should support create/list/update/start plus current context, gate submission, and step advancement enough to run a local workflow.
 - Add daemon transport request/response plumbing for plugin MCP list/call. `mcp-serve` is a separate process and must not construct a second `HubRuntime`; it should register a plugin-backed `McpToolProvider` that forwards to the running daemon via `daemon_transport_request`, just as `NativeHubToolProvider` does.
@@ -122,7 +122,7 @@
 - Runtime/lifecycle: `src/runtime.rs` and `src/lifecycle.rs` for loaded plugin descriptor visibility, owner-thread invocation, and enabled-package loading at daemon start and after enable.
 - Capability/store: `src/capabilities.rs` if plugin store access needs a small typed helper or event-drain convenience; avoid changing existing store semantics unless required. `src/persistence.rs` is probably not a direct modification surface unless package-state reload needs a small hub-state shape change.
 - Package lifecycle and daemon CLI: `src/packages.rs` and `src/main.rs` only as needed to construct Project Pipelines package bundles and keep CLI entrypoints thin.
-- Tests: extend existing `tests/hub_mcp_test.rs`, `tests/hub_plugin_lifecycle_test.rs`, `tests/hub_capability_runtime_test.rs`, and `tests/hub_local_dogfood_test.rs` for restart/lifecycle proof.
+- Tests: extend existing `tests/hub_mcp_test.rs`, `tests/hub_plugin_lifecycle_test.rs`, `tests/hub_capability_runtime_test.rs`, and `tests/hub_local_runtime_test.rs` for restart/lifecycle proof.
 - Docs: plugin README and root `README.md`; this plan artifact.
 
 ## Risks

@@ -55,7 +55,7 @@ cargo run -- shutdown --data-dir target/botster-hub-daemon-smoke-data
 Daily first-party local stack (same topology, first-party packages enabled):
 
 ```sh
-cargo run -- up --data-dir target/botster-hub-dev-stack-data
+cargo run -- up --data-dir target/botster-hub-runtime-data
 ```
 
 Keep one `--data-dir` for `up`/`start`, package commands, sessions, MCP, apps,
@@ -171,7 +171,7 @@ events rather than through readback responses.
 
 ## Local capability runtimes
 
-`HubRuntime` owns the local concrete capability adapter for dogfood plugins. It
+`HubRuntime` owns the local concrete capability adapter for production runtime plugins. It
 accepts `botster-core` `CapabilityRuntimeRequest` values through
 `submit_capability_request`, returns core `CapabilityRuntimeHandle` values, and
 drains core `CapabilityRuntimeEvent` values through `drain_capability_events`.
@@ -183,7 +183,7 @@ Rails, or provider-specific API behavior.
 
 Filesystem access is rooted under the explicit hub data directory at
 `capability-scopes/workspace`. Plugin store data is rooted under
-`plugin-data/<plugin>/`, with `project-pipelines` as the first dogfood namespace
+`plugin-data/<plugin>/`, with `project-pipelines` as the first production runtime namespace
 grant. Runtime data must not be written under plugin source directories.
 Capability grants are scoped to match core request requirements exactly:
 `Network:http`, `Network:websocket`, `Filesystem:workspace`,
@@ -192,7 +192,7 @@ Capability grants are scoped to match core request requirements exactly:
 HTTP requests are admitted through the core capability runtime and then executed
 by the hub transport only when the URL scheme, host, method, headers, body size,
 response size, header limits, and timeout policy pass. The default policy allows
-loopback HTTP/HTTPS hosts for local dogfood plugins, `GET` and `POST`, and a
+loopback HTTP/HTTPS hosts for local production runtime plugins, `GET` and `POST`, and a
 small safe request-header allowlist. Sensitive request headers such as
 authorization and cookie headers are denied without echoing their values in
 capability failure events. Deterministic fake HTTP should be injected only by
@@ -241,7 +241,7 @@ installers that clone remote Git sources at enable time.
 
 What **is** product on this repo: local file-backed durable hub state, OS
 credential store for production secrets, local installed-package WebRTC
-signaling/DataChannel adapter for dogfood clients, local package path install
+signaling/DataChannel adapter for production runtime clients, local package path install
 and entrypoint supervision, and the constrained
 `examples/project-pipelines` local plugin package. That package loads through
 the real Lua plugin runtime; MCP tools register through `mcp-serve`, dispatch
@@ -300,10 +300,10 @@ an explicit-data-dir runtime smoke path through `HubRuntime::load`. Registry,
 grant, and admission mutation saves are now exercised by the local operator CLI
 package commands through `HubStateStore::update`.
 
-## Local dogfood operator CLI
+## Local production runtime operator CLI
 
 The `botster-hub` binary includes a deliberately thin local operator surface for
-dogfood. `start --data-dir` owns the daemon lifecycle and one `HubRuntime`;
+production runtime. `start --data-dir` owns the daemon lifecycle and one `HubRuntime`;
 `status`, `sessions list`, `sessions spawn`, `sessions attach`,
 `sessions send-input`, `sessions resize`, `sessions detach`, and `shutdown`
 connect to that daemon over the resolved local socket. The CLI remains a thin
@@ -313,36 +313,26 @@ invocations. Package state persists through `hub-state.json`, core registry
 metadata persists under the hub data directory, and live worker-backed sessions
 can be adopted after an intentional daemon restart.
 
-The end-to-end local dogfood proof is the Unix integration flow below:
+The end-to-end local production runtime proofs are:
 
 ```sh
-./test.sh --test hub_daemon_lifecycle_test cli_dogfood_launcher_starts_botster_web_in_existing_hub_mode_and_shuts_down
-./test.sh --test hub_local_dogfood_test local_dogfood_runs_daemon_package_lifecycle_session_and_clean_shutdown
+./test.sh --test hub_daemon_lifecycle_test cli_local_runtime_up_starts_reuses_and_down_stops_runtime
+./test.sh --test hub_local_runtime_test
 ./test.sh --test hub_daemon_lifecycle_test cli_daemon_restart_recovers_worker_backed_session_through_transport
+script/test-production-package-runtime \
+  --web-package-path /path/to/botster-web \
+  --tui-package-path /path/to/botster-tui
 ```
 
-The first test proves the production `botster-hub dogfood` entrypoint: it starts
-an isolated daemon/session-worker subprocess, enables the checked-in
-`examples/project-pipelines` package plus a supplied local `botster-web` package
-through the daemon-owned package registry, supervises the `botster-web`
-`web-client` entrypoint in existing-hub attach mode, prints the bridge URL plus
-TUI/MCP/status/shutdown next steps, and shuts down through the daemon socket.
-The library-level dogfood test is the lower-level product-path proof without the
-binary launcher: it starts an explicit `HubDaemon` with durable state, installs
-and enables the checked-in `examples/synthetic-plugin` fixture, persists and
-reloads `hub-state.json`, pulls status/package/lifecycle state through
-`HubClientApi`, resolves the package's Lua entrypoint path, loads the package,
-invokes a synthetic in-process plugin runtime through `HubRuntime`, spawns a
-local PTY session, attaches a client, sends input, drains the observed marker,
-and shuts down through the same local client API. Separate Lua runtime tests
-cover real Lua entrypoint execution. The PTY portion is Unix-only.
+The first test proves the persisted-package CLI path. The explicit-path script
+records the Hub, Web, and TUI revisions and exercises real package manifests,
+dynamic Web readiness, page-load WebRTC bootstrap, the foreground TUI launch
+contract, smoke, and clean shutdown.
 
-For daily first-party local development from fresh main checkouts, use
-`botster-hub up` and `botster-hub down`. The expected local checkout set is this
-`botster-hub` repo, the checked-in `examples/project-pipelines` package, and
-local package roots for `botster-web`, `botster-tui`, and
-`botster-workspaces`. The sibling paths below are only examples; use the package
-path flags when those repos live elsewhere.
+For daily first-party local development, install and enable `botster-web` and
+`botster-tui` once through the ordinary package commands, then use
+`botster-hub up` and `botster-hub down`. `up` never discovers sibling
+checkouts or accepts package-path flags.
 
 Build `botster-hub` normally with Cargo before treating this as a daily stack.
 The session path also needs a built `botster-session-worker` next to the
@@ -351,8 +341,8 @@ package app entrypoints must already exist in their package roots before `apps
 open` can launch them.
 
 `botster-hub up` starts or reuses a daemon over a stable data directory,
-transactionally re-reads every directly installed local path package, installs
-and enables the first-party packages as ordinary local packages, starts the
+transactionally re-reads every directly installed local path package, requires
+the exact enabled package identities `botster-web` and `botster-tui`, starts the
 `botster-web` app entrypoint through daemon supervision, and prints the
 app/operator commands for the same data directory. The refresh completes before
 any enabled entrypoint launches; one invalid local package rejects the complete
@@ -360,11 +350,7 @@ refresh without mixing old and new registrations. Registry-installed packages
 remain pinned and are not implicitly refreshed:
 
 ```sh
-cargo run -- up \
-  --project-pipelines-package-path examples/project-pipelines \
-  --web-package-path ../botster-web \
-  --tui-package-path ../botster-tui \
-  --workspaces-package-path ../botster-workspaces
+cargo run -- up
 
 botster-hub status
 botster-hub doctor
@@ -374,13 +360,9 @@ botster-hub smoke
 botster-hub down
 ```
 
-`botster-hub up` defaults to `target/botster-hub-dev-stack-data`, discovers
-`examples/project-pipelines`, `../botster-web`, `../botster-tui`, and
-`../botster-workspaces` when those package manifests exist, and accepts explicit
-package path flags for CI worktrees or non-sibling checkouts. Keep the same
-checkout as the working directory for the daily commands so they resolve the
-same default. Pass `--data-dir <path>` to any daily command when an isolated
-runtime is needed; the explicit path always overrides the default. Lower-level
+`botster-hub up` defaults to `target/botster-hub-runtime-data`. Keep the same
+checkout as the working directory for daily commands so they resolve that same
+default. Pass `--data-dir <path>` when an isolated runtime is needed. Lower-level
 `apps`, `packages`, `sessions`, `start`, `shutdown`, and `mcp-serve` operations
 continue to require `--data-dir`. The selected directory persists
 `hub-state.json`, package registry state, plugin data, and Project Pipelines
@@ -392,26 +374,25 @@ and rerunning after shutdown reloads the persisted package registry from
 
 ```sh
 runtime=ready
-data_dir=stable:target/botster-hub-dev-stack-data
+data_dir=stable:target/botster-hub-runtime-data
 daemon=started
 protocol=botster-hub-daemon-v1
 protocol_version=1
 conformance_fixture_revision=3
-package_count=4
-enabled_package_count=4
+package_count=2
+enabled_package_count=2
 app_count=2
-app package=botster-web app_id=web-client kind=web_app lifecycle_state=running local_url=http://127.0.0.1:41739/?dogfood=real-hub
-web=http://127.0.0.1:41739/?dogfood=real-hub
-tui=botster-hub apps open --data-dir target/botster-hub-dev-stack-data botster-tui
-mcp=botster-hub mcp-serve --data-dir target/botster-hub-dev-stack-data
-status=botster-hub status --data-dir target/botster-hub-dev-stack-data
-apps=botster-hub apps list --data-dir target/botster-hub-dev-stack-data
-down=botster-hub down --data-dir target/botster-hub-dev-stack-data
+app package=botster-web app_id=web-client kind=web_app lifecycle_state=running local_url=http://127.0.0.1:49152/
+web=http://127.0.0.1:49152/
+tui=botster-hub apps open --data-dir target/botster-hub-runtime-data botster-tui
+mcp=botster-hub mcp-serve --data-dir target/botster-hub-runtime-data
+status=botster-hub status --data-dir target/botster-hub-runtime-data
+apps=botster-hub apps list --data-dir target/botster-hub-runtime-data
+down=botster-hub down --data-dir target/botster-hub-runtime-data
 ```
 
-`dev-stack bootstrap` remains available as a compatibility command with its
-existing output contract. `start`, `shutdown`, `packages`, and `apps` remain the
-lower-level operator surfaces.
+There is no compatibility launcher or bootstrap command. `start`, `shutdown`,
+`packages`, and `apps` remain the lower-level operator surfaces.
 
 `botster-hub doctor [--data-dir <path>]` is the non-mutating diagnostic path for
 the daily runtime or an explicitly selected runtime. It reports stable check
@@ -433,7 +414,7 @@ commands:
 ```sh
 botster-hub open web
 botster-hub open tui
-botster-hub reload botster-web --data-dir target/botster-hub-dev-stack-data
+botster-hub reload botster-web --data-dir target/botster-hub-runtime-data
 ```
 
 `open web` resolves the first-party `botster-web/web-client` app through the
@@ -468,19 +449,19 @@ For lower-level package diagnostics, the daily flow maps to the daemon-owned
 package commands:
 
 ```sh
-botster-hub packages install --data-dir target/botster-hub-dev-stack-data \
+botster-hub packages install --data-dir target/botster-hub-runtime-data \
   --path ../botster-web
-botster-hub packages enable --data-dir target/botster-hub-dev-stack-data botster-web
-botster-hub packages check-update --data-dir target/botster-hub-dev-stack-data botster-web
-botster-hub packages preview-update --data-dir target/botster-hub-dev-stack-data \
+botster-hub packages enable --data-dir target/botster-hub-runtime-data botster-web
+botster-hub packages check-update --data-dir target/botster-hub-runtime-data botster-web
+botster-hub packages preview-update --data-dir target/botster-hub-runtime-data \
   botster-web --revision local-dev --policy manual
-botster-hub packages apply-update --data-dir target/botster-hub-dev-stack-data \
+botster-hub packages apply-update --data-dir target/botster-hub-runtime-data \
   botster-web --revision local-dev --policy manual
-botster-hub packages reload --data-dir target/botster-hub-dev-stack-data botster-web
+botster-hub packages reload --data-dir target/botster-hub-runtime-data botster-web
 ```
 
-`dev-stack bootstrap` normally performs the first install/enable step for the
-first-party local packages. `packages check-update`, `preview-update`, and
+The ordinary package commands perform the one-time install/enable step.
+`packages check-update`, `preview-update`, and
 `apply-update` exercise the hub's update metadata path; they do not fetch local
 package code or rebuild a sibling repo for you. After editing an installed local
 package, rebuild that package's own output when needed, then run bare
@@ -492,10 +473,10 @@ From another terminal, the composed local client app path should be visible
 through the same stable data directory:
 
 ```sh
-botster-hub apps list --data-dir target/botster-hub-dev-stack-data
-botster-hub apps show --data-dir target/botster-hub-dev-stack-data botster-web/web-client
-botster-hub apps open --data-dir target/botster-hub-dev-stack-data botster-web/web-client
-botster-hub apps open --data-dir target/botster-hub-dev-stack-data botster-tui
+botster-hub apps list --data-dir target/botster-hub-runtime-data
+botster-hub apps show --data-dir target/botster-hub-runtime-data botster-web/web-client
+botster-hub apps open --data-dir target/botster-hub-runtime-data botster-web/web-client
+botster-hub apps open --data-dir target/botster-hub-runtime-data botster-tui
 ```
 
 `apps open botster-web/web-client` reports an `app_url=` matching the printed
@@ -503,87 +484,66 @@ botster-hub apps open --data-dir target/botster-hub-dev-stack-data botster-tui
 foreground launch contract; there is no standalone fallback when the package is
 missing or disabled.
 
-`botster-hub dogfood` remains the compatibility/test launcher for isolated
-foreground dogfood runs. It is useful for proving the bridge and shutdown path,
-but the persistent dev-stack bootstrap is the daily local first-party package
-path.
-
-The dev-stack acceptance smoke is the test path, not the daily launcher:
-
-```sh
-./test.sh --test hub_daemon_lifecycle_test \
-  cli_dev_stack_acceptance_smoke_exercises_first_party_plugins_project_pipelines_session_templates_reload_and_shutdown
-```
-
-The first-party plugin dogfood smoke composes the generic plugin contract matrix
-with real Workspaces and Project Pipelines package checks from a clean isolated
-data dir:
-
-```sh
-./test.sh --test hub_daemon_lifecycle_test \
-  cli_dev_stack_first_party_plugin_dogfood_smoke_runs_contract_matrix_then_real_packages
-```
-
 The CLI commands below exercise the daemon-backed workflow across separate
 processes:
 
 ```sh
 # Terminal 1: leave the daemon running.
-cargo run -- start --data-dir target/botster-hub-dogfood-data
+cargo run -- start --data-dir target/botster-hub-runtime-data
 
 # Other terminals:
-cargo run -- status --data-dir target/botster-hub-dogfood-data
+cargo run -- status --data-dir target/botster-hub-runtime-data
 
-cargo run -- packages install --data-dir target/botster-hub-dogfood-data \
+cargo run -- packages install --data-dir target/botster-hub-runtime-data \
   --path examples/synthetic-plugin
-cargo run -- packages available --data-dir target/botster-hub-dogfood-data \
+cargo run -- packages available --data-dir target/botster-hub-runtime-data \
   --registry path/to/package-registry.json
-cargo run -- packages inspect --data-dir target/botster-hub-dogfood-data \
-  --registry path/to/package-registry.json dogfood.synthetic-plugin
-cargo run -- packages preview-install --data-dir target/botster-hub-dogfood-data \
-  --registry path/to/package-registry.json dogfood.synthetic-plugin
-cargo run -- packages install --data-dir target/botster-hub-dogfood-data \
-  --registry path/to/package-registry.json dogfood.synthetic-plugin
-cargo run -- packages list --data-dir target/botster-hub-dogfood-data
-cargo run -- packages show --data-dir target/botster-hub-dogfood-data dogfood.synthetic-plugin
-cargo run -- packages config --data-dir target/botster-hub-dogfood-data dogfood.synthetic-plugin
-cargo run -- packages config set --data-dir target/botster-hub-dogfood-data \
-  dogfood.synthetic-plugin '{"enabled":true}'
-cargo run -- packages enable --data-dir target/botster-hub-dogfood-data dogfood.synthetic-plugin
-cargo run -- packages check-update --data-dir target/botster-hub-dogfood-data dogfood.synthetic-plugin
-cargo run -- packages preview-update --data-dir target/botster-hub-dogfood-data \
-  dogfood.synthetic-plugin --revision v1.0.1 --policy manual
-cargo run -- packages apply-update --data-dir target/botster-hub-dogfood-data \
-  dogfood.synthetic-plugin --revision v1.0.1 --checksum sha256:example --policy manual
-cargo run -- packages reload --data-dir target/botster-hub-dogfood-data dogfood.synthetic-plugin
-cargo run -- packages start-entrypoint --data-dir target/botster-hub-dogfood-data \
-  dogfood.synthetic-plugin web
-cargo run -- packages entrypoint-status --data-dir target/botster-hub-dogfood-data \
-  dogfood.synthetic-plugin web
-cargo run -- packages restart-entrypoint --data-dir target/botster-hub-dogfood-data \
-  dogfood.synthetic-plugin web
-cargo run -- packages stop-entrypoint --data-dir target/botster-hub-dogfood-data \
-  dogfood.synthetic-plugin web
-cargo run -- packages disable --data-dir target/botster-hub-dogfood-data dogfood.synthetic-plugin
-cargo run -- packages remove --data-dir target/botster-hub-dogfood-data dogfood.synthetic-plugin
-cargo run -- providers list --data-dir target/botster-hub-dogfood-data
+cargo run -- packages inspect --data-dir target/botster-hub-runtime-data \
+  --registry path/to/package-registry.json runtime.synthetic-plugin
+cargo run -- packages preview-install --data-dir target/botster-hub-runtime-data \
+  --registry path/to/package-registry.json runtime.synthetic-plugin
+cargo run -- packages install --data-dir target/botster-hub-runtime-data \
+  --registry path/to/package-registry.json runtime.synthetic-plugin
+cargo run -- packages list --data-dir target/botster-hub-runtime-data
+cargo run -- packages show --data-dir target/botster-hub-runtime-data runtime.synthetic-plugin
+cargo run -- packages config --data-dir target/botster-hub-runtime-data runtime.synthetic-plugin
+cargo run -- packages config set --data-dir target/botster-hub-runtime-data \
+  runtime.synthetic-plugin '{"enabled":true}'
+cargo run -- packages enable --data-dir target/botster-hub-runtime-data runtime.synthetic-plugin
+cargo run -- packages check-update --data-dir target/botster-hub-runtime-data runtime.synthetic-plugin
+cargo run -- packages preview-update --data-dir target/botster-hub-runtime-data \
+  runtime.synthetic-plugin --revision v1.0.1 --policy manual
+cargo run -- packages apply-update --data-dir target/botster-hub-runtime-data \
+  runtime.synthetic-plugin --revision v1.0.1 --checksum sha256:example --policy manual
+cargo run -- packages reload --data-dir target/botster-hub-runtime-data runtime.synthetic-plugin
+cargo run -- packages start-entrypoint --data-dir target/botster-hub-runtime-data \
+  runtime.synthetic-plugin web
+cargo run -- packages entrypoint-status --data-dir target/botster-hub-runtime-data \
+  runtime.synthetic-plugin web
+cargo run -- packages restart-entrypoint --data-dir target/botster-hub-runtime-data \
+  runtime.synthetic-plugin web
+cargo run -- packages stop-entrypoint --data-dir target/botster-hub-runtime-data \
+  runtime.synthetic-plugin web
+cargo run -- packages disable --data-dir target/botster-hub-runtime-data runtime.synthetic-plugin
+cargo run -- packages remove --data-dir target/botster-hub-runtime-data runtime.synthetic-plugin
+cargo run -- providers list --data-dir target/botster-hub-runtime-data
 
-cargo run -- apps list --data-dir target/botster-hub-dogfood-data
-cargo run -- apps show --data-dir target/botster-hub-dogfood-data dogfood.synthetic-plugin/web
-cargo run -- apps open --data-dir target/botster-hub-dogfood-data dogfood.synthetic-plugin/web
+cargo run -- apps list --data-dir target/botster-hub-runtime-data
+cargo run -- apps show --data-dir target/botster-hub-runtime-data runtime.synthetic-plugin/web
+cargo run -- apps open --data-dir target/botster-hub-runtime-data runtime.synthetic-plugin/web
 
-cargo run -- sessions spawn --data-dir target/botster-hub-dogfood-data \
-  --session-id dogfood-session -- "printf 'dogfood-ok\n'; sleep 1"
-cargo run -- sessions list --data-dir target/botster-hub-dogfood-data
-cargo run -- sessions attach --data-dir target/botster-hub-dogfood-data dogfood-session
-cargo run -- sessions send-input --data-dir target/botster-hub-dogfood-data \
-  dogfood-session -- "ping\r"
-cargo run -- sessions resize --data-dir target/botster-hub-dogfood-data \
-  dogfood-session 30 100
-cargo run -- sessions detach --data-dir target/botster-hub-dogfood-data dogfood-session
-cargo run -- sessions shutdown --data-dir target/botster-hub-dogfood-data dogfood-session
-cargo run -- inspect --data-dir target/botster-hub-dogfood-data dogfood-session
-cargo run -- shutdown --data-dir target/botster-hub-dogfood-data
+cargo run -- sessions spawn --data-dir target/botster-hub-runtime-data \
+  --session-id runtime-session -- "printf 'production runtime-ok\n'; sleep 1"
+cargo run -- sessions list --data-dir target/botster-hub-runtime-data
+cargo run -- sessions attach --data-dir target/botster-hub-runtime-data runtime-session
+cargo run -- sessions send-input --data-dir target/botster-hub-runtime-data \
+  runtime-session -- "ping\r"
+cargo run -- sessions resize --data-dir target/botster-hub-runtime-data \
+  runtime-session 30 100
+cargo run -- sessions detach --data-dir target/botster-hub-runtime-data runtime-session
+cargo run -- sessions shutdown --data-dir target/botster-hub-runtime-data runtime-session
+cargo run -- inspect --data-dir target/botster-hub-runtime-data runtime-session
+cargo run -- shutdown --data-dir target/botster-hub-runtime-data
 ```
 
 `packages install --path` connects to the running daemon, validates the local
@@ -626,24 +586,24 @@ and must not be resolved relative to the package working directory.
 
 ```sh
 # Terminal 1: leave the daemon running.
-cargo run -- start --data-dir target/botster-hub-tui-dogfood-data
+cargo run -- start --data-dir target/botster-hub-tui-production runtime-data
 
 # Terminal 2: create a deterministic echo-loop session for typed-input testing.
-cargo run -- sessions spawn --data-dir target/botster-hub-tui-dogfood-data \
-  --session-id dogfood-session -- "printf 'dogfood-ok\n'; while IFS= read -r line; do printf 'dogfood:%s\n' \"$line\"; done"
+cargo run -- sessions spawn --data-dir target/botster-hub-tui-production runtime-data \
+  --session-id runtime-session -- "printf 'production runtime-ok\n'; while IFS= read -r line; do printf 'runtime:%s\n' \"$line\"; done"
 
 # Terminal 3: operate the session from the installed terminal app.
-botster-hub apps open --data-dir target/botster-hub-tui-dogfood-data botster-tui
+botster-hub apps open --data-dir target/botster-hub-tui-production runtime-data botster-tui
 ```
 
 The echo-loop fixture is intentionally not a shell: typing `hello` should produce
-`dogfood:hello`, while commands such as `ls` are just echoed back. For shell
+`runtime:hello`, while commands such as `ls` are just echoed back. For shell
 commands, spawn a separate long-lived shell session and attach to that session
 from the TUI:
 
 ```sh
-cargo run -- sessions spawn --data-dir target/botster-hub-tui-dogfood-data \
-  --session-id dogfood-shell -- "/bin/sh -i"
+cargo run -- sessions spawn --data-dir target/botster-hub-tui-production runtime-data \
+  --session-id runtime-shell -- "/bin/sh -i"
 ```
 
 The standalone TUI lists daemon sessions, attaches with a persistent socket
@@ -670,7 +630,7 @@ must be driven by observed session readiness and should prove both a delivered
 case and a deferred/rejected unsafe case. The v1 activity row is a client-rendered
 guarded-write status row, not a separate routed notification event from core.
 
-Package commands require the daemon socket for this local dogfood path. When
+Package commands require the daemon socket for this local production runtime path. When
 the daemon is not running they fail with `daemon not running` instead of
 mutating `hub-state.json` out of band. That keeps package/provider state,
 daemon-backed status, and plugin lifecycle reads on one control plane.
@@ -681,7 +641,7 @@ Local agents can launch the daemon-backed MCP surface with an explicit data
 directory:
 
 ```sh
-botster-hub mcp-serve --data-dir target/botster-hub-dogfood-data
+botster-hub mcp-serve --data-dir target/botster-hub-runtime-data
 ```
 
 `mcp-serve` speaks MCP over stdio as newline-delimited JSON-RPC: every stdout
@@ -734,23 +694,24 @@ second inbox).
 ## Project Pipelines Local Readiness
 
 The checked-in `examples/project-pipelines` package is ready for constrained
-daily local coordination dogfood through the same persistent dev-stack data
-directory. For day-to-day work, bootstrap the dev stack and run MCP from that
-same directory:
+local coordination through the ordinary persisted package registry. Install
+and enable it against the running daemon, then run MCP from that same directory:
 
 ```sh
-cargo run -- dev-stack bootstrap --data-dir target/botster-hub-dev-stack-data
-botster-hub mcp-serve --data-dir target/botster-hub-dev-stack-data
+botster-hub packages install --data-dir target/botster-hub-runtime-data \
+  --path examples/project-pipelines
+botster-hub packages enable --data-dir target/botster-hub-runtime-data project-pipelines
+botster-hub mcp-serve --data-dir target/botster-hub-runtime-data
 ```
 
 For lower-level diagnostics, enable the plugin package through a running daemon
 and serve MCP from the same data directory:
 
 ```sh
-cargo run -- packages install --data-dir target/botster-hub-dogfood-data \
+cargo run -- packages install --data-dir target/botster-hub-runtime-data \
   --path examples/project-pipelines
-cargo run -- packages enable --data-dir target/botster-hub-dogfood-data project-pipelines
-cargo run -- mcp-serve --data-dir target/botster-hub-dogfood-data
+cargo run -- packages enable --data-dir target/botster-hub-runtime-data project-pipelines
+cargo run -- mcp-serve --data-dir target/botster-hub-runtime-data
 ```
 
 `mcp-serve` lists and calls the plugin's Project Pipelines tools through
@@ -785,11 +746,10 @@ this milestone; cutover requires no in-flight monolith tickets or a future
 explicit one-shot export/import before switching active work to the local
 plugin.
 
-`botster-hub dogfood` remains useful for isolated bridge/bootstrap tests, but it
-is not the daily Project Pipelines workflow. The daily path is persistent daemon
-plus first-party local packages plus `mcp-serve` over one data directory.
+Project Pipelines uses the same persistent daemon, ordinary installed packages,
+and `mcp-serve` over one data directory as every other production package.
 
-Dogfood-ready today: explicit local daemon lifecycle, file-backed hub/package
+Production runtime-ready today: explicit local daemon lifecycle, file-backed hub/package
 state, local package admission from a manifest path, typed status/package reads,
 plugin lifecycle observation/invocation through the hub facade, daemon-backed
 PTY spawn/list/attach/input/resize/detach/session-shutdown through
@@ -810,7 +770,7 @@ evidence, missing workers, unhealthy workers, or duplicate candidates are marked
 stale; terminal records remain terminal; and live worker-backed records absent
 from hub-owned state are recovered from core daemon/session-worker evidence.
 The readiness boundary is documented in
-[`docs/adr/local-runtime-dogfood-readiness.md`](docs/adr/local-runtime-dogfood-readiness.md).
+[`docs/adr/local-runtime-production-readiness.md`](docs/adr/local-runtime-production-readiness.md).
 
 In the daemon-backed model, attach, detach, input, and resize requests are
 control-plane acknowledgements. Terminal egress is delivered by explicit
@@ -839,18 +799,18 @@ repo's build command, then rerun `botster-hub up`. The daily command re-reads
 direct local manifests but does not build sibling artifacts; a missing declared
 package-relative command fails before launch with the package name, local path,
 and rebuild remediation. `botster-hub packages reload --data-dir
-target/botster-hub-dev-stack-data <package-name>` remains available for an
+target/botster-hub-runtime-data <package-name>` remains available for an
 explicit one-package refresh.
 
 Missing app or Lua entrypoints: run `botster-hub packages show --data-dir
-target/botster-hub-dev-stack-data <package-name>` and `botster-hub apps list
---data-dir target/botster-hub-dev-stack-data`. Local packages need a valid
+target/botster-hub-runtime-data <package-name>` and `botster-hub apps list
+--data-dir target/botster-hub-runtime-data`. Local packages need a valid
 `botster-package.json`; runnable client apps need `runnable_entrypoints`; Lua
 plugins such as Project Pipelines also need their `entrypoints` path to exist.
 `apps open` has no fallback when the package is missing, disabled, or lacks the
 requested app selector.
 
-Missing provider config or auth: the local dev stack does not import cloud,
+Missing provider config or auth: the local local runtime does not import cloud,
 GitHub, or monolith credentials. Re-enter provider credentials when a provider
 integration asks for them, and treat unavailable provider/GitHub automation as
 deferred unless the relevant package and config are installed.
@@ -862,7 +822,7 @@ also requires explicit `target_id` and `worktree` arguments; missing either one
 is a tool-call error, not a template fallback.
 
 Terminal attach or scrollback issues: use `botster-hub sessions list --data-dir
-target/botster-hub-dev-stack-data`, attach only to a running session, and expect
+target/botster-hub-runtime-data`, attach only to a running session, and expect
 terminal output to arrive through the session-backed drain/subscription path.
 Late attach may replay existing terminal output as ordinary terminal data rather
 than a distinct scrollback frame, and current long-running attach signal
@@ -931,7 +891,7 @@ through `botster_core::admit_host_profile`, so core still owns the narrow
 manifest/admission preconditions while hub owns install, enable, disable, pin,
 grant, provenance, update, and audit policy.
 
-Local dogfood installs accept either an explicit JSON manifest path or a package
+Local production runtime installs accept either an explicit JSON manifest path or a package
 directory containing `botster-package.json`. The file is parsed as
 `botster_core::PackageManifest` plus the hub-owned `runnable_entrypoints`
 extension; the hub rewrites the manifest source to `PackageSource::Path` with
@@ -955,7 +915,7 @@ Local path manifest example:
 
 ```json
 {
-  "name": "dogfood.synthetic-plugin",
+  "name": "runtime.synthetic-plugin",
   "version": "1.0.0",
   "kind": "plugin",
   "botster": ">=0.1.0",

@@ -104,7 +104,7 @@ Explicit `ReloadPackage` already routes through the live daemon owner to `Packag
    - Do not reload, restart, persist, or launch anything when any package fails preparation.
 
 3. Wire the daily and explicit operator paths.
-   - Call the batch daemon request from `prepare_local_runtime` before `enable_dev_stack_package` and `start_botster_web_dogfood`.
+   - Call the batch daemon request from `prepare_local_runtime` before resolving and starting persisted package entrypoints.
    - Keep explicit reload commands and action descriptors unchanged externally, backed by the shared refresh primitive.
    - Keep registry-installed records out of implicit refresh regardless of their catalog source representation.
 
