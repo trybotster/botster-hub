@@ -137,7 +137,7 @@ evidence_helper=$script_repo/script/production-package-runtime-evidence
 mkdir -p "$evidence_dir"
 evidence_dir=$(canonical_dir "$evidence_dir")
 
-runtime_root=$(mktemp -d "${TMPDIR:-/tmp}/botster-production-acceptance.XXXXXX")
+runtime_root=$(mktemp -d "/tmp/botster-production-acceptance.XXXXXX")
 owned_data_dirs=$runtime_root/owned-data-dirs
 owned_worktrees=$runtime_root/owned-worktrees
 raw_commands=$runtime_root/commands.raw
