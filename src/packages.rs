@@ -14,9 +14,11 @@ use botster_core::{
     ExtensionKind, ExtensionRuntime, HostProfileAdmissionError, PackageConfigurationField,
     PackageConfigurationFieldType, PackageConfigurationSchema, PackageConfigurationSecretValue,
     PackageConfigurationValue, PackageManifest, PackageRequirementStatus, PackageResolutionInput,
-    PackageResolutionMatrix, PackageResolutionPackage, PackageSource, RunnableEntrypointKind,
-    RunnableEntrypointLaunchMode, RunnableEntrypointReadiness, admit_host_profile,
-    resolve_package_dependencies,
+    PackageResolutionMatrix, PackageResolutionPackage, PackageSource,
+    RunnableEntrypointHubConnection, RunnableEntrypointHubConnectionTransport,
+    RunnableEntrypointInjection, RunnableEntrypointInjectionKind,
+    RunnableEntrypointInjectionTarget, RunnableEntrypointKind, RunnableEntrypointLaunchMode,
+    RunnableEntrypointReadiness, admit_host_profile, resolve_package_dependencies,
 };
 use serde::{Deserialize, Serialize};
 
@@ -1220,6 +1222,9 @@ pub struct PackageRunnableEntrypoint {
     /// Working-directory policy for future process spawning.
     #[serde(default)]
     pub working_directory: PackageRunnableWorkingDirectory,
+    /// Hub-owned values and their manifest-selected launch targets.
+    #[serde(default)]
+    pub injections: Vec<RunnableEntrypointInjection>,
     /// Declarative environment requirements. Values are optional defaults, not host snapshots.
     #[serde(default)]
     pub environment: Vec<PackageEnvironmentRequirement>,
@@ -1278,6 +1283,78 @@ pub struct PackageResolvedForegroundLaunch {
     pub environment: BTreeMap<String, String>,
 }
 
+/// Host-resolved arguments and environment for one runnable entrypoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PackageResolvedEntrypointLaunch {
+    pub args: Vec<String>,
+    pub environment: BTreeMap<String, String>,
+}
+
+/// Resolve manifest-selected injection targets for a runnable entrypoint.
+pub(crate) fn resolve_entrypoint_launch_contract(
+    entrypoint: &PackageRunnableEntrypoint,
+    data_directory: &Path,
+    socket_path: &Path,
+    environment_overrides: &BTreeMap<String, String>,
+) -> Result<PackageResolvedEntrypointLaunch, String> {
+    let socket_path = socket_path
+        .to_str()
+        .ok_or_else(|| "Hub socket path is not valid UTF-8".to_string())?;
+    let connection = RunnableEntrypointHubConnection {
+        transport: RunnableEntrypointHubConnectionTransport::UnixSocket {
+            path: socket_path.to_string(),
+        },
+    };
+    connection
+        .validate()
+        .map_err(|error| format!("Hub connection descriptor is invalid: {error}"))?;
+    let connection = serde_json::to_string(&connection)
+        .map_err(|error| format!("Hub connection descriptor could not be serialized: {error}"))?;
+
+    let mut args = entrypoint.args.clone();
+    let mut environment = BTreeMap::new();
+    for requirement in &entrypoint.environment {
+        if let Some(default) = requirement.default.as_ref() {
+            environment
+                .entry(requirement.name.clone())
+                .or_insert_with(|| default.clone());
+        }
+    }
+    environment.extend(environment_overrides.clone());
+
+    for injection in &entrypoint.injections {
+        let value = match &injection.kind {
+            RunnableEntrypointInjectionKind::HubConnection => connection.as_str(),
+            RunnableEntrypointInjectionKind::DataDir => data_directory
+                .to_str()
+                .ok_or_else(|| "Hub data directory is not valid UTF-8".to_string())?,
+        };
+        match &injection.target {
+            RunnableEntrypointInjectionTarget::Environment { name } => {
+                environment.insert(name.clone(), value.to_string());
+            }
+            RunnableEntrypointInjectionTarget::Argument { value: placeholder } => {
+                let mut replaced = false;
+                for argument in &mut args {
+                    let rendered = argument.replace(placeholder, value);
+                    if rendered != *argument {
+                        *argument = rendered;
+                        replaced = true;
+                    }
+                }
+                if injection.required && !replaced {
+                    return Err(format!(
+                        "required {:?} injection argument target {placeholder:?} is absent from entrypoint {} arguments",
+                        injection.kind, entrypoint.id
+                    ));
+                }
+            }
+        }
+    }
+
+    Ok(PackageResolvedEntrypointLaunch { args, environment })
+}
+
 /// Resolve the host-local foreground launch contract owned by a package row.
 pub fn resolve_foreground_launch_contract(
     record: &PackageRecord,
@@ -1296,29 +1373,19 @@ pub fn resolve_foreground_launch_contract(
         }
         PackageRunnableWorkingDirectory::Relative { path } => package_root.join(path),
     };
-    let mut environment = BTreeMap::new();
-    environment.insert(
-        "BOTSTER_HUB_DATA_DIR".to_string(),
-        data_directory.display().to_string(),
-    );
-    environment.insert(
-        "BOTSTER_HUB_SOCKET".to_string(),
-        socket_path.display().to_string(),
-    );
-    for requirement in &entrypoint.environment {
-        if let Some(default) = requirement.default.as_ref() {
-            environment
-                .entry(requirement.name.clone())
-                .or_insert_with(|| default.clone());
-        }
-    }
+    let resolved = resolve_entrypoint_launch_contract(
+        entrypoint,
+        data_directory,
+        socket_path,
+        &BTreeMap::new(),
+    )?;
     Ok(PackageResolvedForegroundLaunch {
         command: resolve_command_path(&package_root, entrypoint.command.as_str())
             .display()
             .to_string(),
-        args: entrypoint.args.clone(),
+        args: resolved.args,
         working_directory,
-        environment,
+        environment: resolved.environment,
     })
 }
 
@@ -2931,6 +2998,27 @@ fn validate_runnable_entrypoint_contract(
                 ));
             }
         }
+        for injection in &entrypoint.injections {
+            match &injection.target {
+                RunnableEntrypointInjectionTarget::Environment { name }
+                    if name.trim().is_empty() =>
+                {
+                    return Err(format!(
+                        "runnable entrypoint {} has empty injection environment name",
+                        entrypoint.id
+                    ));
+                }
+                RunnableEntrypointInjectionTarget::Argument { value }
+                    if value.trim().is_empty() =>
+                {
+                    return Err(format!(
+                        "runnable entrypoint {} has empty injection argument target",
+                        entrypoint.id
+                    ));
+                }
+                _ => {}
+            }
+        }
     }
     Ok(())
 }
@@ -4294,6 +4382,84 @@ mod tests {
                 .runnable_entrypoints[0]
                 .args,
             ["--host", "127.0.0.1"]
+        );
+    }
+
+    #[test]
+    fn runnable_entrypoint_injections_use_typed_host_values_and_manifest_targets() {
+        let root = test_root("runnable-entrypoint-injections");
+        fs::write(root.join("plugin.lua"), "-- synthetic plugin").expect("write plugin");
+        fs::write(root.join("client"), "#!/bin/sh\n").expect("write runnable command");
+        write_manifest_json(
+            &root,
+            r#"{
+  "name": "injected.plugin",
+  "version": "1.0.0",
+  "kind": "plugin",
+  "botster": ">=0.1.0",
+  "source": { "type": "path", "path": "." },
+  "capabilities": [{ "surface": "surfaces" }],
+  "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }],
+  "runnable_entrypoints": [{
+    "id": "client",
+    "kind": "terminal_app",
+    "command": "client",
+    "args": ["--connection={{selected_connection}}"],
+    "injections": [
+      {
+        "kind": "hub_connection",
+        "target": { "type": "argument", "value": "{{selected_connection}}" },
+        "required": true
+      },
+      {
+        "kind": "data_dir",
+        "target": { "type": "environment", "name": "PACKAGE_DATA_DIR" },
+        "required": true
+      }
+    ],
+    "environment": [{
+      "name": "PACKAGE_MODE",
+      "required": false,
+      "default": "default"
+    }],
+    "launch_mode": "foreground_stdio"
+  }]
+}
+"#,
+        );
+        let mut registry =
+            PackageRegistry::new(grants(vec![capability(CapabilitySurface::Surfaces, None)]));
+        let record = registry
+            .install_local_path(&root, "install injected package")
+            .expect("install injected package");
+        let entrypoint = &record.runnable_entrypoints[0];
+        let resolved = resolve_entrypoint_launch_contract(
+            entrypoint,
+            Path::new("/private/runtime/data"),
+            Path::new("/private/runtime/hub.sock"),
+            &BTreeMap::from([
+                ("PACKAGE_DATA_DIR".to_string(), "caller-value".to_string()),
+                ("PACKAGE_MODE".to_string(), "explicit".to_string()),
+            ]),
+        )
+        .expect("resolve injected launch");
+
+        assert_eq!(
+            resolved.args,
+            [
+                r#"--connection={"transport":{"type":"unix_socket","path":"/private/runtime/hub.sock"}}"#
+            ]
+        );
+        assert_eq!(
+            resolved
+                .environment
+                .get("PACKAGE_DATA_DIR")
+                .map(String::as_str),
+            Some("/private/runtime/data")
+        );
+        assert_eq!(
+            resolved.environment.get("PACKAGE_MODE").map(String::as_str),
+            Some("explicit")
         );
     }
 

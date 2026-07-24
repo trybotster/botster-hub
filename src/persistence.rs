@@ -912,6 +912,7 @@ mod tests {
             command: "bin/botster-web".to_string(),
             args: vec!["--host".to_string(), "127.0.0.1".to_string()],
             working_directory: PackageRunnableWorkingDirectory::PackageRoot,
+            injections: Vec::new(),
             environment: Vec::new(),
             capabilities: Vec::new(),
             readiness: None,

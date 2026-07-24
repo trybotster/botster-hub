@@ -73,6 +73,11 @@ pub enum EntrypointSupervisorError {
         entrypoint_id: String,
         details: String,
     },
+    LaunchContract {
+        package_name: String,
+        entrypoint_id: String,
+        details: String,
+    },
     Watch(String),
     Io(std::io::Error),
 }
@@ -91,6 +96,7 @@ impl EntrypointSupervisor {
         registry: &PackageRegistry,
         package_name: &str,
         entrypoint_id: &str,
+        arguments: &[String],
         environment_overrides: &BTreeMap<String, String>,
     ) -> EntrypointSupervisorResult<EntrypointProcessSnapshot> {
         self.refresh();
@@ -115,7 +121,7 @@ impl EntrypointSupervisor {
         let command_path = resolve_command(&package_root, entrypoint.command.as_str());
         let working_directory = resolve_working_directory(&package_root, entrypoint)?;
         let mut command = Command::new(command_path);
-        command.args(&entrypoint.args);
+        command.args(arguments);
         command.current_dir(working_directory);
         for (name, value) in environment_overrides {
             command.env(name, value);
@@ -196,28 +202,32 @@ impl EntrypointSupervisor {
         registry: &PackageRegistry,
         package_name: &str,
         entrypoint_id: &str,
+        arguments: &[String],
         environment_overrides: &BTreeMap<String, String>,
     ) -> EntrypointSupervisorResult<EntrypointProcessSnapshot> {
         let _ = self.stop(package_name, entrypoint_id);
-        self.start(registry, package_name, entrypoint_id, environment_overrides)
+        self.start(
+            registry,
+            package_name,
+            entrypoint_id,
+            arguments,
+            environment_overrides,
+        )
     }
 
-    pub fn restart_preserving_environment(
-        &mut self,
-        registry: &PackageRegistry,
+    pub fn launch_environment(
+        &self,
         package_name: &str,
         entrypoint_id: &str,
-    ) -> EntrypointSupervisorResult<EntrypointProcessSnapshot> {
+    ) -> BTreeMap<String, String> {
         let key = EntrypointKey {
             package_name: package_name.to_string(),
             entrypoint_id: entrypoint_id.to_string(),
         };
-        let environment = self
-            .processes
+        self.processes
             .get(&key)
             .map(|process| process.environment.clone())
-            .unwrap_or_default();
-        self.restart(registry, package_name, entrypoint_id, &environment)
+            .unwrap_or_default()
     }
 
     pub fn status(&mut self, package_name: &str, entrypoint_id: &str) -> EntrypointProcessSnapshot {

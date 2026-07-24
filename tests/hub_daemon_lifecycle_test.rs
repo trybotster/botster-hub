@@ -1084,6 +1084,32 @@ fn write_hub_env_web_app_package(root: &Path) {
     fs::create_dir_all(root).expect("create hub-env web package root");
     fs::write(root.join("plugin.lua"), "return botster.register({})\n")
         .expect("write hub-env web package core entrypoint");
+    fs::write(
+        root.join("verify-hub-connection.mjs"),
+        r#"import fs from 'node:fs';
+
+const connection = JSON.parse(process.env.BOTSTER_HUB_CONNECTION || 'null');
+if (connection?.transport?.type !== 'unix_socket') {
+  throw new Error('BOTSTER_HUB_CONNECTION must declare a unix_socket transport');
+}
+if (!connection.transport.path.startsWith('/') || !fs.existsSync(connection.transport.path)) {
+  throw new Error('BOTSTER_HUB_CONNECTION must carry the active absolute socket path');
+}
+if (!process.env.PACKAGE_DATA_DIR || !fs.statSync(process.env.PACKAGE_DATA_DIR).isDirectory()) {
+  throw new Error('PACKAGE_DATA_DIR must carry the active Hub data directory');
+}
+if (process.env.BOTSTER_WEB_MODE !== 'daemon-default') {
+  throw new Error('manifest environment defaults must be preserved');
+}
+fs.writeFileSync(process.env.BOTSTER_ENTRYPOINT_LAUNCH_RESULT, JSON.stringify({
+  entrypoint_id: 'web',
+  process_state: 'running',
+  local_url: 'http://127.0.0.1:49153',
+}));
+setInterval(() => {}, 1000);
+"#,
+    )
+    .expect("write hub connection verifier");
     let manifest = serde_json::json!({
         "name": "runtime.hub-env",
         "version": "1.0.0",
@@ -1097,15 +1123,30 @@ fn write_hub_env_web_app_package(root: &Path) {
         "runnable_entrypoints": [{
             "id": "web",
             "kind": "web_app",
-            "command": "sh",
+            "command": "node",
             "args": [
-                "-c",
-                "if [ -z \"$BOTSTER_HUB_SOCKET\" ] || [ -z \"$BOTSTER_HUB_DATA_DIR\" ]; then echo 'BOTSTER_HUB_BIN must point to a botster-hub binary' >&2; exit 42; fi; test -S \"$BOTSTER_HUB_SOCKET\" || exit 43; test -d \"$BOTSTER_HUB_DATA_DIR\" || exit 44; test \"$BOTSTER_WEB_MODE\" = daemon-default || exit 45; printf '%s\n' '{\"entrypoint_id\":\"web\",\"process_state\":\"running\",\"local_url\":\"http://127.0.0.1:49153\"}' > \"$BOTSTER_ENTRYPOINT_LAUNCH_RESULT\"; while true; do sleep 1; done"
+                "verify-hub-connection.mjs"
             ],
             "working_directory": { "policy": "package_root" },
+            "injections": [
+                {
+                    "kind": "hub_connection",
+                    "target": {
+                        "type": "environment",
+                        "name": "BOTSTER_HUB_CONNECTION"
+                    },
+                    "required": true
+                },
+                {
+                    "kind": "data_dir",
+                    "target": {
+                        "type": "environment",
+                        "name": "PACKAGE_DATA_DIR"
+                    },
+                    "required": true
+                }
+            ],
             "environment": [
-                { "name": "BOTSTER_HUB_SOCKET", "required": false },
-                { "name": "BOTSTER_HUB_DATA_DIR", "required": false },
                 { "name": "BOTSTER_WEB_MODE", "required": false, "default": "daemon-default" }
             ],
             "launch_mode": "background",
@@ -1135,8 +1176,26 @@ fn write_botster_tui_package(root: &Path) {
             "id": "botster-tui",
             "kind": "terminal_app",
             "command": "sh",
-            "args": ["-c", "test -n \"$BOTSTER_HUB_SOCKET\" && test -n \"$BOTSTER_HUB_DATA_DIR\" && printf 'botster-tui-fixture\\n'"],
+            "args": ["-c", "test -n \"$BOTSTER_HUB_CONNECTION\" && test -n \"$BOTSTER_HUB_DATA_DIR\" && printf 'botster-tui-fixture\\n'"],
             "working_directory": { "policy": "package_root" },
+            "injections": [
+                {
+                    "kind": "hub_connection",
+                    "target": {
+                        "type": "environment",
+                        "name": "BOTSTER_HUB_CONNECTION"
+                    },
+                    "required": true
+                },
+                {
+                    "kind": "data_dir",
+                    "target": {
+                        "type": "environment",
+                        "name": "BOTSTER_HUB_DATA_DIR"
+                    },
+                    "required": true
+                }
+            ],
             "environment": [
                 { "name": "BOTSTER_TUI_MODE", "required": false, "default": "headless" }
             ],
@@ -1162,7 +1221,10 @@ import http from 'http';
 import net from 'net';
 
 const port = Number(process.env.BOTSTER_WEB_PORT || '0');
-const socket = process.env.BOTSTER_HUB_SOCKET;
+const connection = JSON.parse(process.env.BOTSTER_HUB_CONNECTION || 'null');
+const socket = connection?.transport?.type === 'unix_socket'
+  ? connection.transport.path
+  : undefined;
 const dataDir = process.env.BOTSTER_HUB_DATA_DIR;
 const launchResult = process.env.BOTSTER_ENTRYPOINT_LAUNCH_RESULT;
 const source = socket ? 'socket' : (dataDir ? 'data_dir' : 'spawned');
@@ -1222,7 +1284,7 @@ function readLine(connection) {
 
 async function connectDaemon() {
   if (!socket) {
-    throw new Error('BOTSTER_HUB_SOCKET is not set');
+    throw new Error('BOTSTER_HUB_CONNECTION does not contain a Unix socket');
   }
   const stream = net.createConnection(socket);
   const connection = { stream, buffer: '' };
@@ -1382,9 +1444,25 @@ if (startupDelayMs > 0) {
             "command": "node",
             "args": ["scripts/local-package-server.mjs"],
             "working_directory": { "policy": "package_root" },
+            "injections": [
+                {
+                    "kind": "hub_connection",
+                    "target": {
+                        "type": "environment",
+                        "name": "BOTSTER_HUB_CONNECTION"
+                    },
+                    "required": true
+                },
+                {
+                    "kind": "data_dir",
+                    "target": {
+                        "type": "environment",
+                        "name": "BOTSTER_HUB_DATA_DIR"
+                    },
+                    "required": true
+                }
+            ],
             "environment": [
-                { "name": "BOTSTER_HUB_SOCKET", "required": false },
-                { "name": "BOTSTER_HUB_DATA_DIR", "required": false },
                 { "name": "BOTSTER_WEB_PORT", "required": false, "default": "0" },
                 { "name": "BOTSTER_WEB_TEST_STARTUP_DELAY_MS", "required": false }
             ],
@@ -1600,10 +1678,16 @@ fn botster_web_health_rejects_stale_daemon_socket_file() {
     );
 
     let listener_port = unused_loopback_port();
+    let connection = serde_json::json!({
+        "transport": {
+            "type": "unix_socket",
+            "path": socket_path
+        }
+    });
     let child = Command::new("node")
         .arg("scripts/local-package-server.mjs")
         .current_dir(&package_dir)
-        .env("BOTSTER_HUB_SOCKET", &socket_path)
+        .env("BOTSTER_HUB_CONNECTION", connection.to_string())
         .env("BOTSTER_HUB_DATA_DIR", &data_dir)
         .env("BOTSTER_WEB_PORT", listener_port.to_string())
         .stdout(Stdio::piped())
@@ -9674,7 +9758,23 @@ fn daemon_resolves_terminal_app_foreground_launch_contract() {
     assert_eq!(launch.kind, "terminal_app");
     assert_eq!(launch.launch_mode, "foreground_stdio");
     assert_eq!(launch.command, "sh");
-    assert!(launch.environment.contains_key("BOTSTER_HUB_SOCKET"));
+    let connection: serde_json::Value = serde_json::from_str(
+        launch
+            .environment
+            .get("BOTSTER_HUB_CONNECTION")
+            .expect("Hub connection injection"),
+    )
+    .expect("decode Hub connection injection");
+    assert_eq!(
+        connection["transport"]["type"],
+        serde_json::Value::String("unix_socket".to_string())
+    );
+    assert!(
+        connection["transport"]["path"]
+            .as_str()
+            .expect("Hub connection path")
+            .starts_with('/')
+    );
     assert!(launch.environment.contains_key("BOTSTER_HUB_DATA_DIR"));
     assert_eq!(
         launch
@@ -9850,7 +9950,7 @@ fn cli_apps_open_web_injects_hub_connection_environment() {
     );
     let open_text = command_output_text(&open);
     assert!(open_text.contains("app_url=http://127.0.0.1:49153"));
-    assert!(!open_text.contains("BOTSTER_HUB_BIN must point to a botster-hub binary"));
+    assert!(!open_text.contains("BOTSTER_HUB_CONNECTION must"));
 
     let status = botster_hub::daemon_transport_request(
         &explicit_config(&data_dir),
@@ -9862,11 +9962,13 @@ fn cli_apps_open_web_injects_hub_connection_environment() {
     .expect("inspect web app entrypoint status");
     let entrypoint = package_entrypoint(&status, "runtime.hub-env");
     assert_eq!(entrypoint.process.state, "running");
-    assert!(entrypoint.process.diagnostics.iter().all(|diagnostic| {
-        !diagnostic
-            .message
-            .contains("BOTSTER_HUB_BIN must point to a botster-hub binary")
-    }));
+    assert!(
+        entrypoint
+            .process
+            .diagnostics
+            .iter()
+            .all(|diagnostic| { !diagnostic.message.contains("BOTSTER_HUB_CONNECTION must") })
+    );
 
     shutdown_cli_daemon(&data_dir, child);
 }
@@ -10132,10 +10234,7 @@ fn package_entrypoint_supervision_stops_and_restarts() {
         &package_dir,
         "runtime.restart",
         "sh",
-        &[
-            "-c",
-            "test -n \"$BOTSTER_HUB_SOCKET\" && test -n \"$BOTSTER_HUB_DATA_DIR\" && while true; do sleep 1; done",
-        ],
+        &["-c", "while true; do sleep 1; done"],
     );
     let child = start_cli_daemon(&data_dir);
     enable_supervised_package(&data_dir, &package_dir);
