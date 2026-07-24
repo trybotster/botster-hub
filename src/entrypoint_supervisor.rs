@@ -320,7 +320,11 @@ impl EntrypointSupervisor {
                         .any(|path| path.file_name() == launch_result_path.file_name());
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
-                    launch_result_may_have_changed = false;
+                    // Filesystem backends may coalesce a create/write sequence or
+                    // report only the watched parent. Re-read the tiny result file
+                    // on timeout as a portability fallback; only valid structured
+                    // readiness can succeed.
+                    launch_result_may_have_changed = true;
                 }
                 Ok(Err(error)) => {
                     return Err(EntrypointSupervisorError::Watch(error.to_string()));
