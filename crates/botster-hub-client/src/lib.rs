@@ -847,6 +847,7 @@ pub enum DaemonRequest {
     ReloadPackage {
         package_name: String,
     },
+    RefreshLocalPackages,
     EnablePackageLocalPath {
         path: PathBuf,
     },
@@ -3685,6 +3686,7 @@ mod tests {
             DaemonRequest::ReloadPackage {
                 package_name: "workflow.plugin".to_string(),
             },
+            DaemonRequest::RefreshLocalPackages,
             DaemonRequest::EnablePackageLocalPath {
                 path: PathBuf::from("/tmp/plugin"),
             },
@@ -3805,6 +3807,7 @@ mod tests {
             DaemonRequest::ShowPackage { .. } => "show_package",
             DaemonRequest::SetPackageConfiguration { .. } => "set_package_configuration",
             DaemonRequest::ReloadPackage { .. } => "reload_package",
+            DaemonRequest::RefreshLocalPackages => "refresh_local_packages",
             DaemonRequest::EnablePackageLocalPath { .. } => "enable_package_local_path",
             DaemonRequest::EnablePackage { .. } => "enable_package",
             DaemonRequest::DisablePackage { .. } => "disable_package",

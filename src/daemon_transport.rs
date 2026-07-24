@@ -826,16 +826,17 @@ fn handle_control_request(
                 })
                 .map(|snapshot| snapshot.entrypoint_id)
                 .collect::<Vec<_>>();
-            let decision = daemon
-                .package_registry_mut()
-                .reload_local_package(&package_name, "daemon socket reload local package")?;
-            persist_package_registry(daemon)?;
+            let (candidate, decision) = daemon
+                .package_registry()
+                .refreshed_local_package(&package_name, "daemon socket reload local package")?;
+            commit_package_registry(daemon, candidate)?;
             if decision.state == PackageState::Enabled {
                 reload_package_after_reload(daemon, &package_name)?;
             }
             restart_running_package_entrypoints(daemon, &package_name, &running_entrypoints)?;
             package_decision_response(daemon, decision)
         }
+        DaemonRequest::RefreshLocalPackages => refresh_local_packages_response(daemon),
         DaemonRequest::EnablePackageLocalPath { path } => {
             let package_name = {
                 let record = daemon
@@ -1647,6 +1648,7 @@ fn handle_runtime_control_request(
         | DaemonRequest::ShowPackage { .. }
         | DaemonRequest::SetPackageConfiguration { .. }
         | DaemonRequest::ReloadPackage { .. }
+        | DaemonRequest::RefreshLocalPackages
         | DaemonRequest::PluginLifecycleStatus
         | DaemonRequest::EnablePackageLocalPath { .. }
         | DaemonRequest::EnablePackage { .. }
@@ -1725,28 +1727,48 @@ fn restart_running_package_entrypoints(
     if entrypoint_ids.is_empty() {
         return Ok(());
     }
-    let config = daemon
-        .runtime()
-        .ok_or(DaemonTransportError::DaemonNotRunning)?
-        .config()
-        .clone();
     let packages = daemon.package_registry().clone();
     for entrypoint_id in entrypoint_ids {
-        let environment = supervised_launch_environment(
-            &config,
-            &packages,
-            package_name,
-            entrypoint_id,
-            &BTreeMap::new(),
-        )?;
-        daemon.entrypoint_supervisor().restart(
-            &packages,
-            package_name,
-            entrypoint_id,
-            &environment,
-        )?;
+        daemon
+            .entrypoint_supervisor()
+            .restart_preserving_environment(&packages, package_name, entrypoint_id)?;
     }
     Ok(())
+}
+
+fn refresh_local_packages_response(
+    daemon: &mut HubDaemon,
+) -> DaemonTransportResult<DaemonResponse> {
+    let running_entrypoints = daemon
+        .entrypoint_supervisor()
+        .snapshots()
+        .into_iter()
+        .filter(|snapshot| snapshot.state == "running")
+        .fold(
+            BTreeMap::<String, Vec<String>>::new(),
+            |mut running, snapshot| {
+                running
+                    .entry(snapshot.package_name)
+                    .or_default()
+                    .push(snapshot.entrypoint_id);
+                running
+            },
+        );
+    let (candidate, decisions) = daemon
+        .package_registry()
+        .refreshed_local_packages("daemon socket refresh local package registrations")?;
+    commit_package_registry(daemon, candidate)?;
+
+    for decision in &decisions {
+        if decision.state == PackageState::Enabled {
+            reload_package_after_reload(daemon, &decision.package_name)?;
+        }
+        if let Some(entrypoint_ids) = running_entrypoints.get(&decision.package_name) {
+            restart_running_package_entrypoints(daemon, &decision.package_name, entrypoint_ids)?;
+        }
+    }
+
+    list_packages_response(daemon)
 }
 
 fn list_packages_response(daemon: &mut HubDaemon) -> DaemonTransportResult<DaemonResponse> {
@@ -2752,16 +2774,35 @@ fn origin_from_local_url(local_url: &str) -> Option<String> {
     Some(local_url[..authority_end].to_string())
 }
 
-fn persist_package_registry(daemon: &HubDaemon) -> DaemonTransportResult<()> {
+fn persist_package_registry(daemon: &mut HubDaemon) -> DaemonTransportResult<()> {
     let runtime = daemon
         .runtime()
         .ok_or(DaemonTransportError::DaemonNotRunning)?;
     let config = runtime.config().clone();
     let snapshot = daemon.package_registry().snapshot();
     let store = FileHubStateStore::for_data_directory(&config.data_directory);
-    store.update(&config, |state| {
+    let state = store.update(&config, |state| {
         state.package_registry = snapshot;
     })?;
+    daemon.replace_state(state);
+    Ok(())
+}
+
+fn commit_package_registry(
+    daemon: &mut HubDaemon,
+    package_registry: PackageRegistry,
+) -> DaemonTransportResult<()> {
+    let runtime = daemon
+        .runtime()
+        .ok_or(DaemonTransportError::DaemonNotRunning)?;
+    let config = runtime.config().clone();
+    let snapshot = package_registry.snapshot();
+    let store = FileHubStateStore::for_data_directory(&config.data_directory);
+    let state = store.update(&config, |state| {
+        state.package_registry = snapshot;
+    })?;
+    daemon.replace_package_registry(package_registry);
+    daemon.replace_state(state);
     Ok(())
 }
 
@@ -5409,6 +5450,12 @@ fn package_registry_error_diagnostics(
 }
 
 fn package_error_display_name(error: &crate::PackageRegistryError) -> &str {
+    if error
+        .audit_reason
+        .contains("refresh local package registrations")
+    {
+        return &error.package_name;
+    }
     match error.reason {
         PackageAdmissionReason::InvalidLocalManifest(_)
         | PackageAdmissionReason::UnsafeLocalPath(_) => "<local-package>",
