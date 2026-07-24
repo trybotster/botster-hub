@@ -29,7 +29,7 @@ Node-based first-party clients can consume the same checked artifact without a
 sibling hub checkout through the public package:
 
 ```sh
-npm install --save-dev @trybotster/hub-test-support@0.1.10
+npm install --save-dev @trybotster/hub-test-support@0.1.11
 ```
 
 ```js
@@ -68,9 +68,9 @@ when checked assets are stale. The metadata's protocol version and conformance
 fixture revision are emitted by the Rust `botster-hub-test-support` asset
 generator instead of being maintained independently in JavaScript.
 
-For version 0.1.10 from the public npm registry, npm-based client
+For version 0.1.11 from the public npm registry, npm-based client
 repos such as botster-web should use the exact dependency spec
-`"@trybotster/hub-test-support": "0.1.10"` in `devDependencies` and let npm write
+`"@trybotster/hub-test-support": "0.1.11"` in `devDependencies` and let npm write
 the corresponding package-lock entry from the public npm registry. The package
 is public, so registry install does not require a scoped `.npmrc` entry or CI
 auth token. After updating the lockfile, run the client smoke that imports the
@@ -178,7 +178,7 @@ but normal client reconciliation must not poll it or maintain a list-refresh
 fallback beside the entity stream.
 
 The shared revision-16 contract is published by
-`@trybotster/hub-test-support@0.1.10` as
+`@trybotster/hub-test-support@0.1.11` as
 `session-lifecycle-subscription-conformance-fixture.json` and through
 `readSessionLifecycleSubscriptionConformanceFixture()`. The fixture serializes
 the public `DaemonEntityFrame` DTOs and normalizes only timestamps and sequence
@@ -786,7 +786,7 @@ assert the same event ordering and classification. `AttachState` and
 
 Node clients can consume that exact JSON through
 `readLateAttachHistoryConformanceFixture()` from
-`@trybotster/hub-test-support@0.1.10`. Version 0.1.6 / conformance revision 13
+`@trybotster/hub-test-support@0.1.11`. Version 0.1.6 / conformance revision 13
 uses JSON number arrays for opaque history and is superseded because that shape
 unnecessarily expands large Ghostty snapshots on the bounded WebRTC response
 path. Version 0.1.5 / revision 12 still exposes lossy string history. Neither is
@@ -866,6 +866,13 @@ Both commands exercise `botster-hub-client` over the daemon socket, then
 `daemon_transport -> HubClientApi -> HubRuntime -> CoreDaemon`, and finally the
 worker-backed `SessionIo`/`ClientWorker` terminal path. The session counts are
 bounded correctness cases, not performance targets or benchmark claims.
+
+Adding the `refresh_local_packages` daemon request changes the request
+vocabulary, so `PROTOCOL_VERSION` advances to 3 alongside
+`CONFORMANCE_FIXTURE_REVISION` 18. This is a cold cut with no protocol-v2 parser
+or parallel fixture. Because `DaemonCompatibilityRequirement::current()`
+derives `minimum_protocol_version` from `PROTOCOL_VERSION`, clients built at
+this identity require a Hub at protocol version 3 or later.
 
 Replacing revision-13 JSON byte arrays with validated `payload_base64`, literal
 `payload_encoding: "base64"`, and decoded `bytes` fields increments
@@ -979,7 +986,7 @@ Node client tests should use the declared npm dependency instead of a relative
 hub checkout:
 
 ```sh
-npm install --save-dev @trybotster/hub-test-support@0.1.1
+npm install --save-dev @trybotster/hub-test-support@0.1.11
 ```
 
 ```js
@@ -994,7 +1001,7 @@ const fixturePath = materializePluginContractMatrixFixture(tempDirectory);
 
 Local environment variables may still point legacy drift checks at a checked-out
 hub artifact, but the normal web-client dependency coordinate is
-`@trybotster/hub-test-support@0.1.1` from the public npm registry.
+`@trybotster/hub-test-support@0.1.11` from the public npm registry.
 
 Each harness instance creates a disposable data directory and socket path under
 the configured test root, uses synthetic default hub identity, and attempts a

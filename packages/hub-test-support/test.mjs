@@ -27,10 +27,10 @@ import {
 } from "@trybotster/hub-test-support";
 
 assert.equal(metadata.package_name, "@trybotster/hub-test-support");
-assert.equal(metadata.package_version, "0.1.10");
+assert.equal(metadata.package_version, "0.1.11");
 assert.equal(metadata.protocol, "botster-hub-daemon-v1");
-assert.equal(metadata.protocol_version, 2);
-assert.equal(metadata.conformance_fixture_revision, 17);
+assert.equal(metadata.protocol_version, 3);
+assert.equal(metadata.conformance_fixture_revision, 18);
 assert.deepEqual(metadata.application_primitives, {
   fixture_package_name: "botster.plugin-contract-matrix",
   artifact_path: "fixtures/plugin-contract-matrix",
@@ -71,6 +71,7 @@ assert.match(protocol, /entity_upsert/);
 assert.match(protocol, /entity_patch/);
 assert.match(protocol, /entity_remove/);
 assert.match(protocol, /resync_reason/);
+assert.match(protocol, /refresh_local_packages/);
 
 assert.equal(
   fileURLToPath(import.meta.resolve("@trybotster/hub-test-support/session-lifecycle-subscription-conformance-fixture")),
@@ -111,7 +112,7 @@ assert.equal(
 );
 assert.equal(supportMatrix.supported_features.includes("terminal_readback"), true);
 
-assert.equal(sessionLifecycleFixture.conformance_fixture_revision, 17);
+assert.equal(sessionLifecycleFixture.conformance_fixture_revision, 18);
 assert.equal(sessionLifecycleFixture.entity_type, "session");
 assert.deepEqual(
   sessionLifecycleFixture.normalized_frames.map((frame) => frame.type),

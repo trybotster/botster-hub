@@ -1,29 +1,29 @@
 {
   "package_name": "@trybotster/hub-test-support",
-  "package_version": "0.1.10",
+  "package_version": "0.1.11",
   "protocol": "botster-hub-daemon-v1",
-  "protocol_version": 2,
-  "conformance_fixture_revision": 17,
+  "protocol_version": 3,
+  "conformance_fixture_revision": 18,
   "generated_by": "cargo run -p botster-hub-test-support --example node_package_assets",
   "daemon_protocol": {
     "artifact_path": "daemon-protocol.ts",
     "source_artifact_path": "crates/botster-hub-client/generated/daemon-protocol.ts",
-    "sha256": "67676b59e05f8273a0061f9905fb66a94ca7afde0fc4f27691d35d67d6df95d8"
+    "sha256": "39e9202bd333584be077e1d1ef5c3fa31a9409996607cb4c01471c103e263980"
   },
   "first_party_client_support_matrix": {
     "artifact_path": "first-party-client-support-matrix.json",
     "source_artifact_path": "botster_hub_test_support::first_party_client_support_matrix()",
-    "sha256": "47619789de48e536bcc5909a35c10f03aaf77b9c0b82ca4869a92562d0caae3a"
+    "sha256": "8162b3391daf72f3a5438e769847e27cf3830b71fc98c3955fe4821f009bbe69"
   },
   "session_lifecycle_subscription_conformance_fixture": {
     "artifact_path": "session-lifecycle-subscription-conformance-fixture.json",
     "source_artifact_path": "botster_hub_test_support::session_lifecycle_subscription_conformance_fixture_json()",
-    "sha256": "faecc37dd73c1489355fa3218f887e3cce09128bf07ed7ce010efc66b188c784"
+    "sha256": "964b63e9015868c4b979d8df9352d4fdebddc3fb64b7d658c00ad05c339c8fe0"
   },
   "late_attach_history_conformance_fixture": {
     "artifact_path": "late-attach-history-conformance-fixture.json",
     "source_artifact_path": "botster_hub_test_support::late_attach_history_conformance_fixture_json()",
-    "sha256": "119fe54d4e7e9567feffd8b2562afbb73ab663be72836174413da2fcef4cdfa9"
+    "sha256": "e449b03a0184211c33fb3b66c7206a8a9a6b1df9bd7013f63a638b19212eaebc"
   },
   "local_webrtc_delivery_chunk_conformance_fixture": {
     "artifact_path": "local-webrtc-delivery-chunk-conformance-fixture.json",
@@ -33,7 +33,7 @@
   "mode_flags_conformance_fixture": {
     "artifact_path": "mode-flags-conformance-fixture.json",
     "source_artifact_path": "botster_hub_test_support::mode_flags_conformance_fixture_json()",
-    "sha256": "210de3cd4ed22ffd13ee19a990b85337d849a10458f7ea2161d941d60bdebab1"
+    "sha256": "64d57fc096e4c4f8c571e38cfb56b118e942afef4a5a1334632473099006b908"
   },
   "plugin_contract_matrix": {
     "package_name": "botster.plugin-contract-matrix",
