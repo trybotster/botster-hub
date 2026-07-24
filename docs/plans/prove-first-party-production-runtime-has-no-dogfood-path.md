@@ -70,6 +70,10 @@ Loaded in the required order:
    - [[botster orchestration prompts must bind agents to explicit worktrees]]
    - [[plan agents must author vault context as wikilinks not home paths]]
    - [[vault example paths are not repository placement conventions]]
+   - [[botster-runtime-reviewer-playbook]]
+   - [[botster-package-reviewer-playbook]]
+   - [[botster-runtime-verifier-playbook]]
+   - [[botster-package-verifier-playbook]]
 5. [[project-pipelines-playbook]], because this run uses Project Pipelines gates,
    artifacts, questions, and checklists and the acceptance stack includes the
    first-party Project Pipelines package.
@@ -144,7 +148,8 @@ to produce durable evidence:
    launcher. Require explicit repository/package coordinates and expected
    revisions for Hub, Core, Web, TUI, TUI Kit, Workspaces, and Project
    Pipelines. Reject dirty, non-Git, or revision-mismatched inputs before
-   starting processes.
+   starting processes. Preflight Ruby 2.7 or newer with an exact installation
+   remediation before using the stdlib-only evidence helper.
 3. Before any expensive build or Web runtime leg, gate every artifact-coupled
    first-party seam against the exact upstream source of truth. For
    `@trybotster/hub-test-support`, install the declared registry coordinate in a
@@ -211,9 +216,23 @@ to produce durable evidence:
         `BOTSTER_WEB_DOGFOOD_*`, `VITE_BOTSTER_REAL_HUB_DOGFOOD`, and
         `?dogfood=`; do not broadly reject `BOTSTER_HUB_SOCKET`, whose
         session-template and generic environment-map uses remain valid;
-      - hard-coded ports: start two isolated current Web package runtimes while
-        the historical fixed port is occupied and require distinct nonzero
-        structured `local_url` ports plus passing health/UI checks;
+      - dynamic ports: without a port override, start two isolated current Web
+        package runtimes concurrently and require distinct nonzero ports in
+        their structured `local_url` results plus passing `/health` and HTML
+        shell checks. This is the load-bearing no-hard-coded-port assertion;
+      - retired fixed-port control: occupy port `41739`, the fixed port named by
+        the Web productionization ticket, while running the dynamic proof. This
+        is a secondary negative control, not the source of the dynamic-binding
+        claim. Do not use `5173` as product provenance; it comes from the stale
+        Hub README example that this ticket removes;
+      - explicit port override: choose an available nonzero port, launch the
+        current supervised Web package with
+        `BOTSTER_WEB_PACKAGE_SERVER_PORT=<port>`, require structured
+        `local_url` to report exactly that port, and require `/health` plus the
+        HTML shell to pass. Then launch with a non-integer or out-of-range value
+        and require the package-owned `invalid_package_server_port` diagnostic
+        instead of fallback. Record the environment name plus both dynamic and
+        explicit ports in the evidence bundle;
       - sibling paths: reject runtime/script/manifest discovery through
         `../botster-*`; every checkout/package path comes from explicit harness
         input;
@@ -229,6 +248,15 @@ to produce durable evidence:
         no `packages reload` or manual file edit may intervene.
     Every silent matcher must preserve diagnostics, distinguish “no matches”
     from command failure, and run a known-positive control for its scope.
+12. Correct the stale runnable-entrypoint operator contract in `README.md`.
+    Replace the old `kind: web` / `mode: dev` /
+    `BOTSTER_WEB_PORT=5173` example with the current `web_app`,
+    `launch_mode: background`, required structured `hub_connection` injection,
+    empty manifest environment, `readiness.result_fields: ["local_url"]`, and
+    `may_supervise: true` shape. Delete the obsolete claim that entrypoints are
+    always `not_started` and are not spawned, supervised, restarted, or
+    health-checked. This is cleanup required by the ticket's current
+    operator-documentation acceptance surface, not adjacent documentation work.
 
 ## Non-Scope
 
@@ -291,6 +319,11 @@ to produce durable evidence:
   exact current main, and proceed through normal Implement, Review, and Verify.
   Do not restart or rewrite already-completed work; prior evidence cannot
   substitute for fresh current-run acceptance.
+- Assumption and explicit execution prerequisite: preserve the existing
+  stdlib-only Ruby evidence helper rather than rewrite prior completed work.
+  The harness requires Ruby 2.7 or newer for `filter_map`; it adds no gem. It
+  must fail before builds with an exact Ruby installation/version remediation,
+  and `README.md` must document that prerequisite beside the acceptance command.
 - Assumption: a repository's supported locked build is authoritative. The run
   records both the top-level current-main SHA and resolved first-party
   dependency SHAs, except that artifact-coupled seams additionally require
@@ -316,10 +349,14 @@ Existing Hub-owned implementation to preserve and integrate:
 - `script/test-production-package-runtime`
   - expand from fresh Web/TUI smoke to revision-pinned seven-repository
     orchestration, fresh/upgrade legs, four-package install/refresh, supported
-    Web/TUI live proofs, evidence capture, and complete cleanup.
+    Web/TUI live proofs, dynamic and explicit Web-port proofs, Ruby preflight,
+    evidence capture, and complete cleanup.
 - `README.md`
   - document the final explicit-path acceptance command, evidence contract,
-    fresh/upgrade coverage, and supported product-surface audit boundary.
+    Ruby 2.7+ prerequisite, fresh/upgrade coverage, and supported
+    product-surface audit boundary; replace the stale runnable-entrypoint
+    example and obsolete no-supervision claim with the current production
+    contract.
 - `docs/client-protocol.md`
   - update the cross-repository production-runtime proof only if its current
     acceptance description becomes inaccurate.
@@ -370,6 +407,17 @@ Expected unchanged unless the acceptance run finds an actual Hub-owned defect:
 - A fixed sleep can make a false readiness claim. Mitigation: wait on protocol
   handshake, structured app state/URL/health, session lifecycle, terminal
   markers, browser events, or process exit with bounded deadlines.
+- An explicit Web port can silently fall back to dynamic binding or accept an
+  invalid value while the default-path smoke stays green. Mitigation: prove the
+  exact `BOTSTER_WEB_PACKAGE_SERVER_PORT` value in structured `local_url` plus
+  health/UI, and prove invalid input emits `invalid_package_server_port`.
+- The retained Ruby helper is a new repository execution prerequisite.
+  Mitigation: keep it stdlib-only, require Ruby 2.7+, preflight before builds
+  with exact remediation, document it beside the command, and run `ruby -c`.
+- A literal vocabulary scan can miss stale current operator guidance that uses
+  different old contract names. Mitigation: correct the known
+  `BOTSTER_WEB_PORT=5173`/no-supervision README section and keep the separate
+  Rules evidence matrix for old environments, ports, and runtime claims.
 - Broad text matching can either miss renamed identifiers or block historical
   plan artifacts intentionally retained. Mitigation: codify the human-approved
   include/exclude set and print every scanned repository/path class.
@@ -384,12 +432,16 @@ Plan/implementation static gates:
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
 - `./test.sh`
-- shell syntax check for every changed executable script
+- `sh -n script/test-production-package-runtime`
+- `ruby -c script/production-package-runtime-evidence`
+- Ruby 2.7+ preflight negative and positive checks, including the exact missing
+  or too-old interpreter remediation
 - the seven-repository product-surface vocabulary audit, with the approved
   history exclusions printed in evidence
 - the separate Rules evidence matrix for aliases/modes, targeted old
-  environment/query tokens, dynamic ports, sibling paths, dependency overrides,
-  readiness predicates, and automatic refresh
+  environment/query tokens, two-runtime dynamic ports, the `41739` retired-port
+  control, `BOTSTER_WEB_PACKAGE_SERVER_PORT` success/failure, sibling paths,
+  dependency overrides, readiness predicates, and automatic refresh
 - a PII/path-neutrality scan over the full committed diff and evidence bundle
 
 Focused Hub regression gates if the production script or docs are the only
@@ -435,12 +487,18 @@ Cross-repository final proof:
    - `smoke` success;
    - `down` success, no responding owned Hub socket, and no owned child left
      alive; teardown must refuse unrecorded sockets/PIDs.
-11. Re-snapshot the operator default Botster state root and require identical
+11. In the fresh leg, additionally require two concurrent default-configured
+    Web runtimes to publish distinct nonzero structured ports while `41739` is
+    occupied; require one explicitly configured
+    `BOTSTER_WEB_PACKAGE_SERVER_PORT` to publish and serve that exact port; and
+    require invalid override input to fail with
+    `invalid_package_server_port`, never dynamic fallback.
+12. Re-snapshot the operator default Botster state root and require identical
     metadata/content. Record both fixture data directories and socket paths so
     Verify can audit isolation without rerunning.
-12. Run the vocabulary audit, Rules evidence matrix, and committed-artifact PII
+13. Run the vocabulary audit, Rules evidence matrix, and committed-artifact PII
     scan with valid exit-status handling and known-positive controls.
-13. Attach the exact command log, revision manifest, and summarized report to the
+14. Attach the exact command log, revision manifest, and summarized report to the
    Project Pipelines run. Code existence, source regexes, or an unrun command do
    not satisfy this gate.
 
@@ -452,18 +510,29 @@ Cross-repository final proof:
   Implement. The seven registered dependencies are closed.
 - Implement: commit the bounded Hub changes, link the PR, attach the
   implementation report, revision manifest, and command/evidence bundle.
-- Review: reject compatibility scaffolding, external-repo fixes, hard-coded
-  coordinates, timing-only readiness, incomplete cleanup, or code-only proof.
-- Verify: rerun or independently inspect both fresh and upgrade live evidence,
-  recheck every finding against the live worktree, and verify the product-surface
-  scan across all seven exact revisions.
+- Review: load [[botster-runtime-reviewer-playbook]] for daemon
+  startup/reuse/restart/adoption/shutdown and terminal lifecycle proof, plus
+  [[botster-package-reviewer-playbook]] for package
+  install/enable/refresh/supervision/readiness and plugin-worker proof. Reject
+  compatibility scaffolding, external-repo fixes, hard-coded coordinates,
+  timing-only readiness, incomplete cleanup, or code-only proof.
+- Verify: load [[botster-runtime-verifier-playbook]] and
+  [[botster-package-verifier-playbook]], rerun or independently inspect both
+  fresh and upgrade live evidence, recheck every finding against the live
+  worktree, and verify the product-surface scan across all seven exact
+  revisions.
 
 ## Convention Conflicts
 
-None. The plan keeps host-profile integration proof in Hub, keeps product
-workflow policy in packages, uses repository-supported locked builds, uses
-universal Git/filesystem/script primitives, performs a cold-turkey audit, avoids
-local dependency overrides, and requires exact production entrypoint proof.
+No architecture convention conflicts. The plan keeps host-profile integration
+proof in Hub, keeps product workflow policy in packages, uses
+repository-supported locked builds, uses universal Git/filesystem/script
+primitives, performs a cold-turkey audit, avoids local dependency overrides,
+and requires exact production entrypoint proof. The retained Ruby helper is a
+deliberate new repo execution prerequisite, not a new framework or gem: keeping
+the stdlib-only existing implementation follows the binding reuse decision,
+while preflight, documentation, version pinning, and `ruby -c` make the
+operational cost explicit.
 
 ## Vault Gaps Worth Capturing
 
