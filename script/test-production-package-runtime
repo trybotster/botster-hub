@@ -93,6 +93,17 @@ if [ -n "$hub_bin" ] || [ -n "$session_worker_bin" ]; then
   [ -n "$hub_bin" ] && [ -n "$session_worker_bin" ] || usage
 fi
 
+ruby_remediation="Install Ruby 2.7 or newer and ensure the ruby executable is on PATH."
+if ! command -v ruby >/dev/null 2>&1; then
+  echo "Ruby 2.7 or newer is required. $ruby_remediation" >&2
+  exit 69
+fi
+ruby_version=$(ruby -e 'print RUBY_VERSION')
+if ! ruby -e 'parts = RUBY_VERSION.split(".").map(&:to_i); exit(parts[0] > 2 || (parts[0] == 2 && parts[1] >= 7) ? 0 : 1)'; then
+  echo "Ruby 2.7 or newer is required; found $ruby_version. $ruby_remediation" >&2
+  exit 69
+fi
+
 canonical_dir() {
   [ -d "$1" ] || {
     echo "repository directory does not exist: $1" >&2
@@ -209,6 +220,26 @@ capture_in() {
     cat "$evidence_dir/$capture_in_label.log" >&2
     return "$capture_in_status"
   fi
+}
+
+capture_expected_failure() {
+  capture_failure_label=$1
+  capture_failure_pattern=$2
+  shift 2
+  capture_failure_raw=$runtime_root/$capture_failure_label.raw
+  printf '%s\n' "$*" >>"$raw_commands"
+  refresh_command_log
+  if "$@" >"$capture_failure_raw" 2>&1; then
+    redact_file "$capture_failure_raw" "$evidence_dir/$capture_failure_label.log"
+    echo "command unexpectedly succeeded: $*" >&2
+    return 1
+  fi
+  redact_file "$capture_failure_raw" "$evidence_dir/$capture_failure_label.log"
+  grep -q "$capture_failure_pattern" "$capture_failure_raw" || {
+    cat "$evidence_dir/$capture_failure_label.log" >&2
+    echo "expected failure did not include $capture_failure_pattern" >&2
+    return 1
+  }
 }
 
 validate_revision() {
@@ -465,14 +496,17 @@ down_runtime_leg() {
 }
 
 if [ "$mode" = fresh ] || [ "$mode" = all ]; then
-  ruby -rsocket -e 'server = TCPServer.new("127.0.0.1", 5173); loop { socket = server.accept; socket.close }' \
+  retired_fixed_port=41739
+  ruby -rsocket -e 'server = TCPServer.new("127.0.0.1", Integer(ARGV.fetch(0))); loop { socket = server.accept; socket.close }' \
+    "$retired_fixed_port" \
     >"$runtime_root/fixed-port.log" 2>&1 &
   fixed_port_pid=$!
   attempts=0
-  until ruby -rsocket -e 'socket = TCPSocket.new("127.0.0.1", 5173); socket.close' >/dev/null 2>&1; do
+  until ruby -rsocket -e 'socket = TCPSocket.new("127.0.0.1", Integer(ARGV.fetch(0))); socket.close' \
+    "$retired_fixed_port" >/dev/null 2>&1; do
     attempts=$((attempts + 1))
     [ "$attempts" -lt 100 ] || {
-      echo "historical fixed-port control did not bind" >&2
+      echo "retired fixed-port control did not bind: $retired_fixed_port" >&2
       exit 1
     }
     sleep 0.05
@@ -492,16 +526,45 @@ if [ "$mode" = fresh ] || [ "$mode" = all ]; then
   }
   for url in "$fresh_web_url" "$second_web_url"; do
     port=$(printf '%s' "$url" | sed -E 's#^https?://[^:]+:([0-9]+).*$#\1#')
-    [ "$port" != 5173 ] && [ "$port" -gt 0 ] || {
-      echo "Web package runtime reused the occupied historical fixed port: $url" >&2
+    [ "$port" != "$retired_fixed_port" ] && [ "$port" -gt 0 ] || {
+      echo "Web package runtime reused the occupied retired fixed port: $url" >&2
       exit 1
     }
   done
   capture dynamic-port-health curl --fail --silent --show-error \
     "$(printf '%s' "$second_web_url" | sed -E 's#^(https?://[^/]+).*$#\1#')/health"
   grep -q '"ok":true' "$runtime_root/dynamic-port-health.raw"
+  capture dynamic-port-html curl --fail --silent --show-error "$second_web_url"
+  grep -qi '<html' "$runtime_root/dynamic-port-html.raw"
   assert_owned_socket "$second_data" >/dev/null
   down_runtime_leg dynamic-port "$second_data"
+
+  explicit_port=$(ruby -rsocket -e 'server = TCPServer.new("127.0.0.1", 0); print server.addr[1]; server.close')
+  explicit_data=$runtime_root/explicit-port-data
+  install_current_packages explicit-port "$explicit_data" "$web_repo" "$tui_repo" "$workspaces_repo" "$project_pipelines_repo"
+  capture explicit-port-up env BOTSTER_WEB_PACKAGE_SERVER_PORT="$explicit_port" \
+    "$hub_bin" up --data-dir "$explicit_data" --session-worker-bin "$session_worker_bin"
+  explicit_web_url=$(sed -n 's/^web=//p' "$runtime_root/explicit-port-up.raw" | tail -1)
+  explicit_web_port=$(printf '%s' "$explicit_web_url" | sed -E 's#^https?://[^:]+:([0-9]+).*$#\1#')
+  [ "$explicit_web_port" = "$explicit_port" ] || {
+    echo "Web package runtime did not honor BOTSTER_WEB_PACKAGE_SERVER_PORT=$explicit_port: $explicit_web_url" >&2
+    exit 1
+  }
+  capture explicit-port-health curl --fail --silent --show-error \
+    "$(printf '%s' "$explicit_web_url" | sed -E 's#^(https?://[^/]+).*$#\1#')/health"
+  grep -q '"ok":true' "$runtime_root/explicit-port-health.raw"
+  capture explicit-port-html curl --fail --silent --show-error "$explicit_web_url"
+  grep -qi '<html' "$runtime_root/explicit-port-html.raw"
+  printf 'environment=BOTSTER_WEB_PACKAGE_SERVER_PORT\ndynamic_urls=%s,%s\nexplicit_port=%s\nexplicit_url=%s\nretired_fixed_port=%s\n' \
+    "$fresh_web_url" "$second_web_url" "$explicit_port" "$explicit_web_url" "$retired_fixed_port" \
+    >"$evidence_dir/web-port-proof.txt"
+  down_runtime_leg explicit-port "$explicit_data"
+
+  invalid_port_data=$runtime_root/invalid-port-data
+  install_current_packages invalid-port "$invalid_port_data" "$web_repo" "$tui_repo" "$workspaces_repo" "$project_pipelines_repo"
+  capture_expected_failure invalid-port-up invalid_package_server_port \
+    env BOTSTER_WEB_PACKAGE_SERVER_PORT=not-a-port \
+    "$hub_bin" up --data-dir "$invalid_port_data" --session-worker-bin "$session_worker_bin"
 
   capture_in web-live-browser "$web_repo" env \
     BOTSTER_HUB_BIN="$hub_bin" \

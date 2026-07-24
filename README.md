@@ -336,6 +336,10 @@ script/test-production-package-runtime \
   --evidence-dir /path/to/new-evidence-directory
 ```
 
+The cross-repository acceptance script requires Ruby 2.7 or newer and uses only
+Ruby's standard library. It checks the interpreter before building artifacts and
+prints an installation/version remediation when the prerequisite is missing.
+
 The first test proves the persisted-package CLI path. The explicit-coordinate
 script rejects dirty or revision-mismatched repositories before starting a
 process. It first installs Web's declared Hub test-support release in a clean
@@ -346,13 +350,13 @@ source and Web's vendored protocol.
 The default `--mode all` then runs fresh and upgrade acceptance. The fresh leg
 installs and enables Web, TUI, Workspaces, and Project Pipelines through the
 public package commands. It proves structured dynamic Web readiness while the
-historical fixed port is occupied, browser/WebRTC session and reconnect
-behavior, the package-launched headless TUI path, registered plugin tools,
-status, doctor, smoke, and owned-process cleanup. The upgrade leg creates its
-fixture with exact pre-cutover revisions in temporary Git worktrees, advances
-only those package worktrees, and lets current `up` refresh the untouched
-durable state without a manual reload. It also proves daemon restart and
-worker-backed session adoption.
+retired fixed port is occupied, an explicit Web port override and invalid-port
+rejection, browser/WebRTC session and reconnect behavior, the package-launched
+headless TUI path, registered plugin tools, status, doctor, smoke, and
+owned-process cleanup. The upgrade leg creates its fixture with exact
+pre-cutover revisions in temporary Git worktrees, advances only those package
+worktrees, and lets current `up` refresh the untouched durable state without a
+manual reload. It also proves daemon restart and worker-backed session adoption.
 
 The new evidence directory contains path-neutral revisions, commands, artifact
 hashes, operator-state before/after manifests, fresh and upgrade endpoints,
@@ -937,14 +941,14 @@ entrypoints before registry mutation. Enabled local records can be prepared into
 canonical entrypoint paths for the core lifecycle adapter.
 
 `entrypoints` remains the core plugin/provider code-load contract. Runnable
-local/dev process declarations live under `runnable_entrypoints` so clients,
-launchers, and future marketplace tooling share one discovery shape without
-changing plugin loading semantics. Each runnable entrypoint declares a stable
-`id`, `kind` (`client`, `web`, `mcp`, `daemon`, or `provider`), `command`,
-`args`, `working_directory`, declarative `environment` requirements, `mode`
-(`dev` or `local`), capability needs, `may_supervise`, and a static process DTO.
-Current process state is always `not_started`; this slice does not spawn,
-supervise, restart, or health-check runnable entrypoints.
+process declarations live under `runnable_entrypoints` so clients, launchers,
+and future marketplace tooling share one discovery shape without changing
+plugin loading semantics. Each runnable entrypoint declares a stable `id`,
+`kind` (`web_app` or `terminal_app`), `command`, `args`, `working_directory`,
+structured `injections`, declarative `environment` requirements, `launch_mode`
+(`background` or `foreground_stdio`), structured `readiness`, capability needs,
+and `may_supervise`. The Hub admits, launches, supervises, health-checks,
+restarts, and projects these entrypoints through the installed-app API.
 
 Local path manifest example:
 
@@ -965,19 +969,23 @@ Local path manifest example:
   "runnable_entrypoints": [
     {
       "id": "web-client",
-      "kind": "web",
-      "command": "bin/botster-web",
-      "args": ["--host", "127.0.0.1"],
+      "kind": "web_app",
+      "launch_mode": "background",
+      "command": "node",
+      "args": ["scripts/local-package-server.mjs"],
       "working_directory": { "policy": "package_root" },
-      "environment": [
+      "injections": [
         {
-          "name": "BOTSTER_WEB_PORT",
-          "required": false,
-          "default": "5173",
-          "description": "Local botster-web dev server port"
+          "kind": "hub_connection",
+          "target": {
+            "type": "environment",
+            "name": "BOTSTER_HUB_CONNECTION"
+          },
+          "required": true
         }
       ],
-      "mode": "dev",
+      "environment": [],
+      "readiness": { "result_fields": ["local_url"] },
       "capabilities": [
         { "surface": "network", "scope": "localhost" }
       ],

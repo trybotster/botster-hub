@@ -249,6 +249,10 @@ to produce durable evidence:
     Every silent matcher must preserve diagnostics, distinguish “no matches”
     from command failure, and run a known-positive control for its scope.
 12. Correct the stale runnable-entrypoint operator contract in `README.md`.
+    Correct the introductory field summary so it names only `web_app` and
+    `terminal_app`, uses `launch_mode` with `background` and
+    `foreground_stdio`, and includes the structured `injections` and
+    `readiness` fields.
     Replace the old `kind: web` / `mode: dev` /
     `BOTSTER_WEB_PORT=5173` example with the current `web_app`,
     `launch_mode: background`, required structured `hub_connection` injection,
