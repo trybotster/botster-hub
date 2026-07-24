@@ -1749,6 +1749,7 @@ fn restart_running_package_entrypoints(
 fn refresh_local_packages_response(
     daemon: &mut HubDaemon,
 ) -> DaemonTransportResult<DaemonResponse> {
+    let previous_packages = daemon.package_registry().clone();
     let running_entrypoints = daemon
         .entrypoint_supervisor()
         .snapshots()
@@ -1774,11 +1775,51 @@ fn refresh_local_packages_response(
             reload_package_after_reload(daemon, &decision.package_name)?;
         }
         if let Some(entrypoint_ids) = running_entrypoints.get(&decision.package_name) {
-            restart_running_package_entrypoints(daemon, &decision.package_name, entrypoint_ids)?;
+            let changed_entrypoint_ids = entrypoint_ids
+                .iter()
+                .filter(|entrypoint_id| {
+                    runnable_entrypoint_definition_changed(
+                        &previous_packages,
+                        daemon.package_registry(),
+                        &decision.package_name,
+                        entrypoint_id,
+                    )
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            restart_running_package_entrypoints(
+                daemon,
+                &decision.package_name,
+                &changed_entrypoint_ids,
+            )?;
         }
     }
 
     list_packages_response(daemon)
+}
+
+fn runnable_entrypoint_definition_changed(
+    previous_packages: &PackageRegistry,
+    refreshed_packages: &PackageRegistry,
+    package_name: &str,
+    entrypoint_id: &str,
+) -> bool {
+    let Some(previous) = previous_packages.package(package_name) else {
+        return true;
+    };
+    let Some(refreshed) = refreshed_packages.package(package_name) else {
+        return true;
+    };
+    let previous_entrypoint = previous
+        .runnable_entrypoints
+        .iter()
+        .find(|entrypoint| entrypoint.id == entrypoint_id);
+    let refreshed_entrypoint = refreshed
+        .runnable_entrypoints
+        .iter()
+        .find(|entrypoint| entrypoint.id == entrypoint_id);
+
+    previous.manifest != refreshed.manifest || previous_entrypoint != refreshed_entrypoint
 }
 
 fn list_packages_response(daemon: &mut HubDaemon) -> DaemonTransportResult<DaemonResponse> {

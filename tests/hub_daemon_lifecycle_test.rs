@@ -3684,6 +3684,34 @@ fn cli_local_runtime_up_starts_reuses_and_down_stops_runtime() {
         );
     }
 
+    let unchanged = run_local_runtime_up(
+        &data_dir,
+        &project_pipelines_package_dir,
+        &web_package_dir,
+        &tui_package_dir,
+        &workspaces_package_dir,
+        web_listener_port,
+    );
+    assert!(
+        unchanged.status.success(),
+        "unchanged up failed: {}",
+        command_output_text(&unchanged)
+    );
+    let unchanged_text = command_output_text(&unchanged);
+    assert!(unchanged_text.contains("daemon=reused"));
+    let first_web_url = first_text
+        .lines()
+        .find_map(|line| line.strip_prefix("web="))
+        .expect("first up output includes Web URL");
+    let unchanged_web_url = unchanged_text
+        .lines()
+        .find_map(|line| line.strip_prefix("web="))
+        .expect("unchanged up output includes Web URL");
+    assert_eq!(
+        unchanged_web_url, first_web_url,
+        "unchanged up should preserve the running Web entrypoint and structured URL"
+    );
+
     rewrite_botster_web_entrypoint(
         &web_package_dir,
         "1.1.0",
