@@ -4,7 +4,7 @@
 
 - Target repository: `botster-hub` (`trybotster/botster-hub`).
 - Target id: `tgt_7e208a0c76a44980a83b63af976b1f22`.
-- Pipeline ticket: `ticket_1784912420_977096`; run
+- Preparation ticket: `ticket_1784912420_977096`; run
   `run_1784912505_507667`.
 - Target routing was resolved from the admitted Botster spawn-target registry,
   not inferred from the process working directory. At Plan time, this worktree,
@@ -54,6 +54,14 @@
   publication child ticket/run pinned to that exact merge commit. The child
   owns publication, human 2FA coordination, registry install/proof,
   live-daemon identity capture, and durable final release evidence.
+- Human clarification `question_1784914707_524559`: this ticket is
+  preparation-only and may auto-close when its linked PR merges. Publication
+  ticket `ticket_1784916883_931144` was created in advance and depends on this
+  preparation ticket. After merge, the product orchestrator starts its
+  Botster Stack run pinned to the exact merge SHA. Web ticket
+  `ticket_1784912421_508855` and final integration ticket
+  `ticket_1784854143_789468` now depend on the publication ticket, so source
+  merge cannot unblock artifact consumers.
 
 ## Scope
 
@@ -80,15 +88,18 @@
 6. In this PR run, verify the complete packed tarball in a clean temporary
    consumer, record exact release commands, and persist a release-preparation
    report. Do not run `npm publish` from the branch.
-7. After this reviewed PR merges, create a post-merge publication child ticket
-   and run against the `botster-hub` target, pinned to the exact merge commit.
-   That child rechecks registry uniqueness, captures live Hub identity, runs
+7. Publication ticket `ticket_1784916883_931144` is already routed to the
+   `botster-hub` target and depends on this preparation ticket. After this
+   reviewed PR merges, the product orchestrator starts its run pinned to the
+   exact merge commit. That run rechecks registry uniqueness, captures live
+   Hub identity, runs
    `npm publish --access public`, waits for human 2FA/publication confirmation
    when required, installs the registry coordinate externally, and proves all
    hashes and identities.
-8. Make final integration, including existing Web consumer ticket
-   `ticket_1784912421_508855`, depend on the publication child rather than
-   treating the preparation PR as a consumable release.
+8. Preserve the registered dependency routing: existing Web consumer ticket
+   `ticket_1784912421_508855` and final integration ticket
+   `ticket_1784854143_789468` depend on publication ticket
+   `ticket_1784916883_931144`, not this preparation ticket.
 
 ## Non-scope
 
@@ -116,8 +127,9 @@
   authoritative generated TypeScript protocol.
 - `botster-hub` owns the Rust-backed Node asset pipeline, npm package contents,
   release documentation, and public registry publication. This PR run owns
-  release preparation; a Hub-targeted post-merge child owns publication and
-  final registry proof from the exact merge commit.
+  release preparation; separately registered Hub publication ticket
+  `ticket_1784916883_931144` owns publication and final registry proof from the
+  exact merge commit.
 - `botster-hub-test-support` must derive compatibility values from
   `botster_hub_client`; it must not introduce duplicate version literals as a
   second source of truth.
@@ -127,10 +139,11 @@
   run. The external clean-Node smoke is required producer proof. Existing
   botster-web ticket `ticket_1784912421_508855`, routed to target
   `tgt_40abcf71ccf049f4ac0c99953a799869`, already depends on this Hub ticket
-  and consumes the published coordinate, hashes, and conformance identity. Once
-  the publication child exists, make Web's final integration depend on that
-  child so a merged preparation PR alone cannot unblock it. Do not create a
-  duplicate Web ticket. Route a separate botster-tui ticket to target
+  and consumes the published coordinate, hashes, and conformance identity. It
+  now depends on publication ticket `ticket_1784916883_931144`; final
+  integration ticket `ticket_1784854143_789468` also depends on that
+  publication ticket, so a merged preparation PR alone cannot unblock either.
+  Do not create a duplicate Web ticket. Route a separate botster-tui ticket to target
   `tgt_c3d470bab78549df920a41e8fb0e58d8` only if its repository still has pinned
   literals, vendored protocol drift, or missing release consumption without
   existing ticket coverage.
@@ -141,9 +154,10 @@
   `18`, based on main and public registry evidence at Plan time. They are
   preflight defaults, not permission to reuse an occupied identity.
 - Publication must be generated from and attributed to one exact merged Hub
-  SHA. The current PR run does not publish. Its merge triggers creation of a
-  post-merge Hub child run pinned to that merge commit; the child verifies a
-  clean checkout and exact `origin/main` identity before `npm publish`.
+  SHA. The current PR run does not publish. Its merge unblocks publication
+  ticket `ticket_1784916883_931144`; the product orchestrator starts that
+  ticket's run pinned to the merge commit, and the run verifies a clean
+  checkout and exact `origin/main` identity before `npm publish`.
 - The repository-supported generator may update every fixture carrying the
   conformance identity even when its semantic body is otherwise unchanged.
   Those derived changes are in scope; unrelated manual fixture edits are not.
@@ -180,10 +194,11 @@
 6. Pack and install the tarball in a clean consumer outside the repository.
    Verify assets, token, identities, and hashes, and commit the preparation
    report. Do not publish from this branch.
-7. Complete Review and Verify, merge the PR, then create a Hub-targeted
-   publication child ticket/run whose base is pinned to that exact merge SHA.
-   Register the final Web integration dependency against the child.
-8. In the clean child checkout, rerun identity/generation/package gates, capture
+7. Complete Review and Verify, then merge the PR. The merge closes this
+   preparation ticket and unblocks the already-created Hub publication ticket
+   `ticket_1784916883_931144`; the product orchestrator starts its run with a
+   base pinned to that exact merge SHA.
+8. In the clean publication-run checkout, rerun identity/generation/package gates, capture
    real Hub status, publish (waiting for human 2FA confirmation if necessary),
    install the public coordinate in a fresh consumer, verify registry metadata,
    and attach durable final release evidence.
@@ -275,11 +290,13 @@
    contents, the exact intended publish command, and the explicit statement
    that no npm publication occurred from the branch.
 
-### Post-merge publication child gates
+### Post-merge publication ticket gates
 
-9. After Review/Verify and merge, create a child ticket/run on target
-   `tgt_7e208a0c76a44980a83b63af976b1f22`, pinned to the exact merge commit.
-   Require `git rev-parse HEAD origin/main` equality and a clean checkout.
+9. Publication ticket `ticket_1784916883_931144` is registered on target
+   `tgt_7e208a0c76a44980a83b63af976b1f22` and depends on this preparation
+   ticket. After Review/Verify and merge, the product orchestrator starts its
+   run pinned to the exact merge commit. Require
+   `git rev-parse HEAD origin/main` equality and a clean checkout.
 10. Recheck npm uniqueness, rerun generator check/focused package tests, and
     capture the real Hub `up`/status output showing
     `protocol=botster-hub-daemon-v1`, `protocol_version=3`, and
@@ -308,9 +325,10 @@
     `sync-assets.mjs` ->
     packed/published npm files -> clean external import. Generated file
     existence alone is not sufficient.
-17. Make existing Web consumer ticket `ticket_1784912421_508855` depend on the
-    publication child before final integration advances. Do not treat this
-    preparation PR or its tarball smoke as the consumable release.
+17. Verify existing Web consumer ticket `ticket_1784912421_508855` and final
+    integration ticket `ticket_1784854143_789468` still depend on publication
+    ticket `ticket_1784916883_931144` before final integration advances. Do not
+    treat this preparation PR or its tarball smoke as the consumable release.
 
 ## Pipeline artifacts and gates
 
@@ -321,7 +339,8 @@
   generated diff, focused/full gate output, tarball contents/hash, clean local
   tarball consumer output, preparation report, and exact post-merge commands.
   It must explicitly attest that no npm publication occurred from the branch.
-- The post-merge publication child owns exact merge SHA, live-daemon output,
+- Publication ticket `ticket_1784916883_931144` and its post-merge run own
+  exact merge SHA, live-daemon output,
   publish command/result, human 2FA coordination, npm registry metadata, clean
   public-consumer output, hashes, and durable final release evidence.
 - Review and Verify must load Hub, hub-client, runtime, and package surfaces;
