@@ -239,7 +239,7 @@ fn enable_synthetic_package_by_name(data_dir: &Path) {
         .arg("enable")
         .arg("--data-dir")
         .arg(data_dir)
-        .arg("dogfood.synthetic-plugin")
+        .arg("runtime.synthetic-plugin")
         .output()
         .expect("run botster-hub packages enable by name");
     assert!(
@@ -340,7 +340,7 @@ fn mcp_serve_lists_and_calls_loaded_lua_plugin_tool_through_daemon_runtime() {
                 "id": 3,
                 "method": "tools/call",
                 "params": {
-                    "name": "dogfood.synthetic.echo",
+                    "name": "runtime.synthetic.echo",
                     "arguments": { "message": "mcp-daemon" }
                 }
             }),
@@ -356,11 +356,11 @@ fn mcp_serve_lists_and_calls_loaded_lua_plugin_tool_through_daemon_runtime() {
         .filter_map(|tool| tool.get("name").and_then(Value::as_str))
         .collect::<Vec<_>>();
     assert!(tool_names.contains(&"hub.status"));
-    assert!(tool_names.contains(&"dogfood.synthetic.echo"));
+    assert!(tool_names.contains(&"runtime.synthetic.echo"));
     assert_eq!(
         tool_names
             .iter()
-            .filter(|name| **name == "dogfood.synthetic.echo")
+            .filter(|name| **name == "runtime.synthetic.echo")
             .count(),
         1
     );

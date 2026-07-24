@@ -1,4 +1,4 @@
-# Add Real Dev-Stack Acceptance Smoke For First-Party Plugins
+# Add Real Local runtime Acceptance Smoke For First-Party Plugins
 
 ## Context Loaded
 
@@ -11,9 +11,9 @@
 
 ## Scope
 
-- Add one hub-side acceptance smoke, preferably in `tests/hub_daemon_lifecycle_test.rs`, that composes the existing real runtime paths instead of creating dogfood-only shims.
+- Add one hub-side acceptance smoke, preferably in `tests/hub_daemon_lifecycle_test.rs`, that composes the existing real runtime paths instead of creating production runtime-only shims.
 - The smoke should:
-  - bootstrap or attach to a persistent local dev hub through `botster-hub dev-stack bootstrap`;
+  - bootstrap or attach to a persistent local dev hub through `botster-hub local runtime bootstrap`;
   - install/enable local first-party packages from configured paths: `project-pipelines`, `botster-web`, `botster-tui`, and `botster-workspaces`;
   - verify the web app descriptor and `apps open botster-web/web-client` URL against the daemon-resolved app row;
   - verify the TUI app descriptor or launch contract through `apps open botster-tui`, without relying on the removed `botster-hub tui` alias;
@@ -35,16 +35,16 @@
 
 ## Assumptions And Unknowns
 
-- Assumption: "first-party plugins" means the locally configured first-party package paths named by `dev-stack bootstrap`: `project-pipelines`, `botster-web`, `botster-tui`, and `botster-workspaces`.
+- Assumption: "first-party plugins" means the locally configured first-party package paths named by the removed bootstrap command: `project-pipelines`, `botster-web`, `botster-tui`, and `botster-workspaces`.
 - Assumption: "open web and TUI app entrypoints or verify their launch descriptors" permits descriptor/launch-contract verification for TUI and URL/HTML shell verification for web in a headless Rust acceptance test.
 - Assumption: the correct proof is one serialized real-daemon integration test guarded by the existing daemon test lock, not a new CLI subcommand.
 - Assumption: workspace proof can use current `botster-workspaces` real package state/capabilities without inventing a full workspace product workflow.
-- Unknown: whether the checked-in `examples/project-pipelines` start path already drives session-template spawning end-to-end in the dev-stack flow or whether the smoke should add a minimal first-party package fixture with a session template and have Project Pipelines reference that explicit template path.
+- Unknown: whether the checked-in `examples/project-pipelines` start path already drives session-template spawning end-to-end in the local runtime flow or whether the smoke should add a minimal first-party package fixture with a session template and have Project Pipelines reference that explicit template path.
 - Unknown: whether the best package reload target is `botster-web` or a small first-party-style local fixture. Prefer `botster-web` if its generated manifest can be rewritten safely in the test; otherwise use the smallest local package fixture and document why the reload proof is for the same package lifecycle path.
 
 ## Botster Layers Touched
 
-- Rust hub daemon and CLI acceptance surface: `dev-stack bootstrap`, package lifecycle, apps, sessions, daemon shutdown.
+- Rust hub daemon and CLI acceptance surface: the removed bootstrap command, package lifecycle, apps, sessions, daemon shutdown.
 - Package lifecycle and app descriptor projection for first-party local packages.
 - Session/client worker path for real PTY spawn, attach, drain, input, and shutdown.
 - Lua plugin/MCP path for Project Pipelines tool registration and calls through `mcp-serve` / daemon plugin provider.
@@ -53,16 +53,16 @@
 
 ## Affected Surfaces And Files
 
-- `tests/hub_daemon_lifecycle_test.rs`: add the conclusive real dev-stack acceptance smoke and likely compose existing fixture helpers such as dev-stack package writers, bridge URL checks, app open checks, session attach/drain helpers, package reload helpers, and shutdown cleanup.
+- `tests/hub_daemon_lifecycle_test.rs`: add the conclusive real local runtime acceptance smoke and likely compose existing fixture helpers such as local runtime package writers, bridge URL checks, app open checks, session attach/drain helpers, package reload helpers, and shutdown cleanup.
 - `crates/botster-hub-test-support/src/lib.rs`: only if reusable external-client conformance helpers need a narrow extension for Project Pipelines start/session-template evidence. Keep public reports stable and additive.
 - `examples/project-pipelines/plugin.lua`: only if the implementation finds `project_pipelines.start` is currently descriptor-only and cannot exercise the required session-template path. Any change must keep Project Pipelines policy plugin-owned.
-- `examples/project-pipelines/README.md` or `README.md`: only if the new smoke changes documented dev-stack acceptance behavior or reveals a residual limitation operators need to know.
+- `examples/project-pipelines/README.md` or `README.md`: only if the new smoke changes documented local runtime acceptance behavior or reveals a residual limitation operators need to know.
 - `src/main.rs`, `src/runtime.rs`, `src/session_templates.rs`, `src/packages.rs`, `crates/botster-hub-client/src/lib.rs`: should remain untouched unless the smoke exposes an actual production-path wiring bug.
 
 ## Runtime Proof Requirements
 
 - The smoke must prove production entrypoints, not code existence:
-  - `dev-stack bootstrap` invokes `ensure_dev_stack_daemon`, `EnablePackageLocalPath`, `start_botster_web_dogfood`, and first-party package enablement through the running daemon.
+  - `up` invokes `ensure_local_runtime_daemon`, refreshes persisted local packages, and starts the installed Web entrypoint through the running daemon.
   - app checks use `apps list/show/open` or daemon `ListApps` / `ResolveAppLaunch`, not local manifest parsing.
   - terminal proof uses real `SpawnSessionTemplate` or plugin session-template spawn into the core daemon, followed by `Attach`/`Drain` over the daemon/client path.
   - Project Pipelines proof uses live plugin MCP registration and tool calls through the loaded `examples/project-pipelines` package.
@@ -72,18 +72,18 @@
 ## Risks
 
 - Flaky long-running integration coverage: the smoke spans daemon startup, package entrypoint supervision, local sockets, Lua worker calls, PTY IO, and shutdown. Keep it serialized with the existing daemon test lock and use bounded readiness waits.
-- Hidden dogfood shims: reusing helper fixtures can accidentally prove synthetic packages rather than first-party package paths. Assertions should name first-party package rows and descriptor ids.
-- Path leaks: dev-stack output and failure diagnostics must not include local package source paths or personal home paths.
+- Hidden production runtime shims: reusing helper fixtures can accidentally prove synthetic packages rather than first-party package paths. Assertions should name first-party package rows and descriptor ids.
+- Path leaks: local runtime output and failure diagnostics must not include local package source paths or personal home paths.
 - Unwired implementation risk: Project Pipelines `start` may record workflow state without spawning a session template. The implementation must either wire the required runtime path or document a human question if the ticket would require changing Project Pipelines semantics beyond a smoke.
 - Cleanup risk: failed readiness must kill spawned daemons/entrypoints and remove subscriptions so later daemon tests do not inherit stale sockets or processes.
 
 ## Acceptance Checks And Tests
 
 - Add and pass a focused acceptance command using the repo wrapper, for example:
-  - `./test.sh --test hub_daemon_lifecycle_test cli_dev_stack_acceptance_smoke_exercises_first_party_plugins_project_pipelines_session_templates_reload_and_shutdown`
+  - `./test.sh --test hub_daemon_lifecycle_test cli_local_runtime_acceptance_smoke_exercises_first_party_plugins_project_pipelines_session_templates_reload_and_shutdown`
 - Re-run nearby focused coverage touched by helper changes:
-  - `./test.sh --test hub_daemon_lifecycle_test cli_dev_stack_bootstrap_starts_daemon_enables_first_party_packages_and_prints_apps`
-  - `./test.sh --test hub_daemon_lifecycle_test cli_dev_stack_bootstrap_reuses_live_daemon_and_preserves_state_after_restart`
+  - `./test.sh --test hub_daemon_lifecycle_test cli_local_runtime_bootstrap_starts_daemon_enables_first_party_packages_and_prints_apps`
+  - `./test.sh --test hub_daemon_lifecycle_test cli_local_runtime_bootstrap_reuses_live_daemon_and_preserves_state_after_restart`
   - `./test.sh --test hub_daemon_lifecycle_test local_package_reload_rereads_manifest_restarts_running_app_and_cli_open_uses_refreshed_state`
   - `./test.sh --test hub_lua_runtime_test real_lua_plugin_spawns_session_template_through_worker_capability`
 - If `crates/botster-hub-test-support/src/lib.rs` changes, also run the downstream-shaped conformance test that uses it.
@@ -105,5 +105,5 @@ None found. The plan follows the loaded Botster constraints: project workflow po
 ## Vault Gaps Worth Capturing
 
 - If implementation confirms that Project Pipelines `start` was not actually coupled to session-template spawning before this ticket, capture the boundary as a new Botster note.
-- If the smoke needs a specific reusable first-party package fixture shape for dev-stack acceptance, capture the accepted fixture boundary after implementation.
+- If the smoke needs a specific reusable first-party package fixture shape for local runtime acceptance, capture the accepted fixture boundary after implementation.
 - No new vault note is needed at Plan time for checklist timeout, plan artifact discipline, or Rust test wrapper usage; existing notes already cover those constraints.

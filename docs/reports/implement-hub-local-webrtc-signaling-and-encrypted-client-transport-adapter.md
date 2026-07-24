@@ -22,7 +22,7 @@
   owns active peer connections on a persistent Tokio runtime.
 - Wired the production path through `StartPackageEntrypoint` for package
   `botster-web`, so the bootstrap is issued while the real installed package
-  entrypoint is launched. The HTTP/SSE dogfood bridge remains intact.
+  entrypoint is launched. The HTTP/SSE production runtime bridge remains intact.
 - Added `LocalWebrtcSignal` and local WebRTC bootstrap/answer DTOs to
   `botster-hub-client`, generated TypeScript, and CLI response printing. CLI
   output prints grant id and metadata but not the grant secret.

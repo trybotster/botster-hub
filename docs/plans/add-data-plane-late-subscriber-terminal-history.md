@@ -94,7 +94,7 @@ Worktree: `project-pipelines/ticket_1782163713_316845`
 - `./test.sh --test hub_daemon_lifecycle_test daemon_late_attach_receives_renderable_history_before_live_output`
 - Existing focused regressions:
   - `./test.sh --test hub_client_api_test local_client_api_exercises_status_spawn_attach_input_resize_detach_shutdown_and_events`
-  - `./test.sh --test hub_daemon_lifecycle_test external_hub_client_spawns_botster_web_dogfood_session_request_shape`
+  - `./test.sh --test hub_daemon_lifecycle_test external_hub_client_spawns_botster_web_production runtime_session_request_shape`
   - `./test.sh --test hub_daemon_lifecycle_test daemon_socket_detaches_subscriptions_on_connection_eof`
 - Broader relevant coverage before review:
   - `./test.sh --unit`

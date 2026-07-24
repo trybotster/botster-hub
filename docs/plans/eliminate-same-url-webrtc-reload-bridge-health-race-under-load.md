@@ -76,7 +76,7 @@ The backstop is never a readiness predicate or evidence of success; expiry is a
 live-yet-stuck diagnostic failure.
 
 After `/health` succeeds, require `ListApps` to publish the exact structured URL
-`http://127.0.0.1:{web_bridge_port}/?dogfood=real-hub`. A non-`None` different URL
+`http://127.0.0.1:{web_bridge_port}/?legacy=removed`. A non-`None` different URL
 fails immediately with expected and actual values. This later signal strengthens
 the launch contract and diagnostics; it is not the race fix.
 
@@ -106,7 +106,7 @@ issuance would broaden the ticket without evidence of a product defect.
 - Add a fixture-only startup-delay environment override and set it above two
   seconds in this test, before `listen`, as deterministic fault injection.
 - After health readiness, assert the exact app-row URL
-  `http://127.0.0.1:{web_bridge_port}/?dogfood=real-hub`; fail fast on any
+  `http://127.0.0.1:{web_bridge_port}/?legacy=removed`; fail fast on any
   different published URL rather than waiting for expiry.
 - Make a failed wait identify the phase and include elapsed time, expected URL,
   last `DaemonApp` lifecycle/launch target/diagnostics, daemon status or request
@@ -284,7 +284,7 @@ synchronization and diagnostics, not a user-facing or plugin UI contract.
    - The passing log or focused diagnostic must show the real
      `StartPackageEntrypoint` path, delayed listener, successful exact `/health`,
      app `local_url` equal to
-     `http://127.0.0.1:{web_bridge_port}/?dogfood=real-hub`, two distinct
+     `http://127.0.0.1:{web_bridge_port}/?legacy=removed`, two distinct
      bootstrap grants, and successful encrypted requests over both peers. It must
      also timestamp worker build, daemon start, package enable, entrypoint return,
      health, and URL publication. Code presence alone is not acceptance.

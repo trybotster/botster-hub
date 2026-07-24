@@ -1,6 +1,6 @@
 # Durable Hub State V1
 
-`botster-hub` stores local dogfood hub state in a versioned JSON file at
+`botster-hub` stores local production runtime hub state in a versioned JSON file at
 `<HubConfig.data_directory>/hub-state.json`.
 
 Version 1 is intentionally local-first and simple. It records host identity
@@ -20,7 +20,7 @@ package-manager commands that call `HubStateStore::update` are future work.
 
 V1 is a single-writer store. It does not use a lockfile or cross-process write
 coordination, so two hub processes pointed at the same data directory can still
-produce last-writer-wins updates. That is acceptable for the local dogfood v1
+produce last-writer-wins updates. That is acceptable for the local production runtime v1
 boundary and should be revisited before multi-process or cloud-synced state.
 
 Schema versioning is explicit. The root `schema_version` must be `1`; unknown

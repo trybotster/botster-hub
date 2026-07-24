@@ -9,9 +9,9 @@ description: Plan for auditing hub transport admission and key storage before E2
 - Pipeline context: ticket `ticket_1782857256_894278`, run `run_1782857310_440658`, current step `botster_plan`, target `tgt_7e208a0c76a44980a83b63af976b1f22`; no prior artifacts, findings, reviews, questions, or answers were present.
 - Required plan playbooks: [[planner-playbook]] and [[botster-planner-playbook]].
 - Required Botster overlays: [[botster-architecture]], [[cli-patterns]], [[spa-patterns]], [[project pipeline orchestration belongs in a device-level botster plugin]], [[project pipelines needs an operator workbench not more primitives]], [[project pipelines ui contract belongs in the plugin readme]], [[botster orchestration should spawn agents with explicit target ids]], and [[botster orchestration prompts must bind agents to explicit worktrees]].
-- Additional review-required vault context: [[botster core owns reusable crypto and identity mechanisms]], [[botster-core local process runtime is feature-gated from contract-only embeds]], [[botster browser pull requests must retry after webrtc reconnect]], [[botster webrtc request consumers should use operation gates not connection checks]], [[botster web pairing ui lives only in the share modal]], and [[botster web dogfood bridge ownership modes are explicit]].
+- Additional review-required vault context: [[botster core owns reusable crypto and identity mechanisms]], [[botster-core local process runtime is feature-gated from contract-only embeds]], [[botster browser pull requests must retry after webrtc reconnect]], [[botster webrtc request consumers should use operation gates not connection checks]], [[botster web pairing ui lives only in the share modal]], and [[botster web production runtime bridge ownership modes are explicit]].
 - Self context loaded as [[identity]] and [[goals]].
-- Repo inspection during planning covered `src/daemon_transport.rs`, `src/client_api.rs`, `src/auth.rs`, `src/config.rs`, `src/persistence.rs`, `src/capabilities.rs`, `src/entrypoint_supervisor.rs`, `src/main.rs`, `crates/botster-hub-client/src/lib.rs`, `docs/client-protocol.md`, existing `docs/plans/*`, existing `docs/reports/*`, and dogfood/bridge tests in `tests/hub_daemon_lifecycle_test.rs`.
+- Repo inspection during planning covered `src/daemon_transport.rs`, `src/client_api.rs`, `src/auth.rs`, `src/config.rs`, `src/persistence.rs`, `src/capabilities.rs`, `src/entrypoint_supervisor.rs`, `src/main.rs`, `crates/botster-hub-client/src/lib.rs`, `docs/client-protocol.md`, existing `docs/plans/*`, existing `docs/reports/*`, and production runtime/bridge tests in `tests/hub_daemon_lifecycle_test.rs`.
 - Plan Review context loaded after return to Plan: four findings from `review_1782857757_312675` plus answered agent question `question_1782857659_902105` requiring one ordered/reliable DataChannel and no application-layer reordering.
 
 ## Scope
@@ -23,7 +23,7 @@ description: Plan for auditing hub transport admission and key storage before E2
   - Runtime terminal attach/input/resize/drain flowing from `HubClientApi` into `HubRuntime` and core `SessionIo`/`ClientWorker` paths, not a hub-owned byte relay.
 - Confirm current package/browser dev behavior:
   - `botster-web` is launched as a supervised local package `runnable_entrypoint` through `StartPackageEntrypoint`.
-  - `dogfood` and `dev-stack bootstrap` pass local bridge settings into the supervised entrypoint and verify a `local_url` through `ListApps`.
+  - `production runtime` and the removed bootstrap command pass local bridge settings into the supervised entrypoint and verify a `local_url` through `ListApps`.
   - The HTTP/SSE-style local bridge is a dev harness/package app surface, not production browser WebRTC.
 - Confirm current network surfaces separately from browser transport:
   - `src/config.rs` has TCP transport binding config shape but no observed TCP listener production path in this repo.
@@ -45,7 +45,7 @@ description: Plan for auditing hub transport admission and key storage before E2
   - diagnostics;
   - package/web app settings exposure.
 - Define transport ordering as a fixed constraint: WebRTC DataChannel ordering is authoritative; Botster sequence/transcript fields are for integrity, replay/duplicate/drop detection, reconnect diagnostics, and crypto transcript binding only.
-- Add a small non-invasive guard only if there is a stable in-repo assertion point. Good candidates are a doc/protocol assertion or a focused Rust test that keeps dogfood/dev-stack bridge output or docs labeled as dev harness rather than production browser transport.
+- Add a small non-invasive guard only if there is a stable in-repo assertion point. Good candidates are a doc/protocol assertion or a focused Rust test that keeps production runtime/local runtime bridge output or docs labeled as dev harness rather than production browser transport.
 
 ## Non-Scope
 
@@ -82,7 +82,7 @@ description: Plan for auditing hub transport admission and key storage before E2
 ## Affected Surfaces And Files
 
 - `docs/reports/audit-hub-transport-admission-and-key-storage-for-e2e-webrtc.md`: new audit report.
-- `docs/client-protocol.md`: optional clarification that `botster-web` local bridge/dogfood paths are dev harnesses and that production browser WebRTC is intentionally absent.
+- `docs/client-protocol.md`: optional clarification that `botster-web` local bridge/production runtime paths are dev harnesses and that production browser WebRTC is intentionally absent.
 - `src/daemon_transport.rs`: inventory same-device Unix socket handling, daemon request routing, app launch, attach subscription cleanup, and any optional guard if warranted.
 - `crates/botster-hub-client/src/lib.rs`: inventory daemon protocol request/response types and handshake; optional tests if classification constants or docs are added.
 - `src/client_api.rs`: inventory transport-neutral local client API, `HubClientAdmission`, and current local-operator/unadmitted policy.
@@ -90,7 +90,7 @@ description: Plan for auditing hub transport admission and key storage before E2
 - `src/persistence.rs`: inventory `hub-state.json`, host identity metadata, package registry, secret redaction persistence, and absence of keychain-backed secret material.
 - `src/auth.rs`: inventory current auth hook seam and absence of concrete admission/auth flows.
 - `src/capabilities.rs`: inventory plugin HTTP/WebSocket capability runtimes separately from browser transport.
-- `src/main.rs`: inventory `dogfood` and `dev-stack bootstrap` package-entrypoint launch behavior and bridge URL printing.
+- `src/main.rs`: inventory `production runtime` and the removed bootstrap command package-entrypoint launch behavior and bridge URL printing.
 - `src/entrypoint_supervisor.rs`: inventory supervised package launch, environment injection, and structured `local_url` result path.
 - `tests/hub_daemon_lifecycle_test.rs`: optional guard around dev bridge semantics if the implementation finds a stable assertion point.
 
@@ -130,7 +130,7 @@ description: Plan for auditing hub transport admission and key storage before E2
    - Diagnostics must distinguish no grant, expired grant, signaling failure, ICE failure, DataChannel closed, core attach failure, encryption/auth failure, and sequence/transcript anomaly.
    - Package/web settings expose only safe local bootstrap status and pairing actions, not raw socket paths, key material, local data dirs, or private identity.
 6. Add a small guard only if it stays surgical:
-   - Prefer a test asserting dogfood/dev-stack bridge output remains labeled `bridge=`/`web=` as local dev harness and no docs/API claim it is production WebRTC. Keep bridge ownership language aligned with [[botster web dogfood bridge ownership modes are explicit]].
+   - Prefer a test asserting production runtime/local runtime bridge output remains labeled `bridge=`/`web=` as local dev harness and no docs/API claim it is production WebRTC. Keep bridge ownership language aligned with [[botster web production runtime bridge ownership modes are explicit]].
    - Add a parallel docs/test assertion where feasible that production browser transport requires a single ordered/reliable DataChannel and that no app-level reorder buffer, resequencing queue, or holdback timer is introduced.
    - If a reliable code-level guard would require new protocol vocabulary or web repo changes, skip it and document why in the report.
 
@@ -165,7 +165,7 @@ description: Plan for auditing hub transport admission and key storage before E2
   - relevant unit test for any added classification helper.
 - Always run or justify skipping:
   - `./test.sh --test hub_client_api_test`
-  - `./test.sh --test hub_daemon_lifecycle_test cli_dogfood_launcher_bridge_request_endpoint_uses_same_daemon_state -- --test-threads=1` if bridge semantics are touched.
+  - `./test.sh --test hub_daemon_lifecycle_test removed_legacy_launcher_launcher_bridge_request_endpoint_uses_same_daemon_state -- --test-threads=1` if bridge semantics are touched.
 - No web repo edits, no old monolith edits, no PII in report or test fixtures.
 
 ## Pipeline Gates And Artifacts
@@ -187,12 +187,12 @@ description: Plan for auditing hub transport admission and key storage before E2
 - Capture a durable note if the audit settles the hub/browser admission policy vocabulary: "local bootstrap grant" vs "remote device approval" while preserving one encrypted stream.
 - Capture a durable note if the audit identifies the final hub wiring pattern for credential storage over existing core primitives: OS keychain/file fallback provider, signing-key persistence, browser identity persistence, grant expiry/revocation, and file-key storage.
 - Capture a durable note if `TransportBindings.tcp` is intentionally scaffold-only, because future planners will otherwise rediscover the same config-vs-listener ambiguity.
-- Capture a durable note if a stable rule emerges that the dogfood HTTP bridge is a dev harness and must not be described as production browser transport.
+- Capture a durable note if a stable rule emerges that the production runtime HTTP bridge is a dev harness and must not be described as production browser transport.
 - Capture a durable note if the single ordered/reliable DataChannel plus detection-only sequence/transcript rule becomes a reusable Botster WebRTC planning constraint.
 
 ## Checklist Evidence
 
-- Vault/context evidence: notes listed in `Context Loaded` constrained the plan to Botster Rust hub/client/session-worker/package boundaries, repo-visible artifacts, explicit target/worktree assumptions, existing core crypto/identity mechanisms, browser reconnect/request-gate conventions, pairing UI ownership, dogfood bridge ownership, and no broad abstractions.
+- Vault/context evidence: notes listed in `Context Loaded` constrained the plan to Botster Rust hub/client/session-worker/package boundaries, repo-visible artifacts, explicit target/worktree assumptions, existing core crypto/identity mechanisms, browser reconnect/request-gate conventions, pairing UI ownership, production runtime bridge ownership, and no broad abstractions.
 - Convention conflicts: none found. The plan follows the Botster playbook by keeping product workflow policy out of core, preserving hub/data-plane boundaries, and using docs/tests instead of implementing speculative WebRTC.
 - Verification evidence gathered during planning: repository inspection found the local daemon socket in `src/daemon_transport.rs`, transport-neutral `HubClientApi` admission in `src/client_api.rs`, metadata-only host identity in `src/config.rs`/`src/persistence.rs`, package secret redaction tests in `src/persistence.rs`/`src/packages.rs`, plugin HTTP/WebSocket capability runtimes in `src/capabilities.rs`, supervised package bridge launch in `src/main.rs`/`src/entrypoint_supervisor.rs`, bridge fixture coverage in `tests/hub_daemon_lifecycle_test.rs`, and `Cargo.lock` pinning `botster-core` to `42538009bc6f6291872c5657bedbe7370f504f8d`.
 - Capture evidence: no vault capture during planning; capture after implementation if the audit produces durable policy/owner decisions listed above.

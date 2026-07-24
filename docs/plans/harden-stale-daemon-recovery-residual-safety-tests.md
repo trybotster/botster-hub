@@ -6,8 +6,8 @@
 - Required role context: [[planner-playbook]], [[botster-planner-playbook]].
 - Vault/project context: [[identity]], [[goals]], [[botster-architecture]], [[cli-patterns]], [[spa-patterns]], [[project pipeline orchestration belongs in a device-level botster plugin]], [[project pipelines needs an operator workbench not more primitives]], [[project pipelines ui contract belongs in the plugin readme]], [[botster orchestration should spawn agents with explicit target ids]], [[botster orchestration prompts must bind agents to explicit worktrees]], and [[plan steps need reviewable plan artifacts]].
 - Repo context inspected: `docs/plans/recover-owned-stale-incompatible-daemons.md`, `src/main.rs`, `src/daemon.rs`, `tests/hub_daemon_lifecycle_test.rs`, and `Cargo.toml`/test wrapper shape via existing repo files.
-- Current production path: `botster-hub up` enters `local_runtime_up -> prepare_local_runtime -> ensure_dev_stack_daemon`; stale compatibility/protocol failures call `recover_owned_stale_dev_stack_daemon` before spawning a replacement daemon. `botster-hub down` calls `daemon_transport_request(DaemonShutdown)` and uses the same stale recovery helper before returning `IncompatibleDaemon`.
-- Current recovery proof: recovery loads `.botster-hub-dev-stack-daemon.json`, checks selected data dir/socket metadata, inspects the live PID with `ps -p <pid> -o command=`, requires a command containing the hub binary name, ` start `, `--data-dir`, and the recorded data dir argument, then sends `SIGTERM`, waits for process exit, removes the selected socket, and removes metadata.
+- Current production path: `botster-hub up` enters `local_runtime_up -> prepare_local_runtime -> ensure_local_runtime_daemon`; stale compatibility/protocol failures call `recover_owned_stale_local_runtime_daemon` before spawning a replacement daemon. `botster-hub down` calls `daemon_transport_request(DaemonShutdown)` and uses the same stale recovery helper before returning `IncompatibleDaemon`.
+- Current recovery proof: recovery loads `.botster-hub-local-runtime-daemon.json`, checks selected data dir/socket metadata, inspects the live PID with `ps -p <pid> -o command=`, requires a command containing the hub binary name, ` start `, `--data-dir`, and the recorded data dir argument, then sends `SIGTERM`, waits for process exit, removes the selected socket, and removes metadata.
 - Current tests already cover owned incompatible recovery, unowned fake socket refusal, scoped socket deletion, and doctor diagnostic behavior. The uncovered adversarial case is forged-looking metadata whose PID belongs to a live non-Botster process.
 
 ## Scope
@@ -57,12 +57,12 @@
 
 1. Add or reuse a helper that binds the configured local socket and writes the old/incomplete daemon hello response used by the existing incompatible-daemon tests.
 2. Add a decoy child helper that starts a live non-Botster process and returns its PID, with cleanup that terminates it if still alive.
-3. Write forged `.botster-hub-dev-stack-daemon.json` for the selected data dir with matching `data_directory`, `data_directory_arg`, `socket_path`, and `hub_bin`, but `pid` set to the decoy process.
-4. Run `botster-hub up --data-dir <dir>` with the required dev-stack package args only if necessary to reach recovery; otherwise use the smallest command path that triggers `ensure_dev_stack_daemon`.
+3. Write forged `.botster-hub-local-runtime-daemon.json` for the selected data dir with matching `data_directory`, `data_directory_arg`, `socket_path`, and `hub_bin`, but `pid` set to the decoy process.
+4. Run `botster-hub up --data-dir <dir>` with the required local runtime package args only if necessary to reach recovery; otherwise use the smallest command path that triggers `ensure_local_runtime_daemon`.
 5. Assert `up` fails with the stale/incompatible diagnostic, the decoy PID still exists, the socket still exists, and the fake listener handled the expected request count.
 6. Run `botster-hub down --data-dir <dir>` against the same class of forged metadata and assert the same refusal/alive/socket behavior.
 7. Tighten the incompatible fixture guard in `start_daemon` only if this can be done without breaking integration tests that spawn the production binary. Prefer an additional explicit fixture env var over broad runtime configurability.
-8. If PID reuse risk cannot be further reduced practically, add precise documentation near `dev_stack_daemon_command_matches` or in the relevant diagnostic path explaining that live command evidence reduces but does not eliminate PID reuse risk.
+8. If PID reuse risk cannot be further reduced practically, add precise documentation near `local_runtime_daemon_command_matches` or in the relevant diagnostic path explaining that live command evidence reduces but does not eliminate PID reuse risk.
 
 ## Risks
 

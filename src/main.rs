@@ -1,8 +1,7 @@
 use std::collections::BTreeMap;
 use std::env;
 use std::fmt;
-use std::io::{self, BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{self, Child, Command, Stdio};
@@ -42,34 +41,19 @@ use webrtc::runtime::{
 
 const SMOKE_MARKER: &str = "botster-hub-smoke-ok";
 const SMOKE_TIMEOUT: Duration = Duration::from_secs(5);
-const DOGFOOD_DAEMON_SHUTDOWN_BUDGET: Duration = Duration::from_secs(5);
-const DEV_STACK_DAEMON_METADATA_FILE: &str = ".botster-hub-dev-stack-daemon.json";
-const DEV_STACK_DAEMON_READINESS_BUDGET: Duration = Duration::from_secs(30);
+const LOCAL_RUNTIME_DAEMON_METADATA_FILE: &str = ".botster-hub-runtime-daemon.json";
+const LOCAL_RUNTIME_DAEMON_READINESS_BUDGET: Duration = Duration::from_secs(30);
 const LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_FILE: &str = "local-webrtc-sender-terminal.json";
 const LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_WAIT: Duration = Duration::from_secs(2);
 const TEST_INCOMPATIBLE_DAEMON_ENV: &str = "BOTSTER_HUB_TEST_INCOMPATIBLE_DAEMON";
-const TEST_DEV_STACK_READINESS_BUDGET_MS_ENV: &str =
-    "BOTSTER_HUB_TEST_DEV_STACK_READINESS_BUDGET_MS";
+const TEST_LOCAL_RUNTIME_READINESS_BUDGET_MS_ENV: &str =
+    "BOTSTER_HUB_TEST_LOCAL_RUNTIME_READINESS_BUDGET_MS";
 
 fn main() {
     match env::args().nth(1).as_deref() {
         Some("start") => {
             if let Err(error) = start_daemon(env::args().skip(2).collect()) {
                 eprintln!("botster-hub start error: {error}");
-                process::exit(1);
-            }
-            return;
-        }
-        Some("dogfood") => {
-            if let Err(error) = dogfood(env::args().skip(2).collect()) {
-                eprintln!("botster-hub dogfood error: {error}");
-                process::exit(1);
-            }
-            return;
-        }
-        Some("dev-stack") => {
-            if let Err(error) = dev_stack(env::args().skip(2).collect()) {
-                eprintln!("botster-hub dev-stack error: {error}");
                 process::exit(1);
             }
             return;
@@ -283,120 +267,8 @@ fn start_daemon(args: Vec<String>) -> Result<(), StartError> {
     Ok(())
 }
 
-fn dogfood(args: Vec<String>) -> Result<(), DogfoodError> {
-    let options = DogfoodOptions::parse(args)?;
-    let data_directory = options.data_directory()?;
-    std::fs::create_dir_all(&data_directory).map_err(|source| DogfoodError::CreateDataDir {
-        path: data_directory.clone(),
-        source,
-    })?;
-
-    let hub_bin = env::current_exe().map_err(DogfoodError::CurrentExe)?;
-    let mut child = spawn_dogfood_daemon(&hub_bin, &data_directory, &options)?;
-
-    if let Err(error) = wait_for_dogfood_ready(&data_directory, &mut child) {
-        cleanup_dogfood_child(&mut child);
-        return Err(error);
-    }
-
-    let config = explicit_config(data_directory.clone())?;
-    if let Err(error) = verify_dogfood_session_worker(&config) {
-        let _ = daemon_transport_request(&config, DaemonRequest::DaemonShutdown);
-        cleanup_dogfood_child_after_shutdown(&mut child);
-        return Err(error);
-    }
-
-    let project_pipelines =
-        enable_dogfood_package(&config, "project-pipelines", options.package_path())?;
-    if project_pipelines.kind == DaemonResponseKind::OperatorError {
-        let _ = daemon_transport_request(&config, DaemonRequest::DaemonShutdown);
-        cleanup_dogfood_child_after_shutdown(&mut child);
-        return Err(DogfoodError::PackageEnable(
-            project_pipelines
-                .error
-                .map(|error| error.message)
-                .unwrap_or_else(|| "package enable failed".to_string()),
-        ));
-    }
-
-    let package_state = project_pipelines
-        .package_decision
-        .as_ref()
-        .map(|decision| decision.state.as_str())
-        .unwrap_or("enabled");
-
-    let web_package_path = match options.web_package_path.as_ref() {
-        Some(path) => path,
-        None => {
-            let _ = daemon_transport_request(&config, DaemonRequest::DaemonShutdown);
-            cleanup_dogfood_child_after_shutdown(&mut child);
-            return Err(DogfoodError::MissingWebPackagePath);
-        }
-    };
-    let web_bridge_port = options.web_bridge_port()?;
-    let web = match start_botster_web_dogfood(
-        &config,
-        &data_directory,
-        web_package_path,
-        web_bridge_port,
-    ) {
-        Ok(web) => web,
-        Err(error) => {
-            let _ = daemon_transport_request(&config, DaemonRequest::DaemonShutdown);
-            cleanup_dogfood_child_after_shutdown(&mut child);
-            return Err(error);
-        }
-    };
-    if let Some(tui_package_path) = options.tui_package_path.as_ref()
-        && let Err(error) = enable_botster_tui_dogfood(&config, tui_package_path)
-    {
-        let _ = daemon_transport_request(&config, DaemonRequest::DaemonShutdown);
-        cleanup_dogfood_child_after_shutdown(&mut child);
-        return Err(error);
-    }
-
-    print_dogfood_ready(
-        &data_directory,
-        options.default_data_dir,
-        package_state,
-        &web,
-    );
-
-    let status = child.wait().map_err(DogfoodError::WaitDaemon)?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(DogfoodError::DaemonExited(status.to_string()))
-    }
-}
-
-fn dev_stack(args: Vec<String>) -> Result<(), DevStackError> {
-    let command = DevStackCommand::parse(args)?;
-    match command {
-        DevStackCommand::Bootstrap(options) => dev_stack_bootstrap(options),
-    }
-}
-
-fn dev_stack_bootstrap(options: DevStackOptions) -> Result<(), DevStackError> {
-    let outcome = prepare_local_runtime(options)?;
-    print_dev_stack_ready(
-        &outcome.options.data_directory,
-        outcome.options.default_data_dir,
-        outcome.daemon_ownership,
-        &[
-            ("project-pipelines", outcome.project_pipelines.as_str()),
-            ("botster-web", outcome.web.package_state.as_str()),
-            ("botster-tui", outcome.tui.as_str()),
-            ("botster-workspaces", outcome.workspaces.as_str()),
-        ],
-        &outcome.web,
-    );
-
-    Ok(())
-}
-
-fn local_runtime_up(args: Vec<String>) -> Result<(), DevStackError> {
-    let outcome = prepare_local_runtime(DevStackOptions::parse(args)?)?;
+fn local_runtime_up(args: Vec<String>) -> Result<(), LocalRuntimeError> {
+    let outcome = prepare_local_runtime(LocalRuntimeOptions::parse(args)?)?;
     let status = daemon_transport_request(&outcome.config, DaemonRequest::Status)?;
     let apps = daemon_transport_request(&outcome.config, DaemonRequest::ListApps)?;
     let status = status
@@ -407,24 +279,24 @@ fn local_runtime_up(args: Vec<String>) -> Result<(), DevStackError> {
     Ok(())
 }
 
-fn local_runtime_down(args: Vec<String>) -> Result<(), DevStackError> {
-    let options = DailyDataDirOptions::parse(args).ok_or(DevStackError::Usage)?;
+fn local_runtime_down(args: Vec<String>) -> Result<(), LocalRuntimeError> {
+    let options = DailyDataDirOptions::parse(args).ok_or(LocalRuntimeError::Usage)?;
     let config = explicit_config(options.data_directory.clone())?;
     let response = match daemon_transport_request(&config, DaemonRequest::DaemonShutdown) {
         Ok(response) => response,
         Err(botster_hub::DaemonTransportError::Compatibility(error)) => {
-            if recover_owned_stale_dev_stack_daemon(&options.data_directory, &config)? {
+            if recover_owned_stale_runtime_daemon(&options.data_directory, &config)? {
                 println!("daemon=recovered_stale");
                 return Ok(());
             }
-            return Err(DevStackError::IncompatibleDaemon(error.to_string()));
+            return Err(LocalRuntimeError::IncompatibleDaemon(error.to_string()));
         }
         Err(botster_hub::DaemonTransportError::Protocol(message)) => {
-            if recover_owned_stale_dev_stack_daemon(&options.data_directory, &config)? {
+            if recover_owned_stale_runtime_daemon(&options.data_directory, &config)? {
                 println!("daemon=recovered_stale");
                 return Ok(());
             }
-            return Err(DevStackError::IncompatibleDaemon(message.to_string()));
+            return Err(LocalRuntimeError::IncompatibleDaemon(message.to_string()));
         }
         Err(error) => return Err(error.into()),
     };
@@ -571,7 +443,7 @@ fn local_runtime_doctor(args: Vec<String>) -> Result<(), OperatorError> {
                 "botster-web web-client app is not installed",
             );
             print_remediation(&format!(
-                "botster-hub up --data-dir {} --web-package-path <path>",
+                "install and enable botster-web, then run botster-hub up --data-dir {}",
                 options.data_directory.display()
             ));
         }
@@ -587,24 +459,22 @@ fn local_runtime_doctor(args: Vec<String>) -> Result<(), OperatorError> {
 fn local_runtime_smoke(args: Vec<String>) -> Result<(), SmokeError> {
     let options = SmokeOptions::parse(args)?;
     println!("smoke=local_runtime");
-    if options.dev_stack.default_data_dir {
+    if options.runtime.default_data_dir {
         println!(
             "data_dir=stable:{}",
-            options.dev_stack.data_directory.display()
+            options.runtime.data_directory.display()
         );
     } else {
         println!("data_dir=explicit");
     }
-    preflight_smoke_packages(&options.dev_stack)?;
-
-    let outcome = prepare_local_runtime(options.dev_stack)?;
+    let outcome = prepare_local_runtime(options.runtime)?;
     let _cleanup = SmokeRuntimeCleanup::new(&outcome);
     print_runtime_check(
         "daemon",
         RuntimeCheckStatus::Pass,
         match outcome.daemon_ownership {
-            DevStackDaemonOwnership::Started => "daemon started",
-            DevStackDaemonOwnership::Reused => "daemon reused",
+            LocalRuntimeDaemonOwnership::Started => "daemon started",
+            LocalRuntimeDaemonOwnership::Reused => "daemon reused",
         },
     );
 
@@ -624,10 +494,8 @@ fn local_runtime_smoke(args: Vec<String>) -> Result<(), SmokeError> {
     );
 
     let packages = daemon_transport_request(&outcome.config, DaemonRequest::ListPackages)?;
-    require_smoke_package(&packages.packages, "project-pipelines")?;
     require_smoke_package(&packages.packages, "botster-web")?;
     require_smoke_package(&packages.packages, "botster-tui")?;
-    require_smoke_package(&packages.packages, "botster-workspaces")?;
     print_runtime_check(
         "packages",
         RuntimeCheckStatus::Pass,
@@ -660,12 +528,23 @@ fn local_runtime_smoke(args: Vec<String>) -> Result<(), SmokeError> {
         "spawn stream-attach marker shutdown succeeded",
     );
 
+    let local_url =
+        web_app
+            .launch_target
+            .local_url
+            .as_deref()
+            .ok_or(SmokeError::MissingPrerequisite(
+                "botster-web running local_url",
+            ))?;
+    let origin = runtime_origin(local_url).ok_or(SmokeError::MissingPrerequisite(
+        "botster-web local_url origin",
+    ))?;
     let bootstrap = daemon_transport_request(
         &outcome.config,
-        DaemonRequest::StartPackageEntrypoint {
+        DaemonRequest::IssueLocalWebrtcBootstrap {
             package_name: "botster-web".to_string(),
             entrypoint_id: "web-client".to_string(),
-            environment_overrides: BTreeMap::new(),
+            origin,
         },
     )?;
     let Some(bootstrap) = bootstrap.local_webrtc_bootstrap.as_ref() else {
@@ -684,21 +563,6 @@ fn local_runtime_smoke(args: Vec<String>) -> Result<(), SmokeError> {
         "encrypted local WebRTC data-channel terminal round trip succeeded",
     );
     println!("smoke_result=pass");
-    Ok(())
-}
-
-fn preflight_smoke_packages(options: &DevStackOptions) -> Result<(), SmokeError> {
-    for label in [
-        "project-pipelines",
-        "botster-web",
-        "botster-tui",
-        "botster-workspaces",
-    ] {
-        let path = options.package_path(label)?;
-        if !path.join("botster-package.json").is_file() {
-            return Err(SmokeError::MissingPrerequisite(label));
-        }
-    }
     Ok(())
 }
 
@@ -1233,13 +1097,10 @@ fn sanitize_runtime_message(message: &str) -> String {
 }
 
 struct LocalRuntimeOutcome {
-    options: DevStackOptions,
+    options: LocalRuntimeOptions,
     config: botster_hub::HubConfig,
-    daemon_ownership: DevStackDaemonOwnership,
-    project_pipelines: String,
-    web: DogfoodWebLaunch,
-    tui: String,
-    workspaces: String,
+    daemon_ownership: LocalRuntimeDaemonOwnership,
+    web: RuntimeWebLaunch,
 }
 
 struct SmokeRuntimeCleanup<'a> {
@@ -1256,7 +1117,7 @@ impl Drop for SmokeRuntimeCleanup<'_> {
     fn drop(&mut self) {
         if !matches!(
             self.outcome.daemon_ownership,
-            DevStackDaemonOwnership::Started
+            LocalRuntimeDaemonOwnership::Started
         ) {
             return;
         }
@@ -1271,92 +1132,69 @@ impl Drop for SmokeRuntimeCleanup<'_> {
     }
 }
 
-fn prepare_local_runtime(options: DevStackOptions) -> Result<LocalRuntimeOutcome, DevStackError> {
+fn prepare_local_runtime(
+    options: LocalRuntimeOptions,
+) -> Result<LocalRuntimeOutcome, LocalRuntimeError> {
     std::fs::create_dir_all(&options.data_directory).map_err(|source| {
-        DevStackError::CreateDataDir {
+        LocalRuntimeError::CreateDataDir {
             path: options.data_directory.clone(),
             source,
         }
     })?;
 
-    let hub_bin = env::current_exe().map_err(DevStackError::CurrentExe)?;
+    let hub_bin = env::current_exe().map_err(LocalRuntimeError::CurrentExe)?;
     let config = explicit_config(options.data_directory.clone())?;
-    let daemon_ownership = ensure_dev_stack_daemon(&hub_bin, &options, &config)?;
+    let daemon_ownership = ensure_local_runtime_daemon(&hub_bin, &options, &config)?;
     daemon_transport_request(&config, DaemonRequest::RefreshLocalPackages)?;
-
-    let project_pipelines = enable_dev_stack_package(
-        &config,
-        "project-pipelines",
-        "project-pipelines",
-        options.package_path("project-pipelines")?,
-    )?;
-    let web_bridge_port = options.web_bridge_port()?;
-    let web = start_botster_web_dogfood(
-        &config,
-        &options.data_directory,
-        &options.package_path("botster-web")?,
-        web_bridge_port,
-    )?;
-    let tui = enable_dev_stack_package(
-        &config,
-        "botster-tui",
-        "botster-tui",
-        options.package_path("botster-tui")?,
-    )?;
-    let workspaces = enable_dev_stack_package(
-        &config,
-        "botster-workspaces",
-        "botster-workspaces",
-        options.package_path("botster-workspaces")?,
-    )?;
+    let packages = daemon_transport_request(&config, DaemonRequest::ListPackages)?;
+    require_runtime_package(&packages.packages, "botster-web")?;
+    require_runtime_package(&packages.packages, "botster-tui")?;
+    let web = start_installed_web_app(&config, &packages.packages)?;
 
     Ok(LocalRuntimeOutcome {
         options,
         config,
         daemon_ownership,
-        project_pipelines,
         web,
-        tui,
-        workspaces,
     })
 }
 
-fn ensure_dev_stack_daemon(
+fn ensure_local_runtime_daemon(
     hub_bin: &Path,
-    options: &DevStackOptions,
+    options: &LocalRuntimeOptions,
     config: &botster_hub::HubConfig,
-) -> Result<DevStackDaemonOwnership, DevStackError> {
+) -> Result<LocalRuntimeDaemonOwnership, LocalRuntimeError> {
     match daemon_transport_request(config, DaemonRequest::Status) {
-        Ok(_) => return Ok(DevStackDaemonOwnership::Reused),
+        Ok(_) => return Ok(LocalRuntimeDaemonOwnership::Reused),
         Err(
             botster_hub::DaemonTransportError::NotRunning
             | botster_hub::DaemonTransportError::ClientDisconnected,
         ) => {}
         Err(botster_hub::DaemonTransportError::Compatibility(error)) => {
-            if recover_owned_stale_dev_stack_daemon(&options.data_directory, config)? {
-                return spawn_dev_stack_daemon(hub_bin, options, config);
+            if recover_owned_stale_runtime_daemon(&options.data_directory, config)? {
+                return spawn_local_runtime_daemon(hub_bin, options, config);
             }
-            return Err(DevStackError::IncompatibleDaemon(error.to_string()));
+            return Err(LocalRuntimeError::IncompatibleDaemon(error.to_string()));
         }
         Err(botster_hub::DaemonTransportError::Protocol(message)) => {
-            if recover_owned_stale_dev_stack_daemon(&options.data_directory, config)? {
-                return spawn_dev_stack_daemon(hub_bin, options, config);
+            if recover_owned_stale_runtime_daemon(&options.data_directory, config)? {
+                return spawn_local_runtime_daemon(hub_bin, options, config);
             }
-            return Err(DevStackError::IncompatibleDaemon(message.to_string()));
+            return Err(LocalRuntimeError::IncompatibleDaemon(message.to_string()));
         }
         Err(error) => return Err(error.into()),
     }
 
-    spawn_dev_stack_daemon(hub_bin, options, config)
+    spawn_local_runtime_daemon(hub_bin, options, config)
 }
 
-fn spawn_dev_stack_daemon(
+fn spawn_local_runtime_daemon(
     hub_bin: &Path,
-    options: &DevStackOptions,
+    options: &LocalRuntimeOptions,
     config: &botster_hub::HubConfig,
-) -> Result<DevStackDaemonOwnership, DevStackError> {
+) -> Result<LocalRuntimeDaemonOwnership, LocalRuntimeError> {
     if !hub_bin.is_file() {
-        return Err(DevStackError::MissingHubBinary(hub_bin.to_path_buf()));
+        return Err(LocalRuntimeError::MissingHubBinary(hub_bin.to_path_buf()));
     }
     let session_worker_bin = options.session_worker_bin(hub_bin)?;
 
@@ -1371,7 +1209,7 @@ fn spawn_dev_stack_daemon(
         .stderr(Stdio::piped());
     let mut child = command
         .spawn()
-        .map_err(|source| DevStackError::SpawnDaemon {
+        .map_err(|source| LocalRuntimeError::SpawnDaemon {
             path: hub_bin.to_path_buf(),
             source,
         })?;
@@ -1385,41 +1223,41 @@ fn spawn_dev_stack_daemon(
     }
 
     if let Err(error) =
-        write_dev_stack_daemon_metadata(&options.data_directory, config, hub_bin, child.id())
+        write_runtime_daemon_metadata(&options.data_directory, config, hub_bin, child.id())
     {
         let _ = child.kill();
         let _ = child.wait();
         return Err(error);
     }
 
-    if let Err(error) = wait_for_dev_stack_ready(
+    if let Err(error) = wait_for_local_runtime_ready(
         config,
         &mut child,
-        dev_stack_daemon_readiness_budget(),
+        local_runtime_daemon_readiness_budget(),
         &stderr_rx,
     ) {
-        let _ = remove_dev_stack_daemon_metadata(&options.data_directory);
+        let _ = remove_runtime_daemon_metadata(&options.data_directory);
         return Err(error);
     }
-    Ok(DevStackDaemonOwnership::Started)
+    Ok(LocalRuntimeDaemonOwnership::Started)
 }
 
-fn wait_for_dev_stack_ready(
+fn wait_for_local_runtime_ready(
     config: &botster_hub::HubConfig,
     child: &mut Child,
     readiness_budget: Duration,
     stderr_rx: &mpsc::Receiver<String>,
-) -> Result<(), DevStackError> {
+) -> Result<(), LocalRuntimeError> {
     let started_at = Instant::now();
     let deadline = started_at + readiness_budget;
     let mut last_probe = "status probe not attempted".to_string();
     let mut stderr_tail = String::new();
     while Instant::now() < deadline {
-        drain_dev_stack_stderr(stderr_rx, &mut stderr_tail);
-        if let Some(status) = child.try_wait().map_err(DevStackError::PollDaemon)? {
+        drain_runtime_stderr(stderr_rx, &mut stderr_tail);
+        if let Some(status) = child.try_wait().map_err(LocalRuntimeError::PollDaemon)? {
             thread::sleep(Duration::from_millis(20));
-            drain_dev_stack_stderr(stderr_rx, &mut stderr_tail);
-            return Err(DevStackError::DaemonExited {
+            drain_runtime_stderr(stderr_rx, &mut stderr_tail);
+            return Err(LocalRuntimeError::DaemonExited {
                 status: status.to_string(),
                 elapsed: started_at.elapsed(),
                 readiness_budget,
@@ -1435,8 +1273,8 @@ fn wait_for_dev_stack_ready(
     }
 
     let child_pid = child.id();
-    let child_status = terminate_owned_dev_stack_child(child)?;
-    Err(DevStackError::ReadinessTimeout {
+    let child_status = terminate_owned_runtime_child(child)?;
+    Err(LocalRuntimeError::ReadinessTimeout {
         elapsed: started_at.elapsed(),
         readiness_budget,
         last_probe,
@@ -1445,7 +1283,7 @@ fn wait_for_dev_stack_ready(
     })
 }
 
-fn drain_dev_stack_stderr(stderr_rx: &mpsc::Receiver<String>, stderr_tail: &mut String) {
+fn drain_runtime_stderr(stderr_rx: &mpsc::Receiver<String>, stderr_tail: &mut String) {
     for line in stderr_rx.try_iter() {
         if !stderr_tail.is_empty() {
             stderr_tail.push(' ');
@@ -1458,29 +1296,29 @@ fn drain_dev_stack_stderr(stderr_rx: &mpsc::Receiver<String>, stderr_tail: &mut 
     }
 }
 
-fn dev_stack_daemon_readiness_budget() -> Duration {
+fn local_runtime_daemon_readiness_budget() -> Duration {
     if env::var("BOTSTER_ENV").as_deref() == Ok("test")
-        && let Some(milliseconds) = env::var_os(TEST_DEV_STACK_READINESS_BUDGET_MS_ENV)
+        && let Some(milliseconds) = env::var_os(TEST_LOCAL_RUNTIME_READINESS_BUDGET_MS_ENV)
             .and_then(|value| value.to_str().and_then(|value| value.parse::<u64>().ok()))
     {
         return Duration::from_millis(milliseconds);
     }
-    DEV_STACK_DAEMON_READINESS_BUDGET
+    LOCAL_RUNTIME_DAEMON_READINESS_BUDGET
 }
 
-fn terminate_owned_dev_stack_child(child: &mut Child) -> Result<String, DevStackError> {
-    if let Some(status) = child.try_wait().map_err(DevStackError::PollDaemon)? {
+fn terminate_owned_runtime_child(child: &mut Child) -> Result<String, LocalRuntimeError> {
+    if let Some(status) = child.try_wait().map_err(LocalRuntimeError::PollDaemon)? {
         return Ok(status.to_string());
     }
-    child.kill().map_err(DevStackError::TerminateDaemon)?;
+    child.kill().map_err(LocalRuntimeError::TerminateDaemon)?;
     child
         .wait()
         .map(|status| status.to_string())
-        .map_err(DevStackError::TerminateDaemon)
+        .map_err(LocalRuntimeError::TerminateDaemon)
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-struct DevStackDaemonMetadata {
+struct LocalRuntimeDaemonMetadata {
     pid: u32,
     data_directory: String,
     #[serde(default)]
@@ -1489,78 +1327,79 @@ struct DevStackDaemonMetadata {
     hub_bin: String,
 }
 
-fn recover_owned_stale_dev_stack_daemon(
+fn recover_owned_stale_runtime_daemon(
     data_directory: &Path,
     config: &botster_hub::HubConfig,
-) -> Result<bool, DevStackError> {
-    let Some(metadata) = read_dev_stack_daemon_metadata(data_directory)? else {
+) -> Result<bool, LocalRuntimeError> {
+    let Some(metadata) = read_runtime_daemon_metadata(data_directory)? else {
         return Ok(false);
     };
-    if !dev_stack_daemon_metadata_matches(&metadata, data_directory, config)? {
+    if !runtime_daemon_metadata_matches(&metadata, data_directory, config)? {
         return Ok(false);
     }
     let Some(command) = process_command(metadata.pid)? else {
         return Ok(false);
     };
-    if !dev_stack_daemon_command_matches(&metadata, &command) {
+    if !runtime_daemon_command_matches(&metadata, &command) {
         return Ok(false);
     }
 
     terminate_process(metadata.pid)?;
-    wait_for_dev_stack_daemon_exit(metadata.pid)?;
+    wait_for_runtime_daemon_exit(metadata.pid)?;
     remove_configured_local_socket(config)?;
-    remove_dev_stack_daemon_metadata(data_directory)?;
+    remove_runtime_daemon_metadata(data_directory)?;
     Ok(true)
 }
 
-fn write_dev_stack_daemon_metadata(
+fn write_runtime_daemon_metadata(
     data_directory: &Path,
     config: &botster_hub::HubConfig,
     hub_bin: &Path,
     pid: u32,
-) -> Result<(), DevStackError> {
-    let metadata = DevStackDaemonMetadata {
+) -> Result<(), LocalRuntimeError> {
+    let metadata = LocalRuntimeDaemonMetadata {
         pid,
         data_directory: stable_path_string(data_directory),
         data_directory_arg: Some(data_directory.display().to_string()),
         socket_path: configured_local_socket_path(config)?.display().to_string(),
         hub_bin: stable_path_string(hub_bin),
     };
-    let bytes = serde_json::to_vec_pretty(&metadata).map_err(DevStackError::SerializeMetadata)?;
-    std::fs::write(dev_stack_daemon_metadata_path(data_directory), bytes).map_err(|source| {
-        DevStackError::WriteDaemonMetadata {
-            path: dev_stack_daemon_metadata_path(data_directory),
+    let bytes =
+        serde_json::to_vec_pretty(&metadata).map_err(LocalRuntimeError::SerializeMetadata)?;
+    std::fs::write(runtime_daemon_metadata_path(data_directory), bytes).map_err(|source| {
+        LocalRuntimeError::WriteDaemonMetadata {
+            path: runtime_daemon_metadata_path(data_directory),
             source,
         }
     })
 }
 
-fn read_dev_stack_daemon_metadata(
+fn read_runtime_daemon_metadata(
     data_directory: &Path,
-) -> Result<Option<DevStackDaemonMetadata>, DevStackError> {
-    let path = dev_stack_daemon_metadata_path(data_directory);
+) -> Result<Option<LocalRuntimeDaemonMetadata>, LocalRuntimeError> {
+    let path = runtime_daemon_metadata_path(data_directory);
     let bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(source) => return Err(DevStackError::ReadDaemonMetadata { path, source }),
+        Err(source) => return Err(LocalRuntimeError::ReadDaemonMetadata { path, source }),
     };
     serde_json::from_slice(&bytes)
         .map(Some)
-        .map_err(DevStackError::ReadDaemonMetadataJson)
+        .map_err(LocalRuntimeError::ReadDaemonMetadataJson)
 }
 
-fn dev_stack_daemon_metadata_matches(
-    metadata: &DevStackDaemonMetadata,
+fn runtime_daemon_metadata_matches(
+    metadata: &LocalRuntimeDaemonMetadata,
     data_directory: &Path,
     config: &botster_hub::HubConfig,
-) -> Result<bool, DevStackError> {
+) -> Result<bool, LocalRuntimeError> {
     Ok(
         metadata.data_directory == stable_path_string(data_directory)
             && metadata.socket_path == configured_local_socket_path(config)?.display().to_string(),
     )
 }
 
-fn dev_stack_daemon_command_matches(metadata: &DevStackDaemonMetadata, command: &str) -> bool {
+fn runtime_daemon_command_matches(metadata: &LocalRuntimeDaemonMetadata, command: &str) -> bool {
     let hub_bin_name = Path::new(&metadata.hub_bin)
         .file_name()
         .and_then(|name| name.to_str())
@@ -1578,38 +1417,42 @@ fn dev_stack_daemon_command_matches(metadata: &DevStackDaemonMetadata, command: 
                 .is_some_and(|argument| command.contains(argument)))
 }
 
-fn configured_local_socket_path(config: &botster_hub::HubConfig) -> Result<PathBuf, DevStackError> {
+fn configured_local_socket_path(
+    config: &botster_hub::HubConfig,
+) -> Result<PathBuf, LocalRuntimeError> {
     config
         .transports
         .local_socket
         .as_ref()
         .map(|binding| binding.path.clone())
-        .ok_or(DevStackError::MissingLocalSocket)
+        .ok_or(LocalRuntimeError::MissingLocalSocket)
 }
 
-fn remove_configured_local_socket(config: &botster_hub::HubConfig) -> Result<(), DevStackError> {
+fn remove_configured_local_socket(
+    config: &botster_hub::HubConfig,
+) -> Result<(), LocalRuntimeError> {
     let socket_path = configured_local_socket_path(config)?;
     match std::fs::remove_file(&socket_path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(source) => Err(DevStackError::RemoveLocalSocket {
+        Err(source) => Err(LocalRuntimeError::RemoveLocalSocket {
             path: socket_path,
             source,
         }),
     }
 }
 
-fn remove_dev_stack_daemon_metadata(data_directory: &Path) -> Result<(), DevStackError> {
-    let path = dev_stack_daemon_metadata_path(data_directory);
+fn remove_runtime_daemon_metadata(data_directory: &Path) -> Result<(), LocalRuntimeError> {
+    let path = runtime_daemon_metadata_path(data_directory);
     match std::fs::remove_file(&path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(source) => Err(DevStackError::RemoveDaemonMetadata { path, source }),
+        Err(source) => Err(LocalRuntimeError::RemoveDaemonMetadata { path, source }),
     }
 }
 
-fn dev_stack_daemon_metadata_path(data_directory: &Path) -> PathBuf {
-    data_directory.join(DEV_STACK_DAEMON_METADATA_FILE)
+fn runtime_daemon_metadata_path(data_directory: &Path) -> PathBuf {
+    data_directory.join(LOCAL_RUNTIME_DAEMON_METADATA_FILE)
 }
 
 fn stable_path_string(path: &Path) -> String {
@@ -1619,14 +1462,14 @@ fn stable_path_string(path: &Path) -> String {
         .to_string()
 }
 
-fn process_command(pid: u32) -> Result<Option<String>, DevStackError> {
+fn process_command(pid: u32) -> Result<Option<String>, LocalRuntimeError> {
     let output = Command::new("ps")
         .arg("-p")
         .arg(pid.to_string())
         .arg("-o")
         .arg("command=")
         .output()
-        .map_err(DevStackError::InspectProcess)?;
+        .map_err(LocalRuntimeError::InspectProcess)?;
     if !output.status.success() {
         return Ok(None);
     }
@@ -1638,16 +1481,18 @@ fn process_command(pid: u32) -> Result<Option<String>, DevStackError> {
     }
 }
 
-fn terminate_process(pid: u32) -> Result<(), DevStackError> {
+fn terminate_process(pid: u32) -> Result<(), LocalRuntimeError> {
     let result = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
     if result == 0 {
         Ok(())
     } else {
-        Err(DevStackError::TerminateDaemon(io::Error::last_os_error()))
+        Err(LocalRuntimeError::TerminateDaemon(
+            io::Error::last_os_error(),
+        ))
     }
 }
 
-fn wait_for_dev_stack_daemon_exit(pid: u32) -> Result<(), DevStackError> {
+fn wait_for_runtime_daemon_exit(pid: u32) -> Result<(), LocalRuntimeError> {
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
         match process_state(pid)? {
@@ -1657,17 +1502,17 @@ fn wait_for_dev_stack_daemon_exit(pid: u32) -> Result<(), DevStackError> {
         }
         thread::sleep(Duration::from_millis(50));
     }
-    Err(DevStackError::TerminateDaemonTimeout(pid))
+    Err(LocalRuntimeError::TerminateDaemonTimeout(pid))
 }
 
-fn process_state(pid: u32) -> Result<Option<String>, DevStackError> {
+fn process_state(pid: u32) -> Result<Option<String>, LocalRuntimeError> {
     let output = Command::new("ps")
         .arg("-p")
         .arg(pid.to_string())
         .arg("-o")
         .arg("stat=")
         .output()
-        .map_err(DevStackError::InspectProcess)?;
+        .map_err(LocalRuntimeError::InspectProcess)?;
     if !output.status.success() {
         return Ok(None);
     }
@@ -1711,528 +1556,189 @@ fn serve_test_incompatible_daemon(
     }
 }
 
-fn enable_dev_stack_package(
-    config: &botster_hub::HubConfig,
-    label: &'static str,
-    expected_package_name: &str,
-    path: PathBuf,
-) -> Result<String, DevStackError> {
-    if !path.join("botster-package.json").is_file() {
-        return Err(DevStackError::MissingPackage { label });
-    }
-    let response = enable_dogfood_package(config, expected_package_name, path)?;
-    if response.kind == DaemonResponseKind::OperatorError {
-        return Err(DevStackError::PackageEnable {
-            label,
-            message: response
-                .error
-                .map(|error| error.message)
-                .unwrap_or_else(|| "package enable failed".to_string()),
-        });
-    }
-    let package = response
-        .packages
-        .iter()
-        .find(|package| package.package_name == expected_package_name)
-        .ok_or(DevStackError::WrongPackage { label })?;
-    Ok(response
-        .package_decision
-        .as_ref()
-        .map(|decision| decision.state.clone())
-        .unwrap_or_else(|| package.state.clone()))
-}
-
-fn verify_dogfood_session_worker(config: &botster_hub::HubConfig) -> Result<(), DogfoodError> {
-    let response = daemon_transport_request(
-        config,
-        DaemonRequest::Spawn {
-            session_id: "dogfood-worker-smoke".to_string(),
-            command: "printf 'dogfood-worker-ok\\n'; sleep 1".to_string(),
-        },
-    )?;
-    if response.kind == DaemonResponseKind::OperatorError {
-        return Err(DogfoodError::SessionWorker(
-            response
-                .error
-                .map(|error| error.message)
-                .unwrap_or_else(|| "session worker smoke failed".to_string()),
-        ));
-    }
-
-    let _ = daemon_transport_request(
-        config,
-        DaemonRequest::ShutdownSession {
-            session_id: "dogfood-worker-smoke".to_string(),
-        },
-    );
-    Ok(())
-}
-
-struct DogfoodWebLaunch {
-    bridge_url: String,
-    web_url: String,
+struct RuntimeWebLaunch {
+    local_url: String,
     package_state: String,
 }
 
-fn start_botster_web_dogfood(
+fn require_runtime_package(
+    packages: &[DaemonPackage],
+    package_name: &'static str,
+) -> Result<(), LocalRuntimeError> {
+    let package = packages
+        .iter()
+        .find(|package| package.package_name == package_name)
+        .ok_or(LocalRuntimeError::MissingPackage {
+            label: package_name,
+        })?;
+    if package.state != "enabled" {
+        return Err(LocalRuntimeError::PackageDisabled {
+            package_name,
+            state: package.state.clone(),
+        });
+    }
+    Ok(())
+}
+
+fn start_installed_web_app(
     config: &botster_hub::HubConfig,
-    data_directory: &Path,
-    package_path: &Path,
-    bridge_port: u16,
-) -> Result<DogfoodWebLaunch, DogfoodError> {
-    if !package_path.join("botster-package.json").is_file() {
-        return Err(DogfoodError::MissingWebPackage(package_path.to_path_buf()));
-    }
-
-    let response = enable_dogfood_package(config, "botster-web", package_path.to_path_buf())?;
-    if response.kind == DaemonResponseKind::OperatorError {
-        return Err(DogfoodError::WebPackageEnable(
-            response
-                .error
-                .map(|error| error.message)
-                .unwrap_or_else(|| "botster-web package enable failed".to_string()),
-        ));
-    }
-
-    let web_package = response
-        .packages
+    packages: &[DaemonPackage],
+) -> Result<RuntimeWebLaunch, LocalRuntimeError> {
+    let package = packages
         .iter()
         .find(|package| package.package_name == "botster-web")
-        .ok_or(DogfoodError::WrongWebPackage)?;
-    if !web_package
+        .ok_or(LocalRuntimeError::MissingPackage {
+            label: "botster-web",
+        })?;
+    if !package
         .runnable_entrypoints
         .iter()
         .any(|entrypoint| entrypoint.id == "web-client")
     {
-        return Err(DogfoodError::MissingWebEntrypoint);
+        return Err(LocalRuntimeError::MissingWebEntrypoint);
     }
-    let package_state = response
-        .package_decision
-        .as_ref()
-        .map(|decision| decision.state.clone())
-        .unwrap_or_else(|| web_package.state.clone());
-
-    let socket_path = config
-        .transports
-        .local_socket
-        .as_ref()
-        .map(|binding| binding.path.clone())
-        .ok_or(DogfoodError::MissingLocalSocket)?;
-    let socket_path = absolutize_path(&socket_path)?;
-    let data_directory = absolutize_path(data_directory)?;
-    let mut environment_overrides = BTreeMap::new();
-    environment_overrides.insert(
-        "BOTSTER_HUB_SOCKET".to_string(),
-        socket_path.display().to_string(),
-    );
-    environment_overrides.insert(
-        "BOTSTER_HUB_DATA_DIR".to_string(),
-        data_directory.display().to_string(),
-    );
-    environment_overrides.insert(
-        "BOTSTER_WEB_DOGFOOD_BRIDGE_PORT".to_string(),
-        bridge_port.to_string(),
-    );
 
     let response = daemon_transport_request(
         config,
         DaemonRequest::StartPackageEntrypoint {
             package_name: "botster-web".to_string(),
             entrypoint_id: "web-client".to_string(),
-            environment_overrides,
+            environment_overrides: BTreeMap::new(),
         },
     )?;
     if response.kind == DaemonResponseKind::OperatorError {
-        return Err(DogfoodError::WebEntrypointStart(
+        return Err(LocalRuntimeError::WebEntrypointStart(
             response
                 .error
                 .map(|error| error.message)
-                .unwrap_or_else(|| "botster-web entrypoint start failed".to_string()),
+                .unwrap_or_else(|| "botster-web/web-client failed without diagnostics".to_string()),
         ));
     }
-    let Some(entrypoint) = response
-        .packages
+
+    let apps = daemon_transport_request(config, DaemonRequest::ListApps)?;
+    let app = apps
+        .apps
         .iter()
-        .find(|package| package.package_name == "botster-web")
-        .and_then(|package| {
-            package
-                .runnable_entrypoints
-                .iter()
-                .find(|entrypoint| entrypoint.id == "web-client")
-        })
-    else {
-        return Err(DogfoodError::MissingWebEntrypoint);
-    };
-    if entrypoint.process.state != "running" {
-        return Err(DogfoodError::WebEntrypointStart(format!(
-            "process state {}",
-            entrypoint.process.state
+        .find(|app| app.package_name == "botster-web" && app.entrypoint_id == "web-client")
+        .ok_or(LocalRuntimeError::MissingWebEntrypoint)?;
+    let local_url = app
+        .launch_target
+        .local_url
+        .as_ref()
+        .filter(|url| !url.trim().is_empty())
+        .ok_or_else(|| {
+            LocalRuntimeError::WebEntrypointStart(format!(
+                "package botster-web entrypoint web-client returned lifecycle_state={} without structured local_url",
+                app.lifecycle_state
+            ))
+        })?
+        .clone();
+    verify_web_health(&local_url)?;
+    verify_web_ui(&local_url)?;
+
+    Ok(RuntimeWebLaunch {
+        local_url,
+        package_state: package.state.clone(),
+    })
+}
+
+fn verify_web_health(local_url: &str) -> Result<(), LocalRuntimeError> {
+    let origin = runtime_origin(local_url).ok_or_else(|| {
+        LocalRuntimeError::WebHealth(format!(
+            "botster-web/web-client returned invalid local_url {local_url}"
+        ))
+    })?;
+    let health_url = format!("{origin}/health");
+    let (_, body) = read_web_http(&health_url, "health")?;
+    let health: serde_json::Value = serde_json::from_slice(&body)
+        .map_err(|error| LocalRuntimeError::WebHealth(format!("invalid JSON: {error}")))?;
+    if health.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+        return Err(LocalRuntimeError::WebHealth(format!(
+            "unexpected response {health}"
         )));
     }
-
-    let bridge_url = format!("http://127.0.0.1:{bridge_port}");
-    let web_url = format!("{bridge_url}/?dogfood=real-hub");
-    wait_for_botster_web_health(config, &bridge_url)?;
-    wait_for_botster_web_ui(config, &web_url)?;
-    let web_url = wait_for_botster_web_app_url(config)?;
-    Ok(DogfoodWebLaunch {
-        bridge_url,
-        web_url,
-        package_state,
-    })
-}
-
-fn wait_for_botster_web_app_url(config: &botster_hub::HubConfig) -> Result<String, DogfoodError> {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let mut last_state = None;
-    while Instant::now() < deadline {
-        let response = daemon_transport_request(config, DaemonRequest::ListApps)?;
-        if let Some(app) = response
-            .apps
-            .iter()
-            .find(|app| app.package_name == "botster-web" && app.entrypoint_id == "web-client")
-        {
-            if app.lifecycle_state == "running"
-                && let Some(url) = app.launch_target.local_url.as_ref()
-            {
-                return Ok(url.clone());
-            }
-            last_state = Some(app.lifecycle_state.clone());
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-    Err(DogfoodError::WebEntrypointStart(format!(
-        "missing structured local_url; lifecycle_state={}",
-        last_state.unwrap_or_else(|| "missing".to_string())
-    )))
-}
-
-fn enable_dogfood_package(
-    config: &botster_hub::HubConfig,
-    expected_package_name: &str,
-    path: PathBuf,
-) -> Result<DaemonResponse, DogfoodError> {
-    let response =
-        daemon_transport_request(config, DaemonRequest::EnablePackageLocalPath { path })?;
-    if !dogfood_package_already_installed(&response) {
-        return Ok(response);
-    }
-
-    daemon_transport_request(
-        config,
-        DaemonRequest::EnablePackage {
-            package_name: expected_package_name.to_string(),
-        },
-    )
-    .map_err(DogfoodError::Transport)
-}
-
-fn enable_botster_tui_dogfood(
-    config: &botster_hub::HubConfig,
-    package_path: &Path,
-) -> Result<(), DogfoodError> {
-    let response = enable_dogfood_package(config, "botster-tui", package_path.to_path_buf())?;
-    if response.kind == DaemonResponseKind::OperatorError {
-        return Err(DogfoodError::TuiPackageEnable(
-            response
-                .error
-                .map(|error| error.message)
-                .unwrap_or_else(|| "botster-tui package enable failed".to_string()),
-        ));
-    }
-    let package = response
-        .packages
-        .iter()
-        .find(|package| package.package_name == "botster-tui")
-        .ok_or(DogfoodError::WrongTuiPackage)?;
-    if !package.runnable_entrypoints.iter().any(|entrypoint| {
-        entrypoint.kind == "terminal_app" && entrypoint.launch_mode == "foreground_stdio"
-    }) {
-        return Err(DogfoodError::MissingTuiEntrypoint);
-    }
     Ok(())
 }
 
-fn dogfood_package_already_installed(response: &DaemonResponse) -> bool {
-    response.kind == DaemonResponseKind::OperatorError
-        && response
-            .error
-            .as_ref()
-            .is_some_and(|error| error.message.contains("AlreadyInstalled"))
-}
-
-fn absolutize_path(path: &Path) -> Result<PathBuf, DogfoodError> {
-    if path.is_absolute() {
-        Ok(path.to_path_buf())
-    } else {
-        env::current_dir()
-            .map(|current_dir| current_dir.join(path))
-            .map_err(DogfoodError::CurrentDir)
-    }
-}
-
-fn wait_for_botster_web_health(
-    config: &botster_hub::HubConfig,
-    bridge_url: &str,
-) -> Result<(), DogfoodError> {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let mut last_error = None;
-    while Instant::now() < deadline {
-        match read_botster_web_health(bridge_url) {
-            Ok(health) if botster_web_health_is_existing_hub_socket(&health) => return Ok(()),
-            Ok(health) => {
-                last_error = Some(format!("unexpected health response {health}"));
-            }
-            Err(error) => last_error = Some(error),
-        }
-        if let Some(message) = failed_web_entrypoint_status(config)? {
-            return Err(DogfoodError::WebEntrypointStart(message));
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-
-    Err(DogfoodError::WebHealth(last_error.unwrap_or_else(|| {
-        "timed out waiting for botster-web health".to_string()
-    })))
-}
-
-fn wait_for_botster_web_ui(
-    config: &botster_hub::HubConfig,
-    web_url: &str,
-) -> Result<(), DogfoodError> {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let mut last_error = None;
-    while Instant::now() < deadline {
-        match read_botster_web_ui(web_url) {
-            Ok(()) => return Ok(()),
-            Err(error) => last_error = Some(error),
-        }
-        if let Some(message) = failed_web_entrypoint_status(config)? {
-            return Err(DogfoodError::WebEntrypointStart(message));
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-
-    Err(DogfoodError::WebUi(last_error.unwrap_or_else(|| {
-        "timed out waiting for botster-web packaged UI".to_string()
-    })))
-}
-
-fn failed_web_entrypoint_status(
-    config: &botster_hub::HubConfig,
-) -> Result<Option<String>, DogfoodError> {
-    let response = daemon_transport_request(
-        config,
-        DaemonRequest::PackageEntrypointStatus {
-            package_name: "botster-web".to_string(),
-            entrypoint_id: "web-client".to_string(),
-        },
-    )?;
-    let Some(entrypoint) = response
-        .packages
-        .iter()
-        .find(|package| package.package_name == "botster-web")
-        .and_then(|package| {
-            package
-                .runnable_entrypoints
-                .iter()
-                .find(|entrypoint| entrypoint.id == "web-client")
-        })
-    else {
-        return Ok(None);
-    };
-    if entrypoint.process.state == "running" {
-        return Ok(None);
-    }
-
-    let mut message = format!("process state {}", entrypoint.process.state);
-    if let Some(exit_status) = entrypoint.process.exit_status.as_ref() {
-        message.push_str(&format!(" exit_status {exit_status}"));
-    }
-    for diagnostic in entrypoint.process.diagnostics.iter().take(4) {
-        message.push_str(&format!("; {}: {}", diagnostic.kind, diagnostic.message));
-    }
-    Ok(Some(message))
-}
-
-fn read_botster_web_health(bridge_url: &str) -> Result<serde_json::Value, String> {
-    let (headers, body) = read_botster_web_http(bridge_url, "/health", "health")?;
-    if !headers.starts_with("HTTP/1.1 200") && !headers.starts_with("HTTP/1.0 200") {
-        return Err("botster-web health returned non-200 status".to_string());
-    }
-    serde_json::from_str(body.trim())
-        .map_err(|error| format!("parse botster-web health JSON: {error}"))
-}
-
-fn read_botster_web_ui(web_url: &str) -> Result<(), String> {
-    let bridge_url = web_url
-        .strip_suffix("/?dogfood=real-hub")
-        .ok_or_else(|| "unsupported botster-web UI URL".to_string())?;
-    let (headers, body) = read_botster_web_http(bridge_url, "/?dogfood=real-hub", "UI")?;
-    if !headers.starts_with("HTTP/1.1 200") && !headers.starts_with("HTTP/1.0 200") {
-        return Err(format!(
-            "botster-web UI returned non-200 status: {headers}; body={body}"
-        ));
-    }
-    let normalized_headers = headers.to_ascii_lowercase();
-    if !normalized_headers.contains("content-type: text/html") {
-        return Err("botster-web UI did not return HTML content type".to_string());
-    }
-    let normalized_body = body.to_ascii_lowercase();
-    if !normalized_body.contains("<!doctype html") && !normalized_body.contains("<html") {
-        return Err("botster-web UI response was not an HTML document".to_string());
-    }
-    if normalized_body.contains(r#""error":"not_found""#) || normalized_body.trim() == "not found" {
-        return Err("botster-web UI returned not_found".to_string());
-    }
-    Ok(())
-}
-
-fn read_botster_web_http(
-    bridge_url: &str,
-    path: &str,
-    label: &str,
-) -> Result<(String, String), String> {
-    let port = bridge_url
-        .strip_prefix("http://127.0.0.1:")
-        .ok_or_else(|| format!("unsupported botster-web {label} URL"))?
-        .parse::<u16>()
-        .map_err(|_| format!("invalid botster-web {label} port"))?;
-    let mut stream = TcpStream::connect(("127.0.0.1", port))
-        .map_err(|error| format!("connect botster-web {label}: {error}"))?;
-    stream
-        .set_read_timeout(Some(Duration::from_secs(1)))
-        .map_err(|error| format!("set botster-web {label} read timeout: {error}"))?;
-    let request =
-        format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
-    stream
-        .write_all(request.as_bytes())
-        .map_err(|error| format!("write botster-web {label} request: {error}"))?;
-    let mut response = String::new();
-    stream
-        .read_to_string(&mut response)
-        .map_err(|error| format!("read botster-web {label} response: {error}"))?;
-    let Some((headers, body)) = response.split_once("\r\n\r\n") else {
-        return Err(format!("malformed botster-web {label} response"));
-    };
-    let body = if headers
-        .to_ascii_lowercase()
-        .contains("transfer-encoding: chunked")
+fn verify_web_ui(local_url: &str) -> Result<(), LocalRuntimeError> {
+    let (content_type, body) = read_web_http(local_url, "UI")?;
+    if !content_type
+        .as_deref()
+        .is_some_and(|value| value.to_ascii_lowercase().contains("text/html"))
     {
-        decode_chunked_http_body(body)?
-    } else {
-        body.to_string()
-    };
-    Ok((headers.to_string(), body))
-}
-
-fn botster_web_health_is_existing_hub_socket(health: &serde_json::Value) -> bool {
-    health.get("ok").and_then(serde_json::Value::as_bool) == Some(true)
-        && health.get("mode").and_then(serde_json::Value::as_str) == Some("existing_hub")
-        && health.get("source").and_then(serde_json::Value::as_str) == Some("socket")
-}
-
-fn decode_chunked_http_body(body: &str) -> Result<String, String> {
-    let mut rest = body;
-    let mut decoded = String::new();
-    loop {
-        let Some((size_line, after_size)) = rest.split_once("\r\n") else {
-            return Err("malformed chunked botster-web health body".to_string());
-        };
-        let size = usize::from_str_radix(size_line.trim(), 16)
-            .map_err(|_| "invalid chunked botster-web health size".to_string())?;
-        if size == 0 {
-            return Ok(decoded);
-        }
-        if after_size.len() < size + 2 {
-            return Err("truncated chunked botster-web health body".to_string());
-        }
-        decoded.push_str(&after_size[..size]);
-        rest = &after_size[size + 2..];
+        return Err(LocalRuntimeError::WebUi(
+            "response did not use an HTML content type".to_string(),
+        ));
     }
-}
-
-fn spawn_dogfood_daemon(
-    hub_bin: &Path,
-    data_directory: &Path,
-    options: &DogfoodOptions,
-) -> Result<Child, DogfoodError> {
-    if !hub_bin.is_file() {
-        return Err(DogfoodError::MissingHubBinary(hub_bin.to_path_buf()));
+    let body = String::from_utf8_lossy(&body).to_ascii_lowercase();
+    if !body.contains("<!doctype html") && !body.contains("<html") {
+        return Err(LocalRuntimeError::WebUi(
+            "response was not an HTML document".to_string(),
+        ));
     }
-    let session_worker_bin = options.session_worker_bin(hub_bin)?;
-
-    let mut command = Command::new(hub_bin);
-    command
-        .arg("start")
-        .arg("--data-dir")
-        .arg(data_directory)
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped());
-    command.arg("--session-worker-bin").arg(&session_worker_bin);
-
-    command.spawn().map_err(|source| DogfoodError::SpawnDaemon {
-        path: hub_bin.to_path_buf(),
-        source,
-    })
+    Ok(())
 }
 
-fn wait_for_dogfood_ready(data_directory: &Path, child: &mut Child) -> Result<(), DogfoodError> {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let config = explicit_config(data_directory.to_path_buf())?;
-    while Instant::now() < deadline {
-        if let Some(status) = child.try_wait().map_err(DogfoodError::PollDaemon)? {
-            return Err(DogfoodError::DaemonExited(status.to_string()));
-        }
-        if daemon_transport_request(&config, DaemonRequest::Status).is_ok() {
-            return Ok(());
-        }
-        thread::sleep(Duration::from_millis(50));
+fn read_web_http(
+    url: &str,
+    label: &'static str,
+) -> Result<(Option<String>, Vec<u8>), LocalRuntimeError> {
+    let timeout = Duration::from_secs(2);
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .max_redirects(0)
+        .proxy(None)
+        .timeout_global(Some(timeout))
+        .timeout_connect(Some(timeout))
+        .timeout_recv_response(Some(timeout))
+        .timeout_recv_body(Some(timeout))
+        .build()
+        .into();
+    let request = ureq::http::Request::builder()
+        .method(ureq::http::Method::GET)
+        .uri(url)
+        .body(Vec::new())
+        .map_err(|_| LocalRuntimeError::WebRequest {
+            label,
+            message: "invalid URL".to_string(),
+        })?;
+    let mut response = agent
+        .run(request)
+        .map_err(|error| LocalRuntimeError::WebRequest {
+            label,
+            message: error.to_string(),
+        })?;
+    if !response.status().is_success() {
+        return Err(LocalRuntimeError::WebRequest {
+            label,
+            message: format!("returned HTTP {}", response.status()),
+        });
     }
-
-    Err(DogfoodError::ReadinessTimeout)
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let body = response
+        .body_mut()
+        .with_config()
+        .limit(1_048_576)
+        .read_to_vec()
+        .map_err(|error| LocalRuntimeError::WebRequest {
+            label,
+            message: error.to_string(),
+        })?;
+    Ok((content_type, body))
 }
 
-fn cleanup_dogfood_child(child: &mut Child) {
-    let _ = child.kill();
-    let _ = child.wait();
-}
-
-fn cleanup_dogfood_child_after_shutdown(child: &mut Child) {
-    let deadline = Instant::now() + DOGFOOD_DAEMON_SHUTDOWN_BUDGET;
-    while Instant::now() < deadline {
-        match child.try_wait() {
-            Ok(Some(_)) => return,
-            Ok(None) => thread::sleep(Duration::from_millis(20)),
-            Err(_) => break,
-        }
-    }
-    cleanup_dogfood_child(child);
-}
-
-fn print_dogfood_ready(
-    data_directory: &Path,
-    default_data_dir: bool,
-    project_pipelines_state: &str,
-    web: &DogfoodWebLaunch,
-) {
-    let dir = data_directory.display();
-    println!("dogfood=ready");
-    if default_data_dir {
-        println!("data_dir=isolated:{dir}");
-    } else {
-        println!("data_dir={dir}");
-    }
-    println!("package name=project-pipelines state={project_pipelines_state}");
-    println!("package name=botster-web state={}", web.package_state);
-    println!("bridge={}", web.bridge_url);
-    println!("web={}", web.web_url);
-    println!("tui=botster-hub apps open --data-dir {dir} botster-tui");
-    println!("mcp=botster-hub mcp-serve --data-dir {dir}");
-    println!("status=botster-hub status --data-dir {dir}");
-    println!(
-        "shutdown=run botster-hub shutdown --data-dir {dir} from another terminal for graceful shutdown; Ctrl-C hard-stops the foreground launcher"
-    );
+fn runtime_origin(local_url: &str) -> Option<String> {
+    let scheme_end = local_url.find("://")?;
+    let after_scheme = scheme_end + 3;
+    let authority_end = local_url[after_scheme..]
+        .find(['/', '?', '#'])
+        .map(|index| after_scheme + index)
+        .unwrap_or(local_url.len());
+    (authority_end > after_scheme).then(|| local_url[..authority_end].to_string())
 }
 
 fn operator_status(args: Vec<String>) -> Result<(), OperatorError> {
@@ -3944,7 +3450,7 @@ impl DailyDataDirOptions {
     fn from_override(data_directory: Option<PathBuf>) -> Self {
         let default_data_dir = data_directory.is_none();
         Self {
-            data_directory: data_directory.unwrap_or_else(default_dev_stack_data_dir),
+            data_directory: data_directory.unwrap_or_else(default_local_runtime_data_dir),
             default_data_dir,
         }
     }
@@ -3984,235 +3490,93 @@ impl StartOptions {
     }
 }
 
-struct DogfoodOptions {
-    data_directory: Option<PathBuf>,
-    session_worker_bin: Option<PathBuf>,
-    web_package_path: Option<PathBuf>,
-    tui_package_path: Option<PathBuf>,
-    web_bridge_port: Option<u16>,
-    default_data_dir: bool,
-}
-
-enum DevStackCommand {
-    Bootstrap(DevStackOptions),
-}
-
-impl DevStackCommand {
-    fn parse(args: Vec<String>) -> Result<Self, DevStackError> {
-        match args.first().map(String::as_str) {
-            Some("bootstrap") => Ok(Self::Bootstrap(DevStackOptions::parse(args[1..].to_vec())?)),
-            _ => Err(DevStackError::Usage),
-        }
-    }
-}
-
-struct DevStackOptions {
+struct LocalRuntimeOptions {
     data_directory: PathBuf,
     default_data_dir: bool,
     session_worker_bin: Option<PathBuf>,
-    project_pipelines_package_path: Option<PathBuf>,
-    web_package_path: Option<PathBuf>,
-    tui_package_path: Option<PathBuf>,
-    workspaces_package_path: Option<PathBuf>,
-    web_bridge_port: Option<u16>,
 }
 
-struct SmokeOptions {
-    dev_stack: DevStackOptions,
-}
-
-impl DevStackOptions {
-    fn parse(args: Vec<String>) -> Result<Self, DevStackError> {
+impl LocalRuntimeOptions {
+    fn parse(args: Vec<String>) -> Result<Self, LocalRuntimeError> {
         let mut data_directory = None;
         let mut session_worker_bin = None;
-        let mut project_pipelines_package_path = None;
-        let mut web_package_path = None;
-        let mut tui_package_path = None;
-        let mut workspaces_package_path = None;
-        let mut web_bridge_port = None;
         let mut cursor = 0;
-
         while cursor < args.len() {
             match args[cursor].as_str() {
                 "--data-dir" => {
                     let Some(value) = args.get(cursor + 1) else {
-                        return Err(DevStackError::Usage);
+                        return Err(LocalRuntimeError::Usage);
                     };
                     data_directory = Some(PathBuf::from(value));
                     cursor += 2;
                 }
                 "--session-worker-bin" => {
                     let Some(value) = args.get(cursor + 1) else {
-                        return Err(DevStackError::Usage);
+                        return Err(LocalRuntimeError::Usage);
                     };
                     session_worker_bin = Some(PathBuf::from(value));
                     cursor += 2;
                 }
-                "--project-pipelines-package-path" => {
-                    let Some(value) = args.get(cursor + 1) else {
-                        return Err(DevStackError::Usage);
-                    };
-                    project_pipelines_package_path = Some(PathBuf::from(value));
-                    cursor += 2;
-                }
-                "--web-package-path" => {
-                    let Some(value) = args.get(cursor + 1) else {
-                        return Err(DevStackError::Usage);
-                    };
-                    web_package_path = Some(PathBuf::from(value));
-                    cursor += 2;
-                }
-                "--tui-package-path" => {
-                    let Some(value) = args.get(cursor + 1) else {
-                        return Err(DevStackError::Usage);
-                    };
-                    tui_package_path = Some(PathBuf::from(value));
-                    cursor += 2;
-                }
-                "--workspaces-package-path" => {
-                    let Some(value) = args.get(cursor + 1) else {
-                        return Err(DevStackError::Usage);
-                    };
-                    workspaces_package_path = Some(PathBuf::from(value));
-                    cursor += 2;
-                }
-                "--web-bridge-port" => {
-                    let Some(value) = args.get(cursor + 1) else {
-                        return Err(DevStackError::Usage);
-                    };
-                    web_bridge_port = Some(value.parse::<u16>().map_err(|_| DevStackError::Usage)?);
-                    cursor += 2;
-                }
-                _ => return Err(DevStackError::Usage),
+                _ => return Err(LocalRuntimeError::Usage),
             }
         }
-
-        let daily_data_dir = DailyDataDirOptions::from_override(data_directory);
+        let daily = DailyDataDirOptions::from_override(data_directory);
         Ok(Self {
-            data_directory: daily_data_dir.data_directory,
-            default_data_dir: daily_data_dir.default_data_dir,
+            data_directory: daily.data_directory,
+            default_data_dir: daily.default_data_dir,
             session_worker_bin,
-            project_pipelines_package_path,
-            web_package_path,
-            tui_package_path,
-            workspaces_package_path,
-            web_bridge_port,
         })
     }
 
-    fn package_path(&self, label: &'static str) -> Result<PathBuf, DevStackError> {
-        let explicit = match label {
-            "project-pipelines" => self.project_pipelines_package_path.as_ref(),
-            "botster-web" => self.web_package_path.as_ref(),
-            "botster-tui" => self.tui_package_path.as_ref(),
-            "botster-workspaces" => self.workspaces_package_path.as_ref(),
-            _ => None,
-        };
-        if let Some(path) = explicit {
-            return Ok(path.clone());
-        }
-
-        let fallback = match label {
-            "project-pipelines" => PathBuf::from("examples/project-pipelines"),
-            "botster-web" => PathBuf::from("../botster-web"),
-            "botster-tui" => PathBuf::from("../botster-tui"),
-            "botster-workspaces" => PathBuf::from("../botster-workspaces"),
-            _ => return Err(DevStackError::MissingPackage { label }),
-        };
-        if fallback.join("botster-package.json").is_file() {
-            Ok(fallback)
-        } else {
-            Err(DevStackError::MissingPackage { label })
-        }
-    }
-
-    fn session_worker_bin(&self, hub_bin: &Path) -> Result<PathBuf, DevStackError> {
-        if let Some(path) = self.session_worker_bin.as_ref() {
+    fn session_worker_bin(&self, hub_bin: &Path) -> Result<PathBuf, LocalRuntimeError> {
+        if let Some(path) = &self.session_worker_bin {
             if path.is_file() {
                 return Ok(path.clone());
             }
-            return Err(DevStackError::MissingSessionWorkerBinary(path.clone()));
+            return Err(LocalRuntimeError::MissingSessionWorkerBinary(path.clone()));
         }
-
-        DogfoodOptions {
-            data_directory: None,
-            session_worker_bin: None,
-            web_package_path: None,
-            tui_package_path: None,
-            web_bridge_port: None,
-            default_data_dir: false,
+        let Some(bin_dir) = hub_bin.parent() else {
+            return Err(LocalRuntimeError::MissingSessionWorkerBinary(
+                PathBuf::from("botster-session-worker"),
+            ));
+        };
+        let path = bin_dir.join("botster-session-worker");
+        if path.is_file() {
+            return Ok(path);
         }
-        .session_worker_bin(hub_bin)
-        .map_err(DevStackError::from)
+        if bin_dir.file_name().and_then(|name| name.to_str()) == Some("deps")
+            && let Some(debug_dir) = bin_dir.parent()
+        {
+            let debug_path = debug_dir.join("botster-session-worker");
+            if debug_path.is_file() {
+                return Ok(debug_path);
+            }
+            return Err(LocalRuntimeError::MissingSessionWorkerBinary(debug_path));
+        }
+        Err(LocalRuntimeError::MissingSessionWorkerBinary(path))
     }
+}
 
-    fn web_bridge_port(&self) -> Result<u16, DevStackError> {
-        match self.web_bridge_port {
-            Some(port) => Ok(port),
-            None => choose_loopback_port().map_err(DevStackError::from),
-        }
-    }
+struct SmokeOptions {
+    runtime: LocalRuntimeOptions,
 }
 
 impl SmokeOptions {
     fn parse(args: Vec<String>) -> Result<Self, SmokeError> {
         Ok(Self {
-            dev_stack: DevStackOptions::parse(args)?,
+            runtime: LocalRuntimeOptions::parse(args)?,
         })
     }
 }
 
-fn default_dev_stack_data_dir() -> PathBuf {
-    PathBuf::from("target").join("botster-hub-dev-stack-data")
-}
-
-fn dev_stack_package_path_flag(label: &str) -> &'static str {
-    match label {
-        "project-pipelines" => "project-pipelines",
-        "botster-web" => "web",
-        "botster-tui" => "tui",
-        "botster-workspaces" => "workspaces",
-        _ => "package",
-    }
+fn default_local_runtime_data_dir() -> PathBuf {
+    PathBuf::from("target").join("botster-hub-runtime-data")
 }
 
 #[derive(Clone, Copy)]
-enum DevStackDaemonOwnership {
+enum LocalRuntimeDaemonOwnership {
     Started,
     Reused,
-}
-
-fn print_dev_stack_ready(
-    data_directory: &Path,
-    default_data_dir: bool,
-    daemon_ownership: DevStackDaemonOwnership,
-    packages: &[(&str, &str)],
-    web: &DogfoodWebLaunch,
-) {
-    let dir = data_directory.display();
-    println!("dev_stack=ready");
-    if default_data_dir {
-        println!("data_dir=stable:{dir}");
-    } else {
-        println!("data_dir={dir}");
-    }
-    println!(
-        "daemon={}",
-        match daemon_ownership {
-            DevStackDaemonOwnership::Started => "started",
-            DevStackDaemonOwnership::Reused => "reused",
-        }
-    );
-    for (name, state) in packages {
-        println!("package name={name} state={state}");
-    }
-    println!("bridge={}", web.bridge_url);
-    println!("web={}", web.web_url);
-    println!("tui=botster-hub apps open --data-dir {dir} botster-tui");
-    println!("mcp=botster-hub mcp-serve --data-dir {dir}");
-    println!("status=botster-hub status --data-dir {dir}");
-    println!("apps=botster-hub apps list --data-dir {dir}");
-    println!("shutdown=botster-hub shutdown --data-dir {dir}");
 }
 
 fn print_local_runtime_ready(
@@ -4230,8 +3594,8 @@ fn print_local_runtime_ready(
     println!(
         "daemon={}",
         match outcome.daemon_ownership {
-            DevStackDaemonOwnership::Started => "started",
-            DevStackDaemonOwnership::Reused => "reused",
+            LocalRuntimeDaemonOwnership::Started => "started",
+            LocalRuntimeDaemonOwnership::Reused => "reused",
         }
     );
     println!("protocol={}", status.compatibility.protocol);
@@ -4253,139 +3617,16 @@ fn print_local_runtime_ready(
             app.launch_target.local_url.as_deref().unwrap_or("none")
         );
     }
-    println!("bridge={}", outcome.web.bridge_url);
-    println!("web={}", outcome.web.web_url);
+    println!(
+        "package name=botster-web state={}",
+        outcome.web.package_state
+    );
+    println!("web={}", outcome.web.local_url);
     println!("tui=botster-hub apps open --data-dir {dir} botster-tui");
     println!("mcp=botster-hub mcp-serve --data-dir {dir}");
     println!("status=botster-hub status --data-dir {dir}");
     println!("apps=botster-hub apps list --data-dir {dir}");
     println!("down=botster-hub down --data-dir {dir}");
-}
-
-impl DogfoodOptions {
-    fn parse(args: Vec<String>) -> Result<Self, DogfoodError> {
-        let mut data_directory = None;
-        let mut session_worker_bin = None;
-        let mut web_package_path = None;
-        let mut tui_package_path = None;
-        let mut web_bridge_port = None;
-        let mut cursor = 0;
-
-        while cursor < args.len() {
-            match args[cursor].as_str() {
-                "--data-dir" => {
-                    let Some(value) = args.get(cursor + 1) else {
-                        return Err(DogfoodError::Usage);
-                    };
-                    data_directory = Some(PathBuf::from(value));
-                    cursor += 2;
-                }
-                "--session-worker-bin" => {
-                    let Some(value) = args.get(cursor + 1) else {
-                        return Err(DogfoodError::Usage);
-                    };
-                    session_worker_bin = Some(PathBuf::from(value));
-                    cursor += 2;
-                }
-                "--web-package-path" => {
-                    let Some(value) = args.get(cursor + 1) else {
-                        return Err(DogfoodError::Usage);
-                    };
-                    web_package_path = Some(PathBuf::from(value));
-                    cursor += 2;
-                }
-                "--tui-package-path" => {
-                    let Some(value) = args.get(cursor + 1) else {
-                        return Err(DogfoodError::Usage);
-                    };
-                    tui_package_path = Some(PathBuf::from(value));
-                    cursor += 2;
-                }
-                "--web-bridge-port" => {
-                    let Some(value) = args.get(cursor + 1) else {
-                        return Err(DogfoodError::Usage);
-                    };
-                    web_bridge_port = Some(value.parse::<u16>().map_err(|_| DogfoodError::Usage)?);
-                    cursor += 2;
-                }
-                _ => return Err(DogfoodError::Usage),
-            }
-        }
-
-        Ok(Self {
-            default_data_dir: data_directory.is_none(),
-            data_directory,
-            session_worker_bin,
-            web_package_path,
-            tui_package_path,
-            web_bridge_port,
-        })
-    }
-
-    fn package_path(&self) -> PathBuf {
-        PathBuf::from("examples/project-pipelines")
-    }
-
-    fn session_worker_bin(&self, hub_bin: &Path) -> Result<PathBuf, DogfoodError> {
-        if let Some(path) = self.session_worker_bin.as_ref() {
-            if path.is_file() {
-                return Ok(path.clone());
-            }
-            return Err(DogfoodError::MissingSessionWorkerBinary(path.clone()));
-        }
-
-        let Some(bin_dir) = hub_bin.parent() else {
-            return Err(DogfoodError::MissingSessionWorkerBinary(PathBuf::from(
-                "botster-session-worker",
-            )));
-        };
-        let path = bin_dir.join("botster-session-worker");
-        if path.is_file() {
-            Ok(path)
-        } else if bin_dir.file_name().and_then(|name| name.to_str()) == Some("deps")
-            && let Some(debug_dir) = bin_dir.parent()
-        {
-            let debug_path = debug_dir.join("botster-session-worker");
-            if debug_path.is_file() {
-                Ok(debug_path)
-            } else {
-                Err(DogfoodError::MissingSessionWorkerBinary(debug_path))
-            }
-        } else {
-            Err(DogfoodError::MissingSessionWorkerBinary(path))
-        }
-    }
-
-    fn data_directory(&self) -> Result<PathBuf, DogfoodError> {
-        if let Some(path) = self.data_directory.as_ref() {
-            return Ok(path.clone());
-        }
-
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(DogfoodError::Clock)?
-            .as_nanos();
-        Ok(PathBuf::from("/tmp")
-            .join("botster-hub-dogfood")
-            .join(format!("{}-{nanos}", process::id())))
-    }
-
-    fn web_bridge_port(&self) -> Result<u16, DogfoodError> {
-        match self.web_bridge_port {
-            Some(port) => Ok(port),
-            None => choose_loopback_port(),
-        }
-    }
-}
-
-fn choose_loopback_port() -> Result<u16, DogfoodError> {
-    let listener = TcpListener::bind(("127.0.0.1", 0)).map_err(DogfoodError::SelectBridgePort)?;
-    let port = listener
-        .local_addr()
-        .map_err(DogfoodError::ReadBridgePort)?
-        .port();
-    drop(listener);
-    Ok(port)
 }
 
 struct SessionCommand {
@@ -5163,41 +4404,7 @@ enum StartError {
 }
 
 #[derive(Debug)]
-enum DogfoodError {
-    Usage,
-    Clock(std::time::SystemTimeError),
-    CurrentExe(io::Error),
-    CurrentDir(io::Error),
-    SelectBridgePort(io::Error),
-    ReadBridgePort(io::Error),
-    CreateDataDir { path: PathBuf, source: io::Error },
-    MissingHubBinary(PathBuf),
-    MissingSessionWorkerBinary(PathBuf),
-    SpawnDaemon { path: PathBuf, source: io::Error },
-    PollDaemon(io::Error),
-    ReadinessTimeout,
-    Config(botster_hub::HubConfigError),
-    Transport(botster_hub::DaemonTransportError),
-    SessionWorker(String),
-    PackageEnable(String),
-    MissingWebPackagePath,
-    MissingWebPackage(PathBuf),
-    WrongWebPackage,
-    MissingWebEntrypoint,
-    MissingLocalSocket,
-    WebPackageEnable(String),
-    WebEntrypointStart(String),
-    WebHealth(String),
-    WebUi(String),
-    TuiPackageEnable(String),
-    WrongTuiPackage,
-    MissingTuiEntrypoint,
-    WaitDaemon(io::Error),
-    DaemonExited(String),
-}
-
-#[derive(Debug)]
-enum DevStackError {
+enum LocalRuntimeError {
     Usage,
     CurrentExe(io::Error),
     CreateDataDir {
@@ -5245,15 +4452,19 @@ enum DevStackError {
     MissingPackage {
         label: &'static str,
     },
-    WrongPackage {
-        label: &'static str,
+    PackageDisabled {
+        package_name: &'static str,
+        state: String,
     },
-    PackageEnable {
+    MissingWebEntrypoint,
+    WebEntrypointStart(String),
+    WebHealth(String),
+    WebUi(String),
+    WebRequest {
         label: &'static str,
         message: String,
     },
     Operator(Box<OperatorError>),
-    Dogfood(Box<DogfoodError>),
     IncompatibleDaemon(String),
     DaemonExited {
         status: String,
@@ -5268,7 +4479,7 @@ enum DevStackError {
 enum SmokeError {
     Usage,
     Clock,
-    DevStack(DevStackError),
+    Runtime(LocalRuntimeError),
     Transport(botster_hub::DaemonTransportError),
     UnexpectedResponse(&'static str),
     MissingPrerequisite(&'static str),
@@ -5331,25 +4542,17 @@ impl fmt::Display for StartError {
     }
 }
 
-impl fmt::Display for DogfoodError {
+impl fmt::Display for LocalRuntimeError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Usage => write!(formatter, "{}", usage_for("dogfood")),
-            Self::Clock(error) => write!(formatter, "{error}"),
+            Self::Usage => write!(formatter, "{}", usage_for("up")),
             Self::CurrentExe(error) => {
                 write!(formatter, "resolve current botster-hub binary: {error}")
-            }
-            Self::CurrentDir(error) => write!(formatter, "resolve current directory: {error}"),
-            Self::SelectBridgePort(error) => {
-                write!(formatter, "select free botster-web bridge port: {error}")
-            }
-            Self::ReadBridgePort(error) => {
-                write!(formatter, "read selected botster-web bridge port: {error}")
             }
             Self::CreateDataDir { path, source } => {
                 write!(
                     formatter,
-                    "create dogfood data dir {}: {source}",
+                    "create local runtime data dir {}: {source}",
                     path.display()
                 )
             }
@@ -5368,126 +4571,11 @@ impl fmt::Display for DogfoodError {
             Self::SpawnDaemon { path, source } => {
                 write!(
                     formatter,
-                    "spawn dogfood daemon {}: {source}",
+                    "spawn local runtime daemon {}: {source}",
                     path.display()
                 )
             }
-            Self::PollDaemon(error) => write!(formatter, "poll dogfood daemon: {error}"),
-            Self::ReadinessTimeout => {
-                write!(formatter, "timed out waiting for dogfood daemon readiness")
-            }
-            Self::Config(error) => write!(formatter, "{error}"),
-            Self::Transport(error) => write!(formatter, "{error}"),
-            Self::SessionWorker(message) => {
-                write!(formatter, "verify botster-session-worker: {message}")
-            }
-            Self::PackageEnable(message) => {
-                write!(formatter, "enable project-pipelines package: {message}")
-            }
-            Self::MissingWebPackagePath => {
-                write!(
-                    formatter,
-                    "pass --web-package-path <path> for the botster-web package"
-                )
-            }
-            Self::MissingWebPackage(path) => {
-                write!(
-                    formatter,
-                    "missing botster-web package at {}",
-                    path.display()
-                )
-            }
-            Self::WrongWebPackage => {
-                write!(
-                    formatter,
-                    "--web-package-path must enable package botster-web"
-                )
-            }
-            Self::MissingWebEntrypoint => {
-                write!(
-                    formatter,
-                    "botster-web package must declare runnable entrypoint web-client"
-                )
-            }
-            Self::MissingLocalSocket => {
-                write!(
-                    formatter,
-                    "dogfood daemon has no local socket transport for botster-web attach mode"
-                )
-            }
-            Self::WebPackageEnable(message) => {
-                write!(formatter, "enable botster-web package: {message}")
-            }
-            Self::WebEntrypointStart(message) => {
-                write!(
-                    formatter,
-                    "start botster-web web-client entrypoint: {message}"
-                )
-            }
-            Self::WebHealth(message) => {
-                write!(
-                    formatter,
-                    "verify botster-web existing-hub health: {message}"
-                )
-            }
-            Self::WebUi(message) => {
-                write!(formatter, "verify botster-web packaged UI: {message}")
-            }
-            Self::TuiPackageEnable(message) => {
-                write!(formatter, "enable botster-tui package: {message}")
-            }
-            Self::WrongTuiPackage => {
-                write!(
-                    formatter,
-                    "--tui-package-path must enable package botster-tui"
-                )
-            }
-            Self::MissingTuiEntrypoint => {
-                write!(
-                    formatter,
-                    "botster-tui package must declare a terminal_app foreground_stdio entrypoint"
-                )
-            }
-            Self::WaitDaemon(error) => write!(formatter, "wait for dogfood daemon: {error}"),
-            Self::DaemonExited(status) => write!(formatter, "dogfood daemon exited with {status}"),
-        }
-    }
-}
-
-impl fmt::Display for DevStackError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Usage => write!(formatter, "{}", usage_for("dev-stack bootstrap")),
-            Self::CurrentExe(error) => {
-                write!(formatter, "resolve current botster-hub binary: {error}")
-            }
-            Self::CreateDataDir { path, source } => {
-                write!(
-                    formatter,
-                    "create dev-stack data dir {}: {source}",
-                    path.display()
-                )
-            }
-            Self::MissingHubBinary(path) => {
-                write!(
-                    formatter,
-                    "missing botster-hub binary at {}",
-                    path.display()
-                )
-            }
-            Self::MissingSessionWorkerBinary(path) => write!(
-                formatter,
-                "missing botster-session-worker binary at {}; pass --session-worker-bin <path>",
-                path.display()
-            ),
-            Self::SpawnDaemon { path, source } => {
-                write!(
-                    formatter,
-                    "spawn dev-stack daemon {}: {source}",
-                    path.display()
-                )
-            }
-            Self::PollDaemon(error) => write!(formatter, "poll dev-stack daemon: {error}"),
+            Self::PollDaemon(error) => write!(formatter, "poll local runtime daemon: {error}"),
             Self::ReadinessTimeout {
                 elapsed,
                 readiness_budget,
@@ -5497,74 +4585,97 @@ impl fmt::Display for DevStackError {
             } => {
                 write!(
                     formatter,
-                    "timed out waiting for dev-stack daemon readiness after {elapsed:?} (budget {readiness_budget:?}); last status probe: {last_probe}; terminated owned child_pid={child_pid} child_status={child_status}"
+                    "timed out waiting for local runtime daemon readiness after {elapsed:?} (budget {readiness_budget:?}); last status probe: {last_probe}; terminated owned child_pid={child_pid} child_status={child_status}"
                 )
             }
             Self::MissingLocalSocket => write!(formatter, "local socket transport is disabled"),
             Self::WriteDaemonMetadata { path, source } => {
                 write!(
                     formatter,
-                    "write dev-stack daemon metadata {}: {source}",
+                    "write local runtime daemon metadata {}: {source}",
                     path.display()
                 )
             }
             Self::ReadDaemonMetadata { path, source } => {
                 write!(
                     formatter,
-                    "read dev-stack daemon metadata {}: {source}",
+                    "read local runtime daemon metadata {}: {source}",
                     path.display()
                 )
             }
             Self::ReadDaemonMetadataJson(error) => {
-                write!(formatter, "parse dev-stack daemon metadata: {error}")
+                write!(formatter, "parse local runtime daemon metadata: {error}")
             }
             Self::RemoveDaemonMetadata { path, source } => {
                 write!(
                     formatter,
-                    "remove dev-stack daemon metadata {}: {source}",
+                    "remove local runtime daemon metadata {}: {source}",
                     path.display()
                 )
             }
             Self::RemoveLocalSocket { path, source } => {
                 write!(
                     formatter,
-                    "remove stale dev-stack local socket {}: {source}",
+                    "remove stale local runtime local socket {}: {source}",
                     path.display()
                 )
             }
             Self::SerializeMetadata(error) => {
-                write!(formatter, "serialize dev-stack daemon metadata: {error}")
+                write!(
+                    formatter,
+                    "serialize local runtime daemon metadata: {error}"
+                )
             }
             Self::InspectProcess(error) => {
-                write!(formatter, "inspect dev-stack daemon process: {error}")
+                write!(formatter, "inspect local runtime daemon process: {error}")
             }
             Self::TerminateDaemon(error) => {
-                write!(formatter, "terminate stale dev-stack daemon: {error}")
+                write!(formatter, "terminate stale local runtime daemon: {error}")
             }
             Self::TerminateDaemonTimeout(pid) => {
                 write!(
                     formatter,
-                    "timed out waiting for stale dev-stack daemon process {pid} to exit"
+                    "timed out waiting for stale local runtime daemon process {pid} to exit"
                 )
             }
             Self::Config(error) => write!(formatter, "{error}"),
             Self::Transport(error) => write!(formatter, "{error}"),
-            Self::MissingPackage { label } => write!(
-                formatter,
-                "missing {label} package; pass --{}-package-path <path>",
-                dev_stack_package_path_flag(label)
-            ),
-            Self::WrongPackage { label } => {
+            Self::MissingPackage { label } => {
                 write!(
                     formatter,
-                    "package path did not enable expected package {label}"
+                    "package {label} is not installed; install it with `botster-hub packages install --data-dir <path> --path <package-path>` and enable it before running `botster-hub up`"
                 )
             }
-            Self::PackageEnable { label, message } => {
-                write!(formatter, "enable {label} package: {message}")
+            Self::PackageDisabled {
+                package_name,
+                state,
+            } => {
+                write!(
+                    formatter,
+                    "package {package_name} must be enabled before `botster-hub up`; current state={state}"
+                )
+            }
+            Self::MissingWebEntrypoint => write!(
+                formatter,
+                "package botster-web must declare runnable entrypoint web-client"
+            ),
+            Self::WebEntrypointStart(message) => write!(
+                formatter,
+                "start package botster-web entrypoint web-client: {message}"
+            ),
+            Self::WebHealth(message) => {
+                write!(formatter, "verify botster-web/web-client health: {message}")
+            }
+            Self::WebUi(message) => {
+                write!(formatter, "verify botster-web/web-client UI: {message}")
+            }
+            Self::WebRequest { label, message } => {
+                write!(
+                    formatter,
+                    "request botster-web/web-client {label}: {message}"
+                )
             }
             Self::Operator(error) => write!(formatter, "{error}"),
-            Self::Dogfood(error) => write!(formatter, "{error}"),
             Self::IncompatibleDaemon(message) => write!(
                 formatter,
                 "running daemon is incompatible or stale: {message}; `botster-hub down` may fail against this daemon because shutdown uses the same protocol handshake. Stop the running botster-hub process directly, remove the stale local socket for this data dir if one remains, then retry `botster-hub up --data-dir <path>`"
@@ -5578,7 +4689,7 @@ impl fmt::Display for DevStackError {
             } => {
                 write!(
                     formatter,
-                    "dev-stack daemon exited with {status} after {elapsed:?} (readiness budget {readiness_budget:?}); last status probe: {last_probe}; daemon error: {stderr_tail}"
+                    "local runtime daemon exited with {status} after {elapsed:?} (readiness budget {readiness_budget:?}); last status probe: {last_probe}; daemon error: {stderr_tail}"
                 )
             }
         }
@@ -5590,7 +4701,7 @@ impl fmt::Display for SmokeError {
         match self {
             Self::Usage => write!(formatter, "{}", usage_for("smoke")),
             Self::Clock => write!(formatter, "system clock is before unix epoch"),
-            Self::DevStack(error) => write!(formatter, "{error}"),
+            Self::Runtime(error) => write!(formatter, "{error}"),
             Self::Transport(error) => write!(formatter, "{error}"),
             Self::UnexpectedResponse(response) => {
                 write!(formatter, "unexpected client API response for {response}")
@@ -5609,43 +4720,30 @@ impl fmt::Display for SmokeError {
     }
 }
 
-impl From<botster_hub::HubConfigError> for DevStackError {
+impl From<botster_hub::HubConfigError> for LocalRuntimeError {
     fn from(error: botster_hub::HubConfigError) -> Self {
         Self::Config(error)
     }
 }
 
-impl From<botster_hub::DaemonTransportError> for DevStackError {
+impl From<botster_hub::DaemonTransportError> for LocalRuntimeError {
     fn from(error: botster_hub::DaemonTransportError) -> Self {
         Self::Transport(error)
     }
 }
 
-impl From<DogfoodError> for DevStackError {
-    fn from(error: DogfoodError) -> Self {
-        match error {
-            DogfoodError::MissingSessionWorkerBinary(path) => {
-                Self::MissingSessionWorkerBinary(path)
-            }
-            DogfoodError::Config(error) => Self::Config(error),
-            DogfoodError::Transport(error) => Self::Transport(error),
-            other => Self::Dogfood(Box::new(other)),
-        }
-    }
-}
-
-impl From<OperatorError> for DevStackError {
+impl From<OperatorError> for LocalRuntimeError {
     fn from(error: OperatorError) -> Self {
         Self::Operator(Box::new(error))
     }
 }
 
-impl From<DevStackError> for SmokeError {
-    fn from(error: DevStackError) -> Self {
+impl From<LocalRuntimeError> for SmokeError {
+    fn from(error: LocalRuntimeError) -> Self {
         match error {
-            DevStackError::Usage => Self::Usage,
-            DevStackError::MissingPackage { label } => Self::MissingPrerequisite(label),
-            other => Self::DevStack(other),
+            LocalRuntimeError::Usage => Self::Usage,
+            LocalRuntimeError::MissingPackage { label } => Self::MissingPrerequisite(label),
+            other => Self::Runtime(other),
         }
     }
 }
@@ -5739,19 +4837,13 @@ Packages:
   botster-hub packages entrypoint-status --data-dir <path> <package> <entrypoint>"
         }
         "start" => "usage: botster-hub start --data-dir <path> [--session-worker-bin <path>]",
-        "dogfood" => {
-            "usage: botster-hub dogfood [--data-dir <path>] [--session-worker-bin <path>] --web-package-path <path> [--tui-package-path <path>] [--web-bridge-port <port>]"
-        }
-        "dev-stack" | "dev-stack bootstrap" => {
-            "usage: botster-hub dev-stack bootstrap [--data-dir <path>] [--session-worker-bin <path>] [--project-pipelines-package-path <path>] [--web-package-path <path>] [--tui-package-path <path>] [--workspaces-package-path <path>] [--web-bridge-port <port>]"
-        }
         "up" => {
-            "usage: botster-hub up [--data-dir <path>] [--session-worker-bin <path>] [--project-pipelines-package-path <path>] [--web-package-path <path>] [--tui-package-path <path>] [--workspaces-package-path <path>] [--web-bridge-port <port>]"
+            "usage: botster-hub up [--data-dir <path>] [--session-worker-bin <path>]"
         }
         "down" => "usage: botster-hub down [--data-dir <path>]",
         "doctor" => "usage: botster-hub doctor [--data-dir <path>]",
         "smoke" => {
-            "usage: botster-hub smoke [--data-dir <path>] [--session-worker-bin <path>] [--project-pipelines-package-path <path>] [--web-package-path <path>] [--tui-package-path <path>] [--workspaces-package-path <path>] [--web-bridge-port <port>]"
+            "usage: botster-hub smoke [--data-dir <path>] [--session-worker-bin <path>]"
         }
         "status" => "usage: botster-hub status [--data-dir <path>]",
         "sessions" => {
@@ -5867,7 +4959,7 @@ Packages:
         "providers" | "providers list" => "usage: botster-hub providers list --data-dir <path>",
         "inspect" => "usage: botster-hub inspect --data-dir <path> <session-id>",
         _ => {
-            "usage: botster-hub <help|up|down|doctor|smoke|open|reload|start|dogfood|dev-stack|status|sessions|shutdown|mcp-serve|apps|packages|providers|inspect|run-one>"
+            "usage: botster-hub <help|up|down|doctor|smoke|open|reload|start|status|sessions|shutdown|mcp-serve|apps|packages|providers|inspect|run-one>"
         }
     }
 }
@@ -5917,18 +5009,6 @@ impl From<botster_hub::DaemonTransportError> for StartError {
 impl From<OperatorError> for StartError {
     fn from(error: OperatorError) -> Self {
         Self::Operator(Box::new(error))
-    }
-}
-
-impl From<botster_hub::HubConfigError> for DogfoodError {
-    fn from(error: botster_hub::HubConfigError) -> Self {
-        Self::Config(error)
-    }
-}
-
-impl From<botster_hub::DaemonTransportError> for DogfoodError {
-    fn from(error: botster_hub::DaemonTransportError) -> Self {
-        Self::Transport(error)
     }
 }
 

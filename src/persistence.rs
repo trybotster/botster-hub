@@ -2,7 +2,7 @@
 //!
 //! The hub persists product and policy state here while `botster-core` remains
 //! the owner of reusable session, transport, package, and admission mechanics.
-//! Version 1 is a single local JSON file intended for local dogfood. It is a
+//! Version 1 is a single local JSON file intended for the local runtime. It is a
 //! single-writer store: atomic rename keeps the previous committed file intact
 //! when a write fails before rename, but concurrent hub processes can still
 //! produce last-writer-wins updates.
@@ -912,6 +912,7 @@ mod tests {
             command: "bin/botster-web".to_string(),
             args: vec!["--host".to_string(), "127.0.0.1".to_string()],
             working_directory: PackageRunnableWorkingDirectory::PackageRoot,
+            injections: Vec::new(),
             environment: Vec::new(),
             capabilities: Vec::new(),
             readiness: None,

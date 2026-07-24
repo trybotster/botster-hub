@@ -6,12 +6,12 @@
 - Required role context: [[planner-playbook]], [[botster-planner-playbook]].
 - Vault/project context: [[identity]], [[goals]], [[botster-architecture]], [[cli-patterns]], [[spa-patterns]], [[project pipeline orchestration belongs in a device-level botster plugin]], [[project pipelines needs an operator workbench not more primitives]], [[project pipelines ui contract belongs in the plugin readme]], [[botster orchestration should spawn agents with explicit target ids]], [[botster orchestration prompts must bind agents to explicit worktrees]], [[plan agents must author vault context as wikilinks not home paths]], [[botster hub client compatibility descriptors belong in client crate]], [[botster hub diagnostics use daemon diagnostic rows in client dtos]], [[operator diagnostic remediation must survive the diagnosed failure]], [[hub singleton requires OS-level flock not pid checks]], and [[test script required for rust tests not cargo test]].
 - Repo context inspected: `src/main.rs`, `src/daemon_transport.rs`, `src/entrypoint_supervisor.rs`, and `tests/hub_daemon_lifecycle_test.rs`.
-- Current production path: `botster-hub up` enters `local_runtime_up -> prepare_local_runtime -> ensure_dev_stack_daemon`; `botster-hub down` enters `local_runtime_down`; both currently treat `DaemonTransportError::Compatibility` and `DaemonTransportError::Protocol` as terminal `IncompatibleDaemon` errors before any recovery path runs.
+- Current production path: `botster-hub up` enters `local_runtime_up -> prepare_local_runtime -> ensure_local_runtime_daemon`; `botster-hub down` enters `local_runtime_down`; both currently treat `DaemonTransportError::Compatibility` and `DaemonTransportError::Protocol` as terminal `IncompatibleDaemon` errors before any recovery path runs.
 - Current tests: `cli_local_runtime_up_reports_incompatible_daemon_without_deleting_socket` asserts the old behavior for both `up` and `down`; this should be replaced or split into owned recovery and unowned diagnostic coverage.
 
 ## Scope
 
-- Add local-runtime daemon ownership metadata scoped to the selected data dir when `up` or `dev-stack bootstrap` spawns a daemon through `ensure_dev_stack_daemon`.
+- Add local-runtime daemon ownership metadata scoped to the selected data dir when `up` or the removed bootstrap command spawns a daemon through `ensure_local_runtime_daemon`.
 - Add a small recovery path used by `up` and `down` when the daemon handshake fails with compatibility/protocol staleness.
 - Recovery should prove ownership before killing: exact resolved data dir, exact socket path, recorded PID, recorded hub binary path, and live process command evidence matching `botster-hub start --data-dir <that data dir>`.
 - When ownership is proven, terminate the stale daemon process directly, wait briefly for exit, remove only the selected data dir's local socket if it remains stale, and retry the original operation once.
@@ -45,10 +45,10 @@
 ## Implementation Plan
 
 1. Introduce a private local-runtime metadata type in `src/main.rs` with `pid`, resolved `data_dir`, resolved `socket_path`, resolved `hub_bin`, optional `session_worker_bin`, spawn timestamp, and owner marker such as `botster-hub-local-runtime`.
-2. After `ensure_dev_stack_daemon` successfully spawns and observes readiness, persist metadata in the selected data dir. Remove or mark it stale after a successful compatible `down`.
+2. After `ensure_local_runtime_daemon` successfully spawns and observes readiness, persist metadata in the selected data dir. Remove or mark it stale after a successful compatible `down`.
 3. Add `recover_stale_owned_daemon(config, data_dir, stale_error)` used only after compatibility/protocol errors. It should load metadata, verify path equality, verify the PID is alive, inspect the live command, and refuse recovery if any proof is missing.
 4. If verified, send SIGTERM to the recorded daemon PID, wait for exit, escalate only if the process remains alive after a short bounded grace window, then remove the local socket path only if it is under the selected data dir and still exists.
-5. In `local_runtime_up`, on stale handshake failure, attempt recovery and then retry `ensure_dev_stack_daemon` once. If recovery is refused, return the existing manual diagnostic, updated to explain that ownership was unproven.
+5. In `local_runtime_up`, on stale handshake failure, attempt recovery and then retry `ensure_local_runtime_daemon` once. If recovery is refused, return the existing manual diagnostic, updated to explain that ownership was unproven.
 6. In `local_runtime_down`, on stale handshake failure, attempt recovery and print a shutdown/recovered response if it succeeds. If recovery is refused, return the existing manual diagnostic.
 7. Keep recovery logging path-neutral where possible, but retain the explicit user-facing `--data-dir` command in diagnostics because the current local-runtime UX already prints that operator path.
 

@@ -5,11 +5,11 @@
 - Project Pipelines ticket `ticket_1784229592_834310`, fresh run `run_1784306016_385967`, Plan run step `run_step_1784306016_920757`, gate `botster_plan_gate`, closed dependency `dependency_1784250061_527940`, and all artifact, review, finding, question, and prior-answer surfaces were loaded through `project_pipelines_current_context` before planning.
 - Required planning authority: [[planner-playbook]], [[botster-planner-playbook]], [[botster-architecture]], [[cli-patterns]], [[spa-patterns]], [[identity]], and [[goals]], plus the Botster overlay's required pipeline notes.
 - Applicable lifecycle and verification authority: [[retention without a reachable flush is data loss]], [[coredaemon must expose terminal truth used by the production hub path]], [[a regression test must be shown to go red with the fix reverted]], [[test script required for rust tests not cargo test]], [[suite wide acceptance criteria make every observed test failure in scope]], [[closed dependency tickets signal merged source not a consumable release]], and [[plan steps need reviewable plan artifacts]].
-- The ticket's retained loaded run `29526604665` tested exact subject `2ff224626c26ea10d506319aef5bdd9eff598163`. `cli_short_lived_session_shutdown_returns_structured_cleanup` failed because attach stdout lacked the exact `dogfood:done` marker, while the independently owned oversized local-WebRTC test passed.
+- The ticket's retained loaded run `29526604665` tested exact subject `2ff224626c26ea10d506319aef5bdd9eff598163`. `cli_short_lived_session_shutdown_returns_structured_cleanup` failed because attach stdout lacked the exact `runtime:done` marker, while the independently owned oversized local-WebRTC test passed.
 - The pipeline worktree was cut from `e8645678e526e9fa23eac741fa50af11af937636`, so its checked-out lockfile is stale. Current `main` is `dfd26cd8c3f50bb26a49f760ddadaabc1940c22b`; inspection used `main`/merged commit objects without treating the stale worktree as current evidence. The production path remains `sessions attach` -> `botster_hub_client::stream_attach` -> daemon Attach/Drain -> HubRuntime/CoreDaemon/session worker.
 - Dependency ticket `ticket_1784168175_972093` merged as PR #143 at `f5e839476152f9bed52a9d17e994a65568de2840`. Its merged changes consume Core revision `84c2ff20f3607ff24fb87d196e132c54365c31c5`, retain final PTY egress before exit, keep the CLI attachment open through terminal exit, and add the generic fast-exit diagnostic and focused harness target.
 - Human answers `question_1784249984_836951` and `question_1784250676_465927` are binding: do not duplicate that dependency's Core pin, lifecycle repair, diagnostics, or harness; after merge, close this ticket with no code if the exact product-shaped behavior is covered.
-- Coverage is complete. The unchanged `cli_short_lived_session_shutdown_returns_structured_cleanup` test still drives spawn -> CLI attach -> CLI input -> natural process exit -> structured cleanup and asserts exact `dogfood:done`. It failed on captured subject `2ff224626c26ea10d506319aef5bdd9eff598163`, then passed under residual-tail load with default test parallelism in post-merge lifecycle-suite runs `29551641598` (`c81a1b1`), `29552856473` (`27851a0`), and `29553895040` (`6508317`). Each campaign later failed only on separately owned tests.
+- Coverage is complete. The unchanged `cli_short_lived_session_shutdown_returns_structured_cleanup` test still drives spawn -> CLI attach -> CLI input -> natural process exit -> structured cleanup and asserts exact `runtime:done`. It failed on captured subject `2ff224626c26ea10d506319aef5bdd9eff598163`, then passed under residual-tail load with default test parallelism in post-merge lifecycle-suite runs `29551641598` (`c81a1b1`), `29552856473` (`27851a0`), and `29553895040` (`6508317`). Each campaign later failed only on separately owned tests.
 
 ## Scope
 
@@ -52,7 +52,7 @@ Expected implementation outcome: no production, test, harness, dependency, or do
 
 ## Risks
 
-- **False covered-by-dependency closure:** the generic fast-exit diagnostic is not the product proof. Mitigation: closure cites the exact input-driven `dogfood:done` test and its three post-merge loaded executions, not the diagnostic campaign.
+- **False covered-by-dependency closure:** the generic fast-exit diagnostic is not the product proof. Mitigation: closure cites the exact input-driven `runtime:done` test and its three post-merge loaded executions, not the diagnostic campaign.
 - **Weak negative control:** the same test happened to pass once on an older vulnerable lock, so Core SHA alone does not deterministically force red. Mitigation: use the exact captured failing subject/run as historical red evidence and do not overstate a universal revision-level failure.
 - **Stale worktree evidence:** the checked-out plan branch predates PR #143. Mitigation: source and lock assertions were inspected from current `main`; downstream work must start from/reconcile with `main` before creating any PR.
 - **Suite-wide failure misrouting:** the cited lifecycle runs are red overall. Mitigation: report the exact ticket-owned test as green and name the separately owned red tests; do not describe the campaigns as suite-green or waive them.
@@ -66,10 +66,10 @@ Expected implementation outcome: no production, test, harness, dependency, or do
    - Merged production wiring reaches `botster_hub_client::stream_attach`, writes terminal events before honoring exit, and performs one final drain after an exited lifecycle readback.
 2. Exact local product-path confirmation through the repository wrapper, if downstream gates require a fresh local run:
    - `./test.sh --test hub_daemon_lifecycle_test cli_short_lived_session_shutdown_returns_structured_cleanup -- --exact --nocapture`
-   - Require attach stdout to contain both `dogfood-ok` and exact `dogfood:done` before attach returns.
-   - Require shutdown stdout to contain `response=session_cleanup`, `session_id=dogfood-session`, and `outcome=already_exited`; stdout/stderr must not contain `client disconnected` or the generated data directory.
+   - Require attach stdout to contain both `production runtime-ok` and exact `runtime:done` before attach returns.
+   - Require shutdown stdout to contain `response=session_cleanup`, `session_id=runtime-session`, and `outcome=already_exited`; stdout/stderr must not contain `client disconnected` or the generated data directory.
 3. Historical red:
-   - GitHub Actions run `29526604665`, exact subject `2ff224626c26ea10d506319aef5bdd9eff598163`, failed this exact test at the exact `dogfood:done` assertion.
+   - GitHub Actions run `29526604665`, exact subject `2ff224626c26ea10d506319aef5bdd9eff598163`, failed this exact test at the exact `runtime:done` assertion.
 4. Post-merge loaded green:
    - Runs `29551641598` (`c81a1b1`), `29552856473` (`27851a0`), and `29553895040` (`6508317`) each used `test_target=lifecycle-suite`, `stress_profile=residual-tail`, default Rust parallelism, and reported `cli_short_lived_session_shutdown_returns_structured_cleanup ... ok`.
    - Preserve each run's later separately owned failures in the handoff; these are exact-test green proofs, not suite-green claims.

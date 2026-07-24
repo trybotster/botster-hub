@@ -411,25 +411,28 @@ roots, socket paths, data-dir values, or manifest environment policy from
 package rows. Normal `ListApps` output intentionally omits this launch contract
 to avoid path and environment leakage.
 
-Foreground terminal launch contracts currently inject `BOTSTER_HUB_SOCKET` and
-`BOTSTER_HUB_DATA_DIR`. These are the canonical same-device connection and
-runtime data directory values for terminal clients. The daemon resolves both as
-absolute host paths before returning the contract, so clients must not reinterpret
-them relative to the package working directory. Clients should not expect the older
-example names `BOTSTER_HUB_CONNECTION` or `BOTSTER_PACKAGE_DATA_DIR`.
+Runnable launch contracts use each manifest's declared injection targets. For
+`hub_connection`, the daemon serializes Core's typed descriptor with a
+`unix_socket` transport and an absolute socket path. For `data_dir`, it injects
+the absolute package runtime data directory. Environment names and argument
+placeholders are package policy rather than Hub constants, and clients must not
+reconstruct either value from package rows or reinterpret the paths relative to
+the package working directory.
 
 Supervised entrypoints are local development processes, not a production
 installer or sandbox. The daemon stops them on explicit stop/restart, package
 disable/remove, `DaemonShutdown`, and daemon SIGINT/SIGTERM cleanup.
 
-Web app `local_url` values, including `botster-web` dogfood `bridge=` / `web=`
-URLs, are supervised local package app outputs. They remain health and dev
-bridge surfaces, not the terminal/session data plane.
+Web app `local_url` values are child-authored supervised package app outputs.
+Hub uses the exact returned URL for health/UI verification; it does not derive
+the URL from a configured port or a second bridge owner.
 
 For the installed `botster-web` `web-client` entrypoint, `StartPackageEntrypoint`
-also returns `local_webrtc_bootstrap` when it mints a short-lived local browser
-grant. The bootstrap contains the grant id/secret, expected same-device origin,
-expiry, signaling transport (`daemon_request`), data plane
+returns package state only after structured readiness. A page-load
+`IssueLocalWebrtcBootstrap` request mints the short-lived local browser grant
+after the app URL is known and validates its origin against `local_url`. The
+bootstrap contains the grant id/secret, expected same-device origin, expiry,
+signaling transport (`daemon_request`), data plane
 (`webrtc_data_channel`), and the required DataChannel reliability contract:
 ordered `true`, no `max_retransmits`, no `max_packet_lifetime_ms`, and no hub
 application reorder buffer.
@@ -674,7 +677,7 @@ CLI operators can inspect package configuration with:
 botster-hub packages config --data-dir <path> <package>
 ```
 
-The checked-in dev-stack acceptance target is `project-pipelines` at
+The checked-in local runtime acceptance target is `project-pipelines` at
 `examples/project-pipelines`. Its manifest exposes deterministic
 `operator_endpoint`, `pipeline_mode`, and `api_token` configuration fields
 through the same `DaemonPackage.configuration` DTO used by first-party clients.
@@ -1060,16 +1063,16 @@ Hub developers can run the full fixture proof from this repository with:
 ./test.sh --test hub_daemon_lifecycle_test daemon_plugin_contract_matrix_fixture_exercises_public_package_contracts
 ```
 
-Hub CI also runs the first-party package compatibility smoke:
+Hub CI also runs the persisted-package runtime smoke:
 
 ```bash
-./test.sh --test hub_daemon_lifecycle_test cli_dev_stack_first_party_plugin_dogfood_smoke_runs_contract_matrix_then_real_packages
+./test.sh --test hub_daemon_lifecycle_test cli_smoke_proves_local_runtime_daemon_package_app_session_and_webrtc
 ```
 
-That smoke runs the contract-matrix helper above for the hub-owned primitive
-inventory, then runs `run_project_pipelines_conformance` against the packaged
-Project Pipelines example to prove first-party external package enablement,
-`PluginSurfaceRender`, `ui_tree_snapshot` identity, form node structure, and
+Separate contract-matrix coverage runs `run_project_pipelines_conformance`
+against the packaged Project Pipelines example to prove first-party external
+package enablement, `PluginSurfaceRender`, `ui_tree_snapshot` identity, form
+node structure, and
 `PluginSurfaceAction` field-error/action-failure feedback. Downstream plugin
 repos should consume these published helpers and fixture assets instead of
 inventing DTO fixtures or reading a stale sibling hub checkout.
@@ -1093,10 +1096,11 @@ policy, call `run_foreground_terminal_app_open_conformance`. The helper installs
 a local `terminal_app` / `foreground_stdio` package, discovers it through
 `ListApps`, resolves it through `ResolveAppLaunch`, executes the returned
 command with the daemon-provided working directory and environment, and has the
-child process perform a real `Status` request through `BOTSTER_HUB_SOCKET`. Its
-report asserts the canonical `BOTSTER_HUB_SOCKET` and `BOTSTER_HUB_DATA_DIR`
-environment values were present and absolute, and that the child exited with code
-0 after completing the real daemon request from its package working directory.
+child process decode the manifest-targeted Core Hub connection descriptor and
+perform a real `Status` request through its absolute Unix socket path. Its
+report asserts the typed connection and data-directory injections were present
+and absolute, and that the child exited with code 0 after completing the real
+daemon request from its package working directory.
 
 The matrix currently marks JSON plugin surface render/action dispatch as
 supported through the contract-matrix fixture and full plugin entity-frame

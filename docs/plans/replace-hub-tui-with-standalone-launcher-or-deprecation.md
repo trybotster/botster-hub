@@ -3,7 +3,7 @@
 ## Context Loaded
 
 - Pipeline context: ticket `ticket_1782338844_576329`, run `run_1782348895_376850`, step `botster_plan`, gate `botster_plan_gate`.
-- Dependency context: closed dependency "Bring standalone botster-tui to required session and package dogfood parity".
+- Dependency context: closed dependency "Bring standalone botster-tui to required session and package production runtime parity".
 - Required vault context: [[identity]], [[goals]], [[planner-playbook]], [[botster-planner-playbook]], [[botster-architecture]], [[cli-patterns]], [[project pipeline orchestration belongs in a device-level botster plugin]], [[project pipelines needs an operator workbench not more primitives]], [[project pipelines ui contract belongs in the plugin readme]], [[botster orchestration should spawn agents with explicit target ids]], [[botster orchestration prompts must bind agents to explicit worktrees]], [[plan agents must author vault context as wikilinks not home paths]], [[plan steps need reviewable plan artifacts]], and [[project pipelines checklist worker timeouts require artifact evidence fallback]].
 - Repo context inspected: `src/main.rs`, `src/lib.rs`, `src/tui.rs`, `Cargo.toml`, `README.md`, `docs/client-protocol.md`, and `tests/hub_daemon_lifecycle_test.rs`.
 - Checklist context: the Project Pipelines checklist instruction tool was loaded. `project_pipelines_create_vault_checklist` timed out with `plugin worker invoke timeout`, so checklist evidence is preserved in this plan artifact and gate evidence per [[project pipelines checklist worker timeouts require artifact evidence fallback]].
@@ -12,8 +12,8 @@
 
 - Change the production `botster-hub tui --data-dir <path>` path so it no longer enters the embedded `src/tui.rs` ratatui implementation.
 - Prefer the smallest deprecation/explicit-command path unless Implementation can prove a standalone `botster-tui` binary contract is locally available and stable enough to delegate to without adding broad process-management policy.
-- Make the intended standalone command explicit everywhere the hub currently advertises the embedded TUI: CLI usage/help, dogfood launcher output, README dogfood/TUI docs, and any tests asserting those strings.
-- Remove or quarantine embedded hub TUI exports and tests so the hub is not maintaining duplicate rendering logic as a supported dogfood path.
+- Make the intended standalone command explicit everywhere the hub currently advertises the embedded TUI: CLI usage/help, production runtime launcher output, README production runtime/TUI docs, and any tests asserting those strings.
+- Remove or quarantine embedded hub TUI exports and tests so the hub is not maintaining duplicate rendering logic as a supported production runtime path.
 - Drop hub-only TUI dependencies (`ratatui`, `crossterm`) if no remaining non-test hub code needs them after the embedded path is removed.
 - Keep the hub daemon/client protocol, `botster-hub-client`, and `botster-hub-test-support` as the supported boundary for standalone first-party clients.
 
@@ -27,10 +27,10 @@
 
 ## Botster Layers Touched
 
-- Rust hub CLI: `botster-hub tui`, dogfood output, usage text.
+- Rust hub CLI: `botster-hub tui`, production runtime output, usage text.
 - Rust hub library boundary: remove embedded TUI module exports if the module is deleted.
 - Docs: README and any client protocol wording that still implies an embedded hub TUI is first-party production behavior.
-- Tests: Rust unit/integration tests that currently depend on `ScriptedTuiDriver`, `run_scripted_probe`, or `botster-hub tui` dogfood output.
+- Tests: Rust unit/integration tests that currently depend on `ScriptedTuiDriver`, `run_scripted_probe`, or `botster-hub tui` production runtime output.
 
 ## Assumptions And Unknowns
 
@@ -42,18 +42,18 @@
 
 ## Affected Surfaces And Files
 
-- `src/main.rs`: remove `run_tui` import and call; update `operator_tui`; update dogfood printed `tui=` command and usage text.
+- `src/main.rs`: remove `run_tui` import and call; update `operator_tui`; update production runtime printed `tui=` command and usage text.
 - `src/lib.rs`: remove `pub mod tui` and public re-exports for `ScriptedTuiDriver`, `ScriptedTuiProof`, `TuiError`, `TuiResult`, `run_tui`, and `run_scripted_probe` if the embedded module is removed.
 - `src/tui.rs`: delete or fully remove from production/library ownership if no longer referenced.
 - `Cargo.toml` and `Cargo.lock`: remove `ratatui` and `crossterm` when no longer used by the hub crate.
-- `tests/hub_daemon_lifecycle_test.rs`: update dogfood output assertions; remove or rewrite embedded scripted TUI tests so runtime coverage uses daemon/socket/client APIs rather than the removed renderer.
+- `tests/hub_daemon_lifecycle_test.rs`: update production runtime output assertions; remove or rewrite embedded scripted TUI tests so runtime coverage uses daemon/socket/client APIs rather than the removed renderer.
 - `README.md`: replace "Minimal local TUI" embedded hub instructions with standalone `botster-tui` guidance and clarify that `botster-hub tui` is deprecated or instructional.
 - `docs/client-protocol.md`: preserve downstream `botster-tui` client guidance; update any wording that describes an embedded hub TUI as part of the client boundary if touched.
 - Historical `docs/plans/*` files are not in scope for retroactive edits.
 
 ## Risks
 
-- Silent dogfood regression: changing docs/help without changing `operator_tui` would leave the real user path on embedded `run_tui`. Acceptance must inspect the production entry point.
+- Silent production runtime regression: changing docs/help without changing `operator_tui` would leave the real user path on embedded `run_tui`. Acceptance must inspect the production entry point.
 - Dead duplicate code: leaving `src/tui.rs` exported or tested as a first-party path would keep the maintenance burden the ticket is meant to remove.
 - Over-deletion: existing integration tests may prove daemon reconnect, session loss, and exited-session guard behavior through the scripted embedded TUI. Implementation must preserve important daemon/client behavior through lower-level tests or explicitly document that it moved to downstream `botster-tui` conformance.
 - Command-shape mismatch: printing a guessed `botster-tui` invocation could mislead operators. Verify help/docs/binary before delegating; otherwise print a conservative explicit instruction.
@@ -62,11 +62,11 @@
 ## Acceptance Checks And Tests
 
 - Production path proof: inspect or test that `botster-hub tui --data-dir <dir>` no longer calls `run_tui` or any embedded renderer. It should either execute a verified `botster-tui` command or print a clear standalone equivalent command.
-- Dogfood output proof: focused test around the dogfood launcher output should assert it advertises standalone `botster-tui --data-dir <path>` or an explicit deprecated hub command that prints that equivalent, not `botster-hub tui` as the primary TUI.
+- Production runtime output proof: focused test around the production runtime launcher output should assert it advertises standalone `botster-tui --data-dir <path>` or an explicit deprecated hub command that prints that equivalent, not `botster-hub tui` as the primary TUI.
 - Duplicate-code proof: `rg -n "run_tui|ScriptedTui|run_scripted_probe|ratatui|crossterm|pub mod tui|botster_hub::tui" src tests Cargo.toml` should show no supported embedded TUI path remains, except historical plan/docs references if intentionally left.
 - CLI behavior proof: add or update a focused Rust test for `operator_tui`/CLI usage behavior if the existing test harness can invoke the binary; otherwise document the exact command output and exit behavior in README and gate evidence.
 - Build/test commands: run `./test.sh` or at minimum the focused daemon lifecycle tests touched plus a workspace compile check. Because [[test script required for rust tests not cargo test]] applies, prefer `./test.sh <focused-filter>` and a broader `./test.sh` when feasible.
-- Docs proof: README no longer instructs users to operate the embedded hub TUI as the dogfood UI; client protocol docs still point standalone clients at `botster-hub-client` and conformance helpers.
+- Docs proof: README no longer instructs users to operate the embedded hub TUI as the production runtime UI; client protocol docs still point standalone clients at `botster-hub-client` and conformance helpers.
 - PII proof: scan the plan and changed docs for local home paths or run-specific filesystem paths before review.
 
 ## Pipeline Gates And Artifacts
