@@ -72,7 +72,11 @@ Passed:
   package install/enable/refresh, dynamic/explicit/invalid Web ports, Web
   health/HTML/browser/WebRTC, TUI live runtime, plugin tools, status, doctor,
   smoke, and cleanup. The refreshed auditable evidence bundle is required
-  before this claim is handed back to Review.
+  before this claim is handed back to Review. The corrected invocation exited
+  0 with `production_package_runtime=pass` at Hub commit `53a11032`; durable
+  Project Pipelines evidence is `artifact_1784933087_975596`, which embeds the
+  exact seven-repository revisions, command log, artifact/port/audit/PII
+  results, operator-root manifests, and runtime summary.
 
 Unverified/blocking:
 
