@@ -91,7 +91,7 @@ Pipeline gates and artifacts:
 Assumptions:
 
 - "Durable state boundary" means a production-shaped API and local implementation now, not a final cloud-sync architecture.
-- JSON file storage is sufficient for local dogfood because the ticket asks for simple local-first storage and explicit versioning/migration posture.
+- JSON file storage is sufficient for local production runtime because the ticket asks for simple local-first storage and explicit versioning/migration posture.
 - Version `1` can be cold-start only: no old file migration is needed, but the code must make future migrations possible by dispatching on schema version.
 - `PackageRegistry` remains the policy owner for install/enable/disable/pin validation; persistence stores accepted records and audit history without bypassing registry policy.
 - Capability grants and admission decisions should use current `botster_core` capability/manifest/admission types where possible instead of introducing a parallel capability vocabulary.

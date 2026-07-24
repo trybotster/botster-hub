@@ -98,36 +98,6 @@ pub struct LocalWebrtcTransport {
 }
 
 impl LocalWebrtcTransport {
-    /// Mint a local, single-use bootstrap grant for the installed botster-web app.
-    pub fn issue_botster_web_bootstrap(
-        &mut self,
-        entrypoint_id: &str,
-        environment: &mut BTreeMap<String, String>,
-    ) -> LocalWebrtcResult<Option<DaemonLocalWebrtcBootstrap>> {
-        if entrypoint_id != "web-client" {
-            return Ok(None);
-        }
-        let expected_origin = expected_origin(environment);
-        let bootstrap = self.issue_bootstrap("botster-web", entrypoint_id, &expected_origin)?;
-        environment.insert(
-            "BOTSTER_LOCAL_WEBRTC_GRANT_ID".to_string(),
-            bootstrap.grant_id.clone(),
-        );
-        environment.insert(
-            "BOTSTER_LOCAL_WEBRTC_GRANT_SECRET".to_string(),
-            bootstrap.grant_secret.clone(),
-        );
-        environment.insert(
-            "BOTSTER_LOCAL_WEBRTC_SIGNALING_TRANSPORT".to_string(),
-            "daemon_request".to_string(),
-        );
-        environment.insert(
-            "BOTSTER_LOCAL_WEBRTC_EXPECTED_ORIGIN".to_string(),
-            expected_origin.clone(),
-        );
-        Ok(Some(bootstrap))
-    }
-
     /// Mint a local, single-use bootstrap grant bound to an already-running app origin.
     pub fn issue_bootstrap(
         &mut self,
@@ -1403,13 +1373,6 @@ fn queued_request_overflow_response() -> DaemonResponse {
         "local_webrtc_data_channel",
         "inbound request queue capacity exceeded; request was rejected",
     ))
-}
-
-fn expected_origin(environment: &BTreeMap<String, String>) -> String {
-    environment
-        .get("BOTSTER_WEB_DOGFOOD_BRIDGE_PORT")
-        .map(|port| format!("http://127.0.0.1:{port}"))
-        .unwrap_or_else(|| "http://127.0.0.1".to_string())
 }
 
 fn random_token(prefix: &str) -> LocalWebrtcResult<String> {

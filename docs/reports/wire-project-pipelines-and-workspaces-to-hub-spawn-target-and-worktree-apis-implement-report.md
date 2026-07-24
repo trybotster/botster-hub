@@ -34,12 +34,12 @@
 - `cargo fmt` - passed
 - `./test.sh --test hub_lua_runtime_test worktree` - passed
 - `./test.sh --test hub_mcp_test project_pipelines` - passed
-- `./test.sh --test hub_daemon_lifecycle_test cli_dev_stack_acceptance_smoke_exercises_first_party_plugins_project_pipelines_session_templates_reload_and_shutdown` - passed
+- `./test.sh --test hub_daemon_lifecycle_test cli_local_runtime_acceptance_smoke_exercises_first_party_plugins_project_pipelines_session_templates_reload_and_shutdown` - passed
 - `cargo clippy --all-targets --all-features -- -D warnings` - passed
 
 ## Deviations
 
-- The plan listed hub-test-support conformance as optional. No change was made there because the changed contract is already proven through the hub MCP and dev-stack acceptance tests.
+- The plan listed hub-test-support conformance as optional. No change was made there because the changed contract is already proven through the hub MCP and local runtime acceptance tests.
 - Project Pipelines checklist creation timed out in the plugin worker, matching the plan-stage known issue, so checklist-equivalent evidence is recorded here and in the implement gate.
 
 ## Residual Risk

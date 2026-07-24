@@ -1,0 +1,134 @@
+#!/bin/sh
+set -eu
+
+usage() {
+  echo "usage: $0 --web-package-path PATH --tui-package-path PATH [--hub-bin PATH] [--session-worker-bin PATH]" >&2
+  exit 64
+}
+
+web_package_path=
+tui_package_path=
+hub_bin=
+session_worker_bin=
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --web-package-path)
+      [ "$#" -ge 2 ] || usage
+      web_package_path=$2
+      shift 2
+      ;;
+    --tui-package-path)
+      [ "$#" -ge 2 ] || usage
+      tui_package_path=$2
+      shift 2
+      ;;
+    --hub-bin)
+      [ "$#" -ge 2 ] || usage
+      hub_bin=$2
+      shift 2
+      ;;
+    --session-worker-bin)
+      [ "$#" -ge 2 ] || usage
+      session_worker_bin=$2
+      shift 2
+      ;;
+    *)
+      usage
+      ;;
+  esac
+done
+
+[ -n "$web_package_path" ] || usage
+[ -n "$tui_package_path" ] || usage
+[ -f "$web_package_path/botster-package.json" ] || {
+  echo "missing botster-web manifest: $web_package_path/botster-package.json" >&2
+  exit 66
+}
+[ -f "$tui_package_path/botster-package.json" ] || {
+  echo "missing botster-tui manifest: $tui_package_path/botster-package.json" >&2
+  exit 66
+}
+grep -q '"name"[[:space:]]*:[[:space:]]*"botster-web"' "$web_package_path/botster-package.json" || {
+  echo "web package identity is not botster-web" >&2
+  exit 65
+}
+grep -q '"name"[[:space:]]*:[[:space:]]*"botster-tui"' "$tui_package_path/botster-package.json" || {
+  echo "tui package identity is not botster-tui" >&2
+  exit 65
+}
+
+if [ -z "$hub_bin" ] || [ -z "$session_worker_bin" ]; then
+  cargo build --locked --bin botster-hub -p botster-hub
+  cargo build --locked --bin botster-session-worker -p botster-core
+  : "${hub_bin:=target/debug/botster-hub}"
+  : "${session_worker_bin:=target/debug/botster-session-worker}"
+fi
+
+runtime_root=$(mktemp -d "/tmp/bh-runtime.XXXXXX")
+data_dir=$runtime_root/data
+daemon_pid=
+
+cleanup() {
+  "$hub_bin" down --data-dir "$data_dir" >/dev/null 2>&1 || true
+  if [ -n "$daemon_pid" ]; then
+    kill "$daemon_pid" >/dev/null 2>&1 || true
+    wait "$daemon_pid" >/dev/null 2>&1 || true
+  fi
+  rm -rf "$runtime_root"
+}
+trap cleanup EXIT INT TERM
+
+echo "hub_revision=$(git rev-parse HEAD)"
+echo "web_revision=$(git -C "$web_package_path" rev-parse HEAD 2>/dev/null || echo unversioned)"
+echo "tui_revision=$(git -C "$tui_package_path" rev-parse HEAD 2>/dev/null || echo unversioned)"
+
+"$hub_bin" start --data-dir "$data_dir" --session-worker-bin "$session_worker_bin" \
+  >"$runtime_root/setup-daemon.log" 2>&1 &
+daemon_pid=$!
+
+attempt=0
+until "$hub_bin" status --data-dir "$data_dir" >/dev/null 2>&1; do
+  attempt=$((attempt + 1))
+  [ "$attempt" -lt 100 ] || {
+    echo "setup daemon did not become ready" >&2
+    sed -n '1,120p' "$runtime_root/setup-daemon.log" >&2
+    exit 1
+  }
+  sleep 0.05
+done
+
+"$hub_bin" packages install --data-dir "$data_dir" --path "$web_package_path"
+"$hub_bin" packages enable --data-dir "$data_dir" botster-web
+"$hub_bin" packages install --data-dir "$data_dir" --path "$tui_package_path"
+"$hub_bin" packages enable --data-dir "$data_dir" botster-tui
+"$hub_bin" shutdown --data-dir "$data_dir"
+wait "$daemon_pid"
+daemon_pid=
+
+up_output=$("$hub_bin" up --data-dir "$data_dir" --session-worker-bin "$session_worker_bin")
+printf '%s\n' "$up_output"
+web_url=$(printf '%s\n' "$up_output" | sed -n 's/^web=//p' | tail -1)
+[ -n "$web_url" ] || {
+  echo "up did not print the structured botster-web local_url" >&2
+  exit 1
+}
+
+"$hub_bin" up --data-dir "$data_dir" --session-worker-bin "$session_worker_bin" >/dev/null
+"$hub_bin" status --data-dir "$data_dir"
+"$hub_bin" doctor --data-dir "$data_dir"
+"$hub_bin" apps list --data-dir "$data_dir"
+
+origin=$(printf '%s\n' "$web_url" | sed -E 's#^(https?://[^/]+).*$#\1#')
+curl --fail --silent --show-error "$origin/health" | grep -q '"ok":true'
+curl --fail --silent --show-error "$web_url" | grep -qi '<html'
+
+# Exercise the foreground-stdio package contract under a pseudo-terminal, then
+# send the documented Ctrl-Q quit key so the proof remains non-interactive.
+(sleep 1; printf '\021') |
+  /usr/bin/script -q "$runtime_root/tui.log" \
+    "$hub_bin" apps open --data-dir "$data_dir" botster-tui
+
+"$hub_bin" smoke --data-dir "$data_dir" --session-worker-bin "$session_worker_bin"
+"$hub_bin" down --data-dir "$data_dir"
+echo "production_package_runtime=pass"

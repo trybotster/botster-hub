@@ -62,6 +62,7 @@ use crate::local_webrtc::{
     LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_FILE, LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_MAX_BYTES,
     LocalWebrtcAttachedSubscription, LocalWebrtcSenderTerminalRecord, LocalWebrtcSignalRequest,
 };
+use crate::packages::{PackageResolvedEntrypointLaunch, resolve_entrypoint_launch_contract};
 use crate::{
     AvailablePackage, AvailablePackageState, FileHubStateStore, HubClientApi,
     HubClientCaptureSnapshot, HubClientEvent, HubClientModeFlags, HubClientPackage,
@@ -888,32 +889,21 @@ fn handle_control_request(
                 .config()
                 .clone();
             let packages = daemon.package_registry().clone();
-            let mut environment = supervised_launch_environment(
+            let launch = supervised_launch_contract(
                 &config,
                 &packages,
                 &package_name,
                 &entrypoint_id,
                 &environment_overrides,
             )?;
-            let local_webrtc_bootstrap = if package_name == "botster-web" {
-                daemon
-                    .local_webrtc()
-                    .issue_botster_web_bootstrap(&entrypoint_id, &mut environment)?
-            } else {
-                None
-            };
             daemon.entrypoint_supervisor().start(
                 &packages,
                 &package_name,
                 &entrypoint_id,
-                &environment,
+                &launch.args,
+                &launch.environment,
             )?;
-            let mut response = show_package_response(daemon, &package_name)?;
-            if let Some(bootstrap) = local_webrtc_bootstrap {
-                response.kind = DaemonResponseKind::LocalWebrtcBootstrap;
-                response.local_webrtc_bootstrap = Some(bootstrap);
-            }
-            Ok(response)
+            show_package_response(daemon, &package_name)
         }
         DaemonRequest::IssueLocalWebrtcBootstrap {
             package_name,
@@ -954,7 +944,7 @@ fn handle_control_request(
                 .config()
                 .clone();
             let packages = daemon.package_registry().clone();
-            let environment = supervised_launch_environment(
+            let launch = supervised_launch_contract(
                 &config,
                 &packages,
                 &package_name,
@@ -965,7 +955,8 @@ fn handle_control_request(
                 &packages,
                 &package_name,
                 &entrypoint_id,
-                &environment,
+                &launch.args,
+                &launch.environment,
             )?;
             show_package_response(daemon, &package_name)
         }
@@ -1727,11 +1718,30 @@ fn restart_running_package_entrypoints(
     if entrypoint_ids.is_empty() {
         return Ok(());
     }
+    let config = daemon
+        .runtime()
+        .ok_or(DaemonTransportError::DaemonNotRunning)?
+        .config()
+        .clone();
     let packages = daemon.package_registry().clone();
     for entrypoint_id in entrypoint_ids {
-        daemon
+        let environment = daemon
             .entrypoint_supervisor()
-            .restart_preserving_environment(&packages, package_name, entrypoint_id)?;
+            .launch_environment(package_name, entrypoint_id);
+        let launch = supervised_launch_contract(
+            &config,
+            &packages,
+            package_name,
+            entrypoint_id,
+            &environment,
+        )?;
+        daemon.entrypoint_supervisor().restart(
+            &packages,
+            package_name,
+            entrypoint_id,
+            &launch.args,
+            &launch.environment,
+        )?;
     }
     Ok(())
 }
@@ -1739,6 +1749,7 @@ fn restart_running_package_entrypoints(
 fn refresh_local_packages_response(
     daemon: &mut HubDaemon,
 ) -> DaemonTransportResult<DaemonResponse> {
+    let previous_packages = daemon.package_registry().clone();
     let running_entrypoints = daemon
         .entrypoint_supervisor()
         .snapshots()
@@ -1764,11 +1775,51 @@ fn refresh_local_packages_response(
             reload_package_after_reload(daemon, &decision.package_name)?;
         }
         if let Some(entrypoint_ids) = running_entrypoints.get(&decision.package_name) {
-            restart_running_package_entrypoints(daemon, &decision.package_name, entrypoint_ids)?;
+            let changed_entrypoint_ids = entrypoint_ids
+                .iter()
+                .filter(|entrypoint_id| {
+                    runnable_entrypoint_definition_changed(
+                        &previous_packages,
+                        daemon.package_registry(),
+                        &decision.package_name,
+                        entrypoint_id,
+                    )
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            restart_running_package_entrypoints(
+                daemon,
+                &decision.package_name,
+                &changed_entrypoint_ids,
+            )?;
         }
     }
 
     list_packages_response(daemon)
+}
+
+fn runnable_entrypoint_definition_changed(
+    previous_packages: &PackageRegistry,
+    refreshed_packages: &PackageRegistry,
+    package_name: &str,
+    entrypoint_id: &str,
+) -> bool {
+    let Some(previous) = previous_packages.package(package_name) else {
+        return true;
+    };
+    let Some(refreshed) = refreshed_packages.package(package_name) else {
+        return true;
+    };
+    let previous_entrypoint = previous
+        .runnable_entrypoints
+        .iter()
+        .find(|entrypoint| entrypoint.id == entrypoint_id);
+    let refreshed_entrypoint = refreshed
+        .runnable_entrypoints
+        .iter()
+        .find(|entrypoint| entrypoint.id == entrypoint_id);
+
+    previous.manifest != refreshed.manifest || previous_entrypoint != refreshed_entrypoint
 }
 
 fn list_packages_response(daemon: &mut HubDaemon) -> DaemonTransportResult<DaemonResponse> {
@@ -1853,13 +1904,13 @@ fn resolve_package_route_response(
     }
 }
 
-fn supervised_launch_environment(
+fn supervised_launch_contract(
     config: &HubConfig,
     registry: &PackageRegistry,
     package_name: &str,
     entrypoint_id: &str,
     environment_overrides: &BTreeMap<String, String>,
-) -> DaemonTransportResult<BTreeMap<String, String>> {
+) -> DaemonTransportResult<PackageResolvedEntrypointLaunch> {
     let socket = runtime_path(socket_path(config)?);
     let record = registry.package(package_name).ok_or_else(|| {
         DaemonTransportError::Entrypoint(EntrypointSupervisorError::PackageNotInstalled(
@@ -1884,26 +1935,19 @@ fn supervised_launch_environment(
         ));
     };
 
-    let mut environment = BTreeMap::new();
-    environment.insert(
-        "BOTSTER_HUB_DATA_DIR".to_string(),
-        runtime_path(config.data_directory.clone())
-            .display()
-            .to_string(),
-    );
-    environment.insert(
-        "BOTSTER_HUB_SOCKET".to_string(),
-        socket.display().to_string(),
-    );
-    for requirement in &entrypoint.environment {
-        if let Some(default) = requirement.default.as_ref() {
-            environment
-                .entry(requirement.name.clone())
-                .or_insert_with(|| default.clone());
-        }
-    }
-    environment.extend(environment_overrides.clone());
-    Ok(environment)
+    resolve_entrypoint_launch_contract(
+        entrypoint,
+        &runtime_path(config.data_directory.clone()),
+        &socket,
+        environment_overrides,
+    )
+    .map_err(|details| {
+        DaemonTransportError::Entrypoint(EntrypointSupervisorError::LaunchContract {
+            package_name: package_name.to_string(),
+            entrypoint_id: entrypoint_id.to_string(),
+            details,
+        })
+    })
 }
 
 fn runtime_path(path: PathBuf) -> PathBuf {
@@ -5500,6 +5544,40 @@ fn daemon_operator_error_from_entrypoint(error: EntrypointSupervisorError) -> Da
         } => (
             "entrypoint_not_supervisable",
             format!("package {package_name} entrypoint {entrypoint_id} is not marked supervisable"),
+        ),
+        EntrypointSupervisorError::ReadinessFailed {
+            package_name,
+            entrypoint_id,
+            details,
+        } => (
+            "entrypoint_readiness_failed",
+            format!(
+                "package {package_name} entrypoint {entrypoint_id} exited before publishing structured readiness: {details}"
+            ),
+        ),
+        EntrypointSupervisorError::ReadinessTimeout {
+            package_name,
+            entrypoint_id,
+            details,
+        } => (
+            "entrypoint_readiness_timeout",
+            format!(
+                "package {package_name} entrypoint {entrypoint_id} did not publish structured readiness before the liveness deadline: {details}"
+            ),
+        ),
+        EntrypointSupervisorError::LaunchContract {
+            package_name,
+            entrypoint_id,
+            details,
+        } => (
+            "entrypoint_launch_contract_error",
+            format!(
+                "package {package_name} entrypoint {entrypoint_id} launch contract could not be resolved: {details}"
+            ),
+        ),
+        EntrypointSupervisorError::Watch(message) => (
+            "entrypoint_readiness_watch_error",
+            format!("entrypoint launch-result watch failed: {message}"),
         ),
         EntrypointSupervisorError::Io(error) => (
             "entrypoint_io_error",

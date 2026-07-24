@@ -33,7 +33,7 @@
   `[[generated typescript dtos must encode serde field optionality]]`,
   `[[hub test support npm releases need external consumer smoke]]`,
   `[[closed dependency tickets signal merged source not a consumable release]]`,
-  and `[[dogfood generated data dirs use short tmp paths for unix sockets]]`.
+  and `[[production runtime generated data dirs use short tmp paths for unix sockets]]`.
 - `[[project-pipelines-playbook]]` was intentionally not applied because no
   Project Pipelines package, plugin, or workflow-policy path changed.
 - Convention conflicts or waivers: none.
@@ -160,7 +160,7 @@ fallbacks. TUI should consume Hub commit `713be1c` and the typed
   reverified after publication.
 - Missing vault guidance: none. The only implementation discovery, Unix socket
   pathname pressure from generated identifiers, is already covered by
-  `[[dogfood generated data dirs use short tmp paths for unix sockets]]`.
+  `[[production runtime generated data dirs use short tmp paths for unix sockets]]`.
 - Durable knowledge captured: no new vault note; the repository fixture,
   protocol docs, package README, plan, and this report are the durable task
   artifacts.

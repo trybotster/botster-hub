@@ -1,5 +1,5 @@
 {
-  "name": "dogfood.synthetic-plugin",
+  "name": "runtime.synthetic-plugin",
   "version": "1.0.0",
   "kind": "plugin",
   "botster": ">=0.1.0",

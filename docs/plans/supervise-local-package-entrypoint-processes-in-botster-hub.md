@@ -13,7 +13,7 @@ step: botster_plan
 - Playbooks: [[planner-playbook]], [[botster-planner-playbook]].
 - Required Botster/vault context: [[botster-architecture]], [[cli-patterns]], [[spa-patterns]], [[project pipeline orchestration belongs in a device-level botster plugin]], [[project pipelines needs an operator workbench not more primitives]], [[project pipelines ui contract belongs in the plugin readme]], [[botster orchestration should spawn agents with explicit target ids]], [[botster orchestration prompts must bind agents to explicit worktrees]].
 - Ticket-specific process constraints: [[hub event loop blocking must use spawn_blocking for IO-bound tasks]], [[pty master fd close sends sighup but ignores it needs killpg]], [[subprocess harnesses must kill child on failed readiness]], [[graceful-termination-requires-explicit-cleanup-hooks]].
-- Plan Review context: `review_1781069203_878651` returned changes required. The blocker was the original plan's unbacked claim that dogfood Ctrl-C cleanup would work even though `botster-hub dogfood` waits on a separate daemon child and `serve_daemon` only runs `daemon.stop()` on `DaemonShutdown`; this revision chooses a daemon-side signal cleanup mechanism and adds a matching acceptance test.
+- Plan Review context: `review_1781069203_878651` returned changes required. The blocker was the original plan's unbacked claim that production runtime Ctrl-C cleanup would work even though the removed legacy launcher waits on a separate daemon child and `serve_daemon` only runs `daemon.stop()` on `DaemonShutdown`; this revision chooses a daemon-side signal cleanup mechanism and adds a matching acceptance test.
 - Prior dependency artifact: `docs/plans/package-entrypoint-manifest-and-registry-state-contracts.md` established `runnable_entrypoints` as the hub-owned local/dev process contract adjacent to core package `entrypoints`.
 - Project Pipelines checklist discipline: `project_pipelines_checklist_instructions` loaded. `project_pipelines_create_vault_checklist` was attempted for this run and failed with `plugin worker invoke timeout`; per [[project pipelines checklist worker timeouts require artifact evidence fallback]], checklist evidence is preserved in this plan and should be copied into gate evidence.
 - Repo context inspected: `src/packages.rs`, `src/daemon.rs`, `src/daemon_transport.rs`, `src/client_api.rs`, `src/main.rs`, `crates/botster-hub-client/src/lib.rs`, `tests/hub_daemon_lifecycle_test.rs`, `tests/hub_client_api_test.rs`, `docs/client-protocol.md`, and `examples/project-pipelines/botster-package.json`.
@@ -34,8 +34,8 @@ step: botster_plan
   - exit status or signal-derived diagnostic;
   - bounded stdout/stderr diagnostics with explicit byte/line caps.
 - Resolve command, args, and working directory from the existing sanitized `runnable_entrypoints` contract without shell expansion.
-- Ensure supervised processes are stopped during package disable/remove, daemon shutdown, `botster-hub shutdown`, and `botster-hub dogfood` Ctrl-C/shutdown paths.
-- Add daemon-side SIGINT/SIGTERM handling in the `botster-hub start` serve path so a foreground dogfood Ctrl-C causes the daemon process to run `HubDaemon::stop()` before exiting. Prefer `signal-hook` as the narrow signal primitive if no direct dependency already exists; verify the current version before adding it as a direct dependency.
+- Ensure supervised processes are stopped during package disable/remove, daemon shutdown, `botster-hub shutdown`, and the removed legacy launcher Ctrl-C/shutdown paths.
+- Add daemon-side SIGINT/SIGTERM handling in the `botster-hub start` serve path so a foreground production runtime Ctrl-C causes the daemon process to run `HubDaemon::stop()` before exiting. Prefer `signal-hook` as the narrow signal primitive if no direct dependency already exists; verify the current version before adding it as a direct dependency.
 - Add fixture-backed tests for successful start, missing command, failed command, stop, restart/status, and shutdown cleanup.
 - Keep all process output capture bounded and test scrubbed; no host environment snapshots, no arbitrary terminal capture, and no real user identity mutation.
 
@@ -56,7 +56,7 @@ step: botster_plan
 - Assumption: `PackageRunnableWorkingDirectory::PackageRoot`, `EntrypointDir`, and `Relative` should be resolved under the local package root already stored in the package source, but raw local roots should not leak into public DTOs.
 - Assumption: command resolution should first support package-relative executable paths. Bare command names may be treated as host `PATH` commands only if tests prove no shell is involved and diagnostics stay bounded.
 - Assumption: stop should use a graceful timeout and then force kill. On Unix, prefer process-group cleanup where the implementation can safely create a child process group; otherwise document the narrower child-only cleanup and add a follow-up risk.
-- Assumption: ticket-required dogfood Ctrl-C cleanup should be solved in the daemon process, not only in the dogfood parent. The daemon owns supervised child handles, so `serve_daemon` must observe SIGINT/SIGTERM, run `daemon.stop()`, clean up the socket path, and then return.
+- Assumption: ticket-required production runtime Ctrl-C cleanup should be solved in the daemon process, not only in the production runtime parent. The daemon owns supervised child handles, so `serve_daemon` must observe SIGINT/SIGTERM, run `daemon.stop()`, clean up the socket path, and then return.
 - Assumption: supervised child processes can still use their own process groups for explicit stop/restart cleanup because the daemon signal handler, not inherited terminal SIGINT propagation, is the cleanup mechanism.
 - Unknown: exact CLI spelling. Prefer `botster-hub packages entrypoints start|stop|restart --data-dir <dir> <package> <entrypoint>` only if the parser stays simple; otherwise `packages start-entrypoint|stop-entrypoint|restart-entrypoint` is acceptable. The public daemon DTO names matter more than the human spelling.
 - Unknown: whether process supervision belongs inside `HubDaemon` directly or a new small `PackageEntrypointSupervisor` module. Prefer a small owned struct if it isolates child handles, reader threads, caps, and cleanup without becoming a speculative framework.
@@ -103,7 +103,7 @@ No Lua core/plugin worker, TUI, React SPA, Rails relay, MCP workflow, or cloud p
 - `src/main.rs`
   - Add thin package command parsing and output for entrypoint start/stop/restart/status.
   - Keep output path-neutral and diagnostic-bounded.
-  - Keep dogfood parent cleanup as a parent-side fallback, but do not rely on parent `SIGKILL` for supervised-entrypoint cleanup because it bypasses daemon cleanup hooks.
+  - Keep production runtime parent cleanup as a parent-side fallback, but do not rely on parent `SIGKILL` for supervised-entrypoint cleanup because it bypasses daemon cleanup hooks.
 - `Cargo.toml` / `Cargo.lock`
   - Add a direct signal-handling dependency only if needed for the daemon signal path; verify the latest version before changing dependency metadata.
 - `tests/hub_daemon_lifecycle_test.rs`
@@ -119,7 +119,7 @@ No Lua core/plugin worker, TUI, React SPA, Rails relay, MCP workflow, or cloud p
 ## Risks
 
 - Orphan risk: ordinary `Child::kill` may not stop grandchildren. Implementation should use process-group cleanup where practical and test the specific child disappears.
-- Dogfood Ctrl-C risk: without daemon-side signal handling, `botster-hub dogfood` can terminate the daemon child without running `HubDaemon::stop`, orphaning supervised entrypoint processes. This plan requires a signal path in `serve_daemon` and a test for that exact path.
+- Production runtime Ctrl-C risk: without daemon-side signal handling, the removed legacy launcher can terminate the daemon child without running `HubDaemon::stop`, orphaning supervised entrypoint processes. This plan requires a signal path in `serve_daemon` and a test for that exact path.
 - Synchronous serve-loop blocking risk: process wait/output reads must not block the daemon owner loop. Use reader threads, `try_wait`, bounded polling, and bounded stop timeouts; do not call `child.wait()` in status/stop handling while the daemon owner loop is expected to keep servicing control messages.
 - PII/logging risk: stdout/stderr can contain arbitrary plugin output. Capture only bounded snippets and expose them as diagnostics with caps; do not persist them into registry state.
 - Underwiring risk: adding a supervisor type without routing through daemon requests and package DTO rows would fail the ticket. Tests must drive `botster-hub packages ...` or `botster_hub_client::request` against a running daemon.
@@ -141,9 +141,9 @@ No Lua core/plugin worker, TUI, React SPA, Rails relay, MCP workflow, or cloud p
 - `./test.sh --test hub_daemon_lifecycle_test package_entrypoint_supervision_cleans_up_on_disable_remove_and_shutdown`
   - Proves package disable/remove and `DaemonShutdown`/`HubDaemon::stop` clean up live entrypoints.
 - `./test.sh --test hub_daemon_lifecycle_test package_entrypoint_supervision_cleans_up_on_daemon_signal`
-  - Starts a daemon subprocess, starts a long-lived package entrypoint, sends SIGINT or SIGTERM to the daemon process, and polls the specific supervised entrypoint pid until it exits. This is the regression for the `botster-hub dogfood` Ctrl-C path because dogfood runs the same `botster-hub start` daemon process.
-- `./test.sh --test hub_daemon_lifecycle_test local_dogfood_runs_daemon_package_lifecycle_session_and_clean_shutdown`
-  - Existing dogfood shutdown path still passes.
+  - Starts a daemon subprocess, starts a long-lived package entrypoint, sends SIGINT or SIGTERM to the daemon process, and polls the specific supervised entrypoint pid until it exits. This is the regression for the the removed legacy launcher Ctrl-C path because production runtime runs the same `botster-hub start` daemon process.
+- `./test.sh --test hub_daemon_lifecycle_test local_runtime_runs_daemon_package_lifecycle_session_and_clean_shutdown`
+  - Existing production runtime shutdown path still passes.
 - `./test.sh --test hub_daemon_lifecycle_test cli_packages_enable_local_path_routes_through_running_daemon_and_persists`
   - Existing package entrypoint DTO path still passes.
 - `./test.sh --test hub_client_api_test package_and_lifecycle_queries_are_sanitized_and_explicitly_pulled`
@@ -171,7 +171,7 @@ No Lua core/plugin worker, TUI, React SPA, Rails relay, MCP workflow, or cloud p
 
 - Capture the final supervisor ownership decision: `HubDaemon` owns local package entrypoint processes while `PackageRecord` remains durable manifest policy only.
 - Capture the concrete process cleanup pattern chosen for supervised entrypoints, especially whether process groups are used for non-PTY package processes.
-- Capture the daemon signal cleanup pattern chosen for `botster-hub start` / dogfood Ctrl-C.
+- Capture the daemon signal cleanup pattern chosen for `botster-hub start` / production runtime Ctrl-C.
 - Capture the exact bounded stdout/stderr diagnostic cap once implemented.
 - Capture the public CLI spelling for package entrypoint lifecycle commands after implementation settles it.
 - No convention conflicts found. The plan follows Botster hub-as-host-profile boundaries, keeps product policy out of core/Lua, and uses the existing public daemon/client package DTO path.

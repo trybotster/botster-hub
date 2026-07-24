@@ -57,9 +57,10 @@ only reusable PluginDb and CoreDaemon-backed routed-envelope helpers needed by
 the plugin. The production daemon/MCP/worker/storage path is proved without a
 second `mcp-serve` runtime or a host-supplied Project Pipelines bundle.
 
-Manual dogfood path: run `botster-hub dogfood --web-package-path /path/to/botster-web`
-from the hub checkout, then open the printed TUI command or botster-web bridge
-URL. Focus the Project Pipelines create-ticket fields, submit once with a blank
+Manual runtime path: install and enable this package through the ordinary Hub
+package commands, run bare `botster-hub up`, then open the reported Web URL or
+the daemon-resolved TUI app. Focus the Project Pipelines create-ticket fields,
+submit once with a blank
 title to see field/form validation, then submit with a nonblank title to create
 a local ticket. The TUI renders the plugin-authored UiNode tree and dispatches
 the semantic action through the daemon; it does not build a Project Pipelines
