@@ -20,8 +20,8 @@ use serde_json::Value;
 mod typescript;
 
 pub const PROTOCOL: &str = "botster-hub-daemon-v1";
-pub const PROTOCOL_VERSION: u16 = 2;
-pub const CONFORMANCE_FIXTURE_REVISION: u16 = 17;
+pub const PROTOCOL_VERSION: u16 = 3;
+pub const CONFORMANCE_FIXTURE_REVISION: u16 = 18;
 /// Version of the local WebRTC delivery chunk framing protocol.
 pub const LOCAL_WEBRTC_DELIVERY_CHUNK_VERSION: u16 = 2;
 /// Serialized local WebRTC delivery frames must remain strictly below this size.
