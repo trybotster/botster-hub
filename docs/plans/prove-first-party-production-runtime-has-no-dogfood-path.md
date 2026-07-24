@@ -5,23 +5,28 @@
 - Target repository: `botster-hub`
 - Target id: `tgt_7e208a0c76a44980a83b63af976b1f22`
 - Pipeline ticket: `ticket_1784854143_789468`
-- Pipeline run: `run_1784910372_173141`
+- Pipeline run: `run_1784928695_310519`
 - Repository charter: [[botster-hub-playbook]]
 - The target was resolved through the admitted Botster spawn-target registry. The
   ambient worktree was not used as routing authority.
 - Current pipeline context was inspected for the ticket, run, active step, gate,
   dependencies, reviews, findings, artifacts, questions, and durable answers.
-  The five declared implementation dependencies are closed:
+  The seven declared dependencies are closed:
   - Hub production package runtime
   - Web production Hub/package runtime
   - TUI production client/runtime identity
   - TUI Kit product-neutral vocabulary
   - Core runnable-entrypoint Hub connection descriptor
-- The initial Plan context had no prior artifacts, reviews, findings, or
-  unanswered questions. Plan Review returned four findings, all addressed by
-  this revision: published Hub protocol availability, pre-routed release and
-  Web-consumption dependencies, operator-state isolation proof, and an explicit
-  non-vocabulary Rules evidence matrix.
+  - published Hub test-support release checkpoint
+  - Web consumption of that published release
+- The current Plan context began with no artifacts, reviews, findings, or open
+  questions. It retained the earlier human decision about deterministic upgrade
+  fixtures and vocabulary-audit exclusions.
+- The current branch already contains the prior-run implementation in commits
+  `bc64f29` and `10e0e76`, with open PR #164. A new blocking human answer
+  requires Implement to reuse that work, integrate it onto exact current main,
+  inspect the resulting diff, and generate fresh acceptance evidence. Prior-run
+  evidence is context only.
 
 ## Playbooks And Notes Loaded
 
@@ -100,38 +105,47 @@ The integration seam already has a Hub-owned starting point:
 - Workspaces and Project Pipelines each expose `script/test` plus real Hub
   package acceptance guidance.
 
-The current Hub worktree is based on merged main `0484ca8653d3b77679d5c8d4600742e99f1c7c91`.
+The current run worktree is based on merged main
+`0484ca8653d3b77679d5c8d4600742e99f1c7c91`.
 The exact pre-cutover Hub producer revision is its first parent,
 `823ded16f148ef8655c71344cde0d2e4b3dd951c`. Execution must fetch and resolve
 all repository main refs again; these observed SHAs are planning evidence, not
 permission to use stale revisions.
 
-Plan Review also proved an artifact-coupled mismatch that ordinary repository
-tests currently miss:
+The worktree is stale relative to authoritative Hub main. Remote main currently
+resolves to `42a2f1df02f69719d5a7a47216fb22515c1c0762`, which merged the
+Hub test-support release preparation after this branch diverged. Implement must
+integrate current main before changing or executing the prior-run implementation.
 
+- The earlier artifact-coupled mismatch is now resolved in merged source and
+  published-consumer state:
 - Current Hub main's
   `crates/botster-hub-client/generated/daemon-protocol.ts` hashes to
   `39e9202bd333584be077e1d1ef5c3fa31a9409996607cb4c01471c103e263980`
   and includes `refresh_local_packages`.
-- Published/installed `@trybotster/hub-test-support@0.1.10` and Web's vendored
-  protocol both hash to
-  `67676b59e05f8273a0061f9905fb66a94ca7afde0fc4f27691d35d67d6df95d8`
-  and omit that request.
-- Web's current drift check compares its vendored file with that same stale
-  installed artifact, so stale-versus-stale passes. A source override is useful
-  diagnosis but is not proof that a consumable release exists.
+- Web main `5b1bbdb17fc835580c9c7a6a88e09ffebdacf5a9` pins the published
+  `@trybotster/hub-test-support@0.1.11`; its vendored protocol has the same
+  `39e920...` hash as Hub source.
+- Closure and local hashes are prerequisite evidence, not final acceptance.
+  The current run must still perform a clean external install and package asset
+  verification before any Web runtime leg.
 
 ## Scope
 
 Make the existing Hub-owned production acceptance harness conclusive and use it
 to produce durable evidence:
 
-1. Extend `script/test-production-package-runtime` rather than creating a
-   parallel launcher. Require explicit repository/package coordinates and
-   expected revisions for Hub, Core, Web, TUI, TUI Kit, Workspaces, and Project
+1. Reuse commits `bc64f29` and `10e0e76`; do not rewrite the completed
+   implementation. Integrate them onto exact current Hub main, including
+   `42a2f1d` or its fetched successor, resolve drift without compatibility
+   scaffolding, and inspect the complete resulting diff before execution.
+2. Preserve the existing extension of
+   `script/test-production-package-runtime` rather than creating a parallel
+   launcher. Require explicit repository/package coordinates and expected
+   revisions for Hub, Core, Web, TUI, TUI Kit, Workspaces, and Project
    Pipelines. Reject dirty, non-Git, or revision-mismatched inputs before
    starting processes.
-2. Before any expensive build or Web runtime leg, gate every artifact-coupled
+3. Before any expensive build or Web runtime leg, gate every artifact-coupled
    first-party seam against the exact upstream source of truth. For
    `@trybotster/hub-test-support`, install the declared registry coordinate in a
    clean external consumer and require:
@@ -146,29 +160,29 @@ to produce durable evidence:
    Record upstream, metadata, installed-artifact, and Web-vendored hashes. Treat
    `BOTSTER_HUB_CLIENT_DAEMON_PROTOCOL` as diagnostic comparison only, never the
    acceptance path.
-3. Build every required artifact through its repository-supported locked path:
+4. Build every required artifact through its repository-supported locked path:
    Hub and session worker through Hub/Core Cargo, Web through `npm run build`,
    TUI through locked Cargo, and the plugin repositories through their own
    `script/test` checks. Do not inject local dependency overrides; lockfiles and
    declared Git revisions remain authoritative.
-4. Run the complete current runtime from a new short temporary data directory:
+5. Run the complete current runtime from a new short temporary data directory:
    install and enable the four first-party packages, run `up`, prove automatic
    local-package refresh, and exercise public package, app, session, status,
    doctor, smoke, and down contracts.
-5. Prove the Web user path with Web's supported live packaged-protocol harness
+6. Prove the Web user path with Web's supported live packaged-protocol harness
    against the exact current Hub/worker binaries and current Workspaces package.
    Require the dynamically bound structured `local_url`, `/health`, HTML shell,
    browser render, WebRTC connection, session lifecycle, terminal
    attach/input/readback/resize, browser reload/reconnect, and cleanup.
-6. Prove the TUI package launch through `apps open` with its supported headless
+7. Prove the TUI package launch through `apps open` with its supported headless
    live-runtime mode, so launch-context, Hub connection decoding, session
    lifecycle, terminal input/readback, and exit are event-driven rather than a
    fixed-delay Ctrl-Q injection.
-7. Exercise Workspaces and Project Pipelines as real installed packages. Verify
+8. Exercise Workspaces and Project Pipelines as real installed packages. Verify
    their enabled package rows, plugin workers, navigation/surface descriptors,
    and registered public tools. Use the package-owned test/harness for workflow
    semantics rather than moving workflow policy into Hub.
-8. Generate the durable upgrade fixture with the exact pre-cutover Hub revision
+9. Generate the durable upgrade fixture with the exact pre-cutover Hub revision
    `823ded16f148ef8655c71344cde0d2e4b3dd951c` and the corresponding pre-cutover
    package revisions in isolated temporary Git worktrees. Record every producer
    SHA and setup command. Stop the old daemon cleanly, change only the package
@@ -177,12 +191,12 @@ to produce durable evidence:
    admission reconstruction, startup, Web/TUI launch, session recovery, public
    status/doctor/smoke, and clean down without a compatibility alias or manual
    state edit.
-9. Record exact repository revisions, resolved first-party dependency revisions,
+10. Record exact repository revisions, resolved first-party dependency revisions,
    build commands, runtime commands, dynamically allocated endpoints, data-dir
    mode (`fresh` or `upgrade`), observable readiness/lifecycle evidence, and
    cleanup results in one machine-readable evidence directory plus the
    implementation report. Attach the evidence to Project Pipelines.
-10. Run two separate cold-turkey audit gates:
+11. Run two separate cold-turkey audit gates:
     - Vocabulary: scan current product surfaces in all seven repositories for
       `dogfood` case-insensitively across source, tests, executable scripts,
       manifests, README, current architecture/reference/operator docs, UI copy,
@@ -252,22 +266,19 @@ to produce durable evidence:
 - `botster-workspaces` and `botster-project-pipelines` own their plugin state,
   tools, surfaces, and workflow semantics. Hub only installs, enables, and
   hosts them.
-- The five existing dependency tickets are closed. If execution exposes a
+- All seven existing dependency tickets are closed. If execution exposes a
   defect in any external repository, create a dependency ticket against that
   repository's exact target and stop the affected acceptance leg. Do not patch
   it in this Hub run.
-- The artifact mismatch is already proven, so it is pre-routed rather than left
-  for implementation discovery:
-  - `ticket_1784912420_977096` on Hub target
-    `tgt_7e208a0c76a44980a83b63af976b1f22` must publish a new
-    `@trybotster/hub-test-support` artifact whose installed protocol and
-    conformance content match exact Hub main.
+- The artifact mismatch was pre-routed and its dependencies are now closed:
+  - release checkpoint `ticket_1784916883_931144` on Hub target
+    `tgt_7e208a0c76a44980a83b63af976b1f22` published
+    `@trybotster/hub-test-support@0.1.11`;
   - `ticket_1784912421_508855` on Web target
-    `tgt_40abcf71ccf049f4ac0c99953a799869` must consume that release and
-    re-vendor the authoritative protocol. The Web ticket depends on the Hub
-    publish ticket.
-  - This integration ticket depends on both. Web build/browser legs are blocked
-    until the installed artifact, exact Hub source, and Web vendored copy match.
+    `tgt_40abcf71ccf049f4ac0c99953a799869` consumed that release and
+    re-vendored the authoritative protocol.
+  - The current run still proves installed artifact, exact Hub source, and Web
+    vendored bytes match before Web build/browser execution.
 
 ## Assumptions And Unknowns
 
@@ -276,6 +287,10 @@ to produce durable evidence:
 - Durable human decision: retained `docs/plans/**` and `docs/reports/**` are
   historical implementation artifacts excluded from the blocking vocabulary
   scan; current ADR/reference/operator docs are included.
+- Durable human decision: reuse the prior-run implementation commits, integrate
+  exact current main, and proceed through normal Implement, Review, and Verify.
+  Do not restart or rewrite already-completed work; prior evidence cannot
+  substitute for fresh current-run acceptance.
 - Assumption: a repository's supported locked build is authoritative. The run
   records both the top-level current-main SHA and resolved first-party
   dependency SHAs, except that artifact-coupled seams additionally require
@@ -290,14 +305,13 @@ to produce durable evidence:
 - Unknown: whether one external package's supported harness exposes a missing
   browser/TUI binary prerequisite on the execution host. Missing prerequisites
   are failures with exact remediation, not waived proof.
-- Known blocker, not an assumption: `@trybotster/hub-test-support@0.1.10` is
-  stale relative to Hub main. The two registered dependencies must close and
-  the artifact-availability gate must pass before implementation can claim Web
-  acceptance.
+- Known resolved prerequisite: Hub published
+  `@trybotster/hub-test-support@0.1.11` and current Web main consumes it. The
+  clean external artifact-availability gate remains blocking runtime evidence.
 
 ## Affected Surfaces And Files
 
-Expected Hub-owned changes:
+Existing Hub-owned implementation to preserve and integrate:
 
 - `script/test-production-package-runtime`
   - expand from fresh Web/TUI smoke to revision-pinned seven-repository
@@ -311,15 +325,16 @@ Expected Hub-owned changes:
     acceptance description becomes inaccurate.
 - `docs/plans/prove-first-party-production-runtime-has-no-dogfood-path.md`
   - this reviewable plan artifact.
+- `script/production-package-runtime-evidence`
+  - narrow filesystem/Git evidence helper for snapshot comparison, artifact
+    parity, seven-repository audit, revision manifests, redaction, and PII
+    checks.
+
+Implementation-stage artifact still required:
+
 - `docs/reports/prove-first-party-production-runtime-has-no-dogfood-path.md`
   - implementation-stage exact revisions, commands, results, deviations, and
-    residual risks.
-
-Only if the harness cannot stay readable as one executable:
-
-- one narrowly named helper under `script/` for deterministic pre-cutover
-  fixture creation or product-surface scanning. Do not add a Rails-style or
-  Hub-specific artifact manager abstraction; use Git and filesystem primitives.
+  residual risks.
 
 Expected unchanged unless the acceptance run finds an actual Hub-owned defect:
 
@@ -388,22 +403,25 @@ changed surfaces:
 
 Cross-repository final proof:
 
-1. Fetch each repository, resolve the exact merged `origin/main`, verify clean
+1. Fetch each repository and integrate the two existing implementation commits
+   onto exact Hub `origin/main`. Confirm PR #164 points at the integrated head,
+   then inspect the complete diff against current main.
+2. Resolve exact merged `origin/main` for all seven repositories, verify clean
    detached worktrees, and record SHA plus supported build command.
-2. Verify both newly registered dependencies are closed, then run the clean
+3. Verify all seven registered dependencies are closed, then run the clean
    external artifact-availability gate. Record package coordinate, upstream
    source hash/revision, installed metadata hash/revision, actual installed
    bytes, and Web vendored hash. Stop before builds if they differ.
-3. Snapshot the resolved operator default Botster state root without mutating
+4. Snapshot the resolved operator default Botster state root without mutating
    it. Record a content manifest and metadata baseline.
-4. Run each repository's supported locked build/test prerequisite.
-5. Run the Hub production acceptance harness in `fresh` mode.
-6. Run Web's live packaged-protocol/browser harness with the exact current Hub
+5. Run each repository's supported locked build/test prerequisite.
+6. Run the Hub production acceptance harness in `fresh` mode.
+7. Run Web's live packaged-protocol/browser harness with the exact current Hub
    and worker binaries and current Workspaces package.
-7. Run the TUI package entrypoint in supported headless live-runtime mode.
-8. Run the Hub production acceptance harness in `upgrade` mode using the
+8. Run the TUI package entrypoint in supported headless live-runtime mode.
+9. Run the Hub production acceptance harness in `upgrade` mode using the
    pre-cutover-produced untouched data directory.
-9. For both runtime legs, require:
+10. For both runtime legs, require:
    - every Hub command has an explicit fixture `--data-dir`;
    - the resolved socket is contained by that fixture and differs from any
      pre-existing live/default socket;
@@ -417,22 +435,21 @@ Cross-repository final proof:
    - `smoke` success;
    - `down` success, no responding owned Hub socket, and no owned child left
      alive; teardown must refuse unrecorded sockets/PIDs.
-10. Re-snapshot the operator default Botster state root and require identical
+11. Re-snapshot the operator default Botster state root and require identical
     metadata/content. Record both fixture data directories and socket paths so
     Verify can audit isolation without rerunning.
-11. Run the vocabulary audit, Rules evidence matrix, and committed-artifact PII
+12. Run the vocabulary audit, Rules evidence matrix, and committed-artifact PII
     scan with valid exit-status handling and known-positive controls.
-12. Attach the exact command log, revision manifest, and summarized report to the
+13. Attach the exact command log, revision manifest, and summarized report to the
    Project Pipelines run. Code existence, source regexes, or an unrun command do
    not satisfy this gate.
 
 ## Pipeline Gates And Artifacts
 
 - Plan: attach this file and the complete `botster_stack_plan_gate` evidence.
-- Plan Review cannot approve into Implement while
-  `ticket_1784912420_977096` or `ticket_1784912421_508855` remains open; Plan
-  itself may advance for review because the blocker and correct targets are now
-  durable.
+- Plan Review must enforce the human routing decision: preserve the prior-run
+  implementation, integrate current main, and require fresh evidence in
+  Implement. The seven registered dependencies are closed.
 - Implement: commit the bounded Hub changes, link the PR, attach the
   implementation report, revision manifest, and command/evidence bundle.
 - Review: reject compatibility scaffolding, external-repo fixes, hard-coded
