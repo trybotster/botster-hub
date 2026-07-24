@@ -867,6 +867,13 @@ Both commands exercise `botster-hub-client` over the daemon socket, then
 worker-backed `SessionIo`/`ClientWorker` terminal path. The session counts are
 bounded correctness cases, not performance targets or benchmark claims.
 
+Adding the `refresh_local_packages` daemon request changes the request
+vocabulary, so `PROTOCOL_VERSION` advances to 3 alongside
+`CONFORMANCE_FIXTURE_REVISION` 18. This is a cold cut with no protocol-v2 parser
+or parallel fixture. Because `DaemonCompatibilityRequirement::current()`
+derives `minimum_protocol_version` from `PROTOCOL_VERSION`, clients built at
+this identity require a Hub at protocol version 3 or later.
+
 Replacing revision-13 JSON byte arrays with validated `payload_base64`, literal
 `payload_encoding: "base64"`, and decoded `bytes` fields increments
 `CONFORMANCE_FIXTURE_REVISION` to 14. `PROTOCOL_VERSION` remains unchanged
@@ -979,7 +986,7 @@ Node client tests should use the declared npm dependency instead of a relative
 hub checkout:
 
 ```sh
-npm install --save-dev @trybotster/hub-test-support@0.1.1
+npm install --save-dev @trybotster/hub-test-support@0.1.11
 ```
 
 ```js
@@ -994,7 +1001,7 @@ const fixturePath = materializePluginContractMatrixFixture(tempDirectory);
 
 Local environment variables may still point legacy drift checks at a checked-out
 hub artifact, but the normal web-client dependency coordinate is
-`@trybotster/hub-test-support@0.1.1` from the public npm registry.
+`@trybotster/hub-test-support@0.1.11` from the public npm registry.
 
 Each harness instance creates a disposable data directory and socket path under
 the configured test root, uses synthetic default hub identity, and attempts a

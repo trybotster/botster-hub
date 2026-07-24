@@ -49,13 +49,17 @@ The package test now asserts that exact token as well as package version
 39e9202bd333584be077e1d1ef5c3fa31a9409996607cb4c01471c103e263980  crates/botster-hub-client/generated/daemon-protocol.ts
 39e9202bd333584be077e1d1ef5c3fa31a9409996607cb4c01471c103e263980  packages/hub-test-support/daemon-protocol.ts
 7f61c1e2a6ef3eaf8a71c593659e6637c86943ea0d0d9c711641caf0f7c464ff  packages/hub-test-support/metadata.json
-2c3c429b4558895d113c38d050389c1c48371d1ad982b50a59ce3c36743ed145  trybotster-hub-test-support-0.1.11.tgz
+b9ffce6209518e71bfebae1865d828f3e45225831a5c5ec2b6f620b29ad0ac18  trybotster-hub-test-support-0.1.11.tgz
 ```
 
 `npm pack --dry-run` and `npm pack` reported 15 files, package size 15.0 kB,
 unpacked size 66.7 kB, npm shasum
-`b62aba983289eb2651c4ed19e609332712a5d3a7`, and filename
+`87418210eb25573108e16b9db60554ed1f50b7a0`, and filename
 `trybotster-hub-test-support-0.1.11.tgz`.
+
+These final tarball values were recomputed after Review corrected the shipped
+package README's current support-matrix wording. The generated protocol and
+metadata hashes did not change.
 
 ## Verification
 

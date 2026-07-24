@@ -73,8 +73,8 @@ Use this exact package spec in npm-based client repos:
 After `@trybotster/hub-test-support@0.1.11` is published to the public npm
 registry, no scoped `.npmrc` entry or CI auth token is required for install.
 
-The support matrix is generated from the Rust compatibility descriptors. In
-0.1.10, `terminal_readback` appears in both `supported_features` and
+The support matrix is generated from the Rust compatibility descriptors.
+`terminal_readback` appears in both `supported_features` and
 `required_features`; downstream compatibility checks must implement it rather
 than treating it as optional. The late-attach fixture is generated from the
 Rust serde scenario and preserves `attaching -> optional initial state ->
