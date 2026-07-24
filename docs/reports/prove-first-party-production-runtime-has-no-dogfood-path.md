@@ -42,6 +42,10 @@ as a blocking dependency instead of adding an integration workaround.
   required.
 - The Plan Review finding expanded the README correction to its introductory
   prose. The committed plan was synchronized before handoff.
+- Review identified missing cold-build redaction coordinates, product-surface
+  extensions, failed-launch cleanup assertions, operator-root coverage, and a
+  shell matcher control. Those proof defects were corrected without changing
+  product runtime ownership.
 
 ## Verification
 
@@ -60,21 +64,25 @@ Passed:
 - Fresh cross-repository acceptance through current builds, artifact parity,
   package install/enable/refresh, dynamic/explicit/invalid Web ports, Web
   health/HTML/browser/WebRTC, TUI live runtime, plugin tools, status, doctor,
-  smoke, and cleanup.
+  smoke, and cleanup. The refreshed auditable evidence bundle is required
+  before this claim is handed back to Review.
 
 Unverified/blocking:
 
-- The deterministic upgrade producer cannot currently be built. Two clean
-  campaign attempts fail at exact pre-cutover Hub `823ded16`, locked Core
-  `879f55e6`, when the vendored Ghostty Zig build cannot spawn its generated
-  `uucode_build_tables` executable from the Cargo git checkout cache. This is
-  the sole incomplete downstream proof and is tracked by
-  `ticket_1784931226_385888`.
+- The deterministic upgrade producer cannot currently be built. Two campaign
+  attempts fail when the vendored Ghostty Zig build cannot spawn its generated
+  `uucode_build_tables` executable. Review's control reproduced the same exit
+  101 at current locked Core `16bf08f` with a fresh `CARGO_TARGET_DIR`; the
+  defect is target-directory/cache-specific, not pre-cutover-specific. The
+  corrected owner ticket is `ticket_1784931226_385888`.
+- Upgrade browser reload/reconnect remains unexecuted behind that blocker.
+  Sessions list and resize are now explicit in the upgrade leg; the complete
+  upgrade matrix still must run before ticket acceptance.
 
 ## Durable Knowledge
 
 Existing vault guidance covered ownership, exact-Hub launch proof, path-neutral
-artifacts, and dependency routing. Missing guidance discovered: reproducible
-pre-cutover builds that compile vendored Ghostty from Cargo git checkouts need
-an owner-approved cache-isolation contract. No vault note was captured here
-because the owning Core investigation has not yet established the durable fix.
+artifacts, and dependency routing. Missing guidance discovered: vendored
+Ghostty builds from Cargo git checkouts need an owner-approved cache-isolation
+contract across target directories. No vault note was captured here because
+the owning Core investigation has not yet established the durable fix.

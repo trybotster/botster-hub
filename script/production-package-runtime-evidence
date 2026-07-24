@@ -73,10 +73,10 @@ def product_surface?(repo, relative)
 
   absolute = File.join(repo, relative)
   return true if File.file?(absolute) && File.executable?(absolute)
-  return true if relative.match?(%r{\A(?:src|test|tests|script|scripts|examples|docs)/})
+  return true if relative.match?(%r{\A(?:src|test|tests|script|scripts|examples|docs|\.github)/})
   return true if File.basename(relative).match?(/\A(?:README|Cargo|package|botster-package)/i)
 
-  relative.match?(/\.(?:rs|lua|js|mjs|cjs|ts|tsx|json|toml|md|sh|rb|py)\z/i)
+  relative.match?(/\.(?:rs|lua|js|mjs|cjs|ts|tsx|json|toml|md|sh|rb|py|yml|yaml|html|css)\z/i)
 end
 
 def scan_text(path, pattern)
