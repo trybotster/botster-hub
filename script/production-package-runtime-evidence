@@ -249,13 +249,13 @@ when "pii-scan"
     "mac_home" => Regexp.new("#{Regexp.escape(mac_home_prefix)}[^/<\\s]+/"),
     "unix_home" => Regexp.new("#{Regexp.escape(unix_home_prefix)}[^/<\\s]+/"),
     "email" => /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/,
-    "assigned_secret" => /(?:TOKEN|SECRET|PASSWORD|API_KEY)\s*=\s*[^\s<]+/i
+    "assigned_secret" => /\b[A-Z][A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|API_KEY)[A-Z0-9_]*\s*=\s*[^\s<]+/
   }
   controls = {
     "mac_home" => "#{mac_home_prefix}example/project".match?(patterns.fetch("mac_home")),
     "unix_home" => "#{unix_home_prefix}example/project".match?(patterns.fetch("unix_home")),
     "email" => ("person" "@" "example.invalid").match?(patterns.fetch("email")),
-    "assigned_secret" => ("API" "_KEY" "=" "not-a-real-value").match?(patterns.fetch("assigned_secret"))
+    "assigned_secret" => ("BOTSTER_" "API" "_KEY" "=" "not-a-real-value").match?(patterns.fetch("assigned_secret"))
   }
   abort_with("a PII matcher failed its known-positive control") unless controls.values.all?
 
