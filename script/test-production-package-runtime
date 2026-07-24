@@ -729,6 +729,12 @@ if [ "$mode" = upgrade ] || [ "$mode" = all ]; then
   capture upgrade-session-shutdown "$hub_bin" sessions shutdown --data-dir "$upgrade_data" upgrade-survivor
   capture upgrade-restart-smoke "$hub_bin" smoke --data-dir "$upgrade_data" --session-worker-bin "$session_worker_bin"
   down_runtime_leg upgrade "$upgrade_data"
+  capture_in upgrade-web-live-browser "$old_web" env \
+    BOTSTER_HUB_BIN="$hub_bin" \
+    BOTSTER_SESSION_WORKER_BIN="$session_worker_bin" \
+    BOTSTER_LIVE_DATA_DIR="$upgrade_data" \
+    BOTSTER_WORKSPACES_PACKAGE_PATH="$old_workspaces" \
+    npm run smoke:live-packaged-protocol
 fi
 
 "$evidence_helper" audit "$evidence_dir/product-surface-audit.json" \

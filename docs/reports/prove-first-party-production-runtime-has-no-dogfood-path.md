@@ -23,7 +23,8 @@
   audit, snapshot, redaction, and PII evidence helper.
 - `script/test-production-package-runtime`: seven-repository fresh/upgrade
   runtime campaign, explicit Ruby preflight, dynamic/explicit/invalid Web port
-  proof, and bounded cleanup.
+  proof, Web-owned browser reload/reconnect against both runtime legs, and
+  bounded cleanup.
 - `src/main.rs`: shut down a newly started owned daemon when `up` fails during
   package refresh/admission/launch.
 - `tests/hub_daemon_lifecycle_test.rs`: regression proof that failed startup
@@ -86,8 +87,10 @@ Unverified/blocking:
   101 at current locked Core `16bf08f` with a fresh `CARGO_TARGET_DIR`; the
   defect is target-directory/cache-specific, not pre-cutover-specific. The
   corrected owner ticket is `ticket_1784931226_385888`.
-- Upgrade browser reload/reconnect remains unexecuted behind that blocker.
-  Sessions list and resize are now explicit in the upgrade leg; the complete
+- Upgrade browser reload/reconnect is now wired through Web's supported live
+  packaged-protocol harness with `BOTSTER_LIVE_DATA_DIR` pointing at the same
+  upgraded durable runtime. It remains unexecuted behind the Core blocker.
+  Sessions list and resize are also explicit in the upgrade leg; the complete
   upgrade matrix still must run before ticket acceptance.
 
 ## Durable Knowledge
