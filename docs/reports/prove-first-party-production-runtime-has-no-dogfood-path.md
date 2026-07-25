@@ -14,7 +14,8 @@
 
 ## Files Changed
 
-- `Cargo.lock`: consume merged Core `011e299` cache isolation.
+- `Cargo.lock`: consume merged Core `49159e7`, including cache isolation,
+  idempotent natural-exit shutdown, and retained terminal egress.
 - `README.md`: production acceptance prerequisite and current runnable-entrypoint
   operator contract.
 - `docs/client-protocol.md`: cross-repository production proof contract.
@@ -29,7 +30,9 @@
 - `src/main.rs`: shut down a newly started owned daemon when `up` fails during
   package refresh/admission/launch.
 - `tests/hub_daemon_lifecycle_test.rs`: regression proof that failed startup
-  leaves neither a responding daemon nor an owned socket.
+  leaves neither a responding daemon nor an owned socket, plus downstream proof
+  that shutdown from a second connection preserves final output and exactly one
+  `ProcessExit` for the attached terminal subscription.
 - This report.
 
 ## Ownership And Cross-Repository Routing
@@ -41,6 +44,11 @@ and supported harnesses; none was patched in this run. The Ghostty cache defect
 was routed to closed Core ticket `ticket_1784931226_385888`; the durable Web
 harness defect was routed to closed Web ticket `ticket_1784938737_759157`.
 Their merged artifacts are consumed here without integration-only patches.
+The production campaign subsequently exposed two Core-owned natural-exit
+shutdown defects. They were routed through closed Core tickets
+`ticket_1784955886_116612` and `ticket_1784997182_148130`; merged Core
+`49159e7` is consumed here. Hub and Web production behavior was not weakened or
+given a compatibility path.
 
 ## Deviations From Plan
 
@@ -67,6 +75,13 @@ Their merged artifacts are consumed here without integration-only patches.
   corrected the caller-owned durable-data path. The final campaign consumes
   merged Web `e044484` and keeps the durable state intact rather than pruning,
   removing/reinstalling, or editing it to force the proof.
+- The unchanged campaign then exposed a natural-exit shutdown race and, after
+  that was fixed, loss of the attached subscription's terminal egress during
+  successful Core recovery. Both were routed to Core rather than hidden in Hub
+  classification or Web retry behavior. The final Hub regression is
+  downstream-shaped: attach on connection A, allow a controlled natural exit,
+  shut down on connection B, then prove A receives final output and one
+  `ProcessExit`, with no duplicate on its next drain.
 
 ## Verification
 
@@ -74,14 +89,15 @@ Passed:
 
 - `git diff --check`
 - `cargo fmt --all -- --check`
-- `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+- `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`
 - `sh -n script/test-production-package-runtime`
 - `ruby -c script/production-package-runtime-evidence`
 - Ruby missing and Ruby 2.6 negative preflight checks (both exit 69 with the
   documented remediation)
 - Three focused lifecycle/smoke/restart tests through `./test.sh`
-- Full `./test.sh`: all default tests passed (one documented ignored
-  adversarial test)
+- Focused locked cross-connection shutdown/terminal-egress regression: passed.
+- Full `./test.sh --locked`: all default tests passed, including 97 daemon
+  lifecycle tests (one documented ignored adversarial test).
 - Fresh cross-repository acceptance through current builds, artifact parity,
   package install/enable/refresh, dynamic/explicit/invalid Web ports, Web
   health/HTML/browser/WebRTC, TUI live runtime, plugin tools, status, doctor,
@@ -100,6 +116,17 @@ Passed:
   artifact parity, seven-repository product-surface audit, and PII scan.
   Durable Project Pipelines evidence, including the exact path-neutral
   invocation and command log, is `artifact_1784954240_655051`.
+- Final post-dependency all-mode acceptance exited 0 with
+  `production_package_runtime=pass` at clean exact revisions Hub
+  `4f494cb47179e50ac547f0ae73cf8d8dff3bac59`, Core
+  `49159e7373ffc2cdbb26c856bb3c738841a42742`, Web
+  `e044484a0ff719dcec2ed753e25eba545faacb95`, TUI
+  `fd68331e09dbba709b276dc650cbaecd90d73631`, TUI Kit
+  `4961e141d76020e53e6db8c80b85539aa26f2a3a`, Workspaces
+  `d4dcf3b9be4d1613db89477217d98634212c6aca`, and Project Pipelines
+  `3e4a3c08c8e0c34fcfa29ebb58f814b035db9384`. Both fresh and untouched
+  durable-upgrade paths passed the complete production workflow; the upgraded
+  Web live-browser proof that previously timed out now passed unchanged.
 
 Unverified behavior or residual risk: none within the approved acceptance
 matrix.
