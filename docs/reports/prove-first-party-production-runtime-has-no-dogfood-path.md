@@ -31,8 +31,9 @@
   package refresh/admission/launch.
 - `tests/hub_daemon_lifecycle_test.rs`: regression proof that failed startup
   leaves neither a responding daemon nor an owned socket, plus downstream proof
-  that shutdown from a second connection preserves final output and exactly one
-  `ProcessExit` for the attached terminal subscription.
+  of clean-exit cross-connection delivery: shutdown from a second connection
+  preserves final output and exactly one `ProcessExit` for the attached
+  terminal subscription.
 - This report.
 
 ## Ownership And Cross-Repository Routing
@@ -78,10 +79,13 @@ given a compatibility path.
 - The unchanged campaign then exposed a natural-exit shutdown race and, after
   that was fixed, loss of the attached subscription's terminal egress during
   successful Core recovery. Both were routed to Core rather than hidden in Hub
-  classification or Web retry behavior. The final Hub regression is
-  downstream-shaped: attach on connection A, allow a controlled natural exit,
+  classification or Web retry behavior. Hub's added coverage exercises the
+  clean-exit contract: attach on connection A, allow a controlled natural exit,
   shut down on connection B, then prove A receives final output and one
-  `ProcessExit`, with no duplicate on its next drain.
+  `ProcessExit`, with no duplicate on its next drain. It does not induce Core's
+  shutdown-recovery capture-failure branch. The discriminating regression
+  oracle is the unchanged Web production campaign: it failed at Core `2e494b8`
+  with a terminal-detach timeout and passes at Core `49159e7`.
 
 ## Verification
 
@@ -95,7 +99,8 @@ Passed:
 - Ruby missing and Ruby 2.6 negative preflight checks (both exit 69 with the
   documented remediation)
 - Three focused lifecycle/smoke/restart tests through `./test.sh`
-- Focused locked cross-connection shutdown/terminal-egress regression: passed.
+- Focused locked clean-exit cross-connection terminal-delivery coverage:
+  passed.
 - Full `./test.sh --locked`: all default tests passed, including 97 daemon
   lifecycle tests (one documented ignored adversarial test).
 - Fresh cross-repository acceptance through current builds, artifact parity,
@@ -127,9 +132,18 @@ Passed:
   `3e4a3c08c8e0c34fcfa29ebb58f814b035db9384`. Both fresh and untouched
   durable-upgrade paths passed the complete production workflow; the upgraded
   Web live-browser proof that previously timed out now passed unchanged.
+- Independent Verify reran the complete all-mode campaign at exact clean PR
+  head `b8831a3073f8d59dd776fcdc9837d976c5fce9cd` with the same downstream
+  revisions and exited 0. Durable artifact `artifact_1785008382_573531`
+  includes the redacted command log, revision and upgrade manifests, Web port
+  proof, operator-state manifests, artifact parity, product-surface audit, and
+  PII scan.
 
-Unverified behavior or residual risk: none within the approved acceptance
-matrix.
+Residual risk: Hub's ordinary automated suite covers clean-exit
+cross-connection delivery but has no negative control that forces Core's
+shutdown-recovery capture-failure branch. Core owns the discriminating
+daemon-level tests. The real first-party user path is verified by the
+single-variable failed-before/passed-after Web production campaign pair.
 
 ## Durable Knowledge
 
