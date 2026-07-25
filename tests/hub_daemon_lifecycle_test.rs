@@ -6309,6 +6309,192 @@ fn session_entity_subscription_observes_natural_exit_without_terminal_attach() {
 }
 
 #[test]
+fn shutdown_from_another_connection_preserves_process_exit_for_attached_subscription() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_short_test_dir("cross-shutdown-egress");
+    let config = explicit_config(&data_dir);
+    let endpoint = botster_hub_client::DaemonEndpoint::new(
+        config
+            .transports
+            .local_socket
+            .as_ref()
+            .expect("test config has local socket")
+            .path
+            .clone(),
+    );
+    let child = start_cli_daemon(&data_dir);
+    let session_id = "cross-connection-shutdown";
+    let subscription_id = "cross-connection-terminal";
+    let marker_path = data_dir.join("natural-exit-marker");
+    let release_path = data_dir.join("natural-exit-release");
+
+    botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::Spawn {
+            session_id: session_id.to_string(),
+            command: format!(
+                "printf ready; IFS= read -r line; printf 'cross-connection-exiting:%s\\n' \"$line\"; \
+                 printf observed > '{}'; while [ ! -e '{}' ]; do sleep 0.01; done; \
+                 printf 'cross-connection-tail\\n'; exit 0",
+                marker_path.display(),
+                release_path.display()
+            ),
+        },
+    )
+    .expect("spawn cross-connection shutdown session");
+    let mut attached =
+        botster_hub_client::DaemonConnection::connect(&endpoint).expect("terminal connection");
+    attached
+        .request(&botster_hub_client::DaemonRequest::Attach {
+            session_id: session_id.to_string(),
+            subscription_id: subscription_id.to_string(),
+        })
+        .expect("attach terminal subscription");
+    attached
+        .request(&botster_hub_client::DaemonRequest::SendInput {
+            session_id: session_id.to_string(),
+            data: "finish\r".to_string(),
+        })
+        .expect("release terminal fixture to its exit marker");
+    for _ in 0..500 {
+        if marker_path.exists() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        marker_path.exists(),
+        "terminal fixture did not publish its marker"
+    );
+
+    let mut observed_marker = false;
+    for _ in 0..100 {
+        let marker_drain = attached
+            .request(&botster_hub_client::DaemonRequest::Drain {
+                session_id: session_id.to_string(),
+            })
+            .expect("drain terminal marker before natural exit");
+        observed_marker |= marker_drain.events.iter().any(|event| {
+            matches!(
+                event,
+                botster_hub_client::DaemonEvent::TerminalOutput { data, .. }
+                    if data.contains("cross-connection-exiting")
+            )
+        });
+        assert!(
+            marker_drain
+                .events
+                .iter()
+                .all(|event| !matches!(event, botster_hub_client::DaemonEvent::ProcessExit { .. })),
+            "fixture must remain live until its explicit release: {:?}",
+            marker_drain.events
+        );
+        if observed_marker {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        observed_marker,
+        "attached subscription did not observe the exit marker"
+    );
+
+    let registry: serde_json::Value = serde_json::from_slice(
+        &fs::read(data_dir.join("sessions").join(format!("{session_id}.json")))
+            .expect("read worker session registry"),
+    )
+    .expect("parse worker session registry");
+    let pty_child_pid = registry["process"]["pid"]
+        .as_u64()
+        .expect("registry PTY child pid") as u32;
+    let worker_socket = PathBuf::from(
+        registry["recovery_identity"]["worker_control_socket"]
+            .as_str()
+            .expect("registry worker control socket"),
+    );
+    fs::write(&release_path, b"release").expect("release controlled natural exit");
+    for _ in 0..500 {
+        if !process_exists(pty_child_pid) && UnixStream::connect(&worker_socket).is_err() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        !process_exists(pty_child_pid) && UnixStream::connect(&worker_socket).is_err(),
+        "worker process and control route did not complete before shutdown"
+    );
+
+    let shutdown = botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::ShutdownSession {
+            session_id: session_id.to_string(),
+        },
+    )
+    .expect("shutdown session from a separate connection");
+    assert!(
+        shutdown.events.iter().all(|event| !matches!(
+            event,
+            botster_hub_client::DaemonEvent::ProcessExit {
+                subscription_id: event_subscription_id,
+                ..
+            } if event_subscription_id == subscription_id
+        )),
+        "shutdown caller must not consume the attached subscription's process exit: {:?}",
+        shutdown.events
+    );
+
+    let attached_drain = attached
+        .request(&botster_hub_client::DaemonRequest::Drain {
+            session_id: session_id.to_string(),
+        })
+        .expect("drain attached subscription after cross-connection shutdown");
+    assert_eq!(
+        attached_drain
+            .events
+            .iter()
+            .filter(|event| matches!(
+                event,
+                botster_hub_client::DaemonEvent::ProcessExit {
+                    session_id: event_session_id,
+                    subscription_id: event_subscription_id,
+                    ..
+                } if event_session_id == session_id && event_subscription_id == subscription_id
+            ))
+            .count(),
+        1,
+        "attached subscription must receive one process exit: {:?}",
+        attached_drain.events
+    );
+    assert!(
+        attached_drain.events.iter().any(|event| matches!(
+            event,
+            botster_hub_client::DaemonEvent::TerminalOutput { data, .. }
+                if data.contains("cross-connection-tail")
+        )),
+        "final terminal output must be preserved with the process exit: {:?}",
+        attached_drain.events
+    );
+    let drained_again = attached
+        .request(&botster_hub_client::DaemonRequest::Drain {
+            session_id: session_id.to_string(),
+        })
+        .expect("repeat drain after cross-connection shutdown");
+    assert!(
+        drained_again.events.iter().all(|event| !matches!(
+            event,
+            botster_hub_client::DaemonEvent::ProcessExit {
+                subscription_id: event_subscription_id,
+                ..
+            } if event_subscription_id == subscription_id
+        )),
+        "subscription-scoped process exit must be delivered once: {:?}",
+        drained_again.events
+    );
+
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
 fn session_entity_subscription_observes_attached_natural_exit_with_pending_egress() {
     let _guard = daemon_test_guard();
     let data_dir = unique_test_dir("session-entity-attached-exit");
