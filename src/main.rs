@@ -1139,7 +1139,6 @@ impl Drop for StartedRuntimeCleanup<'_> {
                 let _ = wait_for_runtime_daemon_exit(metadata.pid);
             }
             let _ = remove_configured_local_socket(self.config);
-            let _ = std::fs::remove_file(self.config.data_directory.join("botster-hub.sock"));
             let _ = remove_runtime_daemon_metadata(&self.config.data_directory);
         }
     }
