@@ -3907,6 +3907,83 @@ fn cli_local_runtime_up_reports_missing_installed_checkout_before_launch() {
 }
 
 #[test]
+fn cli_local_runtime_up_failure_after_daemon_ready_stops_started_daemon() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_short_test_dir("cli-up-post-ready-cleanup");
+    let web_package_dir = unique_test_dir("cli-up-post-ready-web");
+    let tui_package_dir = unique_test_dir("cli-up-post-ready-tui");
+    write_botster_web_package(&web_package_dir);
+    write_botster_tui_package(&tui_package_dir);
+    let web_manifest_path = web_package_dir.join("botster-package.json");
+    let mut web_manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&web_manifest_path).expect("read Web manifest"))
+            .expect("parse Web manifest");
+    web_manifest["runnable_entrypoints"][0]["environment"][0]["default"] =
+        serde_json::Value::String("not-a-port".to_string());
+    fs::write(
+        &web_manifest_path,
+        serde_json::to_string_pretty(&web_manifest).expect("serialize invalid-port Web manifest"),
+    )
+    .expect("write invalid-port Web manifest");
+    ensure_session_worker_binary();
+    ensure_runtime_packages(&data_dir, &web_package_dir, &tui_package_dir);
+
+    let metadata_path = data_dir.join(".botster-hub-runtime-daemon.json");
+    let mut up = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("up")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("--session-worker-bin")
+        .arg(session_worker_binary_path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn up with invalid Web package port");
+
+    for _ in 0..500 {
+        if metadata_path.exists() {
+            break;
+        }
+        assert!(
+            up.try_wait().expect("poll invalid-port up").is_none(),
+            "invalid-port up exited before publishing owned daemon metadata"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        metadata_path.exists(),
+        "invalid-port up should publish owned daemon metadata before Web launch fails"
+    );
+    let metadata: serde_json::Value = serde_json::from_slice(
+        &fs::read(&metadata_path).expect("read invalid-port daemon metadata"),
+    )
+    .expect("parse invalid-port daemon metadata");
+    let daemon_pid = metadata["pid"].as_u64().expect("metadata pid") as u32;
+    let socket_path = PathBuf::from(
+        metadata["socket_path"]
+            .as_str()
+            .expect("metadata socket path"),
+    );
+
+    let failed = up.wait_with_output().expect("wait for invalid-port up");
+    assert!(
+        !failed.status.success(),
+        "up should fail for invalid Web package port"
+    );
+    let text = command_output_text(&failed);
+    assert!(text.contains("botster-web"), "{text}");
+    wait_for_process_exit(daemon_pid);
+    assert!(
+        !socket_path.exists(),
+        "failed up left its configured owned socket: {socket_path:?}"
+    );
+    assert!(
+        !metadata_path.exists(),
+        "failed up left its owned daemon metadata"
+    );
+}
+
+#[test]
 fn cli_daily_commands_share_canonical_default_data_directory() {
     let _guard = daemon_test_guard();
     let checkout = unique_short_test_dir("daily");

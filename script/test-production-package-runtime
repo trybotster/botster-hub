@@ -151,6 +151,13 @@ npm_cache_root=$(npm config get cache) || {
   echo "npm cache root could not be resolved" >&2
   exit 69
 }
+case "$npm_cache_root" in
+  /*) ;;
+  *)
+    echo "npm cache root must resolve to an absolute path, found: $npm_cache_root" >&2
+    exit 69
+    ;;
+esac
 
 cleanup() {
   while IFS= read -r data_dir; do
@@ -230,24 +237,47 @@ capture_in() {
   fi
 }
 
-capture_expected_failure() {
-  capture_failure_label=$1
-  capture_failure_pattern=$2
-  shift 2
-  capture_failure_raw=$runtime_root/$capture_failure_label.raw
+capture_failed_up_with_runtime_identity() {
+  failed_up_label=$1
+  failed_up_pattern=$2
+  failed_up_data_dir=$3
+  shift 3
+  failed_up_raw=$runtime_root/$failed_up_label.raw
+  failed_up_metadata=$failed_up_data_dir/.botster-hub-runtime-daemon.json
   printf '%s\n' "$*" >>"$raw_commands"
   refresh_command_log
-  if "$@" >"$capture_failure_raw" 2>&1; then
-    redact_file "$capture_failure_raw" "$evidence_dir/$capture_failure_label.log"
+  "$@" >"$failed_up_raw" 2>&1 &
+  failed_up_cli_pid=$!
+  failed_up_attempts=0
+  while [ ! -e "$failed_up_metadata" ]; do
+    if ! kill -0 "$failed_up_cli_pid" >/dev/null 2>&1; then
+      wait "$failed_up_cli_pid" || true
+      redact_file "$failed_up_raw" "$evidence_dir/$failed_up_label.log"
+      cat "$evidence_dir/$failed_up_label.log" >&2
+      echo "failing up exited before publishing owned runtime metadata" >&2
+      return 1
+    fi
+    failed_up_attempts=$((failed_up_attempts + 1))
+    [ "$failed_up_attempts" -lt 500 ] || {
+      echo "failing up did not publish owned runtime metadata" >&2
+      return 1
+    }
+    sleep 0.01
+  done
+  failed_up_daemon_pid=$(ruby -rjson -e 'print JSON.parse(File.read(ARGV.fetch(0))).fetch("pid")' "$failed_up_metadata")
+  failed_up_socket=$(ruby -rjson -e 'print JSON.parse(File.read(ARGV.fetch(0))).fetch("socket_path")' "$failed_up_metadata")
+  if wait "$failed_up_cli_pid"; then
+    redact_file "$failed_up_raw" "$evidence_dir/$failed_up_label.log"
     echo "command unexpectedly succeeded: $*" >&2
     return 1
   fi
-  redact_file "$capture_failure_raw" "$evidence_dir/$capture_failure_label.log"
-  grep -q "$capture_failure_pattern" "$capture_failure_raw" || {
-    cat "$evidence_dir/$capture_failure_label.log" >&2
-    echo "expected failure did not include $capture_failure_pattern" >&2
+  redact_file "$failed_up_raw" "$evidence_dir/$failed_up_label.log"
+  grep -q "$failed_up_pattern" "$failed_up_raw" || {
+    cat "$evidence_dir/$failed_up_label.log" >&2
+    echo "expected failure did not include $failed_up_pattern" >&2
     return 1
   }
+  assert_failed_up_cleanup "$failed_up_daemon_pid" "$failed_up_socket" "$failed_up_metadata"
 }
 
 validate_revision() {
@@ -291,6 +321,16 @@ for coordinate in \
 do
   repo=${coordinate%:*}
   revision=${coordinate##*:}
+  case "$revision" in
+    *[!0-9a-f]*|'')
+      echo "pre-cutover revision must be a full lowercase Git SHA: $revision" >&2
+      exit 65
+      ;;
+  esac
+  [ "${#revision}" -eq 40 ] || {
+    echo "pre-cutover revision must be a full 40-character Git SHA: $revision" >&2
+    exit 65
+  }
   git -C "$repo" cat-file -e "$revision^{commit}" || {
     echo "pre-cutover revision is not available in $repo: $revision" >&2
     exit 65
@@ -522,16 +562,11 @@ down_runtime_leg() {
 }
 
 assert_failed_up_cleanup() {
-  failed_data_dir=$1
-  failed_metadata=$failed_data_dir/.botster-hub-runtime-daemon.json
-  failed_socket=$failed_data_dir/botster-hub.sock
-  failed_pid=
-  if [ -e "$failed_metadata" ]; then
-    failed_pid=$(ruby -rjson -e 'print JSON.parse(File.read(ARGV.fetch(0))).fetch("pid")' "$failed_metadata")
-    failed_socket=$(ruby -rjson -e 'print JSON.parse(File.read(ARGV.fetch(0))).fetch("socket_path")' "$failed_metadata")
-  fi
+  failed_pid=$1
+  failed_socket=$2
+  failed_metadata=$3
   failed_cleanup_attempts=0
-  while [ -e "$failed_socket" ]; do
+  while [ -e "$failed_socket" ] || kill -0 "$failed_pid" >/dev/null 2>&1; do
     failed_cleanup_attempts=$((failed_cleanup_attempts + 1))
     [ "$failed_cleanup_attempts" -lt 100 ] || break
     sleep 0.02
@@ -540,10 +575,14 @@ assert_failed_up_cleanup() {
     echo "failed up left an owned socket: $failed_socket" >&2
     exit 1
   }
-  if [ -n "$failed_pid" ] && kill -0 "$failed_pid" >/dev/null 2>&1; then
+  if kill -0 "$failed_pid" >/dev/null 2>&1; then
     echo "failed up left an owned Hub process: $failed_pid" >&2
     exit 1
   fi
+  [ ! -e "$failed_metadata" ] || {
+    echo "failed up left owned runtime metadata: $failed_metadata" >&2
+    exit 1
+  }
 }
 
 if [ "$mode" = fresh ] || [ "$mode" = all ]; then
@@ -596,7 +635,7 @@ if [ "$mode" = fresh ] || [ "$mode" = all ]; then
   while :; do
     explicit_attempt=$((explicit_attempt + 1))
     explicit_port=$(ruby -rsocket -e 'server = TCPServer.new("127.0.0.1", 0); print server.addr[1]; server.close')
-    if capture explicit-port-up env BOTSTER_WEB_PACKAGE_SERVER_PORT="$explicit_port" \
+    if capture "explicit-port-up-$explicit_attempt" env BOTSTER_WEB_PACKAGE_SERVER_PORT="$explicit_port" \
       "$hub_bin" up --data-dir "$explicit_data" --session-worker-bin "$session_worker_bin"; then
       break
     fi
@@ -606,7 +645,8 @@ if [ "$mode" = fresh ] || [ "$mode" = all ]; then
       exit 1
     }
   done
-  explicit_web_url=$(sed -n 's/^web=//p' "$runtime_root/explicit-port-up.raw" | tail -1)
+  explicit_up_raw=$runtime_root/explicit-port-up-$explicit_attempt.raw
+  explicit_web_url=$(sed -n 's/^web=//p' "$explicit_up_raw" | tail -1)
   explicit_web_port=$(printf '%s' "$explicit_web_url" | sed -E 's#^https?://[^:]+:([0-9]+).*$#\1#')
   [ "$explicit_web_port" = "$explicit_port" ] || {
     echo "Web package runtime did not honor BOTSTER_WEB_PACKAGE_SERVER_PORT=$explicit_port: $explicit_web_url" >&2
@@ -617,17 +657,16 @@ if [ "$mode" = fresh ] || [ "$mode" = all ]; then
   grep -q '"ok":true' "$runtime_root/explicit-port-health.raw"
   capture explicit-port-html curl --fail --silent --show-error "$explicit_web_url"
   grep -qi '<html' "$runtime_root/explicit-port-html.raw"
-  printf 'environment=BOTSTER_WEB_PACKAGE_SERVER_PORT\ndynamic_urls=%s,%s\nexplicit_port=%s\nexplicit_url=%s\nretired_fixed_port=%s\n' \
-    "$fresh_web_url" "$second_web_url" "$explicit_port" "$explicit_web_url" "$retired_fixed_port" \
+  printf 'environment=BOTSTER_WEB_PACKAGE_SERVER_PORT\ndynamic_urls=%s,%s\nexplicit_attempts=%s\nexplicit_port=%s\nexplicit_url=%s\nretired_fixed_port=%s\n' \
+    "$fresh_web_url" "$second_web_url" "$explicit_attempt" "$explicit_port" "$explicit_web_url" "$retired_fixed_port" \
     >"$evidence_dir/web-port-proof.txt"
   down_runtime_leg explicit-port "$explicit_data"
 
   invalid_port_data=$runtime_root/invalid-port-data
   install_current_packages invalid-port "$invalid_port_data" "$web_repo" "$tui_repo" "$workspaces_repo" "$project_pipelines_repo"
-  capture_expected_failure invalid-port-up invalid_package_server_port \
+  capture_failed_up_with_runtime_identity invalid-port-up invalid_package_server_port "$invalid_port_data" \
     env BOTSTER_WEB_PACKAGE_SERVER_PORT=not-a-port \
     "$hub_bin" up --data-dir "$invalid_port_data" --session-worker-bin "$session_worker_bin"
-  assert_failed_up_cleanup "$invalid_port_data"
 
   capture_in web-live-browser "$web_repo" env \
     BOTSTER_HUB_BIN="$hub_bin" \
@@ -662,6 +701,18 @@ if [ "$mode" = upgrade ] || [ "$mode" = all ]; then
   add_worktree "$tui_repo" "$pre_cutover_tui_revision" "$old_tui"
   add_worktree "$workspaces_repo" "$pre_cutover_workspaces_revision" "$old_workspaces"
   add_worktree "$project_pipelines_repo" "$pre_cutover_project_pipelines_revision" "$old_pipelines"
+  ruby -rjson -e '
+    rows = ARGV.each_slice(3).to_h do |name, before, after|
+      [name, { "pre_cutover_revision" => before, "current_revision" => after, "advanced" => before != after }]
+    end
+    puts JSON.pretty_generate({ "producers" => rows })
+  ' \
+    botster-hub "$pre_cutover_hub_revision" "$hub_revision" \
+    botster-web "$pre_cutover_web_revision" "$web_revision" \
+    botster-tui "$pre_cutover_tui_revision" "$tui_revision" \
+    botster-workspaces "$pre_cutover_workspaces_revision" "$workspaces_revision" \
+    botster-project-pipelines "$pre_cutover_project_pipelines_revision" "$project_pipelines_revision" \
+    >"$evidence_dir/upgrade-revisions.json"
 
   old_target=$runtime_root/pre-cutover-target
   old_cargo_home=$old_root/cargo-home
