@@ -132,9 +132,11 @@ Passed:
   `3e4a3c08c8e0c34fcfa29ebb58f814b035db9384`. Both fresh and untouched
   durable-upgrade paths passed the complete production workflow; the upgraded
   Web live-browser proof that previously timed out now passed unchanged.
-- Independent Verify reran the complete all-mode campaign at exact clean PR
-  head `b8831a3073f8d59dd776fcdc9837d976c5fce9cd` with the same downstream
-  revisions and exited 0. Durable artifact `artifact_1785008382_573531`
+- Independent Verify reran the complete all-mode campaign at exact clean
+  functional tree `b8831a3073f8d59dd776fcdc9837d976c5fce9cd` with the same
+  downstream revisions and exited 0. Beginning with `d8599d9`, subsequent
+  commits change only this report and the PR's evidence description. Durable
+  artifact `artifact_1785008382_573531`
   includes the redacted command log, revision and upgrade manifests, Web port
   proof, operator-state manifests, artifact parity, product-surface audit, and
   PII scan.
