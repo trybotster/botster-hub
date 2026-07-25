@@ -735,7 +735,6 @@ if [ "$mode" = upgrade ] || [ "$mode" = all ]; then
   grep -q 'recovered_session id=upgrade-survivor' "$runtime_root/upgrade-restart-status.raw"
   capture upgrade-session-shutdown "$hub_bin" sessions shutdown --data-dir "$upgrade_data" upgrade-survivor
   capture upgrade-restart-smoke "$hub_bin" smoke --data-dir "$upgrade_data" --session-worker-bin "$session_worker_bin"
-  capture upgrade-browser-remove-web "$hub_bin" packages remove --data-dir "$upgrade_data" botster-web
   down_runtime_leg upgrade "$upgrade_data"
   capture_in upgrade-web-live-browser "$old_web" env \
     BOTSTER_HUB_BIN="$hub_bin" \
