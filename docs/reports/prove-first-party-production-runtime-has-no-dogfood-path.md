@@ -56,8 +56,10 @@ as a blocking dependency instead of adding an integration workaround.
   changes permitted by its “actual Hub-owned defect” clause.
 - The merged Core fix isolates Zig caches for current builds but cannot alter
   the immutable pre-cutover Core commit. The deterministic historical producer
-  now uses an isolated Cargo home as well as an isolated target directory, so
-  it neither consumes nor mutates the operator's shared legacy checkout cache.
+  now supplies target-contained Zig local/global cache directories through the
+  same public environment contract, together with isolated Cargo home and
+  target directories, so it neither consumes nor mutates the operator's shared
+  legacy checkout cache.
 
 ## Verification
 
