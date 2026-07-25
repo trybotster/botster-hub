@@ -60,12 +60,13 @@ as a blocking dependency instead of adding an integration workaround.
   same public environment contract, together with isolated Cargo home and
   target directories, so it neither consumes nor mutates the operator's shared
   legacy checkout cache.
-- Web's supported live browser harness owns install/enable for `botster-web`
-  and rejects an already-installed record. After the upgraded runtime has
-  already proven automatic refresh, restart/adoption, sessions, and smoke, the
-  campaign removes only `botster-web` through Hub's public package command and
-  hands the same durable data directory to Web's harness. No package reload or
-  direct state edit is used.
+- Web's supported live browser harness currently assumes an empty package and
+  session registry. The real upgraded state exposed that it rejects the
+  existing Web package and, after a supported remove/install control, receives
+  but does not render an external-session upsert alongside pre-existing exited
+  sessions. This is routed to Web ticket `ticket_1784938737_759157`; the Hub
+  campaign keeps the real durable state intact rather than pruning or editing
+  it to force the proof.
 
 ## Verification
 
@@ -93,17 +94,18 @@ Passed:
 
 Unverified/blocking:
 
-- The deterministic upgrade producer cannot currently be built. Two campaign
-  attempts fail when the vendored Ghostty Zig build cannot spawn its generated
-  `uucode_build_tables` executable. Review's control reproduced the same exit
-  101 at current locked Core `16bf08f` with a fresh `CARGO_TARGET_DIR`; the
-  defect is target-directory/cache-specific, not pre-cutover-specific. The
-  corrected owner ticket is `ticket_1784931226_385888`.
+- Core ticket `ticket_1784931226_385888` is closed and Hub now locks merged
+  Core `011e299`. Strict clippy, full Hub tests, and the exact pre-cutover
+  producer build all pass with the fixture-owned cache contract. The upgrade
+  runtime subsequently passes automatic refresh, readiness, TUI, plugin tools,
+  restart/session adoption, sessions list/resize, smoke, and cleanup.
 - Upgrade browser reload/reconnect is now wired through Web's supported live
   packaged-protocol harness with `BOTSTER_LIVE_DATA_DIR` pointing at the same
-  upgraded durable runtime. It remains unexecuted behind the Core blocker.
-  Sessions list and resize are also explicit in the upgrade leg; the complete
-  upgrade matrix still must run before ticket acceptance.
+  upgraded durable runtime. The Hub upgrade, restart/adoption, session
+  list/resize, smoke, and cleanup assertions execute successfully; browser
+  execution is blocked by Web ticket `ticket_1784938737_759157` after the
+  harness establishes WebRTC and terminal attach but times out rendering its
+  externally spawned session in the pre-populated durable state.
 
 ## Durable Knowledge
 
