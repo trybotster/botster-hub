@@ -98,6 +98,8 @@ Passed:
   spawn/list/attach/input/resize/readback/lifecycle, Hub restart/adoption,
   browser reload/reconnect, smoke, down/cleanup, operator-state isolation,
   artifact parity, seven-repository product-surface audit, and PII scan.
+  Durable Project Pipelines evidence, including the exact path-neutral
+  invocation and command log, is `artifact_1784954240_655051`.
 
 Unverified behavior or residual risk: none within the approved acceptance
 matrix.
