@@ -487,7 +487,10 @@ Cross-repository final proof:
    historical producer with both an isolated Cargo home and target directory
    plus target-contained Zig local/global cache directories, using the same
    public cache contract as current Core, so its immutable dependency checkout
-   cannot read or mutate operator caches.
+   cannot read or mutate operator caches. After automatic package refresh and
+   the Hub upgrade matrix pass, hand Web's package lifecycle to its supported
+   browser harness by removing only `botster-web` through the public package
+   command; do not edit persisted state or issue a manual reload.
 10. For both runtime legs, require:
    - every Hub command has an explicit fixture `--data-dir`;
    - the resolved socket is contained by that fixture and differs from any
