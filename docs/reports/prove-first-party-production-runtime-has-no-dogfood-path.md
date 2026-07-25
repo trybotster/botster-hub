@@ -14,6 +14,7 @@
 
 ## Files Changed
 
+- `Cargo.lock`: consume merged Core `011e299` cache isolation.
 - `README.md`: production acceptance prerequisite and current runnable-entrypoint
   operator contract.
 - `docs/client-protocol.md`: cross-repository production proof contract.
@@ -36,9 +37,10 @@
 The changes remain inside Hub-owned startup, package admission/supervision,
 integration proof, and operator documentation. Core, Web, TUI, TUI Kit,
 Workspaces, and Project Pipelines are consumed through their public artifacts
-and supported harnesses; none was patched. The reproducible pre-cutover Ghostty
-build failure was routed to Core ticket `ticket_1784931226_385888` and attached
-as a blocking dependency instead of adding an integration workaround.
+and supported harnesses; none was patched in this run. The Ghostty cache defect
+was routed to closed Core ticket `ticket_1784931226_385888`; the durable Web
+harness defect was routed to closed Web ticket `ticket_1784938737_759157`.
+Their merged artifacts are consumed here without integration-only patches.
 
 ## Deviations From Plan
 
@@ -60,13 +62,11 @@ as a blocking dependency instead of adding an integration workaround.
   same public environment contract, together with isolated Cargo home and
   target directories, so it neither consumes nor mutates the operator's shared
   legacy checkout cache.
-- Web's supported live browser harness currently assumes an empty package and
-  session registry. The real upgraded state exposed that it rejects the
-  existing Web package and, after a supported remove/install control, receives
-  but does not render an external-session upsert alongside pre-existing exited
-  sessions. This is routed to Web ticket `ticket_1784938737_759157`; the Hub
-  campaign keeps the real durable state intact rather than pruning or editing
-  it to force the proof.
+- The real upgraded state exposed that Web's live harness assumed an empty
+  package/session registry. Closed Web ticket `ticket_1784938737_759157`
+  corrected the caller-owned durable-data path. The final campaign consumes
+  merged Web `e044484` and keeps the durable state intact rather than pruning,
+  removing/reinstalling, or editing it to force the proof.
 
 ## Verification
 
@@ -91,26 +91,22 @@ Passed:
   Project Pipelines evidence is `artifact_1784933087_975596`, which embeds the
   exact seven-repository revisions, command log, artifact/port/audit/PII
   results, operator-root manifests, and runtime summary.
+- Final upgrade acceptance exited 0 with
+  `production_package_runtime=pass` at Hub `307adae`, Core `011e299`, and Web
+  `e044484`. It proves the exact historical producer, untouched durable state,
+  automatic refresh, readiness/health/UI, TUI, plugin tools, session
+  spawn/list/attach/input/resize/readback/lifecycle, Hub restart/adoption,
+  browser reload/reconnect, smoke, down/cleanup, operator-state isolation,
+  artifact parity, seven-repository product-surface audit, and PII scan.
 
-Unverified/blocking:
-
-- Core ticket `ticket_1784931226_385888` is closed and Hub now locks merged
-  Core `011e299`. Strict clippy, full Hub tests, and the exact pre-cutover
-  producer build all pass with the fixture-owned cache contract. The upgrade
-  runtime subsequently passes automatic refresh, readiness, TUI, plugin tools,
-  restart/session adoption, sessions list/resize, smoke, and cleanup.
-- Upgrade browser reload/reconnect is now wired through Web's supported live
-  packaged-protocol harness with `BOTSTER_LIVE_DATA_DIR` pointing at the same
-  upgraded durable runtime. The Hub upgrade, restart/adoption, session
-  list/resize, smoke, and cleanup assertions execute successfully; browser
-  execution is blocked by Web ticket `ticket_1784938737_759157` after the
-  harness establishes WebRTC and terminal attach but times out rendering its
-  externally spawned session in the pre-populated durable state.
+Unverified behavior or residual risk: none within the approved acceptance
+matrix.
 
 ## Durable Knowledge
 
 Existing vault guidance covered ownership, exact-Hub launch proof, path-neutral
 artifacts, and dependency routing. Missing guidance discovered: vendored
 Ghostty builds from Cargo git checkouts need an owner-approved cache-isolation
-contract across target directories. No vault note was captured here because
-the owning Core investigation has not yet established the durable fix.
+contract across target directories. The owning Core run established and
+captured that durable contract in its crate README, tests, and CI; no separate
+vault note was added by this Hub integration run.
