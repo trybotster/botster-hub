@@ -485,7 +485,9 @@ Cross-repository final proof:
    live packaged-protocol/browser harness against that same upgraded data
    directory to prove reload/reconnect through the durable runtime. Build the
    historical producer with both an isolated Cargo home and target directory
-   so its immutable dependency checkout cannot read or mutate operator caches.
+   plus target-contained Zig local/global cache directories, using the same
+   public cache contract as current Core, so its immutable dependency checkout
+   cannot read or mutate operator caches.
 10. For both runtime legs, require:
    - every Hub command has an explicit fixture `--data-dir`;
    - the resolved socket is contained by that fixture and differs from any
