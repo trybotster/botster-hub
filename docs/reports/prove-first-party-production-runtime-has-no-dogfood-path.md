@@ -60,6 +60,12 @@ as a blocking dependency instead of adding an integration workaround.
   same public environment contract, together with isolated Cargo home and
   target directories, so it neither consumes nor mutates the operator's shared
   legacy checkout cache.
+- Web's supported live browser harness owns install/enable for `botster-web`
+  and rejects an already-installed record. After the upgraded runtime has
+  already proven automatic refresh, restart/adoption, sessions, and smoke, the
+  campaign removes only `botster-web` through Hub's public package command and
+  hands the same durable data directory to Web's harness. No package reload or
+  direct state edit is used.
 
 ## Verification
 
