@@ -3845,12 +3845,30 @@ fn cli_local_runtime_up_reports_missing_installed_checkout_before_launch() {
         command_output_text(&first)
     );
     shutdown_local_runtime_daemon(&data_dir);
+    let socket_path = data_dir.join("botster-hub.sock");
+    for _ in 0..100 {
+        if !socket_path.exists() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        !socket_path.exists(),
+        "initial daemon socket should be gone before failed-start cleanup proof"
+    );
+    let failed_data_dir = unique_short_test_dir("cli-up-failed-cleanup");
+    fs::create_dir_all(&failed_data_dir).expect("create failed-start data directory");
+    fs::copy(
+        data_dir.join("hub-state.json"),
+        failed_data_dir.join("hub-state.json"),
+    )
+    .expect("copy installed package state into fresh failed-start directory");
     fs::remove_dir_all(&web_package_dir).expect("remove installed web checkout");
 
     let failed = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
         .arg("up")
         .arg("--data-dir")
-        .arg(&data_dir)
+        .arg(&failed_data_dir)
         .arg("--session-worker-bin")
         .arg(session_worker_binary_path())
         .output()
@@ -3864,6 +3882,104 @@ fn cli_local_runtime_up_reports_missing_installed_checkout_before_launch() {
     assert!(
         text.contains(web_package_dir.to_string_lossy().as_ref()),
         "{text}"
+    );
+    let config = explicit_config(failed_data_dir.clone());
+    let status = botster_hub::daemon_transport_request(&config, botster_hub::DaemonRequest::Status);
+    assert!(
+        matches!(
+            status,
+            Err(botster_hub::DaemonTransportError::NotRunning)
+                | Err(botster_hub::DaemonTransportError::ClientDisconnected)
+        ),
+        "failed startup should stop the daemon it started: {status:?}"
+    );
+    let failed_socket_path = failed_data_dir.join("botster-hub.sock");
+    for _ in 0..100 {
+        if !failed_socket_path.exists() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        !failed_socket_path.exists(),
+        "failed startup left its owned socket: {text}"
+    );
+}
+
+#[test]
+fn cli_local_runtime_up_failure_after_daemon_ready_stops_started_daemon() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_short_test_dir("cli-up-post-ready-cleanup");
+    let web_package_dir = unique_test_dir("cli-up-post-ready-web");
+    let tui_package_dir = unique_test_dir("cli-up-post-ready-tui");
+    write_botster_web_package(&web_package_dir);
+    write_botster_tui_package(&tui_package_dir);
+    let web_manifest_path = web_package_dir.join("botster-package.json");
+    let mut web_manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&web_manifest_path).expect("read Web manifest"))
+            .expect("parse Web manifest");
+    web_manifest["runnable_entrypoints"][0]["environment"][0]["default"] =
+        serde_json::Value::String("not-a-port".to_string());
+    fs::write(
+        &web_manifest_path,
+        serde_json::to_string_pretty(&web_manifest).expect("serialize invalid-port Web manifest"),
+    )
+    .expect("write invalid-port Web manifest");
+    ensure_session_worker_binary();
+    ensure_runtime_packages(&data_dir, &web_package_dir, &tui_package_dir);
+
+    let metadata_path = data_dir.join(".botster-hub-runtime-daemon.json");
+    let mut up = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("up")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("--session-worker-bin")
+        .arg(session_worker_binary_path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn up with invalid Web package port");
+
+    for _ in 0..500 {
+        if metadata_path.exists() {
+            break;
+        }
+        assert!(
+            up.try_wait().expect("poll invalid-port up").is_none(),
+            "invalid-port up exited before publishing owned daemon metadata"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        metadata_path.exists(),
+        "invalid-port up should publish owned daemon metadata before Web launch fails"
+    );
+    let metadata: serde_json::Value = serde_json::from_slice(
+        &fs::read(&metadata_path).expect("read invalid-port daemon metadata"),
+    )
+    .expect("parse invalid-port daemon metadata");
+    let daemon_pid = metadata["pid"].as_u64().expect("metadata pid") as u32;
+    let socket_path = PathBuf::from(
+        metadata["socket_path"]
+            .as_str()
+            .expect("metadata socket path"),
+    );
+
+    let failed = up.wait_with_output().expect("wait for invalid-port up");
+    assert!(
+        !failed.status.success(),
+        "up should fail for invalid Web package port"
+    );
+    let text = command_output_text(&failed);
+    assert!(text.contains("botster-web"), "{text}");
+    wait_for_process_exit(daemon_pid);
+    assert!(
+        !socket_path.exists(),
+        "failed up left its configured owned socket: {socket_path:?}"
+    );
+    assert!(
+        !metadata_path.exists(),
+        "failed up left its owned daemon metadata"
     );
 }
 
@@ -6189,6 +6305,192 @@ fn session_entity_subscription_observes_natural_exit_without_terminal_attach() {
     subscription
         .unsubscribe()
         .expect("unsubscribe entity stream");
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
+fn shutdown_from_another_connection_preserves_process_exit_for_attached_subscription() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_short_test_dir("cross-shutdown-egress");
+    let config = explicit_config(&data_dir);
+    let endpoint = botster_hub_client::DaemonEndpoint::new(
+        config
+            .transports
+            .local_socket
+            .as_ref()
+            .expect("test config has local socket")
+            .path
+            .clone(),
+    );
+    let child = start_cli_daemon(&data_dir);
+    let session_id = "cross-connection-shutdown";
+    let subscription_id = "cross-connection-terminal";
+    let marker_path = data_dir.join("natural-exit-marker");
+    let release_path = data_dir.join("natural-exit-release");
+
+    botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::Spawn {
+            session_id: session_id.to_string(),
+            command: format!(
+                "printf ready; IFS= read -r line; printf 'cross-connection-exiting:%s\\n' \"$line\"; \
+                 printf observed > '{}'; while [ ! -e '{}' ]; do sleep 0.01; done; \
+                 printf 'cross-connection-tail\\n'; exit 0",
+                marker_path.display(),
+                release_path.display()
+            ),
+        },
+    )
+    .expect("spawn cross-connection shutdown session");
+    let mut attached =
+        botster_hub_client::DaemonConnection::connect(&endpoint).expect("terminal connection");
+    attached
+        .request(&botster_hub_client::DaemonRequest::Attach {
+            session_id: session_id.to_string(),
+            subscription_id: subscription_id.to_string(),
+        })
+        .expect("attach terminal subscription");
+    attached
+        .request(&botster_hub_client::DaemonRequest::SendInput {
+            session_id: session_id.to_string(),
+            data: "finish\r".to_string(),
+        })
+        .expect("release terminal fixture to its exit marker");
+    for _ in 0..500 {
+        if marker_path.exists() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        marker_path.exists(),
+        "terminal fixture did not publish its marker"
+    );
+
+    let mut observed_marker = false;
+    for _ in 0..100 {
+        let marker_drain = attached
+            .request(&botster_hub_client::DaemonRequest::Drain {
+                session_id: session_id.to_string(),
+            })
+            .expect("drain terminal marker before natural exit");
+        observed_marker |= marker_drain.events.iter().any(|event| {
+            matches!(
+                event,
+                botster_hub_client::DaemonEvent::TerminalOutput { data, .. }
+                    if data.contains("cross-connection-exiting")
+            )
+        });
+        assert!(
+            marker_drain
+                .events
+                .iter()
+                .all(|event| !matches!(event, botster_hub_client::DaemonEvent::ProcessExit { .. })),
+            "fixture must remain live until its explicit release: {:?}",
+            marker_drain.events
+        );
+        if observed_marker {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        observed_marker,
+        "attached subscription did not observe the exit marker"
+    );
+
+    let registry: serde_json::Value = serde_json::from_slice(
+        &fs::read(data_dir.join("sessions").join(format!("{session_id}.json")))
+            .expect("read worker session registry"),
+    )
+    .expect("parse worker session registry");
+    let pty_child_pid = registry["process"]["pid"]
+        .as_u64()
+        .expect("registry PTY child pid") as u32;
+    let worker_socket = PathBuf::from(
+        registry["recovery_identity"]["worker_control_socket"]
+            .as_str()
+            .expect("registry worker control socket"),
+    );
+    fs::write(&release_path, b"release").expect("release controlled natural exit");
+    for _ in 0..500 {
+        if !process_exists(pty_child_pid) && UnixStream::connect(&worker_socket).is_err() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        !process_exists(pty_child_pid) && UnixStream::connect(&worker_socket).is_err(),
+        "worker process and control route did not complete before shutdown"
+    );
+
+    let shutdown = botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::ShutdownSession {
+            session_id: session_id.to_string(),
+        },
+    )
+    .expect("shutdown session from a separate connection");
+    assert!(
+        shutdown.events.iter().all(|event| !matches!(
+            event,
+            botster_hub_client::DaemonEvent::ProcessExit {
+                subscription_id: event_subscription_id,
+                ..
+            } if event_subscription_id == subscription_id
+        )),
+        "shutdown caller must not consume the attached subscription's process exit: {:?}",
+        shutdown.events
+    );
+
+    let attached_drain = attached
+        .request(&botster_hub_client::DaemonRequest::Drain {
+            session_id: session_id.to_string(),
+        })
+        .expect("drain attached subscription after cross-connection shutdown");
+    assert_eq!(
+        attached_drain
+            .events
+            .iter()
+            .filter(|event| matches!(
+                event,
+                botster_hub_client::DaemonEvent::ProcessExit {
+                    session_id: event_session_id,
+                    subscription_id: event_subscription_id,
+                    ..
+                } if event_session_id == session_id && event_subscription_id == subscription_id
+            ))
+            .count(),
+        1,
+        "attached subscription must receive one process exit: {:?}",
+        attached_drain.events
+    );
+    assert!(
+        attached_drain.events.iter().any(|event| matches!(
+            event,
+            botster_hub_client::DaemonEvent::TerminalOutput { data, .. }
+                if data.contains("cross-connection-tail")
+        )),
+        "final terminal output must be preserved with the process exit: {:?}",
+        attached_drain.events
+    );
+    let drained_again = attached
+        .request(&botster_hub_client::DaemonRequest::Drain {
+            session_id: session_id.to_string(),
+        })
+        .expect("repeat drain after cross-connection shutdown");
+    assert!(
+        drained_again.events.iter().all(|event| !matches!(
+            event,
+            botster_hub_client::DaemonEvent::ProcessExit {
+                subscription_id: event_subscription_id,
+                ..
+            } if event_subscription_id == subscription_id
+        )),
+        "subscription-scoped process exit must be delivered once: {:?}",
+        drained_again.events
+    );
+
     shutdown_cli_daemon(&data_dir, child);
 }
 

@@ -2,133 +2,831 @@
 set -eu
 
 usage() {
-  echo "usage: $0 --web-package-path PATH --tui-package-path PATH [--hub-bin PATH] [--session-worker-bin PATH]" >&2
+  cat >&2 <<'USAGE'
+usage: script/test-production-package-runtime \
+  --hub-repo PATH --hub-revision SHA \
+  --core-repo PATH --core-revision SHA \
+  --web-repo PATH --web-revision SHA \
+  --tui-repo PATH --tui-revision SHA \
+  --tui-kit-repo PATH --tui-kit-revision SHA \
+  --workspaces-repo PATH --workspaces-revision SHA \
+  --project-pipelines-repo PATH --project-pipelines-revision SHA \
+  --pre-cutover-hub-revision SHA \
+  --pre-cutover-web-revision SHA \
+  --pre-cutover-tui-revision SHA \
+  --pre-cutover-workspaces-revision SHA \
+  --pre-cutover-project-pipelines-revision SHA \
+  --evidence-dir PATH [--mode fresh|upgrade|all] \
+  [--hub-bin PATH --session-worker-bin PATH]
+USAGE
   exit 64
 }
 
-web_package_path=
-tui_package_path=
+hub_repo=
+hub_revision=
+core_repo=
+core_revision=
+web_repo=
+web_revision=
+tui_repo=
+tui_revision=
+tui_kit_repo=
+tui_kit_revision=
+workspaces_repo=
+workspaces_revision=
+project_pipelines_repo=
+project_pipelines_revision=
+pre_cutover_hub_revision=
+pre_cutover_web_revision=
+pre_cutover_tui_revision=
+pre_cutover_workspaces_revision=
+pre_cutover_project_pipelines_revision=
+evidence_dir=
+mode=all
 hub_bin=
 session_worker_bin=
 
 while [ "$#" -gt 0 ]; do
+  [ "$#" -ge 2 ] || usage
   case "$1" in
-    --web-package-path)
-      [ "$#" -ge 2 ] || usage
-      web_package_path=$2
-      shift 2
-      ;;
-    --tui-package-path)
-      [ "$#" -ge 2 ] || usage
-      tui_package_path=$2
-      shift 2
-      ;;
-    --hub-bin)
-      [ "$#" -ge 2 ] || usage
-      hub_bin=$2
-      shift 2
-      ;;
-    --session-worker-bin)
-      [ "$#" -ge 2 ] || usage
-      session_worker_bin=$2
-      shift 2
-      ;;
-    *)
-      usage
-      ;;
+    --hub-repo) hub_repo=${2-}; shift 2 ;;
+    --hub-revision) hub_revision=${2-}; shift 2 ;;
+    --core-repo) core_repo=${2-}; shift 2 ;;
+    --core-revision) core_revision=${2-}; shift 2 ;;
+    --web-repo) web_repo=${2-}; shift 2 ;;
+    --web-revision) web_revision=${2-}; shift 2 ;;
+    --tui-repo) tui_repo=${2-}; shift 2 ;;
+    --tui-revision) tui_revision=${2-}; shift 2 ;;
+    --tui-kit-repo) tui_kit_repo=${2-}; shift 2 ;;
+    --tui-kit-revision) tui_kit_revision=${2-}; shift 2 ;;
+    --workspaces-repo) workspaces_repo=${2-}; shift 2 ;;
+    --workspaces-revision) workspaces_revision=${2-}; shift 2 ;;
+    --project-pipelines-repo) project_pipelines_repo=${2-}; shift 2 ;;
+    --project-pipelines-revision) project_pipelines_revision=${2-}; shift 2 ;;
+    --pre-cutover-hub-revision) pre_cutover_hub_revision=${2-}; shift 2 ;;
+    --pre-cutover-web-revision) pre_cutover_web_revision=${2-}; shift 2 ;;
+    --pre-cutover-tui-revision) pre_cutover_tui_revision=${2-}; shift 2 ;;
+    --pre-cutover-workspaces-revision) pre_cutover_workspaces_revision=${2-}; shift 2 ;;
+    --pre-cutover-project-pipelines-revision) pre_cutover_project_pipelines_revision=${2-}; shift 2 ;;
+    --evidence-dir) evidence_dir=${2-}; shift 2 ;;
+    --mode) mode=${2-}; shift 2 ;;
+    --hub-bin) hub_bin=${2-}; shift 2 ;;
+    --session-worker-bin) session_worker_bin=${2-}; shift 2 ;;
+    *) usage ;;
   esac
 done
 
-[ -n "$web_package_path" ] || usage
-[ -n "$tui_package_path" ] || usage
-[ -f "$web_package_path/botster-package.json" ] || {
-  echo "missing botster-web manifest: $web_package_path/botster-package.json" >&2
-  exit 66
-}
-[ -f "$tui_package_path/botster-package.json" ] || {
-  echo "missing botster-tui manifest: $tui_package_path/botster-package.json" >&2
-  exit 66
-}
-grep -q '"name"[[:space:]]*:[[:space:]]*"botster-web"' "$web_package_path/botster-package.json" || {
-  echo "web package identity is not botster-web" >&2
-  exit 65
-}
-grep -q '"name"[[:space:]]*:[[:space:]]*"botster-tui"' "$tui_package_path/botster-package.json" || {
-  echo "tui package identity is not botster-tui" >&2
-  exit 65
-}
-
-if [ -z "$hub_bin" ] || [ -z "$session_worker_bin" ]; then
-  cargo build --locked --bin botster-hub -p botster-hub
-  cargo build --locked --bin botster-session-worker -p botster-core
-  : "${hub_bin:=target/debug/botster-hub}"
-  : "${session_worker_bin:=target/debug/botster-session-worker}"
+for required in \
+  hub_repo hub_revision core_repo core_revision web_repo web_revision \
+  tui_repo tui_revision tui_kit_repo tui_kit_revision \
+  workspaces_repo workspaces_revision \
+  project_pipelines_repo project_pipelines_revision \
+  pre_cutover_hub_revision pre_cutover_web_revision pre_cutover_tui_revision \
+  pre_cutover_workspaces_revision pre_cutover_project_pipelines_revision \
+  evidence_dir
+do
+  eval "value=\${$required}"
+  [ -n "$value" ] || usage
+done
+case "$mode" in fresh|upgrade|all) ;; *) usage ;; esac
+if [ -n "$hub_bin" ] || [ -n "$session_worker_bin" ]; then
+  [ -n "$hub_bin" ] && [ -n "$session_worker_bin" ] || usage
 fi
 
-runtime_root=$(mktemp -d "/tmp/bh-runtime.XXXXXX")
-data_dir=$runtime_root/data
-daemon_pid=
+ruby_remediation="Install Ruby 2.7 or newer and ensure the ruby executable is on PATH."
+if ! command -v ruby >/dev/null 2>&1; then
+  echo "Ruby 2.7 or newer is required. $ruby_remediation" >&2
+  exit 69
+fi
+ruby_version=$(ruby -e 'print RUBY_VERSION')
+if ! ruby -e 'parts = RUBY_VERSION.split(".").map(&:to_i); exit(parts[0] > 2 || (parts[0] == 2 && parts[1] >= 7) ? 0 : 1)'; then
+  echo "Ruby 2.7 or newer is required; found $ruby_version. $ruby_remediation" >&2
+  exit 69
+fi
+
+canonical_dir() {
+  [ -d "$1" ] || {
+    echo "repository directory does not exist: $1" >&2
+    exit 66
+  }
+  (CDPATH= cd -- "$1" && pwd -P)
+}
+
+hub_repo=$(canonical_dir "$hub_repo")
+core_repo=$(canonical_dir "$core_repo")
+web_repo=$(canonical_dir "$web_repo")
+tui_repo=$(canonical_dir "$tui_repo")
+tui_kit_repo=$(canonical_dir "$tui_kit_repo")
+workspaces_repo=$(canonical_dir "$workspaces_repo")
+project_pipelines_repo=$(canonical_dir "$project_pipelines_repo")
+script_repo=$(canonical_dir "$(dirname "$0")/..")
+[ "$script_repo" = "$hub_repo" ] || {
+  echo "this harness must run from the routed botster-hub worktree" >&2
+  exit 65
+}
+
+evidence_helper=$script_repo/script/production-package-runtime-evidence
+[ -x "$evidence_helper" ] || {
+  echo "evidence helper is not executable: $evidence_helper" >&2
+  exit 66
+}
+[ ! -e "$evidence_dir" ] || {
+  echo "evidence directory already exists: $evidence_dir" >&2
+  exit 73
+}
+mkdir -p "$evidence_dir"
+evidence_dir=$(canonical_dir "$evidence_dir")
+
+runtime_root=$(mktemp -d "/tmp/botster-production-acceptance.XXXXXX")
+owned_data_dirs=$runtime_root/owned-data-dirs
+owned_worktrees=$runtime_root/owned-worktrees
+raw_commands=$runtime_root/commands.raw
+: >"$owned_data_dirs"
+: >"$owned_worktrees"
+: >"$raw_commands"
+setup_pid=
+fixed_port_pid=
+cargo_home_root=${CARGO_HOME:-$HOME/.cargo}
+npm_cache_root=$(npm config get cache) || {
+  echo "npm cache root could not be resolved" >&2
+  exit 69
+}
+case "$npm_cache_root" in
+  /*) ;;
+  *)
+    echo "npm cache root must resolve to an absolute path, found: $npm_cache_root" >&2
+    exit 69
+    ;;
+esac
 
 cleanup() {
-  "$hub_bin" down --data-dir "$data_dir" >/dev/null 2>&1 || true
-  if [ -n "$daemon_pid" ]; then
-    kill "$daemon_pid" >/dev/null 2>&1 || true
-    wait "$daemon_pid" >/dev/null 2>&1 || true
+  while IFS= read -r data_dir; do
+    [ -n "$data_dir" ] || continue
+    if [ -n "$hub_bin" ] && [ -x "$hub_bin" ]; then
+      "$hub_bin" down --data-dir "$data_dir" >/dev/null 2>&1 || true
+    fi
+  done <"$owned_data_dirs"
+  if [ -n "$setup_pid" ]; then
+    kill "$setup_pid" >/dev/null 2>&1 || true
+    wait "$setup_pid" >/dev/null 2>&1 || true
   fi
+  if [ -n "$fixed_port_pid" ]; then
+    kill "$fixed_port_pid" >/dev/null 2>&1 || true
+    wait "$fixed_port_pid" >/dev/null 2>&1 || true
+  fi
+  while IFS='|' read -r repo worktree; do
+    [ -n "$repo" ] && [ -n "$worktree" ] || continue
+    git -C "$repo" worktree remove --force "$worktree" >/dev/null 2>&1 || true
+  done <"$owned_worktrees"
   rm -rf "$runtime_root"
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
-echo "hub_revision=$(git rev-parse HEAD)"
-echo "web_revision=$(git -C "$web_package_path" rev-parse HEAD 2>/dev/null || echo unversioned)"
-echo "tui_revision=$(git -C "$tui_package_path" rev-parse HEAD 2>/dev/null || echo unversioned)"
-
-"$hub_bin" start --data-dir "$data_dir" --session-worker-bin "$session_worker_bin" \
-  >"$runtime_root/setup-daemon.log" 2>&1 &
-daemon_pid=$!
-
-attempt=0
-until "$hub_bin" status --data-dir "$data_dir" >/dev/null 2>&1; do
-  attempt=$((attempt + 1))
-  [ "$attempt" -lt 100 ] || {
-    echo "setup daemon did not become ready" >&2
-    sed -n '1,120p' "$runtime_root/setup-daemon.log" >&2
-    exit 1
-  }
-  sleep 0.05
-done
-
-"$hub_bin" packages install --data-dir "$data_dir" --path "$web_package_path"
-"$hub_bin" packages enable --data-dir "$data_dir" botster-web
-"$hub_bin" packages install --data-dir "$data_dir" --path "$tui_package_path"
-"$hub_bin" packages enable --data-dir "$data_dir" botster-tui
-"$hub_bin" shutdown --data-dir "$data_dir"
-wait "$daemon_pid"
-daemon_pid=
-
-up_output=$("$hub_bin" up --data-dir "$data_dir" --session-worker-bin "$session_worker_bin")
-printf '%s\n' "$up_output"
-web_url=$(printf '%s\n' "$up_output" | sed -n 's/^web=//p' | tail -1)
-[ -n "$web_url" ] || {
-  echo "up did not print the structured botster-web local_url" >&2
-  exit 1
+redact_file() {
+  "$evidence_helper" redact "$1" "$2" \
+    '<cargo-home>='"$cargo_home_root" \
+    '<npm-cache>='"$npm_cache_root" \
+    '<hub-repo>='"$hub_repo" \
+    '<core-repo>='"$core_repo" \
+    '<web-repo>='"$web_repo" \
+    '<tui-repo>='"$tui_repo" \
+    '<tui-kit-repo>='"$tui_kit_repo" \
+    '<workspaces-repo>='"$workspaces_repo" \
+    '<project-pipelines-repo>='"$project_pipelines_repo" \
+    '<runtime-root>='"$runtime_root" \
+    '<evidence-dir>='"$evidence_dir" \
+    '<home>='"$HOME"
 }
 
-"$hub_bin" up --data-dir "$data_dir" --session-worker-bin "$session_worker_bin" >/dev/null
-"$hub_bin" status --data-dir "$data_dir"
-"$hub_bin" doctor --data-dir "$data_dir"
-"$hub_bin" apps list --data-dir "$data_dir"
+refresh_command_log() {
+  redact_file "$raw_commands" "$evidence_dir/commands.log"
+}
 
-origin=$(printf '%s\n' "$web_url" | sed -E 's#^(https?://[^/]+).*$#\1#')
-curl --fail --silent --show-error "$origin/health" | grep -q '"ok":true'
-curl --fail --silent --show-error "$web_url" | grep -qi '<html'
+capture() {
+  capture_label=$1
+  shift
+  capture_raw=$runtime_root/$capture_label.raw
+  printf '%s\n' "$*" >>"$raw_commands"
+  refresh_command_log
+  if "$@" >"$capture_raw" 2>&1; then
+    redact_file "$capture_raw" "$evidence_dir/$capture_label.log"
+  else
+    capture_status=$?
+    redact_file "$capture_raw" "$evidence_dir/$capture_label.log"
+    cat "$evidence_dir/$capture_label.log" >&2
+    return "$capture_status"
+  fi
+}
 
-# Exercise the foreground-stdio package contract under a pseudo-terminal, then
-# send the documented Ctrl-Q quit key so the proof remains non-interactive.
-(sleep 1; printf '\021') |
-  /usr/bin/script -q "$runtime_root/tui.log" \
-    "$hub_bin" apps open --data-dir "$data_dir" botster-tui
+capture_in() {
+  capture_in_label=$1
+  capture_in_directory=$2
+  shift 2
+  capture_in_raw=$runtime_root/$capture_in_label.raw
+  printf 'cd %s && %s\n' "$capture_in_directory" "$*" >>"$raw_commands"
+  refresh_command_log
+  if (cd "$capture_in_directory" && "$@") >"$capture_in_raw" 2>&1; then
+    redact_file "$capture_in_raw" "$evidence_dir/$capture_in_label.log"
+  else
+    capture_in_status=$?
+    redact_file "$capture_in_raw" "$evidence_dir/$capture_in_label.log"
+    cat "$evidence_dir/$capture_in_label.log" >&2
+    return "$capture_in_status"
+  fi
+}
 
-"$hub_bin" smoke --data-dir "$data_dir" --session-worker-bin "$session_worker_bin"
-"$hub_bin" down --data-dir "$data_dir"
+capture_failed_up_with_runtime_identity() {
+  failed_up_label=$1
+  failed_up_pattern=$2
+  failed_up_data_dir=$3
+  shift 3
+  failed_up_raw=$runtime_root/$failed_up_label.raw
+  failed_up_metadata=$failed_up_data_dir/.botster-hub-runtime-daemon.json
+  printf '%s\n' "$*" >>"$raw_commands"
+  refresh_command_log
+  "$@" >"$failed_up_raw" 2>&1 &
+  failed_up_cli_pid=$!
+  failed_up_attempts=0
+  while [ ! -e "$failed_up_metadata" ]; do
+    if ! kill -0 "$failed_up_cli_pid" >/dev/null 2>&1; then
+      wait "$failed_up_cli_pid" || true
+      redact_file "$failed_up_raw" "$evidence_dir/$failed_up_label.log"
+      cat "$evidence_dir/$failed_up_label.log" >&2
+      echo "failing up exited before publishing owned runtime metadata" >&2
+      return 1
+    fi
+    failed_up_attempts=$((failed_up_attempts + 1))
+    [ "$failed_up_attempts" -lt 500 ] || {
+      echo "failing up did not publish owned runtime metadata" >&2
+      return 1
+    }
+    sleep 0.01
+  done
+  failed_up_daemon_pid=$(ruby -rjson -e 'print JSON.parse(File.read(ARGV.fetch(0))).fetch("pid")' "$failed_up_metadata")
+  failed_up_socket=$(ruby -rjson -e 'print JSON.parse(File.read(ARGV.fetch(0))).fetch("socket_path")' "$failed_up_metadata")
+  if wait "$failed_up_cli_pid"; then
+    redact_file "$failed_up_raw" "$evidence_dir/$failed_up_label.log"
+    echo "command unexpectedly succeeded: $*" >&2
+    return 1
+  fi
+  redact_file "$failed_up_raw" "$evidence_dir/$failed_up_label.log"
+  grep -q "$failed_up_pattern" "$failed_up_raw" || {
+    cat "$evidence_dir/$failed_up_label.log" >&2
+    echo "expected failure did not include $failed_up_pattern" >&2
+    return 1
+  }
+  assert_failed_up_cleanup "$failed_up_daemon_pid" "$failed_up_socket" "$failed_up_metadata"
+}
+
+validate_revision() {
+  validate_repo=$1
+  validate_expected=$2
+  validate_name=$3
+  case "$validate_expected" in
+    *[!0-9a-f]*|'') echo "$validate_name revision must be a full lowercase Git SHA" >&2; exit 65 ;;
+  esac
+  [ "${#validate_expected}" -eq 40 ] || {
+    echo "$validate_name revision must be a full 40-character Git SHA" >&2
+    exit 65
+  }
+  validate_actual=$(git -C "$validate_repo" rev-parse HEAD)
+  [ "$validate_actual" = "$validate_expected" ] || {
+    echo "$validate_name revision mismatch: expected $validate_expected, found $validate_actual" >&2
+    exit 65
+  }
+  validate_dirty=$(git -C "$validate_repo" status --porcelain --untracked-files=all)
+  [ -z "$validate_dirty" ] || {
+    echo "$validate_name repository is dirty:" >&2
+    printf '%s\n' "$validate_dirty" >&2
+    exit 65
+  }
+}
+
+validate_revision "$hub_repo" "$hub_revision" botster-hub
+validate_revision "$core_repo" "$core_revision" botster-core
+validate_revision "$web_repo" "$web_revision" botster-web
+validate_revision "$tui_repo" "$tui_revision" botster-tui
+validate_revision "$tui_kit_repo" "$tui_kit_revision" botster-tui-kit
+validate_revision "$workspaces_repo" "$workspaces_revision" botster-workspaces
+validate_revision "$project_pipelines_repo" "$project_pipelines_revision" botster-project-pipelines
+
+for coordinate in \
+  "$hub_repo:$pre_cutover_hub_revision" \
+  "$web_repo:$pre_cutover_web_revision" \
+  "$tui_repo:$pre_cutover_tui_revision" \
+  "$workspaces_repo:$pre_cutover_workspaces_revision" \
+  "$project_pipelines_repo:$pre_cutover_project_pipelines_revision"
+do
+  repo=${coordinate%:*}
+  revision=${coordinate##*:}
+  case "$revision" in
+    *[!0-9a-f]*|'')
+      echo "pre-cutover revision must be a full lowercase Git SHA: $revision" >&2
+      exit 65
+      ;;
+  esac
+  [ "${#revision}" -eq 40 ] || {
+    echo "pre-cutover revision must be a full 40-character Git SHA: $revision" >&2
+    exit 65
+  }
+  git -C "$repo" cat-file -e "$revision^{commit}" || {
+    echo "pre-cutover revision is not available in $repo: $revision" >&2
+    exit 65
+  }
+done
+
+grep -q "$core_revision" "$hub_repo/Cargo.lock" || {
+  echo "Hub Cargo.lock does not resolve the declared botster-core revision" >&2
+  exit 65
+}
+
+"$evidence_helper" revision-manifest "$evidence_dir/revisions.json" \
+  botster-hub="$hub_repo" \
+  botster-core="$core_repo" \
+  botster-web="$web_repo" \
+  botster-tui="$tui_repo" \
+  botster-tui-kit="$tui_kit_repo" \
+  botster-workspaces="$workspaces_repo" \
+  botster-project-pipelines="$project_pipelines_repo"
+
+operator_worktree_data_dir=$hub_repo/target/botster-hub-runtime-data
+if [ -n "${BOTSTER_HUB_DATA_DIR:-}" ]; then
+  operator_home_data_dir=$BOTSTER_HUB_DATA_DIR
+elif [ -n "${XDG_DATA_HOME:-}" ]; then
+  operator_home_data_dir=$XDG_DATA_HOME/botster-hub
+else
+  operator_home_data_dir=$HOME/.local/share/botster-hub
+fi
+"$evidence_helper" snapshot "$operator_worktree_data_dir" "$evidence_dir/operator-worktree-state-before.json"
+"$evidence_helper" snapshot "$operator_home_data_dir" "$evidence_dir/operator-home-state-before.json"
+snapshot_control=$runtime_root/snapshot-control
+mkdir -p "$snapshot_control"
+"$evidence_helper" snapshot "$snapshot_control" "$runtime_root/snapshot-control-before.json"
+printf 'known-positive\n' >"$snapshot_control/sentinel"
+"$evidence_helper" snapshot "$snapshot_control" "$runtime_root/snapshot-control-after.json"
+if "$evidence_helper" compare-snapshots \
+  "$runtime_root/snapshot-control-before.json" "$runtime_root/snapshot-control-after.json" >/dev/null 2>&1; then
+  echo "snapshot comparator accepted a known changed fixture" >&2
+  exit 1
+fi
+
+declared_support_version=$(ruby -rjson -e \
+  'print JSON.parse(File.read(ARGV.fetch(0))).dig("devDependencies", "@trybotster/hub-test-support")' \
+  "$web_repo/package.json")
+case "$declared_support_version" in
+  [0-9]*.[0-9]*.[0-9]*) ;;
+  *) echo "botster-web must declare an exact hub-test-support version" >&2; exit 65 ;;
+esac
+artifact_consumer=$runtime_root/artifact-consumer
+mkdir -p "$artifact_consumer"
+capture_in artifact-install "$artifact_consumer" \
+  npm install --ignore-scripts --no-package-lock --no-save \
+  "@trybotster/hub-test-support@$declared_support_version"
+installed_support=$artifact_consumer/node_modules/@trybotster/hub-test-support
+"$evidence_helper" artifact-gate \
+  "$hub_repo" "$web_repo" "$installed_support" "$evidence_dir/artifact-gate.json"
+capture_in artifact-assets "$artifact_consumer" node --input-type=module -e \
+  'const support = await import("@trybotster/hub-test-support"); const result = support.verifyPackageAssets(); console.log(JSON.stringify(result)); if (!result.ok) process.exit(1);'
+
+if [ -z "$hub_bin" ]; then
+  capture_in build-hub "$hub_repo" cargo build --locked --bin botster-hub -p botster-hub
+  capture_in build-session-worker "$hub_repo" cargo build --locked --bin botster-session-worker -p botster-core
+  hub_bin=$hub_repo/target/debug/botster-hub
+  session_worker_bin=$hub_repo/target/debug/botster-session-worker
+else
+  hub_bin=$(cd "$(dirname "$hub_bin")" && pwd -P)/$(basename "$hub_bin")
+  session_worker_bin=$(cd "$(dirname "$session_worker_bin")" && pwd -P)/$(basename "$session_worker_bin")
+fi
+[ -x "$hub_bin" ] && [ -x "$session_worker_bin" ] || {
+  echo "Hub and session-worker binaries must be executable" >&2
+  exit 66
+}
+
+capture_in test-hub "$hub_repo" ./test.sh
+capture_in install-web "$web_repo" npm ci
+capture_in test-web "$web_repo" npm test
+capture_in build-web "$web_repo" npm run build
+capture_in test-tui "$tui_repo" ./test.sh
+capture_in build-tui "$tui_repo" cargo build --locked -p botster-tui
+capture_in test-tui-kit "$tui_kit_repo" ./script/test
+capture_in test-workspaces "$workspaces_repo" ./script/test
+capture_in test-project-pipelines "$project_pipelines_repo" ./script/test
+
+wait_for_status() {
+  wait_data_dir=$1
+  wait_log=$2
+  wait_attempts=0
+  until "$hub_bin" status --data-dir "$wait_data_dir" >/dev/null 2>&1; do
+    wait_attempts=$((wait_attempts + 1))
+    [ "$wait_attempts" -lt 200 ] || {
+      echo "Hub did not pass the protocol status predicate for $wait_data_dir" >&2
+      sed -n '1,160p' "$wait_log" >&2
+      exit 1
+    }
+    sleep 0.05
+  done
+}
+
+install_current_packages() {
+  setup_label=$1
+  setup_data_dir=$2
+  setup_web_path=$3
+  setup_tui_path=$4
+  setup_workspaces_path=$5
+  setup_pipelines_path=$6
+  setup_log=$runtime_root/$setup_label-setup-daemon.raw
+
+  printf '%s\n' "$setup_data_dir" >>"$owned_data_dirs"
+  "$hub_bin" start --data-dir "$setup_data_dir" --session-worker-bin "$session_worker_bin" \
+    >"$setup_log" 2>&1 &
+  setup_pid=$!
+  wait_for_status "$setup_data_dir" "$setup_log"
+  redact_file "$setup_log" "$evidence_dir/$setup_label-setup-daemon.log"
+
+  for setup_package_path in "$setup_web_path" "$setup_tui_path" "$setup_workspaces_path" "$setup_pipelines_path"; do
+    setup_package_name=$(ruby -rjson -e 'print JSON.parse(File.read(File.join(ARGV.fetch(0), "botster-package.json"))).fetch("name")' "$setup_package_path")
+    capture "$setup_label-install-$setup_package_name" "$hub_bin" packages install --data-dir "$setup_data_dir" --path "$setup_package_path"
+    capture "$setup_label-enable-$setup_package_name" "$hub_bin" packages enable --data-dir "$setup_data_dir" "$setup_package_name"
+  done
+  capture "$setup_label-setup-shutdown" "$hub_bin" shutdown --data-dir "$setup_data_dir"
+  wait "$setup_pid"
+  setup_pid=
+}
+
+assert_package_rows() {
+  package_rows_output=$1
+  for package_rows_name in botster-web botster-tui botster-workspaces project-pipelines; do
+    grep -q "package name=$package_rows_name .* state=enabled" "$package_rows_output" || {
+      echo "enabled package row missing for $package_rows_name" >&2
+      exit 1
+    }
+  done
+}
+
+assert_owned_socket() {
+  socket_data_dir=$1
+  socket_metadata=$socket_data_dir/.botster-hub-runtime-daemon.json
+  [ -f "$socket_metadata" ] || {
+    echo "owned runtime metadata is missing: $socket_metadata" >&2
+    exit 1
+  }
+  owned_socket_path=$(ruby -rjson -e 'print JSON.parse(File.read(ARGV.fetch(0))).fetch("socket_path")' "$socket_metadata")
+  case "$owned_socket_path" in
+    "$socket_data_dir"/*) ;;
+    *) echo "runtime socket escaped fixture data directory: $owned_socket_path" >&2; exit 1 ;;
+  esac
+  [ "$owned_socket_path" != "$operator_worktree_data_dir/botster-hub.sock" ] || {
+    echo "fixture resolved the operator default socket" >&2
+    exit 1
+  }
+  printf '%s\n' "$owned_socket_path"
+}
+
+run_runtime_leg() {
+  leg_label=$1
+  leg_data_dir=$2
+  leg_web_path=$3
+  leg_tui_path=$4
+  leg_workspaces_path=$5
+  leg_pipelines_path=$6
+  leg_prepare=${7-install}
+  if [ "$leg_prepare" = install ]; then
+    install_current_packages "$leg_label" "$leg_data_dir" "$leg_web_path" "$leg_tui_path" "$leg_workspaces_path" "$leg_pipelines_path"
+  elif [ "$leg_prepare" != refresh ]; then
+    echo "unknown runtime leg preparation: $leg_prepare" >&2
+    exit 64
+  fi
+
+  capture "$leg_label-up" "$hub_bin" up --data-dir "$leg_data_dir" --session-worker-bin "$session_worker_bin"
+  leg_up_raw=$runtime_root/$leg_label-up.raw
+  leg_web_url=$(sed -n 's/^web=//p' "$leg_up_raw" | tail -1)
+  [ -n "$leg_web_url" ] || {
+    echo "$leg_label up did not publish the structured botster-web local_url" >&2
+    exit 1
+  }
+  leg_socket_path=$(assert_owned_socket "$leg_data_dir")
+  printf 'mode=%s\ndata_dir=<runtime-root>/%s\nsocket=%s\nweb_url=%s\n' \
+    "$leg_label" "$(basename "$leg_data_dir")" "$leg_socket_path" "$leg_web_url" \
+    >"$runtime_root/$leg_label-runtime.raw"
+  redact_file "$runtime_root/$leg_label-runtime.raw" "$evidence_dir/$leg_label-runtime.txt"
+
+  capture "$leg_label-status" "$hub_bin" status --data-dir "$leg_data_dir"
+  capture "$leg_label-doctor" "$hub_bin" doctor --data-dir "$leg_data_dir"
+  capture "$leg_label-packages" "$hub_bin" packages list --data-dir "$leg_data_dir"
+  assert_package_rows "$runtime_root/$leg_label-packages.raw"
+  capture "$leg_label-apps" "$hub_bin" apps list --data-dir "$leg_data_dir"
+  capture "$leg_label-health" curl --fail --silent --show-error "$(printf '%s' "$leg_web_url" | sed -E 's#^(https?://[^/]+).*$#\1#')/health"
+  grep -q '"ok":true' "$runtime_root/$leg_label-health.raw"
+  capture "$leg_label-html" curl --fail --silent --show-error "$leg_web_url"
+  grep -qi '<html' "$runtime_root/$leg_label-html.raw"
+  capture "$leg_label-tui" env BOTSTER_TUI_HEADLESS_LIVE_RUNTIME=1 \
+    "$hub_bin" apps open --data-dir "$leg_data_dir" botster-tui
+  grep -q 'terminal-output: echo:botster-tui-headless' "$runtime_root/$leg_label-tui.raw"
+
+  mcp_input=$runtime_root/$leg_label-mcp-input
+  printf '%s\n%s\n' \
+    '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","clientInfo":{"name":"production-acceptance","version":"1"},"capabilities":{}}}' \
+    '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' >"$mcp_input"
+  printf '%s\n' "$hub_bin mcp-serve --data-dir $leg_data_dir < $mcp_input" >>"$raw_commands"
+  if "$hub_bin" mcp-serve --data-dir "$leg_data_dir" <"$mcp_input" >"$runtime_root/$leg_label-mcp.raw" 2>&1; then
+    redact_file "$runtime_root/$leg_label-mcp.raw" "$evidence_dir/$leg_label-mcp.log"
+  else
+    redact_file "$runtime_root/$leg_label-mcp.raw" "$evidence_dir/$leg_label-mcp.log"
+    cat "$evidence_dir/$leg_label-mcp.log" >&2
+    exit 1
+  fi
+  grep -q 'botster_workspaces' "$runtime_root/$leg_label-mcp.raw"
+  grep -q 'project_pipelines' "$runtime_root/$leg_label-mcp.raw"
+
+  capture "$leg_label-smoke" "$hub_bin" smoke --data-dir "$leg_data_dir" --session-worker-bin "$session_worker_bin"
+  current_leg_web_url=$leg_web_url
+}
+
+down_runtime_leg() {
+  down_label=$1
+  down_data_dir=$2
+  down_metadata=$down_data_dir/.botster-hub-runtime-daemon.json
+  down_owned_pid=$(ruby -rjson -e 'print JSON.parse(File.read(ARGV.fetch(0))).fetch("pid")' "$down_metadata")
+  down_owned_socket=$(ruby -rjson -e 'print JSON.parse(File.read(ARGV.fetch(0))).fetch("socket_path")' "$down_metadata")
+  capture "$down_label-down" "$hub_bin" down --data-dir "$down_data_dir"
+  [ ! -e "$down_owned_socket" ] || {
+    echo "owned socket survived down: $down_owned_socket" >&2
+    exit 1
+  }
+  if kill -0 "$down_owned_pid" >/dev/null 2>&1; then
+    echo "owned Hub process survived down: $down_owned_pid" >&2
+    exit 1
+  fi
+}
+
+assert_failed_up_cleanup() {
+  failed_pid=$1
+  failed_socket=$2
+  failed_metadata=$3
+  failed_cleanup_attempts=0
+  while [ -e "$failed_socket" ] || kill -0 "$failed_pid" >/dev/null 2>&1; do
+    failed_cleanup_attempts=$((failed_cleanup_attempts + 1))
+    [ "$failed_cleanup_attempts" -lt 100 ] || break
+    sleep 0.02
+  done
+  [ ! -e "$failed_socket" ] || {
+    echo "failed up left an owned socket: $failed_socket" >&2
+    exit 1
+  }
+  if kill -0 "$failed_pid" >/dev/null 2>&1; then
+    echo "failed up left an owned Hub process: $failed_pid" >&2
+    exit 1
+  fi
+  [ ! -e "$failed_metadata" ] || {
+    echo "failed up left owned runtime metadata: $failed_metadata" >&2
+    exit 1
+  }
+}
+
+if [ "$mode" = fresh ] || [ "$mode" = all ]; then
+  retired_fixed_port=41739
+  ruby -rsocket -e 'server = TCPServer.new("127.0.0.1", Integer(ARGV.fetch(0))); loop { socket = server.accept; socket.close }' \
+    "$retired_fixed_port" \
+    >"$runtime_root/fixed-port.log" 2>&1 &
+  fixed_port_pid=$!
+  attempts=0
+  until ruby -rsocket -e 'socket = TCPSocket.new("127.0.0.1", Integer(ARGV.fetch(0))); socket.close' \
+    "$retired_fixed_port" >/dev/null 2>&1; do
+    attempts=$((attempts + 1))
+    [ "$attempts" -lt 100 ] || {
+      echo "retired fixed-port control did not bind: $retired_fixed_port" >&2
+      exit 1
+    }
+    sleep 0.05
+  done
+
+  fresh_data=$runtime_root/fresh-data
+  run_runtime_leg fresh "$fresh_data" "$web_repo" "$tui_repo" "$workspaces_repo" "$project_pipelines_repo"
+  fresh_web_url=$current_leg_web_url
+
+  second_data=$runtime_root/dynamic-port-data
+  install_current_packages dynamic-port "$second_data" "$web_repo" "$tui_repo" "$workspaces_repo" "$project_pipelines_repo"
+  capture dynamic-port-up "$hub_bin" up --data-dir "$second_data" --session-worker-bin "$session_worker_bin"
+  second_web_url=$(sed -n 's/^web=//p' "$runtime_root/dynamic-port-up.raw" | tail -1)
+  [ -n "$second_web_url" ] && [ "$second_web_url" != "$fresh_web_url" ] || {
+    echo "isolated Web package runtimes did not publish distinct URLs" >&2
+    exit 1
+  }
+  for url in "$fresh_web_url" "$second_web_url"; do
+    port=$(printf '%s' "$url" | sed -E 's#^https?://[^:]+:([0-9]+).*$#\1#')
+    [ "$port" != "$retired_fixed_port" ] && [ "$port" -gt 0 ] || {
+      echo "Web package runtime reused the occupied retired fixed port: $url" >&2
+      exit 1
+    }
+  done
+  capture dynamic-port-health curl --fail --silent --show-error \
+    "$(printf '%s' "$second_web_url" | sed -E 's#^(https?://[^/]+).*$#\1#')/health"
+  grep -q '"ok":true' "$runtime_root/dynamic-port-health.raw"
+  capture dynamic-port-html curl --fail --silent --show-error "$second_web_url"
+  grep -qi '<html' "$runtime_root/dynamic-port-html.raw"
+  assert_owned_socket "$second_data" >/dev/null
+  down_runtime_leg dynamic-port "$second_data"
+
+  explicit_data=$runtime_root/explicit-port-data
+  install_current_packages explicit-port "$explicit_data" "$web_repo" "$tui_repo" "$workspaces_repo" "$project_pipelines_repo"
+  explicit_attempt=0
+  while :; do
+    explicit_attempt=$((explicit_attempt + 1))
+    explicit_port=$(ruby -rsocket -e 'server = TCPServer.new("127.0.0.1", 0); print server.addr[1]; server.close')
+    if capture "explicit-port-up-$explicit_attempt" env BOTSTER_WEB_PACKAGE_SERVER_PORT="$explicit_port" \
+      "$hub_bin" up --data-dir "$explicit_data" --session-worker-bin "$session_worker_bin"; then
+      break
+    fi
+    "$hub_bin" down --data-dir "$explicit_data" >/dev/null 2>&1 || true
+    [ "$explicit_attempt" -lt 5 ] || {
+      echo "Web explicit-port launch failed after $explicit_attempt bounded port selections; last port=$explicit_port" >&2
+      exit 1
+    }
+  done
+  explicit_up_raw=$runtime_root/explicit-port-up-$explicit_attempt.raw
+  explicit_web_url=$(sed -n 's/^web=//p' "$explicit_up_raw" | tail -1)
+  explicit_web_port=$(printf '%s' "$explicit_web_url" | sed -E 's#^https?://[^:]+:([0-9]+).*$#\1#')
+  [ "$explicit_web_port" = "$explicit_port" ] || {
+    echo "Web package runtime did not honor BOTSTER_WEB_PACKAGE_SERVER_PORT=$explicit_port: $explicit_web_url" >&2
+    exit 1
+  }
+  capture explicit-port-health curl --fail --silent --show-error \
+    "$(printf '%s' "$explicit_web_url" | sed -E 's#^(https?://[^/]+).*$#\1#')/health"
+  grep -q '"ok":true' "$runtime_root/explicit-port-health.raw"
+  capture explicit-port-html curl --fail --silent --show-error "$explicit_web_url"
+  grep -qi '<html' "$runtime_root/explicit-port-html.raw"
+  printf 'environment=BOTSTER_WEB_PACKAGE_SERVER_PORT\ndynamic_urls=%s,%s\nexplicit_attempts=%s\nexplicit_port=%s\nexplicit_url=%s\nretired_fixed_port=%s\n' \
+    "$fresh_web_url" "$second_web_url" "$explicit_attempt" "$explicit_port" "$explicit_web_url" "$retired_fixed_port" \
+    >"$evidence_dir/web-port-proof.txt"
+  down_runtime_leg explicit-port "$explicit_data"
+
+  invalid_port_data=$runtime_root/invalid-port-data
+  install_current_packages invalid-port "$invalid_port_data" "$web_repo" "$tui_repo" "$workspaces_repo" "$project_pipelines_repo"
+  capture_failed_up_with_runtime_identity invalid-port-up invalid_package_server_port "$invalid_port_data" \
+    env BOTSTER_WEB_PACKAGE_SERVER_PORT=not-a-port \
+    "$hub_bin" up --data-dir "$invalid_port_data" --session-worker-bin "$session_worker_bin"
+
+  capture_in web-live-browser "$web_repo" env \
+    BOTSTER_HUB_BIN="$hub_bin" \
+    BOTSTER_SESSION_WORKER_BIN="$session_worker_bin" \
+    BOTSTER_WORKSPACES_PACKAGE_PATH="$workspaces_repo" \
+    npm run smoke:live-packaged-protocol
+  capture_in tui-live-hub "$tui_repo" env \
+    BOTSTER_HUB_BIN="$hub_bin" \
+    BOTSTER_SESSION_WORKER_BIN="$session_worker_bin" \
+    ./script/test-live-hub
+  down_runtime_leg fresh "$fresh_data"
+fi
+
+add_worktree() {
+  worktree_repo=$1
+  worktree_revision=$2
+  worktree_path=$3
+  git -C "$worktree_repo" worktree add --detach "$worktree_path" "$worktree_revision"
+  printf '%s|%s\n' "$worktree_repo" "$worktree_path" >>"$owned_worktrees"
+}
+
+if [ "$mode" = upgrade ] || [ "$mode" = all ]; then
+  old_root=$runtime_root/pre-cutover
+  mkdir -p "$old_root"
+  old_hub=$old_root/hub
+  old_web=$old_root/web
+  old_tui=$old_root/tui
+  old_workspaces=$old_root/workspaces
+  old_pipelines=$old_root/project-pipelines
+  add_worktree "$hub_repo" "$pre_cutover_hub_revision" "$old_hub"
+  add_worktree "$web_repo" "$pre_cutover_web_revision" "$old_web"
+  add_worktree "$tui_repo" "$pre_cutover_tui_revision" "$old_tui"
+  add_worktree "$workspaces_repo" "$pre_cutover_workspaces_revision" "$old_workspaces"
+  add_worktree "$project_pipelines_repo" "$pre_cutover_project_pipelines_revision" "$old_pipelines"
+  ruby -rjson -e '
+    rows = ARGV.each_slice(3).to_h do |name, before, after|
+      [name, { "pre_cutover_revision" => before, "current_revision" => after, "advanced" => before != after }]
+    end
+    puts JSON.pretty_generate({ "producers" => rows })
+  ' \
+    botster-hub "$pre_cutover_hub_revision" "$hub_revision" \
+    botster-web "$pre_cutover_web_revision" "$web_revision" \
+    botster-tui "$pre_cutover_tui_revision" "$tui_revision" \
+    botster-workspaces "$pre_cutover_workspaces_revision" "$workspaces_revision" \
+    botster-project-pipelines "$pre_cutover_project_pipelines_revision" "$project_pipelines_revision" \
+    >"$evidence_dir/upgrade-revisions.json"
+
+  old_target=$runtime_root/pre-cutover-target
+  old_cargo_home=$old_root/cargo-home
+  old_zig_local_cache=$old_target/zig-local-cache
+  old_zig_global_cache=$old_target/zig-global-cache
+  capture_in build-pre-cutover-hub "$old_hub" env \
+    CARGO_HOME="$old_cargo_home" CARGO_TARGET_DIR="$old_target" \
+    ZIG_LOCAL_CACHE_DIR="$old_zig_local_cache" ZIG_GLOBAL_CACHE_DIR="$old_zig_global_cache" \
+    cargo build --locked --bin botster-hub -p botster-hub
+  capture_in build-pre-cutover-worker "$old_hub" env \
+    CARGO_HOME="$old_cargo_home" CARGO_TARGET_DIR="$old_target" \
+    ZIG_LOCAL_CACHE_DIR="$old_zig_local_cache" ZIG_GLOBAL_CACHE_DIR="$old_zig_global_cache" \
+    cargo build --locked --bin botster-session-worker -p botster-core
+  old_hub_bin=$old_target/debug/botster-hub
+  old_worker_bin=$old_target/debug/botster-session-worker
+  capture_in build-pre-cutover-web "$old_web" npm ci
+  capture_in bundle-pre-cutover-web "$old_web" npm run build
+  capture_in build-pre-cutover-tui "$old_tui" cargo build --locked -p botster-tui
+  capture_in test-pre-cutover-workspaces "$old_workspaces" ./script/test
+  capture_in test-pre-cutover-project-pipelines "$old_pipelines" ./script/test
+
+  upgrade_data=$runtime_root/upgrade-data
+  printf '%s\n' "$upgrade_data" >>"$owned_data_dirs"
+  "$old_hub_bin" start --data-dir "$upgrade_data" --session-worker-bin "$old_worker_bin" \
+    >"$runtime_root/upgrade-producer-daemon.raw" 2>&1 &
+  setup_pid=$!
+  attempts=0
+  until "$old_hub_bin" status --data-dir "$upgrade_data" >/dev/null 2>&1; do
+    attempts=$((attempts + 1))
+    [ "$attempts" -lt 200 ] || {
+      echo "pre-cutover Hub did not pass its protocol status predicate" >&2
+      exit 1
+    }
+    sleep 0.05
+  done
+  redact_file "$runtime_root/upgrade-producer-daemon.raw" "$evidence_dir/upgrade-producer-daemon.log"
+  for package_path in "$old_web" "$old_tui" "$old_workspaces" "$old_pipelines"; do
+    package_name=$(ruby -rjson -e 'print JSON.parse(File.read(File.join(ARGV.fetch(0), "botster-package.json"))).fetch("name")' "$package_path")
+    capture "upgrade-producer-install-$package_name" "$old_hub_bin" packages install --data-dir "$upgrade_data" --path "$package_path"
+    capture "upgrade-producer-enable-$package_name" "$old_hub_bin" packages enable --data-dir "$upgrade_data" "$package_name"
+  done
+  capture upgrade-producer-shutdown "$old_hub_bin" shutdown --data-dir "$upgrade_data"
+  wait "$setup_pid"
+  setup_pid=
+  "$evidence_helper" snapshot "$upgrade_data" "$evidence_dir/upgrade-produced-state.json"
+
+  git -C "$old_web" switch --detach "$web_revision"
+  git -C "$old_tui" switch --detach "$tui_revision"
+  git -C "$old_workspaces" switch --detach "$workspaces_revision"
+  git -C "$old_pipelines" switch --detach "$project_pipelines_revision"
+  capture_in prepare-upgraded-web "$old_web" npm ci
+  capture_in build-upgraded-web "$old_web" npm run build
+  capture_in build-upgraded-tui "$old_tui" cargo build --locked -p botster-tui
+  capture_in test-upgraded-workspaces "$old_workspaces" ./script/test
+  capture_in test-upgraded-project-pipelines "$old_pipelines" ./script/test
+  validate_revision "$old_web" "$web_revision" upgraded-botster-web
+  validate_revision "$old_tui" "$tui_revision" upgraded-botster-tui
+  validate_revision "$old_workspaces" "$workspaces_revision" upgraded-botster-workspaces
+  validate_revision "$old_pipelines" "$project_pipelines_revision" upgraded-botster-project-pipelines
+
+  run_runtime_leg upgrade "$upgrade_data" "$old_web" "$old_tui" "$old_workspaces" "$old_pipelines" refresh
+  capture upgrade-session-spawn "$hub_bin" sessions spawn --data-dir "$upgrade_data" \
+    --session-id upgrade-survivor -- cat
+  capture upgrade-session-list "$hub_bin" sessions list --data-dir "$upgrade_data"
+  grep -q 'upgrade-survivor' "$runtime_root/upgrade-session-list.raw"
+  capture upgrade-session-resize "$hub_bin" sessions resize --data-dir "$upgrade_data" \
+    upgrade-survivor 30 100
+  capture upgrade-restart "$hub_bin" shutdown --data-dir "$upgrade_data"
+  capture upgrade-restart-up "$hub_bin" up --data-dir "$upgrade_data" --session-worker-bin "$session_worker_bin"
+  capture upgrade-restart-status "$hub_bin" status --data-dir "$upgrade_data"
+  grep -q 'recovered_session id=upgrade-survivor' "$runtime_root/upgrade-restart-status.raw"
+  capture upgrade-session-shutdown "$hub_bin" sessions shutdown --data-dir "$upgrade_data" upgrade-survivor
+  capture upgrade-restart-smoke "$hub_bin" smoke --data-dir "$upgrade_data" --session-worker-bin "$session_worker_bin"
+  down_runtime_leg upgrade "$upgrade_data"
+  capture_in upgrade-web-live-browser "$old_web" env \
+    BOTSTER_HUB_BIN="$hub_bin" \
+    BOTSTER_SESSION_WORKER_BIN="$session_worker_bin" \
+    BOTSTER_LIVE_DATA_DIR="$upgrade_data" \
+    npm run smoke:live-packaged-protocol
+fi
+
+"$evidence_helper" audit "$evidence_dir/product-surface-audit.json" \
+  botster-hub="$hub_repo" \
+  botster-core="$core_repo" \
+  botster-web="$web_repo" \
+  botster-tui="$tui_repo" \
+  botster-tui-kit="$tui_kit_repo" \
+  botster-workspaces="$workspaces_repo" \
+  botster-project-pipelines="$project_pipelines_repo"
+
+manual_reload_pattern='packages reload|(^|[[:space:]])reload[[:space:]]'
+printf 'packages reload\n' | grep -qE "$manual_reload_pattern" || {
+  echo "manual reload audit known-positive control did not match" >&2
+  exit 1
+}
+if grep -nE "$manual_reload_pattern" "$evidence_dir/commands.log" \
+  >"$runtime_root/manual-reload.raw"; then
+  redact_file "$runtime_root/manual-reload.raw" "$evidence_dir/manual-reload-findings.log"
+  echo "acceptance used a hidden manual package reload" >&2
+  exit 1
+elif [ "$?" -gt 1 ]; then
+  echo "manual reload audit failed to execute" >&2
+  exit 1
+fi
+printf 'known_positive_observed=true\nresult=no_manual_reload_command\n' >"$evidence_dir/manual-reload-audit.txt"
+
+"$evidence_helper" snapshot "$operator_worktree_data_dir" "$evidence_dir/operator-worktree-state-after.json"
+"$evidence_helper" snapshot "$operator_home_data_dir" "$evidence_dir/operator-home-state-after.json"
+"$evidence_helper" compare-snapshots \
+  "$evidence_dir/operator-worktree-state-before.json" "$evidence_dir/operator-worktree-state-after.json"
+"$evidence_helper" compare-snapshots \
+  "$evidence_dir/operator-home-state-before.json" "$evidence_dir/operator-home-state-after.json"
+
+capture_in committed-diff "$hub_repo" git show --format= --no-ext-diff HEAD
+refresh_command_log
+"$evidence_helper" pii-scan "$evidence_dir/pii-scan.json" "$evidence_dir"
 echo "production_package_runtime=pass"
