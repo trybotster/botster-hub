@@ -1076,6 +1076,24 @@ Hub CI also runs the persisted-package runtime smoke:
 ./test.sh --test hub_daemon_lifecycle_test cli_smoke_proves_local_runtime_daemon_package_app_session_and_webrtc
 ```
 
+The repository-level production acceptance command is
+`script/test-production-package-runtime`. It requires explicit clean repository
+paths and exact revisions for Hub, Core, Web, TUI, TUI Kit, Workspaces, and
+Project Pipelines. Before any Web build or browser leg, it installs Web's
+declared `@trybotster/hub-test-support` coordinate in a clean external consumer
+and requires the installed metadata, actual generated protocol bytes, fixture
+revision, and packaged asset checksums to match the exact Hub source and Web's
+vendored copy.
+
+Its fresh and pre-cutover-upgrade legs both use isolated explicit data
+directories and daemon-owned sockets. The upgrade producer runs from temporary
+detached worktrees; current `up` must refresh the same persisted local package
+paths without a package reload command or state edit. Evidence includes
+path-neutral revision and command manifests, structured dynamic Web URLs,
+browser and TUI live-runtime output, plugin tool registration, worker-backed
+session adoption after daemon restart, cleanup, and identical before/after
+manifests for the operator's default runtime state.
+
 Separate contract-matrix coverage runs `run_project_pipelines_conformance`
 against the packaged Project Pipelines example to prove first-party external
 package enablement, `PluginSurfaceRender`, `ui_tree_snapshot` identity, form

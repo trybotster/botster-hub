@@ -1107,6 +1107,43 @@ struct SmokeRuntimeCleanup<'a> {
     outcome: &'a LocalRuntimeOutcome,
 }
 
+struct StartedRuntimeCleanup<'a> {
+    config: &'a botster_hub::HubConfig,
+    armed: bool,
+}
+
+impl<'a> StartedRuntimeCleanup<'a> {
+    fn new(
+        config: &'a botster_hub::HubConfig,
+        daemon_ownership: LocalRuntimeDaemonOwnership,
+    ) -> Self {
+        Self {
+            config,
+            armed: matches!(daemon_ownership, LocalRuntimeDaemonOwnership::Started),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for StartedRuntimeCleanup<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let metadata = read_runtime_daemon_metadata(&self.config.data_directory)
+                .ok()
+                .flatten();
+            let _ = daemon_transport_request(self.config, DaemonRequest::DaemonShutdown);
+            if let Some(metadata) = metadata {
+                let _ = wait_for_runtime_daemon_exit(metadata.pid);
+            }
+            let _ = remove_configured_local_socket(self.config);
+            let _ = remove_runtime_daemon_metadata(&self.config.data_directory);
+        }
+    }
+}
+
 impl<'a> SmokeRuntimeCleanup<'a> {
     fn new(outcome: &'a LocalRuntimeOutcome) -> Self {
         Self { outcome }
@@ -1145,12 +1182,15 @@ fn prepare_local_runtime(
     let hub_bin = env::current_exe().map_err(LocalRuntimeError::CurrentExe)?;
     let config = explicit_config(options.data_directory.clone())?;
     let daemon_ownership = ensure_local_runtime_daemon(&hub_bin, &options, &config)?;
+    let mut started_runtime_cleanup = StartedRuntimeCleanup::new(&config, daemon_ownership);
     daemon_transport_request(&config, DaemonRequest::RefreshLocalPackages)?;
     let packages = daemon_transport_request(&config, DaemonRequest::ListPackages)?;
     require_runtime_package(&packages.packages, "botster-web")?;
     require_runtime_package(&packages.packages, "botster-tui")?;
     let web = start_installed_web_app(&config, &packages.packages)?;
 
+    started_runtime_cleanup.disarm();
+    drop(started_runtime_cleanup);
     Ok(LocalRuntimeOutcome {
         options,
         config,
@@ -1237,6 +1277,7 @@ fn spawn_local_runtime_daemon(
         &stderr_rx,
     ) {
         let _ = remove_runtime_daemon_metadata(&options.data_directory);
+        let _ = remove_configured_local_socket(config);
         return Err(error);
     }
     Ok(LocalRuntimeDaemonOwnership::Started)
