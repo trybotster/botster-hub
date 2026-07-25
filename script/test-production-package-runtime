@@ -664,9 +664,12 @@ if [ "$mode" = upgrade ] || [ "$mode" = all ]; then
   add_worktree "$project_pipelines_repo" "$pre_cutover_project_pipelines_revision" "$old_pipelines"
 
   old_target=$runtime_root/pre-cutover-target
-  capture_in build-pre-cutover-hub "$old_hub" env CARGO_TARGET_DIR="$old_target" \
+  old_cargo_home=$old_root/cargo-home
+  capture_in build-pre-cutover-hub "$old_hub" env \
+    CARGO_HOME="$old_cargo_home" CARGO_TARGET_DIR="$old_target" \
     cargo build --locked --bin botster-hub -p botster-hub
-  capture_in build-pre-cutover-worker "$old_hub" env CARGO_TARGET_DIR="$old_target" \
+  capture_in build-pre-cutover-worker "$old_hub" env \
+    CARGO_HOME="$old_cargo_home" CARGO_TARGET_DIR="$old_target" \
     cargo build --locked --bin botster-session-worker -p botster-core
   old_hub_bin=$old_target/debug/botster-hub
   old_worker_bin=$old_target/debug/botster-session-worker

@@ -483,7 +483,9 @@ Cross-repository final proof:
 9. Run the Hub production acceptance harness in `upgrade` mode using the
    pre-cutover-produced untouched data directory, then run Web's supported
    live packaged-protocol/browser harness against that same upgraded data
-   directory to prove reload/reconnect through the durable runtime.
+   directory to prove reload/reconnect through the durable runtime. Build the
+   historical producer with both an isolated Cargo home and target directory
+   so its immutable dependency checkout cannot read or mutate operator caches.
 10. For both runtime legs, require:
    - every Hub command has an explicit fixture `--data-dir`;
    - the resolved socket is contained by that fixture and differs from any

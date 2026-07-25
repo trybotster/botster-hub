@@ -54,6 +54,10 @@ as a blocking dependency instead of adding an integration workaround.
 - The new failed-launch assertion exposed a Hub-owned lifecycle defect rather
   than a harness-only gap. The committed plan now records the runtime and test
   changes permitted by its “actual Hub-owned defect” clause.
+- The merged Core fix isolates Zig caches for current builds but cannot alter
+  the immutable pre-cutover Core commit. The deterministic historical producer
+  now uses an isolated Cargo home as well as an isolated target directory, so
+  it neither consumes nor mutates the operator's shared legacy checkout cache.
 
 ## Verification
 
