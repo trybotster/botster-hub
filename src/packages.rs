@@ -4608,7 +4608,7 @@ mod tests {
             data_directory: DataDirectoryOption::Explicit(data_root),
             ..HubStartupOptions::default()
         }
-        .build_config_for_environment(&RuntimeEnvironment::from_values(None, None, None))
+        .build_config_for_environment(&RuntimeEnvironment::from_values(None, None))
         .expect("explicit state config should build");
         let store = FileHubStateStore::for_data_directory(&config.data_directory);
         let state = store
