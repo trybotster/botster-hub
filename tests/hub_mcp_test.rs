@@ -60,7 +60,7 @@ fn explicit_config(data_dir: &Path) -> botster_hub::HubConfig {
         },
         ..HubStartupOptions::default()
     }
-    .build_config_for_environment(&RuntimeEnvironment::from_values(None, None, None))
+    .build_config_for_environment(&RuntimeEnvironment::from_values(None, None))
     .expect("explicit MCP test config should build")
 }
 

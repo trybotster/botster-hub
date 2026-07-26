@@ -168,7 +168,7 @@ pub enum DataDirectoryOption {
 }
 
 impl DataDirectoryOption {
-    fn resolve(self, environment: &RuntimeEnvironment) -> Result<PathBuf, HubConfigError> {
+    pub fn resolve(self, environment: &RuntimeEnvironment) -> Result<PathBuf, HubConfigError> {
         match self {
             Self::RuntimeDefault => environment.resolve_runtime_data_directory(),
             Self::Explicit(path) => {
@@ -413,7 +413,6 @@ impl SessionIoCoalescingOptions {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeEnvironment {
     botster_hub_data_dir: Option<PathBuf>,
-    xdg_data_home: Option<PathBuf>,
     home: Option<PathBuf>,
 }
 
@@ -421,19 +420,13 @@ impl RuntimeEnvironment {
     pub fn from_current_process() -> Self {
         Self {
             botster_hub_data_dir: env::var_os("BOTSTER_HUB_DATA_DIR").map(PathBuf::from),
-            xdg_data_home: env::var_os("XDG_DATA_HOME").map(PathBuf::from),
             home: env::var_os("HOME").map(PathBuf::from),
         }
     }
 
-    pub fn from_values(
-        botster_hub_data_dir: Option<PathBuf>,
-        xdg_data_home: Option<PathBuf>,
-        home: Option<PathBuf>,
-    ) -> Self {
+    pub fn from_values(botster_hub_data_dir: Option<PathBuf>, home: Option<PathBuf>) -> Self {
         Self {
             botster_hub_data_dir,
-            xdg_data_home,
             home,
         }
     }
@@ -444,14 +437,9 @@ impl RuntimeEnvironment {
             return Ok(path.clone());
         }
 
-        if let Some(path) = self.xdg_data_home.as_ref() {
-            validate_non_empty_path("XDG_DATA_HOME", path)?;
-            return Ok(path.join("botster-hub"));
-        }
-
         if let Some(path) = self.home.as_ref() {
             validate_non_empty_path("HOME", path)?;
-            return Ok(path.join(".local").join("share").join("botster-hub"));
+            return Ok(path.join(".botster").join("hub"));
         }
 
         Err(HubConfigError::MissingRuntimeDataDirectory)
@@ -477,7 +465,7 @@ impl fmt::Display for HubConfigError {
             }
             Self::MissingRuntimeDataDirectory => write!(
                 formatter,
-                "runtime data directory could not be resolved from BOTSTER_HUB_DATA_DIR, XDG_DATA_HOME, or HOME"
+                "runtime data directory could not be resolved from BOTSTER_HUB_DATA_DIR or HOME"
             ),
             Self::InvalidCapacity { field } => {
                 write!(formatter, "{field} must be greater than zero")
@@ -549,11 +537,8 @@ mod tests {
 
     #[test]
     fn serde_round_trip_resolved_hub_config() {
-        let environment = RuntimeEnvironment::from_values(
-            Some(PathBuf::from("/tmp/botster-test-data")),
-            None,
-            None,
-        );
+        let environment =
+            RuntimeEnvironment::from_values(Some(PathBuf::from("/tmp/botster-test-data")), None);
         let config = build_default_config_for_runtime(&environment).expect("build config");
 
         let json = serde_json::to_string(&config).expect("serialize config");
@@ -576,7 +561,6 @@ mod tests {
     fn runtime_data_dir_resolution_uses_injected_env() {
         let explicit = RuntimeEnvironment::from_values(
             Some(PathBuf::from("/tmp/botster-env")),
-            Some(PathBuf::from("/tmp/xdg")),
             Some(PathBuf::from("/tmp/home")),
         );
         assert_eq!(
@@ -586,27 +570,15 @@ mod tests {
             PathBuf::from("/tmp/botster-env")
         );
 
-        let xdg = RuntimeEnvironment::from_values(
-            None,
-            Some(PathBuf::from("/tmp/xdg")),
-            Some(PathBuf::from("/tmp/home")),
-        );
-        assert_eq!(
-            DataDirectoryOption::RuntimeDefault
-                .resolve(&xdg)
-                .expect("resolve xdg env"),
-            PathBuf::from("/tmp/xdg/botster-hub")
-        );
-
-        let home = RuntimeEnvironment::from_values(None, None, Some(PathBuf::from("/tmp/home")));
+        let home = RuntimeEnvironment::from_values(None, Some(PathBuf::from("/tmp/home")));
         assert_eq!(
             DataDirectoryOption::RuntimeDefault
                 .resolve(&home)
                 .expect("resolve home env"),
-            PathBuf::from("/tmp/home/.local/share/botster-hub")
+            PathBuf::from("/tmp/home/.botster/hub")
         );
 
-        let missing = RuntimeEnvironment::from_values(None, None, None);
+        let missing = RuntimeEnvironment::from_values(None, None);
         assert_eq!(
             DataDirectoryOption::RuntimeDefault.resolve(&missing),
             Err(HubConfigError::MissingRuntimeDataDirectory)
@@ -712,11 +684,8 @@ mod tests {
 
     #[test]
     fn entrypoint_constructs_config() {
-        let environment = RuntimeEnvironment::from_values(
-            Some(PathBuf::from("/tmp/botster-entrypoint")),
-            None,
-            None,
-        );
+        let environment =
+            RuntimeEnvironment::from_values(Some(PathBuf::from("/tmp/botster-entrypoint")), None);
 
         let config = build_default_config_for_runtime(&environment).expect("build config");
 
@@ -740,11 +709,8 @@ mod tests {
     }
 
     fn assert_error_field(options: HubStartupOptions, field: &str) {
-        let environment = RuntimeEnvironment::from_values(
-            Some(PathBuf::from("/tmp/botster-invalid")),
-            None,
-            None,
-        );
+        let environment =
+            RuntimeEnvironment::from_values(Some(PathBuf::from("/tmp/botster-invalid")), None);
         let message = options
             .build_config_for_environment(&environment)
             .expect_err("expected invalid config")

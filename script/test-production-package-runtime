@@ -197,6 +197,7 @@ redact_file() {
     '<project-pipelines-repo>='"$project_pipelines_repo" \
     '<runtime-root>='"$runtime_root" \
     '<evidence-dir>='"$evidence_dir" \
+    '<fixture-home>=/tmp/home' \
     '<home>='"$HOME"
 }
 
@@ -354,13 +355,16 @@ grep -q "$core_revision" "$hub_repo/Cargo.lock" || {
 operator_worktree_data_dir=$hub_repo/target/botster-hub-runtime-data
 if [ -n "${BOTSTER_HUB_DATA_DIR:-}" ]; then
   operator_home_data_dir=$BOTSTER_HUB_DATA_DIR
-elif [ -n "${XDG_DATA_HOME:-}" ]; then
-  operator_home_data_dir=$XDG_DATA_HOME/botster-hub
 else
-  operator_home_data_dir=$HOME/.local/share/botster-hub
+  operator_home_data_dir=$HOME/.botster/hub
 fi
 "$evidence_helper" snapshot "$operator_worktree_data_dir" "$evidence_dir/operator-worktree-state-before.json"
 "$evidence_helper" snapshot "$operator_home_data_dir" "$evidence_dir/operator-home-state-before.json"
+for sibling in plugins agents lua profiles shared workspaces; do
+  "$evidence_helper" snapshot \
+    "$HOME/.botster/$sibling" \
+    "$evidence_dir/operator-botster-$sibling-state-before.json"
+done
 snapshot_control=$runtime_root/snapshot-control
 mkdir -p "$snapshot_control"
 "$evidence_helper" snapshot "$snapshot_control" "$runtime_root/snapshot-control-before.json"
@@ -477,7 +481,7 @@ assert_owned_socket() {
     "$socket_data_dir"/*) ;;
     *) echo "runtime socket escaped fixture data directory: $owned_socket_path" >&2; exit 1 ;;
   esac
-  [ "$owned_socket_path" != "$operator_worktree_data_dir/botster-hub.sock" ] || {
+  [ "$owned_socket_path" != "$operator_home_data_dir/botster-hub.sock" ] || {
     echo "fixture resolved the operator default socket" >&2
     exit 1
   }
@@ -825,6 +829,14 @@ printf 'known_positive_observed=true\nresult=no_manual_reload_command\n' >"$evid
   "$evidence_dir/operator-worktree-state-before.json" "$evidence_dir/operator-worktree-state-after.json"
 "$evidence_helper" compare-snapshots \
   "$evidence_dir/operator-home-state-before.json" "$evidence_dir/operator-home-state-after.json"
+for sibling in plugins agents lua profiles shared workspaces; do
+  "$evidence_helper" snapshot \
+    "$HOME/.botster/$sibling" \
+    "$evidence_dir/operator-botster-$sibling-state-after.json"
+  "$evidence_helper" compare-snapshots \
+    "$evidence_dir/operator-botster-$sibling-state-before.json" \
+    "$evidence_dir/operator-botster-$sibling-state-after.json"
+done
 
 capture_in committed-diff "$hub_repo" git show --format= --no-ext-diff HEAD
 refresh_command_log

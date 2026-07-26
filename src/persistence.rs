@@ -479,7 +479,7 @@ mod tests {
             data_directory: DataDirectoryOption::Explicit(unique_test_dir(name)),
             ..HubStartupOptions::default()
         }
-        .build_config_for_environment(&RuntimeEnvironment::from_values(None, None, None))
+        .build_config_for_environment(&RuntimeEnvironment::from_values(None, None))
         .expect("build test config")
     }
 
