@@ -193,6 +193,7 @@ local function create_ticket_surface(_arguments)
           action = {
             id = "project_pipelines.create_ticket",
           },
+          submit_label = "Create ticket",
         },
         children = {
           {
@@ -232,14 +233,19 @@ local function create_ticket_surface(_arguments)
 end
 
 local function create_ticket_action(arguments)
-  local result = create(arguments)
+  local input = arguments.values or {}
+  local metadata = arguments.payload or {}
+  local result = create({
+    title = input.title,
+    pipeline_id = input.pipeline_id or metadata.pipeline_id,
+  })
   if not result.ok then
     local validation_error = result.error.code == "validation_failed"
     return {
-      request_id = arguments.request_id or "project-pipelines-create-ticket",
-      surface_id = "project-pipelines.create-ticket",
-      action_id = "project_pipelines.create_ticket",
-      node_id = "project-pipelines-create-form",
+      request_id = arguments.request_id,
+      surface_id = arguments.surface_id,
+      action_id = arguments.action_id,
+      node_id = arguments.node_id,
       state = validation_error and "rejected" or "error",
       field_errors = validation_error and ui_field_errors(result.field_errors) or {},
       form_errors = validation_error and (result.form_errors or { result.error.message }) or {},
@@ -247,15 +253,22 @@ local function create_ticket_action(arguments)
     }
   end
   return {
-    request_id = arguments.request_id or "project-pipelines-create-ticket",
-    surface_id = "project-pipelines.create-ticket",
-    action_id = "project_pipelines.create_ticket",
-    node_id = "project-pipelines-create-form",
+    request_id = arguments.request_id,
+    surface_id = arguments.surface_id,
+    action_id = arguments.action_id,
+    node_id = arguments.node_id,
     state = "accepted",
     normalized_values = {
       title = result.ticket.title,
       pipeline_id = result.ticket.pipeline_id,
     },
+    presentation = {
+      {
+        kind = "clear",
+        key = "create-ticket-dialog",
+      },
+    },
+    replacement = create_ticket_surface({}),
     payload = {
       message = "Ticket created",
       ticket = result.ticket,

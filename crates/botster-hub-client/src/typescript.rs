@@ -8,6 +8,10 @@ pub(crate) fn daemon_protocol_typescript() -> String {
         &mut output,
         "// Regenerate/check with: ./test.sh -p botster-hub-client",
     );
+    line(
+        &mut output,
+        "import type { UiActionRequest, UiActionResult, UiNode } from \"@trybotster/ui-contract\";",
+    );
     line(&mut output, "");
     line(
         &mut output,
@@ -305,12 +309,7 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             ),
             (
                 "plugin_surface_action",
-                &[
-                    ("package_name", "string"),
-                    ("surface_id", "string"),
-                    ("action_id", "string"),
-                    ("payload", "JsonValue"),
-                ],
+                &[("package_name", "string"), ("request", "UiActionRequest")],
             ),
             (
                 "local_webrtc_signal",
@@ -363,7 +362,7 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             ("plugin_tools", "JsonValue[]"),
             ("plugin_tool_result", "JsonValue"),
             ("plugin_surface?", "DaemonPluginSurface | null"),
-            ("plugin_action_result?", "JsonValue"),
+            ("plugin_action_result?", "UiActionResult"),
             (
                 "local_webrtc_bootstrap?",
                 "DaemonLocalWebrtcBootstrap | null",
@@ -403,7 +402,7 @@ pub(crate) fn daemon_protocol_typescript() -> String {
         &[
             ("package_name", "string"),
             ("surface_id", "string"),
-            ("body", "JsonValue"),
+            ("body", "UiNode"),
             ("ui_tree_snapshot?", "DaemonUiTreeSnapshot | null"),
         ],
     );
@@ -413,7 +412,7 @@ pub(crate) fn daemon_protocol_typescript() -> String {
         &[
             ("package_name", "string"),
             ("surface_id", "string"),
-            ("body", "JsonValue"),
+            ("body", "UiNode"),
         ],
     );
     emit_interface(

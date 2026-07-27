@@ -5,6 +5,16 @@ The authoritative reusable client-to-hub daemon protocol lives in:
 - `crates/botster-hub-client/src/lib.rs`
 - `src/daemon_transport.rs`
 
+The renderer-neutral UI contract used by those protocol DTOs lives in:
+
+- `crates/botster-ui-contract/src/lib.rs`
+- `packages/ui-contract`
+
+Rust clients consume `botster-ui-contract`; TypeScript clients consume
+`@trybotster/ui-contract@0.1.0`. The generated declarations, schema, and
+conformance fixtures are one contract surface and must not be copied into a
+client repository.
+
 Implementation baseline before this split: `9b39f1607144319138151cdf776e8909f35a63d4`. The pipeline implementation commit should be treated as the final protocol revision once merged.
 
 External same-device clients should depend on the `botster-hub-client` crate and use `DaemonEndpoint`, `DaemonConnection`, `request`, or `stream_attach` to talk to a running `botster-hub` daemon socket. The crate owns the client-facing handshake, request, response, event, and JSON frame helpers.
@@ -29,7 +39,7 @@ Node-based first-party clients can consume the same checked artifact without a
 sibling hub checkout through the public package:
 
 ```sh
-npm install --save-dev @trybotster/hub-test-support@0.1.11
+npm install --save-dev @trybotster/ui-contract@0.1.0 @trybotster/hub-test-support@0.1.12
 ```
 
 ```js
@@ -68,9 +78,9 @@ when checked assets are stale. The metadata's protocol version and conformance
 fixture revision are emitted by the Rust `botster-hub-test-support` asset
 generator instead of being maintained independently in JavaScript.
 
-For version 0.1.11 from the public npm registry, npm-based client
+For version 0.1.12 from the public npm registry, npm-based client
 repos such as botster-web should use the exact dependency spec
-`"@trybotster/hub-test-support": "0.1.11"` in `devDependencies` and let npm write
+`"@trybotster/hub-test-support": "0.1.12"` in `devDependencies` and let npm write
 the corresponding package-lock entry from the public npm registry. The package
 is public, so registry install does not require a scoped `.npmrc` entry or CI
 auth token. After updating the lockfile, run the client smoke that imports the
@@ -178,7 +188,7 @@ but normal client reconciliation must not poll it or maintain a list-refresh
 fallback beside the entity stream.
 
 The shared revision-16 contract is published by
-`@trybotster/hub-test-support@0.1.11` as
+`@trybotster/hub-test-support@0.1.12` as
 `session-lifecycle-subscription-conformance-fixture.json` and through
 `readSessionLifecycleSubscriptionConformanceFixture()`. The fixture serializes
 the public `DaemonEntityFrame` DTOs and normalizes only timestamps and sequence
@@ -792,7 +802,7 @@ assert the same event ordering and classification. `AttachState` and
 
 Node clients can consume that exact JSON through
 `readLateAttachHistoryConformanceFixture()` from
-`@trybotster/hub-test-support@0.1.11`. Version 0.1.6 / conformance revision 13
+`@trybotster/hub-test-support@0.1.12`. Version 0.1.6 / conformance revision 13
 uses JSON number arrays for opaque history and is superseded because that shape
 unnecessarily expands large Ghostty snapshots on the bounded WebRTC response
 path. Version 0.1.5 / revision 12 still exposes lossy string history. Neither is
@@ -875,7 +885,7 @@ bounded correctness cases, not performance targets or benchmark claims.
 
 Adding the `refresh_local_packages` daemon request changes the request
 vocabulary, so `PROTOCOL_VERSION` advances to 3 alongside
-`CONFORMANCE_FIXTURE_REVISION` 18. This is a cold cut with no protocol-v2 parser
+`CONFORMANCE_FIXTURE_REVISION` 18. This was a cold cut with no protocol-v2 parser
 or parallel fixture. Because `DaemonCompatibilityRequirement::current()`
 derives `minimum_protocol_version` from `PROTOCOL_VERSION`, clients built at
 this identity require a Hub at protocol version 3 or later.
@@ -910,24 +920,24 @@ fields, and the `terminal_readback` feature increments
 `CONFORMANCE_FIXTURE_REVISION`. `PROTOCOL_VERSION` remains unchanged because
 daemon framing and request issuance are unchanged.
 
-Do not reuse `botster_core::contract` session-worker protocol, session frame magic, `DefaultEngineCommand`, `TransportIngress`, or `BoundaryJson` for external clients. Those are not the client-to-hub protocol. The client crate also intentionally excludes hub runtime, Lua/plugin runtime, `ratatui`, `crossterm`, `mlua`, and core UI action/node types.
+Do not reuse `botster_core::contract` session-worker protocol, session frame magic, `DefaultEngineCommand`, `TransportIngress`, or `BoundaryJson` for external clients. Those are not the client-to-hub protocol. The client crate also intentionally excludes hub runtime, Lua/plugin runtime, `ratatui`, `crossterm`, and `mlua`; its UI DTOs come only from `botster-ui-contract`.
 
 Plugin surface render responses cross the daemon boundary as a
 `DaemonPluginSurface` envelope containing `package_name`, `surface_id`, a JSON
-`body` payload for compatibility, and `ui_tree_snapshot` for browser/TUI
-rendering. The snapshot repeats `package_name` and `surface_id` and carries the
-same validated UiNode JSON in `body`. Hub-owned code renders through
-`HubRuntime::render_plugin_surface`, deserializes the plugin payload into the
-locked core UiNode contract, and validates it before serializing this response.
-Clients should prefer `ui_tree_snapshot` as the blessed surface rendering path
-and keep `body` only as a compatibility fallback for older hubs.
+typed `UiNode` body and `ui_tree_snapshot` for browser/TUI rendering. The
+snapshot repeats `package_name` and `surface_id` and carries the same validated
+`UiNode`. Hub-owned code renders through `HubRuntime::render_plugin_surface`,
+deserializes against `botster-ui-contract`, and validates before serializing
+the response. Plugin actions use one canonical `UiActionRequest` envelope and
+return a typed `UiActionResult`; the daemon and worker do not reconstruct split
+request fields.
 
-Adding `ui_tree_snapshot` increments `CONFORMANCE_FIXTURE_REVISION`.
-`PROTOCOL_VERSION` remains unchanged because daemon framing and request issuance
-are unchanged. Clients that require hub-validated plugin surface snapshots should
-require the current conformance fixture revision during the hello handshake.
-Plugin action responses still cross as JSON values. External clients are not
-required to compile internal UI/runtime dependencies.
+This cold switch advances `PROTOCOL_VERSION` to 4 and
+`CONFORMANCE_FIXTURE_REVISION` to 19. It removes `UiTreeUpdateRef` and
+`tree_update`, requires explicit form `submit_label`, supports scoped
+presentation set/clear/toggle operations, and permits one validated inline
+replacement tree only on accepted results. There is no protocol-v3 parser or
+parallel legacy action path.
 
 Expanding the plugin contract matrix `contract.app` fixture to cover
 application primitives `metric_grid`, `table`, `toolbar`, `empty_state`,
@@ -935,7 +945,7 @@ application primitives `metric_grid`, `table`, `toolbar`, `empty_state`,
 `CONFORMANCE_FIXTURE_REVISION`. `PROTOCOL_VERSION` remains unchanged because
 the daemon framing and `plugin_surface_render` request/response shape are
 unchanged; the hub still delegates validation to the locked
-`botster_core::UiNode` contract.
+`botster-ui-contract::UiNode` contract.
 
 Publishing `@trybotster/hub-test-support@0.1.2` adds an explicit
 application-primitives package API and metadata alias over that already-revised
@@ -992,7 +1002,7 @@ Node client tests should use the declared npm dependency instead of a relative
 hub checkout:
 
 ```sh
-npm install --save-dev @trybotster/hub-test-support@0.1.11
+npm install --save-dev @trybotster/ui-contract@0.1.0 @trybotster/hub-test-support@0.1.12
 ```
 
 ```js
@@ -1007,7 +1017,7 @@ const fixturePath = materializePluginContractMatrixFixture(tempDirectory);
 
 Local environment variables may still point legacy drift checks at a checked-out
 hub artifact, but the normal web-client dependency coordinate is
-`@trybotster/hub-test-support@0.1.11` from the public npm registry.
+`@trybotster/hub-test-support@0.1.12` from the public npm registry.
 
 Each harness instance creates a disposable data directory and socket path under
 the configured test root, uses synthetic default hub identity, and attempts a

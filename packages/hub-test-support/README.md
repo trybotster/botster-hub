@@ -18,7 +18,7 @@ node packages/hub-test-support/scripts/sync-assets.mjs
 ## Usage
 
 ```sh
-npm install --save-dev @trybotster/hub-test-support@0.1.11
+npm install --save-dev @trybotster/ui-contract@0.1.0 @trybotster/hub-test-support@0.1.12
 ```
 
 ```js
@@ -32,6 +32,7 @@ import {
   readLocalWebrtcDeliveryChunkConformanceFixture,
   readModeFlagsConformanceFixture,
   readSessionLifecycleSubscriptionConformanceFixture,
+  readUiContractConformanceFixtures,
 } from "@trybotster/hub-test-support";
 
 const protocolSource = readDaemonProtocolTypescript();
@@ -42,6 +43,7 @@ const lateAttachFixture = readLateAttachHistoryConformanceFixture();
 const localWebrtcChunkFixture = readLocalWebrtcDeliveryChunkConformanceFixture();
 const modeFlagsFixture = readModeFlagsConformanceFixture();
 const sessionLifecycleFixture = readSessionLifecycleSubscriptionConformanceFixture();
+const uiContractFixtures = await readUiContractConformanceFixtures();
 const applicationSurfaceId = metadata.application_primitives.surface_id;
 const rendererEntryPoint = metadata.application_primitives.renderer_entrypoint;
 
@@ -57,6 +59,7 @@ console.log(
   localWebrtcChunkFixture.scenarios.large_generated,
   modeFlagsFixture.mouse_on.mode_flags.mouse_mode,
   sessionLifecycleFixture.normalized_frames,
+  uiContractFixtures.revision,
 );
 ```
 
@@ -65,12 +68,13 @@ Use this exact package spec in npm-based client repos:
 ```json
 {
   "devDependencies": {
-    "@trybotster/hub-test-support": "0.1.11"
+    "@trybotster/hub-test-support": "0.1.12"
   }
 }
 ```
 
-After `@trybotster/hub-test-support@0.1.11` is published to the public npm
+After `@trybotster/ui-contract@0.1.0` and
+`@trybotster/hub-test-support@0.1.12` are published to the public npm
 registry, no scoped `.npmrc` entry or CI auth token is required for install.
 
 The support matrix is generated from the Rust compatibility descriptors.
@@ -86,7 +90,12 @@ Only `read_screen_text` is renderable restored content; `snapshot` and
 version 0.1.5 / revision 12 exposes lossy string history. Neither is current
 binary-history contract authority.
 
-Version 0.1.11 publishes protocol version 3 / conformance revision 18, the
+Version 0.1.12 publishes protocol version 4 / conformance revision 19 and
+depends on `@trybotster/ui-contract@0.1.0` for the canonical UiNode,
+UiActionRequest, and UiActionResult declarations and conformance fixtures.
+The protocol cold-switch replaces split action fields and untyped JSON bodies
+with one canonical request envelope and typed surface/action response bodies.
+It also retains the version 0.1.11
 `refresh_local_packages` daemon request,
 authenticated local-WebRTC delivery-kind fixture, and the
 source-derived session lifecycle subscription fixture. Its normalized public

@@ -19,6 +19,9 @@ Supported in this milestone:
 - plugin-owned form validation for title and pipeline id, returning
   `UiActionResult` failure payloads with `field_errors` keyed by stable UiNode
   id and `form_errors` for form-level feedback
+- the canonical action envelope (`request_id`, `surface_id`, `action_id`,
+  `values`, and `payload`) plus accepted inline replacement and scoped
+  presentation-clear effects from `@trybotster/ui-contract`
 - routed-envelope-backed start coordination with publish, drain, and
   acknowledge delivery evidence
 - session-template spawn on `start`, returning `session_uuid`,
@@ -62,7 +65,8 @@ package commands, run bare `botster-hub up`, then open the reported Web URL or
 the daemon-resolved TUI app. Focus the Project Pipelines create-ticket fields,
 submit once with a blank
 title to see field/form validation, then submit with a nonblank title to create
-a local ticket. The TUI renders the plugin-authored UiNode tree and dispatches
+a local ticket. The TUI renders the plugin-authored UiNode tree, clears the
+scoped dialog presentation key, applies the returned replacement tree, and dispatches
 the semantic action through the daemon; it does not build a Project Pipelines
 form in Rust. The botster-web process is launched from the separate
 `botster-web` package through hub supervision, not from this Project Pipelines

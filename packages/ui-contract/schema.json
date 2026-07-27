@@ -1,0 +1,585 @@
+{
+  "$defs": {
+    "JsonValue": {},
+    "UiAction": {
+      "additionalProperties": false,
+      "properties": {
+        "disabled": {
+          "type": "boolean"
+        },
+        "id": {
+          "$ref": "#/$defs/UiActionId"
+        },
+        "payload": {
+          "$ref": "#/$defs/JsonValue"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    },
+    "UiActionId": {
+      "type": "string"
+    },
+    "UiActionKind": {
+      "enum": [
+        "submit",
+        "reset",
+        "validate",
+        "cancel"
+      ]
+    },
+    "UiActionRequest": {
+      "additionalProperties": false,
+      "properties": {
+        "action_id": {
+          "$ref": "#/$defs/UiActionId"
+        },
+        "kind": {
+          "$ref": "#/$defs/UiActionKind"
+        },
+        "node_id": {
+          "$ref": "#/$defs/UiNodeId"
+        },
+        "payload": {
+          "$ref": "#/$defs/JsonValue"
+        },
+        "request_id": {
+          "$ref": "#/$defs/UiActionRequestId"
+        },
+        "surface_id": {
+          "$ref": "#/$defs/UiSurfaceId"
+        },
+        "values": {
+          "additionalProperties": {
+            "$ref": "#/$defs/JsonValue"
+          },
+          "type": "object"
+        }
+      },
+      "required": [
+        "request_id",
+        "surface_id",
+        "action_id",
+        "kind"
+      ],
+      "type": "object"
+    },
+    "UiActionRequestId": {
+      "type": "string"
+    },
+    "UiActionResult": {
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "state": {
+                "not": {
+                  "const": "accepted"
+                }
+              }
+            },
+            "required": [
+              "state"
+            ]
+          },
+          "then": {
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "presentation"
+                  ]
+                },
+                {
+                  "required": [
+                    "replacement"
+                  ]
+                }
+              ]
+            }
+          }
+        }
+      ],
+      "properties": {
+        "action_id": {
+          "$ref": "#/$defs/UiActionId"
+        },
+        "error": {
+          "type": "string"
+        },
+        "field_errors": {
+          "additionalProperties": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "type": "object"
+        },
+        "form_errors": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "node_id": {
+          "$ref": "#/$defs/UiNodeId"
+        },
+        "normalized_values": {
+          "type": "object"
+        },
+        "payload": {
+          "$ref": "#/$defs/JsonValue"
+        },
+        "presentation": {
+          "items": {
+            "$ref": "#/$defs/UiPresentationOperation"
+          },
+          "type": "array"
+        },
+        "replacement": {
+          "$ref": "#/$defs/UiNode"
+        },
+        "request_id": {
+          "$ref": "#/$defs/UiActionRequestId"
+        },
+        "state": {
+          "$ref": "#/$defs/UiActionResultState"
+        },
+        "surface_id": {
+          "$ref": "#/$defs/UiSurfaceId"
+        },
+        "warnings": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "request_id",
+        "surface_id",
+        "action_id",
+        "state"
+      ],
+      "type": "object"
+    },
+    "UiActionResultState": {
+      "enum": [
+        "accepted",
+        "rejected",
+        "deferred",
+        "error"
+      ]
+    },
+    "UiBindIf": {
+      "oneOf": [
+        {
+          "properties": {
+            "$kind": {
+              "const": "bind_if"
+            },
+            "node": {
+              "$ref": "#/$defs/UiNode"
+            },
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "$kind",
+            "path",
+            "node"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "$kind": {
+              "const": "presentation_if"
+            },
+            "node": {
+              "$ref": "#/$defs/UiNode"
+            },
+            "predicate": {
+              "$ref": "#/$defs/UiPresentationPredicate"
+            }
+          },
+          "required": [
+            "$kind",
+            "predicate",
+            "node"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "UiBindList": {
+      "properties": {
+        "$kind": {
+          "const": "bind_list"
+        },
+        "empty_template": {
+          "$ref": "#/$defs/UiNode"
+        },
+        "item_template": {
+          "$ref": "#/$defs/UiNode"
+        },
+        "source": {
+          "type": "string"
+        },
+        "where": {
+          "type": "object"
+        }
+      },
+      "required": [
+        "$kind",
+        "source",
+        "item_template"
+      ],
+      "type": "object"
+    },
+    "UiChild": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/UiNode"
+        },
+        {
+          "$ref": "#/$defs/UiConditional"
+        },
+        {
+          "$ref": "#/$defs/UiBindList"
+        },
+        {
+          "$ref": "#/$defs/UiBindIf"
+        }
+      ]
+    },
+    "UiConditional": {
+      "properties": {
+        "$kind": {
+          "enum": [
+            "when",
+            "hidden"
+          ]
+        },
+        "condition": {
+          "type": "object"
+        },
+        "node": {
+          "$ref": "#/$defs/UiNode"
+        }
+      },
+      "required": [
+        "$kind",
+        "condition",
+        "node"
+      ],
+      "type": "object"
+    },
+    "UiNode": {
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "form"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "properties": {
+              "props": {
+                "properties": {
+                  "action": {
+                    "$ref": "#/$defs/UiAction"
+                  },
+                  "submit_label": {
+                    "pattern": "\\S",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "action",
+                  "submit_label"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "props"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "dialog"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "properties": {
+              "props": {
+                "not": {
+                  "required": [
+                    "open"
+                  ]
+                },
+                "properties": {
+                  "presentation": {
+                    "enum": [
+                      "auto",
+                      "inline",
+                      "overlay",
+                      "sheet",
+                      "fullscreen"
+                    ]
+                  },
+                  "title": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "title"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "props"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "button"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "properties": {
+              "props": {
+                "properties": {
+                  "action": {
+                    "$ref": "#/$defs/UiAction"
+                  },
+                  "label": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "label",
+                  "action"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "props"
+            ]
+          }
+        }
+      ],
+      "properties": {
+        "children": {
+          "items": {
+            "$ref": "#/$defs/UiChild"
+          },
+          "type": "array"
+        },
+        "id": {
+          "$ref": "#/$defs/UiNodeId"
+        },
+        "props": {
+          "additionalProperties": {
+            "$ref": "#/$defs/JsonValue"
+          },
+          "type": "object"
+        },
+        "slots": {
+          "additionalProperties": {
+            "items": {
+              "$ref": "#/$defs/UiChild"
+            },
+            "type": "array"
+          },
+          "type": "object"
+        },
+        "type": {
+          "$ref": "#/$defs/UiNodeKind"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "type": "object"
+    },
+    "UiNodeId": {
+      "type": "string"
+    },
+    "UiNodeKind": {
+      "enum": [
+        "stack",
+        "inline",
+        "form",
+        "form_section",
+        "form_field",
+        "panel",
+        "metric",
+        "metric_grid",
+        "toolbar",
+        "status_badge",
+        "section",
+        "scroll_area",
+        "text",
+        "icon",
+        "badge",
+        "status_dot",
+        "empty_state",
+        "list",
+        "list_item",
+        "tree",
+        "tree_item",
+        "table",
+        "button",
+        "icon_button",
+        "menu",
+        "menu_item",
+        "dialog",
+        "text_input",
+        "textarea",
+        "checkbox",
+        "select",
+        "select_option",
+        "terminal_view",
+        "connection_code_view",
+        "iframe",
+        "custom"
+      ]
+    },
+    "UiPresentationKey": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "UiPresentationOperation": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "key": {
+              "$ref": "#/$defs/UiPresentationKey"
+            },
+            "kind": {
+              "const": "set"
+            },
+            "value": {
+              "$ref": "#/$defs/JsonValue"
+            }
+          },
+          "required": [
+            "kind",
+            "key",
+            "value"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "key": {
+              "$ref": "#/$defs/UiPresentationKey"
+            },
+            "kind": {
+              "enum": [
+                "clear",
+                "toggle"
+              ]
+            }
+          },
+          "required": [
+            "kind",
+            "key"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "UiPresentationPredicate": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "key": {
+              "$ref": "#/$defs/UiPresentationKey"
+            },
+            "kind": {
+              "enum": [
+                "present",
+                "truthy"
+              ]
+            }
+          },
+          "required": [
+            "kind",
+            "key"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "key": {
+              "$ref": "#/$defs/UiPresentationKey"
+            },
+            "kind": {
+              "const": "equals"
+            },
+            "value": {
+              "$ref": "#/$defs/JsonValue"
+            }
+          },
+          "required": [
+            "kind",
+            "key",
+            "value"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "UiSurfaceId": {
+      "type": "string"
+    }
+  },
+  "$id": "https://trybotster.dev/schemas/ui-contract-0.1.0.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/UiNode"
+    },
+    {
+      "$ref": "#/$defs/UiActionRequest"
+    },
+    {
+      "$ref": "#/$defs/UiActionResult"
+    }
+  ],
+  "title": "Botster UI Contract"
+}

@@ -1,0 +1,30 @@
+{
+  "name": "@trybotster/ui-contract",
+  "version": "0.1.0",
+  "description": "Renderer-neutral Botster plugin UI contract",
+  "license": "SEE LICENSE IN LICENSE",
+  "type": "module",
+  "main": "./index.js",
+  "types": "./index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "default": "./index.js"
+    },
+    "./schema": "./schema.json",
+    "./conformance-fixtures": "./conformance-fixtures.json"
+  },
+  "files": [
+    "README.md",
+    "LICENSE",
+    "index.js",
+    "index.d.ts",
+    "schema.json",
+    "conformance-fixtures.json"
+  ],
+  "scripts": {
+    "generate": "cargo run --manifest-path ../../Cargo.toml -p botster-ui-contract --example generate_assets",
+    "check": "cargo run --manifest-path ../../Cargo.toml -p botster-ui-contract --example generate_assets -- --check",
+    "test": "node test.mjs"
+  }
+}

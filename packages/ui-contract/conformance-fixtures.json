@@ -1,0 +1,128 @@
+{
+  "contract_version": "0.1.0",
+  "fixtures": {
+    "accepted": {
+      "action_id": "ticket.create",
+      "node_id": "ticket-form",
+      "presentation": [
+        {
+          "key": "notice",
+          "kind": "set",
+          "value": "created"
+        },
+        {
+          "key": "details",
+          "kind": "toggle"
+        },
+        {
+          "key": "create-ticket-dialog",
+          "kind": "clear"
+        }
+      ],
+      "replacement": {
+        "id": "ticket-created",
+        "props": {
+          "text": "Ticket created"
+        },
+        "type": "text"
+      },
+      "request_id": "request-1",
+      "state": "accepted",
+      "surface_id": "tickets.create"
+    },
+    "dialog_presence": {
+      "$kind": "presentation_if",
+      "node": {
+        "id": "create-ticket-dialog",
+        "props": {
+          "presentation": "auto",
+          "title": "Create ticket"
+        },
+        "slots": {
+          "body": [
+            {
+              "props": {
+                "text": "Dialog body"
+              },
+              "type": "text"
+            }
+          ]
+        },
+        "type": "dialog"
+      },
+      "predicate": {
+        "key": "create-ticket-dialog",
+        "kind": "present"
+      }
+    },
+    "form": {
+      "children": [
+        {
+          "id": "ticket-title",
+          "props": {
+            "label": "Title",
+            "name": "title",
+            "placeholder": "Ticket title"
+          },
+          "type": "text_input"
+        }
+      ],
+      "id": "ticket-form",
+      "props": {
+        "action": {
+          "id": "ticket.create",
+          "payload": {
+            "source": "toolbar"
+          }
+        },
+        "submit_label": "Create ticket"
+      },
+      "type": "form"
+    },
+    "rejected": {
+      "action_id": "ticket.create",
+      "field_errors": {
+        "ticket-title": [
+          "Title is required"
+        ]
+      },
+      "form_errors": [
+        "Fix the highlighted fields"
+      ],
+      "node_id": "ticket-form",
+      "normalized_values": {
+        "title": ""
+      },
+      "request_id": "request-1",
+      "state": "rejected",
+      "surface_id": "tickets.create"
+    },
+    "request": {
+      "action_id": "ticket.create",
+      "kind": "submit",
+      "node_id": "ticket-form",
+      "payload": {
+        "source": "toolbar"
+      },
+      "request_id": "request-1",
+      "surface_id": "tickets.create",
+      "values": {
+        "title": "Ship contract"
+      }
+    },
+    "selected_workspace_equality": {
+      "$kind": "presentation_if",
+      "node": {
+        "props": {
+          "text": "Selected workspace"
+        },
+        "type": "text"
+      },
+      "predicate": {
+        "key": "selected-workspace",
+        "kind": "equals",
+        "value": "workspace-alpha"
+      }
+    }
+  }
+}
