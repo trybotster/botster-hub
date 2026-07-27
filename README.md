@@ -280,14 +280,14 @@ deterministic tests and local fixtures only, not a production fallback.
 The durable local startup path is explicit:
 
 ```sh
-cargo run -- start --data-dir target/botster-hub-daemon-smoke-data
+cargo run -- start
 ```
 
-`start --data-dir` constructs `HubDaemon`, loads or initializes
+`start` constructs `HubDaemon`, loads or initializes
 `hub-state.json`, restores package/provider policy records through
 `PackageRegistrySnapshot` admission, initializes `HubRuntime` through the
 worker-backed core daemon facade, binds the configured local Unix socket, and
-stays running until `shutdown --data-dir` asks it to stop. Later operator CLI
+stays running until `shutdown` asks it to stop. Later operator CLI
 invocations connect to that socket with a `hello` / `hello_ack` protocol
 handshake before sending daemon requests. Future transports, provider runtimes,
 sockets, and supervisors should attach after this lifecycle object has started;
@@ -295,7 +295,7 @@ they should not recreate config or durable state ownership.
 
 The no-arg binary path is a side-effect-light host-profile summary. It builds
 resolved config and an in-memory `HubRuntime::new` summary only; it does not
-load or save `hub-state.json` through HOME/XDG fallback paths. `run-one` remains
+load or save `hub-state.json` through the runtime data-directory resolver. `run-one` remains
 an explicit-data-dir runtime smoke path through `HubRuntime::load`. Registry,
 grant, and admission mutation saves are now exercised by the local operator CLI
 package commands through `HubStateStore::update`.
@@ -303,7 +303,7 @@ package commands through `HubStateStore::update`.
 ## Local production runtime operator CLI
 
 The `botster-hub` binary includes a deliberately thin local operator surface for
-production runtime. `start --data-dir` owns the daemon lifecycle and one `HubRuntime`;
+production runtime. `start` owns the daemon lifecycle and one `HubRuntime`;
 `status`, `sessions list`, `sessions spawn`, `sessions attach`,
 `sessions send-input`, `sessions resize`, `sessions detach`, and `shutdown`
 connect to that daemon over the resolved local socket. The CLI remains a thin
@@ -428,6 +428,9 @@ apps=botster-hub apps list --data-dir $HOME/.botster/hub
 down=botster-hub down --data-dir $HOME/.botster/hub
 ```
 
+These emitted copy/paste commands pin the exact resolved runtime. Ordinary
+operator examples below omit the optional flag and use the canonical default.
+
 There is no compatibility launcher or bootstrap command. `start`, `shutdown`,
 `packages`, and `apps` remain the lower-level operator surfaces.
 
@@ -451,7 +454,7 @@ commands:
 ```sh
 botster-hub open web
 botster-hub open tui
-botster-hub reload botster-web --data-dir $HOME/.botster/hub
+botster-hub reload botster-web
 ```
 
 `open web` resolves the first-party `botster-web/web-client` app through the
@@ -487,15 +490,15 @@ For lower-level package diagnostics, the daily flow maps to the daemon-owned
 package commands:
 
 ```sh
-botster-hub packages install --data-dir $HOME/.botster/hub \
+botster-hub packages install \
   --path /path/to/botster-web
-botster-hub packages enable --data-dir $HOME/.botster/hub botster-web
-botster-hub packages check-update --data-dir $HOME/.botster/hub botster-web
-botster-hub packages preview-update --data-dir $HOME/.botster/hub \
+botster-hub packages enable botster-web
+botster-hub packages check-update botster-web
+botster-hub packages preview-update \
   botster-web --revision local-dev --policy manual
-botster-hub packages apply-update --data-dir $HOME/.botster/hub \
+botster-hub packages apply-update \
   botster-web --revision local-dev --policy manual
-botster-hub packages reload --data-dir $HOME/.botster/hub botster-web
+botster-hub packages reload botster-web
 ```
 
 The ordinary package commands perform the one-time install/enable step.
@@ -511,10 +514,10 @@ From another terminal, the composed local client app path should be visible
 through the same stable data directory:
 
 ```sh
-botster-hub apps list --data-dir $HOME/.botster/hub
-botster-hub apps show --data-dir $HOME/.botster/hub botster-web/web-client
-botster-hub apps open --data-dir $HOME/.botster/hub botster-web/web-client
-botster-hub apps open --data-dir $HOME/.botster/hub botster-tui
+botster-hub apps list
+botster-hub apps show botster-web/web-client
+botster-hub apps open botster-web/web-client
+botster-hub apps open botster-tui
 ```
 
 `apps open botster-web/web-client` reports an `app_url=` matching the printed
@@ -527,61 +530,61 @@ processes:
 
 ```sh
 # Terminal 1: leave the daemon running.
-cargo run -- start --data-dir $HOME/.botster/hub
+cargo run -- start
 
 # Other terminals:
-cargo run -- status --data-dir $HOME/.botster/hub
+cargo run -- status
 
-cargo run -- packages install --data-dir $HOME/.botster/hub \
+cargo run -- packages install \
   --path examples/synthetic-plugin
-cargo run -- packages available --data-dir $HOME/.botster/hub \
+cargo run -- packages available \
   --registry path/to/package-registry.json
-cargo run -- packages inspect --data-dir $HOME/.botster/hub \
+cargo run -- packages inspect \
   --registry path/to/package-registry.json runtime.synthetic-plugin
-cargo run -- packages preview-install --data-dir $HOME/.botster/hub \
+cargo run -- packages preview-install \
   --registry path/to/package-registry.json runtime.synthetic-plugin
-cargo run -- packages install --data-dir $HOME/.botster/hub \
+cargo run -- packages install \
   --registry path/to/package-registry.json runtime.synthetic-plugin
-cargo run -- packages list --data-dir $HOME/.botster/hub
-cargo run -- packages show --data-dir $HOME/.botster/hub runtime.synthetic-plugin
-cargo run -- packages config --data-dir $HOME/.botster/hub runtime.synthetic-plugin
-cargo run -- packages config set --data-dir $HOME/.botster/hub \
+cargo run -- packages list
+cargo run -- packages show runtime.synthetic-plugin
+cargo run -- packages config runtime.synthetic-plugin
+cargo run -- packages config set \
   runtime.synthetic-plugin '{"enabled":true}'
-cargo run -- packages enable --data-dir $HOME/.botster/hub runtime.synthetic-plugin
-cargo run -- packages check-update --data-dir $HOME/.botster/hub runtime.synthetic-plugin
-cargo run -- packages preview-update --data-dir $HOME/.botster/hub \
+cargo run -- packages enable runtime.synthetic-plugin
+cargo run -- packages check-update runtime.synthetic-plugin
+cargo run -- packages preview-update \
   runtime.synthetic-plugin --revision v1.0.1 --policy manual
-cargo run -- packages apply-update --data-dir $HOME/.botster/hub \
+cargo run -- packages apply-update \
   runtime.synthetic-plugin --revision v1.0.1 --checksum sha256:example --policy manual
-cargo run -- packages reload --data-dir $HOME/.botster/hub runtime.synthetic-plugin
-cargo run -- packages start-entrypoint --data-dir $HOME/.botster/hub \
+cargo run -- packages reload runtime.synthetic-plugin
+cargo run -- packages start-entrypoint \
   runtime.synthetic-plugin web
-cargo run -- packages entrypoint-status --data-dir $HOME/.botster/hub \
+cargo run -- packages entrypoint-status \
   runtime.synthetic-plugin web
-cargo run -- packages restart-entrypoint --data-dir $HOME/.botster/hub \
+cargo run -- packages restart-entrypoint \
   runtime.synthetic-plugin web
-cargo run -- packages stop-entrypoint --data-dir $HOME/.botster/hub \
+cargo run -- packages stop-entrypoint \
   runtime.synthetic-plugin web
-cargo run -- packages disable --data-dir $HOME/.botster/hub runtime.synthetic-plugin
-cargo run -- packages remove --data-dir $HOME/.botster/hub runtime.synthetic-plugin
-cargo run -- providers list --data-dir $HOME/.botster/hub
+cargo run -- packages disable runtime.synthetic-plugin
+cargo run -- packages remove runtime.synthetic-plugin
+cargo run -- providers list
 
-cargo run -- apps list --data-dir $HOME/.botster/hub
-cargo run -- apps show --data-dir $HOME/.botster/hub runtime.synthetic-plugin/web
-cargo run -- apps open --data-dir $HOME/.botster/hub runtime.synthetic-plugin/web
+cargo run -- apps list
+cargo run -- apps show runtime.synthetic-plugin/web
+cargo run -- apps open runtime.synthetic-plugin/web
 
-cargo run -- sessions spawn --data-dir $HOME/.botster/hub \
+cargo run -- sessions spawn \
   --session-id runtime-session -- "printf 'production runtime-ok\n'; sleep 1"
-cargo run -- sessions list --data-dir $HOME/.botster/hub
-cargo run -- sessions attach --data-dir $HOME/.botster/hub runtime-session
-cargo run -- sessions send-input --data-dir $HOME/.botster/hub \
+cargo run -- sessions list
+cargo run -- sessions attach runtime-session
+cargo run -- sessions send-input \
   runtime-session -- "ping\r"
-cargo run -- sessions resize --data-dir $HOME/.botster/hub \
+cargo run -- sessions resize \
   runtime-session 30 100
-cargo run -- sessions detach --data-dir $HOME/.botster/hub runtime-session
-cargo run -- sessions shutdown --data-dir $HOME/.botster/hub runtime-session
-cargo run -- inspect --data-dir $HOME/.botster/hub runtime-session
-cargo run -- shutdown --data-dir $HOME/.botster/hub
+cargo run -- sessions detach runtime-session
+cargo run -- sessions shutdown runtime-session
+cargo run -- inspect runtime-session
+cargo run -- shutdown
 ```
 
 `packages install --path` connects to the running daemon, validates the local
@@ -625,15 +628,15 @@ socket path and the data directory are absolute and must not be resolved
 relative to the package working directory.
 
 ```sh
-# Terminal 1: leave the daemon running.
-cargo run -- start --data-dir target/botster-hub-tui-production runtime-data
+# Terminal 1: leave an explicitly isolated daemon running.
+cargo run -- start --data-dir /tmp/botster-hub-tui-production-runtime-data
 
 # Terminal 2: create a deterministic echo-loop session for typed-input testing.
-cargo run -- sessions spawn --data-dir target/botster-hub-tui-production runtime-data \
+cargo run -- sessions spawn --data-dir /tmp/botster-hub-tui-production-runtime-data \
   --session-id runtime-session -- "printf 'production runtime-ok\n'; while IFS= read -r line; do printf 'runtime:%s\n' \"$line\"; done"
 
 # Terminal 3: operate the session from the installed terminal app.
-botster-hub apps open --data-dir target/botster-hub-tui-production runtime-data botster-tui
+botster-hub apps open --data-dir /tmp/botster-hub-tui-production-runtime-data botster-tui
 ```
 
 The echo-loop fixture is intentionally not a shell: typing `hello` should produce
@@ -642,7 +645,7 @@ commands, spawn a separate long-lived shell session and attach to that session
 from the TUI:
 
 ```sh
-cargo run -- sessions spawn --data-dir target/botster-hub-tui-production runtime-data \
+cargo run -- sessions spawn --data-dir /tmp/botster-hub-tui-production-runtime-data \
   --session-id runtime-shell -- "/bin/sh -i"
 ```
 
@@ -677,11 +680,11 @@ daemon-backed status, and plugin lifecycle reads on one control plane.
 
 ## Agent-facing MCP stdio
 
-Local agents can launch the daemon-backed MCP surface with an explicit data
-directory:
+Local agents can launch the daemon-backed MCP surface against the canonical
+default data directory:
 
 ```sh
-botster-hub mcp-serve --data-dir $HOME/.botster/hub
+botster-hub mcp-serve
 ```
 
 `mcp-serve` speaks MCP over stdio as newline-delimited JSON-RPC: every stdout
@@ -738,20 +741,20 @@ local coordination through the ordinary persisted package registry. Install
 and enable it against the running daemon, then run MCP from that same directory:
 
 ```sh
-botster-hub packages install --data-dir $HOME/.botster/hub \
+botster-hub packages install \
   --path examples/project-pipelines
-botster-hub packages enable --data-dir $HOME/.botster/hub project-pipelines
-botster-hub mcp-serve --data-dir $HOME/.botster/hub
+botster-hub packages enable project-pipelines
+botster-hub mcp-serve
 ```
 
 For lower-level diagnostics, enable the plugin package through a running daemon
 and serve MCP from the same data directory:
 
 ```sh
-cargo run -- packages install --data-dir $HOME/.botster/hub \
+cargo run -- packages install \
   --path examples/project-pipelines
-cargo run -- packages enable --data-dir $HOME/.botster/hub project-pipelines
-cargo run -- mcp-serve --data-dir $HOME/.botster/hub
+cargo run -- packages enable project-pipelines
+cargo run -- mcp-serve
 ```
 
 `mcp-serve` lists and calls the plugin's Project Pipelines tools through
@@ -838,13 +841,11 @@ Stale package build output: rebuild the edited sibling package with its own
 repo's build command, then rerun `botster-hub up`. The daily command re-reads
 direct local manifests but does not build sibling artifacts; a missing declared
 package-relative command fails before launch with the package name, local path,
-and rebuild remediation. `botster-hub packages reload --data-dir
-$HOME/.botster/hub <package-name>` remains available for an
-explicit one-package refresh.
+and rebuild remediation. `botster-hub packages reload <package-name>` remains
+available for an explicit one-package refresh.
 
-Missing app or Lua entrypoints: run `botster-hub packages show --data-dir
-$HOME/.botster/hub <package-name>` and `botster-hub apps list
---data-dir $HOME/.botster/hub`. Local packages need a valid
+Missing app or Lua entrypoints: run
+`botster-hub packages show <package-name>` and `botster-hub apps list`. Local packages need a valid
 `botster-package.json`; runnable client apps need `runnable_entrypoints`; Lua
 plugins such as Project Pipelines also need their `entrypoints` path to exist.
 `apps open` has no fallback when the package is missing, disabled, or lacks the
@@ -861,8 +862,8 @@ declares the `project-pipelines/agent-step` template. `project_pipelines.start`
 also requires explicit `target_id` and `worktree` arguments; missing either one
 is a tool-call error, not a template fallback.
 
-Terminal attach or scrollback issues: use `botster-hub sessions list --data-dir
-$HOME/.botster/hub`, attach only to a running session, and expect
+Terminal attach or scrollback issues: use `botster-hub sessions list`, attach
+only to a running session, and expect
 terminal output to arrive through the session-backed drain/subscription path.
 Late attach may replay existing terminal output as ordinary terminal data rather
 than a distinct scrollback frame, and current long-running attach signal
