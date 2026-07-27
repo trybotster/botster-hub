@@ -19,6 +19,7 @@ mlua = { version = "0.11.6", features = ["lua54", "vendored", "serialize", "send
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 signal-hook = "0.4.4"
+shell-words = "1.1.1"
 ureq = { version = "3.3.0", default-features = false, features = ["rustls"] }
 webrtc = "0.20.0-beta.2"
 tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread", "sync", "test-util", "time"] }
@@ -30,3 +31,4 @@ notify = "8.2.0"
 [dev-dependencies]
 botster-core-test-support = { git = "https://github.com/trybotster/botster-core", branch = "main" }
 botster-hub-test-support = { path = "crates/botster-hub-test-support" }
+portable-pty = "0.9.0"

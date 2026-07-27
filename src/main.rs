@@ -1,8 +1,9 @@
 use std::collections::BTreeMap;
 use std::env;
 use std::fmt;
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, IsTerminal, Write};
 use std::os::unix::net::UnixListener;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{self, Child, Command, Stdio};
 use std::sync::{Arc, mpsc};
@@ -20,8 +21,7 @@ use botster_hub::{
     DaemonSession, DaemonSpawnTarget, DaemonStatus, DaemonWorktree, DataDirectoryOption,
     HubClientApi, HubClientRequest, HubClientResponseBody, HubDaemon, HubDaemonState, HubRuntime,
     HubStartupOptions, HubStateLoadSource, RuntimeEnvironment, SessionDefaults, TransportBindings,
-    build_default_config_for_runtime, daemon_transport_request, default_package_policy,
-    host_profile, serve_daemon, serve_mcp_stdio, stream_attach,
+    daemon_transport_request, host_profile, serve_daemon, serve_mcp_stdio, stream_attach,
 };
 use botster_hub_client::{
     DaemonDiagnostic, DaemonLocalWebrtcBootstrap, DaemonLocalWebrtcDeliveryChunk,
@@ -49,10 +49,39 @@ const TEST_INCOMPATIBLE_DAEMON_ENV: &str = "BOTSTER_HUB_TEST_INCOMPATIBLE_DAEMON
 const TEST_LOCAL_RUNTIME_READINESS_BUDGET_MS_ENV: &str =
     "BOTSTER_HUB_TEST_LOCAL_RUNTIME_READINESS_BUDGET_MS";
 
+mod operator_console;
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum CommandOutcome {
+    Completed,
+    DaemonStopped,
+    ForegroundAppExited { code: i32, description: String },
+}
+
+pub(crate) struct ConsolePackageState {
+    package_name: String,
+    state: String,
+}
+
 fn main() {
     let command = env::args().nth(1);
-    let command_args = match command.as_deref() {
-        Some(command) if stateful_command(command) => {
+    if command.is_none() {
+        if !should_open_operator_console(io::stdin().is_terminal(), io::stdout().is_terminal()) {
+            eprintln!(
+                "botster-hub error: interactive operator console requires terminal stdin and stdout; scripts must use an explicit subcommand"
+            );
+            process::exit(1);
+        }
+        if let Err(error) = run_operator_console() {
+            eprintln!("botster-hub console error: {error}");
+            process::exit(1);
+        }
+        return;
+    }
+
+    let command = command.expect("command checked above");
+    let command_args = match command.as_str() {
+        command if stateful_command(command) => {
             match canonicalize_data_dir_args(command, env::args().skip(2).collect()) {
                 Ok(args) => args,
                 Err(error) => {
@@ -64,177 +93,131 @@ fn main() {
         _ => env::args().skip(2).collect(),
     };
 
-    match command.as_deref() {
-        Some("start") => {
-            if let Err(error) = start_daemon(command_args) {
-                eprintln!("botster-hub start error: {error}");
-                process::exit(1);
-            }
-            return;
-        }
-        Some("up") => {
-            if let Err(error) = local_runtime_up(command_args) {
-                eprintln!("botster-hub up error: {error}");
-                process::exit(1);
-            }
-            return;
-        }
-        Some("down") => {
-            if let Err(error) = local_runtime_down(command_args) {
-                eprintln!("botster-hub down error: {error}");
-                process::exit(1);
-            }
-            return;
-        }
-        Some("doctor") => {
-            if let Err(error) = local_runtime_doctor(command_args) {
-                eprintln!("botster-hub doctor error: {error}");
-                process::exit(1);
-            }
-            return;
-        }
-        Some("smoke") => {
-            if let Err(error) = local_runtime_smoke(command_args) {
-                eprintln!("botster-hub smoke error: {error}");
-                process::exit(1);
-            }
-            return;
-        }
-        Some("status") => {
-            if let Err(error) = operator_status(command_args) {
-                eprintln!("botster-hub status error: {error}");
-                process::exit(1);
-            }
-            return;
-        }
-        Some("sessions") => {
-            if let Err(error) = operator_sessions(command_args) {
-                eprintln!("botster-hub sessions error: {error}");
-                process::exit(1);
-            }
-            return;
-        }
-        Some("session-templates") => {
-            if let Err(error) = operator_session_templates(command_args) {
-                eprintln!("botster-hub session-templates error: {error}");
-                process::exit(1);
-            }
-            return;
-        }
-        Some("spawn-targets") => {
-            if let Err(error) = operator_spawn_targets(command_args) {
-                eprintln!("botster-hub spawn-targets error: {error}");
-                process::exit(1);
-            }
-            return;
-        }
-        Some("context") => {
-            if let Err(error) = operator_context(command_args) {
-                eprintln!("botster-hub context error: {error}");
-                process::exit(1);
-            }
-            return;
-        }
-        Some("shutdown") => {
-            if let Err(error) = operator_shutdown(command_args) {
-                eprintln!("botster-hub shutdown error: {error}");
-                process::exit(1);
-            }
-            return;
-        }
-        Some("mcp-serve") => {
-            if let Err(error) = mcp_serve(command_args) {
-                eprintln!("botster-hub mcp-serve error: {error}");
-                process::exit(1);
-            }
-            return;
-        }
-        Some("open") => {
-            if let Err(error) = operator_open_alias(command_args) {
-                eprintln!("botster-hub open error: {error}");
-                process::exit(1);
-            }
-            return;
-        }
-        Some("reload") => {
-            if let Err(error) = operator_reload_alias(command_args) {
-                eprintln!("botster-hub reload error: {error}");
-                process::exit(1);
-            }
-            return;
-        }
-        Some("apps") => {
-            if let Err(error) = operator_apps(command_args) {
-                eprintln!("botster-hub apps error: {error}");
-                process::exit(1);
-            }
-            return;
-        }
-        Some("packages") => {
-            if let Err(error) = operator_packages(command_args, false) {
-                eprintln!("botster-hub packages error: {error}");
-                process::exit(1);
-            }
-            return;
-        }
-        Some("providers") => {
-            if let Err(error) = operator_packages(command_args, true) {
-                eprintln!("botster-hub providers error: {error}");
-                process::exit(1);
-            }
-            return;
-        }
-        Some("inspect") => {
-            if let Err(error) = operator_inspect(command_args) {
-                eprintln!("botster-hub inspect error: {error}");
-                process::exit(1);
-            }
-            return;
-        }
-        Some("run-one") => {
-            if let Err(error) = run_one(command_args) {
-                eprintln!("botster-hub run-one error: {error}");
-                process::exit(1);
-            }
-            return;
-        }
-        Some("help" | "--help" | "-h") => {
-            print_global_help();
-            return;
-        }
-        Some(command) => {
-            eprintln!("botster-hub {command} error: unknown command");
-            eprintln!("{}", usage_for(command));
-            process::exit(1);
-        }
-        None => {}
-    }
-
-    match boot_summary() {
-        Ok(config) => {
-            let runtime = HubRuntime::new(config);
-            let profile = host_profile();
-            let package_policy = default_package_policy();
-            println!(
-                "{} first-party host profile ready for {}: {} roles, {} core capability surfaces, {} package grants",
-                profile.id,
-                runtime.config().host.id,
-                profile.responsibilities().len(),
-                profile.capability_surfaces().len(),
-                package_policy.registry().granted_capabilities().len()
-            );
-            print_global_help();
-        }
+    match dispatch_command(&command, command_args) {
+        Ok(CommandOutcome::Completed | CommandOutcome::DaemonStopped) => {}
+        Ok(CommandOutcome::ForegroundAppExited { code, .. }) => process::exit(code),
         Err(error) => {
-            eprintln!("botster-hub config error: {error}");
+            eprintln!("botster-hub {command} error: {error}");
             process::exit(1);
         }
     }
 }
 
-fn boot_summary() -> Result<botster_hub::HubConfig, botster_hub::HubConfigError> {
-    let environment = RuntimeEnvironment::from_current_process();
-    build_default_config_for_runtime(&environment)
+fn should_open_operator_console(stdin_is_terminal: bool, stdout_is_terminal: bool) -> bool {
+    stdin_is_terminal && stdout_is_terminal
+}
+
+fn dispatch_command(command: &str, args: Vec<String>) -> Result<CommandOutcome, String> {
+    match command {
+        "start" => start_daemon(args)
+            .map(|()| CommandOutcome::Completed)
+            .map_err(|error| error.to_string()),
+        "up" => local_runtime_up(args)
+            .map(|()| CommandOutcome::Completed)
+            .map_err(|error| error.to_string()),
+        "down" => local_runtime_down(args)
+            .map(|()| CommandOutcome::DaemonStopped)
+            .map_err(|error| error.to_string()),
+        "doctor" => local_runtime_doctor(args)
+            .map(|()| CommandOutcome::Completed)
+            .map_err(|error| error.to_string()),
+        "smoke" => local_runtime_smoke(args)
+            .map(|()| CommandOutcome::Completed)
+            .map_err(|error| error.to_string()),
+        "status" => operator_status(args)
+            .map(|()| CommandOutcome::Completed)
+            .map_err(|error| error.to_string()),
+        "sessions" => operator_sessions(args)
+            .map(|()| CommandOutcome::Completed)
+            .map_err(|error| error.to_string()),
+        "session-templates" => operator_session_templates(args)
+            .map(|()| CommandOutcome::Completed)
+            .map_err(|error| error.to_string()),
+        "spawn-targets" => operator_spawn_targets(args)
+            .map(|()| CommandOutcome::Completed)
+            .map_err(|error| error.to_string()),
+        "context" => operator_context(args)
+            .map(|()| CommandOutcome::Completed)
+            .map_err(|error| error.to_string()),
+        "shutdown" => operator_shutdown(args)
+            .map(|()| CommandOutcome::DaemonStopped)
+            .map_err(|error| error.to_string()),
+        "mcp-serve" => mcp_serve(args)
+            .map(|()| CommandOutcome::Completed)
+            .map_err(|error| error.to_string()),
+        "open" => operator_open_alias(args).map_err(|error| error.to_string()),
+        "reload" => operator_reload_alias(args)
+            .map(|()| CommandOutcome::Completed)
+            .map_err(|error| error.to_string()),
+        "apps" => operator_apps(args).map_err(|error| error.to_string()),
+        "packages" => operator_packages(args, false)
+            .map(|()| CommandOutcome::Completed)
+            .map_err(|error| error.to_string()),
+        "providers" => operator_packages(args, true)
+            .map(|()| CommandOutcome::Completed)
+            .map_err(|error| error.to_string()),
+        "inspect" => operator_inspect(args)
+            .map(|()| CommandOutcome::Completed)
+            .map_err(|error| error.to_string()),
+        "run-one" => run_one(args)
+            .map(|()| CommandOutcome::Completed)
+            .map_err(|error| error.to_string()),
+        "help" | "--help" | "-h" => {
+            print_global_help();
+            Ok(CommandOutcome::Completed)
+        }
+        _ => Err(format!("unknown command\n{}", usage_for(command))),
+    }
+}
+
+fn run_operator_console() -> Result<(), String> {
+    let signals = operator_console::ConsoleSignals::install()
+        .map_err(|error| format!("install Ctrl-C handling: {error}"))?;
+    signals.begin_startup_or_inline();
+    let data_directory = DataDirectoryOption::RuntimeDefault
+        .resolve(&RuntimeEnvironment::from_current_process())
+        .map_err(|error| error.to_string())?;
+    let runtime =
+        prepare_operator_console_runtime(data_directory.clone()).map_err(console_start_error)?;
+    let daemon_state = match runtime.daemon_ownership {
+        LocalRuntimeDaemonOwnership::Started => "started",
+        LocalRuntimeDaemonOwnership::Reused => "reused",
+    };
+    operator_console::print_intro(&data_directory, daemon_state, &runtime.packages);
+    operator_console::run(
+        data_directory.clone(),
+        &signals,
+        |selector| resolve_console_app_mode(&runtime.config, selector),
+        |command, args| {
+            canonicalize_data_dir_args(command, args).map_err(|error| error.to_string())
+        },
+        dispatch_command,
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn console_start_error(error: LocalRuntimeError) -> String {
+    match error {
+        LocalRuntimeError::MissingSessionWorkerBinary(path) => format!(
+            "missing botster-session-worker binary at {}. Install the complete Botster distribution, or in a source checkout run `cargo build --locked -p botster-core --bin botster-session-worker` so the worker is beside botster-hub, then rerun `botster-hub`",
+            path.display()
+        ),
+        other => other.to_string(),
+    }
+}
+
+fn resolve_console_app_mode(
+    config: &botster_hub::HubConfig,
+    selector: &str,
+) -> Result<operator_console::CommandMode, String> {
+    let response = daemon_transport_request(config, DaemonRequest::ListApps)
+        .map_err(|error| error.to_string())?;
+    let app = resolve_app_selector(&response.apps, selector).map_err(|error| error.to_string())?;
+    if app.kind == "terminal_app" {
+        Ok(operator_console::CommandMode::Foreground)
+    } else {
+        Ok(operator_console::CommandMode::Inline)
+    }
 }
 
 fn stateful_command(command: &str) -> bool {
@@ -1241,6 +1224,12 @@ struct LocalRuntimeOutcome {
     web: RuntimeWebLaunch,
 }
 
+struct OperatorConsoleRuntime {
+    config: botster_hub::HubConfig,
+    daemon_ownership: LocalRuntimeDaemonOwnership,
+    packages: Vec<ConsolePackageState>,
+}
+
 struct SmokeRuntimeCleanup<'a> {
     outcome: &'a LocalRuntimeOutcome,
 }
@@ -1337,6 +1326,40 @@ fn prepare_local_runtime(
     })
 }
 
+fn prepare_operator_console_runtime(
+    data_directory: PathBuf,
+) -> Result<OperatorConsoleRuntime, LocalRuntimeError> {
+    std::fs::create_dir_all(&data_directory).map_err(|source| {
+        LocalRuntimeError::CreateDataDir {
+            path: data_directory.clone(),
+            source,
+        }
+    })?;
+    let hub_bin = env::current_exe().map_err(LocalRuntimeError::CurrentExe)?;
+    let options = LocalRuntimeOptions {
+        data_directory,
+        session_worker_bin: None,
+    };
+    let config = explicit_config(options.data_directory.clone())?;
+    let daemon_ownership = ensure_local_runtime_daemon(&hub_bin, &options, &config)?;
+    let mut started_runtime_cleanup = StartedRuntimeCleanup::new(&config, daemon_ownership);
+    let packages = daemon_transport_request(&config, DaemonRequest::ListPackages)?
+        .packages
+        .into_iter()
+        .map(|package| ConsolePackageState {
+            package_name: package.package_name,
+            state: package.state,
+        })
+        .collect();
+    started_runtime_cleanup.disarm();
+    drop(started_runtime_cleanup);
+    Ok(OperatorConsoleRuntime {
+        config,
+        daemon_ownership,
+        packages,
+    })
+}
+
 fn ensure_local_runtime_daemon(
     hub_bin: &Path,
     options: &LocalRuntimeOptions,
@@ -1385,6 +1408,16 @@ fn spawn_local_runtime_daemon(
         .arg(session_worker_bin)
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
+    unsafe {
+        // SAFETY: this hook runs in the daemon child after fork and only creates a new process
+        // group, keeping terminal-generated signals scoped away from the operator console.
+        command.pre_exec(|| {
+            if libc::setpgid(0, 0) == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
     let mut child = command
         .spawn()
         .map_err(|source| LocalRuntimeError::SpawnDaemon {
@@ -2420,7 +2453,7 @@ fn mcp_serve(args: Vec<String>) -> Result<(), McpCliError> {
     Ok(())
 }
 
-fn operator_open_alias(args: Vec<String>) -> Result<(), OperatorError> {
+fn operator_open_alias(args: Vec<String>) -> Result<CommandOutcome, OperatorError> {
     let Some(alias) = args.first() else {
         return Err(OperatorError::Usage("open"));
     };
@@ -2452,32 +2485,35 @@ fn operator_reload_alias(args: Vec<String>) -> Result<(), OperatorError> {
     )
 }
 
-fn operator_apps(args: Vec<String>) -> Result<(), OperatorError> {
+fn operator_apps(args: Vec<String>) -> Result<CommandOutcome, OperatorError> {
     let command = AppCommand::parse(args)?;
     match command.action {
         AppActionCommand::List => {
             let config = explicit_config(command.data_directory)?;
             let response = daemon_transport_request(&config, DaemonRequest::ListApps)?;
             print_apps(&response.apps);
-            Ok(())
+            Ok(CommandOutcome::Completed)
         }
         AppActionCommand::Show(selector) => {
             let config = explicit_config(command.data_directory)?;
             let response = daemon_transport_request(&config, DaemonRequest::ListApps)?;
             let app = resolve_app_selector(&response.apps, &selector)?;
             print_app_detail(app);
-            Ok(())
+            Ok(CommandOutcome::Completed)
         }
         AppActionCommand::Open(selector) => open_app_by_selector(command.data_directory, &selector),
     }
 }
 
-fn open_app_by_selector(data_directory: PathBuf, selector: &str) -> Result<(), OperatorError> {
+fn open_app_by_selector(
+    data_directory: PathBuf,
+    selector: &str,
+) -> Result<CommandOutcome, OperatorError> {
     let config = explicit_config(data_directory)?;
     let response = daemon_transport_request(&config, DaemonRequest::ListApps)?;
     let app = resolve_app_selector(&response.apps, selector)?.clone();
     match app.kind.as_str() {
-        "web_app" => open_web_app(&config, app),
+        "web_app" => open_web_app(&config, app).map(|()| CommandOutcome::Completed),
         "terminal_app" => open_terminal_app(&config, app),
         _ => Err(OperatorError::App(format!(
             "unsupported app kind {} for {}",
@@ -2524,7 +2560,10 @@ fn open_web_app(config: &botster_hub::HubConfig, app: DaemonApp) -> Result<(), O
     Ok(())
 }
 
-fn open_terminal_app(config: &botster_hub::HubConfig, app: DaemonApp) -> Result<(), OperatorError> {
+fn open_terminal_app(
+    config: &botster_hub::HubConfig,
+    app: DaemonApp,
+) -> Result<CommandOutcome, OperatorError> {
     if app.launch_mode != "foreground_stdio" {
         return Err(OperatorError::App(format!(
             "terminal_app {} must use foreground_stdio launch mode",
@@ -2546,7 +2585,8 @@ fn open_terminal_app(config: &botster_hub::HubConfig, app: DaemonApp) -> Result<
         },
     )?;
     if response.kind == DaemonResponseKind::OperatorError {
-        return print_daemon_response(response);
+        print_daemon_response(response)?;
+        return Ok(CommandOutcome::Completed);
     }
     let launch = response
         .resolved_app_launch
@@ -2559,15 +2599,35 @@ fn open_terminal_app(config: &botster_hub::HubConfig, app: DaemonApp) -> Result<
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
+    unsafe {
+        // SAFETY: this hook runs only in the foreground app child. Restoring SIGINT's default
+        // disposition lets Ctrl-C target the handed-off app while the console parent stays alive.
+        command.pre_exec(|| {
+            if libc::signal(libc::SIGINT, libc::SIG_DFL) == libc::SIG_ERR {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
     let status = command.status().map_err(OperatorError::SpawnApp)?;
     if let Some(code) = status.code() {
         if code == 0 {
-            Ok(())
+            Ok(CommandOutcome::Completed)
         } else {
-            process::exit(code);
+            Ok(CommandOutcome::ForegroundAppExited {
+                code,
+                description: format!("exited with code {code}"),
+            })
         }
     } else {
-        process::exit(1);
+        let signal = status.signal();
+        Ok(CommandOutcome::ForegroundAppExited {
+            code: 1,
+            description: signal.map_or_else(
+                || "terminated without an exit code".to_string(),
+                |signal| format!("terminated by signal {signal}"),
+            ),
+        })
     }
 }
 
@@ -4973,7 +5033,13 @@ fn print_global_help() {
 fn usage_for(command: &str) -> &'static str {
     match command {
         "global" => {
-            "usage: botster-hub <command> [args...]
+            "usage: botster-hub [<command> [args...]]
+
+Interactive operator console:
+  botster-hub
+    Starts or reuses the resolved local daemon when stdin/stdout are terminals.
+    Use exit or Ctrl-D to detach; use down to stop the daemon.
+    Noninteractive callers must use an explicit command.
 
 Daily runtime commands:
   botster-hub up [--data-dir <path>] [...]
@@ -5274,6 +5340,14 @@ mod cli_data_dir_tests {
 
     fn environment() -> RuntimeEnvironment {
         RuntimeEnvironment::from_values(None, Some(PathBuf::from("/tmp/botster-cli-home")))
+    }
+
+    #[test]
+    fn operator_console_requires_terminal_stdin_and_stdout() {
+        assert!(should_open_operator_console(true, true));
+        assert!(!should_open_operator_console(true, false));
+        assert!(!should_open_operator_console(false, true));
+        assert!(!should_open_operator_console(false, false));
     }
 
     #[test]
