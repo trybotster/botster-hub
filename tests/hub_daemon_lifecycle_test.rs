@@ -2346,6 +2346,16 @@ impl OperatorConsolePty {
         self.writer.flush().expect("flush operator console input");
     }
 
+    fn send_and_wait_for_prompt(&mut self, bytes: &[u8]) {
+        let expected = self.prompt_count() + 1;
+        self.send(bytes);
+        self.wait_for_occurrences("botster-hub> ", expected);
+    }
+
+    fn prompt_count(&self) -> usize {
+        self.text().matches("botster-hub> ").count()
+    }
+
     fn wait_for(&self, needle: &str) {
         self.wait_for_occurrences(needle, 1);
     }
@@ -10743,7 +10753,7 @@ fn cli_operator_console_starts_reuses_detaches_handles_ctrl_c_and_stops() {
     let web_package_dir = unique_short_test_dir("console-web-package").join("web package");
     write_botster_tui_package_with_script(
         &package_dir,
-        "printf 'console-terminal-failure\\n'; exit 7",
+        "stty raw -echo; printf 'console-terminal-failure\\r\\n'; exit 7",
     );
     write_botster_web_package(&web_package_dir);
     let web_manifest_path = web_package_dir.join("botster-package.json");
@@ -10771,7 +10781,7 @@ fn cli_operator_console_starts_reuses_detaches_handles_ctrl_c_and_stops() {
     first.wait_for("daemon=started");
     first.wait_for("prerequisite botster-web=missing");
     first.wait_for("botster-hub> ");
-    first.send(
+    first.send_and_wait_for_prompt(
         format!(
             "packages install --path {}\n",
             shell_words::quote(&package_dir.to_string_lossy())
@@ -10779,18 +10789,24 @@ fn cli_operator_console_starts_reuses_detaches_handles_ctrl_c_and_stops() {
         .as_bytes(),
     );
     first.wait_for("decision=package");
-    first.wait_for_occurrences("botster-hub> ", 2);
-    first.send(b"packages enable botster-tui\n");
+    first.send_and_wait_for_prompt(b"packages enable botster-tui\n");
     first.wait_for("state=enabled");
-    first.wait_for_occurrences("botster-hub> ", 3);
-    first.send(b"apps list\n");
+    first.send_and_wait_for_prompt(b"packages list\n");
+    first.wait_for("response=packages");
+    first.send_and_wait_for_prompt(b"packages show botster-tui\n");
+    first.wait_for("package_name=botster-tui");
+    first.send_and_wait_for_prompt(b"sessions spawn --session-id console-sentinel -- sleep 300\n");
+    first.wait_for("session_id=console-sentinel");
+    first.send_and_wait_for_prompt(b"sessions list\n");
+    first.wait_for("session id=console-sentinel lifecycle=running");
+    first.send_and_wait_for_prompt(b"apps list\n");
     first.wait_for("response=apps");
     first.wait_for("kind=terminal_app");
-    first.wait_for_occurrences("botster-hub> ", 4);
-    first.send(b"apps open botster-tui\n");
+    first.send_and_wait_for_prompt(b"open tui\n");
     first.wait_for("console-terminal-failure");
     first.wait_for("foreground app exited with code 7");
-    first.wait_for_occurrences("botster-hub> ", 5);
+    first.send_and_wait_for_prompt(b"status\r");
+    first.wait_for("event=status");
     let explicit_open = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
         .arg("apps")
         .arg("open")
@@ -10805,15 +10821,28 @@ fn cli_operator_console_starts_reuses_detaches_handles_ctrl_c_and_stops() {
         "explicit CLI did not preserve foreground app exit code: {}",
         command_output_text(&explicit_open)
     );
-    write_botster_tui_package_with_script(&package_dir, "printf 'foreground-ready\\n'; sleep 30");
-    first.send(b"packages reload botster-tui\n");
+    write_botster_tui_package_with_script(
+        &package_dir,
+        "stty raw -echo; printf 'foreground-clean\\r\\n'; exit 0",
+    );
+    first.send_and_wait_for_prompt(b"packages reload botster-tui\n");
     first.wait_for("action=reload");
-    first.wait_for_occurrences("botster-hub> ", 6);
+    first.send_and_wait_for_prompt(b"apps open botster-tui\n");
+    first.wait_for("foreground-clean");
+    first.send_and_wait_for_prompt(b"status\r");
+    first.wait_for("event=status");
+    write_botster_tui_package_with_script(
+        &package_dir,
+        "stty raw -echo; stty isig; printf 'foreground-ready\\r\\n'; sleep 300",
+    );
+    first.send_and_wait_for_prompt(b"packages reload botster-tui\n");
+    first.wait_for("action=reload");
+    let prompt_after_foreground_interrupt = first.prompt_count() + 1;
     first.send(b"apps open botster-tui\n");
     first.wait_for("foreground-ready");
     first.send(&[3]);
     first.wait_for_occurrences("foreground app ", 2);
-    first.wait_for_occurrences("botster-hub> ", 7);
+    first.wait_for_occurrences("botster-hub> ", prompt_after_foreground_interrupt);
     assert!(
         !first
             .text()
@@ -10821,7 +10850,9 @@ fn cli_operator_console_starts_reuses_detaches_handles_ctrl_c_and_stops() {
         "foreground Ctrl-C was handled as inline console work: {}",
         first.text()
     );
-    first.send(
+    first.send_and_wait_for_prompt(b"sessions list\r");
+    first.wait_for("session id=console-sentinel lifecycle=running");
+    first.send_and_wait_for_prompt(
         format!(
             "packages install --path {}\n",
             shell_words::quote(&web_package_dir.to_string_lossy())
@@ -10829,23 +10860,43 @@ fn cli_operator_console_starts_reuses_detaches_handles_ctrl_c_and_stops() {
         .as_bytes(),
     );
     first.wait_for_occurrences("package_name=botster-web", 1);
-    first.wait_for_occurrences("botster-hub> ", 8);
-    first.send(b"packages enable botster-web\n");
+    first.send_and_wait_for_prompt(b"packages enable botster-web\n");
     first.wait_for_occurrences("package_name=botster-web", 2);
-    first.wait_for_occurrences("botster-hub> ", 9);
+    let prompt_after_inline_interrupt = first.prompt_count() + 1;
     first.send(b"up\n");
     thread::sleep(Duration::from_millis(100));
     first.send(&[3]);
     first.wait_for("interrupt requested; finishing safely");
     first.wait_for("runtime=ready");
-    first.wait_for_occurrences("botster-hub> ", 10);
+    first.wait_for_occurrences("botster-hub> ", prompt_after_inline_interrupt);
+    first.send_and_wait_for_prompt(b"open web\n");
+    first.wait_for("app_url=http://");
+    first.send_and_wait_for_prompt(b"sessions list\n");
+    first.wait_for("session id=console-sentinel lifecycle=running");
+    let prompt_after_idle_interrupt = first.prompt_count() + 1;
     first.send(b"partial input");
     first.send(&[3]);
     first.wait_for("^C");
-    first.wait_for_occurrences("botster-hub> ", 11);
-    first.send(b"status\n");
+    first.wait_for_occurrences("botster-hub> ", prompt_after_idle_interrupt);
+    first.send_and_wait_for_prompt(b"sessions list\n");
+    first.wait_for("session id=console-sentinel lifecycle=running");
+    first.send_and_wait_for_prompt(b"botster-hub status\n");
+    first.wait_for("omit the repeated `botster-hub` prefix");
+    first.send_and_wait_for_prompt(b"packages list \"unterminated\n");
+    first.wait_for("console parse error");
+    first.send_and_wait_for_prompt(b"status --data-dir /tmp/not-this-console\n");
+    first.wait_for("this console is pinned to");
+    first.send_and_wait_for_prompt(b"not-a-command\n");
+    first.wait_for(
+        format!(
+            "run `botster-hub not-a-command --data-dir {}` outside the console",
+            data_dir.display()
+        )
+        .as_str(),
+    );
+    first.send_and_wait_for_prompt(b"status\n");
     first.wait_for("event=status");
-    first.send(b"exit\n");
+    first.send(&[4]);
     first.wait_for("detached=daemon_running");
     first.wait_for_exit();
 
@@ -10861,20 +10912,38 @@ fn cli_operator_console_starts_reuses_detaches_handles_ctrl_c_and_stops() {
         command_output_text(&status)
     );
 
-    let mut eof_console = OperatorConsolePty::spawn(&data_dir);
-    eof_console.wait_for("daemon=reused");
-    eof_console.wait_for("botster-hub> ");
-    eof_console.send(&[4]);
-    eof_console.wait_for("detached=daemon_running");
-    eof_console.wait_for_exit();
+    let mut exit_console = OperatorConsolePty::spawn(&data_dir);
+    exit_console.wait_for("daemon=reused");
+    exit_console.wait_for("botster-hub> ");
+    exit_console.send(b"exit\n");
+    exit_console.wait_for("detached=daemon_running");
+    exit_console.wait_for_exit();
 
     let mut second = OperatorConsolePty::spawn(&data_dir);
     second.wait_for("daemon=reused");
     second.wait_for("botster-hub> ");
-    second.send(b"down\n");
+    second.send(b"shutdown\n");
     second.wait_for("response=shutdown");
     second.wait_for_exit();
 
+    let stopped = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("status")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .output()
+        .expect("query daemon after console down");
+    assert!(
+        !stopped.status.success(),
+        "console shutdown left daemon running: {}",
+        command_output_text(&stopped)
+    );
+
+    let mut third = OperatorConsolePty::spawn(&data_dir);
+    third.wait_for("daemon=started");
+    third.wait_for("botster-hub> ");
+    third.send(b"down\n");
+    third.wait_for("response=shutdown");
+    third.wait_for_exit();
     let stopped = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
         .arg("status")
         .arg("--data-dir")

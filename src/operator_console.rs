@@ -111,8 +111,11 @@ pub(crate) fn command_action(words: &[String]) -> ConsoleAction {
         "sessions" if words.get(1).map(String::as_str) == Some("attach") => {
             ConsoleAction::Command(CommandMode::ExternalOnly)
         }
+        "open" if words.get(1).map(String::as_str) == Some("web") => ConsoleAction::Command(
+            CommandMode::ResolveApp("botster-web/web-client".to_string()),
+        ),
         "open" if words.get(1).map(String::as_str) == Some("tui") => {
-            ConsoleAction::Command(CommandMode::Foreground)
+            ConsoleAction::Command(CommandMode::ResolveApp("botster-tui".to_string()))
         }
         "open" => ConsoleAction::Command(CommandMode::Inline),
         "apps" if words.get(1).map(String::as_str) == Some("open") && words.get(2).is_some() => {
@@ -326,7 +329,15 @@ pub(crate) fn run(
                 } else {
                     signals.begin_startup_or_inline();
                 }
+                let mut saved_terminal_mode = if mode == CommandMode::Foreground {
+                    Some(SavedTerminalMode::capture(stdin_fd)?)
+                } else {
+                    None
+                };
                 let result = dispatch(&command, args);
+                if let Some(saved_terminal_mode) = saved_terminal_mode.as_mut() {
+                    saved_terminal_mode.restore()?;
+                }
                 signals.begin_idle();
                 match result {
                     Ok(CommandOutcome::Completed) => {}
@@ -337,6 +348,66 @@ pub(crate) fn run(
                     Err(error) => eprintln!("botster-hub {command} error: {error}"),
                 }
                 print_prompt()?;
+            }
+        }
+    }
+}
+
+struct SavedTerminalMode {
+    fd: libc::c_int,
+    original: Option<libc::termios>,
+}
+
+impl SavedTerminalMode {
+    fn capture(fd: libc::c_int) -> io::Result<Self> {
+        if unsafe {
+            // SAFETY: isatty only inspects the borrowed file descriptor.
+            libc::isatty(fd)
+        } != 1
+        {
+            return Ok(Self { fd, original: None });
+        }
+
+        let mut original = std::mem::MaybeUninit::<libc::termios>::uninit();
+        if unsafe {
+            // SAFETY: original points to writable termios storage and fd remains borrowed.
+            libc::tcgetattr(fd, original.as_mut_ptr())
+        } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self {
+            fd,
+            original: Some(unsafe {
+                // SAFETY: tcgetattr initialized original after returning success.
+                original.assume_init()
+            }),
+        })
+    }
+
+    fn restore(&mut self) -> io::Result<()> {
+        let Some(original) = self.original.as_ref() else {
+            return Ok(());
+        };
+        if unsafe {
+            // SAFETY: original is initialized and fd remains borrowed by the console.
+            libc::tcsetattr(self.fd, libc::TCSADRAIN, original)
+        } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        self.original = None;
+        Ok(())
+    }
+}
+
+impl Drop for SavedTerminalMode {
+    fn drop(&mut self) {
+        if let Some(original) = self.original.as_ref() {
+            unsafe {
+                // SAFETY: best-effort unwind restoration uses initialized attributes and a
+                // borrowed descriptor that remains open for the lifetime of the console.
+                libc::tcsetattr(self.fd, libc::TCSADRAIN, original);
             }
         }
     }
@@ -395,8 +466,14 @@ mod tests {
             ("context", CommandMode::Inline),
             ("shutdown", CommandMode::Stop),
             ("mcp-serve", CommandMode::ExternalOnly),
-            ("open web", CommandMode::Inline),
-            ("open tui", CommandMode::Foreground),
+            (
+                "open web",
+                CommandMode::ResolveApp("botster-web/web-client".to_string()),
+            ),
+            (
+                "open tui",
+                CommandMode::ResolveApp("botster-tui".to_string()),
+            ),
             ("reload pkg", CommandMode::Inline),
             ("apps list", CommandMode::Inline),
             (
@@ -433,5 +510,26 @@ mod tests {
             "--",
             "--data-dir"
         ])));
+    }
+
+    #[test]
+    fn external_only_commands_render_exact_explicit_invocations() {
+        for (line, expected) in [
+            ("start", "botster-hub start"),
+            ("mcp-serve", "botster-hub mcp-serve"),
+            (
+                "sessions attach sentinel",
+                "botster-hub sessions attach sentinel",
+            ),
+            ("inspect sentinel", "botster-hub inspect sentinel"),
+            ("run-one --once", "botster-hub run-one --once"),
+        ] {
+            let parsed = parse_line(line).expect("parse external-only command");
+            assert_eq!(
+                exact_external_invocation(&parsed, |_command, args| Ok(args)),
+                expected,
+                "{line}"
+            );
+        }
     }
 }
