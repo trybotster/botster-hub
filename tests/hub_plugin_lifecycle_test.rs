@@ -97,7 +97,7 @@ fn explicit_runtime() -> HubRuntime {
         },
         ..HubStartupOptions::default()
     }
-    .build_config_for_environment(&RuntimeEnvironment::from_values(None, None, None))
+    .build_config_for_environment(&RuntimeEnvironment::from_values(None, None))
     .expect("explicit runtime config should build");
 
     HubRuntime::new(config)
@@ -350,7 +350,7 @@ fn local_package_install_persist_enable_prepare_and_load_crosses_core_worker() {
         data_directory: DataDirectoryOption::Explicit(data_root),
         ..HubStartupOptions::default()
     }
-    .build_config_for_environment(&RuntimeEnvironment::from_values(None, None, None))
+    .build_config_for_environment(&RuntimeEnvironment::from_values(None, None))
     .expect("explicit state config should build");
     let store = FileHubStateStore::for_data_directory(&config.data_directory);
     let state = store

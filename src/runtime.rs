@@ -1510,7 +1510,7 @@ mod tests {
             transports: TransportBindings::default(),
             ..HubStartupOptions::default()
         }
-        .build_config_for_environment(&RuntimeEnvironment::from_values(None, None, None))
+        .build_config_for_environment(&RuntimeEnvironment::from_values(None, None))
         .expect("runtime config should build");
 
         let core_config = core_daemon_config(&config);
