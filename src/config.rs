@@ -561,7 +561,7 @@ mod tests {
     fn runtime_data_dir_resolution_uses_injected_env() {
         let explicit = RuntimeEnvironment::from_values(
             Some(PathBuf::from("/tmp/botster-env")),
-            Some(PathBuf::from("/tmp/home")),
+            Some(PathBuf::from("/tmp/botster-fixture-home")),
         );
         assert_eq!(
             DataDirectoryOption::RuntimeDefault
@@ -570,12 +570,13 @@ mod tests {
             PathBuf::from("/tmp/botster-env")
         );
 
-        let home = RuntimeEnvironment::from_values(None, Some(PathBuf::from("/tmp/home")));
+        let home =
+            RuntimeEnvironment::from_values(None, Some(PathBuf::from("/tmp/botster-fixture-home")));
         assert_eq!(
             DataDirectoryOption::RuntimeDefault
                 .resolve(&home)
                 .expect("resolve home env"),
-            PathBuf::from("/tmp/home/.botster/hub")
+            PathBuf::from("/tmp/botster-fixture-home/.botster/hub")
         );
 
         let missing = RuntimeEnvironment::from_values(None, None);

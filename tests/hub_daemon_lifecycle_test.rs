@@ -4080,11 +4080,73 @@ fn cli_daily_commands_share_canonical_default_data_directory() {
             command_output_text(&output)
         );
     }
-    let mcp = run_daily("mcp-serve", &[]);
+    for (command, args, usage) in [
+        (
+            "packages",
+            &["list", "--registry", "/tmp/ignored"][..],
+            "packages list",
+        ),
+        ("providers", &["list", "extra"][..], "providers list"),
+        ("apps", &["list", "extra"][..], "apps list"),
+        ("sessions", &["list", "extra"][..], "sessions list"),
+        (
+            "session-templates",
+            &["list", "extra"][..],
+            "session-templates list",
+        ),
+        (
+            "spawn-targets",
+            &["list", "extra"][..],
+            "spawn-targets list",
+        ),
+        ("shutdown", &["extra"][..], "shutdown"),
+        ("mcp-serve", &["extra"][..], "mcp-serve"),
+    ] {
+        let output = run_daily(command, args);
+        assert!(
+            !output.status.success(),
+            "{command} silently accepted extra operands: {}",
+            command_output_text(&output)
+        );
+        assert!(
+            command_output_text(&output).contains(&format!("usage: botster-hub {usage}")),
+            "{command} did not report its usage: {}",
+            command_output_text(&output)
+        );
+    }
+    let mut mcp_child = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .current_dir(&other_checkout)
+        .env("HOME", &home)
+        .env("XDG_DATA_HOME", &xdg)
+        .env_remove("BOTSTER_HUB_DATA_DIR")
+        .arg("mcp-serve")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn default mcp-serve");
+    mcp_child
+        .stdin
+        .as_mut()
+        .expect("mcp stdin")
+        .write_all(
+            br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}"#,
+        )
+        .expect("write MCP initialize");
+    mcp_child
+        .stdin
+        .take()
+        .expect("close mcp stdin after initialize");
+    let mcp = mcp_child.wait_with_output().expect("wait for mcp-serve");
     assert!(
         mcp.status.success(),
         "mcp-serve without --data-dir failed: {}",
         command_output_text(&mcp)
+    );
+    let mcp_stdout = String::from_utf8(mcp.stdout).expect("MCP output is UTF-8");
+    assert!(
+        mcp_stdout.contains(r#""protocolVersion":"2025-06-18""#),
+        "mcp-serve did not answer initialize through the shared daemon root: {mcp_stdout}"
     );
 
     let doctor = run_daily("doctor", &[]);
@@ -4326,6 +4388,76 @@ fn cli_home_runtime_up_recovers_owned_incompatible_daemon() {
 }
 
 #[test]
+fn cli_home_runtime_start_does_not_reuse_dead_pid_metadata_and_rebinds_leftover_socket() {
+    let _guard = daemon_test_guard();
+    let home = unique_short_test_dir("cli-home-dead-metadata");
+    let data_dir = home.join(".botster/hub");
+    fs::create_dir_all(&data_dir).expect("create home runtime data directory");
+    let socket_path = explicit_config(&data_dir)
+        .transports
+        .local_socket
+        .as_ref()
+        .expect("home runtime socket binding")
+        .path
+        .clone();
+    let stale_listener = UnixListener::bind(&socket_path).expect("bind leftover socket fixture");
+    drop(stale_listener);
+
+    let mut exited = Command::new("true")
+        .spawn()
+        .expect("spawn dead pid fixture");
+    let dead_pid = exited.id();
+    assert!(exited.wait().expect("wait for dead pid fixture").success());
+    assert!(!process_exists(dead_pid), "fixture pid must be dead");
+    write_local_runtime_daemon_metadata(&data_dir, dead_pid);
+
+    ensure_session_worker_binary();
+    let mut daemon = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .env("HOME", &home)
+        .env_remove("BOTSTER_HUB_DATA_DIR")
+        .env_remove("XDG_DATA_HOME")
+        .arg("start")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start home runtime with stale dead-pid metadata");
+    wait_for_status(&data_dir, &mut daemon);
+
+    let stale_metadata: serde_json::Value = serde_json::from_slice(
+        &fs::read(data_dir.join(".botster-hub-runtime-daemon.json"))
+            .expect("read stale daemon metadata"),
+    )
+    .expect("parse stale daemon metadata");
+    assert_eq!(stale_metadata["pid"].as_u64(), Some(dead_pid as u64));
+    assert_ne!(daemon.id(), dead_pid, "start must not reuse the dead pid");
+    assert!(
+        process_exists(daemon.id()),
+        "replacement daemon must remain alive after readiness"
+    );
+    assert!(
+        socket_path.exists(),
+        "replacement daemon must own the canonical home socket"
+    );
+
+    let shutdown = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .env("HOME", &home)
+        .env_remove("BOTSTER_HUB_DATA_DIR")
+        .env_remove("XDG_DATA_HOME")
+        .arg("shutdown")
+        .output()
+        .expect("shut down replacement home runtime");
+    assert!(
+        shutdown.status.success(),
+        "replacement shutdown failed: {}",
+        command_output_text(&shutdown)
+    );
+    assert!(
+        daemon.wait().expect("reap replacement daemon").success(),
+        "replacement daemon should exit cleanly"
+    );
+}
+
+#[test]
 fn cli_local_runtime_down_recovers_owned_incompatible_daemon() {
     let _guard = daemon_test_guard();
     let data_dir = unique_short_test_dir("cli-down-owned-incompat");
@@ -4484,7 +4616,8 @@ fn cli_local_runtime_up_refuses_unowned_incompatible_daemon() {
 #[test]
 fn cli_local_runtime_refuses_forged_metadata_for_live_non_botster_pid() {
     let _guard = daemon_test_guard();
-    let data_dir = unique_short_test_dir("cli-forged-pid-incompat");
+    let home = unique_short_test_dir("cli-home-forged-pid-incompat");
+    let data_dir = home.join(".botster/hub");
     let config = explicit_config(&data_dir);
     let socket_path = config
         .transports
@@ -4514,9 +4647,10 @@ fn cli_local_runtime_refuses_forged_metadata_for_live_non_botster_pid() {
     write_local_runtime_daemon_metadata(&data_dir, decoy.id());
 
     let output = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .env("HOME", &home)
+        .env_remove("BOTSTER_HUB_DATA_DIR")
+        .env_remove("XDG_DATA_HOME")
         .arg("up")
-        .arg("--data-dir")
-        .arg(&data_dir)
         .output()
         .expect("run botster-hub up against forged daemon metadata");
     assert!(
@@ -4534,9 +4668,10 @@ fn cli_local_runtime_refuses_forged_metadata_for_live_non_botster_pid() {
     );
 
     let down = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .env("HOME", &home)
+        .env_remove("BOTSTER_HUB_DATA_DIR")
+        .env_remove("XDG_DATA_HOME")
         .arg("down")
-        .arg("--data-dir")
-        .arg(&data_dir)
         .output()
         .expect("run botster-hub down against forged daemon metadata");
     assert!(

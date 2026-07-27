@@ -2021,6 +2021,9 @@ fn operator_session_templates(args: Vec<String>) -> Result<(), OperatorError> {
     match action {
         "list" => {
             let options = DataArgs::parse(args[1..].to_vec(), "session-templates list")?;
+            if !options.arguments.is_empty() {
+                return Err(OperatorError::Usage("session-templates list"));
+            }
             let config = explicit_config(options.data_directory)?;
             let response = daemon_transport_request(&config, DaemonRequest::ListSessionTemplates)?;
             print_daemon_response(response)?;
@@ -2084,6 +2087,9 @@ fn operator_spawn_targets(args: Vec<String>) -> Result<(), OperatorError> {
     match action {
         "list" => {
             let options = DataArgs::parse(args[1..].to_vec(), "spawn-targets list")?;
+            if !options.arguments.is_empty() {
+                return Err(OperatorError::Usage("spawn-targets list"));
+            }
             let config = explicit_config(options.data_directory)?;
             print_daemon_response(daemon_transport_request(
                 &config,
@@ -2258,10 +2264,9 @@ fn required_arg(
 }
 
 fn operator_context(args: Vec<String>) -> Result<(), OperatorError> {
-    let data_dir = env::var("BOTSTER_HUB_DATA_DIR").ok().map(PathBuf::from);
     let session_id = env::var("BOTSTER_SESSION_ID").ok();
     let context_id = env::var("BOTSTER_CONTEXT_ID").ok();
-    let mut data_directory = data_dir;
+    let mut data_directory = None;
     let mut requested_session_id = session_id;
     let mut requested_context_id = context_id;
     let mut key = None;
@@ -2394,6 +2399,9 @@ fn parse_session_template_request(
 
 fn operator_shutdown(args: Vec<String>) -> Result<(), OperatorError> {
     let options = DataArgs::parse(args, "shutdown")?;
+    if !options.arguments.is_empty() {
+        return Err(OperatorError::Usage("shutdown"));
+    }
     let config = explicit_config(options.data_directory)?;
     let response = daemon_transport_request(&config, DaemonRequest::DaemonShutdown)?;
     print_daemon_response(response)?;
@@ -2402,6 +2410,9 @@ fn operator_shutdown(args: Vec<String>) -> Result<(), OperatorError> {
 
 fn mcp_serve(args: Vec<String>) -> Result<(), McpCliError> {
     let options = DataArgs::parse(args, "mcp-serve")?;
+    if !options.arguments.is_empty() {
+        return Err(OperatorError::Usage("mcp-serve").into());
+    }
     let config = explicit_config(options.data_directory)?;
     let stdin = io::stdin();
     let stdout = io::stdout();
@@ -3610,7 +3621,10 @@ impl DataArgs {
         let mut arguments = Vec::new();
         let mut cursor = 0;
         while cursor < args.len() {
-            if args[cursor] == "--data-dir" {
+            if args[cursor] == "--" {
+                arguments.extend(args[cursor..].iter().cloned());
+                break;
+            } else if args[cursor] == "--data-dir" {
                 if data_directory.is_some() {
                     return Err(OperatorError::Usage(command));
                 }
@@ -3828,6 +3842,9 @@ impl SessionCommand {
         match action {
             "list" => {
                 let options = DataArgs::parse(args[1..].to_vec(), "sessions list")?;
+                if !options.arguments.is_empty() {
+                    return Err(OperatorError::Usage("sessions list"));
+                }
                 Ok(Self {
                     data_directory: options.data_directory,
                     action: SessionAction::List,
@@ -3980,6 +3997,9 @@ impl AppCommand {
         match action {
             "list" => {
                 let options = DataArgs::parse(args[1..].to_vec(), "apps list")?;
+                if !options.arguments.is_empty() {
+                    return Err(OperatorError::Usage("apps list"));
+                }
                 Ok(Self {
                     data_directory: options.data_directory,
                     action: AppActionCommand::List,
@@ -4076,7 +4096,15 @@ impl PackageCommand {
 
         match action {
             "list" => {
-                let options = DataArgs::parse(args[1..].to_vec(), "packages list")?;
+                let command = if providers_only {
+                    "providers list"
+                } else {
+                    "packages list"
+                };
+                let options = DataArgs::parse(args[1..].to_vec(), command)?;
+                if !options.arguments.is_empty() {
+                    return Err(OperatorError::Usage(command));
+                }
                 Ok(Self {
                     data_directory: options.data_directory,
                     action: PackageActionCommand::List,
@@ -5297,7 +5325,7 @@ mod cli_data_dir_tests {
             ],
             &RuntimeEnvironment::from_values(
                 Some(PathBuf::from("/tmp/environment")),
-                Some(PathBuf::from("/tmp/home")),
+                Some(PathBuf::from("/tmp/botster-fixture-home")),
             ),
         )
         .expect("resolve explicit data directory");
@@ -5312,7 +5340,7 @@ mod cli_data_dir_tests {
             Vec::new(),
             &RuntimeEnvironment::from_values(
                 Some(PathBuf::from("/tmp/environment")),
-                Some(PathBuf::from("/tmp/home")),
+                Some(PathBuf::from("/tmp/botster-fixture-home")),
             ),
         )
         .expect("resolve environment data directory");
@@ -5362,6 +5390,28 @@ mod cli_data_dir_tests {
                 "printf",
                 "--data-dir"
             ]
+        );
+    }
+
+    #[test]
+    fn thin_data_args_parser_also_stops_at_operand_separator() {
+        let parsed = DataArgs::parse(
+            vec![
+                "--data-dir".to_string(),
+                "/tmp/explicit".to_string(),
+                "--".to_string(),
+                "--data-dir".to_string(),
+                "/tmp/operand".to_string(),
+            ],
+            "test",
+        )
+        .expect("parse explicit data directory and operand tail");
+
+        assert_eq!(parsed.data_directory, PathBuf::from("/tmp/explicit"));
+        assert_eq!(
+            parsed.arguments,
+            ["--", "--data-dir", "/tmp/operand"],
+            "operand-tail tokens must not be consumed as CLI options"
         );
     }
 

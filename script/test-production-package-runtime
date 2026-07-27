@@ -197,7 +197,6 @@ redact_file() {
     '<project-pipelines-repo>='"$project_pipelines_repo" \
     '<runtime-root>='"$runtime_root" \
     '<evidence-dir>='"$evidence_dir" \
-    '<fixture-home>=/tmp/home' \
     '<home>='"$HOME"
 }
 
@@ -838,7 +837,9 @@ for sibling in plugins agents lua profiles shared workspaces; do
     "$evidence_dir/operator-botster-$sibling-state-after.json"
 done
 
-capture_in committed-diff "$hub_repo" git show --format= --no-ext-diff HEAD
+capture_in committed-diff "$hub_repo" sh -c \
+  'git diff --no-ext-diff "$1...$2" | sed -n "/^+/p"' \
+  sh "$pre_cutover_hub_revision" "$hub_revision"
 refresh_command_log
 "$evidence_helper" pii-scan "$evidence_dir/pii-scan.json" "$evidence_dir"
 echo "production_package_runtime=pass"

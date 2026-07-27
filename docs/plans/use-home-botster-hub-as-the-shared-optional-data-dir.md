@@ -115,6 +115,9 @@ branch remains.
 - No scanning of `$HOME/.botster/{plugins,agents,lua,profiles,shared,workspaces}`.
 - No broad `src/main.rs` cleanup beyond parser/default/remediation code made
   obsolete by this ticket.
+- `run-one` remains an explicit-data-dir scrubbed smoke path. It must not
+  default to the operator's shared runtime root because it writes one-shot
+  diagnostic state; the living contract is documented in `README.md`.
 - No mutation of the developer's real home directory in tests or manual proof.
 - Mechanical updates required by removing the public
   `RuntimeEnvironment::from_values` XDG parameter are in scope even outside
@@ -275,7 +278,7 @@ branch remains.
 - Resolver unit tests in `src/config.rs` prove:
   - `--data-dir` selection wins before config construction;
   - `BOTSTER_HUB_DATA_DIR` wins over `HOME`;
-  - plain `HOME=/tmp/home` resolves `/tmp/home/.botster/hub`;
+  - plain `HOME=/tmp/botster-fixture-home` resolves `/tmp/botster-fixture-home/.botster/hub`;
   - `XDG_DATA_HOME` has no effect;
   - missing CLI/env/home returns a typed error;
   - plugin/provider defaults are children of the resolved `hub` root only.
