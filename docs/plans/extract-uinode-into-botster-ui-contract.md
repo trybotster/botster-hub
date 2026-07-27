@@ -108,6 +108,11 @@ unless this ticket explicitly replaces that behavior. This is extraction plus
 the cohesive dialog/action/presentation contract below, not an opportunity to
 rename primitives or redesign unrelated props.
 
+The replacement model is an explicit cold switch: remove `UiTreeUpdateRef` and
+`UiActionResult.tree_update` rather than carrying the opaque patch/replacement
+reference beside the new direct replacement tree. The new accepted-result
+field is the sole tree replacement path.
+
 ### 2. Define the cross-client interaction contract coherently
 
 Implement these semantics as typed Rust values with matching wire
@@ -142,13 +147,16 @@ discriminants, TypeScript declarations, schema, and fixtures:
 
 Use one canonical action request/result envelope everywhere. Do not add legacy
 field aliases, a second action enum, `action_id + payload` fallback decoding,
-or Hub-local mirror structs.
+the removed `UiTreeUpdateRef`/`tree_update` fields, or Hub-local mirror structs.
 
 ### 3. Cold-switch the Hub and daemon protocol
 
 - Change `src/runtime.rs` to deserialize and validate plugin trees and action
   results through `botster-ui-contract`, then pass the canonical
-  `UiActionRequest` JSON to the owning plugin worker.
+  `UiActionRequest` JSON to the owning plugin worker. This is an intentional
+  plugin-worker ABI change: handlers receive the full request envelope and
+  must read form drafts from `arguments.values` and non-form metadata from
+  `arguments.payload`, not flat legacy arguments.
 - Change `src/client_api.rs` so plugin action routing accepts the canonical
   request rather than separate action id and arbitrary payload fields.
 - Change `crates/botster-hub-client` and `src/daemon_transport.rs` so
@@ -167,7 +175,14 @@ Because request semantics change, implementation must intentionally advance
 the daemon protocol version. If shared fixture bytes change, allocate a
 conformance revision above every already published meaning; do not assume 19
 until registry/release history is rechecked. Derive compatibility and support
-matrix values from the source constants.
+matrix values from the source constants and regenerate
+`first-party-client-support-matrix.json`.
+
+This is a deliberate pre-production flag day. Clients pinned to protocol 3 or
+`@trybotster/hub-test-support@0.1.11` will correctly report a compatibility
+mismatch after the new Hub lands until their routed adoption tickets consume
+the new artifacts. Required landing order is: Hub producer; TUI kit; TUI and
+Web plus plugin adopters; Core removal; final integration.
 
 ### 4. Generate the standalone TypeScript contract and shared fixtures
 
@@ -191,11 +206,17 @@ Update `botster-hub-client`'s generated daemon protocol to import the UI types
 from `@trybotster/ui-contract`. Update
 `@trybotster/hub-test-support` to declare and pin that normal npm dependency
 and consume its shipped fixtures for Hub-specific transport/runtime proof. Do
-not copy the TypeScript contract or fixtures into hub-test-support.
+not copy the TypeScript contract or fixtures into hub-test-support. Because its
+published contents, dependency graph, protocol version, and conformance
+metadata change, bump hub-test-support from the currently published `0.1.11`
+to a new unused package version and update every current README/metadata/docs
+claim that names the version or revision.
 
 If registry authentication or 2FA blocks publication, stop after the merged,
-packed, externally installable artifact is ready and report the exact
-`npm publish --access public` command from `packages/ui-contract`. Do not create
+packed, externally installable artifacts are ready. The operator handoff must
+publish `@trybotster/ui-contract` first, then publish the bumped
+`@trybotster/hub-test-support` that declares it, and report the exact
+`npm publish --access public` command for each package directory. Do not create
 a publication-only ticket.
 
 ### 5. Update contract fixtures and documentation
@@ -203,6 +224,12 @@ a publication-only ticket.
 - Extend the canonical plugin contract matrix source with dialog/form/button
   examples and accepted/rejected action results using the new envelope.
   Regenerate its crate/npm mirrors; do not edit mirrors independently.
+- Cold-switch `examples/project-pipelines/plugin.lua` to the worker-visible
+  canonical request, required Form submit label, and direct accepted/rejected
+  result semantics. Update `examples/project-pipelines/README.md`, which is
+  part of the shipped first-party plugin contract. Inspect
+  `examples/synthetic-plugin/**` and record that it authors no UI, or update it
+  if that inspection proves otherwise.
 - Update `README.md` crate/package ownership, `docs/client-protocol.md`, the new
   package README, and the plugin contract matrix README to name
   `botster-ui-contract` and `@trybotster/ui-contract` as the authority.
@@ -217,7 +244,8 @@ a publication-only ticket.
 ## Non-scope
 
 - No edits to `botster-core`, `botster-web`, `botster-tui`,
-  `botster-tui-kit`, or `botster-workspaces` in this run.
+  `botster-tui-kit`, `botster-workspaces`, or the external
+  `botster-project-pipelines` repository in this run.
 - No renderer implementation, focus manager, React/Ionic component, Ratatui
   widget, workspace product policy, entity store, Git/worktree behavior, or
   session spawning behavior.
@@ -245,6 +273,11 @@ a publication-only ticket.
   the UI package for those proofs. It does not own copied contract fixtures.
 - Web and TUI clients own local scoped presentation stores and rendering. Their
   adoption belongs to the existing Web, TUI kit, and TUI project tickets.
+- The live external Project Pipelines plugin has a different current action
+  ABI and is an explicit downstream adopter, not hidden non-scope.
+  `ticket_1785194090_628084` targets
+  `tgt_a72ca1a83d504385b8648f71409119ab` and is durably blocked on this producer
+  by `dependency_1785194093_410838`.
 - Core still contains the old source until the separate Core removal ticket
   runs after consumers switch. This run makes the Hub-owned package
   authoritative by removing all Hub/Core UI imports; it must not silently
@@ -253,7 +286,8 @@ a publication-only ticket.
 - There is no prerequisite ticket blocking this producer change. This ticket
   is instead a prerequisite artifact for the existing Web
   (`ticket_1785192696_321546`), TUI kit
-  (`ticket_1785192700_939910`), TUI (`ticket_1785192707_900922`), Core removal,
+  (`ticket_1785192700_939910`), TUI (`ticket_1785192707_900922`), the registered
+  Project Pipelines plugin adoption (`ticket_1785194090_628084`), Core removal,
   and final integration tickets. Those runs must consume merged/published
   artifacts, not sibling-worktree overrides.
 
@@ -266,10 +300,9 @@ a publication-only ticket.
 - Assumption: package/surface scope is supplied by the host client context and
   is not author-controlled data inside each presentation action. This prevents
   one plugin surface from mutating another surface's local state.
-- Assumption: the accepted replacement is an inline validated tree, not the
-  current opaque `UiTreeUpdateRef`, because the ticket requires clients to
-  apply an owner-authored replacement without inventing a second fetch
-  protocol.
+- Decision: remove the current opaque `UiTreeUpdateRef` and `tree_update`
+  field. An inline validated accepted-result replacement is the only tree
+  update path; no mutually exclusive compatibility form remains.
 - Assumption: the existing duplicate `plugin_surface.body` and
   `ui_tree_snapshot.body` response fields remain only where current protocol
   documentation still requires them; both must be serialized from the same
@@ -280,6 +313,10 @@ a publication-only ticket.
 - Unknown to resolve during implementation: whether npm publication is
   available without interactive credentials. This does not block building,
   packing, and external tarball consumption proof.
+- Expected flag-day consequence: old first-party client pins will report
+  compatibility mismatch until their routed adoption tickets land. That is
+  intentional evidence of the cold switch, not a reason to retain protocol-3
+  decoding.
 
 ## Affected surfaces and likely files
 
@@ -308,6 +345,10 @@ a publication-only ticket.
   `fixtures/plugins/plugin-contract-matrix/**`,
   `crates/botster-hub-test-support/fixtures/plugin-contract-matrix/**`, and
   `packages/hub-test-support/fixtures/plugin-contract-matrix/**`.
+- First-party in-repo plugin surfaces:
+  `examples/project-pipelines/plugin.lua`,
+  `examples/project-pipelines/README.md`, and an explicit audit of
+  `examples/synthetic-plugin/**`.
 - Runtime/protocol tests: `tests/hub_lua_runtime_test.rs`,
   `tests/hub_client_api_test.rs`, `tests/hub_daemon_lifecycle_test.rs`, and
   `tests/hub_test_support_conformance_test.rs`.
@@ -323,6 +364,10 @@ a publication-only ticket.
 - **False cold switch:** accepting both daemon action shapes would make Web/TUI
   behavior ambiguous. Deserialize only the canonical envelope and include a
   negative old-shape test.
+- **External plugin ABI break:** the live `botster-project-pipelines` handlers
+  read flat arguments and its Form lacks the required submit label. Keep that
+  repository out of this run and enforce its registered dependent adoption
+  ticket after merged artifacts exist.
 - **Renderer policy leakage:** a Hub-side presentation store or dialog layout
   choice would violate the charter. Hub validates/forwards typed effects;
   client harnesses model their application.
@@ -341,6 +386,9 @@ a publication-only ticket.
 - **Protocol compatibility bookkeeping:** request semantics require a protocol
   bump, while fixture content has its own revision. Advance each for its own
   reason and derive published metadata from constants.
+- **Flag-day compatibility failures:** protocol-3 clients will reject the new
+  Hub until adoption. Land producer first, then TUI kit, TUI/Web/plugin
+  adopters, Core removal, and integration; do not weaken compatibility checks.
 - **Published package mismatch:** workspace-local imports can hide missing
   package files or dependencies. Pack exact tarballs, install in clean
   consumers, and verify metadata, schema, types, and fixtures.
@@ -363,7 +411,9 @@ a publication-only ticket.
   - Form requires an explicit submit label;
   - form request values and non-form payload remain distinct;
   - accepted close/replacement validates and round-trips;
-  - rejected results retain presentation/tree and reject accepted-only effects.
+  - rejected results retain presentation/tree and reject accepted-only effects;
+  - `UiTreeUpdateRef` and `tree_update` no longer deserialize or appear in
+    generated Rust/TypeScript/schema output.
 - Run the crate's deterministic TypeScript/schema/fixture generation check and
   assert symmetric Rust/TypeScript field, discriminant, type, and optionality
   parity.
@@ -380,13 +430,18 @@ a publication-only ticket.
 - `./test.sh --test hub_daemon_lifecycle_test`
 - `./test.sh --test hub_test_support_conformance_test`
 - A real isolated Hub/plugin-worker/daemon flow must:
-  - render the canonical plugin fixture;
+  - render both the canonical plugin-contract-matrix fixture and the in-repo
+    `examples/project-pipelines` first-party surface;
   - reject malformed/`props.open` trees at `HubRuntime::render_plugin_surface`;
   - serialize the validated typed snapshot;
   - accept only canonical `UiActionRequest` with exact
     package/surface/action/node/kind/values/payload identity;
   - return a typed rejected result without close/replacement;
   - return a typed accepted result with scoped close and validated replacement.
+- The in-repo Project Pipelines example must prove both accepted and rejected
+  actions through the real worker using `arguments.values`/`payload`, and its
+  rendered Form must carry the explicit submit label. This proof complements,
+  rather than substitutes for, the generic contract matrix.
 - Confirm the production call chain is
   daemon request → `HubClientApi` → `HubRuntime` → plugin worker → new contract
   validation → typed daemon response. Source existence alone is insufficient.
@@ -406,6 +461,9 @@ a publication-only ticket.
   the packed UI contract available and prove it resolves the pinned normal
   dependency and consumes the UI package fixtures while adding Hub-specific
   protocol/harness evidence.
+- Verify the bumped hub-test-support version is unused before packing, and that
+  its generated metadata, support matrix, README, dependency pin, protocol
+  version, and conformance revision agree.
 - Inspect packed contents for missing files and local paths/secrets. If
   publication is blocked by credentials/2FA, attach the verified tarball
   evidence and exact operator publish command instead of opening another
@@ -439,13 +497,26 @@ sibling-worktree overrides to simulate those later adoptions.
 - Capture any generator rule needed to keep Rust serde, TypeScript, and JSON
   schema parity if the implementation discovers a repeatable failure mode not
   already covered by the loaded DTO drift notes.
+- Capture the charter amendment: this ticket/project intentionally supersedes
+  the Hub charter's general shared-contract exclusion by following
+  [[botster core ui and capability contracts must avoid product gravity]] and
+  placing product-speed UI vocabulary in a sibling package.
 - No additional vault capture is warranted at Plan time; these are candidates
   contingent on implemented evidence.
 
 ## Convention fit
 
-No convention conflict is being waived. The plan follows the cold-switch
-instruction, keeps the Hub as trusted validator/router rather than renderer,
-uses a sibling contract package to avoid Core and Hub gravity, keeps
-hub-test-support downstream-shaped, uses the repository wrapper for Rust
-tests, and makes generated/published artifacts prove the actual consumer path.
+There is one explicit charter exception, not a silent no-conflict claim:
+[[botster-hub-playbook]] normally excludes reusable shared contracts and
+[[botster-hub-client-playbook]] excludes Core UI implementation types. The
+ticket and project north star deliberately supersede that older ownership rule
+for this UI surface, supported by
+[[botster core ui and capability contracts must avoid product gravity]]'s
+sibling-contract-package guidance. The new crate remains separate from Hub
+runtime policy and from the narrow daemon-client crate, so the exception does
+not turn Hub runtime into a design-system monolith.
+
+Otherwise the plan follows the cold-switch instruction, keeps the Hub as
+trusted validator/router rather than renderer, keeps hub-test-support
+downstream-shaped, uses the repository wrapper for Rust tests, and makes
+generated/published artifacts prove the actual consumer path.
