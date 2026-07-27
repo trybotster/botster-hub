@@ -50,135 +50,149 @@ const TEST_LOCAL_RUNTIME_READINESS_BUDGET_MS_ENV: &str =
     "BOTSTER_HUB_TEST_LOCAL_RUNTIME_READINESS_BUDGET_MS";
 
 fn main() {
-    match env::args().nth(1).as_deref() {
+    let command = env::args().nth(1);
+    let command_args = match command.as_deref() {
+        Some(command) if stateful_command(command) => {
+            match canonicalize_data_dir_args(command, env::args().skip(2).collect()) {
+                Ok(args) => args,
+                Err(error) => {
+                    eprintln!("botster-hub {command} error: {error}");
+                    process::exit(1);
+                }
+            }
+        }
+        _ => env::args().skip(2).collect(),
+    };
+
+    match command.as_deref() {
         Some("start") => {
-            if let Err(error) = start_daemon(env::args().skip(2).collect()) {
+            if let Err(error) = start_daemon(command_args) {
                 eprintln!("botster-hub start error: {error}");
                 process::exit(1);
             }
             return;
         }
         Some("up") => {
-            if let Err(error) = local_runtime_up(env::args().skip(2).collect()) {
+            if let Err(error) = local_runtime_up(command_args) {
                 eprintln!("botster-hub up error: {error}");
                 process::exit(1);
             }
             return;
         }
         Some("down") => {
-            if let Err(error) = local_runtime_down(env::args().skip(2).collect()) {
+            if let Err(error) = local_runtime_down(command_args) {
                 eprintln!("botster-hub down error: {error}");
                 process::exit(1);
             }
             return;
         }
         Some("doctor") => {
-            if let Err(error) = local_runtime_doctor(env::args().skip(2).collect()) {
+            if let Err(error) = local_runtime_doctor(command_args) {
                 eprintln!("botster-hub doctor error: {error}");
                 process::exit(1);
             }
             return;
         }
         Some("smoke") => {
-            if let Err(error) = local_runtime_smoke(env::args().skip(2).collect()) {
+            if let Err(error) = local_runtime_smoke(command_args) {
                 eprintln!("botster-hub smoke error: {error}");
                 process::exit(1);
             }
             return;
         }
         Some("status") => {
-            if let Err(error) = operator_status(env::args().skip(2).collect()) {
+            if let Err(error) = operator_status(command_args) {
                 eprintln!("botster-hub status error: {error}");
                 process::exit(1);
             }
             return;
         }
         Some("sessions") => {
-            if let Err(error) = operator_sessions(env::args().skip(2).collect()) {
+            if let Err(error) = operator_sessions(command_args) {
                 eprintln!("botster-hub sessions error: {error}");
                 process::exit(1);
             }
             return;
         }
         Some("session-templates") => {
-            if let Err(error) = operator_session_templates(env::args().skip(2).collect()) {
+            if let Err(error) = operator_session_templates(command_args) {
                 eprintln!("botster-hub session-templates error: {error}");
                 process::exit(1);
             }
             return;
         }
         Some("spawn-targets") => {
-            if let Err(error) = operator_spawn_targets(env::args().skip(2).collect()) {
+            if let Err(error) = operator_spawn_targets(command_args) {
                 eprintln!("botster-hub spawn-targets error: {error}");
                 process::exit(1);
             }
             return;
         }
         Some("context") => {
-            if let Err(error) = operator_context(env::args().skip(2).collect()) {
+            if let Err(error) = operator_context(command_args) {
                 eprintln!("botster-hub context error: {error}");
                 process::exit(1);
             }
             return;
         }
         Some("shutdown") => {
-            if let Err(error) = operator_shutdown(env::args().skip(2).collect()) {
+            if let Err(error) = operator_shutdown(command_args) {
                 eprintln!("botster-hub shutdown error: {error}");
                 process::exit(1);
             }
             return;
         }
         Some("mcp-serve") => {
-            if let Err(error) = mcp_serve(env::args().skip(2).collect()) {
+            if let Err(error) = mcp_serve(command_args) {
                 eprintln!("botster-hub mcp-serve error: {error}");
                 process::exit(1);
             }
             return;
         }
         Some("open") => {
-            if let Err(error) = operator_open_alias(env::args().skip(2).collect()) {
+            if let Err(error) = operator_open_alias(command_args) {
                 eprintln!("botster-hub open error: {error}");
                 process::exit(1);
             }
             return;
         }
         Some("reload") => {
-            if let Err(error) = operator_reload_alias(env::args().skip(2).collect()) {
+            if let Err(error) = operator_reload_alias(command_args) {
                 eprintln!("botster-hub reload error: {error}");
                 process::exit(1);
             }
             return;
         }
         Some("apps") => {
-            if let Err(error) = operator_apps(env::args().skip(2).collect()) {
+            if let Err(error) = operator_apps(command_args) {
                 eprintln!("botster-hub apps error: {error}");
                 process::exit(1);
             }
             return;
         }
         Some("packages") => {
-            if let Err(error) = operator_packages(env::args().skip(2).collect(), false) {
+            if let Err(error) = operator_packages(command_args, false) {
                 eprintln!("botster-hub packages error: {error}");
                 process::exit(1);
             }
             return;
         }
         Some("providers") => {
-            if let Err(error) = operator_packages(env::args().skip(2).collect(), true) {
+            if let Err(error) = operator_packages(command_args, true) {
                 eprintln!("botster-hub providers error: {error}");
                 process::exit(1);
             }
             return;
         }
         Some("inspect") => {
-            if let Err(error) = operator_inspect(env::args().skip(2).collect()) {
+            if let Err(error) = operator_inspect(command_args) {
                 eprintln!("botster-hub inspect error: {error}");
                 process::exit(1);
             }
             return;
         }
         Some("run-one") => {
-            if let Err(error) = run_one(env::args().skip(2).collect()) {
+            if let Err(error) = run_one(command_args) {
                 eprintln!("botster-hub run-one error: {error}");
                 process::exit(1);
             }
@@ -221,6 +235,128 @@ fn main() {
 fn boot_summary() -> Result<botster_hub::HubConfig, botster_hub::HubConfigError> {
     let environment = RuntimeEnvironment::from_current_process();
     build_default_config_for_runtime(&environment)
+}
+
+fn stateful_command(command: &str) -> bool {
+    matches!(
+        command,
+        "start"
+            | "up"
+            | "down"
+            | "doctor"
+            | "smoke"
+            | "status"
+            | "sessions"
+            | "session-templates"
+            | "spawn-targets"
+            | "context"
+            | "shutdown"
+            | "mcp-serve"
+            | "open"
+            | "reload"
+            | "apps"
+            | "packages"
+            | "providers"
+            | "inspect"
+    )
+}
+
+fn canonicalize_data_dir_args(
+    command: &str,
+    args: Vec<String>,
+) -> Result<Vec<String>, OperatorError> {
+    canonicalize_data_dir_args_for_environment(
+        command,
+        args,
+        &RuntimeEnvironment::from_current_process(),
+    )
+}
+
+fn canonicalize_data_dir_args_for_environment(
+    command: &str,
+    args: Vec<String>,
+    environment: &RuntimeEnvironment,
+) -> Result<Vec<String>, OperatorError> {
+    let mut explicit_data_directory = None;
+    let mut remaining = Vec::new();
+    let mut cursor = 0;
+    while cursor < args.len() {
+        if args[cursor] == "--" {
+            remaining.extend(args[cursor..].iter().cloned());
+            break;
+        } else if args[cursor] == "--data-dir" {
+            if explicit_data_directory.is_some() {
+                return Err(OperatorError::Usage(command_usage(command)));
+            }
+            let Some(value) = args.get(cursor + 1) else {
+                return Err(OperatorError::Usage(command_usage(command)));
+            };
+            explicit_data_directory = Some(PathBuf::from(value));
+            cursor += 2;
+        } else {
+            remaining.push(args[cursor].clone());
+            cursor += 1;
+        }
+    }
+
+    let data_directory = match explicit_data_directory {
+        Some(path) => DataDirectoryOption::Explicit(path),
+        None => DataDirectoryOption::RuntimeDefault,
+    }
+    .resolve(environment)?;
+    let insert_at = if command == "packages"
+        && remaining.first().map(String::as_str) == Some("config")
+        && remaining.get(1).map(String::as_str) == Some("set")
+    {
+        2
+    } else if matches!(
+        command,
+        "sessions"
+            | "session-templates"
+            | "spawn-targets"
+            | "open"
+            | "reload"
+            | "apps"
+            | "packages"
+            | "providers"
+    ) && !remaining.is_empty()
+    {
+        1
+    } else {
+        0
+    };
+    remaining.splice(
+        insert_at..insert_at,
+        [
+            "--data-dir".to_string(),
+            data_directory.to_string_lossy().into_owned(),
+        ],
+    );
+    Ok(remaining)
+}
+
+fn command_usage(command: &str) -> &'static str {
+    match command {
+        "start" => "start",
+        "up" => "up",
+        "down" => "down",
+        "doctor" => "doctor",
+        "smoke" => "smoke",
+        "status" => "status",
+        "sessions" => "sessions",
+        "session-templates" => "session-templates",
+        "spawn-targets" => "spawn-targets",
+        "context" => "context",
+        "shutdown" => "shutdown",
+        "mcp-serve" => "mcp-serve",
+        "open" => "open",
+        "reload" => "reload",
+        "apps" => "apps",
+        "packages" => "packages",
+        "providers" => "providers",
+        "inspect" => "inspect",
+        _ => "global",
+    }
 }
 
 fn start_daemon(args: Vec<String>) -> Result<(), StartError> {
@@ -280,7 +416,10 @@ fn local_runtime_up(args: Vec<String>) -> Result<(), LocalRuntimeError> {
 }
 
 fn local_runtime_down(args: Vec<String>) -> Result<(), LocalRuntimeError> {
-    let options = DailyDataDirOptions::parse(args).ok_or(LocalRuntimeError::Usage)?;
+    let options = DataArgs::parse(args, "down")?;
+    if !options.arguments.is_empty() {
+        return Err(LocalRuntimeError::Usage);
+    }
     let config = explicit_config(options.data_directory.clone())?;
     let response = match daemon_transport_request(&config, DaemonRequest::DaemonShutdown) {
         Ok(response) => response,
@@ -305,7 +444,10 @@ fn local_runtime_down(args: Vec<String>) -> Result<(), LocalRuntimeError> {
 }
 
 fn local_runtime_doctor(args: Vec<String>) -> Result<(), OperatorError> {
-    let options = DailyDataDirOptions::parse(args).ok_or(OperatorError::Usage("doctor"))?;
+    let options = DataArgs::parse(args, "doctor")?;
+    if !options.arguments.is_empty() {
+        return Err(OperatorError::Usage("doctor"));
+    }
     let config = explicit_config(options.data_directory.clone())?;
     println!("doctor=local_runtime");
     options.print_source();
@@ -459,14 +601,10 @@ fn local_runtime_doctor(args: Vec<String>) -> Result<(), OperatorError> {
 fn local_runtime_smoke(args: Vec<String>) -> Result<(), SmokeError> {
     let options = SmokeOptions::parse(args)?;
     println!("smoke=local_runtime");
-    if options.runtime.default_data_dir {
-        println!(
-            "data_dir=stable:{}",
-            options.runtime.data_directory.display()
-        );
-    } else {
-        println!("data_dir=explicit");
-    }
+    println!(
+        "data_dir=resolved:{}",
+        options.runtime.data_directory.display()
+    );
     let outcome = prepare_local_runtime(options.runtime)?;
     let _cleanup = SmokeRuntimeCleanup::new(&outcome);
     print_runtime_check(
@@ -1783,7 +1921,10 @@ fn runtime_origin(local_url: &str) -> Option<String> {
 }
 
 fn operator_status(args: Vec<String>) -> Result<(), OperatorError> {
-    let options = DailyDataDirOptions::parse(args).ok_or(OperatorError::Usage("status"))?;
+    let options = DataArgs::parse(args, "status")?;
+    if !options.arguments.is_empty() {
+        return Err(OperatorError::Usage("status"));
+    }
     let config = explicit_config(options.data_directory)?;
     let response = daemon_transport_request(&config, DaemonRequest::Status)?;
     let Some(status) = response.status else {
@@ -1879,7 +2020,10 @@ fn operator_session_templates(args: Vec<String>) -> Result<(), OperatorError> {
     };
     match action {
         "list" => {
-            let options = DataDirOptions::parse(args[1..].to_vec(), "session-templates list")?;
+            let options = DataArgs::parse(args[1..].to_vec(), "session-templates list")?;
+            if !options.arguments.is_empty() {
+                return Err(OperatorError::Usage("session-templates list"));
+            }
             let config = explicit_config(options.data_directory)?;
             let response = daemon_transport_request(&config, DaemonRequest::ListSessionTemplates)?;
             print_daemon_response(response)?;
@@ -1888,7 +2032,7 @@ fn operator_session_templates(args: Vec<String>) -> Result<(), OperatorError> {
             if args.len() != 4 {
                 return Err(OperatorError::Usage("session-templates show"));
             }
-            let options = DataDirOptions::parse(args[1..3].to_vec(), "session-templates show")?;
+            let options = DataArgs::parse(args[1..3].to_vec(), "session-templates show")?;
             let config = explicit_config(options.data_directory)?;
             let response = daemon_transport_request(
                 &config,
@@ -1902,7 +2046,7 @@ fn operator_session_templates(args: Vec<String>) -> Result<(), OperatorError> {
             if args.len() < 4 {
                 return Err(OperatorError::Usage("session-templates resolve"));
             }
-            let options = DataDirOptions::parse(args[1..3].to_vec(), "session-templates resolve")?;
+            let options = DataArgs::parse(args[1..3].to_vec(), "session-templates resolve")?;
             let config = explicit_config(options.data_directory)?;
             let request = parse_session_template_request(&args[4..])?;
             let response = daemon_transport_request(
@@ -1918,7 +2062,7 @@ fn operator_session_templates(args: Vec<String>) -> Result<(), OperatorError> {
             if args.len() < 6 || args.get(4).map(String::as_str) != Some("--session-id") {
                 return Err(OperatorError::Usage("session-templates spawn"));
             }
-            let options = DataDirOptions::parse(args[1..3].to_vec(), "session-templates spawn")?;
+            let options = DataArgs::parse(args[1..3].to_vec(), "session-templates spawn")?;
             let config = explicit_config(options.data_directory)?;
             let request = parse_session_template_request(&args[6..])?;
             let response = daemon_transport_request(
@@ -1942,7 +2086,10 @@ fn operator_spawn_targets(args: Vec<String>) -> Result<(), OperatorError> {
     };
     match action {
         "list" => {
-            let options = DataDirOptions::parse(args[1..].to_vec(), "spawn-targets list")?;
+            let options = DataArgs::parse(args[1..].to_vec(), "spawn-targets list")?;
+            if !options.arguments.is_empty() {
+                return Err(OperatorError::Usage("spawn-targets list"));
+            }
             let config = explicit_config(options.data_directory)?;
             print_daemon_response(daemon_transport_request(
                 &config,
@@ -1953,7 +2100,7 @@ fn operator_spawn_targets(args: Vec<String>) -> Result<(), OperatorError> {
             if args.len() != 4 {
                 return Err(OperatorError::Usage("spawn-targets show"));
             }
-            let options = DataDirOptions::parse(args[1..3].to_vec(), "spawn-targets show")?;
+            let options = DataArgs::parse(args[1..3].to_vec(), "spawn-targets show")?;
             let config = explicit_config(options.data_directory)?;
             print_daemon_response(daemon_transport_request(
                 &config,
@@ -1966,7 +2113,7 @@ fn operator_spawn_targets(args: Vec<String>) -> Result<(), OperatorError> {
             if args.len() < 3 {
                 return Err(OperatorError::Usage("spawn-targets create"));
             }
-            let options = DataDirOptions::parse(args[1..3].to_vec(), "spawn-targets create")?;
+            let options = DataArgs::parse(args[1..3].to_vec(), "spawn-targets create")?;
             let request = parse_spawn_target_create(&args[3..])?;
             let config = explicit_config(options.data_directory)?;
             print_daemon_response(daemon_transport_request(&config, request)?)?;
@@ -1975,7 +2122,7 @@ fn operator_spawn_targets(args: Vec<String>) -> Result<(), OperatorError> {
             if args.len() < 4 {
                 return Err(OperatorError::Usage("spawn-targets update"));
             }
-            let options = DataDirOptions::parse(args[1..3].to_vec(), "spawn-targets update")?;
+            let options = DataArgs::parse(args[1..3].to_vec(), "spawn-targets update")?;
             let request = parse_spawn_target_update(&args[3], &args[4..])?;
             let config = explicit_config(options.data_directory)?;
             print_daemon_response(daemon_transport_request(&config, request)?)?;
@@ -1984,7 +2131,7 @@ fn operator_spawn_targets(args: Vec<String>) -> Result<(), OperatorError> {
             if args.len() != 4 {
                 return Err(OperatorError::Usage("spawn-targets delete"));
             }
-            let options = DataDirOptions::parse(args[1..3].to_vec(), "spawn-targets delete")?;
+            let options = DataArgs::parse(args[1..3].to_vec(), "spawn-targets delete")?;
             let config = explicit_config(options.data_directory)?;
             print_daemon_response(daemon_transport_request(
                 &config,
@@ -1997,7 +2144,7 @@ fn operator_spawn_targets(args: Vec<String>) -> Result<(), OperatorError> {
             if args.len() != 4 {
                 return Err(OperatorError::Usage("spawn-targets validate"));
             }
-            let options = DataDirOptions::parse(args[1..3].to_vec(), "spawn-targets validate")?;
+            let options = DataArgs::parse(args[1..3].to_vec(), "spawn-targets validate")?;
             let config = explicit_config(options.data_directory)?;
             print_daemon_response(daemon_transport_request(
                 &config,
@@ -2117,10 +2264,9 @@ fn required_arg(
 }
 
 fn operator_context(args: Vec<String>) -> Result<(), OperatorError> {
-    let data_dir = env::var("BOTSTER_HUB_DATA_DIR").ok().map(PathBuf::from);
     let session_id = env::var("BOTSTER_SESSION_ID").ok();
     let context_id = env::var("BOTSTER_CONTEXT_ID").ok();
-    let mut data_directory = data_dir;
+    let mut data_directory = None;
     let mut requested_session_id = session_id;
     let mut requested_context_id = context_id;
     let mut key = None;
@@ -2252,7 +2398,10 @@ fn parse_session_template_request(
 }
 
 fn operator_shutdown(args: Vec<String>) -> Result<(), OperatorError> {
-    let options = DataDirOptions::parse(args, "shutdown")?;
+    let options = DataArgs::parse(args, "shutdown")?;
+    if !options.arguments.is_empty() {
+        return Err(OperatorError::Usage("shutdown"));
+    }
     let config = explicit_config(options.data_directory)?;
     let response = daemon_transport_request(&config, DaemonRequest::DaemonShutdown)?;
     print_daemon_response(response)?;
@@ -2260,7 +2409,10 @@ fn operator_shutdown(args: Vec<String>) -> Result<(), OperatorError> {
 }
 
 fn mcp_serve(args: Vec<String>) -> Result<(), McpCliError> {
-    let options = DataDirOptions::parse(args, "mcp-serve")?;
+    let options = DataArgs::parse(args, "mcp-serve")?;
+    if !options.arguments.is_empty() {
+        return Err(OperatorError::Usage("mcp-serve").into());
+    }
     let config = explicit_config(options.data_directory)?;
     let stdin = io::stdin();
     let stdout = io::stdout();
@@ -2277,8 +2429,10 @@ fn operator_open_alias(args: Vec<String>) -> Result<(), OperatorError> {
         "tui" => "botster-tui",
         _ => return Err(OperatorError::Usage("open")),
     };
-    let options =
-        DailyDataDirOptions::parse(args[1..].to_vec()).ok_or(OperatorError::Usage("open"))?;
+    let options = DataArgs::parse(args[1..].to_vec(), "open")?;
+    if !options.arguments.is_empty() {
+        return Err(OperatorError::Usage("open"));
+    }
     open_app_by_selector(options.data_directory, selector)
 }
 
@@ -2286,7 +2440,7 @@ fn operator_reload_alias(args: Vec<String>) -> Result<(), OperatorError> {
     if args.len() != 3 {
         return Err(OperatorError::Usage("reload"));
     }
-    let options = DataDirOptions::parse(args[1..3].to_vec(), "reload")?;
+    let options = DataArgs::parse(args[1..3].to_vec(), "reload")?;
     operator_packages(
         vec![
             "reload".to_string(),
@@ -2760,7 +2914,7 @@ fn explicit_config_with_worker(
         },
         ..HubStartupOptions::default()
     }
-    .build_config_for_environment(&RuntimeEnvironment::from_values(None, None, None))
+    .build_config_for_environment(&RuntimeEnvironment::from_values(None, None))
 }
 
 fn print_daemon_transport_status(label: &str, status: &DaemonStatus) {
@@ -3456,52 +3610,47 @@ fn session_lifecycle_label(state: &SessionLifecycleState) -> &'static str {
     }
 }
 
-struct DataDirOptions {
+struct DataArgs {
     data_directory: PathBuf,
+    arguments: Vec<String>,
 }
 
-impl DataDirOptions {
+impl DataArgs {
     fn parse(args: Vec<String>, command: &'static str) -> Result<Self, OperatorError> {
-        if args.len() != 2 || args.first().map(String::as_str) != Some("--data-dir") {
-            return Err(OperatorError::Usage(command));
+        let mut data_directory = None;
+        let mut arguments = Vec::new();
+        let mut cursor = 0;
+        while cursor < args.len() {
+            if args[cursor] == "--" {
+                arguments.extend(args[cursor..].iter().cloned());
+                break;
+            } else if args[cursor] == "--data-dir" {
+                if data_directory.is_some() {
+                    return Err(OperatorError::Usage(command));
+                }
+                let Some(value) = args.get(cursor + 1) else {
+                    return Err(OperatorError::Usage(command));
+                };
+                data_directory = Some(PathBuf::from(value));
+                cursor += 2;
+            } else {
+                arguments.push(args[cursor].clone());
+                cursor += 1;
+            }
         }
+
+        let data_directory =
+            DataDirectoryOption::Explicit(data_directory.ok_or(OperatorError::Usage(command))?)
+                .resolve(&RuntimeEnvironment::from_current_process())?;
 
         Ok(Self {
-            data_directory: PathBuf::from(&args[1]),
+            data_directory,
+            arguments,
         })
-    }
-}
-
-struct DailyDataDirOptions {
-    data_directory: PathBuf,
-    default_data_dir: bool,
-}
-
-impl DailyDataDirOptions {
-    fn parse(args: Vec<String>) -> Option<Self> {
-        match args.as_slice() {
-            [] => Some(Self::from_override(None)),
-            [flag, value] if flag == "--data-dir" => {
-                Some(Self::from_override(Some(PathBuf::from(value))))
-            }
-            _ => None,
-        }
-    }
-
-    fn from_override(data_directory: Option<PathBuf>) -> Self {
-        let default_data_dir = data_directory.is_none();
-        Self {
-            data_directory: data_directory.unwrap_or_else(default_local_runtime_data_dir),
-            default_data_dir,
-        }
     }
 
     fn print_source(&self) {
-        if self.default_data_dir {
-            println!("data_dir=stable:{}", self.data_directory.display());
-        } else {
-            println!("data_dir=explicit");
-        }
+        println!("data_dir=resolved:{}", self.data_directory.display());
     }
 }
 
@@ -3512,20 +3661,17 @@ struct StartOptions {
 
 impl StartOptions {
     fn parse(args: Vec<String>) -> Result<Self, OperatorError> {
-        if args.len() != 2 && args.len() != 4 {
-            return Err(OperatorError::Usage("start"));
-        }
-        if args.first().map(String::as_str) != Some("--data-dir") {
-            return Err(OperatorError::Usage("start"));
-        }
-        let session_worker_bin = match args.get(2).map(String::as_str) {
+        let options = DataArgs::parse(args, "start")?;
+        let session_worker_bin = match options.arguments.first().map(String::as_str) {
             None => None,
-            Some("--session-worker-bin") => args.get(3).map(PathBuf::from),
+            Some("--session-worker-bin") if options.arguments.len() == 2 => {
+                options.arguments.get(1).map(PathBuf::from)
+            }
             Some(_) => return Err(OperatorError::Usage("start")),
         };
 
         Ok(Self {
-            data_directory: PathBuf::from(&args[1]),
+            data_directory: options.data_directory,
             session_worker_bin,
         })
     }
@@ -3533,38 +3679,31 @@ impl StartOptions {
 
 struct LocalRuntimeOptions {
     data_directory: PathBuf,
-    default_data_dir: bool,
     session_worker_bin: Option<PathBuf>,
 }
 
 impl LocalRuntimeOptions {
     fn parse(args: Vec<String>) -> Result<Self, LocalRuntimeError> {
-        let mut data_directory = None;
+        let options = DataArgs::parse(args, "up")?;
         let mut session_worker_bin = None;
         let mut cursor = 0;
-        while cursor < args.len() {
-            match args[cursor].as_str() {
-                "--data-dir" => {
-                    let Some(value) = args.get(cursor + 1) else {
-                        return Err(LocalRuntimeError::Usage);
-                    };
-                    data_directory = Some(PathBuf::from(value));
-                    cursor += 2;
-                }
+        while cursor < options.arguments.len() {
+            match options.arguments[cursor].as_str() {
                 "--session-worker-bin" => {
-                    let Some(value) = args.get(cursor + 1) else {
+                    let Some(value) = options.arguments.get(cursor + 1) else {
                         return Err(LocalRuntimeError::Usage);
                     };
+                    if session_worker_bin.is_some() {
+                        return Err(LocalRuntimeError::Usage);
+                    }
                     session_worker_bin = Some(PathBuf::from(value));
                     cursor += 2;
                 }
                 _ => return Err(LocalRuntimeError::Usage),
             }
         }
-        let daily = DailyDataDirOptions::from_override(data_directory);
         Ok(Self {
-            data_directory: daily.data_directory,
-            default_data_dir: daily.default_data_dir,
+            data_directory: options.data_directory,
             session_worker_bin,
         })
     }
@@ -3610,10 +3749,6 @@ impl SmokeOptions {
     }
 }
 
-fn default_local_runtime_data_dir() -> PathBuf {
-    PathBuf::from("target").join("botster-hub-runtime-data")
-}
-
 #[derive(Clone, Copy)]
 enum LocalRuntimeDaemonOwnership {
     Started,
@@ -3627,11 +3762,7 @@ fn print_local_runtime_ready(
 ) {
     let dir = outcome.options.data_directory.display();
     println!("runtime=ready");
-    if outcome.options.default_data_dir {
-        println!("data_dir=stable:{dir}");
-    } else {
-        println!("data_dir={dir}");
-    }
+    println!("data_dir=resolved:{dir}");
     println!(
         "daemon={}",
         match outcome.daemon_ownership {
@@ -3710,7 +3841,10 @@ impl SessionCommand {
         };
         match action {
             "list" => {
-                let options = DataDirOptions::parse(args[1..].to_vec(), "sessions list")?;
+                let options = DataArgs::parse(args[1..].to_vec(), "sessions list")?;
+                if !options.arguments.is_empty() {
+                    return Err(OperatorError::Usage("sessions list"));
+                }
                 Ok(Self {
                     data_directory: options.data_directory,
                     action: SessionAction::List,
@@ -3720,7 +3854,7 @@ impl SessionCommand {
                 if args.len() < 4 {
                     return Err(OperatorError::Usage("sessions spawn"));
                 }
-                let options = DataDirOptions::parse(args[1..3].to_vec(), "sessions spawn")?;
+                let options = DataArgs::parse(args[1..3].to_vec(), "sessions spawn")?;
                 let mut cursor = 3;
                 let mut session_id = SessionId("botster-hub-cli-session".to_string());
                 if args.get(cursor).map(String::as_str) == Some("--session-id") {
@@ -3745,7 +3879,7 @@ impl SessionCommand {
                 if args.len() < 4 {
                     return Err(OperatorError::Usage("sessions attach"));
                 }
-                let options = DataDirOptions::parse(args[1..3].to_vec(), "sessions attach")?;
+                let options = DataArgs::parse(args[1..3].to_vec(), "sessions attach")?;
                 let session_id = SessionId(args[3].clone());
                 let subscription_id =
                     if args.get(4).map(String::as_str) == Some("--subscription-id") {
@@ -3768,7 +3902,7 @@ impl SessionCommand {
                 if args.len() < 6 {
                     return Err(OperatorError::Usage("sessions send-input"));
                 }
-                let options = DataDirOptions::parse(args[1..3].to_vec(), "sessions send-input")?;
+                let options = DataArgs::parse(args[1..3].to_vec(), "sessions send-input")?;
                 if args.get(4).map(String::as_str) != Some("--") {
                     return Err(OperatorError::Usage("sessions send-input"));
                 }
@@ -3784,7 +3918,7 @@ impl SessionCommand {
                 if args.len() != 6 {
                     return Err(OperatorError::Usage("sessions resize"));
                 }
-                let options = DataDirOptions::parse(args[1..3].to_vec(), "sessions resize")?;
+                let options = DataArgs::parse(args[1..3].to_vec(), "sessions resize")?;
                 let rows = args[4]
                     .parse::<u16>()
                     .map_err(|_| OperatorError::Usage("sessions resize"))?;
@@ -3804,7 +3938,7 @@ impl SessionCommand {
                 if args.len() < 4 {
                     return Err(OperatorError::Usage("sessions detach"));
                 }
-                let options = DataDirOptions::parse(args[1..3].to_vec(), "sessions detach")?;
+                let options = DataArgs::parse(args[1..3].to_vec(), "sessions detach")?;
                 let subscription_id =
                     if args.get(4).map(String::as_str) == Some("--subscription-id") {
                         let Some(value) = args.get(5) else {
@@ -3826,7 +3960,7 @@ impl SessionCommand {
                 if args.len() != 4 {
                     return Err(OperatorError::Usage("sessions shutdown"));
                 }
-                let options = DataDirOptions::parse(args[1..3].to_vec(), "sessions shutdown")?;
+                let options = DataArgs::parse(args[1..3].to_vec(), "sessions shutdown")?;
                 Ok(Self {
                     data_directory: options.data_directory,
                     action: SessionAction::Shutdown {
@@ -3862,7 +3996,10 @@ impl AppCommand {
         };
         match action {
             "list" => {
-                let options = DataDirOptions::parse(args[1..].to_vec(), "apps list")?;
+                let options = DataArgs::parse(args[1..].to_vec(), "apps list")?;
+                if !options.arguments.is_empty() {
+                    return Err(OperatorError::Usage("apps list"));
+                }
                 Ok(Self {
                     data_directory: options.data_directory,
                     action: AppActionCommand::List,
@@ -3872,7 +4009,7 @@ impl AppCommand {
                 if args.len() != 4 {
                     return Err(OperatorError::Usage("apps show"));
                 }
-                let options = DataDirOptions::parse(args[1..3].to_vec(), "apps show")?;
+                let options = DataArgs::parse(args[1..3].to_vec(), "apps show")?;
                 Ok(Self {
                     data_directory: options.data_directory,
                     action: AppActionCommand::Show(args[3].clone()),
@@ -3882,7 +4019,7 @@ impl AppCommand {
                 if args.len() != 4 {
                     return Err(OperatorError::Usage("apps open"));
                 }
-                let options = DataDirOptions::parse(args[1..3].to_vec(), "apps open")?;
+                let options = DataArgs::parse(args[1..3].to_vec(), "apps open")?;
                 Ok(Self {
                     data_directory: options.data_directory,
                     action: AppActionCommand::Open(args[3].clone()),
@@ -3959,7 +4096,15 @@ impl PackageCommand {
 
         match action {
             "list" => {
-                let options = DataDirOptions::parse(args[1..].to_vec(), "packages list")?;
+                let command = if providers_only {
+                    "providers list"
+                } else {
+                    "packages list"
+                };
+                let options = DataArgs::parse(args[1..].to_vec(), command)?;
+                if !options.arguments.is_empty() {
+                    return Err(OperatorError::Usage(command));
+                }
                 Ok(Self {
                     data_directory: options.data_directory,
                     action: PackageActionCommand::List,
@@ -3969,7 +4114,7 @@ impl PackageCommand {
                 if args.len() != 5 || args.get(3).map(String::as_str) != Some("--registry") {
                     return Err(OperatorError::Usage("packages available"));
                 }
-                let options = DataDirOptions::parse(args[1..3].to_vec(), "packages available")?;
+                let options = DataArgs::parse(args[1..3].to_vec(), "packages available")?;
                 Ok(Self {
                     data_directory: options.data_directory,
                     action: PackageActionCommand::Available(PathBuf::from(&args[4])),
@@ -3979,7 +4124,7 @@ impl PackageCommand {
                 if args.len() != 6 || args.get(3).map(String::as_str) != Some("--registry") {
                     return Err(OperatorError::Usage("packages inspect"));
                 }
-                let options = DataDirOptions::parse(args[1..3].to_vec(), "packages inspect")?;
+                let options = DataArgs::parse(args[1..3].to_vec(), "packages inspect")?;
                 Ok(Self {
                     data_directory: options.data_directory,
                     action: PackageActionCommand::InspectAvailable {
@@ -3992,8 +4137,7 @@ impl PackageCommand {
                 if args.len() != 6 || args.get(3).map(String::as_str) != Some("--registry") {
                     return Err(OperatorError::Usage("packages preview-install"));
                 }
-                let options =
-                    DataDirOptions::parse(args[1..3].to_vec(), "packages preview-install")?;
+                let options = DataArgs::parse(args[1..3].to_vec(), "packages preview-install")?;
                 Ok(Self {
                     data_directory: options.data_directory,
                     action: PackageActionCommand::PreviewInstall {
@@ -4006,7 +4150,7 @@ impl PackageCommand {
                 if args.len() != 5 && args.len() != 6 {
                     return Err(OperatorError::Usage("packages install"));
                 }
-                let options = DataDirOptions::parse(args[1..3].to_vec(), "packages install")?;
+                let options = DataArgs::parse(args[1..3].to_vec(), "packages install")?;
                 match args.get(3).map(String::as_str) {
                     Some("--path") if args.len() == 5 => Ok(Self {
                         data_directory: options.data_directory,
@@ -4026,7 +4170,7 @@ impl PackageCommand {
                 if args.len() != 4 {
                     return Err(OperatorError::Usage("packages show"));
                 }
-                let options = DataDirOptions::parse(args[1..3].to_vec(), "packages show")?;
+                let options = DataArgs::parse(args[1..3].to_vec(), "packages show")?;
                 Ok(Self {
                     data_directory: options.data_directory,
                     action: PackageActionCommand::Show(args[3].clone()),
@@ -4037,8 +4181,7 @@ impl PackageCommand {
                     if args.len() != 6 {
                         return Err(OperatorError::Usage("packages config set"));
                     }
-                    let options =
-                        DataDirOptions::parse(args[2..4].to_vec(), "packages config set")?;
+                    let options = DataArgs::parse(args[2..4].to_vec(), "packages config set")?;
                     let values =
                         serde_json::from_str::<BTreeMap<String, serde_json::Value>>(&args[5])
                             .map_err(|_| OperatorError::Usage("packages config set"))?;
@@ -4053,7 +4196,7 @@ impl PackageCommand {
                     if args.len() != 4 {
                         return Err(OperatorError::Usage("packages config"));
                     }
-                    let options = DataDirOptions::parse(args[1..3].to_vec(), "packages config")?;
+                    let options = DataArgs::parse(args[1..3].to_vec(), "packages config")?;
                     Ok(Self {
                         data_directory: options.data_directory,
                         action: PackageActionCommand::Config(args[3].clone()),
@@ -4064,7 +4207,7 @@ impl PackageCommand {
                 if args.len() < 4 {
                     return Err(OperatorError::Usage("packages enable"));
                 }
-                let options = DataDirOptions::parse(args[1..3].to_vec(), "packages enable")?;
+                let options = DataArgs::parse(args[1..3].to_vec(), "packages enable")?;
                 if args.get(3).map(String::as_str) == Some("--path") {
                     let Some(path) = args.get(4) else {
                         return Err(OperatorError::Usage("packages enable"));
@@ -4084,7 +4227,7 @@ impl PackageCommand {
                 if args.len() != 4 {
                     return Err(OperatorError::Usage("packages disable"));
                 }
-                let options = DataDirOptions::parse(args[1..3].to_vec(), "packages disable")?;
+                let options = DataArgs::parse(args[1..3].to_vec(), "packages disable")?;
                 Ok(Self {
                     data_directory: options.data_directory,
                     action: PackageActionCommand::Disable(args[3].clone()),
@@ -4094,7 +4237,7 @@ impl PackageCommand {
                 if args.len() != 4 {
                     return Err(OperatorError::Usage("packages remove"));
                 }
-                let options = DataDirOptions::parse(args[1..3].to_vec(), "packages remove")?;
+                let options = DataArgs::parse(args[1..3].to_vec(), "packages remove")?;
                 Ok(Self {
                     data_directory: options.data_directory,
                     action: PackageActionCommand::Remove(args[3].clone()),
@@ -4104,7 +4247,7 @@ impl PackageCommand {
                 if args.len() != 4 {
                     return Err(OperatorError::Usage("packages check-update"));
                 }
-                let options = DataDirOptions::parse(args[1..3].to_vec(), "packages check-update")?;
+                let options = DataArgs::parse(args[1..3].to_vec(), "packages check-update")?;
                 Ok(Self {
                     data_directory: options.data_directory,
                     action: PackageActionCommand::CheckUpdate(args[3].clone()),
@@ -4114,7 +4257,7 @@ impl PackageCommand {
                 if args.len() != 4 {
                     return Err(OperatorError::Usage("packages reload"));
                 }
-                let options = DataDirOptions::parse(args[1..3].to_vec(), "packages reload")?;
+                let options = DataArgs::parse(args[1..3].to_vec(), "packages reload")?;
                 Ok(Self {
                     data_directory: options.data_directory,
                     action: PackageActionCommand::Reload(args[3].clone()),
@@ -4196,7 +4339,7 @@ fn parse_package_update_command(
     if args.len() < 6 {
         return Err(OperatorError::Usage(usage));
     }
-    let options = DataDirOptions::parse(args[1..3].to_vec(), usage)?;
+    let options = DataArgs::parse(args[1..3].to_vec(), usage)?;
     let package_name = args[3].clone();
     let pin = parse_daemon_package_pin(&args[4..], usage)?;
     let action = match kind {
@@ -4252,11 +4395,11 @@ fn parse_daemon_package_pin(
 fn parse_package_entrypoint_command(
     args: Vec<String>,
     usage: &'static str,
-) -> Result<(DataDirOptions, String, String), OperatorError> {
+) -> Result<(DataArgs, String, String), OperatorError> {
     if args.len() != 5 {
         return Err(OperatorError::Usage(usage));
     }
-    let options = DataDirOptions::parse(args[1..3].to_vec(), usage)?;
+    let options = DataArgs::parse(args[1..3].to_vec(), usage)?;
     Ok((options, args[3].clone(), args[4].clone()))
 }
 
@@ -4270,7 +4413,7 @@ impl InspectCommand {
         if args.len() != 3 {
             return Err(OperatorError::Usage("inspect"));
         }
-        let options = DataDirOptions::parse(args[0..2].to_vec(), "inspect")?;
+        let options = DataArgs::parse(args[0..2].to_vec(), "inspect")?;
         Ok(Self {
             data_directory: options.data_directory,
             session_id: SessionId(args[2].clone()),
@@ -4293,7 +4436,7 @@ fn run_one(args: Vec<String>) -> Result<(), RunOneError> {
         },
         ..HubStartupOptions::default()
     }
-    .build_config_for_environment(&RuntimeEnvironment::from_values(None, None, None))?;
+    .build_config_for_environment(&RuntimeEnvironment::from_values(None, None))?;
 
     let profile = host_profile();
     let host_id = config.host.id.clone();
@@ -4684,7 +4827,7 @@ impl fmt::Display for LocalRuntimeError {
             Self::MissingPackage { label } => {
                 write!(
                     formatter,
-                    "package {label} is not installed; install it with `botster-hub packages install --data-dir <path> --path <package-path>` and enable it before running `botster-hub up`"
+                    "package {label} is not installed; install it with `botster-hub packages install [--data-dir <path>] --path <package-path>` and enable it before running `botster-hub up`"
                 )
             }
             Self::PackageDisabled {
@@ -4719,7 +4862,7 @@ impl fmt::Display for LocalRuntimeError {
             Self::Operator(error) => write!(formatter, "{error}"),
             Self::IncompatibleDaemon(message) => write!(
                 formatter,
-                "running daemon is incompatible or stale: {message}; `botster-hub down` may fail against this daemon because shutdown uses the same protocol handshake. Stop the running botster-hub process directly, remove the stale local socket for this data dir if one remains, then retry `botster-hub up --data-dir <path>`"
+                "running daemon is incompatible or stale: {message}; `botster-hub down` may fail against this daemon because shutdown uses the same protocol handshake. Stop the running botster-hub process directly, remove the stale local socket for this data dir if one remains, then retry `botster-hub up [--data-dir <path>]`"
             ),
             Self::DaemonExited {
                 status,
@@ -4840,44 +4983,44 @@ Daily runtime commands:
   botster-hub smoke [--data-dir <path>] [...]
   botster-hub open web [--data-dir <path>]
   botster-hub open tui [--data-dir <path>]
-  botster-hub mcp-serve --data-dir <path>
+  botster-hub mcp-serve [--data-dir <path>]
 
 Apps:
-  botster-hub apps list --data-dir <path>
-  botster-hub apps show --data-dir <path> <app|package/app>
-  botster-hub apps open --data-dir <path> <app|package/app>
+  botster-hub apps list [--data-dir <path>]
+  botster-hub apps show [--data-dir <path>] <app|package/app>
+  botster-hub apps open [--data-dir <path>] <app|package/app>
 
 Spawn targets:
-  botster-hub spawn-targets list --data-dir <path>
-  botster-hub spawn-targets show --data-dir <path> <target-id>
-  botster-hub spawn-targets create --data-dir <path> --root <dir> [--id <id>] [--label <label>] [--kind directory] [--disabled]
-  botster-hub spawn-targets update --data-dir <path> <target-id> [--label <label>] [--root <dir>] [--enable|--disable]
-  botster-hub spawn-targets delete --data-dir <path> <target-id>
-  botster-hub spawn-targets validate --data-dir <path> <target-id>
+  botster-hub spawn-targets list [--data-dir <path>]
+  botster-hub spawn-targets show [--data-dir <path>] <target-id>
+  botster-hub spawn-targets create [--data-dir <path>] --root <dir> [--id <id>] [--label <label>] [--kind directory] [--disabled]
+  botster-hub spawn-targets update [--data-dir <path>] <target-id> [--label <label>] [--root <dir>] [--enable|--disable]
+  botster-hub spawn-targets delete [--data-dir <path>] <target-id>
+  botster-hub spawn-targets validate [--data-dir <path>] <target-id>
 
 Packages:
-  botster-hub packages list --data-dir <path>
-  botster-hub packages available --data-dir <path> --registry <registry-dir-or-file>
-  botster-hub packages inspect --data-dir <path> --registry <registry-dir-or-file> <entry-id>
-  botster-hub packages preview-install --data-dir <path> --registry <registry-dir-or-file> <entry-id>
-  botster-hub packages install --data-dir <path> (--path <package-dir-or-manifest>|--registry <registry-dir-or-file> <entry-id>)
-  botster-hub packages show --data-dir <path> <name>
-  botster-hub packages config --data-dir <path> <name>
-  botster-hub packages config set --data-dir <path> <name> '<json-object>'
-  botster-hub packages enable --data-dir <path> (--path <package-dir-or-manifest>|<name>)
-  botster-hub packages disable --data-dir <path> <name>
-  botster-hub packages remove --data-dir <path> <name>
-  botster-hub packages reload --data-dir <path> <name>
-  botster-hub reload <name> --data-dir <path>
-  botster-hub packages check-update --data-dir <path> <name>
-  botster-hub packages preview-update --data-dir <path> <name> --revision <revision> [...]
-  botster-hub packages apply-update --data-dir <path> <name> --revision <revision> [...]
-  botster-hub packages start-entrypoint --data-dir <path> <package> <entrypoint>
-  botster-hub packages stop-entrypoint --data-dir <path> <package> <entrypoint>
-  botster-hub packages restart-entrypoint --data-dir <path> <package> <entrypoint>
-  botster-hub packages entrypoint-status --data-dir <path> <package> <entrypoint>"
+  botster-hub packages list [--data-dir <path>]
+  botster-hub packages available [--data-dir <path>] --registry <registry-dir-or-file>
+  botster-hub packages inspect [--data-dir <path>] --registry <registry-dir-or-file> <entry-id>
+  botster-hub packages preview-install [--data-dir <path>] --registry <registry-dir-or-file> <entry-id>
+  botster-hub packages install [--data-dir <path>] (--path <package-dir-or-manifest>|--registry <registry-dir-or-file> <entry-id>)
+  botster-hub packages show [--data-dir <path>] <name>
+  botster-hub packages config [--data-dir <path>] <name>
+  botster-hub packages config set [--data-dir <path>] <name> '<json-object>'
+  botster-hub packages enable [--data-dir <path>] (--path <package-dir-or-manifest>|<name>)
+  botster-hub packages disable [--data-dir <path>] <name>
+  botster-hub packages remove [--data-dir <path>] <name>
+  botster-hub packages reload [--data-dir <path>] <name>
+  botster-hub reload <name> [--data-dir <path>]
+  botster-hub packages check-update [--data-dir <path>] <name>
+  botster-hub packages preview-update [--data-dir <path>] <name> --revision <revision> [...]
+  botster-hub packages apply-update [--data-dir <path>] <name> --revision <revision> [...]
+  botster-hub packages start-entrypoint [--data-dir <path>] <package> <entrypoint>
+  botster-hub packages stop-entrypoint [--data-dir <path>] <package> <entrypoint>
+  botster-hub packages restart-entrypoint [--data-dir <path>] <package> <entrypoint>
+  botster-hub packages entrypoint-status [--data-dir <path>] <package> <entrypoint>"
         }
-        "start" => "usage: botster-hub start --data-dir <path> [--session-worker-bin <path>]",
+        "start" => "usage: botster-hub start [--data-dir <path>] [--session-worker-bin <path>]",
         "up" => {
             "usage: botster-hub up [--data-dir <path>] [--session-worker-bin <path>]"
         }
@@ -4891,114 +5034,114 @@ Packages:
             "usage: botster-hub sessions <list|spawn|attach|send-input|resize|detach|shutdown> ..."
         }
         "session-templates" => "usage: botster-hub session-templates <list|show|resolve|spawn> ...",
-        "session-templates list" => "usage: botster-hub session-templates list --data-dir <path>",
+        "session-templates list" => "usage: botster-hub session-templates list [--data-dir <path>]",
         "session-templates show" => {
-            "usage: botster-hub session-templates show --data-dir <path> <template-id>"
+            "usage: botster-hub session-templates show [--data-dir <path>] <template-id>"
         }
         "session-templates resolve" => {
-            "usage: botster-hub session-templates resolve --data-dir <path> <template-id> [--target-id <id>] [--cwd <path>] [--env NAME=value] [--prompt <text>] [--branch <name>] [--ticket-id <id>] [--workspace-id <id>]"
+            "usage: botster-hub session-templates resolve [--data-dir <path>] <template-id> [--target-id <id>] [--cwd <path>] [--env NAME=value] [--prompt <text>] [--branch <name>] [--ticket-id <id>] [--workspace-id <id>]"
         }
         "session-templates spawn" => {
-            "usage: botster-hub session-templates spawn --data-dir <path> <template-id> --session-id <id> [--target-id <id>] [--cwd <path>] [--env NAME=value] [--prompt <text>] [--branch <name>] [--ticket-id <id>] [--workspace-id <id>]"
+            "usage: botster-hub session-templates spawn [--data-dir <path>] <template-id> --session-id <id> [--target-id <id>] [--cwd <path>] [--env NAME=value] [--prompt <text>] [--branch <name>] [--ticket-id <id>] [--workspace-id <id>]"
         }
         "spawn-targets" | "spawn-targets list" => {
-            "usage: botster-hub spawn-targets list --data-dir <path>"
+            "usage: botster-hub spawn-targets list [--data-dir <path>]"
         }
         "spawn-targets show" => {
-            "usage: botster-hub spawn-targets show --data-dir <path> <target-id>"
+            "usage: botster-hub spawn-targets show [--data-dir <path>] <target-id>"
         }
         "spawn-targets create" => {
-            "usage: botster-hub spawn-targets create --data-dir <path> --root <dir> [--id <id>] [--label <label>] [--kind directory] [--disabled]"
+            "usage: botster-hub spawn-targets create [--data-dir <path>] --root <dir> [--id <id>] [--label <label>] [--kind directory] [--disabled]"
         }
         "spawn-targets update" => {
-            "usage: botster-hub spawn-targets update --data-dir <path> <target-id> [--label <label>] [--root <dir>] [--kind directory] [--enable|--disable]"
+            "usage: botster-hub spawn-targets update [--data-dir <path>] <target-id> [--label <label>] [--root <dir>] [--kind directory] [--enable|--disable]"
         }
         "spawn-targets delete" => {
-            "usage: botster-hub spawn-targets delete --data-dir <path> <target-id>"
+            "usage: botster-hub spawn-targets delete [--data-dir <path>] <target-id>"
         }
         "spawn-targets validate" => {
-            "usage: botster-hub spawn-targets validate --data-dir <path> <target-id>"
+            "usage: botster-hub spawn-targets validate [--data-dir <path>] <target-id>"
         }
         "context" => {
             "usage: botster-hub context [--data-dir <path>] [--session-id <id>] [--context-id <id>] [--key <name>]"
         }
-        "sessions list" => "usage: botster-hub sessions list --data-dir <path>",
+        "sessions list" => "usage: botster-hub sessions list [--data-dir <path>]",
         "sessions spawn" => {
-            "usage: botster-hub sessions spawn --data-dir <path> [--session-id <id>] -- <command>"
+            "usage: botster-hub sessions spawn [--data-dir <path>] [--session-id <id>] -- <command>"
         }
         "sessions attach" => {
-            "usage: botster-hub sessions attach --data-dir <path> <session-id> [--subscription-id <id>]"
+            "usage: botster-hub sessions attach [--data-dir <path>] <session-id> [--subscription-id <id>]"
         }
         "sessions resize" => {
-            "usage: botster-hub sessions resize --data-dir <path> <session-id> <rows> <cols>"
+            "usage: botster-hub sessions resize [--data-dir <path>] <session-id> <rows> <cols>"
         }
         "sessions detach" => {
-            "usage: botster-hub sessions detach --data-dir <path> <session-id> [--subscription-id <id>]"
+            "usage: botster-hub sessions detach [--data-dir <path>] <session-id> [--subscription-id <id>]"
         }
         "sessions send-input" => {
-            "usage: botster-hub sessions send-input --data-dir <path> <session-id> -- <bytes>"
+            "usage: botster-hub sessions send-input [--data-dir <path>] <session-id> -- <bytes>"
         }
         "sessions shutdown" => {
-            "usage: botster-hub sessions shutdown --data-dir <path> <session-id>"
+            "usage: botster-hub sessions shutdown [--data-dir <path>] <session-id>"
         }
-        "shutdown" => "usage: botster-hub shutdown --data-dir <path>",
-        "mcp-serve" => "usage: botster-hub mcp-serve --data-dir <path>",
+        "shutdown" => "usage: botster-hub shutdown [--data-dir <path>]",
+        "mcp-serve" => "usage: botster-hub mcp-serve [--data-dir <path>]",
         "open" => "usage: botster-hub open <web|tui> [--data-dir <path>]",
         "apps" => "usage: botster-hub apps <list|show|open> ...",
-        "apps list" => "usage: botster-hub apps list --data-dir <path>",
-        "apps show" => "usage: botster-hub apps show --data-dir <path> <app|package/app>",
-        "apps open" => "usage: botster-hub apps open --data-dir <path> <app|package/app>",
+        "apps list" => "usage: botster-hub apps list [--data-dir <path>]",
+        "apps show" => "usage: botster-hub apps show [--data-dir <path>] <app|package/app>",
+        "apps open" => "usage: botster-hub apps open [--data-dir <path>] <app|package/app>",
         "packages" => {
             "usage: botster-hub packages <available|inspect|preview-install|install|list|show|config|enable|disable|remove|reload|check-update|preview-update|apply-update|start-entrypoint|stop-entrypoint|restart-entrypoint|entrypoint-status> ..."
         }
         "packages install" => {
-            "usage: botster-hub packages install --data-dir <path> (--path <package-dir-or-manifest>|--registry <registry-dir-or-file> <entry-id>)"
+            "usage: botster-hub packages install [--data-dir <path>] (--path <package-dir-or-manifest>|--registry <registry-dir-or-file> <entry-id>)"
         }
         "packages available" => {
-            "usage: botster-hub packages available --data-dir <path> --registry <registry-dir-or-file>"
+            "usage: botster-hub packages available [--data-dir <path>] --registry <registry-dir-or-file>"
         }
         "packages inspect" => {
-            "usage: botster-hub packages inspect --data-dir <path> --registry <registry-dir-or-file> <entry-id>"
+            "usage: botster-hub packages inspect [--data-dir <path>] --registry <registry-dir-or-file> <entry-id>"
         }
         "packages preview-install" => {
-            "usage: botster-hub packages preview-install --data-dir <path> --registry <registry-dir-or-file> <entry-id>"
+            "usage: botster-hub packages preview-install [--data-dir <path>] --registry <registry-dir-or-file> <entry-id>"
         }
-        "packages list" => "usage: botster-hub packages list --data-dir <path>",
-        "packages show" => "usage: botster-hub packages show --data-dir <path> <name>",
-        "packages config" => "usage: botster-hub packages config --data-dir <path> <name>",
+        "packages list" => "usage: botster-hub packages list [--data-dir <path>]",
+        "packages show" => "usage: botster-hub packages show [--data-dir <path>] <name>",
+        "packages config" => "usage: botster-hub packages config [--data-dir <path>] <name>",
         "packages config set" => {
-            "usage: botster-hub packages config set --data-dir <path> <name> '<json-object>'"
+            "usage: botster-hub packages config set [--data-dir <path>] <name> '<json-object>'"
         }
         "packages enable" => {
-            "usage: botster-hub packages enable --data-dir <path> (--path <package-dir-or-manifest>|<name>)"
+            "usage: botster-hub packages enable [--data-dir <path>] (--path <package-dir-or-manifest>|<name>)"
         }
-        "packages disable" => "usage: botster-hub packages disable --data-dir <path> <name>",
-        "packages remove" => "usage: botster-hub packages remove --data-dir <path> <name>",
-        "reload" => "usage: botster-hub reload <name> --data-dir <path>",
+        "packages disable" => "usage: botster-hub packages disable [--data-dir <path>] <name>",
+        "packages remove" => "usage: botster-hub packages remove [--data-dir <path>] <name>",
+        "reload" => "usage: botster-hub reload <name> [--data-dir <path>]",
         "packages check-update" => {
-            "usage: botster-hub packages check-update --data-dir <path> <name>"
+            "usage: botster-hub packages check-update [--data-dir <path>] <name>"
         }
-        "packages reload" => "usage: botster-hub packages reload --data-dir <path> <name>",
+        "packages reload" => "usage: botster-hub packages reload [--data-dir <path>] <name>",
         "packages preview-update" => {
-            "usage: botster-hub packages preview-update --data-dir <path> <name> --revision <revision> [--branch <branch>] [--tag <tag>] [--rev <rev>] [--checksum <checksum>] [--policy manual|track_source]"
+            "usage: botster-hub packages preview-update [--data-dir <path>] <name> --revision <revision> [--branch <branch>] [--tag <tag>] [--rev <rev>] [--checksum <checksum>] [--policy manual|track_source]"
         }
         "packages apply-update" => {
-            "usage: botster-hub packages apply-update --data-dir <path> <name> --revision <revision> [--branch <branch>] [--tag <tag>] [--rev <rev>] [--checksum <checksum>] [--policy manual|track_source]"
+            "usage: botster-hub packages apply-update [--data-dir <path>] <name> --revision <revision> [--branch <branch>] [--tag <tag>] [--rev <rev>] [--checksum <checksum>] [--policy manual|track_source]"
         }
         "packages start-entrypoint" => {
-            "usage: botster-hub packages start-entrypoint --data-dir <path> <package> <entrypoint>"
+            "usage: botster-hub packages start-entrypoint [--data-dir <path>] <package> <entrypoint>"
         }
         "packages stop-entrypoint" => {
-            "usage: botster-hub packages stop-entrypoint --data-dir <path> <package> <entrypoint>"
+            "usage: botster-hub packages stop-entrypoint [--data-dir <path>] <package> <entrypoint>"
         }
         "packages restart-entrypoint" => {
-            "usage: botster-hub packages restart-entrypoint --data-dir <path> <package> <entrypoint>"
+            "usage: botster-hub packages restart-entrypoint [--data-dir <path>] <package> <entrypoint>"
         }
         "packages entrypoint-status" => {
-            "usage: botster-hub packages entrypoint-status --data-dir <path> <package> <entrypoint>"
+            "usage: botster-hub packages entrypoint-status [--data-dir <path>] <package> <entrypoint>"
         }
-        "providers" | "providers list" => "usage: botster-hub providers list --data-dir <path>",
-        "inspect" => "usage: botster-hub inspect --data-dir <path> <session-id>",
+        "providers" | "providers list" => "usage: botster-hub providers list [--data-dir <path>]",
+        "inspect" => "usage: botster-hub inspect [--data-dir <path>] <session-id>",
         _ => {
             "usage: botster-hub <help|up|down|doctor|smoke|open|reload|start|status|sessions|shutdown|mcp-serve|apps|packages|providers|inspect|run-one>"
         }
@@ -5122,5 +5265,171 @@ impl From<botster_core_daemon::CoreDaemonError> for RunOneError {
 impl From<botster_hub::HubStateStoreError> for RunOneError {
     fn from(error: botster_hub::HubStateStoreError) -> Self {
         Self::State(error)
+    }
+}
+
+#[cfg(test)]
+mod cli_data_dir_tests {
+    use super::*;
+
+    fn environment() -> RuntimeEnvironment {
+        RuntimeEnvironment::from_values(None, Some(PathBuf::from("/tmp/botster-cli-home")))
+    }
+
+    #[test]
+    fn every_stateful_command_family_receives_the_home_runtime_root() {
+        let expected = "/tmp/botster-cli-home/.botster/hub";
+        let cases = [
+            ("start", vec![], 0),
+            ("up", vec![], 0),
+            ("down", vec![], 0),
+            ("doctor", vec![], 0),
+            ("smoke", vec![], 0),
+            ("status", vec![], 0),
+            ("shutdown", vec![], 0),
+            ("mcp-serve", vec![], 0),
+            ("inspect", vec!["session"], 0),
+            ("sessions", vec!["list"], 1),
+            ("session-templates", vec!["list"], 1),
+            ("spawn-targets", vec!["list"], 1),
+            ("context", vec!["--session-id", "session"], 0),
+            ("open", vec!["web"], 1),
+            ("reload", vec!["botster-web"], 1),
+            ("apps", vec!["list"], 1),
+            ("packages", vec!["list"], 1),
+            ("providers", vec!["list"], 1),
+            ("packages", vec!["config", "set", "demo", "{}"], 2),
+        ];
+
+        for (command, args, insert_at) in cases {
+            let resolved = canonicalize_data_dir_args_for_environment(
+                command,
+                args.into_iter().map(str::to_string).collect(),
+                &environment(),
+            )
+            .expect("resolve command data directory");
+            assert_eq!(resolved[insert_at], "--data-dir", "{command}");
+            assert_eq!(resolved[insert_at + 1], expected, "{command}");
+        }
+    }
+
+    #[test]
+    fn explicit_data_dir_wins_and_can_appear_after_operands() {
+        let resolved = canonicalize_data_dir_args_for_environment(
+            "packages",
+            vec![
+                "show".to_string(),
+                "demo".to_string(),
+                "--data-dir".to_string(),
+                "/tmp/explicit".to_string(),
+            ],
+            &RuntimeEnvironment::from_values(
+                Some(PathBuf::from("/tmp/environment")),
+                Some(PathBuf::from("/tmp/botster-fixture-home")),
+            ),
+        )
+        .expect("resolve explicit data directory");
+
+        assert_eq!(resolved, ["show", "--data-dir", "/tmp/explicit", "demo"]);
+    }
+
+    #[test]
+    fn environment_data_dir_wins_over_home() {
+        let resolved = canonicalize_data_dir_args_for_environment(
+            "status",
+            Vec::new(),
+            &RuntimeEnvironment::from_values(
+                Some(PathBuf::from("/tmp/environment")),
+                Some(PathBuf::from("/tmp/botster-fixture-home")),
+            ),
+        )
+        .expect("resolve environment data directory");
+
+        assert_eq!(resolved, ["--data-dir", "/tmp/environment"]);
+    }
+
+    #[test]
+    fn duplicate_or_missing_data_dir_values_are_usage_errors() {
+        for args in [
+            vec!["--data-dir".to_string()],
+            vec![
+                "--data-dir".to_string(),
+                "/tmp/one".to_string(),
+                "--data-dir".to_string(),
+                "/tmp/two".to_string(),
+            ],
+        ] {
+            assert!(matches!(
+                canonicalize_data_dir_args_for_environment("start", args, &environment()),
+                Err(OperatorError::Usage("start"))
+            ));
+        }
+    }
+
+    #[test]
+    fn data_dir_tokens_after_operand_separator_are_not_cli_options() {
+        let resolved = canonicalize_data_dir_args_for_environment(
+            "sessions",
+            vec![
+                "spawn".to_string(),
+                "--".to_string(),
+                "printf".to_string(),
+                "--data-dir".to_string(),
+            ],
+            &environment(),
+        )
+        .expect("resolve session spawn data directory");
+
+        assert_eq!(
+            resolved,
+            [
+                "spawn",
+                "--data-dir",
+                "/tmp/botster-cli-home/.botster/hub",
+                "--",
+                "printf",
+                "--data-dir"
+            ]
+        );
+    }
+
+    #[test]
+    fn thin_data_args_parser_also_stops_at_operand_separator() {
+        let parsed = DataArgs::parse(
+            vec![
+                "--data-dir".to_string(),
+                "/tmp/explicit".to_string(),
+                "--".to_string(),
+                "--data-dir".to_string(),
+                "/tmp/operand".to_string(),
+            ],
+            "test",
+        )
+        .expect("parse explicit data directory and operand tail");
+
+        assert_eq!(parsed.data_directory, PathBuf::from("/tmp/explicit"));
+        assert_eq!(
+            parsed.arguments,
+            ["--", "--data-dir", "/tmp/operand"],
+            "operand-tail tokens must not be consumed as CLI options"
+        );
+    }
+
+    #[test]
+    fn help_marks_data_dir_optional_for_start_smoke_and_command_families() {
+        for command in [
+            "start",
+            "smoke",
+            "sessions list",
+            "session-templates list",
+            "apps list",
+            "packages list",
+            "mcp-serve",
+        ] {
+            assert!(
+                usage_for(command).contains("[--data-dir <path>]"),
+                "{command} usage must mark --data-dir optional"
+            );
+        }
     }
 }

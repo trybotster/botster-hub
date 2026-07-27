@@ -288,6 +288,12 @@ raw worktree paths, and mutable Botster identity. First-party clients may add UI
 severity or remediation copy, but that policy belongs in the client renderer,
 not in the daemon protocol.
 
+Stateful CLI commands resolve one Hub-owned runtime root before opening the
+daemon transport: explicit `--data-dir`, then `BOTSTER_HUB_DATA_DIR`, then
+`$HOME/.botster/hub`. The result is independent of the current working
+directory. `XDG_DATA_HOME` and the sibling device/configuration directories
+under `$HOME/.botster` are not runtime-root inputs.
+
 ## Package Registry Sources And Install Preview
 
 The hub exposes a local/static marketplace registry preview path through the

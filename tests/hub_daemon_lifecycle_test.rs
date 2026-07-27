@@ -93,7 +93,7 @@ fn explicit_config(data_directory: impl Into<PathBuf>) -> botster_hub::HubConfig
         },
         ..HubStartupOptions::default()
     }
-    .build_config_for_environment(&RuntimeEnvironment::from_values(None, None, None))
+    .build_config_for_environment(&RuntimeEnvironment::from_values(None, None))
     .expect("explicit daemon config should build")
 }
 
@@ -3987,10 +3987,32 @@ fn cli_local_runtime_up_failure_after_daemon_ready_stops_started_daemon() {
 fn cli_daily_commands_share_canonical_default_data_directory() {
     let _guard = daemon_test_guard();
     let checkout = unique_short_test_dir("daily");
-    let data_dir = checkout.join("target/botster-hub-runtime-data");
+    let other_checkout = unique_short_test_dir("daily-other-cwd");
+    let home = unique_short_test_dir("daily-home");
+    let xdg = unique_short_test_dir("daily-xdg");
+    let data_dir = home.join(".botster/hub");
     let web_package_dir = unique_short_test_dir("cli-daily-default-web");
     let tui_package_dir = unique_short_test_dir("cli-daily-default-tui");
     fs::create_dir_all(&checkout).expect("create daily command checkout");
+    fs::create_dir_all(&other_checkout).expect("create second daily command cwd");
+    fs::create_dir_all(&home).expect("create daily command home");
+    fs::create_dir_all(&xdg).expect("create ignored XDG root");
+    for sibling in [
+        "plugins",
+        "agents",
+        "lua",
+        "profiles",
+        "shared",
+        "workspaces",
+    ] {
+        let sibling = home.join(".botster").join(sibling);
+        fs::create_dir_all(&sibling).expect("create protected Botster sibling");
+        fs::write(
+            sibling.join("sentinel"),
+            sibling.to_string_lossy().as_bytes(),
+        )
+        .expect("write protected Botster sibling sentinel");
+    }
     write_botster_web_package(&web_package_dir);
     write_botster_tui_package(&tui_package_dir);
     ensure_session_worker_binary();
@@ -3999,6 +4021,9 @@ fn cli_daily_commands_share_canonical_default_data_directory() {
     let mut up_command = Command::new(env!("CARGO_BIN_EXE_botster-hub"));
     up_command
         .current_dir(&checkout)
+        .env("HOME", &home)
+        .env("XDG_DATA_HOME", &xdg)
+        .env_remove("BOTSTER_HUB_DATA_DIR")
         .arg("up")
         .arg("--session-worker-bin")
         .arg(session_worker_binary_path());
@@ -4008,11 +4033,19 @@ fn cli_daily_commands_share_canonical_default_data_directory() {
         "default up failed: {}",
         command_output_text(&up)
     );
-    assert!(command_output_text(&up).contains("data_dir=stable:target/botster-hub-runtime-data"));
+    assert!(
+        command_output_text(&up).contains(&format!("data_dir=resolved:{}", data_dir.display()))
+    );
 
     let run_daily = |command: &str, args: &[&str]| {
         let mut process = Command::new(env!("CARGO_BIN_EXE_botster-hub"));
-        process.current_dir(&checkout).arg(command).args(args);
+        process
+            .current_dir(&other_checkout)
+            .env("HOME", &home)
+            .env("XDG_DATA_HOME", &xdg)
+            .env_remove("BOTSTER_HUB_DATA_DIR")
+            .arg(command)
+            .args(args);
         process.output().expect("run daily command")
     };
 
@@ -4024,6 +4057,98 @@ fn cli_daily_commands_share_canonical_default_data_directory() {
     );
     assert!(command_output_text(&status).contains("lifecycle_state=running"));
 
+    for (command, args, marker) in [
+        ("packages", &["list"][..], "response=packages"),
+        ("apps", &["list"][..], "response=apps"),
+        ("sessions", &["list"][..], "response=sessions"),
+        (
+            "session-templates",
+            &["list"][..],
+            "response=session_templates",
+        ),
+        ("spawn-targets", &["list"][..], "response=spawn_targets"),
+    ] {
+        let output = run_daily(command, args);
+        assert!(
+            output.status.success(),
+            "{command} without --data-dir failed: {}",
+            command_output_text(&output)
+        );
+        assert!(
+            command_output_text(&output).contains(marker),
+            "{command} did not reach the shared daemon: {}",
+            command_output_text(&output)
+        );
+    }
+    for (command, args, usage) in [
+        (
+            "packages",
+            &["list", "--registry", "/tmp/ignored"][..],
+            "packages list",
+        ),
+        ("providers", &["list", "extra"][..], "providers list"),
+        ("apps", &["list", "extra"][..], "apps list"),
+        ("sessions", &["list", "extra"][..], "sessions list"),
+        (
+            "session-templates",
+            &["list", "extra"][..],
+            "session-templates list",
+        ),
+        (
+            "spawn-targets",
+            &["list", "extra"][..],
+            "spawn-targets list",
+        ),
+        ("shutdown", &["extra"][..], "shutdown"),
+        ("mcp-serve", &["extra"][..], "mcp-serve"),
+    ] {
+        let output = run_daily(command, args);
+        assert!(
+            !output.status.success(),
+            "{command} silently accepted extra operands: {}",
+            command_output_text(&output)
+        );
+        assert!(
+            command_output_text(&output).contains(&format!("usage: botster-hub {usage}")),
+            "{command} did not report its usage: {}",
+            command_output_text(&output)
+        );
+    }
+    let mut mcp_child = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .current_dir(&other_checkout)
+        .env("HOME", &home)
+        .env("XDG_DATA_HOME", &xdg)
+        .env_remove("BOTSTER_HUB_DATA_DIR")
+        .arg("mcp-serve")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn default mcp-serve");
+    mcp_child
+        .stdin
+        .as_mut()
+        .expect("mcp stdin")
+        .write_all(
+            br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}"#,
+        )
+        .expect("write MCP initialize");
+    mcp_child
+        .stdin
+        .take()
+        .expect("close mcp stdin after initialize");
+    let mcp = mcp_child.wait_with_output().expect("wait for mcp-serve");
+    assert!(
+        mcp.status.success(),
+        "mcp-serve without --data-dir failed: {}",
+        command_output_text(&mcp)
+    );
+    let mcp_stdout = String::from_utf8(mcp.stdout).expect("MCP output is UTF-8");
+    assert!(
+        mcp_stdout.contains(r#""protocolVersion":"2025-06-18""#),
+        "mcp-serve did not answer initialize through the shared daemon root: {mcp_stdout}"
+    );
+
     let doctor = run_daily("doctor", &[]);
     assert!(
         doctor.status.success(),
@@ -4031,7 +4156,7 @@ fn cli_daily_commands_share_canonical_default_data_directory() {
         command_output_text(&doctor)
     );
     let doctor_text = command_output_text(&doctor);
-    assert!(doctor_text.contains("data_dir=stable:target/botster-hub-runtime-data"));
+    assert!(doctor_text.contains(&format!("data_dir=resolved:{}", data_dir.display())));
     assert!(doctor_text.contains("check name=daemon_running status=pass"));
 
     let open_web = run_daily("open", &["web"]);
@@ -4053,6 +4178,9 @@ fn cli_daily_commands_share_canonical_default_data_directory() {
     let mut smoke_command = Command::new(env!("CARGO_BIN_EXE_botster-hub"));
     smoke_command
         .current_dir(&checkout)
+        .env("HOME", &home)
+        .env("XDG_DATA_HOME", &xdg)
+        .env_remove("BOTSTER_HUB_DATA_DIR")
         .arg("smoke")
         .arg("--session-worker-bin")
         .arg(session_worker_binary_path());
@@ -4063,7 +4191,7 @@ fn cli_daily_commands_share_canonical_default_data_directory() {
         panic!("{}", local_webrtc_smoke_failure_evidence(&smoke, &data_dir));
     }
     let smoke_text = command_output_text(&smoke);
-    assert!(smoke_text.contains("data_dir=stable:target/botster-hub-runtime-data"));
+    assert!(smoke_text.contains(&format!("data_dir=resolved:{}", data_dir.display())));
     assert!(
         smoke_text.contains("check name=daemon status=pass message=daemon reused"),
         "smoke must reuse the daemon started by up: {smoke_text}"
@@ -4091,6 +4219,36 @@ fn cli_daily_commands_share_canonical_default_data_directory() {
         "default status should fail after down: {}",
         command_output_text(&stopped)
     );
+    assert!(
+        !xdg.join("botster-hub").exists(),
+        "XDG_DATA_HOME must not select or create Hub state"
+    );
+    assert!(
+        !checkout.join("target/botster-hub-runtime-data").exists(),
+        "cwd-relative legacy default must not be recreated"
+    );
+    assert!(
+        !other_checkout
+            .join("target/botster-hub-runtime-data")
+            .exists(),
+        "second cwd must not receive legacy runtime state"
+    );
+    for sibling in [
+        "plugins",
+        "agents",
+        "lua",
+        "profiles",
+        "shared",
+        "workspaces",
+    ] {
+        assert!(
+            home.join(".botster")
+                .join(sibling)
+                .join("sentinel")
+                .exists(),
+            "protected Botster sibling {sibling} was mutated"
+        );
+    }
 }
 
 #[test]
@@ -4132,7 +4290,7 @@ fn cli_doctor_reports_healthy_runtime_checks() {
         command_output_text(&doctor)
     );
     let text = command_output_text(&doctor);
-    assert!(text.contains("data_dir=explicit"));
+    assert!(text.contains(&format!("data_dir=resolved:{}", data_dir.display())));
     assert!(text.contains("check name=daemon_running status=pass"));
     assert!(text.contains("check name=daemon_compatible status=pass"));
     assert!(text.contains("conformance_fixture_revision="));
@@ -4155,9 +4313,10 @@ fn cli_doctor_reports_healthy_runtime_checks() {
 }
 
 #[test]
-fn cli_local_runtime_up_recovers_owned_incompatible_daemon() {
+fn cli_home_runtime_up_recovers_owned_incompatible_daemon() {
     let _guard = daemon_test_guard();
-    let data_dir = unique_short_test_dir("cli-up-owned-incompat");
+    let home = unique_short_test_dir("cli-home-owned-incompat");
+    let data_dir = home.join(".botster/hub");
     let project_pipelines_package_dir = unique_test_dir("cli-up-owned-project-pipelines");
     let web_package_dir = unique_test_dir("cli-up-owned-web");
     let tui_package_dir = unique_test_dir("cli-up-owned-tui");
@@ -4171,9 +4330,10 @@ fn cli_local_runtime_up_recovers_owned_incompatible_daemon() {
     let stale_pid = stale_child.id();
 
     let output = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .env("HOME", &home)
+        .env_remove("BOTSTER_HUB_DATA_DIR")
+        .env_remove("XDG_DATA_HOME")
         .arg("up")
-        .arg("--data-dir")
-        .arg(&data_dir)
         .arg("--session-worker-bin")
         .arg(session_worker_binary_path())
         .output()
@@ -4225,6 +4385,76 @@ fn cli_local_runtime_up_recovers_owned_incompatible_daemon() {
     );
 
     shutdown_local_runtime_daemon(&data_dir);
+}
+
+#[test]
+fn cli_home_runtime_start_does_not_reuse_dead_pid_metadata_and_rebinds_leftover_socket() {
+    let _guard = daemon_test_guard();
+    let home = unique_short_test_dir("cli-home-dead-metadata");
+    let data_dir = home.join(".botster/hub");
+    fs::create_dir_all(&data_dir).expect("create home runtime data directory");
+    let socket_path = explicit_config(&data_dir)
+        .transports
+        .local_socket
+        .as_ref()
+        .expect("home runtime socket binding")
+        .path
+        .clone();
+    let stale_listener = UnixListener::bind(&socket_path).expect("bind leftover socket fixture");
+    drop(stale_listener);
+
+    let mut exited = Command::new("true")
+        .spawn()
+        .expect("spawn dead pid fixture");
+    let dead_pid = exited.id();
+    assert!(exited.wait().expect("wait for dead pid fixture").success());
+    assert!(!process_exists(dead_pid), "fixture pid must be dead");
+    write_local_runtime_daemon_metadata(&data_dir, dead_pid);
+
+    ensure_session_worker_binary();
+    let mut daemon = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .env("HOME", &home)
+        .env_remove("BOTSTER_HUB_DATA_DIR")
+        .env_remove("XDG_DATA_HOME")
+        .arg("start")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start home runtime with stale dead-pid metadata");
+    wait_for_status(&data_dir, &mut daemon);
+
+    let stale_metadata: serde_json::Value = serde_json::from_slice(
+        &fs::read(data_dir.join(".botster-hub-runtime-daemon.json"))
+            .expect("read stale daemon metadata"),
+    )
+    .expect("parse stale daemon metadata");
+    assert_eq!(stale_metadata["pid"].as_u64(), Some(dead_pid as u64));
+    assert_ne!(daemon.id(), dead_pid, "start must not reuse the dead pid");
+    assert!(
+        process_exists(daemon.id()),
+        "replacement daemon must remain alive after readiness"
+    );
+    assert!(
+        socket_path.exists(),
+        "replacement daemon must own the canonical home socket"
+    );
+
+    let shutdown = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .env("HOME", &home)
+        .env_remove("BOTSTER_HUB_DATA_DIR")
+        .env_remove("XDG_DATA_HOME")
+        .arg("shutdown")
+        .output()
+        .expect("shut down replacement home runtime");
+    assert!(
+        shutdown.status.success(),
+        "replacement shutdown failed: {}",
+        command_output_text(&shutdown)
+    );
+    assert!(
+        daemon.wait().expect("reap replacement daemon").success(),
+        "replacement daemon should exit cleanly"
+    );
 }
 
 #[test]
@@ -4357,7 +4587,7 @@ fn cli_local_runtime_up_refuses_unowned_incompatible_daemon() {
     assert!(text.contains("may fail against this daemon"));
     assert!(text.contains("Stop the running botster-hub process directly"));
     assert!(text.contains("remove the stale local socket"));
-    assert!(text.contains("botster-hub up --data-dir <path>"));
+    assert!(text.contains("botster-hub up [--data-dir <path>]"));
     assert!(
         socket_path.exists(),
         "up must not delete a connectable socket on compatibility failure"
@@ -4386,7 +4616,8 @@ fn cli_local_runtime_up_refuses_unowned_incompatible_daemon() {
 #[test]
 fn cli_local_runtime_refuses_forged_metadata_for_live_non_botster_pid() {
     let _guard = daemon_test_guard();
-    let data_dir = unique_short_test_dir("cli-forged-pid-incompat");
+    let home = unique_short_test_dir("cli-home-forged-pid-incompat");
+    let data_dir = home.join(".botster/hub");
     let config = explicit_config(&data_dir);
     let socket_path = config
         .transports
@@ -4416,9 +4647,10 @@ fn cli_local_runtime_refuses_forged_metadata_for_live_non_botster_pid() {
     write_local_runtime_daemon_metadata(&data_dir, decoy.id());
 
     let output = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .env("HOME", &home)
+        .env_remove("BOTSTER_HUB_DATA_DIR")
+        .env_remove("XDG_DATA_HOME")
         .arg("up")
-        .arg("--data-dir")
-        .arg(&data_dir)
         .output()
         .expect("run botster-hub up against forged daemon metadata");
     assert!(
@@ -4436,9 +4668,10 @@ fn cli_local_runtime_refuses_forged_metadata_for_live_non_botster_pid() {
     );
 
     let down = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .env("HOME", &home)
+        .env_remove("BOTSTER_HUB_DATA_DIR")
+        .env_remove("XDG_DATA_HOME")
         .arg("down")
-        .arg("--data-dir")
-        .arg(&data_dir)
         .output()
         .expect("run botster-hub down against forged daemon metadata");
     assert!(
@@ -4540,7 +4773,7 @@ fn cli_smoke_proves_local_runtime_daemon_package_app_session_and_webrtc() {
         );
     }
     assert!(text.contains("smoke=local_runtime"));
-    assert!(text.contains("data_dir=explicit"));
+    assert!(text.contains(&format!("data_dir=resolved:{}", data_dir.display())));
     assert!(text.contains("check name=daemon status=pass"));
     assert!(text.contains("check name=core status=pass"));
     assert!(text.contains("check name=packages status=pass"));
@@ -5338,7 +5571,7 @@ fn daemon_restores_existing_provider_policy_records_through_snapshot_admission()
 }
 
 #[test]
-fn cli_start_requires_explicit_data_dir_and_prints_scrubbed_lifecycle_status() {
+fn cli_start_and_status_print_scrubbed_lifecycle_status() {
     let _guard = daemon_test_guard();
     let data_dir = unique_test_dir("cli-start");
     let child = start_cli_daemon(&data_dir);
@@ -10373,9 +10606,9 @@ fn cli_no_arg_prints_host_profile_boot_summary() {
     assert!(text.contains("Daily runtime commands:"));
     assert!(text.contains("botster-hub open web [--data-dir <path>]"));
     assert!(text.contains(
-        "botster-hub packages available --data-dir <path> --registry <registry-dir-or-file>"
+        "botster-hub packages available [--data-dir <path>] --registry <registry-dir-or-file>"
     ));
-    assert!(text.contains("botster-hub packages reload --data-dir <path> <name>"));
+    assert!(text.contains("botster-hub packages reload [--data-dir <path>] <name>"));
     assert!(!text.contains("unknown command"));
 }
 
@@ -10400,15 +10633,13 @@ fn cli_help_like_args_print_command_guidance_without_daemon() {
         assert!(text.contains("botster-hub smoke [--data-dir <path>]"));
         assert!(text.contains("botster-hub open web [--data-dir <path>]"));
         assert!(text.contains("botster-hub open tui [--data-dir <path>]"));
-        assert!(text.contains("botster-hub mcp-serve --data-dir <path>"));
-        assert!(text.contains("botster-hub apps open --data-dir <path> <app|package/app>"));
-        assert!(
-            text.contains(
-                "botster-hub packages config set --data-dir <path> <name> '<json-object>'"
-            )
-        );
+        assert!(text.contains("botster-hub mcp-serve [--data-dir <path>]"));
+        assert!(text.contains("botster-hub apps open [--data-dir <path>] <app|package/app>"));
         assert!(text.contains(
-            "botster-hub packages apply-update --data-dir <path> <name> --revision <revision>"
+            "botster-hub packages config set [--data-dir <path>] <name> '<json-object>'"
+        ));
+        assert!(text.contains(
+            "botster-hub packages apply-update [--data-dir <path>] <name> --revision <revision>"
         ));
         assert!(!text.contains("first-party host profile ready"));
         assert!(!text.contains("unknown command"));
@@ -12457,11 +12688,16 @@ fn assert_no_state_file_under(root: &Path) {
     let direct = root.join("hub-state.json");
     let botster = root.join("botster").join("hub-state.json");
     let botster_hub = root.join("botster-hub").join("hub-state.json");
+    let canonical_hub = root.join(".botster").join("hub").join("hub-state.json");
 
     assert!(!direct.exists(), "unexpected state file at {direct:?}");
     assert!(!botster.exists(), "unexpected state file at {botster:?}");
     assert!(
         !botster_hub.exists(),
         "unexpected state file at {botster_hub:?}"
+    );
+    assert!(
+        !canonical_hub.exists(),
+        "unexpected state file at {canonical_hub:?}"
     );
 }
