@@ -23,6 +23,9 @@ use botster_hub_client::{
     DaemonOperatorError, DaemonRequest, DaemonResponse, DaemonResponseKind, DaemonSessionEntity,
     DaemonTransportError, ensure_compatible,
 };
+use botster_ui_contract::{
+    UiActionId, UiActionKind, UiActionRequest, UiActionRequestId, UiFormValues, UiSurfaceId,
+};
 use serde::{Deserialize, Serialize};
 
 const CONFORMANCE_SESSION_ID: &str = "botster-conformance-session";
@@ -2483,10 +2486,11 @@ pub fn run_project_pipelines_conformance(
     }
     let surface_package_name = surface.package_name.clone();
     let rendered_surface_id = surface.surface_id.clone();
-    let surface_kind = value_string(&surface.body, "type", "project_pipelines_surface")?;
-    let surface_id = value_string(&surface.body, "id", "project_pipelines_surface")?;
-    let surface_node_kinds = ui_node_type_values(&surface.body);
-    let form_node = find_ui_node_by_id(&surface.body, "project-pipelines-create-form").ok_or(
+    let surface_body = serde_json::to_value(&surface.body)?;
+    let surface_kind = value_string(&surface_body, "type", "project_pipelines_surface")?;
+    let surface_id = value_string(&surface_body, "id", "project_pipelines_surface")?;
+    let surface_node_kinds = ui_node_type_values(&surface_body);
+    let form_node = find_ui_node_by_id(&surface_body, "project-pipelines-create-form").ok_or(
         ConformanceError::MissingJsonField {
             operation: "project_pipelines_surface",
             field: "project-pipelines-create-form",
@@ -2520,8 +2524,9 @@ pub fn run_project_pipelines_conformance(
         })?;
     let snapshot_package_name = snapshot.package_name.clone();
     let snapshot_surface_id = snapshot.surface_id.clone();
-    let snapshot_node_id = value_string(&snapshot.body, "id", "project_pipelines_surface")?;
-    let snapshot_node_kinds = ui_node_type_values(&snapshot.body);
+    let snapshot_body = serde_json::to_value(&snapshot.body)?;
+    let snapshot_node_id = value_string(&snapshot_body, "id", "project_pipelines_surface")?;
+    let snapshot_node_kinds = ui_node_type_values(&snapshot_body);
     if snapshot_package_name != PROJECT_PIPELINES_PACKAGE {
         return Err(ConformanceError::UnexpectedValue {
             operation: "project_pipelines_surface",
@@ -2551,13 +2556,14 @@ pub fn run_project_pipelines_conformance(
         hub.endpoint(),
         DaemonRequest::PluginSurfaceAction {
             package_name: PROJECT_PIPELINES_PACKAGE.to_string(),
-            surface_id: PROJECT_PIPELINES_SURFACE.to_string(),
-            action_id: form_action_id.clone(),
-            payload: serde_json::json!({
-                "request_id": "invalid-project-pipelines-conformance",
-                "title": "   ",
-                "pipeline_id": "local_pipeline",
-            }),
+            request: ui_action_request(
+                "invalid-project-pipelines-conformance",
+                PROJECT_PIPELINES_SURFACE,
+                &form_action_id,
+                "project-pipelines-create-form",
+                Some(serde_json::json!({ "title": "   " })),
+                Some(serde_json::json!({ "pipeline_id": "local_pipeline" })),
+            )?,
         },
         "project_pipelines_invalid_action",
     )?;
@@ -2577,9 +2583,11 @@ pub fn run_project_pipelines_conformance(
             operation: "project_pipelines_invalid_action",
             field: "plugin_action_result",
         })?;
-    let invalid_action_status = action_status_string(&invalid, "project_pipelines_invalid_action")?;
+    let invalid_value = serde_json::to_value(&invalid)?;
+    let invalid_action_status =
+        action_status_string(&invalid_value, "project_pipelines_invalid_action")?;
     let invalid_title_error = field_error_string(
-        &invalid,
+        &invalid_value,
         "project-pipelines-create-title",
         "project_pipelines_invalid_action",
     )?;
@@ -2910,15 +2918,17 @@ pub fn run_plugin_contract_matrix_conformance(
                 operation: "contract_matrix_render_app",
                 field: "plugin_surface.ui_tree_snapshot",
             })?;
-    let app_surface_kind = value_string(&app_surface.body, "type", "contract_matrix_render_app")?;
-    let app_surface_node_id = value_string(&app_surface.body, "id", "contract_matrix_render_app")?;
+    let app_surface_body = serde_json::to_value(&app_surface.body)?;
+    let app_surface_snapshot_body = serde_json::to_value(&app_surface_snapshot.body)?;
+    let app_surface_kind = value_string(&app_surface_body, "type", "contract_matrix_render_app")?;
+    let app_surface_node_id = value_string(&app_surface_body, "id", "contract_matrix_render_app")?;
     let app_surface_snapshot_id = value_string(
-        &app_surface_snapshot.body,
+        &app_surface_snapshot_body,
         "id",
         "contract_matrix_render_app",
     )?;
-    let app_surface_node_kinds = ui_node_type_values(&app_surface.body);
-    let app_surface_snapshot_node_kinds = ui_node_type_values(&app_surface_snapshot.body);
+    let app_surface_node_kinds = ui_node_type_values(&app_surface_body);
+    let app_surface_snapshot_node_kinds = ui_node_type_values(&app_surface_snapshot_body);
     let expected_app_surface_node_kinds = application_primitives_fixture_descriptor()
         .node_kinds
         .iter()
@@ -2982,7 +2992,7 @@ pub fn run_plugin_contract_matrix_conformance(
         app_surface_node_id.as_str(),
         &app_surface_snapshot_id,
     )?;
-    let submit_node = find_ui_node_by_id(&app_surface.body, "contract-app-submit").ok_or(
+    let submit_node = find_ui_node_by_id(&app_surface_body, "contract-app-submit").ok_or(
         ConformanceError::MissingJsonField {
             operation: "contract_matrix_render_app",
             field: "contract-app-submit",
@@ -3005,10 +3015,10 @@ pub fn run_plugin_contract_matrix_conformance(
         PLUGIN_CONTRACT_EMPTY_SURFACE,
         "contract_matrix_render_empty",
     )?;
+    let empty_surface_body = serde_json::to_value(&empty_surface.body)?;
     let empty_surface_node_id =
-        value_string(&empty_surface.body, "id", "contract_matrix_render_empty")?;
-    let empty_surface_child_id = empty_surface
-        .body
+        value_string(&empty_surface_body, "id", "contract_matrix_render_empty")?;
+    let empty_surface_child_id = empty_surface_body
         .get("children")
         .and_then(serde_json::Value::as_array)
         .and_then(|children| children.first())
@@ -3139,13 +3149,13 @@ pub fn run_plugin_contract_matrix_conformance(
         PLUGIN_CONTRACT_SETTINGS_SURFACE,
         "contract_matrix_render_settings",
     )?;
+    let settings_surface_body = serde_json::to_value(&settings_surface.body)?;
     let settings_surface_node_id = value_string(
-        &settings_surface.body,
+        &settings_surface_body,
         "id",
         "contract_matrix_render_settings",
     )?;
-    let settings_text = settings_surface
-        .body
+    let settings_text = settings_surface_body
         .get("children")
         .and_then(serde_json::Value::as_array)
         .and_then(|children| children.first())
@@ -3176,12 +3186,14 @@ pub fn run_plugin_contract_matrix_conformance(
         hub.endpoint(),
         DaemonRequest::PluginSurfaceAction {
             package_name: PLUGIN_CONTRACT_MATRIX_PACKAGE.to_string(),
-            surface_id: PLUGIN_CONTRACT_APP_SURFACE.to_string(),
-            action_id: submit_action_id.clone(),
-            payload: serde_json::json!({
-                "request_id": "contract-action-success",
-                "message": "hello",
-            }),
+            request: ui_action_request(
+                "contract-action-success",
+                PLUGIN_CONTRACT_APP_SURFACE,
+                &submit_action_id,
+                "contract-app-action",
+                Some(serde_json::json!({ "message": "hello" })),
+                None,
+            )?,
         },
         "contract_matrix_action_success",
     )?;
@@ -3198,14 +3210,18 @@ pub fn run_plugin_contract_matrix_conformance(
                 operation: "contract_matrix_action_success",
                 field: "plugin_action_result",
             })?;
-    let action_success_state =
-        value_string(action_result, "state", "contract_matrix_action_success")?;
+    let action_result_value = serde_json::to_value(action_result)?;
+    let action_success_state = value_string(
+        &action_result_value,
+        "state",
+        "contract_matrix_action_success",
+    )?;
     let action_success_request_id = value_string(
-        action_result,
+        &action_result_value,
         "request_id",
         "contract_matrix_action_success",
     )?;
-    let action_success_message = action_result
+    let action_success_message = action_result_value
         .get("normalized_values")
         .and_then(|values| values.get("message"))
         .and_then(serde_json::Value::as_str)
@@ -3233,12 +3249,14 @@ pub fn run_plugin_contract_matrix_conformance(
         hub.endpoint(),
         DaemonRequest::PluginSurfaceAction {
             package_name: PLUGIN_CONTRACT_MATRIX_PACKAGE.to_string(),
-            surface_id: PLUGIN_CONTRACT_APP_SURFACE.to_string(),
-            action_id: submit_action_id.clone(),
-            payload: serde_json::json!({
-                "request_id": "contract-action-error",
-                "fail": true,
-            }),
+            request: ui_action_request(
+                "contract-action-error",
+                PLUGIN_CONTRACT_APP_SURFACE,
+                &submit_action_id,
+                "contract-app-action",
+                None,
+                Some(serde_json::json!({ "fail": true })),
+            )?,
         },
         "contract_matrix_action_error",
     )?;
@@ -3261,10 +3279,14 @@ pub fn run_plugin_contract_matrix_conformance(
                 operation: "contract_matrix_action_error",
                 field: "plugin_action_result",
             })?;
-    let action_error_state =
-        value_string(action_error_result, "state", "contract_matrix_action_error")?;
+    let action_error_result_value = serde_json::to_value(action_error_result)?;
+    let action_error_state = value_string(
+        &action_error_result_value,
+        "state",
+        "contract_matrix_action_error",
+    )?;
     let action_error_request_id = value_string(
-        action_error_result,
+        &action_error_result_value,
         "request_id",
         "contract_matrix_action_error",
     )?;
@@ -3279,12 +3301,14 @@ pub fn run_plugin_contract_matrix_conformance(
         hub.endpoint(),
         DaemonRequest::PluginSurfaceAction {
             package_name: PLUGIN_CONTRACT_MATRIX_PACKAGE.to_string(),
-            surface_id: PLUGIN_CONTRACT_APP_SURFACE.to_string(),
-            action_id: submit_action_id.clone(),
-            payload: serde_json::json!({
-                "request_id": "contract-action-field-error",
-                "field_error": true,
-            }),
+            request: ui_action_request(
+                "contract-action-field-error",
+                PLUGIN_CONTRACT_APP_SURFACE,
+                &submit_action_id,
+                "contract-app-action",
+                None,
+                Some(serde_json::json!({ "field_error": true })),
+            )?,
         },
         "contract_matrix_action_field_error",
     )?;
@@ -3308,25 +3332,26 @@ pub fn run_plugin_contract_matrix_conformance(
                 operation: "contract_matrix_action_field_error",
                 field: "plugin_action_result",
             })?;
+    let action_field_error_result_value = serde_json::to_value(action_field_error_result)?;
     let action_field_error_state = value_string(
-        action_field_error_result,
+        &action_field_error_result_value,
         "state",
         "contract_matrix_action_field_error",
     )?;
     let action_field_error_request_id = value_string(
-        action_field_error_result,
+        &action_field_error_result_value,
         "request_id",
         "contract_matrix_action_field_error",
     )?;
     let action_field_error_message = field_error_string(
-        action_field_error_result,
+        &action_field_error_result_value,
         "contract-app-message",
         "contract_matrix_action_field_error",
     )?;
     expect_value(
         "contract_matrix_action_field_error",
         "state",
-        "error",
+        "rejected",
         &action_field_error_state,
     )?;
 
@@ -4067,6 +4092,39 @@ fn action_status_string(
     }
 }
 
+fn ui_action_request(
+    request_id: &str,
+    surface_id: &str,
+    action_id: &str,
+    node_id: &str,
+    values: Option<serde_json::Value>,
+    payload: Option<serde_json::Value>,
+) -> Result<UiActionRequest, ConformanceError> {
+    let values =
+        values
+            .map(|value| {
+                value.as_object().cloned().map(UiFormValues).ok_or(
+                    ConformanceError::UnexpectedValue {
+                        operation: "ui_action_request",
+                        field: "values",
+                        expected: "object".to_string(),
+                        actual: value.to_string(),
+                    },
+                )
+            })
+            .transpose()?;
+
+    Ok(UiActionRequest {
+        request_id: UiActionRequestId(request_id.to_string()),
+        surface_id: UiSurfaceId(surface_id.to_string()),
+        action_id: UiActionId(action_id.to_string()),
+        node_id: Some(botster_ui_contract::UiNodeId(node_id.to_string())),
+        kind: UiActionKind::Submit,
+        values,
+        payload,
+    })
+}
+
 fn field_error_string(
     value: &serde_json::Value,
     field_id: &'static str,
@@ -4168,6 +4226,7 @@ pub enum ConformanceError {
         stdout: String,
         stderr: String,
     },
+    Json(serde_json::Error),
     AttachThreadPanicked,
 }
 
@@ -4192,7 +4251,8 @@ impl ConformanceError {
             | Self::MissingEnvironment { .. }
             | Self::MissingApp { .. }
             | Self::MissingSession { .. }
-            | Self::MissingOutput { .. } => ConformanceFailureClass::ProducerContract,
+            | Self::MissingOutput { .. }
+            | Self::Json(_) => ConformanceFailureClass::ProducerContract,
         }
     }
 }
@@ -4285,6 +4345,7 @@ impl fmt::Display for ConformanceError {
                     "{operation} child exited {status}; stdout={stdout:?}; stderr={stderr:?}"
                 )
             }
+            Self::Json(source) => write!(formatter, "UI contract JSON projection failed: {source}"),
             Self::AttachThreadPanicked => write!(formatter, "stream attach thread panicked"),
         }
     }
@@ -4310,7 +4371,14 @@ impl Error for ConformanceError {
             | Self::ChildFailed { .. }
             | Self::AttachThreadPanicked => None,
             Self::Io { source, .. } => Some(source),
+            Self::Json(source) => Some(source),
         }
+    }
+}
+
+impl From<serde_json::Error> for ConformanceError {
+    fn from(source: serde_json::Error) -> Self {
+        Self::Json(source)
     }
 }
 

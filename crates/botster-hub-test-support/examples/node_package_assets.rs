@@ -78,6 +78,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         "protocol": matrix.protocol,
         "protocol_version": matrix.protocol_version,
         "conformance_fixture_revision": matrix.conformance_fixture_revision,
+        "ui_contract": {
+            "package_name": "@trybotster/ui-contract",
+            "package_version": "0.1.0",
+            "conformance_fixture_export": "@trybotster/ui-contract/conformance-fixtures",
+        },
         "daemon_protocol_source_artifact": protocol.artifact_path,
         "first_party_client_support_matrix": {
             "artifact_path": "first-party-client-support-matrix.json",

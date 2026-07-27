@@ -21,7 +21,7 @@ use botster_core::{
     PackageConfigurationValue, PackageSource, RequestId, RoutedEnvelope, RoutedEnvelopePayload,
     RunnableEntrypointKind, RunnableEntrypointLaunchMode, RunnableEntrypointProcessState,
     RunnableEntrypointResultField, SessionId, SessionLifecycleState, SubscriptionId,
-    TerminalAttachState, UiActionResult, UiActionResultState,
+    TerminalAttachState,
 };
 use botster_core_daemon::{
     GuardedWriteDecision, GuardedWriteDeliveryState, ReadinessEvidence, RegistrySessionState,
@@ -54,6 +54,7 @@ pub use botster_hub_client::{
     FEATURE_PLUGIN_SURFACE_ACTION, FEATURE_PLUGIN_SURFACE_RENDER, PROTOCOL, read_frame,
     read_frame_from_reader, write_frame,
 };
+use botster_ui_contract::{UiActionResult, UiActionResultState};
 use serde_json::Value;
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
@@ -1539,10 +1540,9 @@ fn handle_runtime_control_request(
         }
         DaemonRequest::PluginSurfaceAction {
             package_name,
-            surface_id,
-            action_id,
-            payload,
+            request,
         } => {
+            let surface_id = request.surface_id.0.clone();
             if let Some(response) = undeclared_surface_response(
                 &packages,
                 &package_name,
@@ -1559,9 +1559,7 @@ fn handle_runtime_control_request(
                 HubClientRequest::PluginSurfaceAction {
                     request_id: request_id("daemon-plugin-surface-action"),
                     package_name,
-                    surface_id,
-                    action_id,
-                    payload,
+                    action: request,
                 },
             )?;
             let HubClientResponseBody::PluginActionResult(result) = response.body else {
@@ -4268,7 +4266,7 @@ fn daemon_plugin_tool_result(plugin_tool_result: Value) -> DaemonResponse {
 
 fn daemon_plugin_surface(plugin_surface: HubClientPluginSurface) -> DaemonResponse {
     let mut response = daemon_response_base(DaemonResponseKind::PluginSurface);
-    let body = serde_json::to_value(plugin_surface.body).unwrap_or(Value::Null);
+    let body = plugin_surface.body;
     response.plugin_surface = Some(DaemonPluginSurface {
         package_name: plugin_surface.package_name.clone(),
         surface_id: plugin_surface.surface_id.clone(),
@@ -4293,8 +4291,7 @@ fn daemon_plugin_action_result(plugin_action_result: UiActionResult) -> DaemonRe
             "plugin surface action did not complete successfully",
         )];
     }
-    response.plugin_action_result =
-        Some(serde_json::to_value(plugin_action_result).unwrap_or(Value::Null));
+    response.plugin_action_result = Some(plugin_action_result);
     response
 }
 

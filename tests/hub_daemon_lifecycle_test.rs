@@ -3553,17 +3553,21 @@ fn daemon_package_dtos_expose_declared_surfaces_and_validate_surface_ids() {
     let plugin_surface = workspaces
         .plugin_surface
         .expect("workspaces render includes plugin surface");
+    let plugin_surface_body =
+        serde_json::to_value(&plugin_surface.body).expect("serialize typed workspaces surface");
     assert_eq!(plugin_surface.package_name, "botster-workspaces");
     assert_eq!(plugin_surface.surface_id, "workspaces");
-    assert_eq!(plugin_surface.body["type"], "panel");
-    assert_eq!(plugin_surface.body["id"], "botster-workspaces-panel");
+    assert_eq!(plugin_surface_body["type"], "panel");
+    assert_eq!(plugin_surface_body["id"], "botster-workspaces-panel");
     let snapshot = plugin_surface
         .ui_tree_snapshot
         .as_ref()
         .expect("workspaces render includes validated ui tree snapshot");
     assert_eq!(snapshot.package_name, "botster-workspaces");
     assert_eq!(snapshot.surface_id, "workspaces");
-    assert_eq!(snapshot.body["id"], "botster-workspaces-panel");
+    let snapshot_body =
+        serde_json::to_value(&snapshot.body).expect("serialize typed workspaces snapshot");
+    assert_eq!(snapshot_body["id"], "botster-workspaces-panel");
 
     let iframe = connection
         .request(&botster_hub_client::DaemonRequest::PluginSurfaceRender {
@@ -3579,19 +3583,21 @@ fn daemon_package_dtos_expose_declared_surfaces_and_validate_surface_ids() {
     let iframe_surface = iframe
         .plugin_surface
         .expect("iframe render includes plugin surface");
-    assert_eq!(iframe_surface.body["type"], "iframe");
-    assert_eq!(iframe_surface.body["id"], "preview-frame");
+    let iframe_surface_body =
+        serde_json::to_value(&iframe_surface.body).expect("serialize typed iframe surface");
+    assert_eq!(iframe_surface_body["type"], "iframe");
+    assert_eq!(iframe_surface_body["id"], "preview-frame");
     assert_eq!(
-        iframe_surface.body["props"]["src"],
+        iframe_surface_body["props"]["src"],
         "/packages/iframe.plugin/assets/preview.html"
     );
-    assert_eq!(iframe_surface.body["props"]["title"], "Preview");
+    assert_eq!(iframe_surface_body["props"]["title"], "Preview");
     let iframe_snapshot = iframe_surface
         .ui_tree_snapshot
         .as_ref()
         .expect("iframe render includes validated ui tree snapshot");
     assert_eq!(iframe_snapshot.body, iframe_surface.body);
-    assert_no_raw_html_ui_fields(&iframe_surface.body);
+    assert_no_raw_html_ui_fields(&iframe_surface_body);
 
     let undeclared = connection
         .request(&botster_hub_client::DaemonRequest::PluginSurfaceRender {
@@ -3740,7 +3746,7 @@ fn daemon_plugin_contract_matrix_fixture_exercises_public_package_contracts() {
         report.action_error_diagnostic_operation,
         "plugin_surface_action"
     );
-    assert_eq!(report.action_field_error_state, "error");
+    assert_eq!(report.action_field_error_state, "rejected");
     assert_eq!(
         report.action_field_error_request_id,
         "contract-action-field-error"

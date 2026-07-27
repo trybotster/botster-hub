@@ -4,10 +4,10 @@ local PACKAGE = "botster.plugin-contract-matrix"
 
 local function action_result(arguments, state, extra)
   local result = {
-    request_id = arguments.request_id or "plugin-contract-matrix-action",
-    surface_id = "contract.app",
-    action_id = "contract.action",
-    node_id = "contract-app-action",
+    request_id = arguments.request_id,
+    surface_id = arguments.surface_id,
+    action_id = arguments.action_id,
+    node_id = arguments.node_id,
     state = state,
   }
   for key, value in pairs(extra or {}) do
@@ -56,6 +56,7 @@ local function app_surface(_arguments)
           action = {
             id = "contract.action",
           },
+          submit_label = "Submit contract action",
         },
         children = {
           {
@@ -222,14 +223,16 @@ local function settings_surface(_arguments)
 end
 
 local function contract_action(arguments)
-  if arguments.fail == true then
+  local payload = arguments.payload or {}
+  local values = arguments.values or {}
+  if payload.fail == true then
     return action_result(arguments, "error", {
       error = "contract action failed by request",
       form_errors = { "contract action failed by request" },
     })
   end
-  if arguments.field_error == true then
-    return action_result(arguments, "error", {
+  if payload.field_error == true then
+    return action_result(arguments, "rejected", {
       error = "message is required",
       field_errors = {
         ["contract-app-message"] = { "Message is required" },
@@ -239,11 +242,24 @@ local function contract_action(arguments)
   end
   return action_result(arguments, "accepted", {
     normalized_values = {
-      message = arguments.message or "ok",
+      message = values.message or "ok",
     },
     payload = {
       package_name = PACKAGE,
       message = "contract action accepted",
+    },
+    presentation = {
+      {
+        kind = "clear",
+        key = "contract-dialog",
+      },
+    },
+    replacement = {
+      type = "text",
+      id = "contract-action-replacement",
+      props = {
+        text = "Contract action accepted",
+      },
     },
   })
 end

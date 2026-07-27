@@ -9,6 +9,11 @@ export interface HubTestSupportMetadata {
   protocol: string;
   protocol_version: number;
   conformance_fixture_revision: number;
+  ui_contract: {
+    package_name: "@trybotster/ui-contract";
+    package_version: "0.1.0";
+    conformance_fixture_export: "@trybotster/ui-contract/conformance-fixtures";
+  };
   generated_by: string;
   daemon_protocol: {
     artifact_path: "daemon-protocol.ts";
@@ -71,6 +76,7 @@ export function localWebrtcDeliveryChunkConformanceFixturePath(): string;
 export function readLocalWebrtcDeliveryChunkConformanceFixture(): Record<string, unknown>;
 export function modeFlagsConformanceFixturePath(): string;
 export function readModeFlagsConformanceFixture(): Record<string, unknown>;
+export function readUiContractConformanceFixtures(): Promise<Record<string, unknown>>;
 export function pluginContractMatrixFixturePath(): string;
 export function materializePluginContractMatrixFixture(destination: string): string;
 export function applicationPrimitivesFixturePath(): string;

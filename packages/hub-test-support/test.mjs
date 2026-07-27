@@ -27,10 +27,10 @@ import {
 } from "@trybotster/hub-test-support";
 
 assert.equal(metadata.package_name, "@trybotster/hub-test-support");
-assert.equal(metadata.package_version, "0.1.11");
+assert.equal(metadata.package_version, "0.1.12");
 assert.equal(metadata.protocol, "botster-hub-daemon-v1");
-assert.equal(metadata.protocol_version, 3);
-assert.equal(metadata.conformance_fixture_revision, 18);
+assert.equal(metadata.protocol_version, 4);
+assert.equal(metadata.conformance_fixture_revision, 19);
 assert.deepEqual(metadata.application_primitives, {
   fixture_package_name: "botster.plugin-contract-matrix",
   artifact_path: "fixtures/plugin-contract-matrix",
@@ -112,7 +112,7 @@ assert.equal(
 );
 assert.equal(supportMatrix.supported_features.includes("terminal_readback"), true);
 
-assert.equal(sessionLifecycleFixture.conformance_fixture_revision, 18);
+assert.equal(sessionLifecycleFixture.conformance_fixture_revision, 19);
 assert.equal(sessionLifecycleFixture.entity_type, "session");
 assert.deepEqual(
   sessionLifecycleFixture.normalized_frames.map((frame) => frame.type),

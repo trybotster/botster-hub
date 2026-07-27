@@ -12,7 +12,7 @@ use botster_core::{
     PluginInvocationFailureKind, PluginInvocationOutcome, PluginInvocationRequest,
     PluginInvocationResult, PluginKey, RequestId, RoutedEnvelope, RoutedEnvelopeDrainOutcome,
     RoutedEnvelopePublishOutcome, SessionId, SessionLifecycleState, SessionRuntimeErrorKind,
-    SessionSpawnRequest, SubscriptionId, UiActionResult, UiNode,
+    SessionSpawnRequest, SubscriptionId,
 };
 use botster_core_daemon::{
     AcknowledgeRoutedEnvelopeRequest, CaptureSnapshotRequest, CaptureSnapshotResult, CoreDaemon,
@@ -22,6 +22,7 @@ use botster_core_daemon::{
     RoutedEnvelopeDeliveryStateResult, SessionAdoptionReport, SessionAdoptionState,
     SessionLifecycleBaseline, SessionLifecycleChanges, SessionLifecycleCursor, SpawnSessionRequest,
 };
+use botster_ui_contract::{UiActionRequest, UiActionResult, UiNode};
 use std::collections::{BTreeMap, VecDeque};
 use std::error::Error;
 use std::fmt;
@@ -782,17 +783,17 @@ impl HubRuntime {
     pub fn dispatch_plugin_surface_action(
         &self,
         package_name: &str,
-        surface_id: &str,
-        action_id: &str,
-        payload: serde_json::Value,
+        request: &UiActionRequest,
     ) -> Result<UiActionResult, crate::McpToolError> {
+        let surface_id = &request.surface_id.0;
+        let action_id = &request.action_id.0;
         let descriptor = self
             .plugin_lifecycle
             .ui_action_descriptors()
             .into_iter()
             .find(|descriptor| {
                 descriptor.descriptor.plugin_key.0 == package_name
-                    && descriptor.descriptor.descriptor_id == action_id
+                    && descriptor.descriptor.descriptor_id == action_id.as_str()
             })
             .ok_or_else(|| {
                 crate::McpToolError::new(
@@ -820,15 +821,37 @@ impl HubRuntime {
                 origin: Some("local-client-api".to_string()),
                 metadata: None,
             },
-            payload: BoundaryJson(payload),
+            payload: BoundaryJson(serde_json::to_value(request).map_err(|error| {
+                crate::McpToolError::new(
+                    "invalid_action_request",
+                    format!("invalid plugin UiActionRequest: {error}"),
+                )
+            })?),
         });
         let value = completed_plugin_payload(outcome.result, "plugin surface action")?;
-        serde_json::from_value(value).map_err(|error| {
+        let result: UiActionResult = serde_json::from_value(value).map_err(|error| {
             crate::McpToolError::new(
                 "invalid_action_result",
                 format!("invalid plugin UiActionResult: {error}"),
             )
-        })
+        })?;
+        result.validate().map_err(|error| {
+            crate::McpToolError::new(
+                "invalid_action_result",
+                format!("invalid plugin UiActionResult: {error}"),
+            )
+        })?;
+        if result.request_id != request.request_id
+            || result.surface_id != request.surface_id
+            || result.action_id != request.action_id
+            || result.node_id != request.node_id
+        {
+            return Err(crate::McpToolError::new(
+                "invalid_action_result",
+                "plugin UiActionResult identity does not match the request",
+            ));
+        }
+        Ok(result)
     }
 
     /// Last capability cleanup produced by reload, unload, or explicit cleanup.

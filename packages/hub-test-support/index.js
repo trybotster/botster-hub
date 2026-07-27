@@ -91,6 +91,11 @@ export function readModeFlagsConformanceFixture() {
   return readJson(metadata.mode_flags_conformance_fixture.artifact_path);
 }
 
+export async function readUiContractConformanceFixtures() {
+  const uiContract = await import("@trybotster/ui-contract");
+  return uiContract.conformanceFixtures;
+}
+
 export function pluginContractMatrixFixturePath() {
   return packagePath(metadata.plugin_contract_matrix.artifact_path);
 }

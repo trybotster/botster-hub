@@ -9,7 +9,7 @@ use botster_core::{
     PluginHandlerRef, PluginInvocationContext, PluginInvocationFailure,
     PluginInvocationFailureKind, PluginInvocationRequest, PluginInvocationResult,
     PluginInvocationSuccess, PluginKey, RequestId, RoutedEnvelope, RoutedEnvelopePayload,
-    SessionId, UiActionResultState, UiNodeKind,
+    SessionId,
 };
 use botster_hub::{
     DataDirectoryOption, HostIdentityOptions, HubClientApi, HubClientRequest,
@@ -17,6 +17,7 @@ use botster_hub::{
     PackageRegistry, RuntimeEnvironment, SessionDefaults, SpawnTarget, TransportBindings, Worktree,
     default_package_policy,
 };
+use botster_ui_contract::{UiActionRequest, UiActionResultState, UiNodeKind};
 
 mod support;
 use support::ensure_session_worker_binary;
@@ -51,6 +52,26 @@ fn explicit_runtime(name: &str) -> HubRuntime {
     .expect("explicit runtime config should build");
 
     HubRuntime::new(config)
+}
+
+fn ui_action_request(
+    request_id: &str,
+    surface_id: &str,
+    action_id: &str,
+    node_id: &str,
+    values: serde_json::Value,
+    payload: serde_json::Value,
+) -> UiActionRequest {
+    serde_json::from_value(serde_json::json!({
+        "request_id": request_id,
+        "surface_id": surface_id,
+        "action_id": action_id,
+        "node_id": node_id,
+        "kind": "submit",
+        "values": values,
+        "payload": payload
+    }))
+    .expect("canonical UI action request")
 }
 
 fn install_fixture_registry() -> PackageRegistry {
@@ -294,7 +315,7 @@ return botster.register({
         surface_id = "session-template-spawner.surface",
       },
       call = function(args)
-        local spawned = botster.capabilities.session_templates.spawn(args)
+        local spawned = botster.capabilities.session_templates.spawn(args.payload)
         return {
           request_id = args.request_id or "spawn-action",
           surface_id = "session-template-spawner.surface",
@@ -1142,10 +1163,13 @@ fn session_template_spawn_helper_works_from_non_mcp_plugin_invocation_path() {
     let action = hub
         .dispatch_plugin_surface_action(
             "session-template-spawner.plugin",
-            "session-template-spawner.surface",
-            "session_template.spawn_action",
-            serde_json::json!({
-                "request_id": "spawn-action-non-mcp",
+            &ui_action_request(
+                "spawn-action-non-mcp",
+                "session-template-spawner.surface",
+                "session_template.spawn_action",
+                "session-template-spawner-form",
+                serde_json::json!({}),
+                serde_json::json!({
                 "template_id": "session-template-spawner.plugin/init",
                 "session_id": "lua-template-action-session",
                 "environment": { "BOTSTER_MODE": "action" },
@@ -1153,7 +1177,8 @@ fn session_template_spawn_helper_works_from_non_mcp_plugin_invocation_path() {
                     "prompt": "spawned from lua action worker",
                     "ticket_id": "ticket-action-proof"
                 }
-            }),
+                }),
+            ),
         )
         .expect("spawn session template through UI action worker path");
 
@@ -1243,13 +1268,14 @@ fn project_pipelines_surface_action_round_trip_uses_client_api_and_plugin_worker
             HubClientRequest::PluginSurfaceAction {
                 request_id: RequestId("invalid-project-pipelines-action".to_string()),
                 package_name: "project-pipelines".to_string(),
-                surface_id: "project-pipelines.create-ticket".to_string(),
-                action_id: "project_pipelines.create_ticket".to_string(),
-                payload: serde_json::json!({
-                    "request_id": "invalid-project-pipelines-action",
-                    "title": "   ",
-                    "pipeline_id": "local_pipeline",
-                }),
+                action: ui_action_request(
+                    "invalid-project-pipelines-action",
+                    "project-pipelines.create-ticket",
+                    "project_pipelines.create_ticket",
+                    "project-pipelines-create-form",
+                    serde_json::json!({ "title": "   " }),
+                    serde_json::json!({ "pipeline_id": "local_pipeline" }),
+                ),
             },
         )
         .expect("submit invalid project pipelines action through client api");
@@ -1267,6 +1293,8 @@ fn project_pipelines_surface_action_round_trip_uses_client_api_and_plugin_worker
         Some("Title is required")
     );
     assert_eq!(invalid.form_errors, vec!["Title is required".to_string()]);
+    assert!(invalid.presentation.is_none());
+    assert!(invalid.replacement.is_none());
 
     let valid = api
         .handle_request(
@@ -1275,13 +1303,14 @@ fn project_pipelines_surface_action_round_trip_uses_client_api_and_plugin_worker
             HubClientRequest::PluginSurfaceAction {
                 request_id: RequestId("valid-project-pipelines-action".to_string()),
                 package_name: "project-pipelines".to_string(),
-                surface_id: "project-pipelines.create-ticket".to_string(),
-                action_id: "project_pipelines.create_ticket".to_string(),
-                payload: serde_json::json!({
-                    "request_id": "valid-project-pipelines-action",
-                    "title": "  Runtime ticket  ",
-                    "pipeline_id": "local.pipeline",
-                }),
+                action: ui_action_request(
+                    "valid-project-pipelines-action",
+                    "project-pipelines.create-ticket",
+                    "project_pipelines.create_ticket",
+                    "project-pipelines-create-form",
+                    serde_json::json!({ "title": "  Runtime ticket  " }),
+                    serde_json::json!({ "pipeline_id": "local.pipeline" }),
+                ),
             },
         )
         .expect("submit valid project pipelines action through client api");
@@ -1293,6 +1322,18 @@ fn project_pipelines_surface_action_round_trip_uses_client_api_and_plugin_worker
     assert_eq!(
         valid.normalized_values.as_ref().unwrap().0["title"],
         "Runtime ticket"
+    );
+    assert_eq!(
+        valid
+            .presentation
+            .as_ref()
+            .and_then(|operations| operations.first())
+            .map(|operation| serde_json::to_value(operation).unwrap()["kind"].clone()),
+        Some(serde_json::json!("clear"))
+    );
+    assert_eq!(
+        valid.replacement.as_ref().map(|node| node.kind),
+        Some(UiNodeKind::Panel)
     );
 
     let context = hub
