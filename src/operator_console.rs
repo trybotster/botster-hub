@@ -299,18 +299,18 @@ pub(crate) fn run(
                 continue;
             }
             ConsoleAction::Command(mode) => {
+                let command = words[0].clone();
                 let mode = match mode {
                     CommandMode::ResolveApp(selector) => match resolve_app_mode(&selector) {
                         Ok(mode) => mode,
                         Err(error) => {
-                            eprintln!("botster-hub apps error: {error}");
+                            eprintln!("botster-hub {command} error: {error}");
                             print_prompt()?;
                             continue;
                         }
                     },
                     other => other,
                 };
-                let command = words[0].clone();
                 let args = match canonicalize_with_pinned_data_dir(
                     &command,
                     words[1..].to_vec(),

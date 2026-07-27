@@ -2288,6 +2288,40 @@ struct OperatorConsolePty {
     reader: Option<thread::JoinHandle<()>>,
 }
 
+struct SessionCleanupGuard {
+    data_dir: PathBuf,
+    session_id: &'static str,
+    armed: bool,
+}
+
+impl SessionCleanupGuard {
+    fn new(data_dir: &Path, session_id: &'static str) -> Self {
+        Self {
+            data_dir: data_dir.to_path_buf(),
+            session_id,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for SessionCleanupGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+                .arg("sessions")
+                .arg("shutdown")
+                .arg("--data-dir")
+                .arg(&self.data_dir)
+                .arg(self.session_id)
+                .output();
+        }
+    }
+}
+
 impl OperatorConsolePty {
     fn spawn(data_dir: &Path) -> Self {
         Self::spawn_binary(Path::new(env!("CARGO_BIN_EXE_botster-hub")), data_dir)
@@ -10781,6 +10815,11 @@ fn cli_operator_console_starts_reuses_detaches_handles_ctrl_c_and_stops() {
     first.wait_for("daemon=started");
     first.wait_for("prerequisite botster-web=missing");
     first.wait_for("botster-hub> ");
+    first.send_and_wait_for_prompt(b"open tui\n");
+    first.wait_for("botster-hub open error: app botster-tui is not installed or enabled");
+    first.send_and_wait_for_prompt(b"open web\n");
+    first
+        .wait_for("botster-hub open error: app botster-web/web-client is not installed or enabled");
     first.send_and_wait_for_prompt(
         format!(
             "packages install --path {}\n",
@@ -10797,6 +10836,7 @@ fn cli_operator_console_starts_reuses_detaches_handles_ctrl_c_and_stops() {
     first.wait_for("package_name=botster-tui");
     first.send_and_wait_for_prompt(b"sessions spawn --session-id console-sentinel -- sleep 300\n");
     first.wait_for("session_id=console-sentinel");
+    let mut sentinel_cleanup = SessionCleanupGuard::new(&data_dir, "console-sentinel");
     first.send_and_wait_for_prompt(b"sessions list\n");
     first.wait_for("session id=console-sentinel lifecycle=running");
     first.send_and_wait_for_prompt(b"apps list\n");
@@ -10896,6 +10936,11 @@ fn cli_operator_console_starts_reuses_detaches_handles_ctrl_c_and_stops() {
     );
     first.send_and_wait_for_prompt(b"status\n");
     first.wait_for("event=status");
+    first.send_and_wait_for_prompt(b"sessions shutdown console-sentinel\n");
+    first.wait_for("response=events");
+    first.send_and_wait_for_prompt(b"sessions list\n");
+    first.wait_for("session id=console-sentinel lifecycle=exited");
+    sentinel_cleanup.disarm();
     first.send(&[4]);
     first.wait_for("detached=daemon_running");
     first.wait_for_exit();
