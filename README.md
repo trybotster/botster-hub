@@ -19,7 +19,7 @@ thick wrapper.
 There is one local product topology. Docs, operators, and clients should start
 here—not from parallel scaffold stories or in-process engine embeds:
 
-**explicit `--data-dir` → `HubDaemon` / `HubRuntime` → `CoreDaemon` → `botster-session-worker`**
+**resolved data directory → `HubDaemon` / `HubRuntime` → `CoreDaemon` → `botster-session-worker`**
 
 | Layer | Role on the product path |
 | --- | --- |
@@ -41,22 +41,29 @@ library path separately; this hub documents only the product host path above.
 # Once per checkout: build the PTY worker that CoreDaemon supervises.
 cargo build --locked -p botster-core --bin botster-session-worker
 
-# Terminal 1: durable daemon under $HOME/.botster/hub.
-cargo run -- start
-
-# Terminal 2: every stateful command resolves that same root.
-cargo run -- sessions spawn \
-  --session-id demo -- "printf 'botster-hub-ok\n'; sleep 1"
-cargo run -- sessions list
-cargo run -- sessions attach demo
-cargo run -- shutdown
+# One terminal: start or reuse Hub and attach its operator console.
+cargo run
+data_dir=resolved:$HOME/.botster/hub
+daemon=started
+botster-hub> packages install --path /path/to/botster-web
+botster-hub> packages enable botster-web
+botster-hub> packages install --path /path/to/botster-tui
+botster-hub> packages enable botster-tui
+botster-hub> up
+botster-hub> status
+botster-hub> apps list
+botster-hub> sessions list
+botster-hub> exit
 ```
 
-Daily first-party local stack (same topology, first-party packages enabled):
+`exit` and Ctrl-D detach without stopping Hub. Running bare `botster-hub` again
+reuses the daemon; `down` deliberately stops it and exits the console. At an
+idle prompt Ctrl-C cancels the current line and leaves the daemon and its
+sessions running.
 
-```sh
-cargo run -- up
-```
+Bare invocation requires terminal stdin and stdout. Scripts and redirected
+commands must use an explicit subcommand such as `botster-hub status`; they
+fail clearly instead of entering a prompt.
 
 Use `--data-dir <path>` on any stateful command when an isolated override is
 needed. The selected directory owns `hub-state.json`, package registry state,
@@ -293,17 +300,20 @@ handshake before sending daemon requests. Future transports, provider runtimes,
 sockets, and supervisors should attach after this lifecycle object has started;
 they should not recreate config or durable state ownership.
 
-The no-arg binary path is a side-effect-light host-profile summary. It builds
-resolved config and an in-memory `HubRuntime::new` summary only; it does not
-load or save `hub-state.json` through the runtime data-directory resolver. `run-one` remains
-an explicit-data-dir runtime smoke path through `HubRuntime::load`. Registry,
-grant, and admission mutation saves are now exercised by the local operator CLI
-package commands through `HubStateStore::update`.
+The no-argument binary path is the interactive operator entrypoint. With
+terminal stdin and stdout it resolves the normal data directory, starts or
+reuses the daemon, reports package prerequisites, and opens a prompt over the
+same command parsers and daemon APIs as explicit CLI invocation. Without both
+terminals it rejects before resolving or creating durable runtime state.
+`run-one` remains an explicit-data-dir runtime smoke path through
+`HubRuntime::load`.
 
 ## Local production runtime operator CLI
 
 The `botster-hub` binary includes a deliberately thin local operator surface for
-production runtime. `start` owns the daemon lifecycle and one `HubRuntime`;
+production runtime. Bare interactive `botster-hub` starts or reuses the daemon
+and attaches the console. `start` remains the low-level foreground daemon host;
+`up` remains the noninteractive package-refresh and daily-app orchestrator.
 `status`, `sessions list`, `sessions spawn`, `sessions attach`,
 `sessions send-input`, `sessions resize`, `sessions detach`, and `shutdown`
 connect to that daemon over the resolved local socket. The CLI remains a thin
@@ -431,8 +441,11 @@ down=botster-hub down --data-dir $HOME/.botster/hub
 These emitted copy/paste commands pin the exact resolved runtime. Ordinary
 operator examples below omit the optional flag and use the canonical default.
 
-There is no compatibility launcher or bootstrap command. `start`, `shutdown`,
-`packages`, and `apps` remain the lower-level operator surfaces.
+The console accepts request/response commands without a repeated
+`botster-hub` prefix. Foreground terminal apps temporarily own the terminal and
+return to the prompt afterward. Commands that own stdin or host another runtime
+(`start`, `mcp-serve`, `sessions attach`, `inspect`, and `run-one`) remain
+external-only and the console prints the exact explicit invocation to use.
 
 `botster-hub doctor [--data-dir <path>]` is the non-mutating diagnostic path for
 the daily runtime or an explicitly selected runtime. It reports stable check
