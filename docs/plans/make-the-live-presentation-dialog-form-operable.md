@@ -99,6 +99,9 @@ Project Pipelines package/plugin path or workflow policy.
 6. Allocate conformance revision 21 and npm package version 0.1.13. Revision 21
    identifies the changed published fixture content; 0.1.13 identifies the
    immutable npm artifact. Neither value is a protocol/schema version bump.
+   Because `DaemonCompatibilityRequirement::current()` derives its minimum
+   conformance revision from the constant, clients built at revision 21 require
+   a Hub reporting revision 21 or later.
 
 These decisions are binding for Implement and Review. Choosing a duplicate
 form, retaining the sibling, weakening visible-tree proof, or changing the
@@ -284,11 +287,17 @@ source dependency is required.
   - generated revision and existing plugin-surface Set/equality assertions.
 - Revision-bearing generated fixtures:
   `session-lifecycle-subscription-conformance-fixture.json`,
-  `late-attach-history-conformance-fixture.json`,
-  `local-webrtc-delivery-chunk-conformance-fixture.json`, and
+  `late-attach-history-conformance-fixture.json`, and
   `mode-flags-conformance-fixture.json`.
+- `packages/hub-test-support/local-webrtc-delivery-chunk-conformance-fixture.json`
+  - regenerate through the normal asset sync for parity, but do not add a
+    revision field; its schema intentionally carries delivery limits and
+    scenarios rather than `conformance_fixture_revision`.
 - `packages/hub-test-support/README.md` and root `README.md`
   - 0.1.13/revision 21 and modal-operability contract.
+- `docs/client-protocol.md`
+  - document why revision 21 moves while protocol version 4 stays fixed, and
+    state the resulting minimum-conformance compatibility floor.
 
 `botster-package.json`, protocol DTO shapes, UI-contract generated assets, and
 Cargo dependencies should remain unchanged.

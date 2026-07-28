@@ -39,7 +39,7 @@ Node-based first-party clients can consume the same checked artifact without a
 sibling hub checkout through the public package:
 
 ```sh
-npm install --save-dev @trybotster/ui-contract@0.1.0 @trybotster/hub-test-support@0.1.12
+npm install --save-dev @trybotster/ui-contract@0.1.0 @trybotster/hub-test-support@0.1.13
 ```
 
 ```js
@@ -78,9 +78,9 @@ when checked assets are stale. The metadata's protocol version and conformance
 fixture revision are emitted by the Rust `botster-hub-test-support` asset
 generator instead of being maintained independently in JavaScript.
 
-For version 0.1.12 from the public npm registry, npm-based client
+For version 0.1.13 from the public npm registry, npm-based client
 repos such as botster-web should use the exact dependency spec
-`"@trybotster/hub-test-support": "0.1.12"` in `devDependencies` and let npm write
+`"@trybotster/hub-test-support": "0.1.13"` in `devDependencies` and let npm write
 the corresponding package-lock entry from the public npm registry. The package
 is public, so registry install does not require a scoped `.npmrc` entry or CI
 auth token. After updating the lockfile, run the client smoke that imports the
@@ -218,7 +218,7 @@ but normal client reconciliation must not poll it or maintain a list-refresh
 fallback beside the entity stream.
 
 The shared revision-16 contract is published by
-`@trybotster/hub-test-support@0.1.12` as
+`@trybotster/hub-test-support@0.1.13` as
 `session-lifecycle-subscription-conformance-fixture.json` and through
 `readSessionLifecycleSubscriptionConformanceFixture()`. The fixture serializes
 the public `DaemonEntityFrame` DTOs and normalizes only timestamps and sequence
@@ -832,7 +832,7 @@ assert the same event ordering and classification. `AttachState` and
 
 Node clients can consume that exact JSON through
 `readLateAttachHistoryConformanceFixture()` from
-`@trybotster/hub-test-support@0.1.12`. Version 0.1.6 / conformance revision 13
+`@trybotster/hub-test-support@0.1.13`. Version 0.1.6 / conformance revision 13
 uses JSON number arrays for opaque history and is superseded because that shape
 unnecessarily expands large Ghostty snapshots on the bounded WebRTC response
 path. Version 0.1.5 / revision 12 still exposes lossy string history. Neither is
@@ -975,6 +975,18 @@ retaining the tree and open state, a valid submission returns normalized values
 and a replacement before clearing the dialog, and a distinct rendered action
 proves deterministic toggle transitions.
 
+Relocating the one canonical Form into `contract-dialog.slots.body` advances
+`CONFORMANCE_FIXTURE_REVISION` to 21. The published browser-shaped conformance
+consumer now materializes the delivered tree after accepted scoped effects,
+restricts submit discovery to the active Dialog subtree, rejects actionable
+sibling Forms, retains the visible Dialog/Form/input association after
+rejection, and proves Clear leaves no reachable modal after acceptance.
+`PROTOCOL_VERSION` remains 4 because daemon framing, request vocabulary, DTO
+shapes, and action semantics are unchanged. Because
+`DaemonCompatibilityRequirement::current()` derives
+`minimum_conformance_fixture_revision` from this constant, clients built at
+revision 21 require a Hub reporting conformance revision 21 or later.
+
 This cold switch advances `PROTOCOL_VERSION` to 4 and
 `CONFORMANCE_FIXTURE_REVISION` to 19. It removes `UiTreeUpdateRef` and
 `tree_update`, requires explicit form `submit_label`, supports scoped
@@ -1045,7 +1057,7 @@ Node client tests should use the declared npm dependency instead of a relative
 hub checkout:
 
 ```sh
-npm install --save-dev @trybotster/ui-contract@0.1.0 @trybotster/hub-test-support@0.1.12
+npm install --save-dev @trybotster/ui-contract@0.1.0 @trybotster/hub-test-support@0.1.13
 ```
 
 ```js
@@ -1060,7 +1072,7 @@ const fixturePath = materializePluginContractMatrixFixture(tempDirectory);
 
 Local environment variables may still point legacy drift checks at a checked-out
 hub artifact, but the normal web-client dependency coordinate is
-`@trybotster/hub-test-support@0.1.12` from the public npm registry.
+`@trybotster/hub-test-support@0.1.13` from the public npm registry.
 
 Each harness instance creates a disposable data directory and socket path under
 the configured test root, uses synthetic default hub identity, and attempts a

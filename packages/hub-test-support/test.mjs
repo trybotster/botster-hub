@@ -28,10 +28,10 @@ import {
 } from "@trybotster/hub-test-support";
 
 assert.equal(metadata.package_name, "@trybotster/hub-test-support");
-assert.equal(metadata.package_version, "0.1.12");
+assert.equal(metadata.package_version, "0.1.13");
 assert.equal(metadata.protocol, "botster-hub-daemon-v1");
 assert.equal(metadata.protocol_version, 4);
-assert.equal(metadata.conformance_fixture_revision, 20);
+assert.equal(metadata.conformance_fixture_revision, 21);
 assert.deepEqual(metadata.ui_contract, {
   conformance_fixture_export: "@trybotster/ui-contract/conformance-fixtures",
   package_name: "@trybotster/ui-contract",
@@ -142,7 +142,7 @@ assert.deepEqual(supportMatrix.plugin_surfaces.authored_set_values, {
   "selected-workspace": "workspace-alpha",
 });
 
-assert.equal(sessionLifecycleFixture.conformance_fixture_revision, 20);
+assert.equal(sessionLifecycleFixture.conformance_fixture_revision, 21);
 assert.equal(sessionLifecycleFixture.entity_type, "session");
 assert.deepEqual(
   sessionLifecycleFixture.normalized_frames.map((frame) => frame.type),
@@ -314,9 +314,15 @@ try {
   assert.match(fixtureSource, /key = "selected-workspace"/);
   assert.match(fixtureSource, /kind = "clear"/);
   assert.match(fixtureSource, /kind = "toggle"/);
+  assert.equal(fixtureSource.match(/id = "contract-app-form"/g)?.length, 1);
+  assert.equal(
+    fixtureSource.indexOf('id = "contract-app-form"') >
+      fixtureSource.indexOf('id = "contract-dialog"'),
+    true,
+  );
   assert.match(
     readFileSync(join(fixturePath, "README.md"), "utf8"),
-    /rendered open action returns accepted `set` operations/,
+    /restricts submit discovery to the active Dialog subtree/,
   );
 
   const applicationFixturePath = materializeApplicationPrimitivesFixture(join(root, "application"));

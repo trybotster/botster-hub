@@ -26,6 +26,8 @@ let report = botster_hub_test_support::run_plugin_contract_matrix_conformance(
 .expect("plugin UI conformance");
 assert_eq!(report.app_surface_node_id, "contract-app-panel");
 assert!(report.dialog_visible_after_open);
+assert_eq!(report.dialog_form_node_id, "contract-app-form");
+assert!(!report.actionable_sibling_form_during_dialog);
 assert!(report.selected_workspace_visible_after_open);
 assert!(!report.dialog_visible_after_valid_submit);
 assert_eq!(report.client_render_check.expected_redacted_secret_state, "redacted");
@@ -61,7 +63,7 @@ paths.
 
 ## Matrix
 
-- `contract.app`: app surface returning a concrete UiNode payload through `plugin_surface_render`; it exercises the hub-validated application primitives `panel`, `toolbar`, `metric_grid`, `table`, `empty_state`, `status_badge`, `section`, `form`, `text_input`, `button`, and `dialog`. A rendered open action returns accepted `set` operations for the presence-bound `contract-dialog` and equality-bound `selected-workspace`; invalid form submission rejects without changing that state, valid submission returns normalized values plus a replacement and clears the dialog, and a distinct rendered action toggles `contract-toggle`.
+- `contract.app`: app surface returning a concrete UiNode payload through `plugin_surface_render`; it exercises the hub-validated application primitives `panel`, `toolbar`, `metric_grid`, `table`, `empty_state`, `status_badge`, `section`, `form`, `text_input`, `button`, and `dialog`. The one canonical Form and its input/submit controls live inside the presence-bound Dialog rather than behind it as a panel sibling. A browser-shaped consumer reads Open from the initially visible tree, applies its accepted scoped `set` operations, and restricts submit discovery to the active Dialog subtree. Invalid submission rejects while retaining that reachable Dialog/Form and field association; valid submission returns normalized values plus a replacement and clears the dialog. A distinct rendered action toggles `contract-toggle`.
 - `contract.empty`: placeholder app surface returning a valid empty-state UiNode payload.
 - `contract.blocked`: render handler that fails deliberately so clients can assert the daemon `operator_error` response and continued daemon responsiveness.
 - `contract.invalid_body`: declared render surface whose handler returns malformed UiNode data so clients can assert `invalid_surface` and a structured `plugin_surface_render` diagnostic from hub validation.

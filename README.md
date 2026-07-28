@@ -144,7 +144,7 @@ Terminal attach is a terminal-stream handshake only. Session-list reads remain
 an operator/query API; stateful clients use the explicit held-open `session`
 entity subscription for an authoritative snapshot followed by ordered deltas.
 The reusable revision-16 contract ships in
-`@trybotster/hub-test-support@0.1.12` as source-derived JSON fixtures and a Rust
+`@trybotster/hub-test-support@0.1.13` as source-derived JSON fixtures and a Rust
 `run_session_lifecycle_subscription_conformance` runner over the real isolated
 Hub/Core/session-worker topology.
 That subscription hydrates no status, package, worktree, target, or plugin state.
@@ -449,7 +449,7 @@ data_dir=resolved:$HOME/.botster/hub
 daemon=started
 protocol=botster-hub-daemon-v1
 protocol_version=4
-conformance_fixture_revision=20
+conformance_fixture_revision=21
 package_count=2
 enabled_package_count=2
 app_count=2
