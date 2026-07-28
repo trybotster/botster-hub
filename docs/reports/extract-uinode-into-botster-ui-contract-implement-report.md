@@ -87,6 +87,9 @@ contract remains separate from Hub runtime and the daemon client crate.
 - Corrected the published README fixture key, documented result identity
   correlation, and changed the example TUI text to distinguish emitted
   contracts from separately routed renderer adoption.
+- Marked the hub-test-support test's sibling-package symlink as a
+  pre-publication bridge and ignored `node_modules/` repository-wide, so an
+  interrupted test cannot leave commit-visible dependency artifacts.
 
 ## Files changed
 
@@ -170,6 +173,10 @@ contract remains separate from Hub runtime and the daemon client crate.
   check pass.
 - The focused real-daemon plugin matrix test passed with snapshot-level dialog
   presence/equality assertions and worker-path identity/replacement rejection.
+- `git check-ignore` confirms an interrupted
+  `packages/hub-test-support/node_modules/@trybotster/ui-contract` bridge is
+  ignored, while the normal npm package test still removes everything it
+  creates and leaves the worktree clean.
 - One pre-existing sub-second timing assertion in
   `shutdown_rejects_unrelated_failure_without_waiting_for_live_daemon` failed
   once at 1.15 seconds after passing earlier. The complete test-support crate

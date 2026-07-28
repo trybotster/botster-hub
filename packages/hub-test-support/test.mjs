@@ -135,13 +135,12 @@ assert.deepEqual(
   ["entity_snapshot", "entity_upsert", "entity_patch", "entity_patch", "entity_remove"],
 );
 
+// Pre-publication bridge: a normal npm install resolves the declared package.
+// Until publication, link the repository sibling only for this package test.
 const packageRoot = fileURLToPath(new URL(".", import.meta.url));
 const nodeModulesRoot = join(packageRoot, "node_modules");
 const packageScopeRoot = join(nodeModulesRoot, "@trybotster");
-const localUiContractLink = join(
-  packageScopeRoot,
-  "ui-contract",
-);
+const localUiContractLink = join(packageScopeRoot, "ui-contract");
 const nodeModulesRootAlreadyExisted = existsSync(nodeModulesRoot);
 const packageScopeRootAlreadyExisted = existsSync(packageScopeRoot);
 let createdLocalUiContractLink = false;
