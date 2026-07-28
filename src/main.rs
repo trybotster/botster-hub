@@ -379,6 +379,7 @@ fn start_daemon(args: Vec<String>) -> Result<(), StartError> {
             .iter()
             .map(|session_id| session_id.0.clone())
             .collect(),
+        lifecycle_counters: Default::default(),
         diagnostics: Vec::new(),
     };
     print_daemon_transport_status("stopped", &status);

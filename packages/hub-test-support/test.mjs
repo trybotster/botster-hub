@@ -39,7 +39,7 @@ assert.equal(metadata.package_name, "@trybotster/hub-test-support");
 assert.equal(metadata.package_version, "0.1.12");
 assert.equal(metadata.protocol, "botster-hub-daemon-v1");
 assert.equal(metadata.protocol_version, 4);
-assert.equal(metadata.conformance_fixture_revision, 19);
+assert.equal(metadata.conformance_fixture_revision, 20);
 assert.deepEqual(metadata.ui_contract, {
   conformance_fixture_export: "@trybotster/ui-contract/conformance-fixtures",
   package_name: "@trybotster/ui-contract",
@@ -128,7 +128,7 @@ assert.equal(
 );
 assert.equal(supportMatrix.supported_features.includes("terminal_readback"), true);
 
-assert.equal(sessionLifecycleFixture.conformance_fixture_revision, 19);
+assert.equal(sessionLifecycleFixture.conformance_fixture_revision, 20);
 assert.equal(sessionLifecycleFixture.entity_type, "session");
 assert.deepEqual(
   sessionLifecycleFixture.normalized_frames.map((frame) => frame.type),

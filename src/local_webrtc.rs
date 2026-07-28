@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
-use std::sync::mpsc::{self, Sender};
+use std::sync::mpsc::{self, SyncSender};
 use std::sync::{
     Mutex,
     atomic::{AtomicBool, Ordering},
@@ -139,7 +139,7 @@ impl LocalWebrtcTransport {
     pub(crate) fn signal(
         &mut self,
         request: LocalWebrtcSignalRequest,
-        runtime_tx: Sender<ControlMessage>,
+        runtime_tx: SyncSender<ControlMessage>,
     ) -> LocalWebrtcResult<DaemonLocalWebrtcAnswer> {
         let Some(grant) = self.grants.get_mut(&request.grant_id) else {
             return Err(LocalWebrtcError::MissingGrant);
@@ -266,7 +266,7 @@ impl LocalWebrtcAttachedSubscriptionChange {
 
 struct LocalWebrtcPeerState {
     grant_id: String,
-    runtime_tx: Sender<ControlMessage>,
+    runtime_tx: SyncSender<ControlMessage>,
     attached_subscriptions: Mutex<Vec<LocalWebrtcAttachedSubscription>>,
     entity_subscription_ids: Mutex<BTreeSet<String>>,
     terminal_state: Mutex<LocalWebrtcTerminalState>,
@@ -430,7 +430,7 @@ fn pop_pending_request(
 }
 
 impl LocalWebrtcPeerState {
-    fn new(grant_id: String, runtime_tx: Sender<ControlMessage>) -> Self {
+    fn new(grant_id: String, runtime_tx: SyncSender<ControlMessage>) -> Self {
         let (peer_terminal_tx, _peer_terminal_rx) = watch::channel(None);
         Self {
             grant_id,
@@ -736,7 +736,7 @@ async fn run_data_channel<D>(
     data_channel: &D,
     stream_key: &AesGcmKey,
     peer_state: &LocalWebrtcPeerState,
-    runtime_tx: &Sender<ControlMessage>,
+    runtime_tx: &SyncSender<ControlMessage>,
     entity_frame_tx: tokio_mpsc::Sender<DaemonEntityFrame>,
     mut entity_frame_rx: tokio_mpsc::Receiver<DaemonEntityFrame>,
 ) -> Option<LocalWebrtcSendFailure>
@@ -1127,7 +1127,7 @@ fn apply_data_channel_event(
 
 async fn answer_offer(
     request: LocalWebrtcSignalRequest,
-    runtime_tx: Sender<ControlMessage>,
+    runtime_tx: SyncSender<ControlMessage>,
 ) -> LocalWebrtcResult<LocalWebrtcAnswer> {
     let runtime = default_runtime()
         .ok_or_else(|| LocalWebrtcError::Webrtc("no async runtime".to_string()))?;
@@ -1550,7 +1550,7 @@ mod tests {
     }
 
     fn test_peer_state(grant_id: &str) -> LocalWebrtcPeerState {
-        let (runtime_tx, _runtime_rx) = mpsc::channel();
+        let (runtime_tx, _runtime_rx) = mpsc::sync_channel(64);
         LocalWebrtcPeerState::new(grant_id.to_string(), runtime_tx)
     }
 
@@ -1568,7 +1568,7 @@ mod tests {
                 events.push_back(DataChannelEvent::OnClose);
             }
         }
-        let (runtime_tx, runtime_rx) = mpsc::channel();
+        let (runtime_tx, runtime_rx) = mpsc::sync_channel(64);
         let peer_state = Arc::new(LocalWebrtcPeerState::new(
             "grant-idle-pressure".to_string(),
             runtime_tx,
@@ -1639,7 +1639,7 @@ mod tests {
                 &DaemonRequest::DaemonShutdown,
             ));
         }
-        let (runtime_tx, runtime_rx) = mpsc::channel();
+        let (runtime_tx, runtime_rx) = mpsc::sync_channel(64);
         let peer_state = Arc::new(LocalWebrtcPeerState::new(
             "grant-shutdown-delivery".to_string(),
             runtime_tx,
@@ -1708,7 +1708,7 @@ mod tests {
                 },
             ));
         }
-        let (runtime_tx, runtime_rx) = mpsc::channel();
+        let (runtime_tx, runtime_rx) = mpsc::sync_channel(64);
         let peer_state = Arc::new(LocalWebrtcPeerState::new(
             "grant-entity-fixture".to_string(),
             runtime_tx,
@@ -1857,7 +1857,7 @@ mod tests {
     fn replacement_peer_rejects_prior_generation_frames_and_delivers_current_generation() {
         let key = AesGcmKey::from_slice(&[22; 32]).unwrap();
         let data_channel = Arc::new(FakeDataChannel::default());
-        let (runtime_tx, runtime_rx) = mpsc::channel();
+        let (runtime_tx, runtime_rx) = mpsc::sync_channel(64);
         let peer_state = Arc::new(LocalWebrtcPeerState::new(
             "replacement-grant".to_string(),
             runtime_tx,
@@ -1954,7 +1954,7 @@ mod tests {
                 },
             ));
         }
-        let (runtime_tx, runtime_rx) = mpsc::channel();
+        let (runtime_tx, runtime_rx) = mpsc::sync_channel(64);
         let peer_state = Arc::new(LocalWebrtcPeerState::new(
             "grant-recoverable-disconnect".to_string(),
             runtime_tx,
@@ -2207,7 +2207,7 @@ mod tests {
         let mut pending = VecDeque::from([PendingLocalWebrtcRequest::Request(Box::new(
             DaemonRequest::Status,
         ))]);
-        let (runtime_tx, runtime_rx) = mpsc::channel();
+        let (runtime_tx, runtime_rx) = mpsc::sync_channel(64);
         let peer_state = Arc::new(LocalWebrtcPeerState::new(
             "grant-fixture".to_string(),
             runtime_tx,
@@ -2302,7 +2302,7 @@ mod tests {
         .unwrap();
         assert!(frames.len() > 1);
         let mut pending = VecDeque::new();
-        let (runtime_tx, runtime_rx) = mpsc::channel();
+        let (runtime_tx, runtime_rx) = mpsc::sync_channel(64);
         let peer_state = Arc::new(LocalWebrtcPeerState::new(
             "grant-progress".to_string(),
             runtime_tx,
