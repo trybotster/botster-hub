@@ -94,12 +94,32 @@ const DAEMON_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
 const DAEMON_INCOMPLETE_FRAME_TIMEOUT: Duration = Duration::from_secs(2);
 const DAEMON_MAX_FRAME_BYTES: usize = 1024 * 1024;
 const DAEMON_MAX_CONNECTIONS: usize = 64;
+const DAEMON_MAX_REJECTION_TASKS: usize = 8;
 const DAEMON_CONTROL_QUEUE_CAPACITY: usize = 256;
 pub(crate) const ENTITY_SUBSCRIPTION_QUEUE_CAPACITY: usize = 64;
 const ENTITY_RECONCILIATION_INTERVAL: Duration = Duration::from_millis(500);
 
 pub(crate) type ControlSender = tokio_mpsc::Sender<ControlMessage>;
 type ControlReplySender = oneshot::Sender<DaemonTransportResult<DaemonResponse>>;
+
+enum OwnerEvent {
+    Control(Box<Option<ControlMessage>>),
+    Reconcile,
+}
+
+async fn receive_owner_event(
+    control_rx: &mut tokio_mpsc::Receiver<ControlMessage>,
+    reconciliation_wait: Duration,
+) -> OwnerEvent {
+    if reconciliation_wait.is_zero() {
+        return OwnerEvent::Reconcile;
+    }
+    tokio::select! {
+        biased;
+        _ = tokio::time::sleep(reconciliation_wait) => OwnerEvent::Reconcile,
+        message = control_rx.recv() => OwnerEvent::Control(Box::new(message)),
+    }
+}
 
 /// Run the local daemon socket until a shutdown request is received.
 pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus> {
@@ -141,78 +161,78 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
         while let Ok(cleanup) = cleanup_rx.try_recv() {
             handle_connection_cleanup(&mut daemon, &mut control_state, control_tx.clone(), cleanup);
         }
-        if control_state.next_reconciliation <= Instant::now() {
-            drive_entity_subscriptions(&mut daemon, &mut control_state);
-            control_state.next_reconciliation = Instant::now() + ENTITY_RECONCILIATION_INTERVAL;
-        }
         let wait = control_state
             .next_reconciliation
             .saturating_duration_since(Instant::now());
-        match transport_runtime
-            .block_on(async { tokio::time::timeout(wait, control_rx.recv()).await })
-        {
-            Ok(Some(ControlMessage::AcceptedConnection {
-                stream,
-                admission_permit,
-            })) => {
-                control_state.lifecycle_counters.accepted_connections = control_state
-                    .lifecycle_counters
-                    .accepted_connections
-                    .saturating_add(1);
-                let tx = control_tx.clone();
-                let cleanup = cleanup_tx.clone();
-                let shutdown = shutdown_tx.subscribe();
-                control_state.lifecycle_counters.live_connections = control_state
-                    .lifecycle_counters
-                    .live_connections
-                    .saturating_add(1);
-                control_state.lifecycle_counters.high_water_live_connections = control_state
-                    .lifecycle_counters
-                    .high_water_live_connections
-                    .max(control_state.lifecycle_counters.live_connections);
-                connection_tasks.push(transport_runtime.spawn(async move {
-                    let _admission_permit = admission_permit;
-                    if let Err(error) = handle_connection_async(stream, tx, cleanup, shutdown).await
-                    {
-                        eprintln!("botster-hub daemon connection error: {error}");
-                    }
-                }));
-            }
-            Ok(Some(ControlMessage::RejectedConnection)) => {
-                control_state.lifecycle_counters.rejected_connections = control_state
-                    .lifecycle_counters
-                    .rejected_connections
-                    .saturating_add(1);
-            }
-            Ok(Some(message)) => {
-                if handle_control_message(
-                    &mut daemon,
-                    &mut control_state,
-                    &local_webrtc_terminal_record_path,
-                    control_tx.clone(),
-                    message,
-                ) {
-                    let _ = shutdown_tx.send(true);
-                    wait_for_connection_tasks(
-                        &transport_runtime,
-                        &mut connection_tasks,
-                        &cleanup_rx,
+        match transport_runtime.block_on(receive_owner_event(&mut control_rx, wait)) {
+            OwnerEvent::Control(message) => match *message {
+                Some(ControlMessage::AcceptedConnection {
+                    stream,
+                    admission_permit,
+                }) => {
+                    control_state.lifecycle_counters.accepted_connections = control_state
+                        .lifecycle_counters
+                        .accepted_connections
+                        .saturating_add(1);
+                    let tx = control_tx.clone();
+                    let cleanup = cleanup_tx.clone();
+                    let shutdown = shutdown_tx.subscribe();
+                    control_state.lifecycle_counters.live_connections = control_state
+                        .lifecycle_counters
+                        .live_connections
+                        .saturating_add(1);
+                    control_state.lifecycle_counters.high_water_live_connections = control_state
+                        .lifecycle_counters
+                        .high_water_live_connections
+                        .max(control_state.lifecycle_counters.live_connections);
+                    connection_tasks.push(transport_runtime.spawn(async move {
+                        let _admission_permit = admission_permit;
+                        if let Err(error) =
+                            handle_connection_async(stream, tx, cleanup, shutdown).await
+                        {
+                            eprintln!("botster-hub daemon connection error: {error}");
+                        }
+                    }));
+                }
+                Some(ControlMessage::RejectedConnection) => {
+                    control_state.lifecycle_counters.rejected_connections = control_state
+                        .lifecycle_counters
+                        .rejected_connections
+                        .saturating_add(1);
+                }
+                Some(message) => {
+                    if handle_control_message(
                         &mut daemon,
                         &mut control_state,
+                        &local_webrtc_terminal_record_path,
                         control_tx.clone(),
-                    );
-                    let status = daemon.stop();
-                    cleanup_socket_path(&socket_path);
-                    return Ok(status);
+                        message,
+                    ) {
+                        let _ = shutdown_tx.send(true);
+                        wait_for_connection_tasks(
+                            &transport_runtime,
+                            &mut connection_tasks,
+                            &cleanup_rx,
+                            &mut daemon,
+                            &mut control_state,
+                            control_tx.clone(),
+                        );
+                        let status = daemon.stop();
+                        cleanup_socket_path(&socket_path);
+                        return Ok(status);
+                    }
                 }
-            }
-            Err(_) => {
+                None => return Err(DaemonTransportError::ControlThreadStopped),
+            },
+            OwnerEvent::Reconcile => {
+                if control_state.next_reconciliation <= Instant::now() {
+                    drive_entity_subscriptions(&mut daemon, &mut control_state);
+                    control_state.next_reconciliation =
+                        Instant::now() + ENTITY_RECONCILIATION_INTERVAL;
+                }
                 if !socket_path.exists() {
                     rebind_missing_socket_path(&socket_path);
                 }
-            }
-            Ok(None) => {
-                return Err(DaemonTransportError::ControlThreadStopped);
             }
         }
     }
@@ -267,6 +287,8 @@ async fn accept_connections(
     mut shutdown_rx: watch::Receiver<bool>,
     admission: Arc<Semaphore>,
 ) {
+    let rejection_admission = Arc::new(Semaphore::new(DAEMON_MAX_REJECTION_TASKS));
+    let mut rejection_tasks = tokio::task::JoinSet::new();
     loop {
         tokio::select! {
             accepted = listener.accept() => {
@@ -286,14 +308,23 @@ async fn accept_connections(
                                 }
                             }
                             Err(_) => {
-                                reject_connection_async(stream).await;
-                                if control_tx
-                                    .send(ControlMessage::RejectedConnection)
-                                    .await
-                                    .is_err()
-                                {
-                                    return;
-                                }
+                                let permit = tokio::select! {
+                                    permit = rejection_admission.clone().acquire_owned() => {
+                                        permit.expect("rejection semaphore remains owned by accept loop")
+                                    }
+                                    changed = shutdown_rx.changed() => {
+                                        let _ = changed;
+                                        return;
+                                    }
+                                };
+                                let rejection_tx = control_tx.clone();
+                                rejection_tasks.spawn(async move {
+                                    let _permit = permit;
+                                    reject_connection_async(stream).await;
+                                    let _ = rejection_tx
+                                        .send(ControlMessage::RejectedConnection)
+                                        .await;
+                                });
                             }
                         }
                     }
@@ -306,6 +337,11 @@ async fn accept_connections(
             changed = shutdown_rx.changed() => {
                 let _ = changed;
                 return;
+            }
+            result = rejection_tasks.join_next(), if !rejection_tasks.is_empty() => {
+                if let Some(Err(error)) = result {
+                    eprintln!("botster-hub daemon rejection task error: {error}");
+                }
             }
         }
     }
@@ -3999,8 +4035,8 @@ fn drive_entity_subscriptions(daemon: &mut HubDaemon, state: &mut DaemonControlS
                 )
             });
     } else {
+        let mut unsupported_change = false;
         for change in changes.changes {
-            state.reconciliation.cursor = Some(change.cursor.clone());
             match &change.kind {
                 SessionLifecycleChangeKind::Upsert { record } => {
                     state
@@ -4011,8 +4047,12 @@ fn drive_entity_subscriptions(daemon: &mut HubDaemon, state: &mut DaemonControlS
                 SessionLifecycleChangeKind::Removed { session_id } => {
                     state.reconciliation.records.remove(&session_id.0);
                 }
-                _ => unreachable!("unsupported lifecycle changes were resynced above"),
+                _ => {
+                    unsupported_change = true;
+                    break;
+                }
             }
+            state.reconciliation.cursor = Some(change.cursor.clone());
             state
                 .entity_subscriptions
                 .retain(|subscription_id, subscription| {
@@ -4024,7 +4064,39 @@ fn drive_entity_subscriptions(daemon: &mut HubDaemon, state: &mut DaemonControlS
                     )
                 });
         }
-        state.reconciliation.cursor = Some(changes.cursor);
+        if unsupported_change {
+            state.lifecycle_counters.lifecycle_resync_reads = state
+                .lifecycle_counters
+                .lifecycle_resync_reads
+                .saturating_add(1);
+            state.lifecycle_counters.lifecycle_baseline_reads = state
+                .lifecycle_counters
+                .lifecycle_baseline_reads
+                .saturating_add(1);
+            let Ok(baseline) = runtime.session_lifecycle_baseline() else {
+                return;
+            };
+            state.reconciliation.cursor = Some(baseline.cursor.clone());
+            state.reconciliation.records = baseline
+                .sessions
+                .iter()
+                .cloned()
+                .map(|record| (record.session.session_id.0.clone(), record))
+                .collect();
+            state
+                .entity_subscriptions
+                .retain(|subscription_id, subscription| {
+                    try_resync_subscription(
+                        subscription_id,
+                        subscription,
+                        baseline.clone(),
+                        "unknown_core_change".to_string(),
+                        &mut state.lifecycle_counters,
+                    )
+                });
+        } else {
+            state.reconciliation.cursor = Some(changes.cursor);
+        }
     }
 
     let active_session_ids = state
@@ -6863,6 +6935,38 @@ impl From<crate::HubLifecycleError> for DaemonTransportError {
 pub type DaemonTransportResult<T> = Result<T, DaemonTransportError>;
 
 #[cfg(test)]
+fn receive_test_control_message(
+    receiver: &mut tokio_mpsc::Receiver<ControlMessage>,
+) -> ControlMessage {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build bounded test receive runtime");
+    runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .expect("timed out waiting for daemon control message")
+            .expect("daemon control sender remains live")
+    })
+}
+
+#[cfg(test)]
+fn receive_test_control_reply(
+    receiver: oneshot::Receiver<DaemonTransportResult<DaemonResponse>>,
+) -> DaemonTransportResult<DaemonResponse> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build bounded test reply runtime");
+    runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(1), receiver)
+            .await
+            .expect("timed out waiting for daemon control reply")
+            .expect("daemon control reply sender remains live")
+    })
+}
+
+#[cfg(test)]
 fn handle_connection(stream: UnixStream, control_tx: ControlSender) -> DaemonTransportResult<()> {
     stream
         .set_nonblocking(true)
@@ -6897,7 +7001,7 @@ fn handle_connection(stream: UnixStream, control_tx: ControlSender) -> DaemonTra
                 })
                 .is_ok()
             {
-                let _ = reply_rx.blocking_recv();
+                let _ = receive_test_control_reply(reply_rx);
             }
         }
     }
@@ -6908,6 +7012,29 @@ fn handle_connection(stream: UnixStream, control_tx: ControlSender) -> DaemonTra
 mod tests {
     use super::*;
     use std::net::Shutdown;
+
+    #[test]
+    fn due_reconciliation_precedes_an_already_ready_control_message() {
+        let (control_tx, mut control_rx) = tokio_mpsc::channel(1);
+        control_tx
+            .try_send(ControlMessage::RejectedConnection)
+            .expect("prefill owner control queue");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build owner event test runtime");
+
+        assert!(matches!(
+            runtime.block_on(receive_owner_event(&mut control_rx, Duration::ZERO)),
+            OwnerEvent::Reconcile
+        ));
+        let OwnerEvent::Control(message) =
+            runtime.block_on(receive_owner_event(&mut control_rx, Duration::from_secs(1)))
+        else {
+            panic!("ready control message must win before a future reconciliation deadline");
+        };
+        assert!(matches!(*message, Some(ControlMessage::RejectedConnection)));
+    }
 
     #[test]
     fn read_mode_flags_runtime_failure_projects_operator_error_without_default_body() {
@@ -6950,7 +7077,7 @@ mod tests {
         .expect("write attach request");
         let ControlMessage::Request {
             request, reply_tx, ..
-        } = control_rx.blocking_recv().expect("receive attach request")
+        } = receive_test_control_message(&mut control_rx)
         else {
             panic!("expected attach control request");
         };
@@ -6965,9 +7092,7 @@ mod tests {
             .expect("disconnect daemon client");
         let ControlMessage::Request {
             request, reply_tx, ..
-        } = control_rx
-            .blocking_recv()
-            .expect("receive disconnect detach request")
+        } = receive_test_control_message(&mut control_rx)
         else {
             panic!("expected detach control request");
         };
@@ -7090,10 +7215,7 @@ mod tests {
             let _ = stopped_tx.send(should_stop);
         });
 
-        let response = reply_rx
-            .blocking_recv()
-            .expect("shutdown response reaches transport")
-            .expect("shutdown response succeeds");
+        let response = receive_test_control_reply(reply_rx).expect("shutdown response succeeds");
         assert_eq!(response.kind, DaemonResponseKind::Shutdown);
         assert!(
             stopped_rx.try_recv().is_err(),
@@ -7125,9 +7247,7 @@ mod tests {
             let _ = stopped_tx.send(should_stop);
         });
 
-        let _ = reply_rx
-            .blocking_recv()
-            .expect("shutdown response reaches transport");
+        let _ = receive_test_control_reply(reply_rx);
         drop(response_delivery_tx);
 
         assert!(
@@ -7173,9 +7293,7 @@ mod tests {
             request,
             reply_tx,
             response_delivery_rx,
-        } = control_rx
-            .blocking_recv()
-            .expect("receive daemon shutdown request")
+        } = receive_test_control_message(&mut control_rx)
         else {
             panic!("expected shutdown control request");
         };

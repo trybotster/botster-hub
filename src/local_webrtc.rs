@@ -1573,6 +1573,21 @@ mod tests {
         LocalWebrtcPeerState::new(grant_id.to_string(), runtime_tx)
     }
 
+    fn receive_test_runtime_message(
+        receiver: &mut tokio_mpsc::Receiver<ControlMessage>,
+    ) -> ControlMessage {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build bounded WebRTC test receive runtime");
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                .await
+                .expect("timed out waiting for WebRTC runtime message")
+                .expect("WebRTC runtime sender remains live")
+        })
+    }
+
     fn run_idle_pressure_case(
         terminal_cause: Option<LocalWebrtcTerminalCause>,
     ) -> (FakeDataChannel, Option<LocalWebrtcSendFailure>) {
@@ -1595,7 +1610,7 @@ mod tests {
         let responder = std::thread::spawn(move || {
             let ControlMessage::Request {
                 request, reply_tx, ..
-            } = runtime_rx.blocking_recv().unwrap()
+            } = receive_test_runtime_message(&mut runtime_rx)
             else {
                 panic!("expected daemon request before peer cleanup");
             };
@@ -1606,7 +1621,7 @@ mod tests {
                 ))))
                 .unwrap();
             assert!(matches!(
-                runtime_rx.blocking_recv().unwrap(),
+                receive_test_runtime_message(&mut runtime_rx),
                 ControlMessage::LocalWebrtcPeerClosed { grant_id, .. }
                     if grant_id == "grant-idle-pressure"
             ));
@@ -1669,7 +1684,7 @@ mod tests {
                 request,
                 reply_tx,
                 response_delivery_rx,
-            } = runtime_rx.blocking_recv().unwrap()
+            } = receive_test_runtime_message(&mut runtime_rx)
             else {
                 panic!("expected daemon shutdown request");
             };
@@ -1741,7 +1756,7 @@ mod tests {
                 subscription_id,
                 frame_tx,
                 reply_tx,
-            } = runtime_rx.blocking_recv().unwrap()
+            } = receive_test_runtime_message(&mut runtime_rx)
             else {
                 panic!("expected WebRTC entity subscription registration");
             };
@@ -1789,7 +1804,7 @@ mod tests {
 
             let ControlMessage::Request {
                 request, reply_tx, ..
-            } = runtime_rx.blocking_recv().unwrap()
+            } = receive_test_runtime_message(&mut runtime_rx)
             else {
                 panic!("expected ordinary request while entity subscription is active");
             };
@@ -1810,7 +1825,7 @@ mod tests {
             let ControlMessage::LocalWebrtcPeerClosed {
                 entity_subscription_ids,
                 ..
-            } = runtime_rx.blocking_recv().unwrap()
+            } = receive_test_runtime_message(&mut runtime_rx)
             else {
                 panic!("expected peer cleanup");
             };
@@ -1915,7 +1930,7 @@ mod tests {
             }
             responder_peer_state.publish_peer_terminal(LocalWebrtcTerminalCause::PeerClosed);
             assert!(matches!(
-                runtime_rx.blocking_recv().unwrap(),
+                receive_test_runtime_message(&mut runtime_rx),
                 ControlMessage::LocalWebrtcPeerClosed { grant_id, .. }
                     if grant_id == "replacement-grant"
             ));
@@ -1983,7 +1998,7 @@ mod tests {
         let responder = std::thread::spawn(move || {
             let ControlMessage::Request {
                 request, reply_tx, ..
-            } = runtime_rx.blocking_recv().unwrap()
+            } = receive_test_runtime_message(&mut runtime_rx)
             else {
                 panic!("expected status request");
             };
@@ -2003,7 +2018,7 @@ mod tests {
 
             let ControlMessage::Request {
                 request, reply_tx, ..
-            } = runtime_rx.blocking_recv().unwrap()
+            } = receive_test_runtime_message(&mut runtime_rx)
             else {
                 panic!("expected shutdown-session request after recoverable disconnect");
             };
@@ -2032,7 +2047,7 @@ mod tests {
                 Some(LocalWebrtcTerminalCause::PeerClosed)
             );
             assert!(matches!(
-                runtime_rx.blocking_recv().unwrap(),
+                receive_test_runtime_message(&mut runtime_rx),
                 ControlMessage::LocalWebrtcPeerClosed { grant_id, .. }
                     if grant_id == "grant-recoverable-disconnect"
             ));
@@ -2279,7 +2294,7 @@ mod tests {
             grant_id,
             terminal_record,
             ..
-        } = runtime_rx.blocking_recv().unwrap()
+        } = receive_test_runtime_message(&mut runtime_rx)
         else {
             panic!("expected peer cleanup");
         };
@@ -2366,7 +2381,7 @@ mod tests {
         ));
         let ControlMessage::LocalWebrtcPeerClosed {
             terminal_record, ..
-        } = runtime_rx.blocking_recv().unwrap()
+        } = receive_test_runtime_message(&mut runtime_rx)
         else {
             panic!("expected terminal record after partial response");
         };

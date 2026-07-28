@@ -5,8 +5,8 @@
 - Repository: `trybotster/botster-hub`
 - Target id: `tgt_7e208a0c76a44980a83b63af976b1f22`
 - Run: `run_1785199801_176415`
-- Implement steps: `run_step_1785200938_377318` and
-  `run_step_1785212561_440065`
+- Implement steps: `run_step_1785200938_377318`,
+  `run_step_1785212561_440065`, and `run_step_1785214562_290248`
 
 The approved plan and the authoritative Project Pipelines target both route
 this work to `botster-hub`.
@@ -123,6 +123,10 @@ was required. The existing closed UiNode dependency remains unrelated.
 - Review removed the proposed `cleanup_already_complete` field because the
   single-owner cleanup guard has no legitimate duplicate producer. Cleanup
   enqueue failure degrades to a diagnostic rather than panicking in `Drop`.
+- `lifecycle_resync_reads` remains an explicitly documented exceptional-path
+  scaffold: production increments it for Core `resync_required` or a future
+  unknown lifecycle variant, but pinned Core exposes no deterministic public
+  fixture for either condition.
 
 ## Verification and downstream proof
 
@@ -132,7 +136,7 @@ Passed:
 - `./test.sh --workspace --no-run`
 - `./test.sh -p botster-hub-client` — 42 unit tests and 4 doctests
 - `./test.sh -p botster-hub-test-support` — 32 unit tests and 3 doctests
-- `./test.sh -p botster-hub --lib` — 112 tests
+- `./test.sh -p botster-hub --lib` — 113 tests
 - `./test.sh` — full Hub suite; 101 lifecycle integration tests passed and the
   one documented large local adversarial test remained ignored
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
@@ -146,6 +150,12 @@ Passed:
 - loaded campaign input validation for
   `focused-connection-lifecycle`, 20 repetitions, `residual-tail`
 
+The lifecycle target passed twice consecutively under its default parallel
+test execution before the full-suite pass. The support crate had one transient
+failure in its pre-existing fake-process exit-status test; an immediate full
+support-crate rerun passed all 32 unit tests and 3 doctests. That test and its
+production code were not changed by this ticket.
+
 The focused production test proves:
 
 - one startup baseline and zero live-subscription baseline reads;
@@ -157,6 +167,10 @@ The focused production test proves:
 - cleanup convergence after abrupt drops;
 - sixteen repeated fresh-id subscribe/drop reconnect generations with live
   entity subscriptions returning to zero and high-water remaining bounded;
+- sustained pipelined control pressure with reconciliation still winning once
+  due, plus a red/green unit negative control at the production owner selector:
+  with an already-ready control message, removing the explicit due-deadline
+  guard made the selector test fail, and restoring it made the test pass;
 - live/high-water attach counters plus a real failed cleanup after its session
   is removed;
 - accepted-connection, delivery overflow/failure, and stalled-write producers;
@@ -164,6 +178,8 @@ The focused production test proves:
   incomplete frame;
 - clean daemon shutdown with live idle/entity clients, followed immediately by
   a non-overlapping replacement daemon.
+- explicit shutdown/removal of every session and closure of every raw socket
+  created by the focused proof, preventing suite and loaded-campaign residue.
 
 Existing Hub tests continue to cover failed response/entity delivery, duplicate
 attach/entity identifiers, slow terminal consumers, fresh authoritative entity
