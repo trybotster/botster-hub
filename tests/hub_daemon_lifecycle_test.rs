@@ -7114,13 +7114,23 @@ fn focused_connection_lifecycle_is_bounded_event_driven_and_counter_visible() {
             .is_err(),
         "over-cap connection must not enter the runtime request path"
     );
-    let rejected_status = idle_connections[0]
-        .request(&botster_hub_client::DaemonRequest::Status)
-        .expect("admitted client remains healthy after rejection")
-        .status
-        .expect("post-rejection status body")
-        .lifecycle_counters;
-    assert!(rejected_status.rejected_connections >= 1);
+    let rejection_counter_deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let rejected_status = idle_connections[0]
+            .request(&botster_hub_client::DaemonRequest::Status)
+            .expect("admitted client remains healthy after rejection")
+            .status
+            .expect("post-rejection status body")
+            .lifecycle_counters;
+        if rejected_status.rejected_connections >= 1 {
+            break;
+        }
+        assert!(
+            Instant::now() < rejection_counter_deadline,
+            "typed rejection counter did not converge"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
     drop(stalled_rejection);
     drop(rejected);
     drop(idle_connections);

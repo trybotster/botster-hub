@@ -92,6 +92,11 @@ buffered reader for every response could prefetch and then discard later
 frames, making the proof disconnect itself under Linux load even though the
 daemon emitted valid newline-delimited responses.
 
+The typed rejection remains latency-bounded, while its diagnostic counter is
+asserted with a bounded convergence loop. The rejection task publishes that
+counter after completing its typed handshake, so an immediate Status request
+from another connection may legitimately observe the preceding snapshot.
+
 ## Files changed
 
 - Runtime and policy: `src/daemon_transport.rs`, `src/local_webrtc.rs`,
