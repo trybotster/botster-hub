@@ -22,7 +22,7 @@ mod typescript;
 
 pub const PROTOCOL: &str = "botster-hub-daemon-v1";
 pub const PROTOCOL_VERSION: u16 = 4;
-pub const CONFORMANCE_FIXTURE_REVISION: u16 = 20;
+pub const CONFORMANCE_FIXTURE_REVISION: u16 = 21;
 /// Version of the local WebRTC delivery chunk framing protocol.
 pub const LOCAL_WEBRTC_DELIVERY_CHUNK_VERSION: u16 = 2;
 /// Serialized local WebRTC delivery frames must remain strictly below this size.
@@ -759,6 +759,8 @@ pub enum DaemonRequest {
         enabled: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         kind: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        base_ref: Option<String>,
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         metadata: BTreeMap<String, String>,
     },
@@ -772,6 +774,12 @@ pub enum DaemonRequest {
         enabled: Option<bool>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         kind: Option<String>,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "deserialize_present_nullable"
+        )]
+        base_ref: Option<Option<String>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         metadata: Option<BTreeMap<String, String>>,
     },
@@ -1188,6 +1196,8 @@ pub struct DaemonSpawnTarget {
     pub root: PathBuf,
     pub enabled: bool,
     pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_ref: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub metadata: BTreeMap<String, String>,
 }
@@ -1206,6 +1216,8 @@ pub struct DaemonWorktree {
     pub label: String,
     pub path: PathBuf,
     pub status: String,
+    #[serde(default = "default_registered_management")]
+    pub management: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git: Option<DaemonWorktreeGitMetadata>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -1242,6 +1254,18 @@ pub struct DaemonWorktreeLifecycleEvent {
 
 const fn default_true() -> bool {
     true
+}
+
+fn default_registered_management() -> String {
+    "registered".to_string()
+}
+
+fn deserialize_present_nullable<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2824,6 +2848,70 @@ mod tests {
     }
 
     #[test]
+    fn spawn_target_base_ref_update_distinguishes_omit_set_and_clear() {
+        let omitted: DaemonRequest = serde_json::from_value(serde_json::json!({
+            "type": "update_spawn_target",
+            "target_id": "tgt_example"
+        }))
+        .expect("deserialize omitted base ref");
+        assert!(matches!(
+            omitted,
+            DaemonRequest::UpdateSpawnTarget { base_ref: None, .. }
+        ));
+
+        let set: DaemonRequest = serde_json::from_value(serde_json::json!({
+            "type": "update_spawn_target",
+            "target_id": "tgt_example",
+            "base_ref": "main"
+        }))
+        .expect("deserialize set base ref");
+        assert!(matches!(
+            set,
+            DaemonRequest::UpdateSpawnTarget {
+                base_ref: Some(Some(ref value)),
+                ..
+            } if value == "main"
+        ));
+
+        let clear: DaemonRequest = serde_json::from_value(serde_json::json!({
+            "type": "update_spawn_target",
+            "target_id": "tgt_example",
+            "base_ref": null
+        }))
+        .expect("deserialize cleared base ref");
+        assert!(matches!(
+            clear,
+            DaemonRequest::UpdateSpawnTarget {
+                base_ref: Some(None),
+                ..
+            }
+        ));
+        assert_eq!(
+            serde_json::to_value(clear).expect("serialize cleared base ref")["base_ref"],
+            serde_json::Value::Null
+        );
+
+        let legacy_target: DaemonSpawnTarget = serde_json::from_value(serde_json::json!({
+            "target_id": "legacy",
+            "label": "Legacy",
+            "root": "/tmp/example",
+            "enabled": true,
+            "kind": "directory"
+        }))
+        .expect("deserialize legacy spawn target");
+        assert_eq!(legacy_target.base_ref, None);
+        let legacy_worktree: DaemonWorktree = serde_json::from_value(serde_json::json!({
+            "worktree_id": "legacy",
+            "target_id": "legacy",
+            "label": "Legacy",
+            "path": "/tmp/example",
+            "status": "present"
+        }))
+        .expect("deserialize legacy worktree");
+        assert_eq!(legacy_worktree.management, "registered");
+    }
+
+    #[test]
     fn mode_flags_protocol_is_serde_stable_and_generated() {
         let request = DaemonRequest::ReadModeFlags {
             session_id: "mode-session".to_string(),
@@ -3692,6 +3780,7 @@ mod tests {
                 root: PathBuf::from("/tmp/example"),
                 enabled: true,
                 kind: Some("directory".to_string()),
+                base_ref: None,
                 metadata: BTreeMap::from([("purpose".to_string(), "test".to_string())]),
             },
             DaemonRequest::UpdateSpawnTarget {
@@ -3700,6 +3789,7 @@ mod tests {
                 root: Some(PathBuf::from("/tmp/example-updated")),
                 enabled: Some(false),
                 kind: Some("directory".to_string()),
+                base_ref: None,
                 metadata: Some(BTreeMap::new()),
             },
             DaemonRequest::DeleteSpawnTarget {
@@ -4090,6 +4180,7 @@ mod tests {
                 root: PathBuf::from("/tmp/example"),
                 enabled: true,
                 kind: "directory".to_string(),
+                base_ref: None,
                 metadata: BTreeMap::from([("purpose".to_string(), "test".to_string())]),
             }],
             spawn_target_validation: Some(DaemonSpawnTargetValidation {
@@ -4103,6 +4194,7 @@ mod tests {
                 label: "Example Worktree".to_string(),
                 path: PathBuf::from("/tmp/example/worktree"),
                 status: "present".to_string(),
+                management: "registered".to_string(),
                 git: Some(DaemonWorktreeGitMetadata {
                     repository_root: PathBuf::from("/tmp/example/worktree"),
                     branch: Some("main".to_string()),

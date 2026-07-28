@@ -70,8 +70,29 @@ pub struct SessionTemplateContextInput {
     pub metadata: BTreeMap<String, String>,
 }
 
-/// Sanitized template row exposed to clients.
+/// Semantic caller inputs accepted by the atomic managed-worktree path.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ManagedSessionTemplateRequest {
+    pub environment: BTreeMap<String, String>,
+    pub prompt: Option<String>,
+    pub ticket_id: Option<String>,
+    pub workspace_id: Option<String>,
+    pub metadata: BTreeMap<String, String>,
+}
+
+/// Opaque Hub-derived worktree facts accepted only by trusted materialization.
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EnsuredManagedWorktree {
+    pub target_id: String,
+    pub repository_root: PathBuf,
+    pub worktree_path: PathBuf,
+    pub branch: String,
+    pub base_ref: String,
+    pub base_commit: String,
+}
+
+/// Sanitized template row exposed to clients.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct HubSessionTemplate {
     pub template_id: String,
     pub package_name: String,
@@ -289,6 +310,169 @@ pub fn materialize_session_template(
         spawn_request,
         context,
     })
+}
+
+/// Materialize an atomic managed-worktree spawn without weakening ordinary cwd admission.
+pub(crate) fn materialize_managed_session_template(
+    config: &HubConfig,
+    records: &[&PackageRecord],
+    state: &HubState,
+    template_id: &str,
+    session_id: SessionId,
+    request: ManagedSessionTemplateRequest,
+    ensured: &EnsuredManagedWorktree,
+) -> SessionTemplateResult<MaterializedSessionTemplate> {
+    let source = find_source_template(records, state, template_id)?;
+    if !source.available {
+        return Err(SessionTemplateError::new(
+            "template_unavailable",
+            "session template source is not enabled",
+        ));
+    }
+    validate_template(&source.template)?;
+    if source_default_target_id(&source) != ensured.target_id {
+        return Err(SessionTemplateError::new(
+            "target_not_admitted",
+            "requested spawn target is not admitted for this template",
+        ));
+    }
+    let managed_root = ensured.worktree_path.canonicalize().map_err(|_| {
+        SessionTemplateError::new(
+            "managed_worktree_unavailable",
+            "managed worktree is unavailable",
+        )
+    })?;
+    let working_directory = match &source.template.working_directory {
+        PackageSessionTemplateWorkingDirectory::PackageRoot => managed_root.clone(),
+        PackageSessionTemplateWorkingDirectory::Relative { path } => {
+            let candidate = managed_root.join(path).canonicalize().map_err(|_| {
+                SessionTemplateError::new(
+                    "cwd_not_admitted",
+                    "managed template working directory is unavailable",
+                )
+            })?;
+            if !candidate.starts_with(&managed_root) {
+                return Err(SessionTemplateError::new(
+                    "cwd_not_admitted",
+                    "managed template working directory escapes the worktree",
+                ));
+            }
+            candidate
+        }
+    };
+    let mut environment = source.template.environment.clone();
+    let allowed = source
+        .template
+        .allowed_environment_overrides
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    for (name, value) in &request.environment {
+        validate_environment_name(name)?;
+        if !allowed.contains(name) {
+            return Err(SessionTemplateError::new(
+                "environment_not_admitted",
+                format!("environment override is not admitted: {name}"),
+            ));
+        }
+        environment.insert(name.clone(), value.clone());
+    }
+    let context_id = format!("ctx-{}", session_id.0);
+    let mut metadata = request.metadata;
+    metadata.insert("base_ref".to_string(), ensured.base_ref.clone());
+    metadata.insert("base_commit".to_string(), ensured.base_commit.clone());
+    let context = assemble_context(
+        config,
+        ContextAssemblyInputs {
+            session_id: &session_id,
+            context_id: &context_id,
+            target_id: &ensured.target_id,
+            package_root: &ensured.repository_root,
+            working_directory: &working_directory,
+        },
+        SessionTemplateContextInput {
+            worktree_path: Some(managed_root.display().to_string()),
+            repo_path: Some(ensured.repository_root.display().to_string()),
+            branch_name: Some(ensured.branch.clone()),
+            prompt: request.prompt,
+            ticket_id: request.ticket_id,
+            workspace_id: request.workspace_id,
+            metadata,
+        },
+        &source.template.context,
+    );
+    inject_context_environment(config, &mut environment, &session_id, &context_id);
+    let command_root = if source.rank == TemplateSourceRank::Repo {
+        &managed_root
+    } else {
+        &source.root
+    };
+    let row = template_row_from_source(&source);
+    let resolved = ResolvedSessionTemplate {
+        template: row,
+        session_id: session_id.clone(),
+        executable: resolve_command_path(command_root, &source.template.command)
+            .display()
+            .to_string(),
+        arguments: source.template.args.clone(),
+        working_directory: working_directory.display().to_string(),
+        environment: environment.clone(),
+        context_id: context_id.clone(),
+        context_keys: context.values.keys().cloned().collect(),
+    };
+    let spawn_request = SessionSpawnRequest {
+        request_id: RequestId(format!("managed-session-template-{context_id}")),
+        session_id,
+        executable: resolved.executable.clone(),
+        arguments: resolved.arguments.clone(),
+        working_directory: SpawnWorkingDirectory {
+            path: resolved.working_directory.clone(),
+        },
+        environment: SpawnEnvironment {
+            variables: environment
+                .into_iter()
+                .map(|(name, value)| SpawnEnvironmentVariable { name, value })
+                .collect(),
+        },
+        initial_pty_size: Some(ResizePayload {
+            rows: config.session_defaults.initial_rows,
+            cols: config.session_defaults.initial_cols,
+        }),
+    };
+    Ok(MaterializedSessionTemplate {
+        resolved,
+        spawn_request,
+        context,
+    })
+}
+
+/// Return only enabled effective templates admitted for one target.
+pub fn list_session_templates_for_target(
+    records: &[&PackageRecord],
+    state: &HubState,
+    target_id: &str,
+) -> SessionTemplateResult<Vec<HubSessionTemplate>> {
+    Ok(list_session_templates(records, state)?
+        .into_iter()
+        .filter(|template| template.available && template.target_id == target_id)
+        .collect())
+}
+
+/// Return one enabled effective template admitted for one target.
+pub fn show_session_template_for_target(
+    records: &[&PackageRecord],
+    state: &HubState,
+    target_id: &str,
+    template_id: &str,
+) -> SessionTemplateResult<HubSessionTemplate> {
+    let template = show_session_template(records, state, template_id)?;
+    if !template.available || template.target_id != target_id {
+        return Err(SessionTemplateError::new(
+            "template_not_eligible",
+            "session template is not eligible for the requested target",
+        ));
+    }
+    Ok(template)
 }
 
 /// Return one effective template row by bare or full id.

@@ -674,6 +674,62 @@ fn write_local_plugin_package(root: &Path) {
     .expect("write local package manifest");
 }
 
+fn write_managed_git_session_package(root: &Path) {
+    fs::create_dir_all(root.join("bin")).expect("create managed Git package root");
+    fs::write(
+        root.join("plugin.lua"),
+        r#"
+return botster.register({
+  tools = {{
+    name = "managed_git.live_spawn",
+    description = "Exercise the live Hub managed Git session path.",
+    handler = "live_spawn",
+    call = function(args)
+      return botster.capabilities.session_templates.ensure_worktree_and_spawn(args)
+    end,
+  }},
+})
+"#,
+    )
+    .expect("write managed Git plugin");
+    let script = root.join("bin/init.sh");
+    fs::write(
+        &script,
+        "#!/bin/sh\nprintf 'live-managed\\n' > live-managed.txt\n",
+    )
+    .expect("write managed Git session command");
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755))
+        .expect("make managed Git session command executable");
+    let source_root = fs::canonicalize(root).expect("canonical managed Git package root");
+    fs::write(
+        root.join("botster-package.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "name": "managed-git.live-plugin",
+            "version": "1.0.0",
+            "kind": "plugin",
+            "botster": ">=0.1.0",
+            "source": { "type": "path", "path": source_root },
+            "capabilities": [
+                { "surface": "mcp" },
+                {
+                    "surface": "session_actions",
+                    "scope": "session_template_managed_git_spawn"
+                }
+            ],
+            "entrypoints": [
+                { "runtime": "lua", "path": "plugin.lua", "bootstrap": false }
+            ],
+            "session_templates": [{
+                "id": "init",
+                "command": "bin/init.sh",
+                "target_id": "tgt_live_managed"
+            }]
+        }))
+        .expect("serialize managed Git package"),
+    )
+    .expect("write managed Git package manifest");
+}
+
 fn write_configurable_local_plugin_package(root: &Path) {
     fs::create_dir_all(root).expect("create configurable package root");
     fs::write(root.join("plugin.lua"), "return botster.register({})\n")
@@ -8069,6 +8125,7 @@ fn local_webrtc_chunks_oversized_encrypted_daemon_response() {
                 root: data_dir.clone(),
                 enabled: true,
                 kind: Some("directory".to_string()),
+                base_ref: None,
                 metadata: BTreeMap::from([("synthetic".to_string(), "x".repeat(300_000))]),
             },
         )
@@ -10643,6 +10700,7 @@ fn daemon_spawn_target_crud_persists_plain_non_git_directory_and_cli_lists_it() 
             root: target_root.clone(),
             enabled: true,
             kind: Some("directory".to_string()),
+            base_ref: None,
             metadata: BTreeMap::new(),
         },
     )
@@ -10698,6 +10756,7 @@ fn daemon_spawn_target_crud_persists_plain_non_git_directory_and_cli_lists_it() 
             root: None,
             enabled: Some(false),
             kind: None,
+            base_ref: None,
             metadata: None,
         },
     )
@@ -10723,6 +10782,7 @@ fn daemon_spawn_target_crud_persists_plain_non_git_directory_and_cli_lists_it() 
             root: None,
             enabled: Some(true),
             kind: None,
+            base_ref: None,
             metadata: None,
         },
     )
@@ -10792,6 +10852,7 @@ fn daemon_worktree_crud_scopes_paths_to_spawn_targets_without_requiring_git() {
             root: target_root.clone(),
             enabled: true,
             kind: Some("directory".to_string()),
+            base_ref: None,
             metadata: BTreeMap::new(),
         },
     )
@@ -11059,6 +11120,7 @@ fn daemon_spawns_repo_local_session_template_after_state_reload() {
                 root: repo_root.clone(),
                 enabled: true,
                 kind: "directory".to_string(),
+                base_ref: None,
                 metadata: BTreeMap::new(),
             }];
         })
@@ -12419,6 +12481,276 @@ fn daemon_packages_registry_fixture_preview_and_install_flow() {
     assert_eq!(
         record.pin.as_ref().expect("pin").rev.as_deref(),
         Some("abc123")
+    );
+}
+
+#[test]
+fn live_hub_managed_git_spawn_reconciles_and_reuses_after_restart() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_short_test_dir("managed-live");
+    let competing_data_dir = unique_short_test_dir("managed-competing");
+    let package_dir = unique_short_test_dir("managed-package");
+    let repository = unique_short_test_dir("managed-repo");
+    fs::create_dir_all(&repository).expect("create managed live repository");
+    run_fixture_git(None, &["init", "-b", "main", path_str(&repository)]);
+    run_fixture_git(
+        Some(&repository),
+        &["config", "user.email", "botster@example.invalid"],
+    );
+    run_fixture_git(
+        Some(&repository),
+        &["config", "user.name", "Botster Live Test"],
+    );
+    fs::write(repository.join("README.md"), "managed live\n").expect("write repository fixture");
+    run_fixture_git(Some(&repository), &["add", "README.md"]);
+    run_fixture_git(Some(&repository), &["commit", "-m", "managed live fixture"]);
+    write_managed_git_session_package(&package_dir);
+
+    let first_child = start_cli_daemon(&data_dir);
+    let enabled = botster_hub::daemon_transport_request(
+        &explicit_config(&data_dir),
+        botster_hub::DaemonRequest::EnablePackageLocalPath {
+            path: package_dir.clone(),
+        },
+    )
+    .expect("install and enable live managed Git package");
+    assert_eq!(
+        enabled.kind,
+        botster_hub::DaemonResponseKind::PackageDecision
+    );
+    let created_target = botster_hub::daemon_transport_request(
+        &explicit_config(&data_dir),
+        botster_hub::DaemonRequest::CreateSpawnTarget {
+            target_id: Some("tgt_live_managed".to_string()),
+            label: Some("Live Managed".to_string()),
+            root: repository.clone(),
+            enabled: true,
+            kind: Some("git".to_string()),
+            base_ref: Some("main".to_string()),
+            metadata: BTreeMap::new(),
+        },
+    )
+    .expect("create live Git spawn target");
+    assert_eq!(
+        created_target.spawn_targets[0].base_ref.as_deref(),
+        Some("main")
+    );
+
+    let call = |call_data_dir: &Path| {
+        botster_hub::daemon_transport_request(
+            &explicit_config(call_data_dir),
+            botster_hub::DaemonRequest::PluginMcpCallTool {
+                name: "managed_git.live_spawn".to_string(),
+                arguments: serde_json::json!({
+                    "target_id": "tgt_live_managed",
+                    "branch": "feature/live-restart",
+                    "template_id": "managed-git.live-plugin/init"
+                }),
+            },
+        )
+        .expect("call live managed Git tool")
+    };
+    let first = call(&data_dir);
+    assert_eq!(
+        first.kind,
+        botster_hub::DaemonResponseKind::PluginMcpToolResult
+    );
+    assert_eq!(first.plugin_tool_result["ok"], true);
+    assert_eq!(first.plugin_tool_result["result"]["created_worktree"], true);
+    let first_session_id = first.plugin_tool_result["result"]["session_id"]
+        .as_str()
+        .expect("first live session UUID")
+        .to_string();
+    assert_eq!(first_session_id.len(), 36);
+    let first_worktree_path = PathBuf::from(
+        first.plugin_tool_result["result"]["worktree_path"]
+            .as_str()
+            .expect("first live worktree path"),
+    );
+    let first_marker = first_worktree_path.join("live-managed.txt");
+    for _ in 0..100 {
+        if first_marker.exists() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        fs::read_to_string(first_marker).expect("live managed cwd marker"),
+        "live-managed\n"
+    );
+
+    let competing_child = start_cli_daemon(&competing_data_dir);
+    botster_hub::daemon_transport_request(
+        &explicit_config(&competing_data_dir),
+        botster_hub::DaemonRequest::EnablePackageLocalPath {
+            path: package_dir.clone(),
+        },
+    )
+    .expect("enable package in competing Hub");
+    botster_hub::daemon_transport_request(
+        &explicit_config(&competing_data_dir),
+        botster_hub::DaemonRequest::CreateSpawnTarget {
+            target_id: Some("tgt_live_managed".to_string()),
+            label: Some("Competing Managed".to_string()),
+            root: repository.clone(),
+            enabled: true,
+            kind: Some("git".to_string()),
+            base_ref: Some("main".to_string()),
+            metadata: BTreeMap::new(),
+        },
+    )
+    .expect("create competing Git spawn target");
+    let competing = call(&competing_data_dir);
+    assert_eq!(competing.plugin_tool_result["ok"], false);
+    assert_eq!(
+        competing.plugin_tool_result["error"]["kind"],
+        "branch_in_use"
+    );
+    assert!(
+        first_worktree_path.exists(),
+        "competing Hub must not remove the winning worktree"
+    );
+    let competing_shutdown = shutdown_cli_daemon(&competing_data_dir, competing_child);
+    assert!(
+        competing_shutdown.status.success(),
+        "competing daemon shutdown failed: {}",
+        command_output_text(&competing_shutdown)
+    );
+
+    let first_shutdown = shutdown_cli_daemon(&data_dir, first_child);
+    assert!(
+        first_shutdown.status.success(),
+        "first live daemon shutdown failed: {}",
+        command_output_text(&first_shutdown)
+    );
+
+    let second_child = start_cli_daemon(&data_dir);
+    let listed = botster_hub::daemon_transport_request(
+        &explicit_config(&data_dir),
+        botster_hub::DaemonRequest::ListWorktrees,
+    )
+    .expect("list reconciled managed worktree after restart");
+    let managed = listed
+        .worktrees
+        .iter()
+        .find(|worktree| worktree.target_id == "tgt_live_managed")
+        .expect("managed row after restart");
+    assert_eq!(managed.management, "hub_managed_git");
+    assert_eq!(managed.status, "present");
+    assert_eq!(managed.path, first_worktree_path);
+    let persisted_target = botster_hub::daemon_transport_request(
+        &explicit_config(&data_dir),
+        botster_hub::DaemonRequest::ShowSpawnTarget {
+            target_id: "tgt_live_managed".to_string(),
+        },
+    )
+    .expect("show persisted Git target after restart");
+    assert_eq!(
+        persisted_target.spawn_targets[0].base_ref.as_deref(),
+        Some("main")
+    );
+    let downgrade = botster_hub::daemon_transport_request(
+        &explicit_config(&data_dir),
+        botster_hub::DaemonRequest::UpdateSpawnTarget {
+            target_id: "tgt_live_managed".to_string(),
+            label: None,
+            root: None,
+            enabled: None,
+            kind: Some("directory".to_string()),
+            base_ref: None,
+            metadata: None,
+        },
+    )
+    .expect("return operator error for managed target downgrade");
+    assert_eq!(
+        downgrade.kind,
+        botster_hub::DaemonResponseKind::OperatorError
+    );
+    assert_eq!(
+        downgrade.error.as_ref().map(|error| error.code.as_str()),
+        Some("managed_worktrees_exist")
+    );
+    let delete_target = botster_hub::daemon_transport_request(
+        &explicit_config(&data_dir),
+        botster_hub::DaemonRequest::DeleteSpawnTarget {
+            target_id: "tgt_live_managed".to_string(),
+        },
+    )
+    .expect("return operator error for managed target deletion");
+    assert_eq!(
+        delete_target.kind,
+        botster_hub::DaemonResponseKind::OperatorError
+    );
+    assert_eq!(
+        delete_target
+            .error
+            .as_ref()
+            .map(|error| error.code.as_str()),
+        Some("managed_worktrees_exist")
+    );
+    let delete_worktree = botster_hub::daemon_transport_request(
+        &explicit_config(&data_dir),
+        botster_hub::DaemonRequest::DeleteWorktree {
+            worktree_id: managed.worktree_id.clone(),
+        },
+    )
+    .expect("return operator error for record-only managed worktree deletion");
+    assert_eq!(
+        delete_worktree.kind,
+        botster_hub::DaemonResponseKind::OperatorError
+    );
+    assert_eq!(
+        delete_worktree
+            .error
+            .as_ref()
+            .map(|error| error.code.as_str()),
+        Some("managed_worktree_requires_reclaim")
+    );
+
+    let second = call(&data_dir);
+    assert_eq!(second.plugin_tool_result["ok"], true);
+    assert_eq!(second.plugin_tool_result["result"]["reused_worktree"], true);
+    assert_eq!(
+        second.plugin_tool_result["result"]["worktree_path"],
+        first.plugin_tool_result["result"]["worktree_path"]
+    );
+    let second_session_id = second.plugin_tool_result["result"]["session_id"]
+        .as_str()
+        .expect("second live session UUID")
+        .to_string();
+    assert_ne!(second_session_id, first_session_id);
+
+    for session_id in [first_session_id, second_session_id] {
+        botster_hub::daemon_transport_request(
+            &explicit_config(&data_dir),
+            botster_hub::DaemonRequest::ShutdownSession { session_id },
+        )
+        .expect("shut down live managed session");
+    }
+    let second_shutdown = shutdown_cli_daemon(&data_dir, second_child);
+    assert!(
+        second_shutdown.status.success(),
+        "second live daemon shutdown failed: {}",
+        command_output_text(&second_shutdown)
+    );
+}
+
+fn path_str(path: &Path) -> &str {
+    path.to_str().expect("test path is UTF-8")
+}
+
+fn run_fixture_git(root: Option<&Path>, args: &[&str]) {
+    let mut command = Command::new("git");
+    if let Some(root) = root {
+        command.arg("-C").arg(root);
+    }
+    assert!(
+        command
+            .args(args)
+            .status()
+            .expect("run fixture Git")
+            .success(),
+        "fixture Git command failed: {args:?}"
     );
 }
 

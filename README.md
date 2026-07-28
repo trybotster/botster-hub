@@ -144,7 +144,7 @@ Terminal attach is a terminal-stream handshake only. Session-list reads remain
 an operator/query API; stateful clients use the explicit held-open `session`
 entity subscription for an authoritative snapshot followed by ordered deltas.
 The reusable revision-16 contract ships in
-`@trybotster/hub-test-support@0.1.12` as source-derived JSON fixtures and a Rust
+`@trybotster/hub-test-support@0.1.13` as source-derived JSON fixtures and a Rust
 `run_session_lifecycle_subscription_conformance` runner over the real isolated
 Hub/Core/session-worker topology.
 That subscription hydrates no status, package, worktree, target, or plugin state.
@@ -449,7 +449,7 @@ data_dir=resolved:$HOME/.botster/hub
 daemon=started
 protocol=botster-hub-daemon-v1
 protocol_version=4
-conformance_fixture_revision=20
+conformance_fixture_revision=21
 package_count=2
 enabled_package_count=2
 app_count=2
@@ -1088,21 +1088,62 @@ not require a daemon reload. Disabled or unadmitted targets contribute no repo
 templates, and the final command, cwd, and environment are still checked against
 the selected source root before core spawn.
 
-Hub-owned spawn targets are generic local directory admissions with stable
-`target_id`, label, root, enabled state, kind, and small sanitized metadata.
+Hub-owned spawn targets are local directory admissions with stable `target_id`,
+label, root, enabled state, kind, optional `base_ref`, and small sanitized metadata.
 They are hub policy state, not `botster-core` state. Plugins reference target
 ids and may list or validate them through Lua capabilities, while create,
-update, and delete stay on the daemon/CLI operator path. Git metadata is not
-required; a plain existing directory is a valid spawn target.
+update, and delete stay on the daemon/CLI operator path. `kind = "directory"`
+keeps the generic behavior and does not imply Git even when the directory is a
+repository. `kind = "git"` explicitly opts into managed worktrees and requires
+a stored `base_ref`. Create, or an explicit directory-to-Git update, may capture
+the current symbolic branch once when `base_ref` is omitted. Later managed
+spawns resolve the stored value and never guess `main`/`master` or reread live
+`HEAD` as policy.
 
 Hub-owned worktrees are generic working-directory records scoped to a spawn
 target. They persist a stable `worktree_id`, `target_id`, label, canonical path,
 reconciled status, optional git metadata, and small sanitized metadata. A
-worktree does not require git; `.git` is inspected only when present. Plugins
+worktree does not require git; `.git` is inspected only when present. Existing
+rows deserialize with `management = "registered"` and retain target-root
+containment. The atomic managed-Git path records
+`management = "hub_managed_git"` and owns its deterministic path beneath
+`<data-dir>/managed-worktrees`. Those rows reconcile repository identity and
+branch ownership instead of requiring the path to be beneath the target root.
+Plugins
 that need workflow associations should store those associations in plugin state
 and reference the returned `worktree_id` rather than adding workflow fields to
-hub records. Worktree delete removes the hub record only and does not delete
-filesystem contents.
+hub records. Worktree delete removes registered records only and does not
+delete filesystem contents. Hub-managed Git rows reject record-only deletion,
+and their target cannot be deleted or reclassified while they remain recorded.
+
+All loaded plugins receive the same target-filtered template list/show
+projections as the existing target and worktree reads. Packages granted the
+exact `session_template_managed_git_spawn` session-action scope additionally
+receive one atomic Lua mutation:
+
+```lua
+local templates = botster.capabilities.session_templates.list({
+  target_id = "tgt_repo",
+})
+
+local result =
+  botster.capabilities.session_templates.ensure_worktree_and_spawn({
+    target_id = "tgt_repo",
+    branch = "feature/example",
+    template_id = templates[1].template_id,
+    context = { ticket_id = "ticket_example" },
+  })
+```
+
+The Hub validates the Git target and template, serializes Git mutation on a
+bounded lane, reuses the exact matching worktree or creates it from the stored
+base ref, derives cwd and trusted context, and spawns through Core as one
+operation. Dirty matching worktrees are reused without reset or cleanup.
+Conflicting branch/path ownership is a typed failure. Spawn failure rolls back
+only the worktree and branch created by that call; pre-existing branches,
+worktrees, and dirty content are never deleted. The older
+`session_template_spawn` scope does not grant this operation, and generic
+registered-worktree CRUD remains a record-only, non-destructive API.
 
 Worktree CRUD emits client-visible `worktree_lifecycle` daemon events and
 worker-isolated Lua plugin events:

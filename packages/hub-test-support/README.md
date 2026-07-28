@@ -18,7 +18,7 @@ node packages/hub-test-support/scripts/sync-assets.mjs
 ## Usage
 
 ```sh
-npm install --save-dev @trybotster/ui-contract@0.1.0 @trybotster/hub-test-support@0.1.12
+npm install --save-dev @trybotster/ui-contract@0.1.0 @trybotster/hub-test-support@0.1.13
 ```
 
 ```js
@@ -68,13 +68,13 @@ Use this exact package spec in npm-based client repos:
 ```json
 {
   "devDependencies": {
-    "@trybotster/hub-test-support": "0.1.12"
+    "@trybotster/hub-test-support": "0.1.13"
   }
 }
 ```
 
 After `@trybotster/ui-contract@0.1.0` and
-`@trybotster/hub-test-support@0.1.12` are published to the public npm
+`@trybotster/hub-test-support@0.1.13` are published to the public npm
 registry, no scoped `.npmrc` entry or CI auth token is required for install.
 
 The support matrix is generated from the Rust compatibility descriptors.
@@ -90,9 +90,12 @@ Only `read_screen_text` is renderable restored content; `snapshot` and
 version 0.1.5 / revision 12 exposes lossy string history. Neither is current
 binary-history contract authority.
 
-Version 0.1.12 publishes protocol version 4 / conformance revision 20 and
+Version 0.1.13 publishes protocol version 4 / conformance revision 21 and
 depends on `@trybotster/ui-contract@0.1.0` for the canonical UiNode,
 UiActionRequest, and UiActionResult declarations and conformance fixtures.
+Revision 20 remains the already-published version 0.1.12 application-primitives
+contract; revision 21 adds spawn-target `base_ref` and worktree `management`
+without reusing those bytes.
 The protocol cold-switch replaces split action fields and untyped JSON bodies
 with one canonical request envelope and typed surface/action response bodies.
 It also retains the version 0.1.11
