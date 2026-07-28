@@ -184,6 +184,11 @@ replayed. `reconnect_registrations` counts a new entity or attach registration
 that follows a released registration generation; it does not retain historical
 subscription ids.
 
+`lifecycle_resync_reads` is an exceptional-path scaffold counter. Its producer
+is wired for Core `resync_required` and future unknown lifecycle variants, but
+the pinned Core runtime has no deterministic public fixture that forces either
+condition. Normal-path conformance therefore expects it to remain zero.
+
 The daemon admits 64 live local socket connections. Excess clients receive a
 typed `daemon_connection_admission` backpressure hello and are closed without
 entering the runtime request path. Admitted connections are async tasks on the

@@ -6801,6 +6801,65 @@ fn focused_connection_lifecycle_is_bounded_event_driven_and_counter_visible() {
         "the one shared idle backstop must stay low-frequency"
     );
 
+    const FLOOD_CONNECTIONS: usize = 32;
+    const FLOOD_REQUESTS_PER_CONNECTION: usize = 512;
+    let mut flood_writers = Vec::new();
+    let mut flood_readers = Vec::new();
+    for _ in 0..FLOOD_CONNECTIONS {
+        let mut writer =
+            UnixStream::connect(&endpoint.socket_path).expect("connect pipelined pressure fixture");
+        botster_hub_client::write_frame(
+            &mut writer,
+            &botster_hub_client::DaemonHello {
+                protocol: botster_hub_client::PROTOCOL.to_string(),
+                compatibility: botster_hub_client::DaemonCompatibilityRequirement::current(),
+            },
+        )
+        .expect("write pressure-fixture hello");
+        let _: botster_hub_client::DaemonHelloAck =
+            botster_hub_client::read_frame(&mut writer).expect("read pressure-fixture hello ack");
+        let mut reader = writer
+            .try_clone()
+            .expect("clone pressure-fixture response reader");
+        flood_readers.push(thread::spawn(move || {
+            for _ in 0..FLOOD_REQUESTS_PER_CONNECTION {
+                let _: botster_hub_client::DaemonResponse =
+                    botster_hub_client::read_frame(&mut reader)
+                        .expect("drain pipelined status response");
+            }
+        }));
+        flood_writers.push(writer);
+    }
+    let flood_before =
+        botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status)
+            .expect("status before sustained control pressure")
+            .status
+            .expect("sustained control pressure status body")
+            .lifecycle_counters;
+    for writer in &mut flood_writers {
+        for _ in 0..FLOOD_REQUESTS_PER_CONNECTION {
+            botster_hub_client::write_frame(writer, &botster_hub_client::DaemonRequest::Status)
+                .expect("pipeline sustained status request");
+        }
+    }
+    thread::sleep(Duration::from_millis(1_100));
+    let flood_after =
+        botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status)
+            .expect("status during sustained control pressure")
+            .status
+            .expect("post-pressure status body")
+            .lifecycle_counters;
+    drop(flood_writers);
+    for flood_reader in flood_readers {
+        flood_reader
+            .join()
+            .expect("join pipelined status response drain");
+    }
+    assert!(
+        flood_after.reconciliation_wakes > flood_before.reconciliation_wakes,
+        "a continuously busy control queue must not starve shared entity reconciliation"
+    );
+
     for index in 0..8 {
         botster_hub_client::request(
             &endpoint,
@@ -6865,6 +6924,10 @@ fn focused_connection_lifecycle_is_bounded_event_driven_and_counter_visible() {
             .saturating_sub(many_before.reconciliation_wakes)
             <= 4,
         "shared wake count must stay independent of session count"
+    );
+    assert!(
+        many_after.lifecycle_session_drains > many_before.lifecycle_session_drains,
+        "live sessions must drive the published lifecycle_session_drains producer"
     );
 
     let mut attached = botster_hub_client::DaemonConnection::connect(&endpoint)
@@ -7034,8 +7097,15 @@ fn focused_connection_lifecycle_is_bounded_event_driven_and_counter_visible() {
         );
     }
 
+    let stalled_rejection =
+        UnixStream::connect(&endpoint.socket_path).expect("connect stalled over-cap peer");
+    let rejection_started = Instant::now();
     let mut rejected = botster_hub_client::DaemonConnection::connect(&endpoint)
         .expect("over-cap client receives typed admission hello");
+    assert!(
+        rejection_started.elapsed() < Duration::from_secs(1),
+        "one silent over-cap peer must not head-of-line block typed rejection"
+    );
     assert!(
         rejected
             .request(&botster_hub_client::DaemonRequest::Status)
@@ -7049,6 +7119,7 @@ fn focused_connection_lifecycle_is_bounded_event_driven_and_counter_visible() {
         .expect("post-rejection status body")
         .lifecycle_counters;
     assert!(rejected_status.rejected_connections >= 1);
+    drop(stalled_rejection);
     drop(rejected);
     drop(idle_connections);
     let release_deadline = Instant::now() + Duration::from_secs(3);
@@ -7105,6 +7176,7 @@ fn focused_connection_lifecycle_is_bounded_event_driven_and_counter_visible() {
         half_open.read(&mut closed).is_ok_and(|count| count == 0),
         "half-open handshake deadline must close the connection"
     );
+    drop(half_open);
 
     let mut incomplete =
         UnixStream::connect(&endpoint.socket_path).expect("connect incomplete raw daemon client");
@@ -7128,6 +7200,7 @@ fn focused_connection_lifecycle_is_bounded_event_driven_and_counter_visible() {
         incomplete.read(&mut closed).is_ok_and(|count| count == 0),
         "incomplete frame deadline must close the connection"
     );
+    drop(incomplete);
 
     let cleanup_deadline = Instant::now() + Duration::from_secs(3);
     loop {
@@ -7153,6 +7226,22 @@ fn focused_connection_lifecycle_is_bounded_event_driven_and_counter_visible() {
             "transport cleanup counters did not settle: {counters:?}"
         );
         thread::sleep(Duration::from_millis(20));
+    }
+
+    for index in 1..8 {
+        let session_id = format!("focused-idle-session-{index}");
+        botster_hub_client::request(
+            &endpoint,
+            botster_hub_client::DaemonRequest::ShutdownSession {
+                session_id: session_id.clone(),
+            },
+        )
+        .expect("shutdown focused session-count fixture");
+        botster_hub_client::request(
+            &endpoint,
+            botster_hub_client::DaemonRequest::RemoveSession { session_id },
+        )
+        .expect("remove focused session-count fixture");
     }
 
     shutdown_cli_daemon(&data_dir, child);
