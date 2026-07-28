@@ -27,6 +27,104 @@ import {
   verifyPackageAssets,
 } from "@trybotster/hub-test-support";
 
+function luaTableRanges(source) {
+  const codePositions = new Uint8Array(source.length);
+  const stack = [];
+  const ranges = [];
+  let state = "code";
+
+  for (let index = 0; index < source.length; index += 1) {
+    const character = source[index];
+    const next = source[index + 1];
+
+    if (state === "line_comment") {
+      if (character === "\n") state = "code";
+      continue;
+    }
+    if (state === "single_quote" || state === "double_quote") {
+      if (character === "\\") {
+        index += 1;
+      } else if (
+        (state === "single_quote" && character === "'") ||
+        (state === "double_quote" && character === '"')
+      ) {
+        state = "code";
+      }
+      continue;
+    }
+    if (character === "-" && next === "-") {
+      state = "line_comment";
+      index += 1;
+      continue;
+    }
+    if (character === "'" || character === '"') {
+      state = character === "'" ? "single_quote" : "double_quote";
+      continue;
+    }
+
+    codePositions[index] = 1;
+    if (character === "{") {
+      stack.push(index);
+    } else if (character === "}") {
+      const start = stack.pop();
+      assert.notEqual(start, undefined, "plugin.lua contains an unmatched closing table brace");
+      ranges.push({ start, end: index });
+    }
+  }
+
+  assert.equal(state, "code", "plugin.lua contains an unterminated string or comment");
+  assert.deepEqual(stack, [], "plugin.lua contains an unmatched opening table brace");
+  return { codePositions, ranges };
+}
+
+function luaFieldTableRanges(source, field, expectedValue, parsed) {
+  const escapedField = field.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const escapedValue = expectedValue.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const pattern = new RegExp(`\\b${escapedField}\\s*=\\s*"${escapedValue}"`, "g");
+  const matches = [...source.matchAll(pattern)].filter(
+    (match) => parsed.codePositions[match.index] === 1,
+  );
+
+  return matches.map((match) => {
+    const containing = parsed.ranges
+      .filter((range) => range.start < match.index && match.index < range.end)
+      .sort((left, right) => left.end - left.start - (right.end - right.start))[0];
+    assert.ok(containing, `${field} = "${expectedValue}" is not inside a Lua table`);
+    return containing;
+  });
+}
+
+function assertDialogFormComposition(source) {
+  const parsed = luaTableRanges(source);
+  const [dialog] = luaFieldTableRanges(source, "id", "contract-dialog", parsed);
+  const [form] = luaFieldTableRanges(source, "id", "contract-app-form", parsed);
+  const [input] = luaFieldTableRanges(source, "id", "contract-app-message", parsed);
+
+  assert.ok(dialog, "plugin.lua must contain contract-dialog");
+  assert.ok(form, "plugin.lua must contain contract-app-form");
+  assert.ok(input, "plugin.lua must contain contract-app-message");
+  assert.equal(
+    luaFieldTableRanges(source, "id", "contract-dialog", parsed).length,
+    1,
+    "plugin.lua must contain one canonical contract-dialog",
+  );
+  assert.equal(
+    luaFieldTableRanges(source, "id", "contract-app-form", parsed).length,
+    1,
+    "plugin.lua must contain one canonical contract-app-form",
+  );
+  assert.equal(
+    form.start > dialog.start && form.end < dialog.end,
+    true,
+    "contract-app-form must be structurally nested inside contract-dialog",
+  );
+  assert.equal(
+    input.start > form.start && input.end < form.end,
+    true,
+    "contract-app-message must be structurally nested inside contract-app-form",
+  );
+}
+
 assert.equal(metadata.package_name, "@trybotster/hub-test-support");
 assert.equal(metadata.package_version, "0.1.13");
 assert.equal(metadata.protocol, "botster-hub-daemon-v1");
@@ -129,6 +227,10 @@ assert.deepEqual(supportMatrix.plugin_surfaces.presentation_operation_kinds, [
   "toggle",
 ]);
 assert.equal(supportMatrix.plugin_surfaces.dialog_presence_key, "contract-dialog");
+assert.equal(supportMatrix.plugin_surfaces.dialog_form_node_id, "contract-app-form");
+assert.equal(supportMatrix.plugin_surfaces.dialog_input_node_id, "contract-app-message");
+assert.equal(supportMatrix.plugin_surfaces.actionable_sibling_form_forbidden, true);
+assert.equal(supportMatrix.plugin_surfaces.accepted_replacement_scope, "whole_surface");
 assert.equal(
   supportMatrix.plugin_surfaces.selected_workspace_equality_key,
   "selected-workspace",
@@ -314,11 +416,22 @@ try {
   assert.match(fixtureSource, /key = "selected-workspace"/);
   assert.match(fixtureSource, /kind = "clear"/);
   assert.match(fixtureSource, /kind = "toggle"/);
-  assert.equal(fixtureSource.match(/id = "contract-app-form"/g)?.length, 1);
-  assert.equal(
-    fixtureSource.indexOf('id = "contract-app-form"') >
-      fixtureSource.indexOf('id = "contract-dialog"'),
-    true,
+  assertDialogFormComposition(fixtureSource);
+  assert.throws(
+    () =>
+      assertDialogFormComposition(`
+        return {
+          id = "contract-app-panel",
+          children = {
+            { id = "contract-dialog", slots = { body = {} } },
+            {
+              id = "contract-app-form",
+              children = { { id = "contract-app-message" } },
+            },
+          },
+        }
+      `),
+    /contract-app-form must be structurally nested inside contract-dialog/,
   );
   assert.match(
     readFileSync(join(fixturePath, "README.md"), "utf8"),

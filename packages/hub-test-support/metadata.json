@@ -18,7 +18,7 @@
   "first_party_client_support_matrix": {
     "artifact_path": "first-party-client-support-matrix.json",
     "source_artifact_path": "botster_hub_test_support::first_party_client_support_matrix()",
-    "sha256": "4c0021f0e2683a05e515aa88f44ceecb41f3a77b166217e1f25b1a074e37eedf"
+    "sha256": "ff812a8746556a66fc6c661e7036fbe6b2674e871e55fbda0c2dab14718432ca"
   },
   "session_lifecycle_subscription_conformance_fixture": {
     "artifact_path": "session-lifecycle-subscription-conformance-fixture.json",
@@ -47,7 +47,7 @@
     "files": [
       {
         "path": "README.md",
-        "sha256": "ffe768e1a2b95a97fb727b60701a854b8de7103477a3623b823f3e31a8357e42"
+        "sha256": "15ee65d27f1d2e3b7dab57f891bbe43635ca4ef8ae0a9fbfb280d2a6e453268c"
       },
       {
         "path": "botster-package.json",

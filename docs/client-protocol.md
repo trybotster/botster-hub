@@ -980,7 +980,10 @@ Relocating the one canonical Form into `contract-dialog.slots.body` advances
 consumer now materializes the delivered tree after accepted scoped effects,
 restricts submit discovery to the active Dialog subtree, rejects actionable
 sibling Forms, retains the visible Dialog/Form/input association after
-rejection, and proves Clear leaves no reachable modal after acceptance.
+rejection, applies an accepted replacement as the whole rendered surface tree,
+and proves the scoped Dialog presence key is cleared after acceptance. The
+replacement is not inserted beneath the submitting `node_id`; this keeps the
+accepted replacement observable even though the same result closes the Dialog.
 `PROTOCOL_VERSION` remains 4 because daemon framing, request vocabulary, DTO
 shapes, and action semantics are unchanged. Because
 `DaemonCompatibilityRequirement::current()` derives
