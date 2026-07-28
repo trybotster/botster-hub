@@ -3700,6 +3700,7 @@ fn daemon_plugin_contract_matrix_fixture_exercises_public_package_contracts() {
         vec![
             "button",
             "button",
+            "button",
             "dialog",
             "empty_state",
             "empty_state",
@@ -3710,6 +3711,7 @@ fn daemon_plugin_contract_matrix_fixture_exercises_public_package_contracts() {
             "section",
             "status_badge",
             "table",
+            "text",
             "text",
             "text",
             "text_input",
@@ -3729,6 +3731,52 @@ fn daemon_plugin_contract_matrix_fixture_exercises_public_package_contracts() {
     assert_eq!(report.dialog_presence_key, "contract-dialog");
     assert_eq!(report.selected_workspace_equality_key, "selected-workspace");
     assert_eq!(report.selected_workspace_equality_value, "workspace-alpha");
+    assert_eq!(report.open_action_id, "contract.action");
+    assert_eq!(report.open_action_node_id, "contract-app-open");
+    assert_eq!(
+        report.open_action_payload,
+        serde_json::json!({ "operation": "open" })
+    );
+    assert_eq!(
+        report.open_set_values,
+        std::collections::BTreeMap::from([
+            ("contract-dialog".to_string(), serde_json::json!(true)),
+            (
+                "selected-workspace".to_string(),
+                serde_json::json!("workspace-alpha"),
+            ),
+        ])
+    );
+    let matrix = botster_hub_test_support::first_party_client_support_matrix();
+    assert_eq!(
+        matrix.plugin_surfaces.dialog_presence_key,
+        report.dialog_presence_key
+    );
+    assert_eq!(
+        matrix.plugin_surfaces.selected_workspace_equality_key,
+        report.selected_workspace_equality_key
+    );
+    assert_eq!(
+        matrix.plugin_surfaces.selected_workspace_equality_value,
+        report.selected_workspace_equality_value
+    );
+    assert_eq!(
+        matrix.plugin_surfaces.authored_set_values,
+        report.open_set_values
+    );
+    assert!(report.dialog_visible_after_open);
+    assert!(report.selected_workspace_visible_after_open);
+    assert!(report.rejected_state_retained);
+    assert!(report.rejected_tree_retained);
+    assert!(!report.dialog_visible_after_valid_submit);
+    assert_eq!(report.toggle_action_id, "contract.action");
+    assert_eq!(report.toggle_action_node_id, "contract-app-toggle");
+    assert_eq!(
+        report.toggle_action_payload,
+        serde_json::json!({ "operation": "toggle" })
+    );
+    assert_eq!(report.toggle_key, "contract-toggle");
+    assert_eq!(report.toggle_visible_states, vec![false, true, false]);
     assert_eq!(report.empty_surface_child_id, "contract-empty-message");
     assert_eq!(report.blocked_render_operation, "plugin_surface_render");
     assert!(report.blocked_render_message_contains_failure);

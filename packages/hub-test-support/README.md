@@ -107,6 +107,13 @@ Overflow recovery is an authoritative snapshot with
 subscription instead of concealing a delta gap. Rust consumers can run
 `run_session_lifecycle_subscription_conformance` against an `IsolatedHub` to
 prove the same contract through the real Hub/Core/session-worker topology.
+`run_plugin_contract_matrix_conformance` similarly proves rendered
+open/form/toggle metadata through the real Hub/plugin worker, applies accepted
+`set`/`clear`/`toggle` results to scoped client-shaped state, and evaluates the
+delivered Dialog presence and selected-workspace equality bindings. The
+published first-party support matrix exposes the corresponding expected keys,
+values, and operation kinds to TypeScript consumers; static
+`@trybotster/ui-contract` fixtures remain complementary.
 
 The mode-flags fixture covers the targeted `read_mode_flags` request/response
 contract. It preserves exact authoritative mouse values (`0` for off and `9`

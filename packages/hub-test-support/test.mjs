@@ -1,14 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import {
-  existsSync,
-  mkdirSync,
-  mkdtempSync,
-  readFileSync,
-  rmdirSync,
-  rmSync,
-  symlinkSync,
-} from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -127,6 +119,28 @@ assert.equal(
   "botster_hub_test_support::session_lifecycle_subscription_conformance_fixture_json",
 );
 assert.equal(supportMatrix.supported_features.includes("terminal_readback"), true);
+assert.equal(
+  supportMatrix.plugin_surfaces.runtime_runner,
+  "botster_hub_test_support::run_plugin_contract_matrix_conformance",
+);
+assert.deepEqual(supportMatrix.plugin_surfaces.presentation_operation_kinds, [
+  "set",
+  "clear",
+  "toggle",
+]);
+assert.equal(supportMatrix.plugin_surfaces.dialog_presence_key, "contract-dialog");
+assert.equal(
+  supportMatrix.plugin_surfaces.selected_workspace_equality_key,
+  "selected-workspace",
+);
+assert.equal(
+  supportMatrix.plugin_surfaces.selected_workspace_equality_value,
+  "workspace-alpha",
+);
+assert.deepEqual(supportMatrix.plugin_surfaces.authored_set_values, {
+  "contract-dialog": true,
+  "selected-workspace": "workspace-alpha",
+});
 
 assert.equal(sessionLifecycleFixture.conformance_fixture_revision, 20);
 assert.equal(sessionLifecycleFixture.entity_type, "session");
@@ -135,38 +149,19 @@ assert.deepEqual(
   ["entity_snapshot", "entity_upsert", "entity_patch", "entity_patch", "entity_remove"],
 );
 
-// Pre-publication bridge: a normal npm install resolves the declared package.
-// Until publication, link the repository sibling only for this package test.
-const packageRoot = fileURLToPath(new URL(".", import.meta.url));
-const nodeModulesRoot = join(packageRoot, "node_modules");
-const packageScopeRoot = join(nodeModulesRoot, "@trybotster");
-const localUiContractLink = join(packageScopeRoot, "ui-contract");
-const nodeModulesRootAlreadyExisted = existsSync(nodeModulesRoot);
-const packageScopeRootAlreadyExisted = existsSync(packageScopeRoot);
-let createdLocalUiContractLink = false;
-if (!existsSync(localUiContractLink)) {
-  mkdirSync(packageScopeRoot, { recursive: true });
-  symlinkSync(join(packageRoot, "..", "ui-contract"), localUiContractLink, "dir");
-  createdLocalUiContractLink = true;
-}
-try {
-  const uiContractFixtures = await readUiContractConformanceFixtures();
-  assert.equal(uiContractFixtures.contract_version, "0.1.0");
-  assert.equal(
-    uiContractFixtures.fixtures.dialog_presence.predicate.key,
-    "create-ticket-dialog",
-  );
-} finally {
-  if (createdLocalUiContractLink) {
-    rmSync(localUiContractLink);
-    if (!packageScopeRootAlreadyExisted) {
-      rmdirSync(packageScopeRoot);
-    }
-    if (!nodeModulesRootAlreadyExisted) {
-      rmdirSync(nodeModulesRoot);
-    }
-  }
-}
+const uiContractResolution = fileURLToPath(
+  import.meta.resolve("@trybotster/ui-contract/conformance-fixtures"),
+);
+assert.match(
+  uiContractResolution,
+  /node_modules[\\/]@trybotster[\\/]ui-contract[\\/]/,
+);
+const uiContractFixtures = await readUiContractConformanceFixtures();
+assert.equal(uiContractFixtures.contract_version, "0.1.0");
+assert.equal(
+  uiContractFixtures.fixtures.dialog_presence.predicate.key,
+  "create-ticket-dialog",
+);
 assert.deepEqual(
   sessionLifecycleFixture.normalized_frames.map((frame) => frame.snapshot_seq),
   [0, 1, 2, 3, 4],
@@ -313,7 +308,16 @@ try {
     readFileSync(join(fixturePath, "botster-package.json"), "utf8"),
     /botster\.plugin-contract-matrix/,
   );
-  assert.match(readFileSync(join(fixturePath, "plugin.lua"), "utf8"), /contract\.app/);
+  const fixtureSource = readFileSync(join(fixturePath, "plugin.lua"), "utf8");
+  assert.match(fixtureSource, /contract\.app/);
+  assert.match(fixtureSource, /kind = "set"/);
+  assert.match(fixtureSource, /key = "selected-workspace"/);
+  assert.match(fixtureSource, /kind = "clear"/);
+  assert.match(fixtureSource, /kind = "toggle"/);
+  assert.match(
+    readFileSync(join(fixturePath, "README.md"), "utf8"),
+    /rendered open action returns accepted `set` operations/,
+  );
 
   const applicationFixturePath = materializeApplicationPrimitivesFixture(join(root, "application"));
   assert.equal(
