@@ -28,7 +28,7 @@ signal-hook = "0.4.4"
 shell-words = "1.1.1"
 ureq = { version = "3.3.0", default-features = false, features = ["rustls"] }
 webrtc = "0.20.0-beta.2"
-tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread", "sync", "test-util", "time"] }
+tokio = { version = "1.52.3", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "test-util", "time"] }
 async-trait = "0.1.89"
 getrandom = "0.3.4"
 keyring = "4.1.2"

@@ -22,7 +22,7 @@ mod typescript;
 
 pub const PROTOCOL: &str = "botster-hub-daemon-v1";
 pub const PROTOCOL_VERSION: u16 = 4;
-pub const CONFORMANCE_FIXTURE_REVISION: u16 = 19;
+pub const CONFORMANCE_FIXTURE_REVISION: u16 = 20;
 /// Version of the local WebRTC delivery chunk framing protocol.
 pub const LOCAL_WEBRTC_DELIVERY_CHUNK_VERSION: u16 = 2;
 /// Serialized local WebRTC delivery frames must remain strictly below this size.
@@ -1690,8 +1690,44 @@ pub struct DaemonStatus {
     pub session_count: usize,
     pub recovered_sessions: Vec<String>,
     pub stale_sessions: Vec<String>,
+    #[serde(default, skip_serializing_if = "DaemonLifecycleCounters::is_empty")]
+    pub lifecycle_counters: DaemonLifecycleCounters,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub diagnostics: Vec<DaemonDiagnostic>,
+}
+
+/// Sanitized daemon transport and subscription lifecycle observations.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonLifecycleCounters {
+    pub accepted_connections: u64,
+    pub rejected_connections: u64,
+    pub live_connections: u64,
+    pub high_water_live_connections: u64,
+    pub live_entity_subscriptions: u64,
+    pub high_water_entity_subscriptions: u64,
+    pub live_attach_subscriptions: u64,
+    pub high_water_attach_subscriptions: u64,
+    pub reconnect_registrations: u64,
+    pub cleanup_completed: u64,
+    pub cleanup_failed: u64,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub cleanup_by_reason: BTreeMap<String, u64>,
+    pub reconciliation_wakes: u64,
+    pub lifecycle_change_reads: u64,
+    pub lifecycle_baseline_reads: u64,
+    pub lifecycle_resync_reads: u64,
+    pub lifecycle_session_drains: u64,
+    pub entity_delivery_attempts: u64,
+    pub entity_delivery_successes: u64,
+    pub entity_delivery_overflows: u64,
+    pub entity_delivery_failures: u64,
+    pub stalled_writes: u64,
+}
+
+impl DaemonLifecycleCounters {
+    fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2882,6 +2918,27 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_counters_are_backward_compatible_sanitized_and_generated() {
+        let counters = DaemonLifecycleCounters {
+            accepted_connections: 3,
+            live_connections: 1,
+            cleanup_by_reason: BTreeMap::from([("eof".to_string(), 2)]),
+            ..DaemonLifecycleCounters::default()
+        };
+        let value = serde_json::to_value(&counters).expect("lifecycle counters serialize");
+        assert_eq!(value["accepted_connections"], 3);
+        assert_eq!(value["cleanup_by_reason"]["eof"], 2);
+        let debug = format!("{value:?}");
+        assert!(!debug.contains("session_id"));
+        assert!(!debug.contains("subscription_id"));
+
+        let generated = daemon_protocol_typescript();
+        assert!(generated.contains("lifecycle_counters?: DaemonLifecycleCounters;"));
+        assert!(generated.contains("export interface DaemonLifecycleCounters"));
+        assert!(generated.contains("cleanup_by_reason?: Record<string, number>;"));
+    }
+
+    #[test]
     fn plugin_surface_snapshot_is_serde_stable_and_generated() {
         let surface = DaemonPluginSurface {
             package_name: "workflow.plugin".to_string(),
@@ -3962,6 +4019,7 @@ mod tests {
                 session_count: 1,
                 recovered_sessions: vec!["session".to_string()],
                 stale_sessions: Vec::new(),
+                lifecycle_counters: DaemonLifecycleCounters::default(),
                 diagnostics: vec![DaemonDiagnostic::connected("status")],
             }),
             sessions: vec![DaemonSession {

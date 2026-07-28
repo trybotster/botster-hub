@@ -379,6 +379,7 @@ fn start_daemon(args: Vec<String>) -> Result<(), StartError> {
             .iter()
             .map(|session_id| session_id.0.clone())
             .collect(),
+        lifecycle_counters: Default::default(),
         diagnostics: Vec::new(),
     };
     print_daemon_transport_status("stopped", &status);
@@ -404,6 +405,7 @@ fn local_runtime_down(args: Vec<String>) -> Result<(), LocalRuntimeError> {
         return Err(LocalRuntimeError::Usage);
     }
     let config = explicit_config(options.data_directory.clone())?;
+    let owned_daemon_pid = owned_runtime_daemon_pid(&options.data_directory, &config)?;
     let response = match daemon_transport_request(&config, DaemonRequest::DaemonShutdown) {
         Ok(response) => response,
         Err(botster_hub::DaemonTransportError::Compatibility(error)) => {
@@ -423,6 +425,11 @@ fn local_runtime_down(args: Vec<String>) -> Result<(), LocalRuntimeError> {
         Err(error) => return Err(error.into()),
     };
     print_daemon_response(response)?;
+    if let Some(pid) = owned_daemon_pid {
+        wait_for_runtime_daemon_exit(pid)?;
+        remove_configured_local_socket(&config)?;
+        remove_runtime_daemon_metadata(&options.data_directory)?;
+    }
     Ok(())
 }
 
@@ -1561,6 +1568,25 @@ fn recover_owned_stale_runtime_daemon(
     remove_configured_local_socket(config)?;
     remove_runtime_daemon_metadata(data_directory)?;
     Ok(true)
+}
+
+fn owned_runtime_daemon_pid(
+    data_directory: &Path,
+    config: &botster_hub::HubConfig,
+) -> Result<Option<u32>, LocalRuntimeError> {
+    let Some(metadata) = read_runtime_daemon_metadata(data_directory)? else {
+        return Ok(None);
+    };
+    if !runtime_daemon_metadata_matches(&metadata, data_directory, config)? {
+        return Ok(None);
+    }
+    let Some(command) = process_command(metadata.pid)? else {
+        return Ok(None);
+    };
+    if !runtime_daemon_command_matches(&metadata, &command) {
+        return Ok(None);
+    }
+    Ok(Some(metadata.pid))
 }
 
 fn write_runtime_daemon_metadata(

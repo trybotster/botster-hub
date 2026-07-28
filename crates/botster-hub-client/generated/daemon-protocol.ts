@@ -690,7 +690,33 @@ export interface DaemonStatus {
   session_count: number;
   recovered_sessions: string[];
   stale_sessions: string[];
+  lifecycle_counters?: DaemonLifecycleCounters;
   diagnostics?: DaemonDiagnostic[];
+}
+
+export interface DaemonLifecycleCounters {
+  accepted_connections: number;
+  rejected_connections: number;
+  live_connections: number;
+  high_water_live_connections: number;
+  live_entity_subscriptions: number;
+  high_water_entity_subscriptions: number;
+  live_attach_subscriptions: number;
+  high_water_attach_subscriptions: number;
+  reconnect_registrations: number;
+  cleanup_completed: number;
+  cleanup_failed: number;
+  cleanup_by_reason?: Record<string, number>;
+  reconciliation_wakes: number;
+  lifecycle_change_reads: number;
+  lifecycle_baseline_reads: number;
+  lifecycle_resync_reads: number;
+  lifecycle_session_drains: number;
+  entity_delivery_attempts: number;
+  entity_delivery_successes: number;
+  entity_delivery_overflows: number;
+  entity_delivery_failures: number;
+  stalled_writes: number;
 }
 
 export interface DaemonSession {

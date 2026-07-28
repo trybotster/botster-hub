@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
-use std::sync::mpsc::{self, Sender};
+use std::sync::mpsc;
 use std::sync::{
     Mutex,
     atomic::{AtomicBool, Ordering},
@@ -23,7 +23,7 @@ use botster_hub_client::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::{mpsc as tokio_mpsc, watch};
+use tokio::sync::{mpsc as tokio_mpsc, oneshot, watch};
 use webrtc::data_channel::{DataChannel, DataChannelEvent};
 use webrtc::peer_connection::{
     PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler, RTCIceGatheringState,
@@ -32,7 +32,7 @@ use webrtc::peer_connection::{
 use webrtc::runtime::{Runtime, Sender as AsyncSender, channel, default_runtime, timeout};
 
 use crate::daemon_transport::{
-    ControlMessage, ENTITY_SUBSCRIPTION_QUEUE_CAPACITY, EntityFrameSender,
+    ControlMessage, ControlSender, ENTITY_SUBSCRIPTION_QUEUE_CAPACITY, EntityFrameSender,
 };
 
 const GRANT_TTL_SECONDS: u64 = 120;
@@ -139,7 +139,7 @@ impl LocalWebrtcTransport {
     pub(crate) fn signal(
         &mut self,
         request: LocalWebrtcSignalRequest,
-        runtime_tx: Sender<ControlMessage>,
+        runtime_tx: ControlSender,
     ) -> LocalWebrtcResult<DaemonLocalWebrtcAnswer> {
         let Some(grant) = self.grants.get_mut(&request.grant_id) else {
             return Err(LocalWebrtcError::MissingGrant);
@@ -266,7 +266,7 @@ impl LocalWebrtcAttachedSubscriptionChange {
 
 struct LocalWebrtcPeerState {
     grant_id: String,
-    runtime_tx: Sender<ControlMessage>,
+    runtime_tx: ControlSender,
     attached_subscriptions: Mutex<Vec<LocalWebrtcAttachedSubscription>>,
     entity_subscription_ids: Mutex<BTreeSet<String>>,
     terminal_state: Mutex<LocalWebrtcTerminalState>,
@@ -430,7 +430,7 @@ fn pop_pending_request(
 }
 
 impl LocalWebrtcPeerState {
-    fn new(grant_id: String, runtime_tx: Sender<ControlMessage>) -> Self {
+    fn new(grant_id: String, runtime_tx: ControlSender) -> Self {
         let (peer_terminal_tx, _peer_terminal_rx) = watch::channel(None);
         Self {
             grant_id,
@@ -546,7 +546,6 @@ impl LocalWebrtcPeerState {
             _ => return None,
         };
         self.publish_peer_terminal(cause);
-        self.cleanup_once(cause);
         Some(cause)
     }
 
@@ -564,7 +563,7 @@ impl LocalWebrtcPeerState {
         }
     }
 
-    fn cleanup_once(&self, cause: LocalWebrtcTerminalCause) {
+    async fn cleanup_once(&self, cause: LocalWebrtcTerminalCause) {
         {
             let mut terminal_state = self
                 .terminal_state
@@ -582,25 +581,26 @@ impl LocalWebrtcPeerState {
         if self.cleanup_sent.swap(true, Ordering::AcqRel) {
             return;
         }
-        let terminal_state = self
-            .terminal_state
-            .lock()
-            .expect("local WebRTC terminal state mutex");
-        let terminal_record = LocalWebrtcSenderTerminalRecord {
-            schema_version: 1,
-            grant_id: self.grant_id.clone(),
-            request_operation: terminal_state.request_operation.clone(),
-            message_id: terminal_state.message_id.clone(),
-            next_chunk_index: terminal_state.next_chunk_index,
-            last_sent_chunk_index: terminal_state.last_sent_chunk_index,
-            total_chunks: terminal_state.total_chunks,
-            pressured: terminal_state.pressured,
-            peer_connection_state: terminal_state.peer_connection_state.clone(),
-            channel_terminal_signal: terminal_state.channel_terminal_signal,
-            cause,
-            cleanup_disposition: LocalWebrtcCleanupDisposition::NewlySent,
+        let terminal_record = {
+            let terminal_state = self
+                .terminal_state
+                .lock()
+                .expect("local WebRTC terminal state mutex");
+            LocalWebrtcSenderTerminalRecord {
+                schema_version: 1,
+                grant_id: self.grant_id.clone(),
+                request_operation: terminal_state.request_operation.clone(),
+                message_id: terminal_state.message_id.clone(),
+                next_chunk_index: terminal_state.next_chunk_index,
+                last_sent_chunk_index: terminal_state.last_sent_chunk_index,
+                total_chunks: terminal_state.total_chunks,
+                pressured: terminal_state.pressured,
+                peer_connection_state: terminal_state.peer_connection_state.clone(),
+                channel_terminal_signal: terminal_state.channel_terminal_signal,
+                cause,
+                cleanup_disposition: LocalWebrtcCleanupDisposition::NewlySent,
+            }
         };
-        drop(terminal_state);
         let attached_subscriptions = self
             .attached_subscriptions
             .lock()
@@ -613,12 +613,19 @@ impl LocalWebrtcPeerState {
             .iter()
             .cloned()
             .collect();
-        let _ = self.runtime_tx.send(ControlMessage::LocalWebrtcPeerClosed {
-            grant_id: self.grant_id.clone(),
-            attached_subscriptions,
-            entity_subscription_ids,
-            terminal_record,
-        });
+        if self
+            .runtime_tx
+            .send(ControlMessage::LocalWebrtcPeerClosed {
+                grant_id: self.grant_id.clone(),
+                attached_subscriptions,
+                entity_subscription_ids,
+                terminal_record,
+            })
+            .await
+            .is_err()
+        {
+            eprintln!("local WebRTC cleanup queue closed before peer cleanup");
+        }
     }
 }
 
@@ -663,11 +670,8 @@ impl PeerConnectionEventHandler for LocalWebrtcHandler {
     }
 
     async fn on_connection_state_change(&self, state: RTCPeerConnectionState) {
-        if self
-            .peer_state
-            .observe_peer_connection_state(state)
-            .is_some()
-        {
+        if let Some(cause) = self.peer_state.observe_peer_connection_state(state) {
+            self.peer_state.cleanup_once(cause).await;
             let _ = self.gather_complete_tx.try_send(());
         }
     }
@@ -685,7 +689,9 @@ impl PeerConnectionEventHandler for LocalWebrtcHandler {
             {
                 eprintln!("local WebRTC low-water threshold setup failed: {error}");
                 let _ = data_channel.local_close().await;
-                peer_state.cleanup_once(LocalWebrtcTerminalCause::LowWaterThresholdSetup);
+                peer_state
+                    .cleanup_once(LocalWebrtcTerminalCause::LowWaterThresholdSetup)
+                    .await;
                 return;
             }
             if let Err(error) = data_channel
@@ -694,7 +700,9 @@ impl PeerConnectionEventHandler for LocalWebrtcHandler {
             {
                 eprintln!("local WebRTC high-water threshold setup failed: {error}");
                 let _ = data_channel.local_close().await;
-                peer_state.cleanup_once(LocalWebrtcTerminalCause::HighWaterThresholdSetup);
+                peer_state
+                    .cleanup_once(LocalWebrtcTerminalCause::HighWaterThresholdSetup)
+                    .await;
                 return;
             }
 
@@ -736,7 +744,7 @@ async fn run_data_channel<D>(
     data_channel: &D,
     stream_key: &AesGcmKey,
     peer_state: &LocalWebrtcPeerState,
-    runtime_tx: &Sender<ControlMessage>,
+    runtime_tx: &ControlSender,
     entity_frame_tx: tokio_mpsc::Sender<DaemonEntityFrame>,
     mut entity_frame_rx: tokio_mpsc::Receiver<DaemonEntityFrame>,
 ) -> Option<LocalWebrtcSendFailure>
@@ -886,7 +894,7 @@ where
             }
             _ => None,
         };
-        let (reply_tx, reply_rx) = mpsc::channel();
+        let (reply_tx, reply_rx) = oneshot::channel();
         let (response_delivery_tx, response_delivery_rx) =
             if matches!(*request, DaemonRequest::DaemonShutdown) {
                 let (tx, rx) = mpsc::channel();
@@ -898,42 +906,53 @@ where
             DaemonRequest::SubscribeEntities {
                 entity_type,
                 subscription_id,
-            } => runtime_tx.send(ControlMessage::SubscribeEntities {
-                entity_type,
-                subscription_id,
-                frame_tx: EntityFrameSender::Async(entity_frame_tx.clone()),
-                reply_tx,
-            }),
-            DaemonRequest::UnsubscribeEntities { subscription_id } => {
-                runtime_tx.send(ControlMessage::UnsubscribeEntities {
-                    subscription_id,
-                    reply_tx: Some(reply_tx),
-                })
+            } => {
+                runtime_tx
+                    .send(ControlMessage::SubscribeEntities {
+                        entity_type,
+                        subscription_id,
+                        frame_tx: EntityFrameSender::Async(entity_frame_tx.clone()),
+                        reply_tx,
+                    })
+                    .await
             }
-            request => runtime_tx.send(ControlMessage::Request {
-                request: Box::new(request),
-                reply_tx,
-                response_delivery_rx,
-            }),
+            DaemonRequest::UnsubscribeEntities { subscription_id } => {
+                runtime_tx
+                    .send(ControlMessage::UnsubscribeEntities {
+                        subscription_id,
+                        reply_tx: Some(reply_tx),
+                    })
+                    .await
+            }
+            request => {
+                runtime_tx
+                    .send(ControlMessage::Request {
+                        request: Box::new(request),
+                        reply_tx,
+                        response_delivery_rx,
+                    })
+                    .await
+            }
         };
         if request_sent.is_err() {
             terminal_cause = LocalWebrtcTerminalCause::RuntimeQueueClosed;
             break;
         }
-        let response = reply_rx
-            .recv_timeout(Duration::from_secs(5))
-            .unwrap_or_else(|_| {
-                Ok(response_with_diagnostic(DaemonDiagnostic::action_failure(
-                    "local_webrtc_data_channel",
-                    "runtime request timed out",
-                )))
-            })
-            .unwrap_or_else(|error| {
-                response_with_diagnostic(DaemonDiagnostic::action_failure(
-                    "local_webrtc_data_channel",
-                    error.to_string(),
-                ))
-            });
+        let response = match tokio::time::timeout(Duration::from_secs(5), reply_rx).await {
+            Ok(Ok(Ok(response))) => response,
+            Ok(Ok(Err(error))) => response_with_diagnostic(DaemonDiagnostic::action_failure(
+                "local_webrtc_data_channel",
+                error.to_string(),
+            )),
+            Ok(Err(_)) => response_with_diagnostic(DaemonDiagnostic::action_failure(
+                "local_webrtc_data_channel",
+                "runtime reply channel closed",
+            )),
+            Err(_) => response_with_diagnostic(DaemonDiagnostic::action_failure(
+                "local_webrtc_data_channel",
+                "runtime request timed out",
+            )),
+        };
         peer_state.apply_subscription_change(subscription_change);
         if let Some((subscribed, subscription_id)) = entity_subscription_change {
             if subscribed
@@ -997,7 +1016,7 @@ async fn close_data_channel<D>(
     if let Err(error) = data_channel.local_close().await {
         eprintln!("local WebRTC data channel close failed: {error}");
     }
-    peer_state.cleanup_once(cause);
+    peer_state.cleanup_once(cause).await;
 }
 
 async fn send_response_frames<D>(
@@ -1127,7 +1146,7 @@ fn apply_data_channel_event(
 
 async fn answer_offer(
     request: LocalWebrtcSignalRequest,
-    runtime_tx: Sender<ControlMessage>,
+    runtime_tx: ControlSender,
 ) -> LocalWebrtcResult<LocalWebrtcAnswer> {
     let runtime = default_runtime()
         .ok_or_else(|| LocalWebrtcError::Webrtc("no async runtime".to_string()))?;
@@ -1550,8 +1569,23 @@ mod tests {
     }
 
     fn test_peer_state(grant_id: &str) -> LocalWebrtcPeerState {
-        let (runtime_tx, _runtime_rx) = mpsc::channel();
+        let (runtime_tx, _runtime_rx) = tokio_mpsc::channel(64);
         LocalWebrtcPeerState::new(grant_id.to_string(), runtime_tx)
+    }
+
+    fn receive_test_runtime_message(
+        receiver: &mut tokio_mpsc::Receiver<ControlMessage>,
+    ) -> ControlMessage {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build bounded WebRTC test receive runtime");
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                .await
+                .expect("timed out waiting for WebRTC runtime message")
+                .expect("WebRTC runtime sender remains live")
+        })
     }
 
     fn run_idle_pressure_case(
@@ -1568,7 +1602,7 @@ mod tests {
                 events.push_back(DataChannelEvent::OnClose);
             }
         }
-        let (runtime_tx, runtime_rx) = mpsc::channel();
+        let (runtime_tx, mut runtime_rx) = tokio_mpsc::channel(64);
         let peer_state = Arc::new(LocalWebrtcPeerState::new(
             "grant-idle-pressure".to_string(),
             runtime_tx,
@@ -1576,7 +1610,7 @@ mod tests {
         let responder = std::thread::spawn(move || {
             let ControlMessage::Request {
                 request, reply_tx, ..
-            } = runtime_rx.recv().unwrap()
+            } = receive_test_runtime_message(&mut runtime_rx)
             else {
                 panic!("expected daemon request before peer cleanup");
             };
@@ -1587,7 +1621,7 @@ mod tests {
                 ))))
                 .unwrap();
             assert!(matches!(
-                runtime_rx.recv().unwrap(),
+                receive_test_runtime_message(&mut runtime_rx),
                 ControlMessage::LocalWebrtcPeerClosed { grant_id, .. }
                     if grant_id == "grant-idle-pressure"
             ));
@@ -1639,7 +1673,7 @@ mod tests {
                 &DaemonRequest::DaemonShutdown,
             ));
         }
-        let (runtime_tx, runtime_rx) = mpsc::channel();
+        let (runtime_tx, mut runtime_rx) = tokio_mpsc::channel(64);
         let peer_state = Arc::new(LocalWebrtcPeerState::new(
             "grant-shutdown-delivery".to_string(),
             runtime_tx,
@@ -1650,7 +1684,7 @@ mod tests {
                 request,
                 reply_tx,
                 response_delivery_rx,
-            } = runtime_rx.recv().unwrap()
+            } = receive_test_runtime_message(&mut runtime_rx)
             else {
                 panic!("expected daemon shutdown request");
             };
@@ -1708,7 +1742,7 @@ mod tests {
                 },
             ));
         }
-        let (runtime_tx, runtime_rx) = mpsc::channel();
+        let (runtime_tx, mut runtime_rx) = tokio_mpsc::channel(64);
         let peer_state = Arc::new(LocalWebrtcPeerState::new(
             "grant-entity-fixture".to_string(),
             runtime_tx,
@@ -1722,7 +1756,7 @@ mod tests {
                 subscription_id,
                 frame_tx,
                 reply_tx,
-            } = runtime_rx.recv().unwrap()
+            } = receive_test_runtime_message(&mut runtime_rx)
             else {
                 panic!("expected WebRTC entity subscription registration");
             };
@@ -1770,7 +1804,7 @@ mod tests {
 
             let ControlMessage::Request {
                 request, reply_tx, ..
-            } = runtime_rx.recv().unwrap()
+            } = receive_test_runtime_message(&mut runtime_rx)
             else {
                 panic!("expected ordinary request while entity subscription is active");
             };
@@ -1791,7 +1825,7 @@ mod tests {
             let ControlMessage::LocalWebrtcPeerClosed {
                 entity_subscription_ids,
                 ..
-            } = runtime_rx.recv().unwrap()
+            } = receive_test_runtime_message(&mut runtime_rx)
             else {
                 panic!("expected peer cleanup");
             };
@@ -1857,7 +1891,7 @@ mod tests {
     fn replacement_peer_rejects_prior_generation_frames_and_delivers_current_generation() {
         let key = AesGcmKey::from_slice(&[22; 32]).unwrap();
         let data_channel = Arc::new(FakeDataChannel::default());
-        let (runtime_tx, runtime_rx) = mpsc::channel();
+        let (runtime_tx, mut runtime_rx) = tokio_mpsc::channel(64);
         let peer_state = Arc::new(LocalWebrtcPeerState::new(
             "replacement-grant".to_string(),
             runtime_tx,
@@ -1896,7 +1930,7 @@ mod tests {
             }
             responder_peer_state.publish_peer_terminal(LocalWebrtcTerminalCause::PeerClosed);
             assert!(matches!(
-                runtime_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+                receive_test_runtime_message(&mut runtime_rx),
                 ControlMessage::LocalWebrtcPeerClosed { grant_id, .. }
                     if grant_id == "replacement-grant"
             ));
@@ -1954,7 +1988,7 @@ mod tests {
                 },
             ));
         }
-        let (runtime_tx, runtime_rx) = mpsc::channel();
+        let (runtime_tx, mut runtime_rx) = tokio_mpsc::channel(64);
         let peer_state = Arc::new(LocalWebrtcPeerState::new(
             "grant-recoverable-disconnect".to_string(),
             runtime_tx,
@@ -1964,7 +1998,7 @@ mod tests {
         let responder = std::thread::spawn(move || {
             let ControlMessage::Request {
                 request, reply_tx, ..
-            } = runtime_rx.recv().unwrap()
+            } = receive_test_runtime_message(&mut runtime_rx)
             else {
                 panic!("expected status request");
             };
@@ -1984,7 +2018,7 @@ mod tests {
 
             let ControlMessage::Request {
                 request, reply_tx, ..
-            } = runtime_rx.recv_timeout(Duration::from_secs(1)).unwrap()
+            } = receive_test_runtime_message(&mut runtime_rx)
             else {
                 panic!("expected shutdown-session request after recoverable disconnect");
             };
@@ -2013,7 +2047,7 @@ mod tests {
                 Some(LocalWebrtcTerminalCause::PeerClosed)
             );
             assert!(matches!(
-                runtime_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+                receive_test_runtime_message(&mut runtime_rx),
                 ControlMessage::LocalWebrtcPeerClosed { grant_id, .. }
                     if grant_id == "grant-recoverable-disconnect"
             ));
@@ -2207,7 +2241,7 @@ mod tests {
         let mut pending = VecDeque::from([PendingLocalWebrtcRequest::Request(Box::new(
             DaemonRequest::Status,
         ))]);
-        let (runtime_tx, runtime_rx) = mpsc::channel();
+        let (runtime_tx, mut runtime_rx) = tokio_mpsc::channel(64);
         let peer_state = Arc::new(LocalWebrtcPeerState::new(
             "grant-fixture".to_string(),
             runtime_tx,
@@ -2260,7 +2294,7 @@ mod tests {
             grant_id,
             terminal_record,
             ..
-        } = runtime_rx.recv().unwrap()
+        } = receive_test_runtime_message(&mut runtime_rx)
         else {
             panic!("expected peer cleanup");
         };
@@ -2302,7 +2336,7 @@ mod tests {
         .unwrap();
         assert!(frames.len() > 1);
         let mut pending = VecDeque::new();
-        let (runtime_tx, runtime_rx) = mpsc::channel();
+        let (runtime_tx, mut runtime_rx) = tokio_mpsc::channel(64);
         let peer_state = Arc::new(LocalWebrtcPeerState::new(
             "grant-progress".to_string(),
             runtime_tx,
@@ -2347,7 +2381,7 @@ mod tests {
         ));
         let ControlMessage::LocalWebrtcPeerClosed {
             terminal_record, ..
-        } = runtime_rx.recv().unwrap()
+        } = receive_test_runtime_message(&mut runtime_rx)
         else {
             panic!("expected terminal record after partial response");
         };
