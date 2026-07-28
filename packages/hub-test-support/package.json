@@ -1,6 +1,6 @@
 {
   "name": "@trybotster/hub-test-support",
-  "version": "0.1.11",
+  "version": "0.1.12",
   "description": "Node-consumable Botster hub client protocol and plugin contract test assets",
   "license": "SEE LICENSE IN LICENSE",
   "type": "module",
@@ -34,6 +34,9 @@
     "mode-flags-conformance-fixture.json",
     "fixtures/plugin-contract-matrix"
   ],
+  "dependencies": {
+    "@trybotster/ui-contract": "0.1.0"
+  },
   "scripts": {
     "sync": "node scripts/sync-assets.mjs",
     "check": "node scripts/sync-assets.mjs --check",

@@ -1,5 +1,6 @@
 // Generated from crates/botster-hub-client Rust serde DTOs.
 // Regenerate/check with: ./test.sh -p botster-hub-client
+import type { UiActionRequest, UiActionResult, UiNode } from "@trybotster/ui-contract";
 
 export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 export type JsonObject = { [key: string]: JsonValue };
@@ -116,7 +117,7 @@ export type DaemonRequest =
   | { type: "plugin_mcp_list_tools" }
   | { type: "plugin_mcp_call_tool"; name: string; arguments: JsonValue }
   | { type: "plugin_surface_render"; package_name: string; surface_id: string; payload: JsonValue }
-  | { type: "plugin_surface_action"; package_name: string; surface_id: string; action_id: string; payload: JsonValue }
+  | { type: "plugin_surface_action"; package_name: string; request: UiActionRequest }
   | { type: "local_webrtc_signal"; grant_id: string; grant_secret: string; origin: string; offer: JsonValue }
   | { type: "daemon_shutdown" };
 
@@ -146,7 +147,7 @@ export interface DaemonResponse {
   plugin_tools: JsonValue[];
   plugin_tool_result: JsonValue;
   plugin_surface?: DaemonPluginSurface | null;
-  plugin_action_result?: JsonValue;
+  plugin_action_result?: UiActionResult;
   local_webrtc_bootstrap?: DaemonLocalWebrtcBootstrap | null;
   local_webrtc_answer?: DaemonLocalWebrtcAnswer | null;
   events: DaemonEvent[];
@@ -177,14 +178,14 @@ export interface DaemonCaptureSnapshot {
 export interface DaemonPluginSurface {
   package_name: string;
   surface_id: string;
-  body: JsonValue;
+  body: UiNode;
   ui_tree_snapshot?: DaemonUiTreeSnapshot | null;
 }
 
 export interface DaemonUiTreeSnapshot {
   package_name: string;
   surface_id: string;
-  body: JsonValue;
+  body: UiNode;
 }
 
 export interface DaemonWorktreeLifecycleEvent {

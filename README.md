@@ -144,7 +144,7 @@ Terminal attach is a terminal-stream handshake only. Session-list reads remain
 an operator/query API; stateful clients use the explicit held-open `session`
 entity subscription for an authoritative snapshot followed by ordered deltas.
 The reusable revision-16 contract ships in
-`@trybotster/hub-test-support@0.1.11` as source-derived JSON fixtures and a Rust
+`@trybotster/hub-test-support@0.1.12` as source-derived JSON fixtures and a Rust
 `run_session_lifecycle_subscription_conformance` runner over the real isolated
 Hub/Core/session-worker topology.
 That subscription hydrates no status, package, worktree, target, or plugin state.
@@ -155,6 +155,13 @@ through `HubRuntime -> CoreDaemon` and return typed readback response DTOs.
 Snapshot readback returns metadata only; opaque snapshot bytes stay on the
 attach/drain data plane. Subscription history still flows through attach/drain
 events rather than through readback responses.
+
+The renderer-neutral plugin UI wire contract is owned by the standalone
+`botster-ui-contract` workspace crate and its generated
+`@trybotster/ui-contract` package. Hub runtime code validates and routes those
+types but does not own renderer presentation policy. `botster-hub-client`
+re-exports the same typed daemon bodies; clients must not maintain local
+`UiNode` or action-result mirrors.
 
 | Core / daemon operation | HubRuntime decision | Reason |
 | --- | --- | --- |
@@ -424,8 +431,8 @@ runtime=ready
 data_dir=resolved:$HOME/.botster/hub
 daemon=started
 protocol=botster-hub-daemon-v1
-protocol_version=3
-conformance_fixture_revision=18
+protocol_version=4
+conformance_fixture_revision=19
 package_count=2
 enabled_package_count=2
 app_count=2

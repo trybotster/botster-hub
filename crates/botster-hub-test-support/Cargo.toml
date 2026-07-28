@@ -10,5 +10,6 @@ include = ["Cargo.toml", "src/**/*.rs", "fixtures/plugin-contract-matrix/**", ".
 [dependencies]
 botster-core = { git = "https://github.com/trybotster/botster-core", branch = "main" }
 botster-hub-client = { path = "../botster-hub-client" }
+botster-ui-contract = { path = "../botster-ui-contract" }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"

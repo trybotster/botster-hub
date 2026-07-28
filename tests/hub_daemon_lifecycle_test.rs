@@ -3553,17 +3553,21 @@ fn daemon_package_dtos_expose_declared_surfaces_and_validate_surface_ids() {
     let plugin_surface = workspaces
         .plugin_surface
         .expect("workspaces render includes plugin surface");
+    let plugin_surface_body =
+        serde_json::to_value(&plugin_surface.body).expect("serialize typed workspaces surface");
     assert_eq!(plugin_surface.package_name, "botster-workspaces");
     assert_eq!(plugin_surface.surface_id, "workspaces");
-    assert_eq!(plugin_surface.body["type"], "panel");
-    assert_eq!(plugin_surface.body["id"], "botster-workspaces-panel");
+    assert_eq!(plugin_surface_body["type"], "panel");
+    assert_eq!(plugin_surface_body["id"], "botster-workspaces-panel");
     let snapshot = plugin_surface
         .ui_tree_snapshot
         .as_ref()
         .expect("workspaces render includes validated ui tree snapshot");
     assert_eq!(snapshot.package_name, "botster-workspaces");
     assert_eq!(snapshot.surface_id, "workspaces");
-    assert_eq!(snapshot.body["id"], "botster-workspaces-panel");
+    let snapshot_body =
+        serde_json::to_value(&snapshot.body).expect("serialize typed workspaces snapshot");
+    assert_eq!(snapshot_body["id"], "botster-workspaces-panel");
 
     let iframe = connection
         .request(&botster_hub_client::DaemonRequest::PluginSurfaceRender {
@@ -3579,19 +3583,21 @@ fn daemon_package_dtos_expose_declared_surfaces_and_validate_surface_ids() {
     let iframe_surface = iframe
         .plugin_surface
         .expect("iframe render includes plugin surface");
-    assert_eq!(iframe_surface.body["type"], "iframe");
-    assert_eq!(iframe_surface.body["id"], "preview-frame");
+    let iframe_surface_body =
+        serde_json::to_value(&iframe_surface.body).expect("serialize typed iframe surface");
+    assert_eq!(iframe_surface_body["type"], "iframe");
+    assert_eq!(iframe_surface_body["id"], "preview-frame");
     assert_eq!(
-        iframe_surface.body["props"]["src"],
+        iframe_surface_body["props"]["src"],
         "/packages/iframe.plugin/assets/preview.html"
     );
-    assert_eq!(iframe_surface.body["props"]["title"], "Preview");
+    assert_eq!(iframe_surface_body["props"]["title"], "Preview");
     let iframe_snapshot = iframe_surface
         .ui_tree_snapshot
         .as_ref()
         .expect("iframe render includes validated ui tree snapshot");
     assert_eq!(iframe_snapshot.body, iframe_surface.body);
-    assert_no_raw_html_ui_fields(&iframe_surface.body);
+    assert_no_raw_html_ui_fields(&iframe_surface_body);
 
     let undeclared = connection
         .request(&botster_hub_client::DaemonRequest::PluginSurfaceRender {
@@ -3694,6 +3700,7 @@ fn daemon_plugin_contract_matrix_fixture_exercises_public_package_contracts() {
         vec![
             "button",
             "button",
+            "dialog",
             "empty_state",
             "empty_state",
             "form",
@@ -3703,6 +3710,8 @@ fn daemon_plugin_contract_matrix_fixture_exercises_public_package_contracts() {
             "section",
             "status_badge",
             "table",
+            "text",
+            "text",
             "text_input",
             "toolbar",
         ]
@@ -3717,6 +3726,9 @@ fn daemon_plugin_contract_matrix_fixture_exercises_public_package_contracts() {
         report.app_surface_snapshot_node_kinds,
         report.app_surface_node_kinds
     );
+    assert_eq!(report.dialog_presence_key, "contract-dialog");
+    assert_eq!(report.selected_workspace_equality_key, "selected-workspace");
+    assert_eq!(report.selected_workspace_equality_value, "workspace-alpha");
     assert_eq!(report.empty_surface_child_id, "contract-empty-message");
     assert_eq!(report.blocked_render_operation, "plugin_surface_render");
     assert!(report.blocked_render_message_contains_failure);
@@ -3733,6 +3745,14 @@ fn daemon_plugin_contract_matrix_fixture_exercises_public_package_contracts() {
     assert!(report.settings_text_contains_redacted_secret);
     assert_eq!(report.action_success_state, "accepted");
     assert_eq!(report.action_success_message, "hello");
+    assert_eq!(
+        report.action_success_presentation_clear_key,
+        "contract-dialog"
+    );
+    assert_eq!(
+        report.action_success_replacement_node_id,
+        "contract-action-replacement"
+    );
     assert_eq!(report.submit_action_id, "contract.action");
     assert_eq!(report.action_error_state, "error");
     assert_eq!(report.action_error_diagnostic_kind, "action_failure");
@@ -3740,7 +3760,7 @@ fn daemon_plugin_contract_matrix_fixture_exercises_public_package_contracts() {
         report.action_error_diagnostic_operation,
         "plugin_surface_action"
     );
-    assert_eq!(report.action_field_error_state, "error");
+    assert_eq!(report.action_field_error_state, "rejected");
     assert_eq!(
         report.action_field_error_request_id,
         "contract-action-field-error"
@@ -3751,6 +3771,19 @@ fn daemon_plugin_contract_matrix_fixture_exercises_public_package_contracts() {
         "plugin_surface_action"
     );
     assert_eq!(report.action_field_error_message, "Message is required");
+    assert_eq!(report.identity_mismatch_error_code, "invalid_action_result");
+    assert_eq!(
+        report.identity_mismatch_error_operation,
+        "plugin_surface_action"
+    );
+    assert_eq!(
+        report.invalid_replacement_error_code,
+        "invalid_action_result"
+    );
+    assert_eq!(
+        report.invalid_replacement_error_operation,
+        "plugin_surface_action"
+    );
     assert_eq!(
         report.client_render_check.class,
         botster_hub_test_support::ConformanceFailureClass::ClientRendering

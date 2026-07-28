@@ -400,6 +400,7 @@ dependencies = [
  "botster-core-test-support",
  "botster-hub-client",
  "botster-hub-test-support",
+ "botster-ui-contract",
  "getrandom 0.3.4",
  "keyring",
  "libc",
@@ -420,6 +421,7 @@ name = "botster-hub-client"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "botster-ui-contract",
  "serde",
  "serde_json",
 ]
@@ -430,6 +432,7 @@ version = "0.1.0"
 dependencies = [
  "botster-core",
  "botster-hub-client",
+ "botster-ui-contract",
  "serde",
  "serde_json",
 ]
@@ -440,6 +443,15 @@ version = "0.1.0"
 source = "git+https://github.com/trybotster/botster-core?branch=main#49159e7373ffc2cdbb26c856bb3c738841a42742"
 dependencies = [
  "botster-core",
+]
+
+[[package]]
+name = "botster-ui-contract"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
