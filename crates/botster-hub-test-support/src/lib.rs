@@ -492,11 +492,7 @@ pub fn first_party_client_support_matrix() -> FirstPartyClientSupportMatrix {
             .to_string(),
             runtime_runner: "botster_hub_test_support::run_plugin_contract_matrix_conformance"
                 .to_string(),
-            presentation_operation_kinds: vec![
-                "set".to_string(),
-                "clear".to_string(),
-                "toggle".to_string(),
-            ],
+            presentation_operation_kinds: presentation_operation_kinds(),
             dialog_presence_key: "contract-dialog".to_string(),
             selected_workspace_equality_key: "selected-workspace".to_string(),
             selected_workspace_equality_value: "workspace-alpha".to_string(),
@@ -2188,6 +2184,33 @@ struct ScopedPresentationState {
     values: BTreeMap<(String, String), BTreeMap<String, serde_json::Value>>,
 }
 
+fn presentation_operation_kind(operation: &UiPresentationOperation) -> &'static str {
+    match operation {
+        UiPresentationOperation::Set { .. } => "set",
+        UiPresentationOperation::Clear { .. } => "clear",
+        UiPresentationOperation::Toggle { .. } => "toggle",
+    }
+}
+
+fn presentation_operation_kinds() -> Vec<String> {
+    [
+        UiPresentationOperation::Set {
+            key: botster_ui_contract::UiPresentationKey("key".to_string()),
+            value: serde_json::Value::Null,
+        },
+        UiPresentationOperation::Clear {
+            key: botster_ui_contract::UiPresentationKey("key".to_string()),
+        },
+        UiPresentationOperation::Toggle {
+            key: botster_ui_contract::UiPresentationKey("key".to_string()),
+        },
+    ]
+    .iter()
+    .map(presentation_operation_kind)
+    .map(str::to_string)
+    .collect()
+}
+
 impl ScopedPresentationState {
     fn apply(&mut self, package_name: &str, surface_id: &str, result: &UiActionResult) {
         if result.state != UiActionResultState::Accepted {
@@ -2221,6 +2244,23 @@ impl ScopedPresentationState {
         self.values
             .get(&(package_name.to_string(), surface_id.to_string()))
     }
+}
+
+fn apply_action_result_to_client(
+    presentation_state: &mut ScopedPresentationState,
+    rendered_tree: &mut serde_json::Value,
+    package_name: &str,
+    surface_id: &str,
+    result: &UiActionResult,
+) -> Result<(), serde_json::Error> {
+    presentation_state.apply(package_name, surface_id, result);
+    if result.state != UiActionResultState::Accepted {
+        return Ok(());
+    }
+    if let Some(replacement) = &result.replacement {
+        *rendered_tree = serde_json::to_value(replacement)?;
+    }
+    Ok(())
 }
 
 /// Fields downstream clients should compare against their renderer output.
@@ -3551,16 +3591,13 @@ pub fn run_plugin_contract_matrix_conformance(
         "rejected",
         &action_field_error_state,
     )?;
-    presentation_state.apply(
+    apply_action_result_to_client(
+        &mut presentation_state,
+        &mut client_rendered_tree,
         PLUGIN_CONTRACT_MATRIX_PACKAGE,
         PLUGIN_CONTRACT_APP_SURFACE,
         action_field_error_result,
-    );
-    if action_field_error_result.state == UiActionResultState::Accepted
-        && let Some(replacement) = &action_field_error_result.replacement
-    {
-        client_rendered_tree = serde_json::to_value(replacement)?;
-    }
+    )?;
     let rejected_state_retained = presentation_state
         .values_for(PLUGIN_CONTRACT_MATRIX_PACKAGE, PLUGIN_CONTRACT_APP_SURFACE)
         .is_some_and(|values| values == &open_state_before_rejection);
@@ -3654,11 +3691,26 @@ pub fn run_plugin_contract_matrix_conformance(
             actual: format!("{:?}", action.diagnostics),
         });
     }
-    presentation_state.apply(
+    apply_action_result_to_client(
+        &mut presentation_state,
+        &mut client_rendered_tree,
         PLUGIN_CONTRACT_MATRIX_PACKAGE,
         PLUGIN_CONTRACT_APP_SURFACE,
         action_result,
-    );
+    )?;
+    let accepted_replacement_applied = client_rendered_tree != original_rendered_tree
+        && client_rendered_tree
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            == Some(action_success_replacement_node_id.as_str());
+    if !accepted_replacement_applied {
+        return Err(ConformanceError::UnexpectedValue {
+            operation: "contract_matrix_action_success",
+            field: "client rendered tree",
+            expected: format!("replacement node {action_success_replacement_node_id}"),
+            actual: client_rendered_tree.to_string(),
+        });
+    }
     let dialog_visible_after_valid_submit = presentation_binding_visible(
         dialog_binding,
         presentation_state.values_for(PLUGIN_CONTRACT_MATRIX_PACKAGE, PLUGIN_CONTRACT_APP_SURFACE),
@@ -5354,6 +5406,82 @@ mod tests {
                 .map(str::to_string)
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn rejected_action_result_preserves_scoped_state_and_rendered_tree() {
+        let package_name = "botster.test";
+        let surface_id = "test.surface";
+        let mut presentation_state = ScopedPresentationState::default();
+        let mut rendered_tree = serde_json::json!({
+            "type": "text",
+            "id": "original",
+            "props": { "text": "Original" },
+        });
+        let accepted_seed = UiActionResult {
+            request_id: botster_ui_contract::UiActionRequestId("seed".to_string()),
+            surface_id: botster_ui_contract::UiSurfaceId(surface_id.to_string()),
+            action_id: botster_ui_contract::UiActionId("seed".to_string()),
+            node_id: None,
+            state: UiActionResultState::Accepted,
+            field_errors: BTreeMap::new(),
+            form_errors: Vec::new(),
+            warnings: Vec::new(),
+            normalized_values: None,
+            presentation: Some(vec![UiPresentationOperation::Set {
+                key: botster_ui_contract::UiPresentationKey("dialog".to_string()),
+                value: serde_json::json!(true),
+            }]),
+            replacement: None,
+            payload: None,
+            error: None,
+        };
+        presentation_state.apply(package_name, surface_id, &accepted_seed);
+        let state_before = presentation_state
+            .values_for(package_name, surface_id)
+            .cloned()
+            .expect("seeded scoped presentation state");
+        let tree_before = rendered_tree.clone();
+        let rejected = UiActionResult {
+            request_id: botster_ui_contract::UiActionRequestId("rejected".to_string()),
+            surface_id: botster_ui_contract::UiSurfaceId(surface_id.to_string()),
+            action_id: botster_ui_contract::UiActionId("reject".to_string()),
+            node_id: None,
+            state: UiActionResultState::Rejected,
+            field_errors: BTreeMap::new(),
+            form_errors: vec!["Rejected".to_string()],
+            warnings: Vec::new(),
+            normalized_values: None,
+            presentation: Some(vec![UiPresentationOperation::Set {
+                key: botster_ui_contract::UiPresentationKey("dialog".to_string()),
+                value: serde_json::json!(false),
+            }]),
+            replacement: Some(Box::new(
+                serde_json::from_value(serde_json::json!({
+                    "type": "text",
+                    "id": "replacement",
+                    "props": { "text": "Replacement" },
+                }))
+                .expect("deserialize replacement node"),
+            )),
+            payload: None,
+            error: Some("Rejected".to_string()),
+        };
+
+        apply_action_result_to_client(
+            &mut presentation_state,
+            &mut rendered_tree,
+            package_name,
+            surface_id,
+            &rejected,
+        )
+        .expect("ignore rejected effects");
+
+        assert_eq!(
+            presentation_state.values_for(package_name, surface_id),
+            Some(&state_before)
+        );
+        assert_eq!(rendered_tree, tree_before);
     }
 
     #[test]
