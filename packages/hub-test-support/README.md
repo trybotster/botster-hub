@@ -90,7 +90,7 @@ Only `read_screen_text` is renderable restored content; `snapshot` and
 version 0.1.5 / revision 12 exposes lossy string history. Neither is current
 binary-history contract authority.
 
-Version 0.1.12 publishes protocol version 4 / conformance revision 19 and
+Version 0.1.12 publishes protocol version 4 / conformance revision 20 and
 depends on `@trybotster/ui-contract@0.1.0` for the canonical UiNode,
 UiActionRequest, and UiActionResult declarations and conformance fixtures.
 The protocol cold-switch replaces split action fields and untyped JSON bodies

@@ -148,6 +148,17 @@ The reusable revision-16 contract ships in
 `run_session_lifecycle_subscription_conformance` runner over the real isolated
 Hub/Core/session-worker topology.
 That subscription hydrates no status, package, worktree, target, or plugin state.
+The local socket adapter admits at most 64 live connections and runs them as
+joined Tokio tasks on a fixed transport runtime; it does not create an OS
+thread per client. Complete healthy attach and entity streams may remain idle
+indefinitely. Handshakes, incomplete frames, stalled writes, peer loss, and
+daemon shutdown are bounded failure paths. `DaemonStatus.lifecycle_counters`
+reports sanitized accepted/rejected/live/high-water connection and
+subscription counts, cleanup outcomes, journal/baseline reconciliation work,
+and entity delivery pressure without exposing session or subscription ids.
+Steady-state entity reconciliation consumes the Core lifecycle journal on one
+shared 500 ms backstop and performs a filesystem-backed baseline only when the
+journal explicitly requires resynchronization.
 Hub code
 embeds the typed CoreDaemon API; it must not shell out to the thin core daemon
 CLI or parse CLI output for session routing. Screen and snapshot requests route
@@ -438,7 +449,7 @@ data_dir=resolved:$HOME/.botster/hub
 daemon=started
 protocol=botster-hub-daemon-v1
 protocol_version=4
-conformance_fixture_revision=19
+conformance_fixture_revision=20
 package_count=2
 enabled_package_count=2
 app_count=2

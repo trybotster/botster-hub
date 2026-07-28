@@ -180,7 +180,37 @@ subscription closes instead of silently presenting stale state. Socket EOF,
 write failure, explicit `unsubscribe`, and daemon shutdown release the
 connection-owned subscription. Reconnect with a new subscription id and treat
 its first snapshot as the sole baseline; frames from a prior connection are not
-replayed.
+replayed. `reconnect_registrations` counts a new entity or attach registration
+that follows a released registration generation; it does not retain historical
+subscription ids.
+
+`lifecycle_resync_reads` is an exceptional-path scaffold counter. Its producer
+is wired for Core `resync_required` and future unknown lifecycle variants, but
+the pinned Core runtime has no deterministic public fixture that forces either
+condition. Normal-path conformance therefore expects it to remain zero.
+
+The daemon admits 64 live local socket connections. Excess clients receive a
+typed `daemon_connection_admission` backpressure hello and are closed without
+entering the runtime request path. Admitted connections are async tasks on the
+daemon's fixed transport runtime, not detached OS threads. One connection
+owner releases every attach and entity registration exactly once on EOF,
+malformed or incomplete frames, write failure, cancellation, normal close, or
+shutdown.
+
+Healthy frame-complete streams have no lease and may remain idle indefinitely.
+The handshake, a frame that has started but not completed, and each socket
+write have bounded deadlines. Entity delivery waits on socket input, its
+bounded frame queue, and shutdown; it has no per-client timer or 20 ms poll.
+
+`DaemonStatus.lifecycle_counters` is optional for old-daemon compatibility and
+always populated by the current daemon. It exposes counts only: connection and
+subscription current/high-water values, reconnect registrations, cleanup
+outcomes/reasons, reconciliation wake/change/baseline/resync/drain work,
+entity delivery attempts/outcomes, and stalled writes. It never contains
+connection, session, subscription, path, command, or payload identifiers.
+During steady state the daemon reads one shared Core lifecycle journal cursor;
+the filesystem-backed baseline counter advances only for initial seeding or an
+explicit journal resync.
 
 `RemoveSession` forgets only an already-terminal session and produces the
 ordered remove delta. `ListSessions` remains available for operator queries,

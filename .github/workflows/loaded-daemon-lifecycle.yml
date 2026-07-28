@@ -14,6 +14,7 @@ on:
         type: choice
         options:
           - lifecycle-suite
+          - focused-connection-lifecycle
           - focused-stalled-attach
           - focused-fast-exit-attach-diagnostic
           - focused-oversized-webrtc
@@ -140,6 +141,20 @@ jobs:
           printf '\n' | tee -a "$ARTIFACT_DIR/metadata.txt"
           ./test.sh "${test_args[@]}" 2>&1 \
             | tee "$ARTIFACT_DIR/precompile.log"
+          worker_args=(build --locked -p botster-core --bin botster-session-worker)
+          printf 'worker_precompile_args=cargo ' | tee -a "$ARTIFACT_DIR/metadata.txt"
+          printf '%q ' "${worker_args[@]}" | tee -a "$ARTIFACT_DIR/metadata.txt"
+          printf '\n' | tee -a "$ARTIFACT_DIR/metadata.txt"
+          cargo "${worker_args[@]}" 2>&1 \
+            | tee -a "$ARTIFACT_DIR/precompile.log"
+          worker_bin="$GITHUB_WORKSPACE/subject/target/debug/botster-session-worker"
+          if [[ ! -x "$worker_bin" ]]; then
+            printf 'missing precompiled session worker: %s\n' "$worker_bin" \
+              | tee -a "$ARTIFACT_DIR/metadata.txt"
+            exit 1
+          fi
+          printf 'session_worker_bin=%s\n' "$worker_bin" \
+            | tee -a "$ARTIFACT_DIR/metadata.txt"
 
       - name: Run loaded real-daemon lifecycle campaign
         env:
