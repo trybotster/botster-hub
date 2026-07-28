@@ -3822,8 +3822,30 @@ fn daemon_plugin_contract_matrix_fixture_exercises_public_package_contracts() {
     );
     assert!(report.dialog_visible_after_open);
     assert!(report.selected_workspace_visible_after_open);
+    assert!(!report.form_reachable_before_open);
+    assert_eq!(report.dialog_form_node_id, "contract-app-form");
+    assert_eq!(report.dialog_input_node_id, "contract-app-message");
+    assert_eq!(report.submit_action_node_id, "contract-app-form");
+    assert!(!report.actionable_sibling_form_during_dialog);
+    assert_eq!(
+        report.invalid_submit_values,
+        serde_json::json!({ "message": "   " })
+    );
+    assert_eq!(
+        report.valid_submit_values,
+        serde_json::json!({ "message": "hello" })
+    );
     assert!(report.rejected_state_retained);
     assert!(report.rejected_tree_retained);
+    assert!(report.rejected_dialog_retained);
+    assert!(report.rejected_form_retained);
+    assert_eq!(report.rejected_field_error_node_id, "contract-app-message");
+    assert_eq!(
+        report.accepted_normalized_values,
+        serde_json::json!({ "message": "hello" })
+    );
+    assert!(report.accepted_replacement_applied);
+    assert!(report.dialog_state_cleared);
     assert!(!report.dialog_visible_after_valid_submit);
     assert_eq!(report.toggle_action_id, "contract.action");
     assert_eq!(report.toggle_action_node_id, "contract-app-toggle");

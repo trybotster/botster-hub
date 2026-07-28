@@ -1012,6 +1012,21 @@ retaining the tree and open state, a valid submission returns normalized values
 and a replacement before clearing the dialog, and a distinct rendered action
 proves deterministic toggle transitions.
 
+Relocating the one canonical Form into `contract-dialog.slots.body` advances
+`CONFORMANCE_FIXTURE_REVISION` to 22. The published browser-shaped conformance
+consumer now materializes the delivered tree after accepted scoped effects,
+restricts submit discovery to the active Dialog subtree, rejects actionable
+sibling Forms, retains the visible Dialog/Form/input association after
+rejection, applies an accepted replacement as the whole rendered surface tree,
+and proves the scoped Dialog presence key is cleared after acceptance. The
+replacement is not inserted beneath the submitting `node_id`; this keeps the
+accepted replacement observable even though the same result closes the Dialog.
+`PROTOCOL_VERSION` remains 4 because daemon framing, request vocabulary, DTO
+shapes, and action semantics are unchanged. Because
+`DaemonCompatibilityRequirement::current()` derives
+`minimum_conformance_fixture_revision` from this constant, clients built at
+revision 22 require a Hub reporting conformance revision 22 or later.
+
 This cold switch advances `PROTOCOL_VERSION` to 4 and
 `CONFORMANCE_FIXTURE_REVISION` to 19. It removes `UiTreeUpdateRef` and
 `tree_update`, requires explicit form `submit_label`, supports scoped
