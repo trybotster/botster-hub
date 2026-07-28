@@ -38,11 +38,27 @@ local function app_surface(_arguments)
           actions = {
             {
               type = "button",
-              id = "contract-app-action",
+              id = "contract-app-open",
               props = {
-                label = "Run contract action",
+                label = "Open contract dialog",
                 action = {
                   id = "contract.action",
+                  payload = {
+                    operation = "open",
+                  },
+                },
+              },
+            },
+            {
+              type = "button",
+              id = "contract-app-toggle",
+              props = {
+                label = "Toggle contract state",
+                action = {
+                  id = "contract.action",
+                  payload = {
+                    operation = "toggle",
+                  },
                 },
               },
             },
@@ -55,6 +71,9 @@ local function app_surface(_arguments)
         props = {
           action = {
             id = "contract.action",
+            payload = {
+              operation = "submit",
+            },
           },
           submit_label = "Submit contract action",
         },
@@ -75,6 +94,9 @@ local function app_surface(_arguments)
               label = "Submit contract action",
               action = {
                 id = "contract.action",
+                payload = {
+                  operation = "submit",
+                },
               },
             },
           },
@@ -188,6 +210,20 @@ local function app_surface(_arguments)
       {
         ["$kind"] = "presentation_if",
         predicate = {
+          kind = "truthy",
+          key = "contract-toggle",
+        },
+        node = {
+          type = "text",
+          id = "contract-toggle-state",
+          props = {
+            text = "Contract toggle active",
+          },
+        },
+      },
+      {
+        ["$kind"] = "presentation_if",
+        predicate = {
           kind = "equals",
           key = "selected-workspace",
           value = "workspace-alpha",
@@ -272,15 +308,6 @@ local function contract_action(arguments)
       form_errors = { "contract action failed by request" },
     })
   end
-  if payload.field_error == true then
-    return action_result(arguments, "rejected", {
-      error = "message is required",
-      field_errors = {
-        ["contract-app-message"] = { "Message is required" },
-      },
-      form_errors = { "Message is required" },
-    })
-  end
   if payload.identity_mismatch == true then
     local result = action_result(arguments, "accepted")
     result.request_id = "mismatched-request"
@@ -297,6 +324,42 @@ local function contract_action(arguments)
           },
         },
       },
+    })
+  end
+  if payload.operation == "open" then
+    return action_result(arguments, "accepted", {
+      presentation = {
+        {
+          kind = "set",
+          key = "contract-dialog",
+          value = true,
+        },
+        {
+          kind = "set",
+          key = "selected-workspace",
+          value = "workspace-alpha",
+        },
+      },
+    })
+  end
+  if payload.operation == "toggle" then
+    return action_result(arguments, "accepted", {
+      presentation = {
+        {
+          kind = "toggle",
+          key = "contract-toggle",
+        },
+      },
+    })
+  end
+  local message = values.message
+  if payload.operation == "submit" and (message == nil or message:match("^%s*$")) then
+    return action_result(arguments, "rejected", {
+      error = "message is required",
+      field_errors = {
+        ["contract-app-message"] = { "Message is required" },
+      },
+      form_errors = { "Message is required" },
     })
   end
   return action_result(arguments, "accepted", {
