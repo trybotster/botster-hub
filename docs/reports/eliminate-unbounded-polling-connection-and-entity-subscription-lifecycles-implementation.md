@@ -6,7 +6,8 @@
 - Target id: `tgt_7e208a0c76a44980a83b63af976b1f22`
 - Run: `run_1785199801_176415`
 - Implement steps: `run_step_1785200938_377318`,
-  `run_step_1785212561_440065`, and `run_step_1785214562_290248`
+  `run_step_1785212561_440065`, `run_step_1785214562_290248`, and
+  `run_step_1785218055_609201`
 
 The approved plan and the authoritative Project Pipelines target both route
 this work to `botster-hub`.
@@ -78,6 +79,12 @@ Shutdown signals and joins connection tasks before stopping the daemon and
 unlinking the listener. The `down` command verifies owned daemon metadata and
 waits for that process to exit before returning, so immediate `up` cannot
 overlap old session or entrypoint teardown.
+
+The Linux loaded workflow now precompiles both the selected integration-test
+surface and the locked `botster-session-worker` binary, then verifies the
+resolved worker is executable before synthetic load begins. This keeps the
+runtime-spawned worker build outside the measured stress phase without
+weakening the load profile or widening transport deadlines.
 
 ## Files changed
 
@@ -188,10 +195,10 @@ response-delivery ordering.
 
 ## Unverified behavior and residual risk
 
-- The Linux-only loaded lifecycle selftest and 20-repetition campaign were not
-  executed on macOS because the harness requires `setsid`, `/proc`, and Linux
-  `ps` behavior. The selector and arguments validate locally and the workflow
-  exposes the new target; CI must retain the campaign artifact.
+- The Linux-only loaded lifecycle campaign cannot execute on macOS because the
+  harness requires `setsid`, `/proc`, and Linux `ps` behavior. Its exact-SHA
+  result is attached to the Project Pipelines run rather than embedded here,
+  so recording the result does not itself change the commit that was tested.
 - Local proof uses deterministic wake/delivery counters and process thread
   count. Exact process CPU/context-switch sampling remains a loaded Linux
   campaign responsibility because macOS `ps` CPU time is too coarse for the
