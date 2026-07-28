@@ -2223,6 +2223,7 @@ fn parse_spawn_target_create(args: &[String]) -> Result<DaemonRequest, OperatorE
     let mut root = None;
     let mut enabled = true;
     let mut kind = None;
+    let mut base_ref = None;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -2246,6 +2247,10 @@ fn parse_spawn_target_create(args: &[String]) -> Result<DaemonRequest, OperatorE
                 kind = Some(required_arg(args, index + 1, "spawn-targets create")?);
                 index += 2;
             }
+            "--base-ref" => {
+                base_ref = Some(required_arg(args, index + 1, "spawn-targets create")?);
+                index += 2;
+            }
             "--disabled" => {
                 enabled = false;
                 index += 1;
@@ -2260,6 +2265,7 @@ fn parse_spawn_target_create(args: &[String]) -> Result<DaemonRequest, OperatorE
         root,
         enabled,
         kind,
+        base_ref,
         metadata: BTreeMap::new(),
     })
 }
@@ -2272,6 +2278,7 @@ fn parse_spawn_target_update(
     let mut root = None;
     let mut enabled = None;
     let mut kind = None;
+    let mut base_ref = None;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -2291,6 +2298,14 @@ fn parse_spawn_target_update(
                 kind = Some(required_arg(args, index + 1, "spawn-targets update")?);
                 index += 2;
             }
+            "--base-ref" => {
+                base_ref = Some(Some(required_arg(args, index + 1, "spawn-targets update")?));
+                index += 2;
+            }
+            "--clear-base-ref" => {
+                base_ref = Some(None);
+                index += 1;
+            }
             "--enable" => {
                 enabled = Some(true);
                 index += 1;
@@ -2308,6 +2323,7 @@ fn parse_spawn_target_update(
         root,
         enabled,
         kind,
+        base_ref,
         metadata: None,
     })
 }

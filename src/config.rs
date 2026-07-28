@@ -341,7 +341,7 @@ impl Default for CoreEngineOptions {
             session_io_coalescing: SessionIoCoalescingOptions::from(
                 SessionIoCoalescingPolicy::default(),
             ),
-            plugin_worker_capacity: PluginWorkerEngineConfig::default().per_plugin_capacity,
+            plugin_worker_capacity: PluginWorkerEngineConfig::default().per_plugin_queue_capacity,
         }
     }
 }

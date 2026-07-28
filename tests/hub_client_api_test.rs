@@ -30,7 +30,10 @@ use support::ensure_session_worker_binary;
 
 fn explicit_runtime(name: &str) -> HubRuntime {
     ensure_session_worker_binary();
-    let data_directory = format!("target/botster-hub-test-data/client-api-{name}");
+    let data_directory = format!(
+        "target/botster-hub-test-data/client-api-{}-{name}",
+        std::process::id()
+    );
     let _ = fs::remove_dir_all(&data_directory);
     let config = HubStartupOptions {
         host: HostIdentityOptions {
@@ -679,6 +682,7 @@ fn session_template_sources_apply_device_repo_precedence_and_reload_from_state()
                 root: repo_root.clone(),
                 enabled: true,
                 kind: "directory".to_string(),
+                base_ref: None,
                 metadata: BTreeMap::new(),
             }];
         })
@@ -809,6 +813,7 @@ fn session_template_sources_apply_device_over_package_when_repo_disabled() {
                 root: repo_root.clone(),
                 enabled: false,
                 kind: "directory".to_string(),
+                base_ref: None,
                 metadata: BTreeMap::new(),
             }];
         })
@@ -907,6 +912,7 @@ fn session_template_sources_reject_duplicate_ids_within_repo_source() {
                 root: repo_root.clone(),
                 enabled: true,
                 kind: "directory".to_string(),
+                base_ref: None,
                 metadata: BTreeMap::new(),
             }];
         })
@@ -964,6 +970,7 @@ fn session_template_sources_reject_ambiguous_same_rank_repo_ids() {
                     root: first_repo.clone(),
                     enabled: true,
                     kind: "directory".to_string(),
+                    base_ref: None,
                     metadata: BTreeMap::new(),
                 },
                 SpawnTarget {
@@ -972,6 +979,7 @@ fn session_template_sources_reject_ambiguous_same_rank_repo_ids() {
                     root: second_repo.clone(),
                     enabled: true,
                     kind: "directory".to_string(),
+                    base_ref: None,
                     metadata: BTreeMap::new(),
                 },
             ];
