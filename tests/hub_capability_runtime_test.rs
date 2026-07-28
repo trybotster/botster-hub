@@ -32,7 +32,11 @@ fn explicit_runtime(name: &str) -> HubRuntime {
             fingerprint: None,
         },
         data_directory: DataDirectoryOption::Explicit(
-            format!("target/botster-hub-test-data/capability-runtime/{name}").into(),
+            format!(
+                "target/botster-hub-test-data/capability-runtime/{}-{name}",
+                std::process::id()
+            )
+            .into(),
         ),
         session_defaults: SessionDefaults {
             shell: "/bin/sh".to_string(),

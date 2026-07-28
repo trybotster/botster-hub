@@ -29,6 +29,9 @@ pub struct Worktree {
     /// Reconciled path status. Current values are `present`, `missing`, and `stale`.
     #[serde(default = "default_present_status")]
     pub status: String,
+    /// Row ownership. Existing records default to externally registered directories.
+    #[serde(default = "default_registered_management")]
+    pub management: String,
     /// Optional git metadata detected when available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git: Option<WorktreeGitMetadata>,
@@ -102,6 +105,10 @@ fn default_present_status() -> String {
     "present".to_string()
 }
 
+fn default_registered_management() -> String {
+    "registered".to_string()
+}
+
 /// Return all worktrees in deterministic id order with status reconciled.
 #[must_use]
 pub fn list_worktrees(worktrees: &[Worktree], targets: &[SpawnTarget]) -> Vec<Worktree> {
@@ -164,6 +171,7 @@ pub fn create_worktree(
         label,
         path: path.clone(),
         status: "present".to_string(),
+        management: default_registered_management(),
         git: detect_git_metadata(&path),
         metadata: request.metadata,
     }
@@ -240,6 +248,9 @@ fn reconcile_status(worktree: &Worktree, targets: &[SpawnTarget]) -> &'static st
     else {
         return "stale";
     };
+    if worktree.management == "hub_managed_git" {
+        return crate::managed_git_worktrees::reconcile_managed_worktree(worktree, target);
+    }
     let Ok(root) = target.root.canonicalize() else {
         return "stale";
     };
@@ -309,6 +320,7 @@ mod tests {
             root,
             enabled: true,
             kind: "directory".to_string(),
+            base_ref: None,
             metadata: BTreeMap::new(),
         }
     }
@@ -327,6 +339,7 @@ mod tests {
             label: "Worktree".to_string(),
             path: child.clone(),
             status: "present".to_string(),
+            management: "registered".to_string(),
             git: None,
             metadata: BTreeMap::new(),
         };

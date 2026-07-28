@@ -728,6 +728,7 @@ fn mcp_serve_lists_calls_and_reloads_project_pipelines_plugin_tools() {
             root: fs::canonicalize(&target_root).expect("canonical project-pipelines MCP target"),
             enabled: true,
             kind: Some("directory".to_string()),
+            base_ref: None,
             metadata: BTreeMap::new(),
         },
     )
