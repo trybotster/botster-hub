@@ -59,7 +59,7 @@ console.log(
   localWebrtcChunkFixture.scenarios.large_generated,
   modeFlagsFixture.mouse_on.mode_flags.mouse_mode,
   sessionLifecycleFixture.normalized_frames,
-  uiContractFixtures.revision,
+  uiContractFixtures.contract_version,
 );
 ```
 

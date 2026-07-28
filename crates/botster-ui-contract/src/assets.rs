@@ -1,9 +1,220 @@
+use crate::{
+    UiActionKind, UiActionResultState, UiCapabilityFallback, UiColorToken, UiDensity,
+    UiDialogPresentation, UiFieldKind, UiHeightClass, UiIframePermission, UiIframeSandboxToken,
+    UiMetricTrendDirection, UiNodeKind, UiOrientation, UiPointer, UiSelectionMode, UiSpaceToken,
+    UiTableColumnAlign, UiToolbarOverflow, UiVariant, UiWidthClass,
+};
+use serde::Serialize;
 use serde_json::{Value, json};
+
+trait WireEnum: Copy + Serialize + 'static {
+    fn variants() -> &'static [Self];
+    fn assert_exhaustive(self);
+}
+
+macro_rules! wire_enum {
+    ($enum:ty => [$($variant:path),+ $(,)?]) => {
+        impl WireEnum for $enum {
+            fn variants() -> &'static [Self] {
+                &[$($variant),+]
+            }
+
+            fn assert_exhaustive(self) {
+                match self {
+                    $($variant => {}),+
+                }
+            }
+        }
+    };
+}
+
+wire_enum!(UiNodeKind => [
+    UiNodeKind::Stack,
+    UiNodeKind::Inline,
+    UiNodeKind::Form,
+    UiNodeKind::FormSection,
+    UiNodeKind::FormField,
+    UiNodeKind::Panel,
+    UiNodeKind::Metric,
+    UiNodeKind::MetricGrid,
+    UiNodeKind::Toolbar,
+    UiNodeKind::StatusBadge,
+    UiNodeKind::Section,
+    UiNodeKind::ScrollArea,
+    UiNodeKind::Text,
+    UiNodeKind::Icon,
+    UiNodeKind::Badge,
+    UiNodeKind::StatusDot,
+    UiNodeKind::EmptyState,
+    UiNodeKind::List,
+    UiNodeKind::ListItem,
+    UiNodeKind::Tree,
+    UiNodeKind::TreeItem,
+    UiNodeKind::Table,
+    UiNodeKind::Button,
+    UiNodeKind::IconButton,
+    UiNodeKind::Menu,
+    UiNodeKind::MenuItem,
+    UiNodeKind::Dialog,
+    UiNodeKind::TextInput,
+    UiNodeKind::Textarea,
+    UiNodeKind::Checkbox,
+    UiNodeKind::Select,
+    UiNodeKind::SelectOption,
+    UiNodeKind::TerminalView,
+    UiNodeKind::ConnectionCodeView,
+    UiNodeKind::Iframe,
+    UiNodeKind::Custom,
+]);
+wire_enum!(UiWidthClass => [UiWidthClass::Compact, UiWidthClass::Regular, UiWidthClass::Expanded]);
+wire_enum!(UiHeightClass => [UiHeightClass::Short, UiHeightClass::Regular, UiHeightClass::Tall]);
+wire_enum!(UiPointer => [UiPointer::None, UiPointer::Coarse, UiPointer::Fine]);
+wire_enum!(UiOrientation => [UiOrientation::Portrait, UiOrientation::Landscape]);
+wire_enum!(UiDialogPresentation => [
+    UiDialogPresentation::Auto,
+    UiDialogPresentation::Inline,
+    UiDialogPresentation::Overlay,
+    UiDialogPresentation::Sheet,
+    UiDialogPresentation::Fullscreen,
+]);
+wire_enum!(UiCapabilityFallback => [
+    UiCapabilityFallback::TableAsList,
+    UiCapabilityFallback::DialogInline,
+    UiCapabilityFallback::TerminalSelectionDisabled,
+    UiCapabilityFallback::ConnectionCodeText,
+    UiCapabilityFallback::IframeAsLink,
+    UiCapabilityFallback::RichColorMuted,
+    UiCapabilityFallback::ContextMenuAsMenu,
+    UiCapabilityFallback::ClipboardManual,
+    UiCapabilityFallback::HoverPersistentHints,
+]);
+wire_enum!(UiSpaceToken => [
+    UiSpaceToken::None,
+    UiSpaceToken::Xs,
+    UiSpaceToken::Sm,
+    UiSpaceToken::Md,
+    UiSpaceToken::Lg,
+    UiSpaceToken::Xl,
+]);
+wire_enum!(UiColorToken => [
+    UiColorToken::Default,
+    UiColorToken::Muted,
+    UiColorToken::Accent,
+    UiColorToken::Success,
+    UiColorToken::Warning,
+    UiColorToken::Danger,
+]);
+wire_enum!(UiFieldKind => [
+    UiFieldKind::Text,
+    UiFieldKind::Textarea,
+    UiFieldKind::Checkbox,
+    UiFieldKind::Select,
+]);
+wire_enum!(UiIframeSandboxToken => [
+    UiIframeSandboxToken::AllowForms,
+    UiIframeSandboxToken::AllowModals,
+    UiIframeSandboxToken::AllowPopups,
+    UiIframeSandboxToken::AllowSameOrigin,
+    UiIframeSandboxToken::AllowScripts,
+    UiIframeSandboxToken::AllowDownloads,
+]);
+wire_enum!(UiIframePermission => [
+    UiIframePermission::Fullscreen,
+    UiIframePermission::ClipboardWrite,
+    UiIframePermission::Camera,
+    UiIframePermission::Microphone,
+    UiIframePermission::Geolocation,
+    UiIframePermission::Payment,
+]);
+wire_enum!(UiDensity => [UiDensity::Compact, UiDensity::Regular, UiDensity::Spacious]);
+wire_enum!(UiVariant => [UiVariant::Plain, UiVariant::Subtle, UiVariant::Emphasized]);
+wire_enum!(UiToolbarOverflow => [
+    UiToolbarOverflow::Auto,
+    UiToolbarOverflow::Never,
+    UiToolbarOverflow::Always,
+]);
+wire_enum!(UiMetricTrendDirection => [
+    UiMetricTrendDirection::Up,
+    UiMetricTrendDirection::Down,
+    UiMetricTrendDirection::Flat,
+]);
+wire_enum!(UiSelectionMode => [
+    UiSelectionMode::None,
+    UiSelectionMode::Single,
+    UiSelectionMode::Multiple,
+]);
+wire_enum!(UiTableColumnAlign => [
+    UiTableColumnAlign::Start,
+    UiTableColumnAlign::Center,
+    UiTableColumnAlign::End,
+]);
+wire_enum!(UiActionKind => [
+    UiActionKind::Submit,
+    UiActionKind::Reset,
+    UiActionKind::Validate,
+    UiActionKind::Cancel,
+]);
+wire_enum!(UiActionResultState => [
+    UiActionResultState::Accepted,
+    UiActionResultState::Rejected,
+    UiActionResultState::Deferred,
+    UiActionResultState::Error,
+]);
+
+fn wire_names<T: WireEnum>() -> Vec<String> {
+    T::variants()
+        .iter()
+        .copied()
+        .map(|variant| {
+            variant.assert_exhaustive();
+            serde_json::to_value(variant)
+                .expect("UI wire enum must serialize")
+                .as_str()
+                .expect("UI wire enum must serialize as a string")
+                .to_string()
+        })
+        .collect()
+}
+
+fn typescript_union<T: WireEnum>() -> String {
+    wire_names::<T>()
+        .into_iter()
+        .map(|variant| format!("\"{variant}\""))
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
 
 /// Generate serde-shaped TypeScript declarations for the public UI contract.
 #[must_use]
 pub fn typescript_declarations() -> String {
-    TYPESCRIPT.trim_start().to_string()
+    let mut declarations = TYPESCRIPT.trim_start().to_string();
+    macro_rules! replace_union {
+        ($name:literal, $enum:ty) => {
+            declarations =
+                declarations.replace(concat!("__", $name, "__"), &typescript_union::<$enum>());
+        };
+    }
+    replace_union!("UiNodeKind", UiNodeKind);
+    replace_union!("UiWidthClass", UiWidthClass);
+    replace_union!("UiHeightClass", UiHeightClass);
+    replace_union!("UiPointer", UiPointer);
+    replace_union!("UiOrientation", UiOrientation);
+    replace_union!("UiDialogPresentation", UiDialogPresentation);
+    replace_union!("UiCapabilityFallback", UiCapabilityFallback);
+    replace_union!("UiSpaceToken", UiSpaceToken);
+    replace_union!("UiColorToken", UiColorToken);
+    replace_union!("UiFieldKind", UiFieldKind);
+    replace_union!("UiIframeSandboxToken", UiIframeSandboxToken);
+    replace_union!("UiIframePermission", UiIframePermission);
+    replace_union!("UiDensity", UiDensity);
+    replace_union!("UiVariant", UiVariant);
+    replace_union!("UiToolbarOverflow", UiToolbarOverflow);
+    replace_union!("UiMetricTrendDirection", UiMetricTrendDirection);
+    replace_union!("UiSelectionMode", UiSelectionMode);
+    replace_union!("UiTableColumnAlign", UiTableColumnAlign);
+    replace_union!("UiActionKind", UiActionKind);
+    replace_union!("UiActionResultState", UiActionResultState);
+    declarations
 }
 
 /// Generate the machine-readable schema shipped by `@trybotster/ui-contract`.
@@ -26,14 +237,31 @@ pub fn json_schema() -> Value {
             "UiActionRequestId": { "type": "string" },
             "UiPresentationKey": { "type": "string", "minLength": 1 },
             "UiNodeKind": {
-                "enum": NODE_KINDS
+                "enum": wire_names::<UiNodeKind>()
             },
             "UiActionKind": {
-                "enum": ["submit", "reset", "validate", "cancel"]
+                "enum": wire_names::<UiActionKind>()
             },
             "UiActionResultState": {
-                "enum": ["accepted", "rejected", "deferred", "error"]
+                "enum": wire_names::<UiActionResultState>()
             },
+            "UiWidthClass": { "enum": wire_names::<UiWidthClass>() },
+            "UiHeightClass": { "enum": wire_names::<UiHeightClass>() },
+            "UiPointer": { "enum": wire_names::<UiPointer>() },
+            "UiOrientation": { "enum": wire_names::<UiOrientation>() },
+            "UiDialogPresentation": { "enum": wire_names::<UiDialogPresentation>() },
+            "UiCapabilityFallback": { "enum": wire_names::<UiCapabilityFallback>() },
+            "UiSpaceToken": { "enum": wire_names::<UiSpaceToken>() },
+            "UiColorToken": { "enum": wire_names::<UiColorToken>() },
+            "UiFieldKind": { "enum": wire_names::<UiFieldKind>() },
+            "UiIframeSandboxToken": { "enum": wire_names::<UiIframeSandboxToken>() },
+            "UiIframePermission": { "enum": wire_names::<UiIframePermission>() },
+            "UiDensity": { "enum": wire_names::<UiDensity>() },
+            "UiVariant": { "enum": wire_names::<UiVariant>() },
+            "UiToolbarOverflow": { "enum": wire_names::<UiToolbarOverflow>() },
+            "UiMetricTrendDirection": { "enum": wire_names::<UiMetricTrendDirection>() },
+            "UiSelectionMode": { "enum": wire_names::<UiSelectionMode>() },
+            "UiTableColumnAlign": { "enum": wire_names::<UiTableColumnAlign>() },
             "UiPresentationOperation": {
                 "oneOf": [
                     {
@@ -144,7 +372,7 @@ pub fn json_schema() -> Value {
                                     "properties": {
                                         "title": { "type": "string" },
                                         "presentation": {
-                                            "enum": ["auto", "inline", "overlay", "sheet", "fullscreen"]
+                                            "$ref": "#/$defs/UiDialogPresentation"
                                         }
                                     },
                                     "not": { "required": ["open"] }
@@ -371,45 +599,6 @@ pub fn conformance_fixtures_json() -> Value {
     })
 }
 
-const NODE_KINDS: &[&str] = &[
-    "stack",
-    "inline",
-    "form",
-    "form_section",
-    "form_field",
-    "panel",
-    "metric",
-    "metric_grid",
-    "toolbar",
-    "status_badge",
-    "section",
-    "scroll_area",
-    "text",
-    "icon",
-    "badge",
-    "status_dot",
-    "empty_state",
-    "list",
-    "list_item",
-    "tree",
-    "tree_item",
-    "table",
-    "button",
-    "icon_button",
-    "menu",
-    "menu_item",
-    "dialog",
-    "text_input",
-    "textarea",
-    "checkbox",
-    "select",
-    "select_option",
-    "terminal_view",
-    "connection_code_view",
-    "iframe",
-    "custom",
-];
-
 const TYPESCRIPT: &str = r#"
 // Generated from botster-ui-contract Rust serde DTOs.
 // Regenerate/check with: cargo run -p botster-ui-contract --example generate_assets
@@ -421,18 +610,18 @@ export type UiActionId = string;
 export type UiSurfaceId = string;
 export type UiActionRequestId = string;
 export type UiPresentationKey = string;
-export type UiNodeKind = "stack" | "inline" | "form" | "form_section" | "form_field" | "panel" | "metric" | "metric_grid" | "toolbar" | "status_badge" | "section" | "scroll_area" | "text" | "icon" | "badge" | "status_dot" | "empty_state" | "list" | "list_item" | "tree" | "tree_item" | "table" | "button" | "icon_button" | "menu" | "menu_item" | "dialog" | "text_input" | "textarea" | "checkbox" | "select" | "select_option" | "terminal_view" | "connection_code_view" | "iframe" | "custom";
-export type UiWidthClass = "compact" | "regular" | "expanded";
-export type UiHeightClass = "short" | "regular" | "tall";
-export type UiPointer = "none" | "coarse" | "fine";
-export type UiOrientation = "portrait" | "landscape";
+export type UiNodeKind = __UiNodeKind__;
+export type UiWidthClass = __UiWidthClass__;
+export type UiHeightClass = __UiHeightClass__;
+export type UiPointer = __UiPointer__;
+export type UiOrientation = __UiOrientation__;
 export interface UiViewport { widthClass: UiWidthClass; heightClass: UiHeightClass; pointer: UiPointer; orientation?: UiOrientation; keyboardOccluded?: boolean; }
 export interface UiKeyboardCapability { textEntry?: boolean; shortcuts?: boolean; focusTraversal?: boolean; }
-export type UiDialogPresentation = "auto" | "inline" | "overlay" | "sheet" | "fullscreen";
-export type UiCapabilityFallback = "table_as_list" | "dialog_inline" | "terminal_selection_disabled" | "connection_code_text" | "iframe_as_link" | "rich_color_muted" | "context_menu_as_menu" | "clipboard_manual" | "hover_persistent_hints";
+export type UiDialogPresentation = __UiDialogPresentation__;
+export type UiCapabilityFallback = __UiCapabilityFallback__;
 export interface UiCapabilitySet { widthClasses?: UiWidthClass[]; heightClasses?: UiHeightClass[]; pointer: UiPointer; keyboard: UiKeyboardCapability; hover?: boolean; clipboard?: boolean; contextMenu?: boolean; dialogPresentations?: UiDialogPresentation[]; table?: boolean; terminalSelection?: boolean; qrCode?: boolean; iframe?: boolean; richColor?: boolean; fallbacks?: UiCapabilityFallback[]; }
-export type UiSpaceToken = "none" | "xs" | "sm" | "md" | "lg" | "xl";
-export type UiColorToken = "default" | "muted" | "accent" | "success" | "warning" | "danger";
+export type UiSpaceToken = __UiSpaceToken__;
+export type UiColorToken = __UiColorToken__;
 export interface UiBind { $bind: string; }
 export type UiPresentationOperation = { kind: "set"; key: UiPresentationKey; value: JsonValue } | { kind: "clear"; key: UiPresentationKey } | { kind: "toggle"; key: UiPresentationKey };
 export type UiPresentationPredicate = { kind: "present"; key: UiPresentationKey } | { kind: "truthy"; key: UiPresentationKey } | { kind: "equals"; key: UiPresentationKey; value: JsonValue };
@@ -453,30 +642,30 @@ export type UiNode =
   | (UiNodeBase & { type: "dialog"; props: UiDialogProps })
   | (UiNodeBase & { type: "button"; props: UiButtonProps })
   | (UiNodeBase & { type: Exclude<UiNodeKind, "form" | "dialog" | "button">; props?: JsonObject });
-export type UiFieldKind = "text" | "textarea" | "checkbox" | "select";
+export type UiFieldKind = __UiFieldKind__;
 export interface UiFieldOption { value: JsonValue; label: string; disabled?: boolean; }
 export interface UiFieldValidationHints { minLength?: number; maxLength?: number; pattern?: string; min?: number; max?: number; oneOf?: JsonValue[]; }
 export interface UiFieldSchema { kind: UiFieldKind; name: string; label: string; description?: string; placeholder?: string; required?: boolean; default?: JsonValue; validation?: UiFieldValidationHints; options?: UiFieldOption[]; }
-export type UiIframeSandboxToken = "allow_downloads" | "allow_forms" | "allow_modals" | "allow_orientation_lock" | "allow_pointer_lock" | "allow_popups" | "allow_popups_to_escape_sandbox" | "allow_presentation" | "allow_same_origin" | "allow_scripts" | "allow_top_navigation_by_user_activation";
-export type UiIframePermission = "fullscreen" | "clipboard_write" | "camera" | "microphone" | "geolocation" | "payment";
+export type UiIframeSandboxToken = __UiIframeSandboxToken__;
+export type UiIframePermission = __UiIframePermission__;
 export interface UiIframeBridge { actions?: UiActionId[]; messages?: string[]; }
 export type UiAction = { id: UiActionId; payload?: JsonValue; disabled?: boolean };
-export type UiDensity = "compact" | "regular" | "spacious";
-export type UiVariant = "plain" | "subtle" | "emphasized";
-export type UiToolbarOverflow = "auto" | "never" | "always";
-export type UiMetricTrendDirection = "up" | "down" | "flat";
+export type UiDensity = __UiDensity__;
+export type UiVariant = __UiVariant__;
+export type UiToolbarOverflow = __UiToolbarOverflow__;
+export type UiMetricTrendDirection = __UiMetricTrendDirection__;
 export interface UiMetricTrend { direction: UiMetricTrendDirection; value?: JsonValue; label?: string; }
-export type UiSelectionMode = "none" | "single" | "multiple";
+export type UiSelectionMode = __UiSelectionMode__;
 export interface UiSelection { mode: UiSelectionMode; selected?: string[]; }
-export type UiTableColumnAlign = "start" | "center" | "end";
+export type UiTableColumnAlign = __UiTableColumnAlign__;
 export interface UiTableColumnDescriptor { id: string; label?: string; align?: UiTableColumnAlign; }
 export type UiTableColumn = string | UiTableColumnDescriptor;
 export type UiTableCell = UiNode | JsonValue;
 export interface UiTableRow { id: string; cells?: Record<string, UiTableCell>; action?: UiAction; }
-export type UiActionKind = "submit" | "reset" | "validate" | "cancel";
+export type UiActionKind = __UiActionKind__;
 export type UiFormValues = JsonObject;
 export interface UiActionRequest { request_id: UiActionRequestId; surface_id: UiSurfaceId; action_id: UiActionId; node_id?: UiNodeId; kind: UiActionKind; values?: UiFormValues; payload?: JsonValue; }
-export type UiActionResultState = "accepted" | "rejected" | "deferred" | "error";
+export type UiActionResultState = __UiActionResultState__;
 export type UiFieldErrors = Record<string, string[]>;
 export interface UiActionResult { request_id: UiActionRequestId; surface_id: UiSurfaceId; action_id: UiActionId; node_id?: UiNodeId; state: UiActionResultState; field_errors?: UiFieldErrors; form_errors?: string[]; warnings?: string[]; normalized_values?: UiFormValues; presentation?: UiPresentationOperation[]; replacement?: UiNode; payload?: JsonValue; error?: string; }
 "#;

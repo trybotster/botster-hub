@@ -1,8 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use botster_ui_contract::{
-    UiActionKind, UiActionRequest, UiActionResult, UiActionResultState, UiBindIf, UiNode,
-    conformance_fixtures_json, json_schema, typescript_declarations,
+    UiActionKind, UiActionRequest, UiActionResult, UiActionResultState, UiBindIf,
+    UiCapabilityFallback, UiColorToken, UiDensity, UiDialogPresentation, UiFieldKind,
+    UiHeightClass, UiIframePermission, UiIframeSandboxToken, UiMetricTrendDirection, UiNode,
+    UiNodeKind, UiOrientation, UiPointer, UiSelectionMode, UiSpaceToken, UiTableColumnAlign,
+    UiToolbarOverflow, UiVariant, UiWidthClass, conformance_fixtures_json, json_schema,
+    typescript_declarations,
 };
 use serde::Serialize;
 
@@ -135,28 +139,217 @@ fn typescript_and_schema_encode_wire_names_and_optionality() {
         &result_fields,
     );
 
-    assert_eq!(
-        string_union(&typescript, "UiActionKind"),
-        serialized_variants([
+    let schema = json_schema();
+    macro_rules! assert_wire_enum {
+        ($name:literal, [$($variant:path),+ $(,)?]) => {{
+            let expected = serialized_variants([$($variant),+]);
+            assert_eq!(string_union(&typescript, $name), expected);
+            assert_eq!(schema_enum(&schema, $name), expected);
+        }};
+    }
+    assert_wire_enum!(
+        "UiNodeKind",
+        [
+            UiNodeKind::Stack,
+            UiNodeKind::Inline,
+            UiNodeKind::Form,
+            UiNodeKind::FormSection,
+            UiNodeKind::FormField,
+            UiNodeKind::Panel,
+            UiNodeKind::Metric,
+            UiNodeKind::MetricGrid,
+            UiNodeKind::Toolbar,
+            UiNodeKind::StatusBadge,
+            UiNodeKind::Section,
+            UiNodeKind::ScrollArea,
+            UiNodeKind::Text,
+            UiNodeKind::Icon,
+            UiNodeKind::Badge,
+            UiNodeKind::StatusDot,
+            UiNodeKind::EmptyState,
+            UiNodeKind::List,
+            UiNodeKind::ListItem,
+            UiNodeKind::Tree,
+            UiNodeKind::TreeItem,
+            UiNodeKind::Table,
+            UiNodeKind::Button,
+            UiNodeKind::IconButton,
+            UiNodeKind::Menu,
+            UiNodeKind::MenuItem,
+            UiNodeKind::Dialog,
+            UiNodeKind::TextInput,
+            UiNodeKind::Textarea,
+            UiNodeKind::Checkbox,
+            UiNodeKind::Select,
+            UiNodeKind::SelectOption,
+            UiNodeKind::TerminalView,
+            UiNodeKind::ConnectionCodeView,
+            UiNodeKind::Iframe,
+            UiNodeKind::Custom,
+        ]
+    );
+    assert_wire_enum!(
+        "UiWidthClass",
+        [
+            UiWidthClass::Compact,
+            UiWidthClass::Regular,
+            UiWidthClass::Expanded,
+        ]
+    );
+    assert_wire_enum!(
+        "UiHeightClass",
+        [
+            UiHeightClass::Short,
+            UiHeightClass::Regular,
+            UiHeightClass::Tall,
+        ]
+    );
+    assert_wire_enum!(
+        "UiPointer",
+        [UiPointer::None, UiPointer::Coarse, UiPointer::Fine]
+    );
+    assert_wire_enum!(
+        "UiOrientation",
+        [UiOrientation::Portrait, UiOrientation::Landscape]
+    );
+    assert_wire_enum!(
+        "UiDialogPresentation",
+        [
+            UiDialogPresentation::Auto,
+            UiDialogPresentation::Inline,
+            UiDialogPresentation::Overlay,
+            UiDialogPresentation::Sheet,
+            UiDialogPresentation::Fullscreen,
+        ]
+    );
+    assert_wire_enum!(
+        "UiCapabilityFallback",
+        [
+            UiCapabilityFallback::TableAsList,
+            UiCapabilityFallback::DialogInline,
+            UiCapabilityFallback::TerminalSelectionDisabled,
+            UiCapabilityFallback::ConnectionCodeText,
+            UiCapabilityFallback::IframeAsLink,
+            UiCapabilityFallback::RichColorMuted,
+            UiCapabilityFallback::ContextMenuAsMenu,
+            UiCapabilityFallback::ClipboardManual,
+            UiCapabilityFallback::HoverPersistentHints,
+        ]
+    );
+    assert_wire_enum!(
+        "UiSpaceToken",
+        [
+            UiSpaceToken::None,
+            UiSpaceToken::Xs,
+            UiSpaceToken::Sm,
+            UiSpaceToken::Md,
+            UiSpaceToken::Lg,
+            UiSpaceToken::Xl,
+        ]
+    );
+    assert_wire_enum!(
+        "UiColorToken",
+        [
+            UiColorToken::Default,
+            UiColorToken::Muted,
+            UiColorToken::Accent,
+            UiColorToken::Success,
+            UiColorToken::Warning,
+            UiColorToken::Danger,
+        ]
+    );
+    assert_wire_enum!(
+        "UiFieldKind",
+        [
+            UiFieldKind::Text,
+            UiFieldKind::Textarea,
+            UiFieldKind::Checkbox,
+            UiFieldKind::Select,
+        ]
+    );
+    assert_wire_enum!(
+        "UiIframeSandboxToken",
+        [
+            UiIframeSandboxToken::AllowForms,
+            UiIframeSandboxToken::AllowModals,
+            UiIframeSandboxToken::AllowPopups,
+            UiIframeSandboxToken::AllowSameOrigin,
+            UiIframeSandboxToken::AllowScripts,
+            UiIframeSandboxToken::AllowDownloads,
+        ]
+    );
+    assert_wire_enum!(
+        "UiIframePermission",
+        [
+            UiIframePermission::Fullscreen,
+            UiIframePermission::ClipboardWrite,
+            UiIframePermission::Camera,
+            UiIframePermission::Microphone,
+            UiIframePermission::Geolocation,
+            UiIframePermission::Payment,
+        ]
+    );
+    assert_wire_enum!(
+        "UiDensity",
+        [UiDensity::Compact, UiDensity::Regular, UiDensity::Spacious]
+    );
+    assert_wire_enum!(
+        "UiVariant",
+        [UiVariant::Plain, UiVariant::Subtle, UiVariant::Emphasized]
+    );
+    assert_wire_enum!(
+        "UiToolbarOverflow",
+        [
+            UiToolbarOverflow::Auto,
+            UiToolbarOverflow::Never,
+            UiToolbarOverflow::Always,
+        ]
+    );
+    assert_wire_enum!(
+        "UiMetricTrendDirection",
+        [
+            UiMetricTrendDirection::Up,
+            UiMetricTrendDirection::Down,
+            UiMetricTrendDirection::Flat,
+        ]
+    );
+    assert_wire_enum!(
+        "UiSelectionMode",
+        [
+            UiSelectionMode::None,
+            UiSelectionMode::Single,
+            UiSelectionMode::Multiple,
+        ]
+    );
+    assert_wire_enum!(
+        "UiTableColumnAlign",
+        [
+            UiTableColumnAlign::Start,
+            UiTableColumnAlign::Center,
+            UiTableColumnAlign::End,
+        ]
+    );
+    assert_wire_enum!(
+        "UiActionKind",
+        [
             UiActionKind::Submit,
             UiActionKind::Reset,
             UiActionKind::Validate,
             UiActionKind::Cancel,
-        ])
+        ]
     );
-    assert_eq!(
-        string_union(&typescript, "UiActionResultState"),
-        serialized_variants([
+    assert_wire_enum!(
+        "UiActionResultState",
+        [
             UiActionResultState::Accepted,
             UiActionResultState::Rejected,
             UiActionResultState::Deferred,
             UiActionResultState::Error,
-        ])
+        ]
     );
     assert!(!typescript.contains("UiTreeUpdateRef"));
     assert!(!typescript.contains("tree_update"));
 
-    let schema = json_schema();
     assert_eq!(
         schema["$defs"]["UiActionRequest"]["additionalProperties"],
         false
@@ -233,6 +426,20 @@ fn string_union(typescript: &str, name: &str) -> BTreeSet<String> {
         .trim_end_matches(';')
         .split('|')
         .map(|variant| variant.trim().trim_matches('"').to_string())
+        .collect()
+}
+
+fn schema_enum(schema: &serde_json::Value, name: &str) -> BTreeSet<String> {
+    schema["$defs"][name]["enum"]
+        .as_array()
+        .unwrap_or_else(|| panic!("missing schema enum {name}"))
+        .iter()
+        .map(|variant| {
+            variant
+                .as_str()
+                .unwrap_or_else(|| panic!("schema enum {name} contains a non-string"))
+                .to_string()
+        })
         .collect()
 }
 

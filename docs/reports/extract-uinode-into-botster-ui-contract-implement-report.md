@@ -62,6 +62,32 @@ contract remains separate from Hub runtime and the daemon client crate.
 - Audited `examples/synthetic-plugin/**`; it declares only MCP and timer
   capabilities and authors no UI surface, so no migration was required.
 
+### Implement review remediation
+
+- Replaced hand-maintained TypeScript/schema string unions with generated
+  values from an exhaustive Rust enum inventory. Every exported string enum is
+  checked across Rust serialization, TypeScript, and JSON Schema; adding a Rust
+  variant without updating the inventory is a compile error. This also removed
+  the five iframe sandbox tokens that Rust intentionally rejects.
+- Extended the canonical plugin matrix with a dialog bound to scoped
+  `contract-dialog` presence and a selected-workspace equality binding. The
+  real daemon proof inspects the validated typed snapshot, verifies the
+  accepted clear targets that rendered dialog key, and verifies the replacement
+  node.
+- Added real worker branches and Hub assertions for mismatched result identity
+  and an accepted malformed replacement. Both are rejected as
+  `invalid_action_result` at `plugin_surface_action`.
+- Added exact contract error assertions for non-accepted effects, blank
+  presentation operation keys, invalid replacement trees, and blank
+  presentation predicate keys. Removed obsolete same-type re-export
+  tautologies and kept tests that exercise actual serialization/validation.
+- Made the checked-in hub-test-support npm test assert its UI dependency
+  metadata, resolve the local package through its production package name, load
+  the shared fixtures, and verify a known dialog fixture.
+- Corrected the published README fixture key, documented result identity
+  correlation, and changed the example TUI text to distinguish emitted
+  contracts from separately routed renderer adoption.
+
 ## Files changed
 
 - Workspace and authority:
@@ -111,8 +137,8 @@ contract remains separate from Hub runtime and the daemon client crate.
 
 ## Verification and downstream proof
 
-- `./test.sh -p botster-ui-contract`: 73 contract tests and 3 generated-asset
-  tests passed.
+- Final `cargo test -p botster-ui-contract`: 71 substantive contract tests and
+  3 generated-asset tests passed after removing tautologies.
 - `./test.sh -p botster-hub-client`: 41 unit tests and 4 doc tests passed.
 - `./test.sh -p botster-hub-test-support`: 32 unit tests and 3 doc tests passed.
 - `./test.sh --test hub_client_api_test`: 23 passed.
@@ -125,7 +151,8 @@ contract remains separate from Hub runtime and the daemon client crate.
 - `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets
   --all-features -- -D warnings`, and `git diff --check`: passed.
 - UI generation check, both npm package tests, and the hub-test-support asset
-  sync check passed.
+  sync check passed. The hub-test-support test now imports and asserts the
+  standalone UI fixtures through `@trybotster/ui-contract`.
 - Final `npm pack --dry-run --json` and `npm pack --json` passed for both
   packages. The UI tarball contains 7 declared files; hub-test-support contains
   15 and declares the exact normal UI dependency.
@@ -137,6 +164,12 @@ contract remains separate from Hub runtime and the daemon client crate.
   `ui_action_result_applies_accepted_presentation_and_inline_replacement` fail
   on the rejected-result assertion; restoring the guard made the same focused
   test pass.
+- Enum ablation control: temporarily adding `UiNodeKind::AblationProbe` without
+  inventory coverage made `cargo check -p botster-ui-contract` fail at the
+  generated asset inventory's exhaustive match; restoring the enum made the
+  check pass.
+- The focused real-daemon plugin matrix test passed with snapshot-level dialog
+  presence/equality assertions and worker-path identity/replacement rejection.
 - One pre-existing sub-second timing assertion in
   `shutdown_rejects_unrelated_failure_without_waiting_for_live_daemon` failed
   once at 1.15 seconds after passing earlier. The complete test-support crate

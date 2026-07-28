@@ -324,6 +324,7 @@ static PLUGIN_CONTRACT_MATRIX_FIXTURE_ASSET_FILES: &[TestAssetFile] = &[
 const APPLICATION_PRIMITIVE_NODE_KINDS: &[&str] = &[
     "button",
     "button",
+    "dialog",
     "empty_state",
     "empty_state",
     "form",
@@ -333,6 +334,8 @@ const APPLICATION_PRIMITIVE_NODE_KINDS: &[&str] = &[
     "section",
     "status_badge",
     "table",
+    "text",
+    "text",
     "text_input",
     "toolbar",
 ];
@@ -2094,6 +2097,9 @@ pub struct PluginContractMatrixConformanceReport {
     pub app_surface_snapshot_id: String,
     pub app_surface_snapshot_node_id: String,
     pub app_surface_snapshot_node_kinds: Vec<String>,
+    pub dialog_presence_key: String,
+    pub selected_workspace_equality_key: String,
+    pub selected_workspace_equality_value: String,
     pub empty_surface_node_id: String,
     pub empty_surface_child_id: String,
     pub blocked_render_error_code: String,
@@ -2110,6 +2116,8 @@ pub struct PluginContractMatrixConformanceReport {
     pub action_success_state: String,
     pub action_success_request_id: String,
     pub action_success_message: String,
+    pub action_success_presentation_clear_key: String,
+    pub action_success_replacement_node_id: String,
     pub action_error_state: String,
     pub action_error_request_id: String,
     pub action_error_diagnostic_kind: String,
@@ -2120,6 +2128,10 @@ pub struct PluginContractMatrixConformanceReport {
     pub action_field_error_diagnostic_kind: String,
     pub action_field_error_diagnostic_operation: String,
     pub action_field_error_message: String,
+    pub identity_mismatch_error_code: String,
+    pub identity_mismatch_error_operation: String,
+    pub invalid_replacement_error_code: String,
+    pub invalid_replacement_error_operation: String,
     pub client_render_check: PluginContractMatrixClientRenderCheck,
     pub failure_classes: PluginConformanceFailureClasses,
 }
@@ -2992,6 +3004,70 @@ pub fn run_plugin_contract_matrix_conformance(
         app_surface_node_id.as_str(),
         &app_surface_snapshot_id,
     )?;
+    let dialog_binding =
+        find_presentation_binding_by_node_id(&app_surface_snapshot_body, "contract-dialog").ok_or(
+            ConformanceError::MissingJsonField {
+                operation: "contract_matrix_render_app",
+                field: "ui_tree_snapshot.body contract-dialog presentation binding",
+            },
+        )?;
+    let dialog_predicate =
+        dialog_binding
+            .get("predicate")
+            .ok_or(ConformanceError::MissingJsonField {
+                operation: "contract_matrix_render_app",
+                field: "contract-dialog predicate",
+            })?;
+    expect_value(
+        "contract_matrix_render_app",
+        "contract-dialog predicate.kind",
+        "present",
+        &value_string(dialog_predicate, "kind", "contract_matrix_render_app")?,
+    )?;
+    let dialog_presence_key = value_string(dialog_predicate, "key", "contract_matrix_render_app")?;
+    expect_value(
+        "contract_matrix_render_app",
+        "contract-dialog predicate.key",
+        "contract-dialog",
+        &dialog_presence_key,
+    )?;
+    let equality_binding = find_presentation_binding_by_node_id(
+        &app_surface_snapshot_body,
+        "contract-selected-workspace",
+    )
+    .ok_or(ConformanceError::MissingJsonField {
+        operation: "contract_matrix_render_app",
+        field: "ui_tree_snapshot.body selected-workspace presentation binding",
+    })?;
+    let equality_predicate =
+        equality_binding
+            .get("predicate")
+            .ok_or(ConformanceError::MissingJsonField {
+                operation: "contract_matrix_render_app",
+                field: "selected-workspace predicate",
+            })?;
+    expect_value(
+        "contract_matrix_render_app",
+        "selected-workspace predicate.kind",
+        "equals",
+        &value_string(equality_predicate, "kind", "contract_matrix_render_app")?,
+    )?;
+    let selected_workspace_equality_key =
+        value_string(equality_predicate, "key", "contract_matrix_render_app")?;
+    let selected_workspace_equality_value =
+        value_string(equality_predicate, "value", "contract_matrix_render_app")?;
+    expect_value(
+        "contract_matrix_render_app",
+        "selected-workspace predicate.key",
+        "selected-workspace",
+        &selected_workspace_equality_key,
+    )?;
+    expect_value(
+        "contract_matrix_render_app",
+        "selected-workspace predicate.value",
+        "workspace-alpha",
+        &selected_workspace_equality_value,
+    )?;
     let submit_node = find_ui_node_by_id(&app_surface_body, "contract-app-submit").ok_or(
         ConformanceError::MissingJsonField {
             operation: "contract_matrix_render_app",
@@ -3230,6 +3306,32 @@ pub fn run_plugin_contract_matrix_conformance(
             operation: "contract_matrix_action_success",
             field: "normalized_values.message",
         })?;
+    let action_success_presentation_clear_key = action_result_value
+        .get("presentation")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|operations| operations.first())
+        .and_then(|operation| operation.get("key"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .ok_or(ConformanceError::MissingJsonField {
+            operation: "contract_matrix_action_success",
+            field: "presentation[0].key",
+        })?;
+    expect_value(
+        "contract_matrix_action_success",
+        "presentation[0].key",
+        &dialog_presence_key,
+        &action_success_presentation_clear_key,
+    )?;
+    let action_success_replacement_node_id = action_result_value
+        .get("replacement")
+        .and_then(|replacement| replacement.get("id"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .ok_or(ConformanceError::MissingJsonField {
+            operation: "contract_matrix_action_success",
+            field: "replacement.id",
+        })?;
     expect_value(
         "contract_matrix_action_success",
         "state",
@@ -3355,6 +3457,92 @@ pub fn run_plugin_contract_matrix_conformance(
         &action_field_error_state,
     )?;
 
+    let identity_mismatch = request(
+        hub.endpoint(),
+        DaemonRequest::PluginSurfaceAction {
+            package_name: PLUGIN_CONTRACT_MATRIX_PACKAGE.to_string(),
+            request: ui_action_request(
+                "contract-action-identity-mismatch",
+                PLUGIN_CONTRACT_APP_SURFACE,
+                &submit_action_id,
+                "contract-app-action",
+                None,
+                Some(serde_json::json!({ "identity_mismatch": true })),
+            )?,
+        },
+        "contract_matrix_action_identity_mismatch",
+    )?;
+    expect_kind(
+        &identity_mismatch,
+        DaemonResponseKind::OperatorError,
+        "contract_matrix_action_identity_mismatch",
+    )?;
+    let identity_mismatch_error =
+        identity_mismatch
+            .error
+            .as_ref()
+            .ok_or(ConformanceError::MissingBody {
+                operation: "contract_matrix_action_identity_mismatch",
+                field: "error",
+            })?;
+    let identity_mismatch_error_code = identity_mismatch_error.code.clone();
+    let identity_mismatch_error_operation = identity_mismatch_error.operation.clone();
+    expect_value(
+        "contract_matrix_action_identity_mismatch",
+        "error.code",
+        "invalid_action_result",
+        &identity_mismatch_error_code,
+    )?;
+    expect_value(
+        "contract_matrix_action_identity_mismatch",
+        "error.operation",
+        "plugin_surface_action",
+        &identity_mismatch_error_operation,
+    )?;
+
+    let invalid_replacement = request(
+        hub.endpoint(),
+        DaemonRequest::PluginSurfaceAction {
+            package_name: PLUGIN_CONTRACT_MATRIX_PACKAGE.to_string(),
+            request: ui_action_request(
+                "contract-action-invalid-replacement",
+                PLUGIN_CONTRACT_APP_SURFACE,
+                &submit_action_id,
+                "contract-app-action",
+                None,
+                Some(serde_json::json!({ "invalid_replacement": true })),
+            )?,
+        },
+        "contract_matrix_action_invalid_replacement",
+    )?;
+    expect_kind(
+        &invalid_replacement,
+        DaemonResponseKind::OperatorError,
+        "contract_matrix_action_invalid_replacement",
+    )?;
+    let invalid_replacement_error =
+        invalid_replacement
+            .error
+            .as_ref()
+            .ok_or(ConformanceError::MissingBody {
+                operation: "contract_matrix_action_invalid_replacement",
+                field: "error",
+            })?;
+    let invalid_replacement_error_code = invalid_replacement_error.code.clone();
+    let invalid_replacement_error_operation = invalid_replacement_error.operation.clone();
+    expect_value(
+        "contract_matrix_action_invalid_replacement",
+        "error.code",
+        "invalid_action_result",
+        &invalid_replacement_error_code,
+    )?;
+    expect_value(
+        "contract_matrix_action_invalid_replacement",
+        "error.operation",
+        "plugin_surface_action",
+        &invalid_replacement_error_operation,
+    )?;
+
     Ok(PluginContractMatrixConformanceReport {
         package_name: PLUGIN_CONTRACT_MATRIX_PACKAGE.to_string(),
         installed_state: installed_package.state.clone(),
@@ -3389,6 +3577,9 @@ pub fn run_plugin_contract_matrix_conformance(
         app_surface_snapshot_id: app_surface_snapshot.surface_id.clone(),
         app_surface_snapshot_node_id: app_surface_snapshot_id,
         app_surface_snapshot_node_kinds,
+        dialog_presence_key,
+        selected_workspace_equality_key,
+        selected_workspace_equality_value,
         empty_surface_node_id,
         empty_surface_child_id: empty_surface_child_id.clone(),
         blocked_render_error_code: blocked_error.code.clone(),
@@ -3409,6 +3600,8 @@ pub fn run_plugin_contract_matrix_conformance(
         action_success_state,
         action_success_request_id,
         action_success_message,
+        action_success_presentation_clear_key,
+        action_success_replacement_node_id,
         action_error_state,
         action_error_request_id,
         action_error_diagnostic_kind,
@@ -3419,6 +3612,10 @@ pub fn run_plugin_contract_matrix_conformance(
         action_field_error_diagnostic_kind,
         action_field_error_diagnostic_operation,
         action_field_error_message,
+        identity_mismatch_error_code,
+        identity_mismatch_error_operation,
+        invalid_replacement_error_code,
+        invalid_replacement_error_operation,
         client_render_check: PluginContractMatrixClientRenderCheck {
             class: ConformanceFailureClass::ClientRendering,
             app_surface_node_id,
@@ -4021,6 +4218,47 @@ fn collect_ui_node_type_values(value: &serde_json::Value, values: &mut Vec<Strin
             collect_ui_node_type_values(prop, values);
         }
     }
+    if let Some(bound_node) = value.get("node") {
+        collect_ui_node_type_values(bound_node, values);
+    }
+}
+
+fn find_presentation_binding_by_node_id<'a>(
+    value: &'a serde_json::Value,
+    node_id: &str,
+) -> Option<&'a serde_json::Value> {
+    if value
+        .get("$kind")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|kind| kind == "presentation_if")
+        && value
+            .get("node")
+            .and_then(|node| node.get("id"))
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|id| id == node_id)
+    {
+        return Some(value);
+    }
+    if let Some(children) = value.get("children").and_then(serde_json::Value::as_array) {
+        for child in children {
+            if let Some(found) = find_presentation_binding_by_node_id(child, node_id) {
+                return Some(found);
+            }
+        }
+    }
+    if let Some(slots) = value.get("slots").and_then(serde_json::Value::as_object) {
+        for slot_children in slots.values().filter_map(serde_json::Value::as_array) {
+            for child in slot_children {
+                if let Some(found) = find_presentation_binding_by_node_id(child, node_id) {
+                    return Some(found);
+                }
+            }
+        }
+    }
+    if let Some(bound_node) = value.get("node") {
+        return find_presentation_binding_by_node_id(bound_node, node_id);
+    }
+    None
 }
 
 fn find_ui_node_by_id<'a>(
@@ -4057,6 +4295,11 @@ fn find_ui_node_by_id<'a>(
                 return Some(found);
             }
         }
+    }
+    if let Some(bound_node) = value.get("node")
+        && let Some(found) = find_ui_node_by_id(bound_node, node_id)
+    {
+        return Some(found);
     }
     None
 }
@@ -5357,6 +5600,7 @@ mod tests {
             app_surface_node_kinds: vec![
                 "button".to_string(),
                 "button".to_string(),
+                "dialog".to_string(),
                 "empty_state".to_string(),
                 "empty_state".to_string(),
                 "form".to_string(),
@@ -5366,6 +5610,8 @@ mod tests {
                 "section".to_string(),
                 "status_badge".to_string(),
                 "table".to_string(),
+                "text".to_string(),
+                "text".to_string(),
                 "text_input".to_string(),
                 "toolbar".to_string(),
             ],

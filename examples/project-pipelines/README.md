@@ -65,9 +65,10 @@ package commands, run bare `botster-hub up`, then open the reported Web URL or
 the daemon-resolved TUI app. Focus the Project Pipelines create-ticket fields,
 submit once with a blank
 title to see field/form validation, then submit with a nonblank title to create
-a local ticket. The TUI renders the plugin-authored UiNode tree, clears the
-scoped dialog presentation key, applies the returned replacement tree, and dispatches
-the semantic action through the daemon; it does not build a Project Pipelines
-form in Rust. The botster-web process is launched from the separate
+a local ticket. The plugin emits the canonical UiNode tree, scoped dialog
+presentation operation, and owner-authored replacement tree through the daemon.
+The separately routed TUI and Web adoption tickets implement rendering,
+presentation clearing, and replacement application; this plugin does not build
+a Project Pipelines form in client code. The botster-web process is launched from the separate
 `botster-web` package through hub supervision, not from this Project Pipelines
 manifest.

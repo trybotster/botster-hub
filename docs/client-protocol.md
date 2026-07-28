@@ -930,7 +930,10 @@ snapshot repeats `package_name` and `surface_id` and carries the same validated
 deserializes against `botster-ui-contract`, and validates before serializing
 the response. Plugin actions use one canonical `UiActionRequest` envelope and
 return a typed `UiActionResult`; the daemon and worker do not reconstruct split
-request fields.
+request fields. A result must echo the request's `request_id`, `surface_id`,
+`action_id`, and `node_id` exactly, including preserving an absent `node_id`.
+The Hub rejects a mismatched identity as `invalid_action_result` before it can
+cross the client boundary.
 
 This cold switch advances `PROTOCOL_VERSION` to 4 and
 `CONFORMANCE_FIXTURE_REVISION` to 19. It removes `UiTreeUpdateRef` and
