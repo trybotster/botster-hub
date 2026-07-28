@@ -114,10 +114,11 @@ the delivered tree against its Dialog presence and selected-workspace equality
 bindings. Revision 21 places the one canonical Form inside the active Dialog
 and makes the browser-shaped consumer reject any actionable sibling Form.
 Rejected results retain the visible Dialog, Form, input, and field-error
-association; accepted results apply normalization/replacement, clear the
-scoped Dialog key, and leave no reachable modal. The
-published first-party support matrix exposes the corresponding expected keys,
-values, and operation kinds to TypeScript consumers; static
+association; accepted results apply normalization and a whole-surface
+replacement, then clear the scoped Dialog key. The published first-party
+support matrix exposes the corresponding Dialog/Form/input composition,
+whole-surface replacement scope, expected keys, values, and operation kinds to
+TypeScript consumers; static
 `@trybotster/ui-contract` fixtures remain complementary.
 
 The mode-flags fixture covers the targeted `read_mode_flags` request/response

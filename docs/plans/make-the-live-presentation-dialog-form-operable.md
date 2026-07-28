@@ -153,9 +153,9 @@ consumer that:
 9. After invalid submission, proves the field error targets the visible input,
    presentation state and rendered tree are unchanged, and the same Dialog and
    Form remain reachable.
-10. After valid submission, proves `normalized_values`, replacement
-    application, scoped Clear removal, false Dialog predicate, and no reachable
-    modal.
+10. After valid submission, proves `normalized_values`, whole-surface
+    replacement application, scoped Clear removal, and a false Dialog
+    predicate. It does not publish a tautological post-replacement tree check.
 
 The helper should implement only the presentation filtering and modal
 reachability needed by the conformance sequence. It must not grow DOM, focus,
@@ -221,18 +221,20 @@ consumes that contract; it does not redefine it.
 requires a browser-shaped consumer, which Hub can provide by enforcing
 delivered-tree visibility and blocking-modal reachability without owning a
 browser harness. The open Web ticket `ticket_1785192696_321546` separately owns
-real-renderer click-through. It is not a prerequisite for producing the fixed
-Hub fixture, so no blocking dependency is registered. If Hub's shaped consumer
+real-renderer click-through and is registered as depending on this Hub ticket
+against Web target `tgt_40abcf71ccf049f4ac0c99953a799869`. It is not a
+prerequisite for producing the fixed Hub fixture. If Hub's shaped consumer
 passes but a real DOM consumer cannot perform the sequence, register a finding
-or dependency against Web target `tgt_40abcf71ccf049f4ac0c99953a799869`;
-do not repair Web in this run.
+against that Web run; do not repair Web in this run.
 
 The open TUI-kit pin ticket `ticket_1785261259_330503` consumes the eventual
-merged Hub revision. Moving the existing Form changes ancestry but not contract
-types, ids, primitive inventory, or action semantics, so it requires no
-upstream TUI-kit prerequisite. Its headless downstream proof should consume the
-merged Hub artifact normally. Any ancestry assumption exposed there belongs to
-that consumer ticket, not a compatibility form in Hub.
+merged Hub revision and is registered as depending on this Hub ticket against
+TUI-kit target `tgt_3dfae49c02454037bf13554f552baf7f`. Moving the existing
+Form changes ancestry but not contract types, ids, primitive inventory, or
+action semantics, so it requires no upstream TUI-kit prerequisite. Its headless
+downstream proof should consume the merged Hub artifact normally. Any ancestry
+assumption exposed there belongs to that consumer ticket, not a compatibility
+form in Hub.
 
 `botster-core` participates only through the Hub lockfile-pinned
 `botster-session-worker` binary used for exact runtime provenance. No Core
@@ -388,7 +390,9 @@ npm pack --json
 Install the actual tarball in a clean temporary Node consumer outside the
 repository. Import the package, assert version 0.1.13 and revision 21, run
 `verifyPackageAssets()`, materialize the plugin-contract-matrix fixture, and
-assert the shipped source has the Form inside the Dialog with no sibling Form.
+use balanced Lua-table containment to assert the shipped source has the Form
+inside the Dialog with no sibling Form. Show the same check red with a
+structurally valid sibling-Form ablation.
 
 After merge, repeat against
 `@trybotster/hub-test-support@0.1.13` and record the public

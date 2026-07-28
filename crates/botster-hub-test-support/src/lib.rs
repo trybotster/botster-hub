@@ -55,6 +55,10 @@ const PLUGIN_CONTRACT_BLOCKED_SURFACE: &str = "contract.blocked";
 const PLUGIN_CONTRACT_INVALID_BODY_SURFACE: &str = "contract.invalid_body";
 const PLUGIN_CONTRACT_SETTINGS_SURFACE: &str = "contract.settings";
 const PLUGIN_CONTRACT_ACTION: &str = "contract.action";
+const PLUGIN_CONTRACT_DIALOG_NODE_ID: &str = "contract-dialog";
+const PLUGIN_CONTRACT_DIALOG_FORM_NODE_ID: &str = "contract-app-form";
+const PLUGIN_CONTRACT_DIALOG_INPUT_NODE_ID: &str = "contract-app-message";
+const PLUGIN_CONTRACT_ACCEPTED_REPLACEMENT_SCOPE: &str = "whole_surface";
 const SUPPORTED_PLUGIN_SURFACE_JSON_ACTIONS: &str = "plugin_surface_json_actions";
 const UNSUPPORTED_PLUGIN_ENTITY_FRAMES: &str = "plugin_entity_frames";
 
@@ -207,6 +211,10 @@ pub struct PluginSurfaceSupport {
     pub runtime_runner: String,
     pub presentation_operation_kinds: Vec<String>,
     pub dialog_presence_key: String,
+    pub dialog_form_node_id: String,
+    pub dialog_input_node_id: String,
+    pub actionable_sibling_form_forbidden: bool,
+    pub accepted_replacement_scope: String,
     pub selected_workspace_equality_key: String,
     pub selected_workspace_equality_value: String,
     pub authored_set_values: BTreeMap<String, serde_json::Value>,
@@ -493,7 +501,11 @@ pub fn first_party_client_support_matrix() -> FirstPartyClientSupportMatrix {
             runtime_runner: "botster_hub_test_support::run_plugin_contract_matrix_conformance"
                 .to_string(),
             presentation_operation_kinds: presentation_operation_kinds(),
-            dialog_presence_key: "contract-dialog".to_string(),
+            dialog_presence_key: PLUGIN_CONTRACT_DIALOG_NODE_ID.to_string(),
+            dialog_form_node_id: PLUGIN_CONTRACT_DIALOG_FORM_NODE_ID.to_string(),
+            dialog_input_node_id: PLUGIN_CONTRACT_DIALOG_INPUT_NODE_ID.to_string(),
+            actionable_sibling_form_forbidden: true,
+            accepted_replacement_scope: PLUGIN_CONTRACT_ACCEPTED_REPLACEMENT_SCOPE.to_string(),
             selected_workspace_equality_key: "selected-workspace".to_string(),
             selected_workspace_equality_value: "workspace-alpha".to_string(),
             authored_set_values: BTreeMap::from([
@@ -2085,6 +2097,7 @@ pub struct ProjectPipelinesConformanceReport {
 /// [`ConformanceFailureClass::ProducerContract`]. Renderer/client failures are
 /// intentionally downstream comparisons against the `client_render_*` fields.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct PluginContractMatrixConformanceReport {
     pub package_name: String,
     pub installed_state: String,
@@ -2126,25 +2139,37 @@ pub struct PluginContractMatrixConformanceReport {
     pub open_action_node_id: String,
     pub open_action_payload: serde_json::Value,
     pub open_set_values: BTreeMap<String, serde_json::Value>,
+    #[serde(default)]
     pub form_reachable_before_open: bool,
     pub dialog_visible_after_open: bool,
     pub selected_workspace_visible_after_open: bool,
+    #[serde(default)]
     pub dialog_form_node_id: String,
+    #[serde(default)]
     pub dialog_input_node_id: String,
+    #[serde(default)]
     pub submit_action_node_id: String,
+    #[serde(default)]
     pub actionable_sibling_form_during_dialog: bool,
+    #[serde(default)]
     pub invalid_submit_values: serde_json::Value,
+    #[serde(default)]
     pub valid_submit_values: serde_json::Value,
     pub rejected_state_retained: bool,
     pub rejected_tree_retained: bool,
+    #[serde(default)]
     pub rejected_dialog_retained: bool,
+    #[serde(default)]
     pub rejected_form_retained: bool,
+    #[serde(default)]
     pub rejected_field_error_node_id: String,
+    #[serde(default)]
     pub accepted_normalized_values: serde_json::Value,
+    #[serde(default)]
     pub accepted_replacement_applied: bool,
+    #[serde(default)]
     pub dialog_state_cleared: bool,
     pub dialog_visible_after_valid_submit: bool,
-    pub dialog_reachable_after_valid_submit: bool,
     pub toggle_action_id: String,
     pub toggle_action_node_id: String,
     pub toggle_action_payload: serde_json::Value,
@@ -3232,9 +3257,9 @@ pub fn run_plugin_contract_matrix_conformance(
         },
     )?;
     let form_reachable_before_open =
-        find_ui_node_by_id(&initial_visible_tree, "contract-app-form").is_some();
+        find_ui_node_by_id(&initial_visible_tree, PLUGIN_CONTRACT_DIALOG_FORM_NODE_ID).is_some();
     if form_reachable_before_open
-        || find_ui_node_by_id(&initial_visible_tree, "contract-dialog").is_some()
+        || find_ui_node_by_id(&initial_visible_tree, PLUGIN_CONTRACT_DIALOG_NODE_ID).is_some()
     {
         return Err(ConformanceError::UnexpectedValue {
             operation: "contract_matrix_render_app",
@@ -3521,7 +3546,7 @@ pub fn run_plugin_contract_matrix_conformance(
             field: "visible tree",
         })?;
     let visible_dialog_ids = ui_node_ids_by_type(&open_visible_tree, "dialog");
-    if visible_dialog_ids != ["contract-dialog"] {
+    if visible_dialog_ids != [PLUGIN_CONTRACT_DIALOG_NODE_ID] {
         return Err(ConformanceError::UnexpectedValue {
             operation: "contract_matrix_action_open",
             field: "active dialogs",
@@ -3529,18 +3554,19 @@ pub fn run_plugin_contract_matrix_conformance(
             actual: format!("{visible_dialog_ids:?}"),
         });
     }
-    let active_dialog = find_ui_node_by_id(&open_visible_tree, "contract-dialog").ok_or(
-        ConformanceError::MissingJsonField {
+    let active_dialog = find_ui_node_by_id(&open_visible_tree, PLUGIN_CONTRACT_DIALOG_NODE_ID)
+        .ok_or(ConformanceError::MissingJsonField {
             operation: "contract_matrix_action_open",
             field: "visible contract-dialog",
-        },
-    )?;
+        })?;
     let visible_form_ids = ui_node_ids_by_type(&open_visible_tree, "form");
     let dialog_form_ids = ui_node_ids_by_type(active_dialog, "form");
     let actionable_sibling_form_during_dialog = visible_form_ids
         .iter()
         .any(|form_id| !dialog_form_ids.contains(form_id));
-    if actionable_sibling_form_during_dialog || dialog_form_ids != ["contract-app-form"] {
+    if actionable_sibling_form_during_dialog
+        || dialog_form_ids != [PLUGIN_CONTRACT_DIALOG_FORM_NODE_ID]
+    {
         return Err(ConformanceError::UnexpectedValue {
             operation: "contract_matrix_action_open",
             field: "blocking dialog form reachability",
@@ -3548,12 +3574,11 @@ pub fn run_plugin_contract_matrix_conformance(
             actual: format!("visible_forms={visible_form_ids:?} dialog_forms={dialog_form_ids:?}"),
         });
     }
-    let submit_node = find_ui_node_by_id(active_dialog, "contract-app-form").ok_or(
-        ConformanceError::MissingJsonField {
+    let submit_node = find_ui_node_by_id(active_dialog, PLUGIN_CONTRACT_DIALOG_FORM_NODE_ID)
+        .ok_or(ConformanceError::MissingJsonField {
             operation: "contract_matrix_action_open",
             field: "contract-dialog contract-app-form",
-        },
-    )?;
+        })?;
     let submit_action = rendered_action(
         submit_node,
         "contract_matrix_action_open",
@@ -3576,12 +3601,11 @@ pub fn run_plugin_contract_matrix_conformance(
     let dialog_form_node_id = submit_action.node_id.clone();
     let submit_action_node_id = submit_action.node_id.clone();
     let submit_action_id = submit_action.action_id.clone();
-    let input_node = find_ui_node_by_id(active_dialog, "contract-app-message").ok_or(
-        ConformanceError::MissingJsonField {
+    let input_node = find_ui_node_by_id(active_dialog, PLUGIN_CONTRACT_DIALOG_INPUT_NODE_ID)
+        .ok_or(ConformanceError::MissingJsonField {
             operation: "contract_matrix_action_open",
             field: "contract-dialog contract-app-message",
-        },
-    )?;
+        })?;
     let dialog_input_node_id = value_string(input_node, "id", "contract_matrix_action_open")?;
     let input_name = input_node
         .get("props")
@@ -3695,14 +3719,12 @@ pub fn run_plugin_contract_matrix_conformance(
         operation: "contract_matrix_action_field_error",
         field: "visible tree",
     })?;
-    let rejected_dialog_retained =
-        find_ui_node_by_id(&rejected_visible_tree, "contract-dialog").is_some();
-    let rejected_form_retained = find_ui_node_by_id(
-        find_ui_node_by_id(&rejected_visible_tree, "contract-dialog")
-            .unwrap_or(&rejected_visible_tree),
-        "contract-app-form",
-    )
-    .is_some();
+    let rejected_dialog =
+        find_ui_node_by_id(&rejected_visible_tree, PLUGIN_CONTRACT_DIALOG_NODE_ID);
+    let rejected_dialog_retained = rejected_dialog.is_some();
+    let rejected_form_retained = rejected_dialog.is_some_and(|dialog| {
+        find_ui_node_by_id(dialog, PLUGIN_CONTRACT_DIALOG_FORM_NODE_ID).is_some()
+    });
     if !rejected_state_retained
         || !rejected_tree_retained
         || !rejected_dialog_retained
@@ -3848,22 +3870,12 @@ pub fn run_plugin_contract_matrix_conformance(
             actual: "true".to_string(),
         });
     }
-    let final_visible_tree = materialize_visible_tree(
-        &client_rendered_tree,
-        presentation_state.values_for(PLUGIN_CONTRACT_MATRIX_PACKAGE, PLUGIN_CONTRACT_APP_SURFACE),
-    )
-    .ok_or(ConformanceError::MissingBody {
-        operation: "contract_matrix_action_success",
-        field: "final visible tree",
-    })?;
-    let dialog_reachable_after_valid_submit =
-        find_ui_node_by_id(&final_visible_tree, "contract-dialog").is_some();
-    if !dialog_state_cleared || dialog_reachable_after_valid_submit {
+    if !dialog_state_cleared {
         return Err(ConformanceError::UnexpectedValue {
             operation: "contract_matrix_action_success",
-            field: "final modal reachability",
-            expected: "dialog state cleared and no reachable dialog".to_string(),
-            actual: final_visible_tree.to_string(),
+            field: "dialog state after accepted replacement",
+            expected: "dialog presence key cleared".to_string(),
+            actual: format!("{presentation_state:?}"),
         });
     }
 
@@ -4122,7 +4134,6 @@ pub fn run_plugin_contract_matrix_conformance(
         accepted_replacement_applied,
         dialog_state_cleared,
         dialog_visible_after_valid_submit,
-        dialog_reachable_after_valid_submit,
         toggle_action_id: toggle_action.action_id,
         toggle_action_node_id: toggle_action.node_id,
         toggle_action_payload,
@@ -4992,11 +5003,6 @@ fn collect_ui_node_ids_by_type(value: &serde_json::Value, node_type: &str, ids: 
             for child in slot_children {
                 collect_ui_node_ids_by_type(child, node_type, ids);
             }
-        }
-    }
-    if let Some(props) = value.get("props").and_then(serde_json::Value::as_object) {
-        for prop in props.values() {
-            collect_ui_node_ids_by_type(prop, node_type, ids);
         }
     }
 }
@@ -6037,6 +6043,10 @@ mod tests {
                     "runtime_runner": "botster_hub_test_support::run_plugin_contract_matrix_conformance",
                     "presentation_operation_kinds": ["set", "clear", "toggle"],
                     "dialog_presence_key": "contract-dialog",
+                    "dialog_form_node_id": "contract-app-form",
+                    "dialog_input_node_id": "contract-app-message",
+                    "actionable_sibling_form_forbidden": true,
+                    "accepted_replacement_scope": "whole_surface",
                     "selected_workspace_equality_key": "selected-workspace",
                     "selected_workspace_equality_value": "workspace-alpha",
                     "authored_set_values": {

@@ -95,6 +95,10 @@
       "toggle"
     ],
     "dialog_presence_key": "contract-dialog",
+    "dialog_form_node_id": "contract-app-form",
+    "dialog_input_node_id": "contract-app-message",
+    "actionable_sibling_form_forbidden": true,
+    "accepted_replacement_scope": "whole_surface",
     "selected_workspace_equality_key": "selected-workspace",
     "selected_workspace_equality_value": "workspace-alpha",
     "authored_set_values": {

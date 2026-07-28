@@ -3791,7 +3791,6 @@ fn daemon_plugin_contract_matrix_fixture_exercises_public_package_contracts() {
     assert!(report.accepted_replacement_applied);
     assert!(report.dialog_state_cleared);
     assert!(!report.dialog_visible_after_valid_submit);
-    assert!(!report.dialog_reachable_after_valid_submit);
     assert_eq!(report.toggle_action_id, "contract.action");
     assert_eq!(report.toggle_action_node_id, "contract-app-toggle");
     assert_eq!(
