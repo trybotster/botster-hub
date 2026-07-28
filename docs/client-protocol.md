@@ -273,11 +273,14 @@ deterministic Hub-owned path beneath the daemon data directory and reconcile
 their actual Git common-directory identity and branch, so a valid managed row
 reports `present` even though it is outside the target root.
 
-`DaemonWorktree.status` is reconciled when rows are returned. Current values are
-`present`, `missing`, and `stale`. Missing paths remain listable after daemon
-reload so clients can explain stale local state instead of treating startup as a
-fatal error. `DaemonWorktree.git` is optional opportunistic metadata; plain
-directories without `.git` are valid worktrees.
+`DaemonWorktree.status` values are `present`, `missing`, and `stale`.
+Registered rows are reconciled when returned. Managed rows project the last
+status persisted by startup adoption or the bounded managed-Git lane; list/show
+do not execute Git or refresh externally removed paths, so that status can
+remain stale until restart or another managed operation. Missing paths remain
+listable after daemon reload so clients can explain stale local state instead of
+treating startup as a fatal error. `DaemonWorktree.git` is optional
+opportunistic metadata; plain directories without `.git` are valid worktrees.
 
 ## Connection Diagnostics
 

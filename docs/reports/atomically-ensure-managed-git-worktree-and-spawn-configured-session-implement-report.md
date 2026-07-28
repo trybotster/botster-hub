@@ -125,13 +125,14 @@ application-primitives fixture, so this change allocates globally unique
 revision 21 and unused package candidate version 0.1.13 rather than reusing
 those bytes.
 
-Review also tightened the implementation without changing its ownership
-boundary: managed list/show reads now project the last startup/lane
-reconciliation result without spawning Git on the owner thread; decision
-timeout preserves prepared resources; piped child output is drained while the
-child runs; Git target admission is deadline-bounded; target kinds are
-validated at mutation boundaries; and generic deletion cannot orphan
-Hub-managed rows.
+Review also changed the approved reconciliation design without changing its
+ownership boundary: managed Git identity and branch reconciliation moved from
+list/show projection to startup adoption and the bounded managed-Git lane.
+Managed list/show reads now project that last persisted result without spawning
+Git on the owner thread. Review also required decision timeouts to preserve
+prepared resources, concurrent draining of piped child output, deadline-bounded
+Git target admission, exact target-kind validation at mutation boundaries, and
+deletion guards that cannot orphan Hub-managed rows.
 
 ## Verification and downstream-shaped proof
 
@@ -144,8 +145,10 @@ All commands exited successfully:
 - `./test.sh spawn_targets::tests`: 4 passed, including registration-time
   defaulting, atomic set/clear/invalid/empty `base_ref` updates, kind typo
   rejection, and bounded hung-Git admission.
-- `./test.sh worktrees::tests`: 3 passed, including Git-free managed DTO
-  projection and record-only delete refusal.
+- `./test.sh worktrees::tests`: 13 passed because the substring filter also
+  matches the 10 `managed_git_worktrees::tests`; the 3
+  `worktrees::tests` cases include Git-free managed DTO projection and
+  record-only delete refusal.
 - `./test.sh runtime::tests::managed_git`: 2 passed, including real lane
   contention and decision-timeout resource preservation.
 - `./test.sh -p botster-hub-client`: 43 tests and 4 doc tests passed.
