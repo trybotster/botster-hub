@@ -1,5 +1,5 @@
-//! Renderer-neutral UI node, binding, viewport, and action contracts.
 #![recursion_limit = "256"]
+//! Renderer-neutral UI node, binding, viewport, and action contracts.
 //!
 //! The UI contract is the standalone authority shared by Hub and clients:
 //!

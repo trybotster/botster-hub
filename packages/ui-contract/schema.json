@@ -242,6 +242,19 @@
       ],
       "type": "object"
     },
+    "UiCapabilityFallback": {
+      "enum": [
+        "table_as_list",
+        "dialog_inline",
+        "terminal_selection_disabled",
+        "connection_code_text",
+        "iframe_as_link",
+        "rich_color_muted",
+        "context_menu_as_menu",
+        "clipboard_manual",
+        "hover_persistent_hints"
+      ]
+    },
     "UiChild": {
       "oneOf": [
         {
@@ -256,6 +269,16 @@
         {
           "$ref": "#/$defs/UiBindIf"
         }
+      ]
+    },
+    "UiColorToken": {
+      "enum": [
+        "default",
+        "muted",
+        "accent",
+        "success",
+        "warning",
+        "danger"
       ]
     },
     "UiConditional": {
@@ -279,6 +302,64 @@
         "node"
       ],
       "type": "object"
+    },
+    "UiDensity": {
+      "enum": [
+        "compact",
+        "regular",
+        "spacious"
+      ]
+    },
+    "UiDialogPresentation": {
+      "enum": [
+        "auto",
+        "inline",
+        "overlay",
+        "sheet",
+        "fullscreen"
+      ]
+    },
+    "UiFieldKind": {
+      "enum": [
+        "text",
+        "textarea",
+        "checkbox",
+        "select"
+      ]
+    },
+    "UiHeightClass": {
+      "enum": [
+        "short",
+        "regular",
+        "tall"
+      ]
+    },
+    "UiIframePermission": {
+      "enum": [
+        "fullscreen",
+        "clipboard_write",
+        "camera",
+        "microphone",
+        "geolocation",
+        "payment"
+      ]
+    },
+    "UiIframeSandboxToken": {
+      "enum": [
+        "allow_forms",
+        "allow_modals",
+        "allow_popups",
+        "allow_same_origin",
+        "allow_scripts",
+        "allow_downloads"
+      ]
+    },
+    "UiMetricTrendDirection": {
+      "enum": [
+        "up",
+        "down",
+        "flat"
+      ]
     },
     "UiNode": {
       "additionalProperties": false,
@@ -339,13 +420,7 @@
                 },
                 "properties": {
                   "presentation": {
-                    "enum": [
-                      "auto",
-                      "inline",
-                      "overlay",
-                      "sheet",
-                      "fullscreen"
-                    ]
+                    "$ref": "#/$defs/UiDialogPresentation"
                   },
                   "title": {
                     "type": "string"
@@ -474,6 +549,19 @@
         "custom"
       ]
     },
+    "UiOrientation": {
+      "enum": [
+        "portrait",
+        "landscape"
+      ]
+    },
+    "UiPointer": {
+      "enum": [
+        "none",
+        "coarse",
+        "fine"
+      ]
+    },
     "UiPresentationKey": {
       "minLength": 1,
       "type": "string"
@@ -564,8 +652,53 @@
         }
       ]
     },
+    "UiSelectionMode": {
+      "enum": [
+        "none",
+        "single",
+        "multiple"
+      ]
+    },
+    "UiSpaceToken": {
+      "enum": [
+        "none",
+        "xs",
+        "sm",
+        "md",
+        "lg",
+        "xl"
+      ]
+    },
     "UiSurfaceId": {
       "type": "string"
+    },
+    "UiTableColumnAlign": {
+      "enum": [
+        "start",
+        "center",
+        "end"
+      ]
+    },
+    "UiToolbarOverflow": {
+      "enum": [
+        "auto",
+        "never",
+        "always"
+      ]
+    },
+    "UiVariant": {
+      "enum": [
+        "plain",
+        "subtle",
+        "emphasized"
+      ]
+    },
+    "UiWidthClass": {
+      "enum": [
+        "compact",
+        "regular",
+        "expanded"
+      ]
     }
   },
   "$id": "https://trybotster.dev/schemas/ui-contract-0.1.0.json",

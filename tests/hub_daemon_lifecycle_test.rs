@@ -3700,6 +3700,7 @@ fn daemon_plugin_contract_matrix_fixture_exercises_public_package_contracts() {
         vec![
             "button",
             "button",
+            "dialog",
             "empty_state",
             "empty_state",
             "form",
@@ -3709,6 +3710,8 @@ fn daemon_plugin_contract_matrix_fixture_exercises_public_package_contracts() {
             "section",
             "status_badge",
             "table",
+            "text",
+            "text",
             "text_input",
             "toolbar",
         ]
@@ -3723,6 +3726,9 @@ fn daemon_plugin_contract_matrix_fixture_exercises_public_package_contracts() {
         report.app_surface_snapshot_node_kinds,
         report.app_surface_node_kinds
     );
+    assert_eq!(report.dialog_presence_key, "contract-dialog");
+    assert_eq!(report.selected_workspace_equality_key, "selected-workspace");
+    assert_eq!(report.selected_workspace_equality_value, "workspace-alpha");
     assert_eq!(report.empty_surface_child_id, "contract-empty-message");
     assert_eq!(report.blocked_render_operation, "plugin_surface_render");
     assert!(report.blocked_render_message_contains_failure);
@@ -3739,6 +3745,14 @@ fn daemon_plugin_contract_matrix_fixture_exercises_public_package_contracts() {
     assert!(report.settings_text_contains_redacted_secret);
     assert_eq!(report.action_success_state, "accepted");
     assert_eq!(report.action_success_message, "hello");
+    assert_eq!(
+        report.action_success_presentation_clear_key,
+        "contract-dialog"
+    );
+    assert_eq!(
+        report.action_success_replacement_node_id,
+        "contract-action-replacement"
+    );
     assert_eq!(report.submit_action_id, "contract.action");
     assert_eq!(report.action_error_state, "error");
     assert_eq!(report.action_error_diagnostic_kind, "action_failure");
@@ -3757,6 +3771,19 @@ fn daemon_plugin_contract_matrix_fixture_exercises_public_package_contracts() {
         "plugin_surface_action"
     );
     assert_eq!(report.action_field_error_message, "Message is required");
+    assert_eq!(report.identity_mismatch_error_code, "invalid_action_result");
+    assert_eq!(
+        report.identity_mismatch_error_operation,
+        "plugin_surface_action"
+    );
+    assert_eq!(
+        report.invalid_replacement_error_code,
+        "invalid_action_result"
+    );
+    assert_eq!(
+        report.invalid_replacement_error_operation,
+        "plugin_surface_action"
+    );
     assert_eq!(
         report.client_render_check.class,
         botster_hub_test_support::ConformanceFailureClass::ClientRendering

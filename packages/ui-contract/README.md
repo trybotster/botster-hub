@@ -13,6 +13,9 @@ receive one canonical `UiActionRequest`: form drafts are in `values`, while
 non-form action metadata remains in `payload`. Accepted results may apply
 presentation operations and one validated inline replacement tree. Rejected,
 deferred, and error results retain the current tree and presentation state.
+Every result must echo the request's `request_id`, `surface_id`, `action_id`,
+and `node_id` exactly. This includes preserving an absent `node_id`; the Hub
+rejects mismatched result identity as `invalid_action_result`.
 
 Regenerate or check committed assets:
 

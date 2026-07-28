@@ -47,7 +47,7 @@
     "files": [
       {
         "path": "README.md",
-        "sha256": "749039e9fa366aac7891a7f94b7181f3e0d8cf51870eed5e2ca535fdd6bacb8a"
+        "sha256": "b1050fb7f32feb3b08a397d0bacdeb4aa77cbbd3158509f7cfe626c3b01366f3"
       },
       {
         "path": "botster-package.json",
@@ -55,7 +55,7 @@
       },
       {
         "path": "plugin.lua",
-        "sha256": "50ef55d209f4f0a06a5b8aae07bf41007340510f02d072a9a2ff466769a5f3e3"
+        "sha256": "9fe5f66f5d1789fa045f37f749d28b56abb1f70645fd36fbd16c065ca2d78c50"
       }
     ]
   },
@@ -68,6 +68,7 @@
     "renderer_entrypoint": "ui_tree_snapshot.body",
     "primitive_kinds": [
       "button",
+      "dialog",
       "empty_state",
       "form",
       "metric",
@@ -76,6 +77,7 @@
       "section",
       "status_badge",
       "table",
+      "text",
       "text_input",
       "toolbar"
     ]

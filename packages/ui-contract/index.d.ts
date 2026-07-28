@@ -44,7 +44,7 @@ export type UiFieldKind = "text" | "textarea" | "checkbox" | "select";
 export interface UiFieldOption { value: JsonValue; label: string; disabled?: boolean; }
 export interface UiFieldValidationHints { minLength?: number; maxLength?: number; pattern?: string; min?: number; max?: number; oneOf?: JsonValue[]; }
 export interface UiFieldSchema { kind: UiFieldKind; name: string; label: string; description?: string; placeholder?: string; required?: boolean; default?: JsonValue; validation?: UiFieldValidationHints; options?: UiFieldOption[]; }
-export type UiIframeSandboxToken = "allow_downloads" | "allow_forms" | "allow_modals" | "allow_orientation_lock" | "allow_pointer_lock" | "allow_popups" | "allow_popups_to_escape_sandbox" | "allow_presentation" | "allow_same_origin" | "allow_scripts" | "allow_top_navigation_by_user_activation";
+export type UiIframeSandboxToken = "allow_forms" | "allow_modals" | "allow_popups" | "allow_same_origin" | "allow_scripts" | "allow_downloads";
 export type UiIframePermission = "fullscreen" | "clipboard_write" | "camera" | "microphone" | "geolocation" | "payment";
 export interface UiIframeBridge { actions?: UiActionId[]; messages?: string[]; }
 export type UiAction = { id: UiActionId; payload?: JsonValue; disabled?: boolean };

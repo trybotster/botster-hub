@@ -159,6 +159,47 @@ local function app_surface(_arguments)
           },
         },
       },
+      {
+        ["$kind"] = "presentation_if",
+        predicate = {
+          kind = "present",
+          key = "contract-dialog",
+        },
+        node = {
+          type = "dialog",
+          id = "contract-dialog",
+          props = {
+            title = "Contract dialog",
+            presentation = "auto",
+          },
+          slots = {
+            body = {
+              {
+                type = "text",
+                id = "contract-dialog-body",
+                props = {
+                  text = "Dialog visibility follows scoped presentation state.",
+                },
+              },
+            },
+          },
+        },
+      },
+      {
+        ["$kind"] = "presentation_if",
+        predicate = {
+          kind = "equals",
+          key = "selected-workspace",
+          value = "workspace-alpha",
+        },
+        node = {
+          type = "text",
+          id = "contract-selected-workspace",
+          props = {
+            text = "Workspace alpha selected",
+          },
+        },
+      },
     },
   }
 end
@@ -238,6 +279,24 @@ local function contract_action(arguments)
         ["contract-app-message"] = { "Message is required" },
       },
       form_errors = { "Message is required" },
+    })
+  end
+  if payload.identity_mismatch == true then
+    local result = action_result(arguments, "accepted")
+    result.request_id = "mismatched-request"
+    return result
+  end
+  if payload.invalid_replacement == true then
+    return action_result(arguments, "accepted", {
+      replacement = {
+        type = "form",
+        id = "contract-invalid-replacement",
+        props = {
+          action = {
+            id = "contract.action",
+          },
+        },
+      },
     })
   end
   return action_result(arguments, "accepted", {

@@ -6,16 +6,16 @@ use botster_ui_contract::{
     UiAction, UiActionRequestId, UiToolbarOverflow as FlatUiToolbarOverflow,
 };
 use botster_ui_contract::{
-    UiActionId, UiActionKind, UiActionRequest, UiActionResult, UiActionResultState, UiBind,
-    UiBindIf, UiBindList, UiCapabilityFallback, UiCapabilitySet, UiChild, UiCondition,
-    UiConditional, UiDensity, UiDialogPresentation, UiFieldErrors, UiFieldKind, UiFieldOption,
-    UiFieldSchema, UiFieldValidationHints, UiFormValues, UiHeightClass, UiIframeBridge,
-    UiIframePermission, UiIframeSandboxToken, UiKeyboardCapability, UiMetricTrend,
-    UiMetricTrendDirection, UiNode, UiNodeId, UiNodeKind, UiPointer, UiPresentationKey,
-    UiPresentationOperation, UiPresentationPredicate, UiResponsiveHeight, UiResponsiveValue,
-    UiResponsiveWidth, UiSelection, UiSelectionMode, UiSurfaceId, UiTableCell, UiTableColumn,
-    UiTableColumnDescriptor, UiTableRow, UiToolbarOverflow, UiValidationError, UiVariant,
-    UiWidthClass, validate_ui_node, validate_ui_node_with_capabilities,
+    UiActionId, UiActionKind, UiActionRequest, UiActionResult, UiActionResultState,
+    UiActionResultValidationError, UiBind, UiBindIf, UiBindList, UiCapabilityFallback,
+    UiCapabilitySet, UiChild, UiCondition, UiConditional, UiDensity, UiDialogPresentation,
+    UiFieldErrors, UiFieldKind, UiFieldOption, UiFieldSchema, UiFieldValidationHints, UiFormValues,
+    UiHeightClass, UiIframeBridge, UiIframePermission, UiIframeSandboxToken, UiKeyboardCapability,
+    UiMetricTrend, UiMetricTrendDirection, UiNode, UiNodeId, UiNodeKind, UiPointer,
+    UiPresentationKey, UiPresentationOperation, UiPresentationPredicate, UiResponsiveHeight,
+    UiResponsiveValue, UiResponsiveWidth, UiSelection, UiSelectionMode, UiSurfaceId, UiTableCell,
+    UiTableColumn, UiTableColumnDescriptor, UiTableRow, UiToolbarOverflow, UiValidationError,
+    UiVariant, UiWidthClass, validate_ui_node_with_capabilities,
 };
 use serde_json::{Map, Value, json};
 
@@ -2622,9 +2622,46 @@ fn ui_action_result_applies_accepted_presentation_and_inline_replacement() {
 
     let rejected = UiActionResult {
         state: UiActionResultState::Rejected,
+        ..result.clone()
+    };
+    assert_eq!(
+        rejected.validate(),
+        Err(UiActionResultValidationError::EffectsRequireAcceptance)
+    );
+
+    let empty_presentation_key = UiActionResult {
+        presentation: Some(vec![UiPresentationOperation::Clear {
+            key: UiPresentationKey(" ".to_string()),
+        }]),
+        replacement: None,
+        ..result.clone()
+    };
+    assert_eq!(
+        empty_presentation_key.validate(),
+        Err(UiActionResultValidationError::EmptyPresentationKey)
+    );
+
+    let invalid_replacement = UiActionResult {
+        presentation: None,
+        replacement: Some(Box::new(node(
+            UiNodeKind::Form,
+            json!({ "action": { "id": "ticket.create" } }),
+        ))),
         ..result
     };
-    assert!(rejected.validate().is_err());
+    assert_eq!(
+        invalid_replacement.validate(),
+        Err(UiActionResultValidationError::InvalidReplacement(
+            UiValidationError::Node {
+                id: Some(UiNodeId("form".to_string())),
+                kind: UiNodeKind::Form,
+                source: Box::new(UiValidationError::MissingProp {
+                    kind: UiNodeKind::Form,
+                    prop: "submit_label",
+                }),
+            }
+        ))
+    );
     assert!(
         serde_json::from_value::<UiActionResult>(json!({
             "request_id": "req",
@@ -2675,6 +2712,26 @@ fn dialog_visibility_uses_scoped_presentation_presence_and_equality() {
         ),
         "open",
     );
+
+    let empty_key = UiBindIf::PresentationIf {
+        predicate: UiPresentationPredicate::Present {
+            key: UiPresentationKey(" ".to_string()),
+        },
+        node: Box::new(text_node("Hidden")),
+    };
+    let mut root = node(UiNodeKind::Stack, json!({ "direction": "vertical" }));
+    root.children.push(UiChild::BindIf(empty_key));
+    assert_eq!(
+        root.validate(),
+        Err(UiValidationError::Node {
+            id: Some(UiNodeId("stack".to_string())),
+            kind: UiNodeKind::Stack,
+            source: Box::new(UiValidationError::InvalidBindPath {
+                path: " ".to_string(),
+                reason: "presentation key cannot be empty".to_string(),
+            }),
+        })
+    );
 }
 
 #[test]
@@ -2706,48 +2763,7 @@ fn validate_bind_if_for_test(binding: &UiBindIf) {
 }
 
 #[test]
-fn public_api_import_path_matches_runtime_contract() {
-    let via_module = botster_ui_contract::UiNode {
-        kind: botster_ui_contract::UiNodeKind::Text,
-        id: None,
-        props: Map::from_iter([("text".to_string(), json!("hello"))]),
-        children: Vec::new(),
-        slots: BTreeMap::new(),
-    };
-    let via_root = botster_ui_contract::UiNode {
-        kind: botster_ui_contract::UiNodeKind::Text,
-        id: None,
-        props: Map::from_iter([("text".to_string(), json!("hello"))]),
-        children: Vec::new(),
-        slots: BTreeMap::new(),
-    };
-
-    validate_ui_node(&via_module).expect("module import should validate");
-    assert_eq!(via_module, via_root);
-
-    let via_module_request = botster_ui_contract::UiActionRequest {
-        request_id: UiActionRequestId("req_public".to_string()),
-        surface_id: botster_ui_contract::UiSurfaceId("surface_public".to_string()),
-        node_id: None,
-        action_id: botster_ui_contract::UiActionId("botster.public.test".to_string()),
-        kind: botster_ui_contract::UiActionKind::Cancel,
-        values: None,
-        payload: None,
-    };
-    let via_root_request = botster_ui_contract::UiActionRequest {
-        request_id: UiActionRequestId("req_public".to_string()),
-        surface_id: botster_ui_contract::UiSurfaceId("surface_public".to_string()),
-        node_id: None,
-        action_id: botster_ui_contract::UiActionId("botster.public.test".to_string()),
-        kind: botster_ui_contract::UiActionKind::Cancel,
-        values: None,
-        payload: None,
-    };
-    assert_eq!(via_module_request, via_root_request);
-}
-
-#[test]
-fn public_api_import_path_exposes_v1_form_schema_types() {
+fn crate_root_form_schema_types_validate_a_form_field() {
     let schema = botster_ui_contract::UiFieldSchema {
         kind: botster_ui_contract::UiFieldKind::Select,
         name: "status".to_string(),
@@ -2783,18 +2799,18 @@ fn public_api_import_path_exposes_v1_form_schema_types() {
 }
 
 #[test]
-fn public_api_import_path_exposes_iframe_policy_types() {
-    let via_module_bridge = UiIframeBridge {
+fn crate_root_iframe_policy_types_use_the_wire_vocabulary() {
+    let bridge = UiIframeBridge {
         actions: vec![UiActionId("vault.graph.open_note".to_string())],
         messages: vec!["vault.graph.ready".to_string()],
     };
-    let via_root_bridge = botster_ui_contract::UiIframeBridge {
-        actions: vec![botster_ui_contract::UiActionId(
-            "vault.graph.open_note".to_string(),
-        )],
-        messages: vec!["vault.graph.ready".to_string()],
-    };
-    assert_eq!(via_module_bridge, via_root_bridge);
+    assert_eq!(
+        serde_json::to_value(bridge).expect("serialize iframe bridge"),
+        json!({
+            "actions": ["vault.graph.open_note"],
+            "messages": ["vault.graph.ready"]
+        })
+    );
     assert_eq!(
         serde_json::to_value(UiIframeSandboxToken::AllowScripts)
             .expect("serialize iframe sandbox token"),
@@ -2810,54 +2826,4 @@ fn public_api_import_path_exposes_iframe_policy_types() {
             .expect("deserialize iframe permission"),
         botster_ui_contract::UiIframePermission::Fullscreen
     );
-}
-
-#[test]
-fn public_api_import_path_exposes_ui_capability_types() {
-    let via_module = botster_ui_contract::UiCapabilitySet {
-        width_classes: BTreeMap::from([(botster_ui_contract::UiWidthClass::Regular, ())])
-            .into_keys()
-            .collect(),
-        height_classes: BTreeMap::from([(botster_ui_contract::UiHeightClass::Regular, ())])
-            .into_keys()
-            .collect(),
-        pointer: botster_ui_contract::UiPointer::Fine,
-        keyboard: botster_ui_contract::UiKeyboardCapability {
-            text_entry: true,
-            shortcuts: true,
-            focus_traversal: true,
-        },
-        hover: true,
-        clipboard: true,
-        context_menu: true,
-        dialog_presentations: BTreeMap::from([(
-            botster_ui_contract::UiDialogPresentation::Overlay,
-            (),
-        )])
-        .into_keys()
-        .collect(),
-        table: true,
-        terminal_selection: true,
-        qr_code: true,
-        iframe: true,
-        rich_color: true,
-        fallbacks: BTreeSet::new(),
-    };
-    let via_root = botster_ui_contract::UiCapabilitySet {
-        pointer: botster_ui_contract::UiPointer::Fine,
-        keyboard: botster_ui_contract::UiKeyboardCapability {
-            text_entry: true,
-            shortcuts: true,
-            focus_traversal: true,
-        },
-        dialog_presentations: BTreeMap::from([(
-            botster_ui_contract::UiDialogPresentation::Overlay,
-            (),
-        )])
-        .into_keys()
-        .collect(),
-        ..via_module.clone()
-    };
-
-    assert_eq!(via_module, via_root);
 }
