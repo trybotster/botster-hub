@@ -96,12 +96,15 @@ Project Pipelines package/plugin path or workflow policy.
    or a new shared contract primitive. Moving it to `botster-ui-contract` would
    add renderer-policy gravity to the authoritative data contract and would not
    prove the real Hub/plugin-worker path.
-6. Allocate conformance revision 21 and npm package version 0.1.13. Revision 21
+6. Allocate conformance revision 22 and npm package version 0.1.13. Revision 22
    identifies the changed published fixture content; 0.1.13 identifies the
    immutable npm artifact. Neither value is a protocol/schema version bump.
    Because `DaemonCompatibilityRequirement::current()` derives its minimum
-   conformance revision from the constant, clients built at revision 21 require
-   a Hub reporting revision 21 or later.
+   conformance revision from the constant, clients built at revision 22 require
+   a Hub reporting revision 22 or later. Revision 21 was allocated on `main`
+   while this branch was open for the managed-Git target/worktree projection,
+   so the merge resolution advances this dialog fixture to the next unique
+   revision instead of reusing published-contract bytes.
 
 These decisions are binding for Implement and Review. Choosing a duplicate
 form, retaining the sibling, weakening visible-tree proof, or changing the
@@ -181,11 +184,11 @@ assertions.
 - Update the root source fixture and its README.
 - Keep the Rust embedded fixture copy byte-identical.
 - Regenerate the npm fixture and metadata using the existing sync script.
-- Advance `CONFORMANCE_FIXTURE_REVISION` from 20 to 21 and regenerate every
+- Advance `CONFORMANCE_FIXTURE_REVISION` from 21 to 22 and regenerate every
   revision-bearing published asset.
 - Bump `packages/hub-test-support/package.json` exactly once to 0.1.13.
 - Update root/package documentation and package tests to name 0.1.13 and
-  revision 21.
+  revision 22.
 - Pack and prove the exact tarball in a clean external consumer.
 - Publish only from the clean merged source. If npm authentication or 2FA
   prevents publication, stop and report:
@@ -248,9 +251,10 @@ source dependency is required.
   interaction over the real Hub transport, not a DOM engine in this repository.
 - Assumption: the sorted node-kind inventory remains byte-for-byte unchanged
   because only ancestry changes. Tests remain authoritative.
-- Assumption: revision 21 is globally unused because the latest published
-  package is 0.1.12/revision 20; recheck the public package immediately before
-  packing and publishing.
+- Rebase resolution: revision 21 was globally unused during initial
+  implementation, but `main` allocated it for managed-Git target/worktree
+  projections before this branch merged. The combined source therefore assigns
+  this dialog fixture revision 22.
 - Unknown: the smallest internal representation for a filtered visible tree.
   Prefer a test-support-local recursive helper over a general renderer model.
 - Unknown: npm authentication, provenance, and 2FA requirements after merge.
@@ -273,7 +277,7 @@ source dependency is required.
   - exact report assertions, including the existing exact sorted
     `app_surface_node_kinds` vector and snapshot equality.
 - `crates/botster-hub-client/src/lib.rs`
-  - conformance revision 20 to 21 only.
+  - conformance revision 21 to 22 only.
 - `packages/hub-test-support/package.json`
   - package version 0.1.13.
 - `packages/hub-test-support/test.mjs`
@@ -296,9 +300,9 @@ source dependency is required.
     revision field; its schema intentionally carries delivery limits and
     scenarios rather than `conformance_fixture_revision`.
 - `packages/hub-test-support/README.md` and root `README.md`
-  - 0.1.13/revision 21 and modal-operability contract.
+  - 0.1.13/revision 22 and modal-operability contract.
 - `docs/client-protocol.md`
-  - document why revision 21 moves while protocol version 4 stays fixed, and
+  - document why revision 22 moves while protocol version 4 stays fixed, and
     state the resulting minimum-conformance compatibility floor.
 
 `botster-package.json`, protocol DTO shapes, UI-contract generated assets, and
@@ -363,7 +367,7 @@ These checks must prove:
   `plugin_surface_render`;
 - the exact node-kind vector remains correct;
 - support-matrix Set/equality fields remain correct;
-- metadata and all revision-bearing assets report revision 21;
+- metadata and all revision-bearing assets report revision 22;
 - package metadata reports 0.1.13.
 
 ### Repository gates
@@ -388,7 +392,7 @@ npm pack --json
 ```
 
 Install the actual tarball in a clean temporary Node consumer outside the
-repository. Import the package, assert version 0.1.13 and revision 21, run
+repository. Import the package, assert version 0.1.13 and revision 22, run
 `verifyPackageAssets()`, materialize the plugin-contract-matrix fixture, and
 use balanced Lua-table containment to assert the shipped source has the Form
 inside the Dialog with no sibling Form. Show the same check red with a

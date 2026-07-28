@@ -351,7 +351,7 @@ impl HubClientApi {
             HubClientRequest::ListSessionTemplates { .. } => {
                 let records = packages.packages();
                 let templates =
-                    list_session_templates(&records, runtime.state()).map_err(|error| {
+                    list_session_templates(&records, &runtime.state()).map_err(|error| {
                         HubClientError::SessionTemplate {
                             request_id: request_id.clone(),
                             operation,
@@ -363,7 +363,7 @@ impl HubClientApi {
             }
             HubClientRequest::ShowSessionTemplate { template_id, .. } => {
                 let records = packages.packages();
-                let template = show_session_template(&records, runtime.state(), &template_id)
+                let template = show_session_template(&records, &runtime.state(), &template_id)
                     .map_err(|error| HubClientError::SessionTemplate {
                         request_id: request_id.clone(),
                         operation,
@@ -381,7 +381,7 @@ impl HubClientApi {
                 let materialized = materialize_session_template(
                     runtime.config(),
                     &records,
-                    runtime.state(),
+                    &runtime.state(),
                     &template_id,
                     template_request,
                 )
@@ -403,7 +403,7 @@ impl HubClientApi {
                 let materialized = materialize_session_template(
                     runtime.config(),
                     &records,
-                    runtime.state(),
+                    &runtime.state(),
                     &template_id,
                     template_request,
                 )

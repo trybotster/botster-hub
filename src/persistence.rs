@@ -605,7 +605,21 @@ mod tests {
         let mut value = serde_json::to_value(&state).expect("serialize state value");
         let object = value.as_object_mut().expect("state serializes as object");
         object.remove("device_session_template_sources");
-        object.remove("spawn_targets");
+        object.insert(
+            "spawn_targets".to_string(),
+            serde_json::json!([{
+                "target_id": "legacy-target",
+                "root": "."
+            }]),
+        );
+        object.insert(
+            "worktrees".to_string(),
+            serde_json::json!([{
+                "worktree_id": "legacy-worktree",
+                "target_id": "legacy-target",
+                "path": "."
+            }]),
+        );
         object.remove("credential_keys");
         object.remove("trusted_browser_identities");
         object.remove("bootstrap_grants");
@@ -621,7 +635,11 @@ mod tests {
             .expect("load legacy-shaped v1 state");
 
         assert!(reopened.device_session_template_sources.is_empty());
-        assert!(reopened.spawn_targets.is_empty());
+        assert_eq!(reopened.spawn_targets.len(), 1);
+        assert_eq!(reopened.spawn_targets[0].kind, "directory");
+        assert_eq!(reopened.spawn_targets[0].base_ref, None);
+        assert_eq!(reopened.worktrees.len(), 1);
+        assert_eq!(reopened.worktrees[0].management, "registered");
         assert!(reopened.credential_keys.is_empty());
         assert!(reopened.trusted_browser_identities.is_empty());
         assert!(reopened.bootstrap_grants.is_empty());

@@ -40,6 +40,7 @@ pub mod entrypoint_supervisor;
 pub mod lifecycle;
 pub mod local_webrtc;
 pub mod lua_runtime;
+pub mod managed_git_worktrees;
 pub mod mcp;
 pub mod packages;
 pub mod persistence;

@@ -90,9 +90,13 @@ Only `read_screen_text` is renderable restored content; `snapshot` and
 version 0.1.5 / revision 12 exposes lossy string history. Neither is current
 binary-history contract authority.
 
-Version 0.1.13 publishes protocol version 4 / conformance revision 21 and
+Version 0.1.13 publishes protocol version 4 / conformance revision 22 and
 depends on `@trybotster/ui-contract@0.1.0` for the canonical UiNode,
 UiActionRequest, and UiActionResult declarations and conformance fixtures.
+Revision 20 remains the already-published version 0.1.12 application-primitives
+contract; revision 21 adds spawn-target `base_ref` and worktree `management`
+without reusing those bytes; revision 22 makes the live presentation Dialog
+form-operable without reusing either earlier revision.
 The protocol cold-switch replaces split action fields and untyped JSON bodies
 with one canonical request envelope and typed surface/action response bodies.
 It also retains the version 0.1.11
