@@ -87,7 +87,20 @@
     "surface_id": "contract.app",
     "rendered_surface_kind": "panel",
     "rendered_surface_node_id": "contract-app-panel",
-    "invalid_action_diagnostic_kind": "action_failure"
+    "invalid_action_diagnostic_kind": "action_failure",
+    "runtime_runner": "botster_hub_test_support::run_plugin_contract_matrix_conformance",
+    "presentation_operation_kinds": [
+      "set",
+      "clear",
+      "toggle"
+    ],
+    "dialog_presence_key": "contract-dialog",
+    "selected_workspace_equality_key": "selected-workspace",
+    "selected_workspace_equality_value": "workspace-alpha",
+    "authored_set_values": {
+      "contract-dialog": true,
+      "selected-workspace": "workspace-alpha"
+    }
   },
   "entity_actions": {
     "supported_capabilities": [
