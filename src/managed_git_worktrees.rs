@@ -7,6 +7,7 @@
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
@@ -370,6 +371,21 @@ pub fn adopt_unrecorded_managed_worktrees(
     managed_root: &Path,
 ) -> bool {
     let mut changed = false;
+    for worktree in worktrees
+        .iter_mut()
+        .filter(|worktree| worktree.management == "hub_managed_git")
+    {
+        let status = targets
+            .iter()
+            .find(|target| target.target_id == worktree.target_id)
+            .map_or("stale", |target| {
+                reconcile_managed_worktree(worktree, target)
+            });
+        if worktree.status != status {
+            worktree.status = status.to_string();
+            changed = true;
+        }
+    }
     for target in targets
         .iter()
         .filter(|target| target.enabled && target.kind == "git")
@@ -611,7 +627,7 @@ fn git_stdout(
     git_stdout_using(OsStr::new("git"), root, args, deadline, failure_kind)
 }
 
-fn git_stdout_using(
+pub(crate) fn git_stdout_using(
     executable: &OsStr,
     root: Option<&Path>,
     args: &[&str],
@@ -629,17 +645,26 @@ fn git_stdout_using(
     let mut child = command
         .spawn()
         .map_err(|_| ManagedGitError::new("git_unavailable", "Git is unavailable"))?;
-    wait_for_child(&mut child, deadline)?;
-    let output = child
-        .wait_with_output()
-        .map_err(|_| ManagedGitError::new(failure_kind, "managed Git operation failed"))?;
-    if !output.status.success() {
+    let mut stdout = child.stdout.take().ok_or_else(|| {
+        ManagedGitError::new(failure_kind, "managed Git output could not be captured")
+    })?;
+    let reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes).map(|_| bytes)
+    });
+    let status = wait_for_child(&mut child, deadline);
+    let stdout = reader
+        .join()
+        .map_err(|_| ManagedGitError::new(failure_kind, "managed Git output reader failed"))?
+        .map_err(|_| ManagedGitError::new(failure_kind, "managed Git output could not be read"))?;
+    let status = status?;
+    if !status.success() {
         return Err(ManagedGitError::new(
             failure_kind,
             "managed Git operation was rejected",
         ));
     }
-    String::from_utf8(output.stdout).map_err(|_| {
+    String::from_utf8(stdout).map_err(|_| {
         ManagedGitError::new(
             failure_kind,
             "managed Git operation returned invalid output",
@@ -1009,6 +1034,28 @@ mod tests {
             "timed-out child must be killed and reaped"
         );
 
+        let noisy = root.join("noisy-git");
+        fs::write(
+            &noisy,
+            "#!/bin/sh\ndd if=/dev/zero bs=262144 count=1 2>/dev/null\n",
+        )
+        .expect("write noisy runner");
+        let mut permissions = fs::metadata(&noisy)
+            .expect("noisy runner metadata")
+            .permissions();
+        use std::os::unix::fs::PermissionsExt;
+        permissions.set_mode(0o755);
+        fs::set_permissions(&noisy, permissions).expect("chmod noisy runner");
+        let output = git_stdout_using(
+            noisy.as_os_str(),
+            None,
+            &["--version"],
+            Instant::now() + Duration::from_secs(2),
+            "git_failed",
+        )
+        .expect("large piped output must be drained while the child runs");
+        assert_eq!(output.len(), 262_144);
+
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1041,10 +1088,12 @@ mod tests {
             "stale"
         );
         fs::remove_dir_all(&prepared.path).expect("remove managed worktree path");
-        assert_eq!(
-            reconcile_managed_worktree(&rows[0], &fixture.target()),
-            "missing"
-        );
+        assert!(adopt_unrecorded_managed_worktrees(
+            &[fixture.target()],
+            &mut rows,
+            &fixture.managed_root
+        ));
+        assert_eq!(rows[0].status, "missing");
     }
 
     struct GitFixture {

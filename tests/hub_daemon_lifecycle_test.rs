@@ -12670,6 +12670,42 @@ fn live_hub_managed_git_spawn_reconciles_and_reuses_after_restart() {
         downgrade.error.as_ref().map(|error| error.code.as_str()),
         Some("managed_worktrees_exist")
     );
+    let delete_target = botster_hub::daemon_transport_request(
+        &explicit_config(&data_dir),
+        botster_hub::DaemonRequest::DeleteSpawnTarget {
+            target_id: "tgt_live_managed".to_string(),
+        },
+    )
+    .expect("return operator error for managed target deletion");
+    assert_eq!(
+        delete_target.kind,
+        botster_hub::DaemonResponseKind::OperatorError
+    );
+    assert_eq!(
+        delete_target
+            .error
+            .as_ref()
+            .map(|error| error.code.as_str()),
+        Some("managed_worktrees_exist")
+    );
+    let delete_worktree = botster_hub::daemon_transport_request(
+        &explicit_config(&data_dir),
+        botster_hub::DaemonRequest::DeleteWorktree {
+            worktree_id: managed.worktree_id.clone(),
+        },
+    )
+    .expect("return operator error for record-only managed worktree deletion");
+    assert_eq!(
+        delete_worktree.kind,
+        botster_hub::DaemonResponseKind::OperatorError
+    );
+    assert_eq!(
+        delete_worktree
+            .error
+            .as_ref()
+            .map(|error| error.code.as_str()),
+        Some("managed_worktree_requires_reclaim")
+    );
 
     let second = call(&data_dir);
     assert_eq!(second.plugin_tool_result["ok"], true);
