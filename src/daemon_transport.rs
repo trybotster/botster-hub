@@ -11,7 +11,8 @@ use std::fs;
 use std::io::Write;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Sender, SyncSender};
+use std::sync::Arc;
+use std::sync::mpsc::{self, SyncSender};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -59,7 +60,7 @@ use signal_hook::consts::signal::{SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader as AsyncBufReader};
 use tokio::net::{UnixListener as TokioUnixListener, UnixStream as TokioUnixStream};
-use tokio::sync::{mpsc as tokio_mpsc, watch};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc as tokio_mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use crate::local_webrtc::{
@@ -93,10 +94,12 @@ const DAEMON_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
 const DAEMON_INCOMPLETE_FRAME_TIMEOUT: Duration = Duration::from_secs(2);
 const DAEMON_MAX_FRAME_BYTES: usize = 1024 * 1024;
 const DAEMON_MAX_CONNECTIONS: usize = 64;
-const DAEMON_MAX_REJECTION_TASKS: usize = 8;
 const DAEMON_CONTROL_QUEUE_CAPACITY: usize = 256;
 pub(crate) const ENTITY_SUBSCRIPTION_QUEUE_CAPACITY: usize = 64;
 const ENTITY_RECONCILIATION_INTERVAL: Duration = Duration::from_millis(500);
+
+pub(crate) type ControlSender = tokio_mpsc::Sender<ControlMessage>;
+type ControlReplySender = oneshot::Sender<DaemonTransportResult<DaemonResponse>>;
 
 /// Run the local daemon socket until a shutdown request is received.
 pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus> {
@@ -110,7 +113,7 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
         .set_nonblocking(true)
         .map_err(DaemonTransportError::Io)?;
 
-    let (control_tx, control_rx) = mpsc::sync_channel(DAEMON_CONTROL_QUEUE_CAPACITY);
+    let (control_tx, mut control_rx) = tokio_mpsc::channel(DAEMON_CONTROL_QUEUE_CAPACITY);
     let (cleanup_tx, cleanup_rx) = mpsc::sync_channel(DAEMON_MAX_CONNECTIONS);
     let (shutdown_tx, _) = watch::channel(false);
     install_signal_forwarder(control_tx.clone())?;
@@ -131,43 +134,34 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
         listener,
         control_tx.clone(),
         shutdown_tx.subscribe(),
+        Arc::new(Semaphore::new(DAEMON_MAX_CONNECTIONS)),
     ))];
-    let mut next_connection_id = 1_u64;
-
     loop {
         reap_finished_connection_tasks(&mut connection_tasks);
         while let Ok(cleanup) = cleanup_rx.try_recv() {
             handle_connection_cleanup(&mut daemon, &mut control_state, control_tx.clone(), cleanup);
         }
+        if control_state.next_reconciliation <= Instant::now() {
+            drive_entity_subscriptions(&mut daemon, &mut control_state);
+            control_state.next_reconciliation = Instant::now() + ENTITY_RECONCILIATION_INTERVAL;
+        }
         let wait = control_state
             .next_reconciliation
             .saturating_duration_since(Instant::now());
-        match control_rx.recv_timeout(wait) {
-            Ok(ControlMessage::AcceptedConnection { stream }) => {
+        match transport_runtime
+            .block_on(async { tokio::time::timeout(wait, control_rx.recv()).await })
+        {
+            Ok(Some(ControlMessage::AcceptedConnection {
+                stream,
+                admission_permit,
+            })) => {
                 control_state.lifecycle_counters.accepted_connections = control_state
                     .lifecycle_counters
                     .accepted_connections
                     .saturating_add(1);
-                if control_state.lifecycle_counters.live_connections
-                    >= DAEMON_MAX_CONNECTIONS as u64
-                {
-                    control_state.lifecycle_counters.rejected_connections = control_state
-                        .lifecycle_counters
-                        .rejected_connections
-                        .saturating_add(1);
-                    if connection_tasks.len()
-                        < DAEMON_MAX_CONNECTIONS + DAEMON_MAX_REJECTION_TASKS + 1
-                    {
-                        connection_tasks
-                            .push(transport_runtime.spawn(reject_connection_async(stream)));
-                    }
-                    continue;
-                }
                 let tx = control_tx.clone();
                 let cleanup = cleanup_tx.clone();
                 let shutdown = shutdown_tx.subscribe();
-                let connection_id = next_connection_id;
-                next_connection_id = next_connection_id.saturating_add(1);
                 control_state.lifecycle_counters.live_connections = control_state
                     .lifecycle_counters
                     .live_connections
@@ -177,14 +171,20 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
                     .high_water_live_connections
                     .max(control_state.lifecycle_counters.live_connections);
                 connection_tasks.push(transport_runtime.spawn(async move {
-                    if let Err(error) =
-                        handle_connection_async(stream, tx, cleanup, shutdown, connection_id).await
+                    let _admission_permit = admission_permit;
+                    if let Err(error) = handle_connection_async(stream, tx, cleanup, shutdown).await
                     {
                         eprintln!("botster-hub daemon connection error: {error}");
                     }
                 }));
             }
-            Ok(message) => {
+            Ok(Some(ControlMessage::RejectedConnection)) => {
+                control_state.lifecycle_counters.rejected_connections = control_state
+                    .lifecycle_counters
+                    .rejected_connections
+                    .saturating_add(1);
+            }
+            Ok(Some(message)) => {
                 if handle_control_message(
                     &mut daemon,
                     &mut control_state,
@@ -193,11 +193,6 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
                     message,
                 ) {
                     let _ = shutdown_tx.send(true);
-                    // Release the old listener name before joining connection tasks. An
-                    // immediate restart may bind the same path as soon as the shutdown
-                    // response is delivered; unlinking after the join could then remove
-                    // the replacement daemon's live socket.
-                    cleanup_socket_path(&socket_path);
                     wait_for_connection_tasks(
                         &transport_runtime,
                         &mut connection_tasks,
@@ -207,20 +202,16 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
                         control_tx.clone(),
                     );
                     let status = daemon.stop();
+                    cleanup_socket_path(&socket_path);
                     return Ok(status);
                 }
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                if control_state.next_reconciliation <= Instant::now() {
-                    drive_entity_subscriptions(&mut daemon, &mut control_state);
-                    control_state.next_reconciliation =
-                        Instant::now() + ENTITY_RECONCILIATION_INTERVAL;
-                }
+            Err(_) => {
                 if !socket_path.exists() {
                     rebind_missing_socket_path(&socket_path);
                 }
             }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Ok(None) => {
                 return Err(DaemonTransportError::ControlThreadStopped);
             }
         }
@@ -272,27 +263,38 @@ pub fn stream_attach(
 
 async fn accept_connections(
     listener: TokioUnixListener,
-    control_tx: SyncSender<ControlMessage>,
+    control_tx: tokio_mpsc::Sender<ControlMessage>,
     mut shutdown_rx: watch::Receiver<bool>,
+    admission: Arc<Semaphore>,
 ) {
     loop {
         tokio::select! {
             accepted = listener.accept() => {
                 match accepted {
                     Ok((stream, _)) => {
-                        match control_tx.try_send(ControlMessage::AcceptedConnection { stream }) {
-                            Ok(()) => {}
-                            Err(mpsc::TrySendError::Full(
-                                ControlMessage::AcceptedConnection { stream },
-                            )) => {
-                                // Keep accept-side pressure bounded without parking one of the
-                                // fixed reactor workers on the synchronous owner queue.
-                                reject_connection_async(stream).await;
+                        match admission.clone().try_acquire_owned() {
+                            Ok(admission_permit) => {
+                                if control_tx
+                                    .send(ControlMessage::AcceptedConnection {
+                                        stream,
+                                        admission_permit,
+                                    })
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
                             }
-                            Err(mpsc::TrySendError::Disconnected(_)) => return,
-                            Err(mpsc::TrySendError::Full(_)) => unreachable!(
-                                "accept loop only sends accepted-connection messages"
-                            ),
+                            Err(_) => {
+                                reject_connection_async(stream).await;
+                                if control_tx
+                                    .send(ControlMessage::RejectedConnection)
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                            }
                         }
                     }
                     Err(error) => {
@@ -334,18 +336,13 @@ async fn reject_connection_async(stream: TokioUnixStream) {
 
 async fn handle_connection_async(
     stream: TokioUnixStream,
-    control_tx: SyncSender<ControlMessage>,
+    control_tx: ControlSender,
     cleanup_tx: SyncSender<ConnectionCleanup>,
     mut shutdown_rx: watch::Receiver<bool>,
-    connection_id: u64,
 ) -> DaemonTransportResult<()> {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = AsyncBufReader::new(read_half);
-    let mut cleanup = ConnectionCleanupGuard::new(
-        connection_id,
-        cleanup_tx,
-        ConnectionTerminalReason::Protocol,
-    );
+    let mut cleanup = ConnectionCleanupGuard::new(cleanup_tx, ConnectionTerminalReason::Protocol);
     let hello: DaemonHello =
         match read_async_frame(&mut reader, Some(DAEMON_HANDSHAKE_TIMEOUT)).await {
             Ok(hello) => hello,
@@ -409,7 +406,7 @@ async fn handle_connection_async(
             )
             .await;
         }
-        let (reply_tx, reply_rx) = mpsc::channel();
+        let (reply_tx, reply_rx) = oneshot::channel();
         let close_after_response = matches!(request, DaemonRequest::DaemonShutdown);
         let (response_delivery_tx, response_delivery_rx) = if close_after_response {
             let (tx, rx) = mpsc::channel();
@@ -424,6 +421,7 @@ async fn handle_connection_async(
                 reply_tx,
                 response_delivery_rx,
             })
+            .await
             .map_err(|_| DaemonTransportError::ControlThreadStopped)?;
         let response = receive_control_response(reply_rx).await?;
         if response.kind != DaemonResponseKind::OperatorError {
@@ -435,7 +433,7 @@ async fn handle_connection_async(
         }
         if let Err(error) = write_result {
             cleanup.set_reason(ConnectionTerminalReason::WriteFailure);
-            let _ = control_tx.send(ControlMessage::EgressWriteFailed {
+            let _ = control_tx.try_send(ControlMessage::EgressWriteFailed {
                 delivery_kind: daemon_delivery_kind(&response),
             });
             return Err(error);
@@ -450,14 +448,14 @@ async fn handle_connection_async(
 async fn handle_entity_subscription_async(
     mut write_half: tokio::net::unix::OwnedWriteHalf,
     mut reader: AsyncBufReader<tokio::net::unix::OwnedReadHalf>,
-    control_tx: SyncSender<ControlMessage>,
+    control_tx: ControlSender,
     entity_type: String,
     subscription_id: String,
     mut cleanup: ConnectionCleanupGuard,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> DaemonTransportResult<()> {
     let (frame_tx, mut frame_rx) = tokio_mpsc::channel(ENTITY_SUBSCRIPTION_QUEUE_CAPACITY);
-    let (reply_tx, reply_rx) = mpsc::channel();
+    let (reply_tx, reply_rx) = oneshot::channel();
     control_tx
         .send(ControlMessage::SubscribeEntities {
             entity_type,
@@ -465,6 +463,7 @@ async fn handle_entity_subscription_async(
             frame_tx: EntityFrameSender::Async(frame_tx),
             reply_tx,
         })
+        .await
         .map_err(|_| DaemonTransportError::ControlThreadStopped)?;
     let response = receive_control_response(reply_rx).await?;
     write_async_frame(&mut write_half, &response).await?;
@@ -485,7 +484,7 @@ async fn handle_entity_subscription_async(
                 };
                 if let Err(error) = write_async_frame(&mut write_half, &frame).await {
                     cleanup.set_reason(ConnectionTerminalReason::WriteFailure);
-                    let _ = control_tx.send(ControlMessage::EgressWriteFailed {
+                    let _ = control_tx.try_send(ControlMessage::EgressWriteFailed {
                         delivery_kind: DaemonDeliveryKind::Control,
                     });
                     return Err(error);
@@ -513,12 +512,13 @@ async fn handle_entity_subscription_async(
                         "entity stream accepts only its matching unsubscribe request",
                     ));
                 }
-                let (reply_tx, reply_rx) = mpsc::channel();
+                let (reply_tx, reply_rx) = oneshot::channel();
                 control_tx
                     .send(ControlMessage::UnsubscribeEntities {
                         subscription_id: subscription_id.clone(),
                         reply_tx: Some(reply_tx),
                     })
+                    .await
                     .map_err(|_| DaemonTransportError::ControlThreadStopped)?;
                 let response = receive_control_response(reply_rx).await?;
                 write_async_frame(&mut write_half, &response).await?;
@@ -633,11 +633,10 @@ where
 }
 
 async fn receive_control_response(
-    reply_rx: mpsc::Receiver<DaemonTransportResult<DaemonResponse>>,
+    reply_rx: oneshot::Receiver<DaemonTransportResult<DaemonResponse>>,
 ) -> DaemonTransportResult<DaemonResponse> {
-    tokio::task::spawn_blocking(move || reply_rx.recv())
+    reply_rx
         .await
-        .map_err(|_| DaemonTransportError::ControlThreadStopped)?
         .map_err(|_| DaemonTransportError::ControlThreadStopped)?
 }
 
@@ -666,7 +665,6 @@ impl ConnectionTerminalReason {
 
 #[derive(Debug)]
 struct ConnectionCleanup {
-    connection_id: u64,
     attached_subscriptions: Vec<AttachedSubscription>,
     entity_subscription_ids: BTreeSet<String>,
     reason: ConnectionTerminalReason,
@@ -678,15 +676,10 @@ struct ConnectionCleanupGuard {
 }
 
 impl ConnectionCleanupGuard {
-    fn new(
-        connection_id: u64,
-        cleanup_tx: SyncSender<ConnectionCleanup>,
-        reason: ConnectionTerminalReason,
-    ) -> Self {
+    fn new(cleanup_tx: SyncSender<ConnectionCleanup>, reason: ConnectionTerminalReason) -> Self {
         Self {
             cleanup_tx,
             cleanup: Some(ConnectionCleanup {
-                connection_id,
                 attached_subscriptions: Vec::new(),
                 entity_subscription_ids: BTreeSet::new(),
                 reason,
@@ -722,10 +715,10 @@ impl ConnectionCleanupGuard {
 
 impl Drop for ConnectionCleanupGuard {
     fn drop(&mut self) {
-        if let Some(cleanup) = self.cleanup.take() {
-            self.cleanup_tx
-                .try_send(cleanup)
-                .expect("connection cleanup queue is bounded by admitted connections");
+        if let Some(cleanup) = self.cleanup.take()
+            && let Err(error) = self.cleanup_tx.try_send(cleanup)
+        {
+            eprintln!("botster-hub connection cleanup enqueue failed: {error}");
         }
     }
 }
@@ -740,7 +733,7 @@ fn wait_for_connection_tasks(
     cleanup_rx: &mpsc::Receiver<ConnectionCleanup>,
     daemon: &mut HubDaemon,
     state: &mut DaemonControlState,
-    control_tx: SyncSender<ControlMessage>,
+    control_tx: ControlSender,
 ) {
     let deadline = Instant::now() + DAEMON_CLIENT_WRITE_TIMEOUT;
     while !tasks.iter().all(JoinHandle::is_finished) && Instant::now() < deadline {
@@ -767,16 +760,9 @@ fn wait_for_connection_tasks(
 fn handle_connection_cleanup(
     daemon: &mut HubDaemon,
     state: &mut DaemonControlState,
-    control_tx: SyncSender<ControlMessage>,
+    control_tx: ControlSender,
     cleanup: ConnectionCleanup,
 ) {
-    if !state.cleaned_connections.insert(cleanup.connection_id) {
-        state.lifecycle_counters.cleanup_already_complete = state
-            .lifecycle_counters
-            .cleanup_already_complete
-            .saturating_add(1);
-        return;
-    }
     state.lifecycle_counters.live_connections =
         state.lifecycle_counters.live_connections.saturating_sub(1);
     *state
@@ -796,6 +782,7 @@ fn handle_connection_cleanup(
                 .lifecycle_counters
                 .live_entity_subscriptions
                 .saturating_sub(1);
+            state.released_entity_generations = state.released_entity_generations.saturating_add(1);
         }
     }
     for subscription in cleanup.attached_subscriptions {
@@ -818,6 +805,7 @@ fn handle_connection_cleanup(
             .lifecycle_counters
             .live_attach_subscriptions
             .saturating_sub(1);
+        state.released_attach_generations = state.released_attach_generations.saturating_add(1);
         failed |= result.is_err()
             || result
                 .as_ref()
@@ -853,11 +841,11 @@ fn handle_control_message(
     daemon: &mut HubDaemon,
     state: &mut DaemonControlState,
     local_webrtc_terminal_record_path: &Path,
-    control_tx: SyncSender<ControlMessage>,
+    control_tx: ControlSender,
     message: ControlMessage,
 ) -> bool {
     match message {
-        ControlMessage::AcceptedConnection { .. } => false,
+        ControlMessage::AcceptedConnection { .. } | ControlMessage::RejectedConnection => false,
         ControlMessage::SubscribeEntities {
             entity_type,
             subscription_id,
@@ -882,6 +870,8 @@ fn handle_control_message(
                     .lifecycle_counters
                     .live_entity_subscriptions
                     .saturating_sub(1);
+                state.released_entity_generations =
+                    state.released_entity_generations.saturating_add(1);
             }
             if let Some(reply_tx) = reply_tx {
                 let _ = reply_tx.send(Ok(daemon_response_base(
@@ -971,12 +961,17 @@ fn handle_control_message(
                         .lifecycle_counters
                         .live_entity_subscriptions
                         .saturating_sub(1);
+                    state.released_entity_generations =
+                        state.released_entity_generations.saturating_add(1);
                 }
             }
             state.lifecycle_counters.live_attach_subscriptions = state
                 .lifecycle_counters
                 .live_attach_subscriptions
                 .saturating_sub(attached_subscriptions.len() as u64);
+            state.released_attach_generations = state
+                .released_attach_generations
+                .saturating_add(attached_subscriptions.len() as u64);
             detach_local_webrtc_subscriptions(
                 daemon,
                 &mut state.logical_clock,
@@ -992,16 +987,27 @@ fn handle_control_message(
             false
         }
         ControlMessage::EgressWriteFailed { delivery_kind } => {
-            state.egress_diagnostics.record_write_failure(delivery_kind);
-            state.lifecycle_counters.stalled_writes =
-                state.lifecycle_counters.stalled_writes.saturating_add(1);
+            record_egress_write_failure(
+                &mut state.egress_diagnostics,
+                &mut state.lifecycle_counters,
+                delivery_kind,
+            );
             false
         }
     }
 }
 
+fn record_egress_write_failure(
+    diagnostics: &mut DaemonEgressDiagnostics,
+    counters: &mut DaemonLifecycleCounters,
+    delivery_kind: DaemonDeliveryKind,
+) {
+    diagnostics.record_write_failure(delivery_kind);
+    counters.stalled_writes = counters.stalled_writes.saturating_add(1);
+}
+
 fn send_control_response(
-    reply_tx: Sender<DaemonTransportResult<DaemonResponse>>,
+    reply_tx: ControlReplySender,
     response: DaemonTransportResult<DaemonResponse>,
     response_delivery_rx: Option<mpsc::Receiver<()>>,
 ) -> bool {
@@ -1026,7 +1032,7 @@ fn wait_for_response_delivery(
         && response_received
         && let Some(response_delivery_rx) = response_delivery_rx
     {
-        let _ = response_delivery_rx.recv();
+        let _ = response_delivery_rx.recv_timeout(DAEMON_CLIENT_WRITE_TIMEOUT);
         return true;
     }
     false
@@ -1058,7 +1064,7 @@ fn detach_local_webrtc_subscriptions(
     logical_clock: &mut u64,
     drain_cursors: &mut BTreeMap<String, u64>,
     pending_runtime: &mut PendingRuntimeState,
-    control_tx: SyncSender<ControlMessage>,
+    control_tx: ControlSender,
     observability: DaemonObservability<'_>,
     attached_subscriptions: Vec<LocalWebrtcAttachedSubscription>,
 ) {
@@ -1090,7 +1096,7 @@ fn handle_control_request(
     drain_cursors: &mut BTreeMap<String, u64>,
     pending_runtime: &mut PendingRuntimeState,
     observability: DaemonObservability<'_>,
-    control_tx: SyncSender<ControlMessage>,
+    control_tx: ControlSender,
     request: DaemonRequest,
 ) -> DaemonTransportResult<DaemonResponse> {
     match request {
@@ -3444,12 +3450,12 @@ fn daemon_endpoint(config: &HubConfig) -> DaemonTransportResult<DaemonEndpoint> 
     socket_path(config).map(DaemonEndpoint::new)
 }
 
-fn install_signal_forwarder(control_tx: SyncSender<ControlMessage>) -> DaemonTransportResult<()> {
+fn install_signal_forwarder(control_tx: ControlSender) -> DaemonTransportResult<()> {
     let mut signals = Signals::new([SIGINT, SIGTERM]).map_err(DaemonTransportError::Io)?;
     thread::spawn(move || {
         if signals.forever().next().is_some() {
-            let (reply_tx, _reply_rx) = mpsc::channel();
-            let _ = control_tx.send(ControlMessage::Request {
+            let (reply_tx, _reply_rx) = oneshot::channel();
+            let _ = control_tx.blocking_send(ControlMessage::Request {
                 request: Box::new(DaemonRequest::DaemonShutdown),
                 reply_tx,
                 response_delivery_rx: None,
@@ -3510,20 +3516,22 @@ fn events_from_client(events: Vec<HubClientEvent>) -> Vec<DaemonEvent> {
 pub(crate) enum ControlMessage {
     AcceptedConnection {
         stream: TokioUnixStream,
+        admission_permit: OwnedSemaphorePermit,
     },
+    RejectedConnection,
     SubscribeEntities {
         entity_type: String,
         subscription_id: String,
         frame_tx: EntityFrameSender,
-        reply_tx: Sender<DaemonTransportResult<DaemonResponse>>,
+        reply_tx: ControlReplySender,
     },
     UnsubscribeEntities {
         subscription_id: String,
-        reply_tx: Option<Sender<DaemonTransportResult<DaemonResponse>>>,
+        reply_tx: Option<ControlReplySender>,
     },
     Request {
         request: Box<DaemonRequest>,
-        reply_tx: Sender<DaemonTransportResult<DaemonResponse>>,
+        reply_tx: ControlReplySender,
         response_delivery_rx: Option<mpsc::Receiver<()>>,
     },
     EgressWriteFailed {
@@ -3598,9 +3606,8 @@ struct DaemonControlState {
     pending_runtime: PendingRuntimeState,
     lifecycle_counters: DaemonLifecycleCounters,
     next_reconciliation: Instant,
-    cleaned_connections: BTreeSet<u64>,
-    seen_entity_subscriptions: BTreeSet<String>,
-    seen_attach_subscriptions: BTreeSet<(String, String)>,
+    released_entity_generations: u64,
+    released_attach_generations: u64,
 }
 
 impl Default for DaemonControlState {
@@ -3614,9 +3621,8 @@ impl Default for DaemonControlState {
             pending_runtime: PendingRuntimeState::default(),
             lifecycle_counters: DaemonLifecycleCounters::default(),
             next_reconciliation: Instant::now(),
-            cleaned_connections: BTreeSet::new(),
-            seen_entity_subscriptions: BTreeSet::new(),
-            seen_attach_subscriptions: BTreeSet::new(),
+            released_entity_generations: 0,
+            released_attach_generations: 0,
         }
     }
 }
@@ -3720,12 +3726,9 @@ fn record_attached_subscription_change(
         return;
     };
     match change {
-        AttachedSubscriptionChange::Attach(subscription) => {
-            let key = (
-                subscription.session_id.clone(),
-                subscription.subscription_id.clone(),
-            );
-            if !state.seen_attach_subscriptions.insert(key) {
+        AttachedSubscriptionChange::Attach(_) => {
+            if state.released_attach_generations > 0 {
+                state.released_attach_generations -= 1;
                 state.lifecycle_counters.reconnect_registrations = state
                     .lifecycle_counters
                     .reconnect_registrations
@@ -3745,6 +3748,7 @@ fn record_attached_subscription_change(
                 .lifecycle_counters
                 .live_attach_subscriptions
                 .saturating_sub(1);
+            state.released_attach_generations = state.released_attach_generations.saturating_add(1);
         }
     }
 }
@@ -3851,10 +3855,8 @@ fn register_entity_subscription(
         .lifecycle_counters
         .high_water_entity_subscriptions
         .max(state.lifecycle_counters.live_entity_subscriptions);
-    if !state
-        .seen_entity_subscriptions
-        .insert(subscription_id.clone())
-    {
+    if state.released_entity_generations > 0 {
+        state.released_entity_generations -= 1;
         state.lifecycle_counters.reconnect_registrations = state
             .lifecycle_counters
             .reconnect_registrations
@@ -3961,6 +3963,41 @@ fn drive_entity_subscriptions(daemon: &mut HubDaemon, state: &mut DaemonControlS
                     &mut state.lifecycle_counters,
                 )
             });
+    } else if changes.changes.iter().any(|change| {
+        !matches!(
+            &change.kind,
+            SessionLifecycleChangeKind::Upsert { .. } | SessionLifecycleChangeKind::Removed { .. }
+        )
+    }) {
+        state.lifecycle_counters.lifecycle_resync_reads = state
+            .lifecycle_counters
+            .lifecycle_resync_reads
+            .saturating_add(1);
+        state.lifecycle_counters.lifecycle_baseline_reads = state
+            .lifecycle_counters
+            .lifecycle_baseline_reads
+            .saturating_add(1);
+        let Ok(baseline) = runtime.session_lifecycle_baseline() else {
+            return;
+        };
+        state.reconciliation.cursor = Some(baseline.cursor.clone());
+        state.reconciliation.records = baseline
+            .sessions
+            .iter()
+            .cloned()
+            .map(|record| (record.session.session_id.0.clone(), record))
+            .collect();
+        state
+            .entity_subscriptions
+            .retain(|subscription_id, subscription| {
+                try_resync_subscription(
+                    subscription_id,
+                    subscription,
+                    baseline.clone(),
+                    "unknown_core_change".to_string(),
+                    &mut state.lifecycle_counters,
+                )
+            });
     } else {
         for change in changes.changes {
             state.reconciliation.cursor = Some(change.cursor.clone());
@@ -3974,12 +4011,7 @@ fn drive_entity_subscriptions(daemon: &mut HubDaemon, state: &mut DaemonControlS
                 SessionLifecycleChangeKind::Removed { session_id } => {
                     state.reconciliation.records.remove(&session_id.0);
                 }
-                _ => {
-                    for subscription in state.entity_subscriptions.values_mut() {
-                        subscription.resync_reason = Some("unknown_core_change".to_string());
-                    }
-                    continue;
-                }
+                _ => unreachable!("unsupported lifecycle changes were resynced above"),
             }
             state
                 .entity_subscriptions
@@ -6831,10 +6863,7 @@ impl From<crate::HubLifecycleError> for DaemonTransportError {
 pub type DaemonTransportResult<T> = Result<T, DaemonTransportError>;
 
 #[cfg(test)]
-fn handle_connection(
-    stream: UnixStream,
-    control_tx: SyncSender<ControlMessage>,
-) -> DaemonTransportResult<()> {
+fn handle_connection(stream: UnixStream, control_tx: ControlSender) -> DaemonTransportResult<()> {
     stream
         .set_nonblocking(true)
         .map_err(DaemonTransportError::Io)?;
@@ -6853,13 +6882,12 @@ fn handle_connection(
         control_tx.clone(),
         cleanup_tx,
         shutdown_rx,
-        1,
     ));
     if let Ok(cleanup) = cleanup_rx.try_recv() {
         for subscription in cleanup.attached_subscriptions {
-            let (reply_tx, reply_rx) = mpsc::channel();
+            let (reply_tx, reply_rx) = oneshot::channel();
             if control_tx
-                .send(ControlMessage::Request {
+                .blocking_send(ControlMessage::Request {
                     request: Box::new(DaemonRequest::Detach {
                         session_id: subscription.session_id,
                         subscription_id: subscription.subscription_id,
@@ -6869,7 +6897,7 @@ fn handle_connection(
                 })
                 .is_ok()
             {
-                let _ = reply_rx.recv_timeout(Duration::from_secs(1));
+                let _ = reply_rx.blocking_recv();
             }
         }
     }
@@ -6899,7 +6927,7 @@ mod tests {
     #[test]
     fn client_eof_detaches_connection_subscriptions() {
         let (server, mut client) = UnixStream::pair().expect("create daemon socket pair");
-        let (control_tx, control_rx) = mpsc::sync_channel(DAEMON_CONTROL_QUEUE_CAPACITY);
+        let (control_tx, mut control_rx) = tokio_mpsc::channel(DAEMON_CONTROL_QUEUE_CAPACITY);
         let connection = thread::spawn(move || handle_connection(server, control_tx));
 
         write_frame(
@@ -6922,9 +6950,7 @@ mod tests {
         .expect("write attach request");
         let ControlMessage::Request {
             request, reply_tx, ..
-        } = control_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("receive attach request")
+        } = control_rx.blocking_recv().expect("receive attach request")
         else {
             panic!("expected attach control request");
         };
@@ -6940,7 +6966,7 @@ mod tests {
         let ControlMessage::Request {
             request, reply_tx, ..
         } = control_rx
-            .recv_timeout(Duration::from_secs(1))
+            .blocking_recv()
             .expect("receive disconnect detach request")
         else {
             panic!("expected detach control request");
@@ -7013,8 +7039,17 @@ mod tests {
         assert_eq!(daemon_delivery_kind(&control), DaemonDeliveryKind::Control);
 
         let mut diagnostics = DaemonEgressDiagnostics::default();
-        diagnostics.record_write_failure(daemon_delivery_kind(&terminal));
-        diagnostics.record_write_failure(daemon_delivery_kind(&control));
+        let mut counters = DaemonLifecycleCounters::default();
+        record_egress_write_failure(
+            &mut diagnostics,
+            &mut counters,
+            daemon_delivery_kind(&terminal),
+        );
+        record_egress_write_failure(
+            &mut diagnostics,
+            &mut counters,
+            daemon_delivery_kind(&control),
+        );
         let rows = diagnostics.diagnostics();
 
         assert_eq!(rows.len(), 2);
@@ -7028,6 +7063,7 @@ mod tests {
         assert!(!debug.contains("private terminal payload"));
         assert!(!debug.contains("session-redacted"));
         assert!(!debug.contains("subscription-redacted"));
+        assert_eq!(counters.stalled_writes, 2);
     }
 
     #[test]
@@ -7041,7 +7077,7 @@ mod tests {
             "shutdown response delivery must pass through the wait enforcement seam"
         );
 
-        let (reply_tx, reply_rx) = mpsc::channel();
+        let (reply_tx, reply_rx) = oneshot::channel();
         let (response_delivery_tx, response_delivery_rx) = mpsc::channel();
         let (stopped_tx, stopped_rx) = mpsc::channel();
 
@@ -7055,7 +7091,7 @@ mod tests {
         });
 
         let response = reply_rx
-            .recv_timeout(Duration::from_secs(1))
+            .blocking_recv()
             .expect("shutdown response reaches transport")
             .expect("shutdown response succeeds");
         assert_eq!(response.kind, DaemonResponseKind::Shutdown);
@@ -7076,7 +7112,7 @@ mod tests {
 
     #[test]
     fn daemon_shutdown_releases_when_delivery_owner_drops() {
-        let (reply_tx, reply_rx) = mpsc::channel();
+        let (reply_tx, reply_rx) = oneshot::channel();
         let (response_delivery_tx, response_delivery_rx) = mpsc::channel();
         let (stopped_tx, stopped_rx) = mpsc::channel();
 
@@ -7090,7 +7126,7 @@ mod tests {
         });
 
         let _ = reply_rx
-            .recv_timeout(Duration::from_secs(1))
+            .blocking_recv()
             .expect("shutdown response reaches transport");
         drop(response_delivery_tx);
 
@@ -7103,7 +7139,7 @@ mod tests {
 
     #[test]
     fn daemon_shutdown_releases_when_response_receiver_drops() {
-        let (reply_tx, reply_rx) = mpsc::channel();
+        let (reply_tx, reply_rx) = oneshot::channel();
         let (_response_delivery_tx, response_delivery_rx) = mpsc::channel();
         drop(reply_rx);
 
@@ -7118,7 +7154,7 @@ mod tests {
     fn daemon_shutdown_write_failure_releases_stop_and_preserves_error() {
         let (server, mut client) = UnixStream::pair().expect("create daemon socket pair");
         let server_control = server.try_clone().expect("clone daemon server socket");
-        let (control_tx, control_rx) = mpsc::sync_channel(DAEMON_CONTROL_QUEUE_CAPACITY);
+        let (control_tx, mut control_rx) = tokio_mpsc::channel(DAEMON_CONTROL_QUEUE_CAPACITY);
         let connection = thread::spawn(move || handle_connection(server, control_tx));
 
         write_frame(
@@ -7138,7 +7174,7 @@ mod tests {
             reply_tx,
             response_delivery_rx,
         } = control_rx
-            .recv_timeout(Duration::from_secs(1))
+            .blocking_recv()
             .expect("receive daemon shutdown request")
         else {
             panic!("expected shutdown control request");
@@ -7249,6 +7285,10 @@ mod tests {
             overflow_reason,
             &mut counters,
         ));
+        assert_eq!(counters.entity_delivery_attempts, 3);
+        assert_eq!(counters.entity_delivery_successes, 1);
+        assert_eq!(counters.entity_delivery_overflows, 1);
+        assert_eq!(counters.entity_delivery_failures, 1);
     }
 
     #[test]
@@ -7323,5 +7363,9 @@ mod tests {
             overflow_reason,
             &mut counters,
         ));
+        assert_eq!(counters.entity_delivery_attempts, 3);
+        assert_eq!(counters.entity_delivery_successes, 1);
+        assert_eq!(counters.entity_delivery_overflows, 1);
+        assert_eq!(counters.entity_delivery_failures, 1);
     }
 }

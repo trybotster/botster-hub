@@ -5,7 +5,8 @@
 - Repository: `trybotster/botster-hub`
 - Target id: `tgt_7e208a0c76a44980a83b63af976b1f22`
 - Run: `run_1785199801_176415`
-- Implement step: `run_step_1785200938_377318`
+- Implement steps: `run_step_1785200938_377318` and
+  `run_step_1785212561_440065`
 
 The approved plan and the authoritative Project Pipelines target both route
 this work to `botster-hub`.
@@ -51,15 +52,20 @@ The production `serve_daemon` path now owns a fixed two-worker Tokio transport
 reactor. Unix accepts, held-open reads, entity delivery, cancellation, and
 bounded writes use async waits rather than one detached OS thread and one
 20 ms poll loop per client. Admission is capped at 64 live connections, the
-owner control queue is bounded, and excess clients receive a typed
-backpressure handshake without entering request execution.
+owner control queue is a bounded Tokio channel, replies use one-shot channels,
+and excess clients receive a typed backpressure handshake without entering
+request execution. Active requests and WebRTC control delivery therefore
+neither park reactor workers on blocking sends nor allocate a blocking-pool
+thread per request.
 
 Every admitted connection creates its cleanup guard before the handshake. The
 guard owns attach and entity registrations and emits one cleanup record for
 EOF, protocol/incomplete-frame failure, stalled write, cancellation, shutdown,
 or normal close. The owner performs detach/unsubscribe and publishes sanitized
 current, high-water, cleanup, reconnect, reconciliation, delivery, and stalled
-write counters through `DaemonStatus`.
+write counters through `DaemonStatus`. Reconnect accounting consumes bounded
+released-generation credits, so protocol-compliant fresh subscription ids are
+counted without retaining connection or subscription history.
 
 Lifecycle reconciliation is seeded once before the listener begins accepting
 clients. Subscribers use the cached authoritative baseline; steady state reads
@@ -68,9 +74,10 @@ remembered sessions. A filesystem-backed baseline is read again only when Core
 reports `resync_required`. This keeps potentially slow initial registry I/O
 outside the admitted-client request path.
 
-Shutdown unlinks the old listener path before joining connection tasks. This
-preserves immediate restart ownership and prevents the old daemon from
-unlinking a replacement daemon's newly bound socket.
+Shutdown signals and joins connection tasks before stopping the daemon and
+unlinking the listener. The `down` command verifies owned daemon metadata and
+waits for that process to exit before returning, so immediate `up` cannot
+overlap old session or entrypoint teardown.
 
 ## Files changed
 
@@ -113,6 +120,9 @@ was required. The existing closed UiNode dependency remains unrelated.
   sessions rather than the separate four-package fixture. Package count does
   not participate in the lifecycle journal algorithm; the Linux loaded
   campaign remains the production contention proof.
+- Review removed the proposed `cleanup_already_complete` field because the
+  single-owner cleanup guard has no legitimate duplicate producer. Cleanup
+  enqueue failure degrades to a diagnostic rather than panicking in `Drop`.
 
 ## Verification and downstream proof
 
@@ -145,9 +155,15 @@ The focused production test proves:
 - 64 live idle connections with high-water 64 and bounded OS thread growth;
 - typed admission rejection while an admitted client remains responsive;
 - cleanup convergence after abrupt drops;
+- sixteen repeated fresh-id subscribe/drop reconnect generations with live
+  entity subscriptions returning to zero and high-water remaining bounded;
+- live/high-water attach counters plus a real failed cleanup after its session
+  is removed;
+- accepted-connection, delivery overflow/failure, and stalled-write producers;
 - deadlines and cleanup for half-open handshake, malformed complete frame, and
   incomplete frame;
-- clean daemon shutdown.
+- clean daemon shutdown with live idle/entity clients, followed immediately by
+  a non-overlapping replacement daemon.
 
 Existing Hub tests continue to cover failed response/entity delivery, duplicate
 attach/entity identifiers, slow terminal consumers, fresh authoritative entity
@@ -195,3 +211,6 @@ knowledge-vault work rather than silently broadening this implementation run.
   `resync_required` is the only reason to repeat the filesystem baseline.
 - Existing Web/TUI consumers tolerate an optional status field because Rust
   defaults it for older daemon JSON and generated TypeScript marks it optional.
+- Aggregate released-generation credits are sufficient for the requested
+  reconnect counter; client identity is intentionally not inferred from
+  transport-local subscription ids.

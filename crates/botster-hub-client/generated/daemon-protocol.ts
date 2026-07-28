@@ -705,7 +705,6 @@ export interface DaemonLifecycleCounters {
   high_water_attach_subscriptions: number;
   reconnect_registrations: number;
   cleanup_completed: number;
-  cleanup_already_complete: number;
   cleanup_failed: number;
   cleanup_by_reason?: Record<string, number>;
   reconciliation_wakes: number;

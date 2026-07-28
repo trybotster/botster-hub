@@ -3949,6 +3949,36 @@ fn cli_local_runtime_up_starts_reuses_and_down_stops_runtime() {
         "1.1.0"
     );
 
+    let live_idle_connection =
+        botster_hub_client::DaemonConnection::connect(&botster_hub_client::DaemonEndpoint::new(
+            config
+                .transports
+                .local_socket
+                .as_ref()
+                .expect("local runtime socket binding")
+                .path
+                .clone(),
+        ))
+        .expect("hold idle connection across down");
+    let mut live_entity_subscription = botster_hub_client::subscribe_session_entities(
+        &botster_hub_client::DaemonEndpoint::new(
+            config
+                .transports
+                .local_socket
+                .as_ref()
+                .expect("local runtime socket binding")
+                .path
+                .clone(),
+        ),
+        "down-live-entity",
+    )
+    .expect("hold entity subscription across down");
+    assert!(matches!(
+        live_entity_subscription
+            .next_frame()
+            .expect("live entity initial snapshot"),
+        botster_hub_client::DaemonEntityFrame::Snapshot { .. }
+    ));
     let down = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
         .arg("down")
         .arg("--data-dir")
@@ -3962,6 +3992,8 @@ fn cli_local_runtime_up_starts_reuses_and_down_stops_runtime() {
     );
     let down_text = command_output_text(&down);
     assert!(down_text.contains("response=shutdown"));
+    drop(live_entity_subscription);
+    drop(live_idle_connection);
 
     rewrite_botster_web_entrypoint(
         &web_package_dir,
@@ -6834,6 +6866,58 @@ fn focused_connection_lifecycle_is_bounded_event_driven_and_counter_visible() {
             <= 4,
         "shared wake count must stay independent of session count"
     );
+
+    let mut attached = botster_hub_client::DaemonConnection::connect(&endpoint)
+        .expect("connect persistent attach counter fixture");
+    attached
+        .request(&botster_hub_client::DaemonRequest::Attach {
+            session_id: "focused-idle-session-0".to_string(),
+            subscription_id: "focused-attach".to_string(),
+        })
+        .expect("attach persistent counter fixture");
+    let attached_counters =
+        botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status)
+            .expect("status with live attach")
+            .status
+            .expect("live attach status body")
+            .lifecycle_counters;
+    assert_eq!(attached_counters.live_attach_subscriptions, 1);
+    assert!(attached_counters.high_water_attach_subscriptions >= 1);
+    botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::ShutdownSession {
+            session_id: "focused-idle-session-0".to_string(),
+        },
+    )
+    .expect("shutdown attached cleanup-failure fixture");
+    botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::RemoveSession {
+            session_id: "focused-idle-session-0".to_string(),
+        },
+    )
+    .expect("remove attached cleanup-failure fixture");
+    drop(attached);
+
+    let failed_cleanup_deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let counters =
+            botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status)
+                .expect("status while waiting for failed detach cleanup")
+                .status
+                .expect("failed cleanup status body")
+                .lifecycle_counters;
+        if counters.cleanup_failed > attached_counters.cleanup_failed {
+            assert_eq!(counters.live_attach_subscriptions, 0);
+            break;
+        }
+        assert!(
+            Instant::now() < failed_cleanup_deadline,
+            "cleanup failure producer did not settle: {counters:?}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+
     drop(subscription);
     drop(additional_subscriptions);
 
@@ -6855,6 +6939,74 @@ fn focused_connection_lifecycle_is_bounded_event_driven_and_counter_visible() {
         thread::sleep(Duration::from_millis(20));
     }
 
+    let churn_start =
+        botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status)
+            .expect("status before rapid reconnect churn")
+            .status
+            .expect("rapid reconnect start status")
+            .lifecycle_counters;
+    for index in 0..16 {
+        let mut churn = botster_hub_client::subscribe_session_entities(
+            &endpoint,
+            format!("focused-churn-{index}"),
+        )
+        .expect("register fresh-id reconnect generation");
+        churn
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("bound churn snapshot read");
+        assert!(matches!(
+            churn.next_frame().expect("fresh-id churn snapshot"),
+            botster_hub_client::DaemonEntityFrame::Snapshot { .. }
+        ));
+        drop(churn);
+        let generation_deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let counters =
+                botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status)
+                    .expect("status while releasing reconnect generation")
+                    .status
+                    .expect("reconnect generation status body")
+                    .lifecycle_counters;
+            if counters.live_entity_subscriptions == 0 {
+                assert_eq!(counters.high_water_entity_subscriptions, 8);
+                break;
+            }
+            assert!(
+                Instant::now() < generation_deadline,
+                "reconnect generation {index} did not release: {counters:?}"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+    let churn_end =
+        botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status)
+            .expect("status after rapid reconnect churn")
+            .status
+            .expect("rapid reconnect end status")
+            .lifecycle_counters;
+    assert_eq!(
+        churn_end
+            .reconnect_registrations
+            .saturating_sub(churn_start.reconnect_registrations),
+        16,
+        "every released generation followed by a fresh subscription id is a reconnect"
+    );
+    assert!(
+        churn_end
+            .cleanup_by_reason
+            .get("eof")
+            .copied()
+            .unwrap_or_default()
+            .saturating_sub(
+                churn_start
+                    .cleanup_by_reason
+                    .get("eof")
+                    .copied()
+                    .unwrap_or_default()
+            )
+            >= 16
+    );
+
     let connection_baseline_threads = process_thread_count(daemon_pid);
     let mut idle_connections = Vec::new();
     for _ in 0..64 {
@@ -6871,6 +7023,7 @@ fn focused_connection_lifecycle_is_bounded_event_driven_and_counter_visible() {
         .lifecycle_counters;
     assert_eq!(saturated.live_connections, 64);
     assert_eq!(saturated.high_water_live_connections, 64);
+    assert!(saturated.accepted_connections >= 64);
     if let (Some(baseline), Some(peak)) = (
         connection_baseline_threads,
         process_thread_count(daemon_pid),
