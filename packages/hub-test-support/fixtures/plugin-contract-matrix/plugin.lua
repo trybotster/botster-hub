@@ -66,43 +66,6 @@ local function app_surface(_arguments)
         },
       },
       {
-        type = "form",
-        id = "contract-app-form",
-        props = {
-          action = {
-            id = "contract.action",
-            payload = {
-              operation = "submit",
-            },
-          },
-          submit_label = "Submit contract action",
-        },
-        children = {
-          {
-            type = "text_input",
-            id = "contract-app-message",
-            props = {
-              name = "message",
-              label = "Message",
-              required = true,
-            },
-          },
-          {
-            type = "button",
-            id = "contract-app-submit",
-            props = {
-              label = "Submit contract action",
-              action = {
-                id = "contract.action",
-                payload = {
-                  operation = "submit",
-                },
-              },
-            },
-          },
-        },
-      },
-      {
         type = "metric_grid",
         id = "contract-app-metrics",
         props = {
@@ -201,6 +164,43 @@ local function app_surface(_arguments)
                 id = "contract-dialog-body",
                 props = {
                   text = "Dialog visibility follows scoped presentation state.",
+                },
+              },
+              {
+                type = "form",
+                id = "contract-app-form",
+                props = {
+                  action = {
+                    id = "contract.action",
+                    payload = {
+                      operation = "submit",
+                    },
+                  },
+                  submit_label = "Submit contract action",
+                },
+                children = {
+                  {
+                    type = "text_input",
+                    id = "contract-app-message",
+                    props = {
+                      name = "message",
+                      label = "Message",
+                      required = true,
+                    },
+                  },
+                  {
+                    type = "button",
+                    id = "contract-app-submit",
+                    props = {
+                      label = "Submit contract action",
+                      action = {
+                        id = "contract.action",
+                        payload = {
+                          operation = "submit",
+                        },
+                      },
+                    },
+                  },
                 },
               },
             },

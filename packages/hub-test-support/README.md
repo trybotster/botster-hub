@@ -90,12 +90,13 @@ Only `read_screen_text` is renderable restored content; `snapshot` and
 version 0.1.5 / revision 12 exposes lossy string history. Neither is current
 binary-history contract authority.
 
-Version 0.1.13 publishes protocol version 4 / conformance revision 21 and
+Version 0.1.13 publishes protocol version 4 / conformance revision 22 and
 depends on `@trybotster/ui-contract@0.1.0` for the canonical UiNode,
 UiActionRequest, and UiActionResult declarations and conformance fixtures.
 Revision 20 remains the already-published version 0.1.12 application-primitives
 contract; revision 21 adds spawn-target `base_ref` and worktree `management`
-without reusing those bytes.
+without reusing those bytes; revision 22 makes the live presentation Dialog
+form-operable without reusing either earlier revision.
 The protocol cold-switch replaces split action fields and untyped JSON bodies
 with one canonical request envelope and typed surface/action response bodies.
 It also retains the version 0.1.11
@@ -112,10 +113,16 @@ subscription instead of concealing a delta gap. Rust consumers can run
 prove the same contract through the real Hub/Core/session-worker topology.
 `run_plugin_contract_matrix_conformance` similarly proves rendered
 open/form/toggle metadata through the real Hub/plugin worker, applies accepted
-`set`/`clear`/`toggle` results to scoped client-shaped state, and evaluates the
-delivered Dialog presence and selected-workspace equality bindings. The
-published first-party support matrix exposes the corresponding expected keys,
-values, and operation kinds to TypeScript consumers; static
+`set`/`clear`/`toggle` results to scoped client-shaped state, and materializes
+the delivered tree against its Dialog presence and selected-workspace equality
+bindings. Revision 21 places the one canonical Form inside the active Dialog
+and makes the browser-shaped consumer reject any actionable sibling Form.
+Rejected results retain the visible Dialog, Form, input, and field-error
+association; accepted results apply normalization and a whole-surface
+replacement, then clear the scoped Dialog key. The published first-party
+support matrix exposes the corresponding Dialog/Form/input composition,
+whole-surface replacement scope, expected keys, values, and operation kinds to
+TypeScript consumers; static
 `@trybotster/ui-contract` fixtures remain complementary.
 
 The mode-flags fixture covers the targeted `read_mode_flags` request/response
@@ -129,9 +136,10 @@ Botster web and TUI renderers should consume
 `metadata.application_primitives.surface_id` (`contract.app`) and render
 `metadata.application_primitives.renderer_entrypoint` (`ui_tree_snapshot.body`).
 The current core-validated primitive inventory is exposed as
-`metadata.application_primitives.primitive_kinds`: `button`, `empty_state`,
-`form`, `metric`, `metric_grid`, `panel`, `section`, `status_badge`, `table`,
-`text_input`, and `toolbar`. The current core contract fixture does not include
+`metadata.application_primitives.primitive_kinds`: `button`, `dialog`,
+`empty_state`, `form`, `metric`, `metric_grid`, `panel`, `section`,
+`status_badge`, `table`, `text`, `text_input`, and `toolbar`. The current core
+contract fixture does not include
 `list` or an `action_bar` alias; downstream clients should not invent those
 shapes.
 
