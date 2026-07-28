@@ -3,6 +3,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use botster_core::{
     BoundaryJson, Capability, CapabilitySurface, EndpointId, EnvelopeDeliveryStatus, EnvelopeId,
@@ -57,6 +58,14 @@ fn explicit_runtime_in(name: &str, data_directory: PathBuf) -> HubRuntime {
     .expect("explicit runtime config should build");
 
     HubRuntime::new(config)
+}
+
+fn unique_short_test_dir(name: &str) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time after epoch")
+        .as_nanos();
+    PathBuf::from("/tmp").join(format!("bh-{name}-{nanos}"))
 }
 
 fn ui_action_request(
@@ -1202,10 +1211,8 @@ fn real_lua_plugin_atomically_ensures_managed_worktree_and_spawns_session() {
             ),
         ],
     );
-    let mut hub = explicit_runtime_in(
-        "managed-session-template-spawn",
-        PathBuf::from(format!("/tmp/bml-{}", std::process::id())),
-    );
+    let data_directory = unique_short_test_dir("managed-lua");
+    let mut hub = explicit_runtime_in("managed-session-template-spawn", data_directory.clone());
     let repo_root = PathBuf::from("target")
         .join("botster-hub-test-data")
         .join("lua-runtime")
@@ -1249,6 +1256,18 @@ fn real_lua_plugin_atomically_ensures_managed_worktree_and_spawns_session() {
     .expect("write repo template override");
     run_git(Some(&repo_root), &["add", "-A"]);
     run_git(Some(&repo_root), &["commit", "-m", "managed fixture"]);
+    run_git(Some(&repo_root), &["switch", "-c", "feature/atomic"]);
+    fs::write(
+        &repo_script,
+        "#!/bin/sh\nprintf 'feature\\n' > repo-executed.txt\n",
+    )
+    .expect("write branch-specific repo command");
+    run_git(Some(&repo_root), &["add", "bin/init.sh"]);
+    run_git(
+        Some(&repo_root),
+        &["commit", "-m", "branch-specific command"],
+    );
+    run_git(Some(&repo_root), &["switch", "main"]);
     let mut state = hub.state().clone();
     state.spawn_targets = vec![SpawnTarget {
         target_id: "tgt_managed".to_string(),
@@ -1298,7 +1317,7 @@ fn real_lua_plugin_atomically_ensures_managed_worktree_and_spawns_session() {
     assert_eq!(spawned["target_id"], "tgt_managed");
     assert_eq!(spawned["branch"], "feature/atomic");
     assert_eq!(spawned["base_ref"], "main");
-    assert_eq!(spawned["created_branch"], true);
+    assert_eq!(spawned["created_branch"], false);
     assert_eq!(spawned["created_worktree"], true);
     assert!(
         hub.session(&SessionId(session_id.to_string()))
@@ -1330,7 +1349,7 @@ fn real_lua_plugin_atomically_ensures_managed_worktree_and_spawns_session() {
     }
     assert_eq!(
         fs::read_to_string(repo_marker).expect("repo-source command marker"),
-        "main\n",
+        "feature\n",
         "repo-source templates must execute code from the selected managed branch"
     );
 
@@ -1479,6 +1498,10 @@ fn real_lua_plugin_atomically_ensures_managed_worktree_and_spawns_session() {
         ),
         "a pre-existing branch must survive failed session spawn rollback"
     );
+
+    drop(hub);
+    fs::remove_dir_all(&data_directory).expect("remove short managed Lua data directory");
+    fs::remove_dir_all(&repo_root).expect("remove managed Lua repository");
 }
 
 #[test]

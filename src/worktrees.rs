@@ -26,7 +26,7 @@ pub struct Worktree {
     pub label: String,
     /// Admitted local directory path under the spawn target root.
     pub path: PathBuf,
-    /// Reconciled path status. Current values are `present`, `missing`, and `stale`.
+    /// Last reconciled path status. Current values are `present`, `missing`, and `stale`.
     #[serde(default = "default_present_status")]
     pub status: String,
     /// Row ownership. Existing records default to externally registered directories.
@@ -190,6 +190,12 @@ pub fn delete_worktree(
         .iter()
         .position(|worktree| worktree.worktree_id == worktree_id)
         .ok_or_else(|| WorktreeError::new("not_found", "worktree was not found"))?;
+    if worktrees[position].management == "hub_managed_git" {
+        return Err(WorktreeError::new(
+            "managed_worktree_requires_reclaim",
+            "Hub-managed Git worktrees cannot be removed as record-only worktrees",
+        ));
+    }
     Ok(worktrees.remove(position).reconciled(targets))
 }
 
@@ -249,7 +255,14 @@ fn reconcile_status(worktree: &Worktree, targets: &[SpawnTarget]) -> &'static st
         return "stale";
     };
     if worktree.management == "hub_managed_git" {
-        return crate::managed_git_worktrees::reconcile_managed_worktree(worktree, target);
+        // Startup and the bounded managed-Git lane update this persisted
+        // status. List/show projections must never run Git on the owner thread.
+        return match worktree.status.as_str() {
+            "present" => "present",
+            "missing" => "missing",
+            "stale" => "stale",
+            _ => "stale",
+        };
     }
     let Ok(root) = target.root.canonicalize() else {
         return "stale";
@@ -354,6 +367,70 @@ mod tests {
             "missing"
         );
         assert_eq!(worktree.reconciled(&[]).status, "stale");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn managed_rows_project_persisted_status_without_running_git() {
+        let root = std::env::temp_dir().join(format!(
+            "botster-managed-worktree-status-{}",
+            generated_worktree_id()
+        ));
+        fs::create_dir_all(&root).expect("create target root");
+        let managed_path = root.join("tgt").join("66656174757265");
+        fs::create_dir_all(&managed_path).expect("create managed projection path");
+        let managed = Worktree {
+            worktree_id: "managed:tgt:66656174757265".to_string(),
+            target_id: "tgt".to_string(),
+            label: "Managed".to_string(),
+            path: managed_path,
+            status: "present".to_string(),
+            management: "hub_managed_git".to_string(),
+            git: Some(WorktreeGitMetadata {
+                repository_root: root.clone(),
+                branch: Some("feature".to_string()),
+                head: None,
+            }),
+            metadata: BTreeMap::new(),
+        };
+        assert_eq!(
+            list_worktrees(std::slice::from_ref(&managed), &[target(root.clone())])[0].status,
+            "present",
+            "DTO projection must use the last off-owner reconciliation result"
+        );
+        assert_eq!(
+            managed.reconciled(&[]).status,
+            "stale",
+            "an orphaned managed row still reports stale without running Git"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn managed_rows_cannot_be_deleted_as_record_only_worktrees() {
+        let root = std::env::temp_dir().join(format!(
+            "botster-managed-worktree-delete-{}",
+            generated_worktree_id()
+        ));
+        fs::create_dir_all(&root).expect("create target root");
+        let mut worktrees = vec![Worktree {
+            worktree_id: "managed:tgt:66656174757265".to_string(),
+            target_id: "tgt".to_string(),
+            label: "Managed".to_string(),
+            path: root.join("managed"),
+            status: "present".to_string(),
+            management: "hub_managed_git".to_string(),
+            git: None,
+            metadata: BTreeMap::new(),
+        }];
+        let error = delete_worktree(
+            &mut worktrees,
+            &[target(root.clone())],
+            "managed:tgt:66656174757265",
+        )
+        .expect_err("managed row requires an explicit reclaim operation");
+        assert_eq!(error.kind, "managed_worktree_requires_reclaim");
+        assert_eq!(worktrees.len(), 1);
         let _ = fs::remove_dir_all(root);
     }
 }

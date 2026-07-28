@@ -68,6 +68,9 @@ use crate::worktrees::Worktree;
 /// admission and policy boundaries remain visible at the hub layer.
 pub struct HubRuntime {
     config: HubConfig,
+    // Managed-session fulfillment needs interior mutability while the plugin
+    // owner loop holds `&self`. This state remains owner-thread policy: never
+    // hold a read guard across `replace_state`, which takes the write guard.
     state: RwLock<HubState>,
     core_daemon: SharedCoreDaemon,
     reconciliation: HubSessionReconciliation,
@@ -143,6 +146,7 @@ struct ManagedGitWorkerJob {
 enum ManagedGitDecision {
     Commit,
     Rollback,
+    Preserve,
 }
 
 struct ManagedGitCoordinator {
@@ -848,15 +852,37 @@ impl HubRuntime {
             }
         };
         operation.prepared = Some(prepared.clone());
+        if Instant::now() >= operation.pending.accepted_at + MANAGED_GIT_OPERATION_TIMEOUT {
+            operation.deferred_error = Some(ManagedGitError::new(
+                "reconciliation_required",
+                "managed Git owner deadline elapsed; prepared resources were preserved",
+            ));
+            let _ = operation.decision.send(ManagedGitDecision::Preserve);
+            operation.phase = ManagedGitOwnerPhase::Finalizing;
+            return false;
+        }
         let result = self
             .persist_managed_worktree(&prepared)
             .and_then(|()| self.spawn_prepared_managed_session(&operation.pending, &prepared));
         match result {
             Ok(spawned) => {
+                if Instant::now() >= operation.pending.accepted_at + MANAGED_GIT_OPERATION_TIMEOUT {
+                    self.cleanup_managed_session(&spawned);
+                    operation.deferred_error = Some(ManagedGitError::new(
+                        "reconciliation_required",
+                        "managed Git owner deadline elapsed; prepared resources were preserved",
+                    ));
+                    let _ = operation.decision.send(ManagedGitDecision::Preserve);
+                    operation.phase = ManagedGitOwnerPhase::Finalizing;
+                    return false;
+                }
                 operation.response_delivered =
                     operation.pending.response.send(Ok(spawned.clone())).is_ok();
                 if operation.response_delivered {
                     let _ = operation.decision.send(ManagedGitDecision::Commit);
+                    // The worker owns lane release. Once success is delivered
+                    // and commit is decided, owner bookkeeping is complete.
+                    return true;
                 } else {
                     self.cleanup_managed_session(&spawned);
                     let _ = operation.decision.send(ManagedGitDecision::Rollback);
@@ -1891,17 +1917,11 @@ impl ManagedGitCoordinator {
                             let remaining = (accepted_at + MANAGED_GIT_OPERATION_TIMEOUT)
                                 .saturating_duration_since(Instant::now());
                             let decision = job.decision.recv_timeout(remaining);
-                            let finalized = match decision {
-                                Ok(ManagedGitDecision::Commit) => Ok(()),
-                                Ok(ManagedGitDecision::Rollback)
-                                | Err(mpsc::RecvTimeoutError::Timeout)
-                                | Err(mpsc::RecvTimeoutError::Disconnected) => {
-                                    rollback_prepared_worktree(
-                                        &prepared,
-                                        accepted_at + MANAGED_GIT_OPERATION_TIMEOUT,
-                                    )
-                                }
-                            };
+                            let finalized = finalize_prepared_managed_worktree(
+                                &prepared,
+                                decision,
+                                accepted_at + MANAGED_GIT_OPERATION_TIMEOUT,
+                            );
                             let _ = job.finalized.send(finalized);
                         }
                         Err(error) => {
@@ -1935,6 +1955,27 @@ impl ManagedGitCoordinator {
                 }
             })?;
         Ok((prepared_receiver, decision, finalized_receiver))
+    }
+}
+
+fn finalize_prepared_managed_worktree(
+    prepared: &PreparedManagedWorktree,
+    decision: Result<ManagedGitDecision, mpsc::RecvTimeoutError>,
+    deadline: Instant,
+) -> Result<(), ManagedGitError> {
+    match decision {
+        Ok(ManagedGitDecision::Commit) => Ok(()),
+        Ok(ManagedGitDecision::Rollback) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+            rollback_prepared_worktree(prepared, deadline)
+        }
+        Ok(ManagedGitDecision::Preserve) => Err(ManagedGitError::new(
+            "reconciliation_required",
+            "managed Git owner deadline elapsed; prepared resources were preserved",
+        )),
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(ManagedGitError::new(
+            "reconciliation_required",
+            "managed Git owner decision timed out; prepared resources were preserved",
+        )),
     }
 }
 
@@ -2305,6 +2346,69 @@ mod tests {
             .expect("waiting finalization")
             .expect("waiting commit");
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn managed_git_decision_timeout_preserves_prepared_worktree() {
+        let root = std::env::temp_dir().join(format!(
+            "botster-managed-decision-timeout-{}-{}",
+            std::process::id(),
+            current_unix_nanos()
+        ));
+        let repository = root.join("repository");
+        let managed_root = root.join("managed");
+        fs::create_dir_all(&repository).expect("create repository");
+        run_git(None, &["init", "-b", "main", path_str(&repository)]);
+        run_git(
+            Some(&repository),
+            &["config", "user.email", "botster@example.invalid"],
+        );
+        run_git(Some(&repository), &["config", "user.name", "Botster Test"]);
+        fs::write(repository.join("README.md"), "fixture\n").expect("write fixture");
+        run_git(Some(&repository), &["add", "README.md"]);
+        run_git(Some(&repository), &["commit", "-m", "fixture"]);
+        let request = ManagedGitRequest {
+            target: SpawnTarget {
+                target_id: "tgt_timeout".to_string(),
+                label: "Timeout".to_string(),
+                root: repository.clone(),
+                enabled: true,
+                kind: "git".to_string(),
+                base_ref: Some("main".to_string()),
+                metadata: BTreeMap::new(),
+            },
+            branch: "feature/preserve".to_string(),
+            managed_root,
+            persisted_worktree: None,
+            accepted_at: Instant::now(),
+        };
+        let prepared = prepare_managed_worktree(&request).expect("prepare managed worktree");
+        let error = finalize_prepared_managed_worktree(
+            &prepared,
+            Err(mpsc::RecvTimeoutError::Timeout),
+            Instant::now(),
+        )
+        .expect_err("missing owner decision must preserve the prepared worktree");
+        assert_eq!(error.kind, "reconciliation_required");
+        assert!(
+            prepared.path.exists(),
+            "a decision timeout must not remove the worktree later reported by the owner"
+        );
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(&repository)
+                .args([
+                    "show-ref",
+                    "--verify",
+                    "--quiet",
+                    "refs/heads/feature/preserve"
+                ])
+                .status()
+                .expect("inspect preserved branch")
+                .success()
+        );
         let _ = fs::remove_dir_all(root);
     }
 

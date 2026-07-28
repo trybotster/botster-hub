@@ -6,10 +6,10 @@
 
 use std::collections::BTreeMap;
 use std::error::Error;
+use std::ffi::OsStr;
 use std::fmt;
-use std::path::PathBuf;
-use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -117,6 +117,8 @@ fn default_directory_kind() -> String {
     "directory".to_string()
 }
 
+const SPAWN_TARGET_GIT_ADMISSION_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Return all targets in deterministic id order.
 #[must_use]
 pub fn list_spawn_targets(targets: &[SpawnTarget]) -> Vec<SpawnTarget> {
@@ -180,6 +182,7 @@ pub fn create_spawn_target(
     let root = normalize_root(request.root)?;
     let label = request.label.unwrap_or_else(|| target_id.clone());
     let kind = request.kind.unwrap_or_else(default_directory_kind);
+    validate_requested_kind(&kind)?;
     let base_ref = admitted_git_base_ref(&root, &kind, request.base_ref, true)?;
     validate_metadata(&request.metadata)?;
     let target = SpawnTarget {
@@ -213,6 +216,9 @@ pub fn update_spawn_target(
         .transpose()?
         .unwrap_or_else(|| target.root.clone());
     let enabled = request.enabled.unwrap_or(target.enabled);
+    if let Some(kind) = request.kind.as_deref() {
+        validate_requested_kind(kind)?;
+    }
     let kind = request.kind.unwrap_or_else(|| target.kind.clone());
     let default_base_ref = target.kind != "git" && kind == "git" && request.base_ref.is_none();
     let requested_base_ref = match request.base_ref {
@@ -274,16 +280,52 @@ fn normalize_root(root: PathBuf) -> SpawnTargetResult<PathBuf> {
     })
 }
 
+fn validate_requested_kind(kind: &str) -> SpawnTargetResult<()> {
+    if matches!(kind, "directory" | "git") {
+        Ok(())
+    } else {
+        Err(SpawnTargetError::new(
+            "invalid_target_kind",
+            "spawn target kind must be directory or git",
+        ))
+    }
+}
+
 fn admitted_git_base_ref(
-    root: &std::path::Path,
+    root: &Path,
     kind: &str,
     requested: Option<String>,
     default_from_head: bool,
 ) -> SpawnTargetResult<Option<String>> {
+    admitted_git_base_ref_using(
+        OsStr::new("git"),
+        root,
+        kind,
+        requested,
+        default_from_head,
+        Instant::now() + SPAWN_TARGET_GIT_ADMISSION_TIMEOUT,
+    )
+}
+
+fn admitted_git_base_ref_using(
+    executable: &OsStr,
+    root: &Path,
+    kind: &str,
+    requested: Option<String>,
+    default_from_head: bool,
+    deadline: Instant,
+) -> SpawnTargetResult<Option<String>> {
     if kind != "git" {
         return Ok(None);
     }
-    git_output(root, &["rev-parse", "--is-inside-work-tree"]).and_then(|inside| {
+    admission_git_output(
+        executable,
+        root,
+        &["rev-parse", "--is-inside-work-tree"],
+        deadline,
+        "repository_unavailable",
+    )
+    .and_then(|inside| {
         if inside.trim() != "true" {
             return Err(SpawnTargetError::new(
                 "repository_unavailable",
@@ -298,17 +340,21 @@ fn admitted_git_base_ref(
                     "Git spawn target requires a non-empty base ref",
                 ));
             }
-            None if default_from_head => {
-                git_output(root, &["symbolic-ref", "--quiet", "--short", "HEAD"])
-                    .map_err(|_| {
-                        SpawnTargetError::new(
-                            "base_ref_required",
-                            "Git spawn target requires an explicit base ref when HEAD is detached",
-                        )
-                    })?
-                    .trim()
-                    .to_string()
-            }
+            None if default_from_head => admission_git_output(
+                executable,
+                root,
+                &["symbolic-ref", "--quiet", "--short", "HEAD"],
+                deadline,
+                "base_ref_required",
+            )
+            .map_err(|_| {
+                SpawnTargetError::new(
+                    "base_ref_required",
+                    "Git spawn target requires an explicit base ref when HEAD is detached",
+                )
+            })?
+            .trim()
+            .to_string(),
             None => {
                 return Err(SpawnTargetError::new(
                     "base_ref_required",
@@ -316,9 +362,12 @@ fn admitted_git_base_ref(
                 ));
             }
         };
-        git_output(
+        admission_git_output(
+            executable,
             root,
             &["rev-parse", "--verify", &format!("{base_ref}^{{commit}}")],
+            deadline,
+            "invalid_base_ref",
         )
         .map_err(|_| {
             SpawnTargetError::new(
@@ -330,29 +379,34 @@ fn admitted_git_base_ref(
     })
 }
 
-fn git_output(root: &std::path::Path, args: &[&str]) -> SpawnTargetResult<String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(args)
-        .output()
-        .map_err(|_| {
+fn admission_git_output(
+    executable: &OsStr,
+    root: &Path,
+    args: &[&str],
+    deadline: Instant,
+    failure_kind: &'static str,
+) -> SpawnTargetResult<String> {
+    crate::managed_git_worktrees::git_stdout_using(
+        executable,
+        Some(root),
+        args,
+        deadline,
+        failure_kind,
+    )
+    .map_err(|error| {
+        if error.kind == "git_unavailable" {
             SpawnTargetError::new(
                 "git_unavailable",
                 "Git is unavailable for spawn target admission",
             )
-        })?;
-    if !output.status.success() {
-        return Err(SpawnTargetError::new(
-            "repository_unavailable",
-            "Git spawn target repository validation failed",
-        ));
-    }
-    String::from_utf8(output.stdout).map_err(|_| {
-        SpawnTargetError::new(
-            "repository_unavailable",
-            "Git spawn target repository returned invalid output",
-        )
+        } else if error.kind == "ensure_timed_out" {
+            SpawnTargetError::new(
+                "repository_unavailable",
+                "Git spawn target repository validation timed out",
+            )
+        } else {
+            SpawnTargetError::new(failure_kind, error.message)
+        }
     })
 }
 
@@ -380,6 +434,9 @@ fn generated_target_id() -> String {
 mod tests {
     use super::*;
     use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
 
     #[test]
     fn validates_missing_disabled_and_enabled_targets() {
@@ -413,6 +470,91 @@ mod tests {
             validate_spawn_target(&targets, "missing").status,
             "not_found"
         );
+    }
+
+    #[test]
+    fn rejects_unknown_target_kinds_at_mutation_boundaries() {
+        let root = std::env::temp_dir().join(format!(
+            "botster-spawn-target-kind-{}",
+            generated_target_id()
+        ));
+        fs::create_dir_all(&root).expect("create target root");
+        let mut targets = Vec::new();
+        let create_error = create_spawn_target(
+            &mut targets,
+            SpawnTargetCreate {
+                target_id: Some("mistyped".to_string()),
+                label: None,
+                root: root.clone(),
+                enabled: true,
+                kind: Some("Git".to_string()),
+                base_ref: None,
+                metadata: BTreeMap::new(),
+            },
+        )
+        .expect_err("unknown create kind");
+        assert_eq!(create_error.kind, "invalid_target_kind");
+
+        targets.push(SpawnTarget {
+            target_id: "legacy".to_string(),
+            label: "Legacy".to_string(),
+            root: root.clone(),
+            enabled: true,
+            kind: "legacy-custom".to_string(),
+            base_ref: None,
+            metadata: BTreeMap::new(),
+        });
+        update_spawn_target(
+            &mut targets,
+            "legacy",
+            SpawnTargetUpdate {
+                label: Some("Still readable".to_string()),
+                ..SpawnTargetUpdate::default()
+            },
+        )
+        .expect("legacy kind remains readable when kind is not mutated");
+        let update_error = update_spawn_target(
+            &mut targets,
+            "legacy",
+            SpawnTargetUpdate {
+                kind: Some("git ".to_string()),
+                ..SpawnTargetUpdate::default()
+            },
+        )
+        .expect_err("unknown update kind");
+        assert_eq!(update_error.kind, "invalid_target_kind");
+        assert_eq!(targets[0].kind, "legacy-custom");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_target_admission_bounds_a_hung_git_process() {
+        let root = std::env::temp_dir().join(format!(
+            "botster-spawn-target-hung-git-{}",
+            generated_target_id()
+        ));
+        fs::create_dir_all(&root).expect("create target root");
+        let executable = root.join("hung-git");
+        fs::write(&executable, "#!/bin/sh\nwhile :; do :; done\n").expect("write hung Git");
+        let mut permissions = fs::metadata(&executable)
+            .expect("hung Git metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&executable, permissions).expect("chmod hung Git");
+
+        let error = admitted_git_base_ref_using(
+            executable.as_os_str(),
+            &root,
+            "git",
+            Some("main".to_string()),
+            false,
+            Instant::now() + Duration::from_millis(100),
+        )
+        .expect_err("hung Git admission must time out");
+        assert_eq!(error.kind, "repository_unavailable");
+        assert!(!error.message.contains(root.to_string_lossy().as_ref()));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

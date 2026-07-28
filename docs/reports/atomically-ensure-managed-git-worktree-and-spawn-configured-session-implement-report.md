@@ -114,8 +114,24 @@ The approved plan was amended for the separately routed Core dependency above.
 Hub consumes the Core API rename from `per_plugin_capacity` to
 `per_plugin_queue_capacity`, and test data directories became process-unique
 because the corrected Core runtime rejects stale insecure socket directories.
-There is no behavioral waiver or Hub-side UUID compaction. Otherwise the
-implementation follows the approved scope.
+The exact Lua integration still needs a short temporary data-directory root
+because total Unix socket path length remains bounded; the test now uses the
+shared short-unique shape and removes the directory after success. There is no
+behavioral waiver or Hub-side UUID compaction.
+
+After Review, the branch was rebased onto current `origin/main`. Published
+`@trybotster/hub-test-support@0.1.12` had already assigned revision 20 to the
+application-primitives fixture, so this change allocates globally unique
+revision 21 and unused package candidate version 0.1.13 rather than reusing
+those bytes.
+
+Review also tightened the implementation without changing its ownership
+boundary: managed list/show reads now project the last startup/lane
+reconciliation result without spawning Git on the owner thread; decision
+timeout preserves prepared resources; piped child output is drained while the
+child runs; Git target admission is deadline-bounded; target kinds are
+validated at mutation boundaries; and generic deletion cannot orphan
+Hub-managed rows.
 
 ## Verification and downstream-shaped proof
 
@@ -123,22 +139,36 @@ All commands exited successfully:
 
 - `./test.sh managed_git_worktrees::tests`: 10 passed, including all three
   resolution cases, dirty reuse, collisions, restart adoption, controlled
-  missing/hung Git, exact rollback, and preservation after content changes.
-- `./test.sh spawn_targets::tests`: 2 passed, including registration-time
-  defaulting and atomic set/clear/invalid/empty `base_ref` updates.
-- `./test.sh -p botster-hub-client`: 41 tests and 4 doc tests passed.
+  missing/hung Git, output above the pipe buffer, exact rollback, and
+  preservation after content changes.
+- `./test.sh spawn_targets::tests`: 4 passed, including registration-time
+  defaulting, atomic set/clear/invalid/empty `base_ref` updates, kind typo
+  rejection, and bounded hung-Git admission.
+- `./test.sh worktrees::tests`: 3 passed, including Git-free managed DTO
+  projection and record-only delete refusal.
+- `./test.sh runtime::tests::managed_git`: 2 passed, including real lane
+  contention and decision-timeout resource preservation.
+- `./test.sh -p botster-hub-client`: 43 tests and 4 doc tests passed.
 - `npm run sync` and `npm run check` in `packages/hub-test-support`: generated
-  TypeScript and support fixtures match revision 20.
+  TypeScript and support fixtures match revision 21.
 - `npm test` in `packages/hub-test-support`: passed.
+- A clean external consumer installed the packed 0.1.13 candidate
+  (`sha1 205590707fd009d1849ceae8abf0ecd29d5d6669`), verified all package
+  checksums, materialized the plugin fixture, asserted version 0.1.13 and
+  revision 21, and found the generated `base_ref` and `management` DTO tokens.
+- `npm view @trybotster/hub-test-support@0.1.13 version` returned the expected
+  registry `E404`, proving the candidate coordinate is still unused rather than
+  colliding with another published meaning.
 - `cargo check --workspace --offline`: passed against the locked Core
   coordinate.
 - `cargo fmt --all -- --check`: passed.
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`:
   passed.
 - `git diff --check`: passed.
-- `./test.sh`: passed in full. The suite reported 124 library tests, 12 binary
-  tests, 14 capability tests, 23 client API tests, 101 daemon lifecycle tests
-  with one documented adversarial test ignored, 1 local runtime test, 20 Lua
+- `./test.sh`: passed in full on the rebased tree. The suite reported 130
+  library tests, 12 binary tests, 14 capability tests, 23 client API tests,
+  102 passing daemon lifecycle tests with one documented adversarial test
+  ignored, 1 local runtime test, 20 Lua
   runtime tests, 6 MCP tests, 6 plugin lifecycle tests, 7 runtime tests, 2
   conformance tests, and 1 doc test.
 
@@ -160,8 +190,15 @@ seconds in every Lua integration run; the exact full-budget timeout is not
 repeated end-to-end through Lua. Response-loss cleanup and deferred owner
 reconciliation use the same tested state machine, but no new test deliberately
 tears down a plugin invocation during Git completion. Restart reconciliation
-and worker-owned lane release limit those risks, and Review should inspect
-those paths directly.
+and worker-owned lane release limit those risks.
+
+Managed list/show returns the last status established by startup or the
+managed-Git lane so DTO reads remain Git-free; an out-of-band filesystem change
+becomes visible at the next startup or managed operation rather than by
+shelling out during every read. Version 0.1.13 is a verified package candidate,
+not a claimed npm publication; registry publication and installed-registry
+proof remain release-workflow work. Short temporary data roots remain necessary
+where the full Hub/Core Unix socket path would exceed the platform limit.
 
 No conflicting or missing vault guidance was discovered. Four durable rules
 were confirmed and are captured here pending post-merge vault promotion:

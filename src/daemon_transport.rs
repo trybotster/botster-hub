@@ -1196,7 +1196,15 @@ fn handle_control_request(
             )
         }),
         DaemonRequest::DeleteSpawnTarget { target_id } => {
-            mutate_spawn_targets_response(daemon, |targets| {
+            mutate_spawn_targets_with_worktrees_response(daemon, |targets, worktrees| {
+                if worktrees.iter().any(|worktree| {
+                    worktree.target_id == target_id && worktree.management == "hub_managed_git"
+                }) {
+                    return Err(SpawnTargetError::new(
+                        "managed_worktrees_exist",
+                        "Git target cannot be deleted while managed worktrees reference it",
+                    ));
+                }
                 crate::delete_spawn_target(targets, &target_id)
             })
         }

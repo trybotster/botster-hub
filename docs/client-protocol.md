@@ -39,7 +39,7 @@ Node-based first-party clients can consume the same checked artifact without a
 sibling hub checkout through the public package:
 
 ```sh
-npm install --save-dev @trybotster/ui-contract@0.1.0 @trybotster/hub-test-support@0.1.12
+npm install --save-dev @trybotster/ui-contract@0.1.0 @trybotster/hub-test-support@0.1.13
 ```
 
 ```js
@@ -78,9 +78,9 @@ when checked assets are stale. The metadata's protocol version and conformance
 fixture revision are emitted by the Rust `botster-hub-test-support` asset
 generator instead of being maintained independently in JavaScript.
 
-For version 0.1.12 from the public npm registry, npm-based client
+For version 0.1.13 from the public npm registry, npm-based client
 repos such as botster-web should use the exact dependency spec
-`"@trybotster/hub-test-support": "0.1.12"` in `devDependencies` and let npm write
+`"@trybotster/hub-test-support": "0.1.13"` in `devDependencies` and let npm write
 the corresponding package-lock entry from the public npm registry. The package
 is public, so registry install does not require a scoped `.npmrc` entry or CI
 auth token. After updating the lockfile, run the client smoke that imports the
@@ -218,7 +218,7 @@ but normal client reconciliation must not poll it or maintain a list-refresh
 fallback beside the entity stream.
 
 The shared revision-16 contract is published by
-`@trybotster/hub-test-support@0.1.12` as
+`@trybotster/hub-test-support@0.1.13` as
 `session-lifecycle-subscription-conformance-fixture.json` and through
 `readSessionLifecycleSubscriptionConformanceFixture()`. The fixture serializes
 the public `DaemonEntityFrame` DTOs and normalizes only timestamps and sequence
@@ -263,7 +263,8 @@ The daemon protocol exposes `ListWorktrees`, `ShowWorktree`, `CreateWorktree`,
 and `DeleteWorktree`. Create admits an existing directory under the selected
 spawn target root. The hub canonicalizes the target root and requested path and
 rejects traversal or symlink escapes before persisting the row. Delete removes
-the hub record only; it does not remove filesystem contents.
+registered hub records only; it does not remove filesystem contents.
+Hub-managed Git rows reject this record-only deletion path.
 
 `DaemonWorktree.management` distinguishes ordinary `registered` rows from
 `hub_managed_git` rows. Legacy rows default to `registered`. Registered rows
@@ -675,10 +676,11 @@ List/show/resolve responses are sanitized and do not include prompt values or
 raw context payloads. `ReadSessionContext` is explicit user-path output for the
 spawned session or an admitted local operator.
 
-Lua plugins with the exact `session_template_managed_git_spawn` session-action
-scope additionally receive target-filtered
-`session_templates.list({target_id=...})`,
-`session_templates.show({target_id=..., template_id=...})`, and the single
+Lua plugins receive target-filtered
+`session_templates.list({target_id=...})` and
+`session_templates.show({target_id=..., template_id=...})` as ordinary read
+projections. The exact `session_template_managed_git_spawn` session-action
+scope gates only the single
 `session_templates.ensure_worktree_and_spawn(...)` mutation. The mutation
 accepts semantic target, branch, template, environment, prompt, ticket,
 workspace, and safe metadata values. Hub rejects caller-supplied session id,
@@ -692,7 +694,9 @@ Branch/path/repository ownership conflicts are typed and path-neutral. Session
 spawn failure removes only resources created by that call; uncertain cleanup is
 reconciled and preserved. The existing `session_template_spawn` scope does not
 grant managed Git mutation, and the daemon `CreateWorktree`/`DeleteWorktree`
-contract remains generic record admission/removal rather than a Git operation.
+contract remains generic registered-record admission/removal rather than a Git
+operation. Hub-managed Git rows reject record-only deletion, and a target with
+managed rows cannot be deleted or reclassified.
 
 ## Package Availability
 
@@ -862,7 +866,7 @@ assert the same event ordering and classification. `AttachState` and
 
 Node clients can consume that exact JSON through
 `readLateAttachHistoryConformanceFixture()` from
-`@trybotster/hub-test-support@0.1.12`. Version 0.1.6 / conformance revision 13
+`@trybotster/hub-test-support@0.1.13`. Version 0.1.6 / conformance revision 13
 uses JSON number arrays for opaque history and is superseded because that shape
 unnecessarily expands large Ghostty snapshots on the bounded WebRTC response
 path. Version 0.1.5 / revision 12 still exposes lossy string history. Neither is
@@ -1012,19 +1016,19 @@ presentation set/clear/toggle operations, and permits one validated inline
 replacement tree only on accepted results. There is no protocol-v3 parser or
 parallel legacy action path.
 
-Adding optional spawn-target `base_ref` fields and the worktree `management`
-projection advances `CONFORMANCE_FIXTURE_REVISION` to 20.
-`PROTOCOL_VERSION` remains 4: the existing request/response framing and feature
-families are unchanged, while legacy JSON omitting the new fields continues to
-deserialize as a directory target and registered worktree.
-
 Expanding the plugin contract matrix `contract.app` fixture to cover
 application primitives `metric_grid`, `table`, `toolbar`, `empty_state`,
 `status_badge`, `section`, and `panel` increments
-`CONFORMANCE_FIXTURE_REVISION`. `PROTOCOL_VERSION` remains unchanged because
+`CONFORMANCE_FIXTURE_REVISION` to 20. `PROTOCOL_VERSION` remains unchanged because
 the daemon framing and `plugin_surface_render` request/response shape are
 unchanged; the hub still delegates validation to the locked
 `botster-ui-contract::UiNode` contract.
+
+Adding optional spawn-target `base_ref` fields and the worktree `management`
+projection advances `CONFORMANCE_FIXTURE_REVISION` to 21.
+`PROTOCOL_VERSION` remains 4: the existing request/response framing and feature
+families are unchanged, while legacy JSON omitting the new fields continues to
+deserialize as a directory target and registered worktree.
 
 Publishing `@trybotster/hub-test-support@0.1.2` adds an explicit
 application-primitives package API and metadata alias over that already-revised
@@ -1081,7 +1085,7 @@ Node client tests should use the declared npm dependency instead of a relative
 hub checkout:
 
 ```sh
-npm install --save-dev @trybotster/ui-contract@0.1.0 @trybotster/hub-test-support@0.1.12
+npm install --save-dev @trybotster/ui-contract@0.1.0 @trybotster/hub-test-support@0.1.13
 ```
 
 ```js
@@ -1096,7 +1100,7 @@ const fixturePath = materializePluginContractMatrixFixture(tempDirectory);
 
 Local environment variables may still point legacy drift checks at a checked-out
 hub artifact, but the normal web-client dependency coordinate is
-`@trybotster/hub-test-support@0.1.12` from the public npm registry.
+`@trybotster/hub-test-support@0.1.13` from the public npm registry.
 
 Each harness instance creates a disposable data directory and socket path under
 the configured test root, uses synthetic default hub identity, and attempts a

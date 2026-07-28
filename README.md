@@ -144,7 +144,7 @@ Terminal attach is a terminal-stream handshake only. Session-list reads remain
 an operator/query API; stateful clients use the explicit held-open `session`
 entity subscription for an authoritative snapshot followed by ordered deltas.
 The reusable revision-16 contract ships in
-`@trybotster/hub-test-support@0.1.12` as source-derived JSON fixtures and a Rust
+`@trybotster/hub-test-support@0.1.13` as source-derived JSON fixtures and a Rust
 `run_session_lifecycle_subscription_conformance` runner over the real isolated
 Hub/Core/session-worker topology.
 That subscription hydrates no status, package, worktree, target, or plugin state.
@@ -449,7 +449,7 @@ data_dir=resolved:$HOME/.botster/hub
 daemon=started
 protocol=botster-hub-daemon-v1
 protocol_version=4
-conformance_fixture_revision=20
+conformance_fixture_revision=21
 package_count=2
 enabled_package_count=2
 app_count=2
@@ -1112,11 +1112,14 @@ branch ownership instead of requiring the path to be beneath the target root.
 Plugins
 that need workflow associations should store those associations in plugin state
 and reference the returned `worktree_id` rather than adding workflow fields to
-hub records. Worktree delete removes the hub record only and does not delete
-filesystem contents.
+hub records. Worktree delete removes registered records only and does not
+delete filesystem contents. Hub-managed Git rows reject record-only deletion,
+and their target cannot be deleted or reclassified while they remain recorded.
 
-Packages granted the exact `session_template_managed_git_spawn` session-action
-scope receive target-filtered template reads and one atomic Lua operation:
+All loaded plugins receive the same target-filtered template list/show
+projections as the existing target and worktree reads. Packages granted the
+exact `session_template_managed_git_spawn` session-action scope additionally
+receive one atomic Lua mutation:
 
 ```lua
 local templates = botster.capabilities.session_templates.list({
@@ -1140,7 +1143,7 @@ Conflicting branch/path ownership is a typed failure. Spawn failure rolls back
 only the worktree and branch created by that call; pre-existing branches,
 worktrees, and dirty content are never deleted. The older
 `session_template_spawn` scope does not grant this operation, and generic
-worktree CRUD remains a record-only, non-destructive API.
+registered-worktree CRUD remains a record-only, non-destructive API.
 
 Worktree CRUD emits client-visible `worktree_lifecycle` daemon events and
 worker-isolated Lua plugin events:
