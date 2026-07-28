@@ -8,13 +8,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 use std::fs;
-use std::io::{BufReader, Write};
-use std::os::fd::AsRawFd;
+use std::io::Write;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Sender, SyncSender};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use botster_core::{
     EndpointId, EnvelopeCursor, EnvelopeDeliveryState, EnvelopeId, EnvelopeTarget,
@@ -34,12 +33,12 @@ pub use botster_hub_client::{
     DaemonCaptureSnapshot, DaemonCompatibility, DaemonConnection as ClientDaemonConnection,
     DaemonCoordination, DaemonDiagnostic, DaemonEndpoint, DaemonEntityFrame, DaemonEnvelope,
     DaemonEnvelopeAck, DaemonEnvelopeDelivery, DaemonEnvelopePublish, DaemonEvent, DaemonHello,
-    DaemonHelloAck, DaemonIdentity, DaemonLocalWebrtcAnswer, DaemonLocalWebrtcBootstrap,
-    DaemonModeFlags, DaemonNotify, DaemonOperatorError, DaemonPackage, DaemonPackageActionRequest,
-    DaemonPackageActionRequiredReference, DaemonPackageActionState, DaemonPackageActionStatus,
-    DaemonPackageAvailability, DaemonPackageAvailabilityReason, DaemonPackageAvailabilityState,
-    DaemonPackageCompatibility, DaemonPackageConfiguration, DaemonPackageDecision,
-    DaemonPackageDependencyAvailability, DaemonPackageDiagnostic,
+    DaemonHelloAck, DaemonIdentity, DaemonLifecycleCounters, DaemonLocalWebrtcAnswer,
+    DaemonLocalWebrtcBootstrap, DaemonModeFlags, DaemonNotify, DaemonOperatorError, DaemonPackage,
+    DaemonPackageActionRequest, DaemonPackageActionRequiredReference, DaemonPackageActionState,
+    DaemonPackageActionStatus, DaemonPackageAvailability, DaemonPackageAvailabilityReason,
+    DaemonPackageAvailabilityState, DaemonPackageCompatibility, DaemonPackageConfiguration,
+    DaemonPackageDecision, DaemonPackageDependencyAvailability, DaemonPackageDiagnostic,
     DaemonPackageEnvironmentRequirement, DaemonPackageFeatureAvailability,
     DaemonPackageInstallEffect, DaemonPackageInstallPlan, DaemonPackageNavigationEntry,
     DaemonPackageNavigationSource, DaemonPackagePin, DaemonPackageProcess,
@@ -58,6 +57,10 @@ use botster_ui_contract::{UiActionResult, UiActionResultState};
 use serde_json::Value;
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader as AsyncBufReader};
+use tokio::net::{UnixListener as TokioUnixListener, UnixStream as TokioUnixStream};
+use tokio::sync::{mpsc as tokio_mpsc, watch};
+use tokio::task::JoinHandle;
 
 use crate::local_webrtc::{
     LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_FILE, LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_MAX_BYTES,
@@ -86,8 +89,14 @@ use crate::{Worktree, WorktreeCreate, WorktreeError};
 const MESSAGE_CONTENT_TYPE: &str = "application/vnd.botster.coordination.message+text";
 const WEBRTC_SIGNAL_OPERATION: &str = "local_webrtc_signal";
 const DAEMON_CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+const DAEMON_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
+const DAEMON_INCOMPLETE_FRAME_TIMEOUT: Duration = Duration::from_secs(2);
+const DAEMON_MAX_FRAME_BYTES: usize = 1024 * 1024;
+const DAEMON_MAX_CONNECTIONS: usize = 64;
+const DAEMON_MAX_REJECTION_TASKS: usize = 8;
+const DAEMON_CONTROL_QUEUE_CAPACITY: usize = 256;
 pub(crate) const ENTITY_SUBSCRIPTION_QUEUE_CAPACITY: usize = 64;
-const ENTITY_STREAM_POLL_INTERVAL: Duration = Duration::from_millis(20);
+const ENTITY_RECONCILIATION_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Run the local daemon socket until a shutdown request is received.
 pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus> {
@@ -101,48 +110,119 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
         .set_nonblocking(true)
         .map_err(DaemonTransportError::Io)?;
 
-    let (control_tx, control_rx) = mpsc::channel();
+    let (control_tx, control_rx) = mpsc::sync_channel(DAEMON_CONTROL_QUEUE_CAPACITY);
+    let (cleanup_tx, cleanup_rx) = mpsc::sync_channel(DAEMON_MAX_CONNECTIONS);
+    let (shutdown_tx, _) = watch::channel(false);
     install_signal_forwarder(control_tx.clone())?;
     let mut daemon = HubDaemon::start(config)?;
     let mut control_state = DaemonControlState::default();
+    seed_lifecycle_reconciliation(&mut daemon, &mut control_state);
+    let transport_runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .thread_name("botster-hub-transport")
+        .build()
+        .map_err(DaemonTransportError::Io)?;
+    let listener = {
+        let _runtime = transport_runtime.enter();
+        TokioUnixListener::from_std(listener).map_err(DaemonTransportError::Io)?
+    };
+    let mut connection_tasks = vec![transport_runtime.spawn(accept_connections(
+        listener,
+        control_tx.clone(),
+        shutdown_tx.subscribe(),
+    ))];
+    let mut next_connection_id = 1_u64;
 
     loop {
-        match listener.accept() {
-            Ok((stream, _)) => {
+        reap_finished_connection_tasks(&mut connection_tasks);
+        while let Ok(cleanup) = cleanup_rx.try_recv() {
+            handle_connection_cleanup(&mut daemon, &mut control_state, control_tx.clone(), cleanup);
+        }
+        let wait = control_state
+            .next_reconciliation
+            .saturating_duration_since(Instant::now());
+        match control_rx.recv_timeout(wait) {
+            Ok(ControlMessage::AcceptedConnection { stream }) => {
+                control_state.lifecycle_counters.accepted_connections = control_state
+                    .lifecycle_counters
+                    .accepted_connections
+                    .saturating_add(1);
+                if control_state.lifecycle_counters.live_connections
+                    >= DAEMON_MAX_CONNECTIONS as u64
+                {
+                    control_state.lifecycle_counters.rejected_connections = control_state
+                        .lifecycle_counters
+                        .rejected_connections
+                        .saturating_add(1);
+                    if connection_tasks.len()
+                        < DAEMON_MAX_CONNECTIONS + DAEMON_MAX_REJECTION_TASKS + 1
+                    {
+                        connection_tasks
+                            .push(transport_runtime.spawn(reject_connection_async(stream)));
+                    }
+                    continue;
+                }
                 let tx = control_tx.clone();
-                thread::spawn(move || {
-                    if let Err(error) = handle_connection(stream, tx) {
+                let cleanup = cleanup_tx.clone();
+                let shutdown = shutdown_tx.subscribe();
+                let connection_id = next_connection_id;
+                next_connection_id = next_connection_id.saturating_add(1);
+                control_state.lifecycle_counters.live_connections = control_state
+                    .lifecycle_counters
+                    .live_connections
+                    .saturating_add(1);
+                control_state.lifecycle_counters.high_water_live_connections = control_state
+                    .lifecycle_counters
+                    .high_water_live_connections
+                    .max(control_state.lifecycle_counters.live_connections);
+                connection_tasks.push(transport_runtime.spawn(async move {
+                    if let Err(error) =
+                        handle_connection_async(stream, tx, cleanup, shutdown, connection_id).await
+                    {
                         eprintln!("botster-hub daemon connection error: {error}");
                     }
-                });
+                }));
             }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                while let Ok(message) = control_rx.try_recv() {
-                    if handle_control_message(
+            Ok(message) => {
+                if handle_control_message(
+                    &mut daemon,
+                    &mut control_state,
+                    &local_webrtc_terminal_record_path,
+                    control_tx.clone(),
+                    message,
+                ) {
+                    let _ = shutdown_tx.send(true);
+                    // Release the old listener name before joining connection tasks. An
+                    // immediate restart may bind the same path as soon as the shutdown
+                    // response is delivered; unlinking after the join could then remove
+                    // the replacement daemon's live socket.
+                    cleanup_socket_path(&socket_path);
+                    wait_for_connection_tasks(
+                        &transport_runtime,
+                        &mut connection_tasks,
+                        &cleanup_rx,
                         &mut daemon,
                         &mut control_state,
-                        &local_webrtc_terminal_record_path,
                         control_tx.clone(),
-                        message,
-                    ) {
-                        let status = daemon.stop();
-                        cleanup_socket_path(&socket_path);
-                        return Ok(status);
-                    }
+                    );
+                    let status = daemon.stop();
+                    return Ok(status);
                 }
-                drive_entity_subscriptions(
-                    &mut daemon,
-                    &mut control_state.logical_clock,
-                    &mut control_state.drain_cursors,
-                    &mut control_state.pending_runtime,
-                    &mut control_state.entity_subscriptions,
-                );
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if control_state.next_reconciliation <= Instant::now() {
+                    drive_entity_subscriptions(&mut daemon, &mut control_state);
+                    control_state.next_reconciliation =
+                        Instant::now() + ENTITY_RECONCILIATION_INTERVAL;
+                }
                 if !socket_path.exists() {
                     rebind_missing_socket_path(&socket_path);
                 }
-                thread::sleep(Duration::from_millis(20));
             }
-            Err(error) => return Err(DaemonTransportError::Io(error)),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(DaemonTransportError::ControlThreadStopped);
+            }
         }
     }
 }
@@ -190,53 +270,144 @@ pub fn stream_attach(
         .map_err(DaemonTransportError::from)
 }
 
-fn handle_connection(
-    mut stream: UnixStream,
-    control_tx: Sender<ControlMessage>,
+async fn accept_connections(
+    listener: TokioUnixListener,
+    control_tx: SyncSender<ControlMessage>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    loop {
+        tokio::select! {
+            accepted = listener.accept() => {
+                match accepted {
+                    Ok((stream, _)) => {
+                        match control_tx.try_send(ControlMessage::AcceptedConnection { stream }) {
+                            Ok(()) => {}
+                            Err(mpsc::TrySendError::Full(
+                                ControlMessage::AcceptedConnection { stream },
+                            )) => {
+                                // Keep accept-side pressure bounded without parking one of the
+                                // fixed reactor workers on the synchronous owner queue.
+                                reject_connection_async(stream).await;
+                            }
+                            Err(mpsc::TrySendError::Disconnected(_)) => return,
+                            Err(mpsc::TrySendError::Full(_)) => unreachable!(
+                                "accept loop only sends accepted-connection messages"
+                            ),
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("botster-hub daemon accept error: {error}");
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                }
+            }
+            changed = shutdown_rx.changed() => {
+                let _ = changed;
+                return;
+            }
+        }
+    }
+}
+
+async fn reject_connection_async(stream: TokioUnixStream) {
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = AsyncBufReader::new(read_half);
+    if read_async_frame::<DaemonHello, _>(&mut reader, Some(DAEMON_HANDSHAKE_TIMEOUT))
+        .await
+        .is_err()
+    {
+        return;
+    }
+    let _ = write_async_frame(
+        &mut write_half,
+        &DaemonHelloAck {
+            protocol: PROTOCOL.to_string(),
+            compatibility: DaemonCompatibility::current(),
+            diagnostics: vec![DaemonDiagnostic::backpressure(
+                "daemon_connection_admission",
+                "daemon connection capacity reached",
+            )],
+        },
+    )
+    .await;
+}
+
+async fn handle_connection_async(
+    stream: TokioUnixStream,
+    control_tx: SyncSender<ControlMessage>,
+    cleanup_tx: SyncSender<ConnectionCleanup>,
+    mut shutdown_rx: watch::Receiver<bool>,
+    connection_id: u64,
 ) -> DaemonTransportResult<()> {
-    stream
-        .set_nonblocking(false)
-        .map_err(DaemonTransportError::Io)?;
-    stream
-        .set_write_timeout(Some(DAEMON_CLIENT_WRITE_TIMEOUT))
-        .map_err(DaemonTransportError::Io)?;
-    let mut reader = BufReader::new(stream.try_clone().map_err(DaemonTransportError::Io)?);
-    let hello: DaemonHello = read_frame_from_reader(&mut reader)?;
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = AsyncBufReader::new(read_half);
+    let mut cleanup = ConnectionCleanupGuard::new(
+        connection_id,
+        cleanup_tx,
+        ConnectionTerminalReason::Protocol,
+    );
+    let hello: DaemonHello =
+        match read_async_frame(&mut reader, Some(DAEMON_HANDSHAKE_TIMEOUT)).await {
+            Ok(hello) => hello,
+            Err(ClientDaemonTransportError::ClientDisconnected) => {
+                cleanup.set_reason(ConnectionTerminalReason::Eof);
+                return Ok(());
+            }
+            Err(error) => return Err(error.into()),
+        };
     if hello.protocol != PROTOCOL {
         return Err(DaemonTransportError::Protocol("unexpected hello protocol"));
     }
-    write_frame(
-        &mut stream,
+    if let Err(error) = write_async_frame(
+        &mut write_half,
         &DaemonHelloAck {
             protocol: PROTOCOL.to_string(),
             compatibility: DaemonCompatibility::current(),
             diagnostics: vec![DaemonDiagnostic::connected("hello")],
         },
-    )?;
-    let mut attached_subscriptions = Vec::<AttachedSubscription>::new();
+    )
+    .await
+    {
+        cleanup.set_reason(ConnectionTerminalReason::WriteFailure);
+        return Err(error);
+    }
+    cleanup.set_reason(ConnectionTerminalReason::Eof);
 
     loop {
-        let request = match read_frame_from_reader::<DaemonRequest>(&mut reader) {
-            Ok(request) => request,
-            Err(ClientDaemonTransportError::ClientDisconnected) => {
-                detach_connection_subscriptions(&control_tx, &attached_subscriptions);
+        let request = tokio::select! {
+            request = read_async_frame::<DaemonRequest, _>(&mut reader, None) => request,
+            changed = shutdown_rx.changed() => {
+                let _ = changed;
+                cleanup.set_reason(ConnectionTerminalReason::Shutdown);
                 return Ok(());
             }
-            Err(error) => return Err(error.into()),
+        };
+        let request = match request {
+            Ok(request) => request,
+            Err(ClientDaemonTransportError::ClientDisconnected) => {
+                cleanup.set_reason(ConnectionTerminalReason::Eof);
+                return Ok(());
+            }
+            Err(error) => {
+                cleanup.set_reason(ConnectionTerminalReason::Protocol);
+                return Err(error.into());
+            }
         };
         if let DaemonRequest::SubscribeEntities {
             entity_type,
             subscription_id,
         } = request
         {
-            detach_connection_subscriptions(&control_tx, &attached_subscriptions);
-            return handle_entity_subscription(
-                stream,
+            return handle_entity_subscription_async(
+                write_half,
                 reader,
                 control_tx,
                 entity_type,
                 subscription_id,
-            );
+                cleanup,
+                shutdown_rx,
+            )
+            .await;
         }
         let (reply_tx, reply_rx) = mpsc::channel();
         let close_after_response = matches!(request, DaemonRequest::DaemonShutdown);
@@ -254,82 +425,90 @@ fn handle_connection(
                 response_delivery_rx,
             })
             .map_err(|_| DaemonTransportError::ControlThreadStopped)?;
-        let response = reply_rx
-            .recv()
-            .map_err(|_| DaemonTransportError::ControlThreadStopped)??;
-        apply_attached_subscription_change(&mut attached_subscriptions, active_change);
-        let write_result = write_frame(&mut stream, &response);
+        let response = receive_control_response(reply_rx).await?;
+        if response.kind != DaemonResponseKind::OperatorError {
+            cleanup.apply_subscription_change(active_change);
+        }
+        let write_result = write_async_frame(&mut write_half, &response).await;
         if let Some(response_delivery_tx) = response_delivery_tx {
             let _ = response_delivery_tx.send(());
         }
         if let Err(error) = write_result {
+            cleanup.set_reason(ConnectionTerminalReason::WriteFailure);
             let _ = control_tx.send(ControlMessage::EgressWriteFailed {
                 delivery_kind: daemon_delivery_kind(&response),
             });
-            detach_connection_subscriptions(&control_tx, &attached_subscriptions);
-            return Err(error.into());
+            return Err(error);
         }
         if close_after_response {
-            detach_connection_subscriptions(&control_tx, &attached_subscriptions);
+            cleanup.set_reason(ConnectionTerminalReason::NormalClose);
             return Ok(());
         }
     }
 }
 
-fn handle_entity_subscription(
-    mut stream: UnixStream,
-    mut reader: BufReader<UnixStream>,
-    control_tx: Sender<ControlMessage>,
+async fn handle_entity_subscription_async(
+    mut write_half: tokio::net::unix::OwnedWriteHalf,
+    mut reader: AsyncBufReader<tokio::net::unix::OwnedReadHalf>,
+    control_tx: SyncSender<ControlMessage>,
     entity_type: String,
     subscription_id: String,
+    mut cleanup: ConnectionCleanupGuard,
+    mut shutdown_rx: watch::Receiver<bool>,
 ) -> DaemonTransportResult<()> {
-    let (frame_tx, frame_rx) = mpsc::sync_channel(ENTITY_SUBSCRIPTION_QUEUE_CAPACITY);
+    let (frame_tx, mut frame_rx) = tokio_mpsc::channel(ENTITY_SUBSCRIPTION_QUEUE_CAPACITY);
     let (reply_tx, reply_rx) = mpsc::channel();
     control_tx
         .send(ControlMessage::SubscribeEntities {
             entity_type,
             subscription_id: subscription_id.clone(),
-            frame_tx: EntityFrameSender::Blocking(frame_tx),
+            frame_tx: EntityFrameSender::Async(frame_tx),
             reply_tx,
         })
         .map_err(|_| DaemonTransportError::ControlThreadStopped)?;
-    let response = reply_rx
-        .recv()
-        .map_err(|_| DaemonTransportError::ControlThreadStopped)??;
-    write_frame(&mut stream, &response)?;
+    let response = receive_control_response(reply_rx).await?;
+    write_async_frame(&mut write_half, &response).await?;
     if response.kind != DaemonResponseKind::EntitySubscribed {
+        cleanup.set_reason(ConnectionTerminalReason::NormalClose);
         return Ok(());
     }
+    cleanup.add_entity_subscription(subscription_id.clone());
+    let inbound_request = read_async_frame::<DaemonRequest, _>(&mut reader, None);
+    tokio::pin!(inbound_request);
 
     loop {
-        match frame_rx.recv_timeout(ENTITY_STREAM_POLL_INTERVAL) {
-            Ok(frame) => {
-                if let Err(error) = write_frame(&mut stream, &frame) {
+        tokio::select! {
+            frame = frame_rx.recv() => {
+                let Some(frame) = frame else {
+                    cleanup.set_reason(ConnectionTerminalReason::Cancellation);
+                    return Ok(());
+                };
+                if let Err(error) = write_async_frame(&mut write_half, &frame).await {
+                    cleanup.set_reason(ConnectionTerminalReason::WriteFailure);
                     let _ = control_tx.send(ControlMessage::EgressWriteFailed {
                         delivery_kind: DaemonDeliveryKind::Control,
                     });
-                    unsubscribe_entity_connection(&control_tx, &subscription_id);
-                    return Err(error.into());
+                    return Err(error);
                 }
             }
-            Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-        }
-
-        match socket_readiness(&stream)? {
-            SocketReadiness::Idle => {}
-            SocketReadiness::Closed => {
-                unsubscribe_entity_connection(&control_tx, &subscription_id);
-                return Ok(());
-            }
-            SocketReadiness::Readable => {
-                let request = read_frame_from_reader::<DaemonRequest>(&mut reader)?;
+            request = &mut inbound_request => {
+                let request = match request {
+                    Ok(request) => request,
+                    Err(ClientDaemonTransportError::ClientDisconnected) => {
+                        cleanup.set_reason(ConnectionTerminalReason::Eof);
+                        return Ok(());
+                    }
+                    Err(error) => {
+                        cleanup.set_reason(ConnectionTerminalReason::Protocol);
+                        return Err(error.into());
+                    }
+                };
                 if !matches!(
                     request,
                     DaemonRequest::UnsubscribeEntities { subscription_id: ref requested }
                         if requested == &subscription_id
                 ) {
-                    unsubscribe_entity_connection(&control_tx, &subscription_id);
+                    cleanup.set_reason(ConnectionTerminalReason::Protocol);
                     return Err(DaemonTransportError::Protocol(
                         "entity stream accepts only its matching unsubscribe request",
                     ));
@@ -341,69 +520,315 @@ fn handle_entity_subscription(
                         reply_tx: Some(reply_tx),
                     })
                     .map_err(|_| DaemonTransportError::ControlThreadStopped)?;
-                let response = reply_rx
-                    .recv()
-                    .map_err(|_| DaemonTransportError::ControlThreadStopped)??;
-                write_frame(&mut stream, &response)?;
+                let response = receive_control_response(reply_rx).await?;
+                write_async_frame(&mut write_half, &response).await?;
+                cleanup.remove_entity_subscription(&subscription_id);
+                cleanup.set_reason(ConnectionTerminalReason::NormalClose);
+                return Ok(());
+            }
+            changed = shutdown_rx.changed() => {
+                let _ = changed;
+                cleanup.set_reason(ConnectionTerminalReason::Shutdown);
                 return Ok(());
             }
         }
     }
 }
 
-fn unsubscribe_entity_connection(control_tx: &Sender<ControlMessage>, subscription_id: &str) {
-    let _ = control_tx.send(ControlMessage::UnsubscribeEntities {
-        subscription_id: subscription_id.to_string(),
-        reply_tx: None,
-    });
+async fn read_async_frame<T, R>(
+    reader: &mut AsyncBufReader<R>,
+    first_byte_timeout: Option<Duration>,
+) -> Result<T, ClientDaemonTransportError>
+where
+    T: for<'de> serde::Deserialize<'de>,
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut bytes = Vec::new();
+    let mut first = [0_u8; 1];
+    let read_first = reader.read(&mut first);
+    let count = if let Some(timeout) = first_byte_timeout {
+        tokio::time::timeout(timeout, read_first)
+            .await
+            .map_err(|_| {
+                ClientDaemonTransportError::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "daemon handshake deadline elapsed",
+                ))
+            })?
+            .map_err(ClientDaemonTransportError::Io)?
+    } else {
+        read_first.await.map_err(ClientDaemonTransportError::Io)?
+    };
+    if count == 0 {
+        return Err(ClientDaemonTransportError::ClientDisconnected);
+    }
+    bytes.push(first[0]);
+    if first[0] != b'\n' {
+        tokio::time::timeout(DAEMON_INCOMPLETE_FRAME_TIMEOUT, async {
+            loop {
+                let available = reader
+                    .fill_buf()
+                    .await
+                    .map_err(ClientDaemonTransportError::Io)?;
+                if available.is_empty() {
+                    return Err(ClientDaemonTransportError::Protocol(
+                        "daemon frame ended before newline",
+                    ));
+                }
+                let consumed = available
+                    .iter()
+                    .position(|byte| *byte == b'\n')
+                    .map_or(available.len(), |index| index + 1);
+                if bytes.len().saturating_add(consumed) > DAEMON_MAX_FRAME_BYTES {
+                    return Err(ClientDaemonTransportError::Protocol(
+                        "daemon frame exceeded size bound",
+                    ));
+                }
+                bytes.extend_from_slice(&available[..consumed]);
+                reader.consume(consumed);
+                if bytes.last() == Some(&b'\n') {
+                    return Ok(());
+                }
+            }
+        })
+        .await
+        .map_err(|_| {
+            ClientDaemonTransportError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "daemon incomplete frame deadline elapsed",
+            ))
+        })??;
+    }
+    if bytes.len() > DAEMON_MAX_FRAME_BYTES {
+        return Err(ClientDaemonTransportError::Protocol(
+            "daemon frame exceeded size bound",
+        ));
+    }
+    if bytes.last() != Some(&b'\n') {
+        return Err(ClientDaemonTransportError::Protocol(
+            "daemon frame ended before newline",
+        ));
+    }
+    serde_json::from_slice(&bytes).map_err(ClientDaemonTransportError::Json)
+}
+
+async fn write_async_frame<T>(
+    writer: &mut (impl tokio::io::AsyncWrite + Unpin),
+    frame: &T,
+) -> DaemonTransportResult<()>
+where
+    T: serde::Serialize,
+{
+    let mut bytes = serde_json::to_vec(frame).map_err(DaemonTransportError::Json)?;
+    bytes.push(b'\n');
+    tokio::time::timeout(DAEMON_CLIENT_WRITE_TIMEOUT, writer.write_all(&bytes))
+        .await
+        .map_err(|_| {
+            DaemonTransportError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "daemon client write deadline elapsed",
+            ))
+        })?
+        .map_err(DaemonTransportError::Io)
+}
+
+async fn receive_control_response(
+    reply_rx: mpsc::Receiver<DaemonTransportResult<DaemonResponse>>,
+) -> DaemonTransportResult<DaemonResponse> {
+    tokio::task::spawn_blocking(move || reply_rx.recv())
+        .await
+        .map_err(|_| DaemonTransportError::ControlThreadStopped)?
+        .map_err(|_| DaemonTransportError::ControlThreadStopped)?
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SocketReadiness {
-    Idle,
-    Readable,
-    Closed,
+enum ConnectionTerminalReason {
+    Eof,
+    Protocol,
+    WriteFailure,
+    Cancellation,
+    Shutdown,
+    NormalClose,
 }
 
-fn socket_readiness(stream: &UnixStream) -> DaemonTransportResult<SocketReadiness> {
-    let mut descriptor = libc::pollfd {
-        fd: stream.as_raw_fd(),
-        events: libc::POLLIN | libc::POLLHUP | libc::POLLERR,
-        revents: 0,
-    };
-    // SAFETY: `descriptor` references one valid pollfd for this call only.
-    let result = unsafe { libc::poll(&mut descriptor, 1, 0) };
-    if result < 0 {
-        return Err(DaemonTransportError::Io(std::io::Error::last_os_error()));
-    }
-    if descriptor.revents & (libc::POLLHUP | libc::POLLERR) != 0 {
-        Ok(SocketReadiness::Closed)
-    } else if descriptor.revents & libc::POLLIN != 0 {
-        Ok(SocketReadiness::Readable)
-    } else {
-        Ok(SocketReadiness::Idle)
-    }
-}
-
-fn detach_connection_subscriptions(
-    control_tx: &Sender<ControlMessage>,
-    attached_subscriptions: &[AttachedSubscription],
-) {
-    for subscription in attached_subscriptions {
-        let (reply_tx, reply_rx) = mpsc::channel();
-        if control_tx
-            .send(ControlMessage::Request {
-                request: Box::new(DaemonRequest::Detach {
-                    session_id: subscription.session_id.clone(),
-                    subscription_id: subscription.subscription_id.clone(),
-                }),
-                reply_tx,
-                response_delivery_rx: None,
-            })
-            .is_ok()
-        {
-            let _ = reply_rx.recv_timeout(Duration::from_secs(1));
+impl ConnectionTerminalReason {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Eof => "eof",
+            Self::Protocol => "protocol",
+            Self::WriteFailure => "write_failure",
+            Self::Cancellation => "cancellation",
+            Self::Shutdown => "shutdown",
+            Self::NormalClose => "normal_close",
         }
+    }
+}
+
+#[derive(Debug)]
+struct ConnectionCleanup {
+    connection_id: u64,
+    attached_subscriptions: Vec<AttachedSubscription>,
+    entity_subscription_ids: BTreeSet<String>,
+    reason: ConnectionTerminalReason,
+}
+
+struct ConnectionCleanupGuard {
+    cleanup_tx: SyncSender<ConnectionCleanup>,
+    cleanup: Option<ConnectionCleanup>,
+}
+
+impl ConnectionCleanupGuard {
+    fn new(
+        connection_id: u64,
+        cleanup_tx: SyncSender<ConnectionCleanup>,
+        reason: ConnectionTerminalReason,
+    ) -> Self {
+        Self {
+            cleanup_tx,
+            cleanup: Some(ConnectionCleanup {
+                connection_id,
+                attached_subscriptions: Vec::new(),
+                entity_subscription_ids: BTreeSet::new(),
+                reason,
+            }),
+        }
+    }
+
+    fn apply_subscription_change(&mut self, change: Option<AttachedSubscriptionChange>) {
+        let Some(cleanup) = self.cleanup.as_mut() else {
+            return;
+        };
+        apply_attached_subscription_change(&mut cleanup.attached_subscriptions, change);
+    }
+
+    fn add_entity_subscription(&mut self, subscription_id: String) {
+        if let Some(cleanup) = self.cleanup.as_mut() {
+            cleanup.entity_subscription_ids.insert(subscription_id);
+        }
+    }
+
+    fn remove_entity_subscription(&mut self, subscription_id: &str) {
+        if let Some(cleanup) = self.cleanup.as_mut() {
+            cleanup.entity_subscription_ids.remove(subscription_id);
+        }
+    }
+
+    fn set_reason(&mut self, reason: ConnectionTerminalReason) {
+        if let Some(cleanup) = self.cleanup.as_mut() {
+            cleanup.reason = reason;
+        }
+    }
+}
+
+impl Drop for ConnectionCleanupGuard {
+    fn drop(&mut self) {
+        if let Some(cleanup) = self.cleanup.take() {
+            self.cleanup_tx
+                .try_send(cleanup)
+                .expect("connection cleanup queue is bounded by admitted connections");
+        }
+    }
+}
+
+fn reap_finished_connection_tasks(tasks: &mut Vec<JoinHandle<()>>) {
+    tasks.retain(|task| !task.is_finished());
+}
+
+fn wait_for_connection_tasks(
+    runtime: &tokio::runtime::Runtime,
+    tasks: &mut Vec<JoinHandle<()>>,
+    cleanup_rx: &mpsc::Receiver<ConnectionCleanup>,
+    daemon: &mut HubDaemon,
+    state: &mut DaemonControlState,
+    control_tx: SyncSender<ControlMessage>,
+) {
+    let deadline = Instant::now() + DAEMON_CLIENT_WRITE_TIMEOUT;
+    while !tasks.iter().all(JoinHandle::is_finished) && Instant::now() < deadline {
+        while let Ok(cleanup) = cleanup_rx.try_recv() {
+            handle_connection_cleanup(daemon, state, control_tx.clone(), cleanup);
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    for task in tasks.iter() {
+        if !task.is_finished() {
+            task.abort();
+        }
+    }
+    runtime.block_on(async {
+        for task in tasks.drain(..) {
+            let _ = task.await;
+        }
+    });
+    while let Ok(cleanup) = cleanup_rx.try_recv() {
+        handle_connection_cleanup(daemon, state, control_tx.clone(), cleanup);
+    }
+}
+
+fn handle_connection_cleanup(
+    daemon: &mut HubDaemon,
+    state: &mut DaemonControlState,
+    control_tx: SyncSender<ControlMessage>,
+    cleanup: ConnectionCleanup,
+) {
+    if !state.cleaned_connections.insert(cleanup.connection_id) {
+        state.lifecycle_counters.cleanup_already_complete = state
+            .lifecycle_counters
+            .cleanup_already_complete
+            .saturating_add(1);
+        return;
+    }
+    state.lifecycle_counters.live_connections =
+        state.lifecycle_counters.live_connections.saturating_sub(1);
+    *state
+        .lifecycle_counters
+        .cleanup_by_reason
+        .entry(cleanup.reason.label().to_string())
+        .or_default() += 1;
+
+    let mut failed = false;
+    for subscription_id in cleanup.entity_subscription_ids {
+        if state
+            .entity_subscriptions
+            .remove(&subscription_id)
+            .is_some()
+        {
+            state.lifecycle_counters.live_entity_subscriptions = state
+                .lifecycle_counters
+                .live_entity_subscriptions
+                .saturating_sub(1);
+        }
+    }
+    for subscription in cleanup.attached_subscriptions {
+        let result = handle_control_request(
+            daemon,
+            &mut state.logical_clock,
+            &mut state.drain_cursors,
+            &mut state.pending_runtime,
+            DaemonObservability {
+                egress: &state.egress_diagnostics,
+                lifecycle: &state.lifecycle_counters,
+            },
+            control_tx.clone(),
+            DaemonRequest::Detach {
+                session_id: subscription.session_id,
+                subscription_id: subscription.subscription_id,
+            },
+        );
+        state.lifecycle_counters.live_attach_subscriptions = state
+            .lifecycle_counters
+            .live_attach_subscriptions
+            .saturating_sub(1);
+        failed |= result.is_err()
+            || result
+                .as_ref()
+                .is_ok_and(|response| response.kind == DaemonResponseKind::OperatorError);
+    }
+    if failed {
+        state.lifecycle_counters.cleanup_failed =
+            state.lifecycle_counters.cleanup_failed.saturating_add(1);
+    } else {
+        state.lifecycle_counters.cleanup_completed =
+            state.lifecycle_counters.cleanup_completed.saturating_add(1);
     }
 }
 
@@ -428,23 +853,19 @@ fn handle_control_message(
     daemon: &mut HubDaemon,
     state: &mut DaemonControlState,
     local_webrtc_terminal_record_path: &Path,
-    control_tx: Sender<ControlMessage>,
+    control_tx: SyncSender<ControlMessage>,
     message: ControlMessage,
 ) -> bool {
     match message {
+        ControlMessage::AcceptedConnection { .. } => false,
         ControlMessage::SubscribeEntities {
             entity_type,
             subscription_id,
             frame_tx,
             reply_tx,
         } => {
-            let response = register_entity_subscription(
-                daemon,
-                &mut state.entity_subscriptions,
-                entity_type,
-                subscription_id,
-                frame_tx,
-            );
+            let response =
+                register_entity_subscription(daemon, state, entity_type, subscription_id, frame_tx);
             let _ = reply_tx.send(response);
             false
         }
@@ -452,7 +873,16 @@ fn handle_control_message(
             subscription_id,
             reply_tx,
         } => {
-            state.entity_subscriptions.remove(&subscription_id);
+            if state
+                .entity_subscriptions
+                .remove(&subscription_id)
+                .is_some()
+            {
+                state.lifecycle_counters.live_entity_subscriptions = state
+                    .lifecycle_counters
+                    .live_entity_subscriptions
+                    .saturating_sub(1);
+            }
             if let Some(reply_tx) = reply_tx {
                 let _ = reply_tx.send(Ok(daemon_response_base(
                     DaemonResponseKind::EntityUnsubscribed,
@@ -465,12 +895,23 @@ fn handle_control_message(
             reply_tx,
             response_delivery_rx,
         } => {
+            let attached_change = AttachedSubscriptionChange::from_request(&request);
+            let reconcile_after_request = matches!(
+                request.as_ref(),
+                DaemonRequest::Spawn { .. }
+                    | DaemonRequest::Resize { .. }
+                    | DaemonRequest::ShutdownSession { .. }
+                    | DaemonRequest::RemoveSession { .. }
+            );
             let response = handle_control_request(
                 daemon,
                 &mut state.logical_clock,
                 &mut state.drain_cursors,
                 &mut state.pending_runtime,
-                &state.egress_diagnostics,
+                DaemonObservability {
+                    egress: &state.egress_diagnostics,
+                    lifecycle: &state.lifecycle_counters,
+                },
                 control_tx,
                 *request,
             )
@@ -484,6 +925,16 @@ fn handle_control_message(
                 DaemonTransportError::LocalWebrtc(error) => Ok(daemon_local_webrtc_error(error)),
                 error => Err(error),
             });
+            if response
+                .as_ref()
+                .is_ok_and(|response| response.kind != DaemonResponseKind::OperatorError)
+            {
+                record_attached_subscription_change(state, attached_change);
+            }
+            if reconcile_after_request && !state.entity_subscriptions.is_empty() {
+                drive_entity_subscriptions(daemon, state);
+                state.next_reconciliation = Instant::now() + ENTITY_RECONCILIATION_INTERVAL;
+            }
             send_control_response(reply_tx, response, response_delivery_rx)
         }
         ControlMessage::LocalWebrtcPeerClosed {
@@ -492,6 +943,14 @@ fn handle_control_message(
             entity_subscription_ids,
             terminal_record,
         } => {
+            let cleanup_reason = format!("webrtc_{}", terminal_record.cause);
+            *state
+                .lifecycle_counters
+                .cleanup_by_reason
+                .entry(cleanup_reason)
+                .or_default() += 1;
+            state.lifecycle_counters.cleanup_completed =
+                state.lifecycle_counters.cleanup_completed.saturating_add(1);
             if let Err(error) = persist_local_webrtc_terminal_record(
                 local_webrtc_terminal_record_path,
                 &terminal_record,
@@ -503,21 +962,39 @@ fn handle_control_message(
             }
             daemon.local_webrtc().remove_peer(&grant_id);
             for subscription_id in entity_subscription_ids {
-                state.entity_subscriptions.remove(&subscription_id);
+                if state
+                    .entity_subscriptions
+                    .remove(&subscription_id)
+                    .is_some()
+                {
+                    state.lifecycle_counters.live_entity_subscriptions = state
+                        .lifecycle_counters
+                        .live_entity_subscriptions
+                        .saturating_sub(1);
+                }
             }
+            state.lifecycle_counters.live_attach_subscriptions = state
+                .lifecycle_counters
+                .live_attach_subscriptions
+                .saturating_sub(attached_subscriptions.len() as u64);
             detach_local_webrtc_subscriptions(
                 daemon,
                 &mut state.logical_clock,
                 &mut state.drain_cursors,
                 &mut state.pending_runtime,
                 control_tx,
-                &mut state.egress_diagnostics,
+                DaemonObservability {
+                    egress: &state.egress_diagnostics,
+                    lifecycle: &state.lifecycle_counters,
+                },
                 attached_subscriptions,
             );
             false
         }
         ControlMessage::EgressWriteFailed { delivery_kind } => {
             state.egress_diagnostics.record_write_failure(delivery_kind);
+            state.lifecycle_counters.stalled_writes =
+                state.lifecycle_counters.stalled_writes.saturating_add(1);
             false
         }
     }
@@ -581,8 +1058,8 @@ fn detach_local_webrtc_subscriptions(
     logical_clock: &mut u64,
     drain_cursors: &mut BTreeMap<String, u64>,
     pending_runtime: &mut PendingRuntimeState,
-    control_tx: Sender<ControlMessage>,
-    egress_diagnostics: &mut DaemonEgressDiagnostics,
+    control_tx: SyncSender<ControlMessage>,
+    observability: DaemonObservability<'_>,
     attached_subscriptions: Vec<LocalWebrtcAttachedSubscription>,
 ) {
     for subscription in attached_subscriptions {
@@ -591,7 +1068,7 @@ fn detach_local_webrtc_subscriptions(
             logical_clock,
             drain_cursors,
             pending_runtime,
-            egress_diagnostics,
+            observability,
             control_tx.clone(),
             DaemonRequest::Detach {
                 session_id: subscription.session_id,
@@ -601,13 +1078,19 @@ fn detach_local_webrtc_subscriptions(
     }
 }
 
+#[derive(Clone, Copy)]
+struct DaemonObservability<'a> {
+    egress: &'a DaemonEgressDiagnostics,
+    lifecycle: &'a DaemonLifecycleCounters,
+}
+
 fn handle_control_request(
     daemon: &mut HubDaemon,
     logical_clock: &mut u64,
     drain_cursors: &mut BTreeMap<String, u64>,
     pending_runtime: &mut PendingRuntimeState,
-    egress_diagnostics: &DaemonEgressDiagnostics,
-    control_tx: Sender<ControlMessage>,
+    observability: DaemonObservability<'_>,
+    control_tx: SyncSender<ControlMessage>,
     request: DaemonRequest,
 ) -> DaemonTransportResult<DaemonResponse> {
     match request {
@@ -975,7 +1458,8 @@ fn handle_control_request(
             logical_clock,
             drain_cursors,
             pending_runtime,
-            egress_diagnostics,
+            observability.egress,
+            observability.lifecycle,
             other,
         ),
     }
@@ -987,6 +1471,7 @@ fn handle_runtime_control_request(
     drain_cursors: &mut BTreeMap<String, u64>,
     pending_runtime: &mut PendingRuntimeState,
     egress_diagnostics: &DaemonEgressDiagnostics,
+    lifecycle_counters: &DaemonLifecycleCounters,
     request: DaemonRequest,
 ) -> DaemonTransportResult<DaemonResponse> {
     let status = daemon.status();
@@ -1038,6 +1523,7 @@ fn handle_runtime_control_request(
                 status,
                 client_status.session_count,
                 egress_diagnostics.diagnostics(),
+                lifecycle_counters.clone(),
             ))
         }
         DaemonRequest::ListSessions => {
@@ -1576,6 +2062,7 @@ fn handle_runtime_control_request(
                     .map_err(crate::HubRuntimeError::from)?
                     .len(),
                 Vec::new(),
+                lifecycle_counters.clone(),
             )),
             sessions: Vec::new(),
             session_templates: Vec::new(),
@@ -2957,7 +3444,7 @@ fn daemon_endpoint(config: &HubConfig) -> DaemonTransportResult<DaemonEndpoint> 
     socket_path(config).map(DaemonEndpoint::new)
 }
 
-fn install_signal_forwarder(control_tx: Sender<ControlMessage>) -> DaemonTransportResult<()> {
+fn install_signal_forwarder(control_tx: SyncSender<ControlMessage>) -> DaemonTransportResult<()> {
     let mut signals = Signals::new([SIGINT, SIGTERM]).map_err(DaemonTransportError::Io)?;
     thread::spawn(move || {
         if signals.forever().next().is_some() {
@@ -3021,6 +3508,9 @@ fn events_from_client(events: Vec<HubClientEvent>) -> Vec<DaemonEvent> {
 
 #[derive(Debug)]
 pub(crate) enum ControlMessage {
+    AcceptedConnection {
+        stream: TokioUnixStream,
+    },
     SubscribeEntities {
         entity_type: String,
         subscription_id: String,
@@ -3049,6 +3539,7 @@ pub(crate) enum ControlMessage {
 
 #[derive(Debug)]
 pub(crate) enum EntityFrameSender {
+    #[cfg(test)]
     Blocking(SyncSender<DaemonEntityFrame>),
     Async(tokio::sync::mpsc::Sender<DaemonEntityFrame>),
 }
@@ -3062,6 +3553,7 @@ pub(crate) enum EntityFrameTrySendError {
 impl EntityFrameSender {
     pub(crate) fn try_send(&self, frame: DaemonEntityFrame) -> Result<(), EntityFrameTrySendError> {
         match self {
+            #[cfg(test)]
             Self::Blocking(sender) => sender.try_send(frame).map_err(|error| match error {
                 mpsc::TrySendError::Full(_) => EntityFrameTrySendError::Full,
                 mpsc::TrySendError::Disconnected(_) => EntityFrameTrySendError::Disconnected,
@@ -3085,6 +3577,12 @@ struct EntitySubscriptionState {
 }
 
 #[derive(Debug, Default)]
+struct EntityReconciliationState {
+    cursor: Option<SessionLifecycleCursor>,
+    records: BTreeMap<String, SessionLifecycleRecord>,
+}
+
+#[derive(Debug, Default)]
 struct PendingRuntimeState {
     events: BTreeMap<String, Vec<HubClientEvent>>,
     active_subscriptions: BTreeMap<String, BTreeSet<String>>,
@@ -3096,7 +3594,13 @@ struct DaemonControlState {
     drain_cursors: BTreeMap<String, u64>,
     egress_diagnostics: DaemonEgressDiagnostics,
     entity_subscriptions: BTreeMap<String, EntitySubscriptionState>,
+    reconciliation: EntityReconciliationState,
     pending_runtime: PendingRuntimeState,
+    lifecycle_counters: DaemonLifecycleCounters,
+    next_reconciliation: Instant,
+    cleaned_connections: BTreeSet<u64>,
+    seen_entity_subscriptions: BTreeSet<String>,
+    seen_attach_subscriptions: BTreeSet<(String, String)>,
 }
 
 impl Default for DaemonControlState {
@@ -3106,7 +3610,13 @@ impl Default for DaemonControlState {
             drain_cursors: BTreeMap::new(),
             egress_diagnostics: DaemonEgressDiagnostics::default(),
             entity_subscriptions: BTreeMap::new(),
+            reconciliation: EntityReconciliationState::default(),
             pending_runtime: PendingRuntimeState::default(),
+            lifecycle_counters: DaemonLifecycleCounters::default(),
+            next_reconciliation: Instant::now(),
+            cleaned_connections: BTreeSet::new(),
+            seen_entity_subscriptions: BTreeSet::new(),
+            seen_attach_subscriptions: BTreeSet::new(),
         }
     }
 }
@@ -3196,9 +3706,47 @@ struct AttachedSubscription {
     subscription_id: String,
 }
 
+#[derive(Clone)]
 enum AttachedSubscriptionChange {
     Attach(AttachedSubscription),
     Detach(AttachedSubscription),
+}
+
+fn record_attached_subscription_change(
+    state: &mut DaemonControlState,
+    change: Option<AttachedSubscriptionChange>,
+) {
+    let Some(change) = change else {
+        return;
+    };
+    match change {
+        AttachedSubscriptionChange::Attach(subscription) => {
+            let key = (
+                subscription.session_id.clone(),
+                subscription.subscription_id.clone(),
+            );
+            if !state.seen_attach_subscriptions.insert(key) {
+                state.lifecycle_counters.reconnect_registrations = state
+                    .lifecycle_counters
+                    .reconnect_registrations
+                    .saturating_add(1);
+            }
+            state.lifecycle_counters.live_attach_subscriptions = state
+                .lifecycle_counters
+                .live_attach_subscriptions
+                .saturating_add(1);
+            state.lifecycle_counters.high_water_attach_subscriptions = state
+                .lifecycle_counters
+                .high_water_attach_subscriptions
+                .max(state.lifecycle_counters.live_attach_subscriptions);
+        }
+        AttachedSubscriptionChange::Detach(_) => {
+            state.lifecycle_counters.live_attach_subscriptions = state
+                .lifecycle_counters
+                .live_attach_subscriptions
+                .saturating_sub(1);
+        }
+    }
 }
 
 impl AttachedSubscriptionChange {
@@ -3225,46 +3773,69 @@ impl AttachedSubscriptionChange {
 
 fn register_entity_subscription(
     daemon: &mut HubDaemon,
-    subscriptions: &mut BTreeMap<String, EntitySubscriptionState>,
+    state: &mut DaemonControlState,
     entity_type: String,
     subscription_id: String,
     sender: EntityFrameSender,
 ) -> DaemonTransportResult<DaemonResponse> {
-    if subscriptions.contains_key(&subscription_id) {
+    if state.entity_subscriptions.contains_key(&subscription_id) {
         return Ok(entity_subscription_error(
             "duplicate_entity_subscription",
             &subscription_id,
             "entity subscription id is already active",
         ));
     }
-    let packages = daemon.package_registry().clone();
-    let runtime = daemon
-        .runtime_mut()
-        .ok_or(DaemonTransportError::DaemonNotRunning)?;
-    let api = HubClientApi::local_operator("botster-hub-daemon-entity-stream");
-    let response = api.handle_request(
-        runtime,
-        &packages,
-        HubClientRequest::SubscribeEntities {
-            request_id: request_id("daemon-entity-subscribe"),
-            entity_type,
-            subscription_id: subscription_id.clone(),
-        },
-    );
-    let response = match response {
-        Ok(response) => response,
-        Err(error) => return Ok(daemon_operator_error(error)),
+    let baseline = if let Some(cursor) = state.reconciliation.cursor.clone()
+        && entity_type == "session"
+    {
+        SessionLifecycleBaseline {
+            cursor,
+            sessions: state.reconciliation.records.values().cloned().collect(),
+        }
+    } else {
+        let packages = daemon.package_registry().clone();
+        let runtime = daemon
+            .runtime_mut()
+            .ok_or(DaemonTransportError::DaemonNotRunning)?;
+        let api = HubClientApi::local_operator("botster-hub-daemon-entity-stream");
+        let response = api.handle_request(
+            runtime,
+            &packages,
+            HubClientRequest::SubscribeEntities {
+                request_id: request_id("daemon-entity-subscribe"),
+                entity_type,
+                subscription_id: subscription_id.clone(),
+            },
+        );
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => return Ok(daemon_operator_error(error)),
+        };
+        let HubClientResponseBody::SessionLifecycleBaseline(baseline) = response.body else {
+            return Err(DaemonTransportError::UnexpectedResponse);
+        };
+        state.lifecycle_counters.lifecycle_baseline_reads = state
+            .lifecycle_counters
+            .lifecycle_baseline_reads
+            .saturating_add(1);
+        baseline
     };
-    let HubClientResponseBody::SessionLifecycleBaseline(baseline) = response.body else {
-        return Err(DaemonTransportError::UnexpectedResponse);
-    };
+    if state.reconciliation.cursor.is_none() {
+        state.reconciliation.cursor = Some(baseline.cursor.clone());
+        state.reconciliation.records = baseline
+            .sessions
+            .iter()
+            .cloned()
+            .map(|record| (record.session.session_id.0.clone(), record))
+            .collect();
+    }
     let cursor = baseline.cursor.clone();
     let (entities, snapshot) = entity_snapshot(&subscription_id, baseline, None);
     sender
         .try_send(snapshot)
         .map_err(|_| DaemonTransportError::ControlThreadStopped)?;
-    subscriptions.insert(
-        subscription_id,
+    state.entity_subscriptions.insert(
+        subscription_id.clone(),
         EntitySubscriptionState {
             sender,
             cursor,
@@ -3272,134 +3843,276 @@ fn register_entity_subscription(
             resync_reason: None,
         },
     );
+    state.lifecycle_counters.live_entity_subscriptions = state
+        .lifecycle_counters
+        .live_entity_subscriptions
+        .saturating_add(1);
+    state.lifecycle_counters.high_water_entity_subscriptions = state
+        .lifecycle_counters
+        .high_water_entity_subscriptions
+        .max(state.lifecycle_counters.live_entity_subscriptions);
+    if !state
+        .seen_entity_subscriptions
+        .insert(subscription_id.clone())
+    {
+        state.lifecycle_counters.reconnect_registrations = state
+            .lifecycle_counters
+            .reconnect_registrations
+            .saturating_add(1);
+    }
+    state.next_reconciliation = Instant::now();
     Ok(daemon_response_base(DaemonResponseKind::EntitySubscribed))
 }
 
-fn drive_entity_subscriptions(
-    daemon: &mut HubDaemon,
-    logical_clock: &mut u64,
-    drain_cursors: &mut BTreeMap<String, u64>,
-    pending_runtime: &mut PendingRuntimeState,
-    subscriptions: &mut BTreeMap<String, EntitySubscriptionState>,
-) {
-    if subscriptions.is_empty() {
+fn seed_lifecycle_reconciliation(daemon: &mut HubDaemon, state: &mut DaemonControlState) {
+    let Some(runtime) = daemon.runtime_mut() else {
+        return;
+    };
+    state.lifecycle_counters.lifecycle_baseline_reads = state
+        .lifecycle_counters
+        .lifecycle_baseline_reads
+        .saturating_add(1);
+    let Ok(baseline) = runtime.session_lifecycle_baseline() else {
+        return;
+    };
+    state.reconciliation.cursor = Some(baseline.cursor);
+    state.reconciliation.records = baseline
+        .sessions
+        .into_iter()
+        .map(|record| (record.session.session_id.0.clone(), record))
+        .collect();
+}
+
+fn drive_entity_subscriptions(daemon: &mut HubDaemon, state: &mut DaemonControlState) {
+    if state.entity_subscriptions.is_empty() {
         return;
     }
     let Some(runtime) = daemon.runtime_mut() else {
-        subscriptions.clear();
+        state.entity_subscriptions.clear();
+        state.lifecycle_counters.live_entity_subscriptions = 0;
         return;
     };
 
-    if let Ok(baseline) = runtime.session_lifecycle_baseline() {
-        let active_session_ids = baseline
+    state.lifecycle_counters.reconciliation_wakes = state
+        .lifecycle_counters
+        .reconciliation_wakes
+        .saturating_add(1);
+
+    let Some(cursor) = state.reconciliation.cursor.clone() else {
+        return;
+    };
+    if state
+        .entity_subscriptions
+        .values()
+        .any(|subscription| subscription.resync_reason.is_some())
+    {
+        let baseline = SessionLifecycleBaseline {
+            cursor: cursor.clone(),
+            sessions: state.reconciliation.records.values().cloned().collect(),
+        };
+        state
+            .entity_subscriptions
+            .retain(|subscription_id, subscription| {
+                let Some(reason) = subscription.resync_reason.clone() else {
+                    return true;
+                };
+                try_resync_subscription(
+                    subscription_id,
+                    subscription,
+                    baseline.clone(),
+                    reason,
+                    &mut state.lifecycle_counters,
+                )
+            });
+    }
+    state.lifecycle_counters.lifecycle_change_reads = state
+        .lifecycle_counters
+        .lifecycle_change_reads
+        .saturating_add(1);
+    let changes = runtime.session_lifecycle_changes(&cursor);
+    if let Some(reason) = changes.resync_required {
+        state.lifecycle_counters.lifecycle_resync_reads = state
+            .lifecycle_counters
+            .lifecycle_resync_reads
+            .saturating_add(1);
+        state.lifecycle_counters.lifecycle_baseline_reads = state
+            .lifecycle_counters
+            .lifecycle_baseline_reads
+            .saturating_add(1);
+        let Ok(baseline) = runtime.session_lifecycle_baseline() else {
+            return;
+        };
+        state.reconciliation.cursor = Some(baseline.cursor.clone());
+        state.reconciliation.records = baseline
             .sessions
             .iter()
-            .map(|record| record.session.session_id.0.clone())
-            .collect::<std::collections::BTreeSet<_>>();
-        pending_runtime.events.retain(|session_id, _| {
-            active_session_ids.contains(session_id)
-                && pending_runtime
-                    .active_subscriptions
-                    .contains_key(session_id)
-        });
-        for record in &baseline.sessions {
-            let session_id = record.session.session_id.0.clone();
-            if record.lifecycle.as_ref().is_some_and(|state| {
-                matches!(
-                    state,
-                    SessionLifecycleState::Exited { .. } | SessionLifecycleState::Failed { .. }
+            .cloned()
+            .map(|record| (record.session.session_id.0.clone(), record))
+            .collect();
+        let reason = format!("core_{reason:?}").to_lowercase();
+        state
+            .entity_subscriptions
+            .retain(|subscription_id, subscription| {
+                try_resync_subscription(
+                    subscription_id,
+                    subscription,
+                    baseline.clone(),
+                    reason.clone(),
+                    &mut state.lifecycle_counters,
                 )
-            }) {
-                continue;
-            }
-            let cursor = drain_cursors
-                .entry(session_id.clone())
-                .or_insert_with(|| tick(logical_clock));
-            if let Ok(output) = runtime.drain_runtime_once(&SessionId(session_id.clone()), *cursor)
-            {
-                let has_client_egress = !output.client_egress.is_empty();
-                let events = crate::client_api::events_from_drain(output);
-                if has_client_egress && !events.is_empty() {
-                    *cursor = tick(logical_clock);
-                    pending_runtime
-                        .events
-                        .entry(session_id)
-                        .or_default()
-                        .extend(events);
+            });
+    } else {
+        for change in changes.changes {
+            state.reconciliation.cursor = Some(change.cursor.clone());
+            match &change.kind {
+                SessionLifecycleChangeKind::Upsert { record } => {
+                    state
+                        .reconciliation
+                        .records
+                        .insert(record.session.session_id.0.clone(), record.clone());
                 }
+                SessionLifecycleChangeKind::Removed { session_id } => {
+                    state.reconciliation.records.remove(&session_id.0);
+                }
+                _ => {
+                    for subscription in state.entity_subscriptions.values_mut() {
+                        subscription.resync_reason = Some("unknown_core_change".to_string());
+                    }
+                    continue;
+                }
+            }
+            state
+                .entity_subscriptions
+                .retain(|subscription_id, subscription| {
+                    deliver_lifecycle_change(
+                        subscription_id,
+                        subscription,
+                        &change,
+                        &mut state.lifecycle_counters,
+                    )
+                });
+        }
+        state.reconciliation.cursor = Some(changes.cursor);
+    }
+
+    let active_session_ids = state
+        .reconciliation
+        .records
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    state.pending_runtime.events.retain(|session_id, _| {
+        active_session_ids.contains(session_id)
+            && state
+                .pending_runtime
+                .active_subscriptions
+                .contains_key(session_id)
+    });
+    for record in state.reconciliation.records.values() {
+        let session_id = record.session.session_id.0.clone();
+        if record.lifecycle.as_ref().is_some_and(|lifecycle| {
+            matches!(
+                lifecycle,
+                SessionLifecycleState::Exited { .. } | SessionLifecycleState::Failed { .. }
+            )
+        }) {
+            continue;
+        }
+        let drain_cursor = state
+            .drain_cursors
+            .entry(session_id.clone())
+            .or_insert_with(|| tick(&mut state.logical_clock));
+        state.lifecycle_counters.lifecycle_session_drains = state
+            .lifecycle_counters
+            .lifecycle_session_drains
+            .saturating_add(1);
+        if let Ok(output) =
+            runtime.drain_runtime_once(&SessionId(session_id.clone()), *drain_cursor)
+        {
+            let has_client_egress = !output.client_egress.is_empty();
+            let events = crate::client_api::events_from_drain(output);
+            if has_client_egress && !events.is_empty() {
+                *drain_cursor = tick(&mut state.logical_clock);
+                state
+                    .pending_runtime
+                    .events
+                    .entry(session_id)
+                    .or_default()
+                    .extend(events);
             }
         }
     }
+    state.lifecycle_counters.live_entity_subscriptions = state.entity_subscriptions.len() as u64;
+}
 
-    subscriptions.retain(|subscription_id, state| {
-        if let Some(reason) = state.resync_reason.clone() {
-            let Ok(baseline) = runtime.session_lifecycle_baseline() else {
-                return true;
-            };
-            return try_resync_subscription(subscription_id, state, baseline, reason);
-        }
-
-        let changes = runtime.session_lifecycle_changes(&state.cursor);
-        if let Some(reason) = changes.resync_required {
-            state.resync_reason = Some(format!("core_{reason:?}").to_lowercase());
-            return true;
-        }
-        for change in changes.changes {
-            let sequence = change.cursor.sequence;
-            let frame = match change.kind {
-                SessionLifecycleChangeKind::Upsert { record } => {
-                    let entity = project_session_entity(&record);
-                    let id = entity.session_uuid.clone();
-                    match state.entities.insert(id.clone(), entity.clone()) {
-                        None => DaemonEntityFrame::Upsert {
-                            subscription_id: subscription_id.clone(),
-                            entity_type: "session".to_string(),
-                            snapshot_seq: sequence,
-                            id,
-                            entity,
-                        },
-                        Some(previous) => {
-                            let patch = session_entity_patch(&previous, &entity);
-                            if patch.as_object().is_some_and(serde_json::Map::is_empty) {
-                                state.cursor = change.cursor;
-                                continue;
-                            }
-                            DaemonEntityFrame::Patch {
-                                subscription_id: subscription_id.clone(),
-                                entity_type: "session".to_string(),
-                                snapshot_seq: sequence,
-                                id,
-                                patch,
-                            }
-                        }
+fn deliver_lifecycle_change(
+    subscription_id: &str,
+    state: &mut EntitySubscriptionState,
+    change: &botster_core_daemon::SessionLifecycleChange,
+    counters: &mut DaemonLifecycleCounters,
+) -> bool {
+    let sequence = change.cursor.sequence;
+    let frame = match &change.kind {
+        SessionLifecycleChangeKind::Upsert { record } => {
+            let entity = project_session_entity(record);
+            let id = entity.session_uuid.clone();
+            match state.entities.insert(id.clone(), entity.clone()) {
+                None => DaemonEntityFrame::Upsert {
+                    subscription_id: subscription_id.to_string(),
+                    entity_type: "session".to_string(),
+                    snapshot_seq: sequence,
+                    id,
+                    entity,
+                },
+                Some(previous) => {
+                    let patch = session_entity_patch(&previous, &entity);
+                    if patch.as_object().is_some_and(serde_json::Map::is_empty) {
+                        state.cursor = change.cursor.clone();
+                        return true;
                     }
-                }
-                SessionLifecycleChangeKind::Removed { session_id } => {
-                    state.entities.remove(&session_id.0);
-                    DaemonEntityFrame::Remove {
-                        subscription_id: subscription_id.clone(),
+                    DaemonEntityFrame::Patch {
+                        subscription_id: subscription_id.to_string(),
                         entity_type: "session".to_string(),
                         snapshot_seq: sequence,
-                        id: session_id.0,
+                        id,
+                        patch,
                     }
                 }
-                _ => {
-                    state.resync_reason = Some("unknown_core_change".to_string());
-                    return true;
-                }
-            };
-            match state.sender.try_send(frame) {
-                Ok(()) => state.cursor = change.cursor,
-                Err(EntityFrameTrySendError::Full) => {
-                    state.resync_reason = Some("subscriber_overflow".to_string());
-                    return true;
-                }
-                Err(EntityFrameTrySendError::Disconnected) => return false,
             }
         }
-        state.cursor = changes.cursor;
-        true
-    });
+        SessionLifecycleChangeKind::Removed { session_id } => {
+            state.entities.remove(&session_id.0);
+            DaemonEntityFrame::Remove {
+                subscription_id: subscription_id.to_string(),
+                entity_type: "session".to_string(),
+                snapshot_seq: sequence,
+                id: session_id.0.clone(),
+            }
+        }
+        _ => {
+            state.resync_reason = Some("unknown_core_change".to_string());
+            return true;
+        }
+    };
+    counters.entity_delivery_attempts = counters.entity_delivery_attempts.saturating_add(1);
+    match state.sender.try_send(frame) {
+        Ok(()) => {
+            counters.entity_delivery_successes =
+                counters.entity_delivery_successes.saturating_add(1);
+            state.cursor = change.cursor.clone();
+            true
+        }
+        Err(EntityFrameTrySendError::Full) => {
+            counters.entity_delivery_overflows =
+                counters.entity_delivery_overflows.saturating_add(1);
+            state.resync_reason = Some("subscriber_overflow".to_string());
+            true
+        }
+        Err(EntityFrameTrySendError::Disconnected) => {
+            counters.entity_delivery_failures = counters.entity_delivery_failures.saturating_add(1);
+            false
+        }
+    }
 }
 
 fn try_resync_subscription(
@@ -3407,18 +4120,31 @@ fn try_resync_subscription(
     state: &mut EntitySubscriptionState,
     baseline: SessionLifecycleBaseline,
     reason: String,
+    counters: &mut DaemonLifecycleCounters,
 ) -> bool {
     let cursor = baseline.cursor.clone();
     let (entities, snapshot) = entity_snapshot(subscription_id, baseline, Some(reason));
     match state.sender.try_send(snapshot) {
         Ok(()) => {
+            counters.entity_delivery_attempts = counters.entity_delivery_attempts.saturating_add(1);
+            counters.entity_delivery_successes =
+                counters.entity_delivery_successes.saturating_add(1);
             state.cursor = cursor;
             state.entities = entities;
             state.resync_reason = None;
             true
         }
-        Err(EntityFrameTrySendError::Full) => true,
-        Err(EntityFrameTrySendError::Disconnected) => false,
+        Err(EntityFrameTrySendError::Full) => {
+            counters.entity_delivery_attempts = counters.entity_delivery_attempts.saturating_add(1);
+            counters.entity_delivery_overflows =
+                counters.entity_delivery_overflows.saturating_add(1);
+            true
+        }
+        Err(EntityFrameTrySendError::Disconnected) => {
+            counters.entity_delivery_attempts = counters.entity_delivery_attempts.saturating_add(1);
+            counters.entity_delivery_failures = counters.entity_delivery_failures.saturating_add(1);
+            false
+        }
     }
 }
 
@@ -3543,12 +4269,14 @@ fn daemon_status(
     status: HubDaemonStatus,
     session_count: usize,
     mut egress_diagnostics: Vec<DaemonDiagnostic>,
+    lifecycle_counters: DaemonLifecycleCounters,
 ) -> DaemonResponse {
     let mut response = daemon_response_base(DaemonResponseKind::Status);
     response.status = Some(daemon_status_from_status(
         &status,
         session_count,
         egress_diagnostics.clone(),
+        lifecycle_counters,
     ));
     response.diagnostics = vec![DaemonDiagnostic::connected("status")];
     response.diagnostics.append(&mut egress_diagnostics);
@@ -5307,6 +6035,7 @@ fn daemon_status_from_status(
     status: &HubDaemonStatus,
     session_count: usize,
     diagnostics: Vec<DaemonDiagnostic>,
+    lifecycle_counters: DaemonLifecycleCounters,
 ) -> DaemonStatus {
     DaemonStatus {
         lifecycle_state: match status.lifecycle_state {
@@ -5341,6 +6070,7 @@ fn daemon_status_from_status(
             .iter()
             .map(|session_id| session_id.0.clone())
             .collect(),
+        lifecycle_counters,
         diagnostics,
     }
 }
@@ -6101,6 +6831,52 @@ impl From<crate::HubLifecycleError> for DaemonTransportError {
 pub type DaemonTransportResult<T> = Result<T, DaemonTransportError>;
 
 #[cfg(test)]
+fn handle_connection(
+    stream: UnixStream,
+    control_tx: SyncSender<ControlMessage>,
+) -> DaemonTransportResult<()> {
+    stream
+        .set_nonblocking(true)
+        .map_err(DaemonTransportError::Io)?;
+    let (cleanup_tx, cleanup_rx) = mpsc::sync_channel(1);
+    let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(DaemonTransportError::Io)?;
+    let stream = {
+        let _runtime = runtime.enter();
+        TokioUnixStream::from_std(stream).map_err(DaemonTransportError::Io)?
+    };
+    let result = runtime.block_on(handle_connection_async(
+        stream,
+        control_tx.clone(),
+        cleanup_tx,
+        shutdown_rx,
+        1,
+    ));
+    if let Ok(cleanup) = cleanup_rx.try_recv() {
+        for subscription in cleanup.attached_subscriptions {
+            let (reply_tx, reply_rx) = mpsc::channel();
+            if control_tx
+                .send(ControlMessage::Request {
+                    request: Box::new(DaemonRequest::Detach {
+                        session_id: subscription.session_id,
+                        subscription_id: subscription.subscription_id,
+                    }),
+                    reply_tx,
+                    response_delivery_rx: None,
+                })
+                .is_ok()
+            {
+                let _ = reply_rx.recv_timeout(Duration::from_secs(1));
+            }
+        }
+    }
+    result
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::net::Shutdown;
@@ -6123,7 +6899,7 @@ mod tests {
     #[test]
     fn client_eof_detaches_connection_subscriptions() {
         let (server, mut client) = UnixStream::pair().expect("create daemon socket pair");
-        let (control_tx, control_rx) = mpsc::channel();
+        let (control_tx, control_rx) = mpsc::sync_channel(DAEMON_CONTROL_QUEUE_CAPACITY);
         let connection = thread::spawn(move || handle_connection(server, control_tx));
 
         write_frame(
@@ -6342,7 +7118,7 @@ mod tests {
     fn daemon_shutdown_write_failure_releases_stop_and_preserves_error() {
         let (server, mut client) = UnixStream::pair().expect("create daemon socket pair");
         let server_control = server.try_clone().expect("clone daemon server socket");
-        let (control_tx, control_rx) = mpsc::channel();
+        let (control_tx, control_rx) = mpsc::sync_channel(DAEMON_CONTROL_QUEUE_CAPACITY);
         let connection = thread::spawn(move || handle_connection(server, control_tx));
 
         write_frame(
@@ -6432,12 +7208,14 @@ mod tests {
             entities: BTreeMap::new(),
             resync_reason: Some(overflow_reason.clone()),
         };
+        let mut counters = DaemonLifecycleCounters::default();
 
         assert!(try_resync_subscription(
             "subscription",
             &mut state,
             baseline(),
             overflow_reason.clone(),
+            &mut counters,
         ));
         assert_eq!(
             state.resync_reason.as_deref(),
@@ -6449,6 +7227,7 @@ mod tests {
             &mut state,
             baseline(),
             overflow_reason.clone(),
+            &mut counters,
         ));
         assert!(state.resync_reason.is_none());
         assert!(matches!(
@@ -6468,6 +7247,7 @@ mod tests {
             &mut state,
             baseline(),
             overflow_reason,
+            &mut counters,
         ));
     }
 
@@ -6501,12 +7281,14 @@ mod tests {
             entities: BTreeMap::new(),
             resync_reason: Some(overflow_reason.clone()),
         };
+        let mut counters = DaemonLifecycleCounters::default();
 
         assert!(try_resync_subscription(
             "async-subscription",
             &mut state,
             baseline(),
             overflow_reason.clone(),
+            &mut counters,
         ));
         assert_eq!(
             state.resync_reason.as_deref(),
@@ -6519,6 +7301,7 @@ mod tests {
             &mut state,
             baseline(),
             overflow_reason.clone(),
+            &mut counters,
         ));
         assert!(state.resync_reason.is_none());
         assert!(matches!(
@@ -6538,6 +7321,7 @@ mod tests {
             &mut state,
             baseline(),
             overflow_reason,
+            &mut counters,
         ));
     }
 }

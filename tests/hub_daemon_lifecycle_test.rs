@@ -6688,6 +6688,323 @@ fn session_entity_subscription_pushes_snapshot_ordered_deltas_and_fresh_reconnec
     shutdown_cli_daemon(&data_dir, child);
 }
 
+fn process_thread_count(pid: u32) -> Option<usize> {
+    for field in ["thcount=", "nlwp="] {
+        let output = Command::new("ps")
+            .args(["-o", field, "-p", &pid.to_string()])
+            .output()
+            .ok()?;
+        if output.status.success()
+            && let Ok(count) = String::from_utf8_lossy(&output.stdout).trim().parse()
+        {
+            return Some(count);
+        }
+    }
+    None
+}
+
+#[test]
+fn focused_connection_lifecycle_is_bounded_event_driven_and_counter_visible() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_test_dir("focused-connection-lifecycle");
+    let config = explicit_config(&data_dir);
+    let endpoint = botster_hub_client::DaemonEndpoint::new(
+        config
+            .transports
+            .local_socket
+            .as_ref()
+            .expect("test config has local socket")
+            .path
+            .clone(),
+    );
+    let child = start_cli_daemon(&data_dir);
+    let daemon_pid = child.id();
+    let startup_counters =
+        botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status)
+            .expect("status before first entity subscription")
+            .status
+            .expect("startup status body")
+            .lifecycle_counters;
+    assert_eq!(startup_counters.lifecycle_baseline_reads, 1);
+    let mut subscription =
+        botster_hub_client::subscribe_session_entities(&endpoint, "focused-idle")
+            .expect("subscribe focused idle entity stream");
+    subscription
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("bound initial snapshot read");
+    assert!(matches!(
+        subscription.next_frame().expect("initial focused snapshot"),
+        botster_hub_client::DaemonEntityFrame::Snapshot { .. }
+    ));
+    let before_idle =
+        botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status)
+            .expect("status before focused idle window")
+            .status
+            .expect("focused status body")
+            .lifecycle_counters;
+    assert_eq!(
+        before_idle.lifecycle_baseline_reads, startup_counters.lifecycle_baseline_reads,
+        "first live subscriber must consume the startup-seeded baseline without owner-path I/O"
+    );
+    thread::sleep(Duration::from_millis(1_100));
+    let after_idle =
+        botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status)
+            .expect("status after focused idle window")
+            .status
+            .expect("focused status body")
+            .lifecycle_counters;
+    assert_eq!(
+        after_idle.lifecycle_baseline_reads, before_idle.lifecycle_baseline_reads,
+        "steady-state idle reconciliation must not rescan the session registry"
+    );
+    assert_eq!(
+        after_idle.entity_delivery_attempts, before_idle.entity_delivery_attempts,
+        "an idle entity stream must not receive timer-driven frames"
+    );
+    assert!(
+        after_idle
+            .lifecycle_change_reads
+            .saturating_sub(before_idle.lifecycle_change_reads)
+            <= 4,
+        "the one shared idle backstop must stay low-frequency"
+    );
+
+    for index in 0..8 {
+        botster_hub_client::request(
+            &endpoint,
+            botster_hub_client::DaemonRequest::Spawn {
+                session_id: format!("focused-idle-session-{index}"),
+                command: "sleep 10".to_string(),
+            },
+        )
+        .expect("spawn focused session-count fixture");
+    }
+    let mut upserts = BTreeMap::new();
+    while upserts.len() < 8 {
+        if let botster_hub_client::DaemonEntityFrame::Upsert { id, .. } = subscription
+            .next_frame()
+            .expect("session-count fixture upsert")
+        {
+            upserts.insert(id, ());
+        }
+    }
+    let mut additional_subscriptions = Vec::new();
+    for index in 1..8 {
+        let mut additional = botster_hub_client::subscribe_session_entities(
+            &endpoint,
+            format!("focused-idle-{index}"),
+        )
+        .expect("subscribe additional idle entity stream");
+        additional
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("bound additional snapshot read");
+        assert!(matches!(
+            additional.next_frame().expect("additional idle snapshot"),
+            botster_hub_client::DaemonEntityFrame::Snapshot { ref items, .. }
+                if items.len() == 8
+        ));
+        additional_subscriptions.push(additional);
+    }
+    thread::sleep(Duration::from_millis(600));
+    let many_before =
+        botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status)
+            .expect("status before many-session idle window")
+            .status
+            .expect("many-session status body")
+            .lifecycle_counters;
+    thread::sleep(Duration::from_millis(1_100));
+    let many_after =
+        botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status)
+            .expect("status after many-session idle window")
+            .status
+            .expect("many-session status body")
+            .lifecycle_counters;
+    assert_eq!(
+        many_after.lifecycle_baseline_reads, many_before.lifecycle_baseline_reads,
+        "session count must not restore filesystem-backed baseline polling"
+    );
+    assert_eq!(
+        many_after.entity_delivery_attempts, many_before.entity_delivery_attempts,
+        "subscriber count must not create timer-driven entity delivery"
+    );
+    assert!(
+        many_after
+            .reconciliation_wakes
+            .saturating_sub(many_before.reconciliation_wakes)
+            <= 4,
+        "shared wake count must stay independent of session count"
+    );
+    drop(subscription);
+    drop(additional_subscriptions);
+
+    let cleanup_deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let counters =
+            botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status)
+                .expect("status while waiting for entity cleanup")
+                .status
+                .expect("cleanup status body")
+                .lifecycle_counters;
+        if counters.live_entity_subscriptions == 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < cleanup_deadline,
+            "dropped entity stream did not release its subscription"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    let connection_baseline_threads = process_thread_count(daemon_pid);
+    let mut idle_connections = Vec::new();
+    for _ in 0..64 {
+        idle_connections.push(
+            botster_hub_client::DaemonConnection::connect(&endpoint)
+                .expect("admit bounded idle connection"),
+        );
+    }
+    let saturated = idle_connections[0]
+        .request(&botster_hub_client::DaemonRequest::Status)
+        .expect("existing client stays responsive at admission bound")
+        .status
+        .expect("saturated status body")
+        .lifecycle_counters;
+    assert_eq!(saturated.live_connections, 64);
+    assert_eq!(saturated.high_water_live_connections, 64);
+    if let (Some(baseline), Some(peak)) = (
+        connection_baseline_threads,
+        process_thread_count(daemon_pid),
+    ) {
+        assert!(
+            peak.saturating_sub(baseline) <= 8,
+            "64 idle connections created too many OS threads: baseline={baseline} peak={peak}"
+        );
+    }
+
+    let mut rejected = botster_hub_client::DaemonConnection::connect(&endpoint)
+        .expect("over-cap client receives typed admission hello");
+    assert!(
+        rejected
+            .request(&botster_hub_client::DaemonRequest::Status)
+            .is_err(),
+        "over-cap connection must not enter the runtime request path"
+    );
+    let rejected_status = idle_connections[0]
+        .request(&botster_hub_client::DaemonRequest::Status)
+        .expect("admitted client remains healthy after rejection")
+        .status
+        .expect("post-rejection status body")
+        .lifecycle_counters;
+    assert!(rejected_status.rejected_connections >= 1);
+    drop(rejected);
+    drop(idle_connections);
+    let release_deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let counters =
+            match botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status)
+            {
+                Ok(response) => {
+                    response
+                        .status
+                        .expect("released-connection status body")
+                        .lifecycle_counters
+                }
+                Err(_) if Instant::now() < release_deadline => {
+                    thread::sleep(Duration::from_millis(20));
+                    continue;
+                }
+                Err(error) => panic!("connection admission did not recover: {error}"),
+            };
+        if counters.live_connections <= 1 {
+            break;
+        }
+        assert!(
+            Instant::now() < release_deadline,
+            "idle connection owners did not release: {counters:?}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    let mut malformed =
+        UnixStream::connect(&endpoint.socket_path).expect("connect malformed raw daemon client");
+    botster_hub_client::write_frame(
+        &mut malformed,
+        &botster_hub_client::DaemonHello {
+            protocol: botster_hub_client::PROTOCOL.to_string(),
+            compatibility: botster_hub_client::DaemonCompatibilityRequirement::current(),
+        },
+    )
+    .expect("write malformed-client hello");
+    let _: botster_hub_client::DaemonHelloAck =
+        botster_hub_client::read_frame(&mut malformed).expect("read malformed-client hello ack");
+    malformed
+        .write_all(b"{\"type\":}\n")
+        .expect("write malformed complete frame");
+    drop(malformed);
+
+    let mut half_open =
+        UnixStream::connect(&endpoint.socket_path).expect("connect half-open raw daemon client");
+    half_open
+        .set_read_timeout(Some(Duration::from_secs(4)))
+        .expect("bound half-open handshake close observation");
+    let mut closed = [0_u8; 1];
+    assert!(
+        half_open.read(&mut closed).is_ok_and(|count| count == 0),
+        "half-open handshake deadline must close the connection"
+    );
+
+    let mut incomplete =
+        UnixStream::connect(&endpoint.socket_path).expect("connect incomplete raw daemon client");
+    botster_hub_client::write_frame(
+        &mut incomplete,
+        &botster_hub_client::DaemonHello {
+            protocol: botster_hub_client::PROTOCOL.to_string(),
+            compatibility: botster_hub_client::DaemonCompatibilityRequirement::current(),
+        },
+    )
+    .expect("write incomplete-client hello");
+    let _: botster_hub_client::DaemonHelloAck =
+        botster_hub_client::read_frame(&mut incomplete).expect("read incomplete-client hello ack");
+    incomplete
+        .write_all(b"{\"type\":\"status\"")
+        .expect("write incomplete frame");
+    incomplete
+        .set_read_timeout(Some(Duration::from_secs(4)))
+        .expect("bound incomplete-frame close observation");
+    assert!(
+        incomplete.read(&mut closed).is_ok_and(|count| count == 0),
+        "incomplete frame deadline must close the connection"
+    );
+
+    let cleanup_deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let counters =
+            botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status)
+                .expect("status after malformed and incomplete clients")
+                .status
+                .expect("terminal cleanup status body")
+                .lifecycle_counters;
+        if counters
+            .cleanup_by_reason
+            .get("protocol")
+            .copied()
+            .unwrap_or_default()
+            >= 3
+            && counters.live_connections <= 1
+        {
+            assert!(counters.cleanup_completed >= 67);
+            break;
+        }
+        assert!(
+            Instant::now() < cleanup_deadline,
+            "transport cleanup counters did not settle: {counters:?}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    shutdown_cli_daemon(&data_dir, child);
+}
+
 #[test]
 fn session_entity_subscription_observes_natural_exit_without_terminal_attach() {
     let _guard = daemon_test_guard();

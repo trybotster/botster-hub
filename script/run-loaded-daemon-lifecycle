@@ -62,7 +62,7 @@ validate_inputs() {
     invalid=1
   fi
   case "$TEST_TARGET" in
-    lifecycle-suite|focused-stalled-attach|focused-fast-exit-attach-diagnostic|focused-oversized-webrtc|focused-cli-smoke|focused-lua-worker-suite|focused-lua-session-worker-callers|full-suite-contention) ;;
+    lifecycle-suite|focused-connection-lifecycle|focused-stalled-attach|focused-fast-exit-attach-diagnostic|focused-oversized-webrtc|focused-cli-smoke|focused-lua-worker-suite|focused-lua-session-worker-callers|full-suite-contention) ;;
     *) log "invalid test_target: $TEST_TARGET"; invalid=1 ;;
   esac
   if [[ ! "$REPETITIONS" =~ ^[0-9]+$ ]] || ((10#$REPETITIONS < 1 || 10#$REPETITIONS > 100)); then
@@ -722,6 +722,9 @@ main() {
   case "$TEST_TARGET" in
     lifecycle-suite)
       test_command=(./test.sh --test hub_daemon_lifecycle_test -- --nocapture)
+      ;;
+    focused-connection-lifecycle)
+      test_command=(./test.sh --test hub_daemon_lifecycle_test focused_connection_lifecycle_is_bounded_event_driven_and_counter_visible -- --exact --nocapture)
       ;;
     focused-stalled-attach)
       test_command=(./test.sh --test hub_daemon_lifecycle_test stalled_attach_stdout_does_not_block_other_daemon_commands -- --exact --nocapture)
