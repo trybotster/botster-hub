@@ -86,6 +86,12 @@ resolved worker is executable before synthetic load begins. This keeps the
 runtime-spawned worker build outside the measured stress phase without
 weakening the load profile or widening transport deadlines.
 
+The pipelined control-pressure proof keeps one `BufReader` for each response
+stream and calls the client crate's `read_frame_from_reader` API. Recreating a
+buffered reader for every response could prefetch and then discard later
+frames, making the proof disconnect itself under Linux load even though the
+daemon emitted valid newline-delimited responses.
+
 ## Files changed
 
 - Runtime and policy: `src/daemon_transport.rs`, `src/local_webrtc.rs`,
