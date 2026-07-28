@@ -965,6 +965,16 @@ request fields. A result must echo the request's `request_id`, `surface_id`,
 The Hub rejects a mismatched identity as `invalid_action_result` before it can
 cross the client boundary.
 
+The packaged `contract.app` producer supplies live presentation proof in
+addition to the static UI-contract fixtures. Its rendered open action returns
+accepted `set` operations for `contract-dialog` and
+`selected-workspace = "workspace-alpha"`; the test-support runner applies those
+operations to package/surface-scoped client state and evaluates the delivered
+presence/equality bindings. An invalid rendered form submission rejects while
+retaining the tree and open state, a valid submission returns normalized values
+and a replacement before clearing the dialog, and a distinct rendered action
+proves deterministic toggle transitions.
+
 This cold switch advances `PROTOCOL_VERSION` to 4 and
 `CONFORMANCE_FIXTURE_REVISION` to 19. It removes `UiTreeUpdateRef` and
 `tree_update`, requires explicit form `submit_label`, supports scoped
@@ -1101,6 +1111,10 @@ let report = botster_hub_test_support::run_plugin_contract_matrix_conformance(
 )
 .expect("plugin UI conformance");
 assert_eq!(report.app_surface_node_id, "contract-app-panel");
+assert!(report.dialog_visible_after_open);
+assert!(report.selected_workspace_visible_after_open);
+assert!(report.rejected_state_retained);
+assert!(!report.dialog_visible_after_valid_submit);
 assert_eq!(report.action_error_diagnostic_kind, "action_failure");
 assert_eq!(
     report.client_render_check.class,

@@ -173,6 +173,12 @@ The renderer-neutral plugin UI wire contract is owned by the standalone
 types but does not own renderer presentation policy. `botster-hub-client`
 re-exports the same typed daemon bodies; clients must not maintain local
 `UiNode` or action-result mirrors.
+The packaged plugin-contract-matrix proves the user-shaped path through a real
+isolated Hub and plugin worker: rendered action metadata dispatches an accepted
+presentation `set`, scoped client state opens the delivered Dialog and satisfies
+the selected-workspace equality binding, rejected form values retain both tree
+and state, and valid submit plus toggle/clear effects remain typed. Static
+`@trybotster/ui-contract` fixtures remain the deterministic contract complement.
 
 | Core / daemon operation | HubRuntime decision | Reason |
 | --- | --- | --- |
