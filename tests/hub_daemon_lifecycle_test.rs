@@ -3747,6 +3747,23 @@ fn daemon_plugin_contract_matrix_fixture_exercises_public_package_contracts() {
             ),
         ])
     );
+    let matrix = botster_hub_test_support::first_party_client_support_matrix();
+    assert_eq!(
+        matrix.plugin_surfaces.dialog_presence_key,
+        report.dialog_presence_key
+    );
+    assert_eq!(
+        matrix.plugin_surfaces.selected_workspace_equality_key,
+        report.selected_workspace_equality_key
+    );
+    assert_eq!(
+        matrix.plugin_surfaces.selected_workspace_equality_value,
+        report.selected_workspace_equality_value
+    );
+    assert_eq!(
+        matrix.plugin_surfaces.authored_set_values,
+        report.open_set_values
+    );
     assert!(report.dialog_visible_after_open);
     assert!(report.selected_workspace_visible_after_open);
     assert!(report.rejected_state_retained);

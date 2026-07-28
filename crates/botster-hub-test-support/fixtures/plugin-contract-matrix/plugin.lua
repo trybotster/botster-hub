@@ -53,7 +53,7 @@ local function app_surface(_arguments)
               type = "button",
               id = "contract-app-toggle",
               props = {
-                label = "Toggle contract dialog",
+                label = "Toggle contract state",
                 action = {
                   id = "contract.action",
                   payload = {
@@ -306,15 +306,6 @@ local function contract_action(arguments)
     return action_result(arguments, "error", {
       error = "contract action failed by request",
       form_errors = { "contract action failed by request" },
-    })
-  end
-  if payload.field_error == true then
-    return action_result(arguments, "rejected", {
-      error = "message is required",
-      field_errors = {
-        ["contract-app-message"] = { "Message is required" },
-      },
-      form_errors = { "Message is required" },
     })
   end
   if payload.identity_mismatch == true then
