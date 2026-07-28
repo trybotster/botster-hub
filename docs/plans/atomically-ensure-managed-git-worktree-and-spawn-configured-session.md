@@ -12,6 +12,12 @@
 - Architecture maps and atomic constraints: [[botster-architecture]], [[cli-patterns]], [[spa-patterns]], [[botster hub is a first party host profile over core]], [[botster hub gravity must be watched before it becomes the new monolith]], [[botster hub events use bounded priority lanes instead of unbounded queue fuses]], [[hub supervision admission changes require exact live hub launch proof]], [[botster data plane bypasses the hub through session and client actors]], [[botster local client api lives over hubruntime not raw core routers]], [[queued hub orchestration uses a shared queue policy]], [[device hub owns admitted spawn targets not ambient repo cwd]], [[workspace session templates are hub owned capabilities callable from lua workers]], [[session template override sources use package device repo explicit precedence]], [[botster workspace records are plugin owned references not hub authority]], [[plugin capability tests must validate against real lua runtime table not injected stubs]], [[an mpsc round trip is not a durability barrier]], [[test script required for rust tests not cargo test]], [[rust repo strict lints must be verified before dismissing warnings]], [[workspace struct field changes require workspace cargo gates]], [[botster hub client crate is the external client boundary]], [[botster hub client compatibility descriptors belong in client crate]], [[daemon event shape changes bump conformance fixture revision not protocol version]], and [[generated typescript dtos must encode serde field optionality]].
 - Workflow artifact guidance: [[project pipeline orchestration belongs in a device-level botster plugin]], [[botster orchestration should spawn agents with explicit target ids]], [[botster orchestration prompts must bind agents to explicit worktrees]], [[plan steps need reviewable plan artifacts]], [[plan agents must author vault context as wikilinks not home paths]], and [[vault example paths are not repository placement conventions]].
 - `[[project-pipelines-playbook]]` was not loaded: this ticket changes Hub runtime/client code, not Project Pipelines package paths or workflow policy.
+- Implementation dependency amendment: canonical UUID production proof exposed a
+  macOS Unix-socket path limit in Core. Human answer
+  `question_1785202296_840826` required preserving full UUID identity and routing
+  the private transport fix to Core. Dependency
+  `ticket_1785211693_238645` is now closed; this run consumes tested Core
+  coordinate `e36435f2` and contains no Hub session-id compaction workaround.
 
 ## Existing production seams
 
@@ -81,7 +87,11 @@ The new runtime path must extend these seams. It must not introduce plugin-run G
 
 - Hub owns target admission, stored `base_ref`, managed-root naming, Git execution, locking, reconciliation, rollback, template eligibility/materialization, trusted context, capability enforcement, and CoreDaemon spawn.
 - `botster-hub-client` owns the external optional `base_ref` DTO/request shape, serde behavior, generated TypeScript, compatibility metadata, and downstream fixture parity; it does not own Git policy.
-- `botster-core` continues to receive only the fully materialized generic session spawn request. No Core dependency is required.
+- `botster-core` continues to receive only the fully materialized generic
+  session spawn request. The separately routed and now-closed Core dependency
+  `ticket_1785211693_238645` made worker socket paths independent of caller
+  session-id length; Hub consumes that fix through its normal `main` Git
+  dependency and retains canonical UUIDs.
 - Plugins own only workflow records and references to the returned target/worktree/session ids. They cannot mutate Git or claim filesystem authority.
 - The closed Hub UI-contract prerequisite is present at the run base. It is not an implementation blocker for this runtime ticket.
 - The open `botster-workspaces` and final integration tickets are downstream consumers/proof owners, not code dependencies to absorb into this run. If their eventual request shape needs additional product fields beyond the ticket's target/branch/template/context inputs, register that change against their repository target rather than expanding Hub speculatively.

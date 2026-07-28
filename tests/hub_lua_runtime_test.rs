@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
+use std::process::Command;
 
 use botster_core::{
     BoundaryJson, Capability, CapabilitySurface, EndpointId, EnvelopeDeliveryStatus, EnvelopeId,
@@ -23,11 +24,15 @@ mod support;
 use support::ensure_session_worker_binary;
 
 fn explicit_runtime(name: &str) -> HubRuntime {
-    ensure_session_worker_binary();
     let data_directory = PathBuf::from("target")
         .join("botster-hub-test-data")
         .join("lua-runtime")
-        .join(name);
+        .join(format!("{}-{name}", std::process::id()));
+    explicit_runtime_in(name, data_directory)
+}
+
+fn explicit_runtime_in(name: &str, data_directory: PathBuf) -> HubRuntime {
+    ensure_session_worker_binary();
     let _ = std::fs::remove_dir_all(&data_directory);
     let config = HubStartupOptions {
         host: HostIdentityOptions {
@@ -291,6 +296,7 @@ fn install_session_template_spawn_registry(
     let source_root = std::env::current_dir().expect("current dir").join(&root);
     let _ = fs::remove_dir_all(&root);
     fs::create_dir_all(root.join("bin")).expect("create session-template package root");
+    fs::create_dir_all(root.join("subdir")).expect("create relative template directory");
     fs::write(
         root.join("plugin.lua"),
         r#"
@@ -302,6 +308,28 @@ return botster.register({
       handler = "spawn",
       call = function(args)
         return botster.capabilities.session_templates.spawn(args)
+      end,
+    },
+    {
+      name = "session_template.atomic",
+      description = "Atomically ensure a managed worktree and spawn its configured session.",
+      handler = "atomic",
+      call = function(args)
+        return botster.capabilities.session_templates.ensure_worktree_and_spawn(args)
+      end,
+    },
+    {
+      name = "session_template.inspect",
+      description = "Inspect target-filtered effective templates.",
+      handler = "inspect",
+      call = function(args)
+        return {
+          list = botster.capabilities.session_templates.list({ target_id = args.target_id }),
+          shown = botster.capabilities.session_templates.show({
+            target_id = args.target_id,
+            template_id = args.template_id,
+          }),
+        }
       end,
     },
   },
@@ -334,7 +362,7 @@ return botster.register({
     let script = root.join("bin/init.sh");
     fs::write(
         &script,
-        "#!/bin/sh\nprintf 'template:%s:%s\\n' \"$BOTSTER_SESSION_ID\" \"$BOTSTER_MODE\"\n",
+        "#!/bin/sh\nprintf 'template:%s:%s\\n' \"$BOTSTER_SESSION_ID\" \"$BOTSTER_MODE\"\nprintf 'managed\\n' > template-executed.txt\n",
     )
     .expect("write session-template script");
     let mut permissions = fs::metadata(&script)
@@ -352,13 +380,25 @@ return botster.register({
             "source": { "type": "path", "path": source_root.display().to_string() },
             "capabilities": capabilities,
             "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }],
-            "session_templates": [{
-                "id": "init",
-                "command": "bin/init.sh",
-                "environment": { "BOTSTER_MODE": "default" },
-                "allowed_environment_overrides": ["BOTSTER_MODE"],
-                "context": ["prompt", "ticket_id"]
-            }]
+            "session_templates": [
+                {
+                    "id": "init",
+                    "command": "bin/init.sh",
+                    "environment": { "BOTSTER_MODE": "default" },
+                    "allowed_environment_overrides": ["BOTSTER_MODE"],
+                    "context": ["prompt", "ticket_id"],
+                    "target_id": "tgt_managed"
+                },
+                {
+                    "id": "relative",
+                    "command": "bin/init.sh",
+                    "working_directory": { "policy": "relative", "path": "subdir" },
+                    "environment": { "BOTSTER_MODE": "default" },
+                    "allowed_environment_overrides": ["BOTSTER_MODE"],
+                    "context": ["prompt", "ticket_id"],
+                    "target_id": "tgt_managed"
+                }
+            ]
         })
         .to_string(),
     )
@@ -887,6 +927,7 @@ fn real_lua_plugin_lists_and_validates_spawn_targets_without_mutation_surface() 
             root: target_root.clone(),
             enabled: true,
             kind: "directory".to_string(),
+            base_ref: None,
             metadata: BTreeMap::new(),
         },
         SpawnTarget {
@@ -895,6 +936,7 @@ fn real_lua_plugin_lists_and_validates_spawn_targets_without_mutation_surface() 
             root: target_root,
             enabled: false,
             kind: "directory".to_string(),
+            base_ref: None,
             metadata: BTreeMap::new(),
         },
     ];
@@ -941,6 +983,7 @@ fn real_lua_plugin_lists_and_shows_worktrees_without_mutation_surface() {
         root: target_root,
         enabled: true,
         kind: "directory".to_string(),
+        base_ref: None,
         metadata: BTreeMap::new(),
     }];
     state.worktrees = vec![Worktree {
@@ -949,6 +992,7 @@ fn real_lua_plugin_lists_and_shows_worktrees_without_mutation_surface() {
         label: "Lua Plain".to_string(),
         path: worktree_path,
         status: "present".to_string(),
+        management: "registered".to_string(),
         git: None,
         metadata: BTreeMap::new(),
     }];
@@ -995,6 +1039,7 @@ fn real_lua_plugin_observes_worktrees_added_after_plugin_load() {
         root: target_root,
         enabled: true,
         kind: "directory".to_string(),
+        base_ref: None,
         metadata: BTreeMap::new(),
     }];
     hub.replace_state(state.clone());
@@ -1007,6 +1052,7 @@ fn real_lua_plugin_observes_worktrees_added_after_plugin_load() {
         label: "Lua Late".to_string(),
         path: worktree_path,
         status: "present".to_string(),
+        management: "registered".to_string(),
         git: None,
         metadata: BTreeMap::new(),
     }];
@@ -1142,6 +1188,365 @@ fn real_lua_plugin_spawns_session_template_through_worker_capability() {
             .is_some(),
         "production core daemon should own the spawned PTY session"
     );
+}
+
+#[test]
+fn real_lua_plugin_atomically_ensures_managed_worktree_and_spawns_session() {
+    let registry = install_session_template_spawn_registry(
+        "managed-session-template-spawn",
+        vec![
+            capability(CapabilitySurface::Mcp, None),
+            capability(
+                CapabilitySurface::SessionActions,
+                Some("session_template_managed_git_spawn"),
+            ),
+        ],
+    );
+    let mut hub = explicit_runtime_in(
+        "managed-session-template-spawn",
+        PathBuf::from(format!("/tmp/bml-{}", std::process::id())),
+    );
+    let repo_root = PathBuf::from("target")
+        .join("botster-hub-test-data")
+        .join("lua-runtime")
+        .join("managed-session-template-repository");
+    let _ = fs::remove_dir_all(&repo_root);
+    fs::create_dir_all(&repo_root).expect("create managed repository");
+    run_git(None, &["init", "-b", "main", path_str(&repo_root)]);
+    run_git(
+        Some(&repo_root),
+        &["config", "user.email", "botster@example.invalid"],
+    );
+    run_git(Some(&repo_root), &["config", "user.name", "Botster Test"]);
+    fs::write(repo_root.join("README.md"), "managed\n").expect("write managed fixture");
+    fs::create_dir_all(repo_root.join("subdir")).expect("create managed relative directory");
+    fs::write(repo_root.join("subdir/.keep"), "managed\n").expect("write managed relative fixture");
+    fs::create_dir_all(repo_root.join("bin")).expect("create repo command directory");
+    let repo_script = repo_root.join("bin/init.sh");
+    fs::write(
+        &repo_script,
+        "#!/bin/sh\nprintf 'main\\n' > repo-executed.txt\n",
+    )
+    .expect("write repo branch command");
+    let mut repo_script_permissions = fs::metadata(&repo_script)
+        .expect("repo script metadata")
+        .permissions();
+    repo_script_permissions.set_mode(0o755);
+    fs::set_permissions(&repo_script, repo_script_permissions).expect("chmod repo script");
+    fs::create_dir_all(repo_root.join(".botster")).expect("create repo template directory");
+    fs::write(
+        repo_root.join(".botster/session-templates.json"),
+        serde_json::json!({
+            "session_templates": [{
+                "id": "init",
+                "command": "bin/init.sh",
+                "target_id": "tgt_managed",
+                "context": ["prompt", "ticket_id"]
+            }]
+        })
+        .to_string(),
+    )
+    .expect("write repo template override");
+    run_git(Some(&repo_root), &["add", "-A"]);
+    run_git(Some(&repo_root), &["commit", "-m", "managed fixture"]);
+    let mut state = hub.state().clone();
+    state.spawn_targets = vec![SpawnTarget {
+        target_id: "tgt_managed".to_string(),
+        label: "Managed".to_string(),
+        root: repo_root.clone(),
+        enabled: true,
+        kind: "git".to_string(),
+        base_ref: Some("main".to_string()),
+        metadata: BTreeMap::new(),
+    }];
+    hub.replace_state(state);
+    hub.load_lua_plugin_package(&registry, "session-template-spawner.plugin")
+        .expect("load managed session-template plugin");
+
+    let inspected = hub
+        .call_plugin_mcp_tool(botster_hub::McpCallRequest {
+            name: "session_template.inspect".to_string(),
+            arguments: serde_json::json!({
+                "target_id": "tgt_managed",
+                "template_id": "tgt_managed/init"
+            }),
+        })
+        .expect("inspect target-filtered templates");
+    assert_eq!(inspected["list"].as_array().map(Vec::len), Some(2));
+    assert_eq!(inspected["shown"]["target_id"], "tgt_managed");
+    assert_eq!(inspected["shown"]["source"], "repo");
+
+    let result = hub
+        .call_plugin_mcp_tool(botster_hub::McpCallRequest {
+            name: "session_template.atomic".to_string(),
+            arguments: serde_json::json!({
+                "target_id": "tgt_managed",
+                "branch": "feature/atomic",
+                "template_id": "tgt_managed/init",
+                "context": {
+                    "prompt": "trusted managed spawn",
+                    "ticket_id": "ticket-managed-proof",
+                    "metadata": { "safe": "value" }
+                }
+            }),
+        })
+        .expect("call atomic managed session-template capability");
+    assert_eq!(result["ok"], true, "atomic result: {result}");
+    let spawned = &result["result"];
+    let session_id = spawned["session_id"].as_str().expect("session UUID");
+    assert_eq!(session_id.len(), 36);
+    assert_eq!(spawned["target_id"], "tgt_managed");
+    assert_eq!(spawned["branch"], "feature/atomic");
+    assert_eq!(spawned["base_ref"], "main");
+    assert_eq!(spawned["created_branch"], true);
+    assert_eq!(spawned["created_worktree"], true);
+    assert!(
+        hub.session(&SessionId(session_id.to_string()))
+            .expect("read managed spawned session")
+            .is_some()
+    );
+    let context = hub
+        .session_context(session_id)
+        .expect("read trusted managed session context");
+    assert_eq!(context.values["branch_name"], "feature/atomic");
+    assert_eq!(context.values["target_id"], "tgt_managed");
+    assert_eq!(context.values["metadata.base_ref"], "main");
+    assert_eq!(context.values["metadata.safe"], "value");
+    assert_eq!(
+        context.values["worktree_path"],
+        spawned["worktree_path"].as_str().expect("worktree path")
+    );
+    let repo_marker = PathBuf::from(
+        spawned["worktree_path"]
+            .as_str()
+            .expect("spawned worktree path"),
+    )
+    .join("repo-executed.txt");
+    for _ in 0..100 {
+        if repo_marker.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(
+        fs::read_to_string(repo_marker).expect("repo-source command marker"),
+        "main\n",
+        "repo-source templates must execute code from the selected managed branch"
+    );
+
+    let reused = hub
+        .call_plugin_mcp_tool(botster_hub::McpCallRequest {
+            name: "session_template.atomic".to_string(),
+            arguments: serde_json::json!({
+                "target_id": "tgt_managed",
+                "branch": "feature/atomic",
+                "template_id": "tgt_managed/init"
+            }),
+        })
+        .expect("reuse managed worktree through atomic capability");
+    assert_eq!(reused["ok"], true);
+    assert_eq!(reused["result"]["reused_worktree"], true);
+    assert_ne!(
+        reused["result"]["session_id"], spawned["session_id"],
+        "each successful atomic call creates a distinct session UUID"
+    );
+
+    let relative = hub
+        .call_plugin_mcp_tool(botster_hub::McpCallRequest {
+            name: "session_template.atomic".to_string(),
+            arguments: serde_json::json!({
+                "target_id": "tgt_managed",
+                "branch": "feature/relative",
+                "template_id": "session-template-spawner.plugin/relative"
+            }),
+        })
+        .expect("spawn relative managed template");
+    assert_eq!(relative["ok"], true);
+    let relative_session_id = relative["result"]["session_id"]
+        .as_str()
+        .expect("relative session UUID");
+    hub.session_context(relative_session_id)
+        .expect("relative managed context");
+    let relative_marker = PathBuf::from(
+        relative["result"]["worktree_path"]
+            .as_str()
+            .expect("relative worktree path"),
+    )
+    .join("subdir/template-executed.txt");
+    for _ in 0..100 {
+        if relative_marker.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(
+        fs::read_to_string(relative_marker).expect("relative cwd marker"),
+        "managed\n",
+        "relative working-directory policy must resolve beneath the managed worktree"
+    );
+
+    run_git(
+        Some(&repo_root),
+        &["switch", "-c", "feature/symlink-escape"],
+    );
+    fs::remove_dir_all(repo_root.join("subdir")).expect("replace relative directory");
+    std::os::unix::fs::symlink("/tmp", repo_root.join("subdir")).expect("create escaping symlink");
+    run_git(Some(&repo_root), &["add", "-A"]);
+    run_git(
+        Some(&repo_root),
+        &["commit", "-m", "symlink escape fixture"],
+    );
+    run_git(Some(&repo_root), &["switch", "main"]);
+    let symlink_escape = hub
+        .call_plugin_mcp_tool(botster_hub::McpCallRequest {
+            name: "session_template.atomic".to_string(),
+            arguments: serde_json::json!({
+                "target_id": "tgt_managed",
+                "branch": "feature/symlink-escape",
+                "template_id": "session-template-spawner.plugin/relative"
+            }),
+        })
+        .expect("return tagged symlink escape failure");
+    assert_eq!(symlink_escape["ok"], false);
+    assert_eq!(symlink_escape["error"]["kind"], "cwd_not_admitted");
+    assert!(
+        git_succeeds(
+            &repo_root,
+            &[
+                "show-ref",
+                "--verify",
+                "--quiet",
+                "refs/heads/feature/symlink-escape"
+            ]
+        ),
+        "pre-existing symlink fixture branch must survive rejected materialization"
+    );
+
+    let package_script = PathBuf::from("target")
+        .join("botster-hub-test-data")
+        .join("lua-runtime-packages")
+        .join("managed-session-template-spawn")
+        .join("bin/init.sh");
+    fs::remove_file(package_script).expect("force configured spawn failure");
+
+    let new_branch_failure = hub
+        .call_plugin_mcp_tool(botster_hub::McpCallRequest {
+            name: "session_template.atomic".to_string(),
+            arguments: serde_json::json!({
+                "target_id": "tgt_managed",
+                "branch": "feature/rollback-new",
+                "template_id": "session-template-spawner.plugin/relative"
+            }),
+        })
+        .expect("return tagged new-branch spawn failure");
+    assert_eq!(new_branch_failure["ok"], false);
+    assert_eq!(new_branch_failure["error"]["kind"], "spawn_failed");
+    assert!(
+        !git_succeeds(
+            &repo_root,
+            &[
+                "show-ref",
+                "--verify",
+                "--quiet",
+                "refs/heads/feature/rollback-new"
+            ]
+        ),
+        "a branch created by the failed call must be rolled back"
+    );
+
+    run_git(Some(&repo_root), &["branch", "feature/rollback-existing"]);
+    let existing_branch_failure = hub
+        .call_plugin_mcp_tool(botster_hub::McpCallRequest {
+            name: "session_template.atomic".to_string(),
+            arguments: serde_json::json!({
+                "target_id": "tgt_managed",
+                "branch": "feature/rollback-existing",
+                "template_id": "session-template-spawner.plugin/relative"
+            }),
+        })
+        .expect("return tagged existing-branch spawn failure");
+    assert_eq!(existing_branch_failure["ok"], false);
+    assert_eq!(existing_branch_failure["error"]["kind"], "spawn_failed");
+    assert!(
+        git_succeeds(
+            &repo_root,
+            &[
+                "show-ref",
+                "--verify",
+                "--quiet",
+                "refs/heads/feature/rollback-existing"
+            ]
+        ),
+        "a pre-existing branch must survive failed session spawn rollback"
+    );
+}
+
+#[test]
+fn managed_session_template_capability_denies_old_scope_and_trusted_field_smuggling() {
+    let registry = install_session_template_spawn_registry(
+        "managed-session-template-denied",
+        vec![
+            capability(CapabilitySurface::Mcp, None),
+            capability(
+                CapabilitySurface::SessionActions,
+                Some("session_template_spawn"),
+            ),
+        ],
+    );
+    let mut hub = explicit_runtime("managed-session-template-denied");
+    hub.load_lua_plugin_package(&registry, "session-template-spawner.plugin")
+        .expect("load denied managed session-template plugin");
+    let denied = hub
+        .call_plugin_mcp_tool(botster_hub::McpCallRequest {
+            name: "session_template.atomic".to_string(),
+            arguments: serde_json::json!({
+                "target_id": "tgt_managed",
+                "branch": "feature/denied",
+                "template_id": "session-template-spawner.plugin/init"
+            }),
+        })
+        .expect("typed capability denial");
+    assert_eq!(denied["ok"], false);
+    assert_eq!(denied["error"]["kind"], "capability_denied");
+
+    let smuggling = hub
+        .call_plugin_mcp_tool(botster_hub::McpCallRequest {
+            name: "session_template.atomic".to_string(),
+            arguments: serde_json::json!({
+                "target_id": "tgt_managed",
+                "branch": "feature/denied",
+                "template_id": "session-template-spawner.plugin/init",
+                "cwd": "/tmp/untrusted",
+                "context": { "worktree_path": "/tmp/untrusted" }
+            }),
+        })
+        .expect_err("trusted fields must be rejected at Lua boundary");
+    assert!(smuggling.message.contains("trusted fields"));
+}
+
+fn path_str(path: &std::path::Path) -> &str {
+    path.to_str().expect("test path is UTF-8")
+}
+
+fn run_git(root: Option<&std::path::Path>, args: &[&str]) {
+    let mut command = Command::new("git");
+    if let Some(root) = root {
+        command.arg("-C").arg(root);
+    }
+    assert!(
+        command.args(args).status().expect("run git").success(),
+        "git command failed: {args:?}"
+    );
+}
+
+fn git_succeeds(root: &std::path::Path, args: &[&str]) -> bool {
+    Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .status()
+        .expect("run git status")
+        .success()
 }
 
 #[test]

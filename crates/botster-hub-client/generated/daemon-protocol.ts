@@ -79,8 +79,8 @@ export type DaemonRequest =
   | { type: "read_session_context"; session_id: string; context_id?: string | null; key?: string | null }
   | { type: "list_spawn_targets" }
   | { type: "show_spawn_target"; target_id: string }
-  | { type: "create_spawn_target"; target_id?: string | null; label?: string | null; root: string; enabled?: boolean; kind?: string | null; metadata?: Record<string, string> }
-  | { type: "update_spawn_target"; target_id: string; label?: string | null; root?: string | null; enabled?: boolean | null; kind?: string | null; metadata?: Record<string, string> | null }
+  | { type: "create_spawn_target"; target_id?: string | null; label?: string | null; root: string; enabled?: boolean; kind?: string | null; base_ref?: string | null; metadata?: Record<string, string> }
+  | { type: "update_spawn_target"; target_id: string; label?: string | null; root?: string | null; enabled?: boolean | null; kind?: string | null; base_ref?: string | null; metadata?: Record<string, string> | null }
   | { type: "delete_spawn_target"; target_id: string }
   | { type: "validate_spawn_target"; target_id: string }
   | { type: "list_worktrees" }
@@ -256,6 +256,7 @@ export interface DaemonSpawnTarget {
   root: string;
   enabled: boolean;
   kind: string;
+  base_ref?: string | null;
   metadata?: Record<string, string>;
 }
 
@@ -271,6 +272,7 @@ export interface DaemonWorktree {
   label: string;
   path: string;
   status: string;
+  management: string;
   git?: DaemonWorktreeGitMetadata | null;
   metadata?: Record<string, string>;
 }
