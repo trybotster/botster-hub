@@ -14,12 +14,13 @@ use botster_core::{
     RoutedEnvelope, RoutedEnvelopeDrainOutcome, RoutedEnvelopePublishOutcome,
     RunnableEntrypointKind, RunnableEntrypointLaunchMode, SessionId, SessionLifecycleState,
     SessionRuntimeErrorKind, SessionSpawnRequest, SpawnEnvironment, SpawnWorkingDirectory,
-    SubscriptionId, TerminalAttachState, TransportEgress, UiActionResult, UiNode,
+    SubscriptionId, TerminalAttachState, TransportEgress,
 };
 use botster_core_daemon::{
     GuardedWriteDecision, GuardedWriteDeliveryState, GuardedWriteRequest, GuardedWriteResult,
     ReadinessEvidence, SessionLifecycleBaseline,
 };
+use botster_ui_contract::{UiActionRequest, UiActionResult, UiNode};
 
 use crate::lifecycle::HubPluginLifecycleStatus;
 use crate::packages::{
@@ -494,13 +495,11 @@ impl HubClientApi {
             }
             HubClientRequest::PluginSurfaceAction {
                 package_name,
-                surface_id,
-                action_id,
-                payload,
+                action,
                 ..
             } => HubClientResponseBody::PluginActionResult(
                 runtime
-                    .dispatch_plugin_surface_action(&package_name, &surface_id, &action_id, payload)
+                    .dispatch_plugin_surface_action(&package_name, &action)
                     .map_err(|error| plugin_error(request_id.clone(), operation, error))?,
             ),
         };
@@ -764,9 +763,7 @@ pub enum HubClientRequest {
     PluginSurfaceAction {
         request_id: RequestId,
         package_name: String,
-        surface_id: String,
-        action_id: String,
-        payload: serde_json::Value,
+        action: UiActionRequest,
     },
 }
 

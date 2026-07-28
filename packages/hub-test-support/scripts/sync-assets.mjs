@@ -102,6 +102,7 @@ function metadataJson(originDir) {
     protocol: origin.protocol,
     protocol_version: origin.protocol_version,
     conformance_fixture_revision: origin.conformance_fixture_revision,
+    ui_contract: origin.ui_contract,
     generated_by: "cargo run -p botster-hub-test-support --example node_package_assets",
     daemon_protocol: {
       artifact_path: "daemon-protocol.ts",

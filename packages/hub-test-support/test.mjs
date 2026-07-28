@@ -1,6 +1,14 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmdirSync,
+  rmSync,
+  symlinkSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -22,15 +30,21 @@ import {
   readLocalWebrtcDeliveryChunkConformanceFixture,
   readModeFlagsConformanceFixture,
   readSessionLifecycleSubscriptionConformanceFixture,
+  readUiContractConformanceFixtures,
   sessionLifecycleSubscriptionConformanceFixturePath,
   verifyPackageAssets,
 } from "@trybotster/hub-test-support";
 
 assert.equal(metadata.package_name, "@trybotster/hub-test-support");
-assert.equal(metadata.package_version, "0.1.11");
+assert.equal(metadata.package_version, "0.1.12");
 assert.equal(metadata.protocol, "botster-hub-daemon-v1");
-assert.equal(metadata.protocol_version, 3);
-assert.equal(metadata.conformance_fixture_revision, 18);
+assert.equal(metadata.protocol_version, 4);
+assert.equal(metadata.conformance_fixture_revision, 19);
+assert.deepEqual(metadata.ui_contract, {
+  conformance_fixture_export: "@trybotster/ui-contract/conformance-fixtures",
+  package_name: "@trybotster/ui-contract",
+  package_version: "0.1.0",
+});
 assert.deepEqual(metadata.application_primitives, {
   fixture_package_name: "botster.plugin-contract-matrix",
   artifact_path: "fixtures/plugin-contract-matrix",
@@ -40,6 +54,7 @@ assert.deepEqual(metadata.application_primitives, {
   renderer_entrypoint: "ui_tree_snapshot.body",
   primitive_kinds: [
     "button",
+    "dialog",
     "empty_state",
     "form",
     "metric",
@@ -48,6 +63,7 @@ assert.deepEqual(metadata.application_primitives, {
     "section",
     "status_badge",
     "table",
+    "text",
     "text_input",
     "toolbar",
   ],
@@ -112,12 +128,45 @@ assert.equal(
 );
 assert.equal(supportMatrix.supported_features.includes("terminal_readback"), true);
 
-assert.equal(sessionLifecycleFixture.conformance_fixture_revision, 18);
+assert.equal(sessionLifecycleFixture.conformance_fixture_revision, 19);
 assert.equal(sessionLifecycleFixture.entity_type, "session");
 assert.deepEqual(
   sessionLifecycleFixture.normalized_frames.map((frame) => frame.type),
   ["entity_snapshot", "entity_upsert", "entity_patch", "entity_patch", "entity_remove"],
 );
+
+// Pre-publication bridge: a normal npm install resolves the declared package.
+// Until publication, link the repository sibling only for this package test.
+const packageRoot = fileURLToPath(new URL(".", import.meta.url));
+const nodeModulesRoot = join(packageRoot, "node_modules");
+const packageScopeRoot = join(nodeModulesRoot, "@trybotster");
+const localUiContractLink = join(packageScopeRoot, "ui-contract");
+const nodeModulesRootAlreadyExisted = existsSync(nodeModulesRoot);
+const packageScopeRootAlreadyExisted = existsSync(packageScopeRoot);
+let createdLocalUiContractLink = false;
+if (!existsSync(localUiContractLink)) {
+  mkdirSync(packageScopeRoot, { recursive: true });
+  symlinkSync(join(packageRoot, "..", "ui-contract"), localUiContractLink, "dir");
+  createdLocalUiContractLink = true;
+}
+try {
+  const uiContractFixtures = await readUiContractConformanceFixtures();
+  assert.equal(uiContractFixtures.contract_version, "0.1.0");
+  assert.equal(
+    uiContractFixtures.fixtures.dialog_presence.predicate.key,
+    "create-ticket-dialog",
+  );
+} finally {
+  if (createdLocalUiContractLink) {
+    rmSync(localUiContractLink);
+    if (!packageScopeRootAlreadyExisted) {
+      rmdirSync(packageScopeRoot);
+    }
+    if (!nodeModulesRootAlreadyExisted) {
+      rmdirSync(nodeModulesRoot);
+    }
+  }
+}
 assert.deepEqual(
   sessionLifecycleFixture.normalized_frames.map((frame) => frame.snapshot_seq),
   [0, 1, 2, 3, 4],

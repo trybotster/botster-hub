@@ -14,14 +14,15 @@ use std::thread;
 use std::time::Duration;
 
 use base64::Engine as _;
+use botster_ui_contract::{UiActionRequest, UiActionResult, UiNode};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 mod typescript;
 
 pub const PROTOCOL: &str = "botster-hub-daemon-v1";
-pub const PROTOCOL_VERSION: u16 = 3;
-pub const CONFORMANCE_FIXTURE_REVISION: u16 = 18;
+pub const PROTOCOL_VERSION: u16 = 4;
+pub const CONFORMANCE_FIXTURE_REVISION: u16 = 19;
 /// Version of the local WebRTC delivery chunk framing protocol.
 pub const LOCAL_WEBRTC_DELIVERY_CHUNK_VERSION: u16 = 2;
 /// Serialized local WebRTC delivery frames must remain strictly below this size.
@@ -902,9 +903,7 @@ pub enum DaemonRequest {
     },
     PluginSurfaceAction {
         package_name: String,
-        surface_id: String,
-        action_id: String,
-        payload: Value,
+        request: UiActionRequest,
     },
     DaemonShutdown,
 }
@@ -957,7 +956,7 @@ pub struct DaemonResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plugin_surface: Option<DaemonPluginSurface>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub plugin_action_result: Option<Value>,
+    pub plugin_action_result: Option<UiActionResult>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_webrtc_bootstrap: Option<DaemonLocalWebrtcBootstrap>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -974,7 +973,7 @@ pub struct DaemonResponse {
 pub struct DaemonPluginSurface {
     pub package_name: String,
     pub surface_id: String,
-    pub body: Value,
+    pub body: UiNode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ui_tree_snapshot: Option<DaemonUiTreeSnapshot>,
 }
@@ -983,7 +982,7 @@ pub struct DaemonPluginSurface {
 pub struct DaemonUiTreeSnapshot {
     pub package_name: String,
     pub surface_id: String,
-    pub body: Value,
+    pub body: UiNode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2887,11 +2886,17 @@ mod tests {
         let surface = DaemonPluginSurface {
             package_name: "workflow.plugin".to_string(),
             surface_id: "workflow.surface".to_string(),
-            body: serde_json::json!({ "type": "text", "value": "surface" }),
+            body: serde_json::from_value(
+                serde_json::json!({ "type": "text", "props": { "text": "surface" } }),
+            )
+            .expect("typed surface"),
             ui_tree_snapshot: Some(DaemonUiTreeSnapshot {
                 package_name: "workflow.plugin".to_string(),
                 surface_id: "workflow.surface".to_string(),
-                body: serde_json::json!({ "type": "text", "value": "surface" }),
+                body: serde_json::from_value(
+                    serde_json::json!({ "type": "text", "props": { "text": "surface" } }),
+                )
+                .expect("typed snapshot"),
             }),
         };
         let value = serde_json::to_value(&surface).expect("plugin surface serializes");
@@ -2917,6 +2922,22 @@ mod tests {
         assert!(
             legacy_value.get("ui_tree_snapshot").is_none(),
             "plugin surface should omit absent ui_tree_snapshot"
+        );
+    }
+
+    #[test]
+    fn plugin_surface_action_rejects_the_removed_split_envelope() {
+        let old_shape = serde_json::json!({
+            "type": "plugin_surface_action",
+            "package_name": "workflow.plugin",
+            "surface_id": "workflow.surface",
+            "action_id": "workflow.refresh",
+            "payload": { "source": "toolbar" }
+        });
+
+        assert!(
+            serde_json::from_value::<DaemonRequest>(old_shape).is_err(),
+            "protocol 4 must require the canonical nested UiActionRequest"
         );
     }
 
@@ -3746,9 +3767,14 @@ mod tests {
             },
             DaemonRequest::PluginSurfaceAction {
                 package_name: "workflow.plugin".to_string(),
-                surface_id: "home".to_string(),
-                action_id: "refresh".to_string(),
-                payload: serde_json::json!({ "id": "run" }),
+                request: serde_json::from_value(serde_json::json!({
+                    "request_id": "request-1",
+                    "surface_id": "home",
+                    "action_id": "refresh",
+                    "kind": "submit",
+                    "payload": { "id": "run" }
+                }))
+                .expect("typed action request"),
             },
             DaemonRequest::DaemonShutdown,
         ]
@@ -4205,14 +4231,28 @@ mod tests {
             plugin_surface: Some(DaemonPluginSurface {
                 package_name: "workflow.plugin".to_string(),
                 surface_id: "workflow.surface".to_string(),
-                body: serde_json::json!({ "type": "text", "value": "surface" }),
+                body: serde_json::from_value(
+                    serde_json::json!({ "type": "text", "props": { "text": "surface" } }),
+                )
+                .expect("typed surface"),
                 ui_tree_snapshot: Some(DaemonUiTreeSnapshot {
                     package_name: "workflow.plugin".to_string(),
                     surface_id: "workflow.surface".to_string(),
-                    body: serde_json::json!({ "type": "text", "value": "surface" }),
+                    body: serde_json::from_value(
+                        serde_json::json!({ "type": "text", "props": { "text": "surface" } }),
+                    )
+                    .expect("typed snapshot"),
                 }),
             }),
-            plugin_action_result: Some(serde_json::json!({ "state": "accepted" })),
+            plugin_action_result: Some(
+                serde_json::from_value(serde_json::json!({
+                    "request_id": "request-1",
+                    "surface_id": "home",
+                    "action_id": "refresh",
+                    "state": "accepted"
+                }))
+                .expect("typed action result"),
+            ),
             local_webrtc_bootstrap: Some(DaemonLocalWebrtcBootstrap {
                 grant_id: "grant".to_string(),
                 grant_secret: "secret".to_string(),
