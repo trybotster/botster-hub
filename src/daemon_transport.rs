@@ -1147,6 +1147,7 @@ fn handle_control_request(
             root,
             enabled,
             kind,
+            base_ref,
             metadata,
         } => mutate_spawn_targets_response(daemon, |targets| {
             crate::create_spawn_target(
@@ -1157,6 +1158,7 @@ fn handle_control_request(
                     root,
                     enabled,
                     kind,
+                    base_ref,
                     metadata,
                 },
             )
@@ -1167,8 +1169,19 @@ fn handle_control_request(
             root,
             enabled,
             kind,
+            base_ref,
             metadata,
-        } => mutate_spawn_targets_response(daemon, |targets| {
+        } => mutate_spawn_targets_with_worktrees_response(daemon, |targets, worktrees| {
+            if kind.as_deref().is_some_and(|kind| kind != "git")
+                && worktrees.iter().any(|worktree| {
+                    worktree.target_id == target_id && worktree.management == "hub_managed_git"
+                })
+            {
+                return Err(SpawnTargetError::new(
+                    "managed_worktrees_exist",
+                    "Git target cannot be reclassified while managed worktrees reference it",
+                ));
+            }
             crate::update_spawn_target(
                 targets,
                 &target_id,
@@ -1177,12 +1190,21 @@ fn handle_control_request(
                     root,
                     enabled,
                     kind,
+                    base_ref,
                     metadata,
                 },
             )
         }),
         DaemonRequest::DeleteSpawnTarget { target_id } => {
-            mutate_spawn_targets_response(daemon, |targets| {
+            mutate_spawn_targets_with_worktrees_response(daemon, |targets, worktrees| {
+                if worktrees.iter().any(|worktree| {
+                    worktree.target_id == target_id && worktree.management == "hub_managed_git"
+                }) {
+                    return Err(SpawnTargetError::new(
+                        "managed_worktrees_exist",
+                        "Git target cannot be deleted while managed worktrees reference it",
+                    ));
+                }
                 crate::delete_spawn_target(targets, &target_id)
             })
         }
@@ -3398,6 +3420,27 @@ fn persist_spawn_targets(
     Ok(target)
 }
 
+fn persist_spawn_targets_with_worktrees(
+    daemon: &mut HubDaemon,
+    update: impl FnOnce(&mut Vec<SpawnTarget>, &[Worktree]) -> crate::SpawnTargetResult<SpawnTarget>,
+) -> DaemonTransportResult<SpawnTarget> {
+    let runtime = daemon
+        .runtime()
+        .ok_or(DaemonTransportError::DaemonNotRunning)?;
+    let config = runtime.config().clone();
+    let store = FileHubStateStore::for_data_directory(&config.data_directory);
+    let mut changed = None;
+    let state = store.update(&config, |state| {
+        let worktrees = state.worktrees.clone();
+        changed = Some(update(&mut state.spawn_targets, &worktrees));
+    })?;
+    let target = changed
+        .expect("spawn target update closure always runs")
+        .map_err(DaemonTransportError::SpawnTarget)?;
+    daemon.replace_state(state);
+    Ok(target)
+}
+
 fn persist_worktrees(
     daemon: &mut HubDaemon,
     update: impl FnOnce(&mut Vec<Worktree>, &[SpawnTarget]) -> crate::WorktreeResult<Worktree>,
@@ -4543,6 +4586,14 @@ fn mutate_spawn_targets_response(
     Ok(daemon_spawn_targets(vec![target]))
 }
 
+fn mutate_spawn_targets_with_worktrees_response(
+    daemon: &mut HubDaemon,
+    update: impl FnOnce(&mut Vec<SpawnTarget>, &[Worktree]) -> crate::SpawnTargetResult<SpawnTarget>,
+) -> DaemonTransportResult<DaemonResponse> {
+    let target = persist_spawn_targets_with_worktrees(daemon, update)?;
+    Ok(daemon_spawn_targets(vec![target]))
+}
+
 fn daemon_spawn_target(target: SpawnTarget) -> DaemonSpawnTarget {
     DaemonSpawnTarget {
         target_id: target.target_id,
@@ -4550,6 +4601,7 @@ fn daemon_spawn_target(target: SpawnTarget) -> DaemonSpawnTarget {
         root: target.root,
         enabled: target.enabled,
         kind: target.kind,
+        base_ref: target.base_ref,
         metadata: target.metadata,
     }
 }
@@ -4591,7 +4643,7 @@ fn create_worktree_response(
             let event = worktree_lifecycle_event(
                 "worktree_created",
                 Some(&worktree),
-                daemon_targets(daemon),
+                &daemon_targets(daemon),
                 None,
             );
             let mut response = daemon_worktrees(vec![worktree]);
@@ -4624,7 +4676,7 @@ fn delete_worktree_response(
             let event = worktree_lifecycle_event(
                 "worktree_deleted",
                 Some(&worktree),
-                daemon_targets(daemon),
+                &daemon_targets(daemon),
                 None,
             );
             let mut response = daemon_worktrees(vec![worktree]);
@@ -4646,11 +4698,11 @@ fn delete_worktree_response(
     }
 }
 
-fn daemon_targets(daemon: &HubDaemon) -> &[SpawnTarget] {
+fn daemon_targets(daemon: &HubDaemon) -> Vec<SpawnTarget> {
     daemon
         .runtime()
-        .map(|runtime| runtime.state().spawn_targets.as_slice())
-        .unwrap_or(&[])
+        .map(|runtime| runtime.state().spawn_targets.clone())
+        .unwrap_or_default()
 }
 
 fn emit_worktree_lifecycle_event(
@@ -4732,6 +4784,7 @@ fn daemon_worktree(worktree: Worktree) -> DaemonWorktree {
         label: worktree.label,
         path: worktree.path,
         status: worktree.status,
+        management: worktree.management,
         git: worktree.git.map(|git| DaemonWorktreeGitMetadata {
             repository_root: git.repository_root,
             branch: git.branch,

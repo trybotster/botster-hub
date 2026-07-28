@@ -355,7 +355,7 @@ dependencies = [
 [[package]]
 name = "botster-core"
 version = "0.1.0"
-source = "git+https://github.com/trybotster/botster-core?branch=main#49159e7373ffc2cdbb26c856bb3c738841a42742"
+source = "git+https://github.com/trybotster/botster-core?branch=main#e36435f2cb583c344d6f6ba2d62c39da324c7a64"
 dependencies = [
  "aes-gcm",
  "base64",
@@ -371,7 +371,7 @@ dependencies = [
 [[package]]
 name = "botster-core-daemon"
 version = "0.1.0"
-source = "git+https://github.com/trybotster/botster-core?branch=main#49159e7373ffc2cdbb26c856bb3c738841a42742"
+source = "git+https://github.com/trybotster/botster-core?branch=main#e36435f2cb583c344d6f6ba2d62c39da324c7a64"
 dependencies = [
  "botster-core",
  "botster-terminal-ghostty",
@@ -383,7 +383,7 @@ dependencies = [
 [[package]]
 name = "botster-core-test-support"
 version = "0.1.0"
-source = "git+https://github.com/trybotster/botster-core?branch=main#49159e7373ffc2cdbb26c856bb3c738841a42742"
+source = "git+https://github.com/trybotster/botster-core?branch=main#e36435f2cb583c344d6f6ba2d62c39da324c7a64"
 dependencies = [
  "botster-core",
  "serde",
@@ -440,7 +440,7 @@ dependencies = [
 [[package]]
 name = "botster-terminal-ghostty"
 version = "0.1.0"
-source = "git+https://github.com/trybotster/botster-core?branch=main#49159e7373ffc2cdbb26c856bb3c738841a42742"
+source = "git+https://github.com/trybotster/botster-core?branch=main#e36435f2cb583c344d6f6ba2d62c39da324c7a64"
 dependencies = [
  "botster-core",
 ]
@@ -2945,7 +2945,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.2",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -3153,7 +3153,7 @@ checksum = "f2f6fb2847f6742cd76af783a2a2c49e9375d0a111c7bef6f71cd9e738c72d6e"
 dependencies = [
  "memoffset 0.9.1",
  "tempfile",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -3427,7 +3427,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

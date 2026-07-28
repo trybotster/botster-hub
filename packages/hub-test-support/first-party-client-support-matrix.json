@@ -1,7 +1,7 @@
 {
   "protocol": "botster-hub-daemon-v1",
   "protocol_version": 4,
-  "conformance_fixture_revision": 21,
+  "conformance_fixture_revision": 22,
   "required_features": [
     "sessions",
     "terminal_streaming",

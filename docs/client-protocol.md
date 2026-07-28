@@ -243,9 +243,13 @@ The daemon protocol exposes `ListSpawnTargets`, `ShowSpawnTarget`,
 
 `DaemonSpawnTarget.root` is a runtime local path returned to trusted same-device
 clients. Committed docs and fixtures must use placeholders or temporary paths,
-not user-specific absolute paths. `kind` is generic; the initial value is
-`directory`, and git metadata is optional. A plain existing directory can be
-admitted and used as a target.
+not user-specific absolute paths. `kind = "directory"` is the legacy/default
+generic admission and does not infer Git capability. `kind = "git"` is an
+explicit managed-Git declaration and carries optional-on-the-wire `base_ref`.
+Admission validates the repository and resolves the ref to a commit. Create, or
+an explicit directory-to-Git update, may default the ref once from symbolic
+`HEAD`; managed spawning thereafter uses the stored ref and does not reread
+`HEAD` or guess a conventional branch.
 
 ## Worktrees
 
@@ -259,13 +263,24 @@ The daemon protocol exposes `ListWorktrees`, `ShowWorktree`, `CreateWorktree`,
 and `DeleteWorktree`. Create admits an existing directory under the selected
 spawn target root. The hub canonicalizes the target root and requested path and
 rejects traversal or symlink escapes before persisting the row. Delete removes
-the hub record only; it does not remove filesystem contents.
+registered hub records only; it does not remove filesystem contents.
+Hub-managed Git rows reject this record-only deletion path.
 
-`DaemonWorktree.status` is reconciled when rows are returned. Current values are
-`present`, `missing`, and `stale`. Missing paths remain listable after daemon
-reload so clients can explain stale local state instead of treating startup as a
-fatal error. `DaemonWorktree.git` is optional opportunistic metadata; plain
-directories without `.git` are valid worktrees.
+`DaemonWorktree.management` distinguishes ordinary `registered` rows from
+`hub_managed_git` rows. Legacy rows default to `registered`. Registered rows
+remain contained beneath `DaemonSpawnTarget.root`. Managed Git rows use a
+deterministic Hub-owned path beneath the daemon data directory and reconcile
+their actual Git common-directory identity and branch, so a valid managed row
+reports `present` even though it is outside the target root.
+
+`DaemonWorktree.status` values are `present`, `missing`, and `stale`.
+Registered rows are reconciled when returned. Managed rows project the last
+status persisted by startup adoption or the bounded managed-Git lane; list/show
+do not execute Git or refresh externally removed paths, so that status can
+remain stale until restart or another managed operation. Missing paths remain
+listable after daemon reload so clients can explain stale local state instead of
+treating startup as a fatal error. `DaemonWorktree.git` is optional
+opportunistic metadata; plain directories without `.git` are valid worktrees.
 
 ## Connection Diagnostics
 
@@ -664,6 +679,28 @@ List/show/resolve responses are sanitized and do not include prompt values or
 raw context payloads. `ReadSessionContext` is explicit user-path output for the
 spawned session or an admitted local operator.
 
+Lua plugins receive target-filtered
+`session_templates.list({target_id=...})` and
+`session_templates.show({target_id=..., template_id=...})` as ordinary read
+projections. The exact `session_template_managed_git_spawn` session-action
+scope gates only the single
+`session_templates.ensure_worktree_and_spawn(...)` mutation. The mutation
+accepts semantic target, branch, template, environment, prompt, ticket,
+workspace, and safe metadata values. Hub rejects caller-supplied session id,
+cwd, repo/worktree path, branch/base facts, derives those values from the
+ensured worktree, and returns a tagged result with a canonical UUID plus
+target/branch/worktree/base facts.
+
+Managed Git creation uses the stored target `base_ref`, performs no fetch,
+pull, reset, clean, or prune, and reuses dirty exact matches without mutation.
+Branch/path/repository ownership conflicts are typed and path-neutral. Session
+spawn failure removes only resources created by that call; uncertain cleanup is
+reconciled and preserved. The existing `session_template_spawn` scope does not
+grant managed Git mutation, and the daemon `CreateWorktree`/`DeleteWorktree`
+contract remains generic registered-record admission/removal rather than a Git
+operation. Hub-managed Git rows reject record-only deletion, and a target with
+managed rows cannot be deleted or reclassified.
+
 ## Package Availability
 
 `DaemonPackage` rows include resolved availability so clients do not infer
@@ -976,7 +1013,7 @@ and a replacement before clearing the dialog, and a distinct rendered action
 proves deterministic toggle transitions.
 
 Relocating the one canonical Form into `contract-dialog.slots.body` advances
-`CONFORMANCE_FIXTURE_REVISION` to 21. The published browser-shaped conformance
+`CONFORMANCE_FIXTURE_REVISION` to 22. The published browser-shaped conformance
 consumer now materializes the delivered tree after accepted scoped effects,
 restricts submit discovery to the active Dialog subtree, rejects actionable
 sibling Forms, retains the visible Dialog/Form/input association after
@@ -988,7 +1025,7 @@ accepted replacement observable even though the same result closes the Dialog.
 shapes, and action semantics are unchanged. Because
 `DaemonCompatibilityRequirement::current()` derives
 `minimum_conformance_fixture_revision` from this constant, clients built at
-revision 21 require a Hub reporting conformance revision 21 or later.
+revision 22 require a Hub reporting conformance revision 22 or later.
 
 This cold switch advances `PROTOCOL_VERSION` to 4 and
 `CONFORMANCE_FIXTURE_REVISION` to 19. It removes `UiTreeUpdateRef` and
@@ -1000,10 +1037,16 @@ parallel legacy action path.
 Expanding the plugin contract matrix `contract.app` fixture to cover
 application primitives `metric_grid`, `table`, `toolbar`, `empty_state`,
 `status_badge`, `section`, and `panel` increments
-`CONFORMANCE_FIXTURE_REVISION`. `PROTOCOL_VERSION` remains unchanged because
+`CONFORMANCE_FIXTURE_REVISION` to 20. `PROTOCOL_VERSION` remains unchanged because
 the daemon framing and `plugin_surface_render` request/response shape are
 unchanged; the hub still delegates validation to the locked
 `botster-ui-contract::UiNode` contract.
+
+Adding optional spawn-target `base_ref` fields and the worktree `management`
+projection advances `CONFORMANCE_FIXTURE_REVISION` to 21.
+`PROTOCOL_VERSION` remains 4: the existing request/response framing and feature
+families are unchanged, while legacy JSON omitting the new fields continues to
+deserialize as a directory target and registered worktree.
 
 Publishing `@trybotster/hub-test-support@0.1.2` adds an explicit
 application-primitives package API and metadata alias over that already-revised

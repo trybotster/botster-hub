@@ -83,7 +83,11 @@ fn explicit_runtime() -> HubRuntime {
             fingerprint: None,
         },
         data_directory: DataDirectoryOption::Explicit(
-            "target/botster-hub-test-data/plugin-lifecycle".into(),
+            format!(
+                "target/botster-hub-test-data/plugin-lifecycle-{}",
+                std::process::id()
+            )
+            .into(),
         ),
         session_defaults: SessionDefaults {
             shell: "/bin/sh".to_string(),

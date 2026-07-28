@@ -32,6 +32,14 @@ fn explicit_config_with_data_dir(
 ) -> botster_hub::HubConfig {
     ensure_session_worker_binary();
     let data_directory = data_directory.into();
+    let data_directory = data_directory.with_file_name(format!(
+        "{}-{}",
+        data_directory
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .unwrap_or("runtime"),
+        std::process::id()
+    ));
     let _ = fs::remove_dir_all(&data_directory);
     HubStartupOptions {
         host: HostIdentityOptions {
