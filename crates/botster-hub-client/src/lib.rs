@@ -1709,7 +1709,6 @@ pub struct DaemonLifecycleCounters {
     pub high_water_attach_subscriptions: u64,
     pub reconnect_registrations: u64,
     pub cleanup_completed: u64,
-    pub cleanup_already_complete: u64,
     pub cleanup_failed: u64,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub cleanup_by_reason: BTreeMap<String, u64>,

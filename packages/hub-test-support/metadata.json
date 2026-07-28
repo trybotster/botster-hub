@@ -13,7 +13,7 @@
   "daemon_protocol": {
     "artifact_path": "daemon-protocol.ts",
     "source_artifact_path": "crates/botster-hub-client/generated/daemon-protocol.ts",
-    "sha256": "c420d39ce37a91236d9e2e801b7ce9576beff312c708ef2e7917ab0954004117"
+    "sha256": "4d829e01ddf62bb34c3c177e941e7d7d99d7a65823d9cf8ddb635f75b90d3986"
   },
   "first_party_client_support_matrix": {
     "artifact_path": "first-party-client-support-matrix.json",

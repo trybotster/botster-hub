@@ -180,7 +180,9 @@ subscription closes instead of silently presenting stale state. Socket EOF,
 write failure, explicit `unsubscribe`, and daemon shutdown release the
 connection-owned subscription. Reconnect with a new subscription id and treat
 its first snapshot as the sole baseline; frames from a prior connection are not
-replayed.
+replayed. `reconnect_registrations` counts a new entity or attach registration
+that follows a released registration generation; it does not retain historical
+subscription ids.
 
 The daemon admits 64 live local socket connections. Excess clients receive a
 typed `daemon_connection_admission` backpressure hello and are closed without
