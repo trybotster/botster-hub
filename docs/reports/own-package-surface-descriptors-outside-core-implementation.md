@@ -7,7 +7,8 @@
 - Ticket: `ticket_1785294387_531161`
 - Run: `run_1785294403_658595`
 - Implementation commit used for exact-runtime proof:
-  `ebe5db811590a9c49935a3cea2357a378f28c722`
+  `1a47bd0` (review-rework code commit; the following report-only commit does
+  not change runtime behavior).
 
 ## Guidance applied
 
