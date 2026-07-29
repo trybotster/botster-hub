@@ -1,0 +1,165 @@
+#!/bin/sh
+set -eu
+
+usage() {
+  cat >&2 <<'USAGE'
+usage: script/publish-npm-packages [--dry-run]
+
+Builds, verifies, packs, and publishes:
+  @trybotster/ui-contract
+  @trybotster/hub-test-support
+
+Both packages are packed before either package is published. Publishing happens
+in dependency order. Use --dry-run to stop after producing verified tarballs.
+USAGE
+  exit 64
+}
+
+dry_run=false
+case "${1-}" in
+  "") ;;
+  --dry-run) dry_run=true ;;
+  *) usage ;;
+esac
+[ "$#" -le 1 ] || usage
+
+repo_dir=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd -P)
+ui_dir=$repo_dir/packages/ui-contract
+hub_dir=$repo_dir/packages/hub-test-support
+release_dir=$(mktemp -d "${TMPDIR:-/tmp}/botster-npm-release.XXXXXX")
+npm_config_cache=$release_dir/npm-cache
+export npm_config_cache
+
+cleanup() {
+  rm -rf "$release_dir"
+}
+trap cleanup EXIT INT TERM HUP
+
+log() {
+  printf '\n==> %s\n' "$*"
+}
+
+require_clean_worktree() {
+  changes=$(git -C "$repo_dir" status --porcelain)
+  [ -z "$changes" ] || {
+    printf 'Refusing to publish from a dirty worktree:\n%s\n' "$changes" >&2
+    exit 65
+  }
+}
+
+package_coordinate() {
+  package_dir=$1
+  (
+    cd "$package_dir"
+    node -p 'const package = require("./package.json"); `${package.name}@${package.version}`'
+  )
+}
+
+pack_package() {
+  package_dir=$1
+  package_label=$2
+
+  log "Packing $package_label" >&2
+  (
+    cd "$package_dir"
+    npm pack --dry-run >&2
+    npm pack --silent --pack-destination "$release_dir"
+  )
+}
+
+package_is_published() {
+  coordinate=$1
+  error_file=$release_dir/npm-view-error
+
+  if npm view "$coordinate" version --json --prefer-online >"$release_dir/npm-view.json" 2>"$error_file"; then
+    return 0
+  fi
+  if grep -q 'E404' "$error_file"; then
+    return 1
+  fi
+
+  cat "$error_file" >&2
+  exit 69
+}
+
+publish_package() {
+  coordinate=$1
+  tarball=$2
+
+  if package_is_published "$coordinate"; then
+    log "$coordinate is already published; skipping"
+    return
+  fi
+
+  log "Publishing $coordinate"
+  npm publish "$tarball" --access public
+  published_version=$(npm view "$coordinate" version --json --prefer-online)
+  [ -n "$published_version" ] || {
+    printf 'Could not verify published package %s\n' "$coordinate" >&2
+    exit 69
+  }
+}
+
+for command_name in cargo git node npm; do
+  command -v "$command_name" >/dev/null 2>&1 || {
+    printf 'Required command is unavailable: %s\n' "$command_name" >&2
+    exit 69
+  }
+done
+
+require_clean_worktree
+
+ui_coordinate=$(package_coordinate "$ui_dir")
+hub_coordinate=$(package_coordinate "$hub_dir")
+
+log "Building $ui_coordinate"
+(
+  cd "$ui_dir"
+  npm run generate
+  npm run check
+  npm test
+)
+
+ui_tarball_name=$(pack_package "$ui_dir" "$ui_coordinate")
+ui_tarball=$release_dir/$ui_tarball_name
+[ -f "$ui_tarball" ] || {
+  printf 'Expected package tarball was not created: %s\n' "$ui_tarball" >&2
+  exit 66
+}
+
+log "Installing the packed $ui_coordinate for the dependent package tests"
+(
+  cd "$hub_dir"
+  npm install --no-save --package-lock=false "$ui_tarball"
+)
+
+log "Building $hub_coordinate"
+(
+  cd "$hub_dir"
+  npm run sync
+  npm run check
+  npm test
+)
+
+require_clean_worktree
+
+hub_tarball_name=$(pack_package "$hub_dir" "$hub_coordinate")
+hub_tarball=$release_dir/$hub_tarball_name
+
+[ -f "$hub_tarball" ] || {
+  printf 'Expected package tarball was not created: %s\n' "$hub_tarball" >&2
+  exit 66
+}
+
+if [ "$dry_run" = true ]; then
+  log "Dry run passed for $ui_coordinate and $hub_coordinate"
+  exit 0
+fi
+
+log "Checking npm authentication"
+npm whoami >/dev/null
+
+publish_package "$ui_coordinate" "$ui_tarball"
+publish_package "$hub_coordinate" "$hub_tarball"
+
+log "Published $ui_coordinate and $hub_coordinate"
