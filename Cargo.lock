@@ -355,7 +355,7 @@ dependencies = [
 [[package]]
 name = "botster-core"
 version = "0.1.0"
-source = "git+https://github.com/trybotster/botster-core?branch=main#e36435f2cb583c344d6f6ba2d62c39da324c7a64"
+source = "git+https://github.com/trybotster/botster-core?branch=main#5846fc776d31e2b6c98a8d932f50a31078743901"
 dependencies = [
  "aes-gcm",
  "base64",
@@ -371,7 +371,7 @@ dependencies = [
 [[package]]
 name = "botster-core-daemon"
 version = "0.1.0"
-source = "git+https://github.com/trybotster/botster-core?branch=main#e36435f2cb583c344d6f6ba2d62c39da324c7a64"
+source = "git+https://github.com/trybotster/botster-core?branch=main#5846fc776d31e2b6c98a8d932f50a31078743901"
 dependencies = [
  "botster-core",
  "botster-terminal-ghostty",
@@ -383,7 +383,7 @@ dependencies = [
 [[package]]
 name = "botster-core-test-support"
 version = "0.1.0"
-source = "git+https://github.com/trybotster/botster-core?branch=main#e36435f2cb583c344d6f6ba2d62c39da324c7a64"
+source = "git+https://github.com/trybotster/botster-core?branch=main#5846fc776d31e2b6c98a8d932f50a31078743901"
 dependencies = [
  "botster-core",
  "serde",
@@ -440,7 +440,7 @@ dependencies = [
 [[package]]
 name = "botster-terminal-ghostty"
 version = "0.1.0"
-source = "git+https://github.com/trybotster/botster-core?branch=main#e36435f2cb583c344d6f6ba2d62c39da324c7a64"
+source = "git+https://github.com/trybotster/botster-core?branch=main#5846fc776d31e2b6c98a8d932f50a31078743901"
 dependencies = [
  "botster-core",
 ]
