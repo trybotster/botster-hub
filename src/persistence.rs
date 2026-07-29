@@ -379,9 +379,6 @@ impl HubStateStore for FileHubStateStore {
                 }
                 let state: HubState =
                     serde_json::from_slice(&bytes).map_err(HubStateStoreError::Corrupt)?;
-                state
-                    .validate_version()
-                    .map_err(HubStateStoreError::State)?;
                 Ok(state)
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {

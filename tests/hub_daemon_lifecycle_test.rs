@@ -22,10 +22,11 @@ use botster_core::{
 };
 use botster_core_daemon::{RegistryRecord, SessionRegistry};
 use botster_hub::{
-    DataDirectoryOption, FileHubStateStore, HostIdentityOptions, HubClientApi, HubClientEvent,
-    HubClientRequest, HubClientResponseBody, HubDaemon, HubDaemonState, HubStartupOptions,
-    HubStateLoadSource, HubStateStore, PackageAdmissionPolicy, PackageProvenance, PackageRegistry,
-    RuntimeEnvironment, SessionDefaults, SpawnTarget, TransportBindings,
+    CoreEngineOptions, DataDirectoryOption, FileHubStateStore, HostIdentityOptions, HubClientApi,
+    HubClientEvent, HubClientRequest, HubClientResponseBody, HubDaemon, HubDaemonState,
+    HubStartupOptions, HubStateLoadSource, HubStateStore, PackageAdmissionPolicy,
+    PackageProvenance, PackageRegistry, RuntimeEnvironment, SessionDefaults, SpawnTarget,
+    TransportBindings,
 };
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use webrtc::data_channel::{DataChannel, DataChannelEvent, RTCDataChannelInit};
@@ -3729,8 +3730,19 @@ fn daemon_plugin_contract_matrix_fixture_exercises_public_package_contracts() {
     let counters = lifecycle
         .plugin_worker_counters
         .expect("plugin lifecycle response carries worker counters");
+    let expected = CoreEngineOptions::default();
+    assert_eq!(
+        counters.configured_queue_capacity,
+        expected.plugin_worker_queue_capacity
+    );
+    assert_eq!(
+        counters.configured_executor_concurrency,
+        expected.plugin_worker_executor_concurrency
+    );
     assert!(counters.live_plugin_executors >= 1);
     assert!(counters.live_executor_workers >= 1);
+    assert_eq!(counters.queued_jobs, 0);
+    assert_eq!(counters.in_flight_jobs, 0);
     assert_eq!(report.package_name, "botster.plugin-contract-matrix");
     assert_eq!(report.installed_state, "installed");
     assert_eq!(report.enabled_state, "enabled");

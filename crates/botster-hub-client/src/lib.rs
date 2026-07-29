@@ -2977,6 +2977,13 @@ mod tests {
         let generated = daemon_protocol_typescript();
         assert!(generated.contains("plugin_worker_counters?: DaemonPluginWorkerCounters | null;"));
         assert!(generated.contains("export interface DaemonPluginWorkerCounters"));
+        let populated =
+            serde_json::to_value(daemon_response_example(DaemonResponseKind::PluginLifecycle))
+                .expect("populated plugin lifecycle response serializes");
+        assert_generated_interface_fields(
+            "DaemonPluginWorkerCounters",
+            &populated["plugin_worker_counters"],
+        );
         for field in [
             "configured_queue_capacity",
             "configured_executor_concurrency",
