@@ -174,6 +174,8 @@ assert.match(protocol, /export interface DaemonReadScreen/);
 assert.match(protocol, /export interface DaemonModeFlags/);
 assert.match(protocol, /export interface DaemonCaptureSnapshot/);
 assert.match(protocol, /export interface DaemonLocalWebrtcDeliveryChunk/);
+assert.match(protocol, /export interface DaemonPluginWorkerCounters/);
+assert.match(protocol, /plugin_worker_counters\?: DaemonPluginWorkerCounters \| null/);
 assert.match(protocol, /DaemonLocalWebrtcDeliveryKind/);
 assert.match(protocol, /subscribe_entities/);
 assert.match(protocol, /entity_snapshot/);

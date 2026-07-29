@@ -45,12 +45,12 @@ pub use botster_hub_client::{
     DaemonPackageNavigationSource, DaemonPackagePin, DaemonPackageProcess,
     DaemonPackageRouteDescriptor, DaemonPackageRouteTarget, DaemonPackageRunnableEntrypoint,
     DaemonPackageSurfaceDescriptor, DaemonPackageUpdateStatus, DaemonPackageWorkingDirectory,
-    DaemonPluginLifecycle, DaemonPluginSurface, DaemonReadScreen, DaemonRequest,
-    DaemonResolvedAppLaunch, DaemonResolvedSessionTemplate, DaemonResponse, DaemonResponseKind,
-    DaemonSession, DaemonSessionCleanup, DaemonSessionContext, DaemonSessionEntity,
-    DaemonSessionTemplate, DaemonSessionTemplateContextInput, DaemonSessionTemplateRequest,
-    DaemonSpawnTarget, DaemonSpawnTargetValidation, DaemonStatus, DaemonUiTreeSnapshot,
-    DaemonWorktree, DaemonWorktreeGitMetadata, DaemonWorktreeLifecycleEvent,
+    DaemonPluginLifecycle, DaemonPluginSurface, DaemonPluginWorkerCounters, DaemonReadScreen,
+    DaemonRequest, DaemonResolvedAppLaunch, DaemonResolvedSessionTemplate, DaemonResponse,
+    DaemonResponseKind, DaemonSession, DaemonSessionCleanup, DaemonSessionContext,
+    DaemonSessionEntity, DaemonSessionTemplate, DaemonSessionTemplateContextInput,
+    DaemonSessionTemplateRequest, DaemonSpawnTarget, DaemonSpawnTargetValidation, DaemonStatus,
+    DaemonUiTreeSnapshot, DaemonWorktree, DaemonWorktreeGitMetadata, DaemonWorktreeLifecycleEvent,
     FEATURE_PLUGIN_SURFACE_ACTION, FEATURE_PLUGIN_SURFACE_RENDER, PROTOCOL, read_frame,
     read_frame_from_reader, write_frame,
 };
@@ -73,13 +73,14 @@ use crate::{
     HubClientCaptureSnapshot, HubClientEvent, HubClientModeFlags, HubClientPackage,
     HubClientPackageAvailabilityReason, HubClientPackageAvailabilityState,
     HubClientPackageClassification, HubClientPackageNavigationEntry,
-    HubClientPackageNavigationTarget, HubClientPluginLifecycle, HubClientPluginSurface,
-    HubClientReadScreen, HubClientRequest, HubClientResponseBody, HubClientSession, HubConfig,
-    HubDaemon, HubDaemonStatus, HubStateLoadSource, HubStateStore, McpToolDescriptor,
-    PackageAction, PackageAdmissionReason, PackageCompatibilityResult, PackageDecision,
-    PackageInstallPlan, PackagePin, PackageRegistry, PackageRegistryEntrySourceKind,
-    PackageRegistryError, PackageState, PackageUpdatePolicy, ResolvedSessionTemplate,
-    SessionTemplateContextInput, SessionTemplateRequest, resolve_foreground_launch_contract,
+    HubClientPackageNavigationTarget, HubClientPluginLifecycle, HubClientPluginLifecycleReport,
+    HubClientPluginSurface, HubClientPluginWorkerCounters, HubClientReadScreen, HubClientRequest,
+    HubClientResponseBody, HubClientSession, HubConfig, HubDaemon, HubDaemonStatus,
+    HubStateLoadSource, HubStateStore, McpToolDescriptor, PackageAction, PackageAdmissionReason,
+    PackageCompatibilityResult, PackageDecision, PackageInstallPlan, PackagePin, PackageRegistry,
+    PackageRegistryEntrySourceKind, PackageRegistryError, PackageState, PackageUpdatePolicy,
+    ResolvedSessionTemplate, SessionTemplateContextInput, SessionTemplateRequest,
+    resolve_foreground_launch_contract,
 };
 use crate::{EntrypointProcessSnapshot, EntrypointSupervisorError};
 use crate::{
@@ -2148,6 +2149,7 @@ fn handle_runtime_control_request(
             update_status: None,
             package_decision: None,
             lifecycle: Vec::new(),
+            plugin_worker_counters: None,
             plugin_tools: Vec::new(),
             plugin_tool_result: Value::Null,
             plugin_surface: None,
@@ -2661,10 +2663,10 @@ fn plugin_lifecycle_response(daemon: &mut HubDaemon) -> DaemonTransportResult<Da
             request_id: request_id("daemon-plugin-lifecycle-status"),
         },
     )?;
-    let HubClientResponseBody::PluginLifecycle(lifecycle) = response.body else {
+    let HubClientResponseBody::PluginLifecycle(report) = response.body else {
         return Err(DaemonTransportError::UnexpectedResponse);
     };
-    Ok(daemon_plugin_lifecycle(lifecycle))
+    Ok(daemon_plugin_lifecycle(report))
 }
 
 fn package_decision_response(
@@ -4422,6 +4424,7 @@ fn daemon_response_base(kind: DaemonResponseKind) -> DaemonResponse {
         update_status: None,
         package_decision: None,
         lifecycle: Vec::new(),
+        plugin_worker_counters: None,
         plugin_tools: Vec::new(),
         plugin_tool_result: Value::Null,
         plugin_surface: None,
@@ -4944,12 +4947,16 @@ fn daemon_package_update_status(update_status: DaemonPackageUpdateStatus) -> Dae
     response
 }
 
-fn daemon_plugin_lifecycle(lifecycle: Vec<HubClientPluginLifecycle>) -> DaemonResponse {
+fn daemon_plugin_lifecycle(report: HubClientPluginLifecycleReport) -> DaemonResponse {
     let mut response = daemon_response_base(DaemonResponseKind::PluginLifecycle);
-    response.lifecycle = lifecycle
+    response.lifecycle = report
+        .lifecycle
         .into_iter()
         .map(daemon_plugin_lifecycle_from_client)
         .collect();
+    response.plugin_worker_counters = Some(daemon_plugin_worker_counters_from_client(
+        report.worker_counters,
+    ));
     response
 }
 
@@ -6209,6 +6216,19 @@ fn daemon_plugin_lifecycle_from_client(
         package_name: lifecycle.package_name,
         state: package_state_label(lifecycle.state).to_string(),
         loaded: lifecycle.loaded,
+    }
+}
+
+fn daemon_plugin_worker_counters_from_client(
+    counters: HubClientPluginWorkerCounters,
+) -> DaemonPluginWorkerCounters {
+    DaemonPluginWorkerCounters {
+        configured_queue_capacity: counters.configured_queue_capacity,
+        configured_executor_concurrency: counters.configured_executor_concurrency,
+        live_plugin_executors: counters.live_plugin_executors,
+        live_executor_workers: counters.live_executor_workers,
+        queued_jobs: counters.queued_jobs,
+        in_flight_jobs: counters.in_flight_jobs,
     }
 }
 

@@ -957,6 +957,8 @@ pub struct DaemonResponse {
     pub update_status: Option<DaemonPackageUpdateStatus>,
     pub package_decision: Option<DaemonPackageDecision>,
     pub lifecycle: Vec<DaemonPluginLifecycle>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin_worker_counters: Option<DaemonPluginWorkerCounters>,
     #[serde(default)]
     pub plugin_tools: Vec<Value>,
     #[serde(default)]
@@ -1695,6 +1697,16 @@ pub struct DaemonPluginLifecycle {
     pub package_name: String,
     pub state: String,
     pub loaded: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonPluginWorkerCounters {
+    pub configured_queue_capacity: usize,
+    pub configured_executor_concurrency: usize,
+    pub live_plugin_executors: usize,
+    pub live_executor_workers: usize,
+    pub queued_jobs: usize,
+    pub in_flight_jobs: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2950,6 +2962,40 @@ mod tests {
             generated_interface("DaemonModeFlags"),
             "export interface DaemonModeFlags {\n  session_id: string;\n  mouse_mode: number;\n}\n"
         );
+    }
+
+    #[test]
+    fn plugin_worker_counters_are_optional_sanitized_and_generated() {
+        let response = DaemonResponse {
+            plugin_worker_counters: None,
+            ..daemon_response_example(DaemonResponseKind::PluginLifecycle)
+        };
+        let value = serde_json::to_value(&response).expect("response serializes");
+        assert!(value.get("plugin_worker_counters").is_none());
+        let round_trip: DaemonResponse =
+            serde_json::from_value(value).expect("response without counters deserializes");
+        assert_eq!(round_trip.plugin_worker_counters, None);
+
+        let generated = daemon_protocol_typescript();
+        assert!(generated.contains("plugin_worker_counters?: DaemonPluginWorkerCounters | null;"));
+        assert!(generated.contains("export interface DaemonPluginWorkerCounters"));
+        let populated =
+            serde_json::to_value(daemon_response_example(DaemonResponseKind::PluginLifecycle))
+                .expect("populated plugin lifecycle response serializes");
+        assert_generated_interface_fields(
+            "DaemonPluginWorkerCounters",
+            &populated["plugin_worker_counters"],
+        );
+        for field in [
+            "configured_queue_capacity",
+            "configured_executor_concurrency",
+            "live_plugin_executors",
+            "live_executor_workers",
+            "queued_jobs",
+            "in_flight_jobs",
+        ] {
+            assert!(generated.contains(&format!("  {field}: number;")));
+        }
     }
 
     #[test]
@@ -4378,6 +4424,14 @@ mod tests {
                 state: "loaded".to_string(),
                 loaded: true,
             }],
+            plugin_worker_counters: Some(DaemonPluginWorkerCounters {
+                configured_queue_capacity: 64,
+                configured_executor_concurrency: 2,
+                live_plugin_executors: 1,
+                live_executor_workers: 2,
+                queued_jobs: 0,
+                in_flight_jobs: 0,
+            }),
             plugin_tools: vec![serde_json::json!({ "name": "tool" })],
             plugin_tool_result: serde_json::json!({ "content": [] }),
             plugin_surface: Some(DaemonPluginSurface {
