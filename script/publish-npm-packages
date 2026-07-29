@@ -82,6 +82,26 @@ package_is_published() {
   exit 69
 }
 
+wait_for_published_package() {
+  coordinate=$1
+  attempt=1
+
+  while [ "$attempt" -le 12 ]; do
+    if package_is_published "$coordinate"; then
+      return
+    fi
+    if [ "$attempt" -eq 12 ]; then
+      printf 'Published package did not become visible within one minute: %s\n' "$coordinate" >&2
+      cat "$release_dir/npm-view-error" >&2
+      return 1
+    fi
+
+    log "Waiting for npm to expose $coordinate (attempt $attempt of 12)" >&2
+    sleep 5
+    attempt=$((attempt + 1))
+  done
+}
+
 publish_package() {
   coordinate=$1
   tarball=$2
@@ -93,8 +113,7 @@ publish_package() {
 
   log "Publishing $coordinate"
   npm publish "$tarball" --access public
-  published_version=$(npm view "$coordinate" version --json --prefer-online)
-  [ -n "$published_version" ] || {
+  wait_for_published_package "$coordinate" || {
     printf 'Could not verify published package %s\n' "$coordinate" >&2
     exit 69
   }
