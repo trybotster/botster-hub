@@ -144,9 +144,17 @@ main, retained both `MultiplexerEngineError` and
   passed.
 - `cargo fmt --all -- --check` — passed.
 - `git diff --check` — passed.
-- `./test.sh` — passed on the current-main merged tree: all 12 targets passed,
-  including 133 library tests and 103 daemon-integration tests (one larger
-  local adversarial test ignored).
+- `./test.sh` — observed both a complete pass on the current-main merged tree
+  (133 library tests, 103 daemon-integration tests, one larger local
+  adversarial test ignored, and all remaining targets/doctests) and
+  intermittent failures solely in
+  `cli_operator_console_starts_reuses_detaches_handles_ctrl_c_and_stops`.
+  Review's interleaved branch/base control produced matched pairs
+  fail/fail, pass/pass, fail/fail; across six runs per ref, the branch failed
+  4/6 and unmodified current main `7c6d948` failed 2/6. Focused and strict
+  gates are deterministic. This isolated startup race is attributable to
+  current-main/machine state; any other failure remains blocking and requires
+  its own branch/base isolation.
 - `./test.sh cli_operator_console_starts_reuses_detaches_handles_ctrl_c_and_stops -- --nocapture`
   — passed on this branch in isolation; an earlier full-suite attempt timed out
   waiting for `daemon=started`, establishing intermittent timing rather than a
@@ -178,8 +186,12 @@ main, retained both `MultiplexerEngineError` and
 - Pre-existing insecure Core worker-socket directories remain unrepaired. A
   future session using the same hashed directory can still fail until the
   directory is removed/recreated privately or Core gains an owned migration.
-- The full Hub suite is green. The operator-console test has shown intermittent
-  startup timing, but there is no active failure waiver.
+- The full Hub suite has completed green and has also intermittently failed
+  only at the operator-console startup timing test described above. This is a
+  narrow attribution, not a blanket waiver: every other failure remains
+  blocking. A separate Hub ticket is recommended to make daemon readiness
+  deterministic in that test and ensure timed-out console runs reap their
+  spawned daemon.
 - A package enabled only after an already-loaded caller worker remains a
   potential independent snapshot issue. It did not cause this post-prepare
   failure and was not changed.
