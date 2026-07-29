@@ -98,8 +98,6 @@ impl HubPackageManifest {
             host_profile: self.host_profile.clone(),
             configuration: self.configuration.clone(),
             runnable_entrypoints: self.runnable_entrypoints.clone(),
-            surfaces: Vec::new(),
-            navigation: Vec::new(),
         }
     }
 }
@@ -3411,9 +3409,9 @@ mod tests {
     }
 
     #[test]
-    fn hub_manifest_projection_keeps_core_package_presentation_fields_inert() {
+    fn hub_manifest_projection_keeps_presentation_fields_in_hub() {
         let mut manifest = plugin_manifest("presentation.plugin", Vec::new());
-        manifest.surfaces = vec![botster_ui_contract::PackageSurfaceDescriptor {
+        let surfaces = vec![botster_ui_contract::PackageSurfaceDescriptor {
             id: "home".to_string(),
             kind: botster_ui_contract::PackageSurfaceKind::App,
             title: "Home".to_string(),
@@ -3423,7 +3421,7 @@ mod tests {
             category: None,
             supports: vec![botster_ui_contract::PackageSurfaceOperation::Render],
         }];
-        manifest.navigation = vec![botster_ui_contract::PackageNavigationEntry {
+        let navigation = vec![botster_ui_contract::PackageNavigationEntry {
             id: "home".to_string(),
             label: "Home".to_string(),
             icon: None,
@@ -3432,10 +3430,16 @@ mod tests {
                 surface_id: "home".to_string(),
             },
         }];
+        manifest.surfaces = surfaces.clone();
+        manifest.navigation = navigation.clone();
 
         let core = manifest.core_execution_manifest();
-        assert!(core.surfaces.is_empty());
-        assert!(core.navigation.is_empty());
+        let core = serde_json::to_value(core).expect("core manifest serializes");
+
+        assert_eq!(manifest.surfaces, surfaces);
+        assert_eq!(manifest.navigation, navigation);
+        assert!(core.get("surfaces").is_none());
+        assert!(core.get("navigation").is_none());
     }
 
     #[test]
