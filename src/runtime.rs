@@ -1255,6 +1255,7 @@ impl HubRuntime {
         node.validate().map_err(|error| {
             crate::McpToolError::new("invalid_surface", format!("invalid plugin UiNode: {error}"))
         })?;
+        validate_plugin_surface_binding_families(&node)?;
         Ok(node)
     }
 
@@ -2232,6 +2233,63 @@ pub fn daemon_session_to_core_session(session: DaemonSession) -> CoreSession {
     CoreSession::new(session.session_id, lifecycle)
 }
 
+fn validate_plugin_surface_binding_families(node: &UiNode) -> Result<(), crate::McpToolError> {
+    let value = serde_json::to_value(node).map_err(|error| {
+        crate::McpToolError::new(
+            "invalid_surface",
+            format!("failed to inspect plugin UiNode bindings: {error}"),
+        )
+    })?;
+    validate_plugin_surface_binding_value(&value)
+}
+
+fn validate_plugin_surface_binding_value(
+    value: &serde_json::Value,
+) -> Result<(), crate::McpToolError> {
+    match value {
+        serde_json::Value::Array(values) => {
+            for value in values {
+                validate_plugin_surface_binding_value(value)?;
+            }
+        }
+        serde_json::Value::Object(object) => {
+            if let Some(path) = object.get("$bind").and_then(serde_json::Value::as_str) {
+                validate_plugin_surface_binding_path(path)?;
+            }
+            match object.get("$kind").and_then(serde_json::Value::as_str) {
+                Some("bind_list") => {
+                    if let Some(path) = object.get("source").and_then(serde_json::Value::as_str) {
+                        validate_plugin_surface_binding_path(path)?;
+                    }
+                }
+                Some("bind_if") => {
+                    if let Some(path) = object.get("path").and_then(serde_json::Value::as_str) {
+                        validate_plugin_surface_binding_path(path)?;
+                    }
+                }
+                _ => {}
+            }
+            for value in object.values() {
+                validate_plugin_surface_binding_value(value)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn validate_plugin_surface_binding_path(path: &str) -> Result<(), crate::McpToolError> {
+    if !path.starts_with('/') || path == "/session" || path.starts_with("/session/") {
+        return Ok(());
+    }
+    Err(crate::McpToolError::new(
+        "invalid_surface",
+        format!(
+            "plugin UiNode binding family is not admitted by this Hub: {path}; only /session is available"
+        ),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2241,6 +2299,60 @@ mod tests {
     };
     use std::fs;
     use std::process::Command;
+
+    fn binding_test_node(child: serde_json::Value) -> UiNode {
+        serde_json::from_value(serde_json::json!({
+            "type": "panel",
+            "id": "binding-test",
+            "children": [child]
+        }))
+        .expect("binding test UiNode")
+    }
+
+    #[test]
+    fn plugin_surface_binding_admission_accepts_only_session_absolute_family() {
+        let node = binding_test_node(serde_json::json!({
+            "$kind": "bind_list",
+            "source": "/session",
+            "where": { "session_uuid": "session-1" },
+            "item_template": {
+                "type": "text",
+                "id": "session-row",
+                "props": {
+                    "text": { "$bind": "/session/session-1/lifecycle_class" }
+                }
+            },
+            "empty_template": {
+                "type": "text",
+                "id": "session-unavailable",
+                "props": { "text": "Session unavailable" }
+            }
+        }));
+
+        node.validate().expect("generic UiNode validation");
+        validate_plugin_surface_binding_families(&node)
+            .expect("/session and item-relative bindings are admitted");
+    }
+
+    #[test]
+    fn plugin_surface_binding_admission_rejects_foreign_and_dotted_absolute_families() {
+        for source in ["/workspace", "/project-pipelines.ticket", "/sessionish"] {
+            let node = binding_test_node(serde_json::json!({
+                "$kind": "bind_list",
+                "source": source,
+                "item_template": {
+                    "type": "text",
+                    "id": "row",
+                    "props": { "text": "row" }
+                }
+            }));
+            node.validate().expect("generic UiNode validation");
+            let error = validate_plugin_surface_binding_families(&node)
+                .expect_err("foreign absolute binding family must be rejected");
+            assert_eq!(error.code, "invalid_surface");
+            assert!(error.message.contains(source), "{error:?}");
+        }
+    }
 
     #[test]
     fn hub_core_daemon_config_always_supplies_worker_path() {

@@ -22,7 +22,7 @@ mod typescript;
 
 pub const PROTOCOL: &str = "botster-hub-daemon-v1";
 pub const PROTOCOL_VERSION: u16 = 4;
-pub const CONFORMANCE_FIXTURE_REVISION: u16 = 22;
+pub const CONFORMANCE_FIXTURE_REVISION: u16 = 23;
 /// Version of the local WebRTC delivery chunk framing protocol.
 pub const LOCAL_WEBRTC_DELIVERY_CHUNK_VERSION: u16 = 2;
 /// Serialized local WebRTC delivery frames must remain strictly below this size.
@@ -1767,6 +1767,7 @@ pub struct DaemonSessionEntity {
     pub registry_state: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lifecycle: Option<String>,
+    pub lifecycle_class: String,
     pub rows: u16,
     pub cols: u16,
     pub updated_at: u64,
@@ -2168,6 +2169,7 @@ mod tests {
             session_uuid: "session".to_string(),
             registry_state: "running".to_string(),
             lifecycle: Some("running".to_string()),
+            lifecycle_class: "current".to_string(),
             rows: 24,
             cols: 80,
             updated_at: 7,

@@ -4327,6 +4327,8 @@ fn project_session_entity(record: &SessionLifecycleRecord) -> DaemonSessionEntit
         }
         None => (None, None, None),
     };
+    let lifecycle_class =
+        session_lifecycle_class(&record.session.registry_state, record.lifecycle.as_ref());
     DaemonSessionEntity {
         session_uuid: record.session.session_id.0.clone(),
         registry_state: match record.session.registry_state {
@@ -4337,11 +4339,33 @@ fn project_session_entity(record: &SessionLifecycleRecord) -> DaemonSessionEntit
         }
         .to_string(),
         lifecycle,
+        lifecycle_class: lifecycle_class.to_string(),
         rows: record.session.size.rows,
         cols: record.session.size.cols,
         updated_at: record.session.updated_at,
         exit_code,
         failure_reason,
+    }
+}
+
+fn session_lifecycle_class(
+    registry_state: &RegistrySessionState,
+    lifecycle: Option<&SessionLifecycleState>,
+) -> &'static str {
+    if registry_state == &RegistrySessionState::Stale {
+        "indeterminate"
+    } else {
+        match lifecycle {
+            Some(
+                SessionLifecycleState::Starting
+                | SessionLifecycleState::Running
+                | SessionLifecycleState::Stopping,
+            ) => "current",
+            Some(SessionLifecycleState::Exited { .. } | SessionLifecycleState::Failed { .. }) => {
+                "ended"
+            }
+            None => "indeterminate",
+        }
     }
 }
 
@@ -7065,6 +7089,74 @@ fn handle_connection(stream: UnixStream, control_tx: ControlSender) -> DaemonTra
 mod tests {
     use super::*;
     use std::net::Shutdown;
+
+    #[test]
+    fn session_lifecycle_class_is_total_and_stale_first() {
+        let concrete = [
+            (SessionLifecycleState::Starting, "current"),
+            (SessionLifecycleState::Running, "current"),
+            (SessionLifecycleState::Stopping, "current"),
+            (SessionLifecycleState::Exited { code: Some(0) }, "ended"),
+            (
+                SessionLifecycleState::Failed {
+                    reason: "failed".to_string(),
+                },
+                "ended",
+            ),
+        ];
+        for (lifecycle, expected) in &concrete {
+            assert_eq!(
+                session_lifecycle_class(&RegistrySessionState::Running, Some(lifecycle)),
+                *expected
+            );
+            assert_eq!(
+                session_lifecycle_class(&RegistrySessionState::Stale, Some(lifecycle)),
+                "indeterminate"
+            );
+        }
+        assert_eq!(
+            session_lifecycle_class(&RegistrySessionState::Running, None),
+            "indeterminate"
+        );
+        assert_eq!(
+            session_lifecycle_class(&RegistrySessionState::Stale, None),
+            "indeterminate"
+        );
+    }
+
+    #[test]
+    fn session_entity_patch_explicitly_updates_required_lifecycle_class() {
+        let entity = |registry_state: &str, lifecycle: Option<&str>, lifecycle_class: &str| {
+            DaemonSessionEntity {
+                session_uuid: "session-1".to_string(),
+                registry_state: registry_state.to_string(),
+                lifecycle: lifecycle.map(str::to_string),
+                lifecycle_class: lifecycle_class.to_string(),
+                rows: 24,
+                cols: 80,
+                updated_at: 1,
+                exit_code: None,
+                failure_reason: None,
+            }
+        };
+        let current = entity("running", Some("running"), "current");
+        let ended = entity("exited", Some("exited"), "ended");
+        let no_lifecycle = entity("running", None, "indeterminate");
+        let stale = entity("stale", Some("running"), "indeterminate");
+
+        assert_eq!(
+            session_entity_patch(&current, &ended)["lifecycle_class"],
+            "ended"
+        );
+        assert_eq!(
+            session_entity_patch(&current, &no_lifecycle)["lifecycle_class"],
+            "indeterminate"
+        );
+        assert_eq!(
+            session_entity_patch(&current, &stale)["lifecycle_class"],
+            "indeterminate"
+        );
+    }
 
     #[test]
     fn due_reconciliation_precedes_an_already_ready_control_message() {

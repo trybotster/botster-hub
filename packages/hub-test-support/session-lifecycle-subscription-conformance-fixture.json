@@ -1,5 +1,5 @@
 {
-  "conformance_fixture_revision": 22,
+  "conformance_fixture_revision": 23,
   "entity_type": "session",
   "fresh_subscription": {
     "prior_generation_frames_discarded": true,
@@ -24,6 +24,7 @@
       "entity": {
         "cols": 80,
         "lifecycle": "running",
+        "lifecycle_class": "current",
         "registry_state": "active",
         "rows": 24,
         "session_uuid": "slc-session",
@@ -53,6 +54,7 @@
       "patch": {
         "exit_code": 0,
         "lifecycle": "exited",
+        "lifecycle_class": "ended",
         "updated_at": 3
       },
       "snapshot_seq": 3,

@@ -1113,6 +1113,7 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             ("session_uuid", "string"),
             ("registry_state", "string"),
             ("lifecycle?", "string | null"),
+            ("lifecycle_class", "string"),
             ("rows", "number"),
             ("cols", "number"),
             ("updated_at", "number"),

@@ -51,6 +51,7 @@ const DAEMON_PROTOCOL_TYPESCRIPT_ARTIFACT: &str =
     "crates/botster-hub-client/generated/daemon-protocol.ts";
 const PLUGIN_CONTRACT_APP_SURFACE: &str = "contract.app";
 const PLUGIN_CONTRACT_EMPTY_SURFACE: &str = "contract.empty";
+const PLUGIN_CONTRACT_SESSION_SURFACE: &str = "contract.sessions";
 const PLUGIN_CONTRACT_BLOCKED_SURFACE: &str = "contract.blocked";
 const PLUGIN_CONTRACT_INVALID_BODY_SURFACE: &str = "contract.invalid_body";
 const PLUGIN_CONTRACT_SETTINGS_SURFACE: &str = "contract.settings";
@@ -126,6 +127,13 @@ pub struct SessionEntitySubscriptionSupport {
     pub json_helper: String,
     pub runtime_runner: String,
     pub runtime_regression: String,
+    pub binding_family: String,
+    pub lifecycle_class_field: String,
+    pub lifecycle_classes: Vec<String>,
+    pub missing_row_state: String,
+    pub plugin_surface_id: String,
+    pub plugin_binding_fixture_path: String,
+    pub reference_materializer: String,
 }
 
 /// Source-derived session entity lifecycle contract shared by Rust and Node clients.
@@ -136,6 +144,32 @@ pub struct SessionLifecycleSubscriptionConformanceScenario {
     pub normalized_frames: Vec<DaemonEntityFrame>,
     pub fresh_subscription: FreshSubscriptionContract,
     pub overflow: SessionEntityOverflowContract,
+}
+
+/// Canonical plugin-authored `/session` binding scenario over public entity DTOs.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionPluginBindingConformanceScenario {
+    pub conformance_fixture_revision: u16,
+    pub entity_type: String,
+    pub binding_family: String,
+    pub lifecycle_class_field: String,
+    pub unavailable_state: String,
+    pub references: Vec<String>,
+    pub surface: serde_json::Value,
+    pub initial_snapshot: DaemonEntityFrame,
+    pub transition_frames: Vec<DaemonEntityFrame>,
+    pub reconnect_snapshot: DaemonEntityFrame,
+    pub expected: SessionPluginBindingExpectedStages,
+}
+
+/// Expected reference materialization after each authoritative frame stage.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionPluginBindingExpectedStages {
+    pub initial: BTreeMap<String, String>,
+    pub after_ended_patch: BTreeMap<String, String>,
+    pub after_indeterminate_patch: BTreeMap<String, String>,
+    pub after_remove: BTreeMap<String, String>,
+    pub after_reconnect: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -478,6 +512,19 @@ pub fn first_party_client_support_matrix() -> FirstPartyClientSupportMatrix {
             runtime_regression:
                 "session_entity_subscription_pushes_snapshot_ordered_deltas_and_fresh_reconnect"
                     .to_string(),
+            binding_family: "/session".to_string(),
+            lifecycle_class_field: "lifecycle_class".to_string(),
+            lifecycle_classes: ["current", "ended", "indeterminate"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            missing_row_state: "unavailable".to_string(),
+            plugin_surface_id: PLUGIN_CONTRACT_SESSION_SURFACE.to_string(),
+            plugin_binding_fixture_path:
+                "botster_hub_test_support::session_plugin_binding_conformance_scenario"
+                    .to_string(),
+            reference_materializer:
+                "botster_hub_test_support::materialize_session_plugin_bindings".to_string(),
         },
         resize: ResizeSupport {
             supported: true,
@@ -542,7 +589,7 @@ pub fn first_party_client_support_matrix() -> FirstPartyClientSupportMatrix {
         },
         known_limitations: vec![
             "The matrix is a test/docs contract, not a daemon runtime endpoint.".to_string(),
-            "Full plugin entity-frame hydration is intentionally outside this conformance fixture."
+            "Shipped Web/TUI binding resolution is owned by downstream client tickets; this Hub fixture is a producer/reference contract."
                 .to_string(),
             "Clients own renderer-specific presentation policy for diagnostics.".to_string(),
         ],
@@ -559,6 +606,7 @@ pub fn session_lifecycle_subscription_conformance_scenario()
         session_uuid: SESSION_LIFECYCLE_SESSION_ID.to_string(),
         registry_state: "active".to_string(),
         lifecycle: Some("running".to_string()),
+        lifecycle_class: "current".to_string(),
         rows: 24,
         cols: 80,
         updated_at: 1,
@@ -598,6 +646,7 @@ pub fn session_lifecycle_subscription_conformance_scenario()
                 id: SESSION_LIFECYCLE_SESSION_ID.to_string(),
                 patch: serde_json::json!({
                     "lifecycle": "exited",
+                    "lifecycle_class": "ended",
                     "exit_code": 0,
                     "updated_at": 3
                 }),
@@ -634,6 +683,274 @@ pub fn session_lifecycle_subscription_conformance_scenario()
             },
         },
     }
+}
+
+/// Return the shared plugin surface and public-frame lifecycle binding scenario.
+#[must_use]
+pub fn session_plugin_binding_conformance_scenario() -> SessionPluginBindingConformanceScenario {
+    const TRANSITION: &str = "session-transition";
+    const STABLE: &str = "session-stable-current";
+    const ENDED: &str = "session-ended";
+    const INDETERMINATE: &str = "session-indeterminate";
+    const MISSING: &str = "session-missing";
+    const GENERATION_ONE: &str = "session-plugin-binding-generation-1";
+    const GENERATION_TWO: &str = "session-plugin-binding-generation-2";
+
+    let references = [TRANSITION, STABLE, ENDED, INDETERMINATE, MISSING]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let row = |session_uuid: &str,
+               registry_state: &str,
+               lifecycle: Option<&str>,
+               lifecycle_class: &str,
+               updated_at: u64| DaemonSessionEntity {
+        session_uuid: session_uuid.to_string(),
+        registry_state: registry_state.to_string(),
+        lifecycle: lifecycle.map(str::to_string),
+        lifecycle_class: lifecycle_class.to_string(),
+        rows: 24,
+        cols: 80,
+        updated_at,
+        exit_code: (lifecycle == Some("exited")).then_some(0),
+        failure_reason: None,
+    };
+    let initial_items = vec![
+        row(TRANSITION, "running", Some("running"), "current", 1),
+        row(STABLE, "running", Some("running"), "current", 1),
+        row(ENDED, "exited", Some("exited"), "ended", 1),
+        row(INDETERMINATE, "stale", Some("running"), "indeterminate", 1),
+    ];
+    let expected = |transition: &str| {
+        BTreeMap::from([
+            (TRANSITION.to_string(), transition.to_string()),
+            (STABLE.to_string(), "current".to_string()),
+            (ENDED.to_string(), "ended".to_string()),
+            (INDETERMINATE.to_string(), "indeterminate".to_string()),
+            (MISSING.to_string(), "unavailable".to_string()),
+        ])
+    };
+    let mut after_remove = expected("unavailable");
+    after_remove.insert(TRANSITION.to_string(), "unavailable".to_string());
+
+    SessionPluginBindingConformanceScenario {
+        conformance_fixture_revision: botster_hub_client::CONFORMANCE_FIXTURE_REVISION,
+        entity_type: SESSION_LIFECYCLE_ENTITY_TYPE.to_string(),
+        binding_family: "/session".to_string(),
+        lifecycle_class_field: "lifecycle_class".to_string(),
+        unavailable_state: "unavailable".to_string(),
+        references: references.clone(),
+        surface: session_plugin_binding_surface(&references),
+        initial_snapshot: DaemonEntityFrame::Snapshot {
+            subscription_id: GENERATION_ONE.to_string(),
+            entity_type: SESSION_LIFECYCLE_ENTITY_TYPE.to_string(),
+            snapshot_seq: 1,
+            items: initial_items,
+            resync_reason: None,
+        },
+        transition_frames: vec![
+            DaemonEntityFrame::Patch {
+                subscription_id: GENERATION_ONE.to_string(),
+                entity_type: SESSION_LIFECYCLE_ENTITY_TYPE.to_string(),
+                snapshot_seq: 2,
+                id: TRANSITION.to_string(),
+                patch: serde_json::json!({
+                    "registry_state": "exited",
+                    "lifecycle": "exited",
+                    "lifecycle_class": "ended",
+                    "exit_code": 0,
+                    "updated_at": 2
+                }),
+            },
+            DaemonEntityFrame::Patch {
+                subscription_id: GENERATION_ONE.to_string(),
+                entity_type: SESSION_LIFECYCLE_ENTITY_TYPE.to_string(),
+                snapshot_seq: 3,
+                id: TRANSITION.to_string(),
+                patch: serde_json::json!({
+                    "registry_state": "stale",
+                    "lifecycle": null,
+                    "lifecycle_class": "indeterminate",
+                    "updated_at": 3
+                }),
+            },
+            DaemonEntityFrame::Remove {
+                subscription_id: GENERATION_ONE.to_string(),
+                entity_type: SESSION_LIFECYCLE_ENTITY_TYPE.to_string(),
+                snapshot_seq: 4,
+                id: TRANSITION.to_string(),
+            },
+        ],
+        reconnect_snapshot: DaemonEntityFrame::Snapshot {
+            subscription_id: GENERATION_TWO.to_string(),
+            entity_type: SESSION_LIFECYCLE_ENTITY_TYPE.to_string(),
+            snapshot_seq: 4,
+            items: vec![
+                row(STABLE, "running", Some("running"), "current", 4),
+                row(ENDED, "exited", Some("exited"), "ended", 4),
+                row(INDETERMINATE, "stale", None, "indeterminate", 4),
+            ],
+            resync_reason: None,
+        },
+        expected: SessionPluginBindingExpectedStages {
+            initial: expected("current"),
+            after_ended_patch: expected("ended"),
+            after_indeterminate_patch: expected("indeterminate"),
+            after_remove,
+            after_reconnect: expected("unavailable"),
+        },
+    }
+}
+
+fn session_plugin_binding_surface(references: &[String]) -> serde_json::Value {
+    serde_json::json!({
+        "type": "panel",
+        "id": "contract-session-lifecycle-panel",
+        "props": { "title": "Session lifecycle projection" },
+        "children": references.iter().enumerate().map(|(index, session_uuid)| {
+            serde_json::json!({
+                "$kind": "bind_list",
+                "source": "/session",
+                "where": { "session_uuid": session_uuid },
+                "item_template": {
+                    "type": "text",
+                    "id": format!("contract-session-{}-lifecycle", index + 1),
+                    "props": { "text": { "$bind": "@/lifecycle_class" } }
+                },
+                "empty_template": {
+                    "type": "text",
+                    "id": format!("contract-session-{}-unavailable", index + 1),
+                    "props": { "text": "Session unavailable" }
+                }
+            })
+        }).collect::<Vec<_>>()
+    })
+}
+
+/// Apply public session entity frames and resolve the delivered fixture bindings.
+pub fn materialize_session_plugin_bindings(
+    surface: &serde_json::Value,
+    frames: &[DaemonEntityFrame],
+) -> Result<BTreeMap<String, String>, String> {
+    let references = surface
+        .get("children")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "session binding surface children are missing".to_string())?
+        .iter()
+        .map(|child| {
+            if child.get("$kind").and_then(serde_json::Value::as_str) != Some("bind_list")
+                || child.get("source").and_then(serde_json::Value::as_str) != Some("/session")
+                || child
+                    .pointer("/item_template/props/text/$bind")
+                    .and_then(serde_json::Value::as_str)
+                    != Some("@/lifecycle_class")
+                || child.get("empty_template").is_none()
+            {
+                return Err(
+                    "surface does not use the canonical /session binding grammar".to_string(),
+                );
+            }
+            child
+                .pointer("/where/session_uuid")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+                .ok_or_else(|| {
+                    "session binding is missing an exact session_uuid filter".to_string()
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut entities = BTreeMap::<String, serde_json::Value>::new();
+    for frame in frames {
+        match frame {
+            DaemonEntityFrame::Snapshot {
+                entity_type, items, ..
+            } if entity_type == SESSION_LIFECYCLE_ENTITY_TYPE => {
+                entities = items
+                    .iter()
+                    .map(|item| {
+                        serde_json::to_value(item)
+                            .map(|value| (item.session_uuid.clone(), value))
+                            .map_err(|error| error.to_string())
+                    })
+                    .collect::<Result<_, _>>()?;
+            }
+            DaemonEntityFrame::Upsert {
+                entity_type,
+                id,
+                entity,
+                ..
+            } if entity_type == SESSION_LIFECYCLE_ENTITY_TYPE => {
+                entities.insert(
+                    id.clone(),
+                    serde_json::to_value(entity).map_err(|error| error.to_string())?,
+                );
+            }
+            DaemonEntityFrame::Patch {
+                entity_type,
+                id,
+                patch,
+                ..
+            } if entity_type == SESSION_LIFECYCLE_ENTITY_TYPE => {
+                let entity = entities
+                    .get_mut(id)
+                    .ok_or_else(|| format!("patch references unknown session row {id}"))?;
+                merge_patch(entity, patch);
+            }
+            DaemonEntityFrame::Remove {
+                entity_type, id, ..
+            } if entity_type == SESSION_LIFECYCLE_ENTITY_TYPE => {
+                entities.remove(id);
+            }
+            _ => return Err("scenario contains a foreign entity family".to_string()),
+        }
+    }
+
+    references
+        .into_iter()
+        .map(|session_uuid| {
+            let Some(entity) = entities.get(&session_uuid) else {
+                return Ok((session_uuid, "unavailable".to_string()));
+            };
+            let lifecycle_class = entity
+                .get("lifecycle_class")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    format!("present session row {session_uuid} is missing lifecycle_class")
+                })?
+                .to_string();
+            Ok((session_uuid, lifecycle_class))
+        })
+        .collect::<Result<BTreeMap<_, _>, String>>()
+}
+
+fn merge_patch(target: &mut serde_json::Value, patch: &serde_json::Value) {
+    match patch {
+        serde_json::Value::Object(patch) => {
+            if !target.is_object() {
+                *target = serde_json::json!({});
+            }
+            let target = target.as_object_mut().expect("target converted to object");
+            for (key, value) in patch {
+                if value.is_null() {
+                    target.remove(key);
+                } else {
+                    merge_patch(
+                        target.entry(key.clone()).or_insert(serde_json::Value::Null),
+                        value,
+                    );
+                }
+            }
+        }
+        value => *target = value.clone(),
+    }
+}
+
+/// Return the stable JSON value generated for Node reference consumers.
+#[must_use]
+pub fn session_plugin_binding_conformance_fixture_json() -> serde_json::Value {
+    serde_json::to_value(session_plugin_binding_conformance_scenario())
+        .expect("session plugin binding conformance scenario serializes")
 }
 
 /// Return the typed late-attach history fixture for first-party client tests.
@@ -2132,6 +2449,11 @@ pub struct PluginContractMatrixConformanceReport {
     pub app_surface_snapshot_id: String,
     pub app_surface_snapshot_node_id: String,
     pub app_surface_snapshot_node_kinds: Vec<String>,
+    pub session_surface_id: String,
+    pub session_surface_node_id: String,
+    pub session_surface_binding_family: String,
+    pub session_surface_references: Vec<String>,
+    pub session_surface_matches_fixture: bool,
     pub dialog_presence_key: String,
     pub selected_workspace_equality_key: String,
     pub selected_workspace_equality_value: String,
@@ -2841,7 +3163,7 @@ pub fn run_plugin_contract_matrix_conformance(
     expect_value(
         "contract_matrix_install",
         "surface_ids",
-        r#"["contract.app","contract.empty","contract.blocked","contract.invalid_body","contract.settings"]"#,
+        r#"["contract.app","contract.empty","contract.sessions","contract.blocked","contract.invalid_body","contract.settings"]"#,
         &serde_json::to_string(&surface_ids).expect("surface ids serialize"),
     )?;
     let settings_surface_descriptor = surface_descriptor(
@@ -3128,6 +3450,28 @@ pub fn run_plugin_contract_matrix_conformance(
             actual: format!("{app_surface_snapshot_node_kinds:?}"),
         });
     }
+    let session_binding_scenario = session_plugin_binding_conformance_scenario();
+    let session_surface = render_plugin_surface_with_payload(
+        hub,
+        PLUGIN_CONTRACT_SESSION_SURFACE,
+        serde_json::json!({ "session_uuids": session_binding_scenario.references.clone() }),
+        "contract_matrix_render_sessions",
+    )?;
+    let session_surface_body = serde_json::to_value(&session_surface.body)?;
+    let session_surface_matches_fixture = session_surface_body == session_binding_scenario.surface;
+    if !session_surface_matches_fixture {
+        return Err(ConformanceError::UnexpectedValue {
+            operation: "contract_matrix_render_sessions",
+            field: "surface.body",
+            expected: session_binding_scenario.surface.to_string(),
+            actual: session_surface_body.to_string(),
+        });
+    }
+    let session_surface_node_id = value_string(
+        &session_surface_body,
+        "id",
+        "contract_matrix_render_sessions",
+    )?;
     expect_value(
         "contract_matrix_render_app",
         "package_name",
@@ -4109,6 +4453,11 @@ pub fn run_plugin_contract_matrix_conformance(
         app_surface_snapshot_id: app_surface_snapshot.surface_id.clone(),
         app_surface_snapshot_node_id: app_surface_snapshot_id,
         app_surface_snapshot_node_kinds,
+        session_surface_id: session_surface.surface_id,
+        session_surface_node_id,
+        session_surface_binding_family: session_binding_scenario.binding_family,
+        session_surface_references: session_binding_scenario.references,
+        session_surface_matches_fixture,
         dialog_presence_key,
         selected_workspace_equality_key,
         selected_workspace_equality_value,
@@ -4581,12 +4930,21 @@ fn render_plugin_surface(
     surface_id: &'static str,
     operation: &'static str,
 ) -> Result<botster_hub_client::DaemonPluginSurface, ConformanceError> {
+    render_plugin_surface_with_payload(hub, surface_id, serde_json::json!({}), operation)
+}
+
+fn render_plugin_surface_with_payload(
+    hub: &IsolatedHub,
+    surface_id: &'static str,
+    payload: serde_json::Value,
+    operation: &'static str,
+) -> Result<botster_hub_client::DaemonPluginSurface, ConformanceError> {
     let response = request(
         hub.endpoint(),
         DaemonRequest::PluginSurfaceRender {
             package_name: PLUGIN_CONTRACT_MATRIX_PACKAGE.to_string(),
             surface_id: surface_id.to_string(),
-            payload: serde_json::json!({}),
+            payload,
         },
         operation,
     )?;
@@ -5603,6 +5961,67 @@ mod tests {
     }
 
     #[test]
+    fn session_plugin_binding_reference_materializer_distinguishes_present_and_absent_rows() {
+        let scenario = session_plugin_binding_conformance_scenario();
+        let mut frames = vec![scenario.initial_snapshot.clone()];
+        assert_eq!(
+            materialize_session_plugin_bindings(&scenario.surface, &frames)
+                .expect("materialize initial snapshot"),
+            scenario.expected.initial
+        );
+
+        frames.push(scenario.transition_frames[0].clone());
+        assert_eq!(
+            materialize_session_plugin_bindings(&scenario.surface, &frames)
+                .expect("materialize ended patch"),
+            scenario.expected.after_ended_patch
+        );
+        frames.push(scenario.transition_frames[1].clone());
+        assert_eq!(
+            materialize_session_plugin_bindings(&scenario.surface, &frames)
+                .expect("materialize indeterminate patch"),
+            scenario.expected.after_indeterminate_patch
+        );
+        frames.push(scenario.transition_frames[2].clone());
+        assert_eq!(
+            materialize_session_plugin_bindings(&scenario.surface, &frames)
+                .expect("materialize remove"),
+            scenario.expected.after_remove
+        );
+        assert_eq!(
+            materialize_session_plugin_bindings(
+                &scenario.surface,
+                std::slice::from_ref(&scenario.reconnect_snapshot)
+            )
+            .expect("materialize authoritative reconnect snapshot"),
+            scenario.expected.after_reconnect
+        );
+        assert!(
+            scenario
+                .expected
+                .initial
+                .values()
+                .any(|value| value == "current"),
+            "a matching current row must not false-pass through empty_template"
+        );
+
+        let malformed_patch = DaemonEntityFrame::Patch {
+            subscription_id: "session-plugin-binding-generation-1".to_string(),
+            entity_type: SESSION_LIFECYCLE_ENTITY_TYPE.to_string(),
+            snapshot_seq: 2,
+            id: "session-transition".to_string(),
+            patch: serde_json::json!({ "lifecycle_class": null }),
+        };
+        assert_eq!(
+            materialize_session_plugin_bindings(
+                &scenario.surface,
+                &[scenario.initial_snapshot.clone(), malformed_patch]
+            ),
+            Err("present session row session-transition is missing lifecycle_class".to_string())
+        );
+    }
+
+    #[test]
     fn support_matrix_matches_current_compatibility_descriptor() {
         let matrix = first_party_client_support_matrix();
         let compatibility = DaemonCompatibility::current();
@@ -5847,6 +6266,20 @@ mod tests {
     }
 
     #[test]
+    fn session_plugin_binding_fixture_matches_node_package_copy() {
+        let expected = format!(
+            "{}\n",
+            serde_json::to_string_pretty(&session_plugin_binding_conformance_fixture_json())
+                .expect("serialize session plugin binding conformance fixture")
+        );
+
+        assert_eq!(
+            expected,
+            node_package_asset("session-plugin-binding-conformance-fixture.json")
+        );
+    }
+
+    #[test]
     fn session_lifecycle_subscription_fixture_uses_public_ordered_entity_frames() {
         let scenario = session_lifecycle_subscription_conformance_scenario();
         let sequences = scenario
@@ -6023,6 +6456,13 @@ mod tests {
                     "json_helper": "botster_hub_test_support::session_lifecycle_subscription_conformance_fixture_json",
                     "runtime_runner": "botster_hub_test_support::run_session_lifecycle_subscription_conformance",
                     "runtime_regression": "session_entity_subscription_pushes_snapshot_ordered_deltas_and_fresh_reconnect",
+                    "binding_family": "/session",
+                    "lifecycle_class_field": "lifecycle_class",
+                    "lifecycle_classes": ["current", "ended", "indeterminate"],
+                    "missing_row_state": "unavailable",
+                    "plugin_surface_id": PLUGIN_CONTRACT_SESSION_SURFACE,
+                    "plugin_binding_fixture_path": "botster_hub_test_support::session_plugin_binding_conformance_scenario",
+                    "reference_materializer": "botster_hub_test_support::materialize_session_plugin_bindings",
                 },
                 "resize": {
                     "supported": true,
@@ -6075,7 +6515,7 @@ mod tests {
                 },
                 "known_limitations": [
                     "The matrix is a test/docs contract, not a daemon runtime endpoint.",
-                    "Full plugin entity-frame hydration is intentionally outside this conformance fixture.",
+                    "Shipped Web/TUI binding resolution is owned by downstream client tickets; this Hub fixture is a producer/reference contract.",
                     "Clients own renderer-specific presentation policy for diagnostics.",
                 ],
             })
