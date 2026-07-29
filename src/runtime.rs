@@ -8,11 +8,11 @@
 use botster_core::{
     BotsterEngineObservation, BotsterEngineOutput, BoundaryJson, ClientId, CoreSession,
     CoreSessionMetadata, EnvelopeId, EnvelopeTarget, ManagedSessionRuntimeError,
-    PluginCapabilityRuntime, PluginCleanupResult, PluginHandlerKind, PluginInvocationFailure,
-    PluginInvocationFailureKind, PluginInvocationOutcome, PluginInvocationRequest,
-    PluginInvocationResult, PluginKey, RequestId, RoutedEnvelope, RoutedEnvelopeDrainOutcome,
-    RoutedEnvelopePublishOutcome, SessionId, SessionLifecycleState, SessionRuntimeErrorKind,
-    SessionSpawnRequest, SubscriptionId,
+    MultiplexerEngineError, PluginCapabilityRuntime, PluginCleanupResult, PluginHandlerKind,
+    PluginInvocationFailure, PluginInvocationFailureKind, PluginInvocationOutcome,
+    PluginInvocationRequest, PluginInvocationResult, PluginKey, RequestId, RoutedEnvelope,
+    RoutedEnvelopeDrainOutcome, RoutedEnvelopePublishOutcome, SessionId, SessionLifecycleState,
+    SessionRuntimeErrorKind, SessionSpawnRequest, SubscriptionId,
 };
 use botster_core_daemon::{
     AcknowledgeRoutedEnvelopeRequest, CaptureSnapshotRequest, CaptureSnapshotResult, CoreDaemon,
@@ -1042,7 +1042,12 @@ impl HubRuntime {
                 },
                 current_unix_seconds(),
             )
-            .map_err(|_error| {
+            .map_err(|error| {
+                eprintln!(
+                    "managed_session_spawn_failed session_id={} core_error={}",
+                    context.session_id.0,
+                    managed_session_core_error_class(&error)
+                );
                 if let Ok(mut contexts) = self.session_contexts.lock() {
                     contexts.remove(&context.context_id);
                     contexts.remove(&context.session_id.0);
@@ -1958,6 +1963,50 @@ impl ManagedGitCoordinator {
     }
 }
 
+fn managed_session_core_error_class(error: &CoreDaemonError) -> &'static str {
+    match error {
+        CoreDaemonError::Engine(ManagedSessionRuntimeError::Multiplexer(
+            MultiplexerEngineError::Runtime(runtime_error),
+        ))
+        | CoreDaemonError::Engine(ManagedSessionRuntimeError::Runtime(runtime_error)) => {
+            match runtime_error.kind {
+                SessionRuntimeErrorKind::SpawnFailed
+                    if runtime_error.message.contains(
+                        "worker control socket parent must be owned by the effective user with private permissions",
+                    ) =>
+                {
+                    "runtime.spawn_failed.worker_control_parent_permissions"
+                }
+                SessionRuntimeErrorKind::SpawnFailed => "runtime.spawn_failed",
+                SessionRuntimeErrorKind::SessionNotFound => "runtime.session_not_found",
+                SessionRuntimeErrorKind::InputFailed => "runtime.input_failed",
+                SessionRuntimeErrorKind::OutputFailed => "runtime.output_failed",
+                SessionRuntimeErrorKind::ShutdownFailed => "runtime.shutdown_failed",
+                SessionRuntimeErrorKind::CleanupFailed => "runtime.cleanup_failed",
+            }
+        }
+        CoreDaemonError::Engine(ManagedSessionRuntimeError::Multiplexer(_)) => {
+            "engine.multiplexer"
+        }
+        CoreDaemonError::Engine(ManagedSessionRuntimeError::UnsupportedSessionRequest { .. }) => {
+            "engine.unsupported_session_request"
+        }
+        CoreDaemonError::Engine(
+            ManagedSessionRuntimeError::TerminalBackendConstruction { .. },
+        ) => "engine.terminal_backend_construction",
+        CoreDaemonError::Engine(ManagedSessionRuntimeError::TerminalBackendOperation { .. }) => {
+            "engine.terminal_backend_operation"
+        }
+        CoreDaemonError::Registry(_) => "registry",
+        CoreDaemonError::UnknownSession(_) => "unknown_session",
+        CoreDaemonError::SessionNotReadable(_) => "session_not_readable",
+        CoreDaemonError::MissingWorkerPath => "missing_worker_path",
+        CoreDaemonError::Shutdown => "shutdown",
+        CoreDaemonError::MissingScreenResponse(_) => "missing_screen_response",
+        CoreDaemonError::MissingModeFlagsResponse(_) => "missing_mode_flags_response",
+    }
+}
+
 fn finalize_prepared_managed_worktree(
     prepared: &PreparedManagedWorktree,
     decision: Result<ManagedGitDecision, mpsc::RecvTimeoutError>,
@@ -2242,6 +2291,31 @@ mod tests {
     use std::fs;
     use std::process::Command;
 
+    #[test]
+    fn managed_session_core_error_diagnostic_is_typed_and_path_neutral() {
+        let permissions = CoreDaemonError::Engine(ManagedSessionRuntimeError::Multiplexer(
+            MultiplexerEngineError::Runtime(botster_core::SessionRuntimeError::new(
+                SessionRuntimeErrorKind::SpawnFailed,
+                "connect worker control socket failed: /private/raw/path: worker control socket parent must be owned by the effective user with private permissions",
+            )),
+        ));
+        assert_eq!(
+            managed_session_core_error_class(&permissions),
+            "runtime.spawn_failed.worker_control_parent_permissions"
+        );
+        assert!(!managed_session_core_error_class(&permissions).contains('/'));
+
+        let generic = CoreDaemonError::Engine(ManagedSessionRuntimeError::Multiplexer(
+            MultiplexerEngineError::Runtime(botster_core::SessionRuntimeError::new(
+                SessionRuntimeErrorKind::SpawnFailed,
+                "runtime detail that must not cross the diagnostic boundary",
+            )),
+        ));
+        assert_eq!(
+            managed_session_core_error_class(&generic),
+            "runtime.spawn_failed"
+        );
+    }
     #[test]
     fn hub_core_daemon_config_always_supplies_worker_path() {
         let config = HubStartupOptions {

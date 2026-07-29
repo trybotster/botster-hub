@@ -153,6 +153,144 @@ fn install_project_pipelines_registry() -> PackageRegistry {
     policy.registry().clone()
 }
 
+fn install_cross_package_managed_session_registry(
+    name: &str,
+    template_package_root: &std::path::Path,
+    allow_managed_spawn: bool,
+) -> PackageRegistry {
+    let caller_root = PathBuf::from("target")
+        .join("botster-hub-test-data")
+        .join("lua-runtime-packages")
+        .join(name);
+    let caller_source_root = std::env::current_dir()
+        .expect("current dir")
+        .join(&caller_root);
+    let _ = fs::remove_dir_all(&caller_root);
+    fs::create_dir_all(&caller_root).expect("create cross-package caller root");
+    fs::write(
+        caller_root.join("plugin.lua"),
+        r#"
+return botster.register({
+  tools = {
+    {
+      name = "cross_package.atomic",
+      description = "Spawn an eligible template contributed by another package.",
+      handler = "atomic",
+      call = function(args)
+        return botster.capabilities.session_templates.ensure_worktree_and_spawn(args)
+      end,
+    },
+    {
+      name = "cross_package.inspect",
+      description = "Inspect target-effective templates contributed by another package.",
+      handler = "inspect",
+      call = function(args)
+        return {
+          list = botster.capabilities.session_templates.list({ target_id = args.target_id }),
+          shown = botster.capabilities.session_templates.show({
+            target_id = args.target_id,
+            template_id = args.template_id,
+          }),
+        }
+      end,
+    },
+  },
+})
+"#,
+    )
+    .expect("write cross-package caller plugin");
+    let caller_capabilities = if allow_managed_spawn {
+        serde_json::json!([
+            { "surface": "mcp" },
+            {
+                "surface": "session_actions",
+                "scope": "session_template_managed_git_spawn"
+            }
+        ])
+    } else {
+        serde_json::json!([{ "surface": "mcp" }])
+    };
+    fs::write(
+        caller_root.join("botster-package.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "name": "managed-session-caller.plugin",
+            "version": "1.0.0",
+            "kind": "plugin",
+            "botster": ">=0.1.0",
+            "source": { "type": "path", "path": caller_source_root },
+            "capabilities": caller_capabilities,
+            "entrypoints": [
+                { "runtime": "lua", "path": "plugin.lua", "bootstrap": false }
+            ]
+        }))
+        .expect("serialize cross-package caller manifest"),
+    )
+    .expect("write cross-package caller manifest");
+
+    let mut policy = default_package_policy();
+    policy
+        .install_local_path(&caller_root, "install cross-package caller")
+        .expect("install cross-package caller");
+    policy
+        .enable(
+            "managed-session-caller.plugin",
+            "enable cross-package caller",
+        )
+        .expect("enable cross-package caller");
+    policy
+        .install_local_path(
+            template_package_root,
+            "install cross-package template contributor",
+        )
+        .expect("install cross-package template contributor");
+    let template_package_name = serde_json::from_slice::<serde_json::Value>(
+        &fs::read(template_package_root.join("botster-package.json"))
+            .expect("read template contributor manifest"),
+    )
+    .expect("parse template contributor manifest")["name"]
+        .as_str()
+        .expect("template contributor name")
+        .to_string();
+    policy
+        .enable(
+            &template_package_name,
+            "enable cross-package template contributor",
+        )
+        .expect("enable cross-package template contributor");
+    policy.registry().clone()
+}
+
+fn write_cross_package_template_contributor(root: &std::path::Path, target_id: &str) {
+    fs::create_dir_all(root.join("bin")).expect("create template contributor bin");
+    let command = root.join("bin/init.sh");
+    fs::write(
+        &command,
+        "#!/bin/sh\nprintf 'cross-package\\n' > cross-package-executed.txt\n",
+    )
+    .expect("write cross-package template command");
+    fs::set_permissions(&command, fs::Permissions::from_mode(0o755))
+        .expect("make cross-package template command executable");
+    fs::write(
+        root.join("botster-package.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "name": "managed-session-template.plugin",
+            "version": "1.0.0",
+            "kind": "plugin",
+            "botster": ">=0.1.0",
+            "source": { "type": "path", "path": root },
+            "capabilities": [],
+            "entrypoints": [],
+            "session_templates": [{
+                "id": "init",
+                "command": "bin/init.sh",
+                "target_id": target_id
+            }]
+        }))
+        .expect("serialize cross-package template contributor"),
+    )
+    .expect("write cross-package template contributor manifest");
+}
+
 fn install_coordination_probe_registry(name: &str) -> PackageRegistry {
     let root = PathBuf::from("target")
         .join("botster-hub-test-data")
@@ -1137,6 +1275,174 @@ fn plugin_mcp_call_uses_loaded_runtime_and_returns_structured_payload() {
 
     assert_eq!(result["message"], "from-mcp");
     assert_eq!(result["ambient"]["os"], true);
+}
+
+fn exercise_cross_package_managed_spawn(
+    name: &str,
+    registry: &PackageRegistry,
+    target_id: &str,
+    template_id: &str,
+    inspect_template: bool,
+    expected_marker: Option<&str>,
+) -> (Option<serde_json::Value>, serde_json::Value) {
+    let data_directory = unique_short_test_dir(name);
+    let mut hub = explicit_runtime_in(name, data_directory.clone());
+    let repo_root = PathBuf::from("target")
+        .join("botster-hub-test-data")
+        .join("lua-runtime")
+        .join(format!("{name}-repository"));
+    let _ = fs::remove_dir_all(&repo_root);
+    fs::create_dir_all(&repo_root).expect("create cross-package managed repository");
+    run_git(None, &["init", "-b", "main", path_str(&repo_root)]);
+    run_git(
+        Some(&repo_root),
+        &["config", "user.email", "botster@example.invalid"],
+    );
+    run_git(Some(&repo_root), &["config", "user.name", "Botster Test"]);
+    fs::write(repo_root.join("README.md"), "cross-package\n")
+        .expect("write cross-package repository fixture");
+    run_git(Some(&repo_root), &["add", "-A"]);
+    run_git(Some(&repo_root), &["commit", "-m", "cross-package fixture"]);
+    let mut state = hub.state().clone();
+    state.spawn_targets = vec![SpawnTarget {
+        target_id: target_id.to_string(),
+        label: "Cross-package managed target".to_string(),
+        root: repo_root.clone(),
+        enabled: true,
+        kind: "git".to_string(),
+        base_ref: Some("main".to_string()),
+        metadata: BTreeMap::new(),
+    }];
+    hub.replace_state(state);
+    hub.load_lua_plugin_package(registry, "managed-session-caller.plugin")
+        .expect("load cross-package caller");
+
+    let inspected = inspect_template.then(|| {
+        hub.call_plugin_mcp_tool(botster_hub::McpCallRequest {
+            name: "cross_package.inspect".to_string(),
+            arguments: serde_json::json!({
+                "target_id": target_id,
+                "template_id": template_id
+            }),
+        })
+        .expect("inspect cross-package template through real worker")
+    });
+    let result = hub
+        .call_plugin_mcp_tool(botster_hub::McpCallRequest {
+            name: "cross_package.atomic".to_string(),
+            arguments: serde_json::json!({
+                "target_id": target_id,
+                "branch": format!("feature/{name}"),
+                "template_id": template_id
+            }),
+        })
+        .expect("spawn cross-package template through real worker");
+    if let Some(expected_marker) = expected_marker {
+        let marker = PathBuf::from(
+            result["result"]["worktree_path"]
+                .as_str()
+                .expect("spawned worktree path"),
+        )
+        .join("cross-package-executed.txt");
+        for _ in 0..100 {
+            if marker.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            fs::read_to_string(marker).expect("cross-package command marker"),
+            expected_marker,
+            "the selected template contributor's command must execute"
+        );
+    }
+
+    drop(hub);
+    let _ = fs::remove_dir_all(&data_directory);
+    fs::remove_dir_all(&repo_root).expect("remove cross-package repository");
+    (inspected, result)
+}
+
+#[test]
+fn real_lua_plugin_cross_package_managed_template_spawning() {
+    let contributor_root = PathBuf::from("target")
+        .join("botster-hub-test-data")
+        .join("lua-runtime-packages")
+        .join("cross-package-template-contributor");
+    let _ = fs::remove_dir_all(&contributor_root);
+    write_cross_package_template_contributor(&contributor_root, "tgt_cross_package");
+    let registry = install_cross_package_managed_session_registry(
+        "cross-package-caller",
+        &contributor_root,
+        true,
+    );
+    let (inspected, result) = exercise_cross_package_managed_spawn(
+        "cross-package-explicit-target",
+        &registry,
+        "tgt_cross_package",
+        "managed-session-template.plugin/init",
+        true,
+        Some("cross-package\n"),
+    );
+    assert_eq!(
+        inspected.expect("cross-package inspection")["shown"]["package_name"],
+        "managed-session-template.plugin"
+    );
+    assert_eq!(result["ok"], true, "cross-package result: {result}");
+    assert_eq!(
+        result["result"]["session_id"].as_str().map(str::len),
+        Some(36)
+    );
+
+    let project_pipelines_registry = install_cross_package_managed_session_registry(
+        "project-pipelines-cross-package-caller",
+        std::path::Path::new("examples/project-pipelines"),
+        true,
+    );
+    let (inspected, result) = exercise_cross_package_managed_spawn(
+        "cross-package-project-pipelines",
+        &project_pipelines_registry,
+        "package:project-pipelines",
+        "project-pipelines/agent-step",
+        true,
+        None,
+    );
+    assert_eq!(
+        inspected.expect("Project Pipelines inspection")["shown"]["package_name"],
+        "project-pipelines"
+    );
+    assert_eq!(result["ok"], true, "Project Pipelines result: {result}");
+    assert_eq!(
+        result["result"]["session_id"].as_str().map(str::len),
+        Some(36)
+    );
+
+    let denied_registry = install_cross_package_managed_session_registry(
+        "cross-package-denied-caller",
+        &contributor_root,
+        false,
+    );
+    let (_, denied) = exercise_cross_package_managed_spawn(
+        "cross-package-capability-denied",
+        &denied_registry,
+        "tgt_cross_package",
+        "managed-session-template.plugin/init",
+        false,
+        None,
+    );
+    assert_eq!(denied["ok"], false);
+    assert_eq!(denied["error"]["kind"], "capability_denied");
+
+    let (_, mismatched) = exercise_cross_package_managed_spawn(
+        "cross-package-target-mismatch",
+        &registry,
+        "tgt_other",
+        "managed-session-template.plugin/init",
+        false,
+        None,
+    );
+    assert_eq!(mismatched["ok"], false);
+    assert_eq!(mismatched["error"]["kind"], "template_not_eligible");
 }
 
 #[test]
