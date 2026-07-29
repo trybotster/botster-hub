@@ -101,9 +101,10 @@ fn run_local_runtime() {
     let HubClientResponseBody::PluginLifecycle(records) = lifecycle.body else {
         panic!("plugin lifecycle response expected");
     };
-    assert_eq!(records.len(), 1);
-    assert_eq!(records[0].package_name, RUNTIME_PACKAGE);
-    assert!(records[0].loaded);
+    assert_eq!(records.lifecycle.len(), 1);
+    assert_eq!(records.lifecycle[0].package_name, RUNTIME_PACKAGE);
+    assert!(records.lifecycle[0].loaded);
+    assert_eq!(records.worker_counters.live_plugin_executors, 1);
 
     let tools = reloaded
         .runtime()

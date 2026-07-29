@@ -2,7 +2,7 @@
 //!
 //! The hub persists product and policy state here while `botster-core` remains
 //! the owner of reusable session, transport, package, and admission mechanics.
-//! Version 1 is a single local JSON file intended for the local runtime. It is a
+//! Version 2 is a single local JSON file intended for the local runtime. It is a
 //! single-writer store: atomic rename keeps the previous committed file intact
 //! when a write fails before rename, but concurrent hub processes can still
 //! produce last-writer-wins updates.
@@ -25,7 +25,7 @@ use crate::session_templates::PackageSessionTemplate;
 use crate::spawn_targets::SpawnTarget;
 use crate::worktrees::Worktree;
 
-const HUB_STATE_SCHEMA_VERSION: u16 = 1;
+const HUB_STATE_SCHEMA_VERSION: u16 = 2;
 const HUB_STATE_FILE_NAME: &str = "hub-state.json";
 const HUB_STATE_TEMP_FILE_NAME: &str = "hub-state.json.tmp";
 
@@ -43,7 +43,7 @@ pub enum PersistenceBucket {
 /// Versioned durable hub state aggregate.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HubState {
-    /// Version of this JSON schema. Version 1 has no older migrations.
+    /// Version of this JSON schema. Version 2 rejects older schemas without migration.
     pub schema_version: u16,
     /// Host identity metadata resolved from hub config.
     pub host: HostIdentity,
@@ -294,7 +294,7 @@ pub type HubStateResult<T> = Result<T, HubStateError>;
 
 /// Storage boundary for durable hub state.
 pub trait HubStateStore {
-    /// Load existing state or create a v1 default from config when no file exists.
+    /// Load existing state or create a v2 default from config when no file exists.
     fn load_or_initialize(&self, config: &HubConfig) -> HubStateStoreResult<HubState>;
 
     /// Save a complete state snapshot.
@@ -370,6 +370,13 @@ impl HubStateStore for FileHubStateStore {
     fn load_or_initialize(&self, config: &HubConfig) -> HubStateStoreResult<HubState> {
         match fs::read(&self.path) {
             Ok(bytes) => {
+                let version: HubStateVersion =
+                    serde_json::from_slice(&bytes).map_err(HubStateStoreError::Corrupt)?;
+                if version.schema_version != HUB_STATE_SCHEMA_VERSION {
+                    return Err(HubStateStoreError::State(
+                        HubStateError::UnsupportedVersion(version.schema_version),
+                    ));
+                }
                 let state: HubState =
                     serde_json::from_slice(&bytes).map_err(HubStateStoreError::Corrupt)?;
                 state
@@ -392,6 +399,11 @@ impl HubStateStore for FileHubStateStore {
             .map_err(HubStateStoreError::State)?;
         self.write_atomically(state)
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct HubStateVersion {
+    schema_version: u16,
 }
 
 /// Typed storage boundary errors.
@@ -577,7 +589,7 @@ mod tests {
     }
 
     #[test]
-    fn file_store_creates_and_loads_default_v1_state() {
+    fn file_store_creates_and_loads_default_v2_state() {
         let config = test_config("creates-default");
         let store = FileHubStateStore::for_data_directory(&config.data_directory);
 
@@ -588,7 +600,7 @@ mod tests {
             .load_or_initialize(&config)
             .expect("load committed state");
 
-        assert_eq!(state.schema_version, 1);
+        assert_eq!(state.schema_version, 2);
         assert_eq!(reopened, state);
         assert_eq!(reopened.host.id, "state-test-host");
         assert_eq!(
@@ -598,8 +610,8 @@ mod tests {
     }
 
     #[test]
-    fn file_store_loads_v1_state_without_session_template_source_fields() {
-        let config = test_config("loads-v1-without-session-template-sources");
+    fn file_store_loads_v2_state_without_session_template_source_fields() {
+        let config = test_config("loads-v2-without-session-template-sources");
         let store = FileHubStateStore::for_data_directory(&config.data_directory);
         let state = HubState::from_config(&config);
         let mut value = serde_json::to_value(&state).expect("serialize state value");
@@ -632,7 +644,7 @@ mod tests {
 
         let reopened = store
             .load_or_initialize(&config)
-            .expect("load legacy-shaped v1 state");
+            .expect("load legacy-shaped v2 state");
 
         assert!(reopened.device_session_template_sources.is_empty());
         assert_eq!(reopened.spawn_targets.len(), 1);
@@ -643,7 +655,41 @@ mod tests {
         assert!(reopened.credential_keys.is_empty());
         assert!(reopened.trusted_browser_identities.is_empty());
         assert!(reopened.bootstrap_grants.is_empty());
-        assert_eq!(reopened.schema_version, 1);
+        assert_eq!(reopened.schema_version, 2);
+    }
+
+    #[test]
+    fn file_store_rejects_v1_before_deserializing_legacy_core_engine_options() {
+        let config = test_config("rejects-v1-core-engine-options");
+        let store = FileHubStateStore::for_data_directory(&config.data_directory);
+        let mut value =
+            serde_json::to_value(HubState::from_config(&config)).expect("serialize current state");
+        let object = value.as_object_mut().expect("state object");
+        object.insert("schema_version".to_string(), serde_json::json!(1));
+        let core_engine = object
+            .get_mut("runtime_settings")
+            .and_then(serde_json::Value::as_object_mut)
+            .and_then(|runtime_settings| runtime_settings.get_mut("core_engine"))
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("core engine object");
+        let queue_capacity = core_engine
+            .remove("plugin_worker_queue_capacity")
+            .expect("current queue capacity");
+        core_engine.remove("plugin_worker_executor_concurrency");
+        core_engine.insert("plugin_worker_capacity".to_string(), queue_capacity);
+        fs::create_dir_all(&config.data_directory).expect("create data dir");
+        fs::write(
+            store.path(),
+            serde_json::to_vec_pretty(&value).expect("serialize v1 state"),
+        )
+        .expect("write v1 state");
+
+        assert!(matches!(
+            store.load_or_initialize(&config),
+            Err(HubStateStoreError::State(
+                HubStateError::UnsupportedVersion(1)
+            ))
+        ));
     }
 
     #[test]

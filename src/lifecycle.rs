@@ -11,7 +11,8 @@ use botster_core::{
     BoundaryJson, PluginCleanupResult, PluginCleanupScope, PluginDescriptorKind,
     PluginHandlerRegistration, PluginInvocationOutcome, PluginInvocationRequest, PluginKey,
     PluginLoadSpec, PluginOwnedDescriptor, PluginReloadSpec, PluginResourceRef, PluginRuntime,
-    PluginUnloadSpec, PluginWorkerEngine, PluginWorkerRegistration, RequestId,
+    PluginUnloadSpec, PluginWorkerDebugSnapshot, PluginWorkerEngine, PluginWorkerEngineConfig,
+    PluginWorkerRegistration, RequestId,
 };
 
 use crate::packages::{PackageClassification, PackageRecord, PackageRegistry, PackageState};
@@ -29,12 +30,24 @@ impl HubPluginLifecycle {
     /// Build a lifecycle adapter with core's default plugin worker config.
     #[must_use]
     pub fn new() -> Self {
+        Self::with_config(PluginWorkerEngineConfig::default())
+    }
+
+    /// Build a lifecycle adapter with explicit core plugin worker config.
+    #[must_use]
+    pub fn with_config(config: PluginWorkerEngineConfig) -> Self {
         Self {
-            engine: PluginWorkerEngine::new(),
+            engine: PluginWorkerEngine::with_config(config),
             loaded: Arc::new(Mutex::new(BTreeSet::new())),
             descriptors: Arc::new(Mutex::new(BTreeMap::new())),
             event_handlers: Arc::new(Mutex::new(BTreeMap::new())),
         }
+    }
+
+    /// Return Core's authoritative read-only plugin worker snapshot.
+    #[must_use]
+    pub fn debug_snapshot(&self) -> PluginWorkerDebugSnapshot {
+        self.engine.debug_snapshot()
     }
 
     /// Load an installed-and-enabled package through core worker registration.
