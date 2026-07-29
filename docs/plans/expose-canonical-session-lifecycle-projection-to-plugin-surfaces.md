@@ -28,6 +28,11 @@
   [[botster packages should enforce core hub cli plugin provider boundaries]],
   [[session UUID is the sole routing key across all layers]],
   [[botster hub client state sync is entity frame only]],
+  [[botster hub client crate is the external client boundary]],
+  [[botster hub client compatibility descriptors belong in client crate]],
+  [[daemon event shape changes bump conformance fixture revision not protocol version]],
+  [[generated typescript dtos must encode serde field optionality]],
+  [[adding a hub client feature constant is a three site change]],
   [[botster entity snapshots are authoritative reconnect baselines]],
   [[botster client subscriptions should not hydrate global state]],
   [[plugin surfaces request model state through ui bindings not hub subscribe]],
@@ -77,18 +82,29 @@ Choose the ticket's bindable-entity option, not a Lua worker read capability.
 The canonical plugin-authored path is the Hub-owned `/session` entity family.
 Its row id is the canonical session UUID, and its delivered row is the existing
 sanitized `DaemonSessionEntity` projection. Plugin trees may bind a referenced
-UUID through direct paths such as `/session/<uuid>/lifecycle` or through
+UUID through direct paths such as `/session/<uuid>/lifecycle_class` or through
 `bind_list` with an exact top-level `session_uuid` filter. The production
 transport remains `SubscribeEntities { entity_type: "session" }` on a held-open
 connection; `/session` is the renderer-neutral UiNode name for that same
 family, not a second store or subscription.
 
-Lifecycle classification is Hub contract, not workspace policy:
+Lifecycle classification is one total Hub function over the independently
+observed `(registry_state, lifecycle)` pair, not workspace policy:
 
-- `starting`, `running`, and `stopping` are current.
-- `exited` and `failed` are ended.
-- A present row with `lifecycle: None`, including `registry_state: "stale"`,
-  is indeterminate.
+1. If `registry_state == "stale"`, classify the present row as
+   `indeterminate` regardless of the optional lifecycle value.
+2. Otherwise, `starting`, `running`, and `stopping` lifecycle values are
+   `current`.
+3. Otherwise, `exited` and `failed` lifecycle values are `ended`.
+4. Otherwise, `lifecycle: None` is `indeterminate`.
+
+The stale rule deliberately takes precedence over a concrete lifecycle. The
+existing `daemon_session_to_core_session` helper maps a stale registry-only
+`DaemonSession` summary to synthetic `Failed`, but that is a separate
+registry-to-Core reconstruction path. The session entity projection retains
+registry state and lifecycle as independent observations; calling a stale row
+ended would assert more than those observations establish.
+
 - A UUID absent from the authoritative snapshot/family is unknown or
   unavailable.
 - Session shutdown changes lifecycle but does not remove the row. Only the
@@ -123,9 +139,11 @@ the ticket.
      receive the entity values or a raw Hub-state handle.
    - After generic UiNode validation, enforce a Hub-owned binding-family
      admission pass at the existing plugin-surface validation boundary:
-     accept `/session`, preserve separately sanctioned owner-namespaced plugin
-     families, and reject unauthorized built-in/foreign absolute families.
-     Do not create a general Hub entity introspection API.
+     accept only `/session` and reject every other absolute family. Hub cannot
+     currently deliver plugin-owned entity families, so admitting any
+     owner-namespaced family would create an unresolvable binding and is
+     explicitly out of scope until a separately designed delivery mechanism
+     exists. Do not create a general Hub entity introspection API.
 
 2. **Add a real plugin-worker producer.**
    - Extend the canonical plugin-contract-matrix source with one surface that
@@ -173,9 +191,17 @@ the ticket.
      artifact. Do not claim general plugin-owned entity hydration if it is
      still unsupported.
    - Advance the conformance fixture revision because the public fixture/matrix
-     meaning changes. Change the daemon protocol version only if implementation
-     changes required request/response compatibility rather than composing
-     existing public frames.
+     meaning and required session-row shape change. Keep `PROTOCOL_VERSION` at
+     4: adding a required field to the existing entity event DTO changes serde
+     event shape and downstream deserialization expectations, not daemon
+     framing or request issuance. Do not add a new compatibility feature:
+     `session_entity_subscriptions` already names this capability, and adding a
+     feature would also make it globally required through
+     `DaemonCompatibilityRequirement::current()`. The advanced conformance
+     revision is the compatibility signal: a current client requirement
+     rejects an older Hub before subscribing, while older serde clients ignore
+     the additive field. Those older clients still cannot claim the new
+     binding behavior until their downstream tickets repin and implement it.
 
 5. **Regenerate and prepare the normal test-support artifact.**
    - Generate every checked Rust/Node fixture, matrix, metadata, declaration,
@@ -204,6 +230,10 @@ the ticket.
 - No persistence of lifecycle or `current`/`ended` truth in a plugin database.
 - No workspace-specific Hub DTO, capability, entity family, surface id, or
   policy branch.
+- No owner-namespaced/plugin-owned entity-family admission or delivery
+  mechanism; this revision admits only the built-in `/session` family.
+- No daemon protocol-version bump or new compatibility feature; the required
+  row-shape change advances only the conformance fixture revision.
 - No arbitrary Hub-state read capability, raw CoreDaemon handle, Lua session
   registry exposure, process metadata, terminal bytes, history, screen, files,
   packages, targets, worktrees, or session contexts.
@@ -228,8 +258,12 @@ the ticket.
   compatibility advertisement, conformance fixture, real runtime harness, and
   normal test-support artifact.
 - **In-repository botster-hub-client:** owns public daemon request, entity frame,
-  projection DTO, generated TypeScript, feature, and compatibility metadata.
-  No Hub-local DTO mirror is allowed.
+  projection DTO, generated TypeScript, and compatibility metadata. Adding the
+  required `lifecycle_class` field to `DaemonSessionEntity`, emitting it as a
+  required TypeScript property, regenerating the checked artifact, and
+  advancing `CONFORMANCE_FIXTURE_REVISION` are mandatory. `PROTOCOL_VERSION`
+  remains 4 and no feature constant is added. No Hub-local DTO mirror is
+  allowed.
 - **In-repository botster-ui-contract:** owns renderer-neutral binding grammar
   and validation only. `/session` is Hub family policy documented beside the
   Hub protocol; the UI package must not acquire workspace policy or runtime
@@ -274,6 +308,10 @@ the ticket.
   to distinguish a present unclassified/stale row from an absent UUID. Every
   present row therefore carries required `lifecycle_class:
   current | ended | indeterminate`.
+- Contract decision: stale registry state has highest classification
+  precedence and yields `indeterminate` even when the optional lifecycle is
+  concrete. This differs intentionally from the registry-only
+  `daemon_session_to_core_session` reconstruction described above.
 - Assumption: a plugin-authored binding does not grant the worker raw state;
   values remain in the admitted client entity store. Any implementation that
   sends entity values into the worker needs a fresh security/ownership review.
@@ -285,10 +323,11 @@ the ticket.
   shared by Rust and Node. Prefer existing public UiNode and daemon DTO
   serialization plus relational assertions over a second view-model schema;
   never describe this reference code as a shipped Web/TUI adapter.
-- Unknown: whether a new compatibility feature constant is necessary. Add one
-  only if clients must explicitly negotiate canonical plugin session binding;
-  if added, update advertised features, required features, and support-matrix
-  expectations together.
+- Compatibility decision: advance the conformance fixture revision, keep
+  protocol version 4, and add no feature constant. The required row field is an
+  event-shape change within the existing `session_entity_subscriptions`
+  capability. The botster-tui downstream ticket must repin its
+  `botster-hub-client` Git dependency when it implements the renderer.
 - Unknown: why public Hub test-support `0.1.14` is ahead of the checked main
   package version while retaining revision 22. Reconcile provenance before
   changing version/revision metadata.
@@ -301,11 +340,12 @@ the ticket.
 - `docs/client-protocol.md` and `README.md` — canonical `/session` binding,
   lifecycle mapping, subscription/reconnect semantics, and ownership boundary.
 - `crates/botster-hub-client/src/lib.rs` and
-  `crates/botster-hub-client/src/typescript.rs` — canonical constants or feature
-  metadata, public projection compatibility only if needed, and generated DTO
-  tests.
-- `crates/botster-hub-client/generated/daemon-protocol.ts` — generated output
-  only if the public client contract changes.
+  `crates/botster-hub-client/src/typescript.rs` — required
+  `DaemonSessionEntity.lifecycle_class`, required TypeScript property,
+  conformance revision, serde/generator tests, and unchanged protocol/feature
+  assertions.
+- `crates/botster-hub-client/generated/daemon-protocol.ts` — mandatory
+  regenerated output for the required public property.
 - `src/daemon_transport.rs` — existing session projection and connection-scoped
   delivery tests; production changes only where the canonical binding seam
   requires them.
@@ -354,8 +394,9 @@ the ticket.
   the generic `current | ended | indeterminate` classification; keep labels,
   ordering, retention of references, and product actions in Workspaces.
 - **Present-but-unclassified rows collapse into unknown:** require the
-  always-present `lifecycle_class`, map `lifecycle: None` and stale registry
-  rows to `indeterminate`, and reserve unknown/unavailable for an absent UUID.
+  always-present `lifecycle_class`; apply stale-first precedence, otherwise map
+  lifecycle values through the total function; reserve unknown/unavailable for
+  an absent UUID.
 - **A concrete-to-None patch leaves stale client state:** projection and patch
   tests must prove current -> ended -> indeterminate explicitly updates
   `lifecycle_class`; omitted optional source fields cannot be the clear
@@ -400,14 +441,18 @@ the ticket.
      serde, feature/compatibility metadata, and TypeScript generation.
    - Focused `src/daemon_transport.rs` tests prove every lifecycle state maps
      to the documented `current | ended | indeterminate` class, every present
-     row serializes that field, concrete -> `None` and stale transitions
-     explicitly patch it to `indeterminate`, patches preserve the canonical
-     UUID, explicit remove creates absence, and no extra Hub state enters the
-     row.
+     row serializes that field, each concrete lifecycle combined with stale
+     registry state maps to `indeterminate`, concrete -> `None` and
+     non-stale -> stale transitions explicitly patch it to `indeterminate`,
+     patches preserve the canonical UUID, explicit remove creates absence, and
+     no extra Hub state enters the row.
    - Focused Hub surface-admission tests accept canonical `/session` bindings,
-     preserve explicitly sanctioned owner-namespaced plugin families, and
-     reject unauthorized built-in or foreign absolute families after generic
-     UiNode validation.
+     reject every other absolute family after generic UiNode validation, and
+     prove no owner-namespaced exception is inferred from dotted path names.
+   - `botster-hub-client` tests and generated drift checks require
+     `lifecycle_class` in Rust serde and TypeScript, keep protocol version 4 and
+     the feature list unchanged, and advance the conformance revision to a
+     unique unpublished value after registry preflight.
 
 2. **Real plugin-worker registration and render**
    - A focused
