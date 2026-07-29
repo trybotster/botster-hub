@@ -3751,6 +3751,7 @@ fn daemon_plugin_contract_matrix_fixture_exercises_public_package_contracts() {
         vec![
             "contract.app",
             "contract.empty",
+            "contract.sessions",
             "contract.blocked",
             "contract.invalid_body",
             "contract.settings",
@@ -3806,6 +3807,14 @@ fn daemon_plugin_contract_matrix_fixture_exercises_public_package_contracts() {
         report.app_surface_snapshot_node_kinds,
         report.app_surface_node_kinds
     );
+    assert_eq!(report.session_surface_id, "contract.sessions");
+    assert_eq!(
+        report.session_surface_node_id,
+        "contract-session-lifecycle-panel"
+    );
+    assert_eq!(report.session_surface_binding_family, "/session");
+    assert!(report.session_surface_matches_fixture);
+    assert_eq!(report.session_surface_references.len(), 5);
     assert_eq!(report.dialog_presence_key, "contract-dialog");
     assert_eq!(report.selected_workspace_equality_key, "selected-workspace");
     assert_eq!(report.selected_workspace_equality_value, "workspace-alpha");
@@ -6752,8 +6761,12 @@ fn session_entity_subscription_pushes_snapshot_ordered_deltas_and_fresh_reconnec
         botster_hub_client::DaemonEntityFrame::Upsert {
             snapshot_seq,
             ref id,
+            ref entity,
             ..
-        } if id == "entity-session" => snapshot_seq,
+        } if id == "entity-session" => {
+            assert_eq!(entity.lifecycle_class, "current");
+            snapshot_seq
+        }
         other => panic!("expected first upsert, got {other:?}"),
     };
     assert!(matches!(
@@ -6831,6 +6844,12 @@ fn session_entity_subscription_pushes_snapshot_ordered_deltas_and_fresh_reconnec
                 patch,
                 ..
             } if patch.get("lifecycle").and_then(serde_json::Value::as_str) == Some("exited") => {
+                assert_eq!(
+                    patch
+                        .get("lifecycle_class")
+                        .and_then(serde_json::Value::as_str),
+                    Some("ended")
+                );
                 break snapshot_seq;
             }
             _ => {}
@@ -6890,6 +6909,62 @@ fn session_entity_subscription_pushes_snapshot_ordered_deltas_and_fresh_reconnec
         .unsubscribe()
         .expect("unsubscribe reconnect stream");
     second.unsubscribe().expect("unsubscribe second stream");
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
+fn session_entity_subscription_projects_stale_row_as_indeterminate() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_test_dir("session-entity-stale");
+    let config = explicit_config(&data_dir);
+    let session_id = SessionId("session-entity-stale".to_string());
+    let registry = SessionRegistry::new(config.data_directory.clone());
+    let mut stale_record = RegistryRecord::running(
+        session_id.clone(),
+        Some(ProcessIdentity {
+            pid: Some(42),
+            runtime_id: Some("stale-runtime".to_string()),
+        }),
+        ResizePayload { rows: 24, cols: 80 },
+        "sh".to_string(),
+        1,
+    );
+    stale_record.observe_restart_contract(serde_json::json!({"session": "stale"}), 2);
+    registry
+        .save(&stale_record)
+        .expect("save stale registry fixture");
+
+    let endpoint = botster_hub_client::DaemonEndpoint::new(
+        config
+            .transports
+            .local_socket
+            .as_ref()
+            .expect("test config has local socket")
+            .path
+            .clone(),
+    );
+    let child = start_cli_daemon(&data_dir);
+    let mut subscription =
+        botster_hub_client::subscribe_session_entities(&endpoint, "stale-session-entities")
+            .expect("subscribe to stale session projection");
+    subscription
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("bound stale projection read");
+    let snapshot = subscription
+        .next_frame()
+        .expect("authoritative stale snapshot");
+    assert!(matches!(
+        snapshot,
+        botster_hub_client::DaemonEntityFrame::Snapshot { ref items, .. }
+            if items.iter().any(|entity| {
+                entity.session_uuid == session_id.0.as_str()
+                    && entity.registry_state == "stale"
+                    && entity.lifecycle_class == "indeterminate"
+            })
+    ));
+    subscription
+        .unsubscribe()
+        .expect("unsubscribe stale projection");
     shutdown_cli_daemon(&data_dir, child);
 }
 
@@ -9359,6 +9434,15 @@ fn external_hub_test_support_drives_isolated_daemon_socket_protocol() {
         plugin_report.app_surface_node_id,
         support_matrix.plugin_surfaces.rendered_surface_node_id
     );
+    assert_eq!(
+        plugin_report.session_surface_id,
+        support_matrix.session_entities.plugin_surface_id
+    );
+    assert_eq!(
+        plugin_report.session_surface_binding_family,
+        support_matrix.session_entities.binding_family
+    );
+    assert!(plugin_report.session_surface_matches_fixture);
     assert_eq!(plugin_report.action_error_state, "error");
     assert_eq!(
         plugin_report.action_error_diagnostic_kind,

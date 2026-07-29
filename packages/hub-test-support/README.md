@@ -6,6 +6,7 @@ The package is a generated wrapper over `botster-hub-test-support` and
 `botster-hub-client`. Do not edit `daemon-protocol.ts`,
 `first-party-client-support-matrix.json`,
 `session-lifecycle-subscription-conformance-fixture.json`,
+`session-plugin-binding-conformance-fixture.json`,
 `late-attach-history-conformance-fixture.json`,
 `local-webrtc-delivery-chunk-conformance-fixture.json`,
 `mode-flags-conformance-fixture.json`,
@@ -18,13 +19,14 @@ node packages/hub-test-support/scripts/sync-assets.mjs
 ## Usage
 
 ```sh
-npm install --save-dev @trybotster/ui-contract@0.1.0 @trybotster/hub-test-support@0.1.13
+npm install --save-dev @trybotster/ui-contract@0.1.0 @trybotster/hub-test-support@0.1.15
 ```
 
 ```js
 import {
   materializeApplicationPrimitivesFixture,
   materializePluginContractMatrixFixture,
+  materializeSessionPluginBindingScenario,
   metadata,
   readDaemonProtocolTypescript,
   readFirstPartyClientSupportMatrix,
@@ -32,6 +34,7 @@ import {
   readLocalWebrtcDeliveryChunkConformanceFixture,
   readModeFlagsConformanceFixture,
   readSessionLifecycleSubscriptionConformanceFixture,
+  readSessionPluginBindingConformanceFixture,
   readUiContractConformanceFixtures,
 } from "@trybotster/hub-test-support";
 
@@ -43,6 +46,9 @@ const lateAttachFixture = readLateAttachHistoryConformanceFixture();
 const localWebrtcChunkFixture = readLocalWebrtcDeliveryChunkConformanceFixture();
 const modeFlagsFixture = readModeFlagsConformanceFixture();
 const sessionLifecycleFixture = readSessionLifecycleSubscriptionConformanceFixture();
+const sessionBindingFixture = readSessionPluginBindingConformanceFixture();
+const sessionBindingStages =
+  materializeSessionPluginBindingScenario(sessionBindingFixture);
 const uiContractFixtures = await readUiContractConformanceFixtures();
 const applicationSurfaceId = metadata.application_primitives.surface_id;
 const rendererEntryPoint = metadata.application_primitives.renderer_entrypoint;
@@ -59,6 +65,7 @@ console.log(
   localWebrtcChunkFixture.scenarios.large_generated,
   modeFlagsFixture.mouse_on.mode_flags.mouse_mode,
   sessionLifecycleFixture.normalized_frames,
+  sessionBindingStages,
   uiContractFixtures.contract_version,
 );
 ```
@@ -68,13 +75,13 @@ Use this exact package spec in npm-based client repos:
 ```json
 {
   "devDependencies": {
-    "@trybotster/hub-test-support": "0.1.13"
+    "@trybotster/hub-test-support": "0.1.15"
   }
 }
 ```
 
 After `@trybotster/ui-contract@0.1.0` and
-`@trybotster/hub-test-support@0.1.13` are published to the public npm
+`@trybotster/hub-test-support@0.1.15` are published to the public npm
 registry, no scoped `.npmrc` entry or CI auth token is required for install.
 
 The support matrix is generated from the Rust compatibility descriptors.
@@ -90,7 +97,7 @@ Only `read_screen_text` is renderable restored content; `snapshot` and
 version 0.1.5 / revision 12 exposes lossy string history. Neither is current
 binary-history contract authority.
 
-Version 0.1.13 publishes protocol version 4 / conformance revision 22 and
+Version 0.1.15 publishes protocol version 4 / conformance revision 23 and
 depends on `@trybotster/ui-contract@0.1.0` for the canonical UiNode,
 UiActionRequest, and UiActionResult declarations and conformance fixtures.
 Version 0.1.15 is prepared in this repository with optional aggregate
@@ -99,6 +106,13 @@ Revision 20 remains the already-published version 0.1.12 application-primitives
 contract; revision 21 adds spawn-target `base_ref` and worktree `management`
 without reusing those bytes; revision 22 makes the live presentation Dialog
 form-operable without reusing either earlier revision.
+Revision 23 adds required `DaemonSessionEntity.lifecycle_class`, the canonical
+`/session` binding scenario, and the real `contract.sessions` plugin-worker
+surface. The Node reference materializer proves matching `current`, `ended`,
+and `indeterminate` rows before an absent UUID selects the unavailable path,
+then proves patch, remove, and authoritative reconnect convergence. This
+package does not claim shipped botster-web or botster-tui renderer support;
+those production paths are separately routed.
 The protocol cold-switch replaces split action fields and untyped JSON bodies
 with one canonical request envelope and typed surface/action response bodies.
 It also retains the version 0.1.11

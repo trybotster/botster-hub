@@ -259,6 +259,55 @@ local function empty_surface(_arguments)
   }
 end
 
+local function session_lifecycle_surface(arguments)
+  local requested = arguments.session_uuids or {}
+  if type(requested) ~= "table" then
+    error("session_uuids must be an array")
+  end
+  if #requested > 16 then
+    error("session_uuids exceeds the 16-reference fixture limit")
+  end
+
+  local children = {}
+  for index, session_uuid in ipairs(requested) do
+    if type(session_uuid) ~= "string" or session_uuid == "" then
+      error("session_uuids entries must be non-empty strings")
+    end
+    table.insert(children, {
+      ["$kind"] = "bind_list",
+      source = "/session",
+      where = {
+        session_uuid = session_uuid,
+      },
+      item_template = {
+        type = "text",
+        id = string.format("contract-session-%d-lifecycle", index),
+        props = {
+          text = {
+            ["$bind"] = "@/lifecycle_class",
+          },
+        },
+      },
+      empty_template = {
+        type = "text",
+        id = string.format("contract-session-%d-unavailable", index),
+        props = {
+          text = "Session unavailable",
+        },
+      },
+    })
+  end
+
+  return {
+    type = "panel",
+    id = "contract-session-lifecycle-panel",
+    props = {
+      title = "Session lifecycle projection",
+    },
+    children = children,
+  }
+end
+
 local function blocked_surface(_arguments)
   error("contract matrix blocked render")
 end
@@ -407,6 +456,16 @@ return botster.register({
         surface_id = "contract.empty",
       },
       call = empty_surface,
+    },
+    {
+      id = "contract_session_lifecycle_surface",
+      kind = "surface_route",
+      descriptor_id = "contract.sessions",
+      descriptor = {
+        title = "Session Lifecycle Projection",
+        surface_id = "contract.sessions",
+      },
+      call = session_lifecycle_surface,
     },
     {
       id = "contract_blocked_surface",

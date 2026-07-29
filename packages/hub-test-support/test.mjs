@@ -12,6 +12,8 @@ import {
   lateAttachHistoryConformanceFixturePath,
   localWebrtcDeliveryChunkConformanceFixturePath,
   modeFlagsConformanceFixturePath,
+  materializeSessionPluginBindings,
+  materializeSessionPluginBindingScenario,
   materializeApplicationPrimitivesFixture,
   materializePluginContractMatrixFixture,
   metadata,
@@ -22,8 +24,10 @@ import {
   readLocalWebrtcDeliveryChunkConformanceFixture,
   readModeFlagsConformanceFixture,
   readSessionLifecycleSubscriptionConformanceFixture,
+  readSessionPluginBindingConformanceFixture,
   readUiContractConformanceFixtures,
   sessionLifecycleSubscriptionConformanceFixturePath,
+  sessionPluginBindingConformanceFixturePath,
   verifyPackageAssets,
 } from "@trybotster/hub-test-support";
 
@@ -129,7 +133,7 @@ assert.equal(metadata.package_name, "@trybotster/hub-test-support");
 assert.equal(metadata.package_version, "0.1.15");
 assert.equal(metadata.protocol, "botster-hub-daemon-v1");
 assert.equal(metadata.protocol_version, 4);
-assert.equal(metadata.conformance_fixture_revision, 22);
+assert.equal(metadata.conformance_fixture_revision, 23);
 assert.deepEqual(metadata.ui_contract, {
   conformance_fixture_export: "@trybotster/ui-contract/conformance-fixtures",
   package_name: "@trybotster/ui-contract",
@@ -178,12 +182,17 @@ assert.match(protocol, /entity_snapshot/);
 assert.match(protocol, /entity_upsert/);
 assert.match(protocol, /entity_patch/);
 assert.match(protocol, /entity_remove/);
+assert.match(protocol, /lifecycle_class: string/);
 assert.match(protocol, /resync_reason/);
 assert.match(protocol, /refresh_local_packages/);
 
 assert.equal(
   fileURLToPath(import.meta.resolve("@trybotster/hub-test-support/session-lifecycle-subscription-conformance-fixture")),
   sessionLifecycleSubscriptionConformanceFixturePath(),
+);
+assert.equal(
+  fileURLToPath(import.meta.resolve("@trybotster/hub-test-support/session-plugin-binding-conformance-fixture")),
+  sessionPluginBindingConformanceFixturePath(),
 );
 assert.equal(
   fileURLToPath(import.meta.resolve("@trybotster/hub-test-support/first-party-client-support-matrix")),
@@ -204,12 +213,22 @@ assert.equal(
 
 const supportMatrix = readFirstPartyClientSupportMatrix();
 const sessionLifecycleFixture = readSessionLifecycleSubscriptionConformanceFixture();
+const sessionPluginBindingFixture = readSessionPluginBindingConformanceFixture();
 assert.equal(supportMatrix.late_attach_history.supported, true);
 assert.equal(supportMatrix.required_features.includes("terminal_readback"), true);
 assert.equal(supportMatrix.required_features.includes("session_entity_subscriptions"), true);
 assert.equal(supportMatrix.session_entities.supported, true);
 assert.equal(supportMatrix.session_entities.bounded_delivery, true);
 assert.equal(supportMatrix.session_entities.explicit_snapshot_resync, true);
+assert.equal(supportMatrix.session_entities.binding_family, "/session");
+assert.equal(supportMatrix.session_entities.lifecycle_class_field, "lifecycle_class");
+assert.deepEqual(supportMatrix.session_entities.lifecycle_classes, [
+  "current",
+  "ended",
+  "indeterminate",
+]);
+assert.equal(supportMatrix.session_entities.missing_row_state, "unavailable");
+assert.equal(supportMatrix.session_entities.plugin_surface_id, "contract.sessions");
 assert.equal(
   supportMatrix.session_entities.runtime_runner,
   "botster_hub_test_support::run_session_lifecycle_subscription_conformance",
@@ -246,7 +265,7 @@ assert.deepEqual(supportMatrix.plugin_surfaces.authored_set_values, {
   "selected-workspace": "workspace-alpha",
 });
 
-assert.equal(sessionLifecycleFixture.conformance_fixture_revision, 22);
+assert.equal(sessionLifecycleFixture.conformance_fixture_revision, 23);
 assert.equal(sessionLifecycleFixture.entity_type, "session");
 assert.deepEqual(
   sessionLifecycleFixture.normalized_frames.map((frame) => frame.type),
@@ -283,6 +302,62 @@ assert.equal(
 );
 assert.equal(sessionLifecycleFixture.overflow.snapshot_precedes_later_deltas, true);
 assert.equal(sessionLifecycleFixture.overflow.failed_snapshot_delivery_closes_subscription, true);
+
+assert.equal(sessionPluginBindingFixture.conformance_fixture_revision, 23);
+assert.equal(sessionPluginBindingFixture.binding_family, "/session");
+const sessionPluginMaterialization = materializeSessionPluginBindingScenario(
+  sessionPluginBindingFixture,
+);
+assert.deepEqual(sessionPluginMaterialization, sessionPluginBindingFixture.expected);
+assert.equal(
+  Object.values(sessionPluginMaterialization.initial).includes("current"),
+  true,
+  "matching rows must not false-pass through empty_template",
+);
+assert.equal(
+  Object.values(sessionPluginMaterialization.initial).includes("ended"),
+  true,
+);
+assert.equal(
+  Object.values(sessionPluginMaterialization.initial).includes("indeterminate"),
+  true,
+);
+assert.equal(
+  Object.values(sessionPluginMaterialization.initial).includes("unavailable"),
+  true,
+);
+assert.deepEqual(
+  Object.keys(sessionPluginBindingFixture.transition_frames[1].patch),
+  ["lifecycle_class", "registry_state", "updated_at"],
+  "stale transition must match the producer's omitted optional lifecycle field",
+);
+const transitionRow = structuredClone(
+  sessionPluginBindingFixture.initial_snapshot.items.find(
+    (item) => item.session_uuid === "session-transition",
+  ),
+);
+Object.assign(
+  transitionRow,
+  sessionPluginBindingFixture.transition_frames[0].patch,
+  sessionPluginBindingFixture.transition_frames[1].patch,
+);
+assert.equal(transitionRow.lifecycle, "exited");
+assert.equal(transitionRow.lifecycle_class, "indeterminate");
+const malformedSessionFrames = [
+  sessionPluginBindingFixture.initial_snapshot,
+  {
+    ...sessionPluginBindingFixture.transition_frames[0],
+    patch: { lifecycle_class: null },
+  },
+];
+assert.throws(
+  () =>
+    materializeSessionPluginBindings(
+      sessionPluginBindingFixture.surface,
+      malformedSessionFrames,
+    ),
+  /present session row session-transition is missing lifecycle_class/,
+);
 
 const lateAttachFixture = readLateAttachHistoryConformanceFixture();
 const chunkFixture = readLocalWebrtcDeliveryChunkConformanceFixture();
@@ -414,6 +489,8 @@ try {
   );
   const fixtureSource = readFileSync(join(fixturePath, "plugin.lua"), "utf8");
   assert.match(fixtureSource, /contract\.app/);
+  assert.match(fixtureSource, /contract\.sessions/);
+  assert.match(fixtureSource, /source = "\/session"/);
   assert.match(fixtureSource, /kind = "set"/);
   assert.match(fixtureSource, /key = "selected-workspace"/);
   assert.match(fixtureSource, /kind = "clear"/);

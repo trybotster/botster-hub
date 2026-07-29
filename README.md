@@ -143,10 +143,17 @@ contract instead of bypassing hub admission or calling raw core routers.
 Terminal attach is a terminal-stream handshake only. Session-list reads remain
 an operator/query API; stateful clients use the explicit held-open `session`
 entity subscription for an authoritative snapshot followed by ordered deltas.
-The reusable revision-16 contract ships in
-`@trybotster/hub-test-support@0.1.13` as source-derived JSON fixtures and a Rust
+The reusable contract ships in
+`@trybotster/hub-test-support@0.1.15` as source-derived JSON fixtures and a Rust
 `run_session_lifecycle_subscription_conformance` runner over the real isolated
 Hub/Core/session-worker topology.
+Every delivered session row includes required `lifecycle_class`:
+`starting|running|stopping` map to `current`,
+`exited|failed` map to `ended`, and missing lifecycle maps to
+`indeterminate`; `registry_state: stale` always takes precedence and maps to
+`indeterminate`. Plugin-authored trees may bind only the Hub-admitted
+`/session` family, keyed by canonical session UUID. A missing row alone means
+unknown/unavailable.
 That subscription hydrates no status, package, worktree, target, or plugin state.
 The local socket adapter admits at most 64 live connections and runs them as
 joined Tokio tasks on a fixed transport runtime; it does not create an OS
@@ -179,6 +186,11 @@ presentation `set`, scoped client state opens the delivered Dialog and satisfies
 the selected-workspace equality binding, rejected form values retain both tree
 and state, and valid submit plus toggle/clear effects remain typed. Static
 `@trybotster/ui-contract` fixtures remain the deterministic contract complement.
+The fixture's `contract.sessions` surface accepts a bounded UUID set and
+authors `/session` bindings without receiving session values or raw Hub state.
+The held-open client entity subscription supplies authoritative snapshots and
+ordered patches; reconnect requires a fresh snapshot and explicit removal is
+the only operation that makes a retained reference unavailable.
 
 | Core / daemon operation | HubRuntime decision | Reason |
 | --- | --- | --- |
@@ -449,7 +461,7 @@ data_dir=resolved:$HOME/.botster/hub
 daemon=started
 protocol=botster-hub-daemon-v1
 protocol_version=4
-conformance_fixture_revision=22
+conformance_fixture_revision=23
 package_count=2
 enabled_package_count=2
 app_count=2
