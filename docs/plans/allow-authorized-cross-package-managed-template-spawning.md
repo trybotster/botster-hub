@@ -485,8 +485,10 @@ git diff --check
 
 The full test suite remains required because package reload, persistence, Lua
 worker, managed Git, and daemon lifecycle share this path. Implement and Review
-both observed one passing test for each focused filter. Review ran the complete
-wrapper green: 131 library and 102 daemon-integration tests passed.
+both observed one passing test for each focused filter. After merging current
+`origin/main` `7c6d9488481da3fc43c6fb813eeb583c507f802c`, Implement ran the
+complete wrapper green: 133 library and 103 daemon-integration tests passed
+(one larger local adversarial test ignored).
 
 Plan-stage baseline evidence:
 

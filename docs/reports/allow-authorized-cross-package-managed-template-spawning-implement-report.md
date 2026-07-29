@@ -123,6 +123,12 @@ routable rather than widening this ticket.
 
 ## Verification
 
+PR #175 was initially verified on `80db7b4`, then current `origin/main`
+`7c6d9488481da3fc43c6fb813eeb583c507f802c` advanced the production
+plugin-worker configuration path and made the PR conflict. Implement merged
+main, retained both `MultiplexerEngineError` and
+`PluginWorkerDebugSnapshot`, and reran every gate on the merged tree.
+
 - `./test.sh real_lua_plugin_cross_package_managed_template_spawning -- --nocapture`
   — passed 1 test; proves list/show enumeration for both contributors, both
   positive package-B cases, canonical UUIDs, package-B command execution,
@@ -138,8 +144,9 @@ routable rather than widening this ticket.
   passed.
 - `cargo fmt --all -- --check` — passed.
 - `git diff --check` — passed.
-- `./test.sh` — Review reran the complete wrapper successfully: all 11 targets
-  passed, including 131 library tests and 102 daemon-integration tests.
+- `./test.sh` — passed on the current-main merged tree: all 12 targets passed,
+  including 133 library tests and 103 daemon-integration tests (one larger
+  local adversarial test ignored).
 - `./test.sh cli_operator_console_starts_reuses_detaches_handles_ctrl_c_and_stops -- --nocapture`
   — passed on this branch in isolation; an earlier full-suite attempt timed out
   waiting for `daemon=started`, establishing intermittent timing rather than a
@@ -159,6 +166,12 @@ routable rather than widening this ticket.
   rendered the returned identity, workspace deletion preserved the Hub
   session/worktree, and the live packaged WebRTC protocol harness passed with
   the matched Hub/worker and fresh private temporary socket root.
+- Current-main downstream rerun — because main rejects the former schema-v1
+  held data directory, recreated the same Git target and shipped Project
+  Pipelines template topology in a fresh schema-v2 Hub directory. The
+  Workspaces acceptance smoke passed with canonical UUID
+  `3c77d44f-da15-43f9-a097-f18c291695ec`, and the live packaged WebRTC harness
+  passed using the exact merged Hub and locked worker binaries.
 
 ## Unverified behavior and residual risk
 
