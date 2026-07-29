@@ -204,15 +204,17 @@ Passed:
   operation check made
   `daemon_package_dtos_expose_declared_surfaces_and_validate_surface_operations`
   fail. Both boundaries were restored and re-passed.
-- Fresh target `/private/tmp/botster-hub-surface-fresh-target` built exact Hub
-  commit `ebe5db811590a9c49935a3cea2357a378f28c722` and lock-pinned Core
+- A fresh temporary target built exact reviewed Hub HEAD
+  `5c766b4748c47a2bd98291472960b70d626c928c` and lock-pinned Core
   `e36435f2cb583c344d6f6ba2d62c39da324c7a64`.
-  `daemon_plugin_contract_matrix_fixture_exercises_public_package_contracts`
-  and the strict operation test both passed through those binaries.
+  `daemon_project_pipelines_example_exercises_published_surface_conformance`
+  and
+  `daemon_package_dtos_expose_declared_surfaces_and_validate_surface_operations`
+  both passed through those freshly built binaries.
   Hub SHA-256:
-  `a7a6a4ee15f78cf523506aa5da4175a3d53f06e4dc120584e2036bd08cf906cd`;
+  `c807669961cc84d1cd0f9df5da5c2e4daa370cf15f31f378d877c342183905eb`;
   worker SHA-256:
-  `baeded4263030e54406d0e0fc8eb9f441d68c55f274906e1c4e848820b7d4f1c`.
+  `bbcf64e49e555d411eeeb27a773254c4dea899a8ba3b8a73760db1c3acea2253`.
 
 ## Unverified behavior and residual risk
 
