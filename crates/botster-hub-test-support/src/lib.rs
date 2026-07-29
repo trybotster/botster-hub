@@ -769,7 +769,6 @@ pub fn session_plugin_binding_conformance_scenario() -> SessionPluginBindingConf
                 id: TRANSITION.to_string(),
                 patch: serde_json::json!({
                     "registry_state": "stale",
-                    "lifecycle": null,
                     "lifecycle_class": "indeterminate",
                     "updated_at": 3
                 }),
@@ -5964,11 +5963,15 @@ mod tests {
     fn session_plugin_binding_reference_materializer_distinguishes_present_and_absent_rows() {
         let scenario = session_plugin_binding_conformance_scenario();
         let mut frames = vec![scenario.initial_snapshot.clone()];
-        assert_eq!(
-            materialize_session_plugin_bindings(&scenario.surface, &frames)
-                .expect("materialize initial snapshot"),
-            scenario.expected.initial
-        );
+        let initial = materialize_session_plugin_bindings(&scenario.surface, &frames)
+            .expect("materialize initial snapshot");
+        assert_eq!(initial, scenario.expected.initial);
+        for lifecycle_class in ["current", "ended", "indeterminate", "unavailable"] {
+            assert!(
+                initial.values().any(|value| value == lifecycle_class),
+                "materialized initial state must contain {lifecycle_class}"
+            );
+        }
 
         frames.push(scenario.transition_frames[0].clone());
         assert_eq!(
@@ -5996,14 +5999,38 @@ mod tests {
             .expect("materialize authoritative reconnect snapshot"),
             scenario.expected.after_reconnect
         );
-        assert!(
-            scenario
-                .expected
-                .initial
-                .values()
-                .any(|value| value == "current"),
-            "a matching current row must not false-pass through empty_template"
+        let DaemonEntityFrame::Patch { patch, .. } = &scenario.transition_frames[1] else {
+            panic!("indeterminate transition must be a patch");
+        };
+        assert_eq!(
+            patch
+                .as_object()
+                .map(|patch| patch.keys().cloned().collect::<Vec<_>>()),
+            Some(vec![
+                "lifecycle_class".to_string(),
+                "registry_state".to_string(),
+                "updated_at".to_string()
+            ]),
+            "fixture must preserve the producer's omitted optional lifecycle field"
         );
+        let DaemonEntityFrame::Snapshot { items, .. } = &scenario.initial_snapshot else {
+            panic!("initial frame must be a snapshot");
+        };
+        let mut transition_row = serde_json::to_value(
+            items
+                .iter()
+                .find(|item| item.session_uuid == "session-transition")
+                .expect("transition row in initial snapshot"),
+        )
+        .expect("serialize transition row");
+        for frame in &scenario.transition_frames[..2] {
+            let DaemonEntityFrame::Patch { patch, .. } = frame else {
+                panic!("first two transition frames must be patches");
+            };
+            merge_patch(&mut transition_row, patch);
+        }
+        assert_eq!(transition_row["lifecycle"], "exited");
+        assert_eq!(transition_row["lifecycle_class"], "indeterminate");
 
         let malformed_patch = DaemonEntityFrame::Patch {
             subscription_id: "session-plugin-binding-generation-1".to_string(),

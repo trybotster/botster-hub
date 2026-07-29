@@ -17,8 +17,8 @@ or TUI renderer already supports the grammar.
 
 - Target repository: `trybotster/botster-hub`
 - Target ID: `tgt_7e208a0c76a44980a83b63af976b1f22`
-- Run worktree:
-  `/Users/jasonconigliari/botster-sessions/trybotster-botster-hub-project-pipelines-ticket_1785295607_887142`
+- Run worktree: the assigned pipeline worktree for
+  `ticket_1785295607_887142` at base `35e92f4`
 - Repository charter: `[[botster-hub-playbook]]`
 - Role playbooks: `[[implementer-playbook]]` and
   `[[botster-implementer-playbook]]`
@@ -57,7 +57,8 @@ target ID.
 - `src/daemon_transport.rs` derives and publishes the total lifecycle class,
   including explicit patches and complete stale-first tests.
 - `src/runtime.rs` enforces Hub-owned plugin-surface binding-family admission
-  after generic `UiNode` validation.
+  after generic `UiNode` validation for both initial renders and accepted
+  action replacement trees.
 - `src/local_webrtc.rs` boxes the now-larger entity-frame enum variant to keep
   the strict clippy size boundary green.
 - `crates/botster-hub-client/src/lib.rs`,
@@ -114,6 +115,10 @@ threshold; it does not alter the transport contract.
 - Real `contract.sessions` plugin-worker runtime proof: passed.
 - Live entity subscription natural-exit, stale-row, and reconnect proofs:
   passed.
+- A real worker-backed held-open entity subscription emitted the exact
+  running-to-stale patch:
+  `registry_state`, `lifecycle_class`, and `updated_at`, with the omitted
+  optional `lifecycle` field retaining its prior concrete client value.
 - Rust lifecycle binding reference materializer, including the matching-row
   negative control and malformed-present-row rejection: passed.
 - `npm test --prefix packages/hub-test-support`: passed.
@@ -144,9 +149,9 @@ The last published coordinate is `@trybotster/hub-test-support@0.1.14`.
 Version `0.1.15` was confirmed unused before packing and remained absent after
 the publication attempt. The prepared tarball has:
 
-- shasum: `f4bb216798573b3eeabfb71c16023e310ce42e54`
+- shasum: `f252eee3e50dd6b32e24c68fb6ceca3649852c54`
 - integrity:
-  `sha512-oyhZ4GbrRjSWsGOO5pQSbCVQ2AFbIp1/RWInXzQ/+Cw5mRIwBID2iygHrtuZVAmKGSFF6C82XyL3GfkwKBcl1Q==`
+  `sha512-lIlVJ5E3hEVtk5VyqtroI2TBnLMfInkMWQbfyfCEA52V9xUa/zG29php0ONLiaU4JR5GkkBsEAVf0G3xgGXSbQ==`
 
 `npm publish --access public` reached the registry but was rejected because an
 authenticator OTP is required. An authorized operator can publish the committed
@@ -164,7 +169,16 @@ tickets above.
 
 ## Vault Guidance
 
-No missing vault guidance blocked or changed the implementation. No new durable
-vault note was captured: the contract decisions already live in the approved
-plan and repository protocol documentation, while shipped-client behavior is
-not yet established until the downstream Web and TUI tickets land.
+Review exposed three existing targeted notes that were missing from the initial
+Implement context:
+
+- `[[pipeline artifacts should use path neutral worktree references]]`
+- `[[botster review and verify must scan all committed artifacts for pii]]`
+- `[[shared conformance fixtures that contradict the core contract teach
+  clients the wrong state machine]]`
+
+The report now uses path-neutral ticket/base-SHA wording, the raw full branch
+diff and PR body pass an absolute-home-path scan with a known-positive control,
+and the shared stale-transition frame is byte-shape faithful to the production
+producer. No new vault note was captured because the applicable durable
+guidance already exists.

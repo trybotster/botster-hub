@@ -28,7 +28,7 @@
   "session_plugin_binding_conformance_fixture": {
     "artifact_path": "session-plugin-binding-conformance-fixture.json",
     "source_artifact_path": "botster_hub_test_support::session_plugin_binding_conformance_fixture_json()",
-    "sha256": "7a7ca9938e603957dcbe8a2bbcbc60dffb610b225c3b122e3a41811dfa42eb9f"
+    "sha256": "efd90d52d74347751b96239be260cf4a997207956027118e5f95f70734bd6c6e"
   },
   "late_attach_history_conformance_fixture": {
     "artifact_path": "late-attach-history-conformance-fixture.json",
