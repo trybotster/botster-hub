@@ -1,7 +1,7 @@
 {
   "protocol": "botster-hub-daemon-v1",
   "protocol_version": 4,
-  "conformance_fixture_revision": 22,
+  "conformance_fixture_revision": 23,
   "required_features": [
     "sessions",
     "terminal_streaming",
@@ -70,7 +70,18 @@
     "fixture_path": "botster_hub_test_support::session_lifecycle_subscription_conformance_scenario",
     "json_helper": "botster_hub_test_support::session_lifecycle_subscription_conformance_fixture_json",
     "runtime_runner": "botster_hub_test_support::run_session_lifecycle_subscription_conformance",
-    "runtime_regression": "session_entity_subscription_pushes_snapshot_ordered_deltas_and_fresh_reconnect"
+    "runtime_regression": "session_entity_subscription_pushes_snapshot_ordered_deltas_and_fresh_reconnect",
+    "binding_family": "/session",
+    "lifecycle_class_field": "lifecycle_class",
+    "lifecycle_classes": [
+      "current",
+      "ended",
+      "indeterminate"
+    ],
+    "missing_row_state": "unavailable",
+    "plugin_surface_id": "contract.sessions",
+    "plugin_binding_fixture_path": "botster_hub_test_support::session_plugin_binding_conformance_scenario",
+    "reference_materializer": "botster_hub_test_support::materialize_session_plugin_bindings"
   },
   "resize": {
     "supported": true,
@@ -131,7 +142,7 @@
   },
   "known_limitations": [
     "The matrix is a test/docs contract, not a daemon runtime endpoint.",
-    "Full plugin entity-frame hydration is intentionally outside this conformance fixture.",
+    "Shipped Web/TUI binding resolution is owned by downstream client tickets; this Hub fixture is a producer/reference contract.",
     "Clients own renderer-specific presentation policy for diagnostics."
   ]
 }

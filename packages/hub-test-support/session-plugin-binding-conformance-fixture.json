@@ -1,0 +1,291 @@
+{
+  "binding_family": "/session",
+  "conformance_fixture_revision": 23,
+  "entity_type": "session",
+  "expected": {
+    "after_ended_patch": {
+      "session-ended": "ended",
+      "session-indeterminate": "indeterminate",
+      "session-missing": "unavailable",
+      "session-stable-current": "current",
+      "session-transition": "ended"
+    },
+    "after_indeterminate_patch": {
+      "session-ended": "ended",
+      "session-indeterminate": "indeterminate",
+      "session-missing": "unavailable",
+      "session-stable-current": "current",
+      "session-transition": "indeterminate"
+    },
+    "after_reconnect": {
+      "session-ended": "ended",
+      "session-indeterminate": "indeterminate",
+      "session-missing": "unavailable",
+      "session-stable-current": "current",
+      "session-transition": "unavailable"
+    },
+    "after_remove": {
+      "session-ended": "ended",
+      "session-indeterminate": "indeterminate",
+      "session-missing": "unavailable",
+      "session-stable-current": "current",
+      "session-transition": "unavailable"
+    },
+    "initial": {
+      "session-ended": "ended",
+      "session-indeterminate": "indeterminate",
+      "session-missing": "unavailable",
+      "session-stable-current": "current",
+      "session-transition": "current"
+    }
+  },
+  "initial_snapshot": {
+    "entity_type": "session",
+    "items": [
+      {
+        "cols": 80,
+        "lifecycle": "running",
+        "lifecycle_class": "current",
+        "registry_state": "running",
+        "rows": 24,
+        "session_uuid": "session-transition",
+        "updated_at": 1
+      },
+      {
+        "cols": 80,
+        "lifecycle": "running",
+        "lifecycle_class": "current",
+        "registry_state": "running",
+        "rows": 24,
+        "session_uuid": "session-stable-current",
+        "updated_at": 1
+      },
+      {
+        "cols": 80,
+        "exit_code": 0,
+        "lifecycle": "exited",
+        "lifecycle_class": "ended",
+        "registry_state": "exited",
+        "rows": 24,
+        "session_uuid": "session-ended",
+        "updated_at": 1
+      },
+      {
+        "cols": 80,
+        "lifecycle": "running",
+        "lifecycle_class": "indeterminate",
+        "registry_state": "stale",
+        "rows": 24,
+        "session_uuid": "session-indeterminate",
+        "updated_at": 1
+      }
+    ],
+    "snapshot_seq": 1,
+    "subscription_id": "session-plugin-binding-generation-1",
+    "type": "entity_snapshot"
+  },
+  "lifecycle_class_field": "lifecycle_class",
+  "reconnect_snapshot": {
+    "entity_type": "session",
+    "items": [
+      {
+        "cols": 80,
+        "lifecycle": "running",
+        "lifecycle_class": "current",
+        "registry_state": "running",
+        "rows": 24,
+        "session_uuid": "session-stable-current",
+        "updated_at": 4
+      },
+      {
+        "cols": 80,
+        "exit_code": 0,
+        "lifecycle": "exited",
+        "lifecycle_class": "ended",
+        "registry_state": "exited",
+        "rows": 24,
+        "session_uuid": "session-ended",
+        "updated_at": 4
+      },
+      {
+        "cols": 80,
+        "lifecycle_class": "indeterminate",
+        "registry_state": "stale",
+        "rows": 24,
+        "session_uuid": "session-indeterminate",
+        "updated_at": 4
+      }
+    ],
+    "snapshot_seq": 4,
+    "subscription_id": "session-plugin-binding-generation-2",
+    "type": "entity_snapshot"
+  },
+  "references": [
+    "session-transition",
+    "session-stable-current",
+    "session-ended",
+    "session-indeterminate",
+    "session-missing"
+  ],
+  "surface": {
+    "children": [
+      {
+        "$kind": "bind_list",
+        "empty_template": {
+          "id": "contract-session-1-unavailable",
+          "props": {
+            "text": "Session unavailable"
+          },
+          "type": "text"
+        },
+        "item_template": {
+          "id": "contract-session-1-lifecycle",
+          "props": {
+            "text": {
+              "$bind": "@/lifecycle_class"
+            }
+          },
+          "type": "text"
+        },
+        "source": "/session",
+        "where": {
+          "session_uuid": "session-transition"
+        }
+      },
+      {
+        "$kind": "bind_list",
+        "empty_template": {
+          "id": "contract-session-2-unavailable",
+          "props": {
+            "text": "Session unavailable"
+          },
+          "type": "text"
+        },
+        "item_template": {
+          "id": "contract-session-2-lifecycle",
+          "props": {
+            "text": {
+              "$bind": "@/lifecycle_class"
+            }
+          },
+          "type": "text"
+        },
+        "source": "/session",
+        "where": {
+          "session_uuid": "session-stable-current"
+        }
+      },
+      {
+        "$kind": "bind_list",
+        "empty_template": {
+          "id": "contract-session-3-unavailable",
+          "props": {
+            "text": "Session unavailable"
+          },
+          "type": "text"
+        },
+        "item_template": {
+          "id": "contract-session-3-lifecycle",
+          "props": {
+            "text": {
+              "$bind": "@/lifecycle_class"
+            }
+          },
+          "type": "text"
+        },
+        "source": "/session",
+        "where": {
+          "session_uuid": "session-ended"
+        }
+      },
+      {
+        "$kind": "bind_list",
+        "empty_template": {
+          "id": "contract-session-4-unavailable",
+          "props": {
+            "text": "Session unavailable"
+          },
+          "type": "text"
+        },
+        "item_template": {
+          "id": "contract-session-4-lifecycle",
+          "props": {
+            "text": {
+              "$bind": "@/lifecycle_class"
+            }
+          },
+          "type": "text"
+        },
+        "source": "/session",
+        "where": {
+          "session_uuid": "session-indeterminate"
+        }
+      },
+      {
+        "$kind": "bind_list",
+        "empty_template": {
+          "id": "contract-session-5-unavailable",
+          "props": {
+            "text": "Session unavailable"
+          },
+          "type": "text"
+        },
+        "item_template": {
+          "id": "contract-session-5-lifecycle",
+          "props": {
+            "text": {
+              "$bind": "@/lifecycle_class"
+            }
+          },
+          "type": "text"
+        },
+        "source": "/session",
+        "where": {
+          "session_uuid": "session-missing"
+        }
+      }
+    ],
+    "id": "contract-session-lifecycle-panel",
+    "props": {
+      "title": "Session lifecycle projection"
+    },
+    "type": "panel"
+  },
+  "transition_frames": [
+    {
+      "entity_type": "session",
+      "id": "session-transition",
+      "patch": {
+        "exit_code": 0,
+        "lifecycle": "exited",
+        "lifecycle_class": "ended",
+        "registry_state": "exited",
+        "updated_at": 2
+      },
+      "snapshot_seq": 2,
+      "subscription_id": "session-plugin-binding-generation-1",
+      "type": "entity_patch"
+    },
+    {
+      "entity_type": "session",
+      "id": "session-transition",
+      "patch": {
+        "lifecycle": null,
+        "lifecycle_class": "indeterminate",
+        "registry_state": "stale",
+        "updated_at": 3
+      },
+      "snapshot_seq": 3,
+      "subscription_id": "session-plugin-binding-generation-1",
+      "type": "entity_patch"
+    },
+    {
+      "entity_type": "session",
+      "id": "session-transition",
+      "snapshot_seq": 4,
+      "subscription_id": "session-plugin-binding-generation-1",
+      "type": "entity_remove"
+    }
+  ],
+  "unavailable_state": "unavailable"
+}

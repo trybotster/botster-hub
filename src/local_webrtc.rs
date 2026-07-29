@@ -277,7 +277,7 @@ struct LocalWebrtcPeerState {
 
 enum PendingLocalWebrtcRequest {
     Request(Box<DaemonRequest>),
-    EntityFrame(DaemonEntityFrame),
+    EntityFrame(Box<DaemonEntityFrame>),
     QueueOverflow(usize),
 }
 
@@ -776,7 +776,7 @@ where
                     if !peer_state.owns_entity_subscription(entity_frame_subscription_id(&frame)) {
                         continue;
                     }
-                    PendingLocalWebrtcRequest::EntityFrame(frame)
+                    PendingLocalWebrtcRequest::EntityFrame(Box::new(frame))
                 }
                 LocalWebrtcInbound::Channel(Err(cause)) => {
                     terminal_cause = cause;

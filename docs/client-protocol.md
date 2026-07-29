@@ -39,18 +39,20 @@ Node-based first-party clients can consume the same checked artifact without a
 sibling hub checkout through the public package:
 
 ```sh
-npm install --save-dev @trybotster/ui-contract@0.1.0 @trybotster/hub-test-support@0.1.13
+npm install --save-dev @trybotster/ui-contract@0.1.0 @trybotster/hub-test-support@0.1.15
 ```
 
 ```js
 import {
   materializeApplicationPrimitivesFixture,
   materializePluginContractMatrixFixture,
+  materializeSessionPluginBindingScenario,
   metadata,
   readDaemonProtocolTypescript,
   readFirstPartyClientSupportMatrix,
   readLateAttachHistoryConformanceFixture,
   readSessionLifecycleSubscriptionConformanceFixture,
+  readSessionPluginBindingConformanceFixture,
 } from "@trybotster/hub-test-support";
 
 const protocolSource = readDaemonProtocolTypescript();
@@ -60,6 +62,9 @@ const applicationSurfaceId = metadata.application_primitives.surface_id;
 const supportMatrix = readFirstPartyClientSupportMatrix();
 const lateAttachFixture = readLateAttachHistoryConformanceFixture();
 const sessionLifecycleFixture = readSessionLifecycleSubscriptionConformanceFixture();
+const sessionBindingStages = materializeSessionPluginBindingScenario(
+  readSessionPluginBindingConformanceFixture(),
+);
 
 console.log(
   metadata.protocol,
@@ -70,6 +75,7 @@ console.log(
   supportMatrix.required_features,
   lateAttachFixture.history_then_live,
   sessionLifecycleFixture.normalized_frames,
+  sessionBindingStages,
 );
 ```
 
@@ -78,9 +84,9 @@ when checked assets are stale. The metadata's protocol version and conformance
 fixture revision are emitted by the Rust `botster-hub-test-support` asset
 generator instead of being maintained independently in JavaScript.
 
-For version 0.1.13 from the public npm registry, npm-based client
+For version 0.1.15 from the public npm registry, npm-based client
 repos such as botster-web should use the exact dependency spec
-`"@trybotster/hub-test-support": "0.1.13"` in `devDependencies` and let npm write
+`"@trybotster/hub-test-support": "0.1.15"` in `devDependencies` and let npm write
 the corresponding package-lock entry from the public npm registry. The package
 is public, so registry install does not require a scoped `.npmrc` entry or CI
 auth token. After updating the lockfile, run the client smoke that imports the
@@ -217,8 +223,8 @@ ordered remove delta. `ListSessions` remains available for operator queries,
 but normal client reconciliation must not poll it or maintain a list-refresh
 fallback beside the entity stream.
 
-The shared revision-16 contract is published by
-`@trybotster/hub-test-support@0.1.13` as
+The current contract is published by
+`@trybotster/hub-test-support@0.1.15` as
 `session-lifecycle-subscription-conformance-fixture.json` and through
 `readSessionLifecycleSubscriptionConformanceFixture()`. The fixture serializes
 the public `DaemonEntityFrame` DTOs and normalizes only timestamps and sequence
@@ -229,6 +235,26 @@ independent concurrent delivery, socket-loss cleanup, and a fresh reconnect
 snapshot through the real HubDaemon/CoreDaemon/session-worker topology. Web and
 TUI consumers must use these same semantics and must not add polling or
 list-refresh fallbacks.
+
+The built-in renderer-neutral binding family is `/session`; Hub rejects every
+other absolute family after generic `UiNode` validation. Its row id and
+`session_uuid` are the canonical session UUID. Every present
+`DaemonSessionEntity` has required `lifecycle_class` with this total mapping:
+
+- `registry_state == "stale"` => `indeterminate`, regardless of lifecycle;
+- otherwise `starting | running | stopping` => `current`;
+- otherwise `exited | failed` => `ended`;
+- otherwise an omitted lifecycle => `indeterminate`.
+
+Absence from an authoritative snapshot is the only unknown/unavailable state.
+Shutdown does not remove the row. Only explicit retention removal emits
+`entity_remove`. `session-plugin-binding-conformance-fixture.json` combines the
+real fixture surface shape with public `DaemonEntityFrame` values and exercises
+current, ended, indeterminate, missing, patch, remove, and reconnect semantics.
+Rust uses `materialize_session_plugin_bindings`; Node uses
+`materializeSessionPluginBindingScenario`. These are Hub-owned reference
+materializers, not proof that the shipped Web or TUI renderer already resolves
+bindings.
 
 ## Spawn Targets
 
@@ -869,7 +895,7 @@ assert the same event ordering and classification. `AttachState` and
 
 Node clients can consume that exact JSON through
 `readLateAttachHistoryConformanceFixture()` from
-`@trybotster/hub-test-support@0.1.13`. Version 0.1.6 / conformance revision 13
+`@trybotster/hub-test-support@0.1.15`. Version 0.1.6 / conformance revision 13
 uses JSON number arrays for opaque history and is superseded because that shape
 unnecessarily expands large Ghostty snapshots on the bounded WebRTC response
 path. Version 0.1.5 / revision 12 still exposes lossy string history. Neither is
@@ -1027,6 +1053,13 @@ shapes, and action semantics are unchanged. Because
 `minimum_conformance_fixture_revision` from this constant, clients built at
 revision 22 require a Hub reporting conformance revision 22 or later.
 
+Adding required `DaemonSessionEntity.lifecycle_class`, the Hub-only `/session`
+binding-family admission pass, and the real `contract.sessions` worker surface
+advances `CONFORMANCE_FIXTURE_REVISION` to 23. `PROTOCOL_VERSION` remains 4:
+daemon framing and request issuance are unchanged. No feature is added because
+`session_entity_subscriptions` already names the delivered capability and the
+current helper would otherwise make a new feature globally required.
+
 This cold switch advances `PROTOCOL_VERSION` to 4 and
 `CONFORMANCE_FIXTURE_REVISION` to 19. It removes `UiTreeUpdateRef` and
 `tree_update`, requires explicit form `submit_label`, supports scoped
@@ -1103,7 +1136,7 @@ Node client tests should use the declared npm dependency instead of a relative
 hub checkout:
 
 ```sh
-npm install --save-dev @trybotster/ui-contract@0.1.0 @trybotster/hub-test-support@0.1.13
+npm install --save-dev @trybotster/ui-contract@0.1.0 @trybotster/hub-test-support@0.1.15
 ```
 
 ```js
@@ -1118,7 +1151,7 @@ const fixturePath = materializePluginContractMatrixFixture(tempDirectory);
 
 Local environment variables may still point legacy drift checks at a checked-out
 hub artifact, but the normal web-client dependency coordinate is
-`@trybotster/hub-test-support@0.1.13` from the public npm registry.
+`@trybotster/hub-test-support@0.1.15` from the public npm registry.
 
 Each harness instance creates a disposable data directory and socket path under
 the configured test root, uses synthetic default hub identity, and attempts a
@@ -1248,9 +1281,8 @@ report asserts the typed connection and data-directory injections were present
 and absolute, and that the child exited with code 0 after completing the real
 daemon request from its package working directory.
 
-The matrix currently marks JSON plugin surface render/action dispatch as
-supported through the contract-matrix fixture and full plugin entity-frame
-hydration as intentionally unsupported by this conformance fixture. Clients
-that render plugin entity stores should prove that path with their own
-entity-frame tests until the hub publishes a dedicated entity conformance
-fixture.
+The matrix marks JSON plugin surface render/action dispatch and the Hub-owned
+`/session` producer/reference binding contract as supported. It explicitly
+does not claim shipped Web/TUI rendering: browser ticket
+`ticket_1785298229_125024` and terminal ticket
+`ticket_1785298229_854008` own those production entity-store/binding paths.

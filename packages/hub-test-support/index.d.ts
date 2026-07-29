@@ -30,6 +30,11 @@ export interface HubTestSupportMetadata {
     source_artifact_path: string;
     sha256: string;
   };
+  session_plugin_binding_conformance_fixture: {
+    artifact_path: "session-plugin-binding-conformance-fixture.json";
+    source_artifact_path: string;
+    sha256: string;
+  };
   late_attach_history_conformance_fixture: {
     artifact_path: "late-attach-history-conformance-fixture.json";
     source_artifact_path: string;
@@ -70,6 +75,15 @@ export function firstPartyClientSupportMatrixPath(): string;
 export function readFirstPartyClientSupportMatrix(): Record<string, unknown>;
 export function sessionLifecycleSubscriptionConformanceFixturePath(): string;
 export function readSessionLifecycleSubscriptionConformanceFixture(): Record<string, unknown>;
+export function sessionPluginBindingConformanceFixturePath(): string;
+export function readSessionPluginBindingConformanceFixture(): Record<string, unknown>;
+export function materializeSessionPluginBindings(
+  surface: Record<string, unknown>,
+  frames: Array<Record<string, unknown>>,
+): Record<string, string>;
+export function materializeSessionPluginBindingScenario(
+  scenario: Record<string, unknown>,
+): Record<string, Record<string, string>>;
 export function lateAttachHistoryConformanceFixturePath(): string;
 export function readLateAttachHistoryConformanceFixture(): Record<string, unknown>;
 export function localWebrtcDeliveryChunkConformanceFixturePath(): string;

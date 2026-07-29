@@ -25,6 +25,8 @@ let report = botster_hub_test_support::run_plugin_contract_matrix_conformance(
 )
 .expect("plugin UI conformance");
 assert_eq!(report.app_surface_node_id, "contract-app-panel");
+assert_eq!(report.session_surface_binding_family, "/session");
+assert!(report.session_surface_matches_fixture);
 assert!(report.dialog_visible_after_open);
 assert_eq!(report.dialog_form_node_id, "contract-app-form");
 assert!(!report.actionable_sibling_form_during_dialog);
@@ -43,12 +45,17 @@ sibling hub checkout:
 
 ```js
 import {
+  materializeSessionPluginBindingScenario,
   materializePluginContractMatrixFixture,
+  readSessionPluginBindingConformanceFixture,
   readDaemonProtocolTypescript,
 } from "@trybotster/hub-test-support";
 
 const protocolSource = readDaemonProtocolTypescript();
 const fixturePath = materializePluginContractMatrixFixture(tempDirectory);
+const sessionProjection = materializeSessionPluginBindingScenario(
+  readSessionPluginBindingConformanceFixture(),
+);
 ```
 
 In this repository, the full isolated-hub proof is:
@@ -65,6 +72,11 @@ paths.
 
 - `contract.app`: app surface returning a concrete UiNode payload through `plugin_surface_render`; it exercises the hub-validated application primitives `panel`, `toolbar`, `metric_grid`, `metric`, `table`, `empty_state`, `status_badge`, `section`, `text`, `form`, `text_input`, `button`, and `dialog`. The one canonical Form and its input/submit controls live inside the presence-bound Dialog rather than behind it as a panel sibling. A browser-shaped consumer reads Open from the initially visible tree, applies its accepted scoped `set` operations, and restricts submit discovery to the active Dialog subtree. Invalid submission rejects while retaining that reachable Dialog/Form and field association; valid submission returns normalized values plus a whole-surface replacement and clears the dialog presence key. A distinct rendered action toggles `contract-toggle`.
 - `contract.empty`: placeholder app surface returning a valid empty-state UiNode payload.
+- `contract.sessions`: accepts at most 16 referenced session UUIDs and returns
+  one exact-filter `bind_list` per reference against the Hub-owned `/session`
+  family. Matching rows bind `@/lifecycle_class`; absent rows select
+  `empty_template`. The worker authors only paths and templates—it does not
+  receive session rows or arbitrary Hub state.
 - `contract.blocked`: render handler that fails deliberately so clients can assert the daemon `operator_error` response and continued daemon responsiveness.
 - `contract.invalid_body`: declared render surface whose handler returns malformed UiNode data so clients can assert `invalid_surface` and a structured `plugin_surface_render` diagnostic from hub validation.
 - `contract.settings`: settings surface returning sanitized effective configuration from `botster.capabilities.config.get()`.
