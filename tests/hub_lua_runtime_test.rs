@@ -1363,6 +1363,22 @@ fn exercise_cross_package_managed_spawn(
     (inspected, result)
 }
 
+fn assert_cross_package_template_is_listed(
+    inspected: &serde_json::Value,
+    template_id: &str,
+    package_name: &str,
+) {
+    let listed = inspected["list"]
+        .as_array()
+        .expect("cross-package template list");
+    assert!(
+        listed.iter().any(|template| {
+            template["template_id"] == template_id && template["package_name"] == package_name
+        }),
+        "{template_id} from {package_name} must be visible to the caller; list: {listed:?}"
+    );
+}
+
 #[test]
 fn real_lua_plugin_cross_package_managed_template_spawning() {
     let contributor_root = PathBuf::from("target")
@@ -1384,8 +1400,14 @@ fn real_lua_plugin_cross_package_managed_template_spawning() {
         true,
         Some("cross-package\n"),
     );
+    let inspected = inspected.expect("cross-package inspection");
+    assert_cross_package_template_is_listed(
+        &inspected,
+        "managed-session-template.plugin/init",
+        "managed-session-template.plugin",
+    );
     assert_eq!(
-        inspected.expect("cross-package inspection")["shown"]["package_name"],
+        inspected["shown"]["package_name"],
         "managed-session-template.plugin"
     );
     assert_eq!(result["ok"], true, "cross-package result: {result}");
@@ -1407,10 +1429,13 @@ fn real_lua_plugin_cross_package_managed_template_spawning() {
         true,
         None,
     );
-    assert_eq!(
-        inspected.expect("Project Pipelines inspection")["shown"]["package_name"],
-        "project-pipelines"
+    let inspected = inspected.expect("Project Pipelines inspection");
+    assert_cross_package_template_is_listed(
+        &inspected,
+        "project-pipelines/agent-step",
+        "project-pipelines",
     );
+    assert_eq!(inspected["shown"]["package_name"], "project-pipelines");
     assert_eq!(result["ok"], true, "Project Pipelines result: {result}");
     assert_eq!(
         result["result"]["session_id"].as_str().map(str::len),

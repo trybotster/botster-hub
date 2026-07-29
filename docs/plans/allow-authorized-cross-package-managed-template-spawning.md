@@ -111,9 +111,11 @@ Implementation reproduced the downstream Workspaces failure on the exact
 reported Hub commit `35e92f46a98c445765b6ba7755e029f5dde702f8`,
 locked Core commit `e36435f2cb583c344d6f6ba2d62c39da324c7a64`,
 package records, target, template, and public plugin-worker call. Retaining the
-discarded Core error identified the concrete cause:
-
-`runtime.spawn_failed.worker_control_parent_permissions`
+discarded raw Core error identified the concrete cause: the worker control
+socket parent was not owned by the effective user with private permissions.
+The durable Hub diagnostic deliberately records only the typed, path-neutral
+Core kind `runtime.spawn_failed`; Hub does not couple itself to Core's
+free-text diagnostic.
 
 The Core session worker rejected a pre-existing hashed control-socket parent
 whose permissions were not private. This happened after managed-worktree
@@ -142,6 +144,14 @@ portions of Scope 2-7 for this Hub implementation:
   those boundaries;
 - route any repair or cold migration for stale Core worker-socket directories
   to a separately targeted `botster-core` ticket.
+
+The matched Workspaces registry enabled the Project Pipelines contributor
+before loading the Workspaces caller worker. The caller's production
+`list`/`show`/atomic calls all saw that contributor, so this run takes the
+plan's passing selection-path branch and leaves registry projection unchanged.
+Late enablement after a caller worker is already loaded remains a distinct
+snapshot question; it is not the ordering used by the reported production
+path and requires a separate Hub ticket if product behavior should support it.
 
 ## Scope
 
@@ -412,91 +422,60 @@ contract change.
 
 ## Acceptance checks and tests
 
-### Focused Hub real-worker matrix
+The Implement disposition above is authoritative over the earlier speculative
+Scope 2-7 matrix. This branch must deliver:
 
-- First reproduce both ticket-reported failures without changing behavior and
-  record the inner Core error class at the existing dispatch boundary.
-- Package A is enabled with exactly
-  `session_template_managed_git_spawn`; package B is enabled and contributes
-  the selected template; A has no matching template and B has no managed-spawn
-  capability.
-- Through package A's real MCP handler and production
-  `capabilities_table`, call package B's fully qualified target-effective
-  template for:
-  - an already managed/reusable worktree;
-  - an existing local branch that needs a managed worktree;
-  - a missing branch created from the stored base ref.
-- Each success returns a distinct canonical 36-character UUID, preserves
-  caller A as session owner, executes B's command from B's source root (or the
-  selected managed branch for a repo-source template), and reports correct
-  created/reused facts.
-- The two exact formerly failing scenarios—ephemeral explicit-target package B
-  and shipped `project-pipelines/agent-step`—must return canonical UUIDs after
-  the fix. A synthetic success fixture is not a substitute.
-- Install Hub's shipped `examples/project-pipelines` package as template B,
-  register a Git spawn target with literal id `package:project-pipelines`
-  pointing at the test repository, and invoke
-  `project-pipelines/agent-step` from authorized package A. Record this as an
-  explicit target-semantics decision; do not broaden package templates to
-  arbitrary targets.
-- Load A before enabling B. Assert whether A can enumerate B's eligible
-  template through `session_templates.list`, resolve it through
-  `session_templates.show`, and invoke it. If these fail from stale package
-  rows, the fix and regression coverage must include all three production
-  operations; otherwise record the passing evidence and avoid registry
-  refactoring.
-- Disable B or make its template unavailable and prove A cannot invoke it.
-  Disable/revoke A or give only `session_template_spawn` and prove denial even
-  when B remains enabled.
-- Give B a template for another target and prove typed incompatibility before
-  spawn.
-- Use an unknown/ambiguous template, unsafe/missing command, and unavailable
-  source to prove typed resolution errors.
-- Use a present, admitted executable that deterministically fails only at the
-  Core runtime boundary to prove a distinct sanitized runtime-spawn error.
-- For both resolution and runtime failures, assert that Hub diagnostics retain
-  the safe inner error class and operation correlation while the Lua result
-  excludes raw paths, stderr, and Core internals.
-- Attempt caller/package/source/cwd/session/trusted-context smuggling and prove
-  it cannot redirect authorization or paths.
-- For every post-prepare negative, assert context/session cleanup, worktree
-  record cleanup, missing call-created branch rollback, survival of
-  pre-existing branches, and survival of reused worktrees.
+- a real package-A Lua worker holding
+  `session_template_managed_git_spawn`, with no contributed template, invoking
+  enabled package B, which contributes the template but holds no spawn
+  capability;
+- `session_templates.list` and `show` assertions proving A sees B's fully
+  qualified target-effective template;
+- successful explicit-target B and shipped
+  `project-pipelines/agent-step` atomic spawns, canonical 36-character UUIDs,
+  and proof that B's command executes from the managed worktree;
+- a caller capability denial and a mismatched-target
+  `template_not_eligible` denial;
+- a path-neutral, kind-based Hub diagnostic at the production Core dispatch
+  boundary while the Lua result remains the existing sanitized
+  `spawn_failed`;
+- exact matched Workspaces reproduction and a fresh-private-socket-root control
+  using Hub `35e92f46a98c445765b6ba7755e029f5dde702f8` and locked Core
+  `e36435f2cb583c344d6f6ba2d62c39da324c7a64`;
+- strict repository gates and downstream confirmation that the returned UUID
+  persists, renders, survives reload, and works through the live packaged
+  WebRTC harness.
 
-### Restart and downstream proof
+The following pre-disposition checks are explicitly superseded rather than
+silently waived:
 
-- Run the exact `botster-hub` and lockfile-pinned
-  `botster-session-worker`, recording separate Hub SHA and Core SHA.
-- Restart over the same data directory after a successful cross-package spawn,
-  observe session/worktree reconciliation, and reuse the managed worktree with
-  a new canonical UUID.
-- Exercise a real installed caller package through the daemon/plugin-worker
-  path, not only an in-process `HubRuntime`.
-- Required Hub gate: install the shipped Project Pipelines package and a
-  minimal caller fixture that uses the same public
-  `ensure_worktree_and_spawn` shape as Workspaces into the exact built Hub.
-  Prove package-A list/show selection where applicable, package-B spawn,
-  canonical UUID handling, and failure rollback without modifying either
-  downstream repository.
-- Non-blocking corroboration: run Project Pipelines `script/test-hub-flow`
-  against the built Hub if its existing provenance configuration accepts that
-  binary, and run the Workspaces product flow only from a clean checkout if it
-  already contains the required caller capability. Record results, but do not
-  make this Hub gate depend on an unmerged pin or package change.
-- If either downstream package must change to consume the verified Hub fix,
-  create a follow-up ticket against
-  `tgt_a72ca1a83d504385b8648f71409119ab` or
-  `tgt_71266a8d976d4535902ffed09c18a7ba`; that follow-up owns its dependency and
-  proof.
+- the existing-worktree and existing-local-branch cross-package variants,
+  caller-owner/created-reused assertions, old-scope denial, smuggling, and the
+  full resolution/rollback matrix remain owned by the existing same-package
+  tests; the cross-package regression owns only the package
+  identity/eligibility/authorization boundary;
+- late contributor enablement after caller-worker load, contributor disable,
+  and expanded resolution/error-taxonomy cases require a new Hub ticket if
+  product behavior requires them; the matched Workspaces path enabled the
+  contributor before caller load and passed list/show/atomic selection;
+- a deterministic Core failure fixture and Core worker-socket cleanup or
+  migration belong to Core target
+  `tgt_1f7bce66eb304881980f9b4a2a5ae3fe`; Hub retains a safe kind and operation
+  correlation without matching Core diagnostic text;
+- restart/reconciliation is covered by the matched downstream reload and
+  persistence proof; no downstream repository changes are part of this Hub
+  branch.
 
 ### Repository gates
 
-Expected focused commands after implementation:
+Focused commands use the implemented test names and must each run a nonzero
+count:
 
 ```sh
-./test.sh real_lua_plugin_cross_package_managed_template
+./test.sh real_lua_plugin_cross_package_managed_template_spawning -- --nocapture
+./test.sh managed_session_core_error_diagnostic_is_kind_based_and_path_neutral
+./test.sh real_lua_plugin_atomically_ensures_managed_worktree_and_spawns_session
 ./test.sh managed_session_template
-./test.sh live_hub_cross_package_managed_template
 cargo check --workspace --locked
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
@@ -504,10 +483,10 @@ git diff --check
 ./test.sh
 ```
 
-Use actual test function names chosen by implementation and verify each filter
-runs a nonzero count. The full test suite remains required because package
-reload, persistence, Lua worker, managed Git, and daemon lifecycle share this
-path.
+The full test suite remains required because package reload, persistence, Lua
+worker, managed Git, and daemon lifecycle share this path. Implement and Review
+both observed one passing test for each focused filter. Review ran the complete
+wrapper green: 131 library and 102 daemon-integration tests passed.
 
 Plan-stage baseline evidence:
 

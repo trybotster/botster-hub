@@ -1970,13 +1970,6 @@ fn managed_session_core_error_class(error: &CoreDaemonError) -> &'static str {
         ))
         | CoreDaemonError::Engine(ManagedSessionRuntimeError::Runtime(runtime_error)) => {
             match runtime_error.kind {
-                SessionRuntimeErrorKind::SpawnFailed
-                    if runtime_error.message.contains(
-                        "worker control socket parent must be owned by the effective user with private permissions",
-                    ) =>
-                {
-                    "runtime.spawn_failed.worker_control_parent_permissions"
-                }
                 SessionRuntimeErrorKind::SpawnFailed => "runtime.spawn_failed",
                 SessionRuntimeErrorKind::SessionNotFound => "runtime.session_not_found",
                 SessionRuntimeErrorKind::InputFailed => "runtime.input_failed",
@@ -1985,18 +1978,24 @@ fn managed_session_core_error_class(error: &CoreDaemonError) -> &'static str {
                 SessionRuntimeErrorKind::CleanupFailed => "runtime.cleanup_failed",
             }
         }
-        CoreDaemonError::Engine(ManagedSessionRuntimeError::Multiplexer(_)) => {
-            "engine.multiplexer"
-        }
-        CoreDaemonError::Engine(ManagedSessionRuntimeError::UnsupportedSessionRequest { .. }) => {
-            "engine.unsupported_session_request"
-        }
-        CoreDaemonError::Engine(
-            ManagedSessionRuntimeError::TerminalBackendConstruction { .. },
-        ) => "engine.terminal_backend_construction",
-        CoreDaemonError::Engine(ManagedSessionRuntimeError::TerminalBackendOperation { .. }) => {
-            "engine.terminal_backend_operation"
-        }
+        CoreDaemonError::Engine(ManagedSessionRuntimeError::Multiplexer(
+            MultiplexerEngineError::SessionAlreadyExists { .. },
+        )) => "engine.multiplexer.session_already_exists",
+        CoreDaemonError::Engine(ManagedSessionRuntimeError::Multiplexer(
+            MultiplexerEngineError::UnknownSession { .. },
+        )) => "engine.multiplexer.unknown_session",
+        CoreDaemonError::Engine(ManagedSessionRuntimeError::Multiplexer(
+            MultiplexerEngineError::MetadataTooLarge,
+        )) => "engine.multiplexer.metadata_too_large",
+        CoreDaemonError::Engine(ManagedSessionRuntimeError::UnsupportedSessionRequest {
+            ..
+        }) => "engine.unsupported_session_request",
+        CoreDaemonError::Engine(ManagedSessionRuntimeError::TerminalBackendConstruction {
+            ..
+        }) => "engine.terminal_backend_construction",
+        CoreDaemonError::Engine(ManagedSessionRuntimeError::TerminalBackendOperation {
+            ..
+        }) => "engine.terminal_backend_operation",
         CoreDaemonError::Registry(_) => "registry",
         CoreDaemonError::UnknownSession(_) => "unknown_session",
         CoreDaemonError::SessionNotReadable(_) => "session_not_readable",
@@ -2292,18 +2291,18 @@ mod tests {
     use std::process::Command;
 
     #[test]
-    fn managed_session_core_error_diagnostic_is_typed_and_path_neutral() {
-        let permissions = CoreDaemonError::Engine(ManagedSessionRuntimeError::Multiplexer(
+    fn managed_session_core_error_diagnostic_is_kind_based_and_path_neutral() {
+        let spawn_failed = CoreDaemonError::Engine(ManagedSessionRuntimeError::Multiplexer(
             MultiplexerEngineError::Runtime(botster_core::SessionRuntimeError::new(
                 SessionRuntimeErrorKind::SpawnFailed,
                 "connect worker control socket failed: /private/raw/path: worker control socket parent must be owned by the effective user with private permissions",
             )),
         ));
         assert_eq!(
-            managed_session_core_error_class(&permissions),
-            "runtime.spawn_failed.worker_control_parent_permissions"
+            managed_session_core_error_class(&spawn_failed),
+            "runtime.spawn_failed"
         );
-        assert!(!managed_session_core_error_class(&permissions).contains('/'));
+        assert!(!managed_session_core_error_class(&spawn_failed).contains('/'));
 
         let generic = CoreDaemonError::Engine(ManagedSessionRuntimeError::Multiplexer(
             MultiplexerEngineError::Runtime(botster_core::SessionRuntimeError::new(
