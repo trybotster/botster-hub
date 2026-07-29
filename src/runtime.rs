@@ -10,9 +10,9 @@ use botster_core::{
     CoreSessionMetadata, EnvelopeId, EnvelopeTarget, ManagedSessionRuntimeError,
     PluginCapabilityRuntime, PluginCleanupResult, PluginHandlerKind, PluginInvocationFailure,
     PluginInvocationFailureKind, PluginInvocationOutcome, PluginInvocationRequest,
-    PluginInvocationResult, PluginKey, RequestId, RoutedEnvelope, RoutedEnvelopeDrainOutcome,
-    RoutedEnvelopePublishOutcome, SessionId, SessionLifecycleState, SessionRuntimeErrorKind,
-    SessionSpawnRequest, SubscriptionId,
+    PluginInvocationResult, PluginKey, PluginWorkerDebugSnapshot, RequestId, RoutedEnvelope,
+    RoutedEnvelopeDrainOutcome, RoutedEnvelopePublishOutcome, SessionId, SessionLifecycleState,
+    SessionRuntimeErrorKind, SessionSpawnRequest, SubscriptionId,
 };
 use botster_core_daemon::{
     AcknowledgeRoutedEnvelopeRequest, CaptureSnapshotRequest, CaptureSnapshotResult, CoreDaemon,
@@ -215,6 +215,7 @@ impl HubRuntime {
     pub fn new(config: HubConfig) -> Self {
         let state = HubState::from_config(&config);
         let core_config = core_daemon_config(&config);
+        let plugin_worker_config = config.core_engine.plugin_worker_config();
         let core_daemon = Mutex::new(CoreDaemon::new(core_config));
         Self {
             capability_runtime: Arc::new(Mutex::new(HubCapabilityRuntime::from_config(&config))),
@@ -228,7 +229,7 @@ impl HubRuntime {
             state: RwLock::new(state),
             core_daemon,
             reconciliation: HubSessionReconciliation::default(),
-            plugin_lifecycle: HubPluginLifecycle::new(),
+            plugin_lifecycle: HubPluginLifecycle::with_config(plugin_worker_config),
             last_capability_cleanup: None,
             session_contexts: Arc::new(Mutex::new(BTreeMap::new())),
         }
@@ -286,6 +287,7 @@ impl HubRuntime {
 
     fn from_validated_state(config: HubConfig, state: HubState) -> HubRuntimeResult<Self> {
         let core_config = core_daemon_config(&config);
+        let plugin_worker_config = config.core_engine.plugin_worker_config();
         let core_daemon = Mutex::new(CoreDaemon::new(core_config));
         let mut runtime = Self {
             capability_runtime: Arc::new(Mutex::new(HubCapabilityRuntime::from_config(&config))),
@@ -299,7 +301,7 @@ impl HubRuntime {
             state: RwLock::new(state),
             core_daemon,
             reconciliation: HubSessionReconciliation::default(),
-            plugin_lifecycle: HubPluginLifecycle::new(),
+            plugin_lifecycle: HubPluginLifecycle::with_config(plugin_worker_config),
             last_capability_cleanup: None,
             session_contexts: Arc::new(Mutex::new(BTreeMap::new())),
         };
@@ -1346,6 +1348,12 @@ impl HubRuntime {
         registry: &PackageRegistry,
     ) -> Vec<HubPluginLifecycleStatus> {
         self.plugin_lifecycle.status(registry)
+    }
+
+    /// Return Core's authoritative read-only plugin worker snapshot.
+    #[must_use]
+    pub fn plugin_worker_debug_snapshot(&self) -> PluginWorkerDebugSnapshot {
+        self.plugin_lifecycle.debug_snapshot()
     }
 
     /// Return a daemon-recorded session summary.

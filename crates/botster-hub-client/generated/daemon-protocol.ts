@@ -144,6 +144,7 @@ export interface DaemonResponse {
   update_status?: DaemonPackageUpdateStatus | null;
   package_decision: DaemonPackageDecision | null;
   lifecycle: DaemonPluginLifecycle[];
+  plugin_worker_counters?: DaemonPluginWorkerCounters | null;
   plugin_tools: JsonValue[];
   plugin_tool_result: JsonValue;
   plugin_surface?: DaemonPluginSurface | null;
@@ -674,6 +675,15 @@ export interface DaemonPluginLifecycle {
   package_name: string;
   state: string;
   loaded: boolean;
+}
+
+export interface DaemonPluginWorkerCounters {
+  configured_queue_capacity: number;
+  configured_executor_concurrency: number;
+  live_plugin_executors: number;
+  live_executor_workers: number;
+  queued_jobs: number;
+  in_flight_jobs: number;
 }
 
 export interface DaemonStatus {

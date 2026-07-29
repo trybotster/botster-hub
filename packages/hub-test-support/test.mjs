@@ -126,7 +126,7 @@ function assertDialogFormComposition(source) {
 }
 
 assert.equal(metadata.package_name, "@trybotster/hub-test-support");
-assert.equal(metadata.package_version, "0.1.13");
+assert.equal(metadata.package_version, "0.1.15");
 assert.equal(metadata.protocol, "botster-hub-daemon-v1");
 assert.equal(metadata.protocol_version, 4);
 assert.equal(metadata.conformance_fixture_revision, 22);
@@ -170,6 +170,8 @@ assert.match(protocol, /export interface DaemonReadScreen/);
 assert.match(protocol, /export interface DaemonModeFlags/);
 assert.match(protocol, /export interface DaemonCaptureSnapshot/);
 assert.match(protocol, /export interface DaemonLocalWebrtcDeliveryChunk/);
+assert.match(protocol, /export interface DaemonPluginWorkerCounters/);
+assert.match(protocol, /plugin_worker_counters\?: DaemonPluginWorkerCounters \| null/);
 assert.match(protocol, /DaemonLocalWebrtcDeliveryKind/);
 assert.match(protocol, /subscribe_entities/);
 assert.match(protocol, /entity_snapshot/);
