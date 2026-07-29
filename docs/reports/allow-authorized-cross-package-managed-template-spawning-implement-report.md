@@ -44,9 +44,9 @@ The required real-worker package-A to package-B cases already succeeded on Hub
 
 The exact downstream Workspaces fixture nevertheless reproduced
 `hub_spawn_rejected` / `configured session could not be spawned`. Retaining the
-discarded Core classification localized it to:
-
-`runtime.spawn_failed.worker_control_parent_permissions`
+discarded raw Core diagnostic localized it to the worker-control-parent
+permission check. The durable, path-neutral Hub class is
+`runtime.spawn_failed`; it does not substring-match Core diagnostic text.
 
 The Core worker rejected a pre-existing hashed control-socket parent with
 non-private permissions. The failure was not caused by cross-package template
@@ -114,11 +114,19 @@ The committed plan now records this disposition. Registry projection,
 materialization, authorization, and public error taxonomy changes were not
 made.
 
+The matched Workspaces registry enabled Project Pipelines before the
+Workspaces caller worker loaded. Package A then successfully listed, showed,
+and atomically spawned package B's template. This is the production ordering
+for the reported path and takes the plan's passing selection-path branch;
+late contributor enablement after caller-worker load remains separately
+routable rather than widening this ticket.
+
 ## Verification
 
 - `./test.sh real_lua_plugin_cross_package_managed_template_spawning -- --nocapture`
-  — passed 1 test; proves both positive package-B cases, canonical UUIDs,
-  package-B command execution, capability denial, and target mismatch.
+  — passed 1 test; proves list/show enumeration for both contributors, both
+  positive package-B cases, canonical UUIDs, package-B command execution,
+  capability denial, and target mismatch.
 - `./test.sh real_lua_plugin_atomically_ensures_managed_worktree_and_spawns_session`
   — passed 1 test; preserves the prior same-package, reuse, relative-cwd, and
   rollback baseline.
@@ -130,19 +138,19 @@ made.
   passed.
 - `cargo fmt --all -- --check` — passed.
 - `git diff --check` — passed.
-- `./test.sh` — library tests passed 131/131 and the daemon integration target
-  passed 101 tests before the pre-existing
-  `cli_operator_console_starts_reuses_detaches_handles_ctrl_c_and_stops`
-  timing test failed waiting for `daemon=started`.
+- `./test.sh` — Review reran the complete wrapper successfully: all 11 targets
+  passed, including 131 library tests and 102 daemon-integration tests.
 - `./test.sh cli_operator_console_starts_reuses_detaches_handles_ctrl_c_and_stops -- --nocapture`
-  — passed on this branch in isolation.
+  — passed on this branch in isolation; an earlier full-suite attempt timed out
+  waiting for `daemon=started`, establishing intermittent timing rather than a
+  standing waiver.
 - The identical wrapper command on untouched `origin/main` `35e92f4` — failed
-  in isolation at the same `daemon=started` timeout. This isolates the
-  full-suite failure from the branch rather than treating it as a blanket
-  pre-existing waiver.
+  once in isolation at the same `daemon=started` timeout. This is retained only
+  as timing evidence. Verify must treat any future failure as in scope.
 - Exact matched Workspaces command on the original temp-root state — reproduced
-  `hub_spawn_rejected` with internal class
-  `runtime.spawn_failed.worker_control_parent_permissions`.
+  `hub_spawn_rejected`; the retained raw Core diagnostic identified the
+  worker-control-parent permission check and the committed Hub diagnostic
+  records `runtime.spawn_failed`.
 - Exact matched Workspaces command with a fresh private worker-socket temp root
   — passed and returned UUID
   `4e7cb99c-345c-410a-9ff4-095f4046dc4a`.
@@ -157,9 +165,8 @@ made.
 - Pre-existing insecure Core worker-socket directories remain unrepaired. A
   future session using the same hashed directory can still fail until the
   directory is removed/recreated privately or Core gains an owned migration.
-- The full Hub suite remains red because the exact operator-console timing test
-  also fails on untouched base. The branch-specific focused and strict gates
-  are green.
+- The full Hub suite is green. The operator-console test has shown intermittent
+  startup timing, but there is no active failure waiver.
 - A package enabled only after an already-loaded caller worker remains a
   potential independent snapshot issue. It did not cause this post-prepare
   failure and was not changed.
