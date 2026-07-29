@@ -470,13 +470,22 @@ impl HubClientApi {
                 HubClientResponseBody::SessionContext(context)
             }
             HubClientRequest::PluginLifecycleStatus { .. } => {
-                HubClientResponseBody::PluginLifecycle(
-                    runtime
+                let snapshot = runtime.plugin_worker_debug_snapshot();
+                HubClientResponseBody::PluginLifecycle(HubClientPluginLifecycleReport {
+                    lifecycle: runtime
                         .plugin_lifecycle_status(packages)
                         .into_iter()
                         .map(HubClientPluginLifecycle::from)
                         .collect(),
-                )
+                    worker_counters: HubClientPluginWorkerCounters {
+                        configured_queue_capacity: snapshot.configured_queue_capacity,
+                        configured_executor_concurrency: snapshot.configured_executor_concurrency,
+                        live_plugin_executors: snapshot.live_plugin_executors,
+                        live_executor_workers: snapshot.live_executor_workers,
+                        queued_jobs: snapshot.queued_jobs,
+                        in_flight_jobs: snapshot.in_flight_jobs,
+                    },
+                })
             }
             HubClientRequest::PluginSurfaceRender {
                 package_name,
@@ -904,7 +913,7 @@ pub enum HubClientResponseBody {
     SessionTemplates(Vec<HubSessionTemplate>),
     ResolvedSessionTemplate(ResolvedSessionTemplate),
     SessionContext(HubSessionContext),
-    PluginLifecycle(Vec<HubClientPluginLifecycle>),
+    PluginLifecycle(HubClientPluginLifecycleReport),
     PluginSurface(HubClientPluginSurface),
     PluginActionResult(UiActionResult),
 }
@@ -1747,6 +1756,24 @@ pub struct HubClientPluginLifecycle {
     pub package_name: String,
     pub state: HubClientPackageState,
     pub loaded: bool,
+}
+
+/// Sanitized plugin lifecycle report for local clients.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HubClientPluginLifecycleReport {
+    pub lifecycle: Vec<HubClientPluginLifecycle>,
+    pub worker_counters: HubClientPluginWorkerCounters,
+}
+
+/// Aggregate plugin-worker counters without plugin identities or payloads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HubClientPluginWorkerCounters {
+    pub configured_queue_capacity: usize,
+    pub configured_executor_concurrency: usize,
+    pub live_plugin_executors: usize,
+    pub live_executor_workers: usize,
+    pub queued_jobs: usize,
+    pub in_flight_jobs: usize,
 }
 
 impl From<HubPluginLifecycleStatus> for HubClientPluginLifecycle {

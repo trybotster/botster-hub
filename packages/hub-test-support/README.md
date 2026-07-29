@@ -93,6 +93,8 @@ binary-history contract authority.
 Version 0.1.13 publishes protocol version 4 / conformance revision 22 and
 depends on `@trybotster/ui-contract@0.1.0` for the canonical UiNode,
 UiActionRequest, and UiActionResult declarations and conformance fixtures.
+Version 0.1.15 is prepared in this repository with optional aggregate
+plugin-worker counters; it is not published by this change.
 Revision 20 remains the already-published version 0.1.12 application-primitives
 contract; revision 21 adds spawn-target `base_ref` and worktree `management`
 without reusing those bytes; revision 22 makes the live presentation Dialog
