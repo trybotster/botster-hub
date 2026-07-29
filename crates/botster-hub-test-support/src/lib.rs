@@ -5810,6 +5810,16 @@ mod tests {
 
     #[test]
     fn daemon_protocol_typescript_artifact_matches_node_package_copy() {
+        assert!(
+            daemon_protocol_typescript_artifact()
+                .contents
+                .contains("export interface DaemonPluginWorkerCounters")
+        );
+        assert!(
+            daemon_protocol_typescript_artifact()
+                .contents
+                .contains("plugin_worker_counters?: DaemonPluginWorkerCounters | null;")
+        );
         assert_eq!(
             daemon_protocol_typescript_artifact().contents,
             node_package_asset("daemon-protocol.ts")

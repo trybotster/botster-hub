@@ -22,10 +22,11 @@ use botster_core::{
 };
 use botster_core_daemon::{RegistryRecord, SessionRegistry};
 use botster_hub::{
-    DataDirectoryOption, FileHubStateStore, HostIdentityOptions, HubClientApi, HubClientEvent,
-    HubClientRequest, HubClientResponseBody, HubDaemon, HubDaemonState, HubStartupOptions,
-    HubStateLoadSource, HubStateStore, PackageAdmissionPolicy, PackageProvenance, PackageRegistry,
-    RuntimeEnvironment, SessionDefaults, SpawnTarget, TransportBindings,
+    CoreEngineOptions, DataDirectoryOption, FileHubStateStore, HostIdentityOptions, HubClientApi,
+    HubClientEvent, HubClientRequest, HubClientResponseBody, HubDaemon, HubDaemonState,
+    HubStartupOptions, HubStateLoadSource, HubStateStore, PackageAdmissionPolicy,
+    PackageProvenance, PackageRegistry, RuntimeEnvironment, SessionDefaults, SpawnTarget,
+    TransportBindings,
 };
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use webrtc::data_channel::{DataChannel, DataChannelEvent, RTCDataChannelInit};
@@ -3721,6 +3722,27 @@ fn daemon_plugin_contract_matrix_fixture_exercises_public_package_contracts() {
     let report =
         botster_hub_test_support::run_plugin_contract_matrix_conformance(&hub, fixture_dir)
             .expect("run plugin contract matrix conformance");
+    let lifecycle = botster_hub_client::request(
+        hub.endpoint(),
+        botster_hub_client::DaemonRequest::PluginLifecycleStatus,
+    )
+    .expect("request live plugin worker counters");
+    let counters = lifecycle
+        .plugin_worker_counters
+        .expect("plugin lifecycle response carries worker counters");
+    let expected = CoreEngineOptions::default();
+    assert_eq!(
+        counters.configured_queue_capacity,
+        expected.plugin_worker_queue_capacity
+    );
+    assert_eq!(
+        counters.configured_executor_concurrency,
+        expected.plugin_worker_executor_concurrency
+    );
+    assert!(counters.live_plugin_executors >= 1);
+    assert!(counters.live_executor_workers >= 1);
+    assert_eq!(counters.queued_jobs, 0);
+    assert_eq!(counters.in_flight_jobs, 0);
     assert_eq!(report.package_name, "botster.plugin-contract-matrix");
     assert_eq!(report.installed_state, "installed");
     assert_eq!(report.enabled_state, "enabled");
@@ -5597,7 +5619,7 @@ fn daemon_starts_empty_state_reports_status_uses_core_and_stops_idempotently() {
     assert_eq!(status.state_source, HubStateLoadSource::Initialized);
     assert_eq!(status.host_id, "hub-daemon-test");
     assert_eq!(status.host_display_name, "Hub Daemon Test");
-    assert_eq!(status.schema_version, 1);
+    assert_eq!(status.schema_version, 2);
     assert!(status.data_dir_configured);
     assert!(status.core_initialized);
     assert_eq!(status.package_count, 0);
@@ -5624,8 +5646,33 @@ fn daemon_starts_empty_state_reports_status_uses_core_and_stops_idempotently() {
     let reopened = store
         .load_or_initialize(&config)
         .expect("reload committed daemon state");
-    assert_eq!(reopened.schema_version, 1);
+    assert_eq!(reopened.schema_version, 2);
     assert_eq!(reopened.host.id, "hub-daemon-test");
+}
+
+#[test]
+fn daemon_restart_preserves_split_plugin_worker_configuration() {
+    let mut config = explicit_config(unique_test_dir("plugin-worker-config-restart"));
+    config.core_engine.plugin_worker_queue_capacity = 9;
+    config.core_engine.plugin_worker_executor_concurrency = 3;
+
+    let mut daemon = HubDaemon::start(config.clone()).expect("start configured daemon");
+    let initial = daemon
+        .runtime()
+        .expect("runtime initialized")
+        .plugin_worker_debug_snapshot();
+    assert_eq!(initial.configured_queue_capacity, 9);
+    assert_eq!(initial.configured_executor_concurrency, 3);
+    daemon.stop();
+
+    let mut restarted = HubDaemon::start(config).expect("restart configured daemon");
+    let reopened = restarted
+        .runtime()
+        .expect("runtime initialized")
+        .plugin_worker_debug_snapshot();
+    assert_eq!(reopened.configured_queue_capacity, 9);
+    assert_eq!(reopened.configured_executor_concurrency, 3);
+    restarted.stop();
 }
 
 #[test]
@@ -5917,7 +5964,7 @@ fn daemon_restores_existing_provider_policy_records_through_snapshot_admission()
     assert_eq!(status.enabled_package_count, 1);
     assert_eq!(status.provider_count, 1);
     assert_eq!(status.enabled_provider_count, 1);
-    assert_eq!(status.schema_version, 1);
+    assert_eq!(status.schema_version, 2);
 
     daemon.stop();
     let reopened = store
@@ -5947,7 +5994,7 @@ fn cli_start_and_status_print_scrubbed_lifecycle_status() {
     let stdout = String::from_utf8(output.stdout).expect("stdout is utf8");
     assert!(stdout.contains("event=status"));
     assert!(stdout.contains("lifecycle_state=running"));
-    assert!(stdout.contains("schema_version=1"));
+    assert!(stdout.contains("schema_version=2"));
     assert!(stdout.contains("core_initialized=true"));
     assert!(stdout.contains("state_source=initialized"));
     assert!(!stdout.contains(data_dir.to_string_lossy().as_ref()));
