@@ -97,7 +97,7 @@ In scope:
 - Convert the two Hub values into one `PluginWorkerEngineConfig` and use it when constructing `HubPluginLifecycle` in both fresh and durable-state `HubRuntime` constructors.
 - Make the configured lifecycle constructor the only construction path and add a read-only debug snapshot path through `HubPluginLifecycle` and `HubRuntime`.
 - Extend the existing `HubClientRequest::PluginLifecycleStatus` → `DaemonRequest::PluginLifecycleStatus` diagnostics channel with aggregate, sanitized plugin-worker counters. Do not create a parallel `DaemonStatus` resource surface or expose runtime objects/payloads.
-- Render those counters in the existing Hub CLI plugin-lifecycle response so the operator-facing consumer does not silently discard them.
+- Treat the public daemon/client `PluginLifecycleStatus` request as the production diagnostics consumer. Hub has no CLI command for this request, so do not claim or add a private formatter-only consumer.
 - Add an optional `DaemonResponse.plugin_worker_counters` projection with serde-accurate optional TypeScript output, populated only for the plugin-lifecycle response.
 - Regenerate the checked TypeScript and `packages/hub-test-support` copy, refresh its hash metadata, and bump the prepared npm package to `0.1.15`. Registry inspection confirmed `0.1.14` is already published and contains the old protocol artifact, so it cannot be reused.
 - Update Hub config/default/serde tests, runtime wiring tests, client DTO/generated TypeScript tests, published-package asset tests, and production-shaped plugin lifecycle tests.
@@ -108,7 +108,6 @@ Botster layers touched:
 - Rust Hub configuration and startup composition.
 - Rust Hub plugin lifecycle adapter over Core.
 - Existing Hub plugin-lifecycle diagnostics route.
-- Existing Hub CLI plugin-lifecycle renderer.
 - Hub-client response DTO and generated TypeScript mirror, only for sanitized aggregate debug counters.
 - Hub-test-support Rust/Node published artifact preparation and drift tests.
 - Rust and Node tests, including a real subprocess-spawned Hub through shared test support.
@@ -124,6 +123,7 @@ Botster layers touched:
 - No per-plugin names, handler data, payloads, paths, or other sensitive runtime details in public daemon diagnostics.
 - No four-package resource campaign in this ticket; `ticket_1785199716_875648` owns that downstream production-shaped proof.
 - No new daemon request, feature constant, protocol framing, or compatibility requirement.
+- No new Hub CLI command or formatter-only plugin-worker counter surface.
 - No npm publication in this ticket. `0.1.15` is prepared and pack-tested only; registry publication and clean external install proof remain a later explicit release action.
 - No unrelated cleanup or broad status/DTO refactor.
 
@@ -186,8 +186,6 @@ Expected changes:
 - `src/daemon_transport.rs`
   - Map that report through the existing `DaemonRequest::PluginLifecycleStatus` / `plugin_lifecycle_response` seam.
   - Populate an optional `DaemonResponse.plugin_worker_counters`; do not change `DaemonStatus`.
-- `src/main.rs`
-  - Print all sanitized aggregate counters from the existing plugin-lifecycle response in the CLI's established `key=value` style.
 - `crates/botster-hub-client/src/lib.rs`
   - Add `DaemonPluginWorkerCounters` and the backward-compatible optional response field.
   - Add serde omission, deserialization-default, sanitization, and generated-protocol assertions.
@@ -216,6 +214,7 @@ Likely unchanged:
 
 - `Cargo.toml` and `Cargo.lock`.
 - Core, package/plugin fixture behavior, capability runtime, session worker, terminal/client data plane, and package supervision modules.
+- `src/main.rs`; no production CLI command issues `PluginLifecycleStatus`, so its private response formatter is not a supported counter consumer.
 - `DaemonStatus`, `DaemonLifecycleCounters`, compatibility feature lists, support matrices, and conformance fixtures.
 - Root `README.md` and `docs/client-protocol.md`; their pre-existing `0.1.13` registry coordinates are adjacent cleanup and remain outside this surgical ticket.
 
@@ -244,7 +243,6 @@ Likely unchanged:
    - Delegate a read-only snapshot through lifecycle and runtime.
    - Extend the existing `HubClientRequest::PluginLifecycleStatus` report, then map it through `DaemonRequest::PluginLifecycleStatus`.
    - Project only aggregate configured/live/queued/in-flight counters into `DaemonPluginWorkerCounters` on the plugin-lifecycle `DaemonResponse`; leave `DaemonStatus` unchanged.
-   - Render the same aggregate counters in the existing Hub CLI plugin-lifecycle response.
    - Populate it from the same runtime instance used to load and invoke production plugins, not from `CoreEngineOptions` alone.
    - Keep the public response field additive/defaulted/omittable and regenerate the TypeScript protocol with matching optionality.
 
@@ -322,7 +320,7 @@ Behavioral acceptance:
 - Queue capacity remains independent from live executor count.
 - The real subprocess-spawned Hub and published plugin-contract-matrix fixture return sanitized aggregate counters from `PluginLifecycleStatus`, including `live_plugin_executors >= 1` and `live_executor_workers >= 1`; configured-only assertions do not satisfy this proof.
 - Reload/unload/shutdown evidence shows workers retire without creating a detached generation in the focused fixture.
-- The Hub CLI plugin-lifecycle renderer prints the sanitized configured/live/queued/in-flight counters returned by the daemon.
+- The public daemon/client `PluginLifecycleStatus` request returns sanitized configured/live/queued/in-flight counters through a real subprocess-spawned Hub; no CLI renderer claim is made.
 - The optional response field is omitted when absent and generated TypeScript marks it optional.
 - `DaemonRequest::Status` remains unchanged; no parallel plugin diagnostics DTO is added there.
 - Prepared `@trybotster/hub-test-support@0.1.15` package bytes, metadata hash, Rust source artifact, checked TypeScript, and Node package copy agree.
