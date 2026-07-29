@@ -11,14 +11,19 @@ use std::path::{Component, Path, PathBuf};
 
 use botster_core::{
     AdmittedHostProfile, Capability, CapabilitySet, CapabilitySurface, ExtensionEntrypoint,
-    ExtensionKind, ExtensionRuntime, HostProfileAdmissionError, PackageConfigurationField,
-    PackageConfigurationFieldType, PackageConfigurationSchema, PackageConfigurationSecretValue,
-    PackageConfigurationValue, PackageManifest, PackageRequirementStatus, PackageResolutionInput,
-    PackageResolutionMatrix, PackageResolutionPackage, PackageSource,
-    RunnableEntrypointHubConnection, RunnableEntrypointHubConnectionTransport,
+    ExtensionKind, ExtensionRuntime, HostProfileAdmissionError, HostProfileMetadata,
+    PackageConfigurationField, PackageConfigurationFieldType, PackageConfigurationSchema,
+    PackageConfigurationSecretValue, PackageConfigurationValue, PackageDependency,
+    PackageFeatureGate, PackageManifest as CorePackageManifest, PackageRequirementStatus,
+    PackageResolutionInput, PackageResolutionMatrix, PackageResolutionPackage, PackageSource,
+    RunnableEntrypoint, RunnableEntrypointHubConnection, RunnableEntrypointHubConnectionTransport,
     RunnableEntrypointInjection, RunnableEntrypointInjectionKind,
     RunnableEntrypointInjectionTarget, RunnableEntrypointKind, RunnableEntrypointLaunchMode,
     RunnableEntrypointReadiness, admit_host_profile, resolve_package_dependencies,
+};
+use botster_ui_contract::{
+    PackageNavigationEntry, PackagePresentationValidationError, PackageSurfaceDescriptor,
+    validate_package_presentation,
 };
 use serde::{Deserialize, Serialize};
 
@@ -29,6 +34,74 @@ use crate::session_templates::{PackageSessionTemplate, validate_session_template
 pub const LOCAL_PACKAGE_MANIFEST_FILE: &str = "botster-package.json";
 /// Conventional local marketplace registry filename.
 pub const LOCAL_PACKAGE_REGISTRY_FILE: &str = "botster-registry.json";
+
+/// Hub-owned installable package manifest.
+///
+/// Core field types remain the policy-free execution vocabulary, while package
+/// presentation metadata is owned by the Hub/UI contract boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HubPackageManifest {
+    /// Package name.
+    pub name: String,
+    /// Package version.
+    pub version: String,
+    /// Extension kind.
+    pub kind: ExtensionKind,
+    /// Compatible Botster version requirement.
+    pub botster: String,
+    /// Package source.
+    pub source: Option<PackageSource>,
+    /// Requested capabilities.
+    pub capabilities: Vec<Capability>,
+    /// Entrypoints supplied by this package.
+    pub entrypoints: Vec<ExtensionEntrypoint>,
+    /// Package dependency declarations inspected by the Hub.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dependencies: Vec<PackageDependency>,
+    /// Named feature gates resolved from dependency and requirement state.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub features: Vec<PackageFeatureGate>,
+    /// Host-profile metadata for privileged provider packages.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_profile: Option<HostProfileMetadata>,
+    /// Configuration metadata clients and hubs inspect without plugin execution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configuration: Option<PackageConfigurationSchema>,
+    /// Runnable app/process descriptors inspected without plugin execution.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub runnable_entrypoints: Vec<RunnableEntrypoint>,
+    /// Renderer-neutral UI surface descriptors.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub surfaces: Vec<PackageSurfaceDescriptor>,
+    /// Package-authored discoverability intent.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub navigation: Vec<PackageNavigationEntry>,
+}
+
+impl HubPackageManifest {
+    fn validate_presentation(&self) -> Result<(), PackagePresentationValidationError> {
+        validate_package_presentation(&self.surfaces, &self.navigation)
+    }
+
+    pub(crate) fn core_execution_manifest(&self) -> CorePackageManifest {
+        CorePackageManifest {
+            name: self.name.clone(),
+            version: self.version.clone(),
+            kind: self.kind.clone(),
+            botster: self.botster.clone(),
+            source: self.source.clone(),
+            capabilities: self.capabilities.clone(),
+            entrypoints: self.entrypoints.clone(),
+            dependencies: self.dependencies.clone(),
+            features: self.features.clone(),
+            host_profile: self.host_profile.clone(),
+            configuration: self.configuration.clone(),
+            runnable_entrypoints: self.runnable_entrypoints.clone(),
+            surfaces: Vec::new(),
+            navigation: Vec::new(),
+        }
+    }
+}
 
 /// Hub-owned package admission policy backed by the first-party host profile.
 #[derive(Debug, Clone)]
@@ -64,7 +137,7 @@ impl PackageAdmissionPolicy {
     /// Install a package manifest as disabled until hub policy enables it.
     pub fn install(
         &mut self,
-        manifest: PackageManifest,
+        manifest: HubPackageManifest,
         provenance: PackageProvenance,
         audit_reason: impl Into<String>,
     ) -> PackageRegistryResult<&PackageRecord> {
@@ -105,7 +178,7 @@ pub struct PackageRegistry {
 }
 
 struct PackageInstallOptions {
-    manifest: PackageManifest,
+    manifest: HubPackageManifest,
     provenance: PackageProvenance,
     trust: PackageTrust,
     runnable_entrypoints: Vec<PackageRunnableEntrypoint>,
@@ -129,7 +202,7 @@ impl PackageRegistry {
     /// Install a package manifest as disabled until hub policy enables it.
     pub fn install(
         &mut self,
-        manifest: PackageManifest,
+        manifest: HubPackageManifest,
         provenance: PackageProvenance,
         audit_reason: impl Into<String>,
     ) -> PackageRegistryResult<&PackageRecord> {
@@ -144,7 +217,7 @@ impl PackageRegistry {
     /// Install a package manifest with an explicit hub-owned trust marker.
     pub fn install_with_trust(
         &mut self,
-        manifest: PackageManifest,
+        manifest: HubPackageManifest,
         provenance: PackageProvenance,
         trust: PackageTrust,
         audit_reason: impl Into<String>,
@@ -161,7 +234,7 @@ impl PackageRegistry {
 
     fn install_with_trust_and_templates(
         &mut self,
-        manifest: PackageManifest,
+        manifest: HubPackageManifest,
         provenance: PackageProvenance,
         trust: PackageTrust,
         runnable_entrypoints: Vec<PackageRunnableEntrypoint>,
@@ -222,6 +295,15 @@ impl PackageRegistry {
                 audit_reason,
             ));
         }
+
+        manifest.validate_presentation().map_err(|error| {
+            PackageRegistryError::without_record(
+                package_name.clone(),
+                PackageAction::Install,
+                PackageAdmissionReason::InvalidPresentation(error.to_string()),
+                audit_reason.clone(),
+            )
+        })?;
 
         let compatibility = PackageCompatibility::for_manifest(&manifest);
         if !compatibility.is_compatible() {
@@ -788,7 +870,10 @@ impl PackageRegistry {
     /// Resolve one installed package through the core dependency and feature matrix.
     #[must_use]
     pub fn resolution_matrix_for(&self, record: &PackageRecord) -> PackageResolutionMatrix {
-        resolve_package_dependencies(&record.manifest, &self.resolution_input())
+        resolve_package_dependencies(
+            &record.manifest.core_execution_manifest(),
+            &self.resolution_input(),
+        )
     }
 
     /// Build core's policy-free resolution input from current hub registry state.
@@ -866,6 +951,12 @@ impl PackageRegistry {
 
         for mut record in snapshot.records {
             let package_name = record.manifest.name.clone();
+            record.manifest.validate_presentation().map_err(|error| {
+                PackageRegistrySnapshotError::Presentation {
+                    package_name: package_name.clone(),
+                    reason: error.to_string(),
+                }
+            })?;
             record.compatibility = PackageCompatibility::for_manifest(&record.manifest);
             if !record.compatibility.is_compatible() {
                 return Err(PackageRegistrySnapshotError::BotsterCompatibility {
@@ -1055,7 +1146,7 @@ fn provider_ids_for_record(record: &PackageRecord) -> Vec<String> {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PackageRecord {
     /// Core-owned package manifest.
-    pub manifest: PackageManifest,
+    pub manifest: HubPackageManifest,
     /// Hub-owned enabled/disabled state.
     pub state: PackageState,
     /// Hub classification derived from the core extension kind.
@@ -1521,7 +1612,7 @@ pub struct PackageCompatibility {
 }
 
 impl PackageCompatibility {
-    fn for_manifest(manifest: &PackageManifest) -> Self {
+    fn for_manifest(manifest: &HubPackageManifest) -> Self {
         Self::evaluate(&manifest.botster, env!("CARGO_PKG_VERSION"))
     }
 
@@ -1812,6 +1903,13 @@ impl PackageRegistrySnapshot {
 pub enum PackageRegistrySnapshotError {
     /// More than one persisted record used the same package manifest name.
     DuplicatePackage(String),
+    /// Persisted package presentation declarations no longer validate.
+    Presentation {
+        /// Package whose persisted presentation contract is invalid.
+        package_name: String,
+        /// Sanitized validation reason.
+        reason: String,
+    },
     /// Persisted package compatibility no longer admits under the current hub.
     BotsterCompatibility {
         /// Package whose persisted compatibility state could not be re-derived.
@@ -1924,6 +2022,8 @@ pub enum PackageAdmissionReason {
     UnsafeLocalPath(String),
     /// Local package manifest could not be read or parsed.
     InvalidLocalManifest(String),
+    /// Package surface or navigation declarations are invalid.
+    InvalidPresentation(String),
     /// Local package entrypoint was absent or unsafe.
     UnsafeEntrypoint(String),
     /// Local package session template was absent or unsafe.
@@ -2179,13 +2279,14 @@ fn parse_point_version(version: &str) -> Option<(u64, u64, u64)> {
 }
 
 fn admit_enabled_host_profile(
-    manifest: &PackageManifest,
+    manifest: &HubPackageManifest,
     classification: PackageClassification,
 ) -> Result<Option<AdmittedHostProfile>, PackageAdmissionReason> {
+    let core_manifest = manifest.core_execution_manifest();
     match classification {
         PackageClassification::Plugin if manifest.host_profile.is_none() => Ok(None),
         PackageClassification::Plugin => {
-            admit_host_profile(manifest, true, env!("CARGO_PKG_VERSION"))
+            admit_host_profile(&core_manifest, true, env!("CARGO_PKG_VERSION"))
                 .map(Some)
                 .map_err(PackageAdmissionReason::HostProfileAdmission)
         }
@@ -2193,7 +2294,7 @@ fn admit_enabled_host_profile(
             Err(PackageAdmissionReason::ProviderMissingHostProfile)
         }
         PackageClassification::Provider => {
-            admit_host_profile(manifest, true, env!("CARGO_PKG_VERSION"))
+            admit_host_profile(&core_manifest, true, env!("CARGO_PKG_VERSION"))
                 .map(Some)
                 .map_err(PackageAdmissionReason::HostProfileAdmission)
         }
@@ -2422,7 +2523,7 @@ struct PackageRegistryEntry {
     first_party: bool,
     source: PackageRegistryEntrySource,
     #[serde(default)]
-    manifest: Option<PackageManifest>,
+    manifest: Option<HubPackageManifest>,
     #[serde(default)]
     runnable_entrypoints: Vec<PackageRunnableEntrypoint>,
     #[serde(default)]
@@ -2472,7 +2573,7 @@ pub enum PackageRegistryEntrySourceKind {
 
 #[derive(Debug, Clone)]
 struct PreparedRegistryEntry {
-    manifest: PackageManifest,
+    manifest: HubPackageManifest,
     provenance: PackageProvenance,
     runnable_entrypoints: Vec<PackageRunnableEntrypoint>,
     session_templates: Vec<PackageSessionTemplate>,
@@ -2701,7 +2802,7 @@ impl PreparedLocalPackage {
 #[derive(Debug, Deserialize)]
 struct LocalPackageManifest {
     #[serde(flatten)]
-    manifest: PackageManifest,
+    manifest: HubPackageManifest,
     #[serde(default)]
     runnable_entrypoints: Vec<PackageRunnableEntrypoint>,
     #[serde(default)]
@@ -2797,7 +2898,7 @@ impl LocalPackageSource {
 
     fn validate_manifest_entrypoints(
         &self,
-        manifest: &PackageManifest,
+        manifest: &HubPackageManifest,
         audit_reason: String,
     ) -> PackageRegistryResult<()> {
         for entrypoint in &manifest.entrypoints {
@@ -3076,8 +3177,8 @@ mod tests {
         }
     }
 
-    fn plugin_manifest(name: &str, capabilities: Vec<Capability>) -> PackageManifest {
-        PackageManifest {
+    fn plugin_manifest(name: &str, capabilities: Vec<Capability>) -> HubPackageManifest {
+        HubPackageManifest {
             name: name.to_string(),
             version: "1.0.0".to_string(),
             kind: ExtensionKind::Plugin,
@@ -3102,8 +3203,8 @@ mod tests {
         }
     }
 
-    fn provider_manifest(name: &str, capabilities: Vec<Capability>) -> PackageManifest {
-        PackageManifest {
+    fn provider_manifest(name: &str, capabilities: Vec<Capability>) -> HubPackageManifest {
+        HubPackageManifest {
             name: name.to_string(),
             version: "2.0.0".to_string(),
             kind: ExtensionKind::Provider,
@@ -3144,7 +3245,7 @@ mod tests {
         root.canonicalize().expect("canonical package test root")
     }
 
-    fn write_manifest(package_root: &Path, manifest: &PackageManifest) -> PathBuf {
+    fn write_manifest(package_root: &Path, manifest: &HubPackageManifest) -> PathBuf {
         let manifest_path = package_root.join(LOCAL_PACKAGE_MANIFEST_FILE);
         fs::write(
             &manifest_path,
@@ -3160,7 +3261,7 @@ mod tests {
         manifest_path
     }
 
-    fn local_manifest(name: &str, entrypoint: &str) -> PackageManifest {
+    fn local_manifest(name: &str, entrypoint: &str) -> HubPackageManifest {
         let mut manifest =
             plugin_manifest(name, vec![capability(CapabilitySurface::Surfaces, None)]);
         manifest.source = None;
@@ -3172,7 +3273,7 @@ mod tests {
         manifest
     }
 
-    fn package_record(manifest: PackageManifest, state: PackageState) -> PackageRecord {
+    fn package_record(manifest: HubPackageManifest, state: PackageState) -> PackageRecord {
         let classification = PackageClassification::from_kind(&manifest.kind);
         PackageRecord {
             compatibility: PackageCompatibility::for_manifest(&manifest),
@@ -3195,7 +3296,7 @@ mod tests {
         }
     }
 
-    fn package_configuration_manifest() -> PackageManifest {
+    fn package_configuration_manifest() -> HubPackageManifest {
         let mut manifest = plugin_manifest(
             "configuration.plugin",
             vec![capability(CapabilitySurface::Surfaces, None)],
@@ -3250,6 +3351,59 @@ mod tests {
             ],
         });
         manifest
+    }
+
+    #[test]
+    fn hub_manifest_projection_keeps_core_package_presentation_fields_inert() {
+        let mut manifest = plugin_manifest("presentation.plugin", Vec::new());
+        manifest.surfaces = vec![botster_ui_contract::PackageSurfaceDescriptor {
+            id: "home".to_string(),
+            kind: botster_ui_contract::PackageSurfaceKind::App,
+            title: "Home".to_string(),
+            description: None,
+            icon: None,
+            order: None,
+            category: None,
+            supports: vec![botster_ui_contract::PackageSurfaceOperation::Render],
+        }];
+        manifest.navigation = vec![botster_ui_contract::PackageNavigationEntry {
+            id: "home".to_string(),
+            label: "Home".to_string(),
+            icon: None,
+            description: None,
+            target: botster_ui_contract::PackageNavigationTarget::Surface {
+                surface_id: "home".to_string(),
+            },
+        }];
+
+        let core = manifest.core_execution_manifest();
+        assert!(core.surfaces.is_empty());
+        assert!(core.navigation.is_empty());
+    }
+
+    #[test]
+    fn install_rejects_duplicate_hub_owned_surface_ids() {
+        let mut manifest = plugin_manifest("presentation.plugin", Vec::new());
+        let surface = botster_ui_contract::PackageSurfaceDescriptor {
+            id: "home".to_string(),
+            kind: botster_ui_contract::PackageSurfaceKind::App,
+            title: "Home".to_string(),
+            description: None,
+            icon: None,
+            order: None,
+            category: None,
+            supports: vec![botster_ui_contract::PackageSurfaceOperation::Render],
+        };
+        manifest.surfaces = vec![surface.clone(), surface];
+
+        let error = PackageRegistry::new(CapabilitySet::new())
+            .install(manifest, provenance(), "reject duplicate surfaces")
+            .expect_err("duplicate surface ids should fail Hub admission");
+        assert!(matches!(
+            error.reason,
+            PackageAdmissionReason::InvalidPresentation(ref message)
+                if message.contains("duplicate package surface identifier")
+        ));
     }
 
     #[test]

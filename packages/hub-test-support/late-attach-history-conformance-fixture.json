@@ -1,5 +1,5 @@
 {
-  "conformance_fixture_revision": 23,
+  "conformance_fixture_revision": 24,
   "history_then_live": [
     {
       "session_id": "late-attach-history-fixture-session",

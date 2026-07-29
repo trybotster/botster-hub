@@ -464,7 +464,7 @@ mod tests {
         Capability, CapabilitySurface, CredentialRecord, CredentialStore, CredentialStoreError,
         ExtensionEntrypoint, ExtensionKind, ExtensionRuntime, PackageConfigurationField,
         PackageConfigurationFieldType, PackageConfigurationSchema, PackageConfigurationSecretValue,
-        PackageConfigurationValue, PackageManifest, PackageSource,
+        PackageConfigurationValue, PackageSource,
     };
 
     use super::*;
@@ -473,8 +473,8 @@ mod tests {
         validate_hub_credentials,
     };
     use crate::{
-        DataDirectoryOption, HostIdentityOptions, HubStartupOptions, PackageProvenance,
-        PackageRegistry, PackageRunnableEntrypoint, PackageRunnableProcessState,
+        DataDirectoryOption, HostIdentityOptions, HubPackageManifest, HubStartupOptions,
+        PackageProvenance, PackageRegistry, PackageRunnableEntrypoint, PackageRunnableProcessState,
         PackageRunnableWorkingDirectory, RuntimeEnvironment,
     };
 
@@ -503,8 +503,8 @@ mod tests {
             .join(nanos.to_string())
     }
 
-    fn plugin_manifest() -> PackageManifest {
-        PackageManifest {
+    fn plugin_manifest() -> HubPackageManifest {
+        HubPackageManifest {
             name: "workflow.plugin".to_string(),
             version: "1.0.0".to_string(),
             kind: ExtensionKind::Plugin,
@@ -563,7 +563,7 @@ mod tests {
         }
     }
 
-    fn configurable_plugin_manifest() -> PackageManifest {
+    fn configurable_plugin_manifest() -> HubPackageManifest {
         let mut manifest = plugin_manifest();
         manifest.configuration = Some(PackageConfigurationSchema {
             groups: Vec::new(),
@@ -862,8 +862,28 @@ mod tests {
             scope: None,
         };
         let mut registry = PackageRegistry::new(vec![grant.clone()].into_iter().collect());
+        let mut manifest = plugin_manifest();
+        manifest.surfaces = vec![botster_ui_contract::PackageSurfaceDescriptor {
+            id: "workflow.home".to_string(),
+            kind: botster_ui_contract::PackageSurfaceKind::App,
+            title: "Workflow".to_string(),
+            description: None,
+            icon: None,
+            order: None,
+            category: None,
+            supports: vec![botster_ui_contract::PackageSurfaceOperation::Render],
+        }];
+        manifest.navigation = vec![botster_ui_contract::PackageNavigationEntry {
+            id: "workflow.home".to_string(),
+            label: "Workflow".to_string(),
+            icon: None,
+            description: None,
+            target: botster_ui_contract::PackageNavigationTarget::Surface {
+                surface_id: "workflow.home".to_string(),
+            },
+        }];
         registry
-            .install(plugin_manifest(), provenance(), "install synthetic package")
+            .install(manifest, provenance(), "install synthetic package")
             .expect("install package");
         registry
             .enable("workflow.plugin", "enable synthetic package")
@@ -887,7 +907,16 @@ mod tests {
             .expect("load registry state");
 
         assert_eq!(reopened.package_registry.records.len(), 1);
+        assert_eq!(reopened.schema_version, HUB_STATE_SCHEMA_VERSION);
         assert!(reopened.package_registry.records[0].is_enabled());
+        assert_eq!(
+            reopened.package_registry.records[0].manifest.surfaces[0].id,
+            "workflow.home"
+        );
+        assert_eq!(
+            reopened.package_registry.records[0].manifest.navigation[0].id,
+            "workflow.home"
+        );
         assert_eq!(reopened.capability_grants.len(), 1);
         assert_eq!(
             reopened.package_registry.granted_capabilities,

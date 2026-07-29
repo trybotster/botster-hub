@@ -16,17 +16,17 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use botster_core::{
     AesGcmEnvelope, AesGcmKey, Capability, CapabilitySurface, CoreSessionMetadata,
     ExtensionEntrypoint, ExtensionKind, ExtensionRuntime, HostProfileMetadata,
-    HostProfilePolicySection, PackageManifest, PackageSource, ProcessIdentity, RequestId,
-    ResizePayload, SessionId, SessionSpawnRequest, SpawnEnvironment, SpawnWorkingDirectory,
-    SubscriptionId, decrypt_aes_gcm, encrypt_aes_gcm,
+    HostProfilePolicySection, PackageSource, ProcessIdentity, RequestId, ResizePayload, SessionId,
+    SessionSpawnRequest, SpawnEnvironment, SpawnWorkingDirectory, SubscriptionId, decrypt_aes_gcm,
+    encrypt_aes_gcm,
 };
 use botster_core_daemon::{RegistryRecord, SessionRegistry};
 use botster_hub::{
     CoreEngineOptions, DataDirectoryOption, FileHubStateStore, HostIdentityOptions, HubClientApi,
     HubClientEvent, HubClientRequest, HubClientResponseBody, HubDaemon, HubDaemonState,
-    HubStartupOptions, HubStateLoadSource, HubStateStore, PackageAdmissionPolicy,
-    PackageProvenance, PackageRegistry, RuntimeEnvironment, SessionDefaults, SpawnTarget,
-    TransportBindings,
+    HubPackageManifest, HubStartupOptions, HubStateLoadSource, HubStateStore,
+    PackageAdmissionPolicy, PackageProvenance, PackageRegistry, RuntimeEnvironment,
+    SessionDefaults, SpawnTarget, TransportBindings,
 };
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use webrtc::data_channel::{DataChannel, DataChannelEvent, RTCDataChannelInit};
@@ -593,13 +593,13 @@ fn package_provenance() -> PackageProvenance {
     }
 }
 
-fn provider_manifest() -> PackageManifest {
+fn provider_manifest() -> HubPackageManifest {
     let capabilities = vec![Capability {
         surface: CapabilitySurface::Surfaces,
         scope: None,
     }];
 
-    PackageManifest {
+    HubPackageManifest {
         name: "daemon.provider".to_string(),
         version: "1.0.0".to_string(),
         kind: ExtensionKind::Provider,
@@ -3501,7 +3501,7 @@ fn buffered_child_stdout_wait_observes_backpressure_condition() {
 }
 
 #[test]
-fn daemon_package_dtos_expose_declared_surfaces_and_validate_surface_ids() {
+fn daemon_package_dtos_expose_declared_surfaces_and_validate_surface_operations() {
     let _guard = daemon_test_guard();
     let data_dir = unique_short_test_dir("package-surfaces");
     let surface_package_dir = unique_test_dir("daemon-declared-surface-package");
@@ -3577,7 +3577,7 @@ fn daemon_package_dtos_expose_declared_surfaces_and_validate_surface_ids() {
     assert_eq!(surface_package.surfaces.len(), 2);
     let surface = &surface_package.surfaces[0];
     assert_eq!(surface.id, "runtime.surface.home");
-    assert_eq!(surface.kind, "app");
+    assert_eq!(surface.kind, botster_ui_contract::PackageSurfaceKind::App);
     assert_eq!(surface.title, "Runtime Surface");
     assert_eq!(
         surface.description.as_deref(),
@@ -3586,7 +3586,13 @@ fn daemon_package_dtos_expose_declared_surfaces_and_validate_surface_ids() {
     assert_eq!(surface.icon.as_deref(), Some("workflow"));
     assert_eq!(surface.order, Some(20));
     assert_eq!(surface.category.as_deref(), Some("runtime"));
-    assert_eq!(surface.supports, ["render", "action"]);
+    assert_eq!(
+        surface.supports,
+        [
+            botster_ui_contract::PackageSurfaceOperation::Render,
+            botster_ui_contract::PackageSurfaceOperation::Action
+        ]
+    );
 
     let show = connection
         .request(&botster_hub_client::DaemonRequest::ShowPackage {
@@ -3677,25 +3683,63 @@ fn daemon_package_dtos_expose_declared_surfaces_and_validate_surface_ids() {
                 == Some(botster_hub_client::FEATURE_PLUGIN_SURFACE_RENDER)
     }));
 
-    let legacy_passthrough = connection
+    let undeclared_empty_manifest = connection
         .request(&botster_hub_client::DaemonRequest::PluginSurfaceRender {
             package_name: "runtime.plugin".to_string(),
             surface_id: "legacy.dynamic.surface".to_string(),
             payload: serde_json::json!({}),
         })
-        .expect("legacy package render passes beyond descriptor guard");
+        .expect("package without descriptors returns operator error");
     assert_eq!(
-        legacy_passthrough.kind,
+        undeclared_empty_manifest.kind,
         botster_hub_client::DaemonResponseKind::OperatorError
     );
-    assert_ne!(
-        legacy_passthrough
+    assert_eq!(
+        undeclared_empty_manifest
             .error
             .as_ref()
-            .expect("legacy operator error")
+            .expect("undeclared operator error")
             .code,
         "undeclared_plugin_surface"
     );
+
+    let unsupported_action = connection
+        .request(&botster_hub_client::DaemonRequest::PluginSurfaceAction {
+            package_name: "runtime.surface-plugin".to_string(),
+            request: botster_ui_contract::UiActionRequest {
+                request_id: botster_ui_contract::UiActionRequestId(
+                    "unsupported-action".to_string(),
+                ),
+                surface_id: botster_ui_contract::UiSurfaceId(
+                    "runtime.surface.settings".to_string(),
+                ),
+                action_id: botster_ui_contract::UiActionId("settings.save".to_string()),
+                node_id: None,
+                kind: botster_ui_contract::UiActionKind::Submit,
+                values: None,
+                payload: None,
+            },
+        })
+        .expect("unsupported surface operation returns operator error");
+    assert_eq!(
+        unsupported_action.kind,
+        botster_hub_client::DaemonResponseKind::OperatorError
+    );
+    let unsupported_error = unsupported_action
+        .error
+        .as_ref()
+        .expect("unsupported operation error");
+    assert_eq!(
+        unsupported_error.code,
+        "unsupported_plugin_surface_operation"
+    );
+    assert_eq!(unsupported_error.operation, "plugin_surface_action");
+    assert!(unsupported_action.diagnostics.iter().any(|diagnostic| {
+        diagnostic.kind == botster_hub_client::DaemonDiagnosticKind::UnsupportedFeature
+            && diagnostic.operation.as_deref() == Some("plugin_surface_action")
+            && diagnostic.feature.as_deref()
+                == Some(botster_hub_client::FEATURE_PLUGIN_SURFACE_ACTION)
+    }));
 
     let status = connection
         .request(&botster_hub_client::DaemonRequest::Status)

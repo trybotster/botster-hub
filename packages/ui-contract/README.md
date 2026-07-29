@@ -4,8 +4,12 @@ Renderer-neutral plugin UI contract generated from the authoritative
 `botster-ui-contract` Rust crate in this repository.
 
 The package ships serde-accurate TypeScript declarations, a JSON Schema, and
-shared conformance fixtures. It is a normal build/protocol dependency for
-Botster clients, not an installable marketplace package.
+shared conformance fixtures. Alongside `UiNode` and action contracts it owns
+the renderer-neutral package surface, supported-operation, and navigation
+discoverability vocabulary. Hub manifests own admission and registry policy;
+clients must not copy these descriptors into daemon-specific mirrors. It is a
+normal build/protocol dependency for Botster clients, not an installable
+marketplace package.
 
 The host scopes presentation keys to the active Hub, package, and surface.
 Clients own the scoped presentation store and renderer policy. Plugin workers

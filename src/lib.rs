@@ -124,7 +124,7 @@ pub use mcp::{
     McpToolRegistry, McpToolResult, NativeHubToolProvider, PluginHubToolProvider, serve_mcp_stdio,
 };
 pub use packages::{
-    AvailablePackage, AvailablePackageState, LOCAL_PACKAGE_MANIFEST_FILE,
+    AvailablePackage, AvailablePackageState, HubPackageManifest, LOCAL_PACKAGE_MANIFEST_FILE,
     LOCAL_PACKAGE_REGISTRY_FILE, PackageAction, PackageAdmissionPolicy, PackageAdmissionReason,
     PackageClassification, PackageCompatibility, PackageCompatibilityResult,
     PackageConfigurationDiagnostic, PackageConfigurationState, PackageConfigurationView,
