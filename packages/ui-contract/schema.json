@@ -1,6 +1,104 @@
 {
   "$defs": {
     "JsonValue": {},
+    "PackageNavigationEntry": {
+      "additionalProperties": false,
+      "properties": {
+        "description": {
+          "type": "string"
+        },
+        "icon": {
+          "type": "string"
+        },
+        "id": {
+          "pattern": "\\S",
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "target": {
+          "$ref": "#/$defs/PackageNavigationTarget"
+        }
+      },
+      "required": [
+        "id",
+        "label",
+        "target"
+      ],
+      "type": "object"
+    },
+    "PackageNavigationTarget": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "const": "surface"
+        },
+        "surface_id": {
+          "pattern": "\\S",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "surface_id"
+      ],
+      "type": "object"
+    },
+    "PackageSurfaceDescriptor": {
+      "additionalProperties": false,
+      "properties": {
+        "category": {
+          "type": "string"
+        },
+        "description": {
+          "type": "string"
+        },
+        "icon": {
+          "type": "string"
+        },
+        "id": {
+          "pattern": "\\S",
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/PackageSurfaceKind"
+        },
+        "order": {
+          "type": "integer"
+        },
+        "supports": {
+          "items": {
+            "$ref": "#/$defs/PackageSurfaceOperation"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "title": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "kind",
+        "title"
+      ],
+      "type": "object"
+    },
+    "PackageSurfaceKind": {
+      "enum": [
+        "app",
+        "settings",
+        "dashboard_widget",
+        "diagnostics"
+      ]
+    },
+    "PackageSurfaceOperation": {
+      "enum": [
+        "render",
+        "action"
+      ]
+    },
     "UiAction": {
       "additionalProperties": false,
       "properties": {
@@ -701,7 +799,7 @@
       ]
     }
   },
-  "$id": "https://trybotster.dev/schemas/ui-contract-0.1.0.json",
+  "$id": "https://trybotster.dev/schemas/ui-contract-0.1.1.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "oneOf": [
     {
@@ -712,6 +810,12 @@
     },
     {
       "$ref": "#/$defs/UiActionResult"
+    },
+    {
+      "$ref": "#/$defs/PackageSurfaceDescriptor"
+    },
+    {
+      "$ref": "#/$defs/PackageNavigationEntry"
     }
   ],
   "title": "Botster UI Contract"

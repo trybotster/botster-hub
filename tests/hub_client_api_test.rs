@@ -9,20 +9,22 @@ use botster_core::{
     Capability, CapabilitySurface, ExtensionEntrypoint, ExtensionKind, ExtensionRuntime, ModeFlags,
     PackageBlockedReason, PackageConfigurationField, PackageConfigurationFieldType,
     PackageConfigurationSchema, PackageConfigurationSecretValue, PackageConfigurationValue,
-    PackageDependency, PackageDependencyKind, PackageFeatureGate, PackageNavigationEntry,
-    PackageNavigationTarget, PackageRequirement, PackageSurfaceDescriptor, PackageSurfaceKind,
-    PackageSurfaceOperation, RequestId, SessionId, SessionLifecycleState, SubscriptionId,
-    TerminalAttachState,
+    PackageDependency, PackageDependencyKind, PackageFeatureGate, PackageRequirement, RequestId,
+    SessionId, SessionLifecycleState, SubscriptionId, TerminalAttachState,
 };
 use botster_core_daemon::{GuardedWriteDecision, GuardedWriteDeliveryState, ReadinessEvidence};
 use botster_hub::{
     DataDirectoryOption, DeviceSessionTemplateSource, FileHubStateStore, HostIdentityOptions,
     HubClientAdmission, HubClientApi, HubClientError, HubClientEvent, HubClientIdentity,
     HubClientOperation, HubClientPackageClassification, HubClientPackageState, HubClientRequest,
-    HubClientResponseBody, HubClientRole, HubRuntime, HubStartupOptions, HubStateStore,
-    PackageProvenance, PackageRegistry, PackageSessionTemplate,
+    HubClientResponseBody, HubClientRole, HubPackageManifest, HubRuntime, HubStartupOptions,
+    HubStateStore, PackageProvenance, PackageRegistry, PackageSessionTemplate,
     PackageSessionTemplateWorkingDirectory, RuntimeEnvironment, SessionDefaults, SpawnTarget,
     TransportBindings,
+};
+use botster_ui_contract::{
+    PackageNavigationEntry, PackageNavigationTarget, PackageSurfaceDescriptor, PackageSurfaceKind,
+    PackageSurfaceOperation,
 };
 
 mod support;
@@ -203,8 +205,8 @@ fn capability(surface: CapabilitySurface, scope: Option<&str>) -> Capability {
     }
 }
 
-fn plugin_manifest(name: &str, capabilities: Vec<Capability>) -> botster_core::PackageManifest {
-    botster_core::PackageManifest {
+fn plugin_manifest(name: &str, capabilities: Vec<Capability>) -> HubPackageManifest {
+    HubPackageManifest {
         name: name.to_string(),
         version: "1.0.0".to_string(),
         kind: ExtensionKind::Plugin,
@@ -236,10 +238,7 @@ fn provenance() -> PackageProvenance {
     }
 }
 
-fn configurable_plugin_manifest(
-    name: &str,
-    capabilities: Vec<Capability>,
-) -> botster_core::PackageManifest {
+fn configurable_plugin_manifest(name: &str, capabilities: Vec<Capability>) -> HubPackageManifest {
     let mut manifest = plugin_manifest(name, capabilities);
     manifest.configuration = Some(PackageConfigurationSchema {
         groups: Vec::new(),
@@ -275,7 +274,7 @@ fn configurable_plugin_manifest(
     manifest
 }
 
-fn project_pipelines_manifest_with_github_feature() -> botster_core::PackageManifest {
+fn project_pipelines_manifest_with_github_feature() -> HubPackageManifest {
     let mut manifest = plugin_manifest(
         "project-pipelines",
         vec![capability(CapabilitySurface::Surfaces, None)],
@@ -315,7 +314,7 @@ fn project_pipelines_manifest_with_github_feature() -> botster_core::PackageMani
     manifest
 }
 
-fn capability_gated_plugin_manifest() -> botster_core::PackageManifest {
+fn capability_gated_plugin_manifest() -> HubPackageManifest {
     let mut manifest = plugin_manifest(
         "capability-gated.plugin",
         vec![capability(CapabilitySurface::Surfaces, None)],
@@ -1153,6 +1152,55 @@ fn package_navigation_derives_default_app_surface_entries_without_order_authorit
     let serialized = format!("{row:?}");
     assert!(!serialized.contains("order"));
     assert!(!serialized.contains("priority"));
+}
+
+#[test]
+fn plugin_surface_admission_is_shared_by_the_in_process_client_api() {
+    let api = HubClientApi::local_operator("plugin-surface-admission-client");
+    let surfaces = capability(CapabilitySurface::Surfaces, None);
+    let mut packages = PackageRegistry::new(vec![surfaces.clone()].into_iter().collect());
+    let mut manifest = plugin_manifest("surface.plugin", vec![surfaces]);
+    let mut action_only = app_surface("action-only", "Action only");
+    action_only.supports = vec![PackageSurfaceOperation::Action];
+    manifest.surfaces = vec![action_only];
+    packages
+        .install(manifest, provenance(), "install surface package")
+        .expect("install surface package");
+    let mut runtime = explicit_runtime("plugin-surface-admission");
+
+    let undeclared = api
+        .handle_request(
+            &mut runtime,
+            &packages,
+            HubClientRequest::PluginSurfaceRender {
+                request_id: request_id("render-undeclared-surface"),
+                package_name: "surface.plugin".to_string(),
+                surface_id: "missing".to_string(),
+                payload: serde_json::json!({}),
+            },
+        )
+        .expect_err("undeclared surfaces must be rejected before runtime dispatch");
+    assert!(matches!(
+        undeclared,
+        HubClientError::Plugin { ref code, .. } if code == "undeclared_plugin_surface"
+    ));
+
+    let unsupported = api
+        .handle_request(
+            &mut runtime,
+            &packages,
+            HubClientRequest::PluginSurfaceRender {
+                request_id: request_id("render-unsupported-surface"),
+                package_name: "surface.plugin".to_string(),
+                surface_id: "action-only".to_string(),
+                payload: serde_json::json!({}),
+            },
+        )
+        .expect_err("unsupported surface operations must be rejected before runtime dispatch");
+    assert!(matches!(
+        unsupported,
+        HubClientError::Plugin { ref code, .. } if code == "unsupported_plugin_surface_operation"
+    ));
 }
 
 #[test]
@@ -2637,13 +2685,19 @@ fn package_and_lifecycle_queries_are_sanitized_and_explicitly_pulled() {
     assert_eq!(record.surfaces.len(), 1);
     let surface = &record.surfaces[0];
     assert_eq!(surface.id, "workflow.home");
-    assert_eq!(surface.kind, "app");
+    assert_eq!(surface.kind, PackageSurfaceKind::App);
     assert_eq!(surface.title, "Workflow Home");
     assert_eq!(surface.description.as_deref(), Some("Workflow dashboard"));
     assert_eq!(surface.icon.as_deref(), Some("workflow"));
     assert_eq!(surface.order, Some(10));
     assert_eq!(surface.category.as_deref(), Some("workflows"));
-    assert_eq!(surface.supports, ["render", "action"]);
+    assert_eq!(
+        surface.supports,
+        [
+            PackageSurfaceOperation::Render,
+            PackageSurfaceOperation::Action
+        ]
+    );
     assert_eq!(record.runnable_entrypoints.len(), 1);
     let entrypoint = &record.runnable_entrypoints[0];
     assert_eq!(entrypoint.id, "web");

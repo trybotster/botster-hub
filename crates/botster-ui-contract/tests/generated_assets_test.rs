@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use botster_ui_contract::{
+    PackageNavigationEntry, PackageSurfaceDescriptor, PackageSurfaceKind, PackageSurfaceOperation,
     UiActionKind, UiActionRequest, UiActionResult, UiActionResultState, UiBindIf,
     UiCapabilityFallback, UiColorToken, UiDensity, UiDialogPresentation, UiFieldKind,
     UiHeightClass, UiIframePermission, UiIframeSandboxToken, UiMetricTrendDirection, UiNode,
@@ -35,6 +36,15 @@ fn generated_assets_match_checked_in_package() {
 #[test]
 fn generated_fixtures_deserialize_and_validate_through_rust_authority() {
     let fixtures = conformance_fixtures_json()["fixtures"].clone();
+
+    let surfaces: Vec<PackageSurfaceDescriptor> =
+        serde_json::from_value(fixtures["package_presentation"]["surfaces"].clone())
+            .expect("package surfaces");
+    let navigation: Vec<PackageNavigationEntry> =
+        serde_json::from_value(fixtures["package_presentation"]["navigation"].clone())
+            .expect("package navigation");
+    botster_ui_contract::validate_package_presentation(&surfaces, &navigation)
+        .expect("package presentation fixture validates");
 
     let dialog: UiBindIf =
         serde_json::from_value(fixtures["dialog_presence"].clone()).expect("dialog binding");
@@ -147,6 +157,22 @@ fn typescript_and_schema_encode_wire_names_and_optionality() {
             assert_eq!(schema_enum(&schema, $name), expected);
         }};
     }
+    assert_wire_enum!(
+        "PackageSurfaceKind",
+        [
+            PackageSurfaceKind::App,
+            PackageSurfaceKind::Settings,
+            PackageSurfaceKind::DashboardWidget,
+            PackageSurfaceKind::Diagnostics,
+        ]
+    );
+    assert_wire_enum!(
+        "PackageSurfaceOperation",
+        [
+            PackageSurfaceOperation::Render,
+            PackageSurfaceOperation::Action,
+        ]
+    );
     assert_wire_enum!(
         "UiNodeKind",
         [

@@ -8,6 +8,11 @@ export type UiActionId = string;
 export type UiSurfaceId = string;
 export type UiActionRequestId = string;
 export type UiPresentationKey = string;
+export type PackageSurfaceKind = "app" | "settings" | "dashboard_widget" | "diagnostics";
+export type PackageSurfaceOperation = "render" | "action";
+export interface PackageSurfaceDescriptor { id: string; kind: PackageSurfaceKind; title: string; description?: string; icon?: string; order?: number; category?: string; supports?: PackageSurfaceOperation[]; }
+export type PackageNavigationTarget = { kind: "surface"; surface_id: string };
+export interface PackageNavigationEntry { id: string; label: string; icon?: string; description?: string; target: PackageNavigationTarget; }
 export type UiNodeKind = "stack" | "inline" | "form" | "form_section" | "form_field" | "panel" | "metric" | "metric_grid" | "toolbar" | "status_badge" | "section" | "scroll_area" | "text" | "icon" | "badge" | "status_dot" | "empty_state" | "list" | "list_item" | "tree" | "tree_item" | "table" | "button" | "icon_button" | "menu" | "menu_item" | "dialog" | "text_input" | "textarea" | "checkbox" | "select" | "select_option" | "terminal_view" | "connection_code_view" | "iframe" | "custom";
 export type UiWidthClass = "compact" | "regular" | "expanded";
 export type UiHeightClass = "short" | "regular" | "tall";

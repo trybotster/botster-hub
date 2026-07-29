@@ -1,8 +1,9 @@
 use crate::{
-    UiActionKind, UiActionResultState, UiCapabilityFallback, UiColorToken, UiDensity,
-    UiDialogPresentation, UiFieldKind, UiHeightClass, UiIframePermission, UiIframeSandboxToken,
-    UiMetricTrendDirection, UiNodeKind, UiOrientation, UiPointer, UiSelectionMode, UiSpaceToken,
-    UiTableColumnAlign, UiToolbarOverflow, UiVariant, UiWidthClass,
+    PackageSurfaceKind, PackageSurfaceOperation, UiActionKind, UiActionResultState,
+    UiCapabilityFallback, UiColorToken, UiDensity, UiDialogPresentation, UiFieldKind,
+    UiHeightClass, UiIframePermission, UiIframeSandboxToken, UiMetricTrendDirection, UiNodeKind,
+    UiOrientation, UiPointer, UiSelectionMode, UiSpaceToken, UiTableColumnAlign, UiToolbarOverflow,
+    UiVariant, UiWidthClass,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -160,6 +161,16 @@ wire_enum!(UiActionResultState => [
     UiActionResultState::Deferred,
     UiActionResultState::Error,
 ]);
+wire_enum!(PackageSurfaceKind => [
+    PackageSurfaceKind::App,
+    PackageSurfaceKind::Settings,
+    PackageSurfaceKind::DashboardWidget,
+    PackageSurfaceKind::Diagnostics,
+]);
+wire_enum!(PackageSurfaceOperation => [
+    PackageSurfaceOperation::Render,
+    PackageSurfaceOperation::Action,
+]);
 
 fn wire_names<T: WireEnum>() -> Vec<String> {
     T::variants()
@@ -214,6 +225,8 @@ pub fn typescript_declarations() -> String {
     replace_union!("UiTableColumnAlign", UiTableColumnAlign);
     replace_union!("UiActionKind", UiActionKind);
     replace_union!("UiActionResultState", UiActionResultState);
+    replace_union!("PackageSurfaceKind", PackageSurfaceKind);
+    replace_union!("PackageSurfaceOperation", PackageSurfaceOperation);
     declarations
 }
 
@@ -222,12 +235,14 @@ pub fn typescript_declarations() -> String {
 pub fn json_schema() -> Value {
     json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "$id": "https://trybotster.dev/schemas/ui-contract-0.1.0.json",
+        "$id": "https://trybotster.dev/schemas/ui-contract-0.1.1.json",
         "title": "Botster UI Contract",
         "oneOf": [
             { "$ref": "#/$defs/UiNode" },
             { "$ref": "#/$defs/UiActionRequest" },
-            { "$ref": "#/$defs/UiActionResult" }
+            { "$ref": "#/$defs/UiActionResult" },
+            { "$ref": "#/$defs/PackageSurfaceDescriptor" },
+            { "$ref": "#/$defs/PackageNavigationEntry" }
         ],
         "$defs": {
             "JsonValue": {},
@@ -244,6 +259,52 @@ pub fn json_schema() -> Value {
             },
             "UiActionResultState": {
                 "enum": wire_names::<UiActionResultState>()
+            },
+            "PackageSurfaceKind": {
+                "enum": wire_names::<PackageSurfaceKind>()
+            },
+            "PackageSurfaceOperation": {
+                "enum": wire_names::<PackageSurfaceOperation>()
+            },
+            "PackageSurfaceDescriptor": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["id", "kind", "title"],
+                "properties": {
+                    "id": { "type": "string", "pattern": "\\S" },
+                    "kind": { "$ref": "#/$defs/PackageSurfaceKind" },
+                    "title": { "type": "string" },
+                    "description": { "type": "string" },
+                    "icon": { "type": "string" },
+                    "order": { "type": "integer" },
+                    "category": { "type": "string" },
+                    "supports": {
+                        "type": "array",
+                        "uniqueItems": true,
+                        "items": { "$ref": "#/$defs/PackageSurfaceOperation" }
+                    }
+                }
+            },
+            "PackageNavigationTarget": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["kind", "surface_id"],
+                "properties": {
+                    "kind": { "const": "surface" },
+                    "surface_id": { "type": "string", "pattern": "\\S" }
+                }
+            },
+            "PackageNavigationEntry": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["id", "label", "target"],
+                "properties": {
+                    "id": { "type": "string", "pattern": "\\S" },
+                    "label": { "type": "string" },
+                    "icon": { "type": "string" },
+                    "description": { "type": "string" },
+                    "target": { "$ref": "#/$defs/PackageNavigationTarget" }
+                }
             },
             "UiWidthClass": { "enum": wire_names::<UiWidthClass>() },
             "UiHeightClass": { "enum": wire_names::<UiHeightClass>() },
@@ -513,8 +574,21 @@ pub fn json_schema() -> Value {
 #[must_use]
 pub fn conformance_fixtures_json() -> Value {
     json!({
-        "contract_version": "0.1.0",
+        "contract_version": "0.1.1",
         "fixtures": {
+            "package_presentation": {
+                "surfaces": [{
+                    "id": "tickets",
+                    "kind": "app",
+                    "title": "Tickets",
+                    "supports": ["render", "action"]
+                }],
+                "navigation": [{
+                    "id": "tickets",
+                    "label": "Tickets",
+                    "target": { "kind": "surface", "surface_id": "tickets" }
+                }]
+            },
             "dialog_presence": {
                 "$kind": "presentation_if",
                 "predicate": { "kind": "present", "key": "create-ticket-dialog" },
@@ -610,6 +684,11 @@ export type UiActionId = string;
 export type UiSurfaceId = string;
 export type UiActionRequestId = string;
 export type UiPresentationKey = string;
+export type PackageSurfaceKind = __PackageSurfaceKind__;
+export type PackageSurfaceOperation = __PackageSurfaceOperation__;
+export interface PackageSurfaceDescriptor { id: string; kind: PackageSurfaceKind; title: string; description?: string; icon?: string; order?: number; category?: string; supports?: PackageSurfaceOperation[]; }
+export type PackageNavigationTarget = { kind: "surface"; surface_id: string };
+export interface PackageNavigationEntry { id: string; label: string; icon?: string; description?: string; target: PackageNavigationTarget; }
 export type UiNodeKind = __UiNodeKind__;
 export type UiWidthClass = __UiWidthClass__;
 export type UiHeightClass = __UiHeightClass__;

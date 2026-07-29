@@ -2438,6 +2438,9 @@ pub struct PluginContractMatrixConformanceReport {
     pub list_surfaces_match_enabled: bool,
     pub show_state: String,
     pub show_routes_match_list: bool,
+    pub navigation_item_ids: Vec<String>,
+    pub app_navigation_route_path: String,
+    pub settings_navigation_route_path: String,
     pub settings_route_supports_settings: bool,
     pub app_surface_package_name: String,
     pub app_surface_id: String,
@@ -3169,11 +3172,15 @@ pub fn run_plugin_contract_matrix_conformance(
         &installed_package.surfaces,
         PLUGIN_CONTRACT_SETTINGS_SURFACE,
     )?;
+    let settings_surface_kind: String =
+        serde_json::from_value(serde_json::to_value(settings_surface_descriptor.kind)?)?;
+    let settings_surface_supports: Vec<String> =
+        serde_json::from_value(serde_json::to_value(&settings_surface_descriptor.supports)?)?;
     expect_value(
         "contract_matrix_install",
         "settings_surface.kind",
         "settings",
-        &settings_surface_descriptor.kind,
+        &settings_surface_kind,
     )?;
     expect_value(
         "contract_matrix_install",
@@ -3403,6 +3410,58 @@ pub fn run_plugin_contract_matrix_conformance(
             actual: format!("{:?}", shown.routes),
         });
     }
+
+    let navigation = request(
+        hub.endpoint(),
+        DaemonRequest::ListPackageNavigation,
+        "contract_matrix_navigation",
+    )?;
+    expect_kind(
+        &navigation,
+        DaemonResponseKind::PackageNavigation,
+        "contract_matrix_navigation",
+    )?;
+    let package_navigation = navigation
+        .package_navigation
+        .iter()
+        .filter(|entry| entry.package_name == PLUGIN_CONTRACT_MATRIX_PACKAGE)
+        .collect::<Vec<_>>();
+    let navigation_item_ids = package_navigation
+        .iter()
+        .map(|entry| entry.item_id.clone())
+        .collect::<Vec<_>>();
+    expect_value(
+        "contract_matrix_navigation",
+        "item_ids",
+        r#"["contract.app","contract.settings"]"#,
+        &serde_json::to_string(&navigation_item_ids).expect("navigation ids serialize"),
+    )?;
+    let app_navigation = package_navigation
+        .iter()
+        .find(|entry| entry.item_id == "contract.app")
+        .ok_or(ConformanceError::MissingJsonField {
+            operation: "contract_matrix_navigation",
+            field: "contract.app",
+        })?;
+    let settings_navigation = package_navigation
+        .iter()
+        .find(|entry| entry.item_id == "contract.settings")
+        .ok_or(ConformanceError::MissingJsonField {
+            operation: "contract_matrix_navigation",
+            field: "contract.settings",
+        })?;
+    expect_value(
+        "contract_matrix_navigation",
+        "contract.app.route_path",
+        "/packages/botster.plugin-contract-matrix/surfaces/contract.app",
+        &app_navigation.route_path,
+    )?;
+    expect_value(
+        "contract_matrix_navigation",
+        "contract.settings.route_path",
+        "/packages/botster.plugin-contract-matrix/surfaces/contract.settings",
+        &settings_navigation.route_path,
+    )?;
 
     let app_surface = render_plugin_surface(
         hub,
@@ -4425,8 +4484,8 @@ pub fn run_plugin_contract_matrix_conformance(
         version: installed_package.version.clone(),
         source_kind: installed_package.source_kind.clone(),
         surface_ids,
-        settings_surface_kind: settings_surface_descriptor.kind.clone(),
-        settings_surface_supports: settings_surface_descriptor.supports.clone(),
+        settings_surface_kind,
+        settings_surface_supports,
         app_route_path: app_route.route_path.clone(),
         app_route_target_kind: app_route.target.kind.clone(),
         app_route_surface_id: app_route.surface_id.clone().unwrap_or_default(),
@@ -4442,6 +4501,9 @@ pub fn run_plugin_contract_matrix_conformance(
         list_surfaces_match_enabled,
         show_state: shown.state.clone(),
         show_routes_match_list,
+        navigation_item_ids,
+        app_navigation_route_path: app_navigation.route_path.clone(),
+        settings_navigation_route_path: settings_navigation.route_path.clone(),
         settings_route_supports_settings,
         app_surface_package_name: app_surface.package_name.clone(),
         app_surface_id: app_surface.surface_id.clone(),
@@ -4885,9 +4947,9 @@ fn package_row<'a>(
 }
 
 fn surface_descriptor<'a>(
-    surfaces: &'a [botster_hub_client::DaemonPackageSurfaceDescriptor],
+    surfaces: &'a [botster_ui_contract::PackageSurfaceDescriptor],
     surface_id: &'static str,
-) -> Result<&'a botster_hub_client::DaemonPackageSurfaceDescriptor, ConformanceError> {
+) -> Result<&'a botster_ui_contract::PackageSurfaceDescriptor, ConformanceError> {
     surfaces
         .iter()
         .find(|surface| surface.id == surface_id)
