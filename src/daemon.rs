@@ -258,7 +258,7 @@ impl fmt::Display for HubDaemonError {
             Self::State(error) => write!(formatter, "{error}"),
             Self::Runtime(error) => write!(formatter, "{error}"),
             Self::PackageRegistry(error) => {
-                write!(formatter, "hub package registry restore error: {error:?}")
+                write!(formatter, "hub package registry restore error: {error}")
             }
             Self::Package(error) => write!(formatter, "hub package policy error: {error:?}"),
             Self::Lifecycle(error) => write!(formatter, "hub plugin lifecycle error: {error:?}"),

@@ -14,7 +14,7 @@ use std::thread;
 use std::time::Duration;
 
 use base64::Engine as _;
-use botster_ui_contract::{UiActionRequest, UiActionResult, UiNode};
+use botster_ui_contract::{PackageSurfaceDescriptor, UiActionRequest, UiActionResult, UiNode};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -22,7 +22,7 @@ mod typescript;
 
 pub const PROTOCOL: &str = "botster-hub-daemon-v1";
 pub const PROTOCOL_VERSION: u16 = 4;
-pub const CONFORMANCE_FIXTURE_REVISION: u16 = 23;
+pub const CONFORMANCE_FIXTURE_REVISION: u16 = 24;
 /// Version of the local WebRTC delivery chunk framing protocol.
 pub const LOCAL_WEBRTC_DELIVERY_CHUNK_VERSION: u16 = 2;
 /// Serialized local WebRTC delivery frames must remain strictly below this size.
@@ -1280,7 +1280,7 @@ pub struct DaemonPackage {
     pub state: String,
     pub requested_capabilities: Vec<DaemonCapability>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub surfaces: Vec<DaemonPackageSurfaceDescriptor>,
+    pub surfaces: Vec<PackageSurfaceDescriptor>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub routes: Vec<DaemonPackageRouteDescriptor>,
     #[serde(default)]
@@ -1611,23 +1611,6 @@ pub struct DaemonPackageConfiguration {
 pub struct DaemonCapability {
     pub surface: String,
     pub scope: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DaemonPackageSurfaceDescriptor {
-    pub id: String,
-    pub kind: String,
-    pub title: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub icon: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub order: Option<i64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub category: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub supports: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3135,17 +3118,20 @@ mod tests {
     }
 
     #[test]
-    fn daemon_package_surface_descriptors_use_core_manifest_field_names() {
+    fn daemon_packages_reference_the_canonical_ui_contract_surface_descriptor() {
         let package = DaemonPackage {
-            surfaces: vec![DaemonPackageSurfaceDescriptor {
+            surfaces: vec![PackageSurfaceDescriptor {
                 id: "project-pipelines.home".to_string(),
-                kind: "app".to_string(),
+                kind: botster_ui_contract::PackageSurfaceKind::App,
                 title: "Project Pipelines".to_string(),
                 description: Some("Pipeline workbench".to_string()),
                 icon: Some("workflow".to_string()),
                 order: Some(10),
                 category: Some("workflows".to_string()),
-                supports: vec!["render".to_string(), "action".to_string()],
+                supports: vec![
+                    botster_ui_contract::PackageSurfaceOperation::Render,
+                    botster_ui_contract::PackageSurfaceOperation::Action,
+                ],
             }],
             routes: Vec::new(),
             ..daemon_response_example(DaemonResponseKind::Packages).packages[0].clone()
@@ -3167,9 +3153,9 @@ mod tests {
         );
 
         let generated = daemon_protocol_typescript();
-        assert!(generated.contains("surfaces?: DaemonPackageSurfaceDescriptor[];"));
-        assert!(generated.contains("export interface DaemonPackageSurfaceDescriptor"));
-        assert!(generated.contains("  supports?: string[];"));
+        assert!(generated.contains("surfaces?: PackageSurfaceDescriptor[];"));
+        assert!(generated.contains("PackageSurfaceDescriptor, UiActionRequest"));
+        assert!(!generated.contains("export interface DaemonPackageSurfaceDescriptor"));
     }
 
     #[test]

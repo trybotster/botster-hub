@@ -1,5 +1,5 @@
 {
-  "contract_version": "0.1.0",
+  "contract_version": "0.1.1",
   "fixtures": {
     "accepted": {
       "action_id": "ticket.create",
@@ -78,6 +78,29 @@
         "submit_label": "Create ticket"
       },
       "type": "form"
+    },
+    "package_presentation": {
+      "navigation": [
+        {
+          "id": "tickets",
+          "label": "Tickets",
+          "target": {
+            "kind": "surface",
+            "surface_id": "tickets"
+          }
+        }
+      ],
+      "surfaces": [
+        {
+          "id": "tickets",
+          "kind": "app",
+          "supports": [
+            "render",
+            "action"
+          ],
+          "title": "Tickets"
+        }
+      ]
     },
     "rejected": {
       "action_id": "ticket.create",

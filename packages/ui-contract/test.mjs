@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import { conformanceFixtures, packageVersion, schema } from "./index.js";
 
-assert.equal(packageVersion, "0.1.0");
+assert.equal(packageVersion, "0.1.1");
 assert.equal(schema.title, "Botster UI Contract");
 assert.equal(
   conformanceFixtures.fixtures.request.values.title,

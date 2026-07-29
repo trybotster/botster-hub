@@ -311,7 +311,7 @@ fn registration_for(
             descriptors: bundle.descriptors,
             metadata: bundle.metadata,
         },
-        manifest: record.manifest.clone(),
+        manifest: record.manifest.core_execution_manifest(),
         runtime: bundle.runtime,
         handlers: bundle.handlers,
         resources: bundle.resources,
