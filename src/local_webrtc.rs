@@ -1373,6 +1373,7 @@ fn response_with_diagnostic(diagnostic: DaemonDiagnostic) -> DaemonResponse {
         update_status: None,
         package_decision: None,
         lifecycle: Vec::new(),
+        plugin_worker_counters: None,
         plugin_tools: Vec::new(),
         plugin_tool_result: Value::Null,
         plugin_surface: None,
