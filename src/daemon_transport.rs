@@ -7159,6 +7159,111 @@ mod tests {
     }
 
     #[test]
+    fn live_session_entity_subscription_emits_exact_stale_transition_patch() {
+        let data_directory = std::env::temp_dir().join(format!(
+            "botster-hub-stale-transition-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after epoch")
+                .as_nanos()
+        ));
+        let config = crate::HubStartupOptions {
+            host: crate::HostIdentityOptions {
+                id: "stale-transition-test".to_string(),
+                display_name: "Stale Transition Test".to_string(),
+                fingerprint: None,
+            },
+            data_directory: crate::DataDirectoryOption::Explicit(data_directory.clone()),
+            session_defaults: crate::SessionDefaults {
+                shell: "/bin/sh".to_string(),
+                working_directory: Some(".".into()),
+                initial_rows: 24,
+                initial_cols: 80,
+            },
+            transports: crate::TransportBindings::default(),
+            ..crate::HubStartupOptions::default()
+        }
+        .build_config_for_environment(&crate::RuntimeEnvironment::from_values(None, None))
+        .expect("build stale transition config");
+        let mut daemon = HubDaemon::start(config).expect("start stale transition daemon");
+        let session_id = SessionId("stale-transition-session".to_string());
+        daemon
+            .runtime_mut()
+            .expect("runtime initialized")
+            .spawn_session(
+                botster_core::SessionSpawnRequest {
+                    request_id: RequestId("stale-transition-spawn".to_string()),
+                    session_id: session_id.clone(),
+                    executable: "/bin/sh".to_string(),
+                    arguments: vec![
+                        "-c".to_string(),
+                        "while IFS= read -r line; do printf '%s\\n' \"$line\"; done".to_string(),
+                    ],
+                    working_directory: botster_core::SpawnWorkingDirectory {
+                        path: ".".to_string(),
+                    },
+                    environment: botster_core::SpawnEnvironment::default(),
+                    initial_pty_size: Some(botster_core::ResizePayload { rows: 24, cols: 80 }),
+                },
+                botster_core::CoreSessionMetadata::new(),
+                1,
+            )
+            .expect("spawn worker-backed session");
+
+        let mut state = DaemonControlState::default();
+        seed_lifecycle_reconciliation(&mut daemon, &mut state);
+        let (sender, receiver) = mpsc::sync_channel(4);
+        let response = register_entity_subscription(
+            &mut daemon,
+            &mut state,
+            "session".to_string(),
+            "stale-transition-subscription".to_string(),
+            EntityFrameSender::Blocking(sender),
+        )
+        .expect("register entity subscription");
+        assert_eq!(response.kind, DaemonResponseKind::EntitySubscribed);
+        assert!(matches!(
+            receiver.recv().expect("initial current snapshot"),
+            DaemonEntityFrame::Snapshot { ref items, .. }
+                if items.iter().any(|entity| {
+                    entity.session_uuid == session_id.0
+                        && entity.registry_state == "running"
+                        && entity.lifecycle.as_deref() == Some("running")
+                        && entity.lifecycle_class == "current"
+                })
+        ));
+
+        daemon
+            .runtime()
+            .expect("runtime initialized")
+            .mark_session_stale(&session_id, 2)
+            .expect("mark live session stale through core daemon");
+        drive_entity_subscriptions(&mut daemon, &mut state);
+        assert!(matches!(
+            receiver.recv().expect("stale transition patch"),
+            DaemonEntityFrame::Patch {
+                ref id,
+                ref patch,
+                ..
+            } if id == &session_id.0
+                && patch == &serde_json::json!({
+                    "registry_state": "stale",
+                    "lifecycle_class": "indeterminate",
+                    "updated_at": 2
+                })
+        ));
+
+        daemon
+            .runtime_mut()
+            .expect("runtime initialized")
+            .shutdown_session(session_id, 3)
+            .expect("stop worker-backed test session");
+        daemon.stop();
+        let _ = fs::remove_dir_all(data_directory);
+    }
+
+    #[test]
     fn due_reconciliation_precedes_an_already_ready_control_message() {
         let (control_tx, mut control_rx) = tokio_mpsc::channel(1);
         control_tx

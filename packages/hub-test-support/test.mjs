@@ -324,6 +324,23 @@ assert.equal(
   Object.values(sessionPluginMaterialization.initial).includes("unavailable"),
   true,
 );
+assert.deepEqual(
+  Object.keys(sessionPluginBindingFixture.transition_frames[1].patch),
+  ["lifecycle_class", "registry_state", "updated_at"],
+  "stale transition must match the producer's omitted optional lifecycle field",
+);
+const transitionRow = structuredClone(
+  sessionPluginBindingFixture.initial_snapshot.items.find(
+    (item) => item.session_uuid === "session-transition",
+  ),
+);
+Object.assign(
+  transitionRow,
+  sessionPluginBindingFixture.transition_frames[0].patch,
+  sessionPluginBindingFixture.transition_frames[1].patch,
+);
+assert.equal(transitionRow.lifecycle, "exited");
+assert.equal(transitionRow.lifecycle_class, "indeterminate");
 const malformedSessionFrames = [
   sessionPluginBindingFixture.initial_snapshot,
   {

@@ -270,7 +270,6 @@
       "entity_type": "session",
       "id": "session-transition",
       "patch": {
-        "lifecycle": null,
         "lifecycle_class": "indeterminate",
         "registry_state": "stale",
         "updated_at": 3
