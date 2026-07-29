@@ -4,18 +4,18 @@ use std::sync::{Arc, Mutex};
 
 use botster_core::{
     BoundaryJson, Capability, CapabilitySurface, ExtensionEntrypoint, ExtensionKind,
-    ExtensionRuntime, HostProfileMetadata, HostProfilePolicySection, PackageManifest,
-    PackageSource, PluginCancellationToken, PluginDescriptorKind, PluginDescriptorRef,
-    PluginHandlerKind, PluginHandlerRef, PluginHandlerRegistration, PluginInvocationContext,
-    PluginInvocationFailure, PluginInvocationFailureKind, PluginInvocationRequest,
-    PluginInvocationResult, PluginInvocationSuccess, PluginKey, PluginOwnedDescriptor,
-    PluginResourceKind, PluginResourceRef, PluginRuntime, RequestId,
+    ExtensionRuntime, HostProfileMetadata, HostProfilePolicySection, PackageSource,
+    PluginCancellationToken, PluginDescriptorKind, PluginDescriptorRef, PluginHandlerKind,
+    PluginHandlerRef, PluginHandlerRegistration, PluginInvocationContext, PluginInvocationFailure,
+    PluginInvocationFailureKind, PluginInvocationRequest, PluginInvocationResult,
+    PluginInvocationSuccess, PluginKey, PluginOwnedDescriptor, PluginResourceKind,
+    PluginResourceRef, PluginRuntime, RequestId,
 };
 use botster_hub::{
     CoreEngineOptions, DataDirectoryOption, FileHubStateStore, HostIdentityOptions,
-    HubLifecycleError, HubPluginRuntimeBundle, HubRuntime, HubStartupOptions, HubStateStore,
-    LOCAL_PACKAGE_MANIFEST_FILE, PackageProvenance, PackageRegistry, RuntimeEnvironment,
-    SessionDefaults, TransportBindings,
+    HubLifecycleError, HubPackageManifest, HubPluginRuntimeBundle, HubRuntime, HubStartupOptions,
+    HubStateStore, LOCAL_PACKAGE_MANIFEST_FILE, PackageProvenance, PackageRegistry,
+    RuntimeEnvironment, SessionDefaults, TransportBindings,
 };
 
 #[derive(Clone)]
@@ -125,8 +125,8 @@ fn provenance() -> PackageProvenance {
     }
 }
 
-fn plugin_manifest(name: &str, capabilities: Vec<Capability>) -> PackageManifest {
-    PackageManifest {
+fn plugin_manifest(name: &str, capabilities: Vec<Capability>) -> HubPackageManifest {
+    HubPackageManifest {
         name: name.to_string(),
         version: "1.0.0".to_string(),
         kind: ExtensionKind::Plugin,
@@ -151,14 +151,14 @@ fn plugin_manifest(name: &str, capabilities: Vec<Capability>) -> PackageManifest
     }
 }
 
-fn local_plugin_manifest(name: &str, capabilities: Vec<Capability>) -> PackageManifest {
+fn local_plugin_manifest(name: &str, capabilities: Vec<Capability>) -> HubPackageManifest {
     let mut manifest = plugin_manifest(name, capabilities);
     manifest.source = None;
     manifest
 }
 
-fn provider_manifest(name: &str, capabilities: Vec<Capability>) -> PackageManifest {
-    PackageManifest {
+fn provider_manifest(name: &str, capabilities: Vec<Capability>) -> HubPackageManifest {
+    HubPackageManifest {
         name: name.to_string(),
         version: "1.0.0".to_string(),
         kind: ExtensionKind::Provider,
@@ -275,7 +275,7 @@ fn test_root(name: &str) -> PathBuf {
         .expect("canonical integration test root")
 }
 
-fn write_local_manifest(package_root: &Path, manifest: &PackageManifest) -> PathBuf {
+fn write_local_manifest(package_root: &Path, manifest: &HubPackageManifest) -> PathBuf {
     let manifest_path = package_root.join(LOCAL_PACKAGE_MANIFEST_FILE);
     fs::write(
         &manifest_path,

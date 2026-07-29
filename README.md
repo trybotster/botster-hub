@@ -144,7 +144,7 @@ Terminal attach is a terminal-stream handshake only. Session-list reads remain
 an operator/query API; stateful clients use the explicit held-open `session`
 entity subscription for an authoritative snapshot followed by ordered deltas.
 The reusable contract ships in
-`@trybotster/hub-test-support@0.1.15` as source-derived JSON fixtures and a Rust
+`@trybotster/hub-test-support@0.1.16` as source-derived JSON fixtures and a Rust
 `run_session_lifecycle_subscription_conformance` runner over the real isolated
 Hub/Core/session-worker topology.
 Every delivered session row includes required `lifecycle_class`:
@@ -461,7 +461,7 @@ data_dir=resolved:$HOME/.botster/hub
 daemon=started
 protocol=botster-hub-daemon-v1
 protocol_version=4
-conformance_fixture_revision=23
+conformance_fixture_revision=24
 package_count=2
 enabled_package_count=2
 app_count=2
@@ -966,25 +966,27 @@ outside the smoke command; local TUI attaches through the same daemon socket.
 
 `default_package_policy()` is the production-facing hub-owned package policy
 surface. It builds a `PackageAdmissionPolicy` from `host_profile()` default
-capability grants, then stores in-memory package records around
-`botster_core::PackageManifest` values through `PackageRegistry`. The registry
+capability grants, then stores in-memory package records around the Hub-owned
+`HubPackageManifest` through `PackageRegistry`. The registry
 keeps enabled/disabled state, records provenance/checksum and pin/update
 metadata, classifies providers from `botster_core::ExtensionKind`, persists a
 hub-owned trust marker, records admitted capabilities after enablement, records
 the narrow Botster compatibility result/diagnostics, and validates enable
 decisions against the profile-derived hub grant set.
 
-The registry deliberately uses core package contracts instead of defining a hub
-manifest or capability vocabulary. Provider packages must carry host-profile
+The Hub manifest reuses Core's policy-free capability, dependency,
+configuration, entrypoint, and host-profile field types, while
+`botster-ui-contract` owns renderer-neutral surface and navigation semantics.
+Provider packages must carry host-profile
 metadata before they can be enabled; provider host-profile packages are admitted
 through `botster_core::admit_host_profile`, so core still owns the narrow
 manifest/admission preconditions while hub owns install, enable, disable, pin,
 grant, provenance, update, and audit policy.
 
 Local production runtime installs accept either an explicit JSON manifest path or a package
-directory containing `botster-package.json`. The file is parsed as
-`botster_core::PackageManifest` plus the hub-owned `runnable_entrypoints`
-extension; the hub rewrites the manifest source to `PackageSource::Path` with
+directory containing `botster-package.json`. The file is parsed once as
+`HubPackageManifest`; the hub rewrites the manifest source to
+`PackageSource::Path` with
 the canonical package root, records
 `local:<canonical-package-root>` provenance, marks the record as
 `local_development` trust, and rejects absolute, traversing, or symlink-escaped

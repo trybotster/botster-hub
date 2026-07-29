@@ -3,7 +3,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use botster_ui_contract::{
-    UiAction, UiActionRequestId, UiToolbarOverflow as FlatUiToolbarOverflow,
+    PackageNavigationEntry, PackageNavigationTarget, PackagePresentationValidationError,
+    PackageSurfaceDescriptor, PackageSurfaceKind, PackageSurfaceOperation, UiAction,
+    UiActionRequestId, UiToolbarOverflow as FlatUiToolbarOverflow,
 };
 use botster_ui_contract::{
     UiActionId, UiActionKind, UiActionRequest, UiActionResult, UiActionResultState,
@@ -15,7 +17,7 @@ use botster_ui_contract::{
     UiPresentationKey, UiPresentationOperation, UiPresentationPredicate, UiResponsiveHeight,
     UiResponsiveValue, UiResponsiveWidth, UiSelection, UiSelectionMode, UiSurfaceId, UiTableCell,
     UiTableColumn, UiTableColumnDescriptor, UiTableRow, UiToolbarOverflow, UiValidationError,
-    UiVariant, UiWidthClass, validate_ui_node_with_capabilities,
+    UiVariant, UiWidthClass, validate_package_presentation, validate_ui_node_with_capabilities,
 };
 use serde_json::{Map, Value, json};
 
@@ -148,6 +150,65 @@ fn rich_capabilities() -> UiCapabilitySet {
         rich_color: true,
         fallbacks: BTreeSet::new(),
     }
+}
+
+fn package_surface(id: &str) -> PackageSurfaceDescriptor {
+    PackageSurfaceDescriptor {
+        id: id.to_string(),
+        kind: PackageSurfaceKind::App,
+        title: "Tickets".to_string(),
+        description: None,
+        icon: None,
+        order: None,
+        category: None,
+        supports: vec![
+            PackageSurfaceOperation::Render,
+            PackageSurfaceOperation::Action,
+        ],
+    }
+}
+
+#[test]
+fn package_presentation_validates_ids_operations_and_navigation_targets() {
+    let surface = package_surface("tickets");
+    let navigation = PackageNavigationEntry {
+        id: "tickets".to_string(),
+        label: "Tickets".to_string(),
+        icon: None,
+        description: None,
+        target: PackageNavigationTarget::Surface {
+            surface_id: "tickets".to_string(),
+        },
+    };
+    validate_package_presentation(
+        std::slice::from_ref(&surface),
+        std::slice::from_ref(&navigation),
+    )
+    .expect("valid package presentation");
+
+    assert_eq!(
+        validate_package_presentation(&[surface.clone(), surface.clone()], &[]),
+        Err(PackagePresentationValidationError::DuplicateSurfaceId {
+            id: "tickets".to_string()
+        })
+    );
+    assert_eq!(
+        validate_package_presentation(
+            &[surface],
+            &[PackageNavigationEntry {
+                target: PackageNavigationTarget::Surface {
+                    surface_id: "missing".to_string(),
+                },
+                ..navigation
+            }],
+        ),
+        Err(
+            PackagePresentationValidationError::UnknownNavigationSurface {
+                navigation_id: "tickets".to_string(),
+                surface_id: "missing".to_string(),
+            }
+        )
+    );
 }
 
 #[test]

@@ -72,6 +72,22 @@
       "supports": ["render"]
     }
   ],
+  "navigation": [
+    {
+      "id": "contract.app",
+      "label": "Contract App",
+      "icon": "workflow",
+      "description": "Open the primary package contract surface.",
+      "target": { "kind": "surface", "surface_id": "contract.app" }
+    },
+    {
+      "id": "contract.settings",
+      "label": "Contract Settings",
+      "icon": "settings",
+      "description": "Open the package configuration contract surface.",
+      "target": { "kind": "surface", "surface_id": "contract.settings" }
+    }
+  ],
   "configuration": {
     "fields": [
       {

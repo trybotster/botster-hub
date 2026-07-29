@@ -33,6 +33,192 @@ mod assets;
 
 pub use assets::{conformance_fixtures_json, json_schema, typescript_declarations};
 
+/// Transport-neutral UI surface metadata carried by a package manifest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PackageSurfaceDescriptor {
+    /// Stable surface identifier within the package.
+    pub id: String,
+    /// Semantic surface kind.
+    pub kind: PackageSurfaceKind,
+    /// Human-readable surface title.
+    pub title: String,
+    /// Optional surface help text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Optional renderer-neutral icon or token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+    /// Legacy non-authoritative ordering hint kept for manifest compatibility.
+    /// Hosts, users, and clients own actual navigation ordering policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order: Option<i64>,
+    /// Optional host-readable category.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+    /// Supported surface operations.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub supports: Vec<PackageSurfaceOperation>,
+}
+
+/// Semantic UI surface kinds a package can declare.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PackageSurfaceKind {
+    /// Main application surface.
+    App,
+    /// Settings or preferences surface.
+    Settings,
+    /// Dashboard widget surface.
+    DashboardWidget,
+    /// Diagnostic or troubleshooting surface.
+    Diagnostics,
+}
+
+/// Operations a client can perform for a declared package surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PackageSurfaceOperation {
+    /// Client can render the surface.
+    Render,
+    /// Client can invoke actions for the surface.
+    Action,
+}
+
+/// Package-authored navigation intent inspected by hosts without running
+/// plugin code.
+///
+/// Navigation declares discoverability only. Hosts retain placement, ordering,
+/// pinning, hiding, and admission policy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PackageNavigationEntry {
+    /// Stable navigation item identifier within the package.
+    pub id: String,
+    /// User-facing label for the navigation item.
+    pub label: String,
+    /// Optional renderer-neutral icon token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+    /// Optional descriptive help text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Host-resolved target for the navigation item.
+    pub target: PackageNavigationTarget,
+}
+
+/// Host-resolved target for a package navigation entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PackageNavigationTarget {
+    /// Target one package surface by stable surface id.
+    Surface {
+        /// Stable surface identifier within the same package.
+        surface_id: String,
+    },
+}
+
+/// Invalid package surface or navigation declaration.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum PackagePresentationValidationError {
+    /// A stable identifier is empty or whitespace-only.
+    #[error("{field} identifier must be non-empty")]
+    EmptyId {
+        /// Descriptor field containing the invalid identifier.
+        field: &'static str,
+    },
+    /// More than one surface uses the same package-local identifier.
+    #[error("duplicate package surface identifier `{id}`")]
+    DuplicateSurfaceId {
+        /// Duplicate package-local identifier.
+        id: String,
+    },
+    /// More than one navigation entry uses the same package-local identifier.
+    #[error("duplicate package navigation identifier `{id}`")]
+    DuplicateNavigationId {
+        /// Duplicate package-local identifier.
+        id: String,
+    },
+    /// A navigation entry targets a surface the package did not declare.
+    #[error("package navigation `{navigation_id}` targets undeclared surface `{surface_id}`")]
+    UnknownNavigationSurface {
+        /// Navigation entry containing the unresolved target.
+        navigation_id: String,
+        /// Missing package-local surface identifier.
+        surface_id: String,
+    },
+    /// A surface repeats one operation declaration.
+    #[error("package surface `{surface_id}` declares duplicate `{operation:?}` support")]
+    DuplicateSurfaceOperation {
+        /// Package-local surface identifier.
+        surface_id: String,
+        /// Repeated operation.
+        operation: PackageSurfaceOperation,
+    },
+}
+
+/// Validate one package's renderer-neutral surface and discoverability contract.
+pub fn validate_package_presentation(
+    surfaces: &[PackageSurfaceDescriptor],
+    navigation: &[PackageNavigationEntry],
+) -> Result<(), PackagePresentationValidationError> {
+    let mut surface_ids = BTreeSet::new();
+    for surface in surfaces {
+        if surface.id.trim().is_empty() {
+            return Err(PackagePresentationValidationError::EmptyId { field: "surface" });
+        }
+        if !surface_ids.insert(surface.id.as_str()) {
+            return Err(PackagePresentationValidationError::DuplicateSurfaceId {
+                id: surface.id.clone(),
+            });
+        }
+
+        let mut operations = BTreeSet::new();
+        for operation in &surface.supports {
+            if !operations.insert(*operation) {
+                return Err(
+                    PackagePresentationValidationError::DuplicateSurfaceOperation {
+                        surface_id: surface.id.clone(),
+                        operation: *operation,
+                    },
+                );
+            }
+        }
+    }
+
+    let mut navigation_ids = BTreeSet::new();
+    for entry in navigation {
+        if entry.id.trim().is_empty() {
+            return Err(PackagePresentationValidationError::EmptyId {
+                field: "navigation",
+            });
+        }
+        if !navigation_ids.insert(entry.id.as_str()) {
+            return Err(PackagePresentationValidationError::DuplicateNavigationId {
+                id: entry.id.clone(),
+            });
+        }
+        match &entry.target {
+            PackageNavigationTarget::Surface { surface_id } => {
+                if surface_id.trim().is_empty() {
+                    return Err(PackagePresentationValidationError::EmptyId {
+                        field: "navigation surface target",
+                    });
+                }
+                if !surface_ids.contains(surface_id.as_str()) {
+                    return Err(
+                        PackagePresentationValidationError::UnknownNavigationSurface {
+                            navigation_id: entry.id.clone(),
+                            surface_id: surface_id.clone(),
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Stable UI node identifier.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct UiNodeId(pub String);

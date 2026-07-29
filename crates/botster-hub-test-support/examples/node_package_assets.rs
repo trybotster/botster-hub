@@ -88,7 +88,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         "conformance_fixture_revision": matrix.conformance_fixture_revision,
         "ui_contract": {
             "package_name": "@trybotster/ui-contract",
-            "package_version": "0.1.0",
+            "package_version": "0.1.1",
             "conformance_fixture_export": "@trybotster/ui-contract/conformance-fixtures",
         },
         "daemon_protocol_source_artifact": protocol.artifact_path,

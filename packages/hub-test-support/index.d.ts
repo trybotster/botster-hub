@@ -11,7 +11,7 @@ export interface HubTestSupportMetadata {
   conformance_fixture_revision: number;
   ui_contract: {
     package_name: "@trybotster/ui-contract";
-    package_version: "0.1.0";
+    package_version: "0.1.1";
     conformance_fixture_export: "@trybotster/ui-contract/conformance-fixtures";
   };
   generated_by: string;

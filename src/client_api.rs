@@ -9,9 +9,8 @@ use std::collections::BTreeMap;
 use botster_core::{
     BotsterEngineObservation, CapabilitySurface, ClientId, CoreSession, CoreSessionMetadata,
     EnvelopeCursor, EnvelopeDeliveryState, EnvelopeId, EnvelopeTarget, PackageBlockedReason,
-    PackageDependencyResolution, PackageFeatureResolution, PackageNavigationTarget,
-    PackageResolutionState, PackageSource, PackageSurfaceKind, PackageSurfaceOperation, RequestId,
-    RoutedEnvelope, RoutedEnvelopeDrainOutcome, RoutedEnvelopePublishOutcome,
+    PackageDependencyResolution, PackageFeatureResolution, PackageResolutionState, PackageSource,
+    RequestId, RoutedEnvelope, RoutedEnvelopeDrainOutcome, RoutedEnvelopePublishOutcome,
     RunnableEntrypointKind, RunnableEntrypointLaunchMode, SessionId, SessionLifecycleState,
     SessionRuntimeErrorKind, SessionSpawnRequest, SpawnEnvironment, SpawnWorkingDirectory,
     SubscriptionId, TerminalAttachState, TransportEgress,
@@ -20,7 +19,10 @@ use botster_core_daemon::{
     GuardedWriteDecision, GuardedWriteDeliveryState, GuardedWriteRequest, GuardedWriteResult,
     ReadinessEvidence, SessionLifecycleBaseline,
 };
-use botster_ui_contract::{UiActionRequest, UiActionResult, UiNode};
+use botster_ui_contract::{
+    PackageNavigationTarget, PackageSurfaceDescriptor, PackageSurfaceKind, UiActionRequest,
+    UiActionResult, UiNode,
+};
 
 use crate::lifecycle::HubPluginLifecycleStatus;
 use crate::packages::{
@@ -1140,7 +1142,7 @@ pub struct HubClientPackage {
     pub source_kind: String,
     pub state: HubClientPackageState,
     pub requested_capabilities: Vec<HubClientCapability>,
-    pub surfaces: Vec<HubClientPackageSurfaceDescriptor>,
+    pub surfaces: Vec<PackageSurfaceDescriptor>,
     pub navigation: Vec<HubClientPackageNavigationEntry>,
     pub runnable_entrypoints: Vec<HubClientPackageRunnableEntrypoint>,
     pub configuration: HubClientPackageConfiguration,
@@ -1179,25 +1181,7 @@ impl HubClientPackage {
                     scope: capability.scope.clone(),
                 })
                 .collect(),
-            surfaces: record
-                .manifest
-                .surfaces
-                .iter()
-                .map(|surface| HubClientPackageSurfaceDescriptor {
-                    id: surface.id.clone(),
-                    kind: package_surface_kind_label(&surface.kind).to_string(),
-                    title: surface.title.clone(),
-                    description: surface.description.clone(),
-                    icon: surface.icon.clone(),
-                    order: surface.order,
-                    category: surface.category.clone(),
-                    supports: surface
-                        .supports
-                        .iter()
-                        .map(|operation| package_surface_operation_label(operation).to_string())
-                        .collect(),
-                })
-                .collect(),
+            surfaces: record.manifest.surfaces.clone(),
             navigation: record
                 .manifest
                 .navigation
@@ -1298,7 +1282,7 @@ impl HubClientPackage {
 
         self.surfaces
             .into_iter()
-            .filter(|surface| surface.kind == "app")
+            .filter(|surface| surface.kind == PackageSurfaceKind::App)
             .map(|surface| HubClientPackageNavigationEntry {
                 package_name: self.package_name.clone(),
                 item_id: surface.id.clone(),
@@ -1523,19 +1507,6 @@ impl From<&PackageFeatureResolution> for HubClientPackageFeatureAvailability {
     }
 }
 
-/// Sanitized package UI surface descriptor.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HubClientPackageSurfaceDescriptor {
-    pub id: String,
-    pub kind: String,
-    pub title: String,
-    pub description: Option<String>,
-    pub icon: Option<String>,
-    pub order: Option<i64>,
-    pub category: Option<String>,
-    pub supports: Vec<String>,
-}
-
 /// Sanitized package configuration metadata and effective values.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HubClientPackageConfiguration {
@@ -1678,22 +1649,6 @@ fn runnable_process_state_label(state: PackageRunnableProcessState) -> &'static 
         PackageRunnableProcessState::Exited => "exited",
         PackageRunnableProcessState::Failed => "failed",
         PackageRunnableProcessState::Stopped => "stopped",
-    }
-}
-
-fn package_surface_kind_label(kind: &PackageSurfaceKind) -> &'static str {
-    match kind {
-        PackageSurfaceKind::App => "app",
-        PackageSurfaceKind::Settings => "settings",
-        PackageSurfaceKind::DashboardWidget => "dashboard_widget",
-        PackageSurfaceKind::Diagnostics => "diagnostics",
-    }
-}
-
-fn package_surface_operation_label(operation: &PackageSurfaceOperation) -> &'static str {
-    match operation {
-        PackageSurfaceOperation::Render => "render",
-        PackageSurfaceOperation::Action => "action",
     }
 }
 

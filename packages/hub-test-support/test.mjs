@@ -130,14 +130,14 @@ function assertDialogFormComposition(source) {
 }
 
 assert.equal(metadata.package_name, "@trybotster/hub-test-support");
-assert.equal(metadata.package_version, "0.1.15");
+assert.equal(metadata.package_version, "0.1.16");
 assert.equal(metadata.protocol, "botster-hub-daemon-v1");
 assert.equal(metadata.protocol_version, 4);
-assert.equal(metadata.conformance_fixture_revision, 23);
+assert.equal(metadata.conformance_fixture_revision, 24);
 assert.deepEqual(metadata.ui_contract, {
   conformance_fixture_export: "@trybotster/ui-contract/conformance-fixtures",
   package_name: "@trybotster/ui-contract",
-  package_version: "0.1.0",
+  package_version: "0.1.1",
 });
 assert.deepEqual(metadata.application_primitives, {
   fixture_package_name: "botster.plugin-contract-matrix",
@@ -265,7 +265,7 @@ assert.deepEqual(supportMatrix.plugin_surfaces.authored_set_values, {
   "selected-workspace": "workspace-alpha",
 });
 
-assert.equal(sessionLifecycleFixture.conformance_fixture_revision, 23);
+assert.equal(sessionLifecycleFixture.conformance_fixture_revision, 24);
 assert.equal(sessionLifecycleFixture.entity_type, "session");
 assert.deepEqual(
   sessionLifecycleFixture.normalized_frames.map((frame) => frame.type),
@@ -280,7 +280,7 @@ assert.match(
   /node_modules[\\/]@trybotster[\\/]ui-contract[\\/]/,
 );
 const uiContractFixtures = await readUiContractConformanceFixtures();
-assert.equal(uiContractFixtures.contract_version, "0.1.0");
+assert.equal(uiContractFixtures.contract_version, "0.1.1");
 assert.equal(
   uiContractFixtures.fixtures.dialog_presence.predicate.key,
   "create-ticket-dialog",
@@ -303,7 +303,7 @@ assert.equal(
 assert.equal(sessionLifecycleFixture.overflow.snapshot_precedes_later_deltas, true);
 assert.equal(sessionLifecycleFixture.overflow.failed_snapshot_delivery_closes_subscription, true);
 
-assert.equal(sessionPluginBindingFixture.conformance_fixture_revision, 23);
+assert.equal(sessionPluginBindingFixture.conformance_fixture_revision, 24);
 assert.equal(sessionPluginBindingFixture.binding_family, "/session");
 const sessionPluginMaterialization = materializeSessionPluginBindingScenario(
   sessionPluginBindingFixture,

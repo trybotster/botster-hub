@@ -44,17 +44,20 @@ pub use botster_hub_client::{
     DaemonPackageInstallEffect, DaemonPackageInstallPlan, DaemonPackageNavigationEntry,
     DaemonPackageNavigationSource, DaemonPackagePin, DaemonPackageProcess,
     DaemonPackageRouteDescriptor, DaemonPackageRouteTarget, DaemonPackageRunnableEntrypoint,
-    DaemonPackageSurfaceDescriptor, DaemonPackageUpdateStatus, DaemonPackageWorkingDirectory,
-    DaemonPluginLifecycle, DaemonPluginSurface, DaemonPluginWorkerCounters, DaemonReadScreen,
-    DaemonRequest, DaemonResolvedAppLaunch, DaemonResolvedSessionTemplate, DaemonResponse,
-    DaemonResponseKind, DaemonSession, DaemonSessionCleanup, DaemonSessionContext,
-    DaemonSessionEntity, DaemonSessionTemplate, DaemonSessionTemplateContextInput,
-    DaemonSessionTemplateRequest, DaemonSpawnTarget, DaemonSpawnTargetValidation, DaemonStatus,
-    DaemonUiTreeSnapshot, DaemonWorktree, DaemonWorktreeGitMetadata, DaemonWorktreeLifecycleEvent,
+    DaemonPackageUpdateStatus, DaemonPackageWorkingDirectory, DaemonPluginLifecycle,
+    DaemonPluginSurface, DaemonPluginWorkerCounters, DaemonReadScreen, DaemonRequest,
+    DaemonResolvedAppLaunch, DaemonResolvedSessionTemplate, DaemonResponse, DaemonResponseKind,
+    DaemonSession, DaemonSessionCleanup, DaemonSessionContext, DaemonSessionEntity,
+    DaemonSessionTemplate, DaemonSessionTemplateContextInput, DaemonSessionTemplateRequest,
+    DaemonSpawnTarget, DaemonSpawnTargetValidation, DaemonStatus, DaemonUiTreeSnapshot,
+    DaemonWorktree, DaemonWorktreeGitMetadata, DaemonWorktreeLifecycleEvent,
     FEATURE_PLUGIN_SURFACE_ACTION, FEATURE_PLUGIN_SURFACE_RENDER, PROTOCOL, read_frame,
     read_frame_from_reader, write_frame,
 };
-use botster_ui_contract::{UiActionResult, UiActionResultState};
+use botster_ui_contract::{
+    PackageSurfaceDescriptor, PackageSurfaceKind, PackageSurfaceOperation, UiActionResult,
+    UiActionResultState,
+};
 use serde_json::Value;
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
@@ -2064,13 +2067,14 @@ fn handle_runtime_control_request(
             surface_id,
             payload,
         } => {
-            if let Some(response) = undeclared_surface_response(
+            if let Some(response) = invalid_surface_request_response(
                 &packages,
                 &package_name,
                 &surface_id,
                 "daemon-plugin-surface-render",
                 "plugin_surface_render",
                 FEATURE_PLUGIN_SURFACE_RENDER,
+                PackageSurfaceOperation::Render,
             ) {
                 return Ok(response);
             }
@@ -2094,13 +2098,14 @@ fn handle_runtime_control_request(
             request,
         } => {
             let surface_id = request.surface_id.0.clone();
-            if let Some(response) = undeclared_surface_response(
+            if let Some(response) = invalid_surface_request_response(
                 &packages,
                 &package_name,
                 &surface_id,
                 "daemon-plugin-surface-action",
                 "plugin_surface_action",
                 FEATURE_PLUGIN_SURFACE_ACTION,
+                PackageSurfaceOperation::Action,
             ) {
                 return Ok(response);
             }
@@ -3044,7 +3049,7 @@ fn plugin_surface_route_descriptor(
     package_name: &str,
     package_state: &str,
     requested_capabilities: &[crate::HubClientCapability],
-    surface: &crate::client_api::HubClientPackageSurfaceDescriptor,
+    surface: &PackageSurfaceDescriptor,
     supports_settings: bool,
 ) -> DaemonPackageRouteDescriptor {
     let diagnostics = route_state_diagnostics(package_state);
@@ -3059,7 +3064,7 @@ fn plugin_surface_route_descriptor(
         },
         title: surface.title.clone(),
         label: surface.title.clone(),
-        app_id: (surface.kind == "app").then(|| surface.id.clone()),
+        app_id: (surface.kind == PackageSurfaceKind::App).then(|| surface.id.clone()),
         surface_id: Some(surface.id.clone()),
         icon: surface.icon.clone(),
         category: surface.category.clone(),
@@ -4978,26 +4983,56 @@ fn daemon_unknown_session_cleanup(session_id: &str) -> DaemonResponse {
     response
 }
 
-fn undeclared_surface_response(
+fn invalid_surface_request_response(
     packages: &PackageRegistry,
     package_name: &str,
     surface_id: &str,
     request_id: &str,
     operation: &str,
     feature: &str,
+    required_operation: PackageSurfaceOperation,
 ) -> Option<DaemonResponse> {
     let record = packages.package(package_name)?;
-    if record.manifest.surfaces.is_empty()
-        || record
-            .manifest
-            .surfaces
-            .iter()
-            .any(|surface| surface.id == surface_id)
-    {
+    let Some(surface) = record
+        .manifest
+        .surfaces
+        .iter()
+        .find(|surface| surface.id == surface_id)
+    else {
+        return Some(surface_request_operator_error(
+            request_id,
+            operation,
+            feature,
+            "undeclared_plugin_surface",
+            format!("{package_name} does not declare surface {surface_id}"),
+        ));
+    };
+    if surface.supports.contains(&required_operation) {
         return None;
     }
 
-    let message = format!("{package_name} does not declare surface {surface_id}");
+    Some(surface_request_operator_error(
+        request_id,
+        operation,
+        feature,
+        "unsupported_plugin_surface_operation",
+        format!(
+            "{package_name} surface {surface_id} does not declare {} support",
+            match required_operation {
+                PackageSurfaceOperation::Render => "render",
+                PackageSurfaceOperation::Action => "action",
+            }
+        ),
+    ))
+}
+
+fn surface_request_operator_error(
+    request_id: &str,
+    operation: &str,
+    feature: &str,
+    code: &str,
+    message: String,
+) -> DaemonResponse {
     let diagnostic = DaemonDiagnostic {
         kind: botster_hub_client::DaemonDiagnosticKind::UnsupportedFeature,
         operation: Some(operation.to_string()),
@@ -5006,14 +5041,14 @@ fn undeclared_surface_response(
     };
     let mut response = daemon_response_base(DaemonResponseKind::OperatorError);
     response.error = Some(DaemonOperatorError {
-        code: "undeclared_plugin_surface".to_string(),
+        code: code.to_string(),
         request_id: request_id.to_string(),
         operation: operation.to_string(),
         message,
         diagnostics: vec![diagnostic.clone()],
     });
     response.diagnostics = vec![diagnostic];
-    Some(response)
+    response
 }
 
 fn daemon_operator_error(error: crate::HubClientError) -> DaemonResponse {
@@ -5356,20 +5391,7 @@ fn daemon_package_from_client(package: HubClientPackage) -> DaemonPackage {
                 scope: capability.scope,
             })
             .collect(),
-        surfaces: package
-            .surfaces
-            .into_iter()
-            .map(|surface| DaemonPackageSurfaceDescriptor {
-                id: surface.id,
-                kind: surface.kind,
-                title: surface.title,
-                description: surface.description,
-                icon: surface.icon,
-                order: surface.order,
-                category: surface.category,
-                supports: surface.supports,
-            })
-            .collect(),
+        surfaces: package.surfaces,
         routes,
         runnable_entrypoints: package
             .runnable_entrypoints
