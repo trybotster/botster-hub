@@ -1262,6 +1262,7 @@ impl HubRuntime {
         node.validate().map_err(|error| {
             crate::McpToolError::new("invalid_surface", format!("invalid plugin UiNode: {error}"))
         })?;
+        validate_plugin_surface_binding_families(&node)?;
         Ok(node)
     }
 
@@ -1321,22 +1322,7 @@ impl HubRuntime {
                 format!("invalid plugin UiActionResult: {error}"),
             )
         })?;
-        result.validate().map_err(|error| {
-            crate::McpToolError::new(
-                "invalid_action_result",
-                format!("invalid plugin UiActionResult: {error}"),
-            )
-        })?;
-        if result.request_id != request.request_id
-            || result.surface_id != request.surface_id
-            || result.action_id != request.action_id
-            || result.node_id != request.node_id
-        {
-            return Err(crate::McpToolError::new(
-                "invalid_action_result",
-                "plugin UiActionResult identity does not match the request",
-            ));
-        }
+        validate_plugin_surface_action_result(&result, request)?;
         Ok(result)
     }
 
@@ -1669,6 +1655,17 @@ impl HubRuntime {
             .adoption_scan()
     }
 
+    pub(crate) fn mark_session_stale(
+        &self,
+        session_id: &SessionId,
+        now_seconds: u64,
+    ) -> Result<(), CoreDaemonError> {
+        self.core_daemon
+            .lock()
+            .expect("core daemon mutex")
+            .mark_stale(session_id, now_seconds)
+    }
+
     /// Reattach one live worker-backed session after daemon restart.
     pub fn adopt_session(
         &mut self,
@@ -1714,10 +1711,7 @@ impl HubRuntime {
                                 .push(session.session_id);
                         }
                         Err(error) if is_stale_worker_control_socket_adoption_error(&error) => {
-                            self.core_daemon
-                                .lock()
-                                .expect("core daemon mutex")
-                                .mark_stale(&report.record.session_id, now_seconds)?;
+                            self.mark_session_stale(&report.record.session_id, now_seconds)?;
                             self.reconciliation
                                 .stale_sessions
                                 .push(report.record.session_id);
@@ -1732,20 +1726,14 @@ impl HubRuntime {
                 | SessionAdoptionState::StaleWorker { .. }
                 | SessionAdoptionState::UnhealthyWorker { .. }
                 | SessionAdoptionState::DuplicateWorker { .. } => {
-                    self.core_daemon
-                        .lock()
-                        .expect("core daemon mutex")
-                        .mark_stale(&report.record.session_id, now_seconds)?;
+                    self.mark_session_stale(&report.record.session_id, now_seconds)?;
                     self.reconciliation
                         .stale_sessions
                         .push(report.record.session_id);
                 }
                 SessionAdoptionState::Terminal => {
                     if report.record.state == RegistrySessionState::Running {
-                        self.core_daemon
-                            .lock()
-                            .expect("core daemon mutex")
-                            .mark_stale(&report.record.session_id, now_seconds)?;
+                        self.mark_session_stale(&report.record.session_id, now_seconds)?;
                         self.reconciliation
                             .stale_sessions
                             .push(report.record.session_id);
@@ -2288,6 +2276,97 @@ pub fn daemon_session_to_core_session(session: DaemonSession) -> CoreSession {
     CoreSession::new(session.session_id, lifecycle)
 }
 
+fn validate_plugin_surface_binding_families(node: &UiNode) -> Result<(), crate::McpToolError> {
+    let value = serde_json::to_value(node).map_err(|error| {
+        crate::McpToolError::new(
+            "invalid_surface",
+            format!("failed to inspect plugin UiNode bindings: {error}"),
+        )
+    })?;
+    validate_plugin_surface_binding_value(&value)
+}
+
+fn validate_plugin_surface_binding_value(
+    value: &serde_json::Value,
+) -> Result<(), crate::McpToolError> {
+    match value {
+        serde_json::Value::Array(values) => {
+            for value in values {
+                validate_plugin_surface_binding_value(value)?;
+            }
+        }
+        serde_json::Value::Object(object) => {
+            if let Some(path) = object.get("$bind").and_then(serde_json::Value::as_str) {
+                validate_plugin_surface_binding_path(path)?;
+            }
+            match object.get("$kind").and_then(serde_json::Value::as_str) {
+                Some("bind_list") => {
+                    if let Some(path) = object.get("source").and_then(serde_json::Value::as_str) {
+                        validate_plugin_surface_binding_path(path)?;
+                    }
+                }
+                Some("bind_if") => {
+                    if let Some(path) = object.get("path").and_then(serde_json::Value::as_str) {
+                        validate_plugin_surface_binding_path(path)?;
+                    }
+                }
+                _ => {}
+            }
+            for value in object.values() {
+                validate_plugin_surface_binding_value(value)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn validate_plugin_surface_binding_path(path: &str) -> Result<(), crate::McpToolError> {
+    if !path.starts_with('/') || path == "/session" || path.starts_with("/session/") {
+        return Ok(());
+    }
+    Err(crate::McpToolError::new(
+        "invalid_surface",
+        format!(
+            "plugin UiNode binding family is not admitted by this Hub: {path}; only /session is available"
+        ),
+    ))
+}
+
+fn validate_plugin_surface_action_result(
+    result: &UiActionResult,
+    request: &UiActionRequest,
+) -> Result<(), crate::McpToolError> {
+    result.validate().map_err(|error| {
+        crate::McpToolError::new(
+            "invalid_action_result",
+            format!("invalid plugin UiActionResult: {error}"),
+        )
+    })?;
+    if result.request_id != request.request_id
+        || result.surface_id != request.surface_id
+        || result.action_id != request.action_id
+        || result.node_id != request.node_id
+    {
+        return Err(crate::McpToolError::new(
+            "invalid_action_result",
+            "plugin UiActionResult identity does not match the request",
+        ));
+    }
+    if let Some(replacement) = &result.replacement {
+        validate_plugin_surface_binding_families(replacement).map_err(|error| {
+            crate::McpToolError::new(
+                "invalid_action_result",
+                format!(
+                    "invalid plugin UiActionResult replacement: {}",
+                    error.message
+                ),
+            )
+        })?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2297,6 +2376,107 @@ mod tests {
     };
     use std::fs;
     use std::process::Command;
+
+    fn binding_test_node(child: serde_json::Value) -> UiNode {
+        serde_json::from_value(serde_json::json!({
+            "type": "panel",
+            "id": "binding-test",
+            "children": [child]
+        }))
+        .expect("binding test UiNode")
+    }
+
+    #[test]
+    fn plugin_surface_binding_admission_accepts_only_session_absolute_family() {
+        let node = binding_test_node(serde_json::json!({
+            "$kind": "bind_list",
+            "source": "/session",
+            "where": { "session_uuid": "session-1" },
+            "item_template": {
+                "type": "text",
+                "id": "session-row",
+                "props": {
+                    "text": { "$bind": "/session/session-1/lifecycle_class" }
+                }
+            },
+            "empty_template": {
+                "type": "text",
+                "id": "session-unavailable",
+                "props": { "text": "Session unavailable" }
+            }
+        }));
+
+        node.validate().expect("generic UiNode validation");
+        validate_plugin_surface_binding_families(&node)
+            .expect("/session and item-relative bindings are admitted");
+    }
+
+    #[test]
+    fn plugin_surface_binding_admission_rejects_foreign_and_dotted_absolute_families() {
+        for source in ["/workspace", "/project-pipelines.ticket", "/sessionish"] {
+            let node = binding_test_node(serde_json::json!({
+                "$kind": "bind_list",
+                "source": source,
+                "item_template": {
+                    "type": "text",
+                    "id": "row",
+                    "props": { "text": "row" }
+                }
+            }));
+            node.validate().expect("generic UiNode validation");
+            let error = validate_plugin_surface_binding_families(&node)
+                .expect_err("foreign absolute binding family must be rejected");
+            assert_eq!(error.code, "invalid_surface");
+            assert!(error.message.contains(source), "{error:?}");
+        }
+    }
+
+    fn binding_action_result(source: &str) -> (UiActionRequest, UiActionResult) {
+        let request = serde_json::from_value(serde_json::json!({
+            "request_id": "binding-action-request",
+            "surface_id": "contract.sessions",
+            "action_id": "replace",
+            "node_id": "binding-action",
+            "kind": "submit"
+        }))
+        .expect("binding action request");
+        let result = serde_json::from_value(serde_json::json!({
+            "request_id": "binding-action-request",
+            "surface_id": "contract.sessions",
+            "action_id": "replace",
+            "node_id": "binding-action",
+            "state": "accepted",
+            "replacement": {
+                "type": "panel",
+                "id": "binding-action-replacement",
+                "children": [{
+                    "$kind": "bind_list",
+                    "source": source,
+                    "where": { "session_uuid": "session-1" },
+                    "item_template": {
+                        "type": "text",
+                        "id": "binding-action-row",
+                        "props": { "text": { "$bind": "@/lifecycle_class" } }
+                    }
+                }]
+            }
+        }))
+        .expect("binding action result");
+        (request, result)
+    }
+
+    #[test]
+    fn plugin_surface_action_replacement_applies_binding_family_admission() {
+        let (request, accepted) = binding_action_result("/session");
+        validate_plugin_surface_action_result(&accepted, &request)
+            .expect("/session replacement binding must be admitted");
+
+        let (_, rejected) = binding_action_result("/workspace");
+        let error = validate_plugin_surface_action_result(&rejected, &request)
+            .expect_err("foreign replacement binding must be rejected");
+        assert_eq!(error.code, "invalid_action_result");
+        assert!(error.message.contains("/workspace"), "{error:?}");
+    }
 
     #[test]
     fn managed_session_core_error_diagnostic_is_kind_based_and_path_neutral() {

@@ -32,6 +32,16 @@
       "supports": ["render"]
     },
     {
+      "id": "contract.sessions",
+      "kind": "app",
+      "title": "Session Lifecycle Projection",
+      "description": "Conformance surface binding referenced UUIDs to the canonical Hub /session family.",
+      "icon": "activity",
+      "order": 25,
+      "category": "contract",
+      "supports": ["render"]
+    },
+    {
       "id": "contract.blocked",
       "kind": "app",
       "title": "Contract Blocked Surface",
