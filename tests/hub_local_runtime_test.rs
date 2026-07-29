@@ -8,10 +8,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use botster_core::{RequestId, SessionId, SessionLifecycleState, SubscriptionId};
 use botster_hub::{
-    DataDirectoryOption, FileHubStateStore, HostIdentityOptions, HubClientApi, HubClientEvent,
-    HubClientPackageClassification, HubClientPackageState, HubClientRequest, HubClientResponseBody,
-    HubDaemon, HubStartupOptions, HubStateLoadSource, HubStateStore, PackageRegistry,
-    RuntimeEnvironment, SessionDefaults, TransportBindings,
+    CoreEngineOptions, DataDirectoryOption, FileHubStateStore, HostIdentityOptions, HubClientApi,
+    HubClientEvent, HubClientPackageClassification, HubClientPackageState, HubClientRequest,
+    HubClientResponseBody, HubDaemon, HubStartupOptions, HubStateLoadSource, HubStateStore,
+    PackageRegistry, RuntimeEnvironment, SessionDefaults, TransportBindings,
 };
 
 mod support;
@@ -104,6 +104,15 @@ fn run_local_runtime() {
     assert_eq!(records.lifecycle.len(), 1);
     assert_eq!(records.lifecycle[0].package_name, RUNTIME_PACKAGE);
     assert!(records.lifecycle[0].loaded);
+    let expected = CoreEngineOptions::default();
+    assert_eq!(
+        records.worker_counters.configured_queue_capacity,
+        expected.plugin_worker_queue_capacity
+    );
+    assert_eq!(
+        records.worker_counters.configured_executor_concurrency,
+        expected.plugin_worker_executor_concurrency
+    );
     assert_eq!(records.worker_counters.live_plugin_executors, 1);
 
     let tools = reloaded

@@ -18,7 +18,7 @@ use botster_core::{
 use crate::packages::{PackageClassification, PackageRecord, PackageRegistry, PackageState};
 
 /// Hub-owned lifecycle adapter around core plugin worker mechanics.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct HubPluginLifecycle {
     engine: PluginWorkerEngine,
     loaded: Arc<Mutex<BTreeSet<String>>>,
@@ -27,12 +27,6 @@ pub struct HubPluginLifecycle {
 }
 
 impl HubPluginLifecycle {
-    /// Build a lifecycle adapter with core's default plugin worker config.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::with_config(PluginWorkerEngineConfig::default())
-    }
-
     /// Build a lifecycle adapter with explicit core plugin worker config.
     #[must_use]
     pub fn with_config(config: PluginWorkerEngineConfig) -> Self {

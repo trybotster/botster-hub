@@ -362,6 +362,9 @@ fn hub_runtime_passes_split_plugin_worker_config_to_core_engine() {
     ))
     .expect("configured runtime");
     let mut hub = HubRuntime::new(config);
+    let baseline = hub.plugin_worker_debug_snapshot();
+    assert_eq!(baseline.live_plugin_executors, 0);
+    assert_eq!(baseline.live_executor_workers, 0);
 
     hub.load_plugin_package(
         &registry,
@@ -382,6 +385,20 @@ fn hub_runtime_passes_split_plugin_worker_config_to_core_engine() {
     assert_eq!(snapshot.configured_executor_concurrency, 3);
     assert_eq!(snapshot.live_plugin_executors, 1);
     assert_eq!(snapshot.live_executor_workers, 3);
+
+    let _cleanup = hub.unload_plugin_package(
+        RequestId("unload-configured-plugin".to_string()),
+        package_name,
+    );
+    let retired = hub.plugin_worker_debug_snapshot();
+    assert_eq!(
+        retired.live_plugin_executors,
+        baseline.live_plugin_executors
+    );
+    assert_eq!(
+        retired.live_executor_workers,
+        baseline.live_executor_workers
+    );
 }
 
 #[test]

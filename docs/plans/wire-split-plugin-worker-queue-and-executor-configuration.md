@@ -95,8 +95,9 @@ In scope:
 - Apply `#[serde(deny_unknown_fields)]` to `CoreEngineOptions` so a stale `plugin_worker_capacity` key fails even when the two replacement fields are also present; this removes ambiguity instead of silently ignoring the old knob.
 - Treat the persisted `LocalRuntimeSettings.core_engine` shape change as Hub state schema v2. Preflight the root `schema_version` before deserializing the complete state so an existing v1 file returns typed `UnsupportedVersion(1)` instead of the misleading `Corrupt` error.
 - Convert the two Hub values into one `PluginWorkerEngineConfig` and use it when constructing `HubPluginLifecycle` in both fresh and durable-state `HubRuntime` constructors.
-- Add a configured lifecycle constructor and a read-only debug snapshot path through `HubPluginLifecycle` and `HubRuntime`.
+- Make the configured lifecycle constructor the only construction path and add a read-only debug snapshot path through `HubPluginLifecycle` and `HubRuntime`.
 - Extend the existing `HubClientRequest::PluginLifecycleStatus` → `DaemonRequest::PluginLifecycleStatus` diagnostics channel with aggregate, sanitized plugin-worker counters. Do not create a parallel `DaemonStatus` resource surface or expose runtime objects/payloads.
+- Render those counters in the existing Hub CLI plugin-lifecycle response so the operator-facing consumer does not silently discard them.
 - Add an optional `DaemonResponse.plugin_worker_counters` projection with serde-accurate optional TypeScript output, populated only for the plugin-lifecycle response.
 - Regenerate the checked TypeScript and `packages/hub-test-support` copy, refresh its hash metadata, and bump the prepared npm package to `0.1.15`. Registry inspection confirmed `0.1.14` is already published and contains the old protocol artifact, so it cannot be reused.
 - Update Hub config/default/serde tests, runtime wiring tests, client DTO/generated TypeScript tests, published-package asset tests, and production-shaped plugin lifecycle tests.
@@ -107,6 +108,7 @@ Botster layers touched:
 - Rust Hub configuration and startup composition.
 - Rust Hub plugin lifecycle adapter over Core.
 - Existing Hub plugin-lifecycle diagnostics route.
+- Existing Hub CLI plugin-lifecycle renderer.
 - Hub-client response DTO and generated TypeScript mirror, only for sanitized aggregate debug counters.
 - Hub-test-support Rust/Node published artifact preparation and drift tests.
 - Rust and Node tests, including a real subprocess-spawned Hub through shared test support.
@@ -168,7 +170,7 @@ Expected changes:
   - Rename the queue field, add executor concurrency, deny unknown Core-engine fields, derive both defaults from one Core default config, and validate both positive values.
   - Strengthen serde/default tests to assert the exact new keys and values, absence of the old key, successful round trips, and rejection of legacy-only, mixed legacy-plus-new, and zero-valued inputs.
 - `src/lifecycle.rs`
-  - Add a constructor accepting `PluginWorkerEngineConfig`.
+  - Add a constructor accepting `PluginWorkerEngineConfig` and remove the zero-caller default/unconfigured constructors.
   - Delegate to `PluginWorkerEngine::with_config`.
   - Expose the Core public debug snapshot read-only for Hub runtime diagnostics and tests.
 - `src/runtime.rs`
@@ -184,6 +186,8 @@ Expected changes:
 - `src/daemon_transport.rs`
   - Map that report through the existing `DaemonRequest::PluginLifecycleStatus` / `plugin_lifecycle_response` seam.
   - Populate an optional `DaemonResponse.plugin_worker_counters`; do not change `DaemonStatus`.
+- `src/main.rs`
+  - Print all sanitized aggregate counters from the existing plugin-lifecycle response in the CLI's established `key=value` style.
 - `crates/botster-hub-client/src/lib.rs`
   - Add `DaemonPluginWorkerCounters` and the backward-compatible optional response field.
   - Add serde omission, deserialization-default, sanitization, and generated-protocol assertions.
@@ -200,12 +204,11 @@ Expected changes:
 - `packages/hub-test-support/test.mjs`
   - Update the prepared package-version assertion and require the new DTO/optional field tokens.
 - `packages/hub-test-support/README.md`
-  - Document `0.1.14` as the current published coordinate and distinguish the prepared `0.1.15` package without claiming publication.
+  - Preserve the repository's pre-existing `0.1.13` install coordinate and add only the prepared `0.1.15` note. Moving every published-coordinate reference to `0.1.14` is separate repo-wide cleanup.
 - `tests/hub_plugin_lifecycle_test.rs`
-  - Use the existing `FakeRuntime` fixture to prove a non-default Hub queue/executor configuration reaches the real Core worker engine and materializes the expected executor count after plugin load.
+  - Use the existing `FakeRuntime` fixture to prove a non-default Hub queue/executor configuration reaches the real Core worker engine, materializes the expected executor count after plugin load, and returns live counts to the pre-load baseline after unload.
 - `tests/hub_daemon_lifecycle_test.rs`
   - Extend `daemon_plugin_contract_matrix_fixture_exercises_public_package_contracts` or a focused sibling using `IsolatedHubBuilder` and the existing published fixture. Request `PluginLifecycleStatus` after the real Lua plugin is enabled and require non-zero `live_plugin_executors` and `live_executor_workers`, not configured values alone.
-  - Use existing `write_local_plugin_package` enable/disable coverage for cleanup-to-baseline proof where it is more focused.
 - `docs/plans/wire-split-plugin-worker-queue-and-executor-configuration.md`
   - This Plan artifact.
 
@@ -227,6 +230,7 @@ Likely unchanged:
 
 2. Wire configuration into the production plugin lifecycle.
    - Add `HubPluginLifecycle::with_config`.
+   - Delete the unconfigured `HubPluginLifecycle::new()` and `Default` construction paths; cold-turkey wiring leaves one explicit constructor.
    - Convert `CoreEngineOptions` to `PluginWorkerEngineConfig` once per `HubRuntime` construction.
    - Use the configured lifecycle in both fresh runtime and durable-state load paths. Do not leave `HubPluginLifecycle::new()` in either production constructor.
 
@@ -240,6 +244,7 @@ Likely unchanged:
    - Delegate a read-only snapshot through lifecycle and runtime.
    - Extend the existing `HubClientRequest::PluginLifecycleStatus` report, then map it through `DaemonRequest::PluginLifecycleStatus`.
    - Project only aggregate configured/live/queued/in-flight counters into `DaemonPluginWorkerCounters` on the plugin-lifecycle `DaemonResponse`; leave `DaemonStatus` unchanged.
+   - Render the same aggregate counters in the existing Hub CLI plugin-lifecycle response.
    - Populate it from the same runtime instance used to load and invoke production plugins, not from `CoreEngineOptions` alone.
    - Keep the public response field additive/defaulted/omittable and regenerate the TypeScript protocol with matching optionality.
 
@@ -247,7 +252,7 @@ Likely unchanged:
    - Run `npm run sync` in `packages/hub-test-support` (which invokes `cargo run --quiet -p botster-hub-test-support --example node_package_assets -- <temporary-output-dir>`).
    - Bump the prepared package to `0.1.15`, refresh `metadata.json` including `daemon_protocol.sha256`, and update Node token/version assertions.
    - Keep protocol version `4`, conformance revision `22`, feature lists, support matrices, and fixture JSON unchanged because the field is optional and no request/framing/fixture contract changes.
-   - Run package check/test/pack gates. Do not publish; record that registry consumers still see `0.1.14` until a later release action.
+   - Run package check/test/pack gates. Do not publish; record that the repository retains its pre-existing `0.1.13` install coordinate while the registry has `0.1.14` and the branch prepares `0.1.15`.
 
 6. Prove configuration and runtime behavior.
    - Unit-test exact defaults, serde names, legacy rejection, and both zero-value failures.
@@ -295,7 +300,7 @@ Static acceptance checks:
   - No production/config compatibility occurrence remains. The only allowed current-repository occurrences are explicit negative fixtures proving legacy config and v1 state rejection. Historical plan text elsewhere under `docs/plans/` is not rewritten unless touched for another reason.
 - `rg -n "plugin_worker_queue_capacity|plugin_worker_executor_concurrency" src tests crates`
   - Both fields appear in defaults, validation, Core conversion, serde assertions, and production proof.
-- Inspect both `HubRuntime` constructors and confirm neither silently uses `HubPluginLifecycle::new()`.
+- Confirm `HubPluginLifecycle::new()` and its `Default` implementation are absent and both `HubRuntime` constructors use the explicit configured path.
 - Inspect `FileHubStateStore::load_or_initialize` and confirm root version validation occurs before complete `HubState` deserialization.
 - Assert `DaemonStatus` and `DaemonLifecycleCounters` did not gain plugin-worker fields; the counters belong only to the existing plugin-lifecycle response.
 - Run `npm run sync` and then `npm run check` in `packages/hub-test-support` so the committed package assets are reproducible from the Rust source emitter.
@@ -317,6 +322,7 @@ Behavioral acceptance:
 - Queue capacity remains independent from live executor count.
 - The real subprocess-spawned Hub and published plugin-contract-matrix fixture return sanitized aggregate counters from `PluginLifecycleStatus`, including `live_plugin_executors >= 1` and `live_executor_workers >= 1`; configured-only assertions do not satisfy this proof.
 - Reload/unload/shutdown evidence shows workers retire without creating a detached generation in the focused fixture.
+- The Hub CLI plugin-lifecycle renderer prints the sanitized configured/live/queued/in-flight counters returned by the daemon.
 - The optional response field is omitted when absent and generated TypeScript marks it optional.
 - `DaemonRequest::Status` remains unchanged; no parallel plugin diagnostics DTO is added there.
 - Prepared `@trybotster/hub-test-support@0.1.15` package bytes, metadata hash, Rust source artifact, checked TypeScript, and Node package copy agree.
@@ -329,11 +335,11 @@ Downstream proof:
 - `ticket_1785199716_875648` is already dependency-blocked on this ticket and must use the daemon-exposed counters plus OS/process evidence to prove queue capacity no longer maps to OS thread count under the production-shaped workload.
 - That same-repository proof can consume merged source and does not wait for npm. External repos cannot claim the counters from the registry until `0.1.15` is separately published and verified from a clean install; no current external consumer or botster-web dependency makes that release a prerequisite here.
 
-## Vault Gaps Worth Capturing
+## Vault Knowledge Captured
 
-- The vault has strong general notes for bounded Hub queues and plugin-worker ownership but no atomic note for the new invariant: plugin worker waiting capacity and executor concurrency are independent host-profile knobs, and production proof must read Core's live snapshot rather than serialized Hub config.
-- A second candidate is now visible: when a cold-turkey config rename changes a shape embedded in durable Hub state, the state schema must advance and version rejection must occur before full shape deserialization so an old version is not mislabeled corrupt.
-- Capture these invariants after implementation, when the exact state/error and diagnostic contracts are proven. Route them through the vault inbox/document/connect/verify pipeline rather than writing directly to `notes/`.
+- `[[plugin worker queue capacity and executor concurrency are independent host profile knobs]]` records that waiting capacity and executor width are separate policy inputs and production proof reads Core's live snapshot rather than serialized Hub config.
+- `[[durable state version preflight must precede shape deserialization after cold turkey changes]]` records that a breaking embedded shape advances the state schema and rejects old versions before full-shape decoding.
+- Captured both proven invariants through the vault inbox/document/connect/verify pipeline as `[[plugin worker queue capacity and executor concurrency are independent host profile knobs]]` and `[[durable state version preflight must precede shape deserialization after cold turkey changes]]`.
 - No convention conflict was found. The plan keeps reusable execution in Core, host policy and diagnostics in Hub, uses a cold-turkey rename, and avoids speculative abstractions.
 
 ## Project Pipelines Checklist Evidence
@@ -345,4 +351,4 @@ Downstream proof:
 - Baseline verification: `cargo check --locked` passed against Core revision `e36435f2cb583c344d6f6ba2d62c39da324c7a64`.
 - Registry/package verification: npm reports `0.1.14` as published; its packed metadata retains protocol `4`, conformance revision `22`, and the pre-change daemon-protocol hash, establishing `0.1.15` as the next immutable preparation coordinate.
 - Downstream verification commands and success criteria are listed above.
-- Durable capture disposition: defer the plugin-worker proof invariant and persisted-schema preflight invariant until implementation establishes their exact contracts and evidence.
+- Durable capture disposition: both deferred invariants were captured after implementation established their exact runtime and state-boundary contracts.
