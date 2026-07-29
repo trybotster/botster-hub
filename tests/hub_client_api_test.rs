@@ -1155,6 +1155,55 @@ fn package_navigation_derives_default_app_surface_entries_without_order_authorit
 }
 
 #[test]
+fn plugin_surface_admission_is_shared_by_the_in_process_client_api() {
+    let api = HubClientApi::local_operator("plugin-surface-admission-client");
+    let surfaces = capability(CapabilitySurface::Surfaces, None);
+    let mut packages = PackageRegistry::new(vec![surfaces.clone()].into_iter().collect());
+    let mut manifest = plugin_manifest("surface.plugin", vec![surfaces]);
+    let mut action_only = app_surface("action-only", "Action only");
+    action_only.supports = vec![PackageSurfaceOperation::Action];
+    manifest.surfaces = vec![action_only];
+    packages
+        .install(manifest, provenance(), "install surface package")
+        .expect("install surface package");
+    let mut runtime = explicit_runtime("plugin-surface-admission");
+
+    let undeclared = api
+        .handle_request(
+            &mut runtime,
+            &packages,
+            HubClientRequest::PluginSurfaceRender {
+                request_id: request_id("render-undeclared-surface"),
+                package_name: "surface.plugin".to_string(),
+                surface_id: "missing".to_string(),
+                payload: serde_json::json!({}),
+            },
+        )
+        .expect_err("undeclared surfaces must be rejected before runtime dispatch");
+    assert!(matches!(
+        undeclared,
+        HubClientError::Plugin { ref code, .. } if code == "undeclared_plugin_surface"
+    ));
+
+    let unsupported = api
+        .handle_request(
+            &mut runtime,
+            &packages,
+            HubClientRequest::PluginSurfaceRender {
+                request_id: request_id("render-unsupported-surface"),
+                package_name: "surface.plugin".to_string(),
+                surface_id: "action-only".to_string(),
+                payload: serde_json::json!({}),
+            },
+        )
+        .expect_err("unsupported surface operations must be rejected before runtime dispatch");
+    assert!(matches!(
+        unsupported,
+        HubClientError::Plugin { ref code, .. } if code == "unsupported_plugin_surface_operation"
+    ));
+}
+
+#[test]
 fn package_availability_projects_core_resolution_matrix_to_client_rows() {
     let api = HubClientApi::local_operator("package-availability-client");
     let surfaces = capability(CapabilitySurface::Surfaces, None);

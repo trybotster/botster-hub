@@ -3172,11 +3172,15 @@ pub fn run_plugin_contract_matrix_conformance(
         &installed_package.surfaces,
         PLUGIN_CONTRACT_SETTINGS_SURFACE,
     )?;
+    let settings_surface_kind: String =
+        serde_json::from_value(serde_json::to_value(settings_surface_descriptor.kind)?)?;
+    let settings_surface_supports: Vec<String> =
+        serde_json::from_value(serde_json::to_value(&settings_surface_descriptor.supports)?)?;
     expect_value(
         "contract_matrix_install",
         "settings_surface.kind",
         "settings",
-        package_surface_kind_label(settings_surface_descriptor.kind),
+        &settings_surface_kind,
     )?;
     expect_value(
         "contract_matrix_install",
@@ -4480,13 +4484,8 @@ pub fn run_plugin_contract_matrix_conformance(
         version: installed_package.version.clone(),
         source_kind: installed_package.source_kind.clone(),
         surface_ids,
-        settings_surface_kind: package_surface_kind_label(settings_surface_descriptor.kind)
-            .to_string(),
-        settings_surface_supports: settings_surface_descriptor
-            .supports
-            .iter()
-            .map(|operation| package_surface_operation_label(*operation).to_string())
-            .collect(),
+        settings_surface_kind,
+        settings_surface_supports,
         app_route_path: app_route.route_path.clone(),
         app_route_target_kind: app_route.target.kind.clone(),
         app_route_surface_id: app_route.surface_id.clone().unwrap_or_default(),
@@ -4955,24 +4954,6 @@ fn surface_descriptor<'a>(
         .iter()
         .find(|surface| surface.id == surface_id)
         .ok_or(ConformanceError::MissingSurface { surface_id })
-}
-
-fn package_surface_kind_label(kind: botster_ui_contract::PackageSurfaceKind) -> &'static str {
-    match kind {
-        botster_ui_contract::PackageSurfaceKind::App => "app",
-        botster_ui_contract::PackageSurfaceKind::Settings => "settings",
-        botster_ui_contract::PackageSurfaceKind::DashboardWidget => "dashboard_widget",
-        botster_ui_contract::PackageSurfaceKind::Diagnostics => "diagnostics",
-    }
-}
-
-fn package_surface_operation_label(
-    operation: botster_ui_contract::PackageSurfaceOperation,
-) -> &'static str {
-    match operation {
-        botster_ui_contract::PackageSurfaceOperation::Render => "render",
-        botster_ui_contract::PackageSurfaceOperation::Action => "action",
-    }
 }
 
 fn package_route<'a>(

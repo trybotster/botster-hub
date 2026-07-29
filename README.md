@@ -1231,10 +1231,15 @@ publishing portals, network Git clone/fetch/update behavior, and binary/CLI
 package-install commands remain excluded.
 
 Compatibility and enabled capability admission fail closed. An incompatible or
-invalid `botster` requirement is rejected at install; if a persisted package no
-longer satisfies the current hub version or grant/surface policy during
+invalid `botster` requirement or package presentation declaration is rejected
+at install; if a persisted package no longer satisfies the current hub version,
+grant/surface policy, or presentation validation during
 `PackageRegistry::from_snapshot`, the registry load returns a typed error rather
-than silently quarantining that single record. The persisted
+than silently quarantining that single record. For presentation errors admitted
+before this rule existed, the startup error names the package and validation
+reason. Back up `hub-state.json`, then remove or correct that package record
+before restarting the Hub; the original file is the recovery source if the
+manual correction is wrong. The persisted
 `PackageCompatibility` value on accepted records is therefore the last accepted
 compatible result; incompatible and invalid results are operator diagnostics on
 the rejected install/reload path until package quarantine behavior exists.

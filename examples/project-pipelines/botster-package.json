@@ -7,10 +7,20 @@
   "capabilities": [
     { "surface": "mcp" },
     { "surface": "plugin_db", "scope": "project-pipelines" },
-    { "surface": "session_actions", "scope": "session_template_spawn" }
+    { "surface": "session_actions", "scope": "session_template_spawn" },
+    { "surface": "surfaces" }
   ],
   "entrypoints": [
     { "runtime": "lua", "path": "plugin.lua", "bootstrap": false }
+  ],
+  "surfaces": [
+    {
+      "id": "project-pipelines.create-ticket",
+      "kind": "app",
+      "title": "Create Project Pipelines ticket",
+      "description": "Example package surface for the reusable Project Pipelines conformance flow.",
+      "supports": ["render", "action"]
+    }
   ],
   "session_templates": [
     {

@@ -4002,6 +4002,34 @@ fn daemon_plugin_contract_matrix_fixture_exercises_public_package_contracts() {
 }
 
 #[test]
+fn daemon_project_pipelines_example_exercises_published_surface_conformance() {
+    let _guard = daemon_test_guard();
+    let hub = botster_hub_test_support::IsolatedHubBuilder::new()
+        .hub_bin(env!("CARGO_BIN_EXE_botster-hub"))
+        .session_worker_bin(session_worker_binary_path())
+        .root(PathBuf::from("/tmp/bh-project-pipelines-conformance"))
+        .name("project-pipelines")
+        .start()
+        .expect("start isolated hub through public test-support harness");
+    let package_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("examples")
+        .join("project-pipelines");
+
+    let report = botster_hub_test_support::run_project_pipelines_conformance(&hub, package_path)
+        .expect("run published Project Pipelines conformance through daemon socket");
+    assert_eq!(report.package_state, "enabled");
+    assert_eq!(
+        report.rendered_surface_id,
+        "project-pipelines.create-ticket"
+    );
+    assert_eq!(report.form_action_id, "project_pipelines.create_ticket");
+    assert_eq!(report.invalid_title_error, "Title is required");
+
+    hub.shutdown()
+        .expect("shutdown Project Pipelines conformance hub");
+}
+
+#[test]
 fn cli_doctor_reports_stopped_runtime_with_remediation() {
     let _guard = daemon_test_guard();
     let data_dir = unique_short_test_dir("cli-doctor-stopped");

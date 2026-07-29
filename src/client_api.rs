@@ -20,8 +20,8 @@ use botster_core_daemon::{
     ReadinessEvidence, SessionLifecycleBaseline,
 };
 use botster_ui_contract::{
-    PackageNavigationTarget, PackageSurfaceDescriptor, PackageSurfaceKind, UiActionRequest,
-    UiActionResult, UiNode,
+    PackageNavigationTarget, PackageSurfaceDescriptor, PackageSurfaceKind, PackageSurfaceOperation,
+    UiActionRequest, UiActionResult, UiNode,
 };
 
 use crate::lifecycle::HubPluginLifecycleStatus;
@@ -495,6 +495,14 @@ impl HubClientApi {
                 payload,
                 ..
             } => {
+                admit_plugin_surface_operation(
+                    packages,
+                    &package_name,
+                    &surface_id,
+                    PackageSurfaceOperation::Render,
+                    request_id.clone(),
+                    operation,
+                )?;
                 let body = runtime
                     .render_plugin_surface(&package_name, &surface_id, payload)
                     .map_err(|error| plugin_error(request_id.clone(), operation, error))?;
@@ -508,11 +516,21 @@ impl HubClientApi {
                 package_name,
                 action,
                 ..
-            } => HubClientResponseBody::PluginActionResult(
-                runtime
-                    .dispatch_plugin_surface_action(&package_name, &action)
-                    .map_err(|error| plugin_error(request_id.clone(), operation, error))?,
-            ),
+            } => {
+                admit_plugin_surface_operation(
+                    packages,
+                    &package_name,
+                    &action.surface_id.0,
+                    PackageSurfaceOperation::Action,
+                    request_id.clone(),
+                    operation,
+                )?;
+                HubClientResponseBody::PluginActionResult(
+                    runtime
+                        .dispatch_plugin_surface_action(&package_name, &action)
+                        .map_err(|error| plugin_error(request_id.clone(), operation, error))?,
+                )
+            }
         };
 
         Ok(HubClientResponse { request_id, body })
@@ -1780,6 +1798,48 @@ pub enum HubClientError {
 
 /// Result alias for client API requests.
 pub type HubClientResult<T> = Result<T, HubClientError>;
+
+fn admit_plugin_surface_operation(
+    packages: &PackageRegistry,
+    package_name: &str,
+    surface_id: &str,
+    required_operation: PackageSurfaceOperation,
+    request_id: RequestId,
+    operation: HubClientOperation,
+) -> HubClientResult<()> {
+    let Some(record) = packages.package(package_name) else {
+        return Ok(());
+    };
+    let Some(surface) = record
+        .manifest
+        .surfaces
+        .iter()
+        .find(|surface| surface.id == surface_id)
+    else {
+        return Err(HubClientError::Plugin {
+            request_id,
+            operation,
+            code: "undeclared_plugin_surface".to_string(),
+            message: format!("{package_name} does not declare surface {surface_id}"),
+        });
+    };
+    if surface.supports.contains(&required_operation) {
+        return Ok(());
+    }
+
+    Err(HubClientError::Plugin {
+        request_id,
+        operation,
+        code: "unsupported_plugin_surface_operation".to_string(),
+        message: format!(
+            "{package_name} surface {surface_id} does not declare {} support",
+            match required_operation {
+                PackageSurfaceOperation::Render => "render",
+                PackageSurfaceOperation::Action => "action",
+            }
+        ),
+    })
+}
 
 /// Stable runtime error categories safe to expose across client transports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
