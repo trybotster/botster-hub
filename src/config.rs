@@ -315,6 +315,7 @@ pub struct TcpBinding {
 /// so startup policy is explicit. The underlying queues, session I/O worker,
 /// plugin worker engine, and delivery mechanics remain owned by `botster-core`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CoreEngineOptions {
     /// Queue capacity choices keyed by core queue source name.
     pub queue_capacities: Vec<CoreQueueCapacity>,
@@ -324,11 +325,14 @@ pub struct CoreEngineOptions {
     /// Session I/O coalescing policy passed to core-owned session workers.
     pub session_io_coalescing: SessionIoCoalescingOptions,
     /// Per-plugin worker queue capacity passed to core plugin worker primitives.
-    pub plugin_worker_capacity: usize,
+    pub plugin_worker_queue_capacity: usize,
+    /// Per-plugin executor concurrency passed to core plugin worker primitives.
+    pub plugin_worker_executor_concurrency: usize,
 }
 
 impl Default for CoreEngineOptions {
     fn default() -> Self {
+        let plugin_worker = PluginWorkerEngineConfig::default();
         Self {
             queue_capacities: PUBLIC_QUEUE_SOURCES
                 .iter()
@@ -341,16 +345,28 @@ impl Default for CoreEngineOptions {
             session_io_coalescing: SessionIoCoalescingOptions::from(
                 SessionIoCoalescingPolicy::default(),
             ),
-            plugin_worker_capacity: PluginWorkerEngineConfig::default().per_plugin_queue_capacity,
+            plugin_worker_queue_capacity: plugin_worker.per_plugin_queue_capacity,
+            plugin_worker_executor_concurrency: plugin_worker.per_plugin_executor_concurrency,
         }
     }
 }
 
 impl CoreEngineOptions {
+    pub(crate) const fn plugin_worker_config(&self) -> PluginWorkerEngineConfig {
+        PluginWorkerEngineConfig {
+            per_plugin_queue_capacity: self.plugin_worker_queue_capacity,
+            per_plugin_executor_concurrency: self.plugin_worker_executor_concurrency,
+        }
+    }
+
     fn validate(&self) -> Result<(), HubConfigError> {
         validate_positive_usize(
-            "core_engine.plugin_worker_capacity",
-            self.plugin_worker_capacity,
+            "core_engine.plugin_worker_queue_capacity",
+            self.plugin_worker_queue_capacity,
+        )?;
+        validate_positive_usize(
+            "core_engine.plugin_worker_executor_concurrency",
+            self.plugin_worker_executor_concurrency,
         )?;
         self.session_io_coalescing.validate()?;
         if let Some(path) = &self.session_worker_path {
@@ -533,6 +549,37 @@ mod tests {
             serde_json::from_str(&json).expect("deserialize startup options");
 
         assert_eq!(round_trip, options);
+        assert!(json.contains("\"plugin_worker_queue_capacity\""));
+        assert!(json.contains("\"plugin_worker_executor_concurrency\""));
+        assert!(!json.contains("\"plugin_worker_capacity\""));
+    }
+
+    #[test]
+    fn core_engine_options_reject_legacy_plugin_worker_capacity() {
+        let options = CoreEngineOptions::default();
+        let mut value = serde_json::to_value(&options).expect("serialize core engine options");
+        let queue_capacity = {
+            let object = value.as_object_mut().expect("core engine options object");
+            let queue_capacity = object
+                .remove("plugin_worker_queue_capacity")
+                .expect("queue capacity");
+            object.insert("plugin_worker_capacity".to_string(), queue_capacity.clone());
+            queue_capacity
+        };
+
+        let legacy_only = serde_json::from_value::<CoreEngineOptions>(value.clone())
+            .expect_err("legacy-only worker capacity must fail")
+            .to_string();
+        assert!(legacy_only.contains("plugin_worker_capacity"));
+
+        value
+            .as_object_mut()
+            .expect("core engine options object")
+            .insert("plugin_worker_queue_capacity".to_string(), queue_capacity);
+        let mixed = serde_json::from_value::<CoreEngineOptions>(value)
+            .expect_err("mixed legacy and current worker capacity must fail")
+            .to_string();
+        assert!(mixed.contains("plugin_worker_capacity"));
     }
 
     #[test]
@@ -674,12 +721,22 @@ mod tests {
         assert_error_field(
             HubStartupOptions {
                 core_engine: CoreEngineOptions {
-                    plugin_worker_capacity: 0,
+                    plugin_worker_queue_capacity: 0,
                     ..CoreEngineOptions::default()
                 },
                 ..HubStartupOptions::default()
             },
-            "core_engine.plugin_worker_capacity",
+            "core_engine.plugin_worker_queue_capacity",
+        );
+        assert_error_field(
+            HubStartupOptions {
+                core_engine: CoreEngineOptions {
+                    plugin_worker_executor_concurrency: 0,
+                    ..CoreEngineOptions::default()
+                },
+                ..HubStartupOptions::default()
+            },
+            "core_engine.plugin_worker_executor_concurrency",
         );
     }
 

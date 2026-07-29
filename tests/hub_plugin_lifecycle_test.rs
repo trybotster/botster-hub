@@ -12,8 +12,8 @@ use botster_core::{
     PluginResourceKind, PluginResourceRef, PluginRuntime, RequestId,
 };
 use botster_hub::{
-    DataDirectoryOption, FileHubStateStore, HostIdentityOptions, HubLifecycleError,
-    HubPluginRuntimeBundle, HubRuntime, HubStartupOptions, HubStateStore,
+    CoreEngineOptions, DataDirectoryOption, FileHubStateStore, HostIdentityOptions,
+    HubLifecycleError, HubPluginRuntimeBundle, HubRuntime, HubStartupOptions, HubStateStore,
     LOCAL_PACKAGE_MANIFEST_FILE, PackageProvenance, PackageRegistry, RuntimeEnvironment,
     SessionDefaults, TransportBindings,
 };
@@ -331,6 +331,57 @@ fn hub_runtime_loads_and_invokes_enabled_plugin_package_through_core_worker() {
         PluginInvocationResult::Completed(PluginInvocationSuccess { handler, .. }) if handler == command
     ));
     assert_eq!(runtime.invocations().len(), 1);
+}
+
+#[test]
+fn hub_runtime_passes_split_plugin_worker_config_to_core_engine() {
+    let package_name = "configured.workflow.plugin";
+    let surface = capability(CapabilitySurface::Surfaces, None);
+    let mut registry = registry_with_grants(vec![surface.clone()]);
+    registry
+        .install(
+            plugin_manifest(package_name, vec![surface.clone()]),
+            provenance(),
+            "install configured plugin",
+        )
+        .expect("install configured plugin");
+    registry
+        .enable(package_name, "enable configured plugin")
+        .expect("enable configured plugin");
+    let config = HubStartupOptions {
+        core_engine: CoreEngineOptions {
+            plugin_worker_queue_capacity: 7,
+            plugin_worker_executor_concurrency: 3,
+            ..CoreEngineOptions::default()
+        },
+        ..HubStartupOptions::default()
+    }
+    .build_config_for_environment(&RuntimeEnvironment::from_values(
+        Some(test_root("configured-worker-engine")),
+        None,
+    ))
+    .expect("configured runtime");
+    let mut hub = HubRuntime::new(config);
+
+    hub.load_plugin_package(
+        &registry,
+        package_name,
+        bundle(
+            package_name,
+            FakeRuntime::new("configured"),
+            handler(package_name, "configured"),
+            Some(surface),
+            "configured",
+            "configured-resource",
+        ),
+    )
+    .expect("load configured plugin");
+
+    let snapshot = hub.plugin_worker_debug_snapshot();
+    assert_eq!(snapshot.configured_queue_capacity, 7);
+    assert_eq!(snapshot.configured_executor_concurrency, 3);
+    assert_eq!(snapshot.live_plugin_executors, 1);
+    assert_eq!(snapshot.live_executor_workers, 3);
 }
 
 #[test]

@@ -2679,10 +2679,10 @@ fn package_and_lifecycle_queries_are_sanitized_and_explicitly_pulled() {
     let HubClientResponseBody::PluginLifecycle(records) = response.body else {
         panic!("plugin lifecycle response expected");
     };
-    assert_eq!(records.len(), 1);
-    assert_eq!(records[0].package_name, "workflow.plugin");
-    assert_eq!(records[0].state, HubClientPackageState::Enabled);
-    assert!(!records[0].loaded);
+    assert_eq!(records.lifecycle.len(), 1);
+    assert_eq!(records.lifecycle[0].package_name, "workflow.plugin");
+    assert_eq!(records.lifecycle[0].state, HubClientPackageState::Enabled);
+    assert!(!records.lifecycle[0].loaded);
 }
 
 #[test]
