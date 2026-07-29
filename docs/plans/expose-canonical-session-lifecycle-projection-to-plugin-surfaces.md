@@ -52,10 +52,17 @@
   conformance runners; real daemon lifecycle, client API, and Lua worker tests;
   `test.sh`; and the loaded-daemon CI workflow.
 - Downstream code was inspected read-only at current authoritative refs to
-  identify ownership seams. Web already has a generic `bind_list`/entity-store
-  renderer and consumes daemon session subscriptions, while TUI consumes the
-  same session subscription but does not yet expose a general session entity
-  resolver to plugin UiNode binding. Those repositories are not edited here.
+  identify ownership seams. Neither shipped generic client currently consumes
+  this contract: botster-web at `e044484` has no canonical `$bind`,
+  `bind_list`, or `bind_if` resolver and silently drops canonical bound
+  children in its legacy adapter; botster-tui at `0d26ce0` and
+  botster-tui-kit at `22df686` render `bind_list` as `empty_template` without
+  an entity store. Those repositories are not edited here.
+- Human answer `question_1785297681_855888` selects a staged cold switch:
+  this Hub run owns the `/session` producer, admission, contract, and
+  Hub-authored reference conformance. Shipped-client runtime proof belongs to
+  downstream Web ticket `ticket_1785298229_125024` and TUI ticket
+  `ticket_1785298229_854008`, both registered as depending on this Hub ticket.
 - Registry preflight on 2026-07-28: public latest is
   `@trybotster/hub-test-support@0.1.14`, protocol version 4 / conformance
   revision 22, with `@trybotster/ui-contract@0.1.0`. The current main checkout
@@ -80,17 +87,21 @@ Lifecycle classification is Hub contract, not workspace policy:
 
 - `starting`, `running`, and `stopping` are current.
 - `exited` and `failed` are ended.
+- A present row with `lifecycle: None`, including `registry_state: "stale"`,
+  is indeterminate.
 - A UUID absent from the authoritative snapshot/family is unknown or
   unavailable.
 - Session shutdown changes lifecycle but does not remove the row. Only the
   existing explicit Hub retention/removal operation produces
   `entity_remove`.
 
-Prefer documenting and testing this state mapping over adding a duplicate
-`current`/`ended` field. Add a derived field only if the existing binding
-grammar cannot express the generic conformance surface; if that becomes
-necessary, it must remain a Hub-owned lifecycle phase with source-derived DTO
-generation and explicit compatibility handling, not workspace terminology.
+Every present session row must expose an always-present, Hub-derived
+`lifecycle_class` with exactly `current | ended | indeterminate`. This field is
+the generic binding input; it is not workspace status. Snapshot/upsert/patch
+projection must set it explicitly on every present row, including transitions
+from a concrete lifecycle to `None`, so merge-patch consumers never retain a
+stale class because an optional source field was omitted. Absence from the
+family—not an omitted lifecycle field—is the only unknown/unavailable state.
 
 This option is the smallest contract that satisfies push and reconnect
 semantics. A scoped Lua read would return a correct point-in-time projection,
@@ -110,16 +121,19 @@ the ticket.
    - Bind only against the connection's already admitted `session` entity
      subscription. A plugin worker authors paths and templates; it does not
      receive the entity values or a raw Hub-state handle.
-   - If production validation needs a family allowlist, add the narrow
-     `/session` admission at the existing Hub plugin-surface validation
-     boundary. Do not create a general Hub entity introspection API.
+   - After generic UiNode validation, enforce a Hub-owned binding-family
+     admission pass at the existing plugin-surface validation boundary:
+     accept `/session`, preserve separately sanctioned owner-namespaced plugin
+     families, and reject unauthorized built-in/foreign absolute families.
+     Do not create a general Hub entity introspection API.
 
 2. **Add a real plugin-worker producer.**
    - Extend the canonical plugin-contract-matrix source with one surface that
      accepts or contains a bounded set of referenced UUIDs and returns a
      Hub-validated UiNode tree using `/session` bindings.
-   - The fixture must demonstrate current, ended, and unknown/missing rows
-     using the existing binding/filter/empty-template grammar.
+   - The fixture must demonstrate matching current, ended, and indeterminate
+     rows before demonstrating unknown/missing through
+     binding/filter/empty-template grammar.
    - Load and invoke that fixture through the real package registry,
      supervisor, plugin worker VM, `surface_route` registration,
      `HubRuntime::render_plugin_surface`, client API, and daemon response path.
@@ -129,10 +143,11 @@ the ticket.
    - Reuse the existing lifecycle baseline/delta projector and bounded
      subscription delivery. No polling, `ListSessions` refresh, plugin
      lifecycle cache, or workspace-owned status field is added.
-   - Prove an initial snapshot materializes referenced current, ended, and
-     absent UUIDs; an ordered lifecycle patch moves a referenced row from the
-     current result to the ended result; explicit remove makes the reference
-     unknown without deleting the plugin-owned reference.
+   - Prove an initial snapshot materializes referenced current, ended,
+     indeterminate, and absent UUIDs; ordered lifecycle patches move a
+     referenced row current -> ended -> indeterminate with an explicit
+     `lifecycle_class` update; explicit remove makes the reference unknown
+     without deleting the plugin-owned reference.
    - Drop the connection, create a fresh subscription generation, and require
      a new authoritative snapshot before accepting deltas. The rematerialized
      plugin view must converge without a client-specific list or surface
@@ -141,18 +156,22 @@ the ticket.
      subscription close on failed resync. Do not add an unbounded queue or
      timing-only retry.
 
-4. **Publish one downstream-shaped conformance contract.**
+4. **Publish one Hub-owned reference conformance contract.**
    - Add a source-derived Hub test-support scenario/report that combines the
      real plugin surface tree with public `DaemonEntityFrame` values and
-     materializes a renderer-neutral current/ended/unknown result.
-   - Expose the same scenario through Rust for terminal-client tests and JSON /
-     Node for browser-client tests. Both shapes must consume the canonical
-     UiNode tree and public daemon DTOs rather than parallel lifecycle structs.
+     materializes renderer-neutral current, ended, indeterminate, and
+     absent/unknown results.
+   - Expose the same scenario through Rust and JSON/Node as reference
+     materializers for downstream client tickets. Both shapes must consume the
+     canonical UiNode tree and public daemon DTOs rather than parallel
+     lifecycle structs. They prove producer/fixture self-consistency, not the
+     shipped botster-web or botster-tui runtime path.
    - Update the first-party support matrix to name the canonical `/session`
-     path, lifecycle state mapping, missing-row semantics, real runtime runner,
-     and Web/TUI consumer entry points. Remove any limitation that would
-     contradict this now-supported built-in binding seam; do not claim general
-     plugin-owned entity hydration if it is still unsupported.
+     path, lifecycle-class mapping, missing-row semantics, real runtime runner,
+     reference materializers, and the two downstream consumer tickets. State
+     plainly that shipped Web/TUI rendering is not supplied by this Hub
+     artifact. Do not claim general plugin-owned entity hydration if it is
+     still unsupported.
    - Advance the conformance fixture revision because the public fixture/matrix
      meaning changes. Change the daemon protocol version only if implementation
      changes required request/response compatibility rather than composing
@@ -217,33 +236,44 @@ the ticket.
   access.
 - **botster-workspaces:** downstream ticket
   `ticket_1785296184_677408` consumes this seam after it lands. It owns stored
-  references, current/ended layout, and unknown-reference presentation. It
-  must not become a dependency of this Hub producer run.
-- **botster-web and botster-tui:** downstream clients own renderer/store
-  adaptation to the canonical family. This Hub run supplies and executes their
-  shared conformance shapes but does not edit either repository. If an actual
-  client cannot consume the canonical fixture without product code changes,
-  file a separately routed client ticket against that repository target and
-  record it as downstream work; do not add client-specific aliases in Hub.
+  references, current/ended layout, and unknown-reference presentation. It is
+  registered as depending on this Hub ticket plus both client consumer
+  tickets, because its owner-authored detail surface cannot render the seam
+  until both generic clients resolve it.
+- **botster-web:** downstream ticket `ticket_1785298229_125024`, target
+  `tgt_40abcf71ccf049f4ac0c99953a799869`, owns the production browser
+  entity-store/binding resolver and is registered as depending on this Hub
+  ticket.
+- **botster-tui:** downstream ticket `ticket_1785298229_854008`, target
+  `tgt_c3d470bab78549df920a41e8fb0e58d8`, owns the production terminal client
+  entity-store/binding resolver and is registered as depending on this Hub
+  ticket. Any reusable TUI-kit gap is separately routed by that ticket.
+- This Hub run supplies shared producer/reference conformance but cannot claim
+  shipped Web/TUI runtime proof. Do not add client-specific aliases in Hub to
+  hide either downstream gap.
 - **Final integration:** `ticket_1785192726_335558` owns the eventual complete
   Workspaces browser/TUI click-through. It does not replace this ticket's real
-  Hub/plugin-worker and downstream-shaped consumer proof.
-- No open prerequisite is currently registered. The existing production
-  session entity subscription, plugin surface path, and UI binding grammar are
-  already present on the run base.
+  Hub/plugin-worker proof or the named downstream clients' runtime proof.
+- No open prerequisite blocks this Hub producer. Dependency direction is Hub
+  producer -> Web/TUI consumers -> Workspaces lifecycle consumer; the existing
+  production session subscription, plugin surface path, and generic binding
+  grammar are present on the Hub run base.
 
 ## Assumptions and unknowns
 
-- Assumption: existing `UiBind`, `UiBindList.where`, and `empty_template`
-  semantics can express the generic current/ended/unknown fixture without a
-  new UI primitive. The implementation should prove this first.
+- Binding decision: existing `UiBind`, `UiBindList.where`, and
+  `empty_template` semantics are the selected grammar. The Hub reference
+  materializer must prove matching current, ended, and indeterminate records
+  before absence, including a negative control that a matching UUID never
+  selects `empty_template`.
 - Ask-human threshold: if missing-reference behavior cannot be expressed
   without a new renderer-neutral binding primitive, stop and present that
   precise contract choice rather than silently adding a query language or
   weakening unknown behavior.
-- Assumption: the existing sanitized `lifecycle` strings are sufficient for
-  current/ended classification. A derived lifecycle phase is fallback, not the
-  default.
+- Contract decision: the existing optional `lifecycle` field is insufficient
+  to distinguish a present unclassified/stale row from an absent UUID. Every
+  present row therefore carries required `lifecycle_class:
+  current | ended | indeterminate`.
 - Assumption: a plugin-authored binding does not grant the worker raw state;
   values remain in the admitted client entity store. Any implementation that
   sends entity values into the worker needs a fresh security/ownership review.
@@ -251,9 +281,10 @@ the ticket.
   generic client contract. The plugin fixture scopes what it renders to its
   referenced UUIDs; this ticket does not redesign subscription-level server
   filtering.
-- Unknown: the narrowest stable conformance report/materialization API shared
-  by Rust and Node. Prefer existing public UiNode and daemon DTO serialization
-  plus relational assertions over a second view-model schema.
+- Unknown: the narrowest stable Hub reference report/materialization API
+  shared by Rust and Node. Prefer existing public UiNode and daemon DTO
+  serialization plus relational assertions over a second view-model schema;
+  never describe this reference code as a shipped Web/TUI adapter.
 - Unknown: whether a new compatibility feature constant is necessary. Add one
   only if clients must explicitly negotiate canonical plugin session binding;
   if added, update advertised features, required features, and support-matrix
@@ -278,15 +309,16 @@ the ticket.
 - `src/daemon_transport.rs` — existing session projection and connection-scoped
   delivery tests; production changes only where the canonical binding seam
   requires them.
-- `src/runtime.rs` / `src/client_api.rs` — likely test-adjacent only; preserve
-  the existing real plugin surface render path and validation boundary.
+- `src/runtime.rs` / `src/client_api.rs` — Hub-owned binding-family admission
+  after generic UiNode validation plus preservation of the existing real
+  plugin surface render path.
 - `fixtures/plugins/plugin-contract-matrix/plugin.lua`,
   `fixtures/plugins/plugin-contract-matrix/botster-package.json`, and
   `fixtures/plugins/plugin-contract-matrix/README.md` — authoritative packaged
   binding producer and documentation.
 - `crates/botster-hub-test-support/src/lib.rs` — combined
   plugin-surface/session-entity conformance scenario, real runner/report,
-  support matrix, Rust/TUI-shaped materialization, and source-equality tests.
+  support matrix, Rust reference materialization, and source-equality tests.
 - `crates/botster-hub-test-support/examples/node_package_assets.rs` — generated
   asset metadata/emission.
 - `tests/hub_lua_runtime_test.rs` — focused real worker registration/render
@@ -296,11 +328,14 @@ the ticket.
   removal, disconnect, and reconnect proof through the runner.
 - `packages/hub-test-support/scripts/sync-assets.mjs`,
   `package.json`, `index.js`, `index.d.ts`, `test.mjs`, and `README.md` —
-  generated asset pipeline, exports, Node/Web-shaped materialization, version,
+  generated asset pipeline, exports, Node reference materialization, version,
   tests, and consumer instructions.
-- `packages/hub-test-support/fixtures/plugin-contract-matrix/**`,
-  `metadata.json`, `first-party-client-support-matrix.json`, and the new
-  session-plugin-binding conformance JSON — generated copies only.
+- `packages/hub-test-support/fixtures/plugin-contract-matrix/**` — generated
+  plugin fixture copies only.
+- `packages/hub-test-support/metadata.json`,
+  `packages/hub-test-support/first-party-client-support-matrix.json`, and the
+  new root-level session-plugin-binding conformance JSON — generated contract
+  copies only.
 - `packages/ui-contract/README.md` and existing contract tests only if
   clarifying the generic absolute-path grammar is required. No schema/type
   change is expected by default.
@@ -316,11 +351,20 @@ the ticket.
   only the sanitized `/session` family to the client binding resolver, and
   reject any need for raw Hub/Core state.
 - **Workspace policy leaks into Hub:** document only lifecycle states and
-  generic current/ended classification; keep labels, ordering, retention of
-  references, and product actions in Workspaces.
-- **Unknown UUIDs disappear:** conformance must include a never-known UUID and
-  an explicitly removed UUID, both retaining the owner-authored reference and
-  rendering a deliberate unavailable state.
+  the generic `current | ended | indeterminate` classification; keep labels,
+  ordering, retention of references, and product actions in Workspaces.
+- **Present-but-unclassified rows collapse into unknown:** require the
+  always-present `lifecycle_class`, map `lifecycle: None` and stale registry
+  rows to `indeterminate`, and reserve unknown/unavailable for an absent UUID.
+- **A concrete-to-None patch leaves stale client state:** projection and patch
+  tests must prove current -> ended -> indeterminate explicitly updates
+  `lifecycle_class`; omitted optional source fields cannot be the clear
+  mechanism.
+- **Unknown UUIDs disappear or false-pass through an always-empty renderer:**
+  conformance must materialize matching current, ended, and indeterminate rows
+  first, prove those rows do not select `empty_template`, then include a
+  never-known UUID and an explicitly removed UUID that retain the owner-authored
+  reference and render the deliberate unavailable state.
 - **Shutdown is mistaken for deletion:** prove exited/failed rows remain until
   explicit removal; only `entity_remove` creates absence.
 - **Reconnect accepts stale generation deltas:** require a new subscription id
@@ -333,13 +377,13 @@ the ticket.
 - **Web and TUI learn different family aliases:** publish one `/session` path
   and one source-derived scenario. Reject `botster-web.session`,
   TUI-local names, or renderer-specific fields from the authored tree.
-- **Conformance is not an actual consumer:** Node must materialize the delivered
-  tree and frames through generic browser-shaped store semantics; Rust must do
-  the same through the terminal-client-shaped path. Source/serde checks alone
-  are insufficient.
-- **Current client implementation gap is hidden:** if downstream proof shows a
-  client needs changes, route a client ticket and report it. Do not claim full
-  final integration or add a Hub compatibility alias.
+- **Reference conformance is mistaken for shipped-client proof:** Hub's Node
+  and Rust materializers must execute the delivered tree and public frames,
+  but their reports must be labelled producer/reference self-consistency.
+  Shipped runtime proof belongs only to the registered Web and TUI tickets.
+- **Current client implementation gap is hidden:** record the verified failing
+  client baseline and exact downstream ticket IDs. Do not claim full final
+  integration or add a Hub compatibility alias.
 - **Public artifact collision/drift:** preflight the registry and compare
   `0.1.14` metadata/integrity before selecting a version; allocate a unique
   conformance revision and use generated equality checks.
@@ -355,9 +399,15 @@ the ticket.
    - `./test.sh --locked -p botster-hub-client` proves public session entity
      serde, feature/compatibility metadata, and TypeScript generation.
    - Focused `src/daemon_transport.rs` tests prove every lifecycle state maps
-     to the documented current/ended class, patches preserve the canonical
+     to the documented `current | ended | indeterminate` class, every present
+     row serializes that field, concrete -> `None` and stale transitions
+     explicitly patch it to `indeterminate`, patches preserve the canonical
      UUID, explicit remove creates absence, and no extra Hub state enters the
      row.
+   - Focused Hub surface-admission tests accept canonical `/session` bindings,
+     preserve explicitly sanctioned owner-namespaced plugin families, and
+     reject unauthorized built-in or foreign absolute families after generic
+     UiNode validation.
 
 2. **Real plugin-worker registration and render**
    - A focused
@@ -374,31 +424,34 @@ the ticket.
      `./test.sh --locked --test hub_daemon_lifecycle_test <session-plugin-projection-test> -- --exact --nocapture`
      uses the reusable conformance runner against
      `HubDaemon -> HubRuntime -> CoreDaemon -> botster-session-worker`.
-   - It proves initial current/ended/unknown materialization, ordered
-     current-to-ended transition without list/surface refresh, explicit
-     removal to unknown, concurrent connection isolation, disconnect cleanup,
-     and a fresh authoritative reconnect snapshot.
+   - It proves initial current/ended/indeterminate/absent materialization,
+     ordered current -> ended -> indeterminate transition without list/surface
+     refresh, explicit removal to unknown, concurrent connection isolation,
+     disconnect cleanup, and a fresh authoritative reconnect snapshot.
    - Existing deterministic overflow tests remain green and assert snapshot
      resync or close rather than a hidden delta gap.
 
-4. **Generated artifact and Web-shaped proof**
+4. **Generated artifact and Node reference materialization**
    - `node packages/hub-test-support/scripts/sync-assets.mjs --check`
    - `npm test --prefix packages/hub-test-support`
    - The Node test imports the generated scenario, applies public session
      frames to a generic entity store, resolves the delivered `/session`
-     bindings, and asserts the same current/ended/unknown result before and
-     after patch/remove/reconnect. JSON existence or token checks do not pass
-     this gate.
+     bindings, and asserts matching current, ended, and indeterminate rows
+     before the absent UUID selects `empty_template`. It must include the
+     negative control that a matching UUID never selects `empty_template`, and
+     assert the same distinction after patch/remove/reconnect. JSON existence
+     or token checks do not pass this gate.
+   - This is a Hub-owned reference materializer. It is not botster-web runtime
+     evidence and must not be labelled Web compatibility.
 
-5. **Rust/TUI-shaped proof**
+5. **Rust reference materialization**
    - `./test.sh --locked -p botster-hub-test-support`
    - The Rust test consumes the same delivered UiNode and public entity frames
-     and materializes the same result without a client-specific family alias.
-   - Before claiming actual first-party compatibility, run the current
-     botster-tui consumer conformance target against the packed Hub
-     test-support artifact. If its production renderer lacks the generic
-     binding adapter, file a TUI-targeted downstream ticket and record the
-     limitation rather than weakening this contract.
+     and asserts matching current, ended, and indeterminate rows before the
+     absent UUID selects `empty_template`, including the same matching-row
+     negative control and no client-specific family alias.
+   - This is a Hub-owned reference materializer. It is not botster-tui runtime
+     evidence and must not be labelled TUI compatibility.
 
 6. **Package and external clean-consumer proof**
    - Recheck `npm view @trybotster/hub-test-support version dist-tags --json
@@ -406,7 +459,8 @@ the ticket.
    - Run `npm pack --dry-run --json` and inspect that the new fixture, matrix,
      declarations, plugin mirror, and metadata are present once.
    - Install the exact packed tarball plus `@trybotster/ui-contract@0.1.0` into
-     a clean temporary Node consumer and run the Web-shaped materialization.
+     a clean temporary Node consumer and run the Node reference
+     materialization.
    - Run the repository's Rust external-client/subprocess smoke against fresh
      Hub and lockfile-pinned session-worker binaries.
    - If published in this run, verify the public integrity/metadata and repeat
@@ -424,14 +478,32 @@ the ticket.
    - Record exact Hub SHA, Core SHA from `Cargo.lock`, and resolved fresh binary
      realpaths for live evidence.
 
-8. **Traceability**
+8. **Downstream shipped-client proof (not a Hub completion claim)**
+   - Web ticket `ticket_1785298229_125024` against
+     `tgt_40abcf71ccf049f4ac0c99953a799869` must run the packed scenario through
+     the real botster-web browser renderer/entity store and prove
+     current/ended/indeterminate, absent-only unavailable, patch, removal, and
+     reconnect behavior. Its expected baseline is currently failing because
+     the legacy adapter drops canonical bound children.
+   - TUI ticket `ticket_1785298229_854008` against
+     `tgt_c3d470bab78549df920a41e8fb0e58d8` must run the same scenario through
+     the real botster-tui application renderer/entity store with matching-row
+     negative controls. Its expected baseline is currently failing because
+     every `bind_list` resolves to `empty_template`.
+   - Those tickets depend on this Hub producer and are required before
+     Workspaces lifecycle ticket `ticket_1785296184_677408` can claim actual
+     browser/TUI detail-surface proof. Their current expected failure does not
+     fail this producer-only Hub run, and Hub reference tests cannot substitute
+     for their eventual passing runtime evidence.
+
+9. **Traceability**
    - Every changed line must map to canonical `/session` documentation,
      production plugin registration/binding, public conformance generation,
      lifecycle/reconnect proof, or cleanup made necessary by those changes.
-   - The implementation report must state whether actual Web/TUI client
-     conformance passed unchanged, which downstream tickets were filed if not,
-     registry coordinate/integrity if published, and every deviation from this
-     plan.
+   - The implementation report must name the registered Web and TUI downstream
+     tickets, state plainly that shipped-client proof is outside this Hub run,
+     record registry coordinate/integrity if published, and list every
+     deviation from this plan.
 
 ## Vault gaps worth capturing
 
