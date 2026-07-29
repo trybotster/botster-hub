@@ -194,18 +194,81 @@ fn package_presentation_validates_ids_operations_and_navigation_targets() {
     );
     assert_eq!(
         validate_package_presentation(
-            &[surface],
+            std::slice::from_ref(&surface),
             &[PackageNavigationEntry {
                 target: PackageNavigationTarget::Surface {
                     surface_id: "missing".to_string(),
                 },
-                ..navigation
+                ..navigation.clone()
             }],
         ),
         Err(
             PackagePresentationValidationError::UnknownNavigationSurface {
                 navigation_id: "tickets".to_string(),
                 surface_id: "missing".to_string(),
+            }
+        )
+    );
+    assert_eq!(
+        validate_package_presentation(
+            &[PackageSurfaceDescriptor {
+                id: "   ".to_string(),
+                ..surface.clone()
+            }],
+            &[],
+        ),
+        Err(PackagePresentationValidationError::EmptyId { field: "surface" })
+    );
+    assert_eq!(
+        validate_package_presentation(
+            std::slice::from_ref(&surface),
+            &[PackageNavigationEntry {
+                id: "\t".to_string(),
+                ..navigation.clone()
+            }],
+        ),
+        Err(PackagePresentationValidationError::EmptyId {
+            field: "navigation"
+        })
+    );
+    assert_eq!(
+        validate_package_presentation(
+            std::slice::from_ref(&surface),
+            &[PackageNavigationEntry {
+                target: PackageNavigationTarget::Surface {
+                    surface_id: " \n".to_string(),
+                },
+                ..navigation.clone()
+            }],
+        ),
+        Err(PackagePresentationValidationError::EmptyId {
+            field: "navigation surface target"
+        })
+    );
+    assert_eq!(
+        validate_package_presentation(
+            std::slice::from_ref(&surface),
+            &[navigation.clone(), navigation.clone()],
+        ),
+        Err(PackagePresentationValidationError::DuplicateNavigationId {
+            id: "tickets".to_string()
+        })
+    );
+    assert_eq!(
+        validate_package_presentation(
+            &[PackageSurfaceDescriptor {
+                supports: vec![
+                    PackageSurfaceOperation::Render,
+                    PackageSurfaceOperation::Render,
+                ],
+                ..surface
+            }],
+            &[],
+        ),
+        Err(
+            PackagePresentationValidationError::DuplicateSurfaceOperation {
+                surface_id: "tickets".to_string(),
+                operation: PackageSurfaceOperation::Render,
             }
         )
     );

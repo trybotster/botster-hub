@@ -55,8 +55,7 @@ pub use botster_hub_client::{
     read_frame_from_reader, write_frame,
 };
 use botster_ui_contract::{
-    PackageSurfaceDescriptor, PackageSurfaceKind, PackageSurfaceOperation, UiActionResult,
-    UiActionResultState,
+    PackageSurfaceDescriptor, PackageSurfaceKind, UiActionResult, UiActionResultState,
 };
 use serde_json::Value;
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
@@ -2067,17 +2066,6 @@ fn handle_runtime_control_request(
             surface_id,
             payload,
         } => {
-            if let Some(response) = invalid_surface_request_response(
-                &packages,
-                &package_name,
-                &surface_id,
-                "daemon-plugin-surface-render",
-                "plugin_surface_render",
-                FEATURE_PLUGIN_SURFACE_RENDER,
-                PackageSurfaceOperation::Render,
-            ) {
-                return Ok(response);
-            }
             let response = api.handle_request(
                 runtime,
                 &packages,
@@ -2097,18 +2085,6 @@ fn handle_runtime_control_request(
             package_name,
             request,
         } => {
-            let surface_id = request.surface_id.0.clone();
-            if let Some(response) = invalid_surface_request_response(
-                &packages,
-                &package_name,
-                &surface_id,
-                "daemon-plugin-surface-action",
-                "plugin_surface_action",
-                FEATURE_PLUGIN_SURFACE_ACTION,
-                PackageSurfaceOperation::Action,
-            ) {
-                return Ok(response);
-            }
             let response = api.handle_request(
                 runtime,
                 &packages,
@@ -4983,74 +4959,6 @@ fn daemon_unknown_session_cleanup(session_id: &str) -> DaemonResponse {
     response
 }
 
-fn invalid_surface_request_response(
-    packages: &PackageRegistry,
-    package_name: &str,
-    surface_id: &str,
-    request_id: &str,
-    operation: &str,
-    feature: &str,
-    required_operation: PackageSurfaceOperation,
-) -> Option<DaemonResponse> {
-    let record = packages.package(package_name)?;
-    let Some(surface) = record
-        .manifest
-        .surfaces
-        .iter()
-        .find(|surface| surface.id == surface_id)
-    else {
-        return Some(surface_request_operator_error(
-            request_id,
-            operation,
-            feature,
-            "undeclared_plugin_surface",
-            format!("{package_name} does not declare surface {surface_id}"),
-        ));
-    };
-    if surface.supports.contains(&required_operation) {
-        return None;
-    }
-
-    Some(surface_request_operator_error(
-        request_id,
-        operation,
-        feature,
-        "unsupported_plugin_surface_operation",
-        format!(
-            "{package_name} surface {surface_id} does not declare {} support",
-            match required_operation {
-                PackageSurfaceOperation::Render => "render",
-                PackageSurfaceOperation::Action => "action",
-            }
-        ),
-    ))
-}
-
-fn surface_request_operator_error(
-    request_id: &str,
-    operation: &str,
-    feature: &str,
-    code: &str,
-    message: String,
-) -> DaemonResponse {
-    let diagnostic = DaemonDiagnostic {
-        kind: botster_hub_client::DaemonDiagnosticKind::UnsupportedFeature,
-        operation: Some(operation.to_string()),
-        feature: Some(feature.to_string()),
-        message: Some(message.clone()),
-    };
-    let mut response = daemon_response_base(DaemonResponseKind::OperatorError);
-    response.error = Some(DaemonOperatorError {
-        code: code.to_string(),
-        request_id: request_id.to_string(),
-        operation: operation.to_string(),
-        message,
-        diagnostics: vec![diagnostic.clone()],
-    });
-    response.diagnostics = vec![diagnostic];
-    response
-}
-
 fn daemon_operator_error(error: crate::HubClientError) -> DaemonResponse {
     let mut response = daemon_response_base(DaemonResponseKind::OperatorError);
     response.error = Some(daemon_operator_error_from_client(error));
@@ -6390,6 +6298,22 @@ fn plugin_error_diagnostics(
     code: &str,
     message: &str,
 ) -> Vec<DaemonDiagnostic> {
+    if matches!(
+        code,
+        "undeclared_plugin_surface" | "unsupported_plugin_surface_operation"
+    ) {
+        let feature = match operation {
+            crate::HubClientOperation::PluginSurfaceRender => FEATURE_PLUGIN_SURFACE_RENDER,
+            crate::HubClientOperation::PluginSurfaceAction => FEATURE_PLUGIN_SURFACE_ACTION,
+            _ => return Vec::new(),
+        };
+        return vec![DaemonDiagnostic {
+            kind: botster_hub_client::DaemonDiagnosticKind::UnsupportedFeature,
+            operation: Some(operation_label(operation).to_string()),
+            feature: Some(feature.to_string()),
+            message: Some(message.to_string()),
+        }];
+    }
     if operation == crate::HubClientOperation::PluginSurfaceRender && code == "invalid_surface" {
         return vec![DaemonDiagnostic::action_failure(
             operation_label(operation),

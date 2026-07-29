@@ -101,7 +101,8 @@ Version 0.1.16 publishes protocol version 4 / conformance revision 24 and
 depends on `@trybotster/ui-contract@0.1.1` for the canonical UiNode,
 UiActionRequest, UiActionResult, package surface, and package navigation
 declarations and conformance fixtures. Version 0.1.16 is prepared in this
-repository; it is not published by this change.
+repository; it is not published by this change. It also carries the optional
+aggregate plugin-worker counters prepared in the unpublished 0.1.15 artifact.
 Revision 20 remains the already-published version 0.1.12 application-primitives
 contract; revision 21 adds spawn-target `base_ref` and worktree `management`
 without reusing those bytes; revision 22 makes the live presentation Dialog

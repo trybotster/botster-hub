@@ -6,6 +6,7 @@
 //! does not fetch packages or load plugin/provider lifecycles.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
@@ -1945,6 +1946,62 @@ pub enum PackageRegistrySnapshotError {
         /// Sanitized validation reason.
         reason: String,
     },
+}
+
+impl fmt::Display for PackageRegistrySnapshotError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DuplicatePackage(package_name) => {
+                write!(
+                    formatter,
+                    "persisted package {package_name} appears more than once"
+                )
+            }
+            Self::Presentation {
+                package_name,
+                reason,
+            } => write!(
+                formatter,
+                "persisted package {package_name} has invalid presentation declarations: {reason}; restore a hub-state.json backup or remove/correct that package record before restarting the Hub"
+            ),
+            Self::BotsterCompatibility {
+                package_name,
+                diagnostics,
+            } => write!(
+                formatter,
+                "persisted package {package_name} is incompatible with this Hub: {}",
+                diagnostics.join("; ")
+            ),
+            Self::CapabilityAdmission {
+                package_name,
+                reason,
+            } => write!(
+                formatter,
+                "persisted package {package_name} no longer passes capability admission: {reason:?}"
+            ),
+            Self::HostProfileAdmission {
+                package_name,
+                error,
+            } => write!(
+                formatter,
+                "persisted package {package_name} no longer passes host-profile admission: {error:?}"
+            ),
+            Self::RunnableEntrypoint {
+                package_name,
+                reason,
+            } => write!(
+                formatter,
+                "persisted package {package_name} has invalid runnable entrypoints: {reason}"
+            ),
+            Self::SessionTemplate {
+                package_name,
+                reason,
+            } => write!(
+                formatter,
+                "persisted package {package_name} has invalid session templates: {reason}"
+            ),
+        }
+    }
 }
 
 /// Typed hub package policy error.
@@ -5110,6 +5167,43 @@ mod tests {
                     .iter()
                     .any(|diagnostic| diagnostic.contains("not satisfied"))
         ));
+    }
+
+    #[test]
+    fn from_snapshot_rejects_invalid_presentation_with_recovery_guidance() {
+        let mut manifest = plugin_manifest("invalid-presentation.plugin", Vec::new());
+        let surface = botster_ui_contract::PackageSurfaceDescriptor {
+            id: "duplicate".to_string(),
+            kind: botster_ui_contract::PackageSurfaceKind::App,
+            title: "Duplicate".to_string(),
+            description: None,
+            icon: None,
+            order: None,
+            category: None,
+            supports: vec![botster_ui_contract::PackageSurfaceOperation::Render],
+        };
+        manifest.surfaces = vec![surface.clone(), surface];
+        let snapshot = PackageRegistrySnapshot {
+            granted_capabilities: Vec::new(),
+            governed_surfaces: host_profile().capability_surfaces().to_vec(),
+            records: vec![package_record(manifest, PackageState::Installed)],
+        };
+
+        let error = PackageRegistry::from_snapshot(snapshot)
+            .expect_err("invalid persisted presentation should fail closed");
+
+        assert!(matches!(
+            error,
+            PackageRegistrySnapshotError::Presentation {
+                ref package_name,
+                ref reason,
+            } if package_name == "invalid-presentation.plugin"
+                && reason.contains("duplicate package surface identifier")
+        ));
+        let message = error.to_string();
+        assert!(message.contains("invalid-presentation.plugin"));
+        assert!(message.contains("hub-state.json backup"));
+        assert!(message.contains("remove/correct that package record"));
     }
 
     #[test]

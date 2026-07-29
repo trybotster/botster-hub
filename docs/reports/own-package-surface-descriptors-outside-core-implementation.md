@@ -41,8 +41,11 @@
   [[conformance fixture revisions must be unique per published content]],
   [[test script required for rust tests not cargo test]], and
   [[rust repo strict lints must be verified before dismissing warnings]].
-- [[project-pipelines-playbook]] was not loaded because this change does not
-  edit Project Pipelines package/plugin paths or workflow policy.
+- [[project-pipelines-playbook]] and
+  [[project pipelines is the configurable dev stack package schema acceptance target]]
+  were applied during review rework because the checked-in Project Pipelines
+  example manifest and its public conformance path were brought into scope.
+  No Project Pipelines engine, workflow policy, or plugin behavior changed.
 
 ## Implementation
 
@@ -57,14 +60,23 @@ Hub client and daemon package rows now use the canonical
 `PackageSurfaceDescriptor` directly. The generated daemon TypeScript imports
 that type from `@trybotster/ui-contract` and no longer declares a duplicate
 daemon-owned interface. Render/action admission requires both a declared
-surface id and the matching declared operation, returning structured operator
-errors without disconnecting the daemon.
+surface id and the matching declared operation. Admission lives at the
+transport-neutral `HubClientApi` seam, so in-process and daemon clients cannot
+disagree. The daemon maps those typed client errors to structured operator
+diagnostics without disconnecting.
 
 The packaged contract-matrix fixture now declares explicit app/settings
 navigation. Its reusable exact-Hub conformance runner verifies list/show
 descriptor parity, navigation ids and route paths, render/action behavior, and
 daemon liveness. Focused daemon coverage proves undeclared surfaces and
 unsupported operations are rejected.
+
+Review rework also declares the checked-in
+`examples/project-pipelines` surface as supporting render and action, then
+executes the published `run_project_pipelines_conformance` helper against that
+package through a real daemon socket. Persisted presentation validation remains
+intentionally fail-closed, matching the registry's other restore checks; its
+startup error now names the package and documents backup-first recovery.
 
 ## Files changed
 
@@ -83,6 +95,8 @@ unsupported operations are rejected.
   `fixtures/plugins/plugin-contract-matrix/botster-package.json`, and the
   generated `packages/hub-test-support` protocol, metadata, fixtures,
   declarations, package manifest, tests, and README.
+- First-party acceptance example:
+  `examples/project-pipelines/botster-package.json`.
 - Integration tests:
   `tests/{hub_client_api_test.rs,hub_daemon_lifecycle_test.rs,hub_plugin_lifecycle_test.rs}`.
 
@@ -110,7 +124,10 @@ unsupported operations are rejected.
   convergence `ticket_1785294898_993310` then refreshes the Core lock.
 - A repeated first-party survey found Workspaces and Project Pipelines declare
   action support where they register actions; Web has an empty surface list;
-  TUI declares no surfaces.
+  TUI declares no surfaces. A separate in-repository enumeration checked every
+  `botster-package.json`: all three contract-matrix copies and
+  `examples/project-pipelines` now match their handlers;
+  `examples/synthetic-plugin` registers no surface or UI-action handler.
 
 ## Deviations from the approved plan
 
@@ -123,8 +140,15 @@ unsupported operations are rejected.
   acceptance lists were synchronized to include it.
 - Duplicate ids and unresolved navigation targets are covered by canonical
   contract/admission tests rather than separate negative JSON fixture files.
-  Undeclared surfaces and unsupported operations are exercised through the
-  exact daemon path.
+  Review rework expanded the validator matrix to cover all three empty-id
+  sites, duplicate navigation ids, and duplicate operations. Undeclared
+  surfaces and unsupported operations are exercised through both the
+  in-process client seam and exact daemon path.
+- The initial implementation surveyed sibling first-party repositories but
+  missed the Hub-owned Project Pipelines example. Review correctly exposed the
+  gap through the published conformance helper. The example declaration,
+  repository-local manifest survey, and real-daemon regression were added
+  without restoring the removed permissive pass-through.
 - The full seven-repository production campaign was not run because Web/TUI
   downstream tickets have not yet repinned to these prepared unpublished npm
   coordinates. The charter-required admission proof instead used freshly
@@ -135,13 +159,25 @@ unsupported operations are rejected.
 
 Passed:
 
-- `./test.sh -p botster-ui-contract` — 75 tests.
+- `./test.sh -p botster-ui-contract` — 72 current tests, including every
+  package-presentation validation error variant.
 - `cargo run -p botster-ui-contract --example generate_assets -- --check`.
 - `npm test` in `packages/ui-contract`.
 - `./test.sh -p botster-hub-client` — 44 unit tests and 4 doctests.
 - `cargo run -p botster-hub-client --example generate_typescript -- --check`.
 - Focused Hub manifest projection, duplicate-admission, version-2 persistence,
   client navigation, contract-matrix, and strict surface-operation tests.
+- `plugin_surface_admission_is_shared_by_the_in_process_client_api` — typed
+  undeclared-surface and unsupported-operation rejection at the shared seam.
+- `from_snapshot_rejects_invalid_presentation_with_recovery_guidance` —
+  intentional fail-closed restore behavior and actionable startup guidance.
+- `daemon_project_pipelines_example_exercises_published_surface_conformance` —
+  checked-in first-party package installed through an isolated daemon and
+  exercised by the public `run_project_pipelines_conformance` runner.
+- `daemon_package_dtos_expose_declared_surfaces_and_validate_surface_operations`
+  and
+  `project_pipelines_surface_action_round_trip_uses_client_api_and_plugin_worker`
+  — strict daemon diagnostics and positive in-process plugin-worker behavior.
 - `node packages/hub-test-support/scripts/sync-assets.mjs --check`.
 - `npm test` in `packages/hub-test-support` using a tarball-installed
   `@trybotster/ui-contract@0.1.1`.
@@ -159,6 +195,8 @@ Passed:
   generator assertion and historical plan prose.
 - First-party GitHub survey of current main manifests: Workspaces and Project
   Pipelines declare required operations; Web/TUI have no actionable surfaces.
+  Repository-local enumeration separately covered every checked-in package
+  manifest and its registered surface/action handlers.
 - Ablation:
   ignoring manifest presentation validation made
   `install_rejects_duplicate_hub_owned_surface_ids` fail; bypassing the
@@ -196,6 +234,11 @@ Passed:
   ticket lands. Focused projection and source-scan evidence proves they are
   inactive in this merged Hub path; final convergence must repeat that proof
   after the Core lock changes.
+- A state file written before presentation validation may contain invalid
+  descriptors and will now fail Hub startup by design. The error names the
+  affected package and reason. Operators should back up `hub-state.json`, then
+  remove or correct that package record before restarting; the untouched
+  backup remains the recovery source.
 
 ## Vault guidance
 
