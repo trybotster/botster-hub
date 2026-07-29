@@ -3233,17 +3233,6 @@ fn print_daemon_response(response: DaemonResponse) -> Result<(), OperatorError> 
         DaemonResponseKind::PluginLifecycle => {
             println!("response=plugin_lifecycle");
             println!("plugin_count={}", response.lifecycle.len());
-            if let Some(counters) = response.plugin_worker_counters {
-                println!(
-                    "plugin_worker configured_queue_capacity={} configured_executor_concurrency={} live_plugin_executors={} live_executor_workers={} queued_jobs={} in_flight_jobs={}",
-                    counters.configured_queue_capacity,
-                    counters.configured_executor_concurrency,
-                    counters.live_plugin_executors,
-                    counters.live_executor_workers,
-                    counters.queued_jobs,
-                    counters.in_flight_jobs
-                );
-            }
             for lifecycle in response.lifecycle {
                 println!(
                     "plugin package_name={} state={} loaded={}",
