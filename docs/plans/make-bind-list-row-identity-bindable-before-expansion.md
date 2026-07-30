@@ -84,6 +84,15 @@
   assigning immutable versions. Expected coordinates are UI contract `0.2.0`
   (the Rust-authored node field type changes) and Hub test support `0.1.17`;
   those numbers are not authoritative until the recheck.
+- Plan Review `review_1785438421_704974` returned six specification gaps. This
+  revision reconciles all six against current code: it pins root versus
+  BindList-item validation semantics across both public validation entry
+  points; records the read-only TUI-kit helper audit; adds `src/runtime.rs`
+  render and action-replacement admission controls; preserves the three
+  existing published materializer signatures while adding a named row/payload
+  API; defines all five stage expectations; switches the oracle to a
+  required-identity button; and changes the bound value rule from non-empty to
+  non-blank.
 
 ## Contract decision
 
@@ -102,11 +111,12 @@ The only bound-id form is the existing row-relative sentinel:
 It is valid only inside a `UiBindList.item_template`, where a current producer
 row exists. Resolve it after `where` filtering and before the expanded UiNode
 enters normal renderer/focus/action handling. The referenced row field must be
-a non-empty JSON string. There is no coercion, interpolation, concatenation,
+a non-blank JSON string after trimming, matching the existing
+`validate_stable_id` rule. There is no coercion, interpolation, concatenation,
 fallback, row index, or client-local synthetic id. Absolute paths, unresolved
-paths, non-string values, empty strings, and bound ids in roots, ordinary
-static children, or `empty_template` are contract errors. Literal ids remain
-wire compatible.
+paths, non-string values, empty or whitespace-only strings, and bound ids in
+roots, ordinary static children, or `empty_template` are contract errors.
+Literal ids remain wire compatible.
 
 After materialization the id is an ordinary `UiNodeId`. Duplicate realized ids
 within one rendered tree are producer/contract errors; they are never repaired
@@ -119,14 +129,25 @@ producer-owned uniqueness already matches the `/session` row identity.
    - Add the narrow Rust authored-id enum/value and use it only for `UiNode.id`.
      Preserve the stable realized `UiNodeId` newtype for request/result and
      runtime identity.
-   - Make validation context-aware enough to admit a row-relative id in a
-     BindList item template and reject it wherever no current row exists.
-     Reuse the existing `UiBind` grammar; do not create a second binding
-     language.
+   - Preserve the public root-entry semantics of `UiNode::validate()`,
+     `validate_ui_node()`, and `validate_ui_node_with_capabilities()`: each
+     treats the supplied node as a root with no current row and rejects a
+     bound root id. Thread a private validation context through the recursive
+     semantic validator. Ordinary children, slots, conditionals, `bind_if`
+     nodes, and `empty_template` retain static context; only the descent from
+     `validate_bind_list` into `item_template` switches to BindList-row
+     context. Capability validation continues after that semantic pass and
+     does not relax identity.
+   - Do not add a permissive public detached-template validator. Consumers
+     validate the complete authored tree, materialize a selected item into a
+     literal-id node, and may then validate that realized subtree through the
+     existing root entry points. Reuse the existing `UiBind` grammar; do not
+     create a second binding language.
    - Regenerate JSON Schema and TypeScript so only `UiNodeBase.id` accepts
      `UiNodeId | UiBind`; action request/result `node_id` stays `UiNodeId`.
      Add positive literal/bound round trips plus negative contextual,
-     absolute, missing, empty, and non-string materialization cases.
+     absolute, missing, empty, whitespace-only, and non-string materialization
+     cases.
    - Add a checked conformance fixture whose pre-change parse/validation fails
      and whose post-change parse/validation succeeds. Document author-time
      versus realized identity and duplicate-id failure semantics.
@@ -134,16 +155,47 @@ producer-owned uniqueness already matches the `/session` row identity.
 2. **Add a producer-backed multi-row oracle to `contract.sessions`.**
    - Keep the existing exact-filter lifecycle controls: they prove current,
      ended, indeterminate, missing, patch, remove, and reconnect behavior.
-   - Add one BindList under the same surface which intentionally matches the
-     two initial `current` rows and whose item template binds its id directly
-     to `@/session_uuid`. Use a non-action node unless an action is already
-     required by the fixture; this ticket proves identity, not a second plugin
-     action protocol.
-   - Make the expected oracle name the two distinct realized ids
-     `session-transition` and `session-stable-current`. Extend both Rust and
-     Node reference materializers to resolve the id from each producer row,
-     require a non-empty string, and reject duplicates. Do not merely inspect
-     that `$bind` appears in JSON.
+   - Add one BindList under the same surface with
+     `where.lifecycle_class = "current"`. Its item template is a `button`, so
+     the real path exercises the required stable-id branch. Bind its id
+     directly to `@/session_uuid`, give it a literal non-blank label, and reuse
+     the already-declared `contract.action` descriptor. Its action payload
+     carries a row-relative `session_uuid` bind so downstream keyboard
+     dispatch can prove the selected row's id and payload without inventing a
+     local fixture or adding a second action handler/protocol.
+   - Pin the row-id oracle at every existing scenario stage, preserving
+     producer frame order:
+     `initial = ["session-transition", "session-stable-current"]`;
+     `after_ended_patch`, `after_indeterminate_patch`, `after_remove`, and
+     `after_reconnect = ["session-stable-current"]`. The transition row stops
+     matching after the first lifecycle patch and remains absent after remove
+     and reconnect.
+   - Preserve the published lifecycle materializer APIs and return shapes:
+     Rust
+     `materialize_session_plugin_bindings(&Value, &[DaemonEntityFrame]) ->
+     Result<BTreeMap<String, String>, String>`, Node
+     `materializeSessionPluginBindings(surface, frames) ->
+     Record<string, string>`, and
+     `materializeSessionPluginBindingScenario(scenario) ->
+     Record<string, Record<string, string>>`. Teach them to identify and
+     validate the exact-filter lifecycle controls while ignoring the
+     separately identified row-id oracle.
+   - Add an additive published row materialization type with
+     `{ node_id, action_payload }`, plus sibling APIs: Rust
+     `materialize_session_plugin_rows(&Value, &[DaemonEntityFrame]) ->
+     Result<Vec<SessionPluginMaterializedRow>, String>`, Node
+     `materializeSessionPluginRows(surface, frames) ->
+     Array<{ node_id: string; action_payload: unknown }>`, and Node
+     `materializeSessionPluginRowScenario(scenario) ->
+     Record<string, Array<{ node_id: string; action_payload: unknown }>>`.
+     They locate exactly one canonical current-row oracle, apply the same
+     public frames, resolve the id and bound payload from each selected
+     producer row, require non-blank ids, retain producer order, and reject
+     duplicates. The canonical payload is
+     `{ operation: "select_session", session_uuid: "<realized row id>" }`.
+     Do not merely inspect that `$bind` appears in JSON. This additive API
+     supports the planned Hub-test-support patch release without breaking the
+     two open consumers.
    - Edit the repo-root
      `fixtures/plugins/plugin-contract-matrix` source, then synchronize the
      byte-identical crate and generated npm mirrors. Update all fixture and
@@ -158,6 +210,12 @@ producer-owned uniqueness already matches the `/session` row identity.
      contain the canonical bound-id template, and materialize the two distinct
      ids against public `DaemonEntityFrame` rows. The structural equality check
      alone is insufficient.
+   - Exercise both Hub admission roots in `src/runtime.rs`: the real render
+     response must accept the bound id only inside the BindList item template,
+     while a bound id on the rendered root or static child must fail. An
+     otherwise accepted `UiActionResult.replacement` whose root or static child
+     uses a bound id must also fail through action-result admission. Keep the
+     existing inline binding-family admission tests green.
    - Extend the public conformance report and daemon lifecycle assertions with
      the multi-row oracle. This is the production-entry-point proof: a real
      plugin worker authors the sentinel, Hub admission accepts it, and the
@@ -185,7 +243,8 @@ producer-owned uniqueness already matches the `/session` row identity.
      `ticket_1785298229_854008` must repin the merged Hub contract, remove its
      explicit multi-row/literal-id safety rejection, resolve the authored id
      before expansion enters renderer state, and prove that focusing and
-     keyboard-activating row 2 dispatches row 2's realized node id/payload.
+     keyboard-activating row 2 of the canonical button oracle dispatches
+     `session-stable-current` and its row-bound payload.
    - That child also owns the required real Workspaces surface proof. If a
      reusable renderer primitive must change in `botster-tui-kit`, register a
      separately routed dependency against the kit target; do not edit it from
@@ -234,13 +293,21 @@ producer-owned uniqueness already matches the `/session` row identity.
 - **botster-workspaces:** downstream product consumer owns its surface and
   row actions. It consumes the generic TUI behavior; Hub must not acquire
   Workspaces policy.
-- **botster-tui-kit:** owns generic focus/input primitives only if the TUI
-  implementation proves a kit change is necessary. That would be a separately
-  routed dependency, not silent scope expansion.
+- **botster-tui-kit:** continues to own generic focus/input primitives. Its
+  current `assert_custom_fallbacks_resolve` helper validates each complete
+  fixture through `validate_ui_node_with_capabilities`, then recursively
+  validates only static custom fallbacks; it does not revalidate every
+  BindList item template as a detached root. The canonical button oracle
+  therefore does not require a kit change. The downstream repin must run the
+  kit conformance suite to prove that claim. If the actual repin reveals a
+  detached-template caller or other required kit edit, create and register a
+  separately routed kit dependency against
+  `tgt_3dfae49c02454037bf13554f552baf7f` before changing kit code.
 
 No prerequisite dependency is currently required for this Hub producer run.
-The known dependency direction is downstream: TUI and Workspaces wait for the
-merged/published Hub contract.
+The read-only kit audit above makes that a verified claim rather than an
+assumption. The known dependency direction is downstream: TUI and Workspaces
+wait for the merged/published Hub contract.
 
 ## Assumptions and unknowns
 
@@ -250,6 +317,10 @@ merged/published Hub contract.
 - Authored bound ids are admitted only where BindList supplies a row. Allowing
   them in `empty_template` or a root would leave no deterministic
   materialization context.
+- Existing public validation functions keep root semantics; the context is an
+  internal recursive concern, not an ambient or caller-defaulted flag. A
+  detached authored item template with a bound root id is intentionally
+  invalid until it is materialized.
 - Duplicate-id rejection may live in the generic client tree
   materialization/validation boundary rather than producer admission, because
   Hub does not possess the renderer's entity rows when it validates the
@@ -294,7 +365,7 @@ merged/published Hub contract.
   `packages/hub-test-support/index.js`, `index.d.ts`, `test.mjs`, `README.md`,
   `session-plugin-binding-conformance-fixture.json`, `metadata.json`,
   `first-party-client-support-matrix.json`, and `package.json`;
-  `tests/hub_daemon_lifecycle_test.rs`.
+  `src/runtime.rs`; `tests/hub_daemon_lifecycle_test.rs`.
 - Compatibility/versioning:
   `crates/botster-hub-client/src/lib.rs`, generated compatibility artifacts,
   affected crate manifests, root/public protocol documentation if it describes
@@ -310,9 +381,10 @@ changes, or proof of the real runtime path.
 - **Realized identity accidentally widened:** keep `UiNodeId` string-only and
   add a separate authored-id type; assert action request/result schemas and
   TypeScript reject `$bind`.
-- **Unresolved bindings admitted:** validate with template context and add
-  root/static/empty-template/absolute-path negative tests.
-- **Coercion or collisions hide producer defects:** accept only non-empty JSON
+- **Unresolved bindings admitted:** preserve public root semantics, use a
+  private recursive template context, and add contract plus Hub render/action
+  replacement root/static/empty/absolute negative tests.
+- **Coercion or collisions hide producer defects:** accept only non-blank JSON
   strings and reject duplicate realized ids; never add fallback/index logic.
 - **Fixture looks correct but runtime is unwired:** require the exact
   isolated-Hub/plugin-worker runner and report fields, not only static asset
@@ -325,6 +397,12 @@ changes, or proof of the real runtime path.
 - **Downstream claims success without the user path:** keep producer proof and
   TUI keyboard/action proof distinct; the TUI child must repin the merged
   contract and exercise the real Workspaces surface.
+- **Published materializer break under a patch release:** retain all existing
+  Rust/Node signatures and return shapes; add separately named row-and-payload
+  materializers and test both APIs against the augmented surface.
+- **Detached-template validation regresses TUI-kit:** retain root semantics,
+  document that authored item templates validate only through their containing
+  BindList, and run the kit conformance suite at the downstream repin.
 - **Scope creep into a new expression/query system:** support only the existing
   row-relative `$bind` sentinel and direct row field.
 
@@ -336,8 +414,11 @@ changes, or proof of the real runtime path.
    - Rust round trips literal and bound authored ids. Schema/TypeScript permit
      `$bind` only in `UiNode.id`; action request/result `node_id` remains a
      string.
-   - Reject absolute, missing, empty, non-string, root/static,
+   - Reject absolute, missing, empty, whitespace-only, non-string, root/static,
      `empty_template`, and duplicate-materialized id cases.
+   - Assert `UiNode::validate()`, `validate_ui_node()`, and
+     `validate_ui_node_with_capabilities()` reject the same detached bound-id
+     root, while a containing BindList validates its item template.
    - Run:
 
      ```sh
@@ -347,9 +428,14 @@ changes, or proof of the real runtime path.
      ```
 
 2. **Producer-backed oracle parity**
-   - Rust and Node materializers consume the checked scenario and public
-     session rows, select the same two rows, and return the distinct ids
-     `session-transition` and `session-stable-current`.
+   - Existing Rust/Node lifecycle materializer signatures and output shapes
+     remain compatible against the augmented surface.
+   - New Rust/Node row materializers consume the checked scenario and public
+     session rows. Their `node_id` projections are
+     `["session-transition", "session-stable-current"]` initially and only
+     `["session-stable-current"]` after each of the four subsequent stages;
+     each returned row also contains
+     `{ operation: "select_session", session_uuid: node_id }`.
    - Lifecycle exact-filter stages continue to prove present, missing, patch,
      remove, and reconnect behavior.
    - Source/crate/npm fixture trees and generated metadata remain byte-current.
@@ -370,8 +456,11 @@ changes, or proof of the real runtime path.
      ```
 
    - Assert the real Lua worker response matches the source scenario, Hub
-     validation accepts the authored bound id, and the report exposes the two
-     producer-materialized distinct ids. Static JSON existence is not proof.
+     validation accepts the authored bound id on the required-identity button,
+     and the report exposes the two producer-materialized distinct ids and
+     payloads. Through `src/runtime.rs`, reject the same id on a render
+     root/static child and on an accepted action-result replacement root/static
+     child. Static JSON existence is not proof.
 
 4. **Workspace gates**
 
@@ -398,10 +487,12 @@ changes, or proof of the real runtime path.
 6. **Required downstream proof**
    - In `ticket_1785298229_854008`, repin the merged/published Hub contract
      without a path override; materialize ids before renderer expansion; remove
-     the ambiguity guard; render at least two matching rows; focus row 2; send
-     keyboard activation; and assert the dispatched row-2 node id and action
-     payload. Exercise the owner-authored Workspaces surface, not only a unit
-     fixture.
+     the ambiguity guard; render the two canonical matching buttons; focus row
+     2; send keyboard activation; and assert
+     `node_id = "session-stable-current"` plus that row's bound action payload.
+     Run botster-tui-kit's conformance suite against the repinned contract to
+     prove its custom-fallback helper remains valid. Exercise the owner-authored
+     Workspaces surface, not only a unit fixture.
    - This proof is required before the cross-repository behavior is declared
      delivered, but its code and review remain in the TUI/Workspaces-owned
      targets.
@@ -420,4 +511,3 @@ changes, or proof of the real runtime path.
   exact runtime test, tarball consumer smoke, and downstream repin exist.
   No durable vault content is captured during Plan because this artifact is a
   proposal, not implementation evidence.
-
