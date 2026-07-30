@@ -3936,12 +3936,12 @@ fn local_webrtc_diagnostic_stderr_tail_is_bounded_and_redacts_paths() {
     assert!(!tail.contains(env!("CARGO_MANIFEST_DIR")));
 }
 
-struct LocalWebrtcDiagnosticDaemon {
+struct PanicSafeCliDaemon {
     data_dir: PathBuf,
     child: Option<Child>,
 }
 
-impl LocalWebrtcDiagnosticDaemon {
+impl PanicSafeCliDaemon {
     fn start(data_dir: &Path) -> Self {
         Self {
             data_dir: data_dir.to_path_buf(),
@@ -3955,7 +3955,7 @@ impl LocalWebrtcDiagnosticDaemon {
     }
 }
 
-impl Drop for LocalWebrtcDiagnosticDaemon {
+impl Drop for PanicSafeCliDaemon {
     fn drop(&mut self) {
         let Some(mut child) = self.child.take() else {
             return;
@@ -7822,7 +7822,7 @@ fn session_entity_subscription_pushes_snapshot_ordered_deltas_and_fresh_reconnec
             .path
             .clone(),
     );
-    let child = start_cli_daemon(&data_dir);
+    let child = PanicSafeCliDaemon::start(&data_dir);
 
     let mut first = botster_hub_client::subscribe_session_entities(&endpoint, "entities-first")
         .expect("subscribe first session entity stream");
@@ -8108,7 +8108,7 @@ fn session_entity_subscription_pushes_snapshot_ordered_deltas_and_fresh_reconnec
         .unsubscribe()
         .expect("unsubscribe reconnect stream");
     second.unsubscribe().expect("unsubscribe second stream");
-    shutdown_cli_daemon(&data_dir, child);
+    child.shutdown();
 }
 
 #[test]
@@ -9221,7 +9221,7 @@ fn local_webrtc_chunks_oversized_encrypted_daemon_response() {
         .path
         .clone();
     let endpoint = botster_hub_client::DaemonEndpoint::new(socket_path);
-    let child = LocalWebrtcDiagnosticDaemon::start(&data_dir);
+    let child = PanicSafeCliDaemon::start(&data_dir);
     enable_supervised_package(&data_dir, &package_dir);
 
     let web_listener_port = unused_loopback_port();
