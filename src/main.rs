@@ -20,8 +20,9 @@ use botster_hub::{
     DaemonPackageActionStatus, DaemonPackagePin, DaemonRequest, DaemonResponse, DaemonResponseKind,
     DaemonSession, DaemonSpawnTarget, DaemonStatus, DaemonWorktree, DataDirectoryOption,
     HubClientApi, HubClientRequest, HubClientResponseBody, HubDaemon, HubDaemonState, HubRuntime,
-    HubStartupOptions, HubStateLoadSource, RuntimeEnvironment, SessionDefaults, TransportBindings,
-    daemon_transport_request, host_profile, serve_daemon, serve_mcp_stdio, stream_attach,
+    HubStartupOptions, HubStateLoadSource, LOCAL_RUNTIME_DAEMON_READINESS_BUDGET,
+    RuntimeEnvironment, SessionDefaults, TransportBindings, daemon_transport_request, host_profile,
+    serve_daemon, serve_mcp_stdio, stream_attach,
 };
 use botster_hub_client::{
     DaemonDiagnostic, DaemonLocalWebrtcBootstrap, DaemonLocalWebrtcDeliveryChunk,
@@ -42,7 +43,6 @@ use webrtc::runtime::{
 const SMOKE_MARKER: &str = "botster-hub-smoke-ok";
 const SMOKE_TIMEOUT: Duration = Duration::from_secs(5);
 const LOCAL_RUNTIME_DAEMON_METADATA_FILE: &str = ".botster-hub-runtime-daemon.json";
-const LOCAL_RUNTIME_DAEMON_READINESS_BUDGET: Duration = Duration::from_secs(30);
 const LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_FILE: &str = "local-webrtc-sender-terminal.json";
 const LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_WAIT: Duration = Duration::from_secs(2);
 const TEST_INCOMPATIBLE_DAEMON_ENV: &str = "BOTSTER_HUB_TEST_INCOMPATIBLE_DAEMON";
@@ -425,11 +425,7 @@ fn local_runtime_down(args: Vec<String>) -> Result<(), LocalRuntimeError> {
         Err(error) => return Err(error.into()),
     };
     print_daemon_response(response)?;
-    if let Some(pid) = owned_daemon_pid {
-        wait_for_runtime_daemon_exit(pid)?;
-        remove_configured_local_socket(&config)?;
-        remove_runtime_daemon_metadata(&options.data_directory)?;
-    }
+    complete_owned_runtime_daemon_shutdown(&options.data_directory, &config, owned_daemon_pid)?;
     Ok(())
 }
 
@@ -1690,6 +1686,19 @@ fn remove_runtime_daemon_metadata(data_directory: &Path) -> Result<(), LocalRunt
     }
 }
 
+fn complete_owned_runtime_daemon_shutdown(
+    data_directory: &Path,
+    config: &botster_hub::HubConfig,
+    owned_daemon_pid: Option<u32>,
+) -> Result<(), LocalRuntimeError> {
+    let Some(pid) = owned_daemon_pid else {
+        return Ok(());
+    };
+    wait_for_runtime_daemon_exit(pid)?;
+    remove_configured_local_socket(config)?;
+    remove_runtime_daemon_metadata(data_directory)
+}
+
 fn runtime_daemon_metadata_path(data_directory: &Path) -> PathBuf {
     data_directory.join(LOCAL_RUNTIME_DAEMON_METADATA_FILE)
 }
@@ -2478,9 +2487,13 @@ fn operator_shutdown(args: Vec<String>) -> Result<(), OperatorError> {
     if !options.arguments.is_empty() {
         return Err(OperatorError::Usage("shutdown"));
     }
-    let config = explicit_config(options.data_directory)?;
+    let config = explicit_config(options.data_directory.clone())?;
+    let owned_daemon_pid = owned_runtime_daemon_pid(&options.data_directory, &config)
+        .map_err(|error| OperatorError::App(error.to_string()))?;
     let response = daemon_transport_request(&config, DaemonRequest::DaemonShutdown)?;
     print_daemon_response(response)?;
+    complete_owned_runtime_daemon_shutdown(&options.data_directory, &config, owned_daemon_pid)
+        .map_err(|error| OperatorError::App(error.to_string()))?;
     Ok(())
 }
 
