@@ -235,7 +235,7 @@ pub fn typescript_declarations() -> String {
 pub fn json_schema() -> Value {
     json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "$id": "https://trybotster.dev/schemas/ui-contract-0.1.1.json",
+        "$id": "https://trybotster.dev/schemas/ui-contract-0.2.0.json",
         "title": "Botster UI Contract",
         "oneOf": [
             { "$ref": "#/$defs/UiNode" },
@@ -247,6 +247,20 @@ pub fn json_schema() -> Value {
         "$defs": {
             "JsonValue": {},
             "UiNodeId": { "type": "string" },
+            "UiAuthoredNodeId": {
+                "oneOf": [
+                    { "$ref": "#/$defs/UiNodeId" },
+                    {
+                        "description": "Schema validation is necessary but not sufficient: the Rust/Hub validator admits a bound id only on the direct UiBindList.item_template root, where row context exists.",
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["$bind"],
+                        "properties": {
+                            "$bind": { "type": "string", "pattern": "^@/.+" }
+                        }
+                    }
+                ]
+            },
             "UiActionId": { "type": "string" },
             "UiSurfaceId": { "type": "string" },
             "UiActionRequestId": { "type": "string" },
@@ -385,7 +399,7 @@ pub fn json_schema() -> Value {
                 "required": ["type"],
                 "properties": {
                     "type": { "$ref": "#/$defs/UiNodeKind" },
-                    "id": { "$ref": "#/$defs/UiNodeId" },
+                    "id": { "$ref": "#/$defs/UiAuthoredNodeId" },
                     "props": { "type": "object", "additionalProperties": { "$ref": "#/$defs/JsonValue" } },
                     "children": { "type": "array", "items": { "$ref": "#/$defs/UiChild" } },
                     "slots": {
@@ -574,7 +588,7 @@ pub fn json_schema() -> Value {
 #[must_use]
 pub fn conformance_fixtures_json() -> Value {
     json!({
-        "contract_version": "0.1.1",
+        "contract_version": "0.2.0",
         "fixtures": {
             "package_presentation": {
                 "surfaces": [{
@@ -633,6 +647,29 @@ pub fn conformance_fixtures_json() -> Value {
                     }
                 }]
             },
+            "bound_row_identity": {
+                "type": "panel",
+                "id": "session-list",
+                "children": [{
+                    "$kind": "bind_list",
+                    "source": "/session",
+                    "where": { "lifecycle_class": "current" },
+                    "item_template": {
+                        "type": "button",
+                        "id": { "$bind": "@/session_uuid" },
+                        "props": {
+                            "label": "Select session",
+                            "action": {
+                                "id": "contract.action",
+                                "payload": {
+                                    "operation": "select_session",
+                                    "session_uuid": { "$bind": "@/session_uuid" }
+                                }
+                            }
+                        }
+                    }
+                }]
+            },
             "request": {
                 "request_id": "request-1",
                 "surface_id": "tickets.create",
@@ -680,6 +717,7 @@ const TYPESCRIPT: &str = r#"
 export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 export type JsonObject = { [key: string]: JsonValue };
 export type UiNodeId = string;
+export type UiAuthoredNodeId = UiNodeId | UiBind;
 export type UiActionId = string;
 export type UiSurfaceId = string;
 export type UiActionRequestId = string;
@@ -715,7 +753,7 @@ export type UiChild = UiConditional | UiNode | UiBindList | UiBindIf;
 export type UiFormProps = JsonObject & { action: UiAction; submit_label: string };
 export type UiDialogProps = JsonObject & { title: string; presentation?: UiDialogPresentation; open?: never };
 export type UiButtonProps = JsonObject & { label: string; action: UiAction };
-export interface UiNodeBase { id?: UiNodeId; children?: UiChild[]; slots?: Record<string, UiChild[]>; }
+export interface UiNodeBase { id?: UiAuthoredNodeId; children?: UiChild[]; slots?: Record<string, UiChild[]>; }
 export type UiNode =
   | (UiNodeBase & { type: "form"; props: UiFormProps })
   | (UiNodeBase & { type: "dialog"; props: UiDialogProps })

@@ -11,7 +11,7 @@ export interface HubTestSupportMetadata {
   conformance_fixture_revision: number;
   ui_contract: {
     package_name: "@trybotster/ui-contract";
-    package_version: "0.1.1";
+    package_version: "0.2.0";
     conformance_fixture_export: "@trybotster/ui-contract/conformance-fixtures";
   };
   generated_by: string;
@@ -81,9 +81,23 @@ export function materializeSessionPluginBindings(
   surface: Record<string, unknown>,
   frames: Array<Record<string, unknown>>,
 ): Record<string, string>;
+export interface SessionPluginMaterializedRow {
+  node_id: string;
+  action_payload: {
+    operation: "select_session";
+    session_uuid: string;
+  };
+}
+export function materializeSessionPluginRows(
+  surface: Record<string, unknown>,
+  frames: Array<Record<string, unknown>>,
+): SessionPluginMaterializedRow[];
 export function materializeSessionPluginBindingScenario(
   scenario: Record<string, unknown>,
 ): Record<string, Record<string, string>>;
+export function materializeSessionPluginRowScenario(
+  scenario: Record<string, unknown>,
+): Record<string, SessionPluginMaterializedRow[]>;
 export function lateAttachHistoryConformanceFixturePath(): string;
 export function readLateAttachHistoryConformanceFixture(): Record<string, unknown>;
 export function localWebrtcDeliveryChunkConformanceFixturePath(): string;

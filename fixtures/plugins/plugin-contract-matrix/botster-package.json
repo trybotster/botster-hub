@@ -39,7 +39,7 @@
       "icon": "activity",
       "order": 25,
       "category": "contract",
-      "supports": ["render"]
+      "supports": ["render", "action"]
     },
     {
       "id": "contract.blocked",

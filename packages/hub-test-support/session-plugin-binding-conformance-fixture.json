@@ -1,6 +1,6 @@
 {
   "binding_family": "/session",
-  "conformance_fixture_revision": 24,
+  "conformance_fixture_revision": 25,
   "entity_type": "session",
   "expected": {
     "after_ended_patch": {
@@ -127,6 +127,24 @@
     "session-indeterminate",
     "session-missing"
   ],
+  "row_expected": {
+    "after_ended_patch": [
+      "session-stable-current"
+    ],
+    "after_indeterminate_patch": [
+      "session-stable-current"
+    ],
+    "after_reconnect": [
+      "session-stable-current"
+    ],
+    "after_remove": [
+      "session-stable-current"
+    ],
+    "initial": [
+      "session-transition",
+      "session-stable-current"
+    ]
+  },
   "surface": {
     "children": [
       {
@@ -242,6 +260,31 @@
         "source": "/session",
         "where": {
           "session_uuid": "session-missing"
+        }
+      },
+      {
+        "$kind": "bind_list",
+        "item_template": {
+          "id": {
+            "$bind": "@/session_uuid"
+          },
+          "props": {
+            "action": {
+              "id": "contract.action",
+              "payload": {
+                "operation": "select_session",
+                "session_uuid": {
+                  "$bind": "@/session_uuid"
+                }
+              }
+            },
+            "label": "Select session"
+          },
+          "type": "button"
+        },
+        "source": "/session",
+        "where": {
+          "lifecycle_class": "current"
         }
       }
     ],

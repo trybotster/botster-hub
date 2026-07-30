@@ -21,6 +21,22 @@ Every result must echo the request's `request_id`, `surface_id`, `action_id`,
 and `node_id` exactly. This includes preserving an absent `node_id`; the Hub
 rejects mismatched result identity as `invalid_action_result`.
 
+`UiNode.id` is an authored identity: it may be either a literal `UiNodeId` or
+an item-relative `{ "$bind": "@/field" }` only on a
+`UiBindList.item_template` root. Descendants of that root remain literal-only;
+multi-control descendant identity is separately tracked in
+`ticket_1785443253_376782`. Clients resolve the root binding from the selected
+row after `where` filtering and before the node enters renderer, focus, or
+action state. The resolved value must be a non-blank string and duplicate
+realized ids are contract errors. Root nodes outside BindList, static children,
+item-template descendants, and `empty_template` remain literal-only; action
+request/result `node_id` also remains a literal `UiNodeId`.
+
+The generated JSON Schema can describe the literal-or-binding wire union, but
+cannot express the BindList row context. Schema validity is therefore necessary
+but not sufficient; the Rust/Hub validator is authoritative for the direct
+item-template-root restriction.
+
 Regenerate or check committed assets:
 
 ```sh
