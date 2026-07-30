@@ -870,7 +870,7 @@ mod tests {
     fn controlled_running_process(
         descendant_pid_path: &Path,
         launch_result_path: PathBuf,
-    ) -> SupervisedProcess {
+    ) -> (SupervisedProcess, libc::pid_t) {
         let mut command = Command::new("sh");
         command
             .args([
@@ -891,32 +891,46 @@ mod tests {
             });
         }
         let child = command.spawn().expect("spawn controlled process group");
+        let descendant_pid = wait_for_pid_file(descendant_pid_path);
+        (
+            SupervisedProcess {
+                child,
+                environment: BTreeMap::new(),
+                started_at: now_seconds(),
+                exited_at: None,
+                exit_status: None,
+                stdout: None,
+                stderr: None,
+                diagnostics: Vec::new(),
+                launch_result: Some(RunnableEntrypointLaunchResult {
+                    entrypoint_id: "web".to_string(),
+                    process_state: RunnableEntrypointProcessState::Running,
+                    local_url: None,
+                }),
+                launch_result_path: Some(launch_result_path),
+                state: ProcessState::Running,
+                pending_terminal_state: None,
+                output_finalization_deadline: None,
+            },
+            descendant_pid,
+        )
+    }
+
+    fn wait_for_pid_file(path: &Path) -> libc::pid_t {
         let deadline = Instant::now() + Duration::from_secs(2);
-        while !descendant_pid_path.exists() && Instant::now() < deadline {
+        loop {
+            if let Some(pid) = fs::read_to_string(path)
+                .ok()
+                .and_then(|contents| contents.trim().parse().ok())
+            {
+                return pid;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "controlled descendant pid was not published as parseable content: {}",
+                path.display()
+            );
             thread::sleep(Duration::from_millis(10));
-        }
-        assert!(
-            descendant_pid_path.exists(),
-            "controlled descendant pid was not published"
-        );
-        SupervisedProcess {
-            child,
-            environment: BTreeMap::new(),
-            started_at: now_seconds(),
-            exited_at: None,
-            exit_status: None,
-            stdout: None,
-            stderr: None,
-            diagnostics: Vec::new(),
-            launch_result: Some(RunnableEntrypointLaunchResult {
-                entrypoint_id: "web".to_string(),
-                process_state: RunnableEntrypointProcessState::Running,
-                local_url: None,
-            }),
-            launch_result_path: Some(launch_result_path),
-            state: ProcessState::Running,
-            pending_terminal_state: None,
-            output_finalization_deadline: None,
         }
     }
 
@@ -1152,12 +1166,8 @@ mod tests {
     fn readiness_timeout_stops_real_owned_process_group_and_descendant() {
         let descendant_pid_path = unique_test_path("timeout-descendant");
         let launch_result_path = unique_test_path("timeout-result");
-        let process = controlled_running_process(&descendant_pid_path, launch_result_path);
-        let descendant_pid = fs::read_to_string(&descendant_pid_path)
-            .expect("read descendant pid")
-            .trim()
-            .parse::<libc::pid_t>()
-            .expect("parse descendant pid");
+        let (process, descendant_pid) =
+            controlled_running_process(&descendant_pid_path, launch_result_path);
         let key = EntrypointKey {
             package_name: "fixture".to_string(),
             entrypoint_id: "web".to_string(),
@@ -1186,12 +1196,8 @@ mod tests {
     fn disconnected_launch_result_watcher_stops_owned_process_group() {
         let descendant_pid_path = unique_test_path("watch-descendant");
         let launch_result_path = unique_test_path("watch-result");
-        let process = controlled_running_process(&descendant_pid_path, launch_result_path);
-        let descendant_pid = fs::read_to_string(&descendant_pid_path)
-            .expect("read descendant pid")
-            .trim()
-            .parse::<libc::pid_t>()
-            .expect("parse descendant pid");
+        let (process, descendant_pid) =
+            controlled_running_process(&descendant_pid_path, launch_result_path);
         let key = EntrypointKey {
             package_name: "fixture".to_string(),
             entrypoint_id: "web".to_string(),
