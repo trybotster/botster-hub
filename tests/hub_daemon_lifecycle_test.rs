@@ -29,8 +29,8 @@ use botster_hub::{
     CoreEngineOptions, DataDirectoryOption, FileHubStateStore, HostIdentityOptions, HubClientApi,
     HubClientEvent, HubClientRequest, HubClientResponseBody, HubDaemon, HubDaemonState,
     HubPackageManifest, HubStartupOptions, HubStateLoadSource, HubStateStore,
-    PackageAdmissionPolicy, PackageProvenance, PackageRegistry, RuntimeEnvironment,
-    SessionDefaults, SpawnTarget, TransportBindings,
+    LOCAL_RUNTIME_DAEMON_READINESS_BUDGET, PackageAdmissionPolicy, PackageProvenance,
+    PackageRegistry, RuntimeEnvironment, SessionDefaults, SpawnTarget, TransportBindings,
 };
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use webrtc::data_channel::{DataChannel, DataChannelEvent, RTCDataChannelInit};
@@ -50,7 +50,6 @@ use support::{
 };
 
 static REAL_DAEMON_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-const CLI_DAEMON_READINESS_BUDGET: Duration = Duration::from_secs(30);
 const OPERATOR_CONSOLE_READINESS_LIVENESS_BACKSTOP: Duration = Duration::from_secs(60);
 const OPERATOR_CONSOLE_READER_DRAIN_BACKSTOP: Duration = Duration::from_secs(2);
 const BOTSTER_WEB_READINESS_LIVENESS_BACKSTOP: Duration = Duration::from_secs(60);
@@ -2905,7 +2904,7 @@ impl OperatorConsolePty {
         let result = wait_for_child_condition_with_budget(
             &mut self.child,
             &format!("waiting for {expected} occurrences of operator console output {needle:?}"),
-            CLI_DAEMON_READINESS_BUDGET,
+            LOCAL_RUNTIME_DAEMON_READINESS_BUDGET,
             || {
                 String::from_utf8_lossy(
                     &output
@@ -2919,7 +2918,7 @@ impl OperatorConsolePty {
         );
         if let Err(error) = result {
             if error.contains("child exited before condition") {
-                self.finish_reader_after_exit(CLI_DAEMON_READINESS_BUDGET)?;
+                self.finish_reader_after_exit(LOCAL_RUNTIME_DAEMON_READINESS_BUDGET)?;
                 if self.text().matches(needle).count() >= expected {
                     return Ok(());
                 }
@@ -3150,7 +3149,7 @@ fn start_cli_daemon_with_session_worker(data_dir: &Path, session_worker_bin: &Pa
 }
 
 fn wait_for_status(data_dir: &Path, child: &mut Child) {
-    wait_for_status_with_budget(data_dir, child, CLI_DAEMON_READINESS_BUDGET)
+    wait_for_status_with_budget(data_dir, child, LOCAL_RUNTIME_DAEMON_READINESS_BUDGET)
         .unwrap_or_else(|error| panic!("{error}"));
 }
 
@@ -3345,7 +3344,7 @@ fn owned_operator_console_cleanup_checks_pid_identity_and_runtime_artifacts() {
 #[test]
 fn operator_console_readiness_backstop_outlives_policy_and_reports_context() {
     assert!(
-        OPERATOR_CONSOLE_READINESS_LIVENESS_BACKSTOP > CLI_DAEMON_READINESS_BUDGET,
+        OPERATOR_CONSOLE_READINESS_LIVENESS_BACKSTOP > LOCAL_RUNTIME_DAEMON_READINESS_BUDGET,
         "the harness liveness backstop must not preempt production readiness policy"
     );
 
@@ -11119,8 +11118,11 @@ fn stalled_attach_stdout_does_not_block_other_daemon_commands() {
         .arg(
             "i=0; while [ \"$i\" -lt 50000 ]; do printf 'flood-line-%05d\\n' \"$i\"; i=$((i + 1)); done; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done",
         );
-    let spawn =
-        run_command_with_timeout_diagnostics("spawn", spawn_command, CLI_DAEMON_READINESS_BUDGET);
+    let spawn = run_command_with_timeout_diagnostics(
+        "spawn",
+        spawn_command,
+        LOCAL_RUNTIME_DAEMON_READINESS_BUDGET,
+    );
     assert!(
         spawn.output.status.success(),
         "spawn failed: {}",
@@ -11141,7 +11143,7 @@ fn stalled_attach_stdout_does_not_block_other_daemon_commands() {
         &mut attach_child,
         STALLED_ATTACH_MIN_BUFFERED_STDOUT_BYTES,
         STALLED_ATTACH_STABLE_SAMPLES,
-        CLI_DAEMON_READINESS_BUDGET,
+        LOCAL_RUNTIME_DAEMON_READINESS_BUDGET,
     )
     .unwrap_or_else(|error| panic!("stalled attach did not reach stdout backpressure: {error}"));
     assert!(
@@ -11166,8 +11168,11 @@ fn stalled_attach_stdout_does_not_block_other_daemon_commands() {
         .arg("list")
         .arg("--data-dir")
         .arg(&data_dir);
-    let list =
-        run_command_with_timeout_diagnostics("list", list_command, CLI_DAEMON_READINESS_BUDGET);
+    let list = run_command_with_timeout_diagnostics(
+        "list",
+        list_command,
+        LOCAL_RUNTIME_DAEMON_READINESS_BUDGET,
+    );
     assert!(
         list.output.status.success(),
         "list failed while attach stdout was blocked: {}; attach_child={}",
@@ -11187,7 +11192,7 @@ fn stalled_attach_stdout_does_not_block_other_daemon_commands() {
     let send = run_command_with_timeout_diagnostics(
         "send-input",
         send_command,
-        CLI_DAEMON_READINESS_BUDGET,
+        LOCAL_RUNTIME_DAEMON_READINESS_BUDGET,
     );
     assert!(
         send.output.status.success(),
@@ -11205,8 +11210,11 @@ fn stalled_attach_stdout_does_not_block_other_daemon_commands() {
         .arg("slow-consumer")
         .arg("32")
         .arg("120");
-    let resize =
-        run_command_with_timeout_diagnostics("resize", resize_command, CLI_DAEMON_READINESS_BUDGET);
+    let resize = run_command_with_timeout_diagnostics(
+        "resize",
+        resize_command,
+        LOCAL_RUNTIME_DAEMON_READINESS_BUDGET,
+    );
     assert!(
         resize.output.status.success(),
         "resize failed while attach stdout was blocked: {}; attach_child={}",
@@ -11222,7 +11230,7 @@ fn stalled_attach_stdout_does_not_block_other_daemon_commands() {
     let shutdown = run_command_with_timeout_diagnostics(
         "shutdown",
         shutdown_command,
-        CLI_DAEMON_READINESS_BUDGET,
+        LOCAL_RUNTIME_DAEMON_READINESS_BUDGET,
     );
     assert!(
         shutdown.output.status.success(),
@@ -12690,11 +12698,33 @@ fn cli_operator_console_starts_reuses_detaches_handles_ctrl_c_and_stops() {
 
     let mut second = OperatorConsolePty::spawn(&data_dir);
     daemon_cleanup.wait_until_daemon_ready(&mut second);
+    let shutdown_daemon_pid = *daemon_cleanup
+        .owned_pids()
+        .last()
+        .expect("capture daemon generation before console shutdown");
     second.wait_for("daemon=reused");
     second.wait_for("botster-hub> ");
     second.send(b"shutdown\n");
     second.wait_for("response=shutdown");
     second.wait_for_exit();
+    assert!(
+        !process_exists(shutdown_daemon_pid),
+        "console shutdown returned before owned daemon pid {shutdown_daemon_pid} exited"
+    );
+    assert!(
+        !data_dir.join(".botster-hub-runtime-daemon.json").exists(),
+        "console shutdown left owned daemon metadata"
+    );
+    assert!(
+        !explicit_config(&data_dir)
+            .transports
+            .local_socket
+            .as_ref()
+            .expect("operator console local socket binding")
+            .path
+            .exists(),
+        "console shutdown left the owned daemon socket"
+    );
 
     let stopped = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
         .arg("status")
