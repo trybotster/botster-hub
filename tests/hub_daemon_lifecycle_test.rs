@@ -5261,7 +5261,7 @@ fn cli_local_runtime_up_reports_missing_installed_checkout_before_launch() {
 }
 
 #[test]
-fn cli_local_runtime_up_failure_after_daemon_ready_stops_started_daemon() {
+fn process_ownership_cli_local_runtime_up_failure_stops_started_daemon() {
     let _guard = daemon_test_guard();
     let data_dir = unique_short_test_dir("cli-up-post-ready-cleanup");
     let web_package_dir = unique_test_dir("cli-up-post-ready-web");
@@ -7287,11 +7287,11 @@ fn cli_request_level_runtime_error_returns_operator_frame_and_keeps_daemon_respo
 }
 
 #[test]
-fn cli_daemon_restart_recovers_worker_backed_session_through_transport() {
+fn process_ownership_daemon_restart_adopts_then_shuts_down_worker_session() {
     let _guard = daemon_test_guard();
     let data_dir = unique_test_dir("cli-restart-recover");
     let config = explicit_config(&data_dir);
-    let session_id = "cli-restart-session";
+    let session_id = format!("cli-restart-session-{}", std::process::id());
 
     let child = start_cli_daemon(&data_dir);
     let spawn = botster_hub::daemon_transport_request(
@@ -7302,7 +7302,12 @@ fn cli_daemon_restart_recovers_worker_backed_session_through_transport() {
         },
     )
     .expect("spawn restart recovery session through daemon transport");
-    assert_eq!(spawn.kind, botster_hub::DaemonResponseKind::Spawned);
+    assert_eq!(
+        spawn.kind,
+        botster_hub::DaemonResponseKind::Spawned,
+        "spawn failed: {:?}",
+        spawn.error
+    );
     assert!(
         spawn
             .sessions
@@ -7322,14 +7327,14 @@ fn cli_daemon_restart_recovers_worker_backed_session_through_transport() {
         status
             .recovered_sessions
             .iter()
-            .any(|recovered| recovered == session_id),
+            .any(|recovered| recovered == &session_id),
         "restarted daemon should report startup recovery for the live worker-backed session"
     );
     assert!(
         !status
             .stale_sessions
             .iter()
-            .any(|stale| stale == session_id),
+            .any(|stale| stale == &session_id),
         "worker-backed session with protocol evidence should not be marked stale"
     );
 
@@ -10310,7 +10315,7 @@ fn external_hub_client_reports_compatibility_descriptor_and_mismatch_diagnostics
 }
 
 #[test]
-fn external_hub_test_support_drives_isolated_daemon_socket_protocol() {
+fn process_ownership_external_hub_test_support_cleans_up_isolated_daemon() {
     let _guard = daemon_test_guard();
     let first = botster_hub_test_support::IsolatedHubBuilder::new()
         .hub_bin(env!("CARGO_BIN_EXE_botster-hub"))
@@ -13196,7 +13201,7 @@ fn package_entrypoint_supervision_stops_and_restarts() {
 }
 
 #[test]
-fn package_entrypoint_supervision_cleans_up_on_disable_remove_and_shutdown() {
+fn process_ownership_package_entrypoint_cleanup_covers_disable_remove_and_shutdown() {
     let _guard = daemon_test_guard();
     let data_dir = unique_test_dir("entrypoint-cleanup");
     let package_dir = unique_test_dir("entrypoint-cleanup-package");

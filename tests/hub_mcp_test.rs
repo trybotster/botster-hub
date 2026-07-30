@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::{Mutex, OnceLock};
@@ -65,24 +66,35 @@ fn explicit_config(data_dir: &Path) -> botster_hub::HubConfig {
 }
 
 fn start_cli_daemon(data_dir: &Path) -> Child {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_botster-hub"));
+    command
         .arg("start")
         .arg("--data-dir")
         .arg(data_dir)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn botster-hub start");
+        .stderr(Stdio::piped());
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setpgid(0, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = command.spawn().expect("spawn botster-hub start");
 
-    wait_for_status(data_dir, &mut child);
+    if let Err(error) = wait_for_status(data_dir, &mut child) {
+        terminate_daemon_group(&mut child);
+        panic!("{error}");
+    }
     child
 }
 
-fn wait_for_status(data_dir: &Path, child: &mut Child) {
+fn wait_for_status(data_dir: &Path, child: &mut Child) -> Result<(), String> {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while std::time::Instant::now() < deadline {
         if let Some(status) = child.try_wait().expect("check daemon child") {
-            panic!("daemon exited before ready with {status}");
+            return Err(format!("daemon exited before ready with {status}"));
         }
         let output = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
             .arg("status")
@@ -91,11 +103,29 @@ fn wait_for_status(data_dir: &Path, child: &mut Child) {
             .output()
             .expect("run botster-hub status");
         if output.status.success() {
-            return;
+            return Ok(());
         }
         thread::sleep(Duration::from_millis(50));
     }
-    panic!("daemon did not become ready");
+    Err("daemon did not become ready".to_string())
+}
+
+fn terminate_daemon_group(child: &mut Child) {
+    let pid = child.id();
+    unsafe {
+        libc::killpg(pid as libc::pid_t, libc::SIGTERM);
+    }
+    let deadline = std::time::Instant::now() + Duration::from_millis(500);
+    while std::time::Instant::now() < deadline {
+        if child.try_wait().ok().flatten().is_some() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    unsafe {
+        libc::killpg(pid as libc::pid_t, libc::SIGKILL);
+    }
+    let _ = child.wait();
 }
 
 fn shutdown_cli_daemon(data_dir: &Path, child: Child) -> Output {

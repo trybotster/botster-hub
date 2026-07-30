@@ -1456,8 +1456,7 @@ fn spawn_local_runtime_daemon(
     if let Err(error) =
         write_runtime_daemon_metadata(&options.data_directory, config, hub_bin, child.id())
     {
-        let _ = child.kill();
-        let _ = child.wait();
+        let _ = terminate_owned_runtime_child(&mut child);
         return Err(error);
     }
 
@@ -1467,6 +1466,7 @@ fn spawn_local_runtime_daemon(
         local_runtime_daemon_readiness_budget(),
         &stderr_rx,
     ) {
+        let _ = terminate_owned_runtime_child(&mut child);
         let _ = remove_runtime_daemon_metadata(&options.data_directory);
         let _ = remove_configured_local_socket(config);
         return Err(error);
@@ -1542,7 +1542,21 @@ fn terminate_owned_runtime_child(child: &mut Child) -> Result<String, LocalRunti
     if let Some(status) = child.try_wait().map_err(LocalRuntimeError::PollDaemon)? {
         return Ok(status.to_string());
     }
-    child.kill().map_err(LocalRuntimeError::TerminateDaemon)?;
+
+    let pid = child.id();
+    unsafe {
+        libc::killpg(pid as libc::pid_t, libc::SIGTERM);
+    }
+    let deadline = Instant::now() + Duration::from_millis(500);
+    while Instant::now() < deadline {
+        if let Some(status) = child.try_wait().map_err(LocalRuntimeError::PollDaemon)? {
+            return Ok(status.to_string());
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    unsafe {
+        libc::killpg(pid as libc::pid_t, libc::SIGKILL);
+    }
     child
         .wait()
         .map(|status| status.to_string())

@@ -433,6 +433,7 @@ dependencies = [
  "botster-core",
  "botster-hub-client",
  "botster-ui-contract",
+ "libc",
  "serde",
  "serde_json",
 ]

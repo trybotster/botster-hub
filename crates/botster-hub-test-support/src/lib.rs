@@ -11,6 +11,7 @@ use std::error::Error;
 use std::fmt;
 use std::fs;
 use std::io::Read;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
@@ -1284,6 +1285,14 @@ impl IsolatedHubBuilder {
             .env("BOTSTER_ENV", "test")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
         prepend_worker_dir_to_path(&mut command, &session_worker_bin);
 
         let mut child = command.spawn().map_err(|source| IsolatedHubError::Spawn {
@@ -1356,7 +1365,7 @@ impl IsolatedHub {
 
     fn shutdown_inner(&mut self) -> Result<(), IsolatedHubError> {
         if self.child.is_none() {
-            return Ok(());
+            return self.remove_data_dir();
         }
         let output = Command::new(&self.hub_bin)
             .arg("shutdown")
@@ -1381,7 +1390,7 @@ impl IsolatedHub {
             .map_err(|source| IsolatedHubError::Wait { source })?;
         if daemon_output.status.success() {
             if shutdown_succeeded {
-                Ok(())
+                self.remove_data_dir()
             } else {
                 Err(IsolatedHubError::ShutdownFailed {
                     stderr: shutdown_stderr,
@@ -1393,6 +1402,17 @@ impl IsolatedHub {
                 stdout: String::from_utf8_lossy(&daemon_output.stdout).to_string(),
                 stderr: String::from_utf8_lossy(&daemon_output.stderr).to_string(),
             })
+        }
+    }
+
+    fn remove_data_dir(&self) -> Result<(), IsolatedHubError> {
+        match fs::remove_dir_all(&self.data_dir) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(source) => Err(IsolatedHubError::RemoveDataDir {
+                path: self.data_dir.clone(),
+                source,
+            }),
         }
     }
 }
@@ -5744,10 +5764,10 @@ impl Drop for IsolatedHub {
             return;
         }
         if let Some(child) = self.child.as_mut() {
-            let _ = child.kill();
-            let _ = child.wait();
+            cleanup_child(child);
         }
         self.child = None;
+        let _ = self.remove_data_dir();
     }
 }
 
@@ -5762,6 +5782,10 @@ pub enum IsolatedHubError {
         path: PathBuf,
     },
     CreateDataDir {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    RemoveDataDir {
         path: PathBuf,
         source: std::io::Error,
     },
@@ -5803,6 +5827,13 @@ impl fmt::Display for IsolatedHubError {
                 write!(
                     formatter,
                     "failed to create data dir {}: {source}",
+                    path.display()
+                )
+            }
+            Self::RemoveDataDir { path, source } => {
+                write!(
+                    formatter,
+                    "failed to remove data dir {} after daemon exit: {source}",
                     path.display()
                 )
             }
@@ -5854,6 +5885,7 @@ impl IsolatedHubError {
                 ));
             }
             Self::CreateDataDir { .. } => "failed to create isolated daemon data directory",
+            Self::RemoveDataDir { .. } => "failed to remove isolated daemon data directory",
             Self::Spawn { .. } => "failed to spawn hub daemon",
             Self::ReadyTimeout { .. } => "timed out waiting for hub daemon readiness",
             Self::DaemonExited { .. } => "hub daemon exited before readiness",
@@ -5871,6 +5903,7 @@ impl Error for IsolatedHubError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::CreateDataDir { source, .. }
+            | Self::RemoveDataDir { source, .. }
             | Self::Spawn { source, .. }
             | Self::ShutdownCommand { source }
             | Self::Wait { source } => Some(source),
@@ -5943,7 +5976,20 @@ fn cleanup_child(child: &mut Child) {
     if child.try_wait().ok().flatten().is_some() {
         return;
     }
-    let _ = child.kill();
+    let pid = child.id();
+    unsafe {
+        libc::killpg(pid as libc::pid_t, libc::SIGTERM);
+    }
+    let deadline = Instant::now() + Duration::from_millis(500);
+    while Instant::now() < deadline {
+        if child.try_wait().ok().flatten().is_some() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    unsafe {
+        libc::killpg(pid as libc::pid_t, libc::SIGKILL);
+    }
     let _ = child.wait();
 }
 
@@ -7181,7 +7227,7 @@ done
             .hub_bin(hub)
             .session_worker_bin(worker)
             .root(&root)
-            .ready_timeout(Duration::from_secs(1))
+            .ready_timeout(Duration::from_secs(2))
             .start_error();
 
         assert!(matches!(error, IsolatedHubError::ReadyTimeout { .. }));
