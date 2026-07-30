@@ -98,6 +98,8 @@ Passed:
 - `npm --prefix packages/ui-contract run check`
 - `npm --prefix packages/ui-contract test`
 - `npm --prefix packages/hub-test-support run check`
+- `script/publish-npm-packages --dry-run` — installed the exact UI tarball
+  into Hub test support, passed its Node test, and packed both artifacts
 - `cargo build --locked -p botster-core --bin botster-session-worker`
 - `./test.sh --test hub_client_api_test` — 24 tests
 - `./test.sh --test hub_lua_runtime_test` — 21 tests
@@ -130,13 +132,27 @@ Runtime provenance:
 
 Registry preflight found `@trybotster/ui-contract@0.1.1` and
 `@trybotster/hub-test-support@0.1.16`; therefore the selected coordinates
-`0.2.0` and `0.1.17` are unused. Exact clean-tree dry-run packaging, independent
-tarball consumers, publication status, checksums, and PR linkage are appended
-after the implementation commit.
+`0.2.0` and `0.1.17` are unused.
 
-There are no code deviations from the approved plan. Public publication is not
-performed before review unless the repository release command and credentials
-permit that approved operator step. Until the packages are public and the
+The clean-tree release dry-run passed for both coordinates. Fresh independent
+consumer tarballs had these SHA-256 checksums:
+
+- `@trybotster/ui-contract@0.2.0`:
+  `ffd4358de030985367f4e777495b9913da56e07d701851515c1f5bfdbd1afaa8`
+- `@trybotster/hub-test-support@0.1.17`:
+  `d79dbf2ce26c9e10dc5824b096b3dec1f5bb2385926a7e2735631f424ef7382b`
+
+A fresh consumer installed exactly those two tarballs. Its runtime smoke loaded
+contract version `0.2.0`, schema version `0.2.0`, fixture revision 25, and
+materialized `session-transition` plus `session-stable-current` with matching
+payloads. TypeScript `7.0.2` under strict NodeNext settings compiled a bound
+`UiNode.id` and rejected `{ $bind: "@/session_uuid" }` for
+`UiActionRequest.node_id` with `TS2322`.
+
+There are no code deviations from the approved plan. Public publication is
+intentionally deferred until this implementation is reviewed and merged; the
+verified operator command is `script/publish-npm-packages`, which publishes UI
+contract before Hub test support. Until those packages are public and the
 separate downstream ticket repins them, downstream renderer behavior remains
 intentionally unverified.
 
