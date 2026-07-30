@@ -14,6 +14,7 @@ on:
         type: choice
         options:
           - lifecycle-suite
+          - focused-session-entity-resize
           - focused-process-ownership
           - focused-connection-lifecycle
           - focused-stalled-attach
