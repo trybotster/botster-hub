@@ -111,10 +111,12 @@ fn wait_for_status(data_dir: &Path, child: &mut Child) -> Result<(), String> {
 }
 
 fn terminate_daemon_group(child: &mut Child) {
-    let pid = child.id();
-    unsafe {
-        libc::killpg(pid as libc::pid_t, libc::SIGTERM);
+    if child.try_wait().ok().flatten().is_some() {
+        return;
     }
+    let pid = child.id();
+    signal_daemon_group_or_child(pid, libc::SIGTERM)
+        .expect("signal daemon process group with TERM");
     let deadline = std::time::Instant::now() + Duration::from_millis(500);
     while std::time::Instant::now() < deadline {
         if child.try_wait().ok().flatten().is_some() {
@@ -122,10 +124,35 @@ fn terminate_daemon_group(child: &mut Child) {
         }
         thread::sleep(Duration::from_millis(20));
     }
-    unsafe {
-        libc::killpg(pid as libc::pid_t, libc::SIGKILL);
+    signal_daemon_group_or_child(pid, libc::SIGKILL)
+        .expect("signal daemon process group with KILL");
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while std::time::Instant::now() < deadline {
+        if child.try_wait().ok().flatten().is_some() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(20));
     }
-    let _ = child.wait();
+    panic!("daemon process {pid} did not exit within bounded cleanup");
+}
+
+fn signal_daemon_group_or_child(pid: u32, signal: libc::c_int) -> std::io::Result<()> {
+    if unsafe { libc::killpg(pid as libc::pid_t, signal) } == 0 {
+        return Ok(());
+    }
+    let group_error = std::io::Error::last_os_error();
+    if group_error.raw_os_error() != Some(libc::ESRCH) {
+        return Err(group_error);
+    }
+    if unsafe { libc::kill(pid as libc::pid_t, signal) } == 0 {
+        return Ok(());
+    }
+    let child_error = std::io::Error::last_os_error();
+    if child_error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(())
+    } else {
+        Err(child_error)
+    }
 }
 
 fn shutdown_cli_daemon(data_dir: &Path, child: Child) -> Output {

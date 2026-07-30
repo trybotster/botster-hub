@@ -714,11 +714,11 @@ fn wait_for_child(child: &mut Child, deadline: Instant) -> Result<ExitStatus, Ma
                 thread::sleep(Duration::from_millis(10));
             }
             Ok(None) => {
-                terminate_owned_child_group(child);
+                terminate_owned_child_group(child)?;
                 return Err(timed_out());
             }
             Err(_) => {
-                terminate_owned_child_group(child);
+                terminate_owned_child_group(child)?;
                 return Err(ManagedGitError::new(
                     "git_failed",
                     "managed Git child could not be observed",
@@ -739,22 +739,63 @@ fn configure_owned_process_group(command: &mut Command) {
     }
 }
 
-fn terminate_owned_child_group(child: &mut Child) {
+fn terminate_owned_child_group(child: &mut Child) -> Result<(), ManagedGitError> {
     let pid = child.id();
-    unsafe {
-        libc::killpg(pid as libc::pid_t, libc::SIGTERM);
-    }
+    let mut child_reaped = child.try_wait().ok().flatten().is_some();
+    signal_owned_child(pid, libc::SIGTERM)?;
     let deadline = Instant::now() + Duration::from_millis(500);
     while Instant::now() < deadline {
-        if child.try_wait().ok().flatten().is_some() {
-            return;
+        child_reaped |= child.try_wait().ok().flatten().is_some();
+        if child_reaped && !owned_process_group_exists(pid) {
+            return Ok(());
         }
         thread::sleep(Duration::from_millis(10));
     }
-    unsafe {
-        libc::killpg(pid as libc::pid_t, libc::SIGKILL);
+    signal_owned_child(pid, libc::SIGKILL)?;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        child_reaped |= child.try_wait().ok().flatten().is_some();
+        if child_reaped && !owned_process_group_exists(pid) {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(10));
     }
-    let _ = child.wait();
+    Err(ManagedGitError::new(
+        "git_cleanup_timed_out",
+        "managed Git child cleanup did not finish within the bounded deadline",
+    ))
+}
+
+fn owned_process_group_exists(pid: u32) -> bool {
+    if unsafe { libc::killpg(pid as libc::pid_t, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+fn signal_owned_child(pid: u32, signal: libc::c_int) -> Result<(), ManagedGitError> {
+    if unsafe { libc::killpg(pid as libc::pid_t, signal) } == 0 {
+        return Ok(());
+    }
+    let group_error = std::io::Error::last_os_error();
+    if group_error.raw_os_error() != Some(libc::ESRCH) {
+        return Err(ManagedGitError::new(
+            "git_cleanup_failed",
+            "managed Git process group could not be signalled",
+        ));
+    }
+    if unsafe { libc::kill(pid as libc::pid_t, signal) } == 0 {
+        return Ok(());
+    }
+    let child_error = std::io::Error::last_os_error();
+    if child_error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(())
+    } else {
+        Err(ManagedGitError::new(
+            "git_cleanup_failed",
+            "managed Git child could not be signalled",
+        ))
+    }
 }
 
 fn canonical_or_original(path: &Path) -> PathBuf {
@@ -1063,6 +1104,21 @@ mod tests {
                 .expect("inspect timed out child")
                 .success(),
             "timed-out child must be killed and reaped"
+        );
+
+        let mut direct_child = Command::new("/bin/sleep")
+            .arg("5")
+            .spawn()
+            .expect("spawn non-group-leader Git cleanup fixture");
+        let started = Instant::now();
+        terminate_owned_child_group(&mut direct_child)
+            .expect("fall back to signalling the direct child");
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert!(
+            direct_child
+                .try_wait()
+                .expect("confirm direct Git child was reaped")
+                .is_some()
         );
 
         let descendant_pid_file = root.join("descendant.pid");
