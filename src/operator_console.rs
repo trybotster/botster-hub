@@ -2,7 +2,7 @@ use std::io::{self, Write};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::thread;
 
 use signal_hook::consts::signal::SIGINT;
@@ -36,8 +36,14 @@ pub(crate) enum ConsoleAction {
 pub(crate) struct ConsoleSignals {
     interrupted: Arc<AtomicBool>,
     mode: Arc<AtomicUsize>,
+    foreground_child_pid: Arc<AtomicU32>,
     handle: SignalHandle,
     thread: Option<thread::JoinHandle<()>>,
+}
+
+pub(crate) struct ForegroundChildRegistration<'a> {
+    signals: &'a ConsoleSignals,
+    pid: u32,
 }
 
 impl ConsoleSignals {
@@ -46,19 +52,25 @@ impl ConsoleSignals {
         let handle = signals.handle();
         let interrupted = Arc::new(AtomicBool::new(false));
         let mode = Arc::new(AtomicUsize::new(SIGNAL_MODE_IDLE));
+        let foreground_child_pid = Arc::new(AtomicU32::new(0));
         let thread_interrupted = Arc::clone(&interrupted);
         let thread_mode = Arc::clone(&mode);
+        let thread_foreground_child_pid = Arc::clone(&foreground_child_pid);
         let thread = thread::spawn(move || {
             for _ in signals.forever() {
                 thread_interrupted.store(true, Ordering::SeqCst);
-                if thread_mode.load(Ordering::SeqCst) == SIGNAL_MODE_INLINE {
+                let mode = thread_mode.load(Ordering::SeqCst);
+                if mode == SIGNAL_MODE_INLINE {
                     eprintln!("\ninterrupt requested; finishing safely");
+                } else if mode == SIGNAL_MODE_FOREGROUND {
+                    forward_interrupt_to_foreground_child(&thread_foreground_child_pid);
                 }
             }
         });
         Ok(Self {
             interrupted,
             mode,
+            foreground_child_pid,
             handle,
             thread: Some(thread),
         })
@@ -71,6 +83,7 @@ impl ConsoleSignals {
 
     fn begin_foreground(&self) {
         self.interrupted.store(false, Ordering::SeqCst);
+        self.foreground_child_pid.store(0, Ordering::SeqCst);
         self.mode.store(SIGNAL_MODE_FOREGROUND, Ordering::SeqCst);
     }
 
@@ -81,6 +94,37 @@ impl ConsoleSignals {
 
     fn take_interrupt(&self) -> bool {
         self.interrupted.swap(false, Ordering::SeqCst)
+    }
+
+    pub(crate) fn register_foreground_child(&self, pid: u32) -> ForegroundChildRegistration<'_> {
+        self.foreground_child_pid.store(pid, Ordering::SeqCst);
+        if self.interrupted.load(Ordering::SeqCst) {
+            forward_interrupt_to_foreground_child(&self.foreground_child_pid);
+        }
+        ForegroundChildRegistration { signals: self, pid }
+    }
+}
+
+impl Drop for ForegroundChildRegistration<'_> {
+    fn drop(&mut self) {
+        let _ = self.signals.foreground_child_pid.compare_exchange(
+            self.pid,
+            0,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
+    }
+}
+
+fn forward_interrupt_to_foreground_child(foreground_child_pid: &AtomicU32) {
+    let pid = foreground_child_pid.load(Ordering::SeqCst);
+    if pid <= 1 {
+        return;
+    }
+    unsafe {
+        // SAFETY: the registered PID belongs to the foreground child and remains unreaped while
+        // registered. SIGINT is idempotent with the terminal's normal foreground-group delivery.
+        libc::kill(pid as libc::pid_t, libc::SIGINT);
     }
 }
 
@@ -188,7 +232,7 @@ pub(crate) fn run(
     signals: &ConsoleSignals,
     mut resolve_app_mode: impl FnMut(&str) -> Result<CommandMode, String>,
     mut canonicalize: impl FnMut(&str, Vec<String>) -> Result<Vec<String>, String>,
-    mut dispatch: impl FnMut(&str, Vec<String>) -> Result<CommandOutcome, String>,
+    mut dispatch: impl FnMut(&str, Vec<String>, &ConsoleSignals) -> Result<CommandOutcome, String>,
 ) -> io::Result<()> {
     let stdin = io::stdin();
     let stdin_fd = stdin.as_raw_fd();
@@ -334,7 +378,7 @@ pub(crate) fn run(
                 } else {
                     None
                 };
-                let result = dispatch(&command, args);
+                let result = dispatch(&command, args, signals);
                 if let Some(saved_terminal_mode) = saved_terminal_mode.as_mut() {
                     saved_terminal_mode.restore()?;
                 }

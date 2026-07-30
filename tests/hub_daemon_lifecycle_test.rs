@@ -9,7 +9,11 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
-use std::sync::{Arc, Mutex, OnceLock, mpsc};
+use std::sync::{
+    Arc, Mutex, OnceLock,
+    atomic::{AtomicBool, Ordering},
+    mpsc,
+};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -25,8 +29,8 @@ use botster_hub::{
     CoreEngineOptions, DataDirectoryOption, FileHubStateStore, HostIdentityOptions, HubClientApi,
     HubClientEvent, HubClientRequest, HubClientResponseBody, HubDaemon, HubDaemonState,
     HubPackageManifest, HubStartupOptions, HubStateLoadSource, HubStateStore,
-    PackageAdmissionPolicy, PackageProvenance, PackageRegistry, RuntimeEnvironment,
-    SessionDefaults, SpawnTarget, TransportBindings,
+    LOCAL_RUNTIME_DAEMON_READINESS_BUDGET, PackageAdmissionPolicy, PackageProvenance,
+    PackageRegistry, RuntimeEnvironment, SessionDefaults, SpawnTarget, TransportBindings,
 };
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use webrtc::data_channel::{DataChannel, DataChannelEvent, RTCDataChannelInit};
@@ -46,7 +50,8 @@ use support::{
 };
 
 static REAL_DAEMON_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-const CLI_DAEMON_READINESS_BUDGET: Duration = Duration::from_secs(30);
+const OPERATOR_CONSOLE_READINESS_LIVENESS_BACKSTOP: Duration = Duration::from_secs(60);
+const OPERATOR_CONSOLE_READER_DRAIN_BACKSTOP: Duration = Duration::from_secs(2);
 const BOTSTER_WEB_READINESS_LIVENESS_BACKSTOP: Duration = Duration::from_secs(60);
 const BOTSTER_WEB_READINESS_STARTUP_DELAY_MS: u64 = 3_000;
 const STALLED_ATTACH_MIN_BUFFERED_STDOUT_BYTES: usize = 8 * 1024;
@@ -54,6 +59,8 @@ const STALLED_ATTACH_STABLE_SAMPLES: usize = 5;
 const LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_FILE: &str = "local-webrtc-sender-terminal.json";
 const LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_MAX_BYTES: usize = 4096;
 const TEST_CLOSE_LOCAL_WEBRTC_OPERATION_ENV: &str = "BOTSTER_HUB_TEST_CLOSE_LOCAL_WEBRTC_OPERATION";
+const TEST_LOCAL_RUNTIME_READINESS_BUDGET_MS_ENV: &str =
+    "BOTSTER_HUB_TEST_LOCAL_RUNTIME_READINESS_BUDGET_MS";
 
 fn unique_test_dir(name: &str) -> PathBuf {
     let nanos = SystemTime::now()
@@ -2340,9 +2347,420 @@ fn command_output_text(output: &Output) -> String {
 
 struct OperatorConsolePty {
     child: Box<dyn portable_pty::Child + Send + Sync>,
-    writer: Box<dyn Write + Send>,
+    writer: Option<Box<dyn Write + Send>>,
     output: Arc<Mutex<Vec<u8>>>,
     reader: Option<thread::JoinHandle<()>>,
+    reader_done: Arc<AtomicBool>,
+}
+
+trait TestChildControl {
+    fn try_wait_status(&mut self) -> io::Result<Option<String>>;
+    fn terminate_and_reap(&mut self) -> String;
+    fn captured_output(&mut self) -> String;
+}
+
+impl TestChildControl for Child {
+    fn try_wait_status(&mut self) -> io::Result<Option<String>> {
+        self.try_wait()
+            .map(|status| status.map(|status| status.to_string()))
+    }
+
+    fn terminate_and_reap(&mut self) -> String {
+        terminate_and_reap_child(self)
+    }
+
+    fn captured_output(&mut self) -> String {
+        let (stdout, stderr) = collect_child_output(self);
+        format!("stdout={stdout:?} stderr={stderr:?}")
+    }
+}
+
+impl TestChildControl for Box<dyn portable_pty::Child + Send + Sync> {
+    fn try_wait_status(&mut self) -> io::Result<Option<String>> {
+        self.try_wait()
+            .map(|status| status.map(|status| format!("{status:?}")))
+    }
+
+    fn terminate_and_reap(&mut self) -> String {
+        terminate_and_reap_pty_child(self.as_mut())
+    }
+
+    fn captured_output(&mut self) -> String {
+        String::new()
+    }
+}
+
+fn wait_for_child_condition_with_budget(
+    child: &mut impl TestChildControl,
+    description: &str,
+    budget: Duration,
+    mut condition_met: impl FnMut() -> bool,
+) -> Result<(), String> {
+    let started_at = Instant::now();
+    let deadline = started_at + budget;
+    while Instant::now() < deadline {
+        if condition_met() {
+            return Ok(());
+        }
+        match child.try_wait_status() {
+            Ok(Some(status)) => {
+                let output = child.captured_output();
+                if condition_met() {
+                    return Ok(());
+                }
+                return Err(format!(
+                    "{description}: child exited before condition after {:?} (backstop {budget:?}); child_status={status}; {output}",
+                    started_at.elapsed()
+                ));
+            }
+            Ok(None) => {}
+            Err(error) => {
+                let child_status = child.terminate_and_reap();
+                let output = child.captured_output();
+                return Err(format!(
+                    "{description}: failed to poll child after {:?} (backstop {budget:?}): {error}; child_status={child_status}; {output}",
+                    started_at.elapsed()
+                ));
+            }
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    let child_status = child.terminate_and_reap();
+    let output = child.captured_output();
+    Err(format!(
+        "{description}: condition not met after {:?} (backstop {budget:?}); child_status={child_status}; {output}",
+        started_at.elapsed()
+    ))
+}
+
+fn terminate_and_reap_pty_child(child: &mut dyn portable_pty::Child) -> String {
+    match child.try_wait() {
+        Ok(Some(status)) => return format!("{status:?}"),
+        Ok(None) => {}
+        Err(error) => return format!("poll_error={error}"),
+    }
+
+    if let Some(pid) = child.process_id()
+        && pid > 1
+        && pid != std::process::id()
+    {
+        unsafe {
+            libc::killpg(pid as libc::pid_t, libc::SIGTERM);
+        }
+        for _ in 0..25 {
+            match child.try_wait() {
+                Ok(Some(status)) => return format!("{status:?}"),
+                Ok(None) => thread::sleep(Duration::from_millis(20)),
+                Err(error) => return format!("poll_error={error}"),
+            }
+        }
+        unsafe {
+            libc::killpg(pid as libc::pid_t, libc::SIGKILL);
+        }
+    }
+    let _ = child.kill();
+    child
+        .wait()
+        .map(|status| format!("{status:?}"))
+        .unwrap_or_else(|error| format!("wait_error={error}"))
+}
+
+struct OwnedOperatorConsoleDaemon {
+    data_dir: PathBuf,
+    owned_pids: Vec<u32>,
+    armed: bool,
+}
+
+impl OwnedOperatorConsoleDaemon {
+    fn new(data_dir: &Path) -> Self {
+        let status = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+            .arg("status")
+            .arg("--data-dir")
+            .arg(data_dir)
+            .output()
+            .expect("probe operator console daemon before spawn");
+        assert!(
+            !status.status.success(),
+            "operator console test data directory already has a running daemon: {}",
+            command_output_text(&status)
+        );
+        Self {
+            data_dir: data_dir.to_path_buf(),
+            owned_pids: Vec::new(),
+            armed: true,
+        }
+    }
+
+    fn wait_until_daemon_ready(&mut self, console: &mut OperatorConsolePty) {
+        self.try_wait_until_daemon_ready(console)
+            .unwrap_or_else(|error| panic!("{error}"));
+    }
+
+    fn try_wait_until_daemon_ready(
+        &mut self,
+        console: &mut OperatorConsolePty,
+    ) -> Result<(), String> {
+        self.try_wait_until_daemon_ready_with_backstop(
+            console,
+            OPERATOR_CONSOLE_READINESS_LIVENESS_BACKSTOP,
+        )
+    }
+
+    fn try_wait_until_daemon_ready_with_backstop(
+        &mut self,
+        console: &mut OperatorConsolePty,
+        liveness_backstop: Duration,
+    ) -> Result<(), String> {
+        let config = explicit_config(&self.data_dir);
+        let output = Arc::clone(&console.output);
+        let mut last_status = "status probe not attempted".to_string();
+        let result = wait_for_child_condition_with_budget(
+            &mut console.child,
+            "waiting for typed operator-console daemon readiness",
+            liveness_backstop,
+            || {
+                self.capture_owned_pid();
+                match botster_hub::daemon_transport_request(
+                    &config,
+                    botster_hub::DaemonRequest::Status,
+                ) {
+                    Ok(_) => true,
+                    Err(error) => {
+                        last_status = error.to_string();
+                        false
+                    }
+                }
+            },
+        );
+        self.capture_owned_pid();
+        if let Err(error) = result {
+            let reader_status = console
+                .finish_reader_after_exit(OPERATOR_CONSOLE_READER_DRAIN_BACKSTOP)
+                .map_or_else(|error| error, |()| "reader reached EOF".to_string());
+            self.capture_owned_pid();
+            let metadata_path = self.data_dir.join(".botster-hub-runtime-daemon.json");
+            let socket_path = config
+                .transports
+                .local_socket
+                .as_ref()
+                .expect("operator console local socket binding")
+                .path
+                .clone();
+            return Err(format!(
+                "{error}; last_status={last_status:?}; owned_daemon_pids={:?}; metadata_exists={}; socket_exists={}; reader_status={reader_status:?}; operator_console_output={}",
+                self.owned_pids,
+                metadata_path.exists(),
+                socket_path.exists(),
+                String::from_utf8_lossy(
+                    &output
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                )
+            ));
+        }
+        Ok(())
+    }
+
+    fn capture_owned_pid(&mut self) {
+        let Some(pid) = self.validated_metadata_pid() else {
+            return;
+        };
+        if !self.owned_pids.contains(&pid) {
+            self.owned_pids.push(pid);
+        }
+    }
+
+    fn validated_metadata_pid(&self) -> Option<u32> {
+        let metadata_path = self.data_dir.join(".botster-hub-runtime-daemon.json");
+        let bytes = fs::read(metadata_path).ok()?;
+        let metadata = serde_json::from_slice::<serde_json::Value>(&bytes).ok()?;
+        let pid = metadata["pid"]
+            .as_u64()
+            .and_then(|pid| u32::try_from(pid).ok())?;
+        let expected_socket = explicit_config(&self.data_dir)
+            .transports
+            .local_socket
+            .as_ref()
+            .expect("operator console local socket binding")
+            .path
+            .display()
+            .to_string();
+        let metadata_matches = metadata["data_directory"].as_str()
+            == Some(stable_path_string(&self.data_dir).as_str())
+            && metadata["socket_path"].as_str() == Some(expected_socket.as_str())
+            && metadata["hub_bin"]
+                .as_str()
+                .is_some_and(|path| Path::new(path).file_name() == Some("botster-hub".as_ref()));
+        metadata_matches.then_some(pid)
+    }
+
+    fn assert_cleaned(&mut self) {
+        self.cleanup()
+            .unwrap_or_else(|error| panic!("operator console daemon cleanup failed: {error}"));
+        self.armed = false;
+    }
+
+    fn owned_pids(&self) -> &[u32] {
+        &self.owned_pids
+    }
+
+    fn record_owned_pid(&mut self, pid: u32) {
+        if !self.owned_pids.contains(&pid) {
+            self.owned_pids.push(pid);
+        }
+    }
+
+    fn cleanup(&mut self) -> Result<(), String> {
+        self.capture_owned_pid();
+        let _ = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+            .arg("shutdown")
+            .arg("--data-dir")
+            .arg(&self.data_dir)
+            .output();
+
+        for pid in self.owned_pids.iter().copied() {
+            wait_for_owned_pid_exit(pid, Duration::from_secs(2));
+            if process_exists(pid) && self.process_identity_matches(pid) {
+                unsafe {
+                    libc::kill(pid as libc::pid_t, libc::SIGTERM);
+                }
+                wait_for_owned_pid_exit(pid, Duration::from_secs(2));
+            }
+            if process_exists(pid) && self.process_identity_matches(pid) {
+                unsafe {
+                    libc::kill(pid as libc::pid_t, libc::SIGKILL);
+                }
+                wait_for_owned_pid_exit(pid, Duration::from_secs(2));
+            }
+        }
+
+        let alive = self
+            .owned_pids
+            .iter()
+            .copied()
+            .filter(|pid| process_exists(*pid) && self.process_identity_matches(*pid))
+            .collect::<Vec<_>>();
+        if !alive.is_empty() {
+            return Err(format!("owned daemon pids still alive: {alive:?}"));
+        }
+
+        let metadata_path = self.data_dir.join(".botster-hub-runtime-daemon.json");
+        let socket_path = explicit_config(&self.data_dir)
+            .transports
+            .local_socket
+            .as_ref()
+            .expect("operator console local socket binding")
+            .path
+            .clone();
+        let socket_deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < socket_deadline && socket_path.exists() {
+            thread::sleep(Duration::from_millis(20));
+        }
+        let status = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+            .arg("status")
+            .arg("--data-dir")
+            .arg(&self.data_dir)
+            .output()
+            .map_err(|error| format!("probe stopped daemon: {error}"))?;
+        if status.status.success() {
+            return Err(format!(
+                "typed daemon status still reports running: {}",
+                command_output_text(&status)
+            ));
+        }
+        if socket_path.exists() {
+            return Err(format!(
+                "owned daemon socket remains after stopped status: {}",
+                socket_path.display()
+            ));
+        }
+        if metadata_path.exists() {
+            let Some(metadata_pid) = self.validated_metadata_pid() else {
+                return Err(format!(
+                    "unverified runtime metadata remains: {}",
+                    metadata_path.display()
+                ));
+            };
+            if !self.owned_pids.contains(&metadata_pid) {
+                return Err(format!(
+                    "runtime metadata pid {metadata_pid} was not captured as owned"
+                ));
+            }
+            fs::remove_file(&metadata_path)
+                .map_err(|error| format!("remove verified owned runtime metadata: {error}"))?;
+        }
+        Ok(())
+    }
+
+    fn process_identity_matches(&self, pid: u32) -> bool {
+        let output = Command::new("ps")
+            .arg("-p")
+            .arg(pid.to_string())
+            .arg("-o")
+            .arg("command=")
+            .output();
+        let Ok(output) = output else {
+            return false;
+        };
+        let command = String::from_utf8_lossy(&output.stdout);
+        command.contains("botster-hub")
+            && command.contains(" start ")
+            && command.contains("--data-dir")
+            && (command.contains(&self.data_dir.display().to_string())
+                || command.contains(&stable_path_string(&self.data_dir)))
+    }
+}
+
+impl Drop for OwnedOperatorConsoleDaemon {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.cleanup();
+        }
+    }
+}
+
+fn wait_for_owned_pid_exit(pid: u32, budget: Duration) {
+    let deadline = Instant::now() + budget;
+    while Instant::now() < deadline && process_exists(pid) {
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn assert_detached_daemon_stdin(pid: u32) {
+    #[cfg(target_os = "linux")]
+    {
+        let stdin = fs::read_link(format!("/proc/{pid}/fd/0"))
+            .unwrap_or_else(|error| panic!("read detached daemon pid {pid} stdin: {error}"));
+        assert_eq!(
+            stdin,
+            Path::new("/dev/null"),
+            "detached daemon pid {pid} retained operator-console stdin"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let output = Command::new("lsof")
+            .args(["-a", "-p", &pid.to_string(), "-d", "0", "-Fn"])
+            .output()
+            .unwrap_or_else(|error| panic!("inspect detached daemon pid {pid} stdin: {error}"));
+        assert!(
+            output.status.success(),
+            "inspect detached daemon pid {pid} stdin: {}",
+            command_output_text(&output)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .any(|line| line == "n/dev/null"),
+            "detached daemon pid {pid} retained operator-console stdin: {}",
+            command_output_text(&output)
+        );
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    panic!("detached daemon stdin assertion is unsupported on this Unix target for pid {pid}");
 }
 
 struct SessionCleanupGuard {
@@ -2385,6 +2803,18 @@ impl OperatorConsolePty {
     }
 
     fn spawn_binary(binary: &Path, data_dir: &Path) -> Self {
+        Self::spawn_binary_with_env(binary, data_dir, &[])
+    }
+
+    fn spawn_with_env(data_dir: &Path, environment: &[(&str, &str)]) -> Self {
+        Self::spawn_binary_with_env(
+            Path::new(env!("CARGO_BIN_EXE_botster-hub")),
+            data_dir,
+            environment,
+        )
+    }
+
+    fn spawn_binary_with_env(binary: &Path, data_dir: &Path, environment: &[(&str, &str)]) -> Self {
         let pty = native_pty_system()
             .openpty(PtySize {
                 rows: 30,
@@ -2395,6 +2825,9 @@ impl OperatorConsolePty {
             .expect("open operator console PTY");
         let mut command = CommandBuilder::new(binary);
         command.env("BOTSTER_HUB_DATA_DIR", data_dir);
+        for (name, value) in environment {
+            command.env(name, value);
+        }
         let child = pty
             .slave
             .spawn_command(command)
@@ -2410,6 +2843,8 @@ impl OperatorConsolePty {
         drop(pty.slave);
         let output = Arc::new(Mutex::new(Vec::new()));
         let reader_output = Arc::clone(&output);
+        let reader_done = Arc::new(AtomicBool::new(false));
+        let reader_done_signal = Arc::clone(&reader_done);
         let reader = thread::spawn(move || {
             let mut buffer = [0_u8; 1024];
             while let Ok(count) = reader.read(&mut buffer) {
@@ -2421,20 +2856,28 @@ impl OperatorConsolePty {
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .extend_from_slice(&buffer[..count]);
             }
+            reader_done_signal.store(true, Ordering::Release);
         });
         Self {
             child,
-            writer,
+            writer: Some(writer),
             output,
             reader: Some(reader),
+            reader_done,
         }
     }
 
     fn send(&mut self, bytes: &[u8]) {
         self.writer
+            .as_mut()
+            .expect("operator console writer is open")
             .write_all(bytes)
             .expect("write operator console input");
-        self.writer.flush().expect("flush operator console input");
+        self.writer
+            .as_mut()
+            .expect("operator console writer is open")
+            .flush()
+            .expect("flush operator console input");
     }
 
     fn send_and_wait_for_prompt(&mut self, bytes: &[u8]) {
@@ -2447,22 +2890,42 @@ impl OperatorConsolePty {
         self.text().matches("botster-hub> ").count()
     }
 
-    fn wait_for(&self, needle: &str) {
+    fn wait_for(&mut self, needle: &str) {
         self.wait_for_occurrences(needle, 1);
     }
 
-    fn wait_for_occurrences(&self, needle: &str, expected: usize) {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while Instant::now() < deadline {
-            if self.text().matches(needle).count() >= expected {
-                return;
-            }
-            thread::sleep(Duration::from_millis(20));
-        }
-        panic!(
-            "timed out waiting for {expected} occurrences of operator console output {needle:?}; output={}",
-            self.text()
+    fn wait_for_occurrences(&mut self, needle: &str, expected: usize) {
+        self.try_wait_for_occurrences(needle, expected)
+            .unwrap_or_else(|error| panic!("{error}"));
+    }
+
+    fn try_wait_for_occurrences(&mut self, needle: &str, expected: usize) -> Result<(), String> {
+        let output = Arc::clone(&self.output);
+        let result = wait_for_child_condition_with_budget(
+            &mut self.child,
+            &format!("waiting for {expected} occurrences of operator console output {needle:?}"),
+            LOCAL_RUNTIME_DAEMON_READINESS_BUDGET,
+            || {
+                String::from_utf8_lossy(
+                    &output
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner),
+                )
+                .matches(needle)
+                .count()
+                    >= expected
+            },
         );
+        if let Err(error) = result {
+            if error.contains("child exited before condition") {
+                self.finish_reader_after_exit(LOCAL_RUNTIME_DAEMON_READINESS_BUDGET)?;
+                if self.text().matches(needle).count() >= expected {
+                    return Ok(());
+                }
+            }
+            return Err(format!("{error}; operator_console_output={}", self.text()));
+        }
+        Ok(())
     }
 
     fn text(&self) -> String {
@@ -2484,15 +2947,50 @@ impl OperatorConsolePty {
                 .expect("poll operator console")
                 .is_some()
             {
-                // The master writer remains open until this fixture is dropped, so joining the
-                // reader here can block even though the console child has exited.
-                self.reader.take();
+                self.finish_reader_after_exit(OPERATOR_CONSOLE_READER_DRAIN_BACKSTOP)
+                    .unwrap_or_else(|error| panic!("{error}"));
                 return;
             }
             thread::sleep(Duration::from_millis(20));
         }
-        let _ = self.child.kill();
-        panic!("operator console did not exit; output={}", self.text());
+        self.writer.take();
+        let child_status = terminate_and_reap_pty_child(self.child.as_mut());
+        let reader_status = self
+            .finish_reader_after_exit(OPERATOR_CONSOLE_READER_DRAIN_BACKSTOP)
+            .err()
+            .unwrap_or_else(|| "reader reached EOF".to_string());
+        panic!(
+            "operator console did not exit; child_status={child_status}; reader_status={reader_status}; output={}",
+            self.text()
+        );
+    }
+
+    fn finish_reader_after_exit(&mut self, budget: Duration) -> Result<(), String> {
+        self.writer.take();
+        let deadline = Instant::now() + budget;
+        while Instant::now() < deadline && !self.reader_done.load(Ordering::Acquire) {
+            thread::sleep(Duration::from_millis(20));
+        }
+        if !self.reader_done.load(Ordering::Acquire) {
+            return Err(format!(
+                "operator console PTY reader did not reach EOF within {budget:?}; output={}",
+                self.text()
+            ));
+        }
+        if let Some(reader) = self.reader.take() {
+            reader
+                .join()
+                .map_err(|_| "operator console PTY reader panicked".to_string())?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for OperatorConsolePty {
+    fn drop(&mut self) {
+        self.writer.take();
+        let _ = terminate_and_reap_pty_child(self.child.as_mut());
+        let _ = self.finish_reader_after_exit(OPERATOR_CONSOLE_READER_DRAIN_BACKSTOP);
     }
 }
 
@@ -2651,7 +3149,7 @@ fn start_cli_daemon_with_session_worker(data_dir: &Path, session_worker_bin: &Pa
 }
 
 fn wait_for_status(data_dir: &Path, child: &mut Child) {
-    wait_for_status_with_budget(data_dir, child, CLI_DAEMON_READINESS_BUDGET)
+    wait_for_status_with_budget(data_dir, child, LOCAL_RUNTIME_DAEMON_READINESS_BUDGET)
         .unwrap_or_else(|error| panic!("{error}"));
 }
 
@@ -2660,17 +3158,12 @@ fn wait_for_status_with_budget(
     child: &mut Child,
     readiness_budget: Duration,
 ) -> Result<(), String> {
-    let started_at = std::time::Instant::now();
-    let deadline = started_at + readiness_budget;
     let mut last_status = "status probe not attempted".to_string();
-    while std::time::Instant::now() < deadline {
-        if let Some(status) = child.try_wait().expect("check daemon child") {
-            let (stdout, stderr) = collect_child_output(child);
-            return Err(format!(
-                "daemon exited before ready with {status} after {:?} (readiness budget {readiness_budget:?}); last status output={last_status:?}; stdout={stdout:?} stderr={stderr:?}",
-                started_at.elapsed()
-            ));
-        }
+    wait_for_child_condition_with_budget(
+        child,
+        "waiting for typed daemon status readiness",
+        readiness_budget,
+        || {
         let output = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
             .arg("status")
             .arg("--data-dir")
@@ -2678,18 +3171,14 @@ fn wait_for_status_with_budget(
             .output()
             .expect("run botster-hub status");
         last_status = command_output_text(&output);
-        if output.status.success() {
-            return Ok(());
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-
-    let child_status = terminate_and_reap_child(child);
-    let (stdout, stderr) = collect_child_output(child);
-    Err(format!(
-        "daemon did not become ready after {:?} (readiness budget {readiness_budget:?}); last status output={last_status:?}; child_status={child_status}; stdout={stdout:?} stderr={stderr:?}",
-        started_at.elapsed()
-    ))
+            output.status.success()
+        },
+    )
+    .map_err(|error| {
+        format!(
+            "daemon did not become ready (readiness budget {readiness_budget:?}); last status output={last_status:?}; {error}"
+        )
+    })
 }
 
 fn terminate_and_reap_child(child: &mut Child) -> String {
@@ -2757,6 +3246,349 @@ fn wait_for_status_timeout_reports_diagnostics_and_reaps_owned_child() {
         "timed-out fixture must not answer status: {}",
         command_output_text(&status)
     );
+}
+
+#[test]
+fn operator_console_output_wait_reports_early_child_exit() {
+    let fixture_dir = unique_short_test_dir("console-child-exit");
+    fs::create_dir_all(&fixture_dir).expect("create early-exit console fixture directory");
+    let fixture = fixture_dir.join("early-exit-console");
+    fs::write(
+        &fixture,
+        "#!/bin/sh\nprintf 'console-started\\n'\nexit 23\n",
+    )
+    .expect("write early-exit console fixture");
+    let mut permissions = fs::metadata(&fixture)
+        .expect("read early-exit console fixture metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&fixture, permissions).expect("make early-exit console fixture executable");
+
+    let mut console = OperatorConsolePty::spawn_binary(&fixture, &fixture_dir);
+    console.wait_for("console-started");
+    let error = console
+        .try_wait_for_occurrences("output-that-will-never-arrive", 1)
+        .expect_err("exited console should fail an unrelated output wait");
+    assert!(error.contains("child exited before condition"), "{error}");
+    assert!(error.contains("code: 23"), "{error}");
+    assert!(
+        !error.contains("condition not met after"),
+        "child-exit detection must precede the hang backstop: {error}"
+    );
+    console.wait_for_exit();
+    fs::remove_dir_all(&fixture_dir).expect("remove early-exit console fixture directory");
+}
+
+#[test]
+fn wait_for_child_condition_rechecks_after_exit_drain() {
+    struct ExitDrainChild {
+        drained: Arc<AtomicBool>,
+    }
+
+    impl TestChildControl for ExitDrainChild {
+        fn try_wait_status(&mut self) -> io::Result<Option<String>> {
+            Ok(Some("exit 0".to_string()))
+        }
+
+        fn terminate_and_reap(&mut self) -> String {
+            "exit 0".to_string()
+        }
+
+        fn captured_output(&mut self) -> String {
+            self.drained.store(true, Ordering::Release);
+            "stdout=\"final output\" stderr=\"\"".to_string()
+        }
+    }
+
+    let drained = Arc::new(AtomicBool::new(false));
+    let mut child = ExitDrainChild {
+        drained: Arc::clone(&drained),
+    };
+    wait_for_child_condition_with_budget(
+        &mut child,
+        "waiting for final drained output",
+        Duration::from_secs(1),
+        || drained.load(Ordering::Acquire),
+    )
+    .expect("condition should be rechecked after the exited child's output drain");
+}
+
+#[test]
+fn owned_operator_console_cleanup_checks_pid_identity_and_runtime_artifacts() {
+    let reused_pid_data_dir = unique_short_test_dir("console-reused-pid");
+    let mut reused_pid_cleanup = OwnedOperatorConsoleDaemon::new(&reused_pid_data_dir);
+    reused_pid_cleanup.record_owned_pid(std::process::id());
+    reused_pid_cleanup.assert_cleaned();
+
+    let stale_artifact_data_dir = unique_short_test_dir("console-stale-artifact");
+    let mut stale_artifact_cleanup = OwnedOperatorConsoleDaemon::new(&stale_artifact_data_dir);
+    fs::create_dir_all(&stale_artifact_data_dir).expect("create stale-artifact data directory");
+    let metadata_path = stale_artifact_data_dir.join(".botster-hub-runtime-daemon.json");
+    fs::write(&metadata_path, b"not owned daemon metadata")
+        .expect("write unverified daemon metadata");
+    let error = stale_artifact_cleanup
+        .cleanup()
+        .expect_err("cleanup must not unlink unverified runtime artifacts");
+    assert!(
+        error.contains("unverified runtime metadata remains"),
+        "{error}"
+    );
+    assert!(
+        metadata_path.exists(),
+        "cleanup oracle removed the artifact it was supposed to verify"
+    );
+    stale_artifact_cleanup.armed = false;
+    fs::remove_dir_all(&stale_artifact_data_dir).expect("remove stale-artifact data directory");
+}
+
+#[test]
+fn operator_console_readiness_backstop_outlives_policy_and_reports_context() {
+    assert!(
+        OPERATOR_CONSOLE_READINESS_LIVENESS_BACKSTOP > LOCAL_RUNTIME_DAEMON_READINESS_BUDGET,
+        "the harness liveness backstop must not preempt production readiness policy"
+    );
+
+    let fixture_dir = unique_short_test_dir("console-readiness-backstop");
+    fs::create_dir_all(&fixture_dir).expect("create readiness-backstop fixture directory");
+    let fixture = fixture_dir.join("wedged-console");
+    fs::write(&fixture, "#!/bin/sh\nexec sleep 60\n").expect("write readiness-backstop fixture");
+    let mut permissions = fs::metadata(&fixture)
+        .expect("read readiness-backstop fixture metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&fixture, permissions).expect("make readiness-backstop fixture executable");
+
+    let mut daemon_cleanup = OwnedOperatorConsoleDaemon::new(&fixture_dir);
+    let diagnostic_pid = std::process::id();
+    daemon_cleanup.record_owned_pid(diagnostic_pid);
+    let mut console = OperatorConsolePty::spawn_binary(&fixture, &fixture_dir);
+    let error = daemon_cleanup
+        .try_wait_until_daemon_ready_with_backstop(&mut console, Duration::from_millis(100))
+        .expect_err("wedged console should hit the harness liveness backstop");
+    assert!(error.contains("condition not met after"), "{error}");
+    assert!(error.contains("last_status="), "{error}");
+    assert!(
+        error.contains(&format!("owned_daemon_pids=[{diagnostic_pid}]")),
+        "{error}"
+    );
+    assert!(error.contains("metadata_exists=false"), "{error}");
+    assert!(error.contains("socket_exists=false"), "{error}");
+    assert!(
+        error.contains("reader_status=\"reader reached EOF\""),
+        "{error}"
+    );
+    console.wait_for_exit();
+    daemon_cleanup.assert_cleaned();
+    fs::remove_dir_all(&fixture_dir).expect("remove readiness-backstop fixture directory");
+}
+
+#[test]
+fn operator_console_detach_releases_reader_while_daemon_stays_running() {
+    let _guard = daemon_test_guard();
+    ensure_session_worker_binary();
+    let data_dir = unique_short_test_dir("console-detach-reader");
+    let mut daemon_cleanup = OwnedOperatorConsoleDaemon::new(&data_dir);
+    let mut console = OperatorConsolePty::spawn(&data_dir);
+    daemon_cleanup.wait_until_daemon_ready(&mut console);
+    let daemon_pid = *daemon_cleanup
+        .owned_pids()
+        .first()
+        .expect("capture detached daemon pid");
+    assert_detached_daemon_stdin(daemon_pid);
+    console.wait_for("botster-hub> ");
+    console.send(&[4]);
+    console.wait_for("detached=daemon_running");
+    console.wait_for_exit();
+    assert!(
+        console.reader.is_none(),
+        "console exit did not join its PTY reader"
+    );
+
+    let status = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("status")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .output()
+        .expect("probe daemon after detached console reader EOF");
+    assert!(
+        status.status.success(),
+        "daemon did not remain running after console reader EOF: {}",
+        command_output_text(&status)
+    );
+    daemon_cleanup.assert_cleaned();
+    fs::remove_dir_all(&data_dir).expect("remove detached-reader console data directory");
+}
+
+#[test]
+fn operator_console_ctrl_c_reaches_foreground_app_process_group_and_returns_prompt() {
+    let _guard = daemon_test_guard();
+    ensure_session_worker_binary();
+    let data_dir = unique_short_test_dir("console-foreground-interrupt");
+    let package_dir =
+        unique_short_test_dir("console-foreground-interrupt-package").join("package with spaces");
+    write_botster_tui_package_with_script(
+        &package_dir,
+        "trap '' INT; node -e 'process.on(\"SIGINT\", () => process.exit(130)); console.log(\"foreground-forward-ready\"); setInterval(() => {}, 1000)' & child=$!; wait \"$child\"",
+    );
+
+    let mut daemon_cleanup = OwnedOperatorConsoleDaemon::new(&data_dir);
+    let mut console = OperatorConsolePty::spawn(&data_dir);
+    daemon_cleanup.wait_until_daemon_ready(&mut console);
+    console.wait_for("botster-hub> ");
+    console.send_and_wait_for_prompt(
+        format!(
+            "packages install --path {}\n",
+            shell_words::quote(&package_dir.to_string_lossy())
+        )
+        .as_bytes(),
+    );
+    console.send_and_wait_for_prompt(b"packages enable botster-tui\n");
+
+    let prompt_after_interrupt = console.prompt_count() + 1;
+    console.send(b"apps open botster-tui\n");
+    console.wait_for("foreground-forward-ready");
+    console.send(&[3]);
+    console.wait_for("foreground app exited with code 130");
+    console.wait_for_occurrences("botster-hub> ", prompt_after_interrupt);
+    assert!(
+        !console
+            .text()
+            .contains("interrupt requested; finishing safely"),
+        "foreground Ctrl-C was handled as inline console work: {}",
+        console.text()
+    );
+
+    console.send(b"shutdown\n");
+    console.wait_for_exit();
+    daemon_cleanup.assert_cleaned();
+    fs::remove_dir_all(&data_dir).expect("remove foreground-interrupt data directory");
+    fs::remove_dir_all(
+        package_dir
+            .parent()
+            .expect("foreground-interrupt package parent"),
+    )
+    .expect("remove foreground-interrupt package directory");
+}
+
+#[test]
+fn operator_console_readiness_failure_reaps_console_and_owned_daemon() {
+    let _guard = daemon_test_guard();
+    ensure_session_worker_binary();
+    let data_dir = unique_short_test_dir("console-readiness-failure");
+    let mut daemon_cleanup = OwnedOperatorConsoleDaemon::new(&data_dir);
+    let mut console = OperatorConsolePty::spawn_with_env(
+        &data_dir,
+        &[(TEST_LOCAL_RUNTIME_READINESS_BUDGET_MS_ENV, "1")],
+    );
+    let error = console
+        .try_wait_for_occurrences("botster-hub> ", 1)
+        .expect_err("injected daemon readiness failure should stop console startup");
+    console.wait_for_exit();
+    let output = console.text();
+    let daemon_pid = output
+        .split("terminated owned child_pid=")
+        .nth(1)
+        .and_then(|tail| {
+            tail.chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+                .parse::<u32>()
+                .ok()
+        })
+        .expect("production diagnostic includes the terminated owned daemon pid");
+    daemon_cleanup.record_owned_pid(daemon_pid);
+
+    assert!(error.contains("child exited before condition"), "{error}");
+    assert!(
+        output.contains("timed out waiting for local runtime daemon readiness"),
+        "{output}"
+    );
+    assert!(
+        output.contains("(budget 1ms)"),
+        "the injected production readiness budget was not observed: {output}"
+    );
+    assert!(
+        output.contains("terminated owned child_pid="),
+        "production failure diagnostic omitted terminated daemon evidence: {output}"
+    );
+    daemon_cleanup.assert_cleaned();
+    assert!(
+        !process_exists(daemon_pid),
+        "induced readiness failure left exact daemon pid {daemon_pid} alive"
+    );
+    fs::remove_dir_all(&data_dir).expect("remove readiness-failure console data directory");
+}
+
+#[test]
+fn operator_console_panic_reaps_console_and_owned_daemon() {
+    let _guard = daemon_test_guard();
+    ensure_session_worker_binary();
+    let data_dir = unique_short_test_dir("console-panic-cleanup");
+    let observed_pids = Arc::new(Mutex::new((None, None)));
+    let unwind_pids = Arc::clone(&observed_pids);
+    let unwind_data_dir = data_dir.clone();
+
+    let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let mut daemon_cleanup = OwnedOperatorConsoleDaemon::new(&unwind_data_dir);
+        let mut console = OperatorConsolePty::spawn(&unwind_data_dir);
+        daemon_cleanup.wait_until_daemon_ready(&mut console);
+        let console_pid = console
+            .child
+            .process_id()
+            .expect("operator console fixture exposes a process id");
+        let daemon_pid = *daemon_cleanup
+            .owned_pids()
+            .first()
+            .expect("capture panic-test owned daemon pid");
+        *unwind_pids
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            (Some(console_pid), Some(daemon_pid));
+        panic!("induced operator console panic");
+    }));
+    assert!(unwind.is_err(), "panic fixture should unwind");
+
+    let (console_pid, daemon_pid) = *observed_pids
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let console_pid = console_pid.expect("recorded panic-test console pid");
+    let daemon_pid = daemon_pid.expect("recorded panic-test daemon pid");
+    wait_for_owned_pid_exit(console_pid, Duration::from_secs(2));
+    wait_for_owned_pid_exit(daemon_pid, Duration::from_secs(2));
+    assert!(
+        !process_exists(console_pid),
+        "panic left operator console pid {console_pid} alive"
+    );
+    assert!(
+        !process_exists(daemon_pid),
+        "panic left owned daemon pid {daemon_pid} alive"
+    );
+    let status = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("status")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .output()
+        .expect("probe panic-cleaned daemon");
+    assert!(
+        !status.status.success(),
+        "panic cleanup left typed daemon status running: {}",
+        command_output_text(&status)
+    );
+    assert!(
+        !data_dir.join(".botster-hub-runtime-daemon.json").exists(),
+        "panic cleanup left daemon metadata"
+    );
+    assert!(
+        !explicit_config(&data_dir)
+            .transports
+            .local_socket
+            .as_ref()
+            .expect("panic-test local socket binding")
+            .path
+            .exists(),
+        "panic cleanup left daemon socket"
+    );
+    fs::remove_dir_all(&data_dir).expect("remove panic-cleanup console data directory");
 }
 
 fn shutdown_cli_daemon(data_dir: &Path, child: Child) -> Output {
@@ -4275,6 +5107,68 @@ fn cli_local_runtime_up_starts_reuses_and_down_stops_runtime() {
         !status.status.success(),
         "status should fail after daemon shutdown: {}",
         command_output_text(&status)
+    );
+}
+
+#[test]
+fn cli_shutdown_waits_for_metadata_owned_runtime_daemon_cleanup() {
+    let _guard = daemon_test_guard();
+    ensure_session_worker_binary();
+    let data_dir = unique_short_test_dir("cli-shutdown-owned-runtime");
+    let web_package_dir = unique_test_dir("cli-shutdown-owned-web");
+    let tui_package_dir = unique_test_dir("cli-shutdown-owned-tui");
+    write_botster_web_package(&web_package_dir);
+    write_botster_tui_package(&tui_package_dir);
+    ensure_runtime_packages(&data_dir, &web_package_dir, &tui_package_dir);
+
+    let up = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("up")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("--session-worker-bin")
+        .arg(session_worker_binary_path())
+        .output()
+        .expect("start metadata-owned runtime daemon");
+    assert!(
+        up.status.success(),
+        "metadata-owned runtime startup failed: {}",
+        command_output_text(&up)
+    );
+
+    let metadata_path = data_dir.join(".botster-hub-runtime-daemon.json");
+    let metadata: serde_json::Value = serde_json::from_slice(
+        &fs::read(&metadata_path).expect("read metadata-owned runtime daemon metadata"),
+    )
+    .expect("parse metadata-owned runtime daemon metadata");
+    let daemon_pid = metadata["pid"].as_u64().expect("metadata-owned daemon pid") as u32;
+    let socket_path = PathBuf::from(
+        metadata["socket_path"]
+            .as_str()
+            .expect("metadata-owned daemon socket path"),
+    );
+
+    let shutdown = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("shutdown")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .output()
+        .expect("shutdown metadata-owned runtime daemon");
+    assert!(
+        shutdown.status.success(),
+        "metadata-owned runtime shutdown failed: {}",
+        command_output_text(&shutdown)
+    );
+    assert!(
+        !process_exists(daemon_pid),
+        "shutdown returned before metadata-owned daemon pid {daemon_pid} exited"
+    );
+    assert!(
+        !metadata_path.exists(),
+        "shutdown returned before owned runtime metadata was removed"
+    );
+    assert!(
+        !socket_path.exists(),
+        "shutdown returned before owned runtime socket was removed"
     );
 }
 
@@ -10337,8 +11231,11 @@ fn stalled_attach_stdout_does_not_block_other_daemon_commands() {
         .arg(
             "i=0; while [ \"$i\" -lt 50000 ]; do printf 'flood-line-%05d\\n' \"$i\"; i=$((i + 1)); done; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done",
         );
-    let spawn =
-        run_command_with_timeout_diagnostics("spawn", spawn_command, CLI_DAEMON_READINESS_BUDGET);
+    let spawn = run_command_with_timeout_diagnostics(
+        "spawn",
+        spawn_command,
+        LOCAL_RUNTIME_DAEMON_READINESS_BUDGET,
+    );
     assert!(
         spawn.output.status.success(),
         "spawn failed: {}",
@@ -10359,7 +11256,7 @@ fn stalled_attach_stdout_does_not_block_other_daemon_commands() {
         &mut attach_child,
         STALLED_ATTACH_MIN_BUFFERED_STDOUT_BYTES,
         STALLED_ATTACH_STABLE_SAMPLES,
-        CLI_DAEMON_READINESS_BUDGET,
+        LOCAL_RUNTIME_DAEMON_READINESS_BUDGET,
     )
     .unwrap_or_else(|error| panic!("stalled attach did not reach stdout backpressure: {error}"));
     assert!(
@@ -10384,8 +11281,11 @@ fn stalled_attach_stdout_does_not_block_other_daemon_commands() {
         .arg("list")
         .arg("--data-dir")
         .arg(&data_dir);
-    let list =
-        run_command_with_timeout_diagnostics("list", list_command, CLI_DAEMON_READINESS_BUDGET);
+    let list = run_command_with_timeout_diagnostics(
+        "list",
+        list_command,
+        LOCAL_RUNTIME_DAEMON_READINESS_BUDGET,
+    );
     assert!(
         list.output.status.success(),
         "list failed while attach stdout was blocked: {}; attach_child={}",
@@ -10405,7 +11305,7 @@ fn stalled_attach_stdout_does_not_block_other_daemon_commands() {
     let send = run_command_with_timeout_diagnostics(
         "send-input",
         send_command,
-        CLI_DAEMON_READINESS_BUDGET,
+        LOCAL_RUNTIME_DAEMON_READINESS_BUDGET,
     );
     assert!(
         send.output.status.success(),
@@ -10423,8 +11323,11 @@ fn stalled_attach_stdout_does_not_block_other_daemon_commands() {
         .arg("slow-consumer")
         .arg("32")
         .arg("120");
-    let resize =
-        run_command_with_timeout_diagnostics("resize", resize_command, CLI_DAEMON_READINESS_BUDGET);
+    let resize = run_command_with_timeout_diagnostics(
+        "resize",
+        resize_command,
+        LOCAL_RUNTIME_DAEMON_READINESS_BUDGET,
+    );
     assert!(
         resize.output.status.success(),
         "resize failed while attach stdout was blocked: {}; attach_child={}",
@@ -10440,7 +11343,7 @@ fn stalled_attach_stdout_does_not_block_other_daemon_commands() {
     let shutdown = run_command_with_timeout_diagnostics(
         "shutdown",
         shutdown_command,
-        CLI_DAEMON_READINESS_BUDGET,
+        LOCAL_RUNTIME_DAEMON_READINESS_BUDGET,
     );
     assert!(
         shutdown.output.status.success(),
@@ -11750,7 +12653,9 @@ fn cli_operator_console_starts_reuses_detaches_handles_ctrl_c_and_stops() {
     )
     .expect("write delayed botster-web manifest");
 
+    let mut daemon_cleanup = OwnedOperatorConsoleDaemon::new(&data_dir);
     let mut first = OperatorConsolePty::spawn(&data_dir);
+    daemon_cleanup.wait_until_daemon_ready(&mut first);
     first.wait_for("daemon=started");
     first.wait_for("prerequisite botster-web=missing");
     first.wait_for("botster-hub> ");
@@ -11897,6 +12802,7 @@ fn cli_operator_console_starts_reuses_detaches_handles_ctrl_c_and_stops() {
     );
 
     let mut exit_console = OperatorConsolePty::spawn(&data_dir);
+    daemon_cleanup.wait_until_daemon_ready(&mut exit_console);
     exit_console.wait_for("daemon=reused");
     exit_console.wait_for("botster-hub> ");
     exit_console.send(b"exit\n");
@@ -11904,11 +12810,34 @@ fn cli_operator_console_starts_reuses_detaches_handles_ctrl_c_and_stops() {
     exit_console.wait_for_exit();
 
     let mut second = OperatorConsolePty::spawn(&data_dir);
+    daemon_cleanup.wait_until_daemon_ready(&mut second);
+    let shutdown_daemon_pid = *daemon_cleanup
+        .owned_pids()
+        .last()
+        .expect("capture daemon generation before console shutdown");
     second.wait_for("daemon=reused");
     second.wait_for("botster-hub> ");
     second.send(b"shutdown\n");
     second.wait_for("response=shutdown");
     second.wait_for_exit();
+    assert!(
+        !process_exists(shutdown_daemon_pid),
+        "console shutdown returned before owned daemon pid {shutdown_daemon_pid} exited"
+    );
+    assert!(
+        !data_dir.join(".botster-hub-runtime-daemon.json").exists(),
+        "console shutdown left owned daemon metadata"
+    );
+    assert!(
+        !explicit_config(&data_dir)
+            .transports
+            .local_socket
+            .as_ref()
+            .expect("operator console local socket binding")
+            .path
+            .exists(),
+        "console shutdown left the owned daemon socket"
+    );
 
     let stopped = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
         .arg("status")
@@ -11923,6 +12852,7 @@ fn cli_operator_console_starts_reuses_detaches_handles_ctrl_c_and_stops() {
     );
 
     let mut third = OperatorConsolePty::spawn(&data_dir);
+    daemon_cleanup.wait_until_daemon_ready(&mut third);
     third.wait_for("daemon=started");
     third.wait_for("botster-hub> ");
     third.send(b"down\n");
@@ -11939,6 +12869,7 @@ fn cli_operator_console_starts_reuses_detaches_handles_ctrl_c_and_stops() {
         "console down left daemon running: {}",
         command_output_text(&stopped)
     );
+    daemon_cleanup.assert_cleaned();
     fs::remove_dir_all(&data_dir).expect("remove isolated operator console data directory");
     fs::remove_dir_all(
         package_dir
