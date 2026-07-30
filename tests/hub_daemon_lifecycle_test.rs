@@ -7,6 +7,7 @@ use std::net::{TcpListener, TcpStream};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::{
@@ -3033,14 +3034,15 @@ fn daemon_test_guard_recovers_poison_without_losing_mutual_exclusion() {
 
 fn start_cli_daemon(data_dir: &Path) -> Child {
     ensure_session_worker_binary();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_botster-hub"));
+    command
         .arg("start")
         .arg("--data-dir")
         .arg(data_dir)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn botster-hub start");
+        .stderr(Stdio::piped());
+    configure_test_process_group(&mut command);
+    let mut child = command.spawn().expect("spawn botster-hub start");
 
     wait_for_status(data_dir, &mut child);
     child
@@ -3049,7 +3051,8 @@ fn start_cli_daemon(data_dir: &Path) -> Child {
 fn start_owned_incompatible_local_runtime_daemon(data_dir: &Path) -> Child {
     ensure_session_worker_binary();
     fs::create_dir_all(data_dir).expect("create data dir");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_botster-hub"));
+    command
         .arg("start")
         .arg("--data-dir")
         .arg(data_dir)
@@ -3057,7 +3060,9 @@ fn start_owned_incompatible_local_runtime_daemon(data_dir: &Path) -> Child {
         .arg(session_worker_binary_path())
         .env("BOTSTER_HUB_TEST_INCOMPATIBLE_DAEMON", "1")
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    configure_test_process_group(&mut command);
+    let mut child = command
         .spawn()
         .expect("spawn incompatible botster-hub start");
     wait_for_incompatible_status(data_dir, &mut child);
@@ -3133,16 +3138,17 @@ fn stable_path_string(path: &Path) -> String {
 }
 
 fn start_cli_daemon_with_session_worker(data_dir: &Path, session_worker_bin: &Path) -> Child {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_botster-hub"));
+    command
         .arg("start")
         .arg("--data-dir")
         .arg(data_dir)
         .arg("--session-worker-bin")
         .arg(session_worker_bin)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn botster-hub start");
+        .stderr(Stdio::piped());
+    configure_test_process_group(&mut command);
+    let mut child = command.spawn().expect("spawn botster-hub start");
 
     wait_for_status(data_dir, &mut child);
     child
@@ -3185,13 +3191,56 @@ fn terminate_and_reap_child(child: &mut Child) -> String {
     if let Some(status) = child.try_wait().expect("check daemon child before cleanup") {
         return status.to_string();
     }
-    child
-        .kill()
-        .expect("kill daemon child after readiness failure");
-    child
-        .wait()
-        .expect("reap daemon child after readiness failure")
-        .to_string()
+    let pid = child.id();
+    signal_test_group_or_child(pid, libc::SIGTERM)
+        .expect("signal daemon group after readiness failure");
+    let deadline = Instant::now() + Duration::from_millis(500);
+    while Instant::now() < deadline {
+        if let Some(status) = child.try_wait().expect("poll daemon child during cleanup") {
+            return status.to_string();
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    signal_test_group_or_child(pid, libc::SIGKILL)
+        .expect("kill daemon group after readiness failure");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        if let Some(status) = child.try_wait().expect("poll killed daemon child") {
+            return status.to_string();
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    panic!("daemon child {pid} did not exit within bounded cleanup");
+}
+
+fn configure_test_process_group(command: &mut Command) {
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setpgid(0, 0) == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+fn signal_test_group_or_child(pid: u32, signal: libc::c_int) -> io::Result<()> {
+    if unsafe { libc::killpg(pid as libc::pid_t, signal) } == 0 {
+        return Ok(());
+    }
+    let group_error = io::Error::last_os_error();
+    if group_error.raw_os_error() != Some(libc::ESRCH) {
+        return Err(group_error);
+    }
+    if unsafe { libc::kill(pid as libc::pid_t, signal) } == 0 {
+        return Ok(());
+    }
+    let child_error = io::Error::last_os_error();
+    if child_error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(())
+    } else {
+        Err(child_error)
+    }
 }
 
 fn collect_child_output(child: &mut Child) -> (String, String) {
@@ -3207,7 +3256,7 @@ fn collect_child_output(child: &mut Child) -> (String, String) {
 }
 
 #[test]
-fn wait_for_status_timeout_reports_diagnostics_and_reaps_owned_child() {
+fn process_ownership_wait_for_status_timeout_reports_diagnostics_and_reaps_owned_child() {
     let data_dir = unique_test_dir("wait-for-status-timeout");
     let mut child = Command::new("sh")
         .arg("-c")
@@ -3471,7 +3520,7 @@ fn operator_console_ctrl_c_reaches_foreground_app_process_group_and_returns_prom
 }
 
 #[test]
-fn operator_console_readiness_failure_reaps_console_and_owned_daemon() {
+fn process_ownership_operator_console_readiness_failure_reaps_console_and_owned_daemon() {
     let _guard = daemon_test_guard();
     ensure_session_worker_binary();
     let data_dir = unique_short_test_dir("console-readiness-failure");
@@ -5261,7 +5310,7 @@ fn cli_local_runtime_up_reports_missing_installed_checkout_before_launch() {
 }
 
 #[test]
-fn cli_local_runtime_up_failure_after_daemon_ready_stops_started_daemon() {
+fn process_ownership_cli_local_runtime_up_failure_stops_started_daemon() {
     let _guard = daemon_test_guard();
     let data_dir = unique_short_test_dir("cli-up-post-ready-cleanup");
     let web_package_dir = unique_test_dir("cli-up-post-ready-web");
@@ -5335,6 +5384,67 @@ fn cli_local_runtime_up_failure_after_daemon_ready_stops_started_daemon() {
         !metadata_path.exists(),
         "failed up left its owned daemon metadata"
     );
+}
+
+#[test]
+fn process_ownership_metadata_write_failure_reaps_started_daemon_group() {
+    let _guard = daemon_test_guard();
+    ensure_session_worker_binary();
+    let data_dir = unique_short_test_dir("cli-up-metadata-write-failure");
+    fs::create_dir_all(&data_dir).expect("create metadata failure data directory");
+    let metadata_path = data_dir.join(".botster-hub-runtime-daemon.json");
+    fs::create_dir(&metadata_path).expect("block metadata file creation with a directory");
+    let socket_path = explicit_config(&data_dir)
+        .transports
+        .local_socket
+        .expect("local socket binding")
+        .path;
+
+    let failed = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("up")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("--session-worker-bin")
+        .arg(session_worker_binary_path())
+        .output()
+        .expect("run up with blocked metadata path");
+
+    assert!(
+        !failed.status.success(),
+        "metadata write failure must fail local runtime startup"
+    );
+    let text = command_output_text(&failed);
+    assert!(
+        text.contains("write local runtime daemon metadata"),
+        "{text}"
+    );
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let data_dir_text = data_dir.to_string_lossy();
+    loop {
+        let process_rows = Command::new("ps")
+            .args(["-axo", "command="])
+            .output()
+            .expect("inspect metadata-failure process rows");
+        let process_rows_text = String::from_utf8_lossy(&process_rows.stdout);
+        let attributable_rows = process_rows_text
+            .lines()
+            .filter(|row| row.contains(data_dir_text.as_ref()) && row.contains("botster-hub"))
+            .collect::<Vec<_>>();
+        if attributable_rows.is_empty() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "metadata write failure left attributable daemon rows: {attributable_rows:?}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        !socket_path.exists(),
+        "metadata write failure left the owned daemon socket"
+    );
+    fs::remove_dir(&metadata_path).expect("remove metadata blocker");
+    fs::remove_dir_all(&data_dir).expect("remove metadata failure data directory");
 }
 
 #[test]
@@ -7287,11 +7397,11 @@ fn cli_request_level_runtime_error_returns_operator_frame_and_keeps_daemon_respo
 }
 
 #[test]
-fn cli_daemon_restart_recovers_worker_backed_session_through_transport() {
+fn process_ownership_daemon_restart_adopts_then_shuts_down_worker_session() {
     let _guard = daemon_test_guard();
     let data_dir = unique_test_dir("cli-restart-recover");
     let config = explicit_config(&data_dir);
-    let session_id = "cli-restart-session";
+    let session_id = format!("cli-restart-session-{}", std::process::id());
 
     let child = start_cli_daemon(&data_dir);
     let spawn = botster_hub::daemon_transport_request(
@@ -7302,7 +7412,12 @@ fn cli_daemon_restart_recovers_worker_backed_session_through_transport() {
         },
     )
     .expect("spawn restart recovery session through daemon transport");
-    assert_eq!(spawn.kind, botster_hub::DaemonResponseKind::Spawned);
+    assert_eq!(
+        spawn.kind,
+        botster_hub::DaemonResponseKind::Spawned,
+        "spawn failed: {:?}",
+        spawn.error
+    );
     assert!(
         spawn
             .sessions
@@ -7322,14 +7437,14 @@ fn cli_daemon_restart_recovers_worker_backed_session_through_transport() {
         status
             .recovered_sessions
             .iter()
-            .any(|recovered| recovered == session_id),
+            .any(|recovered| recovered == &session_id),
         "restarted daemon should report startup recovery for the live worker-backed session"
     );
     assert!(
         !status
             .stale_sessions
             .iter()
-            .any(|stale| stale == session_id),
+            .any(|stale| stale == &session_id),
         "worker-backed session with protocol evidence should not be marked stale"
     );
 
@@ -10310,7 +10425,7 @@ fn external_hub_client_reports_compatibility_descriptor_and_mismatch_diagnostics
 }
 
 #[test]
-fn external_hub_test_support_drives_isolated_daemon_socket_protocol() {
+fn process_ownership_external_hub_test_support_cleans_up_isolated_daemon() {
     let _guard = daemon_test_guard();
     let first = botster_hub_test_support::IsolatedHubBuilder::new()
         .hub_bin(env!("CARGO_BIN_EXE_botster-hub"))
@@ -13196,7 +13311,7 @@ fn package_entrypoint_supervision_stops_and_restarts() {
 }
 
 #[test]
-fn package_entrypoint_supervision_cleans_up_on_disable_remove_and_shutdown() {
+fn process_ownership_package_entrypoint_cleanup_covers_disable_remove_and_shutdown() {
     let _guard = daemon_test_guard();
     let data_dir = unique_test_dir("entrypoint-cleanup");
     let package_dir = unique_test_dir("entrypoint-cleanup-package");

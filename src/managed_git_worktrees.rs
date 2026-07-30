@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fs;
 use std::io::Read;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
@@ -642,6 +643,7 @@ pub(crate) fn git_stdout_using(
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
+    configure_owned_process_group(&mut command);
     let mut child = command
         .spawn()
         .map_err(|_| ManagedGitError::new("git_unavailable", "Git is unavailable"))?;
@@ -690,10 +692,12 @@ fn git_exit_using(
     if let Some(root) = root {
         command.arg("-C").arg(root);
     }
-    let mut child = command
+    command
         .args(args)
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::null());
+    configure_owned_process_group(&mut command);
+    let mut child = command
         .spawn()
         .map_err(|_| ManagedGitError::new("git_unavailable", "Git is unavailable"))?;
     wait_for_child(&mut child, deadline)
@@ -710,19 +714,87 @@ fn wait_for_child(child: &mut Child, deadline: Instant) -> Result<ExitStatus, Ma
                 thread::sleep(Duration::from_millis(10));
             }
             Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                terminate_owned_child_group(child)?;
                 return Err(timed_out());
             }
             Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                terminate_owned_child_group(child)?;
                 return Err(ManagedGitError::new(
                     "git_failed",
                     "managed Git child could not be observed",
                 ));
             }
         }
+    }
+}
+
+fn configure_owned_process_group(command: &mut Command) {
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setpgid(0, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+fn terminate_owned_child_group(child: &mut Child) -> Result<(), ManagedGitError> {
+    let pid = child.id();
+    let mut child_reaped = child.try_wait().ok().flatten().is_some();
+    signal_owned_child(pid, libc::SIGTERM)?;
+    let deadline = Instant::now() + Duration::from_millis(500);
+    while Instant::now() < deadline {
+        child_reaped |= child.try_wait().ok().flatten().is_some();
+        if child_reaped && !owned_process_group_exists(pid) {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    signal_owned_child(pid, libc::SIGKILL)?;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        child_reaped |= child.try_wait().ok().flatten().is_some();
+        if child_reaped && !owned_process_group_exists(pid) {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    Err(ManagedGitError::new(
+        "git_cleanup_timed_out",
+        "managed Git child cleanup did not finish within the bounded deadline",
+    ))
+}
+
+fn owned_process_group_exists(pid: u32) -> bool {
+    if unsafe { libc::killpg(pid as libc::pid_t, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+fn signal_owned_child(pid: u32, signal: libc::c_int) -> Result<(), ManagedGitError> {
+    if unsafe { libc::killpg(pid as libc::pid_t, signal) } == 0 {
+        return Ok(());
+    }
+    let group_error = std::io::Error::last_os_error();
+    if group_error.raw_os_error() != Some(libc::ESRCH) {
+        return Err(ManagedGitError::new(
+            "git_cleanup_failed",
+            "managed Git process group could not be signalled",
+        ));
+    }
+    if unsafe { libc::kill(pid as libc::pid_t, signal) } == 0 {
+        return Ok(());
+    }
+    let child_error = std::io::Error::last_os_error();
+    if child_error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(())
+    } else {
+        Err(ManagedGitError::new(
+            "git_cleanup_failed",
+            "managed Git child could not be signalled",
+        ))
     }
 }
 
@@ -1015,10 +1087,10 @@ mod tests {
         .expect_err("unexecutable Git runner");
         assert_eq!(unavailable.kind, "git_unavailable");
 
-        let mut child = Command::new("/bin/sleep")
-            .arg("5")
-            .spawn()
-            .expect("spawn controlled slow child");
+        let mut slow_command = Command::new("/bin/sleep");
+        slow_command.arg("5");
+        configure_owned_process_group(&mut slow_command);
+        let mut child = slow_command.spawn().expect("spawn controlled slow child");
         let pid = child.id().to_string();
         let timeout = wait_for_child(&mut child, Instant::now() + Duration::from_millis(100))
             .expect_err("slow Git child must time out");
@@ -1032,6 +1104,59 @@ mod tests {
                 .expect("inspect timed out child")
                 .success(),
             "timed-out child must be killed and reaped"
+        );
+
+        let mut direct_child = Command::new("/bin/sleep")
+            .arg("5")
+            .spawn()
+            .expect("spawn non-group-leader Git cleanup fixture");
+        let started = Instant::now();
+        terminate_owned_child_group(&mut direct_child)
+            .expect("fall back to signalling the direct child");
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert!(
+            direct_child
+                .try_wait()
+                .expect("confirm direct Git child was reaped")
+                .is_some()
+        );
+
+        let descendant_pid_file = root.join("descendant.pid");
+        let descendant = root.join("descendant-git");
+        fs::write(
+            &descendant,
+            format!(
+                "#!/bin/sh\nsleep 5 &\nprintf '%s\\n' \"$!\" > '{}'\nwait\n",
+                descendant_pid_file.display()
+            ),
+        )
+        .expect("write descendant runner");
+        let mut permissions = fs::metadata(&descendant)
+            .expect("descendant runner metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&descendant, permissions).expect("chmod descendant runner");
+        let timeout = git_exit_using(
+            descendant.as_os_str(),
+            None,
+            &[],
+            Instant::now() + Duration::from_secs(2),
+        )
+        .expect_err("descendant Git runner must time out");
+        assert_eq!(timeout.kind, "ensure_timed_out");
+        let descendant_pid = fs::read_to_string(&descendant_pid_file)
+            .expect("read descendant pid")
+            .trim()
+            .to_string();
+        assert!(
+            !Command::new("ps")
+                .args(["-p", &descendant_pid])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .expect("inspect descendant")
+                .success(),
+            "timed-out Git process group must leave no descendant"
         );
 
         let noisy = root.join("noisy-git");

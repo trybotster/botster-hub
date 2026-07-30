@@ -11,6 +11,7 @@ use std::error::Error;
 use std::fmt;
 use std::fs;
 use std::io::Read;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
@@ -1284,6 +1285,14 @@ impl IsolatedHubBuilder {
             .env("BOTSTER_ENV", "test")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
         prepend_worker_dir_to_path(&mut command, &session_worker_bin);
 
         let mut child = command.spawn().map_err(|source| IsolatedHubError::Spawn {
@@ -1292,7 +1301,8 @@ impl IsolatedHubBuilder {
         })?;
 
         if let Err(error) = wait_for_ready(&endpoint, &mut child, self.ready_timeout) {
-            cleanup_child(&mut child);
+            cleanup_child(&mut child)?;
+            remove_data_dir_path(&data_dir)?;
             return Err(error);
         }
 
@@ -1322,6 +1332,10 @@ impl IsolatedHubBuilder {
 }
 
 /// Running isolated hub daemon. Drop attempts shutdown, then kills on failure.
+///
+/// Successful explicit shutdown removes the harness-owned data directory. Drop
+/// also removes it after the child exits, except during panic unwinding so the
+/// failing daemon state remains available for diagnosis.
 pub struct IsolatedHub {
     hub_bin: PathBuf,
     data_dir: PathBuf,
@@ -1338,6 +1352,9 @@ impl IsolatedHub {
     }
 
     /// Disposable data directory owned by this harness instance.
+    ///
+    /// The path remains valid while the harness is running. Successful
+    /// [`Self::shutdown`] removes it; panic-time Drop intentionally preserves it.
     #[must_use]
     pub const fn data_dir(&self) -> &PathBuf {
         &self.data_dir
@@ -1349,14 +1366,14 @@ impl IsolatedHub {
         &self.working_directory
     }
 
-    /// Stop the daemon through the operator command and wait for the process.
+    /// Stop the daemon, wait for its process, then remove its owned data directory.
     pub fn shutdown(mut self) -> Result<(), IsolatedHubError> {
         self.shutdown_inner()
     }
 
     fn shutdown_inner(&mut self) -> Result<(), IsolatedHubError> {
         if self.child.is_none() {
-            return Ok(());
+            return self.remove_data_dir();
         }
         let output = Command::new(&self.hub_bin)
             .arg("shutdown")
@@ -1381,7 +1398,7 @@ impl IsolatedHub {
             .map_err(|source| IsolatedHubError::Wait { source })?;
         if daemon_output.status.success() {
             if shutdown_succeeded {
-                Ok(())
+                self.remove_data_dir()
             } else {
                 Err(IsolatedHubError::ShutdownFailed {
                     stderr: shutdown_stderr,
@@ -1394,6 +1411,21 @@ impl IsolatedHub {
                 stderr: String::from_utf8_lossy(&daemon_output.stderr).to_string(),
             })
         }
+    }
+
+    fn remove_data_dir(&self) -> Result<(), IsolatedHubError> {
+        remove_data_dir_path(&self.data_dir)
+    }
+}
+
+fn remove_data_dir_path(data_dir: &Path) -> Result<(), IsolatedHubError> {
+    match fs::remove_dir_all(data_dir) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(IsolatedHubError::RemoveDataDir {
+            path: data_dir.to_path_buf(),
+            source,
+        }),
     }
 }
 
@@ -5740,19 +5772,23 @@ impl From<serde_json::Error> for ConformanceError {
 
 impl Drop for IsolatedHub {
     fn drop(&mut self) {
-        if self.shutdown_inner().is_ok() {
+        if !thread::panicking() && self.shutdown_inner().is_ok() {
             return;
         }
+        let mut child_cleaned = true;
         if let Some(child) = self.child.as_mut() {
-            let _ = child.kill();
-            let _ = child.wait();
+            child_cleaned = cleanup_child(child).is_ok();
         }
         self.child = None;
+        if child_cleaned && !thread::panicking() {
+            let _ = self.remove_data_dir();
+        }
     }
 }
 
 /// Errors returned by the isolated daemon harness.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum IsolatedHubError {
     MissingBinaryEnv {
         variable: &'static str,
@@ -5764,6 +5800,17 @@ pub enum IsolatedHubError {
     CreateDataDir {
         path: PathBuf,
         source: std::io::Error,
+    },
+    RemoveDataDir {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    CleanupChild {
+        pid: u32,
+        source: std::io::Error,
+    },
+    CleanupTimeout {
+        pid: u32,
     },
     Spawn {
         path: PathBuf,
@@ -5804,6 +5851,25 @@ impl fmt::Display for IsolatedHubError {
                     formatter,
                     "failed to create data dir {}: {source}",
                     path.display()
+                )
+            }
+            Self::RemoveDataDir { path, source } => {
+                write!(
+                    formatter,
+                    "failed to remove data dir {} after daemon exit: {source}",
+                    path.display()
+                )
+            }
+            Self::CleanupChild { pid, source } => {
+                write!(
+                    formatter,
+                    "failed to signal isolated daemon process {pid}: {source}"
+                )
+            }
+            Self::CleanupTimeout { pid } => {
+                write!(
+                    formatter,
+                    "timed out waiting for isolated daemon process {pid} cleanup"
                 )
             }
             Self::Spawn { path, source } => {
@@ -5854,6 +5920,9 @@ impl IsolatedHubError {
                 ));
             }
             Self::CreateDataDir { .. } => "failed to create isolated daemon data directory",
+            Self::RemoveDataDir { .. } => "failed to remove isolated daemon data directory",
+            Self::CleanupChild { .. } => "failed to clean up isolated daemon process",
+            Self::CleanupTimeout { .. } => "timed out cleaning up isolated daemon process",
             Self::Spawn { .. } => "failed to spawn hub daemon",
             Self::ReadyTimeout { .. } => "timed out waiting for hub daemon readiness",
             Self::DaemonExited { .. } => "hub daemon exited before readiness",
@@ -5871,12 +5940,15 @@ impl Error for IsolatedHubError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::CreateDataDir { source, .. }
+            | Self::RemoveDataDir { source, .. }
+            | Self::CleanupChild { source, .. }
             | Self::Spawn { source, .. }
             | Self::ShutdownCommand { source }
             | Self::Wait { source } => Some(source),
             Self::Clock(source) => Some(source),
             Self::MissingBinaryEnv { .. }
             | Self::MissingBinary { .. }
+            | Self::CleanupTimeout { .. }
             | Self::ReadyTimeout { .. }
             | Self::DaemonExited { .. }
             | Self::ShutdownFailed { .. } => None,
@@ -5939,12 +6011,60 @@ fn wait_for_ready(
     })
 }
 
-fn cleanup_child(child: &mut Child) {
-    if child.try_wait().ok().flatten().is_some() {
-        return;
+fn cleanup_child(child: &mut Child) -> Result<(), IsolatedHubError> {
+    let pid = child.id();
+    let mut child_reaped = child.try_wait().ok().flatten().is_some();
+    signal_child_group_or_child(pid, libc::SIGTERM)?;
+    let deadline = Instant::now() + Duration::from_millis(500);
+    while Instant::now() < deadline {
+        child_reaped |= child.try_wait().ok().flatten().is_some();
+        if child_reaped && !child_process_group_exists(pid) {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(20));
     }
-    let _ = child.kill();
-    let _ = child.wait();
+    signal_child_group_or_child(pid, libc::SIGKILL)?;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        child_reaped |= child.try_wait().ok().flatten().is_some();
+        if child_reaped && !child_process_group_exists(pid) {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    Err(IsolatedHubError::CleanupTimeout { pid })
+}
+
+fn child_process_group_exists(pid: u32) -> bool {
+    if unsafe { libc::killpg(pid as libc::pid_t, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+fn signal_child_group_or_child(pid: u32, signal: libc::c_int) -> Result<(), IsolatedHubError> {
+    if unsafe { libc::killpg(pid as libc::pid_t, signal) } == 0 {
+        return Ok(());
+    }
+    let group_error = std::io::Error::last_os_error();
+    if group_error.raw_os_error() != Some(libc::ESRCH) {
+        return Err(IsolatedHubError::CleanupChild {
+            pid,
+            source: group_error,
+        });
+    }
+    if unsafe { libc::kill(pid as libc::pid_t, signal) } == 0 {
+        return Ok(());
+    }
+    let child_error = std::io::Error::last_os_error();
+    if child_error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(())
+    } else {
+        Err(IsolatedHubError::CleanupChild {
+            pid,
+            source: child_error,
+        })
+    }
 }
 
 fn collect_child_output(child: &mut Child) -> (String, String) {
@@ -7128,6 +7248,32 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn panic_drop_reaps_daemon_but_preserves_data_directory_for_diagnosis() {
+        let root = unique_root("panic-drop-diagnostics");
+        let hub_bin = shutdown_script(&root, "exit 1");
+        let child = Command::new("/bin/sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn panic-drop daemon child");
+        let pid = child.id();
+        let hub = isolated_hub(hub_bin, root.clone(), child);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _hub = hub;
+            panic!("controlled harness panic");
+        }));
+
+        assert!(result.is_err());
+        assert_process_exits(pid);
+        assert!(
+            root.exists(),
+            "panic-time Drop must preserve failing daemon state"
+        );
+        fs::remove_dir_all(root).expect("remove preserved panic diagnostics");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn start_reports_daemon_exit_before_readiness() {
         let root = unique_root("daemon-exit");
         let worker = existing_file(&root, "botster-session-worker");
@@ -7145,7 +7291,7 @@ exit 42
             .hub_bin(hub)
             .session_worker_bin(worker)
             .root(&root)
-            .ready_timeout(Duration::from_millis(500))
+            .ready_timeout(Duration::from_secs(2))
             .start_error();
 
         assert!(matches!(
@@ -7181,12 +7327,110 @@ done
             .hub_bin(hub)
             .session_worker_bin(worker)
             .root(&root)
-            .ready_timeout(Duration::from_secs(1))
+            .ready_timeout(Duration::from_secs(2))
             .start_error();
 
         assert!(matches!(error, IsolatedHubError::ReadyTimeout { .. }));
-        let pid = read_fake_pid(&pid_file);
-        assert_process_exits(pid);
+        assert_process_exits(wait_for_fake_pid(&pid_file));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_child_falls_back_when_child_is_not_a_process_group_leader() {
+        let mut child = Command::new("/bin/sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn direct child fixture");
+        let started = Instant::now();
+
+        cleanup_child(&mut child).expect("clean up direct child fallback");
+
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert!(
+            child
+                .try_wait()
+                .expect("confirm direct child was reaped")
+                .is_some()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_child_terminates_and_reaps_owned_descendant() {
+        struct DescendantGuard(libc::pid_t);
+        impl Drop for DescendantGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    libc::kill(self.0, libc::SIGKILL);
+                }
+            }
+        }
+
+        let root = unique_root("cleanup-descendant");
+        let descendant_pid_file = root.join("descendant.pid");
+        let mut command = Command::new("sh");
+        command
+            .args([
+                "-c",
+                &format!(
+                    "sleep 60 & printf '%s\\n' \"$!\" > '{}'; wait",
+                    descendant_pid_file.display()
+                ),
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let child = command.spawn().expect("spawn owned descendant fixture");
+        let child_pid = child.id();
+        let child_guard = CleanupChildGuard::new(child);
+        let descendant_pid = wait_for_fake_pid(&descendant_pid_file);
+        let _descendant_guard = DescendantGuard(descendant_pid as libc::pid_t);
+        let mut child = child_guard.into_child();
+
+        cleanup_child(&mut child).expect("clean up owned process group");
+
+        assert_process_exits(child_pid);
+        assert_process_exits(descendant_pid);
+        fs::remove_dir_all(root).expect("remove descendant fixture");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_pid_publication_reaps_owned_fixture_process_group() {
+        let root = unique_root("missing-pid-publication");
+        let missing_pid_file = root.join("never-published.pid");
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "sleep 60 & wait"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let child = command.spawn().expect("spawn missing-publication fixture");
+        let child_pid = child.id();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _child_guard = CleanupChildGuard::new(child);
+            let _ = wait_for_fake_pid(&missing_pid_file);
+        }));
+
+        assert!(result.is_err(), "missing PID publication must fail loudly");
+        assert_process_exits(child_pid);
+        assert_process_group_exits(child_pid);
+        fs::remove_dir_all(root).expect("remove missing-publication fixture");
     }
 
     fn unique_root(name: &str) -> PathBuf {
@@ -7282,12 +7526,47 @@ done
     }
 
     #[cfg(unix)]
-    fn read_fake_pid(pid_file: &Path) -> u32 {
-        fs::read_to_string(pid_file)
-            .expect("read fake pid")
-            .trim()
-            .parse()
-            .expect("fake pid is numeric")
+    fn wait_for_fake_pid(pid_file: &Path) -> u32 {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(pid) = fs::read_to_string(pid_file)
+                .ok()
+                .and_then(|contents| contents.trim().parse().ok())
+            {
+                return pid;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "fake pid was not published as parseable content: {}",
+                pid_file.display()
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(unix)]
+    struct CleanupChildGuard {
+        child: Option<Child>,
+    }
+
+    #[cfg(unix)]
+    impl CleanupChildGuard {
+        fn new(child: Child) -> Self {
+            Self { child: Some(child) }
+        }
+
+        fn into_child(mut self) -> Child {
+            self.child.take().expect("owned child is present")
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for CleanupChildGuard {
+        fn drop(&mut self) {
+            if let Some(child) = &mut self.child {
+                let _ = cleanup_child(child);
+            }
+        }
     }
 
     #[cfg(unix)]
@@ -7300,6 +7579,20 @@ done
             thread::sleep(Duration::from_millis(25));
         }
         panic!("process {pid} still exists after readiness timeout cleanup");
+    }
+
+    #[cfg(unix)]
+    fn assert_process_group_exits(pgid: u32) {
+        let pgid = pgid as libc::pid_t;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while unsafe { libc::killpg(pgid, 0) } == 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            unsafe { libc::killpg(pgid, 0) },
+            -1,
+            "process group {pgid} survived"
+        );
     }
 
     #[cfg(unix)]
