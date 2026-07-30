@@ -120,8 +120,10 @@ Unknowns to resolve during implementation:
 - Whether the resize request reaches Core while the session is still current,
   or races a lifecycle-exit journal entry.
 - Whether the in-repository published conformance runner's separate two-second
-  fixture needs the same deterministic barrier. Do not touch it unless the
-  focused evidence reproduces the same premise there.
+  fixture has enough post-spawn liveness margin under `residual-tail`. Measure
+  elapsed spawn-to-resize-ack time against its two-second process budget and
+  record an explicit keep-or-change decision in the implementation report.
+  Keeping it unchanged is acceptable only with that measured basis.
 
 ## Scope
 
@@ -138,10 +140,11 @@ Unknowns to resolve during implementation:
    authoritative snapshot -> session upsert -> rows/cols resize patch -> natural
    exit patch. Keep strict increasing sequence checks and require the fresh
    reconnect snapshot to reflect current authoritative retained/removed state.
-4. Add a focused loaded-runner target for this exact regression if the existing
-   runner cannot invoke it without running unrelated lifecycle tests. Reuse the
-   existing load profile, exact-SHA checkout, process tracking, and cleanup
-   artifact machinery.
+4. Add a focused loaded-runner target for this exact regression. Update the
+   validation allowlist, command dispatch, and workflow `test_target` choices in
+   lockstep; the current runner has no selector for this test. Reuse the existing
+   load profile, exact-SHA checkout, process tracking, and cleanup artifact
+   machinery.
 5. Change production reconciliation code only if the controlled live-session
    barrier still proves delivery, ordering, or lifecycle truth is wrong. Any
    such change must be the smallest correction at the existing HubRuntime /
@@ -199,8 +202,10 @@ Expected:
 
 Conditional, only if evidence requires it:
 
-- `crates/botster-hub-test-support/src/lib.rs` -- only if its published runner
-  shares the reproduced readiness defect
+- `crates/botster-hub-test-support/src/lib.rs` -- measure its two-second
+  fixture's spawn-to-resize-ack liveness margin under the same loaded profile,
+  then explicitly keep or change it; any temporary instrumentation must be
+  recorded as a reproducible patch in the report
 - `src/daemon_transport.rs`, `src/client_api.rs`, or `src/runtime.rs` -- only if
   the live barrier proves a production defect rather than fixture readiness
 
@@ -209,11 +214,13 @@ not change.
 
 ## Implementation sequence
 
-1. Preserve a red evidence packet from the existing fixture: exact Hub SHA,
-   locked Core SHA, command/load profile, first unexpected frame for both
-   subscribers, resize response, and cleanup artifact. A temporary controlled
-   scheduling delay or pre-fix checkout may be used as a negative control; it
-   must not remain in production tests.
+1. Preserve a reproducible red evidence packet from the existing fixture:
+   exact Hub SHA, locked Core SHA, exact command/load profile, first unexpected
+   frame for both subscribers, resize response, and cleanup artifact. Use
+   either the cited pre-fix SHA with a complete invocation recipe or record the
+   verbatim temporary diagnostic/delay patch hunk in the implementation report.
+   Temporary instrumentation must not remain in production tests, but Review
+   and Verify must be able to re-derive the red from the report.
 2. Make the fixture publish semantic readiness and then block on test-controlled
    input. Observe readiness through real terminal output, submit resize while
    the process is provably live, and require both subscribers to receive the
@@ -223,8 +230,12 @@ not change.
 4. If frame evidence still shows a defect, trace
    `DaemonRequest::Resize` -> `HubClientApi` -> `HubRuntime` -> `CoreDaemon` ->
    request-triggered `drive_entity_subscriptions`; fix only the proven seam.
-5. Add or select the focused loaded campaign and produce repeated local/default
-   and Linux loaded results without changing time budgets.
+5. Measure the published conformance runner's elapsed spawn-to-resize-ack time
+   under `residual-tail` against its two-second fixture budget. Record the
+   measurement and an explicit keep/change decision. If temporary timing
+   instrumentation is used, preserve its exact patch and command in the report.
+6. Add the focused loaded campaign and produce repeated local/default and Linux
+   loaded results without changing time budgets.
 
 ## Risks
 
@@ -236,6 +247,9 @@ not change.
   mask an ordering regression. Capture and classify every intervening frame.
 - Updating only one subscriber can hide divergence. Both subscribers must agree
   on resize sequence and ordered lifecycle state.
+- The published conformance runner's discard-until-match loops prove eventual
+  matching frames and matching-frame sequence arithmetic only. Its report
+  booleans cannot prove that no out-of-contract frame preceded a match.
 - Test failure/panic before release can strand a worker. Existing owned harness
   cleanup must remain active, and teardown artifacts must show zero survivors.
 - A broad production change could disturb the fixed owner loop or 500 ms
@@ -250,7 +264,9 @@ Red/green and focused proof:
 
 - Demonstrate the pre-fix failure under a controlled negative condition or the
   cited exact pre-fix loaded checkout, including the first unexpected frame;
-  then show the same focused path green with the deterministic barrier.
+  record an exact reproducible SHA/command/profile recipe or verbatim temporary
+  patch hunk, then show the same focused path green with the deterministic
+  barrier.
 - Run the exact regression repeatedly through:
 
   `./test.sh --test hub_daemon_lifecycle_test session_entity_subscription_pushes_snapshot_ordered_deltas_and_fresh_reconnect -- --exact --nocapture`
@@ -273,11 +289,25 @@ Production/downstream proof:
 
 - Run the focused exact-SHA Linux campaign for multiple repetitions under
   `residual-tail`, followed by the existing `full-suite-contention` campaign.
+- The focused selector must be present in all three runner surfaces:
+  `script/run-loaded-daemon-lifecycle` validation, its command dispatch, and
+  `.github/workflows/loaded-daemon-lifecycle.yml` input choices.
 - Record the tested Hub SHA and locked Core SHA separately, build the session
   worker with `--locked`, and verify both binary realpaths belong to the fresh
   target directory.
 - Prove both subscribers observe the same strictly ordered resize and natural
-  exit transitions; prove reconnect receives a fresh authoritative snapshot.
+  exit transitions by capturing and classifying every intervening frame in the
+  direct live-daemon section. Replace the current unchecked
+  `let _ = second.next_frame()` with explicit second-subscriber field and
+  sequence assertions. Prove reconnect receives a fresh authoritative snapshot.
+- Do not count `SessionLifecycleSubscriptionConformanceReport` booleans as proof
+  that no out-of-contract frame preceded resize or exit; its current
+  discard-until-match loops establish eventual matching delivery only. The
+  direct two-subscriber capture is the ordered-delivery authority for this
+  ticket.
+- Record the published conformance runner's spawn-to-resize-ack measurement
+  under `residual-tail`, its two-second budget, and the explicit keep/change
+  decision in the implementation report.
 - Preserve exact branch/base attribution for every new red. The known
   metadata-owned cleanup failure is not in scope and may be waived only with
   matching authoritative-base evidence.
