@@ -7854,7 +7854,8 @@ fn session_entity_subscription_pushes_snapshot_ordered_deltas_and_fresh_reconnec
         &endpoint,
         botster_hub_client::DaemonRequest::Spawn {
             session_id: "entity-session".to_string(),
-            command: "printf 'entity-before\\n'; sleep 0.15; printf 'entity-after\\n'; sleep 0.25"
+            command: "printf 'entity-before\\nentity-ready\\n'; IFS= read -r release; \
+                      printf 'entity-after:%s\\n' \"$release\""
                 .to_string(),
         },
     )
@@ -7894,7 +7895,7 @@ fn session_entity_subscription_pushes_snapshot_ordered_deltas_and_fresh_reconnec
         .expect("attach while entity pump is active");
     let terminal_deadline = Instant::now() + Duration::from_secs(5);
     let mut terminal_output = String::new();
-    while Instant::now() < terminal_deadline && !terminal_output.contains("entity-after") {
+    while Instant::now() < terminal_deadline && !terminal_output.contains("entity-ready") {
         let drain = terminal
             .request(&botster_hub_client::DaemonRequest::Drain {
                 session_id: "entity-session".to_string(),
@@ -7908,11 +7909,12 @@ fn session_entity_subscription_pushes_snapshot_ordered_deltas_and_fresh_reconnec
         thread::sleep(Duration::from_millis(20));
     }
     assert!(
-        terminal_output.contains("entity-after"),
-        "entity lifecycle pumping must retain terminal egress, got {terminal_output:?}"
+        terminal_output.contains("entity-before") && terminal_output.contains("entity-ready"),
+        "entity fixture must publish semantic readiness through retained terminal egress, \
+         got {terminal_output:?}"
     );
 
-    botster_hub_client::request(
+    let resize = botster_hub_client::request(
         &endpoint,
         botster_hub_client::DaemonRequest::Resize {
             session_id: "entity-session".to_string(),
@@ -7921,47 +7923,138 @@ fn session_entity_subscription_pushes_snapshot_ordered_deltas_and_fresh_reconnec
         },
     )
     .expect("resize entity session");
-    let resize_patch = first.next_frame().expect("resize patch");
-    let resize_sequence = match resize_patch {
+    assert_eq!(
+        resize.kind,
+        botster_hub_client::DaemonResponseKind::Events,
+        "live semantic barrier must keep resize accepted: {resize:?}"
+    );
+    let first_resize = first
+        .next_frame()
+        .expect("first subscriber resize transition");
+    let second_resize = second
+        .next_frame()
+        .expect("second subscriber resize transition");
+    let resize_sequence = match &first_resize {
         botster_hub_client::DaemonEntityFrame::Patch {
             snapshot_seq,
+            id,
             patch,
             ..
-        } => {
-            assert_eq!(
-                patch.get("rows").and_then(serde_json::Value::as_u64),
-                Some(31)
-            );
-            assert_eq!(
-                patch.get("cols").and_then(serde_json::Value::as_u64),
-                Some(101)
-            );
-            snapshot_seq
+        } if id == "entity-session"
+            && patch.get("rows").and_then(serde_json::Value::as_u64) == Some(31)
+            && patch.get("cols").and_then(serde_json::Value::as_u64) == Some(101) =>
+        {
+            *snapshot_seq
         }
-        other => panic!("expected resize patch, got {other:?}"),
+        _ => panic!(
+            "expected rows=31/cols=101 as the first post-resize frame for both subscribers; \
+             resize={resize:?} first={first_resize:?} second={second_resize:?}"
+        ),
     };
     assert!(resize_sequence > upsert_sequence);
-    let _ = second.next_frame().expect("second subscriber resize patch");
-
-    let exit_sequence = loop {
-        match first.next_frame().expect("natural exit patch") {
-            botster_hub_client::DaemonEntityFrame::Patch {
-                snapshot_seq,
-                patch,
-                ..
-            } if patch.get("lifecycle").and_then(serde_json::Value::as_str) == Some("exited") => {
-                assert_eq!(
-                    patch
-                        .get("lifecycle_class")
-                        .and_then(serde_json::Value::as_str),
-                    Some("ended")
-                );
-                break snapshot_seq;
-            }
-            _ => {}
+    let second_resize_sequence = match &second_resize {
+        botster_hub_client::DaemonEntityFrame::Patch {
+            snapshot_seq,
+            id,
+            patch,
+            ..
+        } if id == "entity-session"
+            && patch.get("rows").and_then(serde_json::Value::as_u64) == Some(31)
+            && patch.get("cols").and_then(serde_json::Value::as_u64) == Some(101) =>
+        {
+            *snapshot_seq
         }
+        _ => panic!(
+            "expected rows=31/cols=101 as the first post-resize frame for both subscribers; \
+             resize={resize:?} first={first_resize:?} second={second_resize:?}"
+        ),
+    };
+    assert_eq!(
+        second_resize_sequence, resize_sequence,
+        "subscriber resize sequences diverged: first={first_resize:?} second={second_resize:?}"
+    );
+
+    let release = terminal
+        .request(&botster_hub_client::DaemonRequest::SendInput {
+            session_id: "entity-session".to_string(),
+            data: "release\r".to_string(),
+        })
+        .expect("release entity fixture through terminal input");
+    assert_eq!(release.kind, botster_hub_client::DaemonResponseKind::Events);
+    for event in release.events {
+        if let botster_hub_client::DaemonEvent::TerminalOutput { data, .. } = event {
+            terminal_output.push_str(&data);
+        }
+    }
+    let release_deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < release_deadline && !terminal_output.contains("entity-after:release") {
+        let drain = terminal
+            .request(&botster_hub_client::DaemonRequest::Drain {
+                session_id: "entity-session".to_string(),
+            })
+            .expect("drain terminal output after releasing entity fixture");
+        for event in drain.events {
+            if let botster_hub_client::DaemonEvent::TerminalOutput { data, .. } = event {
+                terminal_output.push_str(&data);
+            }
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        terminal_output.contains("entity-after:release"),
+        "entity lifecycle pumping must retain terminal egress through natural exit, \
+         got {terminal_output:?}"
+    );
+
+    let first_exit = first.next_frame().expect("first subscriber natural exit");
+    let second_exit = second.next_frame().expect("second subscriber natural exit");
+    let exit_sequence = match &first_exit {
+        botster_hub_client::DaemonEntityFrame::Patch {
+            snapshot_seq,
+            id,
+            patch,
+            ..
+        } if id == "entity-session"
+            && patch.get("lifecycle").and_then(serde_json::Value::as_str) == Some("exited")
+            && patch
+                .get("lifecycle_class")
+                .and_then(serde_json::Value::as_str)
+                == Some("ended")
+            && patch.get("exit_code").and_then(serde_json::Value::as_i64) == Some(0) =>
+        {
+            *snapshot_seq
+        }
+        _ => panic!(
+            "expected natural exit_code=0 as the first post-release frame for both subscribers; \
+             first={first_exit:?} second={second_exit:?}"
+        ),
+    };
+    let second_exit_sequence = match &second_exit {
+        botster_hub_client::DaemonEntityFrame::Patch {
+            snapshot_seq,
+            id,
+            patch,
+            ..
+        } if id == "entity-session"
+            && patch.get("lifecycle").and_then(serde_json::Value::as_str) == Some("exited")
+            && patch
+                .get("lifecycle_class")
+                .and_then(serde_json::Value::as_str)
+                == Some("ended")
+            && patch.get("exit_code").and_then(serde_json::Value::as_i64) == Some(0) =>
+        {
+            *snapshot_seq
+        }
+        _ => panic!(
+            "expected natural exit_code=0 as the first post-release frame for both subscribers; \
+             first={first_exit:?} second={second_exit:?}"
+        ),
     };
     assert!(exit_sequence > resize_sequence);
+    assert_eq!(
+        second_exit_sequence, exit_sequence,
+        "subscriber exit sequences diverged: first={first_exit:?} second={second_exit:?}"
+    );
 
     let removed = botster_hub_client::request(
         &endpoint,
