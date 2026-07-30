@@ -53,6 +53,13 @@ directory; missing, stale, malformed, mismatched, or oversized evidence remains
 a test failure. This selector is diagnostic evidence only and does not replace
 the default-parallel lifecycle-suite campaign.
 
+Use `focused-session-entity-resize` to repeat the exact
+`session_entity_subscription_pushes_snapshot_ordered_deltas_and_fresh_reconnect`
+test through `./test.sh --exact` under the selected stress profile. It isolates
+the resize and natural-exit entity transition so an unrelated first-red test
+cannot stop that diagnostic campaign. This selector is focused evidence only
+and does not replace the five-repetition `full-suite-contention` campaign.
+
 Use `focused-lua-worker-suite` to run the unchanged, default-parallel
 `hub_lua_runtime_test` binary while preserving the first control-socket failure.
 For the Lua worker investigation, the fixed diagnostic budget is 20 repetitions
