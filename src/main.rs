@@ -1539,28 +1539,70 @@ fn local_runtime_daemon_readiness_budget() -> Duration {
 }
 
 fn terminate_owned_runtime_child(child: &mut Child) -> Result<String, LocalRuntimeError> {
-    if let Some(status) = child.try_wait().map_err(LocalRuntimeError::PollDaemon)? {
-        return Ok(status.to_string());
-    }
-
     let pid = child.id();
-    unsafe {
-        libc::killpg(pid as libc::pid_t, libc::SIGTERM);
-    }
+    let mut child_status = child
+        .try_wait()
+        .map_err(LocalRuntimeError::PollDaemon)?
+        .map(|status| status.to_string());
+    signal_owned_runtime_child(pid, libc::SIGTERM).map_err(LocalRuntimeError::TerminateDaemon)?;
     let deadline = Instant::now() + Duration::from_millis(500);
     while Instant::now() < deadline {
-        if let Some(status) = child.try_wait().map_err(LocalRuntimeError::PollDaemon)? {
-            return Ok(status.to_string());
+        if child_status.is_none() {
+            child_status = child
+                .try_wait()
+                .map_err(LocalRuntimeError::PollDaemon)?
+                .map(|status| status.to_string());
+        }
+        if !process_group_exists(pid)
+            && let Some(status) = child_status.take()
+        {
+            return Ok(status);
         }
         thread::sleep(Duration::from_millis(20));
     }
-    unsafe {
-        libc::killpg(pid as libc::pid_t, libc::SIGKILL);
+    signal_owned_runtime_child(pid, libc::SIGKILL).map_err(LocalRuntimeError::TerminateDaemon)?;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        if child_status.is_none() {
+            child_status = child
+                .try_wait()
+                .map_err(LocalRuntimeError::PollDaemon)?
+                .map(|status| status.to_string());
+        }
+        if !process_group_exists(pid)
+            && let Some(status) = child_status.take()
+        {
+            return Ok(status);
+        }
+        thread::sleep(Duration::from_millis(20));
     }
-    child
-        .wait()
-        .map(|status| status.to_string())
-        .map_err(LocalRuntimeError::TerminateDaemon)
+    Err(LocalRuntimeError::TerminateDaemonTimeout(pid))
+}
+
+fn process_group_exists(pid: u32) -> bool {
+    if unsafe { libc::killpg(pid as libc::pid_t, 0) } == 0 {
+        return true;
+    }
+    io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+fn signal_owned_runtime_child(pid: u32, signal: libc::c_int) -> io::Result<()> {
+    if unsafe { libc::killpg(pid as libc::pid_t, signal) } == 0 {
+        return Ok(());
+    }
+    let group_error = io::Error::last_os_error();
+    if group_error.raw_os_error() != Some(libc::ESRCH) {
+        return Err(group_error);
+    }
+    if unsafe { libc::kill(pid as libc::pid_t, signal) } == 0 {
+        return Ok(());
+    }
+    let child_error = io::Error::last_os_error();
+    if child_error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(())
+    } else {
+        Err(child_error)
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -5685,5 +5727,29 @@ mod cli_data_dir_tests {
                 "{command} usage must mark --data-dir optional"
             );
         }
+    }
+
+    #[test]
+    fn owned_runtime_cleanup_falls_back_to_direct_child_and_remains_bounded() {
+        let mut child = Command::new("/bin/sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn non-process-group-leader fixture");
+        let pid = child.id();
+        let started = Instant::now();
+
+        let status =
+            terminate_owned_runtime_child(&mut child).expect("terminate direct child fallback");
+
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert!(!status.is_empty());
+        assert!(
+            child
+                .try_wait()
+                .expect("confirm fallback child was reaped")
+                .is_some(),
+            "cleanup must reap a child even when killpg reports ESRCH for its pid"
+        );
+        assert_eq!(unsafe { libc::kill(pid as libc::pid_t, 0) }, -1);
     }
 }
