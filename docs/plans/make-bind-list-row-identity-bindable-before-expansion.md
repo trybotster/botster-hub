@@ -93,6 +93,17 @@
   API; defines all five stage expectations; switches the oracle to a
   required-identity button; and changes the bound value rule from non-empty to
   non-blank.
+- Re-review `review_1785439471_685483` found two remaining wiring/strictness
+  gaps. This revision adds `action` support to the `contract.sessions`
+  manifest and requires dispatch through the real client-API admission path;
+  it also requires the compatibility materializer to recognize exactly the
+  lifecycle-control and canonical-oracle child shapes and continue rejecting
+  every malformed or extra child.
+- `origin/main` advanced from `95e829a` to `162e8ea` while this plan was under
+  review. The reviewed drift is an unrelated Hub test-support shutdown test
+  and does not change the contract premises or planned surfaces. Rebase onto
+  the then-current main before Implement; do not rewrite the Plan-time base
+  provenance above.
 
 ## Contract decision
 
@@ -177,9 +188,13 @@ producer-owned uniqueness already matches the `/session` row identity.
      `materializeSessionPluginBindings(surface, frames) ->
      Record<string, string>`, and
      `materializeSessionPluginBindingScenario(scenario) ->
-     Record<string, Record<string, string>>`. Teach them to identify and
-     validate the exact-filter lifecycle controls while ignoring the
-     separately identified row-id oracle.
+     Record<string, Record<string, string>>`. Teach them to recognize exactly
+     two child shapes: each exact-session-UUID lifecycle control and the single
+     canonical current-row oracle. Lifecycle controls continue to populate the
+     existing result; the recognized oracle is interpreted by the additive
+     API. Missing/duplicate oracle children, malformed lifecycle controls, and
+     every unrecognized or extra child remain hard errors rather than
+     permissive skips.
    - Add an additive published row materialization type with
      `{ node_id, action_payload }`, plus sibling APIs: Rust
      `materialize_session_plugin_rows(&Value, &[DaemonEntityFrame]) ->
@@ -197,10 +212,12 @@ producer-owned uniqueness already matches the `/session` row identity.
      supports the planned Hub-test-support patch release without breaking the
      two open consumers.
    - Edit the repo-root
-     `fixtures/plugins/plugin-contract-matrix` source, then synchronize the
-     byte-identical crate and generated npm mirrors. Update all fixture and
-     package READMEs that currently say `contract.sessions` contains only one
-     exact-filter BindList per reference.
+     `fixtures/plugins/plugin-contract-matrix` source, including
+     `botster-package.json`: add `"action"` beside `"render"` in the
+     `contract.sessions` `supports` array. Then synchronize the byte-identical
+     crate and generated npm mirrors. Update all fixture and package READMEs
+     that currently say `contract.sessions` contains only one exact-filter
+     BindList per reference or is render-only.
 
 3. **Prove the real Hub producer/admission path.**
    - Render `contract.sessions` through the installed package registry,
@@ -216,6 +233,14 @@ producer-owned uniqueness already matches the `/session` row identity.
      otherwise accepted `UiActionResult.replacement` whose root or static child
      uses a bound id must also fail through action-result admission. Keep the
      existing inline binding-family admission tests green.
+   - Do not stop at `runtime.dispatch_plugin_surface_action`, which bypasses
+     surface-operation admission. Materialize the canonical second button into
+     `node_id = "session-stable-current"` and its row payload, submit its
+     `PluginSurfaceAction` through the real daemon/client-API path, and require
+     `admit_plugin_surface_operation` in `src/client_api.rs` to admit
+     `contract.sessions` because the installed manifest declares `action`.
+     Assert the real Lua `contract.action` handler receives and echoes the
+     second row identity and accepts the request.
    - Extend the public conformance report and daemon lifecycle assertions with
      the multi-row oracle. This is the production-entry-point proof: a real
      plugin worker authors the sentinel, Hub admission accepts it, and the
@@ -354,7 +379,8 @@ wait for the merged/published Hub contract.
   `conformance-fixtures.json`, `index.js`, `test.mjs`, `README.md`, and
   `package.json`.
 - Canonical producer fixture:
-  `fixtures/plugins/plugin-contract-matrix/plugin.lua` and `README.md`;
+  `fixtures/plugins/plugin-contract-matrix/plugin.lua`,
+  `botster-package.json`, and `README.md`;
   synchronized crate mirror under
   `crates/botster-hub-test-support/fixtures/plugin-contract-matrix`; generated
   npm mirror under
@@ -365,7 +391,8 @@ wait for the merged/published Hub contract.
   `packages/hub-test-support/index.js`, `index.d.ts`, `test.mjs`, `README.md`,
   `session-plugin-binding-conformance-fixture.json`, `metadata.json`,
   `first-party-client-support-matrix.json`, and `package.json`;
-  `src/runtime.rs`; `tests/hub_daemon_lifecycle_test.rs`.
+  `src/runtime.rs`; `src/client_api.rs`; `tests/hub_client_api_test.rs`;
+  `tests/hub_daemon_lifecycle_test.rs`.
 - Compatibility/versioning:
   `crates/botster-hub-client/src/lib.rs`, generated compatibility artifacts,
   affected crate manifests, root/public protocol documentation if it describes
@@ -399,7 +426,13 @@ changes, or proof of the real runtime path.
   contract and exercise the real Workspaces surface.
 - **Published materializer break under a patch release:** retain all existing
   Rust/Node signatures and return shapes; add separately named row-and-payload
-  materializers and test both APIs against the augmented surface.
+  materializers and test both APIs against the augmented surface. Recognize
+  exactly the two canonical child shapes and retain hard failure for malformed,
+  missing, duplicate, unrecognized, or extra children.
+- **Button renders but cannot dispatch:** add `action` to the canonical
+  `contract.sessions` manifest support declaration and prove the second-row
+  request through client-API/daemon admission, not only the lower-level runtime
+  dispatcher.
 - **Detached-template validation regresses TUI-kit:** retain root semantics,
   document that authored item templates validate only through their containing
   BindList, and run the kit conformance suite at the downstream repin.
@@ -438,6 +471,9 @@ changes, or proof of the real runtime path.
      `{ operation: "select_session", session_uuid: node_id }`.
    - Lifecycle exact-filter stages continue to prove present, missing, patch,
      remove, and reconnect behavior.
+   - Rust and Node negative tests append a malformed extra child, mutate each
+     canonical shape, remove/duplicate the oracle, and require both
+     materializers to fail rather than silently skip it.
    - Source/crate/npm fixture trees and generated metadata remain byte-current.
    - Run:
 
@@ -452,6 +488,7 @@ changes, or proof of the real runtime path.
 
      ```sh
      cargo build --locked -p botster-core --bin botster-session-worker
+     ./test.sh --test hub_client_api_test
      ./test.sh --test hub_daemon_lifecycle_test daemon_plugin_contract_matrix_fixture_exercises_public_package_contracts
      ```
 
@@ -460,7 +497,11 @@ changes, or proof of the real runtime path.
      and the report exposes the two producer-materialized distinct ids and
      payloads. Through `src/runtime.rs`, reject the same id on a render
      root/static child and on an accepted action-result replacement root/static
-     child. Static JSON existence is not proof.
+     child. Through the daemon/client API, dispatch the materialized second-row
+     Button action on `contract.sessions`; assert manifest operation admission,
+     the echoed `session-stable-current` node identity, the matching bound
+     payload, and an accepted Lua result. A direct runtime dispatch or static
+     JSON existence is not proof.
 
 4. **Workspace gates**
 
