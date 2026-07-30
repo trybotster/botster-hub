@@ -7387,16 +7387,50 @@ done
                 Ok(())
             });
         }
-        let mut child = command.spawn().expect("spawn owned descendant fixture");
+        let child = command.spawn().expect("spawn owned descendant fixture");
         let child_pid = child.id();
+        let child_guard = CleanupChildGuard::new(child);
         let descendant_pid = wait_for_fake_pid(&descendant_pid_file);
         let _descendant_guard = DescendantGuard(descendant_pid as libc::pid_t);
+        let mut child = child_guard.into_child();
 
         cleanup_child(&mut child).expect("clean up owned process group");
 
         assert_process_exits(child_pid);
         assert_process_exits(descendant_pid);
         fs::remove_dir_all(root).expect("remove descendant fixture");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_pid_publication_reaps_owned_fixture_process_group() {
+        let root = unique_root("missing-pid-publication");
+        let missing_pid_file = root.join("never-published.pid");
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "sleep 60 & wait"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let child = command.spawn().expect("spawn missing-publication fixture");
+        let child_pid = child.id();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _child_guard = CleanupChildGuard::new(child);
+            let _ = wait_for_fake_pid(&missing_pid_file);
+        }));
+
+        assert!(result.is_err(), "missing PID publication must fail loudly");
+        assert_process_exits(child_pid);
+        assert_process_group_exits(child_pid);
+        fs::remove_dir_all(root).expect("remove missing-publication fixture");
     }
 
     fn unique_root(name: &str) -> PathBuf {
@@ -7511,6 +7545,31 @@ done
     }
 
     #[cfg(unix)]
+    struct CleanupChildGuard {
+        child: Option<Child>,
+    }
+
+    #[cfg(unix)]
+    impl CleanupChildGuard {
+        fn new(child: Child) -> Self {
+            Self { child: Some(child) }
+        }
+
+        fn into_child(mut self) -> Child {
+            self.child.take().expect("owned child is present")
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for CleanupChildGuard {
+        fn drop(&mut self) {
+            if let Some(child) = &mut self.child {
+                let _ = cleanup_child(child);
+            }
+        }
+    }
+
+    #[cfg(unix)]
     fn assert_process_exits(pid: u32) {
         let deadline = Instant::now() + Duration::from_secs(2);
         while Instant::now() < deadline {
@@ -7520,6 +7579,20 @@ done
             thread::sleep(Duration::from_millis(25));
         }
         panic!("process {pid} still exists after readiness timeout cleanup");
+    }
+
+    #[cfg(unix)]
+    fn assert_process_group_exits(pgid: u32) {
+        let pgid = pgid as libc::pid_t;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while unsafe { libc::killpg(pgid, 0) } == 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            unsafe { libc::killpg(pgid, 0) },
+            -1,
+            "process group {pgid} survived"
+        );
     }
 
     #[cfg(unix)]
