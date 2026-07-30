@@ -56,6 +56,13 @@ pub use botster_core::{
     RunnableEntrypointProcessState, RunnableEntrypointReadiness, RunnableEntrypointResultField,
 };
 
+/// Product deadline for the local runtime daemon to publish typed readiness.
+///
+/// This is public so lifecycle harnesses can keep their liveness backstop
+/// strictly outside the production policy they observe.
+pub const LOCAL_RUNTIME_DAEMON_READINESS_BUDGET: std::time::Duration =
+    std::time::Duration::from_secs(30);
+
 pub use capabilities::HubCapabilityRuntime;
 pub use client_api::{
     HubClientAdmission, HubClientApi, HubClientCapability, HubClientCaptureSnapshot,
