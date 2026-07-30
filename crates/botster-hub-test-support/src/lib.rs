@@ -7327,13 +7327,11 @@ done
             .hub_bin(hub)
             .session_worker_bin(worker)
             .root(&root)
-            .ready_timeout(Duration::from_secs(1))
+            .ready_timeout(Duration::from_secs(2))
             .start_error();
 
         assert!(matches!(error, IsolatedHubError::ReadyTimeout { .. }));
-        if pid_file.exists() {
-            assert_process_exits(read_fake_pid(&pid_file));
-        }
+        assert_process_exits(wait_for_fake_pid(&pid_file));
     }
 
     #[cfg(unix)]
@@ -7391,11 +7389,7 @@ done
         }
         let mut child = command.spawn().expect("spawn owned descendant fixture");
         let child_pid = child.id();
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while !descendant_pid_file.exists() && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(10));
-        }
-        let descendant_pid = read_fake_pid(&descendant_pid_file);
+        let descendant_pid = wait_for_fake_pid(&descendant_pid_file);
         let _descendant_guard = DescendantGuard(descendant_pid as libc::pid_t);
 
         cleanup_child(&mut child).expect("clean up owned process group");
@@ -7498,12 +7492,22 @@ done
     }
 
     #[cfg(unix)]
-    fn read_fake_pid(pid_file: &Path) -> u32 {
-        fs::read_to_string(pid_file)
-            .expect("read fake pid")
-            .trim()
-            .parse()
-            .expect("fake pid is numeric")
+    fn wait_for_fake_pid(pid_file: &Path) -> u32 {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(pid) = fs::read_to_string(pid_file)
+                .ok()
+                .and_then(|contents| contents.trim().parse().ok())
+            {
+                return pid;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "fake pid was not published as parseable content: {}",
+                pid_file.display()
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[cfg(unix)]
