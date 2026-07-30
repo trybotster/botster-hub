@@ -75,8 +75,11 @@ paths.
 - `contract.sessions`: accepts at most 16 referenced session UUIDs and returns
   one exact-filter `bind_list` per reference against the Hub-owned `/session`
   family. Matching rows bind `@/lifecycle_class`; absent rows select
-  `empty_template`. The worker authors only paths and templates—it does not
-  receive session rows or arbitrary Hub state.
+  `empty_template`. A second current-session `bind_list` is the canonical
+  multi-row identity oracle: its Button binds `id` and action-payload
+  `session_uuid` to `@/session_uuid`, and the surface supports both render and
+  action. The worker authors only paths and templates—it does not receive
+  session rows or arbitrary Hub state.
 - `contract.blocked`: render handler that fails deliberately so clients can assert the daemon `operator_error` response and continued daemon responsiveness.
 - `contract.invalid_body`: declared render surface whose handler returns malformed UiNode data so clients can assert `invalid_surface` and a structured `plugin_surface_render` diagnostic from hub validation.
 - `contract.settings`: settings surface returning sanitized effective configuration from `botster.capabilities.config.get()`.

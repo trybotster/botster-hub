@@ -11,7 +11,7 @@ The renderer-neutral UI contract used by those protocol DTOs lives in:
 - `packages/ui-contract`
 
 Rust clients consume `botster-ui-contract`; TypeScript clients consume
-`@trybotster/ui-contract@0.1.1`. The generated declarations, schema, and
+`@trybotster/ui-contract@0.2.0`. The generated declarations, schema, and
 conformance fixtures are one contract surface and must not be copied into a
 client repository.
 
@@ -39,7 +39,7 @@ Node-based first-party clients can consume the same checked artifact without a
 sibling hub checkout through the public package:
 
 ```sh
-npm install --save-dev @trybotster/ui-contract@0.1.1 @trybotster/hub-test-support@0.1.16
+npm install --save-dev @trybotster/ui-contract@0.2.0 @trybotster/hub-test-support@0.1.17
 ```
 
 ```js
@@ -47,6 +47,7 @@ import {
   materializeApplicationPrimitivesFixture,
   materializePluginContractMatrixFixture,
   materializeSessionPluginBindingScenario,
+  materializeSessionPluginRowScenario,
   metadata,
   readDaemonProtocolTypescript,
   readFirstPartyClientSupportMatrix,
@@ -65,6 +66,9 @@ const sessionLifecycleFixture = readSessionLifecycleSubscriptionConformanceFixtu
 const sessionBindingStages = materializeSessionPluginBindingScenario(
   readSessionPluginBindingConformanceFixture(),
 );
+const sessionRowStages = materializeSessionPluginRowScenario(
+  readSessionPluginBindingConformanceFixture(),
+);
 
 console.log(
   metadata.protocol,
@@ -76,6 +80,7 @@ console.log(
   lateAttachFixture.history_then_live,
   sessionLifecycleFixture.normalized_frames,
   sessionBindingStages,
+  sessionRowStages,
 );
 ```
 
@@ -84,9 +89,9 @@ when checked assets are stale. The metadata's protocol version and conformance
 fixture revision are emitted by the Rust `botster-hub-test-support` asset
 generator instead of being maintained independently in JavaScript.
 
-After version 0.1.16 is published to the public npm registry, npm-based client
+After version 0.1.17 is published to the public npm registry, npm-based client
 repos such as botster-web should use the exact dependency spec
-`"@trybotster/hub-test-support": "0.1.16"` in `devDependencies` and let npm write
+`"@trybotster/hub-test-support": "0.1.17"` in `devDependencies` and let npm write
 the corresponding package-lock entry from the public npm registry. The package
 is public, so registry install does not require a scoped `.npmrc` entry or CI
 auth token. After updating the lockfile, run the client smoke that imports the
@@ -224,7 +229,7 @@ but normal client reconciliation must not poll it or maintain a list-refresh
 fallback beside the entity stream.
 
 The prepared current contract ships from
-`@trybotster/hub-test-support@0.1.16` as
+`@trybotster/hub-test-support@0.1.17` as
 `session-lifecycle-subscription-conformance-fixture.json` and through
 `readSessionLifecycleSubscriptionConformanceFixture()`. The fixture serializes
 the public `DaemonEntityFrame` DTOs and normalizes only timestamps and sequence
@@ -252,9 +257,14 @@ Shutdown does not remove the row. Only explicit retention removal emits
 real fixture surface shape with public `DaemonEntityFrame` values and exercises
 current, ended, indeterminate, missing, patch, remove, and reconnect semantics.
 Rust uses `materialize_session_plugin_bindings`; Node uses
-`materializeSessionPluginBindingScenario`. These are Hub-owned reference
-materializers, not proof that the shipped Web or TUI renderer already resolves
-bindings.
+`materializeSessionPluginBindingScenario`. The additive
+`materialize_session_plugin_rows` and `materializeSessionPluginRowScenario`
+helpers resolve the current-row Button's authored id and action payload after
+filtering. Only a BindList item-template id accepts `@/field`; roots, static
+children, empty templates, and action request/result `node_id` remain literal.
+Blank, non-string, or duplicate realized ids fail. These are Hub-owned
+reference materializers, not proof that the shipped Web or TUI renderer already
+resolves bindings.
 
 ## Spawn Targets
 
@@ -1144,7 +1154,7 @@ Node client tests should use the declared npm dependency instead of a relative
 hub checkout:
 
 ```sh
-npm install --save-dev @trybotster/ui-contract@0.1.1 @trybotster/hub-test-support@0.1.16
+npm install --save-dev @trybotster/ui-contract@0.2.0 @trybotster/hub-test-support@0.1.17
 ```
 
 ```js
@@ -1159,7 +1169,7 @@ const fixturePath = materializePluginContractMatrixFixture(tempDirectory);
 
 Local environment variables may still point legacy drift checks at a checked-out
 hub artifact, but after publication the normal web-client dependency coordinate
-is `@trybotster/hub-test-support@0.1.16` from the public npm registry.
+is `@trybotster/hub-test-support@0.1.17` from the public npm registry.
 
 Each harness instance creates a disposable data directory and socket path under
 the configured test root, uses synthetic default hub identity, and attempts a

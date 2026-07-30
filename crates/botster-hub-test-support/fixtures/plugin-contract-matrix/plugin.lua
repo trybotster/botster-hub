@@ -298,6 +298,32 @@ local function session_lifecycle_surface(arguments)
     })
   end
 
+  table.insert(children, {
+    ["$kind"] = "bind_list",
+    source = "/session",
+    where = {
+      lifecycle_class = "current",
+    },
+    item_template = {
+      type = "button",
+      id = {
+        ["$bind"] = "@/session_uuid",
+      },
+      props = {
+        label = "Select session",
+        action = {
+          id = "contract.action",
+          payload = {
+            operation = "select_session",
+            session_uuid = {
+              ["$bind"] = "@/session_uuid",
+            },
+          },
+        },
+      },
+    },
+  })
+
   return {
     type = "panel",
     id = "contract-session-lifecycle-panel",
@@ -398,6 +424,14 @@ local function contract_action(arguments)
           kind = "toggle",
           key = "contract-toggle",
         },
+      },
+    })
+  end
+  if payload.operation == "select_session" then
+    return action_result(arguments, "accepted", {
+      payload = {
+        operation = "select_session",
+        session_uuid = payload.session_uuid,
       },
     })
   end

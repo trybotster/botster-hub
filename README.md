@@ -144,7 +144,7 @@ Terminal attach is a terminal-stream handshake only. Session-list reads remain
 an operator/query API; stateful clients use the explicit held-open `session`
 entity subscription for an authoritative snapshot followed by ordered deltas.
 The reusable contract ships in
-`@trybotster/hub-test-support@0.1.16` as source-derived JSON fixtures and a Rust
+`@trybotster/hub-test-support@0.1.17` as source-derived JSON fixtures and a Rust
 `run_session_lifecycle_subscription_conformance` runner over the real isolated
 Hub/Core/session-worker topology.
 Every delivered session row includes required `lifecycle_class`:
@@ -152,8 +152,10 @@ Every delivered session row includes required `lifecycle_class`:
 `exited|failed` map to `ended`, and missing lifecycle maps to
 `indeterminate`; `registry_state: stale` always takes precedence and maps to
 `indeterminate`. Plugin-authored trees may bind only the Hub-admitted
-`/session` family, keyed by canonical session UUID. A missing row alone means
-unknown/unavailable.
+`/session` family, keyed by canonical session UUID. Inside a BindList item
+template, authored `UiNode.id` may bind directly to a row field such as
+`@/session_uuid`; realized ids and action request/result `node_id` remain
+literal strings. A missing row alone means unknown/unavailable.
 That subscription hydrates no status, package, worktree, target, or plugin state.
 The local socket adapter admits at most 64 live connections and runs them as
 joined Tokio tasks on a fixed transport runtime; it does not create an OS

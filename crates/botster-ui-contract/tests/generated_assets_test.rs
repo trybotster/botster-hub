@@ -52,6 +52,8 @@ fn generated_fixtures_deserialize_and_validate_through_rust_authority() {
         serde_json::from_value(fixtures["selected_workspace_equality"].clone())
             .expect("equality binding");
     let form: UiNode = serde_json::from_value(fixtures["form"].clone()).expect("form node");
+    let bound_row_identity: UiNode = serde_json::from_value(fixtures["bound_row_identity"].clone())
+        .expect("bound row identity node");
     let request: UiActionRequest =
         serde_json::from_value(fixtures["request"].clone()).expect("action request");
     let accepted: UiActionResult =
@@ -64,6 +66,9 @@ fn generated_fixtures_deserialize_and_validate_through_rust_authority() {
         assert!(value.get("$kind").is_some());
     }
     form.validate().expect("form fixture validates");
+    bound_row_identity
+        .validate()
+        .expect("bound row identity fixture validates");
     accepted.validate().expect("accepted fixture validates");
     rejected.validate().expect("rejected fixture validates");
     assert!(request.values.is_some());
@@ -73,6 +78,8 @@ fn generated_fixtures_deserialize_and_validate_through_rust_authority() {
 #[test]
 fn typescript_and_schema_encode_wire_names_and_optionality() {
     let typescript = typescript_declarations();
+    assert!(typescript.contains("export type UiAuthoredNodeId = UiNodeId | UiBind;"));
+    assert!(typescript.contains("export interface UiNodeBase { id?: UiAuthoredNodeId;"));
     let request_fields = interface_fields(&typescript, "UiActionRequest");
     let result_fields = interface_fields(&typescript, "UiActionResult");
     assert_eq!(
@@ -104,6 +111,19 @@ fn typescript_and_schema_encode_wire_names_and_optionality() {
             ("surface_id", ("UiSurfaceId", false)),
             ("warnings", ("string[]", true)),
         ])
+    );
+    let schema = json_schema();
+    assert_eq!(
+        schema.pointer("/$defs/UiNode/properties/id/$ref"),
+        Some(&serde_json::json!("#/$defs/UiAuthoredNodeId"))
+    );
+    assert_eq!(
+        schema.pointer("/$defs/UiActionRequest/properties/node_id/$ref"),
+        Some(&serde_json::json!("#/$defs/UiNodeId"))
+    );
+    assert_eq!(
+        schema.pointer("/$defs/UiActionResult/properties/node_id/$ref"),
+        Some(&serde_json::json!("#/$defs/UiNodeId"))
     );
 
     assert_serde_fields_match_typescript::<UiActionRequest>(
