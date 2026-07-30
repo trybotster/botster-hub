@@ -547,6 +547,12 @@ impl SupervisedProcess {
     }
 }
 
+impl Drop for SupervisedProcess {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
 impl Drop for EntrypointSupervisor {
     fn drop(&mut self) {
         self.stop_all();
@@ -891,29 +897,31 @@ mod tests {
             });
         }
         let child = command.spawn().expect("spawn controlled process group");
+        let process = supervised_running_process(child, launch_result_path);
         let descendant_pid = wait_for_pid_file(descendant_pid_path);
-        (
-            SupervisedProcess {
-                child,
-                environment: BTreeMap::new(),
-                started_at: now_seconds(),
-                exited_at: None,
-                exit_status: None,
-                stdout: None,
-                stderr: None,
-                diagnostics: Vec::new(),
-                launch_result: Some(RunnableEntrypointLaunchResult {
-                    entrypoint_id: "web".to_string(),
-                    process_state: RunnableEntrypointProcessState::Running,
-                    local_url: None,
-                }),
-                launch_result_path: Some(launch_result_path),
-                state: ProcessState::Running,
-                pending_terminal_state: None,
-                output_finalization_deadline: None,
-            },
-            descendant_pid,
-        )
+        (process, descendant_pid)
+    }
+
+    fn supervised_running_process(child: Child, launch_result_path: PathBuf) -> SupervisedProcess {
+        SupervisedProcess {
+            child,
+            environment: BTreeMap::new(),
+            started_at: now_seconds(),
+            exited_at: None,
+            exit_status: None,
+            stdout: None,
+            stderr: None,
+            diagnostics: Vec::new(),
+            launch_result: Some(RunnableEntrypointLaunchResult {
+                entrypoint_id: "web".to_string(),
+                process_state: RunnableEntrypointProcessState::Running,
+                local_url: None,
+            }),
+            launch_result_path: Some(launch_result_path),
+            state: ProcessState::Running,
+            pending_terminal_state: None,
+            output_finalization_deadline: None,
+        }
     }
 
     fn wait_for_pid_file(path: &Path) -> libc::pid_t {
@@ -1160,6 +1168,47 @@ mod tests {
             -1,
             "supervisor drop must leave no owned child"
         );
+    }
+
+    #[test]
+    fn missing_descendant_pid_publication_reaps_owned_process_group() {
+        let descendant_pid_path = unique_test_path("missing-descendant");
+        let launch_result_path = unique_test_path("missing-result");
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "sleep 60 & wait"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let child = command
+            .spawn()
+            .expect("spawn missing-publication process group");
+        let pid = child.id();
+        let process = supervised_running_process(child, launch_result_path.clone());
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _process = process;
+            let _ = wait_for_pid_file(&descendant_pid_path);
+        }));
+
+        assert!(
+            result.is_err(),
+            "missing descendant PID publication must fail loudly"
+        );
+        assert_pid_gone(pid as libc::pid_t);
+        assert!(
+            !supervised_process_group_exists(pid),
+            "missing publication must leave no owned process group"
+        );
+        let _ = fs::remove_file(descendant_pid_path);
+        let _ = fs::remove_file(launch_result_path);
     }
 
     #[test]
