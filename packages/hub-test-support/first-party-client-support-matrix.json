@@ -1,7 +1,7 @@
 {
   "protocol": "botster-hub-daemon-v1",
   "protocol_version": 4,
-  "conformance_fixture_revision": 24,
+  "conformance_fixture_revision": 25,
   "required_features": [
     "sessions",
     "terminal_streaming",
@@ -81,7 +81,8 @@
     "missing_row_state": "unavailable",
     "plugin_surface_id": "contract.sessions",
     "plugin_binding_fixture_path": "botster_hub_test_support::session_plugin_binding_conformance_scenario",
-    "reference_materializer": "botster_hub_test_support::materialize_session_plugin_bindings"
+    "reference_materializer": "botster_hub_test_support::materialize_session_plugin_bindings",
+    "row_reference_materializer": "botster_hub_test_support::materialize_session_plugin_rows"
   },
   "resize": {
     "supported": true,

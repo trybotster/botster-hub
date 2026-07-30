@@ -9,22 +9,23 @@ use botster_ui_contract::{
 };
 use botster_ui_contract::{
     UiActionId, UiActionKind, UiActionRequest, UiActionResult, UiActionResultState,
-    UiActionResultValidationError, UiBind, UiBindIf, UiBindList, UiCapabilityFallback,
-    UiCapabilitySet, UiChild, UiCondition, UiConditional, UiDensity, UiDialogPresentation,
-    UiFieldErrors, UiFieldKind, UiFieldOption, UiFieldSchema, UiFieldValidationHints, UiFormValues,
-    UiHeightClass, UiIframeBridge, UiIframePermission, UiIframeSandboxToken, UiKeyboardCapability,
-    UiMetricTrend, UiMetricTrendDirection, UiNode, UiNodeId, UiNodeKind, UiPointer,
-    UiPresentationKey, UiPresentationOperation, UiPresentationPredicate, UiResponsiveHeight,
-    UiResponsiveValue, UiResponsiveWidth, UiSelection, UiSelectionMode, UiSurfaceId, UiTableCell,
-    UiTableColumn, UiTableColumnDescriptor, UiTableRow, UiToolbarOverflow, UiValidationError,
-    UiVariant, UiWidthClass, validate_package_presentation, validate_ui_node_with_capabilities,
+    UiActionResultValidationError, UiAuthoredNodeId, UiBind, UiBindIf, UiBindList,
+    UiCapabilityFallback, UiCapabilitySet, UiChild, UiCondition, UiConditional, UiDensity,
+    UiDialogPresentation, UiFieldErrors, UiFieldKind, UiFieldOption, UiFieldSchema,
+    UiFieldValidationHints, UiFormValues, UiHeightClass, UiIframeBridge, UiIframePermission,
+    UiIframeSandboxToken, UiKeyboardCapability, UiMetricTrend, UiMetricTrendDirection, UiNode,
+    UiNodeId, UiNodeKind, UiPointer, UiPresentationKey, UiPresentationOperation,
+    UiPresentationPredicate, UiResponsiveHeight, UiResponsiveValue, UiResponsiveWidth, UiSelection,
+    UiSelectionMode, UiSurfaceId, UiTableCell, UiTableColumn, UiTableColumnDescriptor, UiTableRow,
+    UiToolbarOverflow, UiValidationError, UiVariant, UiWidthClass, validate_package_presentation,
+    validate_ui_node, validate_ui_node_with_capabilities,
 };
 use serde_json::{Map, Value, json};
 
 fn node(kind: UiNodeKind, props: Value) -> UiNode {
     UiNode {
         kind,
-        id: Some(UiNodeId(format!("{kind:?}").to_lowercase())),
+        id: Some(UiNodeId(format!("{kind:?}").to_lowercase()).into()),
         props: props.as_object().cloned().unwrap_or_default(),
         children: Vec::new(),
         slots: BTreeMap::new(),
@@ -293,7 +294,7 @@ fn ui_node_serializes_minimal_and_populated_wire_shape() {
 
     let node = UiNode {
         kind: UiNodeKind::ListItem,
-        id: Some(UiNodeId("ticket-row".to_string())),
+        id: Some(UiNodeId("ticket-row".to_string()).into()),
         props: Map::from_iter([("value".to_string(), json!("ticket_123"))]),
         children: vec![text("Child")],
         slots,
@@ -2085,6 +2086,136 @@ fn bind_list_and_bind_if_wire_shapes_round_trip() {
 }
 
 #[test]
+fn bound_node_identity_is_valid_only_on_a_bind_list_item_template() {
+    let bound_button = serde_json::from_value::<UiNode>(json!({
+        "type": "button",
+        "id": { "$bind": "@/session_uuid" },
+        "props": {
+            "label": "Select session",
+            "action": { "id": "contract.action" }
+        }
+    }))
+    .expect("bound-id button");
+    assert_eq!(
+        bound_button.id,
+        Some(UiAuthoredNodeId::Bind(UiBind {
+            path: "@/session_uuid".to_string()
+        }))
+    );
+    assert_eq!(
+        serde_json::to_value(&bound_button).expect("serialize bound-id button")["id"],
+        json!({ "$bind": "@/session_uuid" })
+    );
+
+    for error in [
+        bound_button
+            .validate()
+            .expect_err("detached root must fail"),
+        validate_ui_node(&bound_button).expect_err("public root validator must fail"),
+        validate_ui_node_with_capabilities(&bound_button, &rich_capabilities())
+            .expect_err("capability validator must retain root semantics"),
+    ] {
+        assert!(error.to_string().contains("bind_list item_template"));
+    }
+
+    let valid_tree = serde_json::from_value::<UiNode>(json!({
+        "type": "panel",
+        "id": "sessions",
+        "props": { "title": "Sessions" },
+        "children": [{
+            "$kind": "bind_list",
+            "source": "/session",
+            "item_template": {
+                "type": "button",
+                "id": { "$bind": "@/session_uuid" },
+                "props": {
+                    "label": "Select session",
+                    "action": { "id": "contract.action" }
+                }
+            }
+        }]
+    }))
+    .expect("bound-id BindList tree");
+    valid_tree
+        .validate()
+        .expect("BindList item template supplies row context");
+
+    for invalid in [
+        json!({
+            "type": "panel",
+            "id": "sessions",
+            "props": { "title": "Sessions" },
+            "children": [{
+                "type": "button",
+                "id": { "$bind": "@/session_uuid" },
+                "props": {
+                    "label": "Select session",
+                    "action": { "id": "contract.action" }
+                }
+            }]
+        }),
+        json!({
+            "type": "panel",
+            "id": "sessions",
+            "props": { "title": "Sessions" },
+            "children": [{
+                "$kind": "bind_list",
+                "source": "/session",
+                "item_template": {
+                    "type": "button",
+                    "id": { "$bind": "/session/session-1/session_uuid" },
+                    "props": {
+                        "label": "Select session",
+                        "action": { "id": "contract.action" }
+                    }
+                }
+            }]
+        }),
+        json!({
+            "type": "panel",
+            "id": "sessions",
+            "props": { "title": "Sessions" },
+            "children": [{
+                "$kind": "bind_list",
+                "source": "/session",
+                "item_template": {
+                    "type": "text",
+                    "id": "session",
+                    "props": { "text": "Session" }
+                },
+                "empty_template": {
+                    "type": "button",
+                    "id": { "$bind": "@/session_uuid" },
+                    "props": {
+                        "label": "Select session",
+                        "action": { "id": "contract.action" }
+                    }
+                }
+            }]
+        }),
+    ] {
+        let node = serde_json::from_value::<UiNode>(invalid).expect("invalid-context node");
+        assert_error_contains(node, "bind_list item_template");
+    }
+}
+
+#[test]
+fn authored_node_identity_rejects_malformed_bind_sentinels() {
+    for id in [
+        json!({ "$bind": 1 }),
+        json!({ "$bind": "@/session_uuid", "fallback": "session" }),
+        json!({ "bind": "@/session_uuid" }),
+    ] {
+        serde_json::from_value::<UiNode>(json!({
+            "type": "text",
+            "id": id,
+            "props": { "text": "Session" }
+        }))
+        .expect_err("malformed authored id must fail deserialization");
+    }
+}
+
+#[test]
 fn bind_list_filters_are_exact_top_level_fields() {
     let empty_field = UiBindList::BindList {
         source: "/project-pipelines.ticket".to_string(),
@@ -2777,7 +2908,7 @@ fn ui_action_result_applies_accepted_presentation_and_inline_replacement() {
         invalid_replacement.validate(),
         Err(UiActionResultValidationError::InvalidReplacement(
             UiValidationError::Node {
-                id: Some(UiNodeId("form".to_string())),
+                id: Some(UiNodeId("form".to_string()).into()),
                 kind: UiNodeKind::Form,
                 source: Box::new(UiValidationError::MissingProp {
                     kind: UiNodeKind::Form,
@@ -2848,7 +2979,7 @@ fn dialog_visibility_uses_scoped_presentation_presence_and_equality() {
     assert_eq!(
         root.validate(),
         Err(UiValidationError::Node {
-            id: Some(UiNodeId("stack".to_string())),
+            id: Some(UiNodeId("stack".to_string()).into()),
             kind: UiNodeKind::Stack,
             source: Box::new(UiValidationError::InvalidBindPath {
                 path: " ".to_string(),
@@ -2909,7 +3040,7 @@ fn crate_root_form_schema_types_validate_a_form_field() {
 
     let field = botster_ui_contract::UiNode {
         kind: botster_ui_contract::UiNodeKind::FormField,
-        id: Some(botster_ui_contract::UiNodeId("status-field".to_string())),
+        id: Some(botster_ui_contract::UiNodeId("status-field".to_string()).into()),
         props: Map::from_iter([(
             "schema".to_string(),
             serde_json::to_value(schema).expect("serialize schema"),

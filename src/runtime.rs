@@ -1259,10 +1259,7 @@ impl HubRuntime {
         let node: UiNode = serde_json::from_value(value).map_err(|error| {
             crate::McpToolError::new("invalid_surface", format!("invalid plugin UiNode: {error}"))
         })?;
-        node.validate().map_err(|error| {
-            crate::McpToolError::new("invalid_surface", format!("invalid plugin UiNode: {error}"))
-        })?;
-        validate_plugin_surface_binding_families(&node)?;
+        validate_plugin_surface_node(&node)?;
         Ok(node)
     }
 
@@ -2333,6 +2330,13 @@ fn validate_plugin_surface_binding_path(path: &str) -> Result<(), crate::McpTool
     ))
 }
 
+fn validate_plugin_surface_node(node: &UiNode) -> Result<(), crate::McpToolError> {
+    node.validate().map_err(|error| {
+        crate::McpToolError::new("invalid_surface", format!("invalid plugin UiNode: {error}"))
+    })?;
+    validate_plugin_surface_binding_families(node)
+}
+
 fn validate_plugin_surface_action_result(
     result: &UiActionResult,
     request: &UiActionRequest,
@@ -2406,9 +2410,56 @@ mod tests {
             }
         }));
 
-        node.validate().expect("generic UiNode validation");
-        validate_plugin_surface_binding_families(&node)
+        validate_plugin_surface_node(&node)
             .expect("/session and item-relative bindings are admitted");
+    }
+
+    #[test]
+    fn plugin_surface_render_admission_scopes_bound_identity_to_item_templates() {
+        let admitted = binding_test_node(serde_json::json!({
+            "$kind": "bind_list",
+            "source": "/session",
+            "where": { "lifecycle_class": "current" },
+            "item_template": {
+                "type": "button",
+                "id": { "$bind": "@/session_uuid" },
+                "props": {
+                    "label": "Select session",
+                    "action": { "id": "contract.action" }
+                }
+            }
+        }));
+        validate_plugin_surface_node(&admitted)
+            .expect("render admission accepts bound item-template identity");
+
+        for rejected in [
+            serde_json::json!({
+                "type": "button",
+                "id": { "$bind": "@/session_uuid" },
+                "props": {
+                    "label": "Select session",
+                    "action": { "id": "contract.action" }
+                }
+            }),
+            serde_json::json!({
+                "type": "panel",
+                "id": "binding-root",
+                "children": [{
+                    "type": "button",
+                    "id": { "$bind": "@/session_uuid" },
+                    "props": {
+                        "label": "Select session",
+                        "action": { "id": "contract.action" }
+                    }
+                }]
+            }),
+        ] {
+            let node = serde_json::from_value(rejected).expect("authored UiNode");
+            let error =
+                validate_plugin_surface_node(&node).expect_err("unresolved render id must fail");
+            assert_eq!(error.code, "invalid_surface");
+            assert!(error.message.contains("bind_list item_template"));
+        }
     }
 
     #[test]
@@ -2476,6 +2527,54 @@ mod tests {
             .expect_err("foreign replacement binding must be rejected");
         assert_eq!(error.code, "invalid_action_result");
         assert!(error.message.contains("/workspace"), "{error:?}");
+    }
+
+    #[test]
+    fn plugin_surface_action_replacement_rejects_bound_root_and_static_child_identity() {
+        for replacement in [
+            serde_json::json!({
+                "type": "button",
+                "id": { "$bind": "@/session_uuid" },
+                "props": {
+                    "label": "Select session",
+                    "action": { "id": "contract.action" }
+                }
+            }),
+            serde_json::json!({
+                "type": "panel",
+                "id": "replacement-root",
+                "children": [{
+                    "type": "button",
+                    "id": { "$bind": "@/session_uuid" },
+                    "props": {
+                        "label": "Select session",
+                        "action": { "id": "contract.action" }
+                    }
+                }]
+            }),
+        ] {
+            let request = serde_json::from_value::<UiActionRequest>(serde_json::json!({
+                "request_id": "binding-action-request",
+                "surface_id": "contract.sessions",
+                "action_id": "contract.action",
+                "node_id": "session-stable-current",
+                "kind": "submit"
+            }))
+            .expect("action request");
+            let result = serde_json::from_value::<UiActionResult>(serde_json::json!({
+                "request_id": "binding-action-request",
+                "surface_id": "contract.sessions",
+                "action_id": "contract.action",
+                "node_id": "session-stable-current",
+                "state": "accepted",
+                "replacement": replacement
+            }))
+            .expect("action result");
+            let error = validate_plugin_surface_action_result(&result, &request)
+                .expect_err("unresolved replacement id must fail");
+            assert_eq!(error.code, "invalid_action_result");
+            assert!(error.message.contains("bind_list item_template"));
+        }
     }
 
     #[test]

@@ -1,5 +1,5 @@
 {
-  "contract_version": "0.1.1",
+  "contract_version": "0.2.0",
   "fixtures": {
     "accepted": {
       "action_id": "ticket.create",
@@ -29,6 +29,37 @@
       "request_id": "request-1",
       "state": "accepted",
       "surface_id": "tickets.create"
+    },
+    "bound_row_identity": {
+      "children": [
+        {
+          "$kind": "bind_list",
+          "item_template": {
+            "id": {
+              "$bind": "@/session_uuid"
+            },
+            "props": {
+              "action": {
+                "id": "contract.action",
+                "payload": {
+                  "operation": "select_session",
+                  "session_uuid": {
+                    "$bind": "@/session_uuid"
+                  }
+                }
+              },
+              "label": "Select session"
+            },
+            "type": "button"
+          },
+          "source": "/session",
+          "where": {
+            "lifecycle_class": "current"
+          }
+        }
+      ],
+      "id": "session-list",
+      "type": "panel"
     },
     "dialog_presence": {
       "$kind": "presentation_if",

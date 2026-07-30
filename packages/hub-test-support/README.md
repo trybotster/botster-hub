@@ -19,7 +19,7 @@ node packages/hub-test-support/scripts/sync-assets.mjs
 ## Usage
 
 ```sh
-npm install --save-dev @trybotster/ui-contract@0.1.1 @trybotster/hub-test-support@0.1.16
+npm install --save-dev @trybotster/ui-contract@0.2.0 @trybotster/hub-test-support@0.1.17
 ```
 
 ```js
@@ -27,6 +27,7 @@ import {
   materializeApplicationPrimitivesFixture,
   materializePluginContractMatrixFixture,
   materializeSessionPluginBindingScenario,
+  materializeSessionPluginRowScenario,
   metadata,
   readDaemonProtocolTypescript,
   readFirstPartyClientSupportMatrix,
@@ -49,6 +50,8 @@ const sessionLifecycleFixture = readSessionLifecycleSubscriptionConformanceFixtu
 const sessionBindingFixture = readSessionPluginBindingConformanceFixture();
 const sessionBindingStages =
   materializeSessionPluginBindingScenario(sessionBindingFixture);
+const sessionRowStages =
+  materializeSessionPluginRowScenario(sessionBindingFixture);
 const uiContractFixtures = await readUiContractConformanceFixtures();
 const applicationSurfaceId = metadata.application_primitives.surface_id;
 const rendererEntryPoint = metadata.application_primitives.renderer_entrypoint;
@@ -66,6 +69,7 @@ console.log(
   modeFlagsFixture.mouse_on.mode_flags.mouse_mode,
   sessionLifecycleFixture.normalized_frames,
   sessionBindingStages,
+  sessionRowStages,
   uiContractFixtures.contract_version,
 );
 ```
@@ -75,13 +79,13 @@ Use this exact package spec in npm-based client repos:
 ```json
 {
   "devDependencies": {
-    "@trybotster/hub-test-support": "0.1.16"
+    "@trybotster/hub-test-support": "0.1.17"
   }
 }
 ```
 
-After `@trybotster/ui-contract@0.1.1` and
-`@trybotster/hub-test-support@0.1.16` are published to the public npm
+After `@trybotster/ui-contract@0.2.0` and
+`@trybotster/hub-test-support@0.1.17` are published to the public npm
 registry, no scoped `.npmrc` entry or CI auth token is required for install.
 
 The support matrix is generated from the Rust compatibility descriptors.
@@ -97,11 +101,10 @@ Only `read_screen_text` is renderable restored content; `snapshot` and
 version 0.1.5 / revision 12 exposes lossy string history. Neither is current
 binary-history contract authority.
 
-Version 0.1.16 publishes protocol version 4 / conformance revision 24 and
-depends on `@trybotster/ui-contract@0.1.1` for the canonical UiNode,
+Version 0.1.17 publishes protocol version 4 / conformance revision 25 and
+depends on `@trybotster/ui-contract@0.2.0` for the canonical UiNode,
 UiActionRequest, UiActionResult, package surface, and package navigation
-declarations and conformance fixtures. Version 0.1.16 is prepared in this
-repository; it is not published by this change. It also carries the optional
+declarations and conformance fixtures. It also carries the optional
 aggregate plugin-worker counters prepared in the unpublished 0.1.15 artifact.
 Revision 20 remains the already-published version 0.1.12 application-primitives
 contract; revision 21 adds spawn-target `base_ref` and worktree `management`
@@ -112,6 +115,11 @@ Revision 23 adds required `DaemonSessionEntity.lifecycle_class`, the canonical
 surface. Revision 24 removes the daemon-owned package-surface TypeScript mirror,
 references `PackageSurfaceDescriptor` from `@trybotster/ui-contract`, and adds
 explicit package navigation to the contract-matrix fixture.
+Revision 25 makes only authored `UiNode.id` bindable inside a BindList item
+template and adds the producer-backed `contract.sessions` multi-row Button
+oracle. The row materializer resolves ids in producer order, binds each
+matching action payload, rejects blank/non-string/duplicate identities, and
+keeps action request/result `node_id` literal.
 The Node reference materializer proves matching `current`, `ended`,
 and `indeterminate` rows before an absent UUID selects the unavailable path,
 then proves patch, remove, and authoritative reconnect convergence. This
