@@ -1413,6 +1413,7 @@ fn spawn_local_runtime_daemon(
         .arg(&options.data_directory)
         .arg("--session-worker-bin")
         .arg(session_worker_bin)
+        .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
     unsafe {

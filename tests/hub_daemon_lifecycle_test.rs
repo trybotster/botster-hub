@@ -9,7 +9,11 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
-use std::sync::{Arc, Mutex, OnceLock, mpsc};
+use std::sync::{
+    Arc, Mutex, OnceLock,
+    atomic::{AtomicBool, Ordering},
+    mpsc,
+};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -2345,6 +2349,7 @@ struct OperatorConsolePty {
     writer: Option<Box<dyn Write + Send>>,
     output: Arc<Mutex<Vec<u8>>>,
     reader: Option<thread::JoinHandle<()>>,
+    reader_done: Arc<AtomicBool>,
 }
 
 trait TestChildControl {
@@ -2399,6 +2404,9 @@ fn wait_for_child_condition_with_budget(
         match child.try_wait_status() {
             Ok(Some(status)) => {
                 let output = child.captured_output();
+                if condition_met() {
+                    return Ok(());
+                }
                 return Err(format!(
                     "{description}: child exited before condition after {:?} (backstop {budget:?}); child_status={status}; {output}",
                     started_at.elapsed()
@@ -2527,19 +2535,21 @@ impl OwnedOperatorConsoleDaemon {
     }
 
     fn capture_owned_pid(&mut self) {
+        let Some(pid) = self.validated_metadata_pid() else {
+            return;
+        };
+        if !self.owned_pids.contains(&pid) {
+            self.owned_pids.push(pid);
+        }
+    }
+
+    fn validated_metadata_pid(&self) -> Option<u32> {
         let metadata_path = self.data_dir.join(".botster-hub-runtime-daemon.json");
-        let Ok(bytes) = fs::read(metadata_path) else {
-            return;
-        };
-        let Ok(metadata) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
-            return;
-        };
-        let Some(pid) = metadata["pid"]
+        let bytes = fs::read(metadata_path).ok()?;
+        let metadata = serde_json::from_slice::<serde_json::Value>(&bytes).ok()?;
+        let pid = metadata["pid"]
             .as_u64()
-            .and_then(|pid| u32::try_from(pid).ok())
-        else {
-            return;
-        };
+            .and_then(|pid| u32::try_from(pid).ok())?;
         let expected_socket = explicit_config(&self.data_dir)
             .transports
             .local_socket
@@ -2554,9 +2564,7 @@ impl OwnedOperatorConsoleDaemon {
             && metadata["hub_bin"]
                 .as_str()
                 .is_some_and(|path| Path::new(path).file_name() == Some("botster-hub".as_ref()));
-        if metadata_matches && !self.owned_pids.contains(&pid) {
-            self.owned_pids.push(pid);
-        }
+        metadata_matches.then_some(pid)
     }
 
     fn assert_cleaned(&mut self) {
@@ -2603,7 +2611,7 @@ impl OwnedOperatorConsoleDaemon {
             .owned_pids
             .iter()
             .copied()
-            .filter(|pid| process_exists(*pid))
+            .filter(|pid| process_exists(*pid) && self.process_identity_matches(*pid))
             .collect::<Vec<_>>();
         if !alive.is_empty() {
             return Err(format!("owned daemon pids still alive: {alive:?}"));
@@ -2617,8 +2625,10 @@ impl OwnedOperatorConsoleDaemon {
             .expect("operator console local socket binding")
             .path
             .clone();
-        let _ = fs::remove_file(&metadata_path);
-        let _ = fs::remove_file(&socket_path);
+        let socket_deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < socket_deadline && socket_path.exists() {
+            thread::sleep(Duration::from_millis(20));
+        }
         let status = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
             .arg("status")
             .arg("--data-dir")
@@ -2631,11 +2641,31 @@ impl OwnedOperatorConsoleDaemon {
                 command_output_text(&status)
             ));
         }
-        if metadata_path.exists() || socket_path.exists() {
+        if socket_path.exists() {
             return Err(format!(
-                "runtime artifacts remain: metadata={} socket={}",
-                metadata_path.exists(),
-                socket_path.exists()
+                "owned daemon socket remains after stopped status: {}",
+                socket_path.display()
+            ));
+        }
+        if metadata_path.exists() {
+            let Some(metadata_pid) = self.validated_metadata_pid() else {
+                return Err(format!(
+                    "unverified runtime metadata remains: {}",
+                    metadata_path.display()
+                ));
+            };
+            if !self.owned_pids.contains(&metadata_pid) {
+                return Err(format!(
+                    "runtime metadata pid {metadata_pid} was not captured as owned"
+                ));
+            }
+            fs::remove_file(&metadata_path)
+                .map_err(|error| format!("remove verified owned runtime metadata: {error}"))?;
+        }
+        if metadata_path.exists() {
+            return Err(format!(
+                "verified owned runtime metadata remains: {}",
+                metadata_path.display()
             ));
         }
         Ok(())
@@ -2672,6 +2702,39 @@ fn wait_for_owned_pid_exit(pid: u32, budget: Duration) {
     let deadline = Instant::now() + budget;
     while Instant::now() < deadline && process_exists(pid) {
         thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn assert_detached_daemon_stdin(pid: u32) {
+    #[cfg(target_os = "linux")]
+    {
+        let stdin = fs::read_link(format!("/proc/{pid}/fd/0"))
+            .unwrap_or_else(|error| panic!("read detached daemon pid {pid} stdin: {error}"));
+        assert_eq!(
+            stdin,
+            Path::new("/dev/null"),
+            "detached daemon pid {pid} retained operator-console stdin"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let output = Command::new("lsof")
+            .args(["-a", "-p", &pid.to_string(), "-d", "0", "-Fn"])
+            .output()
+            .unwrap_or_else(|error| panic!("inspect detached daemon pid {pid} stdin: {error}"));
+        assert!(
+            output.status.success(),
+            "inspect detached daemon pid {pid} stdin: {}",
+            command_output_text(&output)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .any(|line| line == "n/dev/null"),
+            "detached daemon pid {pid} retained operator-console stdin: {}",
+            command_output_text(&output)
+        );
     }
 }
 
@@ -2755,6 +2818,8 @@ impl OperatorConsolePty {
         drop(pty.slave);
         let output = Arc::new(Mutex::new(Vec::new()));
         let reader_output = Arc::clone(&output);
+        let reader_done = Arc::new(AtomicBool::new(false));
+        let reader_done_signal = Arc::clone(&reader_done);
         let reader = thread::spawn(move || {
             let mut buffer = [0_u8; 1024];
             while let Ok(count) = reader.read(&mut buffer) {
@@ -2766,12 +2831,14 @@ impl OperatorConsolePty {
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .extend_from_slice(&buffer[..count]);
             }
+            reader_done_signal.store(true, Ordering::Release);
         });
         Self {
             child,
             writer: Some(writer),
             output,
             reader: Some(reader),
+            reader_done,
         }
     }
 
@@ -2809,7 +2876,7 @@ impl OperatorConsolePty {
 
     fn try_wait_for_occurrences(&mut self, needle: &str, expected: usize) -> Result<(), String> {
         let output = Arc::clone(&self.output);
-        wait_for_child_condition_with_budget(
+        let result = wait_for_child_condition_with_budget(
             &mut self.child,
             &format!("waiting for {expected} occurrences of operator console output {needle:?}"),
             CLI_DAEMON_READINESS_BUDGET,
@@ -2823,8 +2890,17 @@ impl OperatorConsolePty {
                 .count()
                     >= expected
             },
-        )
-        .map_err(|error| format!("{error}; operator_console_output={}", self.text()))
+        );
+        if let Err(error) = result {
+            if error.contains("child exited before condition") {
+                self.finish_reader_after_exit(CLI_DAEMON_READINESS_BUDGET)?;
+                if self.text().matches(needle).count() >= expected {
+                    return Ok(());
+                }
+            }
+            return Err(format!("{error}; operator_console_output={}", self.text()));
+        }
+        Ok(())
     }
 
     fn text(&self) -> String {
@@ -2846,23 +2922,42 @@ impl OperatorConsolePty {
                 .expect("poll operator console")
                 .is_some()
             {
-                self.writer.take();
-                if let Some(reader) = self.reader.take() {
-                    reader.join().expect("join operator console PTY reader");
-                }
+                self.finish_reader_after_exit(deadline.saturating_duration_since(Instant::now()))
+                    .unwrap_or_else(|error| panic!("{error}"));
                 return;
             }
             thread::sleep(Duration::from_millis(20));
         }
         self.writer.take();
         let child_status = terminate_and_reap_pty_child(self.child.as_mut());
-        if let Some(reader) = self.reader.take() {
-            reader.join().expect("join operator console PTY reader");
-        }
+        let reader_status = self
+            .finish_reader_after_exit(Duration::from_secs(2))
+            .err()
+            .unwrap_or_else(|| "reader reached EOF".to_string());
         panic!(
-            "operator console did not exit; child_status={child_status}; output={}",
+            "operator console did not exit; child_status={child_status}; reader_status={reader_status}; output={}",
             self.text()
         );
+    }
+
+    fn finish_reader_after_exit(&mut self, budget: Duration) -> Result<(), String> {
+        self.writer.take();
+        let deadline = Instant::now() + budget;
+        while Instant::now() < deadline && !self.reader_done.load(Ordering::Acquire) {
+            thread::sleep(Duration::from_millis(20));
+        }
+        if !self.reader_done.load(Ordering::Acquire) {
+            return Err(format!(
+                "operator console PTY reader did not reach EOF within {budget:?}; output={}",
+                self.text()
+            ));
+        }
+        if let Some(reader) = self.reader.take() {
+            reader
+                .join()
+                .map_err(|_| "operator console PTY reader panicked".to_string())?;
+        }
+        Ok(())
     }
 }
 
@@ -2870,9 +2965,7 @@ impl Drop for OperatorConsolePty {
     fn drop(&mut self) {
         self.writer.take();
         let _ = terminate_and_reap_pty_child(self.child.as_mut());
-        if let Some(reader) = self.reader.take() {
-            let _ = reader.join();
-        }
+        let _ = self.finish_reader_after_exit(Duration::from_secs(2));
     }
 }
 
@@ -3162,6 +3255,105 @@ fn operator_console_output_wait_reports_early_child_exit() {
 }
 
 #[test]
+fn wait_for_child_condition_rechecks_after_exit_drain() {
+    struct ExitDrainChild {
+        drained: Arc<AtomicBool>,
+    }
+
+    impl TestChildControl for ExitDrainChild {
+        fn try_wait_status(&mut self) -> io::Result<Option<String>> {
+            Ok(Some("exit 0".to_string()))
+        }
+
+        fn terminate_and_reap(&mut self) -> String {
+            "exit 0".to_string()
+        }
+
+        fn captured_output(&mut self) -> String {
+            self.drained.store(true, Ordering::Release);
+            "stdout=\"final output\" stderr=\"\"".to_string()
+        }
+    }
+
+    let drained = Arc::new(AtomicBool::new(false));
+    let mut child = ExitDrainChild {
+        drained: Arc::clone(&drained),
+    };
+    wait_for_child_condition_with_budget(
+        &mut child,
+        "waiting for final drained output",
+        Duration::from_secs(1),
+        || drained.load(Ordering::Acquire),
+    )
+    .expect("condition should be rechecked after the exited child's output drain");
+}
+
+#[test]
+fn owned_operator_console_cleanup_checks_pid_identity_and_runtime_artifacts() {
+    let reused_pid_data_dir = unique_short_test_dir("console-reused-pid");
+    let mut reused_pid_cleanup = OwnedOperatorConsoleDaemon::new(&reused_pid_data_dir);
+    reused_pid_cleanup.record_owned_pid(std::process::id());
+    reused_pid_cleanup.assert_cleaned();
+
+    let stale_artifact_data_dir = unique_short_test_dir("console-stale-artifact");
+    let mut stale_artifact_cleanup = OwnedOperatorConsoleDaemon::new(&stale_artifact_data_dir);
+    fs::create_dir_all(&stale_artifact_data_dir).expect("create stale-artifact data directory");
+    let metadata_path = stale_artifact_data_dir.join(".botster-hub-runtime-daemon.json");
+    fs::write(&metadata_path, b"not owned daemon metadata")
+        .expect("write unverified daemon metadata");
+    let error = stale_artifact_cleanup
+        .cleanup()
+        .expect_err("cleanup must not unlink unverified runtime artifacts");
+    assert!(
+        error.contains("unverified runtime metadata remains"),
+        "{error}"
+    );
+    assert!(
+        metadata_path.exists(),
+        "cleanup oracle removed the artifact it was supposed to verify"
+    );
+    stale_artifact_cleanup.armed = false;
+    fs::remove_dir_all(&stale_artifact_data_dir).expect("remove stale-artifact data directory");
+}
+
+#[test]
+fn operator_console_detach_releases_reader_while_daemon_stays_running() {
+    let _guard = daemon_test_guard();
+    ensure_session_worker_binary();
+    let data_dir = unique_short_test_dir("console-detach-reader");
+    let mut daemon_cleanup = OwnedOperatorConsoleDaemon::new(&data_dir);
+    let mut console = OperatorConsolePty::spawn(&data_dir);
+    daemon_cleanup.wait_until_daemon_ready(&mut console);
+    let daemon_pid = *daemon_cleanup
+        .owned_pids()
+        .first()
+        .expect("capture detached daemon pid");
+    assert_detached_daemon_stdin(daemon_pid);
+    console.wait_for("botster-hub> ");
+    console.send(&[4]);
+    console.wait_for("detached=daemon_running");
+    console.wait_for_exit();
+    assert!(
+        console.reader.is_none(),
+        "console exit did not join its PTY reader"
+    );
+
+    let status = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("status")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .output()
+        .expect("probe daemon after detached console reader EOF");
+    assert!(
+        status.status.success(),
+        "daemon did not remain running after console reader EOF: {}",
+        command_output_text(&status)
+    );
+    daemon_cleanup.assert_cleaned();
+    fs::remove_dir_all(&data_dir).expect("remove detached-reader console data directory");
+}
+
+#[test]
 fn operator_console_readiness_failure_reaps_console_and_owned_daemon() {
     let _guard = daemon_test_guard();
     ensure_session_worker_binary();
@@ -3202,11 +3394,11 @@ fn operator_console_readiness_failure_reaps_console_and_owned_daemon() {
         output.contains("terminated owned child_pid="),
         "production failure diagnostic omitted terminated daemon evidence: {output}"
     );
-    assert!(
-        !daemon_cleanup.owned_pids().is_empty(),
-        "fixture did not capture the owned daemon pid before induced failure"
-    );
     daemon_cleanup.assert_cleaned();
+    assert!(
+        !process_exists(daemon_pid),
+        "induced readiness failure left exact daemon pid {daemon_pid} alive"
+    );
     fs::remove_dir_all(&data_dir).expect("remove readiness-failure console data directory");
 }
 
