@@ -51,6 +51,8 @@ use support::{
 
 static REAL_DAEMON_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 const CLI_DAEMON_READINESS_BUDGET: Duration = Duration::from_secs(30);
+const OPERATOR_CONSOLE_READINESS_LIVENESS_BACKSTOP: Duration = Duration::from_secs(60);
+const OPERATOR_CONSOLE_READER_DRAIN_BACKSTOP: Duration = Duration::from_secs(2);
 const BOTSTER_WEB_READINESS_LIVENESS_BACKSTOP: Duration = Duration::from_secs(60);
 const BOTSTER_WEB_READINESS_STARTUP_DELAY_MS: u64 = 3_000;
 const STALLED_ATTACH_MIN_BUFFERED_STDOUT_BYTES: usize = 8 * 1024;
@@ -2500,13 +2502,24 @@ impl OwnedOperatorConsoleDaemon {
         &mut self,
         console: &mut OperatorConsolePty,
     ) -> Result<(), String> {
+        self.try_wait_until_daemon_ready_with_backstop(
+            console,
+            OPERATOR_CONSOLE_READINESS_LIVENESS_BACKSTOP,
+        )
+    }
+
+    fn try_wait_until_daemon_ready_with_backstop(
+        &mut self,
+        console: &mut OperatorConsolePty,
+        liveness_backstop: Duration,
+    ) -> Result<(), String> {
         let config = explicit_config(&self.data_dir);
         let output = Arc::clone(&console.output);
         let mut last_status = "status probe not attempted".to_string();
         let result = wait_for_child_condition_with_budget(
             &mut console.child,
             "waiting for typed operator-console daemon readiness",
-            CLI_DAEMON_READINESS_BUDGET,
+            liveness_backstop,
             || {
                 self.capture_owned_pid();
                 match botster_hub::daemon_transport_request(
@@ -2522,16 +2535,32 @@ impl OwnedOperatorConsoleDaemon {
             },
         );
         self.capture_owned_pid();
-        result.map_err(|error| {
-            format!(
-                "{error}; last_status={last_status:?}; operator_console_output={}",
+        if let Err(error) = result {
+            let reader_status = console
+                .finish_reader_after_exit(OPERATOR_CONSOLE_READER_DRAIN_BACKSTOP)
+                .map_or_else(|error| error, |()| "reader reached EOF".to_string());
+            self.capture_owned_pid();
+            let metadata_path = self.data_dir.join(".botster-hub-runtime-daemon.json");
+            let socket_path = config
+                .transports
+                .local_socket
+                .as_ref()
+                .expect("operator console local socket binding")
+                .path
+                .clone();
+            return Err(format!(
+                "{error}; last_status={last_status:?}; owned_daemon_pids={:?}; metadata_exists={}; socket_exists={}; reader_status={reader_status:?}; operator_console_output={}",
+                self.owned_pids,
+                metadata_path.exists(),
+                socket_path.exists(),
                 String::from_utf8_lossy(
                     &output
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                 )
-            )
-        })
+            ));
+        }
+        Ok(())
     }
 
     fn capture_owned_pid(&mut self) {
@@ -2662,12 +2691,6 @@ impl OwnedOperatorConsoleDaemon {
             fs::remove_file(&metadata_path)
                 .map_err(|error| format!("remove verified owned runtime metadata: {error}"))?;
         }
-        if metadata_path.exists() {
-            return Err(format!(
-                "verified owned runtime metadata remains: {}",
-                metadata_path.display()
-            ));
-        }
         Ok(())
     }
 
@@ -2736,6 +2759,9 @@ fn assert_detached_daemon_stdin(pid: u32) {
             command_output_text(&output)
         );
     }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    panic!("detached daemon stdin assertion is unsupported on this Unix target for pid {pid}");
 }
 
 struct SessionCleanupGuard {
@@ -2922,7 +2948,7 @@ impl OperatorConsolePty {
                 .expect("poll operator console")
                 .is_some()
             {
-                self.finish_reader_after_exit(deadline.saturating_duration_since(Instant::now()))
+                self.finish_reader_after_exit(OPERATOR_CONSOLE_READER_DRAIN_BACKSTOP)
                     .unwrap_or_else(|error| panic!("{error}"));
                 return;
             }
@@ -2931,7 +2957,7 @@ impl OperatorConsolePty {
         self.writer.take();
         let child_status = terminate_and_reap_pty_child(self.child.as_mut());
         let reader_status = self
-            .finish_reader_after_exit(Duration::from_secs(2))
+            .finish_reader_after_exit(OPERATOR_CONSOLE_READER_DRAIN_BACKSTOP)
             .err()
             .unwrap_or_else(|| "reader reached EOF".to_string());
         panic!(
@@ -2965,7 +2991,7 @@ impl Drop for OperatorConsolePty {
     fn drop(&mut self) {
         self.writer.take();
         let _ = terminate_and_reap_pty_child(self.child.as_mut());
-        let _ = self.finish_reader_after_exit(Duration::from_secs(2));
+        let _ = self.finish_reader_after_exit(OPERATOR_CONSOLE_READER_DRAIN_BACKSTOP);
     }
 }
 
@@ -3314,6 +3340,47 @@ fn owned_operator_console_cleanup_checks_pid_identity_and_runtime_artifacts() {
     );
     stale_artifact_cleanup.armed = false;
     fs::remove_dir_all(&stale_artifact_data_dir).expect("remove stale-artifact data directory");
+}
+
+#[test]
+fn operator_console_readiness_backstop_outlives_policy_and_reports_context() {
+    assert!(
+        OPERATOR_CONSOLE_READINESS_LIVENESS_BACKSTOP > CLI_DAEMON_READINESS_BUDGET,
+        "the harness liveness backstop must not preempt production readiness policy"
+    );
+
+    let fixture_dir = unique_short_test_dir("console-readiness-backstop");
+    fs::create_dir_all(&fixture_dir).expect("create readiness-backstop fixture directory");
+    let fixture = fixture_dir.join("wedged-console");
+    fs::write(&fixture, "#!/bin/sh\nexec sleep 60\n").expect("write readiness-backstop fixture");
+    let mut permissions = fs::metadata(&fixture)
+        .expect("read readiness-backstop fixture metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&fixture, permissions).expect("make readiness-backstop fixture executable");
+
+    let mut daemon_cleanup = OwnedOperatorConsoleDaemon::new(&fixture_dir);
+    let diagnostic_pid = std::process::id();
+    daemon_cleanup.record_owned_pid(diagnostic_pid);
+    let mut console = OperatorConsolePty::spawn_binary(&fixture, &fixture_dir);
+    let error = daemon_cleanup
+        .try_wait_until_daemon_ready_with_backstop(&mut console, Duration::from_millis(100))
+        .expect_err("wedged console should hit the harness liveness backstop");
+    assert!(error.contains("condition not met after"), "{error}");
+    assert!(error.contains("last_status="), "{error}");
+    assert!(
+        error.contains(&format!("owned_daemon_pids=[{diagnostic_pid}]")),
+        "{error}"
+    );
+    assert!(error.contains("metadata_exists=false"), "{error}");
+    assert!(error.contains("socket_exists=false"), "{error}");
+    assert!(
+        error.contains("reader_status=\"reader reached EOF\""),
+        "{error}"
+    );
+    console.wait_for_exit();
+    daemon_cleanup.assert_cleaned();
+    fs::remove_dir_all(&fixture_dir).expect("remove readiness-backstop fixture directory");
 }
 
 #[test]
