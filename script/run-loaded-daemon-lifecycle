@@ -24,6 +24,7 @@ TEST_SID=
 TEST_RUN_TOKEN=
 RECORDED_PGID=
 RECORDED_SID=
+STARTED_PID=
 FINALIZED=0
 CLEANUP_LOG=
 OWNERSHIP_FILE=
@@ -62,7 +63,7 @@ validate_inputs() {
     invalid=1
   fi
   case "$TEST_TARGET" in
-    lifecycle-suite|focused-connection-lifecycle|focused-stalled-attach|focused-fast-exit-attach-diagnostic|focused-oversized-webrtc|focused-cli-smoke|focused-lua-worker-suite|focused-lua-session-worker-callers|full-suite-contention) ;;
+    lifecycle-suite|focused-process-ownership|focused-connection-lifecycle|focused-stalled-attach|focused-fast-exit-attach-diagnostic|focused-oversized-webrtc|focused-cli-smoke|focused-lua-worker-suite|focused-lua-session-worker-callers|full-suite-contention) ;;
     *) log "invalid test_target: $TEST_TARGET"; invalid=1 ;;
   esac
   if [[ ! "$REPETITIONS" =~ ^[0-9]+$ ]] || ((10#$REPETITIONS < 1 || 10#$REPETITIONS > 100)); then
@@ -93,7 +94,7 @@ validate_linux_runner() {
   local command_name
   local invalid=0
 
-  for command_name in awk bash free nproc ps setsid tee timeout; do
+  for command_name in awk bash free nproc ps setsid tee; do
     if ! command -v "$command_name" >/dev/null 2>&1; then
       log "missing required Linux runner command: $command_name"
       invalid=1
@@ -106,10 +107,74 @@ validate_linux_runner() {
   ((invalid == 0))
 }
 
+runner_platform() {
+  uname -s
+}
+
+validate_runner() {
+  local command_name
+  local invalid=0
+
+  for command_name in awk bash ps tee; do
+    if ! command -v "$command_name" >/dev/null 2>&1; then
+      log "missing required runner command: $command_name"
+      invalid=1
+    fi
+  done
+  case "$(runner_platform)" in
+    Linux)
+      validate_linux_runner || invalid=1
+      ;;
+    Darwin)
+      for command_name in perl; do
+        if ! command -v "$command_name" >/dev/null 2>&1; then
+          log "missing required Darwin process-group launcher command: $command_name"
+          invalid=1
+        fi
+      done
+      if [[ "$STRESS_PROFILE" != none ]]; then
+        log "Darwin campaigns require --stress-profile none"
+        invalid=1
+      fi
+      ;;
+    *)
+      log "unsupported runner platform: $(runner_platform)"
+      invalid=1
+      ;;
+  esac
+  ((invalid == 0))
+}
+
+start_owned_group() {
+  if [[ "$(runner_platform)" == Darwin ]]; then
+    perl -MPOSIX -e 'POSIX::setsid() >= 0 or die "setsid: $!"; exec @ARGV or die "exec: $!"' \
+      "$@" &
+  else
+    setsid "$@" &
+  fi
+  STARTED_PID=$!
+}
+
+runner_cpu_count() {
+  if [[ "$(runner_platform)" == Darwin ]]; then
+    sysctl -n hw.ncpu 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || printf '1\n'
+  else
+    nproc
+  fi
+}
+
 group_is_alive() {
   local pgid=$1
 
   ps -eo pgid=,stat= | awk -v pgid="$pgid" '$1 == pgid && $2 !~ /^Z/ { found=1 } END { exit !found }'
+}
+
+direct_child_is_running() {
+  local pid=$1
+  local state
+
+  state=$(ps -o stat= -p "$pid" 2>/dev/null | tr -d '[:space:]')
+  [[ -n "$state" && "$state" != Z* ]]
 }
 
 deactivate_group() {
@@ -147,6 +212,8 @@ deactivate_run_token() {
 session_process_rows() {
   local sid=$1
 
+  # macOS ps exposes a session pointer rather than Linux's numeric SID.
+  # Darwin attribution therefore uses the inherited run token instead.
   ps -eo pid=,ppid=,pgid=,sid=,stat=,comm=,args= \
     | awk -v sid="$sid" '
         $4 == sid && $5 !~ /^Z/ {
@@ -170,7 +237,42 @@ process_has_run_token() {
 
 run_token_process_rows() {
   local token=$1
-  local environment_file pid
+  local environment_file pid ps_error_file ps_rows_file token_file
+
+  if [[ "$(runner_platform)" == Darwin ]]; then
+    token_file="$ARTIFACT_DIR/run-token-query.$$.tmp"
+    ps_rows_file="$ARTIFACT_DIR/run-token-ps.$$.tmp"
+    ps_error_file="$ARTIFACT_DIR/run-token-ps.$$.stderr"
+    if [[ -z "$token" ]] || ! printf '%s\n' "$token" > "$token_file"; then
+      log "Darwin run-token census requires a non-empty readable token"
+      rm -f "$token_file" "$ps_rows_file"
+      return 1
+    fi
+    if ! ps eww -axo pid=,ppid=,pgid=,sess=,stat=,comm=,args= \
+      > "$ps_rows_file" 2> "$ps_error_file"; then
+      log "Darwin run-token census ps failed; see $(basename "$ps_error_file")"
+      rm -f "$token_file" "$ps_rows_file"
+      return 1
+    fi
+    if ! awk -v token_file="$token_file" '
+          BEGIN {
+            if ((getline token < token_file) != 1 || token == "") exit 2
+            close(token_file)
+            token = "BOTSTER_LOADED_RUN_TOKEN=" token
+          }
+          index($0, token) && $5 !~ /^Z/ {
+            printf "%s\t%s\t%s\t%s\t%s\t%s", $1, $2, $3, $4, $5, $6
+            for (field = 7; field <= NF; field++) printf "\t%s", $field
+            printf "\n"
+          }
+        ' "$ps_rows_file"; then
+      log "Darwin run-token census token read failed"
+      rm -f "$token_file" "$ps_rows_file"
+      return 1
+    fi
+    rm -f "$token_file" "$ps_rows_file" "$ps_error_file"
+    return
+  fi
 
   for environment_file in /proc/[0-9]*/environ; do
     [[ -r "$environment_file" ]] || continue
@@ -193,7 +295,11 @@ capture_run_token_survivors() {
   local rows_file="$ARTIFACT_DIR/run-token-rows.$$.tmp"
   local survivor_count
 
-  run_token_process_rows "$token" > "$rows_file"
+  if ! run_token_process_rows "$token" > "$rows_file"; then
+    cleanup_log "role=$role run_token=$token census_status=failed"
+    rm -f "$rows_file"
+    return 1
+  fi
   survivor_count=$(awk 'END { print NR + 0 }' "$rows_file")
   {
     printf 'role\tpid\tppid\tpgid\tsid\tstat\tcomm\targs\n'
@@ -295,7 +401,11 @@ cleanup_run_token() {
 
   [[ -n "$token" ]] || return 0
   for cleanup_pass in {1..3}; do
-    run_token_process_rows "$token" > "$rows_file"
+    if ! run_token_process_rows "$token" > "$rows_file"; then
+      cleanup_log "role=$role run_token=$token cleanup_census_status=failed"
+      cleanup_status=1
+      break
+    fi
     [[ -s "$rows_file" ]] || break
     awk -F '\t' '!seen[$3]++ { print $1 "\t" $3 }' "$rows_file" > "$groups_file"
     while IFS=$'\t' read -r representative_pid pgid; do
@@ -305,7 +415,12 @@ cleanup_run_token() {
   done
   rm -f "$rows_file" "$groups_file"
 
-  if [[ -n "$(run_token_process_rows "$token")" ]]; then
+  local remaining_rows
+  if ! remaining_rows=$(run_token_process_rows "$token"); then
+    cleanup_log "role=$role run_token=$token post_clean=census-failed"
+    return 1
+  fi
+  if [[ -n "$remaining_rows" ]]; then
     cleanup_log "role=$role run_token=$token post_clean=alive"
     cleanup_status=1
   else
@@ -447,6 +562,7 @@ record_group() {
   local role=$1
   local pid=$2
   local pgid=
+  local group_member_count=not-counted
 
   for _ in {1..100}; do
     pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d '[:space:]')
@@ -458,9 +574,21 @@ record_group() {
     log "failed to establish owned process group for role=$role pid=$pid pgid=${pgid:-missing}"
     return 1
   fi
+  if [[ "$(runner_platform)" == Darwin && "$role" == test ]]; then
+    for _ in {1..100}; do
+      group_member_count=$(ps -eo pgid= 2>/dev/null | awk -v pgid="$pgid" '$1 == pgid { count++ } END { print count + 0 }')
+      ((group_member_count > 1)) && break
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 0.05
+    done
+    if ((group_member_count < 2)); then
+      log "owned Darwin test group did not contain the launched test tree role=$role pid=$pid pgid=$pgid members=$group_member_count"
+      return 1
+    fi
+  fi
   printf '%s\t%s\t%s\t%s\n' "$role" "$pid" "$pgid" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$OWNERSHIP_FILE"
   printf '%s\t%s\t%s\t%s\n' "$role" "$pid" "$pgid" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$ACTIVE_OWNERSHIP_FILE"
-  log "owned_group role=$role pid=$pid pgid=$pgid"
+  log "owned_group role=$role pid=$pid pgid=$pgid members=$group_member_count"
   RECORDED_PGID=$pgid
 }
 
@@ -527,14 +655,14 @@ start_load() {
 
   # Variables in this single-quoted program expand inside the owned Bash group.
   # shellcheck disable=SC2016
-  setsid bash -c '
+  start_owned_group bash -c '
     workers=$1
     for ((worker = 1; worker <= workers; worker++)); do
       bash -c "while :; do :; done" &
     done
     wait
-  ' load "$workers" &
-  LOAD_PID=$!
+  ' load "$workers"
+  LOAD_PID=$STARTED_PID
   if ! record_group load "$LOAD_PID"; then
     terminate_unrecorded_process load "$LOAD_PID"
     LOAD_PID=
@@ -548,7 +676,7 @@ start_sampler() {
 
   # Variables in this single-quoted program expand inside the owned Bash group.
   # shellcheck disable=SC2016
-  setsid bash -c '
+  start_owned_group bash -c '
     samples_file=$1
     while :; do
       {
@@ -562,8 +690,8 @@ start_sampler() {
       } | tee -a "$samples_file"
       sleep 5
     done
-  ' sampler "$samples_file" &
-  SAMPLER_PID=$!
+  ' sampler "$samples_file"
+  SAMPLER_PID=$STARTED_PID
   if ! record_group sampler "$SAMPLER_PID"; then
     terminate_unrecorded_process sampler "$SAMPLER_PID"
     SAMPLER_PID=
@@ -601,39 +729,51 @@ run_repetition() {
 
   # Variables in this single-quoted program expand inside the owned Bash group.
   # shellcheck disable=SC2016
-  setsid bash -c '
+  start_owned_group bash -c '
     set -o pipefail
     subject_dir=$1
     run_log=$2
-    timeout_seconds=$3
-    run_token=$4
-    shift 4
+    run_token=$3
+    shift 3
     export BOTSTER_LOADED_RUN_TOKEN="$run_token"
     cd "$subject_dir"
-    timeout --signal=TERM --kill-after=30 "${timeout_seconds}s" "$@" 2>&1 | tee "$run_log"
-  ' test "$SUBJECT_DIR" "$run_log" "$timeout_seconds" "$run_token" "${command[@]}" &
-  TEST_PID=$!
+    "$@" 2>&1 | tee "$run_log"
+  ' test "$SUBJECT_DIR" "$run_log" "$run_token" "${command[@]}"
+  TEST_PID=$STARTED_PID
   if ! record_group test "$TEST_PID"; then
     terminate_unrecorded_process test "$TEST_PID"
     TEST_PID=
     return 1
   fi
   TEST_PGID=$RECORDED_PGID
-  if ! record_session test "$TEST_PID"; then
-    terminate_unrecorded_process test "$TEST_PID"
-    TEST_PID=
-    TEST_PGID=
-    return 1
+  if [[ "$(runner_platform)" == Linux ]]; then
+    if ! record_session test "$TEST_PID"; then
+      terminate_unrecorded_process test "$TEST_PID"
+      TEST_PID=
+      TEST_PGID=
+      return 1
+    fi
+    TEST_SID=$RECORDED_SID
   fi
-  TEST_SID=$RECORDED_SID
-  wait "$TEST_PID"
-  status=$?
+  while direct_child_is_running "$TEST_PID" && ((SECONDS - started_at < timeout_seconds)); do
+    sleep 0.1
+  done
+  if direct_child_is_running "$TEST_PID"; then
+    cleanup_log "role=test pid=$TEST_PID pgid=$TEST_PGID action=timeout"
+    cleanup_group test "$TEST_PID" "$TEST_PGID" yes || true
+    status=124
+  else
+    wait "$TEST_PID"
+    status=$?
+  fi
   owned_survivor_evidence=$(printf '%s/run-%03d-owned-survivors.tsv' "$ARTIFACT_DIR" "$repetition")
   verify_and_cleanup_run_token test "$TEST_RUN_TOKEN" "$owned_survivor_evidence" || status=1
   TEST_RUN_TOKEN=
-  survivor_evidence=$(printf '%s/run-%03d-session-survivors.tsv' "$ARTIFACT_DIR" "$repetition")
-  verify_and_cleanup_session test "$TEST_PID" "$TEST_SID" "$survivor_evidence" || status=1
-  TEST_SID=
+  if [[ -n "$TEST_SID" ]]; then
+    survivor_evidence=$(printf '%s/run-%03d-session-survivors.tsv' "$ARTIFACT_DIR" "$repetition")
+    verify_and_cleanup_session test "$TEST_PID" "$TEST_SID" "$survivor_evidence" || status=1
+    TEST_SID=
+  fi
   cleanup_group test "$TEST_PID" "$TEST_PGID" no || status=1
   TEST_PID=
   TEST_PGID=
@@ -705,7 +845,7 @@ main() {
     log "subject checkout must contain an executable test.sh: ${SUBJECT_DIR:-missing}"
     return 2
   fi
-  validate_linux_runner || return 2
+  validate_runner || return 2
   SUBJECT_DIR=$(cd "$SUBJECT_DIR" && pwd)
 
   RUN_TIMEOUT_SECONDS=${BOTSTER_LOADED_RUN_TIMEOUT_SECONDS:-$DEFAULT_RUN_TIMEOUT_SECONDS}
@@ -722,6 +862,9 @@ main() {
   case "$TEST_TARGET" in
     lifecycle-suite)
       test_command=(./test.sh --test hub_daemon_lifecycle_test -- --nocapture)
+      ;;
+    focused-process-ownership)
+      test_command=(./test.sh --test hub_daemon_lifecycle_test process_ownership_ -- --nocapture)
       ;;
     focused-connection-lifecycle)
       test_command=(./test.sh --test hub_daemon_lifecycle_test focused_connection_lifecycle_is_bounded_event_driven_and_counter_visible -- --exact --nocapture)
@@ -754,9 +897,11 @@ main() {
     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$RUN_TIMEOUT_SECONDS" "$CAMPAIGN_TIMEOUT_SECONDS" \
     >> "$ARTIFACT_DIR/campaign-summary.txt"
 
-  cpu_count=$(nproc)
+  cpu_count=$(runner_cpu_count)
   start_load "$cpu_count" || return 1
-  start_sampler "$ARTIFACT_DIR/resource-samples.log" || return 1
+  if [[ "$(runner_platform)" == Linux ]]; then
+    start_sampler "$ARTIFACT_DIR/resource-samples.log" || return 1
+  fi
 
   campaign_deadline=$((SECONDS + CAMPAIGN_TIMEOUT_SECONDS))
   for ((run = 1; run <= 10#$REPETITIONS; run++)); do

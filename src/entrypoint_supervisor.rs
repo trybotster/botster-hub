@@ -175,7 +175,7 @@ impl EntrypointSupervisor {
         self.processes.insert(key.clone(), process);
         let _ = record;
         if let Some((_watcher, events)) = launch_result_watcher {
-            self.wait_for_launch_result(&key, &events)
+            self.wait_for_launch_result(&key, &events, LAUNCH_RESULT_READINESS_BUDGET)
         } else {
             Ok(snapshot)
         }
@@ -276,8 +276,9 @@ impl EntrypointSupervisor {
         &mut self,
         key: &EntrypointKey,
         events: &Receiver<notify::Result<notify::Event>>,
+        readiness_budget: Duration,
     ) -> EntrypointSupervisorResult<EntrypointProcessSnapshot> {
-        let deadline = Instant::now() + LAUNCH_RESULT_READINESS_BUDGET;
+        let deadline = Instant::now() + readiness_budget;
         let launch_result_path = self
             .processes
             .get(key)
@@ -315,11 +316,13 @@ impl EntrypointSupervisor {
 
             let now = Instant::now();
             if now >= deadline {
-                return Err(EntrypointSupervisorError::ReadinessTimeout {
+                let error = EntrypointSupervisorError::ReadinessTimeout {
                     package_name: key.package_name.clone(),
                     entrypoint_id: key.entrypoint_id.clone(),
                     details: readiness_details(&snapshot),
-                });
+                };
+                process.stop();
+                return Err(error);
             }
             let wait = (deadline - now).min(Duration::from_millis(50));
             match events.recv_timeout(wait) {
@@ -337,9 +340,11 @@ impl EntrypointSupervisor {
                     launch_result_may_have_changed = true;
                 }
                 Ok(Err(error)) => {
+                    process.stop();
                     return Err(EntrypointSupervisorError::Watch(error.to_string()));
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    process.stop();
                     return Err(EntrypointSupervisorError::Watch(
                         "launch-result watcher disconnected".to_string(),
                     ));
@@ -417,29 +422,65 @@ impl SupervisedProcess {
 
     fn stop(&mut self) {
         self.refresh();
-        if self.exited_at.is_some() {
+        let pid = self.child.id();
+        if self.exited_at.is_some() && !supervised_process_group_exists(pid) {
             self.mark_stopped();
             return;
         }
-        kill_process_group(self.child.id(), libc::SIGTERM);
+        if let Err(error) = signal_process_group_or_child(pid, libc::SIGTERM) {
+            self.diagnostics.push(EntrypointDiagnostic {
+                kind: "cleanup_signal".to_string(),
+                message: bounded_message(error.to_string()),
+            });
+            return;
+        }
         let deadline = std::time::Instant::now() + STOP_GRACE;
         while std::time::Instant::now() < deadline {
             self.refresh();
-            if self.exited_at.is_some() {
+            if self.exited_at.is_some() && !supervised_process_group_exists(pid) {
                 self.mark_stopped();
                 return;
             }
             thread::sleep(Duration::from_millis(20));
         }
-        kill_process_group(self.child.id(), libc::SIGKILL);
-        let _ = self.child.wait().map(|status| self.mark_exit(status));
+        if let Err(error) = signal_process_group_or_child(pid, libc::SIGKILL) {
+            self.diagnostics.push(EntrypointDiagnostic {
+                kind: "cleanup_signal".to_string(),
+                message: bounded_message(error.to_string()),
+            });
+            return;
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            self.refresh();
+            if self.exited_at.is_some() && !supervised_process_group_exists(pid) {
+                self.mark_stopped();
+                return;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        self.diagnostics.push(EntrypointDiagnostic {
+            kind: "cleanup_timeout".to_string(),
+            message: format!(
+                "process {} did not exit within the bounded cleanup deadline",
+                pid
+            ),
+        });
         self.mark_stopped();
-        self.refresh();
     }
 
     fn mark_exit(&mut self, status: ExitStatus) {
         self.exited_at = Some(now_seconds());
         self.exit_status = Some(exit_status_label(status));
+        if let Some(path) = self.launch_result_path.take()
+            && let Err(error) = fs::remove_file(&path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            self.diagnostics.push(EntrypointDiagnostic {
+                kind: "launch_result_cleanup".to_string(),
+                message: bounded_message(error.to_string()),
+            });
+        }
         let state = if status.success() {
             ProcessState::Exited
         } else {
@@ -503,6 +544,18 @@ impl SupervisedProcess {
             diagnostics: self.diagnostics.clone(),
             launch_result: self.launch_result.clone(),
         }
+    }
+}
+
+impl Drop for SupervisedProcess {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+impl Drop for EntrypointSupervisor {
+    fn drop(&mut self) {
+        self.stop_all();
     }
 }
 
@@ -695,10 +748,30 @@ fn drain_output(
     }
 }
 
-fn kill_process_group(pid: u32, signal: libc::c_int) {
-    unsafe {
-        libc::killpg(pid as libc::pid_t, signal);
+fn signal_process_group_or_child(pid: u32, signal: libc::c_int) -> std::io::Result<()> {
+    if unsafe { libc::killpg(pid as libc::pid_t, signal) } == 0 {
+        return Ok(());
     }
+    let group_error = std::io::Error::last_os_error();
+    if group_error.raw_os_error() != Some(libc::ESRCH) {
+        return Err(group_error);
+    }
+    if unsafe { libc::kill(pid as libc::pid_t, signal) } == 0 {
+        return Ok(());
+    }
+    let child_error = std::io::Error::last_os_error();
+    if child_error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(())
+    } else {
+        Err(child_error)
+    }
+}
+
+fn supervised_process_group_exists(pid: u32) -> bool {
+    if unsafe { libc::killpg(pid as libc::pid_t, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
 }
 
 fn exit_status_label(status: ExitStatus) -> String {
@@ -786,7 +859,96 @@ fn failed_snapshot(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::process::CommandExt;
     use std::sync::mpsc::Sender;
+
+    fn unique_test_path(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "botster-entrypoint-supervisor-{label}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("test clock")
+                .as_nanos()
+        ))
+    }
+
+    fn controlled_running_process(
+        descendant_pid_path: &Path,
+        launch_result_path: PathBuf,
+    ) -> (SupervisedProcess, libc::pid_t) {
+        let mut command = Command::new("sh");
+        command
+            .args([
+                "-c",
+                &format!(
+                    "sleep 60 & printf '%s\\n' \"$!\" > '{}'; wait",
+                    descendant_pid_path.display()
+                ),
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let child = command.spawn().expect("spawn controlled process group");
+        let process = supervised_running_process(child, launch_result_path);
+        let descendant_pid = wait_for_pid_file(descendant_pid_path);
+        (process, descendant_pid)
+    }
+
+    fn supervised_running_process(child: Child, launch_result_path: PathBuf) -> SupervisedProcess {
+        SupervisedProcess {
+            child,
+            environment: BTreeMap::new(),
+            started_at: now_seconds(),
+            exited_at: None,
+            exit_status: None,
+            stdout: None,
+            stderr: None,
+            diagnostics: Vec::new(),
+            launch_result: Some(RunnableEntrypointLaunchResult {
+                entrypoint_id: "web".to_string(),
+                process_state: RunnableEntrypointProcessState::Running,
+                local_url: None,
+            }),
+            launch_result_path: Some(launch_result_path),
+            state: ProcessState::Running,
+            pending_terminal_state: None,
+            output_finalization_deadline: None,
+        }
+    }
+
+    fn wait_for_pid_file(path: &Path) -> libc::pid_t {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(pid) = fs::read_to_string(path)
+                .ok()
+                .and_then(|contents| contents.trim().parse().ok())
+            {
+                return pid;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "controlled descendant pid was not published as parseable content: {}",
+                path.display()
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn assert_pid_gone(pid: libc::pid_t) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while unsafe { libc::kill(pid, 0) } == 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "pid {pid} survived");
+    }
 
     fn controlled_failed_process() -> (SupervisedProcess, Sender<Vec<u8>>, Sender<Vec<u8>>) {
         let child = Command::new("sh")
@@ -956,5 +1118,185 @@ mod tests {
                 .map(|result| &result.process_state),
             Some(RunnableEntrypointProcessState::Failed)
         ));
+    }
+
+    #[test]
+    fn supervisor_drop_terminates_and_reaps_owned_process_group() {
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "while :; do sleep 1; done"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let child = command.spawn().expect("spawn controlled process group");
+        let pid = child.id();
+        let key = EntrypointKey {
+            package_name: "fixture".to_string(),
+            entrypoint_id: "web".to_string(),
+        };
+        let mut supervisor = EntrypointSupervisor::default();
+        supervisor.processes.insert(
+            key,
+            SupervisedProcess {
+                child,
+                environment: BTreeMap::new(),
+                started_at: now_seconds(),
+                exited_at: None,
+                exit_status: None,
+                stdout: None,
+                stderr: None,
+                diagnostics: Vec::new(),
+                launch_result: None,
+                launch_result_path: None,
+                state: ProcessState::Running,
+                pending_terminal_state: None,
+                output_finalization_deadline: None,
+            },
+        );
+
+        drop(supervisor);
+
+        assert_eq!(
+            unsafe { libc::kill(pid as libc::pid_t, 0) },
+            -1,
+            "supervisor drop must leave no owned child"
+        );
+    }
+
+    #[test]
+    fn missing_descendant_pid_publication_reaps_owned_process_group() {
+        let descendant_pid_path = unique_test_path("missing-descendant");
+        let launch_result_path = unique_test_path("missing-result");
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "sleep 60 & wait"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let child = command
+            .spawn()
+            .expect("spawn missing-publication process group");
+        let pid = child.id();
+        let process = supervised_running_process(child, launch_result_path.clone());
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _process = process;
+            let _ = wait_for_pid_file(&descendant_pid_path);
+        }));
+
+        assert!(
+            result.is_err(),
+            "missing descendant PID publication must fail loudly"
+        );
+        assert_pid_gone(pid as libc::pid_t);
+        assert!(
+            !supervised_process_group_exists(pid),
+            "missing publication must leave no owned process group"
+        );
+        let _ = fs::remove_file(descendant_pid_path);
+        let _ = fs::remove_file(launch_result_path);
+    }
+
+    #[test]
+    fn readiness_timeout_stops_real_owned_process_group_and_descendant() {
+        let descendant_pid_path = unique_test_path("timeout-descendant");
+        let launch_result_path = unique_test_path("timeout-result");
+        let (process, descendant_pid) =
+            controlled_running_process(&descendant_pid_path, launch_result_path);
+        let key = EntrypointKey {
+            package_name: "fixture".to_string(),
+            entrypoint_id: "web".to_string(),
+        };
+        let mut supervisor = EntrypointSupervisor::default();
+        supervisor.processes.insert(key.clone(), process);
+        let (_events_tx, events) = mpsc::channel();
+
+        let error = supervisor
+            .wait_for_launch_result(&key, &events, Duration::from_millis(100))
+            .expect_err("missing launch result must time out");
+
+        assert!(matches!(
+            error,
+            EntrypointSupervisorError::ReadinessTimeout { .. }
+        ));
+        assert!(
+            supervisor.processes[&key].exited_at.is_some(),
+            "readiness timeout must reap the supervised child"
+        );
+        assert_pid_gone(descendant_pid);
+        let _ = fs::remove_file(descendant_pid_path);
+    }
+
+    #[test]
+    fn disconnected_launch_result_watcher_stops_owned_process_group() {
+        let descendant_pid_path = unique_test_path("watch-descendant");
+        let launch_result_path = unique_test_path("watch-result");
+        let (process, descendant_pid) =
+            controlled_running_process(&descendant_pid_path, launch_result_path);
+        let key = EntrypointKey {
+            package_name: "fixture".to_string(),
+            entrypoint_id: "web".to_string(),
+        };
+        let mut supervisor = EntrypointSupervisor::default();
+        supervisor.processes.insert(key.clone(), process);
+        let (_events_tx, events) = mpsc::channel::<notify::Result<notify::Event>>();
+        drop(_events_tx);
+
+        let error = supervisor
+            .wait_for_launch_result(&key, &events, Duration::from_secs(1))
+            .expect_err("disconnected watcher must fail readiness");
+
+        assert!(
+            matches!(error, EntrypointSupervisorError::Watch(message) if message.contains("disconnected"))
+        );
+        assert!(supervisor.processes[&key].exited_at.is_some());
+        assert_pid_gone(descendant_pid);
+        let _ = fs::remove_file(descendant_pid_path);
+    }
+
+    #[test]
+    fn observed_exit_removes_launch_result_file() {
+        let launch_result_path = unique_test_path("exit-result");
+        fs::write(&launch_result_path, b"{}").expect("write launch result fixture");
+        let child = Command::new("sh")
+            .args(["-c", "exit 0"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn exiting child");
+        let mut process = SupervisedProcess {
+            child,
+            environment: BTreeMap::new(),
+            started_at: now_seconds(),
+            exited_at: None,
+            exit_status: None,
+            stdout: None,
+            stderr: None,
+            diagnostics: Vec::new(),
+            launch_result: None,
+            launch_result_path: Some(launch_result_path.clone()),
+            state: ProcessState::Running,
+            pending_terminal_state: None,
+            output_finalization_deadline: None,
+        };
+
+        observe_child_exit(&mut process);
+
+        assert!(!launch_result_path.exists());
+        assert!(process.launch_result_path.is_none());
     }
 }
