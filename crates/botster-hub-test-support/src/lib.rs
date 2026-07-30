@@ -1648,7 +1648,6 @@ pub fn run_session_lifecycle_subscription_conformance(
         ));
     }
 
-    let spawn_to_resize_started_at = Instant::now();
     let spawn = botster_hub_client::request(
         endpoint,
         DaemonRequest::Spawn {
@@ -1710,10 +1709,6 @@ pub fn run_session_lifecycle_subscription_conformance(
         },
     )
     .map_err(|error| session_lifecycle_error("lifecycle patch", error.to_string()))?;
-    eprintln!(
-        "session_lifecycle_conformance_spawn_to_resize_ack_ms={}",
-        spawn_to_resize_started_at.elapsed().as_millis()
-    );
     let resize_sequence = loop {
         match first
             .next_frame()
