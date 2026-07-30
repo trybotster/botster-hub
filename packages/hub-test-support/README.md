@@ -101,7 +101,8 @@ Only `read_screen_text` is renderable restored content; `snapshot` and
 version 0.1.5 / revision 12 exposes lossy string history. Neither is current
 binary-history contract authority.
 
-Version 0.1.17 publishes protocol version 4 / conformance revision 25 and
+Version 0.1.17 is prepared in this repository; it is not published by this
+change. It carries protocol version 4 / conformance revision 25 and
 depends on `@trybotster/ui-contract@0.2.0` for the canonical UiNode,
 UiActionRequest, UiActionResult, package surface, and package navigation
 declarations and conformance fixtures. It also carries the optional

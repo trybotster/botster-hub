@@ -119,9 +119,10 @@ The only bound-id form is the existing row-relative sentinel:
 { "id": { "$bind": "@/session_uuid" } }
 ```
 
-It is valid only inside a `UiBindList.item_template`, where a current producer
-row exists. Resolve it after `where` filtering and before the expanded UiNode
-enters normal renderer/focus/action handling. The referenced row field must be
+It is valid only on the direct `UiBindList.item_template` root, where a current
+producer row exists. Descendant nodes remain literal-only in this revision.
+Resolve it after `where` filtering and before the expanded UiNode enters normal
+renderer/focus/action handling. The referenced row field must be
 a non-blank JSON string after trimming, matching the existing
 `validate_stable_id` rule. There is no coercion, interpolation, concatenation,
 fallback, row index, or client-local synthetic id. Absolute paths, unresolved
@@ -265,7 +266,7 @@ producer-owned uniqueness already matches the `/session` row identity.
 
 5. **Hand the canonical seam to the downstream owner.**
    - After merge/publication, downstream `botster-tui` ticket
-     `ticket_1785298229_854008` must repin the merged Hub contract, remove its
+     `ticket_1785438029_926883` must repin the merged Hub contract, remove its
      explicit multi-row/literal-id safety rejection, resolve the authored id
      before expansion enters renderer state, and prove that focusing and
      keyboard-activating row 2 of the canonical button oracle dispatches
@@ -313,26 +314,25 @@ producer-owned uniqueness already matches the `/session` row identity.
   prerequisite against the botster-core target instead of forking a private
   validator.
 - **botster-tui:** downstream consumer ticket
-  `ticket_1785298229_854008` is unblocked by this producer ticket. It owns
+  `ticket_1785438029_926883` is unblocked by this producer ticket. It owns
   expansion, focus, keyboard dispatch, and action-state proof.
 - **botster-workspaces:** downstream product consumer owns its surface and
   row actions. It consumes the generic TUI behavior; Hub must not acquire
   Workspaces policy.
-- **botster-tui-kit:** continues to own generic focus/input primitives. Its
-  current `assert_custom_fallbacks_resolve` helper validates each complete
-  fixture through `validate_ui_node_with_capabilities`, then recursively
-  validates only static custom fallbacks; it does not revalidate every
-  BindList item template as a detached root. The canonical button oracle
-  therefore does not require a kit change. The downstream repin must run the
-  kit conformance suite to prove that claim. If the actual repin reveals a
-  detached-template caller or other required kit edit, create and register a
-  separately routed kit dependency against
-  `tgt_3dfae49c02454037bf13554f552baf7f` before changing kit code.
+- **botster-tui-kit:** continues to own generic focus/input primitives.
+  Validation semantics remain compatible because its custom-fallback helper
+  does not revalidate BindList item templates as detached roots. However,
+  changing `UiNode.id` from `Option<UiNodeId>` to
+  `Option<UiAuthoredNodeId>` is source-breaking at the kit's literal-id access
+  and construction sites. That repin is separately routed as
+  `ticket_1785443243_233047` against
+  `tgt_3dfae49c02454037bf13554f552baf7f`; downstream TUI ticket
+  `ticket_1785438029_926883` depends on it through
+  `dependency_1785443246_930722`.
 
-No prerequisite dependency is currently required for this Hub producer run.
-The read-only kit audit above makes that a verified claim rather than an
-assumption. The known dependency direction is downstream: TUI and Workspaces
-wait for the merged/published Hub contract.
+The kit prerequisite was discovered by Review's exact repin compile proof. Hub
+still must not edit kit code; TUI and Workspaces wait for the merged/published
+Hub contract and the separately routed kit adaptation.
 
 ## Assumptions and unknowns
 
@@ -526,7 +526,7 @@ changes, or proof of the real runtime path.
      coordinates, then verify the public registry before downstream repinning.
 
 6. **Required downstream proof**
-   - In `ticket_1785298229_854008`, repin the merged/published Hub contract
+   - In `ticket_1785438029_926883`, repin the merged/published Hub contract
      without a path override; materialize ids before renderer expansion; remove
      the ambiguity guard; render the two canonical matching buttons; focus row
      2; send keyboard activation; and assert

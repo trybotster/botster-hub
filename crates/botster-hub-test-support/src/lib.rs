@@ -1038,7 +1038,7 @@ pub fn materialize_session_plugin_rows(
     let expected_class = oracle
         .pointer("/where/lifecycle_class")
         .and_then(serde_json::Value::as_str)
-        .expect("canonical oracle lifecycle class");
+        .ok_or_else(|| "canonical oracle is missing its lifecycle_class filter".to_string())?;
     let entities = materialize_session_entities(frames)?;
     let mut seen = BTreeSet::new();
     let mut rows = Vec::new();

@@ -23,12 +23,19 @@ rejects mismatched result identity as `invalid_action_result`.
 
 `UiNode.id` is an authored identity: it may be either a literal `UiNodeId` or
 an item-relative `{ "$bind": "@/field" }` only on a
-`UiBindList.item_template`. Clients resolve that binding from the selected row
-after `where` filtering and before the node enters renderer, focus, or action
-state. The resolved value must be a non-blank string and duplicate realized
-ids are contract errors. Root nodes, static children, and `empty_template`
-remain literal-only; action request/result `node_id` also remains a literal
-`UiNodeId`.
+`UiBindList.item_template` root. Descendants of that root remain literal-only;
+multi-control descendant identity is separately tracked in
+`ticket_1785443253_376782`. Clients resolve the root binding from the selected
+row after `where` filtering and before the node enters renderer, focus, or
+action state. The resolved value must be a non-blank string and duplicate
+realized ids are contract errors. Root nodes outside BindList, static children,
+item-template descendants, and `empty_template` remain literal-only; action
+request/result `node_id` also remains a literal `UiNodeId`.
+
+The generated JSON Schema can describe the literal-or-binding wire union, but
+cannot express the BindList row context. Schema validity is therefore necessary
+but not sufficient; the Rust/Hub validator is authoritative for the direct
+item-template-root restriction.
 
 Regenerate or check committed assets:
 
