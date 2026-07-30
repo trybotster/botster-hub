@@ -125,6 +125,14 @@ fn typescript_and_schema_encode_wire_names_and_optionality() {
         schema.pointer("/$defs/UiActionResult/properties/node_id/$ref"),
         Some(&serde_json::json!("#/$defs/UiNodeId"))
     );
+    assert_eq!(
+        schema
+            .pointer("/$defs/UiAuthoredNodeId/oneOf/1/description")
+            .and_then(serde_json::Value::as_str),
+        Some(
+            "Schema validation is necessary but not sufficient: the Rust/Hub validator admits a bound id only on the direct UiBindList.item_template root, where row context exists."
+        )
+    );
 
     assert_serde_fields_match_typescript::<UiActionRequest>(
         serde_json::json!({

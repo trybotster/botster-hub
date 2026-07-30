@@ -251,6 +251,7 @@ pub fn json_schema() -> Value {
                 "oneOf": [
                     { "$ref": "#/$defs/UiNodeId" },
                     {
+                        "description": "Schema validation is necessary but not sufficient: the Rust/Hub validator admits a bound id only on the direct UiBindList.item_template root, where row context exists.",
                         "type": "object",
                         "additionalProperties": false,
                         "required": ["$bind"],

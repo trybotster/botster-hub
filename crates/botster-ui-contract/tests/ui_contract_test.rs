@@ -2140,6 +2140,34 @@ fn bound_node_identity_is_valid_only_on_a_bind_list_item_template() {
         .validate()
         .expect("BindList item template supplies row context");
 
+    let nested_bound_id = serde_json::from_value::<UiNode>(json!({
+        "type": "panel",
+        "id": "sessions",
+        "props": { "title": "Sessions" },
+        "children": [{
+            "$kind": "bind_list",
+            "source": "/session",
+            "item_template": {
+                "type": "stack",
+                "id": "session-row",
+                "props": { "direction": "vertical" },
+                "children": [{
+                    "type": "button",
+                    "id": { "$bind": "@/session_uuid" },
+                    "props": {
+                        "label": "Select session",
+                        "action": { "id": "contract.action" }
+                    }
+                }]
+            }
+        }]
+    }))
+    .expect("nested bound-id tree");
+    assert_error_contains(
+        nested_bound_id,
+        "item_template root, not on its descendants",
+    );
+
     for invalid in [
         json!({
             "type": "panel",

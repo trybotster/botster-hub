@@ -260,8 +260,11 @@ Rust uses `materialize_session_plugin_bindings`; Node uses
 `materializeSessionPluginBindingScenario`. The additive
 `materialize_session_plugin_rows` and `materializeSessionPluginRowScenario`
 helpers resolve the current-row Button's authored id and action payload after
-filtering. Only a BindList item-template id accepts `@/field`; roots, static
-children, empty templates, and action request/result `node_id` remain literal.
+filtering. Only the direct BindList item-template root id accepts `@/field`;
+roots outside BindList, item-template descendants, static children, empty
+templates, and action request/result `node_id` remain literal. Descendant
+identity for multi-control rows is separately tracked in
+`ticket_1785443253_376782`.
 Blank, non-string, or duplicate realized ids fail. These are Hub-owned
 reference materializers, not proof that the shipped Web or TUI renderer already
 resolves bindings.
@@ -1303,4 +1306,4 @@ The matrix marks JSON plugin surface render/action dispatch and the Hub-owned
 `/session` producer/reference binding contract as supported. It explicitly
 does not claim shipped Web/TUI rendering: browser ticket
 `ticket_1785298229_125024` and terminal ticket
-`ticket_1785298229_854008` own those production entity-store/binding paths.
+`ticket_1785438029_926883` owns those production entity-store/binding paths.

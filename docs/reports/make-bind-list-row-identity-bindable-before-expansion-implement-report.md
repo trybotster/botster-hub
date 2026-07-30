@@ -85,10 +85,18 @@ Web, Workspaces, terminal, or Project Pipelines source was edited. Core was
 consumed at the lockfile pin
 `5846fc776d31e2b6c98a8d932f50a31078743901`.
 
-The separately routed downstream renderer work remains
-`ticket_1785298229_854008`. That ticket must repin the merged and publicly
+The separately routed downstream renderer work is
+`ticket_1785438029_926883`. That ticket must repin the merged and publicly
 available Hub packages and prove expansion, interaction, and duplicate-ID
-rejection without a path override.
+rejection without a path override. Review proved that the public
+`UiNode.id` type change is source-breaking for TUI Kit even though its
+validation semantics remain compatible. The required kit repin and literal-id
+call-site adaptation is `ticket_1785443243_233047`, and the TUI ticket depends
+on it through `dependency_1785443246_930722`.
+
+Direct item-template-root identity is the intentional ceiling of this contract
+revision. Multi-control descendant identity is separately routed as Hub ticket
+`ticket_1785443253_376782`.
 
 ## Verification
 
@@ -138,9 +146,9 @@ The clean-tree release dry-run passed for both coordinates. Fresh independent
 consumer tarballs had these SHA-256 checksums:
 
 - `@trybotster/ui-contract@0.2.0`:
-  `ffd4358de030985367f4e777495b9913da56e07d701851515c1f5bfdbd1afaa8`
+  `ccca09e17b8d43a2abb921a0d2a35472a1e69f2be03bcec50285745a23360138`
 - `@trybotster/hub-test-support@0.1.17`:
-  `d79dbf2ce26c9e10dc5824b096b3dec1f5bb2385926a7e2735631f424ef7382b`
+  `0bd559e3c8d377be16a28ae072faf0c0bbf31859e522bba509c0b04e3893890c`
 
 A fresh consumer installed exactly those two tarballs. Its runtime smoke loaded
 contract version `0.2.0`, schema version `0.2.0`, fixture revision 25, and
@@ -149,7 +157,10 @@ payloads. TypeScript `7.0.2` under strict NodeNext settings compiled a bound
 `UiNode.id` and rejected `{ $bind: "@/session_uuid" }` for
 `UiActionRequest.node_id` with `TS2322`.
 
-There are no code deviations from the approved plan. Public publication is
+There are no implementation-scope deviations from the approved plan. Review
+corrected two plan/handoff assumptions: the contract type change does require a
+separately routed TUI Kit repin, and the live downstream owner is
+`ticket_1785438029_926883` rather than its closed predecessor. Public publication is
 intentionally deferred until this implementation is reviewed and merged; the
 verified operator command is `script/publish-npm-packages`, which publishes UI
 contract before Hub test support. Until those packages are public and the
@@ -160,3 +171,26 @@ No missing vault guidance was discovered. The existing durable row-identity
 note should not be updated yet: its plan requires implementation, exact runtime
 proof, tarball proof, and downstream repin before appending verification
 evidence.
+
+## Review corrections
+
+Review findings were addressed without crossing the Hub charter:
+
+- The published Rust row materializer now returns an error instead of
+  panicking if the canonical lifecycle filter is absent.
+- The generated schema and package README state that schema validation cannot
+  enforce row context and that the Rust/Hub validator is authoritative.
+- The direct item-template-root ceiling is explicit in validation diagnostics
+  and public docs, with a negative descendant test.
+- Package/root READMEs describe `0.1.17` as prepared but unpublished.
+- Stale downstream references now point to live TUI ticket
+  `ticket_1785438029_926883`.
+- Review-proven TUI Kit source adaptation is separately routed to
+  `ticket_1785443243_233047` and blocks the live TUI ticket through
+  `dependency_1785443246_930722`.
+- Multi-control descendant identity is separately routed to Hub ticket
+  `ticket_1785443253_376782`.
+
+After these corrections, the UI Rust/Node suites, targeted Rust support
+materializer tests, generated-asset checks, strict workspace clippy, formatting,
+and the full Hub suite passed again.

@@ -40,6 +40,10 @@ assert.equal(
   schema.$defs.UiActionResult.properties.node_id.$ref,
   "#/$defs/UiNodeId",
 );
+assert.match(
+  schema.$defs.UiAuthoredNodeId.oneOf[1].description,
+  /schema validation is necessary but not sufficient/i,
+);
 
 const declarations = fs.readFileSync(
   new URL("./index.d.ts", import.meta.url),

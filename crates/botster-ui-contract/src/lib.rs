@@ -1409,7 +1409,17 @@ pub enum UiValidationError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UiValidationContext {
     Static,
-    BindListItem,
+    BindListItemRoot,
+    BindListItemDescendant,
+}
+
+impl UiValidationContext {
+    fn child(self) -> Self {
+        match self {
+            Self::Static => Self::Static,
+            Self::BindListItemRoot | Self::BindListItemDescendant => Self::BindListItemDescendant,
+        }
+    }
 }
 
 fn validate_ui_node_in_context(
@@ -1472,30 +1482,35 @@ fn validate_node(node: &UiNode, context: UiValidationContext) -> Result<(), UiVa
             });
         }
         for child in children {
-            validate_child(child)?;
+            validate_child(child, context.child())?;
         }
     }
 
     for child in &node.children {
-        validate_child(child)?;
+        validate_child(child, context.child())?;
     }
 
     Ok(())
 }
 
-fn validate_child(child: &UiChild) -> Result<(), UiValidationError> {
+fn validate_child(child: &UiChild, context: UiValidationContext) -> Result<(), UiValidationError> {
     match child {
-        UiChild::Conditional(conditional) => validate_conditional(conditional),
-        UiChild::Node(node) => node.validate(),
+        UiChild::Conditional(conditional) => validate_conditional(conditional, context),
+        UiChild::Node(node) => validate_ui_node_in_context(node, context),
         UiChild::BindList(bind_list) => validate_bind_list(bind_list),
-        UiChild::BindIf(bind_if) => validate_bind_if(bind_if),
+        UiChild::BindIf(bind_if) => validate_bind_if(bind_if, context),
     }
 }
 
-fn validate_conditional(conditional: &UiConditional) -> Result<(), UiValidationError> {
+fn validate_conditional(
+    conditional: &UiConditional,
+    context: UiValidationContext,
+) -> Result<(), UiValidationError> {
     match conditional {
         UiConditional::When { condition: _, node }
-        | UiConditional::Hidden { condition: _, node } => node.validate(),
+        | UiConditional::Hidden { condition: _, node } => {
+            validate_ui_node_in_context(node, context)
+        }
     }
 }
 
@@ -1515,7 +1530,7 @@ fn validate_bind_list(bind_list: &UiBindList) -> Result<(), UiValidationError> {
                 });
             }
             validate_bind_list_where(r#where)?;
-            validate_ui_node_in_context(item_template, UiValidationContext::BindListItem)?;
+            validate_ui_node_in_context(item_template, UiValidationContext::BindListItemRoot)?;
             if let Some(template) = empty_template {
                 template.validate()?;
             }
@@ -1524,15 +1539,18 @@ fn validate_bind_list(bind_list: &UiBindList) -> Result<(), UiValidationError> {
     }
 }
 
-fn validate_bind_if(bind_if: &UiBindIf) -> Result<(), UiValidationError> {
+fn validate_bind_if(
+    bind_if: &UiBindIf,
+    context: UiValidationContext,
+) -> Result<(), UiValidationError> {
     match bind_if {
         UiBindIf::BindIf { path, node } => {
             validate_bind_path(path)?;
-            node.validate()
+            validate_ui_node_in_context(node, context)
         }
         UiBindIf::PresentationIf { predicate, node } => {
             validate_presentation_predicate(predicate)?;
-            node.validate()
+            validate_ui_node_in_context(node, context)
         }
     }
 }
@@ -2249,10 +2267,17 @@ fn validate_stable_id(
 ) -> Result<(), UiValidationError> {
     if let Some(UiAuthoredNodeId::Bind(bind)) = &node.id {
         validate_bind_path(&bind.path)?;
-        if context != UiValidationContext::BindListItem || !bind.path.starts_with("@/") {
+        if context == UiValidationContext::BindListItemDescendant {
             return Err(UiValidationError::InvalidBindPath {
                 path: bind.path.clone(),
-                reason: "bound node id requires an item-relative path on a bind_list item_template"
+                reason: "a bound node id is valid only on the bind_list item_template root, not on its descendants"
+                    .to_string(),
+            });
+        }
+        if context != UiValidationContext::BindListItemRoot || !bind.path.starts_with("@/") {
+            return Err(UiValidationError::InvalidBindPath {
+                path: bind.path.clone(),
+                reason: "bound node id requires an item-relative path on the bind_list item_template root"
                     .to_string(),
             });
         }
