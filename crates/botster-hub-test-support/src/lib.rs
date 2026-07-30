@@ -7222,26 +7222,33 @@ mod tests {
             &root,
             "printf 'botster-hub shutdown error: permission denied\\n' >&2\nexit 1",
         );
-        let child = Command::new("sh")
-            .arg("-c")
-            .arg("sleep 2")
+        let child = Command::new("/bin/cat")
+            .stdin(Stdio::piped())
             .spawn()
             .expect("spawn live daemon child");
         let pid = child.id();
         let mut hub = isolated_hub(hub_bin, root, child);
-        let started = Instant::now();
 
         let error = hub
             .shutdown_inner()
             .expect_err("unrelated shutdown failure must remain an error");
 
-        assert!(started.elapsed() < Duration::from_secs(1));
         assert!(matches!(
             error,
             IsolatedHubError::ShutdownFailed { stderr }
                 if stderr.contains("permission denied")
         ));
-        assert!(hub.child.is_some());
+        let child = hub
+            .child
+            .as_mut()
+            .expect("unrelated shutdown failure must retain live daemon child");
+        assert!(
+            child
+                .try_wait()
+                .expect("inspect retained live daemon child")
+                .is_none(),
+            "unrelated shutdown failure must not wait for live daemon child"
+        );
         drop(hub);
         assert_process_exits(pid);
     }
