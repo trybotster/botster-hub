@@ -143,7 +143,6 @@ The verbatim temporary patch was:
          "entity lifecycle pumping must retain terminal egress, got {terminal_output:?}"
      );
 +    thread::sleep(Duration::from_millis(400));
- 
 -    botster_hub_client::request(
 +    let resize_response = botster_hub_client::request(
          &endpoint,
