@@ -61,6 +61,8 @@ const LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_MAX_BYTES: usize = 4096;
 const TEST_CLOSE_LOCAL_WEBRTC_OPERATION_ENV: &str = "BOTSTER_HUB_TEST_CLOSE_LOCAL_WEBRTC_OPERATION";
 const TEST_LOCAL_RUNTIME_READINESS_BUDGET_MS_ENV: &str =
     "BOTSTER_HUB_TEST_LOCAL_RUNTIME_READINESS_BUDGET_MS";
+const TEST_FOREGROUND_CHILD_PROCESS_GROUP_ENV: &str =
+    "BOTSTER_HUB_TEST_FOREGROUND_CHILD_PROCESS_GROUP";
 
 fn unique_test_dir(name: &str) -> PathBuf {
     let nanos = SystemTime::now()
@@ -3420,6 +3422,60 @@ fn operator_console_detach_releases_reader_while_daemon_stays_running() {
 }
 
 #[test]
+fn operator_console_forwards_ctrl_c_to_registered_foreground_child() {
+    let _guard = daemon_test_guard();
+    ensure_session_worker_binary();
+    let data_dir = unique_short_test_dir("console-foreground-interrupt");
+    let package_dir =
+        unique_short_test_dir("console-foreground-interrupt-package").join("package with spaces");
+    write_botster_tui_package_with_script(
+        &package_dir,
+        "printf 'foreground-forward-ready\\r\\n'; exec sleep 300",
+    );
+
+    let mut daemon_cleanup = OwnedOperatorConsoleDaemon::new(&data_dir);
+    let mut console = OperatorConsolePty::spawn_with_env(
+        &data_dir,
+        &[(TEST_FOREGROUND_CHILD_PROCESS_GROUP_ENV, "1")],
+    );
+    daemon_cleanup.wait_until_daemon_ready(&mut console);
+    console.wait_for("botster-hub> ");
+    console.send_and_wait_for_prompt(
+        format!(
+            "packages install --path {}\n",
+            shell_words::quote(&package_dir.to_string_lossy())
+        )
+        .as_bytes(),
+    );
+    console.send_and_wait_for_prompt(b"packages enable botster-tui\n");
+
+    let prompt_after_interrupt = console.prompt_count() + 1;
+    console.send(b"apps open botster-tui\n");
+    console.wait_for("foreground-forward-ready");
+    console.send(&[3]);
+    console.wait_for("foreground app terminated by signal 2");
+    console.wait_for_occurrences("botster-hub> ", prompt_after_interrupt);
+    assert!(
+        !console
+            .text()
+            .contains("interrupt requested; finishing safely"),
+        "foreground Ctrl-C was handled as inline console work: {}",
+        console.text()
+    );
+
+    console.send(b"shutdown\n");
+    console.wait_for_exit();
+    daemon_cleanup.assert_cleaned();
+    fs::remove_dir_all(&data_dir).expect("remove foreground-interrupt data directory");
+    fs::remove_dir_all(
+        package_dir
+            .parent()
+            .expect("foreground-interrupt package parent"),
+    )
+    .expect("remove foreground-interrupt package directory");
+}
+
+#[test]
 fn operator_console_readiness_failure_reaps_console_and_owned_daemon() {
     let _guard = daemon_test_guard();
     ensure_session_worker_binary();
@@ -5056,6 +5112,68 @@ fn cli_local_runtime_up_starts_reuses_and_down_stops_runtime() {
         !status.status.success(),
         "status should fail after daemon shutdown: {}",
         command_output_text(&status)
+    );
+}
+
+#[test]
+fn cli_shutdown_waits_for_metadata_owned_runtime_daemon_cleanup() {
+    let _guard = daemon_test_guard();
+    ensure_session_worker_binary();
+    let data_dir = unique_short_test_dir("cli-shutdown-owned-runtime");
+    let web_package_dir = unique_test_dir("cli-shutdown-owned-web");
+    let tui_package_dir = unique_test_dir("cli-shutdown-owned-tui");
+    write_botster_web_package(&web_package_dir);
+    write_botster_tui_package(&tui_package_dir);
+    ensure_runtime_packages(&data_dir, &web_package_dir, &tui_package_dir);
+
+    let up = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("up")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("--session-worker-bin")
+        .arg(session_worker_binary_path())
+        .output()
+        .expect("start metadata-owned runtime daemon");
+    assert!(
+        up.status.success(),
+        "metadata-owned runtime startup failed: {}",
+        command_output_text(&up)
+    );
+
+    let metadata_path = data_dir.join(".botster-hub-runtime-daemon.json");
+    let metadata: serde_json::Value = serde_json::from_slice(
+        &fs::read(&metadata_path).expect("read metadata-owned runtime daemon metadata"),
+    )
+    .expect("parse metadata-owned runtime daemon metadata");
+    let daemon_pid = metadata["pid"].as_u64().expect("metadata-owned daemon pid") as u32;
+    let socket_path = PathBuf::from(
+        metadata["socket_path"]
+            .as_str()
+            .expect("metadata-owned daemon socket path"),
+    );
+
+    let shutdown = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("shutdown")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .output()
+        .expect("shutdown metadata-owned runtime daemon");
+    assert!(
+        shutdown.status.success(),
+        "metadata-owned runtime shutdown failed: {}",
+        command_output_text(&shutdown)
+    );
+    assert!(
+        !process_exists(daemon_pid),
+        "shutdown returned before metadata-owned daemon pid {daemon_pid} exited"
+    );
+    assert!(
+        !metadata_path.exists(),
+        "shutdown returned before owned runtime metadata was removed"
+    );
+    assert!(
+        !socket_path.exists(),
+        "shutdown returned before owned runtime socket was removed"
     );
 }
 

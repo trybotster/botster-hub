@@ -48,6 +48,8 @@ const LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_WAIT: Duration = Duration::from_secs(2
 const TEST_INCOMPATIBLE_DAEMON_ENV: &str = "BOTSTER_HUB_TEST_INCOMPATIBLE_DAEMON";
 const TEST_LOCAL_RUNTIME_READINESS_BUDGET_MS_ENV: &str =
     "BOTSTER_HUB_TEST_LOCAL_RUNTIME_READINESS_BUDGET_MS";
+const TEST_FOREGROUND_CHILD_PROCESS_GROUP_ENV: &str =
+    "BOTSTER_HUB_TEST_FOREGROUND_CHILD_PROCESS_GROUP";
 
 mod operator_console;
 
@@ -191,9 +193,25 @@ fn run_operator_console() -> Result<(), String> {
         |command, args| {
             canonicalize_data_dir_args(command, args).map_err(|error| error.to_string())
         },
-        dispatch_command,
+        dispatch_console_command,
     )
     .map_err(|error| error.to_string())
+}
+
+fn dispatch_console_command(
+    command: &str,
+    args: Vec<String>,
+    signals: &operator_console::ConsoleSignals,
+) -> Result<CommandOutcome, String> {
+    match command {
+        "open" => {
+            operator_open_alias_with_signals(args, Some(signals)).map_err(|error| error.to_string())
+        }
+        "apps" => {
+            operator_apps_with_signals(args, Some(signals)).map_err(|error| error.to_string())
+        }
+        _ => dispatch_command(command, args),
+    }
 }
 
 fn console_start_error(error: LocalRuntimeError) -> String {
@@ -2510,6 +2528,13 @@ fn mcp_serve(args: Vec<String>) -> Result<(), McpCliError> {
 }
 
 fn operator_open_alias(args: Vec<String>) -> Result<CommandOutcome, OperatorError> {
+    operator_open_alias_with_signals(args, None)
+}
+
+fn operator_open_alias_with_signals(
+    args: Vec<String>,
+    signals: Option<&operator_console::ConsoleSignals>,
+) -> Result<CommandOutcome, OperatorError> {
     let Some(alias) = args.first() else {
         return Err(OperatorError::Usage("open"));
     };
@@ -2522,7 +2547,7 @@ fn operator_open_alias(args: Vec<String>) -> Result<CommandOutcome, OperatorErro
     if !options.arguments.is_empty() {
         return Err(OperatorError::Usage("open"));
     }
-    open_app_by_selector(options.data_directory, selector)
+    open_app_by_selector(options.data_directory, selector, signals)
 }
 
 fn operator_reload_alias(args: Vec<String>) -> Result<(), OperatorError> {
@@ -2542,6 +2567,13 @@ fn operator_reload_alias(args: Vec<String>) -> Result<(), OperatorError> {
 }
 
 fn operator_apps(args: Vec<String>) -> Result<CommandOutcome, OperatorError> {
+    operator_apps_with_signals(args, None)
+}
+
+fn operator_apps_with_signals(
+    args: Vec<String>,
+    signals: Option<&operator_console::ConsoleSignals>,
+) -> Result<CommandOutcome, OperatorError> {
     let command = AppCommand::parse(args)?;
     match command.action {
         AppActionCommand::List => {
@@ -2557,20 +2589,23 @@ fn operator_apps(args: Vec<String>) -> Result<CommandOutcome, OperatorError> {
             print_app_detail(app);
             Ok(CommandOutcome::Completed)
         }
-        AppActionCommand::Open(selector) => open_app_by_selector(command.data_directory, &selector),
+        AppActionCommand::Open(selector) => {
+            open_app_by_selector(command.data_directory, &selector, signals)
+        }
     }
 }
 
 fn open_app_by_selector(
     data_directory: PathBuf,
     selector: &str,
+    signals: Option<&operator_console::ConsoleSignals>,
 ) -> Result<CommandOutcome, OperatorError> {
     let config = explicit_config(data_directory)?;
     let response = daemon_transport_request(&config, DaemonRequest::ListApps)?;
     let app = resolve_app_selector(&response.apps, selector)?.clone();
     match app.kind.as_str() {
         "web_app" => open_web_app(&config, app).map(|()| CommandOutcome::Completed),
-        "terminal_app" => open_terminal_app(&config, app),
+        "terminal_app" => open_terminal_app(&config, app, signals),
         _ => Err(OperatorError::App(format!(
             "unsupported app kind {} for {}",
             app.kind, app.entrypoint_id
@@ -2619,6 +2654,7 @@ fn open_web_app(config: &botster_hub::HubConfig, app: DaemonApp) -> Result<(), O
 fn open_terminal_app(
     config: &botster_hub::HubConfig,
     app: DaemonApp,
+    signals: Option<&operator_console::ConsoleSignals>,
 ) -> Result<CommandOutcome, OperatorError> {
     if app.launch_mode != "foreground_stdio" {
         return Err(OperatorError::App(format!(
@@ -2655,17 +2691,23 @@ fn open_terminal_app(
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
+    let use_separate_process_group = env::var_os(TEST_FOREGROUND_CHILD_PROCESS_GROUP_ENV).is_some();
     unsafe {
         // SAFETY: this hook runs only in the foreground app child. Restoring SIGINT's default
         // disposition lets Ctrl-C target the handed-off app while the console parent stays alive.
-        command.pre_exec(|| {
+        command.pre_exec(move || {
             if libc::signal(libc::SIGINT, libc::SIG_DFL) == libc::SIG_ERR {
+                return Err(io::Error::last_os_error());
+            }
+            if use_separate_process_group && libc::setpgid(0, 0) == -1 {
                 return Err(io::Error::last_os_error());
             }
             Ok(())
         });
     }
-    let status = command.status().map_err(OperatorError::SpawnApp)?;
+    let mut child = command.spawn().map_err(OperatorError::SpawnApp)?;
+    let _foreground_child = signals.map(|signals| signals.register_foreground_child(child.id()));
+    let status = child.wait().map_err(OperatorError::SpawnApp)?;
     if let Some(code) = status.code() {
         if code == 0 {
             Ok(CommandOutcome::Completed)
