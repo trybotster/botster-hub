@@ -48,8 +48,6 @@ const LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_WAIT: Duration = Duration::from_secs(2
 const TEST_INCOMPATIBLE_DAEMON_ENV: &str = "BOTSTER_HUB_TEST_INCOMPATIBLE_DAEMON";
 const TEST_LOCAL_RUNTIME_READINESS_BUDGET_MS_ENV: &str =
     "BOTSTER_HUB_TEST_LOCAL_RUNTIME_READINESS_BUDGET_MS";
-const TEST_FOREGROUND_CHILD_PROCESS_GROUP_ENV: &str =
-    "BOTSTER_HUB_TEST_FOREGROUND_CHILD_PROCESS_GROUP";
 
 mod operator_console;
 
@@ -2691,16 +2689,31 @@ fn open_terminal_app(
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
-    let use_separate_process_group = env::var_os(TEST_FOREGROUND_CHILD_PROCESS_GROUP_ENV).is_some();
+    let use_foreground_process_group = signals.is_some();
+    let mut foreground_terminal =
+        use_foreground_process_group.then(ForegroundTerminalRegistration::new);
     unsafe {
-        // SAFETY: this hook runs only in the foreground app child. Restoring SIGINT's default
-        // disposition lets Ctrl-C target the handed-off app while the console parent stays alive.
+        // SAFETY: this hook runs only in the foreground app child. The console path gives the app
+        // its own process group and terminal foreground before exec so Ctrl-C reaches the complete
+        // app tree. SIGTTOU is ignored only around the tcsetpgrp call required for that handoff.
         command.pre_exec(move || {
             if libc::signal(libc::SIGINT, libc::SIG_DFL) == libc::SIG_ERR {
                 return Err(io::Error::last_os_error());
             }
-            if use_separate_process_group && libc::setpgid(0, 0) == -1 {
-                return Err(io::Error::last_os_error());
+            if use_foreground_process_group {
+                if libc::setpgid(0, 0) == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                let previous = libc::signal(libc::SIGTTOU, libc::SIG_IGN);
+                if previous == libc::SIG_ERR {
+                    return Err(io::Error::last_os_error());
+                }
+                let handoff_result = libc::tcsetpgrp(libc::STDIN_FILENO, libc::getpid());
+                let handoff_error = (handoff_result == -1).then(io::Error::last_os_error);
+                libc::signal(libc::SIGTTOU, previous);
+                if let Some(error) = handoff_error {
+                    return Err(error);
+                }
             }
             Ok(())
         });
@@ -2708,6 +2721,11 @@ fn open_terminal_app(
     let mut child = command.spawn().map_err(OperatorError::SpawnApp)?;
     let _foreground_child = signals.map(|signals| signals.register_foreground_child(child.id()));
     let status = child.wait().map_err(OperatorError::SpawnApp)?;
+    if let Some(foreground_terminal) = foreground_terminal.as_mut() {
+        foreground_terminal
+            .restore()
+            .map_err(OperatorError::SpawnApp)?;
+    }
     if let Some(code) = status.code() {
         if code == 0 {
             Ok(CommandOutcome::Completed)
@@ -2726,6 +2744,56 @@ fn open_terminal_app(
                 |signal| format!("terminated by signal {signal}"),
             ),
         })
+    }
+}
+
+struct ForegroundTerminalRegistration {
+    process_group: libc::pid_t,
+    armed: bool,
+}
+
+impl ForegroundTerminalRegistration {
+    fn new() -> Self {
+        Self {
+            process_group: unsafe {
+                // SAFETY: getpgrp has no preconditions and returns the console process group.
+                libc::getpgrp()
+            },
+            armed: true,
+        }
+    }
+
+    fn restore(&mut self) -> io::Result<()> {
+        let previous = unsafe {
+            // SAFETY: SIGTTOU is ignored only while the background console retakes its terminal.
+            libc::signal(libc::SIGTTOU, libc::SIG_IGN)
+        };
+        if previous == libc::SIG_ERR {
+            return Err(io::Error::last_os_error());
+        }
+        let result = unsafe {
+            // SAFETY: stdin remains the operator console's controlling terminal and the recorded
+            // process group belongs to that console.
+            libc::tcsetpgrp(libc::STDIN_FILENO, self.process_group)
+        };
+        let error = (result == -1).then(io::Error::last_os_error);
+        unsafe {
+            // SAFETY: previous is the disposition returned by signal immediately above.
+            libc::signal(libc::SIGTTOU, previous);
+        }
+        if let Some(error) = error {
+            return Err(error);
+        }
+        self.armed = false;
+        Ok(())
+    }
+}
+
+impl Drop for ForegroundTerminalRegistration {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.restore();
+        }
     }
 }
 

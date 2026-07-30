@@ -61,8 +61,6 @@ const LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_MAX_BYTES: usize = 4096;
 const TEST_CLOSE_LOCAL_WEBRTC_OPERATION_ENV: &str = "BOTSTER_HUB_TEST_CLOSE_LOCAL_WEBRTC_OPERATION";
 const TEST_LOCAL_RUNTIME_READINESS_BUDGET_MS_ENV: &str =
     "BOTSTER_HUB_TEST_LOCAL_RUNTIME_READINESS_BUDGET_MS";
-const TEST_FOREGROUND_CHILD_PROCESS_GROUP_ENV: &str =
-    "BOTSTER_HUB_TEST_FOREGROUND_CHILD_PROCESS_GROUP";
 
 fn unique_test_dir(name: &str) -> PathBuf {
     let nanos = SystemTime::now()
@@ -3422,7 +3420,7 @@ fn operator_console_detach_releases_reader_while_daemon_stays_running() {
 }
 
 #[test]
-fn operator_console_forwards_ctrl_c_to_registered_foreground_child() {
+fn operator_console_ctrl_c_reaches_foreground_app_process_group_and_returns_prompt() {
     let _guard = daemon_test_guard();
     ensure_session_worker_binary();
     let data_dir = unique_short_test_dir("console-foreground-interrupt");
@@ -3430,14 +3428,11 @@ fn operator_console_forwards_ctrl_c_to_registered_foreground_child() {
         unique_short_test_dir("console-foreground-interrupt-package").join("package with spaces");
     write_botster_tui_package_with_script(
         &package_dir,
-        "printf 'foreground-forward-ready\\r\\n'; exec sleep 300",
+        "trap '' INT; node -e 'process.on(\"SIGINT\", () => process.exit(130)); console.log(\"foreground-forward-ready\"); setInterval(() => {}, 1000)' & child=$!; wait \"$child\"",
     );
 
     let mut daemon_cleanup = OwnedOperatorConsoleDaemon::new(&data_dir);
-    let mut console = OperatorConsolePty::spawn_with_env(
-        &data_dir,
-        &[(TEST_FOREGROUND_CHILD_PROCESS_GROUP_ENV, "1")],
-    );
+    let mut console = OperatorConsolePty::spawn(&data_dir);
     daemon_cleanup.wait_until_daemon_ready(&mut console);
     console.wait_for("botster-hub> ");
     console.send_and_wait_for_prompt(
@@ -3453,7 +3448,7 @@ fn operator_console_forwards_ctrl_c_to_registered_foreground_child() {
     console.send(b"apps open botster-tui\n");
     console.wait_for("foreground-forward-ready");
     console.send(&[3]);
-    console.wait_for("foreground app terminated by signal 2");
+    console.wait_for("foreground app exited with code 130");
     console.wait_for_occurrences("botster-hub> ", prompt_after_interrupt);
     assert!(
         !console
