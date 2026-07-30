@@ -223,6 +223,33 @@ pub fn validate_package_presentation(
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct UiNodeId(pub String);
 
+/// Node identity as authored before any BindList row template is expanded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum UiAuthoredNodeId {
+    /// Already-realized stable node identity.
+    Literal(UiNodeId),
+    /// Item-relative identity resolved from the current BindList row.
+    Bind(UiBind),
+}
+
+impl From<UiNodeId> for UiAuthoredNodeId {
+    fn from(id: UiNodeId) -> Self {
+        Self::Literal(id)
+    }
+}
+
+impl UiAuthoredNodeId {
+    /// Return the realized literal identity, if this value is not a binding.
+    #[must_use]
+    pub fn as_literal(&self) -> Option<&UiNodeId> {
+        match self {
+            Self::Literal(id) => Some(id),
+            Self::Bind(_) => None,
+        }
+    }
+}
+
 /// Stable UI action identifier.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct UiActionId(pub String);
@@ -757,9 +784,13 @@ pub struct UiNode {
     /// Semantic primitive type.
     #[serde(rename = "type")]
     pub kind: UiNodeKind,
-    /// Optional stable node id.
+    /// Optional authored node identity.
+    ///
+    /// A row-relative binding is valid only on a BindList item template and
+    /// must be resolved to a literal [`UiNodeId`] before renderer state or
+    /// action dispatch uses the node.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub id: Option<UiNodeId>,
+    pub id: Option<UiAuthoredNodeId>,
     /// Semantic properties.
     #[serde(default, skip_serializing_if = "Map::is_empty")]
     pub props: Map<String, Value>,
@@ -799,11 +830,7 @@ impl UiNode {
 
 /// Validate one semantic UI node recursively.
 pub fn validate_ui_node(node: &UiNode) -> Result<(), UiValidationError> {
-    validate_node(node).map_err(|error| UiValidationError::Node {
-        id: node.id.clone(),
-        kind: node.kind,
-        source: Box::new(error),
-    })
+    validate_ui_node_in_context(node, UiValidationContext::Static)
 }
 
 /// Validate one semantic UI node against renderer capabilities.
@@ -811,7 +838,7 @@ pub fn validate_ui_node_with_capabilities(
     node: &UiNode,
     capabilities: &UiCapabilitySet,
 ) -> Result<(), UiValidationError> {
-    validate_node(node)
+    validate_node(node, UiValidationContext::Static)
         .and_then(|()| validate_node_capabilities(node, capabilities))
         .map_err(|error| UiValidationError::Node {
             id: node.id.clone(),
@@ -1371,7 +1398,7 @@ pub enum UiValidationError {
     #[error("invalid node {id:?} ({kind:?}): {source}")]
     Node {
         /// Node id.
-        id: Option<UiNodeId>,
+        id: Option<UiAuthoredNodeId>,
         /// Node kind.
         kind: UiNodeKind,
         /// Nested error.
@@ -1379,7 +1406,34 @@ pub enum UiValidationError {
     },
 }
 
-fn validate_node(node: &UiNode) -> Result<(), UiValidationError> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UiValidationContext {
+    Static,
+    BindListItemRoot,
+    BindListItemDescendant,
+}
+
+impl UiValidationContext {
+    fn child(self) -> Self {
+        match self {
+            Self::Static => Self::Static,
+            Self::BindListItemRoot | Self::BindListItemDescendant => Self::BindListItemDescendant,
+        }
+    }
+}
+
+fn validate_ui_node_in_context(
+    node: &UiNode,
+    context: UiValidationContext,
+) -> Result<(), UiValidationError> {
+    validate_node(node, context).map_err(|error| UiValidationError::Node {
+        id: node.id.clone(),
+        kind: node.kind,
+        source: Box::new(error),
+    })
+}
+
+fn validate_node(node: &UiNode, context: UiValidationContext) -> Result<(), UiValidationError> {
     let schema = schema_for(node.kind);
 
     for required in schema.required_props {
@@ -1407,7 +1461,7 @@ fn validate_node(node: &UiNode) -> Result<(), UiValidationError> {
 
     validate_prop_combinations(node)?;
     validate_custom_node(node)?;
-    validate_stable_id(node)?;
+    validate_stable_id(node, context)?;
     validate_required_action(node)?;
     validate_required_label(node)?;
 
@@ -1428,30 +1482,35 @@ fn validate_node(node: &UiNode) -> Result<(), UiValidationError> {
             });
         }
         for child in children {
-            validate_child(child)?;
+            validate_child(child, context.child())?;
         }
     }
 
     for child in &node.children {
-        validate_child(child)?;
+        validate_child(child, context.child())?;
     }
 
     Ok(())
 }
 
-fn validate_child(child: &UiChild) -> Result<(), UiValidationError> {
+fn validate_child(child: &UiChild, context: UiValidationContext) -> Result<(), UiValidationError> {
     match child {
-        UiChild::Conditional(conditional) => validate_conditional(conditional),
-        UiChild::Node(node) => node.validate(),
+        UiChild::Conditional(conditional) => validate_conditional(conditional, context),
+        UiChild::Node(node) => validate_ui_node_in_context(node, context),
         UiChild::BindList(bind_list) => validate_bind_list(bind_list),
-        UiChild::BindIf(bind_if) => validate_bind_if(bind_if),
+        UiChild::BindIf(bind_if) => validate_bind_if(bind_if, context),
     }
 }
 
-fn validate_conditional(conditional: &UiConditional) -> Result<(), UiValidationError> {
+fn validate_conditional(
+    conditional: &UiConditional,
+    context: UiValidationContext,
+) -> Result<(), UiValidationError> {
     match conditional {
         UiConditional::When { condition: _, node }
-        | UiConditional::Hidden { condition: _, node } => node.validate(),
+        | UiConditional::Hidden { condition: _, node } => {
+            validate_ui_node_in_context(node, context)
+        }
     }
 }
 
@@ -1471,7 +1530,7 @@ fn validate_bind_list(bind_list: &UiBindList) -> Result<(), UiValidationError> {
                 });
             }
             validate_bind_list_where(r#where)?;
-            item_template.validate()?;
+            validate_ui_node_in_context(item_template, UiValidationContext::BindListItemRoot)?;
             if let Some(template) = empty_template {
                 template.validate()?;
             }
@@ -1480,15 +1539,18 @@ fn validate_bind_list(bind_list: &UiBindList) -> Result<(), UiValidationError> {
     }
 }
 
-fn validate_bind_if(bind_if: &UiBindIf) -> Result<(), UiValidationError> {
+fn validate_bind_if(
+    bind_if: &UiBindIf,
+    context: UiValidationContext,
+) -> Result<(), UiValidationError> {
     match bind_if {
         UiBindIf::BindIf { path, node } => {
             validate_bind_path(path)?;
-            node.validate()
+            validate_ui_node_in_context(node, context)
         }
         UiBindIf::PresentationIf { predicate, node } => {
             validate_presentation_predicate(predicate)?;
-            node.validate()
+            validate_ui_node_in_context(node, context)
         }
     }
 }
@@ -2199,7 +2261,28 @@ fn is_custom_fallback_kind(kind: UiNodeKind) -> bool {
     )
 }
 
-fn validate_stable_id(node: &UiNode) -> Result<(), UiValidationError> {
+fn validate_stable_id(
+    node: &UiNode,
+    context: UiValidationContext,
+) -> Result<(), UiValidationError> {
+    if let Some(UiAuthoredNodeId::Bind(bind)) = &node.id {
+        validate_bind_path(&bind.path)?;
+        if context == UiValidationContext::BindListItemDescendant {
+            return Err(UiValidationError::InvalidBindPath {
+                path: bind.path.clone(),
+                reason: "a bound node id is valid only on the bind_list item_template root, not on its descendants"
+                    .to_string(),
+            });
+        }
+        if context != UiValidationContext::BindListItemRoot || !bind.path.starts_with("@/") {
+            return Err(UiValidationError::InvalidBindPath {
+                path: bind.path.clone(),
+                reason: "bound node id requires an item-relative path on the bind_list item_template root"
+                    .to_string(),
+            });
+        }
+    }
+
     let reason = if matches!(
         node.kind,
         UiNodeKind::Form | UiNodeKind::FormSection | UiNodeKind::FormField
@@ -2223,8 +2306,12 @@ fn validate_stable_id(node: &UiNode) -> Result<(), UiValidationError> {
         None
     };
 
+    let missing_id = node.id.as_ref().is_none_or(|id| match id {
+        UiAuthoredNodeId::Literal(id) => id.0.trim().is_empty(),
+        UiAuthoredNodeId::Bind(_) => false,
+    });
     if let Some(reason) = reason
-        && node.id.as_ref().is_none_or(|id| id.0.trim().is_empty())
+        && missing_id
     {
         return Err(UiValidationError::MissingId {
             kind: node.kind,

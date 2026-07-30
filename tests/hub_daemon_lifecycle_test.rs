@@ -4740,6 +4740,31 @@ fn daemon_plugin_contract_matrix_fixture_exercises_public_package_contracts() {
     assert_eq!(report.session_surface_binding_family, "/session");
     assert!(report.session_surface_matches_fixture);
     assert_eq!(report.session_surface_references.len(), 5);
+    assert_eq!(
+        report
+            .session_materialized_rows
+            .iter()
+            .map(|row| row.node_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["session-transition", "session-stable-current"]
+    );
+    assert_eq!(report.session_action_node_id, "session-stable-current");
+    assert_eq!(
+        report.session_action_payload,
+        serde_json::json!({
+            "operation": "select_session",
+            "session_uuid": "session-stable-current"
+        })
+    );
+    assert_eq!(report.session_action_state, "accepted");
+    assert_eq!(
+        report.session_action_result_node_id,
+        "session-stable-current"
+    );
+    assert_eq!(
+        report.session_action_result_payload,
+        report.session_action_payload
+    );
     assert_eq!(report.dialog_presence_key, "contract-dialog");
     assert_eq!(report.selected_workspace_equality_key, "selected-workspace");
     assert_eq!(report.selected_workspace_equality_value, "workspace-alpha");

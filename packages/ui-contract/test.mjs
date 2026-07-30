@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import { conformanceFixtures, packageVersion, schema } from "./index.js";
 
-assert.equal(packageVersion, "0.1.1");
+assert.equal(packageVersion, "0.2.0");
 assert.equal(schema.title, "Botster UI Contract");
 assert.equal(
   conformanceFixtures.fixtures.request.values.title,
@@ -24,6 +24,26 @@ assert.equal(
   Object.hasOwn(conformanceFixtures.fixtures.dialog_presence.node.props, "open"),
   false,
 );
+assert.deepEqual(
+  conformanceFixtures.fixtures.bound_row_identity.children[0].item_template.id,
+  { $bind: "@/session_uuid" },
+);
+assert.equal(
+  schema.$defs.UiNode.properties.id.$ref,
+  "#/$defs/UiAuthoredNodeId",
+);
+assert.equal(
+  schema.$defs.UiActionRequest.properties.node_id.$ref,
+  "#/$defs/UiNodeId",
+);
+assert.equal(
+  schema.$defs.UiActionResult.properties.node_id.$ref,
+  "#/$defs/UiNodeId",
+);
+assert.match(
+  schema.$defs.UiAuthoredNodeId.oneOf[1].description,
+  /schema validation is necessary but not sufficient/i,
+);
 
 const declarations = fs.readFileSync(
   new URL("./index.d.ts", import.meta.url),
@@ -31,6 +51,7 @@ const declarations = fs.readFileSync(
 );
 for (const token of [
   "UiNode",
+  "UiAuthoredNodeId",
   "UiActionRequest",
   "UiActionResult",
   "UiPresentationOperation",

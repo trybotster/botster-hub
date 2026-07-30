@@ -8,6 +8,7 @@ import {
 } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { isDeepStrictEqual } from "node:util";
 
 const packageRoot = fileURLToPath(new URL(".", import.meta.url));
 
@@ -94,47 +95,105 @@ function mergePatch(target, patch) {
   }
 }
 
-export function materializeSessionPluginBindings(surface, frames) {
+function inspectSessionPluginSurface(surface) {
   if (!Array.isArray(surface?.children)) {
     throw new TypeError("session binding surface children are missing");
   }
-  const references = surface.children.map((child) => {
-    if (
-      child?.$kind !== "bind_list" ||
-      child.source !== "/session" ||
-      child.item_template?.props?.text?.$bind !== "@/lifecycle_class" ||
-      !child.empty_template ||
-      typeof child.where?.session_uuid !== "string"
-    ) {
-      throw new TypeError("surface does not use the canonical /session binding grammar");
+  const references = [];
+  let oracle;
+  for (const child of surface.children) {
+    if (typeof child?.where?.session_uuid === "string") {
+      const index = references.length + 1;
+      const expected = {
+        $kind: "bind_list",
+        source: "/session",
+        where: { session_uuid: child.where.session_uuid },
+        item_template: {
+          type: "text",
+          id: `contract-session-${index}-lifecycle`,
+          props: { text: { $bind: "@/lifecycle_class" } },
+        },
+        empty_template: {
+          type: "text",
+          id: `contract-session-${index}-unavailable`,
+          props: { text: "Session unavailable" },
+        },
+      };
+      if (!isDeepStrictEqual(child, expected)) {
+        throw new TypeError("surface does not use the canonical /session binding grammar");
+      }
+      references.push(child.where.session_uuid);
+      continue;
     }
-    return child.where.session_uuid;
-  });
-  const entities = new Map();
+
+    const expectedOracle = {
+      $kind: "bind_list",
+      source: "/session",
+      where: { lifecycle_class: "current" },
+      item_template: {
+        type: "button",
+        id: { $bind: "@/session_uuid" },
+        props: {
+          label: "Select session",
+          action: {
+            id: "contract.action",
+            payload: {
+              operation: "select_session",
+              session_uuid: { $bind: "@/session_uuid" },
+            },
+          },
+        },
+      },
+    };
+    if (!isDeepStrictEqual(child, expectedOracle)) {
+      throw new TypeError("surface contains an unrecognized session binding child");
+    }
+    if (oracle) {
+      throw new TypeError("surface contains duplicate current-row identity oracles");
+    }
+    oracle = child;
+  }
+  if (!oracle) {
+    throw new TypeError("surface is missing the current-row identity oracle");
+  }
+  return { references, oracle };
+}
+
+function materializeSessionEntities(frames) {
+  const entities = [];
   for (const frame of frames) {
     if (frame.entity_type !== "session") {
       throw new TypeError("scenario contains a foreign entity family");
     }
     if (frame.type === "entity_snapshot") {
-      entities.clear();
+      entities.length = 0;
       for (const entity of frame.items) {
-        entities.set(entity.session_uuid, structuredClone(entity));
+        entities.push([entity.session_uuid, structuredClone(entity)]);
       }
     } else if (frame.type === "entity_upsert") {
-      entities.set(frame.id, structuredClone(frame.entity));
+      const index = entities.findIndex(([id]) => id === frame.id);
+      if (index === -1) entities.push([frame.id, structuredClone(frame.entity)]);
+      else entities[index][1] = structuredClone(frame.entity);
     } else if (frame.type === "entity_patch") {
-      const entity = entities.get(frame.id);
+      const entity = entities.find(([id]) => id === frame.id)?.[1];
       if (!entity) throw new TypeError(`patch references unknown session row ${frame.id}`);
       mergePatch(entity, frame.patch);
     } else if (frame.type === "entity_remove") {
-      entities.delete(frame.id);
+      const index = entities.findIndex(([id]) => id === frame.id);
+      if (index !== -1) entities.splice(index, 1);
     } else {
       throw new TypeError(`unsupported entity frame ${frame.type}`);
     }
   }
+  return entities;
+}
+
+export function materializeSessionPluginBindings(surface, frames) {
+  const { references } = inspectSessionPluginSurface(surface);
+  const entities = materializeSessionEntities(frames);
   return Object.fromEntries(
     references.map((sessionUuid) => {
-      const entity = entities.get(sessionUuid);
+      const entity = entities.find(([id]) => id === sessionUuid)?.[1];
       if (!entity) return [sessionUuid, "unavailable"];
       if (typeof entity.lifecycle_class !== "string") {
         throw new TypeError(
@@ -144,6 +203,35 @@ export function materializeSessionPluginBindings(surface, frames) {
       return [sessionUuid, entity.lifecycle_class];
     }),
   );
+}
+
+export function materializeSessionPluginRows(surface, frames) {
+  const { oracle } = inspectSessionPluginSurface(surface);
+  const expectedClass = oracle.where.lifecycle_class;
+  const entities = materializeSessionEntities(frames);
+  const seen = new Set();
+  const rows = [];
+  for (const [, entity] of entities) {
+    if (entity.lifecycle_class !== expectedClass) continue;
+    if (typeof entity.session_uuid !== "string") {
+      throw new TypeError("selected session row is missing string session_uuid");
+    }
+    if (entity.session_uuid.trim() === "") {
+      throw new TypeError("selected session row has blank session_uuid");
+    }
+    if (seen.has(entity.session_uuid)) {
+      throw new TypeError(`duplicate materialized session node id ${entity.session_uuid}`);
+    }
+    seen.add(entity.session_uuid);
+    rows.push({
+      node_id: entity.session_uuid,
+      action_payload: {
+        operation: "select_session",
+        session_uuid: entity.session_uuid,
+      },
+    });
+  }
+  return rows;
 }
 
 export function materializeSessionPluginBindingScenario(scenario) {
@@ -156,6 +244,28 @@ export function materializeSessionPluginBindingScenario(scenario) {
   frames.push(scenario.transition_frames[2]);
   const after_remove = materializeSessionPluginBindings(scenario.surface, frames);
   const after_reconnect = materializeSessionPluginBindings(
+    scenario.surface,
+    [scenario.reconnect_snapshot],
+  );
+  return {
+    initial,
+    after_ended_patch,
+    after_indeterminate_patch,
+    after_remove,
+    after_reconnect,
+  };
+}
+
+export function materializeSessionPluginRowScenario(scenario) {
+  const frames = [scenario.initial_snapshot];
+  const initial = materializeSessionPluginRows(scenario.surface, frames);
+  frames.push(scenario.transition_frames[0]);
+  const after_ended_patch = materializeSessionPluginRows(scenario.surface, frames);
+  frames.push(scenario.transition_frames[1]);
+  const after_indeterminate_patch = materializeSessionPluginRows(scenario.surface, frames);
+  frames.push(scenario.transition_frames[2]);
+  const after_remove = materializeSessionPluginRows(scenario.surface, frames);
+  const after_reconnect = materializeSessionPluginRows(
     scenario.surface,
     [scenario.reconnect_snapshot],
   );

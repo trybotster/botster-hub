@@ -19,7 +19,7 @@ use botster_hub::{
     PackageRegistry, RuntimeEnvironment, SessionDefaults, SpawnTarget, TransportBindings, Worktree,
     default_package_policy,
 };
-use botster_ui_contract::{UiActionRequest, UiActionResultState, UiNodeKind};
+use botster_ui_contract::{UiActionRequest, UiActionResultState, UiAuthoredNodeId, UiNodeKind};
 
 mod support;
 use support::ensure_session_worker_binary;
@@ -2016,7 +2016,12 @@ fn project_pipelines_surface_action_round_trip_uses_client_api_and_plugin_worker
     assert_eq!(surface.surface_id, "project-pipelines.create-ticket");
     assert_eq!(surface.body.kind, UiNodeKind::Panel);
     assert_eq!(
-        surface.body.id.as_ref().map(|id| id.0.as_str()),
+        surface
+            .body
+            .id
+            .as_ref()
+            .and_then(UiAuthoredNodeId::as_literal)
+            .map(|id| id.0.as_str()),
         Some("project-pipelines-create-panel")
     );
 

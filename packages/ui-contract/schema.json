@@ -273,6 +273,27 @@
         "error"
       ]
     },
+    "UiAuthoredNodeId": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/UiNodeId"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Schema validation is necessary but not sufficient: the Rust/Hub validator admits a bound id only on the direct UiBindList.item_template root, where row context exists.",
+          "properties": {
+            "$bind": {
+              "pattern": "^@/.+",
+              "type": "string"
+            }
+          },
+          "required": [
+            "$bind"
+          ],
+          "type": "object"
+        }
+      ]
+    },
     "UiBindIf": {
       "oneOf": [
         {
@@ -578,7 +599,7 @@
           "type": "array"
         },
         "id": {
-          "$ref": "#/$defs/UiNodeId"
+          "$ref": "#/$defs/UiAuthoredNodeId"
         },
         "props": {
           "additionalProperties": {
@@ -799,7 +820,7 @@
       ]
     }
   },
-  "$id": "https://trybotster.dev/schemas/ui-contract-0.1.1.json",
+  "$id": "https://trybotster.dev/schemas/ui-contract-0.2.0.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "oneOf": [
     {

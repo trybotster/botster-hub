@@ -4,6 +4,7 @@
 export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 export type JsonObject = { [key: string]: JsonValue };
 export type UiNodeId = string;
+export type UiAuthoredNodeId = UiNodeId | UiBind;
 export type UiActionId = string;
 export type UiSurfaceId = string;
 export type UiActionRequestId = string;
@@ -39,7 +40,7 @@ export type UiChild = UiConditional | UiNode | UiBindList | UiBindIf;
 export type UiFormProps = JsonObject & { action: UiAction; submit_label: string };
 export type UiDialogProps = JsonObject & { title: string; presentation?: UiDialogPresentation; open?: never };
 export type UiButtonProps = JsonObject & { label: string; action: UiAction };
-export interface UiNodeBase { id?: UiNodeId; children?: UiChild[]; slots?: Record<string, UiChild[]>; }
+export interface UiNodeBase { id?: UiAuthoredNodeId; children?: UiChild[]; slots?: Record<string, UiChild[]>; }
 export type UiNode =
   | (UiNodeBase & { type: "form"; props: UiFormProps })
   | (UiNodeBase & { type: "dialog"; props: UiDialogProps })

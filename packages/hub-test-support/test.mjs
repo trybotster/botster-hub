@@ -14,6 +14,8 @@ import {
   modeFlagsConformanceFixturePath,
   materializeSessionPluginBindings,
   materializeSessionPluginBindingScenario,
+  materializeSessionPluginRows,
+  materializeSessionPluginRowScenario,
   materializeApplicationPrimitivesFixture,
   materializePluginContractMatrixFixture,
   metadata,
@@ -130,14 +132,14 @@ function assertDialogFormComposition(source) {
 }
 
 assert.equal(metadata.package_name, "@trybotster/hub-test-support");
-assert.equal(metadata.package_version, "0.1.16");
+assert.equal(metadata.package_version, "0.1.17");
 assert.equal(metadata.protocol, "botster-hub-daemon-v1");
 assert.equal(metadata.protocol_version, 4);
-assert.equal(metadata.conformance_fixture_revision, 24);
+assert.equal(metadata.conformance_fixture_revision, 25);
 assert.deepEqual(metadata.ui_contract, {
   conformance_fixture_export: "@trybotster/ui-contract/conformance-fixtures",
   package_name: "@trybotster/ui-contract",
-  package_version: "0.1.1",
+  package_version: "0.2.0",
 });
 assert.deepEqual(metadata.application_primitives, {
   fixture_package_name: "botster.plugin-contract-matrix",
@@ -265,7 +267,7 @@ assert.deepEqual(supportMatrix.plugin_surfaces.authored_set_values, {
   "selected-workspace": "workspace-alpha",
 });
 
-assert.equal(sessionLifecycleFixture.conformance_fixture_revision, 24);
+assert.equal(sessionLifecycleFixture.conformance_fixture_revision, 25);
 assert.equal(sessionLifecycleFixture.entity_type, "session");
 assert.deepEqual(
   sessionLifecycleFixture.normalized_frames.map((frame) => frame.type),
@@ -280,7 +282,7 @@ assert.match(
   /node_modules[\\/]@trybotster[\\/]ui-contract[\\/]/,
 );
 const uiContractFixtures = await readUiContractConformanceFixtures();
-assert.equal(uiContractFixtures.contract_version, "0.1.1");
+assert.equal(uiContractFixtures.contract_version, "0.2.0");
 assert.equal(
   uiContractFixtures.fixtures.dialog_presence.predicate.key,
   "create-ticket-dialog",
@@ -303,12 +305,27 @@ assert.equal(
 assert.equal(sessionLifecycleFixture.overflow.snapshot_precedes_later_deltas, true);
 assert.equal(sessionLifecycleFixture.overflow.failed_snapshot_delivery_closes_subscription, true);
 
-assert.equal(sessionPluginBindingFixture.conformance_fixture_revision, 24);
+assert.equal(sessionPluginBindingFixture.conformance_fixture_revision, 25);
 assert.equal(sessionPluginBindingFixture.binding_family, "/session");
 const sessionPluginMaterialization = materializeSessionPluginBindingScenario(
   sessionPluginBindingFixture,
 );
 assert.deepEqual(sessionPluginMaterialization, sessionPluginBindingFixture.expected);
+const sessionPluginRows = materializeSessionPluginRowScenario(
+  sessionPluginBindingFixture,
+);
+for (const [stage, rows] of Object.entries(sessionPluginRows)) {
+  assert.deepEqual(
+    rows.map((row) => row.node_id),
+    sessionPluginBindingFixture.row_expected[stage],
+  );
+  for (const row of rows) {
+    assert.deepEqual(row.action_payload, {
+      operation: "select_session",
+      session_uuid: row.node_id,
+    });
+  }
+}
 assert.equal(
   Object.values(sessionPluginMaterialization.initial).includes("current"),
   true,
@@ -357,6 +374,69 @@ assert.throws(
       malformedSessionFrames,
     ),
   /present session row session-transition is missing lifecycle_class/,
+);
+
+for (const mutate of [
+  (surface) => surface.children.pop(),
+  (surface) => surface.children.push(structuredClone(surface.children.at(-1))),
+  (surface) => {
+    surface.children[0].item_template.props.text.$bind = "@/registry_state";
+  },
+  (surface) => {
+    surface.children.at(-1).item_template.id.$bind = "@/registry_state";
+  },
+  (surface) => {
+    surface.children.push({
+      $kind: "bind_list",
+      source: "/session",
+      where: { registry_state: "running" },
+      item_template: {
+        type: "text",
+        id: "extra",
+        props: { text: "Extra" },
+      },
+    });
+  },
+]) {
+  const surface = structuredClone(sessionPluginBindingFixture.surface);
+  mutate(surface);
+  assert.throws(() =>
+    materializeSessionPluginBindings(
+      surface,
+      [sessionPluginBindingFixture.initial_snapshot],
+    ),
+  );
+  assert.throws(() =>
+    materializeSessionPluginRows(
+      surface,
+      [sessionPluginBindingFixture.initial_snapshot],
+    ),
+  );
+}
+
+for (const sessionUuid of [null, " \t"]) {
+  const invalidIdPatch = {
+    ...sessionPluginBindingFixture.transition_frames[0],
+    patch: { session_uuid: sessionUuid },
+  };
+  assert.throws(() =>
+    materializeSessionPluginRows(
+      sessionPluginBindingFixture.surface,
+      [sessionPluginBindingFixture.initial_snapshot, invalidIdPatch],
+    ),
+  );
+}
+const duplicateIdPatch = {
+  ...sessionPluginBindingFixture.transition_frames[0],
+  patch: { session_uuid: "session-stable-current" },
+};
+assert.throws(
+  () =>
+    materializeSessionPluginRows(
+      sessionPluginBindingFixture.surface,
+      [sessionPluginBindingFixture.initial_snapshot, duplicateIdPatch],
+    ),
+  /duplicate materialized session node id session-stable-current/,
 );
 
 const lateAttachFixture = readLateAttachHistoryConformanceFixture();
