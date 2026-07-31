@@ -13826,16 +13826,16 @@ fn package_entrypoint_supervision_passes_environment_overrides() {
     let entrypoint = package_entrypoint(&start, "runtime.env");
     assert_eq!(entrypoint.process.state, "running");
 
+    let expected_output = "override-reached-child";
+    let mut observed_output = String::new();
     for _ in 0..100 {
-        if output_path.exists() {
+        observed_output = fs::read_to_string(&output_path).unwrap_or_default();
+        if observed_output == expected_output {
             break;
         }
         thread::sleep(Duration::from_millis(20));
     }
-    assert_eq!(
-        fs::read_to_string(&output_path).expect("read env output"),
-        "override-reached-child"
-    );
+    assert_eq!(observed_output, expected_output);
 
     shutdown_cli_daemon(&data_dir, child);
 }
