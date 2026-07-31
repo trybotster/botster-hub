@@ -3,6 +3,13 @@
   "package_directory": "packages/hub-test-support",
   "coordinate": "@trybotster/hub-test-support@0.1.18",
   "registry_state_before_publish": "npm E404",
+  "registry_state_after_publish": {
+    "registry": "https://registry.npmjs.org/",
+    "version": "0.1.18",
+    "npm_integrity": "sha512-llWRLNjFVKzi3CxII1waPO6u2w+TEAesiI8esVTEu8/rwuedeoZXXYTD0Sew76/8reysoZ1gy4P6LNoTptXsTA==",
+    "npm_shasum": "f2bce90dfd0554990f80ba6621c70b77ab2a0720",
+    "dependency": "@trybotster/ui-contract@0.2.0"
+  },
   "superseded_coordinate": {
     "coordinate": "@trybotster/hub-test-support@0.1.17",
     "status": "published with stale daemon protocol bytes; never use as consumer contract authority",
@@ -36,7 +43,8 @@
     "npm test in packages/hub-test-support with published ui-contract@0.2.0",
     "npm pack --json for the exact hub-test-support@0.1.18 tarball",
     "fresh temporary project installed published ui-contract@0.2.0 plus the exact local 0.1.18 tarball",
-    "fresh install verified package assets, plugin_resource_counters protocol bytes, metadata hash, and plugin fixture materialization"
+    "fresh install verified package assets, plugin_resource_counters protocol bytes, metadata hash, and plugin fixture materialization",
+    "fresh normal-registry install of both exact public coordinates repeated the asset, token, SHA, and fixture assertions"
   ],
   "publication": {
     "authorized_for_pipeline_agent": false,

@@ -87,9 +87,12 @@ immutability requires the cold-turkey 0.1.18 move.
 
 The remaining vendored-byte and exact-pin update is Follow-up
 `ticket_1785515827_864108`, routed to the `botster-web` target and registered as
-dependency `dependency_1785515833_230748`. It remains blocked until the human
-confirms npm serves 0.1.18 with the recorded integrity. This Hub run does not bypass registry artifact
-parity or patch Web.
+dependency `dependency_1785515833_230748`. The human published 0.1.18 from the
+exact verified worktree; a normal-registry metadata query and fresh
+coordinate-only install match the recorded integrity, shasum, protocol SHA,
+required resource-counter tokens, and fixtures. The registry prerequisite is
+therefore satisfied, but this Hub run does not patch Web; that repository must
+consume the coordinate through its separately routed ticket.
 
 ## Deviations from plan
 
@@ -144,7 +147,9 @@ Passed:
   package import, asset verification, protocol-field/hash validation, and
   plugin fixture materialization
 - registry checks confirming ui-contract 0.2.0 matches its locally packed
-  integrity and hub-test-support 0.1.18 still returns npm 404
+  integrity, plus post-publication hub-test-support 0.1.18 integrity and shasum
+- a fresh normal-registry install of both exact public coordinates, followed by
+  the same asset, protocol-token/SHA, metadata, and fixture assertions
 - loaded selector validation with `stress_profile=none`, plus a negative check
   proving `moderate` exits 2
 - shell/Ruby syntax checks and `git diff --check`
@@ -156,19 +161,17 @@ entity reconnects through `script/probe-hub-resources`, reloaded every owner,
 retired them stepwise through public disable, and ended with zero timer,
 queued-job, and in-flight-job resources.
 
-The exact-coordinate fresh campaign remains correctly blocked before launch:
-the Hub-owned 0.1.18 package is publish-ready but is not yet available from npm,
-and Web cannot consume or vendor it until the human publication step completes.
-No sibling-worktree or local-tarball override is accepted as four-package
-production proof.
+The Hub-owned registry prerequisite is complete without a sibling-worktree or
+local-tarball override. The exact-coordinate fresh campaign remains blocked
+only on Web ticket `ticket_1785515827_864108` consuming the public artifact and
+closing dependency `dependency_1785515833_230748`.
 
 ## Unverified behavior and residual risk
 
-- The exact named-package fresh campaign cannot execute its new phases until a
-  human publishes the prepared 0.1.18 artifact and
+- The exact named-package fresh campaign cannot execute its new phases until
   `ticket_1785515827_864108` updates Web's generated/vendored protocol and exact
-  pin. After that dependency closes, rerun the unchanged campaign and retain
-  its redacted evidence bundle.
+  public 0.1.18 pin. After that dependency closes, rerun the unchanged campaign
+  and retain its redacted evidence bundle.
 - The 250 ms Linux CPU assertion is implemented and selector-gated but was not
   executed on this macOS implementation host. The loaded Ubuntu selector is
   the authoritative environment for that threshold.
