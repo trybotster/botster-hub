@@ -53,7 +53,7 @@ use support::{
 static REAL_DAEMON_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 const OPERATOR_CONSOLE_READINESS_LIVENESS_BACKSTOP: Duration = Duration::from_secs(60);
 const OPERATOR_CONSOLE_READER_DRAIN_BACKSTOP: Duration = Duration::from_secs(2);
-const OPERATOR_CONSOLE_OUTPUT_PROGRESS_BACKSTOP: Duration = Duration::from_secs(30);
+const OPERATOR_CONSOLE_OUTPUT_PROGRESS_BACKSTOP: Duration = LOCAL_RUNTIME_DAEMON_READINESS_BUDGET;
 const DETERMINISTIC_FOREGROUND_INTERRUPT_SCRIPT: &str = "trap '' INT; node -e 'process.on(\"SIGINT\", () => process.exit(130)); console.log(\"foreground-forward-ready\"); setInterval(() => {}, 1000)' & child=$!; wait \"$child\"";
 const BOTSTER_WEB_READINESS_LIVENESS_BACKSTOP: Duration = Duration::from_secs(60);
 const BOTSTER_WEB_READINESS_STARTUP_DELAY_MS: u64 = 3_000;
@@ -3513,6 +3513,45 @@ fn operator_console_output_wait_reports_early_child_exit() {
     );
     console.wait_for_exit();
     fs::remove_dir_all(&fixture_dir).expect("remove early-exit console fixture directory");
+}
+
+#[test]
+fn operator_console_output_checkpoint_reports_early_child_exit() {
+    let fixture_dir = unique_short_test_dir("console-checkpoint-child-exit");
+    fs::create_dir_all(&fixture_dir)
+        .expect("create checkpoint early-exit console fixture directory");
+    let fixture = fixture_dir.join("checkpoint-early-exit-console");
+    fs::write(
+        &fixture,
+        "#!/bin/sh\nprintf 'console-started\\n'\nexit 23\n",
+    )
+    .expect("write checkpoint early-exit console fixture");
+    let mut permissions = fs::metadata(&fixture)
+        .expect("read checkpoint early-exit console fixture metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&fixture, permissions)
+        .expect("make checkpoint early-exit console fixture executable");
+
+    let mut console = OperatorConsolePty::spawn_binary(&fixture, &fixture_dir);
+    console.wait_for("console-started");
+    let checkpoint = console.output_checkpoint();
+    let error = console
+        .try_wait_for_output_after(
+            checkpoint,
+            "output-that-will-never-arrive",
+            OPERATOR_CONSOLE_OUTPUT_PROGRESS_BACKSTOP,
+        )
+        .expect_err("exited console should fail a post-checkpoint output wait");
+    assert!(error.contains("console exited after"), "{error}");
+    assert!(error.contains("code: 23"), "{error}");
+    assert!(
+        !error.contains("no post-action progress"),
+        "child-exit detection must precede the post-action backstop: {error}"
+    );
+    console.wait_for_exit();
+    fs::remove_dir_all(&fixture_dir)
+        .expect("remove checkpoint early-exit console fixture directory");
 }
 
 #[test]
