@@ -14,6 +14,7 @@ on:
         type: choice
         options:
           - lifecycle-suite
+          - focused-session-entity-resize
           - focused-process-ownership
           - focused-connection-lifecycle
           - focused-stalled-attach
@@ -124,6 +125,7 @@ jobs:
       - name: Precompile selected test surface
         working-directory: subject
         env:
+          SUBJECT_SHA: ${{ inputs.subject_sha }}
           TEST_TARGET: ${{ inputs.test_target }}
         run: |
           case "$TEST_TARGET" in
@@ -148,14 +150,43 @@ jobs:
           printf '\n' | tee -a "$ARTIFACT_DIR/metadata.txt"
           cargo "${worker_args[@]}" 2>&1 \
             | tee -a "$ARTIFACT_DIR/precompile.log"
+          hub_bin="$GITHUB_WORKSPACE/subject/target/debug/botster-hub"
           worker_bin="$GITHUB_WORKSPACE/subject/target/debug/botster-session-worker"
-          if [[ ! -x "$worker_bin" ]]; then
-            printf 'missing precompiled session worker: %s\n' "$worker_bin" \
+          if [[ ! -x "$hub_bin" || ! -x "$worker_bin" ]]; then
+            printf 'missing precompiled runtime binary: hub=%s worker=%s\n' "$hub_bin" "$worker_bin" \
               | tee -a "$ARTIFACT_DIR/metadata.txt"
             exit 1
           fi
-          printf 'session_worker_bin=%s\n' "$worker_bin" \
-            | tee -a "$ARTIFACT_DIR/metadata.txt"
+          target_realpath="$(realpath "$GITHUB_WORKSPACE/subject/target")"
+          hub_realpath="$(realpath "$hub_bin")"
+          worker_realpath="$(realpath "$worker_bin")"
+          for runtime_realpath in "$hub_realpath" "$worker_realpath"; do
+            case "$runtime_realpath" in
+              "$target_realpath"/*) ;;
+              *)
+                printf 'runtime binary escaped fresh target: %s\n' "$runtime_realpath" \
+                  | tee -a "$ARTIFACT_DIR/metadata.txt"
+                exit 1
+                ;;
+            esac
+          done
+          locked_core_sha="$(
+            sed -n '/name = "botster-core"/,/^$/p' Cargo.lock \
+              | sed -n 's/^source = "git+[^#]*#\([0-9a-f]\{40\}\)"$/\1/p' \
+              | head -n 1
+          )"
+          if [[ ! "$locked_core_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            printf 'unable to resolve locked botster-core SHA\n' \
+              | tee -a "$ARTIFACT_DIR/metadata.txt"
+            exit 1
+          fi
+          {
+            printf 'hub_sha=%s\n' "$SUBJECT_SHA"
+            printf 'locked_core_sha=%s\n' "$locked_core_sha"
+            printf 'target_realpath=%s\n' "$target_realpath"
+            printf 'hub_bin_realpath=%s\n' "$hub_realpath"
+            printf 'session_worker_bin_realpath=%s\n' "$worker_realpath"
+          } | tee -a "$ARTIFACT_DIR/metadata.txt"
 
       - name: Run loaded real-daemon lifecycle campaign
         env:
