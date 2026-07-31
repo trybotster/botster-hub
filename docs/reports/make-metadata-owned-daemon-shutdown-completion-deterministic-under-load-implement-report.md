@@ -111,8 +111,53 @@ path was added.
 - Extended the existing Linux runner self-test with a real held zombie. The
   fixture must fail the settled evidence gate, remain non-live to group and
   direct-child predicates, and disappear after its owning parent exits.
-- Exact branch/pre-fix loaded workflow evidence is pending remote dispatch and
-  will be appended before Review.
+- The Linux self-test passed in every dispatched workflow. It observed one
+  held zombie after the five-second settle, proved that zombie remained
+  non-live to the group/direct-child predicates, and observed zero zombies
+  after its parent reaped it.
+
+## Loaded workflow evidence
+
+- Instrumented pre-fix focused run:
+  [30609814800](https://github.com/trybotster/botster-hub/actions/runs/30609814800).
+  It checked out `3638fdc5c83991b0c4f3cb974683c20cc3fd558c`
+  with locked Core
+  `5846fc776d31e2b6c98a8d932f50a31078743901`. Repetition 1
+  produced the required exit 101: daemon PID `9886` was `Z` with PPID `9832`,
+  shutdown returned success after 504 ms, and metadata/socket were already
+  absent. Final live and zombie survivor counts were zero and
+  `cleanup_status=0`.
+- Fixed focused run:
+  [30610014273](https://github.com/trybotster/botster-hub/actions/runs/30610014273).
+  The exact implementation SHA
+  `13e60d96ff7218c38ee91677fc0c72616a4a808f` passed 20/20
+  default-parallel repetitions under the residual-tail profile (four CPUs, 48
+  stress workers). Each repetition observed the daemon as a real `Z` child,
+  held shutdown pending, then passed after reap. Observed exit-to-reap
+  intervals were about 0.93-1.10 seconds and shutdown completion about
+  1.04-1.29 seconds. Every repetition recorded zero live and settled zombie
+  survivors; final ownership ledgers were empty and `cleanup_status=0`.
+- Fixed full-suite run:
+  [30609817554](https://github.com/trybotster/botster-hub/actions/runs/30609817554).
+  Repetitions 1-4 were entirely green. Repetition 5 made the workflow red only
+  in untouched
+  `occupied_generic_web_port_reports_structured_entrypoint_failure`; the new
+  shutdown regression passed 5/5. All five repetitions recorded zero settled
+  zombies. The unrelated failed web fixture left one live run-token process;
+  the runner terminated it, verified it gone, emptied all ledgers, and
+  finished with `cleanup_status=0`.
+- Identical authoritative-base full-suite attribution:
+  [30611916117](https://github.com/trybotster/botster-hub/actions/runs/30611916117).
+  It checked out authoritative base
+  `b1bca77a16c36276ffba6ea726b54ae0664e905b`, the same locked
+  Core SHA, runner image, four-CPU/48-worker residual-tail profile, and passed
+  5/5. Every repetition recorded zero live and settled zombie survivors;
+  ledgers were empty and `cleanup_status=0`.
+
+The branch full-suite red is therefore recorded, not waived: its exact failing
+symbol and survivor belonged to an untouched web entrypoint fixture, the
+changed shutdown path passed in every branch repetition, and the identical
+base attribution completed green.
 
 ## Files changed
 
@@ -165,11 +210,18 @@ no cross-repository dependencies and no separately routed implementation work.
   passed.
 - `git diff --check`: passed.
 - Runner Bash syntax and focused selector validation: passed locally.
+- Linux instrumented pre-fix focused proof: expected red with exact zombie
+  evidence and clean final teardown.
+- Linux fixed focused residual-tail proof: 20/20 passed with zero live/zombie
+  survivors.
+- Linux fixed full-suite residual-tail proof: four fully green repetitions;
+  fifth repetition's shutdown path green and unrelated web entrypoint fixture
+  red; zero settled zombies and clean final teardown.
+- Linux authoritative-base full-suite residual-tail attribution: 5/5 passed
+  with zero live/zombie survivors.
 
 ## Unverified behavior and residual risk
 
-- Linux-only real-zombie runner self-test and the required residual-tail loaded
-  campaigns are pending GitHub Actions execution.
 - Local proof observed PID 1 as the production orphan reaper and bounded total
   shutdown completion, but the zombie interval was shorter than the 20 ms
   process-snapshot sampling resolution in that topology. The controlled-parent
@@ -177,6 +229,11 @@ no cross-repository dependencies and no separately routed implementation work.
 - The settled cross-session role census depends on Linux `ps` retaining the
   executable role in zombie `comm`/args; recorded-SID evidence independently
   covers the campaign's own session.
+- The branch full-suite campaign was not 5/5 globally green because the fifth
+  repetition hit the untouched generic-web-port readiness fixture described
+  above. This is not hidden as a pre-existing blanket exception: the exact
+  failing symbol, its one live fixture process, successful cleanup, the new
+  test's 5/5 result, and the identical base's 5/5 result are all retained.
 
 ## Missing vault guidance discovered
 
@@ -188,4 +245,3 @@ must reap that exact exited child or its own wait prevents PID absence.
 This was not written directly to the vault from the repository run because the
 vault is a separately owned target. It should be captured through the vault
 pipeline as a Botster lifecycle gotcha after this implementation is reviewed.
-
