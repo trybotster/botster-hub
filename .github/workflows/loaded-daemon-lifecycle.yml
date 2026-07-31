@@ -15,6 +15,7 @@ on:
         options:
           - lifecycle-suite
           - focused-metadata-owned-shutdown
+          - focused-occupied-web-port
           - focused-session-entity-resize
           - focused-process-ownership
           - focused-connection-lifecycle

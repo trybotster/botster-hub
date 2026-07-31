@@ -5754,6 +5754,73 @@ fn cli_shutdown_waits_until_metadata_owned_daemon_is_reaped() {
 }
 
 #[test]
+fn cli_shutdown_reaps_metadata_owned_daemon_started_by_live_operator_console() {
+    let _guard = daemon_test_guard();
+    ensure_session_worker_binary();
+    let data_dir = unique_short_test_dir("external-shutdown-live-console");
+    let metadata_path = data_dir.join(".botster-hub-runtime-daemon.json");
+    let socket_path = explicit_config(&data_dir)
+        .transports
+        .local_socket
+        .expect("local socket binding")
+        .path;
+    let mut daemon_cleanup = OwnedOperatorConsoleDaemon::new(&data_dir);
+    let mut console = OperatorConsolePty::spawn(&data_dir);
+    daemon_cleanup.wait_until_daemon_ready(&mut console);
+    console.wait_for("daemon=started");
+    console.wait_for("botster-hub> ");
+    let daemon_pid = *daemon_cleanup
+        .owned_pids()
+        .last()
+        .expect("operator console started daemon pid");
+
+    let shutdown_started_at = Instant::now();
+    let shutdown = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("shutdown")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .output()
+        .expect("run external shutdown while starting console remains live");
+    assert!(
+        shutdown.status.success(),
+        "external shutdown failed while daemon parent console remained live after {:?}: {}",
+        shutdown_started_at.elapsed(),
+        command_output_text(&shutdown)
+    );
+    assert!(
+        shutdown_started_at.elapsed() < Duration::from_secs(5),
+        "external shutdown approached the ten-second timeout while daemon parent console remained live: {:?}",
+        shutdown_started_at.elapsed()
+    );
+    assert!(
+        console
+            .child
+            .try_wait()
+            .expect("poll starting operator console after external shutdown")
+            .is_none(),
+        "starting operator console exited instead of remaining available to reap its daemon: {}",
+        console.text()
+    );
+    assert!(
+        !process_exists(daemon_pid),
+        "external shutdown returned before console-reaped daemon pid {daemon_pid} disappeared"
+    );
+    assert!(
+        !metadata_path.exists(),
+        "external shutdown left owned runtime metadata"
+    );
+    assert!(
+        !socket_path.exists(),
+        "external shutdown left owned runtime socket"
+    );
+
+    console.send(&[4]);
+    console.wait_for_exit();
+    daemon_cleanup.assert_cleaned();
+    fs::remove_dir_all(&data_dir).expect("remove external-shutdown console data directory");
+}
+
+#[test]
 fn cli_local_runtime_up_reports_missing_installed_checkout_before_launch() {
     let _guard = daemon_test_guard();
     let data_dir = unique_short_test_dir("cli-up-missing-checkout");

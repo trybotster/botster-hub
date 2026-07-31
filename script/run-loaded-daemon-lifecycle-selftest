@@ -8,6 +8,12 @@ DECOY_PID=
 ESCAPED_PID=
 ZOMBIE_PARENT_PID=
 ZOMBIE_PID=
+BASELINE_ROLE_PARENT_PID=
+BASELINE_ROLE_ZOMBIE_PID=
+NEW_ROLE_PARENT_PID=
+NEW_ROLE_ZOMBIE_PID=
+STARTED_ROLE_PARENT_PID=
+STARTED_ROLE_ZOMBIE_PID=
 
 cleanup_selftest() {
   if [[ -n "$FIXTURE_PID" ]]; then
@@ -22,10 +28,18 @@ cleanup_selftest() {
   if [[ -n "$ZOMBIE_PARENT_PID" ]]; then
     kill -TERM -- "-$ZOMBIE_PARENT_PID" 2>/dev/null || true
   fi
+  if [[ -n "$BASELINE_ROLE_PARENT_PID" ]]; then
+    kill -TERM -- "-$BASELINE_ROLE_PARENT_PID" 2>/dev/null || true
+  fi
+  if [[ -n "$NEW_ROLE_PARENT_PID" ]]; then
+    kill -TERM -- "-$NEW_ROLE_PARENT_PID" 2>/dev/null || true
+  fi
   wait "${FIXTURE_PID:-}" 2>/dev/null || true
   wait "${DECOY_PID:-}" 2>/dev/null || true
   wait "${ESCAPED_PID:-}" 2>/dev/null || true
   wait "${ZOMBIE_PARENT_PID:-}" 2>/dev/null || true
+  wait "${BASELINE_ROLE_PARENT_PID:-}" 2>/dev/null || true
+  wait "${NEW_ROLE_PARENT_PID:-}" 2>/dev/null || true
   rm -rf "$SELFTEST_DIR"
 }
 trap cleanup_selftest EXIT INT TERM HUP
@@ -39,9 +53,43 @@ pass() {
   printf 'ok - %s\n' "$*"
 }
 
+start_role_zombie() {
+  local pid_file=$1
+  local comm=$2
+
+  setsid python3 -c '
+import ctypes
+import os
+import sys
+import time
+
+if ctypes.CDLL(None).prctl(15, sys.argv[2].encode(), 0, 0, 0) != 0:
+    raise OSError(ctypes.get_errno(), "prctl(PR_SET_NAME) failed")
+child = os.fork()
+if child == 0:
+    os.setpgid(0, 0)
+    os._exit(0)
+with open(sys.argv[1], "w", encoding="utf-8") as output:
+    output.write(f"{child}\n")
+time.sleep(300)
+' "$pid_file" "$comm" &
+  STARTED_ROLE_PARENT_PID=$!
+
+  for _ in {1..100}; do
+    [[ -s "$pid_file" ]] && break
+    sleep 0.05
+  done
+  [[ -s "$pid_file" ]] \
+    || fail "$comm role zombie fixture did not publish its child pid"
+  STARTED_ROLE_ZOMBIE_PID=$(cat "$pid_file")
+}
+
 source "$RUNNER" --artifact-dir "$SELFTEST_DIR/source-must-not-run"
 [[ ! -e "$SELFTEST_DIR/source-must-not-run" ]] || fail "sourcing executed runner main"
 pass "runner sources without CLI or campaign side effects"
+
+command -v python3 >/dev/null 2>&1 \
+  || fail "missing required self-test command: python3"
 
 ARTIFACT_DIR="$SELFTEST_DIR/artifacts"
 mkdir -p "$ARTIFACT_DIR"
@@ -55,6 +103,20 @@ ACTIVE_TOKEN_OWNERSHIP_FILE="$ARTIFACT_DIR/active-run-tokens.tsv"
 touch "$CLEANUP_LOG" "$OWNERSHIP_FILE" "$ACTIVE_OWNERSHIP_FILE" \
   "$SESSION_OWNERSHIP_FILE" "$ACTIVE_SESSION_OWNERSHIP_FILE" \
   "$TOKEN_OWNERSHIP_FILE" "$ACTIVE_TOKEN_OWNERSHIP_FILE"
+
+scanner_baseline="$ARTIFACT_DIR/scanner-error-baseline.tsv"
+: > "$scanner_baseline"
+saved_all_process_rows=$(declare -f all_process_rows)
+all_process_rows() {
+  return 73
+}
+capture_settled_zombie_survivors "" "$scanner_baseline" \
+  "$ARTIFACT_DIR/scanner-error-evidence.tsv"
+scanner_status=$?
+eval "$saved_all_process_rows"
+((scanner_status == 2)) \
+  || fail "zombie scanner failure was not propagated; status=$scanner_status"
+pass "zombie census fails closed when its process scanner fails"
 
 setsid bash -c 'exit 0' &
 finished_pid=$!
@@ -125,6 +187,87 @@ capture_settled_zombie_survivors "" "$zombie_baseline" "$ARTIFACT_DIR/reaped-zom
   || fail "reaped zombie row remained in settled evidence"
 ZOMBIE_PID=
 pass "reaped zombie disappears from the settled evidence gate"
+
+if [[ "$(runner_platform)" == Linux ]]; then
+  baseline_role_pid_file="$ARTIFACT_DIR/baseline-role-zombie.pid"
+  start_role_zombie "$baseline_role_pid_file" botster-hub
+  BASELINE_ROLE_PARENT_PID=$STARTED_ROLE_PARENT_PID
+  BASELINE_ROLE_ZOMBIE_PID=$STARTED_ROLE_ZOMBIE_PID
+  baseline_role_ready=0
+  for _ in {1..100}; do
+    if botster_role_zombie_rows \
+      | awk -v pid="$BASELINE_ROLE_ZOMBIE_PID" '$1 == pid { found=1 } END { exit !found }'; then
+      baseline_role_ready=1
+      break
+    fi
+    sleep 0.05
+  done
+  ((baseline_role_ready == 1)) \
+    || fail "botster-hub role zombie was not observed"
+
+  role_zombie_baseline="$ARTIFACT_DIR/role-zombie-baseline.tsv"
+  botster_role_zombie_rows > "$role_zombie_baseline" \
+    || fail "role zombie baseline census failed"
+  awk -v pid="$BASELINE_ROLE_ZOMBIE_PID" '$1 == pid { found=1 } END { exit !found }' \
+    "$role_zombie_baseline" \
+    || fail "role zombie baseline omitted the pre-existing botster-hub zombie"
+
+  new_role_pid_file="$ARTIFACT_DIR/new-role-zombie.pid"
+  start_role_zombie "$new_role_pid_file" botster-session
+  NEW_ROLE_PARENT_PID=$STARTED_ROLE_PARENT_PID
+  NEW_ROLE_ZOMBIE_PID=$STARTED_ROLE_ZOMBIE_PID
+  new_role_ready=0
+  for _ in {1..100}; do
+    if session_zombie_rows "$NEW_ROLE_PARENT_PID" \
+      | awk -v pid="$NEW_ROLE_ZOMBIE_PID" '$1 == pid { found=1 } END { exit !found }'; then
+      new_role_ready=1
+      break
+    fi
+    sleep 0.05
+  done
+  ((new_role_ready == 1)) \
+    || fail "truncated session-worker role zombie was not observed"
+
+  role_zombie_evidence="$ARTIFACT_DIR/role-zombie-survivors.tsv"
+  capture_settled_zombie_survivors "$NEW_ROLE_PARENT_PID" \
+    "$role_zombie_baseline" "$role_zombie_evidence"
+  role_zombie_status=$?
+  ((role_zombie_status == 1)) \
+    || fail "new role zombie did not fail settled evidence; status=$role_zombie_status"
+  awk -F '\t' -v pid="$NEW_ROLE_ZOMBIE_PID" \
+    '$1 == "new-role" && $2 == pid { found=1 } END { exit !found }' \
+    "$role_zombie_evidence" \
+    || fail "new truncated session-worker zombie omitted from new-role evidence"
+  if awk -F '\t' -v pid="$BASELINE_ROLE_ZOMBIE_PID" \
+    '$2 == pid { found=1 } END { exit !found }' "$role_zombie_evidence"; then
+    fail "pre-existing botster-hub role zombie was not subtracted by baseline"
+  fi
+  pass "cross-session role census reports new zombies and subtracts its baseline"
+
+  kill -TERM -- "-$NEW_ROLE_PARENT_PID" 2>/dev/null || true
+  wait "$NEW_ROLE_PARENT_PID" 2>/dev/null || true
+  NEW_ROLE_PARENT_PID=
+  kill -TERM -- "-$BASELINE_ROLE_PARENT_PID" 2>/dev/null || true
+  wait "$BASELINE_ROLE_PARENT_PID" 2>/dev/null || true
+  BASELINE_ROLE_PARENT_PID=
+  for _ in {1..100}; do
+    if ! kill -0 "$NEW_ROLE_ZOMBIE_PID" 2>/dev/null \
+      && ! kill -0 "$BASELINE_ROLE_ZOMBIE_PID" 2>/dev/null; then
+      break
+    fi
+    sleep 0.05
+  done
+  kill -0 "$NEW_ROLE_ZOMBIE_PID" 2>/dev/null \
+    && fail "new role zombie remained after parent exit"
+  kill -0 "$BASELINE_ROLE_ZOMBIE_PID" 2>/dev/null \
+    && fail "baseline role zombie remained after parent exit"
+  capture_settled_zombie_survivors "" "$role_zombie_baseline" \
+    "$ARTIFACT_DIR/reaped-role-zombies.tsv" \
+    || fail "reaped role zombies remained in settled evidence"
+  NEW_ROLE_ZOMBIE_PID=
+  BASELINE_ROLE_ZOMBIE_PID=
+  pass "reaped cross-session role zombies disappear from settled evidence"
+fi
 
 escaped_token="botster-loaded-selftest-escaped-$$"
 escaped_pid_file="$ARTIFACT_DIR/escaped.pid"

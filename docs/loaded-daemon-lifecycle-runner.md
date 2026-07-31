@@ -36,11 +36,13 @@ triage. A focused run does not satisfy the required 20-or-more default-parallel
 lifecycle-suite campaign. The runner stops at the first red repetition so the
 failure remains easy to locate and no later retry can hide it.
 
-Use `focused-metadata-owned-shutdown` to repeat the exact
-`cli_shutdown_waits_until_metadata_owned_daemon_is_reaped` regression with
-default Cargo test concurrency. The test owns the real daemon child, holds its
-zombie state long enough to prove the shutdown CLI remains pending, reaps it,
-and then requires successful shutdown plus PID, metadata, and socket absence.
+Use `focused-metadata-owned-shutdown` to repeat the metadata-owned shutdown
+regressions with default Cargo test concurrency. One test owns the real daemon
+child, holds its zombie state long enough to prove the shutdown CLI remains
+pending, reaps it, and then requires successful shutdown plus PID, metadata,
+and socket absence. The production-topology test keeps the operator console
+that started the daemon alive while a separate CLI shuts it down, proving the
+console's background waiter reaps the child and the external command completes.
 For this lifecycle defect, the binding focused campaign is 20 repetitions with
 `residual-tail`; the broader five-repetition `full-suite-contention` campaign
 still supplies downstream suite proof.
@@ -152,11 +154,13 @@ contains:
 - `run-NNN-zombie-baseline.tsv` and `run-NNN-zombie-survivors.tsv`: the
   pre-repetition Botster-role zombie baseline and the post-cleanup,
   five-second-settled zombie delta. The settled evidence combines newly
-  appearing Hub, session-worker, and fixture-shell role zombies across sessions
-  with every zombie in the recorded test session. A remaining row fails the
-  repetition as `zombie_survivors` evidence, but it never enters the
+  appearing Hub and session-worker role zombies across sessions with every
+  zombie in the recorded Linux test session. Linux session-worker matching uses
+  the kernel's truncated `botster-session` comm value. A remaining row fails
+  the repetition as `zombie_survivors` evidence, but it never enters the
   zombie-excluding TERM/KILL loops or changes `cleanup_status` for otherwise
-  completed cleanup.
+  completed cleanup. Scanner failure is a distinct nonzero campaign error;
+  empty evidence counts as clean only after every census command succeeds.
 
 Download from the run's **Artifacts** section or with:
 
