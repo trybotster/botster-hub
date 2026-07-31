@@ -36,7 +36,9 @@
   with Lua-API and capability-manifest positive controls.
 - `script/process-census` — shared macOS/Linux process/zombie scanner consumed
   by both lifecycle and production harnesses, including a real spawned-child
-  executable-provenance positive control.
+  executable-provenance positive control and a fork/exec zombie positive
+  control. Darwin gates on every new baseline-diff zombie because zombie
+  `comm` and `args` are both `<defunct>`; Linux retains role-name filtering.
 - `script/test-production-package-runtime` — exact zero-timer source baseline,
   caller-owned-Hub resource phases, reconnect/reload/idle/disable generations,
   cross-generation stability comparison, and split live/zombie post-down
@@ -98,7 +100,8 @@ parity or patch Web.
   `script/process-census` so both the loaded lifecycle runner and production
   campaign use the same process/zombie scanner. Live survivors use exact
   executable provenance; zombies use a settled pre-campaign baseline because
-  `<defunct>` rows retain no argv.
+  `<defunct>` rows retain neither argv nor, on Darwin, `comm`. Darwin therefore
+  compares every new zombie while Linux retains the Botster-role filter.
 
 ## Verification
 
@@ -118,7 +121,8 @@ Passed:
   `botster.capabilities.timer_once` and manifest `{ "surface": "timer" }`
   declarations make the gate fail
 - `script/process-census --self-test`, proving a real spawned executable is
-  visible to the live-survivor oracle
+  visible to the live-survivor oracle and a real fork/exec zombie makes the
+  platform-specific zombie oracle fail with the fixture PID in evidence
 - `node packages/hub-test-support/scripts/sync-assets.mjs --check`
 - `script/publish-npm-packages --dry-run`, covering generation/check/test/pack
   for both `@trybotster/ui-contract@0.2.0` and
