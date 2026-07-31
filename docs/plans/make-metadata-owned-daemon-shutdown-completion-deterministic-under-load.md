@@ -76,6 +76,28 @@ Botster layer: Rust Hub CLI/local-daemon lifecycle plus its repository-owned
 real-process integration and loaded CI proof. No SPA behavior is touched even
 though the generic Botster planner map is required context.
 
+### Accepted implementation deviations synchronized after downstream review
+
+Characterization and suite-wide acceptance exposed four repository-owned needs
+that were accepted during Implement but were not reflected in the original
+plan text:
+
+- A long-lived operator console that starts the metadata-owned daemon retains a
+  background `Child::wait()` waiter for that exact child. This is lifecycle
+  ownership/reaping only; foreground UI, PTY, application, and console-output
+  behavior remain out of scope.
+- The loaded-runner self-test proves its fail-closed zombie census with real
+  cross-session Hub and session-worker zombies, scanner-error propagation, and
+  baseline subtraction.
+- The full-suite occupied-port first red required the existing
+  `EntrypointSupervisor` terminal-diagnostic finalization window to be observed
+  before constructing `ReadinessFailed`.
+- An exact occupied-web-port selector provides identical branch/base isolation
+  for that first red before the complete suite is rerun.
+
+These are surgical extensions of the approved Hub lifecycle/test/CI ownership
+boundary, not cross-repository scope.
+
 ## Current production-path finding
 
 `botster-hub shutdown` and `down` already resolve the metadata-owned PID before
@@ -141,6 +163,10 @@ census after a bounded settle/recheck; it must never feed TERM/KILL loops.
 - Add an owned-shutdown-only terminal wait in which `Z` remains pending inside
   the existing ten-second budget. Keep the existing `None | Z` socket-release
   wait unchanged for stale recovery and failed-start unwind.
+- When the process that spawned the daemon stays alive as an operator console,
+  retain a background waiter for that exact child so an external shutdown can
+  observe PID disappearance. Do not change foreground UI, PTY, application, or
+  console-output behavior.
 - Keep socket and metadata removal after terminal PID disappearance. Preserve
   typed failure if the documented completion state is not reached within the
   existing budget.
@@ -155,6 +181,12 @@ census after a bounded settle/recheck; it must never feed TERM/KILL loops.
   liveness, cleanup group selection, and post-clean checks. Zombie rows fail the
   repetition as evidence but are not sent through TERM/KILL loops the runner
   cannot satisfy.
+- Make the runner self-test fail closed on scanner errors and prove real
+  cross-session Hub/session-worker zombie detection plus baseline subtraction.
+- If the complete suite exposes an occupied-port readiness diagnostic race,
+  isolate it with an exact branch/base selector and repair only the existing
+  entrypoint terminal-diagnostic finalization boundary before rerunning the
+  complete suite.
 - Document in `README.md` that successful `shutdown`/`down` for a verified
   metadata-owned runtime means the recorded PID is absent and its owned socket
   and metadata are removed.
@@ -162,7 +194,9 @@ census after a bounded settle/recheck; it must never feed TERM/KILL loops.
 ## Non-scope
 
 - No foreground-console progress, PTY handoff, foreground app, or console
-  output change from the just-merged upstream ticket.
+  output change from the just-merged upstream ticket. Retaining a background
+  waiter for a daemon child started by a live console is the accepted lifecycle
+  ownership exception; it must not alter those foreground surfaces.
 - No longer timeout, fixed sleep, blind retry, weakened `kill(pid, 0)`
   assertion, zombie-as-success rule, or test-only wait inserted after the CLI
   has returned.
@@ -250,9 +284,14 @@ census after a bounded settle/recheck; it must never feed TERM/KILL loops.
 - `script/run-loaded-daemon-lifecycle` — exact focused selector plus a separate
   zombie evidence/settle gate; live-only liveness and cleanup predicates remain
   unchanged.
+- `script/run-loaded-daemon-lifecycle-selftest` — fail-closed scanner negative
+  control and real cross-session Hub/session-worker zombie positive controls.
 - `.github/workflows/loaded-daemon-lifecycle.yml` — expose the focused selector.
 - `docs/loaded-daemon-lifecycle-runner.md` — document focused campaign and
   zombie-inclusive evidence semantics.
+- `src/entrypoint_supervisor.rs` — preserve the existing terminal-diagnostic
+  finalization window when an occupied-port child exits before its reader
+  publishes the structured readiness failure.
 - `README.md` — operator-facing successful shutdown completion contract.
 - This plan and the later implementation report under the repository's
   established `docs/plans/` and `docs/reports/` hierarchy.
@@ -299,9 +338,11 @@ leading hypothesis.
    Its immediate alive-PID assertion remains a second production-shaped oracle;
    do not replace it with the controlled-parent test.
 8. Add `focused-metadata-owned-shutdown` in runner validation, command dispatch,
-   workflow choices, and runner docs. Its command must use `./test.sh`, the exact
-   integration test filter, `--exact`, `--nocapture`, and default Cargo test
-   concurrency.
+   workflow choices, and runner docs. Its command must use `./test.sh`, the
+   `metadata_owned_daemon` integration-test filter, `--nocapture`, and default
+   Cargo test concurrency. Do not combine this broad two-test filter with
+   `--exact`; the binding command is
+   `./test.sh --test hub_daemon_lifecycle_test metadata_owned_daemon -- --nocapture`.
 9. Keep these runner predicates zombie-excluding:
    `group_is_alive` (TERM/KILL wait loops), `direct_child_is_running` (direct
    child wait/reap), `session_process_rows`, and `run_token_process_rows`
@@ -313,14 +354,22 @@ leading hypothesis.
    is never passed to TERM/KILL or labelled `post_clean=alive`. Preserve
    `cleanup_status=0` when the cleanup machinery completed; the test/campaign
    status carries the zombie-evidence failure. Cover recorded-SID zombies and
-   newly appearing Botster Hub/session-worker/fixture role zombies across
-   sessions relative to a pre-repetition baseline.
+   newly appearing Botster Hub/session-worker role zombies across sessions
+   relative to a pre-repetition baseline. Fixture shells remain covered by
+   generic ownership ledgers and are not a fabricated role match.
 10. Add a runner self-check or fixture proving a zombie row survives the settle
     gate long enough to make the enclosing repetition nonzero, while a reaped
     row and a live group still follow their distinct existing paths. The
     self-check must also prove `group_is_alive` and
-    `direct_child_is_running` continue treating `Z` as non-live.
-11. Document the operator completion contract and produce an implementation
+    `direct_child_is_running` continue treating `Z` as non-live, scanner
+    failures propagate nonzero, and a nonempty pre-existing baseline is
+    subtracted from newly observed role zombies.
+11. If full-suite contention exposes the occupied generic web-port readiness
+    race, add `focused-occupied-web-port`, isolate the exact test on branch and
+    authoritative base with identical inputs, and make
+    `EntrypointSupervisor` wait only for its existing pending terminal-state
+    diagnostic finalization before returning `ReadinessFailed`.
+12. Document the operator completion contract and produce an implementation
    report with characterization, pre-fix red, fixed green, exact subjects,
    branch/base campaigns, expected real reaper and exit-to-reap observations,
    runtime binary provenance, and separate live/zombie survivor evidence.
@@ -359,7 +408,8 @@ leading hypothesis.
   exit-to-reap interval in artifacts.
 - **Upstream foreground overlap:** current main changed the same large
   integration test and runner. Limit edits to shutdown helpers/selectors and
-  reject foreground-console cleanup.
+  the accepted exact-child background waiter; reject foreground UI, PTY,
+  application, or console-output cleanup.
 - **Broad lifecycle refactor:** a new reaper/supervisor is disproportionate
   unless the bounded terminal wait is proven insufficient and the human
   approves the topology change.
@@ -382,6 +432,10 @@ leading hypothesis.
   pass. The original socket-release predicate is not ablated.
 - Existing production path:
   `./test.sh --test hub_daemon_lifecycle_test cli_shutdown_waits_for_metadata_owned_runtime_daemon_cleanup -- --exact --nocapture`.
+- Combined focused production proof:
+  `./test.sh --test hub_daemon_lifecycle_test metadata_owned_daemon -- --nocapture`
+  executes both the held-child regression and the live-console ownership
+  topology. A zero-test result is a failure, not evidence.
 - Adjacent lifecycle paths:
   `cli_local_runtime_up_starts_reuses_and_down_stops_runtime`,
   `process_ownership_daemon_restart_adopts_then_shuts_down_worker_session`,
@@ -418,7 +472,7 @@ leading hypothesis.
 - Focused loaded branch proof: dispatch the new exact selector for 20
   repetitions with `residual-tail` and default Cargo concurrency. Require every
   repetition green, exact Hub SHA and locked Core SHA, binary realpaths under
-  the fresh target, zero Hub/session-worker/fixture-shell/socket survivors, no
+  the fresh target, zero Hub/session-worker/socket survivors, no
   zombie rows after the bounded settle, every owned group gone, and
   `cleanup_status=0`. Artifacts must distinguish live survivors from zombies
   and record the production daemon's expected reaper plus exit-to-reap
@@ -427,9 +481,14 @@ leading hypothesis.
   stress profile, workflow harness, and runner image against the exact
   pre-fix/base SHA. Preserve a target red or explicitly report the bounded
   non-reproduction; do not retry away a red.
+- Occupied-port attribution if observed: run `focused-occupied-web-port` with
+  identical repetitions and stress on branch and authoritative base, then
+  require the exact structured-readiness test to pass before citing a complete
+  suite rerun.
 - Full downstream branch proof: run `full-suite-contention` for five
-  `residual-tail` repetitions at default parallelism. No foreground-console red
-  is attributed to this ticket without exact branch/base evidence.
+  `residual-tail` repetitions at default parallelism against the same final
+  committed SHA as the focused branch proof. No foreground-console red is
+  attributed to this ticket without exact branch/base evidence.
 - Full authoritative-base attribution: use identical full-suite inputs against
   the exact base SHA when any non-target red occurs. A base red does not waive a
   ticket-owned regression or missing zombie evidence.
@@ -449,14 +508,16 @@ leading hypothesis.
 - Implement evidence must attach the pre-fix red, fixed green, narrow ablation,
   characterization packet, exact diff, focused/adjacent commands, and the
   production call-chain proof.
-- Verify evidence must independently rerun the deterministic regression,
-  repository strict gates, focused loaded campaign, full contention campaign,
-  exact branch/base attribution, stale-recovery checks, and the separate
-  settled zombie evidence gate.
+- Verify evidence must independently rerun the two-test
+  `metadata_owned_daemon` filter without `--exact`, repository strict gates,
+  final-SHA focused loaded campaign, final-SHA full contention campaign, exact
+  branch/base attribution, stale-recovery checks, and the separate settled
+  zombie evidence gate.
 - Review must reject timeout inflation, retry-only proof, weaker PID assertions,
   missing zombie evidence, zombie-fed kill loops, a tightened stale-recovery or
-  failed-start predicate, missing child reaping, foreground-console edits, dead
-  code, unwired helpers, or a new supervisor without a human-approved re-plan.
+  failed-start predicate, missing child reaping, foreground UI/PTY/application/
+  output edits beyond the accepted child-reaping waiter, dead code, unwired
+  helpers, or a new supervisor without a human-approved re-plan.
 
 ## Vault gaps worth capturing
 
