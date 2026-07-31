@@ -7,7 +7,7 @@
 - Target repository: `trybotster/botster-hub`.
 - Target ID: `tgt_7e208a0c76a44980a83b63af976b1f22`.
 - Implementation SHA:
-  `3de6963ea2e8438fa6e03d344c68dc1a74c5f157`.
+  `734154cdd3f4bb7ba6e05320ae121355c36a3433`.
 - Authoritative base SHA:
   `b1bca77a16c36276ffba6ea726b54ae0664e905b`.
 - Pull request:
@@ -123,6 +123,24 @@ removed without changing deterministic shutdown behavior:
   actually wired in both parent and non-parent topologies: successful daemon
   response followed by observed PID absence.
 
+The downstream Verify return identified that the committed plan still carried
+the obsolete broad-filter-plus-`--exact` command and stale topology/survivor
+instructions. Plan SHA `2a1871b0c345e9fd00a4b713903f87fc72fefc9d`
+synchronizes the already accepted waiter, runner self-test, entrypoint repair,
+occupied-port selector, affected files, real role names, and foreground scope.
+Its binding focused command omits `--exact` and locally executed both intended
+tests: 2 passed, 0 failed.
+
+The required final-SHA redispatch first exposed a separate suite-wide fixture
+race in full run 30626016446, repetition 5. The environment-override shell had
+created and truncated its output file, but the test treated existence as
+completion and read an empty value before `printf` wrote the expected content.
+The child and entrypoint were still live, repetitions 1-4 were green, cleanup
+removed both survivors, and zombie evidence was empty. SHA
+`734154cdd3f4bb7ba6e05320ae121355c36a3433` preserves the existing two-second
+budget but polls for the expected content instead of file existence. It changes
+no production entrypoint behavior.
+
 The earlier runs 30609814800, 30610014273, 30609817554, and 30611916117 remain
 historical characterization only. Their role-zombie scans hit an awk parse
 error whose exit status was discarded, so none is cited as valid zombie
@@ -130,11 +148,33 @@ acceptance evidence after Review.
 
 ## Corrected Linux workflow evidence
 
-All corrected loaded runs use the workflow harness from lifecycle SHA
-`7c9cd67bc98f3ea562544291980c00a56b0a93a4`, Ubuntu 24.04, default Cargo test
+The final workflow harness and subject SHA are
+`734154cdd3f4bb7ba6e05320ae121355c36a3433`. Both final runs use Ubuntu 24.04,
+default Cargo concurrency, four CPUs, 48 residual-tail stress workers, and
+locked Core SHA `5846fc776d31e2b6c98a8d932f50a31078743901`.
+
+- Final focused metadata-owned shutdown:
+  [30628951242](https://github.com/trybotster/botster-hub/actions/runs/30628951242).
+  Both intended tests passed 20/20. All 20 raw exit statuses are 0, survivor
+  TSVs have zero data rows, active PGID/SID/run-token ledgers are empty, and
+  campaign plus cleanup status are 0.
+- Final full-suite contention:
+  [30628996604](https://github.com/trybotster/botster-hub/actions/runs/30628996604).
+  Five repetitions passed with raw exit statuses `0, 0, 0, 0, 0`. Every
+  lifecycle binary reported 119 passed, 0 failed, and 1 documented ignored
+  test. Both metadata-owned tests and the corrected environment-override test
+  passed 5/5. Survivor TSVs have zero data rows, active ledgers are empty, and
+  campaign plus cleanup status are 0.
+
+The earlier corrected branch/base campaigns below establish the required
+historical attribution and were run with lifecycle harness SHA
+`7c9cd67bc98f3ea562544291980c00a56b0a93a4`.
+
+Those runs use Ubuntu 24.04, default Cargo test
 parallelism, four CPUs, 48 residual-tail stress workers, and the locked Core
-revision resolved by the repository. Subject checkouts are the implementation
-SHA except where an authoritative-base comparison is named explicitly.
+revision resolved by the repository. Branch subject checkouts use lifecycle SHA
+`7c9cd67bc98f3ea562544291980c00a56b0a93a4`; authoritative-base comparisons
+are named explicitly.
 
 Follow-up SHA `3de6963ea2e8438fa6e03d344c68dc1a74c5f157` only removes an
 unreachable wait-status branch and corrects its documentation; the background
@@ -184,6 +224,7 @@ error appears.
 - `.github/workflows/loaded-daemon-lifecycle.yml`
 - `README.md`
 - `docs/loaded-daemon-lifecycle-runner.md`
+- `docs/plans/make-metadata-owned-daemon-shutdown-completion-deterministic-under-load.md`
 - `docs/reports/make-metadata-owned-daemon-shutdown-completion-deterministic-under-load-implement-report.md`
 - `script/run-loaded-daemon-lifecycle`
 - `script/run-loaded-daemon-lifecycle-selftest`
@@ -214,6 +255,12 @@ implementation tickets.
   binding full-suite criterion green.
 - A `focused-occupied-web-port` selector was added to provide the exact
   branch/base isolation requested by Review.
+- The committed plan was synchronized after downstream Verify found its broad
+  filter combined with `--exact` executed zero tests and its topology/survivor
+  instructions predated accepted implementation deviations.
+- The environment-override integration fixture now waits semantically for its
+  expected value within the unchanged budget after final-SHA full contention
+  exposed its create-before-write window.
 
 No acceptance criterion was narrowed or waived.
 
@@ -232,8 +279,16 @@ No acceptance criterion was narrowed or waived.
 - `./test.sh --test hub_daemon_lifecycle_test metadata_owned_daemon --
   --nocapture`: 2 passed.
 - `readiness_failure_waits_for_delayed_exit_diagnostics`: passed.
+- `package_entrypoint_supervision_passes_environment_overrides`: 10/10
+  repeated real-process runs passed; the complete wrapper also passed it.
 - Existing operator-console and ordinary metadata-owned shutdown paths:
   passed.
+
+One repeated environment-fixture invocation inside the restricted command
+sandbox failed before the assertion because daemon startup returned operating
+system error `EPERM`. It is excluded as sandbox evidence: the identical
+repository command executed through the approved real-process path passed
+10/10, and the complete wrapper passed outside that restriction.
 
 Two lifecycle test binaries were once launched independently in parallel during
 diagnosis and contended for repository-global fixtures. Those contradictory
@@ -252,8 +307,7 @@ default wrapper are the cited local evidence.
   not affect the campaign result and is outside this ticket's lifecycle scope.
 - Final residual risk is limited to behaviors outside the exercised
   metadata-owned shutdown, entrypoint readiness, and repository-wide test
-  surfaces. No known ticket behavior remains unverified once the final base
-  campaign is inspected.
+  surfaces. No known ticket behavior remains unverified.
 
 ## Missing vault guidance discovered
 
