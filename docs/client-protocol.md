@@ -438,6 +438,15 @@ the daemon can invoke. Unsupported reload and hub-restart style actions are
 reported as unavailable diagnostics; they are not hidden client policy and do
 not imply an implementation exists.
 
+`PluginLifecycleStatus` projects two sanitized aggregate observations. The
+optional `plugin_worker_counters` object carries Core-authored queue capacity,
+executor concurrency, live executor/worker, queued-job, and in-flight-job
+counters. The optional `plugin_resource_counters` object carries Hub-owned
+resource observations; currently it contains only `active_timer_resources`.
+Neither object exposes plugin identities, payloads, handler names, or resource
+IDs. Clients must treat absence as an older-daemon compatibility case rather
+than synthesizing a zero value.
+
 CLI operators can inspect the same daemon path:
 
 ```sh

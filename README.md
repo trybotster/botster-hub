@@ -395,6 +395,9 @@ script/test-production-package-runtime \
 The cross-repository acceptance script requires Ruby 2.7 or newer and uses only
 Ruby's standard library. It checks the interpreter before building artifacts and
 prints an installation/version remediation when the prerequisite is missing.
+The committed counter, thread, idle, reload, disable, and post-down invariants
+and their macOS/Linux diagnostic recipes are documented in
+[`docs/hub-resource-proof.md`](docs/hub-resource-proof.md).
 
 The first test proves the persisted-package CLI path. The explicit-coordinate
 script rejects dirty or revision-mismatched repositories before starting a

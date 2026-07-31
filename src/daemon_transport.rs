@@ -45,12 +45,12 @@ pub use botster_hub_client::{
     DaemonPackageNavigationSource, DaemonPackagePin, DaemonPackageProcess,
     DaemonPackageRouteDescriptor, DaemonPackageRouteTarget, DaemonPackageRunnableEntrypoint,
     DaemonPackageUpdateStatus, DaemonPackageWorkingDirectory, DaemonPluginLifecycle,
-    DaemonPluginSurface, DaemonPluginWorkerCounters, DaemonReadScreen, DaemonRequest,
-    DaemonResolvedAppLaunch, DaemonResolvedSessionTemplate, DaemonResponse, DaemonResponseKind,
-    DaemonSession, DaemonSessionCleanup, DaemonSessionContext, DaemonSessionEntity,
-    DaemonSessionTemplate, DaemonSessionTemplateContextInput, DaemonSessionTemplateRequest,
-    DaemonSpawnTarget, DaemonSpawnTargetValidation, DaemonStatus, DaemonUiTreeSnapshot,
-    DaemonWorktree, DaemonWorktreeGitMetadata, DaemonWorktreeLifecycleEvent,
+    DaemonPluginResourceCounters, DaemonPluginSurface, DaemonPluginWorkerCounters,
+    DaemonReadScreen, DaemonRequest, DaemonResolvedAppLaunch, DaemonResolvedSessionTemplate,
+    DaemonResponse, DaemonResponseKind, DaemonSession, DaemonSessionCleanup, DaemonSessionContext,
+    DaemonSessionEntity, DaemonSessionTemplate, DaemonSessionTemplateContextInput,
+    DaemonSessionTemplateRequest, DaemonSpawnTarget, DaemonSpawnTargetValidation, DaemonStatus,
+    DaemonUiTreeSnapshot, DaemonWorktree, DaemonWorktreeGitMetadata, DaemonWorktreeLifecycleEvent,
     FEATURE_PLUGIN_SURFACE_ACTION, FEATURE_PLUGIN_SURFACE_RENDER, PROTOCOL, read_frame,
     read_frame_from_reader, write_frame,
 };
@@ -2131,6 +2131,7 @@ fn handle_runtime_control_request(
             package_decision: None,
             lifecycle: Vec::new(),
             plugin_worker_counters: None,
+            plugin_resource_counters: None,
             plugin_tools: Vec::new(),
             plugin_tool_result: Value::Null,
             plugin_surface: None,
@@ -4406,6 +4407,7 @@ fn daemon_response_base(kind: DaemonResponseKind) -> DaemonResponse {
         package_decision: None,
         lifecycle: Vec::new(),
         plugin_worker_counters: None,
+        plugin_resource_counters: None,
         plugin_tools: Vec::new(),
         plugin_tool_result: Value::Null,
         plugin_surface: None,
@@ -4938,6 +4940,9 @@ fn daemon_plugin_lifecycle(report: HubClientPluginLifecycleReport) -> DaemonResp
     response.plugin_worker_counters = Some(daemon_plugin_worker_counters_from_client(
         report.worker_counters,
     ));
+    response.plugin_resource_counters = Some(DaemonPluginResourceCounters {
+        active_timer_resources: report.resource_counters.active_timer_resources,
+    });
     response
 }
 

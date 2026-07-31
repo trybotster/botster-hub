@@ -3,13 +3,14 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use botster_core::{
-    BoundaryJson, Capability, CapabilitySurface, ExtensionEntrypoint, ExtensionKind,
+    BoundaryJson, Capability, CapabilityOperation, CapabilityOperationId, CapabilityRuntimeEvent,
+    CapabilityRuntimeRequest, CapabilitySurface, ExtensionEntrypoint, ExtensionKind,
     ExtensionRuntime, HostProfileMetadata, HostProfilePolicySection, PackageSource,
     PluginCancellationToken, PluginDescriptorKind, PluginDescriptorRef, PluginHandlerKind,
     PluginHandlerRef, PluginHandlerRegistration, PluginInvocationContext, PluginInvocationFailure,
     PluginInvocationFailureKind, PluginInvocationRequest, PluginInvocationResult,
     PluginInvocationSuccess, PluginKey, PluginOwnedDescriptor, PluginResourceKind,
-    PluginResourceRef, PluginRuntime, RequestId,
+    PluginResourceRef, PluginRuntime, RequestId, TimerCapabilityRequest,
 };
 use botster_hub::{
     CoreEngineOptions, DataDirectoryOption, FileHubStateStore, HostIdentityOptions,
@@ -705,6 +706,15 @@ fn reload_and_unload_return_core_cleanup_and_stop_runtimes() {
         ),
     )
     .expect("load old plugin");
+    hub.submit_capability_request(CapabilityRuntimeRequest {
+        plugin_key: plugin_key(package_name),
+        operation_id: CapabilityOperationId("reload-timer".to_string()),
+        operation: CapabilityOperation::Timer(TimerCapabilityRequest::Interval { interval_ms: 5 }),
+        timeout_ms: 1_000,
+        callback: None,
+    })
+    .expect("register timer owned by old plugin generation");
+    assert_eq!(hub.active_plugin_timer_resources(), 1);
     let reload_cleanup = hub
         .reload_plugin_package(
             RequestId("reload-plugin".to_string()),
@@ -723,7 +733,20 @@ fn reload_and_unload_return_core_cleanup_and_stop_runtimes() {
 
     assert_eq!(old_runtime.stopped(), vec![plugin_key(package_name)]);
     assert_eq!(reload_cleanup.removed_descriptors.len(), 1);
-    assert_eq!(reload_cleanup.removed_resources.len(), 1);
+    assert_eq!(reload_cleanup.removed_resources.len(), 2);
+    assert!(reload_cleanup.removed_resources.iter().any(|resource| {
+        resource.kind == PluginResourceKind::Timer
+            && resource.plugin_key == plugin_key(package_name)
+    }));
+    assert_eq!(hub.active_plugin_timer_resources(), 0);
+    let after_reload = hub
+        .drain_capability_events_at(&plugin_key(package_name), 10)
+        .expect("drain after reload cleanup");
+    assert!(
+        after_reload
+            .iter()
+            .all(|event| !matches!(event, CapabilityRuntimeEvent::TimerFired(_)))
+    );
     assert!(matches!(
         hub.invoke_plugin(invocation("invoke-new", new_handler))
             .result,

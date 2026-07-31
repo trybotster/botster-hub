@@ -186,7 +186,9 @@ Add one exact focused Rust test, `focused_plugin_resources_are_bounded_across_re
 - Hub-process OS thread count is at most 64, so the reported approximately 1,041-thread failure cannot pass;
 - queue/in-flight work, connection/subscription state, and timer resources converge to baseline;
 - disable/unload retires live executors and executor workers to the pre-load snapshot;
-- under Linux with no external stress, the post-convergence five-second CPU-time delta is at most 250 ms.
+- on Linux the test always records the post-convergence five-second CPU-time
+  delta; it asserts the 250 ms ceiling only when
+  `BOTSTER_ASSERT_IDLE_CPU_BOUND=1` is set by the no-stress focused selector.
 
 The deterministic four-owner fixture is the CI mechanism regression, not a substitute for the operator-run exact-package campaign and not a claim that the real packages register timers. Because it is a normal Rust integration test, `./test.sh` runs it. Add a `focused-plugin-resource-bounds` `test_target` to `.github/workflows/loaded-daemon-lifecycle.yml`, map it to the exact test in `script/run-loaded-daemon-lifecycle`, and require `stress_profile=none` for this selector. This is the named CI-executable threshold carrier; the cross-repository production campaign remains operator-run downstream proof.
 
@@ -245,7 +247,7 @@ Implementation is complete only when all applicable checks pass from a clean rou
 
 1. `cargo fmt --check` and `cargo clippy --all-targets --all-features -- -D warnings`.
 2. `./test.sh` for the Hub workspace.
-3. `./test.sh --test hub_daemon_lifecycle_test focused_plugin_resources_are_bounded_across_reconnect_reload_idle_and_unload -- --exact --nocapture` proves in a normal CI-runnable Rust test that production defaults are `256`/`2`, four owners create exactly eight executor workers, the Hub stays at or below 64 OS threads, idle Linux CPU-time growth is at most 250 ms over five seconds with no stress, all resource counters converge, and public disable/unload retires workers to baseline.
+3. `./test.sh --test hub_daemon_lifecycle_test focused_plugin_resources_are_bounded_across_reconnect_reload_idle_and_unload -- --exact --nocapture` proves in a normal CI-runnable Rust test that production defaults are `256`/`2`, four owners create exactly eight executor workers, the Hub stays at or below 64 OS threads, all resource counters converge, and public disable/unload retires workers to baseline. On Linux it records the five-second CPU delta but asserts the 250 ms ceiling only when `BOTSTER_ASSERT_IDLE_CPU_BOUND=1`; `script/run-loaded-daemon-lifecycle` sets that signal exclusively for `focused-plugin-resource-bounds` and rejects any stress profile other than `none`.
 4. The existing focused connection lifecycle selector continues to prove event-driven connections/subscriptions and reconnect cleanup.
 5. Focused capability/plugin lifecycle tests prove zero timer observation plus `hub_runtime_schedules_cancels_and_cleans_up_timers`, `unload_cleans_up_capability_resources_for_plugin`, the new reload cleanup path, and no post-cleanup firing; `hub_runtime_passes_split_plugin_worker_config_to_core_engine` remains the distinct-knob/unload-retirement unit regression.
 6. Script self-tests cover readiness failure, timeout diagnostics, redaction, child teardown, counter non-convergence, and supported macOS/Linux census parsing.
