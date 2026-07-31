@@ -1766,7 +1766,7 @@ fn complete_owned_runtime_daemon_shutdown(
     let Some(pid) = owned_daemon_pid else {
         return Ok(());
     };
-    wait_for_runtime_daemon_exit(pid)?;
+    wait_for_owned_runtime_daemon_reaped(pid)?;
     remove_configured_local_socket(config)?;
     remove_runtime_daemon_metadata(data_directory)
 }
@@ -1823,6 +1823,39 @@ fn wait_for_runtime_daemon_exit(pid: u32) -> Result<(), LocalRuntimeError> {
         thread::sleep(Duration::from_millis(50));
     }
     Err(LocalRuntimeError::TerminateDaemonTimeout(pid))
+}
+
+fn wait_for_owned_runtime_daemon_reaped(pid: u32) -> Result<(), LocalRuntimeError> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if reap_owned_child_if_exited(pid)? {
+            return Ok(());
+        }
+        if process_state(pid)?.is_none() {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    Err(LocalRuntimeError::TerminateDaemonTimeout(pid))
+}
+
+fn reap_owned_child_if_exited(pid: u32) -> Result<bool, LocalRuntimeError> {
+    loop {
+        let mut status = 0;
+        let result = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) };
+        if result == pid as libc::pid_t {
+            return Ok(true);
+        }
+        if result == 0 {
+            return Ok(false);
+        }
+        let error = io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::ECHILD) | Some(libc::ESRCH) => return Ok(false),
+            Some(libc::EINTR) => {}
+            _ => return Err(LocalRuntimeError::InspectProcess(error)),
+        }
+    }
 }
 
 fn process_state(pid: u32) -> Result<Option<String>, LocalRuntimeError> {
