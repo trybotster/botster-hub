@@ -5,6 +5,7 @@ readonly DEFAULT_RUN_TIMEOUT_SECONDS=900
 readonly DEFAULT_CAMPAIGN_TIMEOUT_SECONDS=19800
 readonly CLEANUP_GRACE_SECONDS=30
 readonly SURVIVOR_EVIDENCE_LIMIT=80
+readonly ZOMBIE_SETTLE_SECONDS=5
 
 MODE=run
 SUBJECT_DIR=
@@ -63,7 +64,7 @@ validate_inputs() {
     invalid=1
   fi
   case "$TEST_TARGET" in
-    lifecycle-suite|focused-session-entity-resize|focused-process-ownership|focused-connection-lifecycle|focused-stalled-attach|focused-fast-exit-attach-diagnostic|focused-oversized-webrtc|focused-cli-smoke|focused-operator-console|focused-lua-worker-suite|focused-lua-session-worker-callers|full-suite-contention) ;;
+    lifecycle-suite|focused-metadata-owned-shutdown|focused-occupied-web-port|focused-session-entity-resize|focused-process-ownership|focused-connection-lifecycle|focused-stalled-attach|focused-fast-exit-attach-diagnostic|focused-oversized-webrtc|focused-cli-smoke|focused-operator-console|focused-lua-worker-suite|focused-lua-session-worker-callers|full-suite-contention) ;;
     *) log "invalid test_target: $TEST_TARGET"; invalid=1 ;;
   esac
   if [[ ! "$REPETITIONS" =~ ^[0-9]+$ ]] || ((10#$REPETITIONS < 1 || 10#$REPETITIONS > 100)); then
@@ -166,7 +167,8 @@ runner_cpu_count() {
 group_is_alive() {
   local pgid=$1
 
-  ps -eo pgid=,stat= | awk -v pgid="$pgid" '$1 == pgid && $2 !~ /^Z/ { found=1 } END { exit !found }'
+  ps -eo pgid=,stat= \
+    | awk -v pgid="$pgid" '$1 == pgid && $2 !~ /^Z/ { found=1 } END { exit !found }'
 }
 
 direct_child_is_running() {
@@ -212,9 +214,7 @@ deactivate_run_token() {
 session_process_rows() {
   local sid=$1
 
-  # macOS ps exposes a session pointer rather than Linux's numeric SID.
-  # Darwin attribution therefore uses the inherited run token instead.
-  ps -eo pid=,ppid=,pgid=,sid=,stat=,comm=,args= \
+  all_process_rows \
     | awk -v sid="$sid" '
         $4 == sid && $5 !~ /^Z/ {
           printf "%s\t%s\t%s\t%s\t%s\t%s", $1, $2, $3, $4, $5, $6
@@ -222,6 +222,119 @@ session_process_rows() {
           printf "\n"
         }
       '
+}
+
+all_process_rows() {
+  # macOS ps exposes a session pointer rather than Linux's numeric SID.
+  # Darwin attribution therefore uses the inherited run token; the numeric
+  # session zombie arm and its self-test assertions are Linux-only.
+  if [[ "$(runner_platform)" == Darwin ]]; then
+    ps -axo pid=,ppid=,pgid=,sess=,stat=,comm=,args=
+  else
+    ps -eo pid=,ppid=,pgid=,sid=,stat=,comm=,args=
+  fi
+}
+
+session_zombie_rows() {
+  local sid=$1
+
+  [[ -n "$sid" ]] || return 0
+  all_process_rows \
+    | awk -v sid="$sid" '
+        $4 == sid && $5 ~ /^Z/ {
+          printf "%s\t%s\t%s\t%s\t%s\t%s", $1, $2, $3, $4, $5, $6
+          for (field = 7; field <= NF; field++) printf "\t%s", $field
+          printf "\n"
+        }
+      '
+}
+
+botster_role_zombie_rows() {
+  all_process_rows \
+    | awk '
+        $5 ~ /^Z/ && ($6 == "botster-hub" || $6 == "botster-session" || $6 == "botster-session-worker") {
+          printf "%s\t%s\t%s\t%s\t%s\t%s", $1, $2, $3, $4, $5, $6
+          for (field = 7; field <= NF; field++) printf "\t%s", $field
+          printf "\n"
+        }
+      '
+}
+
+new_process_rows() {
+  local baseline_file=$1
+  local current_file=$2
+
+  awk -F '\t' '
+    FILENAME == ARGV[1] { baseline[$1]=1; next }
+    !baseline[$1] { print }
+  ' "$baseline_file" "$current_file"
+}
+
+settled_zombie_rows() {
+  local sid=$1
+  local baseline_file=$2
+  local current_file="$ARTIFACT_DIR/zombie-current.$$.tmp"
+  local new_roles_file="$ARTIFACT_DIR/zombie-new-roles.$$.tmp"
+  local tagged_file="$ARTIFACT_DIR/zombie-tagged.$$.tmp"
+
+  if ! botster_role_zombie_rows > "$current_file"; then
+    rm -f "$current_file" "$new_roles_file" "$tagged_file"
+    return 2
+  fi
+  if ! new_process_rows "$baseline_file" "$current_file" > "$new_roles_file"; then
+    rm -f "$current_file" "$new_roles_file" "$tagged_file"
+    return 2
+  fi
+  if ! awk -F '\t' '{ print "new-role\t" $0 }' "$new_roles_file" > "$tagged_file"; then
+    rm -f "$current_file" "$new_roles_file" "$tagged_file"
+    return 2
+  fi
+  if ! session_zombie_rows "$sid" \
+    | awk -F '\t' '{ print "recorded-session\t" $0 }' >> "$tagged_file"; then
+    rm -f "$current_file" "$new_roles_file" "$tagged_file"
+    return 2
+  fi
+  if ! awk -F '\t' '!seen[$2]++' "$tagged_file"; then
+    rm -f "$current_file" "$new_roles_file" "$tagged_file"
+    return 2
+  fi
+  rm -f "$current_file" "$new_roles_file" "$tagged_file"
+}
+
+capture_settled_zombie_survivors() {
+  local sid=$1
+  local baseline_file=$2
+  local evidence_file=$3
+  local rows_file="$ARTIFACT_DIR/zombie-rows.$$.tmp"
+  local deadline=$((SECONDS + ZOMBIE_SETTLE_SECONDS))
+  local survivor_count
+
+  while :; do
+    if ! settled_zombie_rows "$sid" "$baseline_file" > "$rows_file"; then
+      cleanup_log "zombie_census=error settle_seconds=$ZOMBIE_SETTLE_SECONDS"
+      rm -f "$rows_file"
+      return 2
+    fi
+    [[ ! -s "$rows_file" ]] && break
+    ((SECONDS >= deadline)) && break
+    sleep 0.1
+  done
+  survivor_count=$(awk 'END { print NR + 0 }' "$rows_file")
+  {
+    printf 'source\tpid\tppid\tpgid\tsid\tstat\tcomm\targs\n'
+    awk -v limit="$SURVIVOR_EVIDENCE_LIMIT" 'NR <= limit { print }' "$rows_file"
+    if ((survivor_count > SURVIVOR_EVIDENCE_LIMIT)); then
+      printf 'truncated\t%s\tlimit=%s\n' "$survivor_count" "$SURVIVOR_EVIDENCE_LIMIT"
+    fi
+  } > "$evidence_file"
+  rm -f "$rows_file"
+
+  if ((survivor_count > 0)); then
+    cleanup_log "zombie_survivors=$survivor_count settle_seconds=$ZOMBIE_SETTLE_SECONDS evidence=$(basename "$evidence_file")"
+    return 1
+  fi
+  cleanup_log "zombie_survivors=0 settle_seconds=$ZOMBIE_SETTLE_SECONDS evidence=$(basename "$evidence_file")"
+  return 0
 }
 
 process_has_run_token() {
@@ -312,10 +425,10 @@ capture_run_token_survivors() {
   rm -f "$rows_file"
 
   if ((survivor_count > 0)); then
-    cleanup_log "role=$role run_token=$token survivor_count=$survivor_count evidence=$(basename "$evidence_file")"
+    cleanup_log "role=$role run_token=$token live_survivors=$survivor_count evidence=$(basename "$evidence_file")"
     return 1
   fi
-  cleanup_log "role=$role run_token=$token survivor_count=0 evidence=$(basename "$evidence_file")"
+  cleanup_log "role=$role run_token=$token live_survivors=0 evidence=$(basename "$evidence_file")"
   return 0
 }
 
@@ -339,10 +452,10 @@ capture_session_survivors() {
   rm -f "$rows_file"
 
   if ((survivor_count > 0)); then
-    cleanup_log "role=$role sid=$sid survivor_count=$survivor_count evidence=$(basename "$evidence_file")"
+    cleanup_log "role=$role sid=$sid live_survivors=$survivor_count evidence=$(basename "$evidence_file")"
     return 1
   fi
-  cleanup_log "role=$role sid=$sid survivor_count=0 evidence=$(basename "$evidence_file")"
+  cleanup_log "role=$role sid=$sid live_survivors=0 evidence=$(basename "$evidence_file")"
   return 0
 }
 
@@ -706,7 +819,10 @@ run_repetition() {
   local run_log
   local survivor_evidence
   local owned_survivor_evidence
+  local zombie_baseline
+  local zombie_survivor_evidence
   local run_token
+  local test_sid
   local started_at=$SECONDS
   local status
   shift 2
@@ -724,6 +840,11 @@ run_repetition() {
   log "run=$repetition stage=test-start timeout_seconds=$timeout_seconds"
 
   run_token="botster-loaded-${SUBJECT_SHA}-${repetition}-$$-$RANDOM"
+  zombie_baseline=$(printf '%s/run-%03d-zombie-baseline.tsv' "$ARTIFACT_DIR" "$repetition")
+  if ! botster_role_zombie_rows > "$zombie_baseline"; then
+    log "run=$repetition stage=zombie-baseline exit_status=2"
+    return 2
+  fi
   record_run_token test "$run_token" || return 1
   TEST_RUN_TOKEN=$run_token
 
@@ -772,11 +893,15 @@ run_repetition() {
   if [[ -n "$TEST_SID" ]]; then
     survivor_evidence=$(printf '%s/run-%03d-session-survivors.tsv' "$ARTIFACT_DIR" "$repetition")
     verify_and_cleanup_session test "$TEST_PID" "$TEST_SID" "$survivor_evidence" || status=1
+    test_sid=$TEST_SID
     TEST_SID=
   fi
   cleanup_group test "$TEST_PID" "$TEST_PGID" no || status=1
   TEST_PID=
   TEST_PGID=
+  zombie_survivor_evidence=$(printf '%s/run-%03d-zombie-survivors.tsv' "$ARTIFACT_DIR" "$repetition")
+  capture_settled_zombie_survivors "${test_sid:-}" "$zombie_baseline" \
+    "$zombie_survivor_evidence" || status=1
 
   printf 'run=%s\tfinished_at=%s\telapsed_seconds=%s\texit_status=%s\n' \
     "$repetition" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$((SECONDS - started_at))" "$status" \
@@ -862,6 +987,12 @@ main() {
   case "$TEST_TARGET" in
     lifecycle-suite)
       test_command=(./test.sh --test hub_daemon_lifecycle_test -- --nocapture)
+      ;;
+    focused-metadata-owned-shutdown)
+      test_command=(./test.sh --test hub_daemon_lifecycle_test metadata_owned_daemon -- --nocapture)
+      ;;
+    focused-occupied-web-port)
+      test_command=(./test.sh --test hub_daemon_lifecycle_test occupied_generic_web_port_reports_structured_entrypoint_failure -- --exact --nocapture)
       ;;
     focused-session-entity-resize)
       test_command=(./test.sh --test hub_daemon_lifecycle_test session_entity_subscription_pushes_snapshot_ordered_deltas_and_fresh_reconnect -- --exact --nocapture)

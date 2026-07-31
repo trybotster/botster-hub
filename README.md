@@ -61,6 +61,14 @@ reuses the daemon; `down` deliberately stops it and exits the console. At an
 idle prompt Ctrl-C cancels the current line and leaves the daemon and its
 sessions running.
 
+For a verified metadata-owned runtime, successful `shutdown` or `down` means
+the recorded Hub PID is absent from the process table and the owned local socket
+and runtime metadata file have been removed. Receiving the daemon's shutdown
+response or observing an exited-but-unreaped zombie is not completion.
+Completion combines the daemon's successful shutdown response with
+independently observed PID absence; an owner may reap the child while reaching
+that same process-table terminal state.
+
 Bare invocation requires terminal stdin and stdout. Scripts and redirected
 commands must use an explicit subcommand such as `botster-hub status`; they
 fail clearly instead of entering a prompt.

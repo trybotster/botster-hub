@@ -1697,6 +1697,98 @@ fn process_exists(pid: u32) -> bool {
     unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
 }
 
+#[derive(Debug)]
+struct ProcessSnapshot {
+    pid: u32,
+    ppid: u32,
+    pgid: u32,
+    sid: String,
+    stat: String,
+    command: String,
+}
+
+fn process_snapshot(pid: u32) -> Option<ProcessSnapshot> {
+    let output = Command::new("ps")
+        .arg("-p")
+        .arg(pid.to_string())
+        .arg("-o")
+        .arg("pid=")
+        .arg("-o")
+        .arg("ppid=")
+        .arg("-o")
+        .arg("pgid=")
+        .arg("-o")
+        .arg("sess=")
+        .arg("-o")
+        .arg("stat=")
+        .arg("-o")
+        .arg("command=")
+        .output()
+        .expect("inspect process snapshot");
+    if !output.status.success() {
+        return None;
+    }
+    let row = String::from_utf8_lossy(&output.stdout);
+    let mut fields = row.split_whitespace();
+    Some(ProcessSnapshot {
+        pid: fields.next()?.parse().ok()?,
+        ppid: fields.next()?.parse().ok()?,
+        pgid: fields.next()?.parse().ok()?,
+        sid: fields.next()?.to_string(),
+        stat: fields.next()?.to_string(),
+        command: fields.collect::<Vec<_>>().join(" "),
+    })
+}
+
+fn wait_for_process_snapshot(
+    pid: u32,
+    stage: &str,
+    predicate: impl Fn(&ProcessSnapshot) -> bool,
+) -> ProcessSnapshot {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut last_snapshot = None;
+    while Instant::now() < deadline {
+        if let Some(snapshot) = process_snapshot(pid) {
+            if predicate(&snapshot) {
+                return snapshot;
+            }
+            last_snapshot = Some(snapshot);
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    panic!("process {pid} did not reach {stage} within 5s; last_snapshot={last_snapshot:?}");
+}
+
+struct ReapingChild {
+    child: Option<Child>,
+}
+
+impl ReapingChild {
+    fn new(child: Child) -> Self {
+        Self { child: Some(child) }
+    }
+
+    fn child_mut(&mut self) -> &mut Child {
+        self.child.as_mut().expect("owned child")
+    }
+
+    fn wait_with_output(mut self) -> Output {
+        self.child
+            .take()
+            .expect("owned child")
+            .wait_with_output()
+            .expect("wait for owned child output")
+    }
+}
+
+impl Drop for ReapingChild {
+    fn drop(&mut self) {
+        if let Some(child) = self.child.as_mut() {
+            let _ = terminate_and_reap_child(child);
+        }
+    }
+}
+
 struct ChildCleanup {
     child: Child,
 }
@@ -5506,7 +5598,10 @@ fn cli_shutdown_waits_for_metadata_owned_runtime_daemon_cleanup() {
             .as_str()
             .expect("metadata-owned daemon socket path"),
     );
+    let daemon_before_shutdown =
+        process_snapshot(daemon_pid).expect("metadata-owned daemon process snapshot");
 
+    let shutdown_started_at = Instant::now();
     let shutdown = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
         .arg("shutdown")
         .arg("--data-dir")
@@ -5518,9 +5613,16 @@ fn cli_shutdown_waits_for_metadata_owned_runtime_daemon_cleanup() {
         "metadata-owned runtime shutdown failed: {}",
         command_output_text(&shutdown)
     );
+    let daemon_after_shutdown = process_snapshot(daemon_pid);
     assert!(
-        !process_exists(daemon_pid),
-        "shutdown returned before metadata-owned daemon pid {daemon_pid} exited"
+        daemon_after_shutdown.is_none() && !process_exists(daemon_pid),
+        "shutdown returned before metadata-owned daemon pid {daemon_pid} disappeared: \
+         before={daemon_before_shutdown:?} after={daemon_after_shutdown:?} \
+         shutdown_elapsed={:?} metadata_exists={} socket_exists={} output={}",
+        shutdown_started_at.elapsed(),
+        metadata_path.exists(),
+        socket_path.exists(),
+        command_output_text(&shutdown),
     );
     assert!(
         !metadata_path.exists(),
@@ -5530,6 +5632,192 @@ fn cli_shutdown_waits_for_metadata_owned_runtime_daemon_cleanup() {
         !socket_path.exists(),
         "shutdown returned before owned runtime socket was removed"
     );
+    eprintln!(
+        "metadata_owned_shutdown_production_topology pid={daemon_pid} \
+         expected_reaper_pid={} before={daemon_before_shutdown:?} after=absent \
+         shutdown_elapsed={:?}",
+        daemon_before_shutdown.ppid,
+        shutdown_started_at.elapsed(),
+    );
+}
+
+#[test]
+fn cli_shutdown_waits_until_metadata_owned_daemon_is_reaped() {
+    let _guard = daemon_test_guard();
+    ensure_session_worker_binary();
+    let data_dir = unique_short_test_dir("cli-shutdown-reaped-runtime");
+    let metadata_path = data_dir.join(".botster-hub-runtime-daemon.json");
+    let socket_path = explicit_config(&data_dir)
+        .transports
+        .local_socket
+        .expect("local socket binding")
+        .path;
+    let mut daemon = ReapingChild::new(start_cli_daemon_with_session_worker(
+        &data_dir,
+        &session_worker_binary_path(),
+    ));
+    let daemon_pid = daemon.child_mut().id();
+    write_local_runtime_daemon_metadata(&data_dir, daemon_pid);
+    let before_shutdown = process_snapshot(daemon_pid).expect("ready daemon process snapshot");
+
+    let shutdown_started_at = Instant::now();
+    let mut shutdown_command = Command::new(env!("CARGO_BIN_EXE_botster-hub"));
+    shutdown_command
+        .arg("shutdown")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut shutdown = ReapingChild::new(shutdown_command.spawn().expect("spawn shutdown command"));
+
+    let zombie_observed_at = Instant::now();
+    let zombie = wait_for_process_snapshot(daemon_pid, "zombie state", |snapshot| {
+        snapshot.stat.starts_with('Z')
+    });
+    assert_eq!(zombie.pid, daemon_pid, "zombie snapshot pid changed");
+    assert_eq!(
+        zombie.ppid,
+        std::process::id(),
+        "integration test should remain the daemon's expected reaper"
+    );
+    assert_eq!(
+        zombie.pgid, before_shutdown.pgid,
+        "daemon process group changed before exit"
+    );
+    assert_eq!(
+        zombie.sid, before_shutdown.sid,
+        "daemon process session changed before exit"
+    );
+    assert!(
+        before_shutdown.command.contains("botster-hub"),
+        "ready daemon command identity was unexpected: {before_shutdown:?}"
+    );
+    let pending_observation_deadline = Instant::now() + Duration::from_millis(500);
+    while Instant::now() < pending_observation_deadline {
+        if let Some(status) = shutdown
+            .child_mut()
+            .try_wait()
+            .expect("poll shutdown while daemon is unreaped")
+        {
+            let (stdout, stderr) = collect_child_output(shutdown.child_mut());
+            panic!(
+                "shutdown returned before metadata-owned daemon was reaped: status={status} \
+                 daemon_before={before_shutdown:?} daemon_zombie={zombie:?} \
+                 expected_reaper_pid={} shutdown_elapsed={:?} stdout={stdout:?} stderr={stderr:?} \
+                 metadata_exists={} socket_exists={}",
+                std::process::id(),
+                shutdown_started_at.elapsed(),
+                metadata_path.exists(),
+                socket_path.exists(),
+            );
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    let daemon_output = daemon.wait_with_output();
+    assert!(
+        daemon_output.status.success(),
+        "daemon did not exit cleanly before reap: status={} stdout={:?} stderr={:?}",
+        daemon_output.status,
+        String::from_utf8_lossy(&daemon_output.stdout),
+        String::from_utf8_lossy(&daemon_output.stderr),
+    );
+    let reaped_at = Instant::now();
+    let shutdown_output = shutdown.wait_with_output();
+    assert!(
+        shutdown_output.status.success(),
+        "shutdown failed after daemon reap: status={} stdout={:?} stderr={:?}",
+        shutdown_output.status,
+        String::from_utf8_lossy(&shutdown_output.stdout),
+        String::from_utf8_lossy(&shutdown_output.stderr),
+    );
+    assert!(
+        !process_exists(daemon_pid),
+        "shutdown completed while daemon pid {daemon_pid} still existed"
+    );
+    assert!(
+        !metadata_path.exists(),
+        "shutdown returned before owned runtime metadata was removed"
+    );
+    assert!(
+        !socket_path.exists(),
+        "shutdown returned before owned runtime socket was removed"
+    );
+    eprintln!(
+        "metadata_owned_shutdown_characterization pid={daemon_pid} \
+         expected_reaper_pid={} before={before_shutdown:?} zombie={zombie:?} \
+         exit_to_reap={:?} shutdown_elapsed={:?}",
+        std::process::id(),
+        reaped_at.duration_since(zombie_observed_at),
+        shutdown_started_at.elapsed(),
+    );
+}
+
+#[test]
+fn cli_shutdown_reaps_metadata_owned_daemon_started_by_live_operator_console() {
+    let _guard = daemon_test_guard();
+    ensure_session_worker_binary();
+    let data_dir = unique_short_test_dir("external-shutdown-live-console");
+    let metadata_path = data_dir.join(".botster-hub-runtime-daemon.json");
+    let socket_path = explicit_config(&data_dir)
+        .transports
+        .local_socket
+        .expect("local socket binding")
+        .path;
+    let mut daemon_cleanup = OwnedOperatorConsoleDaemon::new(&data_dir);
+    let mut console = OperatorConsolePty::spawn(&data_dir);
+    daemon_cleanup.wait_until_daemon_ready(&mut console);
+    console.wait_for("daemon=started");
+    console.wait_for("botster-hub> ");
+    let daemon_pid = *daemon_cleanup
+        .owned_pids()
+        .last()
+        .expect("operator console started daemon pid");
+
+    let shutdown_started_at = Instant::now();
+    let shutdown = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("shutdown")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .output()
+        .expect("run external shutdown while starting console remains live");
+    assert!(
+        shutdown.status.success(),
+        "external shutdown failed while daemon parent console remained live after {:?}: {}",
+        shutdown_started_at.elapsed(),
+        command_output_text(&shutdown)
+    );
+    assert!(
+        shutdown_started_at.elapsed() < Duration::from_secs(5),
+        "external shutdown approached the ten-second timeout while daemon parent console remained live: {:?}",
+        shutdown_started_at.elapsed()
+    );
+    assert!(
+        console
+            .child
+            .try_wait()
+            .expect("poll starting operator console after external shutdown")
+            .is_none(),
+        "starting operator console exited instead of remaining available to reap its daemon: {}",
+        console.text()
+    );
+    assert!(
+        !process_exists(daemon_pid),
+        "external shutdown returned before console-reaped daemon pid {daemon_pid} disappeared"
+    );
+    assert!(
+        !metadata_path.exists(),
+        "external shutdown left owned runtime metadata"
+    );
+    assert!(
+        !socket_path.exists(),
+        "external shutdown left owned runtime socket"
+    );
+
+    console.send(&[4]);
+    console.wait_for_exit();
+    daemon_cleanup.assert_cleaned();
+    fs::remove_dir_all(&data_dir).expect("remove external-shutdown console data directory");
 }
 
 #[test]
@@ -13538,16 +13826,16 @@ fn package_entrypoint_supervision_passes_environment_overrides() {
     let entrypoint = package_entrypoint(&start, "runtime.env");
     assert_eq!(entrypoint.process.state, "running");
 
+    let expected_output = "override-reached-child";
+    let mut observed_output = String::new();
     for _ in 0..100 {
-        if output_path.exists() {
+        observed_output = fs::read_to_string(&output_path).unwrap_or_default();
+        if observed_output == expected_output {
             break;
         }
         thread::sleep(Duration::from_millis(20));
     }
-    assert_eq!(
-        fs::read_to_string(&output_path).expect("read env output"),
-        "override-reached-child"
-    );
+    assert_eq!(observed_output, expected_output);
 
     shutdown_cli_daemon(&data_dir, child);
 }
