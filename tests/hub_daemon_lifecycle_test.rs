@@ -54,6 +54,7 @@ static REAL_DAEMON_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 const OPERATOR_CONSOLE_READINESS_LIVENESS_BACKSTOP: Duration = Duration::from_secs(60);
 const OPERATOR_CONSOLE_READER_DRAIN_BACKSTOP: Duration = Duration::from_secs(2);
 const OPERATOR_CONSOLE_OUTPUT_PROGRESS_BACKSTOP: Duration = Duration::from_secs(30);
+const DETERMINISTIC_FOREGROUND_INTERRUPT_SCRIPT: &str = "trap '' INT; node -e 'process.on(\"SIGINT\", () => process.exit(130)); console.log(\"foreground-forward-ready\"); setInterval(() => {}, 1000)' & child=$!; wait \"$child\"";
 const BOTSTER_WEB_READINESS_LIVENESS_BACKSTOP: Duration = Duration::from_secs(60);
 const BOTSTER_WEB_READINESS_STARTUP_DELAY_MS: u64 = 3_000;
 const STALLED_ATTACH_MIN_BUFFERED_STDOUT_BYTES: usize = 8 * 1024;
@@ -3697,10 +3698,7 @@ fn operator_console_ctrl_c_reaches_foreground_app_process_group_and_returns_prom
     let data_dir = unique_short_test_dir("console-foreground-interrupt");
     let package_dir =
         unique_short_test_dir("console-foreground-interrupt-package").join("package with spaces");
-    write_botster_tui_package_with_script(
-        &package_dir,
-        "trap '' INT; node -e 'process.on(\"SIGINT\", () => process.exit(130)); console.log(\"foreground-forward-ready\"); setInterval(() => {}, 1000)' & child=$!; wait \"$child\"",
-    );
+    write_botster_tui_package_with_script(&package_dir, DETERMINISTIC_FOREGROUND_INTERRUPT_SCRIPT);
 
     let mut daemon_cleanup = OwnedOperatorConsoleDaemon::new(&data_dir);
     let mut console = OperatorConsolePty::spawn(&data_dir);
@@ -3718,9 +3716,19 @@ fn operator_console_ctrl_c_reaches_foreground_app_process_group_and_returns_prom
     let prompt_after_interrupt = console.prompt_count() + 1;
     console.send(b"apps open botster-tui\n");
     console.wait_for("foreground-forward-ready");
+    let foreground_interrupt_checkpoint = console.output_checkpoint();
     console.send(&[3]);
-    console.wait_for("foreground app exited with code 130");
-    console.wait_for_occurrences("botster-hub> ", prompt_after_interrupt);
+    console.wait_for_output_after(
+        foreground_interrupt_checkpoint,
+        "foreground app exited with code 130",
+    );
+    console.wait_for_output_after(foreground_interrupt_checkpoint, "botster-hub> ");
+    assert_eq!(
+        console.prompt_count(),
+        prompt_after_interrupt,
+        "foreground interrupt printed an unexpected number of prompts: {}",
+        console.text()
+    );
     assert!(
         !console
             .text()
@@ -13189,18 +13197,18 @@ fn cli_operator_console_starts_reuses_detaches_handles_ctrl_c_and_stops() {
     first.wait_for("foreground-clean");
     first.send_and_wait_for_prompt(b"status\r");
     first.wait_for("event=status");
-    write_botster_tui_package_with_script(
-        &package_dir,
-        "stty raw -echo; stty isig; printf 'foreground-ready\\r\\n'; sleep 300",
-    );
+    write_botster_tui_package_with_script(&package_dir, DETERMINISTIC_FOREGROUND_INTERRUPT_SCRIPT);
     first.send_and_wait_for_prompt(b"packages reload botster-tui\n");
     first.wait_for("action=reload");
     let prompt_after_foreground_interrupt = first.prompt_count() + 1;
     first.send(b"apps open botster-tui\n");
-    first.wait_for("foreground-ready");
+    first.wait_for("foreground-forward-ready");
     let foreground_interrupt_checkpoint = first.output_checkpoint();
     first.send(&[3]);
-    first.wait_for_output_after(foreground_interrupt_checkpoint, "foreground app ");
+    first.wait_for_output_after(
+        foreground_interrupt_checkpoint,
+        "foreground app exited with code 130",
+    );
     first.wait_for_output_after(foreground_interrupt_checkpoint, "botster-hub> ");
     assert_eq!(
         first.prompt_count(),
