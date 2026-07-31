@@ -47,6 +47,9 @@
 - `README.md`, `docs/client-protocol.md`, `docs/hub-resource-proof.md`, and the
   committed plan — operator contract, diagnostics, and implementation-aligned
   acceptance criteria.
+- `docs/reports/hub-test-support-0.1.17-release-evidence.json` — immutable
+  release-content commit, tarball integrity, dependency order, clean-install
+  proof, and operator handoff.
 - `packages/hub-test-support/daemon-protocol.ts` and `metadata.json` — synced
   Hub-owned npm release assets for the additive protocol field.
 - `test.sh` — fails the repository wrapper when the Hub-owned npm assets drift.
@@ -65,8 +68,12 @@ Hub now owns and completes the source/generated/package-copy portion of the
 protocol release chain: `@trybotster/hub-test-support@0.1.17` contains the
 synced `plugin_resource_counters` bytes and matching metadata. Human answer
 `question_1785521549_236526` prohibits pipeline agents from publishing npm
-releases; the operator command after reviewing the immutable package evidence
-is `npm publish --access public` from `packages/hub-test-support`.
+releases. Follow-up answer `question_1785522029_180355` confirmed the dependency
+`@trybotster/ui-contract@0.2.0` is part of the same Hub-owned release batch. The
+operator command after reviewing
+`docs/reports/hub-test-support-0.1.17-release-evidence.json` is
+`script/publish-npm-packages` from the committed Hub root; the script publishes
+ui-contract before hub-test-support and stops on failure.
 
 The remaining vendored-byte and exact-pin update is Follow-up
 `ticket_1785515827_864108`, routed to the `botster-web` target and registered as
@@ -113,6 +120,13 @@ Passed:
 - `script/process-census --self-test`, proving a real spawned executable is
   visible to the live-survivor oracle
 - `node packages/hub-test-support/scripts/sync-assets.mjs --check`
+- `script/publish-npm-packages --dry-run`, covering generation/check/test/pack
+  for both `@trybotster/ui-contract@0.2.0` and
+  `@trybotster/hub-test-support@0.1.17`
+- a clean temporary-project install of those exact two tarballs, followed by
+  package import, asset verification, protocol-field/hash validation, and
+  plugin fixture materialization
+- registry checks confirming both target versions still return npm 404
 - loaded selector validation with `stress_profile=none`, plus a negative check
   proving `moderate` exits 2
 - shell/Ruby syntax checks and `git diff --check`
