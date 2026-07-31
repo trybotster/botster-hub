@@ -306,7 +306,7 @@ impl EntrypointSupervisor {
             {
                 return Ok(snapshot);
             }
-            if process.exited_at.is_some() {
+            if process.exited_at.is_some() && process.pending_terminal_state.is_none() {
                 return Err(EntrypointSupervisorError::ReadinessFailed {
                     package_name: key.package_name.clone(),
                     entrypoint_id: key.entrypoint_id.clone(),
@@ -1055,6 +1055,37 @@ mod tests {
         stdout_tx.send(Vec::new()).expect("settle stdout reader");
         process.refresh();
         assert!(matches!(process.state, ProcessState::Failed));
+    }
+
+    #[test]
+    fn readiness_failure_waits_for_delayed_exit_diagnostics() {
+        let (mut process, stdout_tx, stderr_tx) = controlled_failed_process();
+        process.launch_result_path = Some(unique_test_path("delayed-readiness-diagnostics"));
+        let key = EntrypointKey {
+            package_name: "fixture".to_string(),
+            entrypoint_id: "web".to_string(),
+        };
+        let mut supervisor = EntrypointSupervisor::default();
+        supervisor.processes.insert(key.clone(), process);
+        let (_events_tx, events) = mpsc::channel();
+        let output = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            stdout_tx.send(Vec::new()).expect("finish stdout reader");
+            stderr_tx
+                .send(b"delayed fixture failure\n".to_vec())
+                .expect("finish stderr reader");
+        });
+
+        let error = supervisor
+            .wait_for_launch_result(&key, &events, Duration::from_secs(1))
+            .expect_err("exited process must fail readiness");
+        output.join().expect("join delayed output fixture");
+
+        assert!(matches!(
+            error,
+            EntrypointSupervisorError::ReadinessFailed { details, .. }
+                if details.contains("delayed fixture failure")
+        ));
     }
 
     #[test]
