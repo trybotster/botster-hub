@@ -663,6 +663,8 @@ run_runtime_leg() {
 down_runtime_leg() {
   down_label=$1
   down_data_dir=$2
+  down_require_global_census=${3-true}
+  case "$down_require_global_census" in true|false) ;; *) usage ;; esac
   down_metadata=$down_data_dir/.botster-hub-runtime-daemon.json
   down_owned_pid=$(ruby -rjson -e 'print JSON.parse(File.read(ARGV.fetch(0))).fetch("pid")' "$down_metadata")
   down_owned_socket=$(ruby -rjson -e 'print JSON.parse(File.read(ARGV.fetch(0))).fetch("socket_path")' "$down_metadata")
@@ -675,27 +677,29 @@ down_runtime_leg() {
     echo "owned Hub process survived down: $down_owned_pid" >&2
     exit 1
   fi
-  down_executables=$runtime_root/$down_label-executables.txt
-  ruby -e 'ARGV.each { |path| puts File.realpath(path) }' \
-    "$hub_bin" "$session_worker_bin" >"$down_executables"
-  down_live_survivors=$runtime_root/$down_label-live-survivors.raw
-  if ! "$process_census" assert-no-live-executables \
-    "$down_executables" "$down_live_survivors" 5; then
+  if [ "$down_require_global_census" = true ]; then
+    down_executables=$runtime_root/$down_label-executables.txt
+    ruby -e 'ARGV.each { |path| puts File.realpath(path) }' \
+      "$hub_bin" "$session_worker_bin" >"$down_executables"
+    down_live_survivors=$runtime_root/$down_label-live-survivors.raw
+    if ! "$process_census" assert-no-live-executables \
+      "$down_executables" "$down_live_survivors" 5; then
+      redact_file "$down_live_survivors" "$evidence_dir/$down_label-live-survivors.log"
+      echo "owned Hub/session-worker process survived down" >&2
+      cat "$evidence_dir/$down_label-live-survivors.log" >&2
+      exit 1
+    fi
     redact_file "$down_live_survivors" "$evidence_dir/$down_label-live-survivors.log"
-    echo "owned Hub/session-worker process survived down" >&2
-    cat "$evidence_dir/$down_label-live-survivors.log" >&2
-    exit 1
-  fi
-  redact_file "$down_live_survivors" "$evidence_dir/$down_label-live-survivors.log"
-  down_zombie_survivors=$runtime_root/$down_label-zombie-survivors.raw
-  if ! "$process_census" assert-no-new-zombies \
-    "$zombie_baseline" "$down_zombie_survivors" 5; then
+    down_zombie_survivors=$runtime_root/$down_label-zombie-survivors.raw
+    if ! "$process_census" assert-no-new-zombies \
+      "$zombie_baseline" "$down_zombie_survivors" 5; then
+      redact_file "$down_zombie_survivors" "$evidence_dir/$down_label-zombie-survivors.log"
+      echo "Botster zombie child survived down" >&2
+      cat "$evidence_dir/$down_label-zombie-survivors.log" >&2
+      exit 1
+    fi
     redact_file "$down_zombie_survivors" "$evidence_dir/$down_label-zombie-survivors.log"
-    echo "Botster zombie child survived down" >&2
-    cat "$evidence_dir/$down_label-zombie-survivors.log" >&2
-    exit 1
   fi
-  redact_file "$down_zombie_survivors" "$evidence_dir/$down_label-zombie-survivors.log"
   if find "$down_data_dir" -type s -print -quit | grep -q .; then
     echo "live or stale socket survived under campaign data directory" >&2
     exit 1
@@ -768,7 +772,7 @@ if [ "$mode" = fresh ] || [ "$mode" = all ]; then
   capture dynamic-port-html curl --fail --silent --show-error "$second_web_url"
   grep -qi '<html' "$runtime_root/dynamic-port-html.raw"
   assert_owned_socket "$second_data" >/dev/null
-  down_runtime_leg dynamic-port "$second_data"
+  down_runtime_leg dynamic-port "$second_data" false
 
   explicit_data=$runtime_root/explicit-port-data
   install_current_packages explicit-port "$explicit_data" "$web_repo" "$tui_repo" "$workspaces_repo" "$project_pipelines_repo"
@@ -801,7 +805,7 @@ if [ "$mode" = fresh ] || [ "$mode" = all ]; then
   printf 'environment=BOTSTER_WEB_PACKAGE_SERVER_PORT\ndynamic_urls=%s,%s\nexplicit_attempts=%s\nexplicit_port=%s\nexplicit_url=%s\nretired_fixed_port=%s\n' \
     "$fresh_web_url" "$second_web_url" "$explicit_attempt" "$explicit_port" "$explicit_web_url" "$retired_fixed_port" \
     >"$evidence_dir/web-port-proof.txt"
-  down_runtime_leg explicit-port "$explicit_data"
+  down_runtime_leg explicit-port "$explicit_data" false
 
   invalid_port_data=$runtime_root/invalid-port-data
   install_current_packages invalid-port "$invalid_port_data" "$web_repo" "$tui_repo" "$workspaces_repo" "$project_pipelines_repo"
