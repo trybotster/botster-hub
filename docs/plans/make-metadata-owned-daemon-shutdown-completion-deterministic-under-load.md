@@ -11,6 +11,11 @@
 - Base: `origin/main`. Before planning, the clean ticket branch was fetched and
   fast-forwarded from `868c61700c8c145e5dadca5005ae20ccf3220805` to current
   upstream `b1bca77a16c36276ffba6ea726b54ae0664e905b`.
+- Plan Review `review_1785476868_561667` returned changes required. This
+  revision resolves all five findings by splitting the shared process predicate
+  by contract, preserving stale recovery and failed-start unwind, separating
+  zombie evidence from runner cleanup/liveness, recording real reaper topology,
+  and adding recovery acceptance checks.
 - Repository playbook: [[botster-hub-playbook]].
 - Role and surface playbooks: [[planner-playbook]],
   [[botster-planner-playbook]], [[botster-runtime-reviewer-playbook]], and
@@ -91,6 +96,21 @@ or a state beginning with `Z`. The test's `kill(pid, 0)` oracle still reports a
 zombie PID as present. Under scheduler pressure, the interval between daemon
 exit and adoption/reaping can therefore escape the production wait.
 
+That helper has three callers with two different contracts:
+
+| Caller | Contract | `Z` today |
+| --- | --- | --- |
+| `complete_owned_runtime_daemon_shutdown` | certify successful operator shutdown and remove owned artifacts only after the recorded PID is absent | too weak; `Z` must remain pending |
+| `recover_owned_stale_runtime_daemon` | establish that a terminated stale/incompatible daemon released its file descriptors/socket so startup or down recovery can proceed | correct success; `Z` has released the socket |
+| `StartedRuntimeCleanup::drop` | best-effort release of a newly started daemon's socket/metadata while failed `up` unwinds | correct success; a stricter reap wait would silently add up to ten seconds to error unwinding |
+
+The repair must split these questions instead of tightening the shared helper.
+`wait_for_runtime_daemon_exit` keeps its current exited/socket-free `None | Z`
+semantics for stale recovery and `StartedRuntimeCleanup`. A new, explicitly
+named owned-shutdown terminal wait accepts only `None` and is called only by
+`complete_owned_runtime_daemon_shutdown`. A boolean mode on the existing helper
+would hide the semantic distinction and is out of scope.
+
 This is the leading code-backed hypothesis, not yet retained-run proof. The
 existing artifact did not record PID `24852`'s state/PPID at the assertion
 boundary. The first implementation action must characterize that boundary
@@ -101,7 +121,9 @@ second speculative mechanism.
 The loaded runner's current “zero survivors” result is not zero-zombie proof:
 both SID and run-token census functions intentionally filter states beginning
 with `Z`, and the runner documentation calls the outputs “non-zombie”
-censuses.
+censuses. Those live-only functions also drive cleanup group selection, so they
+must not be changed in place. Zombie evidence needs a separate observation-only
+census after a bounded settle/recheck; it must never feed TERM/KILL loops.
 
 ## Scope
 
@@ -116,8 +138,9 @@ censuses.
   metadata-owned daemon shutdown completion as disappearance of the recorded,
   identity-checked PID from the process table. Zombie is an exited process
   state but not completed/reaped ownership.
-- Change the existing production wait predicate so `Z` remains pending inside
-  the existing bounded wait; do not increase its ten-second budget.
+- Add an owned-shutdown-only terminal wait in which `Z` remains pending inside
+  the existing ten-second budget. Keep the existing `None | Z` socket-release
+  wait unchanged for stale recovery and failed-start unwind.
 - Keep socket and metadata removal after terminal PID disappearance. Preserve
   typed failure if the documented completion state is not reached within the
   existing budget.
@@ -126,9 +149,12 @@ censuses.
 - Add a focused loaded-runner selector for this exact lifecycle test and update
   the workflow input and runner documentation so focused branch/base campaigns
   do not depend on unrelated first-red tests.
-- Make the loaded survivor evidence count and display zombies at the relevant
-  ownership boundary. Keep the exact run-token plus SID/process topology and
-  idempotent cleanup model; do not replace it with broad process-name killing.
+- Add a separate loaded-runner zombie evidence category after a bounded
+  settle/recheck. Keep `group_is_alive`, `direct_child_is_running`,
+  `session_process_rows`, and `run_token_process_rows` zombie-excluding for
+  liveness, cleanup group selection, and post-clean checks. Zombie rows fail the
+  repetition as evidence but are not sent through TERM/KILL loops the runner
+  cannot satisfy.
 - Document in `README.md` that successful `shutdown`/`down` for a verified
   metadata-owned runtime means the recorded PID is absent and its owned socket
   and metadata are removed.
@@ -176,9 +202,10 @@ censuses.
   predicate becoming observable before PID 1 reaps the orphaned daemon. This is
   an inference from code and test semantics, not a claim supplied by the
   retained artifact.
-- Waiting for process-table absence within the existing budget is lifecycle
-  acknowledgement, not timeout inflation: success becomes stricter, while
-  failure remains bounded and truthful.
+- Waiting for process-table absence within the existing budget is the
+  metadata-owned operator-shutdown acknowledgement only. Stale recovery and
+  failed-start unwind continue to accept exited-but-unreaped `Z` as
+  socket-release evidence.
 - A regression that holds the real daemon as the integration test's unreaped
   direct child reproduces the exact kernel state deterministically without
   changing production code or relying on scheduler luck.
@@ -192,27 +219,37 @@ censuses.
   for PID `24852` at the assertion. If a new controlled reproduction observes a
   non-zombie live Hub, an inspection-command failure, or PID reuse, stop and
   revise the plan around that evidence.
+- Characterization must identify the expected reaper for the failing daemon
+  (PID 1, another subreaper, or a live non-reaping ancestor) and record the
+  observed exit-to-reap interval. The direct-child regression proves the
+  terminal predicate; only the loaded campaign proves the real orphan/reaper
+  topology and the comfort of the unchanged ten-second budget.
 - Non-parent CLI processes cannot reap another process's zombie. The planned
   contract waits for the real owner/adoptive reaper to finish. If the existing
   ten-second budget proves insufficient on an authoritative environment,
   return a typed failure and ask the human before considering a persistent
   supervisor or daemonization topology change.
 - Linux run-token lookup through `/proc/<pid>/environ` may not identify a
-  zombie after its environment is gone. The Linux SID census must include
-  zombies, and the focused test's exact PID/state evidence remains the primary
+  zombie after its environment is gone. The separate zombie evidence must
+  combine the recorded test SID, exact known PIDs when available, and a
+  before/after census of newly appearing Botster role identities across
+  sessions. The focused test's exact PID/state evidence remains the primary
   oracle. Any cross-session survivor still needs the existing run-token
-  mechanism or an exact-PID marker per [[sid scoped census is blind to setsid session leaks]].
+  mechanism or an exact-PID/role marker per
+  [[sid scoped census is blind to setsid session leaks]].
 
 ## Affected surfaces/files
 
-- `src/main.rs` — production metadata-owned PID selection, completion predicate,
-  socket/metadata cleanup ordering, and focused private tests only if needed for
-  state classification.
+- `src/main.rs` — production metadata-owned PID selection, the new
+  owned-shutdown reaped predicate, unchanged socket-release predicate for
+  `recover_owned_stale_runtime_daemon` and `StartedRuntimeCleanup`, cleanup
+  ordering, and focused private tests only if needed for state classification.
 - `tests/hub_daemon_lifecycle_test.rs` — deterministic real-daemon
   zombie/reaping regression, retained ordinary `up`/`shutdown` assertion, exact
   PID state diagnostics, and cleanup guards.
-- `script/run-loaded-daemon-lifecycle` — exact focused selector and
-  zombie-inclusive survivor evidence.
+- `script/run-loaded-daemon-lifecycle` — exact focused selector plus a separate
+  zombie evidence/settle gate; live-only liveness and cleanup predicates remain
+  unchanged.
 - `.github/workflows/loaded-daemon-lifecycle.yml` — expose the focused selector.
 - `docs/loaded-daemon-lifecycle-runner.md` — document focused campaign and
   zombie-inclusive evidence semantics.
@@ -228,8 +265,9 @@ leading hypothesis.
 
 1. Add bounded diagnostic helpers in the lifecycle integration test that read
    exact PID state and identity. On any boundary failure, print PID, PPID, PGID,
-   SID, stat, command, metadata, socket, shutdown output/status, and daemon
-   output/status. Do not add periodic production logging.
+   SID, stat, command, metadata, socket, shutdown output/status, daemon
+   output/status, expected reaper identity, and the measured exit-to-reap
+   interval. Do not add periodic production logging.
 2. Add the deterministic regression using
    `start_cli_daemon_with_session_worker` plus
    `write_local_runtime_daemon_metadata`. Spawn the shutdown CLI without waiting
@@ -241,31 +279,51 @@ leading hypothesis.
    fail because the shutdown CLI returns while the daemon is zombie. Preserve
    the nonzero command output as pre-fix evidence.
 4. Confirm the controlled state matches the retained failure's contract. If it
-   does, remove only the `Z` success arm from
-   `wait_for_runtime_daemon_exit`; success is `process_state(pid) == None`.
-   Preserve the existing poll cadence and ten-second bound. Include the last
-   observed state/identity in a typed timeout diagnostic if the current error
-   cannot distinguish a live process from an unreaped zombie without widening
-   the change.
+   does, add `wait_for_owned_runtime_daemon_reaped` (final name may vary but
+   must state the contract) with success only at
+   `process_state(pid) == None`. Preserve the existing 50 ms poll cadence and
+   ten-second bound. Include the last observed state/identity in a typed timeout
+   diagnostic if the current error cannot distinguish a live process from an
+   unreaped zombie without widening the change.
 5. Keep `complete_owned_runtime_daemon_shutdown` ordering unchanged:
    process-table disappearance, configured socket cleanup, then metadata
    cleanup. Confirm both `operator_shutdown` and `local_runtime_down` continue
-   to call it after a successful protocol response.
-6. Keep the existing ordinary metadata-owned `up`/`shutdown` integration test.
+   to call it after a successful protocol response. Route only this helper
+   through the new reaped predicate.
+6. Leave `wait_for_runtime_daemon_exit` and both remaining callers unchanged:
+   `recover_owned_stale_runtime_daemon` continues to accept `None | Z` before
+   removing stale socket/metadata and rebinding, and
+   `StartedRuntimeCleanup::drop` continues the same fast best-effort
+   socket-release behavior during failed-`up` unwind. Do not add a boolean mode.
+7. Keep the existing ordinary metadata-owned `up`/`shutdown` integration test.
    Its immediate alive-PID assertion remains a second production-shaped oracle;
    do not replace it with the controlled-parent test.
-7. Add `focused-metadata-owned-shutdown` in runner validation, command dispatch,
+8. Add `focused-metadata-owned-shutdown` in runner validation, command dispatch,
    workflow choices, and runner docs. Its command must use `./test.sh`, the exact
    integration test filter, `--exact`, `--nocapture`, and default Cargo test
    concurrency.
-8. Remove the explicit zombie exclusions from the relevant Linux SID survivor
-   census and document which evidence can and cannot attribute zombie rows.
-   Keep run-token and process-group cleanup exact and idempotent. Add a
-   runner-level fixture/self-check or artifact assertion showing a zombie row
-   would make the gate nonzero; a prose-only change is insufficient.
-9. Document the operator completion contract and produce an implementation
+9. Keep these runner predicates zombie-excluding:
+   `group_is_alive` (TERM/KILL wait loops), `direct_child_is_running` (direct
+   child wait/reap), `session_process_rows`, and `run_token_process_rows`
+   (live-process cleanup group selection and post-clean checks). Add separate
+   observation-only zombie row functions. After the direct test leader is
+   reaped, poll within a named bounded settle budget for PID-1/subreaper
+   convergence, then emit distinct `live_survivors` and `zombie_survivors`
+   evidence. A zombie remaining after settle makes the repetition nonzero but
+   is never passed to TERM/KILL or labelled `post_clean=alive`. Preserve
+   `cleanup_status=0` when the cleanup machinery completed; the test/campaign
+   status carries the zombie-evidence failure. Cover recorded-SID zombies and
+   newly appearing Botster Hub/session-worker/fixture role zombies across
+   sessions relative to a pre-repetition baseline.
+10. Add a runner self-check or fixture proving a zombie row survives the settle
+    gate long enough to make the enclosing repetition nonzero, while a reaped
+    row and a live group still follow their distinct existing paths. The
+    self-check must also prove `group_is_alive` and
+    `direct_child_is_running` continue treating `Z` as non-live.
+11. Document the operator completion contract and produce an implementation
    report with characterization, pre-fix red, fixed green, exact subjects,
-   branch/base campaigns, runtime binary provenance, and survivor evidence.
+   branch/base campaigns, expected real reaper and exit-to-reap observations,
+   runtime binary provenance, and separate live/zombie survivor evidence.
 
 ## Risks
 
@@ -280,14 +338,25 @@ leading hypothesis.
 - **Moving the race:** removing only the test assertion or adding a test wait
   after CLI completion would hide the production bug. The production CLI must
   remain blocked until the terminal predicate.
+- **Regressing stale recovery:** tightening the shared socket-release helper
+  would turn a correctly exited `Z` stale daemon into a ten-second timeout.
+  Split the owned-shutdown predicate and prove up/down recovery remains
+  unchanged.
+- **Slowing failed-start unwind:** applying the reap predicate inside
+  `StartedRuntimeCleanup::drop` would add invisible latency while an already
+  failed `up` unwinds. Keep its existing socket-release predicate.
 - **PID reuse/identity ambiguity:** capture command identity and do not signal or
   classify an unrelated reused PID as the owned daemon.
 - **Overclaiming survivor proof:** `/proc` run-token scans may miss zombies.
-  Require exact-PID regression evidence plus zombie-inclusive Linux SID/process
-  evidence; do not describe the old zero-survivor artifacts as zero-zombie.
-- **Runner cleanup unable to reap nonchildren:** detection should fail the
-  campaign rather than pretend cleanup succeeded. Only an owning parent or PID
-  1 can reap.
+  Require exact-PID regression evidence plus the separate settled SID and
+  before/after cross-session role census; do not describe the old zero-survivor
+  artifacts as zero-zombie.
+- **Runner cleanup unable to reap nonchildren:** observation may fail the
+  repetition after a bounded settle, but zombies must not feed TERM/KILL loops
+  or the live `post_clean` predicate. Only an owning parent or PID 1 can reap.
+- **Normal reaper latency scored as a leak:** take a bounded semantic
+  settle-and-recheck before failing on zombie evidence, and keep the measured
+  exit-to-reap interval in artifacts.
 - **Upstream foreground overlap:** current main changed the same large
   integration test and runner. Limit edits to shutdown helpers/selectors and
   reject foreground-console cleanup.
@@ -308,8 +377,9 @@ leading hypothesis.
   reaps the child, then observes successful shutdown, PID absence, socket
   absence, and metadata absence.
 - Narrow ablation: restore only the old `Some(state) if state.starts_with('Z')
-  => Ok(())` enforcement decision while retaining the committed test. The exact
-  regression must fail; restore the fix and it must pass.
+  => Ok(())` decision in the new owned-shutdown predicate while retaining the
+  committed test. The exact regression must fail; restore the fix and it must
+  pass. The original socket-release predicate is not ablated.
 - Existing production path:
   `./test.sh --test hub_daemon_lifecycle_test cli_shutdown_waits_for_metadata_owned_runtime_daemon_cleanup -- --exact --nocapture`.
 - Adjacent lifecycle paths:
@@ -317,6 +387,19 @@ leading hypothesis.
   `cli_local_runtime_bootstrap_reuses_live_daemon_and_preserves_state_after_restart`,
   the operator-console shutdown test, and daemon response-delivery tests pass
   without changes to their response ordering or foreground behavior.
+- Unchanged stale/recovery paths:
+  `cli_home_runtime_up_recovers_owned_incompatible_daemon`,
+  `cli_local_runtime_down_recovers_owned_incompatible_daemon`,
+  `cli_local_runtime_recovery_removes_only_selected_data_dir_socket`,
+  and
+  `cli_doctor_reports_incompatible_stale_daemon_without_deleting_socket`
+  pass. Add a deterministic zombie-stale-recovery characterization only if the
+  implementation touches the original socket-release predicate; the approved
+  split must leave it byte-for-byte unchanged.
+- Failed-start unwind:
+  `cli_local_runtime_up_reports_missing_installed_checkout_before_launch`
+  passes without a new ten-second delay, proving
+  `StartedRuntimeCleanup::drop` did not inherit the reaped predicate.
 - Default-parallel integration binary:
   `./test.sh --test hub_daemon_lifecycle_test -- --nocapture`.
 - Repository gates:
@@ -328,7 +411,10 @@ leading hypothesis.
   repetitions with `residual-tail` and default Cargo concurrency. Require every
   repetition green, exact Hub SHA and locked Core SHA, binary realpaths under
   the fresh target, zero Hub/session-worker/fixture-shell/socket survivors, no
-  zombie rows, every owned group gone, and `cleanup_status=0`.
+  zombie rows after the bounded settle, every owned group gone, and
+  `cleanup_status=0`. Artifacts must distinguish live survivors from zombies
+  and record the production daemon's expected reaper plus exit-to-reap
+  interval.
 - Focused authoritative-base proof: run the identical selector, repetitions,
   stress profile, workflow harness, and runner image against the exact
   pre-fix/base SHA. Preserve a target red or explicitly report the bounded
@@ -340,8 +426,11 @@ leading hypothesis.
   the exact base SHA when any non-target red occurs. A base red does not waive a
   ticket-owned regression or missing zombie evidence.
 - The implementation report must show the production entry points
-  `operator_shutdown` and `local_runtime_down` using the changed terminal wait.
-  A private helper/unit test alone is insufficient.
+  `operator_shutdown` and `local_runtime_down` using the new owned terminal
+  wait through `complete_owned_runtime_daemon_shutdown`; it must also show
+  `recover_owned_stale_runtime_daemon` and `StartedRuntimeCleanup::drop` remain
+  on the original socket-release wait. A private helper/unit test alone is
+  insufficient.
 
 ## Pipeline gates and artifacts
 
@@ -354,10 +443,12 @@ leading hypothesis.
   production call-chain proof.
 - Verify evidence must independently rerun the deterministic regression,
   repository strict gates, focused loaded campaign, full contention campaign,
-  exact branch/base attribution, and zombie-inclusive survivor checks.
+  exact branch/base attribution, stale-recovery checks, and the separate
+  settled zombie evidence gate.
 - Review must reject timeout inflation, retry-only proof, weaker PID assertions,
-  zombie filtering, missing child reaping, foreground-console edits, dead code,
-  unwired helpers, or a new supervisor without a human-approved re-plan.
+  missing zombie evidence, zombie-fed kill loops, a tightened stale-recovery or
+  failed-start predicate, missing child reaping, foreground-console edits, dead
+  code, unwired helpers, or a new supervisor without a human-approved re-plan.
 
 ## Vault gaps worth capturing
 
