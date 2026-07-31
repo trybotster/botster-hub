@@ -82,6 +82,34 @@ package_is_published() {
   exit 69
 }
 
+tarball_integrity() {
+  tarball=$1
+  node -e '
+    const { createHash } = require("node:crypto");
+    const { readFileSync } = require("node:fs");
+    process.stdout.write(`sha512-${createHash("sha512").update(readFileSync(process.argv[1])).digest("base64")}`);
+  ' "$tarball"
+}
+
+published_package_integrity() {
+  coordinate=$1
+  encoded=$(npm view "$coordinate" dist.integrity --json --prefer-online)
+  node -e 'process.stdout.write(JSON.parse(process.argv[1]))' "$encoded"
+}
+
+validate_published_package() {
+  coordinate=$1
+  tarball=$2
+  expected=$(tarball_integrity "$tarball")
+  actual=$(published_package_integrity "$coordinate")
+
+  [ "$actual" = "$expected" ] || {
+    printf 'Published package does not match the locally verified tarball: %s\nexpected: %s\nactual:   %s\n' \
+      "$coordinate" "$expected" "$actual" >&2
+    exit 67
+  }
+}
+
 wait_for_published_package() {
   coordinate=$1
   attempt=1
@@ -107,7 +135,8 @@ publish_package() {
   tarball=$2
 
   if package_is_published "$coordinate"; then
-    log "$coordinate is already published; skipping"
+    validate_published_package "$coordinate" "$tarball"
+    log "$coordinate is already published with matching integrity; skipping"
     return
   fi
 
@@ -169,6 +198,13 @@ hub_tarball=$release_dir/$hub_tarball_name
   printf 'Expected package tarball was not created: %s\n' "$hub_tarball" >&2
   exit 66
 }
+
+if package_is_published "$ui_coordinate"; then
+  validate_published_package "$ui_coordinate" "$ui_tarball"
+fi
+if package_is_published "$hub_coordinate"; then
+  validate_published_package "$hub_coordinate" "$hub_tarball"
+fi
 
 if [ "$dry_run" = true ]; then
   log "Dry run passed for $ui_coordinate and $hub_coordinate"
