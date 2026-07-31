@@ -65,10 +65,9 @@ For a verified metadata-owned runtime, successful `shutdown` or `down` means
 the recorded Hub PID is absent from the process table and the owned local socket
 and runtime metadata file have been removed. Receiving the daemon's shutdown
 response or observing an exited-but-unreaped zombie is not completion.
-When the command still owns the daemon child, it also requires a clean child
-exit status. A non-parent command cannot obtain that status and therefore
-combines the daemon's successful shutdown response with independently observed
-PID absence.
+Completion combines the daemon's successful shutdown response with
+independently observed PID absence; an owner may reap the child while reaching
+that same process-table terminal state.
 
 Bare invocation requires terminal stdin and stdout. Scripts and redirected
 commands must use an explicit subcommand such as `botster-hub status`; they
