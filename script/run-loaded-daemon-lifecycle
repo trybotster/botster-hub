@@ -63,7 +63,7 @@ validate_inputs() {
     invalid=1
   fi
   case "$TEST_TARGET" in
-    lifecycle-suite|focused-process-ownership|focused-connection-lifecycle|focused-stalled-attach|focused-fast-exit-attach-diagnostic|focused-oversized-webrtc|focused-cli-smoke|focused-lua-worker-suite|focused-lua-session-worker-callers|full-suite-contention) ;;
+    lifecycle-suite|focused-session-entity-resize|focused-process-ownership|focused-connection-lifecycle|focused-stalled-attach|focused-fast-exit-attach-diagnostic|focused-oversized-webrtc|focused-cli-smoke|focused-lua-worker-suite|focused-lua-session-worker-callers|full-suite-contention) ;;
     *) log "invalid test_target: $TEST_TARGET"; invalid=1 ;;
   esac
   if [[ ! "$REPETITIONS" =~ ^[0-9]+$ ]] || ((10#$REPETITIONS < 1 || 10#$REPETITIONS > 100)); then
@@ -862,6 +862,9 @@ main() {
   case "$TEST_TARGET" in
     lifecycle-suite)
       test_command=(./test.sh --test hub_daemon_lifecycle_test -- --nocapture)
+      ;;
+    focused-session-entity-resize)
+      test_command=(./test.sh --test hub_daemon_lifecycle_test session_entity_subscription_pushes_snapshot_ordered_deltas_and_fresh_reconnect -- --exact --nocapture)
       ;;
     focused-process-ownership)
       test_command=(./test.sh --test hub_daemon_lifecycle_test process_ownership_ -- --nocapture)
