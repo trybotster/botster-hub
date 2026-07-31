@@ -132,7 +132,14 @@ Implement one production-path campaign that installs exactly the four packages i
 
 `botster-web`, `botster-tui`, `botster-workspaces`, and `project-pipelines` are exact-coordinate acceptance inputs. The Hub campaign may invoke their existing public live/smoke entrypoints and inspect their manifests; it may not edit them. If one cannot attach to the caller-owned Hub or expose its declared production action, add a ticket dependency against that repository and stop that slice instead of broadening this run.
 
-No new cross-repository dependency is currently planned. The sibling target ticket concerning BindList descendant identity is unrelated and is not absorbed here.
+Implementation exposed one cross-repository protocol-consumption dependency:
+Web's pinned/vendored Hub daemon protocol must consume the additive
+`plugin_resource_counters` response before the exact production artifact gate
+can pass. That work is registered separately as
+`ticket_1785515827_864108` against the `botster-web` target and as dependency
+`dependency_1785515833_230748`; this Hub run does not patch Web. The sibling
+target ticket concerning BindList descendant identity remains unrelated and is
+not absorbed here.
 
 ## Surgical implementation plan
 
