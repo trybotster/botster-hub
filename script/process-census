@@ -1,0 +1,126 @@
+#!/bin/sh
+set -eu
+
+all_process_rows() {
+  case "$(uname -s)" in
+    Darwin) ps -axo pid=,ppid=,pgid=,sess=,stat=,comm=,args= ;;
+    Linux) ps -eo pid=,ppid=,pgid=,sid=,stat=,comm=,args= ;;
+    *) echo "unsupported process census platform: $(uname -s)" >&2; return 2 ;;
+  esac
+}
+
+filter_botster_zombie_rows() {
+  awk '
+    $5 ~ /^Z/ && ($6 == "botster-hub" || $6 == "botster-session" || $6 == "botster-session-worker") {
+      printf "%s\t%s\t%s\t%s\t%s\t%s", $1, $2, $3, $4, $5, $6
+      for (field = 7; field <= NF; field++) printf "\t%s", $field
+      printf "\n"
+    }
+  '
+}
+
+botster_zombie_rows() {
+  all_process_rows | filter_botster_zombie_rows
+}
+
+new_rows() {
+  baseline=$1
+  current=$2
+  awk -F '\t' '
+    FILENAME == ARGV[1] { baseline[$1]=1; next }
+    !baseline[$1] { print }
+  ' "$baseline" "$current"
+}
+
+assert_no_new_zombies() {
+  baseline=$1
+  evidence=$2
+  settle_seconds=$3
+  current=$evidence.current.$$
+  deadline=$(( $(date +%s) + settle_seconds ))
+  trap 'rm -f "$current"' EXIT INT TERM
+  while :; do
+    botster_zombie_rows >"$current"
+    new_rows "$baseline" "$current" >"$evidence"
+    [ ! -s "$evidence" ] && return 0
+    [ "$(date +%s)" -ge "$deadline" ] && return 1
+    sleep 0.1
+  done
+}
+
+live_executable_rows() {
+  paths_file=$1
+  all_process_rows | awk -v paths_file="$paths_file" '
+    BEGIN {
+      while ((getline path < paths_file) > 0) {
+        if (path != "") paths[++count] = path
+      }
+      close(paths_file)
+      if (count == 0) exit 2
+    }
+    $5 !~ /^Z/ {
+      for (i = 1; i <= count; i++) {
+        if (index($0, paths[i])) {
+          printf "%s\t%s\t%s\t%s\t%s\t%s", $1, $2, $3, $4, $5, $6
+          for (field = 7; field <= NF; field++) printf "\t%s", $field
+          printf "\n"
+          next
+        }
+      }
+    }
+  '
+}
+
+assert_no_live_executables() {
+  paths_file=$1
+  evidence=$2
+  settle_seconds=$3
+  deadline=$(( $(date +%s) + settle_seconds ))
+  while :; do
+    live_executable_rows "$paths_file" >"$evidence"
+    [ ! -s "$evidence" ] && return 0
+    [ "$(date +%s)" -ge "$deadline" ] && return 1
+    sleep 0.1
+  done
+}
+
+self_test() {
+  fixture=$(mktemp -d "${TMPDIR:-/tmp}/botster-process-census.XXXXXX")
+  marker=$fixture/owned-session-worker
+  paths=$fixture/paths
+  evidence=$fixture/evidence
+  trap 'kill "${marker_pid:-}" >/dev/null 2>&1 || true; wait "${marker_pid:-}" >/dev/null 2>&1 || true; rm -rf "$fixture"' EXIT INT TERM
+  printf '%s\n' '#!/bin/sh' 'sleep 30' >"$marker"
+  chmod +x "$marker"
+  printf '%s\n' "$marker" >"$paths"
+  "$marker" &
+  marker_pid=$!
+  attempts=0
+  while ! live_executable_rows "$paths" | awk -v pid="$marker_pid" '$1 == pid { found=1 } END { exit !found }'; do
+    attempts=$((attempts + 1))
+    [ "$attempts" -lt 100 ] || {
+      echo "executable-provenance positive control was not observable" >&2
+      exit 1
+    }
+    sleep 0.01
+  done
+  if assert_no_live_executables "$paths" "$evidence" 1; then
+    echo "live executable positive control passed unexpectedly" >&2
+    exit 1
+  fi
+  kill "$marker_pid"
+  wait "$marker_pid" || true
+  marker_pid=
+  assert_no_live_executables "$paths" "$evidence" 1
+  echo "process census self-test passed"
+}
+
+case "${1-}" in
+  all) [ "$#" -eq 1 ] || exit 64; all_process_rows ;;
+  botster-zombies) [ "$#" -eq 1 ] || exit 64; botster_zombie_rows ;;
+  botster-zombies-from-stdin) [ "$#" -eq 1 ] || exit 64; filter_botster_zombie_rows ;;
+  assert-no-new-zombies) [ "$#" -eq 4 ] || exit 64; assert_no_new_zombies "$2" "$3" "$4" ;;
+  assert-no-live-executables) [ "$#" -eq 4 ] || exit 64; assert_no_live_executables "$2" "$3" "$4" ;;
+  --self-test) [ "$#" -eq 1 ] || exit 64; self_test ;;
+  *) echo "usage: script/process-census all|botster-zombies|botster-zombies-from-stdin|assert-no-new-zombies BASELINE EVIDENCE SECONDS|assert-no-live-executables PATHS EVIDENCE SECONDS|--self-test" >&2; exit 64 ;;
+esac

@@ -2,6 +2,7 @@
 set -uo pipefail
 
 readonly RUNNER=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/run-loaded-daemon-lifecycle
+readonly PROCESS_CENSUS=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/process-census
 SELFTEST_DIR=$(mktemp -d)
 FIXTURE_PID=
 DECOY_PID=
@@ -87,6 +88,9 @@ time.sleep(300)
 source "$RUNNER" --artifact-dir "$SELFTEST_DIR/source-must-not-run"
 [[ ! -e "$SELFTEST_DIR/source-must-not-run" ]] || fail "sourcing executed runner main"
 pass "runner sources without CLI or campaign side effects"
+
+"$PROCESS_CENSUS" --self-test || fail "process census positive control failed"
+pass "process census observes executable-provenance survivors"
 
 command -v python3 >/dev/null 2>&1 \
   || fail "missing required self-test command: python3"

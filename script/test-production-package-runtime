@@ -135,6 +135,16 @@ resource_probe=$script_repo/script/probe-hub-resources
   echo "resource probe is not executable: $resource_probe" >&2
   exit 66
 }
+timer_scan=$script_repo/script/assert-no-plugin-timers
+[ -x "$timer_scan" ] || {
+  echo "timer scan is not executable: $timer_scan" >&2
+  exit 66
+}
+process_census=$script_repo/script/process-census
+[ -x "$process_census" ] || {
+  echo "process census is not executable: $process_census" >&2
+  exit 66
+}
 [ ! -e "$evidence_dir" ] || {
   echo "evidence directory already exists: $evidence_dir" >&2
   exit 73
@@ -149,6 +159,8 @@ raw_commands=$runtime_root/commands.raw
 : >"$owned_data_dirs"
 : >"$owned_worktrees"
 : >"$raw_commands"
+zombie_baseline=$runtime_root/botster-zombie-baseline.tsv
+"$process_census" botster-zombies >"$zombie_baseline"
 setup_pid=
 fixed_port_pid=
 cargo_home_root=${CARGO_HOME:-$HOME/.cargo}
@@ -314,18 +326,13 @@ record_zero_timer_baseline() {
   timer_revision=$2
   timer_package=$3
   timer_matches=$runtime_root/$timer_package-timer-declarations.raw
-  if git -C "$timer_repo" grep -n -E \
-    'timer\.(after|every|set_timeout|set_interval)|hub\.timer|timers\.register' \
-    "$timer_revision" -- '*.lua' >"$timer_matches"; then
-    echo "$timer_package declares or registers a plugin timer at $timer_revision" >&2
-    cat "$timer_matches" >&2
-    exit 1
+  if "$timer_scan" "$timer_repo" "$timer_revision" "$timer_package" >"$timer_matches" 2>&1; then
+    :
   else
     timer_status=$?
-    [ "$timer_status" -eq 1 ] || {
-      echo "$timer_package timer source scan failed with status $timer_status" >&2
-      exit "$timer_status"
-    }
+    cat "$timer_matches" >&2
+    echo "$timer_package timer source scan failed with status $timer_status" >&2
+    exit "$timer_status"
   fi
   printf 'package=%s revision=%s timer_declarations=0\n' \
     "$timer_package" "$timer_revision" >>"$evidence_dir/four-package-timer-baseline.txt"
@@ -340,6 +347,7 @@ validate_revision "$workspaces_repo" "$workspaces_revision" botster-workspaces
 validate_revision "$project_pipelines_repo" "$project_pipelines_revision" botster-project-pipelines
 
 : >"$evidence_dir/four-package-timer-baseline.txt"
+capture timer-scan-self-test "$timer_scan" --self-test
 record_zero_timer_baseline "$web_repo" "$web_revision" botster-web
 record_zero_timer_baseline "$tui_repo" "$tui_revision" botster-tui
 record_zero_timer_baseline "$workspaces_repo" "$workspaces_revision" botster-workspaces
@@ -525,6 +533,7 @@ capture_resource_probe() {
   probe_label=$1
   probe_data_dir=$2
   probe_expected_owners=$3
+  probe_reconnects=${4-0}
   probe_metadata=$probe_data_dir/.botster-hub-runtime-daemon.json
   probe_pid=$(ruby -rjson -e 'print JSON.parse(File.read(ARGV.fetch(0))).fetch("pid")' "$probe_metadata")
   probe_socket=$(ruby -rjson -e 'print JSON.parse(File.read(ARGV.fetch(0))).fetch("socket_path")' "$probe_metadata")
@@ -533,6 +542,7 @@ capture_resource_probe() {
     --hub-pid "$probe_pid" \
     --phase "$probe_label" \
     --expected-owners "$probe_expected_owners" \
+    --exercise-entity-reconnects "$probe_reconnects" \
     --max-threads 64
 }
 
@@ -549,9 +559,26 @@ run_fresh_resource_generations() {
 
   resource_reconnect=1
   while [ "$resource_reconnect" -le 8 ]; do
-    capture_resource_probe "fresh-reconnect-$resource_reconnect" "$resource_data_dir" 4
+    capture_resource_probe "fresh-reconnect-$resource_reconnect" "$resource_data_dir" 4 1
     resource_reconnect=$((resource_reconnect + 1))
   done
+  ruby -rjson -e '
+    paths = ARGV
+    snapshots = paths.map { |path| JSON.parse(File.read(path)) }
+    stable = snapshots.map { |snapshot|
+      [
+        snapshot.dig("observed", "workers", "live_plugin_executors"),
+        snapshot.dig("observed", "workers", "live_executor_workers"),
+        snapshot.dig("observed", "workers", "queued_jobs"),
+        snapshot.dig("observed", "workers", "in_flight_jobs"),
+        snapshot.dig("observed", "resources", "active_timer_resources"),
+        snapshot.dig("observed", "lifecycle", "live_connections"),
+        snapshot.dig("observed", "lifecycle", "live_entity_subscriptions"),
+        snapshot.dig("observed", "lifecycle", "live_attach_subscriptions")
+      ]
+    }
+    abort("resource counters grew across reconnect generations: #{stable.inspect}") unless stable.uniq.length == 1
+  ' "$runtime_root"/fresh-reconnect-*-resources.raw
 
   for resource_package in botster-web botster-tui botster-workspaces project-pipelines; do
     capture "fresh-reload-$resource_package" "$hub_bin" packages reload \
@@ -647,16 +674,27 @@ down_runtime_leg() {
     echo "owned Hub process survived down: $down_owned_pid" >&2
     exit 1
   fi
-  down_survivors=$runtime_root/$down_label-survivors.raw
-  DOWN_MARKER="$down_data_dir" ps -axo pid=,ppid=,stat=,command= \
-    | DOWN_MARKER="$down_data_dir" awk 'index($0, ENVIRON["DOWN_MARKER"]) { print }' \
-      >"$down_survivors"
-  if [ -s "$down_survivors" ]; then
-    redact_file "$down_survivors" "$evidence_dir/$down_label-survivors.log"
-    echo "owned Hub/session-worker process or zombie survived down" >&2
-    cat "$evidence_dir/$down_label-survivors.log" >&2
+  down_executables=$runtime_root/$down_label-executables.txt
+  ruby -e 'ARGV.each { |path| puts File.realpath(path) }' \
+    "$hub_bin" "$session_worker_bin" >"$down_executables"
+  down_live_survivors=$runtime_root/$down_label-live-survivors.raw
+  if ! "$process_census" assert-no-live-executables \
+    "$down_executables" "$down_live_survivors" 5; then
+    redact_file "$down_live_survivors" "$evidence_dir/$down_label-live-survivors.log"
+    echo "owned Hub/session-worker process survived down" >&2
+    cat "$evidence_dir/$down_label-live-survivors.log" >&2
     exit 1
   fi
+  redact_file "$down_live_survivors" "$evidence_dir/$down_label-live-survivors.log"
+  down_zombie_survivors=$runtime_root/$down_label-zombie-survivors.raw
+  if ! "$process_census" assert-no-new-zombies \
+    "$zombie_baseline" "$down_zombie_survivors" 5; then
+    redact_file "$down_zombie_survivors" "$evidence_dir/$down_label-zombie-survivors.log"
+    echo "Botster zombie child survived down" >&2
+    cat "$evidence_dir/$down_label-zombie-survivors.log" >&2
+    exit 1
+  fi
+  redact_file "$down_zombie_survivors" "$evidence_dir/$down_label-zombie-survivors.log"
   if find "$down_data_dir" -type s -print -quit | grep -q .; then
     echo "live or stale socket survived under campaign data directory" >&2
     exit 1

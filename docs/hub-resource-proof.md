@@ -40,11 +40,15 @@ runs record the same observation but do not use it as a pass/fail gate.
 
 Run `script/test-production-package-runtime` with the exact source revisions
 and a new evidence directory as documented in the README. The fresh leg invokes
-`script/probe-hub-resources` against the caller-owned Hub before churn, across
-eight reconnect generations, after public package reload, after idle settle,
-and after each public package disable. The probe emits one bounded JSON object
-per phase; evidence redaction and PII verification remain owned by the existing
-production evidence helper.
+`script/probe-hub-resources` against the caller-owned Hub before churn, during
+an eight-reconnect churn phase, once for each of eight additional reconnect
+generations, after public package reload, after idle settle, and after each
+public package disable. Every probe waits for authoritative counters to
+converge, asserts reconnect/cleanup deltas and stable idle delivery counters,
+and emits one bounded JSON object per phase. The campaign compares the eight
+generation snapshots so retained live resources cannot grow. Evidence
+redaction and PII verification remain owned by the existing production evidence
+helper.
 
 `botster-tui-kit` remains an exact build/test source input. It is not installed
 and does not count as a fifth package.
@@ -75,6 +79,8 @@ only after counters converge and average CPU remains at or below 5% of one
 core. CPU corroborates the deterministic resource gates; it never replaces
 them.
 
-After `down`, census all sessions by the unique campaign data-directory marker
-and executable provenance. A SID-only scan is insufficient because PTY workers
-may call `setsid()`.
+After `down`, the shared census checks live processes by the exact Hub and
+session-worker executable realpaths. It separately compares Botster-role
+zombies with a pre-campaign baseline and a bounded settle window because
+zombies have no argv to match. A SID-only scan is insufficient because PTY
+workers may call `setsid()`.

@@ -60,15 +60,77 @@ def thread_count(pid)
     output = IO.popen(["ps", "-M", "-p", pid.to_s, "-o", "pid="], &:read)
     raise "ps thread census failed for Hub pid #{pid}" unless $?.success?
 
-    output.lines.length
+    output.lines.drop(1).length
   else
     raise "unsupported resource-census platform: #{RUBY_PLATFORM}"
   end
 end
 
+def read_snapshot(socket, timeout_seconds)
+  resources = exchange(socket, { type: "plugin_lifecycle_status" }, timeout_seconds)
+  status = exchange(socket, { type: "status" }, timeout_seconds)
+  {
+    resources: resources,
+    workers: resources.fetch("plugin_worker_counters"),
+    plugin_resources: resources.fetch("plugin_resource_counters"),
+    lifecycle: status.fetch("status").fetch("lifecycle_counters")
+  }
+end
+
+def converged?(snapshot, expected_owners)
+  workers = snapshot.fetch(:workers)
+  lifecycle = snapshot.fetch(:lifecycle)
+  workers.fetch("live_plugin_executors") == expected_owners &&
+    workers.fetch("live_executor_workers") == expected_owners * 2 &&
+    workers.fetch("queued_jobs").zero? &&
+    workers.fetch("in_flight_jobs").zero? &&
+    snapshot.fetch(:plugin_resources).fetch("active_timer_resources").zero? &&
+    lifecycle.fetch("live_connections") == 1 &&
+    lifecycle.fetch("live_entity_subscriptions").zero? &&
+    lifecycle.fetch("live_attach_subscriptions").zero?
+end
+
+def wait_for_convergence(path, timeout_seconds, expected_owners)
+  socket = connect_and_hello(path, timeout_seconds)
+  deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout_seconds
+  last_snapshot = nil
+  loop do
+    last_snapshot = read_snapshot(socket, timeout_seconds)
+    return [socket, last_snapshot] if converged?(last_snapshot, expected_owners)
+    break if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+
+    sleep(0.02)
+  end
+  socket.close
+  [nil, last_snapshot]
+end
+
+# Seed one released generation so every requested churn subscription is counted
+# as a reconnect rather than treating the first generation as an initial load.
+warmup = connect_and_hello(options.fetch(:socket), options[:timeout_seconds])
+warmup_subscription_id = "resource-probe-warmup-#{Process.pid}"
+warmup_subscribed = exchange(
+  warmup,
+  { type: "subscribe_entities", entity_type: "session", subscription_id: warmup_subscription_id },
+  options[:timeout_seconds]
+)
+raise "warmup entity subscription was not accepted" unless warmup_subscribed.fetch("kind") == "entity_subscribed"
+warmup.close
+
+baseline_socket, baseline_snapshot = wait_for_convergence(
+  options.fetch(:socket),
+  options[:timeout_seconds],
+  options[:expected_owners]
+)
+unless baseline_socket
+  puts(JSON.generate(phase: options[:phase], convergence: "baseline_timeout", last_observed: baseline_snapshot))
+  abort("resource baseline did not converge for phase=#{options[:phase]}")
+end
+baseline_socket.close
+
 options[:exercise_entity_reconnects].times do |index|
   churn = connect_and_hello(options.fetch(:socket), options[:timeout_seconds])
-  subscription_id = "resource-probe-#{index}"
+  subscription_id = "resource-probe-#{Process.pid}-#{index}"
   subscribed = exchange(
     churn,
     { type: "subscribe_entities", entity_type: "session", subscription_id: subscription_id },
@@ -92,18 +154,35 @@ options[:exercise_entity_reconnects].times do |index|
   churn.close
 end
 
-socket = connect_and_hello(options.fetch(:socket), options[:timeout_seconds])
+socket, snapshot = wait_for_convergence(
+  options.fetch(:socket),
+  options[:timeout_seconds],
+  options[:expected_owners]
+)
+unless socket
+  puts(JSON.generate(phase: options[:phase], convergence: "post_churn_timeout", last_observed: snapshot))
+  abort("resource counters did not converge for phase=#{options[:phase]}")
+end
 
-resources = exchange(socket, { type: "plugin_lifecycle_status" }, options[:timeout_seconds])
-status = exchange(socket, { type: "status" }, options[:timeout_seconds])
+resources = snapshot.fetch(:resources)
+workers = snapshot.fetch(:workers)
+plugin_resources = snapshot.fetch(:plugin_resources)
+lifecycle = snapshot.fetch(:lifecycle)
+idle_before = lifecycle
+sleep(0.25)
+idle_after = exchange(socket, { type: "status" }, options[:timeout_seconds])
+  .fetch("status").fetch("lifecycle_counters")
 socket.close
 
-workers = resources.fetch("plugin_worker_counters")
-plugin_resources = resources.fetch("plugin_resource_counters")
-lifecycle = status.fetch("status").fetch("lifecycle_counters")
+baseline_lifecycle = baseline_snapshot.fetch(:lifecycle)
 expected_owners = options[:expected_owners]
 expected_workers = expected_owners * 2
 threads = thread_count(options[:hub_pid])
+reconnect_delta = lifecycle.fetch("reconnect_registrations") - baseline_lifecycle.fetch("reconnect_registrations")
+cleanup_delta = lifecycle.fetch("cleanup_completed") - baseline_lifecycle.fetch("cleanup_completed")
+accepted_delta = lifecycle.fetch("accepted_connections") - baseline_lifecycle.fetch("accepted_connections")
+idle_reconciliation_delta = idle_after.fetch("reconciliation_wakes") - idle_before.fetch("reconciliation_wakes")
+idle_delivery_delta = idle_after.fetch("entity_delivery_attempts") - idle_before.fetch("entity_delivery_attempts")
 
 checks = {
   response_kind: resources.fetch("kind") == "plugin_lifecycle",
@@ -115,8 +194,14 @@ checks = {
   queued_jobs: workers.fetch("queued_jobs").zero?,
   in_flight_jobs: workers.fetch("in_flight_jobs").zero?,
   active_timer_resources: plugin_resources.fetch("active_timer_resources").zero?,
+  live_connections: lifecycle.fetch("live_connections") == 1,
   live_entity_subscriptions: lifecycle.fetch("live_entity_subscriptions").zero?,
   live_attach_subscriptions: lifecycle.fetch("live_attach_subscriptions").zero?,
+  reconnect_registrations: reconnect_delta == options[:exercise_entity_reconnects],
+  cleanup_completed: cleanup_delta >= options[:exercise_entity_reconnects] + 1,
+  accepted_connections: accepted_delta == options[:exercise_entity_reconnects] + 1,
+  idle_reconciliation: idle_reconciliation_delta <= 1,
+  idle_entity_delivery: idle_delivery_delta.zero?,
   cleanup_failed: lifecycle.fetch("cleanup_failed").zero?,
   hub_threads: threads <= options[:max_threads]
 }
@@ -131,6 +216,26 @@ evidence = {
     max_hub_threads: options[:max_threads]
   },
   exercised_entity_reconnects: options[:exercise_entity_reconnects],
+  baseline: {
+    lifecycle: baseline_lifecycle.slice(
+      "accepted_connections",
+      "live_connections",
+      "live_entity_subscriptions",
+      "live_attach_subscriptions",
+      "reconnect_registrations",
+      "cleanup_completed",
+      "cleanup_failed",
+      "reconciliation_wakes",
+      "entity_delivery_attempts"
+    )
+  },
+  deltas: {
+    accepted_connections: accepted_delta,
+    reconnect_registrations: reconnect_delta,
+    cleanup_completed: cleanup_delta,
+    idle_reconciliation_wakes: idle_reconciliation_delta,
+    idle_entity_delivery_attempts: idle_delivery_delta
+  },
   observed: {
     workers: workers,
     resources: plugin_resources,
@@ -139,8 +244,11 @@ evidence = {
       "live_connections",
       "live_entity_subscriptions",
       "live_attach_subscriptions",
+      "reconnect_registrations",
       "cleanup_completed",
-      "cleanup_failed"
+      "cleanup_failed",
+      "reconciliation_wakes",
+      "entity_delivery_attempts"
     ),
     hub_threads: threads
   },

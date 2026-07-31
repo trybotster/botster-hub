@@ -30,16 +30,26 @@
   cleanup, four-owner production-default bounds, reconnects, public reload,
   stepwise disable, OS threads, and the public-protocol probe.
 - `script/probe-hub-resources` — bounded standard-library daemon-protocol and
-  macOS/Linux process census.
+  macOS/Linux process census, authoritative convergence, reconnect/cleanup
+  delta accounting, and idle delivery/reconciliation bounds.
+- `script/assert-no-plugin-timers` — source and manifest timer-declaration gate
+  with Lua-API and capability-manifest positive controls.
+- `script/process-census` — shared macOS/Linux process/zombie scanner consumed
+  by both lifecycle and production harnesses, including a real spawned-child
+  executable-provenance positive control.
 - `script/test-production-package-runtime` — exact zero-timer source baseline,
   caller-owned-Hub resource phases, reconnect/reload/idle/disable generations,
-  and cross-session post-down census.
+  cross-generation stability comparison, and split live/zombie post-down
+  census.
 - `script/run-loaded-daemon-lifecycle` and
   `script/run-loaded-daemon-lifecycle-selftest` — selector mapping, explicit
   no-stress/CPU assertion signal, and platform-correct self-test routing.
 - `README.md`, `docs/client-protocol.md`, `docs/hub-resource-proof.md`, and the
   committed plan — operator contract, diagnostics, and implementation-aligned
   acceptance criteria.
+- `packages/hub-test-support/daemon-protocol.ts` and `metadata.json` — synced
+  Hub-owned npm release assets for the additive protocol field.
+- `test.sh` — fails the repository wrapper when the Hub-owned npm assets drift.
 - This report.
 
 ## Ownership boundaries and cross-repository work
@@ -51,12 +61,18 @@ executor/worker, queued-job, and in-flight-job counters. No Core mechanism or
 package repository was edited, and terminal bytes remain on the existing
 SessionIo/ClientWorker path.
 
-The exact production campaign stopped at its pre-launch artifact gate because
-Web's pinned/vendored protocol does not yet contain
-`plugin_resource_counters`. Follow-up `ticket_1785515827_864108` is routed to
-the `botster-web` target and registered as dependency
-`dependency_1785515833_230748`. This Hub run does not bypass artifact parity or
-patch Web.
+Hub now owns and completes the source/generated/package-copy portion of the
+protocol release chain: `@trybotster/hub-test-support@0.1.17` contains the
+synced `plugin_resource_counters` bytes and matching metadata. Human answer
+`question_1785521549_236526` prohibits pipeline agents from publishing npm
+releases; the operator command after reviewing the immutable package evidence
+is `npm publish --access public` from `packages/hub-test-support`.
+
+The remaining vendored-byte and exact-pin update is Follow-up
+`ticket_1785515827_864108`, routed to the `botster-web` target and registered as
+dependency `dependency_1785515833_230748`. It remains blocked until the human
+confirms npm serves 0.1.17. This Hub run does not bypass registry artifact
+parity or patch Web.
 
 ## Deviations from plan
 
@@ -67,9 +83,15 @@ patch Web.
   fixtures as Linux-only but attempted them on Darwin. It now uses the runner's
   platform launcher for common coverage and skips only those Linux-specific
   fixtures on macOS; Linux CI coverage is unchanged.
-- The plan expected Web's protocol artifact to remain directly consumable.
-  The additive DTO made that assumption false, so the committed plan now names
-  the separately routed Web dependency.
+- The plan expected the existing evidence helper to gain a new generic
+  resource-artifact subcommand. The implementation instead routes bounded JSON
+  through the campaign's existing `capture`/`redact_file` path and its existing
+  `audit`/`pii-scan` gates; the committed plan now records that narrower design.
+- The cleanup census required a semantics-preserving extraction into
+  `script/process-census` so both the loaded lifecycle runner and production
+  campaign use the same process/zombie scanner. Live survivors use exact
+  executable provenance; zombies use a settled pre-campaign baseline because
+  `<defunct>` rows retain no argv.
 
 ## Verification
 
@@ -80,9 +102,17 @@ Passed:
 - full `./test.sh`: all default tests passed, including 120/120 executed daemon
   lifecycle tests; one documented local adversarial test remains ignored
 - exact focused resource test through `./test.sh`
+- the focused test's deliberate wrong-owner-count control, which exits nonzero
+  and emits the last authoritative snapshot at its convergence deadline
 - Hub client generated-protocol unit suite: 44 passed
 - focused timer and reload cleanup tests
 - `script/run-loaded-daemon-lifecycle-selftest` on macOS
+- `script/assert-no-plugin-timers --self-test`, proving both
+  `botster.capabilities.timer_once` and manifest `{ "surface": "timer" }`
+  declarations make the gate fail
+- `script/process-census --self-test`, proving a real spawned executable is
+  visible to the live-survivor oracle
+- `node packages/hub-test-support/scripts/sync-assets.mjs --check`
 - loaded selector validation with `stress_profile=none`, plus a negative check
   proving `moderate` exits 2
 - shell/Ruby syntax checks and `git diff --check`
@@ -94,18 +124,19 @@ entity reconnects through `script/probe-hub-resources`, reloaded every owner,
 retired them stepwise through public disable, and ended with zero timer,
 queued-job, and in-flight-job resources.
 
-The exact-coordinate fresh campaign was invoked at the committed Hub revision
-with clean exact Core, Web, TUI, TUI Kit, Workspaces, and Project Pipelines
-inputs. It correctly stopped before launch with `installed Hub test-support
-artifact does not match exact Hub source and Web vendored bytes`; therefore it
-did not produce a false four-package pass.
+The exact-coordinate fresh campaign remains correctly blocked before launch:
+the Hub-owned 0.1.17 package is publish-ready but is not yet available from npm,
+and Web cannot consume or vendor it until the human publication step completes.
+No sibling-worktree or local-tarball override is accepted as four-package
+production proof.
 
 ## Unverified behavior and residual risk
 
-- The exact named-package fresh campaign cannot execute its new phases until
-  `ticket_1785515827_864108` updates Web's generated/vendored protocol and
-  pinned Hub test-support artifact. After that dependency closes, rerun the
-  unchanged campaign and retain its redacted evidence bundle.
+- The exact named-package fresh campaign cannot execute its new phases until a
+  human publishes the prepared 0.1.17 artifact and
+  `ticket_1785515827_864108` updates Web's generated/vendored protocol and exact
+  pin. After that dependency closes, rerun the unchanged campaign and retain
+  its redacted evidence bundle.
 - The 250 ms Linux CPU assertion is implemented and selector-gated but was not
   executed on this macOS implementation host. The loaded Ubuntu selector is
   the authoritative environment for that threshold.
@@ -116,8 +147,12 @@ did not produce a false four-package pass.
 
 ## Missing vault guidance
 
-No missing durable guidance was found. Existing notes covered Hub/Core
+Review exposed two missing durable rules and captured them for vault
+processing: [[hub generated protocol changes are a four site release chain]]
+for producer sync/publish obligations, and [[argv marker censuses cannot see
+zombie survivors]] for the required split between live executable provenance
+and baseline-diff zombie state. Existing notes already covered Hub/Core
 ownership, distinct worker knobs, deterministic conformance, timer worker
 semantics, exact binary provenance, subprocess teardown, and cross-session
-survivor census. No new vault note was captured because the implementation did
-not establish a reusable method beyond those existing conventions.
+survivor census. Implementation found no additional durable gap beyond the two
+Review captures.
