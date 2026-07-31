@@ -11,30 +11,34 @@
 - Planner maps and orchestration context loaded: [[botster-architecture]], [[cli-patterns]], [[spa-patterns]], [[project pipeline orchestration belongs in a device-level botster plugin]], [[project pipelines needs an operator workbench not more primitives]], [[project pipelines ui contract belongs in the plugin readme]], [[botster orchestration should spawn agents with explicit target ids]], [[botster orchestration prompts must bind agents to explicit worktrees]], [[botster pipeline needs continuous product owner between agent steps]], [[plan agents must author vault context as wikilinks not home paths]], and [[vault example paths are not repository placement conventions]].
 - Hub ownership context loaded: [[botster hub is a first party host profile over core]], [[botster hub gravity must be watched before it becomes the new monolith]], [[botster data plane bypasses the hub through session and client actors]], [[botster local client api lives over hubruntime not raw core routers]], [[botster hub events use bounded priority lanes instead of unbounded queue fuses]], [[may supervise permits the hub to supervise the package entrypoint]], [[hub supervision admission changes require exact live hub launch proof]], [[live hub proof records distinct hub and locked core binary provenance]], [[webrtc bootstrap origin must be requested after the package server binds]], [[plugin worker queue capacity and executor concurrency are independent host profile knobs]], and [[durable state version preflight must precede shape deserialization after cold turkey changes]].
 - Ticket-specific and verification notes loaded: [[apps cli uses exact selectors and daemon resolved terminal launch contracts]], [[foreground terminal app open conformance belongs in hub test support]], [[botster core hosts need an explicit drain loop contract]], [[plan steps need reviewable plan artifacts]], [[project pipelines checklist worker timeouts require artifact evidence fallback]], [[test script required for rust tests not cargo test]], and [[a regression test must be shown to go red with the fix reverted]].
-- Pipeline context contained no prior artifacts, reviews, findings, dependencies, questions, or answers. A run-scoped vault checklist was created and reconciled after its create call timed out post-persistence.
+- Initial pipeline context contained no prior artifacts, reviews, findings, dependencies, questions, or answers. Plan Review returned the artifact with one blocker, two high, two medium, and one low finding: correct the contradicted early-readiness diagnosis, investigate the external `stty`/ISIG boundary, distinguish signal failure from terminal-restore stalls, use a mechanism-matched negative control, make full-suite contention the primary loaded proof, and reconcile checklist note evidence. No dependency or human question was added.
 
 ## Current repository and failure evidence
 
 - The production path is the operator console in `src/operator_console.rs` dispatching `apps open` to `open_terminal_app` in `src/main.rs`. It resolves the launch through the daemon, gives the foreground app its own process group and controlling terminal, inherits the PTY streams, waits for exit, restores the console process group, reports a nonzero/signal outcome, and prints the next prompt.
-- The failing coverage is `cli_operator_console_starts_reuses_detaches_handles_ctrl_c_and_stops` in `tests/hub_daemon_lifecycle_test.rs`. Its fixture prints `foreground-ready` from a shell and only then starts `sleep 300`. The test sends Ctrl-C as soon as the reader observes that marker. The marker therefore acknowledges output, but it does not acknowledge that the long-lived leaf process is installed and able to observe SIGINT.
+- The failing coverage is `cli_operator_console_starts_reuses_detaches_handles_ctrl_c_and_stops` in `tests/hub_daemon_lifecycle_test.rs`. Its fixture runs `stty raw -echo; stty isig; printf 'foreground-ready\r\n'; sleep 300`, then the test sends Ctrl-C as soon as the reader observes the marker.
+- Early readiness by itself cannot explain the observed silence. The child `pre_exec` establishes the new process group and terminal foreground before `sh` executes and resets the shell's SIGINT disposition to default. If Ctrl-C is generated between `printf` and `sleep`, it kills the foreground shell and the console reports `foreground app terminated by signal 2`; that would satisfy the existing second-occurrence barrier.
+- A distinct fixture defect does match the symptom: `stty raw` disables ISIG, and a separate external `stty isig` must re-enable it. The shell does not use `set -e`, so a failed second `stty` can still be followed by `foreground-ready`; with ISIG off, byte `0x03` becomes ordinary input and `sleep` remains alive. Residual-tail launches 12 busy-loop workers per CPU (capped at 64), making fork/exec and scheduling pressure relevant. The failed workflow transcript contains no visible `stty`, fork, or resource-unavailable error, so this remains a candidate to prove rather than an established root cause.
 - The same test uses cumulative substring occurrence counts over the complete PTY transcript. That does not identify output produced after a particular input action and is the stale-state barrier rejected by [[a regression test must be shown to go red with the fix reverted]].
 - Workflow `30590359513` confirms the shape under residual-tail pressure: repetitions 1-3 passed; repetition 4 printed `foreground-ready`, then produced neither a second `foreground app ` line nor a returned prompt before the 30-second liveness backstop. The harness terminated the stuck console, and cleanup reported no run-token or session survivors.
+- The missing completion line has another production-shaped explanation that transcript-only evidence cannot distinguish: after the foreground app exits, `open_terminal_app` must restore the console foreground process group with `tcsetpgrp`, then the console restores termios with `tcsetattr(TCSADRAIN)`, before it prints the foreground outcome. A stall in either restore step also yields no completion line or prompt.
 - The neighboring focused test `operator_console_ctrl_c_reaches_foreground_app_process_group_and_returns_prompt` already uses the stronger fixture contract: the long-lived Node child installs its SIGINT handler before printing its readiness marker, while the shell waits with SIGINT ignored. That test exercises the same production process-group handoff and expects exit code 130.
 - The loaded-lifecycle harness currently has no exact operator-console target. `focused-cli-smoke` runs a different smoke test, so repeated residual-tail proof for this ticket presently requires the whole suite.
 
 ## Scope
 
-1. Give `OperatorConsolePty` a post-action output observation primitive: capture a byte offset/checkpoint before input and wait for an exact marker only in bytes appended after that checkpoint. Keep the existing bounded liveness backstop and child-exit diagnostics.
-2. Change the long operator-console lifecycle fixture to acknowledge readiness only after the signal-observing foreground child is live, using the already-proven child/handler shape from the neighboring focused process-group test.
-3. After sending Ctrl-C, require post-checkpoint evidence for the exact foreground completion (`exited with code 130`) and the subsequent prompt. Do not use a global occurrence count as the completion barrier.
-4. Keep the broad lifecycle scenario and focused process-group scenario aligned on the same deterministic fixture contract without broadly rewriting unrelated `wait_for` call sites.
-5. Add a `focused-operator-console` loaded-lifecycle target that invokes the existing exact broad test through `./test.sh`, and expose it in the workflow input choices so branch/base residual-tail campaigns can prove the requested path without paying for unrelated suites.
-6. Preserve and verify the existing owned-daemon, PTY child, session, fixture-directory, socket, and metadata cleanup behavior on success and assertion failure.
+1. Add attribution diagnostics to the test-owned `OperatorConsolePty` before selecting a fix. On a foreground-progress timeout, capture the console child's wait status, the PTY's effective termios/ISIG state, its foreground process-group id, and a process census for that group before cleanup terminates anything.
+2. Use those observations plus a mechanism-matched deterministic reproduction to decide among: line discipline never generated SIGINT; the byte was generated for the wrong foreground group; or the foreground group exited but console terminal restoration/output progress stalled.
+3. If attribution lands on the fixture's external `stty`/ISIG boundary, replace it with the neighboring proven child-owned acknowledgement: no external `stty` establishes signal semantics, the long-lived child installs its handler before it prints readiness, and the shell waits with SIGINT ignored. If attribution instead establishes a production handoff/restore defect, stop and return the evidence to Plan before editing product code.
+4. Give `OperatorConsolePty` a post-action output observation primitive: capture a byte offset/checkpoint before input and wait for an exact marker only in bytes appended after that checkpoint. Keep the existing bounded liveness backstop, add the attribution snapshot above, and do not present the checkpoint itself as root-cause evidence.
+5. After sending Ctrl-C, require post-checkpoint evidence for the exact foreground completion (`exited with code 130`) and subsequent prompt. Keep the broad lifecycle and focused process-group scenarios on the same proven fixture contract without rewriting unrelated waits.
+6. Add a `focused-operator-console` loaded-lifecycle target that invokes the existing exact broad test through `./test.sh`; this is supporting branch/base attribution evidence, not a substitute for full-suite contention.
+7. Preserve and verify owned-daemon, PTY/foreground children, session, fixture-directory, socket, and metadata cleanup on success and every diagnostic/timeout path.
 
 ## Non-scope
 
 - No timeout increase, blind retry, sleep-as-success-oracle, or relaxation/removal of the foreground completion and prompt assertions.
-- No production `src/main.rs` or `src/operator_console.rs` behavior change unless a deterministic fixture plus post-action observation proves that the real console fails to deliver a signal or regain the terminal. If that happens, stop implementation and return the evidence to Plan Review before changing product semantics.
+- No production `src/main.rs` or `src/operator_console.rs` behavior change in this plan. If attribution shows the foreground group exited but `tcsetpgrp`, `tcsetattr(TCSADRAIN)`, outcome printing, or prompt progress stalled—or shows the correct foreground group had ISIG enabled but received no signal—stop and return to Plan with the evidence.
 - No change to daemon launch resolution, app selectors, package manifests, public client DTOs, Core session/worker behavior, terminal data-plane routing, or package supervision policy.
 - No `botster-core`, client-repository, TUI, Web, Ghostty, Project Pipelines plugin, or npm package change.
 - No broad cleanup of cumulative waits elsewhere in the lifecycle test. Port the checkpoint pattern only where this ticket touches an action whose output can repeat.
@@ -49,22 +53,29 @@
 
 ## Implementation plan
 
-1. Add a small `OperatorConsolePty` output checkpoint type or byte-offset helper in `tests/hub_daemon_lifecycle_test.rs`. It must snapshot the synchronized capture length, search only the suffix after that position, preserve byte correctness across partial UTF-8 chunks, report the full transcript plus checkpoint/suffix diagnostics on failure, and retain early-child-exit detection.
-2. Add focused helper coverage showing a pre-checkpoint duplicate marker cannot satisfy a post-checkpoint wait and a newly emitted marker can. Avoid real-time sleeps as the pass oracle; drive the fixture through PTY input/output.
-3. Reuse one deterministic foreground interrupt script shape in both operator-console tests: ignore SIGINT in the shell, start a long-lived child that registers its SIGINT handler, print readiness only after registration, and have the shell wait for the child's code 130 exit.
-4. In `cli_operator_console_starts_reuses_detaches_handles_ctrl_c_and_stops`, capture a checkpoint after the readiness marker and before Ctrl-C, then wait after that checkpoint for the exact code-130 foreground completion followed by a new prompt. Preserve the sentinel-session and subsequent inline/idle Ctrl-C assertions so terminal restoration remains proven.
-5. Keep production files unchanged if the corrected fixture passes. If the child-side acknowledgement fires but post-checkpoint completion still fails deterministically, capture child/process-group/foreground-terminal diagnostics and return to planning; do not paper over a product bug with fixture edits.
-6. Add `focused-operator-console` to `script/run-loaded-daemon-lifecycle` validation and dispatch, and to `.github/workflows/loaded-daemon-lifecycle.yml`. Keep the exact test name stable so the same workflow harness can exercise an authoritative base SHA.
-7. Run the negative control, focused checks, strict repository gates, and branch/base loaded campaigns below. Record immutable Hub SHA, locked Core SHA, fresh target realpaths, per-repetition results, first-red attribution, and cleanup census artifacts.
+1. Retain the portable-pty master handle in `OperatorConsolePty`. Before the timeout helper terminates the console, use the existing `MasterPty::process_group_leader`/raw fd plus `libc::tcgetattr` to record foreground pgid and whether `c_lflag & ISIG` is set; record the console pid/status and `ps -o pid,ppid,pgid,sid,stat,command -g <foreground-pgid>`. Include failures to inspect each field rather than converting missing diagnostics into a pass.
+2. Add a deterministic current-fixture reproduction that intentionally leaves ISIG disabled after `stty raw -echo`, emits the same readiness marker, receives byte `0x03`, and fails at the same missing foreground-completion barrier with an alive foreground group and `ISIG=false`. Use a short test-local liveness budget and verify the enclosing test command exits nonzero. This proves the candidate mechanism can produce workflow `30590359513`'s exact symptom; it does not alone prove that the historical `stty isig` failed.
+3. Run the unmodified current fixture with the new diagnostics under residual-tail/default-parallel pressure before changing it. Decision ledger:
+   - `ISIG=false` plus a live foreground shell/leaf means the fixture's line-discipline setup is the defect.
+   - `ISIG=true` but the PTY foreground pgid/census identifies the console rather than the fixture shell/leaf means terminal ownership is wrong; stop and return to Plan.
+   - `ISIG=true` plus a live correct fixture foreground group means signal/input delivery is a product-path defect; stop and return to Plan.
+   - No live foreground process plus a console still waiting, with the PTY foreground pgid either old or restored, means restoration/output progress is a product-path defect; stop and return to Plan.
+   - A dead console or inspection failure needs its exact status/error resolved before choosing a fix.
+4. Only on the fixture-defect branch, reuse the neighboring deterministic interrupt script in both tests: the shell ignores SIGINT, the long-lived child registers its own handler before printing readiness, and no external `stty` command establishes the SIGINT-relevant terminal state. Have the shell wait for code 130.
+5. Add a small post-action byte checkpoint helper. It must snapshot the synchronized capture length, search only the suffix after that position, preserve byte correctness across partial UTF-8 chunks, and report full transcript, suffix, console status, ISIG, foreground pgid, and group census on failure. Add helper coverage proving stale identical output cannot satisfy it.
+6. In the broad lifecycle test, checkpoint after readiness and before Ctrl-C, then require the exact post-checkpoint code-130 outcome and a new prompt. Preserve sentinel-session and later inline/idle Ctrl-C assertions.
+7. Add `focused-operator-console` to `script/run-loaded-daemon-lifecycle` validation/dispatch and `.github/workflows/loaded-daemon-lifecycle.yml`. Keep the exact broad test name stable for authoritative-base comparison.
+8. Run the mechanism negative control, focused checks, strict gates, 20-repetition focused branch/base support runs, and the 20-repetition full-suite branch campaign below. Record immutable Hub SHA, locked Core SHA, fresh target realpaths, attribution snapshots, per-repetition results, first-red attribution, and cleanup censuses.
 
 ## Assumptions and unknowns
 
-- Assumption: the loaded failure is the fixture's false readiness boundary, not a proven production terminal-handoff bug. The log ends immediately after `foreground-ready`, and the neighboring handler-installed child fixture already proves the real process-group path.
+- Assumption: none of the candidate mechanisms is established yet. Early readiness alone is ruled out because the foreground shell has default SIGINT and would report signal 2; external `stty`/ISIG failure matches the silence but the failed transcript contains no visible `stty` or fork error; a foreground-exit/terminal-restore stall remains possible.
 - Assumption: a suffix/checkpoint wait is the smallest deterministic observation contract. It distinguishes progress caused by the current action from identical earlier transcript text without changing production output.
 - Assumption: retaining the exact broad test name is necessary for same-harness authoritative-base comparison.
-- Unknown: whether only the fixture acknowledgement is needed or whether the output checkpoint also exposes a reader/capture defect. The checkpoint helper gets focused coverage and better diagnostics so implementation can distinguish them.
+- Unknown: the effective ISIG bit, foreground pgid, and foreground-group liveness at the historical timeout. The new snapshot must capture these before cleanup in any reproduced failure.
+- Unknown: whether the foreground child remained alive or exited before one of the two terminal restores. The group census plus PTY foreground pgid distinguishes these states.
 - Unknown: whether authoritative base reproduces the intermittent red during a bounded focused campaign. Base results are attribution evidence, not permission to weaken the branch negative control.
-- Unknown: the final repetition count affordable within the workflow budget. Default to 20 focused residual-tail repetitions for branch and base, then run the required broader campaign at the ticket's five-repetition shape unless the pipeline owner approves a different bounded count.
+- Assumption: 20 full-suite residual-tail repetitions fit the configured 19,800-second campaign budget: the observed repetitions were roughly 430 seconds, so the primary proof is expected to consume about 8,600 seconds. If actual runtime threatens the bounded campaign limit, stop with completed-count/timing evidence and ask the pipeline owner rather than silently reducing the proof.
 - No convention conflict or waiver is known. The plan keeps behavior in Hub, uses existing Rust/PTY primitives and repository harnesses, avoids a speculative abstraction, and preserves current production behavior.
 
 ## Affected surfaces and likely files
@@ -77,10 +88,11 @@
 
 ## Risks and mitigations
 
+- **The plan fixes an unproven cause:** capture ISIG, foreground pgid, group processes, and console status before mutation; choose the fixture branch only when evidence lands there.
+- **External `stty` silently leaves ISIG disabled:** the replacement fixture must not use a separate external process to establish SIGINT semantics. If terminal shaping truly must remain, verify effective ISIG and fail before readiness.
+- **Foreground app exits but restoration stalls:** treat an empty foreground group plus live console/no outcome as product evidence and return to Plan; do not hide it with a fixture rewrite.
 - **A new helper passes on stale output:** make the checkpoint an absolute byte position and require the needle wholly after it; prove stale identical output does not satisfy the wait.
-- **Readiness still precedes the signal observer:** the child, not the launching shell, emits readiness only after installing its handler.
 - **Fixture stops resembling production:** continue using the real daemon-resolved `foreground_stdio` launch, inherited PTY, separate process group, terminal handoff, Ctrl-C byte, child wait status, restoration, and prompt path.
-- **A fixture-only fix hides a real product defect:** retain the neighboring focused production-path test, add post-action diagnostics, and treat any deterministic failure after child acknowledgement as a stop-and-replan condition.
 - **Workflow surface grows without value:** add one exact target only because the ticket explicitly requires repeated loaded branch/base proof; do not add knobs or duplicate harness logic.
 - **A panic leaks the now-stuck child or daemon:** preserve RAII cleanup, process-group termination/reaping, typed stopped-status proof, and socket/metadata absence checks.
 - **Loaded green hides unrelated leftovers:** require the harness's independent run-token and session censuses plus explicit Hub, worker, fixture-shell, zombie, socket, test/load/sampler group evidence.
@@ -89,9 +101,9 @@
 ## Acceptance checks and downstream proof
 
 1. Regression negative control:
-   - Temporarily move the fixture readiness marker before signal-handler installation, with a deterministic test-only pause before the observer becomes live, or narrowly bypass the post-action checkpoint.
-   - Run the exact affected test through `./test.sh`; it must exit nonzero at the intended completion barrier.
-   - Restore the implementation and show the identical command passes. A printed panic with process exit zero is not evidence.
+   - With the current fixture shape, intentionally omit/force failure of the ISIG re-enable after `stty raw -echo`. Emit the same `foreground-ready`, send Ctrl-C, and show the exact test-local path exits nonzero at the missing `foreground app ` barrier while diagnostics report `ISIG=false` and a live foreground group.
+   - Restore the attributed fix and show the identical command passes with post-checkpoint code-130 outcome and prompt. A printed panic with process exit zero is not evidence.
+   - Separately ablate the byte checkpoint to prove stale identical output cannot satisfy post-action progress; label this helper strictness proof separately from root-cause reproduction.
 2. Focused local checks:
    - `./test.sh --test hub_daemon_lifecycle_test <new-output-checkpoint-test> -- --exact --nocapture`
    - `./test.sh --test hub_daemon_lifecycle_test operator_console_ctrl_c_reaches_foreground_app_process_group_and_returns_prompt -- --exact --nocapture`
@@ -105,17 +117,18 @@
    - Dispatch `focused-operator-console` with `stress_profile=residual-tail` and 20 repetitions against the immutable branch SHA.
    - Dispatch the same workflow harness, target, profile, and repetition count against the authoritative base SHA. Record whether base reproduces; do not require a base red as the branch's only negative proof.
 5. Broader lifecycle proof:
-   - Run `full-suite-contention` under `residual-tail` for the ticket-required five-repetition campaign on the branch.
-   - Attribute any first red with the same-input authoritative base rather than declaring all pre-existing failures irrelevant.
+   - Treat focused runs as supporting evidence only. Run `full-suite-contention` under `residual-tail` for 20 green repetitions on the immutable branch SHA; this is the primary suite-pressure proof.
+   - Attribute any first red with the same-input authoritative base rather than declaring it pre-existing. A base match does not complete the branch campaign; resume/restart until the required branch proof completes or ask the pipeline owner with exact timing/failure evidence.
 6. Runtime provenance and cleanup:
    - Record the exact Hub subject SHA, lockfile-pinned Core SHA, and Hub/session-worker realpaths under the fresh subject target.
    - Require each run and final cleanup to report zero live Hub daemons, session workers, foreground fixture shells/children, zombies, stale runtime sockets/metadata, run-token descendants, and session survivors.
    - Require test, load, and sampler process groups to be gone and `cleanup_status=0`.
 
-The changed runtime path is proven by the exact operator-console integration test: a real Hub binary resolves the package app through the daemon, launches it on the console PTY, transfers foreground terminal ownership, observes Ctrl-C in the acknowledged child, waits/reaps it, restores terminal ownership, emits the foreground outcome, and accepts the next command. Code-presence or helper-only tests are not sufficient.
+This ticket is intentionally production-behavior-preserving unless attribution proves otherwise. The changed path is the test's acknowledgement/observation contract, but it must exercise the real runtime path: a real Hub binary resolves the package app through the daemon, launches it on the console PTY, transfers foreground terminal ownership, observes Ctrl-C, waits/reaps the app, restores terminal ownership, emits the foreground outcome, and accepts the next command. Code-presence or helper-only tests are not sufficient.
 
 ## Vault gaps worth capturing
 
-- If the implementation and negative control confirm the diagnosis, capture one durable gotcha: a foreground-process readiness marker must be emitted by the signal-observing child after handler installation; launcher-shell output is not a signal-readiness acknowledgement.
+- If attribution confirms the ISIG branch, capture one durable gotcha: foreground fixtures must not let a non-fatal external `stty` command silently establish the line-discipline state on which Ctrl-C progress depends.
+- If attribution instead finds a restore stall, capture the proven ordering/blocking boundary for `tcsetpgrp`, `tcsetattr(TCSADRAIN)`, outcome emission, and prompt progress.
 - Capture the post-action PTY checkpoint pattern if it proves reusable: cumulative transcript occurrence counts cannot establish progress after an action when identical output already exists.
 - Do not capture either as established knowledge during Plan; current evidence supports the plan, but implementation/ablation must prove the durable claim first.
