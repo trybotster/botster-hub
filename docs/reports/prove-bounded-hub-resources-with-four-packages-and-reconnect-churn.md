@@ -41,8 +41,10 @@
   `comm` and `args` are both `<defunct>`; Linux retains role-name filtering.
 - `script/test-production-package-runtime` — exact zero-timer source baseline,
   caller-owned-Hub resource phases, reconnect/reload/idle/disable generations,
-  cross-generation stability comparison, and split live/zombie post-down
-  census.
+  cross-generation stability comparison, clean Project Pipelines dependency
+  setup, the public package's contract fixture passed to TUI, per-leg owned
+  PID/socket cleanup, and split live/zombie census deferred until the final
+  campaign down.
 - `script/run-loaded-daemon-lifecycle` and
   `script/run-loaded-daemon-lifecycle-selftest` — selector mapping, explicit
   no-stress/CPU assertion signal, and platform-correct self-test routing.
@@ -85,14 +87,21 @@ locally packed tarball before skipping it. Published hub-test-support 0.1.17
 contains stale daemon-protocol bytes and is explicitly superseded; npm
 immutability requires the cold-turkey 0.1.18 move.
 
-The remaining vendored-byte and exact-pin update is Follow-up
+The vendored-byte and exact-pin update was Follow-up
 `ticket_1785515827_864108`, routed to the `botster-web` target and registered as
-dependency `dependency_1785515833_230748`. The human published 0.1.18 from the
+dependency `dependency_1785515833_230748`; it is merged and closed. The human published 0.1.18 from the
 exact verified worktree; a normal-registry metadata query and fresh
 coordinate-only install match the recorded integrity, shasum, protocol SHA,
 required resource-counter tokens, and fixtures. The registry prerequisite is
-therefore satisfied, but this Hub run does not patch Web; that repository must
-consume the coordinate through its separately routed ticket.
+therefore satisfied, and merged Web `ebc72e5808ea8c8ce7c409936c257a3e02eaa5ef`
+consumes it without a local override.
+
+The resumed exact campaign exposed a TUI-owned contract mismatch. Canonical
+TUI `c426b8ff9e2dd603c024259897241460992fbb6b` still resolves revision-24 Hub
+contracts and cannot deserialize the public revision-25 contract-matrix
+`UiChild`. Existing TUI ticket `ticket_1785438029_926883` exactly owns the
+cold-turkey repin and multi-row input proof, so it is registered as dependency
+`dependency_1785535722_455627`; no TUI files were edited here.
 
 ## Deviations from plan
 
@@ -117,6 +126,12 @@ consume the coordinate through its separately routed ticket.
   coordinate could not be repaired. The implementation moved cold-turkey to
   unused 0.1.18, retained the collision as negative release evidence, and
   updated the separately routed Web ticket without editing Web.
+- The production campaign assumed Project Pipelines dependencies were already
+  installed and applied a global survivor census while another intentional
+  campaign leg was still live. The harness now runs its locked `npm ci`, keeps
+  exact PID/socket cleanup on intermediate legs, and retains the global
+  executable/zombie census at final down. It also passes the fixture from the
+  installed public test-support package into TUI's documented live command.
 
 ## Verification
 
@@ -153,6 +168,10 @@ Passed:
 - loaded selector validation with `stress_profile=none`, plus a negative check
   proving `moderate` exits 2
 - shell/Ruby syntax checks and `git diff --check`
+- exact campaign setup through merged Web: all seven clean-revision gates,
+  registry artifact gate, repository test/build gates, dynamic/explicit Web
+  ports, Web live browser/WebRTC proof, and public-fixture TUI setup reached
+  production runtime paths before the TUI-owned revision mismatch
 
 Downstream-shaped proof passed inside the focused real-daemon test: the
 production entrypoint loaded four owners at `256`/`2`, observed exactly eight
@@ -161,17 +180,20 @@ entity reconnects through `script/probe-hub-resources`, reloaded every owner,
 retired them stepwise through public disable, and ended with zero timer,
 queued-job, and in-flight-job resources.
 
-The Hub-owned registry prerequisite is complete without a sibling-worktree or
-local-tarball override. The exact-coordinate fresh campaign remains blocked
-only on Web ticket `ticket_1785515827_864108` consuming the public artifact and
-closing dependency `dependency_1785515833_230748`.
+The Hub-owned registry prerequisite and Web consumption are complete without a
+sibling-worktree or local-tarball override. The exact-coordinate fresh campaign
+now stops at canonical TUI's revision-24 `UiChild` mismatch against the public
+revision-25 fixture. The failed run passed session lifecycle, package storage,
+terminal echo, and package install before `contract_matrix_render_sessions`
+rejected the stale DTO. The TUI dependency must close before the unchanged
+campaign can proceed into its final resource phases.
 
 ## Unverified behavior and residual risk
 
-- The exact named-package fresh campaign cannot execute its new phases until
-  `ticket_1785515827_864108` updates Web's generated/vendored protocol and exact
-  public 0.1.18 pin. After that dependency closes, rerun the unchanged campaign
-  and retain its redacted evidence bundle.
+- The exact named-package fresh campaign cannot complete until TUI ticket
+  `ticket_1785438029_926883` repins to the current Hub-owned contract and passes
+  the public-fixture live proof. After that dependency closes, rerun the
+  unchanged campaign and retain its redacted evidence bundle.
 - The 250 ms Linux CPU assertion is implemented and selector-gated but was not
   executed on this macOS implementation host. The loaded Ubuntu selector is
   the authoritative environment for that threshold.
