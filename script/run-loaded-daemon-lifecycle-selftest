@@ -6,6 +6,8 @@ SELFTEST_DIR=$(mktemp -d)
 FIXTURE_PID=
 DECOY_PID=
 ESCAPED_PID=
+ZOMBIE_PARENT_PID=
+ZOMBIE_PID=
 
 cleanup_selftest() {
   if [[ -n "$FIXTURE_PID" ]]; then
@@ -17,9 +19,13 @@ cleanup_selftest() {
   if [[ -n "$ESCAPED_PID" ]]; then
     kill -TERM -- "-$ESCAPED_PID" 2>/dev/null || true
   fi
+  if [[ -n "$ZOMBIE_PARENT_PID" ]]; then
+    kill -TERM -- "-$ZOMBIE_PARENT_PID" 2>/dev/null || true
+  fi
   wait "${FIXTURE_PID:-}" 2>/dev/null || true
   wait "${DECOY_PID:-}" 2>/dev/null || true
   wait "${ESCAPED_PID:-}" 2>/dev/null || true
+  wait "${ZOMBIE_PARENT_PID:-}" 2>/dev/null || true
   rm -rf "$SELFTEST_DIR"
 }
 trap cleanup_selftest EXIT INT TERM HUP
@@ -59,6 +65,66 @@ capture_session_survivors selftest "$finished_pid" "$no_survivor_evidence" \
 [[ $(wc -l < "$no_survivor_evidence") -eq 1 ]] \
   || fail "no-survivor evidence should contain only its header"
 pass "no-survivor session is green"
+
+zombie_pid_file="$ARTIFACT_DIR/zombie.pid"
+setsid python3 -c '
+import os
+import sys
+import time
+
+child = os.fork()
+if child == 0:
+    os.setpgid(0, 0)
+    os._exit(0)
+with open(sys.argv[1], "w", encoding="utf-8") as output:
+    output.write(f"{child}\n")
+time.sleep(300)
+' "$zombie_pid_file" &
+ZOMBIE_PARENT_PID=$!
+
+for _ in {1..100}; do
+  [[ -s "$zombie_pid_file" ]] && break
+  sleep 0.05
+done
+[[ -s "$zombie_pid_file" ]] || fail "zombie fixture did not publish its child pid"
+ZOMBIE_PID=$(cat "$zombie_pid_file")
+zombie_ready=0
+for _ in {1..100}; do
+  if session_zombie_rows "$ZOMBIE_PARENT_PID" | awk -v pid="$ZOMBIE_PID" '$1 == pid { found=1 } END { exit !found }'; then
+    zombie_ready=1
+    break
+  fi
+  sleep 0.05
+done
+((zombie_ready == 1)) || fail "unreaped child was not observed as a zombie"
+if group_is_alive "$ZOMBIE_PID"; then
+  fail "zombie-only process group was classified live"
+fi
+if direct_child_is_running "$ZOMBIE_PID"; then
+  fail "zombie child was classified running"
+fi
+zombie_baseline="$ARTIFACT_DIR/zombie-baseline.tsv"
+: > "$zombie_baseline"
+zombie_evidence="$ARTIFACT_DIR/zombie-survivors.tsv"
+if capture_settled_zombie_survivors "$ZOMBIE_PARENT_PID" "$zombie_baseline" "$zombie_evidence"; then
+  fail "zombie that survived the settle gate was classified clean"
+fi
+grep -q $'^recorded-session\t' "$zombie_evidence" \
+  || fail "zombie evidence omitted the recorded-session row"
+pass "zombie survives the settle gate without entering live cleanup predicates"
+
+kill -TERM -- "-$ZOMBIE_PARENT_PID" 2>/dev/null || true
+wait "$ZOMBIE_PARENT_PID" 2>/dev/null || true
+ZOMBIE_PARENT_PID=
+for _ in {1..100}; do
+  kill -0 "$ZOMBIE_PID" 2>/dev/null || break
+  sleep 0.05
+done
+kill -0 "$ZOMBIE_PID" 2>/dev/null && fail "zombie fixture remained after its parent exited"
+capture_settled_zombie_survivors "" "$zombie_baseline" "$ARTIFACT_DIR/reaped-zombie.tsv" \
+  || fail "reaped zombie row remained in settled evidence"
+ZOMBIE_PID=
+pass "reaped zombie disappears from the settled evidence gate"
 
 escaped_token="botster-loaded-selftest-escaped-$$"
 escaped_pid_file="$ARTIFACT_DIR/escaped.pid"

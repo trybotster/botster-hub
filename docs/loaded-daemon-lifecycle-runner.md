@@ -36,6 +36,15 @@ triage. A focused run does not satisfy the required 20-or-more default-parallel
 lifecycle-suite campaign. The runner stops at the first red repetition so the
 failure remains easy to locate and no later retry can hide it.
 
+Use `focused-metadata-owned-shutdown` to repeat the exact
+`cli_shutdown_waits_until_metadata_owned_daemon_is_reaped` regression with
+default Cargo test concurrency. The test owns the real daemon child, holds its
+zombie state long enough to prove the shutdown CLI remains pending, reaps it,
+and then requires successful shutdown plus PID, metadata, and socket absence.
+For this lifecycle defect, the binding focused campaign is 20 repetitions with
+`residual-tail`; the broader five-repetition `full-suite-contention` campaign
+still supplies downstream suite proof.
+
 Use `focused-oversized-webrtc` to repeat the existing
 `local_webrtc_chunks_oversized_encrypted_daemon_response` test under the selected
 stress profile without changing its body, assertions, deadlines, or cleanup.
@@ -118,6 +127,9 @@ contains:
   and Zig, runner image, architecture, CPU count, and selected inputs.
 - `precompile.log`: output from compiling the exact lifecycle test binary before
   synthetic load starts, so the per-run deadline measures loaded test execution.
+- `runner-selftest.log`: proof that a held zombie fails the settled evidence
+  gate while remaining non-live to group/direct-child cleanup predicates, and
+  that the same row disappears after its owning parent releases it.
 - `commands.txt` and `campaign-status.tsv`: exact wrapper command, repetition,
   stage times, elapsed time, and exit status.
 - `run-NNN.log`: complete combined stdout/stderr, including assertion or panic.
@@ -137,6 +149,14 @@ contains:
   This is the no-surviving-owned-process gate for workers that enter their own
   sessions; any survivor makes the repetition fail before exact token-owned
   process-group cleanup.
+- `run-NNN-zombie-baseline.tsv` and `run-NNN-zombie-survivors.tsv`: the
+  pre-repetition Botster-role zombie baseline and the post-cleanup,
+  five-second-settled zombie delta. The settled evidence combines newly
+  appearing Hub, session-worker, and fixture-shell role zombies across sessions
+  with every zombie in the recorded test session. A remaining row fails the
+  repetition as `zombie_survivors` evidence, but it never enters the
+  zombie-excluding TERM/KILL loops or changes `cleanup_status` for otherwise
+  completed cleanup.
 
 Download from the run's **Artifacts** section or with:
 
