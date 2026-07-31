@@ -1,0 +1,152 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "json"
+require "optparse"
+require "socket"
+require "timeout"
+
+options = {
+  phase: "unspecified",
+  expected_owners: 4,
+  max_threads: 64,
+  exercise_entity_reconnects: 0,
+  timeout_seconds: 5
+}
+
+OptionParser.new do |parser|
+  parser.banner = "usage: script/probe-hub-resources --socket PATH --hub-pid PID [options]"
+  parser.on("--socket PATH") { |value| options[:socket] = value }
+  parser.on("--hub-pid PID", Integer) { |value| options[:hub_pid] = value }
+  parser.on("--phase NAME") { |value| options[:phase] = value }
+  parser.on("--expected-owners COUNT", Integer) { |value| options[:expected_owners] = value }
+  parser.on("--max-threads COUNT", Integer) { |value| options[:max_threads] = value }
+  parser.on("--exercise-entity-reconnects COUNT", Integer) { |value| options[:exercise_entity_reconnects] = value }
+  parser.on("--timeout-seconds SECONDS", Integer) { |value| options[:timeout_seconds] = value }
+end.parse!
+
+abort("--socket is required") unless options[:socket]
+abort("--hub-pid must be positive") unless options[:hub_pid]&.positive?
+abort("--expected-owners must be between zero and four") unless (0..4).cover?(options[:expected_owners])
+abort("--max-threads must be positive") unless options[:max_threads].positive?
+abort("--exercise-entity-reconnects must be between zero and 32") unless (0..32).cover?(options[:exercise_entity_reconnects])
+abort("--timeout-seconds must be between one and 30") unless (1..30).cover?(options[:timeout_seconds])
+
+def exchange(socket, request, timeout_seconds)
+  socket.puts(JSON.generate(request))
+  line = Timeout.timeout(timeout_seconds) { socket.gets }
+  raise "daemon closed before responding to #{request.fetch(:type)}" unless line
+
+  JSON.parse(line)
+end
+
+def connect_and_hello(path, timeout_seconds)
+  socket = UNIXSocket.new(path)
+  socket.puts(JSON.generate(protocol: "botster-hub-daemon-v1"))
+  hello = Timeout.timeout(timeout_seconds) { socket.gets }
+  raise "daemon closed before hello acknowledgement" unless hello
+
+  hello_ack = JSON.parse(hello)
+  raise "unexpected daemon protocol" unless hello_ack.fetch("protocol") == "botster-hub-daemon-v1"
+
+  socket
+end
+
+def thread_count(pid)
+  case RUBY_PLATFORM
+  when /linux/
+    Dir.children("/proc/#{pid}/task").length
+  when /darwin/
+    output = IO.popen(["ps", "-M", "-p", pid.to_s, "-o", "pid="], &:read)
+    raise "ps thread census failed for Hub pid #{pid}" unless $?.success?
+
+    output.lines.length
+  else
+    raise "unsupported resource-census platform: #{RUBY_PLATFORM}"
+  end
+end
+
+options[:exercise_entity_reconnects].times do |index|
+  churn = connect_and_hello(options.fetch(:socket), options[:timeout_seconds])
+  subscription_id = "resource-probe-#{index}"
+  subscribed = exchange(
+    churn,
+    { type: "subscribe_entities", entity_type: "session", subscription_id: subscription_id },
+    options[:timeout_seconds]
+  )
+  raise "entity subscription was not accepted" unless subscribed.fetch("kind") == "entity_subscribed"
+
+  if index.odd?
+    churn.close
+    next
+  end
+
+  churn.puts(JSON.generate(type: "unsubscribe_entities", subscription_id: subscription_id))
+  loop do
+    frame = Timeout.timeout(options[:timeout_seconds]) { churn.gets }
+    raise "daemon closed before entity unsubscribe acknowledgement" unless frame
+
+    parsed = JSON.parse(frame)
+    break if parsed["kind"] == "entity_unsubscribed"
+  end
+  churn.close
+end
+
+socket = connect_and_hello(options.fetch(:socket), options[:timeout_seconds])
+
+resources = exchange(socket, { type: "plugin_lifecycle_status" }, options[:timeout_seconds])
+status = exchange(socket, { type: "status" }, options[:timeout_seconds])
+socket.close
+
+workers = resources.fetch("plugin_worker_counters")
+plugin_resources = resources.fetch("plugin_resource_counters")
+lifecycle = status.fetch("status").fetch("lifecycle_counters")
+expected_owners = options[:expected_owners]
+expected_workers = expected_owners * 2
+threads = thread_count(options[:hub_pid])
+
+checks = {
+  response_kind: resources.fetch("kind") == "plugin_lifecycle",
+  configured_queue_capacity: workers.fetch("configured_queue_capacity") == 256,
+  configured_executor_concurrency: workers.fetch("configured_executor_concurrency") == 2,
+  live_plugin_executors: workers.fetch("live_plugin_executors") == expected_owners,
+  live_executor_workers: workers.fetch("live_executor_workers") == expected_workers,
+  executor_formula: workers.fetch("live_executor_workers") <= workers.fetch("live_plugin_executors") * workers.fetch("configured_executor_concurrency"),
+  queued_jobs: workers.fetch("queued_jobs").zero?,
+  in_flight_jobs: workers.fetch("in_flight_jobs").zero?,
+  active_timer_resources: plugin_resources.fetch("active_timer_resources").zero?,
+  live_entity_subscriptions: lifecycle.fetch("live_entity_subscriptions").zero?,
+  live_attach_subscriptions: lifecycle.fetch("live_attach_subscriptions").zero?,
+  cleanup_failed: lifecycle.fetch("cleanup_failed").zero?,
+  hub_threads: threads <= options[:max_threads]
+}
+
+evidence = {
+  phase: options[:phase],
+  expected: {
+    owners: expected_owners,
+    queue_capacity: 256,
+    executor_concurrency: 2,
+    executor_workers: expected_workers,
+    max_hub_threads: options[:max_threads]
+  },
+  exercised_entity_reconnects: options[:exercise_entity_reconnects],
+  observed: {
+    workers: workers,
+    resources: plugin_resources,
+    lifecycle: lifecycle.slice(
+      "accepted_connections",
+      "live_connections",
+      "live_entity_subscriptions",
+      "live_attach_subscriptions",
+      "cleanup_completed",
+      "cleanup_failed"
+    ),
+    hub_threads: threads
+  },
+  checks: checks
+}
+
+puts(JSON.generate(evidence))
+failed = checks.reject { |_, passed| passed }.keys
+abort("resource bounds failed for phase=#{options[:phase]} checks=#{failed.join(',')}") unless failed.empty?

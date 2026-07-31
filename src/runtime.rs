@@ -1344,6 +1344,15 @@ impl HubRuntime {
         self.plugin_lifecycle.debug_snapshot()
     }
 
+    /// Return the sanitized count of active Hub-owned timer resources.
+    #[must_use]
+    pub fn active_plugin_timer_resources(&self) -> usize {
+        self.capability_runtime
+            .lock()
+            .expect("hub capability runtime lock")
+            .active_timer_resource_count()
+    }
+
     /// Return a daemon-recorded session summary.
     pub fn session(
         &self,

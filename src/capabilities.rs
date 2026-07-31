@@ -143,6 +143,15 @@ impl HubCapabilityRuntime {
         self.plugin_store.root()
     }
 
+    /// Return the current number of Hub-owned timer resources.
+    ///
+    /// This aggregate diagnostic deliberately omits owner and resource
+    /// identities so lifecycle proof does not expose plugin-private state.
+    #[must_use]
+    pub fn active_timer_resource_count(&self) -> usize {
+        self.timers.len()
+    }
+
     /// Drain due timer events using a deterministic logical millisecond clock.
     pub fn drain_events_at(
         &mut self,

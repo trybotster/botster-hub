@@ -118,8 +118,8 @@ eval "$saved_all_process_rows"
   || fail "zombie scanner failure was not propagated; status=$scanner_status"
 pass "zombie census fails closed when its process scanner fails"
 
-setsid bash -c 'exit 0' &
-finished_pid=$!
+start_owned_group bash -c 'exit 0'
+finished_pid=$STARTED_PID
 wait "$finished_pid"
 no_survivor_evidence="$ARTIFACT_DIR/no-survivors.tsv"
 capture_session_survivors selftest "$finished_pid" "$no_survivor_evidence" \
@@ -128,8 +128,9 @@ capture_session_survivors selftest "$finished_pid" "$no_survivor_evidence" \
   || fail "no-survivor evidence should contain only its header"
 pass "no-survivor session is green"
 
-zombie_pid_file="$ARTIFACT_DIR/zombie.pid"
-setsid python3 -c '
+if [[ "$(runner_platform)" == Linux ]]; then
+  zombie_pid_file="$ARTIFACT_DIR/zombie.pid"
+  start_owned_group python3 -c '
 import os
 import sys
 import time
@@ -141,8 +142,8 @@ if child == 0:
 with open(sys.argv[1], "w", encoding="utf-8") as output:
     output.write(f"{child}\n")
 time.sleep(300)
-' "$zombie_pid_file" &
-ZOMBIE_PARENT_PID=$!
+' "$zombie_pid_file"
+  ZOMBIE_PARENT_PID=$STARTED_PID
 
 for _ in {1..100}; do
   [[ -s "$zombie_pid_file" ]] && break
@@ -185,8 +186,11 @@ done
 kill -0 "$ZOMBIE_PID" 2>/dev/null && fail "zombie fixture remained after its parent exited"
 capture_settled_zombie_survivors "" "$zombie_baseline" "$ARTIFACT_DIR/reaped-zombie.tsv" \
   || fail "reaped zombie row remained in settled evidence"
-ZOMBIE_PID=
-pass "reaped zombie disappears from the settled evidence gate"
+  ZOMBIE_PID=
+  pass "reaped zombie disappears from the settled evidence gate"
+else
+  pass "numeric-session zombie fixture is Linux-only"
+fi
 
 if [[ "$(runner_platform)" == Linux ]]; then
   baseline_role_pid_file="$ARTIFACT_DIR/baseline-role-zombie.pid"
@@ -269,6 +273,7 @@ if [[ "$(runner_platform)" == Linux ]]; then
   pass "reaped cross-session role zombies disappear from settled evidence"
 fi
 
+if [[ "$(runner_platform)" == Linux ]]; then
 escaped_token="botster-loaded-selftest-escaped-$$"
 escaped_pid_file="$ARTIFACT_DIR/escaped.pid"
 BOTSTER_LOADED_RUN_TOKEN="$escaped_token" setsid bash -c '
@@ -364,5 +369,8 @@ cleanup_session selftest "$RECORDED_SID" "$RECORDED_SID" \
   || fail "second cleanup was not idempotent"
 kill -0 "$DECOY_PID" 2>/dev/null || fail "idempotent cleanup killed the decoy"
 pass "second cleanup is idempotent"
+else
+  pass "setsid escape and numeric-session cleanup fixtures are Linux-only"
+fi
 
 printf 'loaded daemon lifecycle selftest passed\n'

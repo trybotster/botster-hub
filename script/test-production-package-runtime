@@ -130,6 +130,11 @@ evidence_helper=$script_repo/script/production-package-runtime-evidence
   echo "evidence helper is not executable: $evidence_helper" >&2
   exit 66
 }
+resource_probe=$script_repo/script/probe-hub-resources
+[ -x "$resource_probe" ] || {
+  echo "resource probe is not executable: $resource_probe" >&2
+  exit 66
+}
 [ ! -e "$evidence_dir" ] || {
   echo "evidence directory already exists: $evidence_dir" >&2
   exit 73
@@ -304,6 +309,28 @@ validate_revision() {
   }
 }
 
+record_zero_timer_baseline() {
+  timer_repo=$1
+  timer_revision=$2
+  timer_package=$3
+  timer_matches=$runtime_root/$timer_package-timer-declarations.raw
+  if git -C "$timer_repo" grep -n -E \
+    'timer\.(after|every|set_timeout|set_interval)|hub\.timer|timers\.register' \
+    "$timer_revision" -- '*.lua' >"$timer_matches"; then
+    echo "$timer_package declares or registers a plugin timer at $timer_revision" >&2
+    cat "$timer_matches" >&2
+    exit 1
+  else
+    timer_status=$?
+    [ "$timer_status" -eq 1 ] || {
+      echo "$timer_package timer source scan failed with status $timer_status" >&2
+      exit "$timer_status"
+    }
+  fi
+  printf 'package=%s revision=%s timer_declarations=0\n' \
+    "$timer_package" "$timer_revision" >>"$evidence_dir/four-package-timer-baseline.txt"
+}
+
 validate_revision "$hub_repo" "$hub_revision" botster-hub
 validate_revision "$core_repo" "$core_revision" botster-core
 validate_revision "$web_repo" "$web_revision" botster-web
@@ -311,6 +338,13 @@ validate_revision "$tui_repo" "$tui_revision" botster-tui
 validate_revision "$tui_kit_repo" "$tui_kit_revision" botster-tui-kit
 validate_revision "$workspaces_repo" "$workspaces_revision" botster-workspaces
 validate_revision "$project_pipelines_repo" "$project_pipelines_revision" botster-project-pipelines
+
+: >"$evidence_dir/four-package-timer-baseline.txt"
+record_zero_timer_baseline "$web_repo" "$web_revision" botster-web
+record_zero_timer_baseline "$tui_repo" "$tui_revision" botster-tui
+record_zero_timer_baseline "$workspaces_repo" "$workspaces_revision" botster-workspaces
+record_zero_timer_baseline \
+  "$project_pipelines_repo" "$project_pipelines_revision" project-pipelines
 
 for coordinate in \
   "$hub_repo:$pre_cutover_hub_revision" \
@@ -487,6 +521,57 @@ assert_owned_socket() {
   printf '%s\n' "$owned_socket_path"
 }
 
+capture_resource_probe() {
+  probe_label=$1
+  probe_data_dir=$2
+  probe_expected_owners=$3
+  probe_metadata=$probe_data_dir/.botster-hub-runtime-daemon.json
+  probe_pid=$(ruby -rjson -e 'print JSON.parse(File.read(ARGV.fetch(0))).fetch("pid")' "$probe_metadata")
+  probe_socket=$(ruby -rjson -e 'print JSON.parse(File.read(ARGV.fetch(0))).fetch("socket_path")' "$probe_metadata")
+  capture "$probe_label-resources" "$resource_probe" \
+    --socket "$probe_socket" \
+    --hub-pid "$probe_pid" \
+    --phase "$probe_label" \
+    --expected-owners "$probe_expected_owners" \
+    --max-threads 64
+}
+
+run_fresh_resource_generations() {
+  resource_data_dir=$1
+  capture_resource_probe fresh-before-churn "$resource_data_dir" 4
+  capture "fresh-entity-reconnect-churn-resources" "$resource_probe" \
+    --socket "$(assert_owned_socket "$resource_data_dir")" \
+    --hub-pid "$(ruby -rjson -e 'print JSON.parse(File.read(ARGV.fetch(0))).fetch("pid")' "$resource_data_dir/.botster-hub-runtime-daemon.json")" \
+    --phase fresh-entity-reconnect-churn \
+    --expected-owners 4 \
+    --exercise-entity-reconnects 8 \
+    --max-threads 64
+
+  resource_reconnect=1
+  while [ "$resource_reconnect" -le 8 ]; do
+    capture_resource_probe "fresh-reconnect-$resource_reconnect" "$resource_data_dir" 4
+    resource_reconnect=$((resource_reconnect + 1))
+  done
+
+  for resource_package in botster-web botster-tui botster-workspaces project-pipelines; do
+    capture "fresh-reload-$resource_package" "$hub_bin" packages reload \
+      --data-dir "$resource_data_dir" "$resource_package"
+  done
+  capture_resource_probe fresh-after-reload "$resource_data_dir" 4
+
+  sleep 5
+  capture_resource_probe fresh-after-idle "$resource_data_dir" 4
+
+  resource_remaining=4
+  for resource_package in botster-web botster-tui botster-workspaces project-pipelines; do
+    capture "fresh-disable-$resource_package" "$hub_bin" packages disable \
+      --data-dir "$resource_data_dir" "$resource_package"
+    resource_remaining=$((resource_remaining - 1))
+    capture_resource_probe "fresh-after-disable-$resource_package" \
+      "$resource_data_dir" "$resource_remaining"
+  done
+}
+
 run_runtime_leg() {
   leg_label=$1
   leg_data_dir=$2
@@ -560,6 +645,20 @@ down_runtime_leg() {
   }
   if kill -0 "$down_owned_pid" >/dev/null 2>&1; then
     echo "owned Hub process survived down: $down_owned_pid" >&2
+    exit 1
+  fi
+  down_survivors=$runtime_root/$down_label-survivors.raw
+  DOWN_MARKER="$down_data_dir" ps -axo pid=,ppid=,stat=,command= \
+    | DOWN_MARKER="$down_data_dir" awk 'index($0, ENVIRON["DOWN_MARKER"]) { print }' \
+      >"$down_survivors"
+  if [ -s "$down_survivors" ]; then
+    redact_file "$down_survivors" "$evidence_dir/$down_label-survivors.log"
+    echo "owned Hub/session-worker process or zombie survived down" >&2
+    cat "$evidence_dir/$down_label-survivors.log" >&2
+    exit 1
+  fi
+  if find "$down_data_dir" -type s -print -quit | grep -q .; then
+    echo "live or stale socket survived under campaign data directory" >&2
     exit 1
   fi
 }
@@ -680,6 +779,7 @@ if [ "$mode" = fresh ] || [ "$mode" = all ]; then
     BOTSTER_HUB_BIN="$hub_bin" \
     BOTSTER_SESSION_WORKER_BIN="$session_worker_bin" \
     ./script/test-live-hub
+  run_fresh_resource_generations "$fresh_data"
   down_runtime_leg fresh "$fresh_data"
 fi
 
