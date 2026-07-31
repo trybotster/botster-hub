@@ -10,8 +10,9 @@ all_process_rows() {
 }
 
 filter_botster_zombie_rows() {
-  awk '
-    $5 ~ /^Z/ && ($6 == "botster-hub" || $6 == "botster-session" || $6 == "botster-session-worker") {
+  census_platform=$(uname -s)
+  awk -v platform="$census_platform" '
+    $5 ~ /^Z/ && (platform == "Darwin" || $6 == "botster-hub" || $6 == "botster-session" || $6 == "botster-session-worker") {
       printf "%s\t%s\t%s\t%s\t%s\t%s", $1, $2, $3, $4, $5, $6
       for (field = 7; field <= NF; field++) printf "\t%s", $field
       printf "\n"
@@ -38,12 +39,17 @@ assert_no_new_zombies() {
   settle_seconds=$3
   current=$evidence.current.$$
   deadline=$(( $(date +%s) + settle_seconds ))
-  trap 'rm -f "$current"' EXIT INT TERM
   while :; do
     botster_zombie_rows >"$current"
     new_rows "$baseline" "$current" >"$evidence"
-    [ ! -s "$evidence" ] && return 0
-    [ "$(date +%s)" -ge "$deadline" ] && return 1
+    if [ ! -s "$evidence" ]; then
+      rm -f "$current"
+      return 0
+    fi
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      rm -f "$current"
+      return 1
+    fi
     sleep 0.1
   done
 }
@@ -87,9 +93,13 @@ assert_no_live_executables() {
 self_test() {
   fixture=$(mktemp -d "${TMPDIR:-/tmp}/botster-process-census.XXXXXX")
   marker=$fixture/owned-session-worker
+  zombie_marker=$fixture/botster-session-worker
+  zombie_pid_file=$fixture/zombie-pid
+  zombie_baseline=$fixture/zombie-baseline
+  zombie_evidence=$fixture/zombie-evidence
   paths=$fixture/paths
   evidence=$fixture/evidence
-  trap 'kill "${marker_pid:-}" >/dev/null 2>&1 || true; wait "${marker_pid:-}" >/dev/null 2>&1 || true; rm -rf "$fixture"' EXIT INT TERM
+  trap 'kill "${marker_pid:-}" "${zombie_parent_pid:-}" >/dev/null 2>&1 || true; wait "${marker_pid:-}" >/dev/null 2>&1 || true; wait "${zombie_parent_pid:-}" >/dev/null 2>&1 || true; rm -rf "$fixture"' EXIT INT TERM
   printf '%s\n' '#!/bin/sh' 'sleep 30' >"$marker"
   chmod +x "$marker"
   printf '%s\n' "$marker" >"$paths"
@@ -112,6 +122,42 @@ self_test() {
   wait "$marker_pid" || true
   marker_pid=
   assert_no_live_executables "$paths" "$evidence" 1
+
+  botster_zombie_rows >"$zombie_baseline"
+  cp /bin/sleep "$zombie_marker"
+  chmod +x "$zombie_marker"
+  ruby -e '
+    child = fork { exec(ARGV.fetch(1), "0.01") }
+    File.write(ARGV.fetch(0), child.to_s)
+    sleep(30)
+  ' "$zombie_pid_file" "$zombie_marker" &
+  zombie_parent_pid=$!
+  attempts=0
+  while :; do
+    if [ -s "$zombie_pid_file" ]; then
+      zombie_pid=$(cat "$zombie_pid_file")
+      if all_process_rows | awk -v pid="$zombie_pid" '$1 == pid && $5 ~ /^Z/ { found=1 } END { exit !found }'; then
+        break
+      fi
+    fi
+    attempts=$((attempts + 1))
+    [ "$attempts" -lt 200 ] || {
+      echo "zombie positive control did not reach zombie state" >&2
+      exit 1
+    }
+    sleep 0.01
+  done
+  if assert_no_new_zombies "$zombie_baseline" "$zombie_evidence" 1; then
+    echo "zombie positive control passed unexpectedly" >&2
+    exit 1
+  fi
+  awk -F '\t' -v pid="$zombie_pid" '$1 == pid { found=1 } END { exit !found }' "$zombie_evidence" || {
+    echo "zombie positive control did not identify the fixture pid" >&2
+    exit 1
+  }
+  kill "$zombie_parent_pid"
+  wait "$zombie_parent_pid" || true
+  zombie_parent_pid=
   echo "process census self-test passed"
 }
 

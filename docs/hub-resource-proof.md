@@ -80,7 +80,10 @@ core. CPU corroborates the deterministic resource gates; it never replaces
 them.
 
 After `down`, the shared census checks live processes by the exact Hub and
-session-worker executable realpaths. It separately compares Botster-role
-zombies with a pre-campaign baseline and a bounded settle window because
-zombies have no argv to match. A SID-only scan is insufficient because PTY
+session-worker executable realpaths. It separately compares zombies with a
+pre-campaign baseline and a bounded settle window because zombies have no argv
+to match. Linux retains the Botster-role `comm` filter; Darwin compares every
+new zombie because both `comm` and `args` become `<defunct>`. The self-test
+forks and execs a worker-named binary and proves the platform-specific zombie
+oracle rejects it before cleanup. A SID-only scan is insufficient because PTY
 workers may call `setsid()`.
