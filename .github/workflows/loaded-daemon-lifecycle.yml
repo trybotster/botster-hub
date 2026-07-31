@@ -21,6 +21,7 @@ on:
           - focused-fast-exit-attach-diagnostic
           - focused-oversized-webrtc
           - focused-cli-smoke
+          - focused-operator-console
           - focused-lua-worker-suite
           - focused-lua-session-worker-callers
           - full-suite-contention
