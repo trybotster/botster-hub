@@ -78,7 +78,7 @@ though the generic Botster planner map is required context.
 
 ### Accepted implementation deviations synchronized after downstream review
 
-Characterization and suite-wide acceptance exposed four repository-owned needs
+Characterization and suite-wide acceptance exposed five repository-owned needs
 that were accepted during Implement but were not reflected in the original
 plan text:
 
@@ -94,6 +94,10 @@ plan text:
   before constructing `ReadinessFailed`.
 - An exact occupied-web-port selector provides identical branch/base isolation
   for that first red before the complete suite is rerun.
+- Final-SHA full-suite contention exposed the environment-override test polling
+  only for file existence. A shell can create/truncate the file before writing
+  its value, so the same bounded poll must wait for the expected content rather
+  than treating an empty file as completion.
 
 These are surgical extensions of the approved Hub lifecycle/test/CI ownership
 boundary, not cross-repository scope.
@@ -369,7 +373,11 @@ leading hypothesis.
     authoritative base with identical inputs, and make
     `EntrypointSupervisor` wait only for its existing pending terminal-state
     diagnostic finalization before returning `ReadinessFailed`.
-12. Document the operator completion contract and produce an implementation
+12. If final-SHA contention exposes the entrypoint environment fixture's
+    create-before-write window, preserve its existing two-second budget but
+    poll for the expected content instead of file existence. Do not change the
+    production entrypoint environment contract.
+13. Document the operator completion contract and produce an implementation
    report with characterization, pre-fix red, fixed green, exact subjects,
    branch/base campaigns, expected real reaper and exit-to-reap observations,
    runtime binary provenance, and separate live/zombie survivor evidence.
