@@ -457,6 +457,7 @@ capture_in test-tui "$tui_repo" ./test.sh
 capture_in build-tui "$tui_repo" cargo build --locked -p botster-tui
 capture_in test-tui-kit "$tui_kit_repo" ./script/test
 capture_in test-workspaces "$workspaces_repo" ./script/test
+capture_in install-project-pipelines "$project_pipelines_repo" npm ci
 capture_in test-project-pipelines "$project_pipelines_repo" ./script/test
 
 wait_for_status() {
