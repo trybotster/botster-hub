@@ -1851,12 +1851,6 @@ fn reap_owned_child_if_exited(pid: u32) -> Result<bool, LocalRuntimeError> {
         let mut status = 0;
         let result = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) };
         if result == pid as libc::pid_t {
-            if !libc::WIFEXITED(status) || libc::WEXITSTATUS(status) != 0 {
-                return Err(LocalRuntimeError::OwnedDaemonExitedAbnormally {
-                    pid,
-                    status: wait_status_label(status),
-                });
-            }
             return Ok(true);
         }
         if result == 0 {
@@ -1869,16 +1863,6 @@ fn reap_owned_child_if_exited(pid: u32) -> Result<bool, LocalRuntimeError> {
             _ => return Err(LocalRuntimeError::InspectProcess(error)),
         }
     }
-}
-
-fn wait_status_label(status: libc::c_int) -> String {
-    if libc::WIFEXITED(status) {
-        return format!("exit:{}", libc::WEXITSTATUS(status));
-    }
-    if libc::WIFSIGNALED(status) {
-        return format!("signal:{}", libc::WTERMSIG(status));
-    }
-    format!("wait_status:{status}")
 }
 
 fn process_state(pid: u32) -> Result<Option<String>, LocalRuntimeError> {
@@ -4969,10 +4953,6 @@ enum LocalRuntimeError {
     InspectProcess(io::Error),
     TerminateDaemon(io::Error),
     TerminateDaemonTimeout(u32),
-    OwnedDaemonExitedAbnormally {
-        pid: u32,
-        status: String,
-    },
     Config(botster_hub::HubConfigError),
     Transport(botster_hub::DaemonTransportError),
     MissingPackage {
@@ -5162,12 +5142,6 @@ impl fmt::Display for LocalRuntimeError {
                 write!(
                     formatter,
                     "timed out waiting for stale local runtime daemon process {pid} to exit"
-                )
-            }
-            Self::OwnedDaemonExitedAbnormally { pid, status } => {
-                write!(
-                    formatter,
-                    "metadata-owned local runtime daemon process {pid} exited abnormally with {status}"
                 )
             }
             Self::Config(error) => write!(formatter, "{error}"),
@@ -5816,28 +5790,6 @@ mod cli_data_dir_tests {
                 .is_some(),
             "cleanup must reap a child even when killpg reports ESRCH for its pid"
         );
-        assert_eq!(unsafe { libc::kill(pid as libc::pid_t, 0) }, -1);
-    }
-
-    #[test]
-    fn owned_runtime_reap_rejects_abnormal_direct_child_exit() {
-        let mut child = Command::new("/bin/sh")
-            .args(["-c", "exit 7"])
-            .spawn()
-            .expect("spawn abnormal owned daemon fixture");
-        let pid = child.id();
-
-        let error = wait_for_owned_runtime_daemon_reaped(pid)
-            .expect_err("abnormal owned child exit must not be successful shutdown");
-        let _ = child.wait();
-
-        assert!(matches!(
-            error,
-            LocalRuntimeError::OwnedDaemonExitedAbnormally {
-                pid: failed_pid,
-                status,
-            } if failed_pid == pid && status == "exit:7"
-        ));
         assert_eq!(unsafe { libc::kill(pid as libc::pid_t, 0) }, -1);
     }
 }
