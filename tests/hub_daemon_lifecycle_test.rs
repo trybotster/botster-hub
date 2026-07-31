@@ -33,7 +33,7 @@ use botster_hub::{
     LOCAL_RUNTIME_DAEMON_READINESS_BUDGET, PackageAdmissionPolicy, PackageProvenance,
     PackageRegistry, RuntimeEnvironment, SessionDefaults, SpawnTarget, TransportBindings,
 };
-use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use webrtc::data_channel::{DataChannel, DataChannelEvent, RTCDataChannelInit};
 use webrtc::peer_connection::{
     PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler, RTCIceGatheringState,
@@ -53,6 +53,7 @@ use support::{
 static REAL_DAEMON_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 const OPERATOR_CONSOLE_READINESS_LIVENESS_BACKSTOP: Duration = Duration::from_secs(60);
 const OPERATOR_CONSOLE_READER_DRAIN_BACKSTOP: Duration = Duration::from_secs(2);
+const OPERATOR_CONSOLE_OUTPUT_PROGRESS_BACKSTOP: Duration = Duration::from_secs(30);
 const BOTSTER_WEB_READINESS_LIVENESS_BACKSTOP: Duration = Duration::from_secs(60);
 const BOTSTER_WEB_READINESS_STARTUP_DELAY_MS: u64 = 3_000;
 const STALLED_ATTACH_MIN_BUFFERED_STDOUT_BYTES: usize = 8 * 1024;
@@ -2348,6 +2349,7 @@ fn command_output_text(output: &Output) -> String {
 
 struct OperatorConsolePty {
     child: Box<dyn portable_pty::Child + Send + Sync>,
+    master: Box<dyn MasterPty + Send>,
     writer: Option<Box<dyn Write + Send>>,
     output: Arc<Mutex<Vec<u8>>>,
     reader: Option<thread::JoinHandle<()>>,
@@ -2861,6 +2863,7 @@ impl OperatorConsolePty {
         });
         Self {
             child,
+            master: pty.master,
             writer: Some(writer),
             output,
             reader: Some(reader),
@@ -2898,6 +2901,135 @@ impl OperatorConsolePty {
     fn wait_for_occurrences(&mut self, needle: &str, expected: usize) {
         self.try_wait_for_occurrences(needle, expected)
             .unwrap_or_else(|error| panic!("{error}"));
+    }
+
+    fn output_checkpoint(&self) -> usize {
+        self.output
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+
+    fn wait_for_output_after(&mut self, checkpoint: usize, needle: &str) {
+        self.try_wait_for_output_after(
+            checkpoint,
+            needle,
+            OPERATOR_CONSOLE_OUTPUT_PROGRESS_BACKSTOP,
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+    }
+
+    fn try_wait_for_output_after(
+        &mut self,
+        checkpoint: usize,
+        needle: &str,
+        budget: Duration,
+    ) -> Result<(), String> {
+        let started_at = Instant::now();
+        let deadline = started_at + budget;
+        while Instant::now() < deadline {
+            if self.output_contains_after(checkpoint, needle.as_bytes()) {
+                return Ok(());
+            }
+            match self.child.try_wait() {
+                Ok(Some(status)) => {
+                    self.finish_reader_after_exit(OPERATOR_CONSOLE_READER_DRAIN_BACKSTOP)?;
+                    if self.output_contains_after(checkpoint, needle.as_bytes()) {
+                        return Ok(());
+                    }
+                    return Err(format!(
+                        "waiting for operator console output {needle:?} after byte checkpoint {checkpoint}: console exited after {:?}; console_status={status:?}; {}",
+                        started_at.elapsed(),
+                        self.output_progress_context(checkpoint)
+                    ));
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    return Err(format!(
+                        "waiting for operator console output {needle:?} after byte checkpoint {checkpoint}: failed to poll console after {:?}: {error}; {}",
+                        started_at.elapsed(),
+                        self.output_progress_context(checkpoint)
+                    ));
+                }
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        let diagnostics = self.foreground_diagnostics();
+        self.writer.take();
+        let console_status = terminate_and_reap_pty_child(self.child.as_mut());
+        let reader_status = self
+            .finish_reader_after_exit(OPERATOR_CONSOLE_READER_DRAIN_BACKSTOP)
+            .err()
+            .unwrap_or_else(|| "reader reached EOF".to_string());
+        Err(format!(
+            "waiting for operator console output {needle:?} after byte checkpoint {checkpoint}: no post-action progress after {:?} (backstop {budget:?}); console_status={console_status}; reader_status={reader_status:?}; {diagnostics}; {}",
+            started_at.elapsed(),
+            self.output_progress_context(checkpoint)
+        ))
+    }
+
+    fn output_contains_after(&self, checkpoint: usize, needle: &[u8]) -> bool {
+        let output = self
+            .output
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        output
+            .get(checkpoint..)
+            .is_some_and(|suffix| suffix.windows(needle.len()).any(|window| window == needle))
+    }
+
+    fn output_progress_context(&self, checkpoint: usize) -> String {
+        let output = self
+            .output
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let suffix = output.get(checkpoint..).unwrap_or_default();
+        format!(
+            "post_checkpoint_output={:?}; operator_console_output={:?}",
+            String::from_utf8_lossy(suffix),
+            String::from_utf8_lossy(&output)
+        )
+    }
+
+    fn foreground_diagnostics(&mut self) -> String {
+        let console_status = match self.child.try_wait() {
+            Ok(Some(status)) => format!("{status:?}"),
+            Ok(None) => "running".to_string(),
+            Err(error) => format!("inspection_error={error}"),
+        };
+        let raw_fd = self.master.as_raw_fd();
+        let foreground_pgid = self.master.process_group_leader();
+        let termios = raw_fd.map(|fd| {
+            let mut attributes = std::mem::MaybeUninit::<libc::termios>::uninit();
+            let result = unsafe { libc::tcgetattr(fd, attributes.as_mut_ptr()) };
+            if result == 0 {
+                let attributes = unsafe { attributes.assume_init() };
+                format!(
+                    "isig={}",
+                    attributes.c_lflag & libc::ISIG as libc::tcflag_t != 0
+                )
+            } else {
+                format!("inspection_error={}", io::Error::last_os_error())
+            }
+        });
+        let group_probe = foreground_pgid.map(process_group_probe);
+        let leader_probe = foreground_pgid.map(process_probe);
+        let census = foreground_pgid.map(process_group_census);
+        let inspection_consistency = match (&group_probe, &census) {
+            (Some(Ok(true)), Some(Ok(rows))) if rows.is_empty() => {
+                "inspection_error=live killpg probe disagrees with empty ps census".to_string()
+            }
+            (Some(Ok(false)), Some(Ok(rows))) if !rows.is_empty() => {
+                "inspection_error=dead killpg probe disagrees with nonempty ps census".to_string()
+            }
+            (Some(Err(error)), _) => format!("inspection_error={error}"),
+            (_, Some(Err(error))) => format!("inspection_error={error}"),
+            _ => "inspection_consistent=true".to_string(),
+        };
+        format!(
+            "foreground_diagnostics console_status={console_status}; raw_fd={raw_fd:?}; termios={termios:?}; foreground_pgid={foreground_pgid:?}; killpg_probe={group_probe:?}; leader_pid_probe={leader_probe:?}; group_census={census:?}; {inspection_consistency}"
+        )
     }
 
     fn try_wait_for_occurrences(&mut self, needle: &str, expected: usize) -> Result<(), String> {
@@ -2985,6 +3117,60 @@ impl OperatorConsolePty {
         }
         Ok(())
     }
+}
+
+fn process_probe(pid: libc::pid_t) -> Result<bool, String> {
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return Ok(true);
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(false)
+    } else if error.raw_os_error() == Some(libc::EPERM) {
+        Ok(true)
+    } else {
+        Err(format!("kill({pid}, 0) failed: {error}"))
+    }
+}
+
+fn process_group_probe(pgid: libc::pid_t) -> Result<bool, String> {
+    if unsafe { libc::killpg(pgid, 0) } == 0 {
+        return Ok(true);
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(false)
+    } else if error.raw_os_error() == Some(libc::EPERM) {
+        Ok(true)
+    } else {
+        Err(format!("killpg({pgid}, 0) failed: {error}"))
+    }
+}
+
+fn process_group_census(pgid: libc::pid_t) -> Result<Vec<String>, String> {
+    let output = Command::new("ps")
+        .args(["-axo", "pid=,ppid=,pgid=,stat=,command="])
+        .output()
+        .map_err(|error| format!("run portable process census: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "portable process census exited with {}: stderr={:?}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let rows = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| {
+            line.split_whitespace()
+                .nth(2)
+                .and_then(|value| value.parse::<libc::pid_t>().ok())
+                == Some(pgid)
+        })
+        .map(str::trim)
+        .map(str::to_string)
+        .collect();
+    Ok(rows)
 }
 
 impl Drop for OperatorConsolePty {
@@ -3326,6 +3512,42 @@ fn operator_console_output_wait_reports_early_child_exit() {
     );
     console.wait_for_exit();
     fs::remove_dir_all(&fixture_dir).expect("remove early-exit console fixture directory");
+}
+
+#[test]
+fn operator_console_output_checkpoint_rejects_stale_identical_output() {
+    let fixture_dir = unique_short_test_dir("console-output-checkpoint");
+    fs::create_dir_all(&fixture_dir).expect("create output-checkpoint fixture directory");
+    let fixture = fixture_dir.join("checkpoint-console");
+    fs::write(
+        &fixture,
+        "#!/bin/sh\nprintf 'repeated-output\\n'; sleep 60\n",
+    )
+    .expect("write output-checkpoint console fixture");
+    let mut permissions = fs::metadata(&fixture)
+        .expect("read output-checkpoint console fixture metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&fixture, permissions)
+        .expect("make output-checkpoint console fixture executable");
+
+    let mut console = OperatorConsolePty::spawn_binary(&fixture, &fixture_dir);
+    console.wait_for("repeated-output");
+    let checkpoint = console.output_checkpoint();
+    assert!(
+        !console.output_contains_after(checkpoint, b"repeated-output"),
+        "output from before the checkpoint satisfied a post-action observation"
+    );
+    let error = console
+        .try_wait_for_output_after(checkpoint, "repeated-output", Duration::from_millis(100))
+        .expect_err("stale identical output must not satisfy a post-checkpoint wait");
+    assert!(error.contains("no post-action progress"), "{error}");
+    assert!(
+        !console.output_contains_after(checkpoint, b"repeated-output"),
+        "output from before the checkpoint appeared in the post-checkpoint suffix: {error}"
+    );
+    console.wait_for_exit();
+    fs::remove_dir_all(&fixture_dir).expect("remove output-checkpoint fixture directory");
 }
 
 #[test]
@@ -12976,9 +13198,16 @@ fn cli_operator_console_starts_reuses_detaches_handles_ctrl_c_and_stops() {
     let prompt_after_foreground_interrupt = first.prompt_count() + 1;
     first.send(b"apps open botster-tui\n");
     first.wait_for("foreground-ready");
+    let foreground_interrupt_checkpoint = first.output_checkpoint();
     first.send(&[3]);
-    first.wait_for_occurrences("foreground app ", 2);
-    first.wait_for_occurrences("botster-hub> ", prompt_after_foreground_interrupt);
+    first.wait_for_output_after(foreground_interrupt_checkpoint, "foreground app ");
+    first.wait_for_output_after(foreground_interrupt_checkpoint, "botster-hub> ");
+    assert_eq!(
+        first.prompt_count(),
+        prompt_after_foreground_interrupt,
+        "foreground interrupt printed an unexpected number of prompts: {}",
+        first.text()
+    );
     assert!(
         !first
             .text()
