@@ -69,10 +69,11 @@ Important existing behavior to preserve and reuse:
 - `script/test-production-package-runtime` already installs and enables exactly `botster-web`, `botster-tui`, `botster-workspaces`, and `project-pipelines` at exact source coordinates in a clean data directory, exercises public package/application/daemon paths, checks Web and TUI downstream behavior, runs upgrade coverage, and emits redacted evidence. The resource proof belongs in this path rather than a parallel installer.
 - `DaemonStatus.lifecycle_counters` already exposes connection, subscription, reconnect, cleanup, reconciliation, delivery, and stalled-write counters. `PluginLifecycleStatus` already carries the Core-authored worker snapshot: configured queue capacity/concurrency, live executors/workers, queued jobs, and in-flight jobs.
 - `focused_connection_lifecycle_is_bounded_event_driven_and_counter_visible` already proves one authoritative reconnect baseline, low event-driven idle wakeups, subscription cleanup, repeated reconnects, admission, malformed/half-open clients, and shutdown. The integration campaign should consume the same invariants and only add the missing four-package/runtime axes.
-- `.github/workflows/loaded-daemon-lifecycle.yml` and `script/run-loaded-daemon-lifecycle` already provide exact-SHA, locked-toolchain, distinct Hub/Core-binary, repeated loaded-campaign proof. They remain the downstream loaded proof; this ticket must not fork that lifecycle machinery.
-- Hub-owned deterministic timer tests already cover registration, firing, cancellation, and unload cleanup. Reload cleanup should be cited if already covered or strengthened in that focused fixture, separately from the production four-package campaign.
+- `.github/workflows/loaded-daemon-lifecycle.yml` and `script/run-loaded-daemon-lifecycle` already provide exact-SHA, locked-toolchain, distinct Hub/Core-binary, repeated loaded-campaign proof and run-token/process-group/zombie cleanup census. This ticket adds one focused resource-bound selector to that machinery and reuses its cleanup census; it must not create a parallel CI runner or census.
+- `hub_runtime_passes_split_plugin_worker_config_to_core_engine` in `tests/hub_plugin_lifecycle_test.rs` already proves distinct knobs (`queue_capacity = 7`, `executor_concurrency = 3`), three rather than seven live OS-backed executor workers, and unload retirement to the pre-load snapshot. The new proof preserves and consumes this mechanism instead of rebuilding it.
+- `hub_runtime_schedules_cancels_and_cleans_up_timers` and `unload_cleans_up_capability_resources_for_plugin` in `tests/hub_capability_runtime_test.rs` already prove timer registration/firing/cancellation and owner-scoped unload cleanup with no post-cleanup firing. Production cleanup is `HubCapabilityRuntime::cleanup_plugin` in `src/capabilities.rs`, reached from `HubRuntime::unload_plugin_package` in `src/runtime.rs`. Reload-path cleanup is the specific missing timer fixture.
 
-The four package sources were inspected at `botster-web@9d1607…`, `botster-tui@c426b8…`, `botster-workspaces@c78f3b…`, and `project-pipelines@f2266a…`. Their manifests, entrypoints, and actions declare no plugin timer registration.
+The four installed package sources were inspected at `botster-web@9d1607…`, `botster-tui@c426b8…`, `botster-workspaces@c78f3b…`, and `project-pipelines@f2266a…`. Their manifests, entrypoints, and actions declare no plugin timer registration. `botster-tui-kit` remains the production script's exact source-revision build/test input; it is not installed or enabled and therefore is not a fifth package in the runtime shape.
 
 ## Binding clarification and assumptions
 
@@ -90,14 +91,15 @@ Assumptions that implementation must validate rather than silently preserve:
 - A minimal sanitized timer-resource count can be projected through the existing daemon lifecycle response without exposing plugin internals or adding a new service/endpoint. If the existing response can already derive it, no new DTO field is needed.
 - Web can attach to the campaign-owned data directory and TUI can attach to the campaign-owned socket through their existing public live-test inputs. If a downstream harness cannot attach without owning another Hub, that is a dependency on that repository, not permission to edit it in this run.
 - Package reload applies only to loaded plugin entrypoints; the campaign records which of the four packages have reloadable plugin owners and does not pretend client-only activity is a plugin reload.
-- Exact numeric thread/CPU thresholds must be measured on the supported CI runners during implementation and committed as readable constants with rationale. They may be conservative, but may not be discovered dynamically from the stressed observation itself.
+- The CI regression uses the production Core defaults explicitly: configured queue capacity `256`, configured executor concurrency `2`, four loaded plugin owners, exactly eight live executor workers, and an absolute Hub-process ceiling of 64 OS threads. The ceiling is deliberately conservative across the fixed runtime overhead while still failing the reported pre-fix shape of about 1,041 threads; it is a committed invariant, not a value discovered from the observation under test.
+- The no-stress Linux CI selector also enforces the initial idle CPU ceiling: no more than 250 ms of Hub process CPU-time growth during a five-second observation after counter convergence (5% of one core). macOS/Linux operator evidence applies the equivalent 5% ceiling through the documented platform recipe. Any threshold revision requires captured runner evidence and plan/review visibility rather than runtime calibration.
 
 Unknowns to close while implementing:
 
-- Whether the existing timer fixture already proves reload cleanup in addition to unload cleanup.
+- The exact reload path through which the existing unload timer cleanup should be exercised; review confirmed reload cleanup itself is not yet proven.
 - Whether the current generated Hub client bindings include a lifecycle response shape suitable for the minimal timer-resource field or require regeneration.
 - Which existing package smoke entrypoints can attach to one caller-owned Hub without modification. Any missing downstream capability must be registered as a dependency against that package repository.
-- The fixed Hub/runtime thread overhead used by the explicit worker-bound formula on macOS and Linux.
+- Whether the existing cleanup census functions can be sourced directly or need a small semantics-preserving extraction for reuse by the production campaign.
 
 ## Scope
 
@@ -105,9 +107,9 @@ Implement one production-path campaign that installs exactly the four packages i
 
 1. Exact package coordinates, declared entrypoints/actions, and a source-derived zero-timer declaration baseline.
 2. Real package activity through public application/plugin/MCP paths, including Web and TUI attaching to the campaign Hub rather than substituting isolated test daemons.
-3. Repeated normal unsubscribe/detach, abrupt EOF, reconnect, slow-consumer, plugin reload, idle-settle, and shutdown generations.
+3. Repeated normal unsubscribe/detach, abrupt EOF, reconnect, slow-consumer, plugin reload, public package disable/unload retirement, idle-settle, and shutdown generations.
 4. Deterministic convergence of connection, entity, terminal-attach, worker, queue, timer, and cleanup counters after every generation.
-5. Explicit high-water and current-resource bounds, including queue capacity versus executor concurrency as independent axes.
+5. Explicit high-water and current-resource bounds at production defaults (`256` queue capacity and `2` executor concurrency), including exactly eight executor workers for four loaded owners, the relative formulas at every snapshot, and an absolute ceiling of 64 Hub OS threads.
 6. OS corroboration for threads, processes/process groups, sockets, and idle CPU on macOS and Linux, with exact Hub and Core worker binary provenance.
 7. Redacted, bounded evidence suitable for local use and CI artifact retention.
 
@@ -151,6 +153,7 @@ Add a small standard-library script under `script/` that connects through the pu
 - live plugin executors equal the loaded reloadable-plugin owner count;
 - live executor workers are no greater than `loaded_plugin_owners * configured_executor_concurrency`;
 - no bound is multiplied by configured queue capacity, and queue depth never exceeds configured capacity;
+- the production-default four-owner phase reports queue capacity `256`, executor concurrency `2`, exactly eight live executor workers, and no more than 64 total Hub-process OS threads;
 - active timer resources stay exactly zero for the four-package workload;
 - slow consumers increment bounded overflow/failure evidence without retaining a subscription or creating an unbounded producer;
 - evidence collection itself is constant-cost and does not enumerate an unbounded historical event stream.
@@ -161,24 +164,38 @@ Use explicit convergence loops over authoritative counters with deadlines and im
 
 In the fresh-mode path of `script/test-production-package-runtime`:
 
-- verify the exact four source revisions and record their manifest/entrypoint/action/timer-declaration facts;
+- verify all existing source inputs, including `botster-tui-kit`, at their exact revisions; record manifest/entrypoint/action/timer-declaration facts for the four installed packages while retaining TUI Kit as a build/test input rather than installing it;
 - start one Hub from the freshly installed coordinates and record the Hub executable realpath/SHA plus the locked Core worker executable realpath/SHA;
 - run actual Project Pipelines and Workspaces plugin actions through their public Hub surfaces;
 - run Web against the same data directory and TUI headless against the same socket using their existing caller-owned-Hub inputs;
 - create a worker-backed session and exercise entity plus terminal subscriptions across normal detach, abrupt client loss, rapid reconnect, and slow-consumer phases;
 - explicitly reload the packages with reloadable plugin owners through the public package reload command, never by touching files;
+- after the four-enabled-package churn/reload/idle proof, disable each reloadable package through the public package disable path and assert live plugin executors/workers retire stepwise to the pre-load baseline before `down`;
 - invoke the resource probe before activity, after each churn/reload generation, after idle settling, and before/after orderly down;
+- after `down`, reuse the loaded lifecycle cleanup census across executable provenance and relevant process groups—not one SID—to gate on zero surviving Hub processes, zero owned session workers, zero zombie children, and zero live or stale sockets under the campaign data directory;
 - retain the existing upgrade leg and ensure it cannot mask the fresh resource proof.
 
 The production evidence helper should add bounded JSON snapshots for declared package facts, lifecycle counters, worker/timer resource counters, OS census, and phase results while preserving existing secret/path/PII redaction.
 
-### 4. Reuse focused tests and close only timer-specific gaps
+### 4. Add the CI-executable focused regression and close only mechanism gaps
 
-Extend focused Rust tests only where the production assertions need a missing product observation:
+Add one exact focused Rust test, `focused_plugin_resources_are_bounded_across_reconnect_reload_idle_and_unload`, under `tests/hub_daemon_lifecycle_test.rs`. It starts a real Hub with four deterministic loaded plugin owners at the explicit production defaults, drives reconnect/reload/idle/disable generations, and enforces the same committed resource constants as the production campaign:
+
+- `configured_queue_capacity == 256` and `configured_executor_concurrency == 2`;
+- `live_plugin_executors == 4` and `live_executor_workers == 8` while all four owners are loaded;
+- Hub-process OS thread count is at most 64, so the reported approximately 1,041-thread failure cannot pass;
+- queue/in-flight work, connection/subscription state, and timer resources converge to baseline;
+- disable/unload retires live executors and executor workers to the pre-load snapshot;
+- under Linux with no external stress, the post-convergence five-second CPU-time delta is at most 250 ms.
+
+The deterministic four-owner fixture is the CI mechanism regression, not a substitute for the operator-run exact-package campaign and not a claim that the real packages register timers. Because it is a normal Rust integration test, `./test.sh` runs it. Add a `focused-plugin-resource-bounds` `test_target` to `.github/workflows/loaded-daemon-lifecycle.yml`, map it to the exact test in `script/run-loaded-daemon-lifecycle`, and require `stress_profile=none` for this selector. This is the named CI-executable threshold carrier; the cross-repository production campaign remains operator-run downstream proof.
+
+Extend other focused tests only where the product observation or lifecycle mechanism is missing:
 
 - verify the timer-resource field is live, sanitized, and zero for no-timer owners;
-- cite the existing capability timer registration/firing/cancel/unload tests;
-- if reload cleanup is not already deterministic, add one focused Hub-owned test that registers a real timer under a test plugin owner, reloads/unloads that owner through the runtime lifecycle, and proves zero retained timer resources and no post-cleanup firing;
+- preserve `hub_runtime_passes_split_plugin_worker_config_to_core_engine` as the distinct-knob/unload-retirement unit proof;
+- preserve `hub_runtime_schedules_cancels_and_cleans_up_timers` and `unload_cleans_up_capability_resources_for_plugin` as the timer mechanism proof;
+- add one focused Hub-owned reload-path test that registers a real timer under a test plugin owner, reloads that owner through the runtime lifecycle, and proves zero retained pre-reload timer resources and no post-cleanup firing;
 - reuse `focused_connection_lifecycle_is_bounded_event_driven_and_counter_visible` for connection/subscription semantics rather than duplicating it in another large Rust test.
 
 ### 5. Document CI and local macOS/Linux proof
@@ -188,9 +205,9 @@ Add a short resource-proof document and link it from the runtime acceptance docu
 - local macOS process/thread/socket census using universal `ps`/`lsof` fields;
 - local Linux census using `ps` plus `/proc` where available;
 - the exact four-package fresh campaign;
-- the existing focused lifecycle selector and loaded daemon workflow.
+- the new `focused-plugin-resource-bounds` selector with `stress_profile=none`, the existing focused connection selector, and the loaded daemon workflow.
 
-CPU is corroborating evidence, not the sole idle gate. In an unstressed idle phase, sample Hub CPU over a fixed five-second observation after deterministic counter convergence and require an implementation-committed ceiling (initial target: average no more than 5% of one core) plus no growth proportional to connection/subscription count. Loaded/stressed jobs record CPU but gate on resource/counter convergence instead. The implementation review must adjust the initial ceiling only with runner evidence and must keep the committed value explicit.
+CPU is corroborating evidence, not the sole idle gate. The no-stress focused Linux selector gates on no more than 250 ms of Hub CPU-time growth over five seconds after deterministic convergence, and the operator macOS/Linux recipe gates on the equivalent average of no more than 5% of one core plus no growth proportional to connection/subscription count. Other loaded/stressed jobs record CPU but gate on resource/counter convergence instead.
 
 ## Expected affected surfaces/files
 
@@ -199,12 +216,12 @@ CPU is corroborating evidence, not the sole idle gate. In an unstressed idle pha
 - `crates/botster-hub-client/src/lib.rs` and generated TypeScript client artifacts — response schema update only if the DTO changes.
 - `crates/botster-hub-test-support/src/lib.rs` — shared snapshot/probe support only when it removes duplication from focused tests.
 - `tests/hub_capability_runtime_test.rs` and/or `tests/hub_plugin_lifecycle_test.rs` — zero baseline and any missing reload timer cleanup proof.
-- `tests/hub_daemon_lifecycle_test.rs` — minimal assertion updates for the public response; retain the existing focused lifecycle campaign.
+- `tests/hub_daemon_lifecycle_test.rs` — the exact CI-focused four-owner/default-knob/absolute-thread-bound regression plus minimal public-response assertions; retain the existing focused connection campaign.
 - `script/test-production-package-runtime` — wire resource phases into the real four-package path.
 - `script/production-package-runtime-evidence` — bounded, redacted resource/provenance artifacts.
-- One focused new `script/` resource probe and its script-level self-test if needed.
+- One focused new `script/` resource probe and its script-level self-test if needed; reuse or minimally extract the loaded lifecycle cleanup census instead of implementing a second process/zombie census.
 - `README.md` and a focused `docs/` resource-proof guide.
-- `.github/workflows/loaded-daemon-lifecycle.yml` only if an existing selector/input cannot run the new exact-coordinate proof; prefer the existing script contract and workflow rather than duplicating workflow logic.
+- `.github/workflows/loaded-daemon-lifecycle.yml` and `script/run-loaded-daemon-lifecycle` — add the `focused-plugin-resource-bounds` no-stress CI selector and reuse its existing survivor/zombie cleanup machinery.
 
 This list is a forecast, not permission to touch every file. Each changed line must serve the missing live observation, production-path wiring, deterministic proof, or documentation made necessary by those changes.
 
@@ -213,6 +230,7 @@ This list is a forecast, not permission to touch every file. Each changed line m
 - **False proof from another Hub:** require one caller-owned data directory/socket and record PID plus executable provenance for every downstream phase.
 - **Reimplementing Core state in Hub:** consume `DaemonPluginWorkerCounters`; never infer executor bounds from config or process counts.
 - **Flaky timing thresholds:** gate on authoritative convergence and explicit high-water/current bounds; keep CPU observational except for a conservative unstressed ceiling.
+- **Ceiling accidentally ceases to cover production defaults:** the focused and exact-package campaigns both assert `256`/`2`, eight workers, and the fixed 64-thread ceiling before accepting resource evidence.
 - **Process census blind to `setsid`:** census the relevant process tree/process groups system-wide by executable provenance, not only one SID.
 - **Slow-consumer deadlock or leaked child:** use bounded writes/readiness and unconditional child teardown on every failure path.
 - **Probe-caused load:** take fixed-size snapshots and avoid loops proportional to queue capacity, event history, or subscriber count.
@@ -227,15 +245,17 @@ Implementation is complete only when all applicable checks pass from a clean rou
 
 1. `cargo fmt --check` and `cargo clippy --all-targets --all-features -- -D warnings`.
 2. `./test.sh` for the Hub workspace.
-3. Focused daemon lifecycle selector proving bounded event-driven connections/subscriptions and reconnect cleanup.
-4. Focused capability/plugin lifecycle tests proving zero timer observation plus real registration, firing, cancellation, reload/unload cleanup, and no post-cleanup firing.
-5. Script self-tests covering readiness failure, timeout diagnostics, redaction, child teardown, counter non-convergence, and supported macOS/Linux census parsing.
-6. The exact-coordinate fresh production campaign installs only the four named packages, drives their real declared actions, attaches Web and TUI to the same Hub, performs reconnect/slow-consumer/reload/idle/down phases, and emits all resource/provenance artifacts.
-7. Every phase satisfies the formulas and baselines above: no retained connection/entity/attach/timer resources; empty queue/in-flight work; workers bounded by plugin owners times executor concurrency; queue depth bounded independently by queue capacity; no cleanup failure; no growth with reconnect generation count.
-8. The unstressed idle observation has stable deterministic counters and CPU within the committed near-zero ceiling on both supported local recipes; loaded CI records CPU but uses deterministic bounds as its gate.
-9. `script/run-loaded-daemon-lifecycle --scenario focused-connection-lifecycle` (or its current equivalent) passes with exact Hub and locked Core worker provenance, and `.github/workflows/loaded-daemon-lifecycle.yml` remains the downstream loaded proof.
-10. `script/production-package-runtime-evidence verify` and the repository's secret/PII scans accept the new bounded artifacts.
-11. A final source scan confirms the four resolved package revisions still declare zero timers; evidence shows the live timer count stayed zero rather than merely omitting the check.
+3. `./test.sh --test hub_daemon_lifecycle_test focused_plugin_resources_are_bounded_across_reconnect_reload_idle_and_unload -- --exact --nocapture` proves in a normal CI-runnable Rust test that production defaults are `256`/`2`, four owners create exactly eight executor workers, the Hub stays at or below 64 OS threads, idle Linux CPU-time growth is at most 250 ms over five seconds with no stress, all resource counters converge, and public disable/unload retires workers to baseline.
+4. The existing focused connection lifecycle selector continues to prove event-driven connections/subscriptions and reconnect cleanup.
+5. Focused capability/plugin lifecycle tests prove zero timer observation plus `hub_runtime_schedules_cancels_and_cleans_up_timers`, `unload_cleans_up_capability_resources_for_plugin`, the new reload cleanup path, and no post-cleanup firing; `hub_runtime_passes_split_plugin_worker_config_to_core_engine` remains the distinct-knob/unload-retirement unit regression.
+6. Script self-tests cover readiness failure, timeout diagnostics, redaction, child teardown, counter non-convergence, and supported macOS/Linux census parsing.
+7. The exact-coordinate fresh production campaign retains all existing exact source inputs, installs only the four named packages, drives their real declared actions, attaches Web and TUI to the same Hub, performs reconnect/slow-consumer/reload/idle/public-disable/down phases, and emits all resource/provenance artifacts.
+8. Every loaded phase runs at configured defaults `256`/`2` and satisfies both absolute and relative bounds: exactly eight executor workers for four owners; no more than 64 Hub OS threads; no retained connection/entity/attach/timer resources; empty queue/in-flight work; workers bounded by owners times concurrency; queue depth bounded independently by capacity; no cleanup failure; no growth with reconnect generation count.
+9. After public disable, live plugin executors/workers equal the pre-load baseline. After orderly `down`, the shared provenance/process-group census asserts zero surviving Hub processes, zero owned `botster-session-worker` processes, zero zombie children, and zero live or stale sockets under the campaign data directory. A SID-only result cannot satisfy this gate.
+10. The unstressed idle observation has stable deterministic counters and CPU within the committed near-zero ceiling on the CI Linux selector and both supported operator recipes; stressed runs use deterministic resource gates and record CPU only.
+11. `.github/workflows/loaded-daemon-lifecycle.yml` exposes `focused-plugin-resource-bounds`, runs it with `stress_profile=none`, and records exact Hub plus locked Core worker provenance and the existing survivor/zombie evidence. The existing `focused-connection-lifecycle` selector remains complementary downstream proof.
+12. `script/production-package-runtime-evidence verify` and the repository's secret/PII scans accept the new bounded artifacts.
+13. A final source scan confirms the four installed package revisions still declare zero timers; evidence shows the live timer count stayed zero rather than merely omitting the check. `botster-tui-kit` remains an exact source/build input and is not counted as an installed package.
 
 Code existence is insufficient: evidence must show the production `script/test-production-package-runtime` entrypoint invoked the probe against the same Hub used by all four installed packages and downstream Web/TUI checks.
 
