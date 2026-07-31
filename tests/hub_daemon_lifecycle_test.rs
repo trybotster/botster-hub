@@ -8803,7 +8803,12 @@ fn process_thread_count(pid: u32) -> Option<usize> {
             .output()
             .ok()?;
         if output.status.success() {
-            return Some(String::from_utf8_lossy(&output.stdout).lines().count());
+            return Some(
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .skip(1)
+                    .count(),
+            );
         }
     }
     None
@@ -8835,8 +8840,8 @@ fn focused_plugin_resources_are_bounded_across_reconnect_reload_idle_and_unload(
             .path
             .clone(),
     );
-    let child = start_cli_daemon(&data_dir);
-    let hub_pid = child.id();
+    let daemon = PanicSafeCliDaemon::start(&data_dir, "plugin resource bounds daemon evidence");
+    let hub_pid = daemon.child.as_ref().expect("panic-safe daemon child").id();
 
     for package_name in PACKAGE_NAMES {
         let package_dir = root.join(package_name);
@@ -8928,6 +8933,35 @@ fn focused_plugin_resources_are_bounded_across_reconnect_reload_idle_and_unload(
     assert_eq!(probe_evidence["checks"]["hub_threads"], true);
     assert_eq!(probe_evidence["checks"]["active_timer_resources"], true);
     assert_eq!(probe_evidence["exercised_entity_reconnects"], 4);
+
+    let non_converging_probe =
+        Command::new(Path::new(env!("CARGO_MANIFEST_DIR")).join("script/probe-hub-resources"))
+            .arg("--socket")
+            .arg(&endpoint.socket_path)
+            .arg("--hub-pid")
+            .arg(hub_pid.to_string())
+            .args([
+                "--phase",
+                "focused-non-converging-control",
+                "--expected-owners",
+                "3",
+                "--timeout-seconds",
+                "1",
+            ])
+            .output()
+            .expect("run non-converging resource probe control");
+    assert!(
+        !non_converging_probe.status.success(),
+        "non-converging resource probe passed unexpectedly"
+    );
+    let non_converging_evidence: serde_json::Value =
+        serde_json::from_slice(&non_converging_probe.stdout)
+            .expect("non-converging probe emits its last snapshot");
+    assert_eq!(non_converging_evidence["convergence"], "baseline_timeout");
+    assert_eq!(
+        non_converging_evidence["last_observed"]["workers"]["live_plugin_executors"],
+        4
+    );
 
     for package_name in PACKAGE_NAMES {
         let reload = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
@@ -9025,12 +9059,7 @@ fn focused_plugin_resources_are_bounded_across_reconnect_reload_idle_and_unload(
         );
     }
 
-    let shutdown = shutdown_cli_daemon(&data_dir, child);
-    assert!(
-        shutdown.status.success(),
-        "{}",
-        command_output_text(&shutdown)
-    );
+    daemon.shutdown();
 }
 
 #[test]

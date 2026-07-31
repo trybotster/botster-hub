@@ -182,7 +182,7 @@ In the fresh-mode path of `script/test-production-package-runtime`:
 - after `down`, reuse the loaded lifecycle cleanup census across executable provenance and relevant process groups—not one SID—to gate on zero surviving Hub processes, zero owned session workers, zero zombie children, and zero live or stale sockets under the campaign data directory;
 - retain the existing upgrade leg and ensure it cannot mask the fresh resource proof.
 
-The production evidence helper should add bounded JSON snapshots for declared package facts, lifecycle counters, worker/timer resource counters, OS census, and phase results while preserving existing secret/path/PII redaction.
+The production campaign routes bounded JSON snapshots for declared package facts, lifecycle counters, worker/timer resource counters, OS census, and phase results through its existing `capture`/`redact_file` path. The evidence helper retains its existing audit and PII-scan commands; no new artifact abstraction or subcommand is needed.
 
 ### 4. Add the CI-executable focused regression and close only mechanism gaps
 
@@ -227,8 +227,8 @@ CPU is corroborating evidence, not the sole idle gate. The no-stress focused Lin
 - `tests/hub_capability_runtime_test.rs` and/or `tests/hub_plugin_lifecycle_test.rs` — zero baseline and any missing reload timer cleanup proof.
 - `tests/hub_daemon_lifecycle_test.rs` — the exact CI-focused four-owner/default-knob/absolute-thread-bound regression plus minimal public-response assertions; retain the existing focused connection campaign.
 - `script/test-production-package-runtime` — wire resource phases into the real four-package path.
-- `script/production-package-runtime-evidence` — bounded, redacted resource/provenance artifacts.
-- One focused new `script/` resource probe and its script-level self-test if needed; reuse or minimally extract the loaded lifecycle cleanup census instead of implementing a second process/zombie census.
+- `script/test-production-package-runtime` plus the existing `script/production-package-runtime-evidence` capture/redaction path — bounded, redacted resource/provenance artifacts.
+- `script/probe-hub-resources`, `script/assert-no-plugin-timers`, and the minimally extracted shared `script/process-census`; the loaded lifecycle runner and production campaign consume the same process/zombie scanner.
 - `README.md` and a focused `docs/` resource-proof guide.
 - `.github/workflows/loaded-daemon-lifecycle.yml` and `script/run-loaded-daemon-lifecycle` — add the `focused-plugin-resource-bounds` no-stress CI selector and reuse its existing survivor/zombie cleanup machinery.
 
@@ -263,7 +263,7 @@ Implementation is complete only when all applicable checks pass from a clean rou
 9. After public disable, live plugin executors/workers equal the pre-load baseline. After orderly `down`, the shared provenance/process-group census asserts zero surviving Hub processes, zero owned `botster-session-worker` processes, zero zombie children, and zero live or stale sockets under the campaign data directory. A SID-only result cannot satisfy this gate.
 10. The unstressed idle observation has stable deterministic counters and CPU within the committed near-zero ceiling on the CI Linux selector and both supported operator recipes; stressed runs use deterministic resource gates and record CPU only.
 11. `.github/workflows/loaded-daemon-lifecycle.yml` exposes `focused-plugin-resource-bounds`, runs it with `stress_profile=none`, and records exact Hub plus locked Core worker provenance and the existing survivor/zombie evidence. The existing `focused-connection-lifecycle` selector remains complementary downstream proof.
-12. `script/production-package-runtime-evidence verify` and the repository's secret/PII scans accept the new bounded artifacts.
+12. `script/production-package-runtime-evidence audit` and `pii-scan`, plus the repository's secret/PII scans, accept the bounded probe artifacts routed through the existing `capture`/`redact_file` path. No new evidence-helper subcommand is required.
 13. A final source scan confirms the four installed package revisions still declare zero timers; evidence shows the live timer count stayed zero rather than merely omitting the check. `botster-tui-kit` remains an exact source/build input and is not counted as an installed package.
 
 Code existence is insufficient: evidence must show the production `script/test-production-package-runtime` entrypoint invoked the probe against the same Hub used by all four installed packages and downstream Web/TUI checks.
