@@ -55,6 +55,7 @@ readiness race, not a Hub delivery, ordering, or lifecycle-truth defect.
   [[clients subscribe to entities not ptys]],
   [[shared conformance fixtures that contradict the core contract teach clients the wrong state machine]],
   [[subprocess harnesses must kill child on failed readiness]],
+  [[input gated fixtures require explicit session cleanup]],
   [[loaded lifecycle ci precompiles the exact test target before synthetic cpu stress]],
   [[live hub proof records distinct hub and locked core binary provenance]],
   [[graceful-termination-requires-explicit-cleanup-hooks]], and
@@ -75,8 +76,11 @@ No loaded convention conflicted with the approved plan.
   - asserts `exit_code=0`;
   - keeps terminal-egress, removal, disconnect cleanup, and fresh authoritative
     reconnect coverage;
-  - reuses the existing panic-safe daemon owner under a generic name so a red
-    assertion shuts down or kills and reaps its exact daemon.
+  - arms `SessionCleanupGuard` immediately after spawn and disarms it only after
+    successful removal, so a red assertion removes the unbounded session,
+    worker, shell, and socket before the panic-safe daemon owner reaps the Hub;
+  - keeps WebRTC-only stderr classification behind the WebRTC constructor while
+    emitting session-entity diagnostics with the correct subsystem label.
 - `script/run-loaded-daemon-lifecycle`
   - admits and dispatches `focused-session-entity-resize` to the exact
     regression through `./test.sh`.
@@ -86,6 +90,9 @@ No loaded convention conflicted with the approved plan.
   - builds the worker with `--locked`;
   - resolves the Hub and worker binaries and rejects either path outside the
     fresh subject target directory.
+- `docs/loaded-daemon-lifecycle-runner.md`
+  - documents the exact focused session-entity selector, its diagnostic
+    purpose, and the five-repetition full-suite campaign it does not replace.
 - `docs/plans/stabilize-session-entity-resize-transition-under-load.md`
   - approved plan and Plan Review amendments.
 - `docs/reports/stabilize-session-entity-resize-transition-under-load-implement-report.md`
@@ -168,12 +175,38 @@ first next frame was the same `snapshot_seq=2` patch containing
 contained rows or columns. This classifies the race as process exit winning
 before resize, not a dropped or divergent entity delivery.
 
-The intentional panic exposed one exact daemon survivor from the diagnostic
-run. The owned process was terminated, and a follow-up worktree/runtime process
-and Unix-socket census returned no Hub or session-worker survivor. The final
-test now uses the existing panic-safe daemon owner, so the reproducible red
-path performs shutdown or exact-child kill/reap during unwinding. No temporary
-delay, panic, or timing output remains in the final tree.
+That pre-fix negative control used the original self-terminating fixture. Its
+intentional panic exposed one exact Hub daemon survivor, which was terminated;
+the session itself had already exited before the follow-up census. That census
+therefore proved cleanup only for the pre-fix fixture and is not evidence for
+the final input-gated fixture.
+
+Review's equivalent panic ablation on the input-gated fixture exposed the
+missing ownership boundary: the Hub daemon was reaped, but the durable
+session-worker, its read-blocked shell, and its control socket survived. The
+final test now combines the panic-safe daemon owner with a
+`SessionCleanupGuard` armed immediately after spawn and disarmed only after
+`SessionRemoved`.
+
+The post-fix ablation inserted this exact temporary statement after both
+subscribers' resize assertions:
+
+```diff
+@@
+     assert_eq!(
+         second_resize_sequence, resize_sequence,
+         "subscriber resize sequences diverged: first={first_resize:?} second={second_resize:?}"
+     );
++    panic!("panic-ablation-after-entity-resize");
+```
+
+The exact focused command failed with the intended exit status 101 and printed
+`session entity daemon evidence: ... daemon_status=exit status: 0`. An immediate
+census scoped to this run worktree, `entity-session`, and the
+`session-entity-subscription` data directory found no Hub, session worker,
+fixture shell, or control socket. The temporary panic was removed, and the
+focused test then passed. No temporary delay, panic, or timing output remains in
+the final tree.
 
 ## Conformance-runner measurement and decision
 
@@ -215,6 +248,8 @@ Passed locally:
 - `./test.sh`
 - `git diff --check`
 - exact focused regression after removal of all instrumentation: 1/1
+- forced panic after the two-subscriber resize transition: intended exit 101,
+  followed by zero run-worktree/session processes and zero fixture sockets
 - repo-owned focused harness, 10/10 repetitions at default test concurrency:
   every repetition passed, every run-token survivor census was zero, every test
   group was `post_clean=gone`, and `cleanup_status=0`
@@ -269,6 +304,40 @@ Linux loaded proof:
   The run-token and session survivor censuses were zero, all
   test/load/sampler groups were gone, and campaign `exit_status=0` with
   `cleanup_status=0`.
+- Review-remediation five-repetition full-suite contention workflow
+  [30590359513](https://github.com/trybotster/botster-hub/actions/runs/30590359513):
+  requested the repository's full five-repetition residual-tail budget on
+  immutable code subject
+  `a94981bab4f786a449d66f043694bf1ef3bb3c92`. Repetitions 1–3 passed every
+  suite. Repetition 4 stopped first-red with the unchanged
+  `cli_operator_console_starts_reuses_detaches_handles_ctrl_c_and_stops` test
+  waiting 30 seconds for a second `foreground app ` output occurrence; the
+  lifecycle binary reported 114 passed, 1 failed, and 1 ignored. The ticket's
+  session-entity regression passed in all four executed repetitions. Per-run
+  exit statuses were 0, 0, 0, and 101. Every repetition reported zero
+  run-token and session survivors, every test/load/sampler process group was
+  gone, and campaign `cleanup_status=0`.
+- Same-input authoritative-base workflow
+  [30592300735](https://github.com/trybotster/botster-hub/actions/runs/30592300735):
+  used the same workflow harness, requested repetitions, target, and
+  residual-tail profile against
+  `95e829ab039198177e14e17a494f93963951ea6f`. It stopped in repetition 1 with
+  the original session-entity resize failure plus
+  `package_entrypoint_supervision_passes_environment_overrides`; the
+  operator-console test passed. Cleanup detected three run-token descendants,
+  terminated them, verified the run-token group gone, reported zero session
+  survivors, removed every test/load/sampler process group, and finished with
+  `cleanup_status=0`.
+
+The exact operator-console test passed independently on both the final branch
+and authoritative base with the same `./test.sh --test
+hub_daemon_lifecycle_test ... --exact --nocapture` command. Combined with its
+passing status in branch repetitions 1–3, its passing status in the
+same-input base run, the absence of any changed operator-console path, and the
+branch's four loaded passes of the ticket regression, the repetition-4 red is
+attributed to a nondeterministic unchanged-path load flake rather than this
+session-entity change. First-red behavior correctly prevented a fifth
+repetition from hiding that evidence.
 
 ## Deviations from plan
 
@@ -277,6 +346,12 @@ plain `Child` ownership could survive a panic, so the implementation also
 renamed and reused the file's existing panic-safe daemon owner. That change is
 cleanup made necessary by the approved red/green procedure and teardown
 acceptance, not adjacent lifecycle refactoring.
+
+Review then proved that daemon ownership alone was insufficient for the new
+input-gated fixture. The added session guard, role-correct panic diagnostics,
+operator documentation, and five-repetition full-suite campaign are direct
+repairs for Review findings and the ticket's cleanup/repeated-load acceptance,
+not broader production work.
 
 The workflow's explicit Core-SHA and binary-realpath recording was added after
 the first measurement artifact showed that build provenance was inferable but
@@ -295,11 +370,23 @@ not broaden runtime behavior.
 - `SessionLifecycleSubscriptionConformanceReport` still proves eventual
   matching delivery rather than absence of preceding frames. This report does
   not upgrade that claim.
+- The input-gated fixture would be a permanent orphan risk without explicit
+  session ownership. That risk is now guarded and the forced-panic path has
+  zero-survivor proof; Verify should repeat that ablation rather than infer
+  cleanup from a clean Hub exit.
+- The requested five-repetition full-suite campaign stopped on an unchanged
+  operator-console load flake in repetition 4, so repetition 5 did not execute.
+  Exact branch/base isolation is green and the same-input base aggregate passed
+  that test, but this ticket does not repair or claim to resolve the separate
+  operator-console output-progress flake.
 
 ## Missing vault guidance and durable capture
 
-None. Existing semantic-readiness, panic cleanup, exact process ownership,
-retained-output, ordered-fixture, wrapper-test, and loaded-provenance notes
-covered the implementation discoveries. The rows-versus-exit-code correction
-is ticket-specific and is already durable in the human answer, approved plan,
-and this report, so no new vault capture is warranted.
+Review identified and captured the reusable gap as
+[[input gated fixtures require explicit session cleanup]]. It records that an
+input barrier trades a transient readiness race for an unbounded fixture and
+therefore requires session-scoped unwind ownership through successful removal.
+The note is linked from the Botster reviewer/verifier guidance and CLI patterns.
+No additional capture is needed. The rows-versus-exit-code correction remains
+ticket-specific and is durable in the human answer, approved plan, and this
+report.
