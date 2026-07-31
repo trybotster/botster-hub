@@ -7,7 +7,7 @@
 - Target repository: `trybotster/botster-hub`.
 - Target ID: `tgt_7e208a0c76a44980a83b63af976b1f22`.
 - Implementation SHA:
-  `7c9cd67bc98f3ea562544291980c00a56b0a93a4`.
+  `3de6963ea2e8438fa6e03d344c68dc1a74c5f157`.
 - Authoritative base SHA:
   `b1bca77a16c36276ffba6ea726b54ae0664e905b`.
 - Pull request:
@@ -23,8 +23,8 @@ to `trybotster/botster-hub`. Work remained inside the routed run worktree.
 - [[botster-hub-playbook]]
 - [[project-pipelines-playbook]] for workflow discipline only; no Project
   Pipelines package/plugin product source changed.
-- `/Users/jasonconigliari/knowledge/self/identity.md`
-- `/Users/jasonconigliari/knowledge/self/goals.md`
+- [[identity]]
+- [[goals]]
 - [[daemon shutdown disconnects count as success only after clean owned process exit]]
 - [[worker shutdown completion requires lifecycle transport and process termination]]
 - [[bounded command execution requires process group termination and reaping]]
@@ -47,16 +47,14 @@ metadata-owned runtime state, receive the daemon response, and call
 `complete_owned_runtime_daemon_shutdown`. Completion still requires PID
 absence before socket and metadata removal.
 
-Two parent topologies now complete deterministically:
-
-1. When the command performing shutdown is the exact daemon parent,
-   `reap_owned_child_if_exited` uses `waitpid(WNOHANG)`. A zero exit is accepted;
-   a signal or nonzero exit returns
-   `LocalRuntimeError::OwnedDaemonExitedAbnormally`.
-2. When a long-lived operator console started the daemon and a separate CLI
-   performs shutdown, the console owns a background `Child::wait()` thread.
-   The console remains usable while that thread reaps the daemon, allowing the
-   non-parent shutdown CLI's PID-absence wait to finish.
+Parent and non-parent topologies now complete deterministically. A long-lived
+operator console transfers its daemon child to a background `Child::wait()`
+thread. The console remains usable while that thread reaps the daemon, allowing
+an external shutdown CLI's PID-absence wait to finish. The shutdown path may
+also opportunistically reap an owned child with `waitpid(WNOHANG)`, but wait
+status is not part of the completion contract because the background waiter is
+the single practical owner of it. Successful completion requires the daemon's
+shutdown response followed by PID absence.
 
 Short-lived `up` behavior remains unchanged in effect: its process exits after
 readiness and the daemon is adopted normally. The ten-second shutdown budget
@@ -109,10 +107,21 @@ was added.
 - The Darwin session-pointer caveat is restored next to `all_process_rows`;
   numeric session zombie assertions remain Linux-only.
 - A live operator-console production topology is tested and reaped.
-- Direct-child abnormal exit status is rejected and documented.
+- The documented completion contract requires the daemon's successful response
+  plus PID absence and does not claim an unavailable child wait status.
 - The occupied web-port first root was isolated on branch and base with the
   same command/stress, and the diagnostic race was fixed before rerunning the
   complete suite.
+
+The second Review round identified two report/contract defects and both were
+removed without changing deterministic shutdown behavior:
+
+- Local absolute vault paths were replaced by `[[identity]]` and `[[goals]]`.
+- The background waiter wins the child wait-status race in production, so the
+  unreachable abnormal-exit error, its synthetic direct-child unit, and the
+  clean-wait-status claim were removed. The contract now states the behavior
+  actually wired in both parent and non-parent topologies: successful daemon
+  response followed by observed PID absence.
 
 The earlier runs 30609814800, 30610014273, 30609817554, and 30611916117 remain
 historical characterization only. Their role-zombie scans hit an awk parse
@@ -121,11 +130,17 @@ acceptance evidence after Review.
 
 ## Corrected Linux workflow evidence
 
-All corrected runs use the workflow harness from implementation SHA
+All corrected loaded runs use the workflow harness from lifecycle SHA
 `7c9cd67bc98f3ea562544291980c00a56b0a93a4`, Ubuntu 24.04, default Cargo test
 parallelism, four CPUs, 48 residual-tail stress workers, and the locked Core
 revision resolved by the repository. Subject checkouts are the implementation
 SHA except where an authoritative-base comparison is named explicitly.
+
+Follow-up SHA `3de6963ea2e8438fa6e03d344c68dc1a74c5f157` only removes an
+unreachable wait-status branch and corrects its documentation; the background
+waiter, PID-absence predicate, production-topology test, runner, and loaded
+behavior are unchanged. The complete local wrapper and both metadata-owned
+tests were rerun at the follow-up SHA.
 
 - Focused metadata-owned shutdown:
   [30617403730](https://github.com/trybotster/botster-hub/actions/runs/30617403730).
@@ -217,7 +232,6 @@ No acceptance criterion was narrowed or waived.
 - `./test.sh --test hub_daemon_lifecycle_test metadata_owned_daemon --
   --nocapture`: 2 passed.
 - `readiness_failure_waits_for_delayed_exit_diagnostics`: passed.
-- `owned_runtime_reap_rejects_abnormal_direct_child_exit`: passed.
 - Existing operator-console and ordinary metadata-owned shutdown paths:
   passed.
 
@@ -228,13 +242,10 @@ default wrapper are the cited local evidence.
 
 ## Assumptions, unverified behavior, and residual risk
 
-- A non-parent shutdown client cannot retrieve another process's wait status.
-  Its success therefore combines a successful daemon shutdown response with
-  independently observed PID absence. An exact parent additionally requires
-  clean wait status.
-- The console's background waiter intentionally discards status because the
-  external shutdown command is the success authority in that topology; its PID
-  absence wait and daemon response remain required.
+- The background waiter is the single practical owner of the child wait status
+  and intentionally discards it. The daemon's successful response plus observed
+  PID absence are the shutdown completion contract in both parent and
+  non-parent topologies.
 - Local Darwin cannot execute the Linux `setsid`/numeric-SID positive control.
   The corrected GitHub Ubuntu self-test is the binding proof.
 - The setup-zig action emits a GitHub Node.js deprecation annotation. It does
@@ -246,8 +257,11 @@ default wrapper are the cited local evidence.
 
 ## Missing vault guidance discovered
 
-Existing notes correctly require clean owned-process exit and explain that a
-non-parent cannot reap another process. They do not explicitly record the
+Existing notes require clean owned-process completion and explain that a
+non-parent cannot reap another process. In this topology the successful daemon
+response supplies protocol-level success and PID absence supplies the terminal
+process state; the single background waiter consumes and discards the wait
+status. The notes do not explicitly distinguish that topology or record the
 complementary long-lived-owner rule: a console that starts a metadata-owned
 daemon must keep a waiter for that exact child so an external shutdown can
 observe PID absence while the console remains alive.
