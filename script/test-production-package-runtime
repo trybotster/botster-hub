@@ -821,6 +821,7 @@ if [ "$mode" = fresh ] || [ "$mode" = all ]; then
   capture_in tui-live-hub "$tui_repo" env \
     BOTSTER_HUB_BIN="$hub_bin" \
     BOTSTER_SESSION_WORKER_BIN="$session_worker_bin" \
+    BOTSTER_PLUGIN_CONTRACT_MATRIX_FIXTURE="$installed_support/fixtures/plugin-contract-matrix" \
     ./script/test-live-hub
   run_fresh_resource_generations "$fresh_data"
   down_runtime_leg fresh "$fresh_data"
