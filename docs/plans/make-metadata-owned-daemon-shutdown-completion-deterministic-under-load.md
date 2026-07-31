@@ -384,9 +384,17 @@ leading hypothesis.
   `./test.sh --test hub_daemon_lifecycle_test cli_shutdown_waits_for_metadata_owned_runtime_daemon_cleanup -- --exact --nocapture`.
 - Adjacent lifecycle paths:
   `cli_local_runtime_up_starts_reuses_and_down_stops_runtime`,
-  `cli_local_runtime_bootstrap_reuses_live_daemon_and_preserves_state_after_restart`,
-  the operator-console shutdown test, and daemon response-delivery tests pass
-  without changes to their response ordering or foreground behavior.
+  `process_ownership_daemon_restart_adopts_then_shuts_down_worker_session`,
+  and
+  `cli_operator_console_starts_reuses_detaches_handles_ctrl_c_and_stops`
+  pass, proving startup/reuse/down, restart/adoption/worker cleanup, and the
+  existing operator-console shutdown path without foreground behavior changes.
+  The exact daemon response-delivery tests
+  `daemon_shutdown_waits_for_response_delivery_before_stopping`,
+  `daemon_shutdown_releases_when_delivery_owner_drops`,
+  `daemon_shutdown_releases_when_response_receiver_drops`, and
+  `daemon_shutdown_write_failure_releases_stop_and_preserves_error` also pass
+  without response-ordering changes.
 - Unchanged stale/recovery paths:
   `cli_home_runtime_up_recovers_owned_incompatible_daemon`,
   `cli_local_runtime_down_recovers_owned_incompatible_daemon`,
