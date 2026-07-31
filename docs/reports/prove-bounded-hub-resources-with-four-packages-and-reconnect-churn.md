@@ -49,11 +49,15 @@
 - `README.md`, `docs/client-protocol.md`, `docs/hub-resource-proof.md`, and the
   committed plan — operator contract, diagnostics, and implementation-aligned
   acceptance criteria.
-- `docs/reports/hub-test-support-0.1.17-release-evidence.json` — immutable
+- `docs/reports/hub-test-support-0.1.18-release-evidence.json` — immutable
   release-content commit, tarball integrity, dependency order, clean-install
   proof, and operator handoff.
 - `packages/hub-test-support/daemon-protocol.ts` and `metadata.json` — synced
   Hub-owned npm release assets for the additive protocol field.
+- `packages/hub-test-support/package.json`, `test.mjs`, and `README.md` — fresh
+  0.1.18 coordinate after immutable 0.1.17 was found to contain stale bytes.
+- `script/publish-npm-packages` — exact-integrity validation before an
+  already-published prerequisite may be skipped.
 - `test.sh` — fails the repository wrapper when the Hub-owned npm assets drift.
 - This report.
 
@@ -67,20 +71,24 @@ package repository was edited, and terminal bytes remain on the existing
 SessionIo/ClientWorker path.
 
 Hub now owns and completes the source/generated/package-copy portion of the
-protocol release chain: `@trybotster/hub-test-support@0.1.17` contains the
+protocol release chain: `@trybotster/hub-test-support@0.1.18` contains the
 synced `plugin_resource_counters` bytes and matching metadata. Human answer
 `question_1785521549_236526` prohibits pipeline agents from publishing npm
 releases. Follow-up answer `question_1785522029_180355` confirmed the dependency
 `@trybotster/ui-contract@0.2.0` is part of the same Hub-owned release batch. The
 operator command after reviewing
-`docs/reports/hub-test-support-0.1.17-release-evidence.json` is
+`docs/reports/hub-test-support-0.1.18-release-evidence.json` is
 `script/publish-npm-packages` from the committed Hub root; the script publishes
-ui-contract before hub-test-support and stops on failure.
+ui-contract before hub-test-support and stops on failure. Because ui-contract
+0.2.0 is now published, the script validates its registry integrity against the
+locally packed tarball before skipping it. Published hub-test-support 0.1.17
+contains stale daemon-protocol bytes and is explicitly superseded; npm
+immutability requires the cold-turkey 0.1.18 move.
 
 The remaining vendored-byte and exact-pin update is Follow-up
 `ticket_1785515827_864108`, routed to the `botster-web` target and registered as
 dependency `dependency_1785515833_230748`. It remains blocked until the human
-confirms npm serves 0.1.17. This Hub run does not bypass registry artifact
+confirms npm serves 0.1.18 with the recorded integrity. This Hub run does not bypass registry artifact
 parity or patch Web.
 
 ## Deviations from plan
@@ -102,6 +110,10 @@ parity or patch Web.
   executable provenance; zombies use a settled pre-campaign baseline because
   `<defunct>` rows retain neither argv nor, on Darwin, `comm`. Darwin therefore
   compares every new zombie while Linux retains the Botster-role filter.
+- The operator published 0.1.17 from stale package bytes, so the immutable npm
+  coordinate could not be repaired. The implementation moved cold-turkey to
+  unused 0.1.18, retained the collision as negative release evidence, and
+  updated the separately routed Web ticket without editing Web.
 
 ## Verification
 
@@ -126,11 +138,13 @@ Passed:
 - `node packages/hub-test-support/scripts/sync-assets.mjs --check`
 - `script/publish-npm-packages --dry-run`, covering generation/check/test/pack
   for both `@trybotster/ui-contract@0.2.0` and
-  `@trybotster/hub-test-support@0.1.17`
-- a clean temporary-project install of those exact two tarballs, followed by
+  `@trybotster/hub-test-support@0.1.18`
+- a clean temporary-project install of published ui-contract 0.2.0 and the
+  exact local hub-test-support 0.1.18 tarball, followed by
   package import, asset verification, protocol-field/hash validation, and
   plugin fixture materialization
-- registry checks confirming both target versions still return npm 404
+- registry checks confirming ui-contract 0.2.0 matches its locally packed
+  integrity and hub-test-support 0.1.18 still returns npm 404
 - loaded selector validation with `stress_profile=none`, plus a negative check
   proving `moderate` exits 2
 - shell/Ruby syntax checks and `git diff --check`
@@ -143,7 +157,7 @@ retired them stepwise through public disable, and ended with zero timer,
 queued-job, and in-flight-job resources.
 
 The exact-coordinate fresh campaign remains correctly blocked before launch:
-the Hub-owned 0.1.17 package is publish-ready but is not yet available from npm,
+the Hub-owned 0.1.18 package is publish-ready but is not yet available from npm,
 and Web cannot consume or vendor it until the human publication step completes.
 No sibling-worktree or local-tarball override is accepted as four-package
 production proof.
@@ -151,7 +165,7 @@ production proof.
 ## Unverified behavior and residual risk
 
 - The exact named-package fresh campaign cannot execute its new phases until a
-  human publishes the prepared 0.1.17 artifact and
+  human publishes the prepared 0.1.18 artifact and
   `ticket_1785515827_864108` updates Web's generated/vendored protocol and exact
   pin. After that dependency closes, rerun the unchanged campaign and retain
   its redacted evidence bundle.
