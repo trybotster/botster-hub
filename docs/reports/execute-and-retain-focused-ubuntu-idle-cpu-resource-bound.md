@@ -125,9 +125,9 @@ production campaign, and this ticket makes no such claim.
 ## Missing vault guidance
 
 Review identified and captured two reusable rules that were missing from the
-processed vault: header-bearing survivor files require a present/header-only
-predicate rather than an emptiness check, and an environment-gated assertion
-can be proven executed by an unconditional observation plus the absence of its
-distinct else-branch marker. The captures are preserved in the vault inbox
-archive for later processing. Existing notes already cover the underlying need
-for independent live, session, and zombie cleanup oracles.
+processed vault: [[header bearing survivor evidence files invert the emptiness
+predicate]] and [[env gated assertions are proven executed by the absent else
+branch marker]]. Both rules have since been processed into canonical vault
+notes, with their source captures retained in the vault archive. Existing notes
+also cover the underlying need for independent live, session, and zombie
+cleanup oracles.
