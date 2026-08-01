@@ -47,7 +47,7 @@ The implementation also followed the approved revision at `docs/plans/accept-bou
   - `docs/plans/accept-bound-sentinels-for-required-bindable-fields.md`
   - this report
 
-Authored validation now accepts a structurally valid `$bind` sentinel for the seven proven required-bindable fields. Class A keeps nonblank string-or-bind semantics for Button/IconButton/MenuItem `label`, Form `submit_label`, and Iframe `src`/`title`. Class B keeps Text `text` presence-only literal semantics, including empty string, number, and null, while accepting valid binds. Representative required non-bindable fields still reject sentinels. Strict realized validation recursively rejects unresolved binds, bound identity/list constructs, and sentinels nested in action payloads.
+Authored validation now accepts a structurally valid `$bind` sentinel for the seven proven required-bindable fields. Class A keeps nonblank string-or-bind semantics for Button/IconButton/MenuItem `label`, Form `submit_label`, and Iframe `src`/`title`. Class B keeps Text `text` presence-only literal semantics, including empty string, number, and null, while accepting valid binds. Every required non-bindable field rejects sentinels in Rust, TypeScript declarations, and JSON Schema. Strict realized validation recursively rejects unresolved binds, including Custom freeform payloads, bound identity/list constructs, and sentinels nested in action payloads. A combined realized-tree/capability API removes ambiguity for Rust renderer consumers; the npm package intentionally remains a DTO/schema/fixture package without a JavaScript runtime validator.
 
 Prepared coordinated unpublished identities are `@trybotster/ui-contract@0.3.1`, `@trybotster/hub-test-support@0.1.20`, and conformance fixture revision `27`; publication remains a manual post-merge operator action.
 
@@ -61,24 +61,27 @@ No new cross-repository prerequisite was discovered. The existing downstream TUI
 
 - No semantic deviation.
 - Generated field-specific JSON Schema and TypeScript aliases were necessary to express the approved matrix in published artifacts; no shared Rust schema-metadata refactor was introduced.
+- Review follow-up extended the generated non-bindable declarations/schema branches to every kind with required props, added instance-level schema validation through the dev-only `jsonschema` crate, and made the existing label bindability allowlist load-bearing from `validate_required_label`.
 - The live daemon assertion records the exact source value `current`; capitalization would be presentation behavior outside this contract.
 - A clean npm consumer needed a task-local npm cache because the user cache was not writable in the sandbox. Both tarballs were then installed offline and tested together.
 
 ## Verification and downstream proof
 
 - Red-before proof: `./test.sh -p botster-ui-contract authored_button_accepts_required_bound_label -- --exact` failed with `Button missing required label` before the validator change.
-- Focused contract suites: `./test.sh -p botster-ui-contract` passed (3 generated-asset tests and 81 semantic tests).
+- Focused contract suites: `./test.sh -p botster-ui-contract` passed (4 generated-asset tests and 81 semantic tests).
 - Test-support suites: `./test.sh -p botster-hub-test-support` passed (42 tests and 3 doctests).
 - Hub runtime admission tests passed for a valid required bound label, malformed required label rejection, and action replacement binding admission.
 - `./test.sh --test hub_client_api_test` passed (24 tests).
 - `./test.sh --test hub_daemon_lifecycle_test daemon_plugin_contract_matrix_fixture_exercises_public_package_contracts` passed through a real isolated Hub and locked session worker, including the realized `current` Button label.
+- The review-follow-up rerun of that live test first hit the restricted sandbox's local process/socket boundary (`Operation not permitted`) and then passed unchanged with the required execution permission; the full wrapper subsequently passed it in the normal test run.
 - `cargo build --locked -p botster-core --bin botster-session-worker` passed against Core `5846fc776d31e2b6c98a8d932f50a31078743901`.
 - `cargo fmt --all -- --check` passed.
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings` passed.
 - `./test.sh` passed: all repository tests green; one documented adversarial test remained ignored by design.
 - UI package `run check` and `test` passed; Hub test-support `run check` and `test` passed.
+- Generated JSON Schema instance tests accept all authored/realized required-bindable fixtures and reject malformed sentinels plus required non-bindable Form, Table, and SelectOption sentinels.
 - `npm pack --dry-run --json` passed for both packages and included expected declarations, schema, conformance fixtures, metadata, fixtures, and licenses.
-- Actual `0.3.1` and `0.1.20` tarballs installed together in a clean temporary consumer. The smoke test verified exact versions/dependency/revision, generated schema and declarations, checksums, licenses, realized label `current`, and absence of unresolved `$bind` values.
+- Actual `0.3.1` and `0.1.20` tarballs installed together in a fresh clean temporary consumer after review. The smoke test verified exact versions/dependency/revision, generated bindable and non-bindable declarations, complete Table schema coverage, checksums, licenses, realized label `current`, and absence of unresolved `$bind` values.
 - Live registry collision check found published UI versions through `0.2.0` and Hub test-support through `0.1.18`; the prepared identities do not collide.
 
 ## Residual risk and vault guidance

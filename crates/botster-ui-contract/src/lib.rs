@@ -568,6 +568,11 @@ impl UiCapabilitySet {
         validate_ui_node_with_capabilities(node, self)
     }
 
+    /// Validate that a realized node can be rendered or downgraded by this capability set.
+    pub fn validate_realized_node(&self, node: &UiNode) -> Result<(), UiValidationError> {
+        validate_ui_node_realized_with_capabilities(node, self)
+    }
+
     fn supports_fallback(&self, fallback: UiCapabilityFallback) -> bool {
         self.fallbacks.contains(&fallback)
     }
@@ -921,9 +926,25 @@ pub fn validate_ui_node_with_capabilities(
     node: &UiNode,
     capabilities: &UiCapabilitySet,
 ) -> Result<(), UiValidationError> {
+    validate_ui_node_with_capabilities_in_phase(node, capabilities, UiValidationPhase::Authored)
+}
+
+/// Validate one realized semantic UI node against renderer capabilities.
+pub fn validate_ui_node_realized_with_capabilities(
+    node: &UiNode,
+    capabilities: &UiCapabilitySet,
+) -> Result<(), UiValidationError> {
+    validate_ui_node_with_capabilities_in_phase(node, capabilities, UiValidationPhase::Realized)
+}
+
+fn validate_ui_node_with_capabilities_in_phase(
+    node: &UiNode,
+    capabilities: &UiCapabilitySet,
+    phase: UiValidationPhase,
+) -> Result<(), UiValidationError> {
     validate_node(
         node,
-        UiValidationPhase::Authored,
+        phase,
         UiValidationContext::Static,
         &mut BTreeSet::new(),
     )
@@ -1579,7 +1600,7 @@ fn validate_node(
                 schema.required_props.contains(&prop.as_str()),
             )?;
         } else {
-            validate_custom_payload_prop(node.kind, prop, value)?;
+            validate_custom_payload_prop(node.kind, prop, value, phase)?;
         }
     }
 
@@ -2322,6 +2343,7 @@ fn validate_custom_payload_prop(
     kind: UiNodeKind,
     prop: &str,
     value: &Value,
+    phase: UiValidationPhase,
 ) -> Result<(), UiValidationError> {
     if prop == "fallback" {
         return Err(UiValidationError::InvalidProp {
@@ -2354,6 +2376,10 @@ fn validate_custom_payload_prop(
             }
         })?;
         validate_bind_path(path)?;
+    }
+
+    if phase == UiValidationPhase::Realized {
+        reject_unresolved_bind(kind, prop, value)?;
     }
 
     Ok(())
@@ -2672,6 +2698,9 @@ fn validate_required_label(node: &UiNode) -> Result<(), UiValidationError> {
     let Some(label) = node.props.get("label") else {
         return Err(UiValidationError::MissingLabel { kind: node.kind });
     };
+    if !is_required_bindable_prop(node.kind, "label") {
+        return Err(UiValidationError::MissingLabel { kind: node.kind });
+    }
     validate_nonblank_string_or_bind_prop(node.kind, "label", label)
         .map_err(|_| UiValidationError::MissingLabel { kind: node.kind })
 }

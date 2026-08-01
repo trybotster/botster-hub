@@ -195,8 +195,11 @@ re-exports the same typed daemon bodies; clients must not maintain local
 Hub validates plugin surfaces and accepted replacement trees as authored
 UiNodes. Required bindable fields are the explicit seven-field contract:
 Button/IconButton/MenuItem `label`, Form `submit_label`, Iframe `src` and
-`title`, and Text `text`. Renderer clients materialize these bindings and use
-the strict realized validator; Hub intentionally does not materialize UI trees.
+`title`, and Text `text`. Renderer clients materialize these bindings; Rust
+clients use the contract crate's strict realized validator, while non-Rust
+clients enforce the equivalent sentinel-free boundary in their own runtime.
+The npm contract package does not export a JavaScript runtime validator. Hub
+intentionally does not materialize UI trees.
 The packaged plugin-contract-matrix proves the user-shaped path through a real
 isolated Hub and plugin worker: rendered action metadata dispatches an accepted
 presentation `set`, scoped client state opens the delivered Dialog and satisfies
