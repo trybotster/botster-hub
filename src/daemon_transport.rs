@@ -848,6 +848,8 @@ fn handle_connection_cleanup(
         failed |= cleanup_detach_failed(&result);
     }
     if failed {
+        // `connection_cleanup_ignores_only_an_already_removed_session` is the
+        // designated positive control for predicate-true cleanup failures.
         state.lifecycle_counters.cleanup_failed =
             state.lifecycle_counters.cleanup_failed.saturating_add(1);
     } else {

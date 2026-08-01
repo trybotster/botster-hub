@@ -89,8 +89,8 @@ when checked assets are stale. The metadata's protocol version and conformance
 fixture revision are emitted by the Rust `botster-hub-test-support` asset
 generator instead of being maintained independently in JavaScript.
 
-After version 0.1.18 is published to the public npm registry, npm-based client
-repos such as botster-web should use the exact dependency spec
+Version 0.1.18 is published to the public npm registry. npm-based client repos
+such as botster-web use the exact dependency spec
 `"@trybotster/hub-test-support": "0.1.18"` in `devDependencies` and let npm write
 the corresponding package-lock entry from the public npm registry. The package
 is public, so registry install does not require a scoped `.npmrc` entry or CI
