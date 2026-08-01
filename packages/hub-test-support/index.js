@@ -138,7 +138,10 @@ function inspectSessionPluginSurface(surface) {
           type: "button",
           id: { $kind: "bind_list_descendant_id", key },
           props: {
-            label: `${key[0].toUpperCase()}${key.slice(1)} session`,
+            label:
+              key === "spawn"
+                ? { $bind: "@/lifecycle_class" }
+                : `${key[0].toUpperCase()}${key.slice(1)} session`,
             action: {
               id: "contract.action",
               payload: {
@@ -243,18 +246,55 @@ export function materializeSessionPluginRows(surface, frames) {
         const key = control.id.key;
         const nodeId = realizeBindListDescendantId(entity.session_uuid, key);
         insertRealizedNodeId(seen, nodeId);
+        const label = materializeControlLabel(control, entity);
+        const actionPayload = {
+          operation: key,
+          session_uuid: entity.session_uuid,
+        };
+        assertRealizedRequiredValues({
+          type: "button",
+          id: nodeId,
+          props: {
+            label,
+            action: { id: "contract.action", payload: actionPayload },
+          },
+        });
         return {
           key,
           node_id: nodeId,
-          action_payload: {
-            operation: key,
-            session_uuid: entity.session_uuid,
-          },
+          label,
+          action_payload: actionPayload,
         };
       }),
     });
   }
   return rows;
+}
+
+function materializeControlLabel(control, entity) {
+  const label = control?.props?.label;
+  if (typeof label === "string") return label;
+  const path = label?.$bind;
+  if (typeof path !== "string" || !path.startsWith("@/")) {
+    throw new TypeError("identity-bearing control label is not a string or item-relative bind");
+  }
+  const field = path.slice(2);
+  if (typeof entity[field] !== "string") {
+    throw new TypeError(`selected session row is missing string ${field}`);
+  }
+  return entity[field];
+}
+
+function assertRealizedRequiredValues(value) {
+  if (Array.isArray(value)) {
+    for (const child of value) assertRealizedRequiredValues(child);
+    return;
+  }
+  if (!value || typeof value !== "object") return;
+  if (Object.hasOwn(value, "$bind")) {
+    throw new TypeError("unresolved binding sentinel remains after materialization");
+  }
+  for (const child of Object.values(value)) assertRealizedRequiredValues(child);
 }
 
 function insertRealizedNodeId(seen, nodeId) {

@@ -568,6 +568,11 @@ impl UiCapabilitySet {
         validate_ui_node_with_capabilities(node, self)
     }
 
+    /// Validate that a realized node can be rendered or downgraded by this capability set.
+    pub fn validate_realized_node(&self, node: &UiNode) -> Result<(), UiValidationError> {
+        validate_ui_node_realized_with_capabilities(node, self)
+    }
+
     fn supports_fallback(&self, fallback: UiCapabilityFallback) -> bool {
         self.fallbacks.contains(&fallback)
     }
@@ -856,9 +861,19 @@ pub struct UiNode {
 }
 
 impl UiNode {
-    /// Validate the semantic UI contract recursively.
+    /// Validate an authored semantic UI tree recursively.
     pub fn validate(&self) -> Result<(), UiValidationError> {
-        validate_ui_node(self)
+        self.validate_authored()
+    }
+
+    /// Validate an authored semantic UI tree recursively before binding materialization.
+    pub fn validate_authored(&self) -> Result<(), UiValidationError> {
+        validate_ui_node_authored(self)
+    }
+
+    /// Validate a realized semantic UI tree recursively after binding materialization.
+    pub fn validate_realized(&self) -> Result<(), UiValidationError> {
+        validate_ui_node_realized(self)
     }
 
     /// Return the declared fallback for a validated custom component node.
@@ -881,9 +896,29 @@ impl UiNode {
     }
 }
 
-/// Validate one semantic UI node recursively.
+/// Validate one authored semantic UI node recursively.
 pub fn validate_ui_node(node: &UiNode) -> Result<(), UiValidationError> {
-    validate_ui_node_in_context(node, UiValidationContext::Static, &mut BTreeSet::new())
+    validate_ui_node_authored(node)
+}
+
+/// Validate one authored semantic UI node recursively before binding materialization.
+pub fn validate_ui_node_authored(node: &UiNode) -> Result<(), UiValidationError> {
+    validate_ui_node_in_context(
+        node,
+        UiValidationPhase::Authored,
+        UiValidationContext::Static,
+        &mut BTreeSet::new(),
+    )
+}
+
+/// Validate one realized semantic UI node recursively after binding materialization.
+pub fn validate_ui_node_realized(node: &UiNode) -> Result<(), UiValidationError> {
+    validate_ui_node_in_context(
+        node,
+        UiValidationPhase::Realized,
+        UiValidationContext::Static,
+        &mut BTreeSet::new(),
+    )
 }
 
 /// Validate one semantic UI node against renderer capabilities.
@@ -891,13 +926,34 @@ pub fn validate_ui_node_with_capabilities(
     node: &UiNode,
     capabilities: &UiCapabilitySet,
 ) -> Result<(), UiValidationError> {
-    validate_node(node, UiValidationContext::Static, &mut BTreeSet::new())
-        .and_then(|()| validate_node_capabilities(node, capabilities))
-        .map_err(|error| UiValidationError::Node {
-            id: node.id.clone(),
-            kind: node.kind,
-            source: Box::new(error),
-        })
+    validate_ui_node_with_capabilities_in_phase(node, capabilities, UiValidationPhase::Authored)
+}
+
+/// Validate one realized semantic UI node against renderer capabilities.
+pub fn validate_ui_node_realized_with_capabilities(
+    node: &UiNode,
+    capabilities: &UiCapabilitySet,
+) -> Result<(), UiValidationError> {
+    validate_ui_node_with_capabilities_in_phase(node, capabilities, UiValidationPhase::Realized)
+}
+
+fn validate_ui_node_with_capabilities_in_phase(
+    node: &UiNode,
+    capabilities: &UiCapabilitySet,
+    phase: UiValidationPhase,
+) -> Result<(), UiValidationError> {
+    validate_node(
+        node,
+        phase,
+        UiValidationContext::Static,
+        &mut BTreeSet::new(),
+    )
+    .and_then(|()| validate_node_capabilities(node, capabilities))
+    .map_err(|error| UiValidationError::Node {
+        id: node.id.clone(),
+        kind: node.kind,
+        source: Box::new(error),
+    })
 }
 
 /// Narrow v1 field kinds shared by form fields and input primitives.
@@ -1336,7 +1392,7 @@ impl UiActionResult {
 
         if let Some(replacement) = &self.replacement {
             replacement
-                .validate()
+                .validate_authored()
                 .map_err(UiActionResultValidationError::InvalidReplacement)?;
         }
 
@@ -1475,6 +1531,12 @@ enum UiValidationContext {
     UnboundBindListItemDescendant,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UiValidationPhase {
+    Authored,
+    Realized,
+}
+
 impl UiValidationContext {
     fn child(self, node: &UiNode) -> Self {
         match self {
@@ -1494,10 +1556,11 @@ impl UiValidationContext {
 
 fn validate_ui_node_in_context(
     node: &UiNode,
+    phase: UiValidationPhase,
     context: UiValidationContext,
     descendant_keys: &mut BTreeSet<String>,
 ) -> Result<(), UiValidationError> {
-    validate_node(node, context, descendant_keys).map_err(|error| UiValidationError::Node {
+    validate_node(node, phase, context, descendant_keys).map_err(|error| UiValidationError::Node {
         id: node.id.clone(),
         kind: node.kind,
         source: Box::new(error),
@@ -1506,12 +1569,13 @@ fn validate_ui_node_in_context(
 
 fn validate_node(
     node: &UiNode,
+    phase: UiValidationPhase,
     context: UiValidationContext,
     descendant_keys: &mut BTreeSet<String>,
 ) -> Result<(), UiValidationError> {
     let schema = schema_for(node.kind);
 
-    for required in schema.required_props {
+    for &required in &schema.required_props {
         if !node.props.contains_key(required) {
             return Err(UiValidationError::MissingProp {
                 kind: node.kind,
@@ -1528,15 +1592,21 @@ fn validate_node(
             });
         }
         if schema.allowed_props.contains(prop.as_str()) {
-            validate_prop_value(node.kind, prop, value)?;
+            validate_prop_value(
+                node.kind,
+                prop,
+                value,
+                phase,
+                schema.required_props.contains(&prop.as_str()),
+            )?;
         } else {
-            validate_custom_payload_prop(node.kind, prop, value)?;
+            validate_custom_payload_prop(node.kind, prop, value, phase)?;
         }
     }
 
     validate_prop_combinations(node)?;
     validate_custom_node(node)?;
-    validate_stable_id(node, context, descendant_keys)?;
+    validate_stable_id(node, phase, context, descendant_keys)?;
     validate_required_action(node)?;
     validate_required_label(node)?;
 
@@ -1558,12 +1628,12 @@ fn validate_node(
             });
         }
         for child in children {
-            validate_child(child, child_context, descendant_keys)?;
+            validate_child(child, phase, child_context, descendant_keys)?;
         }
     }
 
     for child in &node.children {
-        validate_child(child, child_context, descendant_keys)?;
+        validate_child(child, phase, child_context, descendant_keys)?;
     }
 
     Ok(())
@@ -1571,33 +1641,38 @@ fn validate_node(
 
 fn validate_child(
     child: &UiChild,
+    phase: UiValidationPhase,
     context: UiValidationContext,
     descendant_keys: &mut BTreeSet<String>,
 ) -> Result<(), UiValidationError> {
     match child {
         UiChild::Conditional(conditional) => {
-            validate_conditional(conditional, context, descendant_keys)
+            validate_conditional(conditional, phase, context, descendant_keys)
         }
-        UiChild::Node(node) => validate_ui_node_in_context(node, context, descendant_keys),
-        UiChild::BindList(bind_list) => validate_bind_list(bind_list),
-        UiChild::BindIf(bind_if) => validate_bind_if(bind_if, context, descendant_keys),
+        UiChild::Node(node) => validate_ui_node_in_context(node, phase, context, descendant_keys),
+        UiChild::BindList(bind_list) => validate_bind_list(bind_list, phase),
+        UiChild::BindIf(bind_if) => validate_bind_if(bind_if, phase, context, descendant_keys),
     }
 }
 
 fn validate_conditional(
     conditional: &UiConditional,
+    phase: UiValidationPhase,
     context: UiValidationContext,
     descendant_keys: &mut BTreeSet<String>,
 ) -> Result<(), UiValidationError> {
     match conditional {
         UiConditional::When { condition: _, node }
         | UiConditional::Hidden { condition: _, node } => {
-            validate_ui_node_in_context(node, context, descendant_keys)
+            validate_ui_node_in_context(node, phase, context, descendant_keys)
         }
     }
 }
 
-fn validate_bind_list(bind_list: &UiBindList) -> Result<(), UiValidationError> {
+fn validate_bind_list(
+    bind_list: &UiBindList,
+    phase: UiValidationPhase,
+) -> Result<(), UiValidationError> {
     match bind_list {
         UiBindList::BindList {
             source,
@@ -1606,6 +1681,12 @@ fn validate_bind_list(bind_list: &UiBindList) -> Result<(), UiValidationError> {
             empty_template,
         } => {
             validate_bind_path(source)?;
+            if phase == UiValidationPhase::Realized {
+                return Err(UiValidationError::InvalidBindPath {
+                    path: source.clone(),
+                    reason: "bind_list must be materialized before realized validation".to_string(),
+                });
+            }
             if !source.starts_with('/') {
                 return Err(UiValidationError::InvalidBindPath {
                     path: source.clone(),
@@ -1615,11 +1696,17 @@ fn validate_bind_list(bind_list: &UiBindList) -> Result<(), UiValidationError> {
             validate_bind_list_where(r#where)?;
             validate_ui_node_in_context(
                 item_template,
+                phase,
                 UiValidationContext::BindListItemRoot,
                 &mut BTreeSet::new(),
             )?;
             if let Some(template) = empty_template {
-                template.validate()?;
+                validate_ui_node_in_context(
+                    template,
+                    phase,
+                    UiValidationContext::Static,
+                    &mut BTreeSet::new(),
+                )?;
             }
             Ok(())
         }
@@ -1628,17 +1715,24 @@ fn validate_bind_list(bind_list: &UiBindList) -> Result<(), UiValidationError> {
 
 fn validate_bind_if(
     bind_if: &UiBindIf,
+    phase: UiValidationPhase,
     context: UiValidationContext,
     descendant_keys: &mut BTreeSet<String>,
 ) -> Result<(), UiValidationError> {
     match bind_if {
         UiBindIf::BindIf { path, node } => {
             validate_bind_path(path)?;
-            validate_ui_node_in_context(node, context, descendant_keys)
+            if phase == UiValidationPhase::Realized {
+                return Err(UiValidationError::InvalidBindPath {
+                    path: path.clone(),
+                    reason: "bind_if must be materialized before realized validation".to_string(),
+                });
+            }
+            validate_ui_node_in_context(node, phase, context, descendant_keys)
         }
         UiBindIf::PresentationIf { predicate, node } => {
             validate_presentation_predicate(predicate)?;
-            validate_ui_node_in_context(node, context, descendant_keys)
+            validate_ui_node_in_context(node, phase, context, descendant_keys)
         }
     }
 }
@@ -1664,6 +1758,8 @@ fn validate_prop_value(
     kind: UiNodeKind,
     prop: &str,
     value: &Value,
+    phase: UiValidationPhase,
+    required: bool,
 ) -> Result<(), UiValidationError> {
     if let Some(path) = value.get("$bind").and_then(Value::as_str) {
         validate_bind_path(path)?;
@@ -1691,6 +1787,10 @@ fn validate_prop_value(
                 reason: "$bind value must be a string".to_string(),
             });
         }
+    }
+
+    if phase == UiValidationPhase::Realized {
+        reject_unresolved_bind(kind, prop, value)?;
     }
 
     if let Some(dynamic_kind) = value.get("$kind").and_then(Value::as_str) {
@@ -1799,7 +1899,12 @@ fn validate_prop_value(
         }
         (UiNodeKind::Table, "empty_state") => {
             let empty_state = deserialize_prop::<UiNode>(kind, prop, value)?;
-            empty_state.validate()?;
+            validate_ui_node_in_context(
+                &empty_state,
+                phase,
+                UiValidationContext::Static,
+                &mut BTreeSet::new(),
+            )?;
         }
         (UiNodeKind::Iframe, "src" | "title") => {
             validate_nonblank_string_or_bind_prop(kind, prop, value)?;
@@ -1823,6 +1928,59 @@ fn validate_prop_value(
         _ => {}
     }
 
+    if phase == UiValidationPhase::Authored
+        && required
+        && value.get("$bind").is_some()
+        && !is_required_bindable_prop(kind, prop)
+    {
+        return Err(UiValidationError::InvalidProp {
+            kind,
+            prop: prop.to_string(),
+            reason: "required field does not accept a binding sentinel".to_string(),
+        });
+    }
+
+    Ok(())
+}
+
+fn is_required_bindable_prop(kind: UiNodeKind, prop: &str) -> bool {
+    matches!(
+        (kind, prop),
+        (
+            UiNodeKind::Button | UiNodeKind::IconButton | UiNodeKind::MenuItem,
+            "label"
+        ) | (UiNodeKind::Form, "submit_label")
+            | (UiNodeKind::Iframe, "src" | "title")
+            | (UiNodeKind::Text, "text")
+    )
+}
+
+fn reject_unresolved_bind(
+    kind: UiNodeKind,
+    prop: &str,
+    value: &Value,
+) -> Result<(), UiValidationError> {
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                reject_unresolved_bind(kind, prop, value)?;
+            }
+        }
+        Value::Object(object) => {
+            if object.contains_key("$bind") {
+                return Err(UiValidationError::InvalidProp {
+                    kind,
+                    prop: prop.to_string(),
+                    reason: "unresolved binding sentinel is not valid after materialization"
+                        .to_string(),
+                });
+            }
+            for value in object.values() {
+                reject_unresolved_bind(kind, prop, value)?;
+            }
+        }
+        _ => {}
+    }
     Ok(())
 }
 
@@ -2185,6 +2343,7 @@ fn validate_custom_payload_prop(
     kind: UiNodeKind,
     prop: &str,
     value: &Value,
+    phase: UiValidationPhase,
 ) -> Result<(), UiValidationError> {
     if prop == "fallback" {
         return Err(UiValidationError::InvalidProp {
@@ -2217,6 +2376,10 @@ fn validate_custom_payload_prop(
             }
         })?;
         validate_bind_path(path)?;
+    }
+
+    if phase == UiValidationPhase::Realized {
+        reject_unresolved_bind(kind, prop, value)?;
     }
 
     Ok(())
@@ -2351,11 +2514,18 @@ fn is_custom_fallback_kind(kind: UiNodeKind) -> bool {
 
 fn validate_stable_id(
     node: &UiNode,
+    phase: UiValidationPhase,
     context: UiValidationContext,
     descendant_keys: &mut BTreeSet<String>,
 ) -> Result<(), UiValidationError> {
     if let Some(UiAuthoredNodeId::Bind(bind)) = &node.id {
         validate_bind_path(&bind.path)?;
+        if phase == UiValidationPhase::Realized {
+            return Err(UiValidationError::InvalidBindPath {
+                path: bind.path.clone(),
+                reason: "bound node id must be materialized before realized validation".to_string(),
+            });
+        }
         if matches!(
             context,
             UiValidationContext::BoundBindListItemDescendant
@@ -2378,6 +2548,13 @@ fn validate_stable_id(
 
     if let Some(UiAuthoredNodeId::BindListDescendant(descendant_id)) = &node.id {
         let key = descendant_id.key();
+        if phase == UiValidationPhase::Realized {
+            return Err(UiValidationError::InvalidBindListDescendantId {
+                key: key.to_string(),
+                reason: "descendant identity must be materialized before realized validation"
+                    .to_string(),
+            });
+        }
         if key.trim().is_empty() {
             return Err(UiValidationError::InvalidBindListDescendantId {
                 key: key.to_string(),
@@ -2518,10 +2695,14 @@ fn validate_required_label(node: &UiNode) -> Result<(), UiValidationError> {
         return Ok(());
     }
 
-    match node.props.get("label").and_then(Value::as_str) {
-        Some(label) if !label.trim().is_empty() => Ok(()),
-        _ => Err(UiValidationError::MissingLabel { kind: node.kind }),
+    let Some(label) = node.props.get("label") else {
+        return Err(UiValidationError::MissingLabel { kind: node.kind });
+    };
+    if !is_required_bindable_prop(node.kind, "label") {
+        return Err(UiValidationError::MissingLabel { kind: node.kind });
     }
+    validate_nonblank_string_or_bind_prop(node.kind, "label", label)
+        .map_err(|_| UiValidationError::MissingLabel { kind: node.kind })
 }
 
 fn validate_bind_path(path: &str) -> Result<(), UiValidationError> {

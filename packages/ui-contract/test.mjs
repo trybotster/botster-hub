@@ -36,6 +36,19 @@ assert.deepEqual(
   conformanceFixtures.fixtures.bound_row_identity.children[0].item_template.id,
   { $bind: "@/session_uuid" },
 );
+assert.equal(conformanceFixtures.contract_version, "0.3.1");
+assert.equal(
+  conformanceFixtures.fixtures.required_bindable_fields.authored.length,
+  7,
+);
+assert.deepEqual(
+  conformanceFixtures.fixtures.required_bindable_fields.authored[0].props.label,
+  { $bind: "@/lifecycle_class" },
+);
+assert.equal(
+  conformanceFixtures.fixtures.required_bindable_fields.realized[0].props.label,
+  "current",
+);
 for (const vector of conformanceFixtures.bind_list_descendant_identity_vectors) {
   assert.equal(
     realizeBindListDescendantId(vector.row, vector.key),
@@ -60,6 +73,13 @@ assert.match(
   schema.$defs.UiAuthoredNodeId.oneOf[1].description,
   /schema validation is necessary but not sufficient/i,
 );
+assert.equal(schema.$defs.UiBind.additionalProperties, false);
+assert.deepEqual(schema.$defs.UiBind.required, ["$bind"]);
+assert.equal(
+  schema.$defs.UiBindableString.oneOf[1].$ref,
+  "#/$defs/UiBind",
+);
+assert.deepEqual(schema.$defs.UiNonBindableValue.not.required, ["$bind"]);
 
 const declarations = fs.readFileSync(
   new URL("./index.d.ts", import.meta.url),
@@ -67,6 +87,13 @@ const declarations = fs.readFileSync(
 );
 for (const token of [
   "UiNode",
+  "UiBindableString",
+  "UiAuthoredTextValue",
+  "UiIconButtonProps",
+  "UiMenuItemProps",
+  "UiIframeProps",
+  "UiFieldControlProps",
+  "UiSelectOptionProps",
   "UiAuthoredNodeId",
   "UiBindListDescendantId",
   "realizeBindListDescendantId",

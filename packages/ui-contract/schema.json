@@ -312,6 +312,34 @@
         }
       ]
     },
+    "UiAuthoredTextValue": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/UiBind"
+        },
+        {
+          "not": {
+            "required": [
+              "$bind"
+            ],
+            "type": "object"
+          }
+        }
+      ]
+    },
+    "UiBind": {
+      "additionalProperties": false,
+      "properties": {
+        "$bind": {
+          "pattern": "^(/|@/)",
+          "type": "string"
+        }
+      },
+      "required": [
+        "$bind"
+      ],
+      "type": "object"
+    },
     "UiBindIf": {
       "oneOf": [
         {
@@ -378,6 +406,17 @@
         "item_template"
       ],
       "type": "object"
+    },
+    "UiBindableString": {
+      "oneOf": [
+        {
+          "pattern": "\\S",
+          "type": "string"
+        },
+        {
+          "$ref": "#/$defs/UiBind"
+        }
+      ]
     },
     "UiCapabilityFallback": {
       "enum": [
@@ -505,6 +544,370 @@
           "if": {
             "properties": {
               "type": {
+                "const": "stack"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "properties": {
+              "props": {
+                "properties": {
+                  "direction": {
+                    "$ref": "#/$defs/UiNonBindableValue"
+                  }
+                },
+                "required": [
+                  "direction"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "props"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "form_section"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "properties": {
+              "props": {
+                "properties": {
+                  "title": {
+                    "$ref": "#/$defs/UiNonBindableValue"
+                  }
+                },
+                "required": [
+                  "title"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "props"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "form_field"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "properties": {
+              "props": {
+                "properties": {
+                  "schema": {
+                    "$ref": "#/$defs/UiNonBindableValue"
+                  }
+                },
+                "required": [
+                  "schema"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "props"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "metric"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "properties": {
+              "props": {
+                "properties": {
+                  "label": {
+                    "$ref": "#/$defs/UiNonBindableValue"
+                  },
+                  "value": {
+                    "$ref": "#/$defs/UiNonBindableValue"
+                  }
+                },
+                "required": [
+                  "label",
+                  "value"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "props"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "status_badge"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "properties": {
+              "props": {
+                "properties": {
+                  "label": {
+                    "$ref": "#/$defs/UiNonBindableValue"
+                  }
+                },
+                "required": [
+                  "label"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "props"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "icon"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "properties": {
+              "props": {
+                "properties": {
+                  "icon": {
+                    "$ref": "#/$defs/UiNonBindableValue"
+                  }
+                },
+                "required": [
+                  "icon"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "props"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "badge"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "properties": {
+              "props": {
+                "properties": {
+                  "label": {
+                    "$ref": "#/$defs/UiNonBindableValue"
+                  }
+                },
+                "required": [
+                  "label"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "props"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "status_dot"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "properties": {
+              "props": {
+                "properties": {
+                  "label": {
+                    "$ref": "#/$defs/UiNonBindableValue"
+                  }
+                },
+                "required": [
+                  "label"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "props"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "empty_state"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "properties": {
+              "props": {
+                "properties": {
+                  "title": {
+                    "$ref": "#/$defs/UiNonBindableValue"
+                  }
+                },
+                "required": [
+                  "title"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "props"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "table"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "properties": {
+              "props": {
+                "properties": {
+                  "columns": {
+                    "$ref": "#/$defs/UiNonBindableValue"
+                  }
+                },
+                "required": [
+                  "columns"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "props"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "terminal_view"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "properties": {
+              "props": {
+                "properties": {
+                  "session_id": {
+                    "$ref": "#/$defs/UiNonBindableValue"
+                  }
+                },
+                "required": [
+                  "session_id"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "props"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "connection_code_view"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "properties": {
+              "props": {
+                "properties": {
+                  "code": {
+                    "$ref": "#/$defs/UiNonBindableValue"
+                  }
+                },
+                "required": [
+                  "code"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "props"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
                 "const": "form"
               }
             },
@@ -520,8 +923,7 @@
                     "$ref": "#/$defs/UiAction"
                   },
                   "submit_label": {
-                    "pattern": "\\S",
-                    "type": "string"
+                    "$ref": "#/$defs/UiBindableString"
                   }
                 },
                 "required": [
@@ -560,7 +962,7 @@
                     "$ref": "#/$defs/UiDialogPresentation"
                   },
                   "title": {
-                    "type": "string"
+                    "$ref": "#/$defs/UiNonBindableValue"
                   }
                 },
                 "required": [
@@ -593,12 +995,259 @@
                     "$ref": "#/$defs/UiAction"
                   },
                   "label": {
-                    "type": "string"
+                    "$ref": "#/$defs/UiBindableString"
                   }
                 },
                 "required": [
                   "label",
                   "action"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "props"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "icon_button"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "properties": {
+              "props": {
+                "properties": {
+                  "action": {
+                    "$ref": "#/$defs/UiAction"
+                  },
+                  "icon": {
+                    "$ref": "#/$defs/UiNonBindableValue"
+                  },
+                  "label": {
+                    "$ref": "#/$defs/UiBindableString"
+                  }
+                },
+                "required": [
+                  "label",
+                  "icon",
+                  "action"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "props"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "menu_item"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "properties": {
+              "props": {
+                "properties": {
+                  "action": {
+                    "$ref": "#/$defs/UiAction"
+                  },
+                  "label": {
+                    "$ref": "#/$defs/UiBindableString"
+                  }
+                },
+                "required": [
+                  "label",
+                  "action"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "props"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "text"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "properties": {
+              "props": {
+                "properties": {
+                  "text": {
+                    "$ref": "#/$defs/UiAuthoredTextValue"
+                  }
+                },
+                "required": [
+                  "text"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "props"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "iframe"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "properties": {
+              "props": {
+                "properties": {
+                  "src": {
+                    "$ref": "#/$defs/UiBindableString"
+                  },
+                  "title": {
+                    "$ref": "#/$defs/UiBindableString"
+                  }
+                },
+                "required": [
+                  "src",
+                  "title"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "props"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "enum": [
+                  "text_input",
+                  "textarea",
+                  "checkbox",
+                  "select"
+                ]
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "properties": {
+              "props": {
+                "properties": {
+                  "label": {
+                    "$ref": "#/$defs/UiNonBindableValue"
+                  },
+                  "name": {
+                    "$ref": "#/$defs/UiNonBindableValue"
+                  }
+                },
+                "required": [
+                  "name",
+                  "label"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "props"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "select_option"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "properties": {
+              "props": {
+                "properties": {
+                  "label": {
+                    "$ref": "#/$defs/UiNonBindableValue"
+                  },
+                  "value": {
+                    "$ref": "#/$defs/UiNonBindableValue"
+                  }
+                },
+                "required": [
+                  "value",
+                  "label"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "props"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "custom"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "properties": {
+              "props": {
+                "properties": {
+                  "component": {
+                    "type": "string"
+                  },
+                  "namespace": {
+                    "type": "string"
+                  },
+                  "reason": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "namespace",
+                  "component",
+                  "reason"
                 ],
                 "type": "object"
               }
@@ -685,6 +1334,14 @@
         "iframe",
         "custom"
       ]
+    },
+    "UiNonBindableValue": {
+      "not": {
+        "required": [
+          "$bind"
+        ],
+        "type": "object"
+      }
     },
     "UiOrientation": {
       "enum": [
@@ -838,7 +1495,7 @@
       ]
     }
   },
-  "$id": "https://trybotster.dev/schemas/ui-contract-0.3.0.json",
+  "$id": "https://trybotster.dev/schemas/ui-contract-0.3.1.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "oneOf": [
     {
