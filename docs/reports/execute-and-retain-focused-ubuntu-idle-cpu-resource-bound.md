@@ -26,6 +26,13 @@ repetitions passed the asserted 250 ms ceiling. Observed five-second idle CPU
 was 0 ticks in 17 repetitions and 1 tick in 3 repetitions at 100 ticks/second,
 or 0-10 ms.
 
+This campaign discharges the authoritative unstressed Linux carry-forward from
+merged ticket `ticket_1785199716_875648`, recorded in
+`docs/reports/bounded-hub-resources-fresh-campaign-evidence.json`
+(`residual_risk[0]`) and
+`docs/reports/prove-bounded-hub-resources-with-four-packages-and-reconnect-churn.md`.
+Those parent files remain unchanged as historical records.
+
 The real production entry point is proven end to end: the dispatched workflow
 checked out workflow and subject SHA
 `281db04523503c5cf692813ea313344aa6067644`, precompiled the exact integration
@@ -117,7 +124,10 @@ production campaign, and this ticket makes no such claim.
 
 ## Missing vault guidance
 
-No missing durable vault guidance was discovered. The Plan Review correction
-about header-only survivor evidence is harness-specific and is recorded in the
-committed evidence/report; existing notes already cover the underlying need for
-independent live, session, and zombie cleanup oracles.
+Review identified and captured two reusable rules that were missing from the
+processed vault: header-bearing survivor files require a present/header-only
+predicate rather than an emptiness check, and an environment-gated assertion
+can be proven executed by an unconditional observation plus the absence of its
+distinct else-branch marker. The captures are preserved in the vault inbox
+archive for later processing. Existing notes already cover the underlying need
+for independent live, session, and zombie cleanup oracles.
