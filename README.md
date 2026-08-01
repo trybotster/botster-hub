@@ -151,8 +151,8 @@ contract instead of bypassing hub admission or calling raw core routers.
 Terminal attach is a terminal-stream handshake only. Session-list reads remain
 an operator/query API; stateful clients use the explicit held-open `session`
 entity subscription for an authoritative snapshot followed by ordered deltas.
-After it is published, the reusable contract will ship in
-`@trybotster/hub-test-support@0.1.17` as source-derived JSON fixtures and a Rust
+The reusable contract is published in `@trybotster/hub-test-support@0.1.18` as
+source-derived JSON fixtures and a Rust
 `run_session_lifecycle_subscription_conformance` runner over the real isolated
 Hub/Core/session-worker topology.
 Every delivered session row includes required `lifecycle_class`:
@@ -395,6 +395,9 @@ script/test-production-package-runtime \
 The cross-repository acceptance script requires Ruby 2.7 or newer and uses only
 Ruby's standard library. It checks the interpreter before building artifacts and
 prints an installation/version remediation when the prerequisite is missing.
+The committed counter, thread, idle, reload, disable, and post-down invariants
+and their macOS/Linux diagnostic recipes are documented in
+[`docs/hub-resource-proof.md`](docs/hub-resource-proof.md).
 
 The first test proves the persisted-package CLI path. The explicit-coordinate
 script rejects dirty or revision-mismatched repositories before starting a

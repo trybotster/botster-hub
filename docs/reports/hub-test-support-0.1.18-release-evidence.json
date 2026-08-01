@@ -1,0 +1,59 @@
+{
+  "release_content_commit": "8d79e7835280413098c11862d408fbace0b6a725",
+  "package_directory": "packages/hub-test-support",
+  "coordinate": "@trybotster/hub-test-support@0.1.18",
+  "registry_state_before_publish": "npm E404",
+  "registry_state_after_publish": {
+    "registry": "https://registry.npmjs.org/",
+    "version": "0.1.18",
+    "npm_integrity": "sha512-llWRLNjFVKzi3CxII1waPO6u2w+TEAesiI8esVTEu8/rwuedeoZXXYTD0Sew76/8reysoZ1gy4P6LNoTptXsTA==",
+    "npm_shasum": "f2bce90dfd0554990f80ba6621c70b77ab2a0720",
+    "dependency": "@trybotster/ui-contract@0.2.0"
+  },
+  "superseded_coordinate": {
+    "coordinate": "@trybotster/hub-test-support@0.1.17",
+    "status": "published with stale daemon protocol bytes; never use as consumer contract authority",
+    "published_npm_integrity": "sha512-8Mgkhp6ZycMcvYTHxCFzpXnpdZaAO7ONXof/300ZZZg4p3HOLnOti9RZFZ6dXCp9RYZ9UXxyL4ADYQcWdsAT4w==",
+    "published_daemon_protocol_sha256": "ce28d2ada7f80845ff4c8afb47e689bd80b356f1d2fbb103559589f5091ab157",
+    "missing_required_text": "plugin_resource_counters?: DaemonPluginResourceCounters | null"
+  },
+  "tarball": {
+    "filename": "trybotster-hub-test-support-0.1.18.tgz",
+    "size": 21472,
+    "unpacked_size": 100078,
+    "entry_count": 16,
+    "npm_shasum": "f2bce90dfd0554990f80ba6621c70b77ab2a0720",
+    "npm_integrity": "sha512-llWRLNjFVKzi3CxII1waPO6u2w+TEAesiI8esVTEu8/rwuedeoZXXYTD0Sew76/8reysoZ1gy4P6LNoTptXsTA==",
+    "sha256": "f7f4de99034d3dca061fcda7ae6a70b97f002a1e26c274c0a65f041ce3792f0e"
+  },
+  "daemon_protocol": {
+    "sha256": "956b2ce7c07523af848da885006c21f944b580799551b208f59f96450a245c0b",
+    "required_text": "plugin_resource_counters?: DaemonPluginResourceCounters | null"
+  },
+  "dependency": {
+    "coordinate": "@trybotster/ui-contract@0.2.0",
+    "registry_state_before_publish": "published and externally verified",
+    "local_tarball_npm_integrity": "sha512-Q2HBDVq1p72v19cQCup8ZbGJEzHrbyIJqI/V70kUwzGobp3QJEKW1DlGVdQOQBn/aKQ1/8K9e5JxkJBFw4P7uQ==",
+    "published_npm_integrity": "sha512-Q2HBDVq1p72v19cQCup8ZbGJEzHrbyIJqI/V70kUwzGobp3QJEKW1DlGVdQOQBn/aKQ1/8K9e5JxkJBFw4P7uQ==",
+    "local_tarball_sha256": "ccca09e17b8d43a2abb921a0d2a35472a1e69f2be03bcec50285745a23360138"
+  },
+  "verification": [
+    "script/publish-npm-packages --dry-run validates the published ui-contract integrity before skipping it",
+    "node packages/hub-test-support/scripts/sync-assets.mjs --check",
+    "npm test in packages/hub-test-support with published ui-contract@0.2.0",
+    "npm pack --json for the exact hub-test-support@0.1.18 tarball",
+    "fresh temporary project installed published ui-contract@0.2.0 plus the exact local 0.1.18 tarball",
+    "fresh install verified package assets, plugin_resource_counters protocol bytes, metadata hash, and plugin fixture materialization",
+    "fresh normal-registry install of both exact public coordinates repeated the asset, token, SHA, and fixture assertions"
+  ],
+  "publication": {
+    "authorized_for_pipeline_agent": false,
+    "operator_command": "script/publish-npm-packages",
+    "operator_working_directory": "committed botster-hub root",
+    "order": [
+      "validate and skip @trybotster/ui-contract@0.2.0 only when registry integrity equals the locally packed tarball",
+      "publish @trybotster/hub-test-support@0.1.18"
+    ],
+    "failure_policy": "set -eu and exact-integrity validation stop the batch before publishing the dependent package when a prerequisite differs or fails"
+  }
+}

@@ -19,6 +19,7 @@ on:
           - focused-session-entity-resize
           - focused-process-ownership
           - focused-connection-lifecycle
+          - focused-plugin-resource-bounds
           - focused-stalled-attach
           - focused-fast-exit-attach-diagnostic
           - focused-oversized-webrtc

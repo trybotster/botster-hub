@@ -19,7 +19,7 @@ node packages/hub-test-support/scripts/sync-assets.mjs
 ## Usage
 
 ```sh
-npm install --save-dev @trybotster/ui-contract@0.2.0 @trybotster/hub-test-support@0.1.17
+npm install --save-dev @trybotster/ui-contract@0.2.0 @trybotster/hub-test-support@0.1.18
 ```
 
 ```js
@@ -79,14 +79,13 @@ Use this exact package spec in npm-based client repos:
 ```json
 {
   "devDependencies": {
-    "@trybotster/hub-test-support": "0.1.17"
+    "@trybotster/hub-test-support": "0.1.18"
   }
 }
 ```
 
-After `@trybotster/ui-contract@0.2.0` and
-`@trybotster/hub-test-support@0.1.17` are published to the public npm
-registry, no scoped `.npmrc` entry or CI auth token is required for install.
+`@trybotster/hub-test-support@0.1.18` is published to the public npm registry,
+so no scoped `.npmrc` entry or CI auth token is required for install.
 
 The support matrix is generated from the Rust compatibility descriptors.
 `terminal_readback` appears in both `supported_features` and
@@ -101,8 +100,10 @@ Only `read_screen_text` is renderable restored content; `snapshot` and
 version 0.1.5 / revision 12 exposes lossy string history. Neither is current
 binary-history contract authority.
 
-Version 0.1.17 is prepared in this repository; it is not published by this
-change. It carries protocol version 4 / conformance revision 25 and
+Version 0.1.18 is published and is the current consumer coordinate. Version
+0.1.17 was published with stale protocol bytes and is not a valid consumer
+coordinate. Version 0.1.18 carries protocol version 4 /
+conformance revision 25 and
 depends on `@trybotster/ui-contract@0.2.0` for the canonical UiNode,
 UiActionRequest, UiActionResult, package surface, and package navigation
 declarations and conformance fixtures. It also carries the optional

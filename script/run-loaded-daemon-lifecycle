@@ -6,6 +6,7 @@ readonly DEFAULT_CAMPAIGN_TIMEOUT_SECONDS=19800
 readonly CLEANUP_GRACE_SECONDS=30
 readonly SURVIVOR_EVIDENCE_LIMIT=80
 readonly ZOMBIE_SETTLE_SECONDS=5
+readonly PROCESS_CENSUS_HELPER="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/process-census"
 
 MODE=run
 SUBJECT_DIR=
@@ -64,7 +65,7 @@ validate_inputs() {
     invalid=1
   fi
   case "$TEST_TARGET" in
-    lifecycle-suite|focused-metadata-owned-shutdown|focused-occupied-web-port|focused-session-entity-resize|focused-process-ownership|focused-connection-lifecycle|focused-stalled-attach|focused-fast-exit-attach-diagnostic|focused-oversized-webrtc|focused-cli-smoke|focused-operator-console|focused-lua-worker-suite|focused-lua-session-worker-callers|full-suite-contention) ;;
+    lifecycle-suite|focused-metadata-owned-shutdown|focused-occupied-web-port|focused-session-entity-resize|focused-process-ownership|focused-connection-lifecycle|focused-plugin-resource-bounds|focused-stalled-attach|focused-fast-exit-attach-diagnostic|focused-oversized-webrtc|focused-cli-smoke|focused-operator-console|focused-lua-worker-suite|focused-lua-session-worker-callers|full-suite-contention) ;;
     *) log "invalid test_target: $TEST_TARGET"; invalid=1 ;;
   esac
   if [[ ! "$REPETITIONS" =~ ^[0-9]+$ ]] || ((10#$REPETITIONS < 1 || 10#$REPETITIONS > 100)); then
@@ -75,6 +76,10 @@ validate_inputs() {
     residual-tail|moderate|none) ;;
     *) log "invalid stress_profile: $STRESS_PROFILE"; invalid=1 ;;
   esac
+  if [[ "$TEST_TARGET" == focused-plugin-resource-bounds && "$STRESS_PROFILE" != none ]]; then
+    log "focused-plugin-resource-bounds requires stress_profile=none"
+    invalid=1
+  fi
 
   {
     printf 'validated_at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -225,14 +230,7 @@ session_process_rows() {
 }
 
 all_process_rows() {
-  # macOS ps exposes a session pointer rather than Linux's numeric SID.
-  # Darwin attribution therefore uses the inherited run token; the numeric
-  # session zombie arm and its self-test assertions are Linux-only.
-  if [[ "$(runner_platform)" == Darwin ]]; then
-    ps -axo pid=,ppid=,pgid=,sess=,stat=,comm=,args=
-  else
-    ps -eo pid=,ppid=,pgid=,sid=,stat=,comm=,args=
-  fi
+  "$PROCESS_CENSUS_HELPER" all
 }
 
 session_zombie_rows() {
@@ -250,14 +248,7 @@ session_zombie_rows() {
 }
 
 botster_role_zombie_rows() {
-  all_process_rows \
-    | awk '
-        $5 ~ /^Z/ && ($6 == "botster-hub" || $6 == "botster-session" || $6 == "botster-session-worker") {
-          printf "%s\t%s\t%s\t%s\t%s\t%s", $1, $2, $3, $4, $5, $6
-          for (field = 7; field <= NF; field++) printf "\t%s", $field
-          printf "\n"
-        }
-      '
+  all_process_rows | "$PROCESS_CENSUS_HELPER" botster-zombies-from-stdin
 }
 
 new_process_rows() {
@@ -1002,6 +993,9 @@ main() {
       ;;
     focused-connection-lifecycle)
       test_command=(./test.sh --test hub_daemon_lifecycle_test focused_connection_lifecycle_is_bounded_event_driven_and_counter_visible -- --exact --nocapture)
+      ;;
+    focused-plugin-resource-bounds)
+      test_command=(env BOTSTER_ASSERT_IDLE_CPU_BOUND=1 ./test.sh --test hub_daemon_lifecycle_test focused_plugin_resources_are_bounded_across_reconnect_reload_idle_and_unload -- --exact --nocapture)
       ;;
     focused-stalled-attach)
       test_command=(./test.sh --test hub_daemon_lifecycle_test stalled_attach_stdout_does_not_block_other_daemon_commands -- --exact --nocapture)

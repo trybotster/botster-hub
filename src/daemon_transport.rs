@@ -45,12 +45,12 @@ pub use botster_hub_client::{
     DaemonPackageNavigationSource, DaemonPackagePin, DaemonPackageProcess,
     DaemonPackageRouteDescriptor, DaemonPackageRouteTarget, DaemonPackageRunnableEntrypoint,
     DaemonPackageUpdateStatus, DaemonPackageWorkingDirectory, DaemonPluginLifecycle,
-    DaemonPluginSurface, DaemonPluginWorkerCounters, DaemonReadScreen, DaemonRequest,
-    DaemonResolvedAppLaunch, DaemonResolvedSessionTemplate, DaemonResponse, DaemonResponseKind,
-    DaemonSession, DaemonSessionCleanup, DaemonSessionContext, DaemonSessionEntity,
-    DaemonSessionTemplate, DaemonSessionTemplateContextInput, DaemonSessionTemplateRequest,
-    DaemonSpawnTarget, DaemonSpawnTargetValidation, DaemonStatus, DaemonUiTreeSnapshot,
-    DaemonWorktree, DaemonWorktreeGitMetadata, DaemonWorktreeLifecycleEvent,
+    DaemonPluginResourceCounters, DaemonPluginSurface, DaemonPluginWorkerCounters,
+    DaemonReadScreen, DaemonRequest, DaemonResolvedAppLaunch, DaemonResolvedSessionTemplate,
+    DaemonResponse, DaemonResponseKind, DaemonSession, DaemonSessionCleanup, DaemonSessionContext,
+    DaemonSessionEntity, DaemonSessionTemplate, DaemonSessionTemplateContextInput,
+    DaemonSessionTemplateRequest, DaemonSpawnTarget, DaemonSpawnTargetValidation, DaemonStatus,
+    DaemonUiTreeSnapshot, DaemonWorktree, DaemonWorktreeGitMetadata, DaemonWorktreeLifecycleEvent,
     FEATURE_PLUGIN_SURFACE_ACTION, FEATURE_PLUGIN_SURFACE_RENDER, PROTOCOL, read_frame,
     read_frame_from_reader, write_frame,
 };
@@ -845,17 +845,28 @@ fn handle_connection_cleanup(
             .live_attach_subscriptions
             .saturating_sub(1);
         state.released_attach_generations = state.released_attach_generations.saturating_add(1);
-        failed |= result.is_err()
-            || result
-                .as_ref()
-                .is_ok_and(|response| response.kind == DaemonResponseKind::OperatorError);
+        failed |= cleanup_detach_failed(&result);
     }
     if failed {
+        // `connection_cleanup_ignores_only_an_already_removed_session` is the
+        // designated positive control for predicate-true cleanup failures.
         state.lifecycle_counters.cleanup_failed =
             state.lifecycle_counters.cleanup_failed.saturating_add(1);
     } else {
         state.lifecycle_counters.cleanup_completed =
             state.lifecycle_counters.cleanup_completed.saturating_add(1);
+    }
+}
+
+fn cleanup_detach_failed(result: &DaemonTransportResult<DaemonResponse>) -> bool {
+    match result {
+        Err(DaemonTransportError::Client(crate::HubClientError::Runtime {
+            operation: crate::HubClientOperation::Detach,
+            kind: crate::HubClientRuntimeErrorKind::UnknownSession,
+            ..
+        })) => false,
+        Ok(response) => response.kind == DaemonResponseKind::OperatorError,
+        Err(_) => true,
     }
 }
 
@@ -2131,6 +2142,7 @@ fn handle_runtime_control_request(
             package_decision: None,
             lifecycle: Vec::new(),
             plugin_worker_counters: None,
+            plugin_resource_counters: None,
             plugin_tools: Vec::new(),
             plugin_tool_result: Value::Null,
             plugin_surface: None,
@@ -4406,6 +4418,7 @@ fn daemon_response_base(kind: DaemonResponseKind) -> DaemonResponse {
         package_decision: None,
         lifecycle: Vec::new(),
         plugin_worker_counters: None,
+        plugin_resource_counters: None,
         plugin_tools: Vec::new(),
         plugin_tool_result: Value::Null,
         plugin_surface: None,
@@ -4938,6 +4951,9 @@ fn daemon_plugin_lifecycle(report: HubClientPluginLifecycleReport) -> DaemonResp
     response.plugin_worker_counters = Some(daemon_plugin_worker_counters_from_client(
         report.worker_counters,
     ));
+    response.plugin_resource_counters = Some(DaemonPluginResourceCounters {
+        active_timer_resources: report.resource_counters.active_timer_resources,
+    });
     response
 }
 
@@ -7265,6 +7281,27 @@ mod tests {
         let error = response.error.expect("operator error body");
         assert_eq!(error.code, "runtime_error");
         assert_eq!(error.operation, "read_mode_flags");
+    }
+
+    #[test]
+    fn connection_cleanup_ignores_only_an_already_removed_session() {
+        let unknown_session = Err(DaemonTransportError::Client(
+            crate::HubClientError::Runtime {
+                request_id: RequestId("cleanup-detach".to_string()),
+                operation: crate::HubClientOperation::Detach,
+                kind: crate::HubClientRuntimeErrorKind::UnknownSession,
+            },
+        ));
+        assert!(!cleanup_detach_failed(&unknown_session));
+
+        let unavailable_runtime: DaemonTransportResult<DaemonResponse> =
+            Err(DaemonTransportError::DaemonNotRunning);
+        assert!(cleanup_detach_failed(&unavailable_runtime));
+        assert!(cleanup_detach_failed(&Ok(entity_subscription_error(
+            "detach_failed",
+            "cleanup-detach",
+            "detach failed",
+        ))));
     }
 
     #[test]

@@ -1,0 +1,93 @@
+#!/bin/sh
+set -eu
+
+usage() {
+  echo "usage: script/assert-no-plugin-timers REPO REVISION PACKAGE | --self-test" >&2
+  exit 64
+}
+
+scan() {
+  timer_repo=$1
+  timer_revision=$2
+  timer_package=$3
+  timer_status=0
+
+  if git -C "$timer_repo" grep -n -E \
+    'botster\.capabilities\.timer_once|capabilities\.timer\b' \
+    "$timer_revision" -- '*.lua'; then
+    timer_status=1
+  else
+    grep_status=$?
+    [ "$grep_status" -eq 1 ] || exit "$grep_status"
+  fi
+
+  manifest_paths=$(git -C "$timer_repo" ls-tree -r --name-only "$timer_revision" \
+    | awk '/(^|\/)botster-package\.json$/ { print }')
+  [ -n "$manifest_paths" ] || {
+    echo "$timer_package has no botster-package.json at $timer_revision" >&2
+    return 2
+  }
+  for manifest_path in $manifest_paths; do
+    if git -C "$timer_repo" show "$timer_revision:$manifest_path" \
+      | ruby -rjson -e '
+          value = JSON.parse(STDIN.read)
+          capabilities = value.fetch("capabilities", [])
+          exit(capabilities.any? { |item|
+            item == "timer" || (item.is_a?(Hash) && item["surface"] == "timer")
+          } ? 0 : 1)
+        '
+    then
+      printf '%s:%s: declared timer capability\n' "$timer_revision" "$manifest_path"
+      timer_status=1
+    else
+      manifest_status=$?
+      [ "$manifest_status" -eq 1 ] || exit "$manifest_status"
+    fi
+  done
+
+  if [ "$timer_status" -ne 0 ]; then
+    echo "$timer_package declares or registers a plugin timer at $timer_revision" >&2
+    return 1
+  fi
+}
+
+self_test() {
+  fixture=$(mktemp -d "${TMPDIR:-/tmp}/botster-timer-scan.XXXXXX")
+  trap 'rm -rf "$fixture"' EXIT INT TERM
+  git -C "$fixture" init -q
+  git -C "$fixture" config user.email timer-scan@example.invalid
+  git -C "$fixture" config user.name timer-scan
+
+  printf '%s\n' '{"name":"timer-scan","capabilities":[]}' >"$fixture/botster-package.json"
+  printf '%s\n' 'local h = botster.capabilities.timer_once(1000)' >"$fixture/plugin.lua"
+  git -C "$fixture" add botster-package.json plugin.lua
+  git -C "$fixture" commit -qm timer-once
+  if scan "$fixture" HEAD timer-once >/dev/null 2>&1; then
+    echo "timer_once positive control passed unexpectedly" >&2
+    exit 1
+  fi
+
+  printf '%s\n' 'return botster.register({})' >"$fixture/plugin.lua"
+  printf '%s\n' '{"name":"timer-scan","capabilities":[{"surface":"timer"}]}' >"$fixture/botster-package.json"
+  git -C "$fixture" add botster-package.json plugin.lua
+  git -C "$fixture" commit -qm timer-capability
+  if scan "$fixture" HEAD timer-capability >/dev/null 2>&1; then
+    echo "timer capability positive control passed unexpectedly" >&2
+    exit 1
+  fi
+
+  printf '%s\n' '{"name":"timer-scan","capabilities":[]}' >"$fixture/botster-package.json"
+  git -C "$fixture" add botster-package.json
+  git -C "$fixture" commit -qm timer-free
+  scan "$fixture" HEAD timer-free
+  echo "plugin timer scan self-test passed"
+}
+
+if [ "${1-}" = "--self-test" ]; then
+  [ "$#" -eq 1 ] || usage
+  self_test
+  exit 0
+fi
+
+[ "$#" -eq 3 ] || usage
+scan "$1" "$2" "$3"
