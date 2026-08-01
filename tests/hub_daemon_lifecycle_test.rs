@@ -5222,18 +5222,21 @@ fn daemon_plugin_contract_matrix_fixture_exercises_public_package_contracts() {
             .collect::<Vec<_>>(),
         vec!["session-transition", "session-stable-current"]
     );
-    assert_eq!(report.session_action_node_id, "session-stable-current");
+    assert_eq!(
+        report.session_action_node_id,
+        "botster-ui-descendant-v1:22:session-stable-current6:rename"
+    );
     assert_eq!(
         report.session_action_payload,
         serde_json::json!({
-            "operation": "select_session",
+            "operation": "rename",
             "session_uuid": "session-stable-current"
         })
     );
     assert_eq!(report.session_action_state, "accepted");
     assert_eq!(
         report.session_action_result_node_id,
-        "session-stable-current"
+        "botster-ui-descendant-v1:22:session-stable-current6:rename"
     );
     assert_eq!(
         report.session_action_result_payload,

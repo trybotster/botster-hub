@@ -21,21 +21,25 @@ Every result must echo the request's `request_id`, `surface_id`, `action_id`,
 and `node_id` exactly. This includes preserving an absent `node_id`; the Hub
 rejects mismatched result identity as `invalid_action_result`.
 
-`UiNode.id` is an authored identity: it may be either a literal `UiNodeId` or
-an item-relative `{ "$bind": "@/field" }` only on a
-`UiBindList.item_template` root. Descendants of that root remain literal-only;
-multi-control descendant identity is separately tracked in
-`ticket_1785443253_376782`. Clients resolve the root binding from the selected
-row after `where` filtering and before the node enters renderer, focus, or
-action state. The resolved value must be a non-blank string and duplicate
-realized ids are contract errors. Root nodes outside BindList, static children,
-item-template descendants, and `empty_template` remain literal-only; action
-request/result `node_id` also remains a literal `UiNodeId`.
+`UiNode.id` is authored identity. The direct `UiBindList.item_template` root
+may retain the 0.2.0 item-relative `{ "$bind": "@/field" }` form. Identity-
+bearing descendants below that bound root may use
+`{ "$kind": "bind_list_descendant_id", "key": "remove" }`. Keys are
+nonblank, preserve their exact UTF-8 bytes, and are unique across the complete
+authored item template. The canonical helper realizes them as
+`botster-ui-descendant-v1:<row-bytes>:<row><key-bytes>:<key>`; consumers must
+call the exported helper rather than synthesize IDs locally.
+
+Clients filter rows, resolve the direct root, then realize descendants before
+any identity enters renderer, focus, hit, or action state. The new keyed form
+is invalid on the item root, outside a bound item template, under
+`empty_template`, or below a literal/absent root. Descendant full-ID `$bind`
+remains invalid. Action request/result `node_id` remains a literal `UiNodeId`.
 
 The generated JSON Schema can describe the literal-or-binding wire union, but
-cannot express the BindList row context. Schema validity is therefore necessary
-but not sufficient; the Rust/Hub validator is authoritative for the direct
-item-template-root restriction.
+cannot express the complete BindList row context or template-global key
+uniqueness. Schema validity is therefore necessary but not sufficient; the
+Rust/Hub validator is authoritative.
 
 Regenerate or check committed assets:
 

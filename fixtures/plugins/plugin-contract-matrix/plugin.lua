@@ -305,18 +305,65 @@ local function session_lifecycle_surface(arguments)
       lifecycle_class = "current",
     },
     item_template = {
-      type = "button",
+      type = "inline",
       id = {
         ["$bind"] = "@/session_uuid",
       },
-      props = {
-        label = "Select session",
-        action = {
-          id = "contract.action",
-          payload = {
-            operation = "select_session",
-            session_uuid = {
-              ["$bind"] = "@/session_uuid",
+      children = {
+        {
+          type = "button",
+          id = {
+            ["$kind"] = "bind_list_descendant_id",
+            key = "spawn",
+          },
+          props = {
+            label = "Spawn session",
+            action = {
+              id = "contract.action",
+              payload = {
+                operation = "spawn",
+                session_uuid = {
+                  ["$bind"] = "@/session_uuid",
+                },
+              },
+            },
+          },
+        },
+        {
+          type = "button",
+          id = {
+            ["$kind"] = "bind_list_descendant_id",
+            key = "rename",
+          },
+          props = {
+            label = "Rename session",
+            action = {
+              id = "contract.action",
+              payload = {
+                operation = "rename",
+                session_uuid = {
+                  ["$bind"] = "@/session_uuid",
+                },
+              },
+            },
+          },
+        },
+        {
+          type = "button",
+          id = {
+            ["$kind"] = "bind_list_descendant_id",
+            key = "remove",
+          },
+          props = {
+            label = "Remove session",
+            action = {
+              id = "contract.action",
+              payload = {
+                operation = "remove",
+                session_uuid = {
+                  ["$bind"] = "@/session_uuid",
+                },
+              },
             },
           },
         },
@@ -427,10 +474,10 @@ local function contract_action(arguments)
       },
     })
   end
-  if payload.operation == "select_session" then
+  if payload.operation == "spawn" or payload.operation == "rename" or payload.operation == "remove" then
     return action_result(arguments, "accepted", {
       payload = {
-        operation = "select_session",
+        operation = payload.operation,
         session_uuid = payload.session_uuid,
       },
     })

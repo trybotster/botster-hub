@@ -4,7 +4,8 @@
 export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 export type JsonObject = { [key: string]: JsonValue };
 export type UiNodeId = string;
-export type UiAuthoredNodeId = UiNodeId | UiBind;
+export type UiBindListDescendantId = { $kind: "bind_list_descendant_id"; key: string };
+export type UiAuthoredNodeId = UiNodeId | UiBind | UiBindListDescendantId;
 export type UiActionId = string;
 export type UiSurfaceId = string;
 export type UiActionRequestId = string;

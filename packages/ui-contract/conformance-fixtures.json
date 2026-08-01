@@ -1,5 +1,37 @@
 {
-  "contract_version": "0.2.0",
+  "bind_list_descendant_identity_vectors": [
+    {
+      "key": "remove",
+      "realized_id": "botster-ui-descendant-v1:9:session-16:remove",
+      "row": "session-1"
+    },
+    {
+      "key": "23:c",
+      "realized_id": "botster-ui-descendant-v1:4:1:ab4:23:c",
+      "row": "1:ab"
+    },
+    {
+      "key": " spaced key ",
+      "realized_id": "botster-ui-descendant-v1:7:  row  12: spaced key ",
+      "row": "  row  "
+    },
+    {
+      "key": "重命名",
+      "realized_id": "botster-ui-descendant-v1:5:café9:重命名",
+      "row": "café"
+    },
+    {
+      "key": "remove-🧹",
+      "realized_id": "botster-ui-descendant-v1:11:会話-😀11:remove-🧹",
+      "row": "会話-😀"
+    },
+    {
+      "key": "0:prefix:9",
+      "realized_id": "botster-ui-descendant-v1:28:botster-ui-descendant-v1:1:x10:0:prefix:9",
+      "row": "botster-ui-descendant-v1:1:x"
+    }
+  ],
+  "contract_version": "0.3.0",
   "fixtures": {
     "accepted": {
       "action_id": "ticket.create",
@@ -35,22 +67,31 @@
         {
           "$kind": "bind_list",
           "item_template": {
+            "children": [
+              {
+                "id": {
+                  "$kind": "bind_list_descendant_id",
+                  "key": "select"
+                },
+                "props": {
+                  "action": {
+                    "id": "contract.action",
+                    "payload": {
+                      "operation": "select_session",
+                      "session_uuid": {
+                        "$bind": "@/session_uuid"
+                      }
+                    }
+                  },
+                  "label": "Select session"
+                },
+                "type": "button"
+              }
+            ],
             "id": {
               "$bind": "@/session_uuid"
             },
-            "props": {
-              "action": {
-                "id": "contract.action",
-                "payload": {
-                  "operation": "select_session",
-                  "session_uuid": {
-                    "$bind": "@/session_uuid"
-                  }
-                }
-              },
-              "label": "Select session"
-            },
-            "type": "button"
+            "type": "inline"
           },
           "source": "/session",
           "where": {
