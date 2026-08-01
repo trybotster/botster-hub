@@ -4,6 +4,12 @@
   "result": "pass",
   "target_repository": "trybotster/botster-hub",
   "target_id": "tgt_7e208a0c76a44980a83b63af976b1f22",
+  "discharges": {
+    "ticket": "ticket_1785199716_875648",
+    "carry_forward": "authoritative unstressed Linux verification of the selector-gated 250 ms idle CPU ceiling",
+    "parent_evidence": "docs/reports/bounded-hub-resources-fresh-campaign-evidence.json#residual_risk[0]",
+    "parent_report": "docs/reports/prove-bounded-hub-resources-with-four-packages-and-reconnect-churn.md"
+  },
   "workflow": {
     "name": "Loaded daemon lifecycle diagnostics",
     "run_id": 30680145233,
