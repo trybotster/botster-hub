@@ -1,6 +1,6 @@
 {
   "binding_family": "/session",
-  "conformance_fixture_revision": 26,
+  "conformance_fixture_revision": 27,
   "entity_type": "session",
   "expected": {
     "after_ended_patch": {
@@ -137,6 +137,7 @@
               "session_uuid": "session-stable-current"
             },
             "key": "spawn",
+            "label": "current",
             "node_id": "botster-ui-descendant-v1:22:session-stable-current5:spawn"
           },
           {
@@ -145,6 +146,7 @@
               "session_uuid": "session-stable-current"
             },
             "key": "rename",
+            "label": "Rename session",
             "node_id": "botster-ui-descendant-v1:22:session-stable-current6:rename"
           },
           {
@@ -153,6 +155,7 @@
               "session_uuid": "session-stable-current"
             },
             "key": "remove",
+            "label": "Remove session",
             "node_id": "botster-ui-descendant-v1:22:session-stable-current6:remove"
           }
         ],
@@ -168,6 +171,7 @@
               "session_uuid": "session-stable-current"
             },
             "key": "spawn",
+            "label": "current",
             "node_id": "botster-ui-descendant-v1:22:session-stable-current5:spawn"
           },
           {
@@ -176,6 +180,7 @@
               "session_uuid": "session-stable-current"
             },
             "key": "rename",
+            "label": "Rename session",
             "node_id": "botster-ui-descendant-v1:22:session-stable-current6:rename"
           },
           {
@@ -184,6 +189,7 @@
               "session_uuid": "session-stable-current"
             },
             "key": "remove",
+            "label": "Remove session",
             "node_id": "botster-ui-descendant-v1:22:session-stable-current6:remove"
           }
         ],
@@ -199,6 +205,7 @@
               "session_uuid": "session-stable-current"
             },
             "key": "spawn",
+            "label": "current",
             "node_id": "botster-ui-descendant-v1:22:session-stable-current5:spawn"
           },
           {
@@ -207,6 +214,7 @@
               "session_uuid": "session-stable-current"
             },
             "key": "rename",
+            "label": "Rename session",
             "node_id": "botster-ui-descendant-v1:22:session-stable-current6:rename"
           },
           {
@@ -215,6 +223,7 @@
               "session_uuid": "session-stable-current"
             },
             "key": "remove",
+            "label": "Remove session",
             "node_id": "botster-ui-descendant-v1:22:session-stable-current6:remove"
           }
         ],
@@ -230,6 +239,7 @@
               "session_uuid": "session-stable-current"
             },
             "key": "spawn",
+            "label": "current",
             "node_id": "botster-ui-descendant-v1:22:session-stable-current5:spawn"
           },
           {
@@ -238,6 +248,7 @@
               "session_uuid": "session-stable-current"
             },
             "key": "rename",
+            "label": "Rename session",
             "node_id": "botster-ui-descendant-v1:22:session-stable-current6:rename"
           },
           {
@@ -246,6 +257,7 @@
               "session_uuid": "session-stable-current"
             },
             "key": "remove",
+            "label": "Remove session",
             "node_id": "botster-ui-descendant-v1:22:session-stable-current6:remove"
           }
         ],
@@ -261,6 +273,7 @@
               "session_uuid": "session-transition"
             },
             "key": "spawn",
+            "label": "current",
             "node_id": "botster-ui-descendant-v1:18:session-transition5:spawn"
           },
           {
@@ -269,6 +282,7 @@
               "session_uuid": "session-transition"
             },
             "key": "rename",
+            "label": "Rename session",
             "node_id": "botster-ui-descendant-v1:18:session-transition6:rename"
           },
           {
@@ -277,6 +291,7 @@
               "session_uuid": "session-transition"
             },
             "key": "remove",
+            "label": "Remove session",
             "node_id": "botster-ui-descendant-v1:18:session-transition6:remove"
           }
         ],
@@ -290,6 +305,7 @@
               "session_uuid": "session-stable-current"
             },
             "key": "spawn",
+            "label": "current",
             "node_id": "botster-ui-descendant-v1:22:session-stable-current5:spawn"
           },
           {
@@ -298,6 +314,7 @@
               "session_uuid": "session-stable-current"
             },
             "key": "rename",
+            "label": "Rename session",
             "node_id": "botster-ui-descendant-v1:22:session-stable-current6:rename"
           },
           {
@@ -306,6 +323,7 @@
               "session_uuid": "session-stable-current"
             },
             "key": "remove",
+            "label": "Remove session",
             "node_id": "botster-ui-descendant-v1:22:session-stable-current6:remove"
           }
         ],
@@ -449,7 +467,9 @@
                     }
                   }
                 },
-                "label": "Spawn session"
+                "label": {
+                  "$bind": "@/lifecycle_class"
+                }
               },
               "type": "button"
             },

@@ -36,6 +36,23 @@ is invalid on the item root, outside a bound item template, under
 `empty_template`, or below a literal/absent root. Descendant full-ID `$bind`
 remains invalid. Action request/result `node_id` remains a literal `UiNodeId`.
 
+Required field binding is explicit rather than inferred from arbitrary JSON.
+Authored validation accepts a structurally valid `UiBind` for
+`Button.label`, `IconButton.label`, `MenuItem.label`, `Form.submit_label`,
+`Iframe.src`, `Iframe.title`, and `Text.text`. The first six fields otherwise
+require a nonblank string. `Text.text` retains its existing presence-only
+literal contract, including empty strings, numbers, and null; only its authored
+binding sentinel receives structural validation. Other required fields remain
+non-bindable.
+
+`UiNode.validate()` and `validate_ui_node()` are compatible authored-tree
+entry points. Rust consumers must call `UiNode.validate_realized()` or
+`validate_ui_node_realized()` after materialization. Realized validation
+rejects unresolved property, payload, list, conditional, and identity bindings
+while applying each field's existing literal rules. Hub performs authored
+admission and transport only; renderer clients own materialization and the
+realized validation boundary.
+
 The generated JSON Schema can describe the literal-or-binding wire union, but
 cannot express the complete BindList row context or template-global key
 uniqueness. Schema validity is therefore necessary but not sufficient; the

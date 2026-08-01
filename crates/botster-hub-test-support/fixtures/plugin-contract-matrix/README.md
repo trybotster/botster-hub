@@ -79,7 +79,9 @@ paths.
   multi-row identity oracle: its Inline root binds `id` to
   `@/session_uuid`, while nested Spawn, Rename, and Remove Buttons use
   `bind_list_descendant_id` keys. Their exact realized IDs derive from the row
-  identity through the contract-owned UTF-8 byte-length helper, and each
+  identity through the contract-owned UTF-8 byte-length helper. Spawn binds its
+  required label to `@/lifecycle_class`; strict reference materialization
+  resolves that value before realized validation. Each
   action payload retains both operation and `session_uuid`. The worker authors
   only paths, keys, and templates—it does not receive session rows or arbitrary
   Hub state.

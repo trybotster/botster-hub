@@ -2340,7 +2340,7 @@ fn validate_plugin_surface_binding_path(path: &str) -> Result<(), crate::McpTool
 }
 
 fn validate_plugin_surface_node(node: &UiNode) -> Result<(), crate::McpToolError> {
-    node.validate().map_err(|error| {
+    node.validate_authored().map_err(|error| {
         crate::McpToolError::new("invalid_surface", format!("invalid plugin UiNode: {error}"))
     })?;
     validate_plugin_surface_binding_families(node)
@@ -2436,7 +2436,7 @@ mod tests {
                     "type": "button",
                     "id": { "$kind": "bind_list_descendant_id", "key": "remove" },
                     "props": {
-                        "label": "Remove session",
+                        "label": { "$bind": "@/lifecycle_class" },
                         "action": { "id": "contract.action" }
                     }
                 }]
@@ -2551,9 +2551,12 @@ mod tests {
                     "source": source,
                     "where": { "session_uuid": "session-1" },
                     "item_template": {
-                        "type": "text",
+                        "type": "button",
                         "id": "binding-action-row",
-                        "props": { "text": { "$bind": "@/lifecycle_class" } }
+                        "props": {
+                            "label": { "$bind": "@/lifecycle_class" },
+                            "action": { "id": "contract.action" }
+                        }
                     }
                 }]
             }
@@ -2573,6 +2576,27 @@ mod tests {
             .expect_err("foreign replacement binding must be rejected");
         assert_eq!(error.code, "invalid_action_result");
         assert!(error.message.contains("/workspace"), "{error:?}");
+    }
+
+    #[test]
+    fn plugin_surface_authored_admission_rejects_malformed_required_label_bind() {
+        let node: UiNode = serde_json::from_value(serde_json::json!({
+            "type": "button",
+            "id": "bound-button",
+            "props": {
+                "label": { "$bind": "@/lifecycle_class", "fallback": "current" },
+                "action": { "id": "contract.action" }
+            }
+        }))
+        .expect("authored button wire shape");
+
+        let error = validate_plugin_surface_node(&node)
+            .expect_err("malformed required label binding must fail Hub admission");
+        assert_eq!(error.code, "invalid_surface");
+        assert!(
+            error.message.contains("may only contain $bind"),
+            "{error:?}"
+        );
     }
 
     #[test]

@@ -5223,6 +5223,10 @@ fn daemon_plugin_contract_matrix_fixture_exercises_public_package_contracts() {
         vec!["session-transition", "session-stable-current"]
     );
     assert_eq!(
+        report.session_materialized_rows[1].controls[0].label,
+        "current"
+    );
+    assert_eq!(
         report.session_action_node_id,
         "botster-ui-descendant-v1:22:session-stable-current6:rename"
     );

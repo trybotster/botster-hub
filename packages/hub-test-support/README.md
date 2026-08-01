@@ -19,7 +19,7 @@ node packages/hub-test-support/scripts/sync-assets.mjs
 ## Usage
 
 ```sh
-npm install --save-dev @trybotster/ui-contract@0.3.0 @trybotster/hub-test-support@0.1.19
+npm install --save-dev @trybotster/ui-contract@0.3.1 @trybotster/hub-test-support@0.1.20
 ```
 
 ```js
@@ -100,12 +100,12 @@ Only `read_screen_text` is renderable restored content; `snapshot` and
 version 0.1.5 / revision 12 exposes lossy string history. Neither is current
 binary-history contract authority.
 
-Version 0.1.19 is the next cold consumer coordinate. Version 0.1.18 is the
+Version 0.1.20 is the next cold consumer coordinate. Version 0.1.18 is the
 currently published coordinate. Version
 0.1.17 was published with stale protocol bytes and is not a valid consumer
-coordinate. Version 0.1.19 carries protocol version 4 /
-conformance revision 26 and
-depends on `@trybotster/ui-contract@0.3.0` for the canonical UiNode,
+coordinate. Version 0.1.20 carries protocol version 4 /
+conformance revision 27 and
+depends on `@trybotster/ui-contract@0.3.1` for the canonical UiNode,
 UiActionRequest, UiActionResult, package surface, and package navigation
 declarations and conformance fixtures. It also carries the optional
 aggregate plugin-worker counters prepared in the unpublished 0.1.15 artifact.
@@ -127,6 +127,10 @@ Revision 26 adds bound-root descendant keys, the canonical UTF-8 byte-length
 identity helper, and `spawn`/`rename`/`remove` controls for every current row.
 The Rust and Node materializers publish exact root/control IDs and payloads and
 reject collisions with roots, static siblings, or other realized rows.
+Revision 27 binds the Spawn Button's required label to
+`@/lifecycle_class`. Both reference materializers resolve it to the selected
+row's literal class and reject unresolved required values; the Rust path also
+passes the materialized Button through strict realized UiNode validation.
 The Node reference materializer proves matching `current`, `ended`,
 and `indeterminate` rows before an absent UUID selects the unavailable path,
 then proves patch, remove, and authoritative reconnect convergence. This

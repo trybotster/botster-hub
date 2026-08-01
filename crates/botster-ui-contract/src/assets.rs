@@ -235,7 +235,7 @@ pub fn typescript_declarations() -> String {
 pub fn json_schema() -> Value {
     json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "$id": "https://trybotster.dev/schemas/ui-contract-0.3.0.json",
+        "$id": "https://trybotster.dev/schemas/ui-contract-0.3.1.json",
         "title": "Botster UI Contract",
         "oneOf": [
             { "$ref": "#/$defs/UiNode" },
@@ -246,6 +246,29 @@ pub fn json_schema() -> Value {
         ],
         "$defs": {
             "JsonValue": {},
+            "UiBind": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["$bind"],
+                "properties": {
+                    "$bind": { "type": "string", "pattern": "^(/|@/)" }
+                }
+            },
+            "UiBindableString": {
+                "oneOf": [
+                    { "type": "string", "pattern": "\\S" },
+                    { "$ref": "#/$defs/UiBind" }
+                ]
+            },
+            "UiAuthoredTextValue": {
+                "oneOf": [
+                    { "$ref": "#/$defs/UiBind" },
+                    { "not": { "type": "object", "required": ["$bind"] } }
+                ]
+            },
+            "UiNonBindableValue": {
+                "not": { "type": "object", "required": ["$bind"] }
+            },
             "UiNodeId": { "type": "string" },
             "UiAuthoredNodeId": {
                 "oneOf": [
@@ -434,10 +457,7 @@ pub fn json_schema() -> Value {
                                     "required": ["action", "submit_label"],
                                     "properties": {
                                         "action": { "$ref": "#/$defs/UiAction" },
-                                        "submit_label": {
-                                            "type": "string",
-                                            "pattern": "\\S"
-                                        }
+                                        "submit_label": { "$ref": "#/$defs/UiBindableString" }
                                     }
                                 }
                             }
@@ -477,8 +497,144 @@ pub fn json_schema() -> Value {
                                     "type": "object",
                                     "required": ["label", "action"],
                                     "properties": {
-                                        "label": { "type": "string" },
+                                        "label": { "$ref": "#/$defs/UiBindableString" },
                                         "action": { "$ref": "#/$defs/UiAction" }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    {
+                        "if": {
+                            "properties": { "type": { "const": "icon_button" } },
+                            "required": ["type"]
+                        },
+                        "then": {
+                            "required": ["props"],
+                            "properties": {
+                                "props": {
+                                    "type": "object",
+                                    "required": ["label", "icon", "action"],
+                                    "properties": {
+                                        "label": { "$ref": "#/$defs/UiBindableString" },
+                                        "icon": { "type": "string" },
+                                        "action": { "$ref": "#/$defs/UiAction" }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    {
+                        "if": {
+                            "properties": { "type": { "const": "menu_item" } },
+                            "required": ["type"]
+                        },
+                        "then": {
+                            "required": ["props"],
+                            "properties": {
+                                "props": {
+                                    "type": "object",
+                                    "required": ["label", "action"],
+                                    "properties": {
+                                        "label": { "$ref": "#/$defs/UiBindableString" },
+                                        "action": { "$ref": "#/$defs/UiAction" }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    {
+                        "if": {
+                            "properties": { "type": { "const": "text" } },
+                            "required": ["type"]
+                        },
+                        "then": {
+                            "required": ["props"],
+                            "properties": {
+                                "props": {
+                                    "type": "object",
+                                    "required": ["text"],
+                                    "properties": {
+                                        "text": { "$ref": "#/$defs/UiAuthoredTextValue" }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    {
+                        "if": {
+                            "properties": { "type": { "const": "iframe" } },
+                            "required": ["type"]
+                        },
+                        "then": {
+                            "required": ["props"],
+                            "properties": {
+                                "props": {
+                                    "type": "object",
+                                    "required": ["src", "title"],
+                                    "properties": {
+                                        "src": { "$ref": "#/$defs/UiBindableString" },
+                                        "title": { "$ref": "#/$defs/UiBindableString" }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    {
+                        "if": {
+                            "properties": {
+                                "type": { "enum": ["text_input", "textarea", "checkbox", "select"] }
+                            },
+                            "required": ["type"]
+                        },
+                        "then": {
+                            "required": ["props"],
+                            "properties": {
+                                "props": {
+                                    "type": "object",
+                                    "required": ["name", "label"],
+                                    "properties": {
+                                        "name": { "type": "string" },
+                                        "label": { "type": "string" }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    {
+                        "if": {
+                            "properties": { "type": { "const": "select_option" } },
+                            "required": ["type"]
+                        },
+                        "then": {
+                            "required": ["props"],
+                            "properties": {
+                                "props": {
+                                    "type": "object",
+                                    "required": ["value", "label"],
+                                    "properties": {
+                                        "value": { "$ref": "#/$defs/UiNonBindableValue" },
+                                        "label": { "type": "string" }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    {
+                        "if": {
+                            "properties": { "type": { "const": "custom" } },
+                            "required": ["type"]
+                        },
+                        "then": {
+                            "required": ["props"],
+                            "properties": {
+                                "props": {
+                                    "type": "object",
+                                    "required": ["namespace", "component", "reason"],
+                                    "properties": {
+                                        "namespace": { "type": "string" },
+                                        "component": { "type": "string" },
+                                        "reason": { "type": "string" }
                                     }
                                 }
                             }
@@ -598,7 +754,7 @@ pub fn json_schema() -> Value {
 #[must_use]
 pub fn conformance_fixtures_json() -> Value {
     json!({
-        "contract_version": "0.3.0",
+        "contract_version": "0.3.1",
         "bind_list_descendant_identity_vectors": [
             {
                 "row": "session-1",
@@ -716,6 +872,26 @@ pub fn conformance_fixtures_json() -> Value {
                     }
                 }]
             },
+            "required_bindable_fields": {
+                "authored": [
+                    { "type": "button", "id": "bound-button", "props": { "label": { "$bind": "@/lifecycle_class" }, "action": { "id": "contract.action" } } },
+                    { "type": "icon_button", "id": "bound-icon-button", "props": { "label": { "$bind": "@/lifecycle_class" }, "icon": "play", "action": { "id": "contract.action" } } },
+                    { "type": "menu_item", "id": "bound-menu-item", "props": { "label": { "$bind": "@/lifecycle_class" }, "action": { "id": "contract.action" } } },
+                    { "type": "form", "id": "bound-form", "props": { "action": { "id": "contract.submit" }, "submit_label": { "$bind": "@/lifecycle_class" } } },
+                    { "type": "iframe", "id": "bound-iframe-src", "props": { "src": { "$bind": "@/url" }, "title": "Session" } },
+                    { "type": "iframe", "id": "bound-iframe-title", "props": { "src": "/session.html", "title": { "$bind": "@/lifecycle_class" } } },
+                    { "type": "text", "id": "bound-text", "props": { "text": { "$bind": "@/lifecycle_class" } } }
+                ],
+                "realized": [
+                    { "type": "button", "id": "bound-button", "props": { "label": "current", "action": { "id": "contract.action" } } },
+                    { "type": "icon_button", "id": "bound-icon-button", "props": { "label": "current", "icon": "play", "action": { "id": "contract.action" } } },
+                    { "type": "menu_item", "id": "bound-menu-item", "props": { "label": "current", "action": { "id": "contract.action" } } },
+                    { "type": "form", "id": "bound-form", "props": { "action": { "id": "contract.submit" }, "submit_label": "current" } },
+                    { "type": "iframe", "id": "bound-iframe-src", "props": { "src": "/session.html", "title": "Session" } },
+                    { "type": "iframe", "id": "bound-iframe-title", "props": { "src": "/session.html", "title": "current" } },
+                    { "type": "text", "id": "bound-text", "props": { "text": "current" } }
+                ]
+            },
             "request": {
                 "request_id": "request-1",
                 "surface_id": "tickets.create",
@@ -791,6 +967,8 @@ export interface UiCapabilitySet { widthClasses?: UiWidthClass[]; heightClasses?
 export type UiSpaceToken = __UiSpaceToken__;
 export type UiColorToken = __UiColorToken__;
 export interface UiBind { $bind: string; }
+export type UiBindableString = string | UiBind;
+export type UiAuthoredTextValue = JsonValue | UiBind;
 export type UiPresentationOperation = { kind: "set"; key: UiPresentationKey; value: JsonValue } | { kind: "clear"; key: UiPresentationKey } | { kind: "toggle"; key: UiPresentationKey };
 export type UiPresentationPredicate = { kind: "present"; key: UiPresentationKey } | { kind: "truthy"; key: UiPresentationKey } | { kind: "equals"; key: UiPresentationKey; value: JsonValue };
 export interface UiResponsiveWidth { compact?: JsonValue; regular?: JsonValue; expanded?: JsonValue; }
@@ -801,15 +979,29 @@ export type UiConditional = { $kind: "when"; condition: UiCondition; node: UiNod
 export type UiBindList = { $kind: "bind_list"; source: string; where?: Record<string, JsonValue>; item_template: UiNode; empty_template?: UiNode };
 export type UiBindIf = { $kind: "bind_if"; path: string; node: UiNode } | { $kind: "presentation_if"; predicate: UiPresentationPredicate; node: UiNode };
 export type UiChild = UiConditional | UiNode | UiBindList | UiBindIf;
-export type UiFormProps = JsonObject & { action: UiAction; submit_label: string };
+export type UiFormProps = JsonObject & { action: UiAction; submit_label: UiBindableString };
 export type UiDialogProps = JsonObject & { title: string; presentation?: UiDialogPresentation; open?: never };
-export type UiButtonProps = JsonObject & { label: string; action: UiAction };
+export type UiButtonProps = JsonObject & { label: UiBindableString; action: UiAction };
+export type UiIconButtonProps = JsonObject & { label: UiBindableString; icon: string; action: UiAction };
+export type UiMenuItemProps = JsonObject & { label: UiBindableString; action: UiAction };
+export type UiTextProps = JsonObject & { text: UiAuthoredTextValue };
+export type UiIframeProps = JsonObject & { src: UiBindableString; title: UiBindableString };
+export type UiFieldControlProps = JsonObject & { name: string; label: string };
+export type UiSelectOptionProps = JsonObject & { value: JsonValue; label: string };
+export type UiCustomProps = JsonObject & { namespace: string; component: string; reason: string };
 export interface UiNodeBase { id?: UiAuthoredNodeId; children?: UiChild[]; slots?: Record<string, UiChild[]>; }
 export type UiNode =
   | (UiNodeBase & { type: "form"; props: UiFormProps })
   | (UiNodeBase & { type: "dialog"; props: UiDialogProps })
   | (UiNodeBase & { type: "button"; props: UiButtonProps })
-  | (UiNodeBase & { type: Exclude<UiNodeKind, "form" | "dialog" | "button">; props?: JsonObject });
+  | (UiNodeBase & { type: "icon_button"; props: UiIconButtonProps })
+  | (UiNodeBase & { type: "menu_item"; props: UiMenuItemProps })
+  | (UiNodeBase & { type: "text"; props: UiTextProps })
+  | (UiNodeBase & { type: "iframe"; props: UiIframeProps })
+  | (UiNodeBase & { type: "text_input" | "textarea" | "checkbox" | "select"; props: UiFieldControlProps })
+  | (UiNodeBase & { type: "select_option"; props: UiSelectOptionProps })
+  | (UiNodeBase & { type: "custom"; props: UiCustomProps })
+  | (UiNodeBase & { type: Exclude<UiNodeKind, "form" | "dialog" | "button" | "icon_button" | "menu_item" | "text" | "iframe" | "text_input" | "textarea" | "checkbox" | "select" | "select_option" | "custom">; props?: JsonObject });
 export type UiFieldKind = __UiFieldKind__;
 export interface UiFieldOption { value: JsonValue; label: string; disabled?: boolean; }
 export interface UiFieldValidationHints { minLength?: number; maxLength?: number; pattern?: string; min?: number; max?: number; oneOf?: JsonValue[]; }
