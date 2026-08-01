@@ -10,6 +10,7 @@ use botster_ui_contract::{
     realize_bind_list_descendant_id, typescript_declarations,
 };
 use serde::Serialize;
+use serde_json::{Value, json};
 
 #[test]
 fn generated_assets_match_checked_in_package() {
@@ -70,6 +71,12 @@ fn generated_fixtures_deserialize_and_validate_through_rust_authority() {
     let form: UiNode = serde_json::from_value(fixtures["form"].clone()).expect("form node");
     let bound_row_identity: UiNode = serde_json::from_value(fixtures["bound_row_identity"].clone())
         .expect("bound row identity node");
+    let authored_required: Vec<UiNode> =
+        serde_json::from_value(fixtures["required_bindable_fields"]["authored"].clone())
+            .expect("authored required-bindable nodes");
+    let realized_required: Vec<UiNode> =
+        serde_json::from_value(fixtures["required_bindable_fields"]["realized"].clone())
+            .expect("realized required-bindable nodes");
     let request: UiActionRequest =
         serde_json::from_value(fixtures["request"].clone()).expect("action request");
     let accepted: UiActionResult =
@@ -85,10 +92,85 @@ fn generated_fixtures_deserialize_and_validate_through_rust_authority() {
     bound_row_identity
         .validate()
         .expect("bound row identity fixture validates");
+    assert_eq!(authored_required.len(), 7);
+    for node in authored_required {
+        node.validate_authored()
+            .expect("authored required binding fixture validates");
+        node.validate_realized()
+            .expect_err("authored required binding remains unresolved");
+    }
+    assert_eq!(realized_required.len(), 7);
+    for node in realized_required {
+        node.validate_realized()
+            .expect("materialized required binding fixture validates");
+    }
     accepted.validate().expect("accepted fixture validates");
     rejected.validate().expect("rejected fixture validates");
     assert!(request.values.is_some());
     assert!(request.payload.is_some());
+}
+
+#[test]
+fn generated_schema_validates_required_binding_instances() {
+    let schema = json_schema();
+    let validator = jsonschema::validator_for(&schema).expect("compile generated JSON Schema");
+    let conformance = conformance_fixtures_json();
+    let required = &conformance["fixtures"]["required_bindable_fields"];
+
+    for node in required["authored"].as_array().expect("authored nodes") {
+        assert!(
+            validator.is_valid(node),
+            "generated schema rejected authored fixture: {node}"
+        );
+    }
+    for node in required["realized"].as_array().expect("realized nodes") {
+        assert!(
+            validator.is_valid(node),
+            "generated schema rejected realized fixture: {node}"
+        );
+    }
+
+    for malformed in [
+        json!({ "$bind": "" }),
+        json!({ "$bind": "relative" }),
+        json!({ "$bind": 42 }),
+        json!({ "$bind": "@/value", "fallback": "value" }),
+    ] {
+        let node = json!({
+            "type": "button",
+            "props": {
+                "label": malformed,
+                "action": { "id": "contract.action" }
+            }
+        });
+        assert!(
+            !validator.is_valid(&node),
+            "generated schema accepted malformed sentinel: {node}"
+        );
+    }
+
+    for node in [
+        json!({
+            "type": "select_option",
+            "props": { "value": { "$bind": "@/value" }, "label": "Open" }
+        }),
+        json!({
+            "type": "table",
+            "props": { "columns": { "$bind": "@/columns" } }
+        }),
+        json!({
+            "type": "form",
+            "props": {
+                "action": { "$bind": "@/action" },
+                "submit_label": "Submit"
+            }
+        }),
+    ] {
+        assert!(
+            !validator.is_valid(&node),
+            "generated schema accepted required non-bindable sentinel: {node}"
+        );
+    }
 }
 
 #[test]
@@ -105,6 +187,15 @@ fn typescript_and_schema_encode_wire_names_and_optionality() {
         "export declare function realizeBindListDescendantId(rowId: string, key: string): UiNodeId;"
     ));
     assert!(typescript.contains("export interface UiNodeBase { id?: UiAuthoredNodeId;"));
+    assert!(typescript.contains("export type UiBindableString = string | UiBind;"));
+    assert!(typescript.contains("export type UiNonBindableValue ="));
+    assert!(typescript.contains("UiRequiredNonBindableProps<\"columns\">"));
+    assert!(typescript.contains("submit_label: UiBindableString"));
+    assert!(typescript.contains("label: UiBindableString"));
+    assert!(typescript.contains("text: UiAuthoredTextValue"));
+    assert!(typescript.contains("src: UiBindableString; title: UiBindableString"));
+    assert!(typescript.contains("name: UiNonBindableValue; label: UiNonBindableValue"));
+    assert!(typescript.contains("value: UiNonBindableValue; label: UiNonBindableValue"));
     let request_fields = interface_fields(&typescript, "UiActionRequest");
     let result_fields = interface_fields(&typescript, "UiActionResult");
     assert_eq!(
@@ -158,6 +249,43 @@ fn typescript_and_schema_encode_wire_names_and_optionality() {
             "Schema validation is necessary but not sufficient: the Rust/Hub validator admits a bound id only on the direct UiBindList.item_template root, where row context exists."
         )
     );
+    assert_eq!(
+        schema.pointer("/$defs/UiBindableString/oneOf/1/$ref"),
+        Some(&serde_json::json!("#/$defs/UiBind"))
+    );
+    assert_eq!(
+        required_prop_schema(&schema, "form", "submit_label").and_then(|value| value.get("$ref")),
+        Some(&serde_json::json!("#/$defs/UiBindableString"))
+    );
+    for kind in ["button", "icon_button", "menu_item"] {
+        assert_eq!(
+            required_prop_schema(&schema, kind, "label").and_then(|value| value.get("$ref")),
+            Some(&serde_json::json!("#/$defs/UiBindableString"))
+        );
+    }
+    assert_eq!(
+        required_prop_schema(&schema, "text", "text").and_then(|value| value.get("$ref")),
+        Some(&serde_json::json!("#/$defs/UiAuthoredTextValue"))
+    );
+    for field in ["src", "title"] {
+        assert_eq!(
+            required_prop_schema(&schema, "iframe", field).and_then(|value| value.get("$ref")),
+            Some(&serde_json::json!("#/$defs/UiBindableString"))
+        );
+    }
+    for (kind, field) in [
+        ("stack", "direction"),
+        ("metric", "label"),
+        ("table", "columns"),
+        ("text_input", "name"),
+        ("select_option", "value"),
+        ("terminal_view", "session_id"),
+    ] {
+        assert_eq!(
+            required_prop_schema(&schema, kind, field).and_then(|value| value.get("$ref")),
+            Some(&serde_json::json!("#/$defs/UiNonBindableValue"))
+        );
+    }
 
     assert_serde_fields_match_typescript::<UiActionRequest>(
         serde_json::json!({
@@ -438,13 +566,32 @@ fn typescript_and_schema_encode_wire_names_and_optionality() {
         false
     );
     assert_eq!(
-        schema["$defs"]["UiNode"]["allOf"][0]["then"]["properties"]["props"]["required"],
+        kind_schema_branch(&schema, "form").expect("form schema")["then"]["properties"]["props"]["required"],
         serde_json::json!(["action", "submit_label"])
     );
     assert_eq!(
-        schema["$defs"]["UiNode"]["allOf"][1]["then"]["properties"]["props"]["not"]["required"],
+        kind_schema_branch(&schema, "dialog").expect("dialog schema")["then"]["properties"]["props"]
+            ["not"]["required"],
         serde_json::json!(["open"])
     );
+}
+
+fn required_prop_schema<'a>(schema: &'a Value, kind: &str, prop: &str) -> Option<&'a Value> {
+    kind_schema_branch(schema, kind)
+        .and_then(|branch| branch["then"]["properties"]["props"]["properties"].get(prop))
+}
+
+fn kind_schema_branch<'a>(schema: &'a Value, kind: &str) -> Option<&'a Value> {
+    schema["$defs"]["UiNode"]["allOf"]
+        .as_array()?
+        .iter()
+        .find(|branch| {
+            let kind_schema = &branch["if"]["properties"]["type"];
+            kind_schema["const"] == kind
+                || kind_schema["enum"]
+                    .as_array()
+                    .is_some_and(|kinds| kinds.iter().any(|candidate| candidate == kind))
+        })
 }
 
 fn interface_fields<'a>(typescript: &'a str, name: &str) -> BTreeMap<&'a str, (&'a str, bool)> {

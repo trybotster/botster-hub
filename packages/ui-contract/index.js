@@ -2,7 +2,7 @@ import schema from "./schema.json" with { type: "json" };
 import conformanceFixtures from "./conformance-fixtures.json" with { type: "json" };
 
 export { schema, conformanceFixtures };
-export const packageVersion = "0.3.0";
+export const packageVersion = "0.3.1";
 
 export function realizeBindListDescendantId(rowId, key) {
   if (typeof rowId !== "string" || rowId.trim() === "") {

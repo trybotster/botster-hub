@@ -36,6 +36,32 @@ is invalid on the item root, outside a bound item template, under
 `empty_template`, or below a literal/absent root. Descendant full-ID `$bind`
 remains invalid. Action request/result `node_id` remains a literal `UiNodeId`.
 
+Required field binding is explicit rather than inferred from arbitrary JSON.
+Authored validation accepts a structurally valid `UiBind` for
+`Button.label`, `IconButton.label`, `MenuItem.label`, `Form.submit_label`,
+`Iframe.src`, `Iframe.title`, and `Text.text`. The first six fields otherwise
+require a nonblank string. `Text.text` retains its existing presence-only
+literal contract, including empty strings, numbers, and null; only its authored
+binding sentinel receives structural validation. Other required fields remain
+non-bindable. Version 0.3.1 intentionally closes an earlier permissive gap:
+required fields outside this seven-field allowlist now reject a binding
+sentinel that an earlier authored validator could admit accidentally.
+
+`UiNode.validate()` and `validate_ui_node()` are compatible authored-tree
+entry points. Rust consumers must call `UiNode.validate_realized()` or
+`validate_ui_node_realized()` after materialization. Realized validation
+rejects unresolved property, payload, list, conditional, and identity bindings
+while applying each field's existing literal rules. Hub performs authored
+admission and transport only; renderer clients own materialization and the
+realized validation boundary.
+
+Rust renderers that also validate capability fallbacks can call
+`validate_ui_node_realized_with_capabilities()` or
+`UiCapabilitySet.validate_realized_node()` for the combined realized-tree and
+capability traversal. The npm package publishes DTO declarations, schema, and
+fixtures but does not export a JavaScript runtime validator; non-Rust renderers
+must enforce the equivalent post-materialization boundary in their own runtime.
+
 The generated JSON Schema can describe the literal-or-binding wire union, but
 cannot express the complete BindList row context or template-global key
 uniqueness. Schema validity is therefore necessary but not sufficient; the

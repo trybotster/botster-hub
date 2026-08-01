@@ -32,6 +32,10 @@ export interface UiCapabilitySet { widthClasses?: UiWidthClass[]; heightClasses?
 export type UiSpaceToken = "none" | "xs" | "sm" | "md" | "lg" | "xl";
 export type UiColorToken = "default" | "muted" | "accent" | "success" | "warning" | "danger";
 export interface UiBind { $bind: string; }
+export type UiBindableString = string | UiBind;
+export type UiAuthoredTextValue = JsonValue | UiBind;
+export type UiNonBindableValue = null | boolean | number | string | JsonValue[] | ({ [key: string]: JsonValue } & { $bind?: never });
+export type UiRequiredNonBindableProps<Fields extends string> = JsonObject & Record<Fields, UiNonBindableValue>;
 export type UiPresentationOperation = { kind: "set"; key: UiPresentationKey; value: JsonValue } | { kind: "clear"; key: UiPresentationKey } | { kind: "toggle"; key: UiPresentationKey };
 export type UiPresentationPredicate = { kind: "present"; key: UiPresentationKey } | { kind: "truthy"; key: UiPresentationKey } | { kind: "equals"; key: UiPresentationKey; value: JsonValue };
 export interface UiResponsiveWidth { compact?: JsonValue; regular?: JsonValue; expanded?: JsonValue; }
@@ -42,15 +46,41 @@ export type UiConditional = { $kind: "when"; condition: UiCondition; node: UiNod
 export type UiBindList = { $kind: "bind_list"; source: string; where?: Record<string, JsonValue>; item_template: UiNode; empty_template?: UiNode };
 export type UiBindIf = { $kind: "bind_if"; path: string; node: UiNode } | { $kind: "presentation_if"; predicate: UiPresentationPredicate; node: UiNode };
 export type UiChild = UiConditional | UiNode | UiBindList | UiBindIf;
-export type UiFormProps = JsonObject & { action: UiAction; submit_label: string };
-export type UiDialogProps = JsonObject & { title: string; presentation?: UiDialogPresentation; open?: never };
-export type UiButtonProps = JsonObject & { label: string; action: UiAction };
+export type UiFormProps = JsonObject & { action: UiAction; submit_label: UiBindableString };
+export type UiDialogProps = JsonObject & { title: UiNonBindableValue; presentation?: UiDialogPresentation; open?: never };
+export type UiButtonProps = JsonObject & { label: UiBindableString; action: UiAction };
+export type UiIconButtonProps = JsonObject & { label: UiBindableString; icon: UiNonBindableValue; action: UiAction };
+export type UiMenuItemProps = JsonObject & { label: UiBindableString; action: UiAction };
+export type UiTextProps = JsonObject & { text: UiAuthoredTextValue };
+export type UiIframeProps = JsonObject & { src: UiBindableString; title: UiBindableString };
+export type UiFieldControlProps = JsonObject & { name: UiNonBindableValue; label: UiNonBindableValue };
+export type UiSelectOptionProps = JsonObject & { value: UiNonBindableValue; label: UiNonBindableValue };
+export type UiCustomProps = JsonObject & { namespace: string; component: string; reason: string };
 export interface UiNodeBase { id?: UiAuthoredNodeId; children?: UiChild[]; slots?: Record<string, UiChild[]>; }
 export type UiNode =
+  | (UiNodeBase & { type: "stack"; props: UiRequiredNonBindableProps<"direction"> })
   | (UiNodeBase & { type: "form"; props: UiFormProps })
+  | (UiNodeBase & { type: "form_section"; props: UiRequiredNonBindableProps<"title"> })
+  | (UiNodeBase & { type: "form_field"; props: UiRequiredNonBindableProps<"schema"> })
+  | (UiNodeBase & { type: "metric"; props: UiRequiredNonBindableProps<"label" | "value"> })
+  | (UiNodeBase & { type: "status_badge"; props: UiRequiredNonBindableProps<"label"> })
+  | (UiNodeBase & { type: "icon"; props: UiRequiredNonBindableProps<"icon"> })
+  | (UiNodeBase & { type: "badge"; props: UiRequiredNonBindableProps<"label"> })
+  | (UiNodeBase & { type: "status_dot"; props: UiRequiredNonBindableProps<"label"> })
+  | (UiNodeBase & { type: "empty_state"; props: UiRequiredNonBindableProps<"title"> })
+  | (UiNodeBase & { type: "table"; props: UiRequiredNonBindableProps<"columns"> })
   | (UiNodeBase & { type: "dialog"; props: UiDialogProps })
   | (UiNodeBase & { type: "button"; props: UiButtonProps })
-  | (UiNodeBase & { type: Exclude<UiNodeKind, "form" | "dialog" | "button">; props?: JsonObject });
+  | (UiNodeBase & { type: "icon_button"; props: UiIconButtonProps })
+  | (UiNodeBase & { type: "menu_item"; props: UiMenuItemProps })
+  | (UiNodeBase & { type: "text"; props: UiTextProps })
+  | (UiNodeBase & { type: "iframe"; props: UiIframeProps })
+  | (UiNodeBase & { type: "text_input" | "textarea" | "checkbox" | "select"; props: UiFieldControlProps })
+  | (UiNodeBase & { type: "select_option"; props: UiSelectOptionProps })
+  | (UiNodeBase & { type: "terminal_view"; props: UiRequiredNonBindableProps<"session_id"> })
+  | (UiNodeBase & { type: "connection_code_view"; props: UiRequiredNonBindableProps<"code"> })
+  | (UiNodeBase & { type: "custom"; props: UiCustomProps })
+  | (UiNodeBase & { type: Exclude<UiNodeKind, "stack" | "form" | "form_section" | "form_field" | "metric" | "status_badge" | "icon" | "badge" | "status_dot" | "empty_state" | "table" | "dialog" | "button" | "icon_button" | "menu_item" | "text" | "iframe" | "text_input" | "textarea" | "checkbox" | "select" | "select_option" | "terminal_view" | "connection_code_view" | "custom">; props?: JsonObject });
 export type UiFieldKind = "text" | "textarea" | "checkbox" | "select";
 export interface UiFieldOption { value: JsonValue; label: string; disabled?: boolean; }
 export interface UiFieldValidationHints { minLength?: number; maxLength?: number; pattern?: string; min?: number; max?: number; oneOf?: JsonValue[]; }

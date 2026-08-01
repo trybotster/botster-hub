@@ -317,7 +317,9 @@ local function session_lifecycle_surface(arguments)
             key = "spawn",
           },
           props = {
-            label = "Spawn session",
+            label = {
+              ["$bind"] = "@/lifecycle_class",
+            },
             action = {
               id = "contract.action",
               payload = {

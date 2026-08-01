@@ -151,7 +151,7 @@ contract instead of bypassing hub admission or calling raw core routers.
 Terminal attach is a terminal-stream handshake only. Session-list reads remain
 an operator/query API; stateful clients use the explicit held-open `session`
 entity subscription for an authoritative snapshot followed by ordered deltas.
-The reusable contract is prepared in `@trybotster/hub-test-support@0.1.19` as
+The reusable contract is prepared in `@trybotster/hub-test-support@0.1.20` as
 source-derived JSON fixtures and a Rust
 `run_session_lifecycle_subscription_conformance` runner over the real isolated
 Hub/Core/session-worker topology.
@@ -192,6 +192,14 @@ The renderer-neutral plugin UI wire contract is owned by the standalone
 types but does not own renderer presentation policy. `botster-hub-client`
 re-exports the same typed daemon bodies; clients must not maintain local
 `UiNode` or action-result mirrors.
+Hub validates plugin surfaces and accepted replacement trees as authored
+UiNodes. Required bindable fields are the explicit seven-field contract:
+Button/IconButton/MenuItem `label`, Form `submit_label`, Iframe `src` and
+`title`, and Text `text`. Renderer clients materialize these bindings; Rust
+clients use the contract crate's strict realized validator, while non-Rust
+clients enforce the equivalent sentinel-free boundary in their own runtime.
+The npm contract package does not export a JavaScript runtime validator. Hub
+intentionally does not materialize UI trees.
 The packaged plugin-contract-matrix proves the user-shaped path through a real
 isolated Hub and plugin worker: rendered action metadata dispatches an accepted
 presentation `set`, scoped client state opens the delivered Dialog and satisfies
@@ -201,7 +209,9 @@ and state, and valid submit plus toggle/clear effects remain typed. Static
 The fixture's `contract.sessions` surface accepts a bounded UUID set and
 authors `/session` bindings without receiving session values or raw Hub state.
 The held-open client entity subscription supplies authoritative snapshots and
-ordered patches; reconnect requires a fresh snapshot and explicit removal is
+ordered patches. The Spawn Button label binds `@/lifecycle_class`; strict Rust
+and Node reference materializers resolve it to the row's literal class before
+realized validation. Reconnect requires a fresh snapshot and explicit removal is
 the only operation that makes a retained reference unavailable.
 
 | Core / daemon operation | HubRuntime decision | Reason |

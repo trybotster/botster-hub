@@ -19,7 +19,8 @@ use botster_ui_contract::{
     UiResponsiveWidth, UiSelection, UiSelectionMode, UiSurfaceId, UiTableCell, UiTableColumn,
     UiTableColumnDescriptor, UiTableRow, UiToolbarOverflow, UiValidationError, UiVariant,
     UiWidthClass, realize_bind_list_descendant_id, validate_package_presentation, validate_ui_node,
-    validate_ui_node_with_capabilities,
+    validate_ui_node_authored, validate_ui_node_realized,
+    validate_ui_node_realized_with_capabilities, validate_ui_node_with_capabilities,
 };
 use serde_json::{Map, Value, json};
 
@@ -2002,6 +2003,256 @@ fn icon_button_requires_accessible_label() {
     )
     .validate()
     .expect("labeled icon button should validate");
+}
+
+#[test]
+fn authored_button_accepts_required_bound_label() {
+    node(
+        UiNodeKind::Button,
+        json!({
+            "label": { "$bind": "@/lifecycle_class" },
+            "action": { "id": "contract.action" }
+        }),
+    )
+    .validate()
+    .expect("authored required label binding should validate before materialization");
+}
+
+#[test]
+fn authored_required_bindable_field_matrix_accepts_valid_sentinels() {
+    let cases = [
+        (
+            UiNodeKind::Button,
+            json!({
+                "label": { "$bind": "@/lifecycle_class" },
+                "action": { "id": "contract.action" }
+            }),
+        ),
+        (
+            UiNodeKind::IconButton,
+            json!({
+                "label": { "$bind": "/session/session-1/lifecycle_class" },
+                "icon": "play",
+                "action": { "id": "contract.action" }
+            }),
+        ),
+        (
+            UiNodeKind::MenuItem,
+            json!({
+                "label": { "$bind": "@/lifecycle_class" },
+                "action": { "id": "contract.action" }
+            }),
+        ),
+        (
+            UiNodeKind::Form,
+            json!({
+                "action": { "id": "contract.submit" },
+                "submit_label": { "$bind": "/session/session-1/lifecycle_class" }
+            }),
+        ),
+        (
+            UiNodeKind::Iframe,
+            json!({
+                "src": { "$bind": "@/url" },
+                "title": "Session"
+            }),
+        ),
+        (
+            UiNodeKind::Iframe,
+            json!({
+                "src": "/plugin-assets/session.html",
+                "title": { "$bind": "@/lifecycle_class" }
+            }),
+        ),
+        (
+            UiNodeKind::Text,
+            json!({ "text": { "$bind": "@/lifecycle_class" } }),
+        ),
+    ];
+
+    for (kind, props) in cases {
+        let authored = node(kind, props);
+        authored
+            .validate_authored()
+            .unwrap_or_else(|error| panic!("{kind:?} authored binding should validate: {error}"));
+        validate_ui_node(&authored).expect("compatible free function remains authored");
+        validate_ui_node_authored(&authored).expect("explicit authored free function validates");
+    }
+}
+
+#[test]
+fn class_a_required_bindable_fields_reject_invalid_authored_values() {
+    let cases = [
+        (
+            UiNodeKind::Button,
+            "label",
+            json!({ "action": { "id": "go" } }),
+        ),
+        (
+            UiNodeKind::IconButton,
+            "label",
+            json!({ "icon": "play", "action": { "id": "go" } }),
+        ),
+        (
+            UiNodeKind::MenuItem,
+            "label",
+            json!({ "action": { "id": "go" } }),
+        ),
+        (
+            UiNodeKind::Form,
+            "submit_label",
+            json!({ "action": { "id": "go" } }),
+        ),
+        (UiNodeKind::Iframe, "src", json!({ "title": "Session" })),
+        (
+            UiNodeKind::Iframe,
+            "title",
+            json!({ "src": "/plugin-assets/session.html" }),
+        ),
+    ];
+
+    for (kind, field, base) in cases {
+        for invalid in [
+            Value::Null,
+            json!(""),
+            json!(" \t"),
+            json!(42),
+            json!({ "$bind": "" }),
+            json!({ "$bind": "relative" }),
+            json!({ "$bind": 42 }),
+            json!({ "$bind": "@/value", "fallback": "value" }),
+        ] {
+            let mut props = base.as_object().cloned().expect("object props");
+            props.insert(field.to_string(), invalid);
+            assert!(
+                node(kind, Value::Object(props))
+                    .validate_authored()
+                    .is_err(),
+                "{kind:?}.{field} should reject an invalid authored value"
+            );
+        }
+    }
+}
+
+#[test]
+fn text_required_presence_preserves_permissive_literals() {
+    for text in [Value::String(String::new()), json!(42), Value::Null] {
+        node(UiNodeKind::Text, json!({ "text": text }))
+            .validate_authored()
+            .expect("Text.text literal semantics remain presence-only");
+    }
+    assert_error_contains(node(UiNodeKind::Text, json!({})), "text");
+}
+
+#[test]
+fn required_non_bindable_fields_reject_sentinels() {
+    let cases = [
+        node(
+            UiNodeKind::Stack,
+            json!({ "direction": { "$bind": "@/direction" } }),
+        ),
+        node(
+            UiNodeKind::Form,
+            json!({
+                "action": { "$bind": "@/action" },
+                "submit_label": "Save"
+            }),
+        ),
+        node(
+            UiNodeKind::TextInput,
+            json!({ "name": { "$bind": "@/name" }, "label": "Name" }),
+        ),
+        node(
+            UiNodeKind::SelectOption,
+            json!({ "value": { "$bind": "@/value" }, "label": "Open" }),
+        ),
+    ];
+
+    for case in cases {
+        case.validate_authored()
+            .expect_err("required non-bindable sentinel should fail");
+    }
+}
+
+#[test]
+fn realized_validation_requires_materialized_literals_recursively() {
+    let realized = node(
+        UiNodeKind::Button,
+        json!({
+            "label": "current",
+            "action": {
+                "id": "contract.action",
+                "payload": { "session_uuid": "session-1" }
+            }
+        }),
+    );
+    realized
+        .validate_realized()
+        .expect("literal button is realized");
+    validate_ui_node_realized(&realized).expect("realized free function validates");
+
+    for unresolved in [
+        node(
+            UiNodeKind::Button,
+            json!({
+                "label": { "$bind": "@/lifecycle_class" },
+                "action": { "id": "contract.action" }
+            }),
+        ),
+        node(
+            UiNodeKind::Text,
+            json!({ "text": { "$bind": "@/lifecycle_class" } }),
+        ),
+        node(
+            UiNodeKind::Button,
+            json!({
+                "label": "Spawn",
+                "action": {
+                    "id": "contract.action",
+                    "payload": { "session_uuid": { "$bind": "@/session_uuid" } }
+                }
+            }),
+        ),
+        {
+            let mut custom = custom_node(node(UiNodeKind::Text, json!({ "text": "Fallback" })));
+            custom
+                .props
+                .insert("series".to_string(), json!({ "$bind": "@/series" }));
+            custom
+        },
+    ] {
+        let message = unresolved
+            .validate_realized()
+            .expect_err("unresolved realized binding should fail")
+            .to_string();
+        assert!(message.contains("unresolved binding sentinel"), "{message}");
+    }
+
+    let mut realized_custom = custom_node(node(UiNodeKind::Text, json!({ "text": "Fallback" })));
+    realized_custom
+        .props
+        .insert("series".to_string(), json!([1, 2, 3]));
+    realized_custom
+        .validate_realized()
+        .expect("literal custom payload is realized");
+
+    let mut bound_button = node(
+        UiNodeKind::Button,
+        json!({
+            "label": { "$bind": "@/lifecycle_class" },
+            "action": { "id": "contract.action" }
+        }),
+    );
+    validate_ui_node_with_capabilities(&bound_button, &rich_capabilities())
+        .expect("authored capability validation accepts unresolved binds");
+    validate_ui_node_realized_with_capabilities(&bound_button, &rich_capabilities())
+        .expect_err("realized capability validation rejects unresolved binds");
+    bound_button
+        .props
+        .insert("label".to_string(), json!("current"));
+    rich_capabilities()
+        .validate_realized_node(&bound_button)
+        .expect("realized capability convenience API accepts literals");
 }
 
 #[test]

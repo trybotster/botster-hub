@@ -26,7 +26,7 @@ use botster_hub_client::{
 };
 use botster_ui_contract::{
     UiActionId, UiActionKind, UiActionRequest, UiActionRequestId, UiActionResult,
-    UiActionResultState, UiFormValues, UiPresentationOperation, UiSurfaceId,
+    UiActionResultState, UiFormValues, UiNode, UiPresentationOperation, UiSurfaceId,
     realize_bind_list_descendant_id,
 };
 use serde::{Deserialize, Serialize};
@@ -198,6 +198,7 @@ pub struct SessionPluginMaterializedRow {
 pub struct SessionPluginMaterializedControl {
     pub key: String,
     pub node_id: String,
+    pub label: String,
     pub action_payload: serde_json::Value,
 }
 
@@ -875,7 +876,7 @@ fn session_plugin_binding_surface(references: &[String]) -> serde_json::Value {
                         "type": "button",
                         "id": { "$kind": "bind_list_descendant_id", "key": "spawn" },
                         "props": {
-                            "label": "Spawn session",
+                            "label": { "$bind": "@/lifecycle_class" },
                             "action": {
                                 "id": "contract.action",
                                 "payload": {
@@ -929,6 +930,11 @@ fn expected_session_plugin_materialized_row(node_id: &str) -> SessionPluginMater
                 node_id: realize_bind_list_descendant_id(node_id, key)
                     .expect("fixture row and control keys are nonblank")
                     .0,
+                label: if key == "spawn" {
+                    "current".to_string()
+                } else {
+                    format!("{} session", uppercase_first(key))
+                },
                 action_payload: serde_json::json!({
                     "operation": key,
                     "session_uuid": node_id
@@ -951,7 +957,7 @@ fn expected_session_plugin_identity_oracle() -> serde_json::Value {
                     "type": "button",
                     "id": { "$kind": "bind_list_descendant_id", "key": "spawn" },
                     "props": {
-                        "label": "Spawn session",
+                        "label": { "$bind": "@/lifecycle_class" },
                         "action": {
                             "id": "contract.action",
                             "payload": {
@@ -1204,13 +1210,31 @@ pub fn materialize_session_plugin_rows(
                     .map_err(|error| error.to_string())?
                     .0;
                 insert_realized_node_id(&mut seen, &realized)?;
+                let label = materialize_control_label(control, &entity)?;
+                let action_payload = serde_json::json!({
+                    "operation": key,
+                    "session_uuid": node_id
+                });
+                let realized_control: UiNode = serde_json::from_value(serde_json::json!({
+                    "type": "button",
+                    "id": realized,
+                    "props": {
+                        "label": label,
+                        "action": {
+                            "id": "contract.action",
+                            "payload": action_payload
+                        }
+                    }
+                }))
+                .map_err(|error| format!("materialized control is not a UiNode: {error}"))?;
+                realized_control
+                    .validate_realized()
+                    .map_err(|error| format!("materialized control is not realized: {error}"))?;
                 Ok(SessionPluginMaterializedControl {
                     key: key.to_string(),
                     node_id: realized,
-                    action_payload: serde_json::json!({
-                        "operation": key,
-                        "session_uuid": node_id
-                    }),
+                    label,
+                    action_payload,
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
@@ -1220,6 +1244,38 @@ pub fn materialize_session_plugin_rows(
         });
     }
     Ok(rows)
+}
+
+fn materialize_control_label(
+    control: &serde_json::Value,
+    entity: &serde_json::Value,
+) -> Result<String, String> {
+    let label = control
+        .pointer("/props/label")
+        .ok_or_else(|| "identity-bearing control is missing label".to_string())?;
+    if let Some(label) = label.as_str() {
+        return Ok(label.to_string());
+    }
+    let path = label
+        .get("$bind")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "identity-bearing control label is not a string or bind".to_string())?;
+    let field = path
+        .strip_prefix("@/")
+        .ok_or_else(|| "identity-bearing control label bind must be item-relative".to_string())?;
+    entity
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .map(ToString::to_string)
+        .ok_or_else(|| format!("selected session row is missing string {field}"))
+}
+
+fn uppercase_first(value: &str) -> String {
+    let mut chars = value.chars();
+    chars
+        .next()
+        .map(|first| first.to_uppercase().collect::<String>() + chars.as_str())
+        .unwrap_or_default()
 }
 
 fn insert_realized_node_id(seen: &mut BTreeSet<String>, node_id: &str) -> Result<(), String> {
@@ -6711,10 +6767,14 @@ mod tests {
     fn session_plugin_row_materializer_realizes_identity_and_payload_in_producer_order() {
         let scenario = session_plugin_binding_conformance_scenario();
         let mut frames = vec![scenario.initial_snapshot.clone()];
-        assert_eq!(
-            materialize_session_plugin_rows(&scenario.surface, &frames)
-                .expect("materialize initial current rows"),
-            scenario.row_expected.initial
+        let initial = materialize_session_plugin_rows(&scenario.surface, &frames)
+            .expect("materialize initial current rows");
+        assert_eq!(initial, scenario.row_expected.initial);
+        assert!(initial.iter().all(|row| row.controls[0].label == "current"));
+        assert!(
+            initial
+                .iter()
+                .all(|row| row.controls[1].label == "Rename session")
         );
         frames.push(scenario.transition_frames[0].clone());
         assert_eq!(
@@ -6783,6 +6843,16 @@ mod tests {
         malformed_oracle["children"][last]["item_template"]["id"]["$bind"] =
             serde_json::json!("@/registry_state");
         assert_both_reject(&malformed_oracle);
+
+        let mut unresolved_label = scenario.surface.clone();
+        let last = unresolved_label["children"]
+            .as_array()
+            .expect("children")
+            .len()
+            - 1;
+        unresolved_label["children"][last]["item_template"]["children"][0]["props"]["label"]["$bind"] =
+            serde_json::json!("@/missing_label");
+        assert_both_reject(&unresolved_label);
 
         let mut extra = scenario.surface.clone();
         extra["children"]
