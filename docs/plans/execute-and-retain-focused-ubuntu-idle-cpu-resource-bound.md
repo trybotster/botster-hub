@@ -98,7 +98,7 @@ The environment variable is therefore consumed by the production test path, not 
    - `test_target=focused-plugin-resource-bounds`
    - `repetitions=20`
    - `stress_profile=none`
-   - for repetitions 1 through 20: elapsed seconds, raw idle delta ticks, ticks per second, threshold result derived from the executed assertion and Rust result (or an explicit verdict if a conditional evidence change proves necessary), campaign exit status, and names plus emptiness/count results for `run-NNN-owned-survivors.tsv`, `run-NNN-session-survivors.tsv`, and `run-NNN-zombie-survivors.tsv`;
+   - for repetitions 1 through 20: elapsed seconds, raw idle delta ticks, ticks per second, threshold result derived from the executed assertion and Rust result (or an explicit verdict if a conditional evidence change proves necessary), campaign exit status, and names plus presence, line/data-row counts, and truncated-row results for `run-NNN-owned-survivors.tsv`, `run-NNN-session-survivors.tsv`, and `run-NNN-zombie-survivors.tsv`;
    - final campaign and cleanup statuses, `cleanup.log`, and empty `active-pgids.tsv`, `active-sessions.tsv`, and `active-run-tokens.tsv` ledgers;
    - SHA-256 hashes for the retained raw artifact files used to construct the bounded record.
 6. Link the durable report to the GitHub run. Keep the full uploaded diagnostics as the raw review packet while it is available; the committed bounded record preserves the ticket-defining facts after GitHub's 14-day artifact expiry.
@@ -173,7 +173,7 @@ Authoritative runtime acceptance:
 8. `commands.txt` proves every repetition invokes the exact focused Rust test through `./test.sh` with `BOTSTER_ASSERT_IDLE_CPU_BOUND=1`.
 9. Each `run-001.log` through `run-020.log` contains one raw CPU sample, no `idle_cpu_bound=observed_not_asserted` line, and a green Rust result. The bounded evidence evaluates the committed predicate `delta_ticks * 4 <= ticks_per_second` for each row and retains `result=pass`; if this cannot be established deterministically, add the conditional explicit verdict and rerun all 20. No aggregate average substitutes for any repetition.
 10. `campaign-status.tsv` contains 20 completed zero-exit repetitions with elapsed times, and campaign/final cleanup status is zero.
-11. For every repetition, `run-NNN-owned-survivors.tsv`, `run-NNN-session-survivors.tsv`, and `run-NNN-zombie-survivors.tsv` are empty after their bounded settle paths. Final cleanup reports zero survivors, `cleanup.log` succeeds, and `active-pgids.tsv`, `active-sessions.tsv`, and `active-run-tokens.tsv` are empty.
+11. For every repetition, `run-NNN-owned-survivors.tsv`, `run-NNN-session-survivors.tsv`, and `run-NNN-zombie-survivors.tsv` are present after their bounded settle paths, contain exactly the one expected header line and zero data rows, and contain no `truncated` row. A missing or zero-byte file is a failure. Final cleanup reports zero survivors, `cleanup.log` succeeds, and `active-pgids.tsv`, `active-sessions.tsv`, and `active-run-tokens.tsv` are empty.
 12. The complete diagnostics artifact uploads successfully and its digest is retained. The committed report/evidence JSON contains all 20 rows and hashes back to the inspected raw files.
 13. The final diff contains only lines traceable to the plan, retained evidence, and any concrete first-run retention gap. No bound, load, lifecycle, managed-Git, or unrelated behavior changes.
 
