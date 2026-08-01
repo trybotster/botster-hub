@@ -950,21 +950,37 @@ fi
   botster-workspaces="$workspaces_repo" \
   botster-project-pipelines="$project_pipelines_repo"
 
-manual_reload_pattern='packages reload|(^|[[:space:]])reload[[:space:]]'
-printf 'packages reload\n' | grep -qE "$manual_reload_pattern" || {
-  echo "manual reload audit known-positive control did not match" >&2
+public_reload_pattern='^<hub-repo>/target/debug/botster-hub packages reload --data-dir <runtime-root>/fresh-data (botster-web|botster-tui|botster-workspaces|project-pipelines)$'
+printf 'botster-hub reload botster-web\n' |
+  awk '$0 ~ /(^|[[:space:]])reload([[:space:]]|$)/ { found=1 } END { exit !found }' || {
+  echo "hidden reload audit known-positive control did not match" >&2
   exit 1
 }
-if grep -nE "$manual_reload_pattern" "$evidence_dir/commands.log" \
-  >"$runtime_root/manual-reload.raw"; then
+awk -v public_reload_pattern="$public_reload_pattern" '
+  $0 ~ /(^|[[:space:]])reload([[:space:]]|$)/ && $0 !~ public_reload_pattern {
+    print NR ":" $0
+    found=1
+  }
+  END { exit !found }
+' "$evidence_dir/commands.log" >"$runtime_root/manual-reload.raw" && {
   redact_file "$runtime_root/manual-reload.raw" "$evidence_dir/manual-reload-findings.log"
   echo "acceptance used a hidden manual package reload" >&2
   exit 1
-elif [ "$?" -gt 1 ]; then
-  echo "manual reload audit failed to execute" >&2
+}
+grep -E "$public_reload_pattern" "$evidence_dir/commands.log" \
+  >"$evidence_dir/public-package-reloads.log"
+[ "$(wc -l <"$evidence_dir/public-package-reloads.log" | tr -d ' ')" -eq 4 ] || {
+  echo "acceptance did not exercise exactly four public package reloads" >&2
   exit 1
-fi
-printf 'known_positive_observed=true\nresult=no_manual_reload_command\n' >"$evidence_dir/manual-reload-audit.txt"
+}
+for public_reload_package in botster-web botster-tui botster-workspaces project-pipelines; do
+  grep -qx "<hub-repo>/target/debug/botster-hub packages reload --data-dir <runtime-root>/fresh-data $public_reload_package" \
+    "$evidence_dir/public-package-reloads.log" || {
+    echo "acceptance did not exercise public reload for $public_reload_package" >&2
+    exit 1
+  }
+done
+printf 'known_positive_observed=true\nresult=public_package_reload_only\n' >"$evidence_dir/manual-reload-audit.txt"
 
 "$evidence_helper" snapshot "$operator_worktree_data_dir" "$evidence_dir/operator-worktree-state-after.json"
 "$evidence_helper" snapshot "$operator_home_data_dir" "$evidence_dir/operator-home-state-after.json"
