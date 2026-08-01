@@ -763,6 +763,10 @@ const TYPESCRIPT: &str = r#"
 export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 export type JsonObject = { [key: string]: JsonValue };
 export type UiNodeId = string;
+export declare const packageVersion: string;
+export declare const schema: JsonObject;
+export declare const conformanceFixtures: JsonObject;
+export declare function realizeBindListDescendantId(rowId: string, key: string): UiNodeId;
 export type UiBindListDescendantId = { $kind: "bind_list_descendant_id"; key: string };
 export type UiAuthoredNodeId = UiNodeId | UiBind | UiBindListDescendantId;
 export type UiActionId = string;

@@ -67,6 +67,22 @@ pack_package() {
   )
 }
 
+verify_ui_typescript_consumer() {
+  tarball=$1
+  consumer_dir=$release_dir/ui-typescript-consumer
+
+  log "Compiling a strict TypeScript consumer of the packed UI contract" >&2
+  mkdir -p "$consumer_dir"
+  cp "$repo_dir/script/fixtures/ui-contract-typescript-consumer.ts" "$consumer_dir/consumer.ts"
+  (
+    cd "$consumer_dir"
+    npm install --no-save --package-lock=false "$tarball" >/dev/null
+    npm exec --yes --package=typescript@7.0.2 -- \
+      tsc --strict --noEmit --module NodeNext --moduleResolution NodeNext \
+      --target ES2022 consumer.ts
+  )
+}
+
 package_is_published() {
   coordinate=$1
   error_file=$release_dir/npm-view-error
@@ -174,6 +190,7 @@ ui_tarball=$release_dir/$ui_tarball_name
   printf 'Expected package tarball was not created: %s\n' "$ui_tarball" >&2
   exit 66
 }
+verify_ui_typescript_consumer "$ui_tarball"
 
 log "Installing the packed $ui_coordinate for the dependent package tests"
 (

@@ -2321,6 +2321,36 @@ fn bound_list_descendant_identity_is_contextual_unique_and_utf8_stable() {
                     "type": "inline",
                     "id": { "$bind": "@/session_uuid" },
                     "children": [{
+                        "$kind": "when",
+                        "condition": { "width": "compact" },
+                        "node": {
+                            "type": "button",
+                            "id": { "$kind": "bind_list_descendant_id", "key": "remove" },
+                            "props": { "label": "Remove", "action": { "id": "contract.action" } }
+                        }
+                    }, {
+                        "$kind": "hidden",
+                        "condition": { "width": "compact" },
+                        "node": {
+                            "type": "button",
+                            "id": { "$kind": "bind_list_descendant_id", "key": "remove" },
+                            "props": { "label": "Remove when expanded", "action": { "id": "contract.action" } }
+                        }
+                    }]
+                }
+            }]
+        }),
+        json!({
+            "type": "panel",
+            "id": "sessions",
+            "props": { "title": "Sessions" },
+            "children": [{
+                "$kind": "bind_list",
+                "source": "/session",
+                "item_template": {
+                    "type": "inline",
+                    "id": { "$bind": "@/session_uuid" },
+                    "children": [{
                         "type": "button",
                         "id": { "$kind": "bind_list_descendant_id", "key": "remove" },
                         "props": { "label": "Remove", "action": { "id": "contract.action" } }

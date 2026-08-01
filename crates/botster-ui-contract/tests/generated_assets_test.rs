@@ -98,6 +98,12 @@ fn typescript_and_schema_encode_wire_names_and_optionality() {
         typescript
             .contains("export type UiAuthoredNodeId = UiNodeId | UiBind | UiBindListDescendantId;")
     );
+    assert!(typescript.contains("export declare const packageVersion: string;"));
+    assert!(typescript.contains("export declare const schema: JsonObject;"));
+    assert!(typescript.contains("export declare const conformanceFixtures: JsonObject;"));
+    assert!(typescript.contains(
+        "export declare function realizeBindListDescendantId(rowId: string, key: string): UiNodeId;"
+    ));
     assert!(typescript.contains("export interface UiNodeBase { id?: UiAuthoredNodeId;"));
     let request_fields = interface_fields(&typescript, "UiActionRequest");
     let result_fields = interface_fields(&typescript, "UiActionResult");
