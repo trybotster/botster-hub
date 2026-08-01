@@ -1,8 +1,16 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
-import { conformanceFixtures, packageVersion, schema } from "./index.js";
+import {
+  conformanceFixtures,
+  packageVersion,
+  realizeBindListDescendantId,
+  schema,
+} from "./index.js";
 
-assert.equal(packageVersion, "0.2.0");
+const packageManifest = JSON.parse(
+  fs.readFileSync(new URL("./package.json", import.meta.url), "utf8"),
+);
+assert.equal(packageVersion, packageManifest.version);
 assert.equal(schema.title, "Botster UI Contract");
 assert.equal(
   conformanceFixtures.fixtures.request.values.title,
@@ -28,6 +36,14 @@ assert.deepEqual(
   conformanceFixtures.fixtures.bound_row_identity.children[0].item_template.id,
   { $bind: "@/session_uuid" },
 );
+for (const vector of conformanceFixtures.bind_list_descendant_identity_vectors) {
+  assert.equal(
+    realizeBindListDescendantId(vector.row, vector.key),
+    vector.realized_id,
+  );
+}
+assert.throws(() => realizeBindListDescendantId(" ", "remove"), /non-blank/);
+assert.throws(() => realizeBindListDescendantId("session-1", "\t"), /non-blank/);
 assert.equal(
   schema.$defs.UiNode.properties.id.$ref,
   "#/$defs/UiAuthoredNodeId",
@@ -52,6 +68,11 @@ const declarations = fs.readFileSync(
 for (const token of [
   "UiNode",
   "UiAuthoredNodeId",
+  "UiBindListDescendantId",
+  "realizeBindListDescendantId",
+  "packageVersion",
+  "conformanceFixtures",
+  "schema",
   "UiActionRequest",
   "UiActionResult",
   "UiPresentationOperation",

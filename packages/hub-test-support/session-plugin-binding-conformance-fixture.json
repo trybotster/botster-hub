@@ -1,6 +1,6 @@
 {
   "binding_family": "/session",
-  "conformance_fixture_revision": 25,
+  "conformance_fixture_revision": 26,
   "entity_type": "session",
   "expected": {
     "after_ended_patch": {
@@ -129,20 +129,188 @@
   ],
   "row_expected": {
     "after_ended_patch": [
-      "session-stable-current"
+      {
+        "controls": [
+          {
+            "action_payload": {
+              "operation": "spawn",
+              "session_uuid": "session-stable-current"
+            },
+            "key": "spawn",
+            "node_id": "botster-ui-descendant-v1:22:session-stable-current5:spawn"
+          },
+          {
+            "action_payload": {
+              "operation": "rename",
+              "session_uuid": "session-stable-current"
+            },
+            "key": "rename",
+            "node_id": "botster-ui-descendant-v1:22:session-stable-current6:rename"
+          },
+          {
+            "action_payload": {
+              "operation": "remove",
+              "session_uuid": "session-stable-current"
+            },
+            "key": "remove",
+            "node_id": "botster-ui-descendant-v1:22:session-stable-current6:remove"
+          }
+        ],
+        "node_id": "session-stable-current"
+      }
     ],
     "after_indeterminate_patch": [
-      "session-stable-current"
+      {
+        "controls": [
+          {
+            "action_payload": {
+              "operation": "spawn",
+              "session_uuid": "session-stable-current"
+            },
+            "key": "spawn",
+            "node_id": "botster-ui-descendant-v1:22:session-stable-current5:spawn"
+          },
+          {
+            "action_payload": {
+              "operation": "rename",
+              "session_uuid": "session-stable-current"
+            },
+            "key": "rename",
+            "node_id": "botster-ui-descendant-v1:22:session-stable-current6:rename"
+          },
+          {
+            "action_payload": {
+              "operation": "remove",
+              "session_uuid": "session-stable-current"
+            },
+            "key": "remove",
+            "node_id": "botster-ui-descendant-v1:22:session-stable-current6:remove"
+          }
+        ],
+        "node_id": "session-stable-current"
+      }
     ],
     "after_reconnect": [
-      "session-stable-current"
+      {
+        "controls": [
+          {
+            "action_payload": {
+              "operation": "spawn",
+              "session_uuid": "session-stable-current"
+            },
+            "key": "spawn",
+            "node_id": "botster-ui-descendant-v1:22:session-stable-current5:spawn"
+          },
+          {
+            "action_payload": {
+              "operation": "rename",
+              "session_uuid": "session-stable-current"
+            },
+            "key": "rename",
+            "node_id": "botster-ui-descendant-v1:22:session-stable-current6:rename"
+          },
+          {
+            "action_payload": {
+              "operation": "remove",
+              "session_uuid": "session-stable-current"
+            },
+            "key": "remove",
+            "node_id": "botster-ui-descendant-v1:22:session-stable-current6:remove"
+          }
+        ],
+        "node_id": "session-stable-current"
+      }
     ],
     "after_remove": [
-      "session-stable-current"
+      {
+        "controls": [
+          {
+            "action_payload": {
+              "operation": "spawn",
+              "session_uuid": "session-stable-current"
+            },
+            "key": "spawn",
+            "node_id": "botster-ui-descendant-v1:22:session-stable-current5:spawn"
+          },
+          {
+            "action_payload": {
+              "operation": "rename",
+              "session_uuid": "session-stable-current"
+            },
+            "key": "rename",
+            "node_id": "botster-ui-descendant-v1:22:session-stable-current6:rename"
+          },
+          {
+            "action_payload": {
+              "operation": "remove",
+              "session_uuid": "session-stable-current"
+            },
+            "key": "remove",
+            "node_id": "botster-ui-descendant-v1:22:session-stable-current6:remove"
+          }
+        ],
+        "node_id": "session-stable-current"
+      }
     ],
     "initial": [
-      "session-transition",
-      "session-stable-current"
+      {
+        "controls": [
+          {
+            "action_payload": {
+              "operation": "spawn",
+              "session_uuid": "session-transition"
+            },
+            "key": "spawn",
+            "node_id": "botster-ui-descendant-v1:18:session-transition5:spawn"
+          },
+          {
+            "action_payload": {
+              "operation": "rename",
+              "session_uuid": "session-transition"
+            },
+            "key": "rename",
+            "node_id": "botster-ui-descendant-v1:18:session-transition6:rename"
+          },
+          {
+            "action_payload": {
+              "operation": "remove",
+              "session_uuid": "session-transition"
+            },
+            "key": "remove",
+            "node_id": "botster-ui-descendant-v1:18:session-transition6:remove"
+          }
+        ],
+        "node_id": "session-transition"
+      },
+      {
+        "controls": [
+          {
+            "action_payload": {
+              "operation": "spawn",
+              "session_uuid": "session-stable-current"
+            },
+            "key": "spawn",
+            "node_id": "botster-ui-descendant-v1:22:session-stable-current5:spawn"
+          },
+          {
+            "action_payload": {
+              "operation": "rename",
+              "session_uuid": "session-stable-current"
+            },
+            "key": "rename",
+            "node_id": "botster-ui-descendant-v1:22:session-stable-current6:rename"
+          },
+          {
+            "action_payload": {
+              "operation": "remove",
+              "session_uuid": "session-stable-current"
+            },
+            "key": "remove",
+            "node_id": "botster-ui-descendant-v1:22:session-stable-current6:remove"
+          }
+        ],
+        "node_id": "session-stable-current"
+      }
     ]
   },
   "surface": {
@@ -265,22 +433,69 @@
       {
         "$kind": "bind_list",
         "item_template": {
+          "children": [
+            {
+              "id": {
+                "$kind": "bind_list_descendant_id",
+                "key": "spawn"
+              },
+              "props": {
+                "action": {
+                  "id": "contract.action",
+                  "payload": {
+                    "operation": "spawn",
+                    "session_uuid": {
+                      "$bind": "@/session_uuid"
+                    }
+                  }
+                },
+                "label": "Spawn session"
+              },
+              "type": "button"
+            },
+            {
+              "id": {
+                "$kind": "bind_list_descendant_id",
+                "key": "rename"
+              },
+              "props": {
+                "action": {
+                  "id": "contract.action",
+                  "payload": {
+                    "operation": "rename",
+                    "session_uuid": {
+                      "$bind": "@/session_uuid"
+                    }
+                  }
+                },
+                "label": "Rename session"
+              },
+              "type": "button"
+            },
+            {
+              "id": {
+                "$kind": "bind_list_descendant_id",
+                "key": "remove"
+              },
+              "props": {
+                "action": {
+                  "id": "contract.action",
+                  "payload": {
+                    "operation": "remove",
+                    "session_uuid": {
+                      "$bind": "@/session_uuid"
+                    }
+                  }
+                },
+                "label": "Remove session"
+              },
+              "type": "button"
+            }
+          ],
           "id": {
             "$bind": "@/session_uuid"
           },
-          "props": {
-            "action": {
-              "id": "contract.action",
-              "payload": {
-                "operation": "select_session",
-                "session_uuid": {
-                  "$bind": "@/session_uuid"
-                }
-              }
-            },
-            "label": "Select session"
-          },
-          "type": "button"
+          "type": "inline"
         },
         "source": "/session",
         "where": {

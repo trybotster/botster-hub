@@ -7,7 +7,7 @@ use botster_ui_contract::{
     UiHeightClass, UiIframePermission, UiIframeSandboxToken, UiMetricTrendDirection, UiNode,
     UiNodeKind, UiOrientation, UiPointer, UiSelectionMode, UiSpaceToken, UiTableColumnAlign,
     UiToolbarOverflow, UiVariant, UiWidthClass, conformance_fixtures_json, json_schema,
-    typescript_declarations,
+    realize_bind_list_descendant_id, typescript_declarations,
 };
 use serde::Serialize;
 
@@ -35,7 +35,23 @@ fn generated_assets_match_checked_in_package() {
 
 #[test]
 fn generated_fixtures_deserialize_and_validate_through_rust_authority() {
-    let fixtures = conformance_fixtures_json()["fixtures"].clone();
+    let conformance = conformance_fixtures_json();
+    let fixtures = conformance["fixtures"].clone();
+
+    for vector in conformance["bind_list_descendant_identity_vectors"]
+        .as_array()
+        .expect("identity vectors")
+    {
+        assert_eq!(
+            realize_bind_list_descendant_id(
+                vector["row"].as_str().expect("row"),
+                vector["key"].as_str().expect("key"),
+            )
+            .expect("realize identity")
+            .0,
+            vector["realized_id"].as_str().expect("realized id")
+        );
+    }
 
     let surfaces: Vec<PackageSurfaceDescriptor> =
         serde_json::from_value(fixtures["package_presentation"]["surfaces"].clone())
@@ -78,7 +94,16 @@ fn generated_fixtures_deserialize_and_validate_through_rust_authority() {
 #[test]
 fn typescript_and_schema_encode_wire_names_and_optionality() {
     let typescript = typescript_declarations();
-    assert!(typescript.contains("export type UiAuthoredNodeId = UiNodeId | UiBind;"));
+    assert!(
+        typescript
+            .contains("export type UiAuthoredNodeId = UiNodeId | UiBind | UiBindListDescendantId;")
+    );
+    assert!(typescript.contains("export declare const packageVersion: string;"));
+    assert!(typescript.contains("export declare const schema: JsonObject;"));
+    assert!(typescript.contains("export declare const conformanceFixtures: JsonObject;"));
+    assert!(typescript.contains(
+        "export declare function realizeBindListDescendantId(rowId: string, key: string): UiNodeId;"
+    ));
     assert!(typescript.contains("export interface UiNodeBase { id?: UiAuthoredNodeId;"));
     let request_fields = interface_fields(&typescript, "UiActionRequest");
     let result_fields = interface_fields(&typescript, "UiActionResult");

@@ -9,6 +9,7 @@ import {
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { isDeepStrictEqual } from "node:util";
+import { realizeBindListDescendantId } from "@trybotster/ui-contract";
 
 const packageRoot = fileURLToPath(new URL(".", import.meta.url));
 
@@ -131,18 +132,22 @@ function inspectSessionPluginSurface(surface) {
       source: "/session",
       where: { lifecycle_class: "current" },
       item_template: {
-        type: "button",
+        type: "inline",
         id: { $bind: "@/session_uuid" },
-        props: {
-          label: "Select session",
-          action: {
-            id: "contract.action",
-            payload: {
-              operation: "select_session",
-              session_uuid: { $bind: "@/session_uuid" },
+        children: ["spawn", "rename", "remove"].map((key) => ({
+          type: "button",
+          id: { $kind: "bind_list_descendant_id", key },
+          props: {
+            label: `${key[0].toUpperCase()}${key.slice(1)} session`,
+            action: {
+              id: "contract.action",
+              payload: {
+                operation: key,
+                session_uuid: { $bind: "@/session_uuid" },
+              },
             },
           },
-        },
+        })),
       },
     };
     if (!isDeepStrictEqual(child, expectedOracle)) {
@@ -210,6 +215,18 @@ export function materializeSessionPluginRows(surface, frames) {
   const expectedClass = oracle.where.lifecycle_class;
   const entities = materializeSessionEntities(frames);
   const seen = new Set();
+  insertRealizedNodeId(seen, surface.id);
+  for (const child of surface.children) {
+    if (child === oracle) continue;
+    const hasRow = entities.some(
+      ([, entity]) => entity.session_uuid === child.where.session_uuid,
+    );
+    collectLiteralNodeIds(
+      hasRow ? child.item_template : child.empty_template,
+      seen,
+    );
+  }
+  const controls = oracle.item_template.children;
   const rows = [];
   for (const [, entity] of entities) {
     if (entity.lifecycle_class !== expectedClass) continue;
@@ -219,19 +236,49 @@ export function materializeSessionPluginRows(surface, frames) {
     if (entity.session_uuid.trim() === "") {
       throw new TypeError("selected session row has blank session_uuid");
     }
-    if (seen.has(entity.session_uuid)) {
-      throw new TypeError(`duplicate materialized session node id ${entity.session_uuid}`);
-    }
-    seen.add(entity.session_uuid);
+    insertRealizedNodeId(seen, entity.session_uuid);
     rows.push({
       node_id: entity.session_uuid,
-      action_payload: {
-        operation: "select_session",
-        session_uuid: entity.session_uuid,
-      },
+      controls: controls.map((control) => {
+        const key = control.id.key;
+        const nodeId = realizeBindListDescendantId(entity.session_uuid, key);
+        insertRealizedNodeId(seen, nodeId);
+        return {
+          key,
+          node_id: nodeId,
+          action_payload: {
+            operation: key,
+            session_uuid: entity.session_uuid,
+          },
+        };
+      }),
     });
   }
   return rows;
+}
+
+function insertRealizedNodeId(seen, nodeId) {
+  if (typeof nodeId !== "string" || nodeId.trim() === "") {
+    throw new TypeError("realized node id must be a non-blank string");
+  }
+  if (seen.has(nodeId)) {
+    throw new TypeError(`duplicate realized node id ${nodeId}`);
+  }
+  seen.add(nodeId);
+}
+
+function collectLiteralNodeIds(value, seen) {
+  if (Array.isArray(value)) {
+    for (const child of value) collectLiteralNodeIds(child, seen);
+    return;
+  }
+  if (!value || typeof value !== "object") return;
+  if (typeof value.type === "string" && typeof value.id === "string") {
+    insertRealizedNodeId(seen, value.id);
+  }
+  for (const [key, child] of Object.entries(value)) {
+    if (key !== "id") collectLiteralNodeIds(child, seen);
+  }
 }
 
 export function materializeSessionPluginBindingScenario(scenario) {
