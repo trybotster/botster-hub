@@ -938,6 +938,62 @@ fn expected_session_plugin_materialized_row(node_id: &str) -> SessionPluginMater
     }
 }
 
+fn expected_session_plugin_identity_oracle() -> serde_json::Value {
+    serde_json::json!({
+        "$kind": "bind_list",
+        "source": "/session",
+        "where": { "lifecycle_class": "current" },
+        "item_template": {
+            "type": "inline",
+            "id": { "$bind": "@/session_uuid" },
+            "children": [
+                {
+                    "type": "button",
+                    "id": { "$kind": "bind_list_descendant_id", "key": "spawn" },
+                    "props": {
+                        "label": "Spawn session",
+                        "action": {
+                            "id": "contract.action",
+                            "payload": {
+                                "operation": "spawn",
+                                "session_uuid": { "$bind": "@/session_uuid" }
+                            }
+                        }
+                    }
+                },
+                {
+                    "type": "button",
+                    "id": { "$kind": "bind_list_descendant_id", "key": "rename" },
+                    "props": {
+                        "label": "Rename session",
+                        "action": {
+                            "id": "contract.action",
+                            "payload": {
+                                "operation": "rename",
+                                "session_uuid": { "$bind": "@/session_uuid" }
+                            }
+                        }
+                    }
+                },
+                {
+                    "type": "button",
+                    "id": { "$kind": "bind_list_descendant_id", "key": "remove" },
+                    "props": {
+                        "label": "Remove session",
+                        "action": {
+                            "id": "contract.action",
+                            "payload": {
+                                "operation": "remove",
+                                "session_uuid": { "$bind": "@/session_uuid" }
+                            }
+                        }
+                    }
+                }
+            ]
+        }
+    })
+}
+
 fn inspect_session_plugin_surface(
     surface: &serde_json::Value,
 ) -> Result<(Vec<String>, &serde_json::Value), String> {
@@ -977,10 +1033,7 @@ fn inspect_session_plugin_surface(
             continue;
         }
 
-        let expected_oracle = session_plugin_binding_surface(&[])
-            .pointer("/children/0")
-            .cloned()
-            .expect("canonical surface always contains the identity oracle");
+        let expected_oracle = expected_session_plugin_identity_oracle();
         if child != &expected_oracle {
             return Err("surface contains an unrecognized session binding child".to_string());
         }
@@ -2776,6 +2829,11 @@ pub struct PluginContractMatrixConformanceReport {
     pub session_action_state: String,
     pub session_action_result_node_id: String,
     pub session_action_result_payload: serde_json::Value,
+    pub session_remove_action_node_id: String,
+    pub session_remove_action_payload: serde_json::Value,
+    pub session_remove_action_state: String,
+    pub session_remove_action_result_node_id: String,
+    pub session_remove_action_result_payload: serde_json::Value,
     pub dialog_presence_key: String,
     pub selected_workspace_equality_key: String,
     pub selected_workspace_equality_value: String,
@@ -3867,65 +3925,44 @@ pub fn run_plugin_contract_matrix_conformance(
                 operation: "contract_matrix_materialize_session_rows",
                 field: "rows[1]",
             })?;
-    let session_action_control =
-        session_action_row
-            .controls
-            .get(1)
-            .ok_or(ConformanceError::MissingJsonField {
-                operation: "contract_matrix_materialize_session_rows",
-                field: "rows[1].controls[1]",
-            })?;
-    let session_action_node_id = session_action_control.node_id.clone();
-    let session_action_payload = session_action_control.action_payload.clone();
-    let session_action = request(
-        hub.endpoint(),
-        DaemonRequest::PluginSurfaceAction {
-            package_name: PLUGIN_CONTRACT_MATRIX_PACKAGE.to_string(),
-            request: ui_action_request(
-                "contract-action-rename-session",
-                PLUGIN_CONTRACT_SESSION_SURFACE,
-                "contract.action",
-                &session_action_node_id,
-                None,
-                Some(session_action_payload.clone()),
-            )?,
-        },
-        "contract_matrix_action_select_session",
-    )?;
-    expect_kind(
-        &session_action,
-        DaemonResponseKind::PluginActionResult,
-        "contract_matrix_action_select_session",
-    )?;
-    let session_action_result =
-        session_action
-            .plugin_action_result
-            .ok_or(ConformanceError::MissingBody {
-                operation: "contract_matrix_action_select_session",
-                field: "plugin_action_result",
-            })?;
-    let session_action_state = serde_json::to_value(session_action_result.state)?
-        .as_str()
-        .map(str::to_string)
+    let session_action_control = session_action_row
+        .controls
+        .iter()
+        .find(|control| control.key == "rename")
         .ok_or(ConformanceError::MissingJsonField {
-            operation: "contract_matrix_action_select_session",
-            field: "state",
+            operation: "contract_matrix_materialize_session_rows",
+            field: "rows[1].controls[key=rename]",
         })?;
-    let session_action_result_node_id = session_action_result
-        .node_id
-        .as_ref()
-        .map(|id| id.0.clone())
+    let session_remove_action_control = session_action_row
+        .controls
+        .iter()
+        .find(|control| control.key == "remove")
         .ok_or(ConformanceError::MissingJsonField {
-            operation: "contract_matrix_action_select_session",
-            field: "node_id",
+            operation: "contract_matrix_materialize_session_rows",
+            field: "rows[1].controls[key=remove]",
         })?;
-    let session_action_result_payload =
-        session_action_result
-            .payload
-            .ok_or(ConformanceError::MissingJsonField {
-                operation: "contract_matrix_action_select_session",
-                field: "payload",
-            })?;
+    let session_action = run_session_plugin_action(
+        hub,
+        session_action_control,
+        "contract-action-rename-session",
+        "contract_matrix_action_rename_session",
+    )?;
+    let session_remove_action = run_session_plugin_action(
+        hub,
+        session_remove_action_control,
+        "contract-action-remove-session",
+        "contract_matrix_action_remove_session",
+    )?;
+    let session_action_node_id = session_action.node_id;
+    let session_action_payload = session_action.payload;
+    let session_action_state = session_action.state;
+    let session_action_result_node_id = session_action.result_node_id;
+    let session_action_result_payload = session_action.result_payload;
+    let session_remove_action_node_id = session_remove_action.node_id;
+    let session_remove_action_payload = session_remove_action.payload;
+    let session_remove_action_state = session_remove_action.state;
+    let session_remove_action_result_node_id = session_remove_action.result_node_id;
+    let session_remove_action_result_payload = session_remove_action.result_payload;
     expect_value(
         "contract_matrix_render_app",
         "package_name",
@@ -4921,6 +4958,11 @@ pub fn run_plugin_contract_matrix_conformance(
         session_action_state,
         session_action_result_node_id,
         session_action_result_payload,
+        session_remove_action_node_id,
+        session_remove_action_payload,
+        session_remove_action_state,
+        session_remove_action_result_node_id,
+        session_remove_action_result_payload,
         dialog_presence_key,
         selected_workspace_equality_key,
         selected_workspace_equality_value,
@@ -5880,6 +5922,71 @@ fn ui_action_request(
         kind: UiActionKind::Submit,
         values,
         payload,
+    })
+}
+
+struct SessionPluginActionObservation {
+    node_id: String,
+    payload: serde_json::Value,
+    state: String,
+    result_node_id: String,
+    result_payload: serde_json::Value,
+}
+
+fn run_session_plugin_action(
+    hub: &IsolatedHub,
+    control: &SessionPluginMaterializedControl,
+    request_id: &str,
+    operation: &'static str,
+) -> Result<SessionPluginActionObservation, ConformanceError> {
+    let node_id = control.node_id.clone();
+    let payload = control.action_payload.clone();
+    let response = request(
+        hub.endpoint(),
+        DaemonRequest::PluginSurfaceAction {
+            package_name: PLUGIN_CONTRACT_MATRIX_PACKAGE.to_string(),
+            request: ui_action_request(
+                request_id,
+                PLUGIN_CONTRACT_SESSION_SURFACE,
+                PLUGIN_CONTRACT_ACTION,
+                &node_id,
+                None,
+                Some(payload.clone()),
+            )?,
+        },
+        operation,
+    )?;
+    expect_kind(&response, DaemonResponseKind::PluginActionResult, operation)?;
+    let result = response
+        .plugin_action_result
+        .ok_or(ConformanceError::MissingBody {
+            operation,
+            field: "plugin_action_result",
+        })?;
+    let state = serde_json::to_value(result.state)?
+        .as_str()
+        .map(str::to_string)
+        .ok_or(ConformanceError::MissingJsonField {
+            operation,
+            field: "state",
+        })?;
+    let result_node_id = result.node_id.as_ref().map(|id| id.0.clone()).ok_or(
+        ConformanceError::MissingJsonField {
+            operation,
+            field: "node_id",
+        },
+    )?;
+    let result_payload = result.payload.ok_or(ConformanceError::MissingJsonField {
+        operation,
+        field: "payload",
+    })?;
+
+    Ok(SessionPluginActionObservation {
+        node_id,
+        payload,
+        state,
+        result_node_id,
+        result_payload,
     })
 }
 

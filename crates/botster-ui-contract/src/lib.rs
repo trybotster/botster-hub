@@ -2391,6 +2391,8 @@ fn validate_stable_id(
                     .to_string(),
             });
         }
+        // Authored descendant keys are intentionally template-global, even across
+        // mutually exclusive branches; final realized-id collisions stay render-scoped.
         if !descendant_keys.insert(key.to_string()) {
             return Err(UiValidationError::InvalidBindListDescendantId {
                 key: key.to_string(),
