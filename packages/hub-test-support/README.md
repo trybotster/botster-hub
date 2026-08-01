@@ -131,6 +131,10 @@ Revision 27 binds the Spawn Button's required label to
 `@/lifecycle_class`. Both reference materializers resolve it to the selected
 row's literal class and reject unresolved required values; the Rust path also
 passes the materialized Button through strict realized UiNode validation.
+The coordinated UI contract also closes earlier accidental authored acceptance
+of sentinels on required fields outside the explicit seven-field allowlist;
+0.3.1 is the intended prepared coordinate for that narrowing because the
+distinct unpublished 0.3.0 bytes may already have been packed or consumed.
 The Node reference materializer proves matching `current`, `ended`,
 and `indeterminate` rows before an absent UUID selects the unavailable path,
 then proves patch, remove, and authoritative reconnect convergence. This

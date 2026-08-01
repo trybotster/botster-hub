@@ -444,6 +444,18 @@ pub fn json_schema() -> Value {
                     }
                 },
                 "allOf": [
+                    required_non_bindable_props_schema("stack", &["direction"]),
+                    required_non_bindable_props_schema("form_section", &["title"]),
+                    required_non_bindable_props_schema("form_field", &["schema"]),
+                    required_non_bindable_props_schema("metric", &["label", "value"]),
+                    required_non_bindable_props_schema("status_badge", &["label"]),
+                    required_non_bindable_props_schema("icon", &["icon"]),
+                    required_non_bindable_props_schema("badge", &["label"]),
+                    required_non_bindable_props_schema("status_dot", &["label"]),
+                    required_non_bindable_props_schema("empty_state", &["title"]),
+                    required_non_bindable_props_schema("table", &["columns"]),
+                    required_non_bindable_props_schema("terminal_view", &["session_id"]),
+                    required_non_bindable_props_schema("connection_code_view", &["code"]),
                     {
                         "if": {
                             "properties": { "type": { "const": "form" } },
@@ -475,7 +487,7 @@ pub fn json_schema() -> Value {
                                     "type": "object",
                                     "required": ["title"],
                                     "properties": {
-                                        "title": { "type": "string" },
+                                        "title": { "$ref": "#/$defs/UiNonBindableValue" },
                                         "presentation": {
                                             "$ref": "#/$defs/UiDialogPresentation"
                                         }
@@ -517,7 +529,7 @@ pub fn json_schema() -> Value {
                                     "required": ["label", "icon", "action"],
                                     "properties": {
                                         "label": { "$ref": "#/$defs/UiBindableString" },
-                                        "icon": { "type": "string" },
+                                        "icon": { "$ref": "#/$defs/UiNonBindableValue" },
                                         "action": { "$ref": "#/$defs/UiAction" }
                                     }
                                 }
@@ -594,8 +606,8 @@ pub fn json_schema() -> Value {
                                     "type": "object",
                                     "required": ["name", "label"],
                                     "properties": {
-                                        "name": { "type": "string" },
-                                        "label": { "type": "string" }
+                                        "name": { "$ref": "#/$defs/UiNonBindableValue" },
+                                        "label": { "$ref": "#/$defs/UiNonBindableValue" }
                                     }
                                 }
                             }
@@ -614,7 +626,7 @@ pub fn json_schema() -> Value {
                                     "required": ["value", "label"],
                                     "properties": {
                                         "value": { "$ref": "#/$defs/UiNonBindableValue" },
-                                        "label": { "type": "string" }
+                                        "label": { "$ref": "#/$defs/UiNonBindableValue" }
                                     }
                                 }
                             }
@@ -932,6 +944,35 @@ pub fn conformance_fixtures_json() -> Value {
     })
 }
 
+fn required_non_bindable_props_schema(kind: &str, required_props: &[&str]) -> Value {
+    let properties = required_props
+        .iter()
+        .map(|prop| {
+            (
+                (*prop).to_string(),
+                json!({ "$ref": "#/$defs/UiNonBindableValue" }),
+            )
+        })
+        .collect::<serde_json::Map<String, Value>>();
+
+    json!({
+        "if": {
+            "properties": { "type": { "const": kind } },
+            "required": ["type"]
+        },
+        "then": {
+            "required": ["props"],
+            "properties": {
+                "props": {
+                    "type": "object",
+                    "required": required_props,
+                    "properties": properties
+                }
+            }
+        }
+    })
+}
+
 const TYPESCRIPT: &str = r#"
 // Generated from botster-ui-contract Rust serde DTOs.
 // Regenerate/check with: cargo run -p botster-ui-contract --example generate_assets
@@ -969,6 +1010,8 @@ export type UiColorToken = __UiColorToken__;
 export interface UiBind { $bind: string; }
 export type UiBindableString = string | UiBind;
 export type UiAuthoredTextValue = JsonValue | UiBind;
+export type UiNonBindableValue = null | boolean | number | string | JsonValue[] | ({ [key: string]: JsonValue } & { $bind?: never });
+export type UiRequiredNonBindableProps<Fields extends string> = JsonObject & Record<Fields, UiNonBindableValue>;
 export type UiPresentationOperation = { kind: "set"; key: UiPresentationKey; value: JsonValue } | { kind: "clear"; key: UiPresentationKey } | { kind: "toggle"; key: UiPresentationKey };
 export type UiPresentationPredicate = { kind: "present"; key: UiPresentationKey } | { kind: "truthy"; key: UiPresentationKey } | { kind: "equals"; key: UiPresentationKey; value: JsonValue };
 export interface UiResponsiveWidth { compact?: JsonValue; regular?: JsonValue; expanded?: JsonValue; }
@@ -980,18 +1023,28 @@ export type UiBindList = { $kind: "bind_list"; source: string; where?: Record<st
 export type UiBindIf = { $kind: "bind_if"; path: string; node: UiNode } | { $kind: "presentation_if"; predicate: UiPresentationPredicate; node: UiNode };
 export type UiChild = UiConditional | UiNode | UiBindList | UiBindIf;
 export type UiFormProps = JsonObject & { action: UiAction; submit_label: UiBindableString };
-export type UiDialogProps = JsonObject & { title: string; presentation?: UiDialogPresentation; open?: never };
+export type UiDialogProps = JsonObject & { title: UiNonBindableValue; presentation?: UiDialogPresentation; open?: never };
 export type UiButtonProps = JsonObject & { label: UiBindableString; action: UiAction };
-export type UiIconButtonProps = JsonObject & { label: UiBindableString; icon: string; action: UiAction };
+export type UiIconButtonProps = JsonObject & { label: UiBindableString; icon: UiNonBindableValue; action: UiAction };
 export type UiMenuItemProps = JsonObject & { label: UiBindableString; action: UiAction };
 export type UiTextProps = JsonObject & { text: UiAuthoredTextValue };
 export type UiIframeProps = JsonObject & { src: UiBindableString; title: UiBindableString };
-export type UiFieldControlProps = JsonObject & { name: string; label: string };
-export type UiSelectOptionProps = JsonObject & { value: JsonValue; label: string };
+export type UiFieldControlProps = JsonObject & { name: UiNonBindableValue; label: UiNonBindableValue };
+export type UiSelectOptionProps = JsonObject & { value: UiNonBindableValue; label: UiNonBindableValue };
 export type UiCustomProps = JsonObject & { namespace: string; component: string; reason: string };
 export interface UiNodeBase { id?: UiAuthoredNodeId; children?: UiChild[]; slots?: Record<string, UiChild[]>; }
 export type UiNode =
+  | (UiNodeBase & { type: "stack"; props: UiRequiredNonBindableProps<"direction"> })
   | (UiNodeBase & { type: "form"; props: UiFormProps })
+  | (UiNodeBase & { type: "form_section"; props: UiRequiredNonBindableProps<"title"> })
+  | (UiNodeBase & { type: "form_field"; props: UiRequiredNonBindableProps<"schema"> })
+  | (UiNodeBase & { type: "metric"; props: UiRequiredNonBindableProps<"label" | "value"> })
+  | (UiNodeBase & { type: "status_badge"; props: UiRequiredNonBindableProps<"label"> })
+  | (UiNodeBase & { type: "icon"; props: UiRequiredNonBindableProps<"icon"> })
+  | (UiNodeBase & { type: "badge"; props: UiRequiredNonBindableProps<"label"> })
+  | (UiNodeBase & { type: "status_dot"; props: UiRequiredNonBindableProps<"label"> })
+  | (UiNodeBase & { type: "empty_state"; props: UiRequiredNonBindableProps<"title"> })
+  | (UiNodeBase & { type: "table"; props: UiRequiredNonBindableProps<"columns"> })
   | (UiNodeBase & { type: "dialog"; props: UiDialogProps })
   | (UiNodeBase & { type: "button"; props: UiButtonProps })
   | (UiNodeBase & { type: "icon_button"; props: UiIconButtonProps })
@@ -1000,8 +1053,10 @@ export type UiNode =
   | (UiNodeBase & { type: "iframe"; props: UiIframeProps })
   | (UiNodeBase & { type: "text_input" | "textarea" | "checkbox" | "select"; props: UiFieldControlProps })
   | (UiNodeBase & { type: "select_option"; props: UiSelectOptionProps })
+  | (UiNodeBase & { type: "terminal_view"; props: UiRequiredNonBindableProps<"session_id"> })
+  | (UiNodeBase & { type: "connection_code_view"; props: UiRequiredNonBindableProps<"code"> })
   | (UiNodeBase & { type: "custom"; props: UiCustomProps })
-  | (UiNodeBase & { type: Exclude<UiNodeKind, "form" | "dialog" | "button" | "icon_button" | "menu_item" | "text" | "iframe" | "text_input" | "textarea" | "checkbox" | "select" | "select_option" | "custom">; props?: JsonObject });
+  | (UiNodeBase & { type: Exclude<UiNodeKind, "stack" | "form" | "form_section" | "form_field" | "metric" | "status_badge" | "icon" | "badge" | "status_dot" | "empty_state" | "table" | "dialog" | "button" | "icon_button" | "menu_item" | "text" | "iframe" | "text_input" | "textarea" | "checkbox" | "select" | "select_option" | "terminal_view" | "connection_code_view" | "custom">; props?: JsonObject });
 export type UiFieldKind = __UiFieldKind__;
 export interface UiFieldOption { value: JsonValue; label: string; disabled?: boolean; }
 export interface UiFieldValidationHints { minLength?: number; maxLength?: number; pattern?: string; min?: number; max?: number; oneOf?: JsonValue[]; }

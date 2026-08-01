@@ -19,7 +19,8 @@ use botster_ui_contract::{
     UiResponsiveWidth, UiSelection, UiSelectionMode, UiSurfaceId, UiTableCell, UiTableColumn,
     UiTableColumnDescriptor, UiTableRow, UiToolbarOverflow, UiValidationError, UiVariant,
     UiWidthClass, realize_bind_list_descendant_id, validate_package_presentation, validate_ui_node,
-    validate_ui_node_authored, validate_ui_node_realized, validate_ui_node_with_capabilities,
+    validate_ui_node_authored, validate_ui_node_realized,
+    validate_ui_node_realized_with_capabilities, validate_ui_node_with_capabilities,
 };
 use serde_json::{Map, Value, json};
 
@@ -2212,6 +2213,13 @@ fn realized_validation_requires_materialized_literals_recursively() {
                 }
             }),
         ),
+        {
+            let mut custom = custom_node(node(UiNodeKind::Text, json!({ "text": "Fallback" })));
+            custom
+                .props
+                .insert("series".to_string(), json!({ "$bind": "@/series" }));
+            custom
+        },
     ] {
         let message = unresolved
             .validate_realized()
@@ -2219,6 +2227,32 @@ fn realized_validation_requires_materialized_literals_recursively() {
             .to_string();
         assert!(message.contains("unresolved binding sentinel"), "{message}");
     }
+
+    let mut realized_custom = custom_node(node(UiNodeKind::Text, json!({ "text": "Fallback" })));
+    realized_custom
+        .props
+        .insert("series".to_string(), json!([1, 2, 3]));
+    realized_custom
+        .validate_realized()
+        .expect("literal custom payload is realized");
+
+    let mut bound_button = node(
+        UiNodeKind::Button,
+        json!({
+            "label": { "$bind": "@/lifecycle_class" },
+            "action": { "id": "contract.action" }
+        }),
+    );
+    validate_ui_node_with_capabilities(&bound_button, &rich_capabilities())
+        .expect("authored capability validation accepts unresolved binds");
+    validate_ui_node_realized_with_capabilities(&bound_button, &rich_capabilities())
+        .expect_err("realized capability validation rejects unresolved binds");
+    bound_button
+        .props
+        .insert("label".to_string(), json!("current"));
+    rich_capabilities()
+        .validate_realized_node(&bound_button)
+        .expect("realized capability convenience API accepts literals");
 }
 
 #[test]

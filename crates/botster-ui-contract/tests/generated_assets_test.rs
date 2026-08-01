@@ -10,6 +10,7 @@ use botster_ui_contract::{
     realize_bind_list_descendant_id, typescript_declarations,
 };
 use serde::Serialize;
+use serde_json::{Value, json};
 
 #[test]
 fn generated_assets_match_checked_in_package() {
@@ -110,6 +111,69 @@ fn generated_fixtures_deserialize_and_validate_through_rust_authority() {
 }
 
 #[test]
+fn generated_schema_validates_required_binding_instances() {
+    let schema = json_schema();
+    let validator = jsonschema::validator_for(&schema).expect("compile generated JSON Schema");
+    let conformance = conformance_fixtures_json();
+    let required = &conformance["fixtures"]["required_bindable_fields"];
+
+    for node in required["authored"].as_array().expect("authored nodes") {
+        assert!(
+            validator.is_valid(node),
+            "generated schema rejected authored fixture: {node}"
+        );
+    }
+    for node in required["realized"].as_array().expect("realized nodes") {
+        assert!(
+            validator.is_valid(node),
+            "generated schema rejected realized fixture: {node}"
+        );
+    }
+
+    for malformed in [
+        json!({ "$bind": "" }),
+        json!({ "$bind": "relative" }),
+        json!({ "$bind": 42 }),
+        json!({ "$bind": "@/value", "fallback": "value" }),
+    ] {
+        let node = json!({
+            "type": "button",
+            "props": {
+                "label": malformed,
+                "action": { "id": "contract.action" }
+            }
+        });
+        assert!(
+            !validator.is_valid(&node),
+            "generated schema accepted malformed sentinel: {node}"
+        );
+    }
+
+    for node in [
+        json!({
+            "type": "select_option",
+            "props": { "value": { "$bind": "@/value" }, "label": "Open" }
+        }),
+        json!({
+            "type": "table",
+            "props": { "columns": { "$bind": "@/columns" } }
+        }),
+        json!({
+            "type": "form",
+            "props": {
+                "action": { "$bind": "@/action" },
+                "submit_label": "Submit"
+            }
+        }),
+    ] {
+        assert!(
+            !validator.is_valid(&node),
+            "generated schema accepted required non-bindable sentinel: {node}"
+        );
+    }
+}
+
+#[test]
 fn typescript_and_schema_encode_wire_names_and_optionality() {
     let typescript = typescript_declarations();
     assert!(
@@ -124,12 +188,14 @@ fn typescript_and_schema_encode_wire_names_and_optionality() {
     ));
     assert!(typescript.contains("export interface UiNodeBase { id?: UiAuthoredNodeId;"));
     assert!(typescript.contains("export type UiBindableString = string | UiBind;"));
+    assert!(typescript.contains("export type UiNonBindableValue ="));
+    assert!(typescript.contains("UiRequiredNonBindableProps<\"columns\">"));
     assert!(typescript.contains("submit_label: UiBindableString"));
     assert!(typescript.contains("label: UiBindableString"));
     assert!(typescript.contains("text: UiAuthoredTextValue"));
     assert!(typescript.contains("src: UiBindableString; title: UiBindableString"));
-    assert!(typescript.contains("name: string; label: string"));
-    assert!(typescript.contains("value: JsonValue; label: string"));
+    assert!(typescript.contains("name: UiNonBindableValue; label: UiNonBindableValue"));
+    assert!(typescript.contains("value: UiNonBindableValue; label: UiNonBindableValue"));
     let request_fields = interface_fields(&typescript, "UiActionRequest");
     let result_fields = interface_fields(&typescript, "UiActionResult");
     assert_eq!(
@@ -188,37 +254,38 @@ fn typescript_and_schema_encode_wire_names_and_optionality() {
         Some(&serde_json::json!("#/$defs/UiBind"))
     );
     assert_eq!(
-        schema.pointer("/$defs/UiNode/allOf/0/then/properties/props/properties/submit_label/$ref"),
+        required_prop_schema(&schema, "form", "submit_label").and_then(|value| value.get("$ref")),
         Some(&serde_json::json!("#/$defs/UiBindableString"))
     );
-    for index in [2, 3, 4] {
+    for kind in ["button", "icon_button", "menu_item"] {
         assert_eq!(
-            schema.pointer(&format!(
-                "/$defs/UiNode/allOf/{index}/then/properties/props/properties/label/$ref"
-            )),
+            required_prop_schema(&schema, kind, "label").and_then(|value| value.get("$ref")),
             Some(&serde_json::json!("#/$defs/UiBindableString"))
         );
     }
     assert_eq!(
-        schema.pointer("/$defs/UiNode/allOf/5/then/properties/props/properties/text/$ref"),
+        required_prop_schema(&schema, "text", "text").and_then(|value| value.get("$ref")),
         Some(&serde_json::json!("#/$defs/UiAuthoredTextValue"))
     );
     for field in ["src", "title"] {
         assert_eq!(
-            schema.pointer(&format!(
-                "/$defs/UiNode/allOf/6/then/properties/props/properties/{field}/$ref"
-            )),
+            required_prop_schema(&schema, "iframe", field).and_then(|value| value.get("$ref")),
             Some(&serde_json::json!("#/$defs/UiBindableString"))
         );
     }
-    assert_eq!(
-        schema.pointer("/$defs/UiNode/allOf/7/then/properties/props/properties/name/type"),
-        Some(&serde_json::json!("string"))
-    );
-    assert_eq!(
-        schema.pointer("/$defs/UiNode/allOf/8/then/properties/props/properties/value/$ref"),
-        Some(&serde_json::json!("#/$defs/UiNonBindableValue"))
-    );
+    for (kind, field) in [
+        ("stack", "direction"),
+        ("metric", "label"),
+        ("table", "columns"),
+        ("text_input", "name"),
+        ("select_option", "value"),
+        ("terminal_view", "session_id"),
+    ] {
+        assert_eq!(
+            required_prop_schema(&schema, kind, field).and_then(|value| value.get("$ref")),
+            Some(&serde_json::json!("#/$defs/UiNonBindableValue"))
+        );
+    }
 
     assert_serde_fields_match_typescript::<UiActionRequest>(
         serde_json::json!({
@@ -499,13 +566,32 @@ fn typescript_and_schema_encode_wire_names_and_optionality() {
         false
     );
     assert_eq!(
-        schema["$defs"]["UiNode"]["allOf"][0]["then"]["properties"]["props"]["required"],
+        kind_schema_branch(&schema, "form").expect("form schema")["then"]["properties"]["props"]["required"],
         serde_json::json!(["action", "submit_label"])
     );
     assert_eq!(
-        schema["$defs"]["UiNode"]["allOf"][1]["then"]["properties"]["props"]["not"]["required"],
+        kind_schema_branch(&schema, "dialog").expect("dialog schema")["then"]["properties"]["props"]
+            ["not"]["required"],
         serde_json::json!(["open"])
     );
+}
+
+fn required_prop_schema<'a>(schema: &'a Value, kind: &str, prop: &str) -> Option<&'a Value> {
+    kind_schema_branch(schema, kind)
+        .and_then(|branch| branch["then"]["properties"]["props"]["properties"].get(prop))
+}
+
+fn kind_schema_branch<'a>(schema: &'a Value, kind: &str) -> Option<&'a Value> {
+    schema["$defs"]["UiNode"]["allOf"]
+        .as_array()?
+        .iter()
+        .find(|branch| {
+            let kind_schema = &branch["if"]["properties"]["type"];
+            kind_schema["const"] == kind
+                || kind_schema["enum"]
+                    .as_array()
+                    .is_some_and(|kinds| kinds.iter().any(|candidate| candidate == kind))
+        })
 }
 
 fn interface_fields<'a>(typescript: &'a str, name: &str) -> BTreeMap<&'a str, (&'a str, bool)> {

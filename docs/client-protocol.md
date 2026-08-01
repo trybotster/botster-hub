@@ -1048,7 +1048,10 @@ deserializes against `botster-ui-contract`, and validates before serializing
 the response. This is authored validation: Button/IconButton/MenuItem label,
 Form submit_label, Iframe src/title, and Text text accept valid sentinels before
 materialization. Clients own materialization and strict realized validation;
-Hub intentionally has no realized-tree caller. Plugin actions use one canonical `UiActionRequest` envelope and
+Rust clients use the contract crate validator, while non-Rust clients enforce
+the equivalent sentinel-free boundary because the npm package publishes DTOs,
+schema, and fixtures rather than a JavaScript runtime validator. Hub
+intentionally has no realized-tree caller. Plugin actions use one canonical `UiActionRequest` envelope and
 return a typed `UiActionResult`; the daemon and worker do not reconstruct split
 request fields. A result must echo the request's `request_id`, `surface_id`,
 `action_id`, and `node_id` exactly, including preserving an absent `node_id`.
