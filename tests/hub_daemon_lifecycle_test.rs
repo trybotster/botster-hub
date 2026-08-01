@@ -4357,6 +4357,59 @@ impl PanicSafeCliDaemon {
         let child = self.child.take().expect("panic-safe daemon child");
         shutdown_cli_daemon(&self.data_dir, child);
     }
+
+    fn cleanup_owned_sessions_after_panic(&self) {
+        let config = explicit_config(&self.data_dir);
+        let sessions = match botster_hub::daemon_transport_request(
+            &config,
+            botster_hub::DaemonRequest::ListSessions,
+        ) {
+            Ok(response) if response.kind == botster_hub::DaemonResponseKind::Sessions => response,
+            Ok(response) => {
+                eprintln!(
+                    "{}: panic session cleanup received unexpected ListSessions response: \
+                     {response:?}",
+                    self.panic_context
+                );
+                return;
+            }
+            Err(error) => {
+                eprintln!(
+                    "{}: panic session cleanup could not list owned sessions: {error}",
+                    self.panic_context
+                );
+                return;
+            }
+        };
+
+        let mut cleanup_responses = Vec::new();
+        for session in sessions
+            .sessions
+            .iter()
+            .filter(|session| session.lifecycle != "exited")
+        {
+            let cleanup = botster_hub::daemon_transport_request(
+                &config,
+                botster_hub::DaemonRequest::ShutdownSession {
+                    session_id: session.session_id.clone(),
+                },
+            );
+            cleanup_responses.push(format!(
+                "session_id={} lifecycle={} response={cleanup:?}",
+                session.session_id, session.lifecycle
+            ));
+        }
+
+        let verification = botster_hub::daemon_transport_request(
+            &config,
+            botster_hub::DaemonRequest::ListSessions,
+        );
+        eprintln!(
+            "{}: panic session cleanup initial={:?} shutdowns={cleanup_responses:?} \
+             verification={verification:?}",
+            self.panic_context, sessions.sessions
+        );
+    }
 }
 
 impl Drop for PanicSafeCliDaemon {
@@ -4370,6 +4423,12 @@ impl Drop for PanicSafeCliDaemon {
             return;
         }
 
+        if std::panic::catch_unwind(|| self.cleanup_owned_sessions_after_panic()).is_err() {
+            eprintln!(
+                "{}: panic session cleanup itself panicked; continuing daemon reap",
+                self.panic_context
+            );
+        }
         let shutdown = request_cli_daemon_shutdown(&self.data_dir);
         let shutdown_failed = shutdown.as_ref().map_or(true, |output| {
             !output.status.success()
@@ -14783,7 +14842,7 @@ fn live_hub_managed_git_spawn_reconciles_and_reuses_after_restart() {
     run_fixture_git(Some(&repository), &["commit", "-m", "managed live fixture"]);
     write_managed_git_session_package(&package_dir);
 
-    let first_child = start_cli_daemon(&data_dir);
+    let first_daemon = PanicSafeCliDaemon::start(&data_dir, "live managed Git daemon cleanup");
     let enabled = botster_hub::daemon_transport_request(
         &explicit_config(&data_dir),
         botster_hub::DaemonRequest::EnablePackageLocalPath {
@@ -14845,18 +14904,14 @@ fn live_hub_managed_git_spawn_reconciles_and_reuses_after_restart() {
             .expect("first live worktree path"),
     );
     let first_marker = first_worktree_path.join("live-managed.txt");
-    for _ in 0..100 {
-        if first_marker.exists() {
-            break;
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
+    wait_for_managed_git_session_exit(&data_dir, &first_session_id);
     assert_eq!(
         fs::read_to_string(first_marker).expect("live managed cwd marker"),
         "live-managed\n"
     );
 
-    let competing_child = start_cli_daemon(&competing_data_dir);
+    let competing_daemon =
+        PanicSafeCliDaemon::start(&competing_data_dir, "competing managed Git daemon cleanup");
     botster_hub::daemon_transport_request(
         &explicit_config(&competing_data_dir),
         botster_hub::DaemonRequest::EnablePackageLocalPath {
@@ -14887,21 +14942,12 @@ fn live_hub_managed_git_spawn_reconciles_and_reuses_after_restart() {
         first_worktree_path.exists(),
         "competing Hub must not remove the winning worktree"
     );
-    let competing_shutdown = shutdown_cli_daemon(&competing_data_dir, competing_child);
-    assert!(
-        competing_shutdown.status.success(),
-        "competing daemon shutdown failed: {}",
-        command_output_text(&competing_shutdown)
-    );
+    competing_daemon.shutdown();
 
-    let first_shutdown = shutdown_cli_daemon(&data_dir, first_child);
-    assert!(
-        first_shutdown.status.success(),
-        "first live daemon shutdown failed: {}",
-        command_output_text(&first_shutdown)
-    );
+    first_daemon.shutdown();
 
-    let second_child = start_cli_daemon(&data_dir);
+    let second_daemon =
+        PanicSafeCliDaemon::start(&data_dir, "restarted managed Git daemon cleanup");
     let listed = botster_hub::daemon_transport_request(
         &explicit_config(&data_dir),
         botster_hub::DaemonRequest::ListWorktrees,
@@ -15004,12 +15050,139 @@ fn live_hub_managed_git_spawn_reconciles_and_reuses_after_restart() {
         )
         .expect("shut down live managed session");
     }
-    let second_shutdown = shutdown_cli_daemon(&data_dir, second_child);
-    assert!(
-        second_shutdown.status.success(),
-        "second live daemon shutdown failed: {}",
-        command_output_text(&second_shutdown)
-    );
+    second_daemon.shutdown();
+}
+
+fn wait_for_managed_git_session_exit(data_dir: &Path, session_id: &str) {
+    let started_at = Instant::now();
+    let mut ever_observed = false;
+    let mut last_listing = "<no ListSessions response>".to_string();
+    let mut last_drain = "<no Drain response>".to_string();
+    let mut drained_events = Vec::new();
+
+    loop {
+        let elapsed = started_at.elapsed();
+        assert!(
+            elapsed < LOCAL_RUNTIME_DAEMON_READINESS_BUDGET,
+            "managed Git session {session_id} did not emit SessionLifecycle exited and remain \
+             retained at lifecycle exited within {:?}; elapsed={elapsed:?} \
+             ever_observed={ever_observed} last_listing={last_listing} \
+             last_drain={last_drain} drained_events={drained_events:?}",
+            LOCAL_RUNTIME_DAEMON_READINESS_BUDGET,
+        );
+
+        let drain = botster_hub::daemon_transport_request(
+            &explicit_config(data_dir),
+            botster_hub::DaemonRequest::Drain {
+                session_id: session_id.to_string(),
+            },
+        )
+        .unwrap_or_else(|error| {
+            panic!(
+                "Drain failed while waiting for managed Git session {session_id} to exit; \
+                 elapsed={elapsed:?} ever_observed={ever_observed} \
+                 last_listing={last_listing}; last_drain={last_drain}; \
+                 drained_events={drained_events:?}; error={error}"
+            )
+        });
+        assert_eq!(
+            drain.kind,
+            botster_hub::DaemonResponseKind::Events,
+            "unexpected Drain response while waiting for managed Git session {session_id} to \
+             exit; elapsed={elapsed:?} response={drain:?}"
+        );
+        last_drain = format!("{drain:?}");
+        drained_events.extend(drain.events.iter().map(|event| format!("{event:?}")));
+
+        let mut observed_exited_lifecycle = false;
+        for event in &drain.events {
+            match event {
+                botster_hub::DaemonEvent::SessionLifecycle {
+                    session_id: event_session_id,
+                    state,
+                } if event_session_id == session_id => match state.as_str() {
+                    "starting" | "running" | "stopping" => {}
+                    "exited" => observed_exited_lifecycle = true,
+                    "failed" => panic!(
+                        "managed Git session {session_id} emitted lifecycle failed while \
+                         draining; elapsed={elapsed:?} last_drain={last_drain} \
+                         drained_events={drained_events:?}"
+                    ),
+                    lifecycle => panic!(
+                        "managed Git session {session_id} emitted unexpected lifecycle \
+                         {lifecycle:?}; elapsed={elapsed:?} last_drain={last_drain} \
+                         drained_events={drained_events:?}"
+                    ),
+                },
+                _ => {}
+            }
+        }
+
+        let response = botster_hub::daemon_transport_request(
+            &explicit_config(data_dir),
+            botster_hub::DaemonRequest::ListSessions,
+        )
+        .unwrap_or_else(|error| {
+            panic!(
+                "ListSessions failed while waiting for managed Git session {session_id} to exit; \
+                 elapsed={elapsed:?} ever_observed={ever_observed} \
+                 last_listing={last_listing}; error={error}"
+            )
+        });
+        assert_eq!(
+            response.kind,
+            botster_hub::DaemonResponseKind::Sessions,
+            "unexpected response while waiting for managed Git session {session_id} to exit; \
+             elapsed={elapsed:?} response={response:?}"
+        );
+        last_listing = format!("{:?}", response.sessions);
+
+        if let Some(session) = response
+            .sessions
+            .iter()
+            .find(|session| session.session_id == session_id)
+        {
+            ever_observed = true;
+            match session.lifecycle.as_str() {
+                "exited" if observed_exited_lifecycle => {
+                    println!(
+                        "managed_git_session_ready session_id={session_id} \
+                         drain_lifecycle=exited retained_lifecycle=exited elapsed={:?} \
+                         listing={last_listing} \
+                         drained_events={drained_events:?}",
+                        started_at.elapsed()
+                    );
+                    return;
+                }
+                lifecycle if observed_exited_lifecycle => panic!(
+                    "managed Git session {session_id} emitted SessionLifecycle exited but was \
+                     retained with lifecycle {lifecycle:?}; elapsed={elapsed:?} \
+                     full_listing={last_listing} last_drain={last_drain} \
+                     drained_events={drained_events:?}"
+                ),
+                "running" | "stopping" | "exited" => {}
+                "failed" => panic!(
+                    "managed Git session {session_id} reached lifecycle failed; ListSessions maps \
+                     a stale daemon registry row to failed; elapsed={elapsed:?} \
+                     full_listing={last_listing} last_drain={last_drain} \
+                     drained_events={drained_events:?}"
+                ),
+                lifecycle => panic!(
+                    "managed Git session {session_id} reached unexpected lifecycle {lifecycle:?}; \
+                     elapsed={elapsed:?} full_listing={last_listing} last_drain={last_drain} \
+                     drained_events={drained_events:?}"
+                ),
+            }
+        } else if ever_observed {
+            panic!(
+                "managed Git session {session_id} disappeared after first observation; \
+                 elapsed={elapsed:?} full_listing={last_listing} last_drain={last_drain} \
+                 drained_events={drained_events:?}"
+            );
+        }
+
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 fn path_str(path: &Path) -> &str {
