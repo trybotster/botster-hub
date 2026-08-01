@@ -1,0 +1,69 @@
+{
+  "campaign": "four-package fresh production runtime",
+  "result": "pass",
+  "target_id": "tgt_7e208a0c76a44980a83b63af976b1f22",
+  "target_repository": "trybotster/botster-hub",
+  "revisions": {
+    "botster-hub": "990821c437a85632f352fbc9e10e5b38536ec534",
+    "botster-core": "5846fc776d31e2b6c98a8d932f50a31078743901",
+    "botster-web": "ebc72e5808ea8c8ce7c409936c257a3e02eaa5ef",
+    "botster-tui": "65af502b63503eb6995b2d9cc9c618bc5bd9a618",
+    "botster-tui-kit": "3bf8ae81d3e716b196fae8e4a7560dd5fc5c2e69",
+    "botster-workspaces": "c78f3bfa80a88e89645ba8dbba892f18d6d041c7",
+    "botster-project-pipelines": "f2266aae72429fa9c126dca3ec0f273e7255020e"
+  },
+  "public_artifact": {
+    "coordinate": "@trybotster/hub-test-support@0.1.18",
+    "integrity": "sha512-llWRLNjFVKzi3CxII1waPO6u2w+TEAesiI8esVTEu8/rwuedeoZXXYTD0Sew76/8reysoZ1gy4P6LNoTptXsTA==",
+    "protocol_sha256": "956b2ce7c07523af848da885006c21f944b580799551b208f59f96450a245c0b"
+  },
+  "resource_proof": {
+    "snapshots": 16,
+    "all_checks_passed": true,
+    "configured_queue_capacity": 256,
+    "configured_executor_concurrency": 2,
+    "four_owner_executor_workers": 8,
+    "maximum_observed_hub_threads": 29,
+    "maximum_allowed_hub_threads": 64,
+    "active_timer_resources": 0,
+    "queued_jobs": 0,
+    "in_flight_jobs": 0,
+    "cleanup_failed": 0,
+    "disable_generations": [
+      { "owners": 4, "workers": 8 },
+      { "owners": 3, "workers": 6 },
+      { "owners": 2, "workers": 4 },
+      { "owners": 1, "workers": 2 },
+      { "owners": 0, "workers": 0 }
+    ]
+  },
+  "audits": {
+    "product_surface": "pass with no findings",
+    "pii": "pass with no findings",
+    "public_package_reloads": [
+      "botster-web",
+      "botster-tui",
+      "botster-workspaces",
+      "project-pipelines"
+    ],
+    "live_survivors_after_down": 0,
+    "zombie_survivors_after_down": 0
+  },
+  "selected_redacted_evidence_sha256": {
+    "revisions.json": "49de5d6d5ff6096a833bdd3bcd524709500b6b9433302be3880aaff33c85a8cd",
+    "product-surface-audit.json": "418d66f0edceb9b6e3e48af19bc49b8ae7fc013634fbed67f5e75f540ad8812b",
+    "pii-scan.json": "2008aa6f22f31464d97cfa3c7de5bf4acac2a11152839f1db22d36d3c3b46eb8",
+    "fresh-before-churn-resources.log": "85c76809146957683848c7842092ffa4d92ce5ae45b77f090f66a2b454bb3e0f",
+    "fresh-after-reload-resources.log": "8183bf87f7264b5a1f8ff861d588e18fdbe48ce694da5a5369843f4ef501dc0d",
+    "fresh-after-idle-resources.log": "4ecb57372243dee3024c7ae9b9addb10116af66a0bb1aaf9f656d815492d4042",
+    "fresh-after-disable-project-pipelines-resources.log": "4a1465a21d8e8f7d92184df4fdc9a5ed12579fa9ee98314bbbe8bb060ad979e3",
+    "commands.log": "93aa1ca6a4717575499164df87152fb7b850a66decd6a09188b761758b9ba625"
+  },
+  "assumptions": [
+    "The selected evidence hashes refer to the redacted output produced by the passing campaign; the raw temporary runtime was disposable.",
+    "Slow-consumer semantics are exercised by the repository-owned real-daemon focused tests run inside the campaign's full Hub wrapper, while the exact-package probe exercises normal and abrupt reconnects."
+  ],
+  "residual_risk": [
+    "The selector-gated 250 ms idle CPU ceiling still requires the authoritative unstressed Linux CI runner; this implementation host was macOS."
+  ]
+}

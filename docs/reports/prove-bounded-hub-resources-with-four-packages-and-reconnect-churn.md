@@ -43,8 +43,9 @@
   caller-owned-Hub resource phases, reconnect/reload/idle/disable generations,
   cross-generation stability comparison, clean Project Pipelines dependency
   setup, the public package's contract fixture passed to TUI, per-leg owned
-  PID/socket cleanup, and split live/zombie census deferred until the final
-  campaign down.
+  PID/socket cleanup, split live/zombie census deferred until the final
+  campaign down, and an audit requiring exactly the four public package reload
+  commands while rejecting hidden reload paths.
 - `script/run-loaded-daemon-lifecycle` and
   `script/run-loaded-daemon-lifecycle-selftest` — selector mapping, explicit
   no-stress/CPU assertion signal, and platform-correct self-test routing.
@@ -58,9 +59,16 @@
   Hub-owned npm release assets for the additive protocol field.
 - `packages/hub-test-support/package.json`, `test.mjs`, and `README.md` — fresh
   0.1.18 coordinate after immutable 0.1.17 was found to contain stale bytes.
+- `src/daemon_transport.rs` and `tests/hub_daemon_lifecycle_test.rs` — treat the
+  typed `Detach + UnknownSession` race after an already-retired session as
+  idempotent connection cleanup while retaining failure classification for
+  every other detach error.
 - `script/publish-npm-packages` — exact-integrity validation before an
   already-published prerequisite may be skipped.
 - `test.sh` — fails the repository wrapper when the Hub-owned npm assets drift.
+- `docs/reports/bounded-hub-resources-fresh-campaign-evidence.json` — durable
+  exact revisions, selected redacted-evidence hashes, phase bounds, audits, and
+  residual-risk statement for the passing fresh campaign.
 - This report.
 
 ## Ownership boundaries and cross-repository work
@@ -96,12 +104,11 @@ required resource-counter tokens, and fixtures. The registry prerequisite is
 therefore satisfied, and merged Web `ebc72e5808ea8c8ce7c409936c257a3e02eaa5ef`
 consumes it without a local override.
 
-The resumed exact campaign exposed a TUI-owned contract mismatch. Canonical
-TUI `c426b8ff9e2dd603c024259897241460992fbb6b` still resolves revision-24 Hub
-contracts and cannot deserialize the public revision-25 contract-matrix
-`UiChild`. Existing TUI ticket `ticket_1785438029_926883` exactly owns the
-cold-turkey repin and multi-row input proof, so it is registered as dependency
-`dependency_1785535722_455627`; no TUI files were edited here.
+The resumed exact campaign exposed a TUI-owned contract mismatch. Existing TUI
+ticket `ticket_1785438029_926883` owned the cold-turkey repin and multi-row
+input proof and was registered as dependency
+`dependency_1785535722_455627`; it is now merged and closed at
+`65af502b63503eb6995b2d9cc9c618bc5bd9a618`. No TUI files were edited here.
 
 ## Deviations from plan
 
@@ -132,6 +139,17 @@ cold-turkey repin and multi-row input proof, so it is registered as dependency
   exact PID/socket cleanup on intermediate legs, and retains the global
   executable/zombie census at final down. It also passes the fixture from the
   installed public test-support package into TUI's documented live command.
+- Real Web/TUI teardown retires terminal sessions before their held socket is
+  always dropped. The final socket cleanup used to count the resulting typed
+  unknown-session detach as a failure even though the subscription resource
+  was already gone. Cleanup now recognizes only that exact idempotent race as
+  complete; unavailable-runtime and operator-error positive controls still
+  classify as failures.
+- The older product-surface audit rejected every command containing `reload`,
+  contradicting the approved plan's required public package reload phase once
+  the campaign finally reached it. The audit now requires one exact public
+  reload command for each named package and continues to reject any other
+  reload form with a known-positive control.
 
 ## Verification
 
@@ -168,10 +186,21 @@ Passed:
 - loaded selector validation with `stress_profile=none`, plus a negative check
   proving `moderate` exits 2
 - shell/Ruby syntax checks and `git diff --check`
-- exact campaign setup through merged Web: all seven clean-revision gates,
-  registry artifact gate, repository test/build gates, dynamic/explicit Web
-  ports, Web live browser/WebRTC proof, and public-fixture TUI setup reached
-  production runtime paths before the TUI-owned revision mismatch
+- the exact fresh campaign at Hub
+  `990821c437a85632f352fbc9e10e5b38536ec534`: all seven clean-revision gates,
+  public registry artifact gate, repository test/build gates, dynamic and
+  explicit Web ports, Web live browser/WebRTC, public-fixture TUI, four-package
+  actions, reconnect churn, public reload, idle, stepwise public disable, and
+  final down passed
+- every one of the 16 resource snapshots passed every deterministic check;
+  four owners held `256`/`2`, exactly eight executor workers, zero queued or
+  in-flight jobs, zero timers, zero cleanup failures, and at most 29 Hub
+  threads against the ceiling of 64
+- public disable retired owners/workers `4/8 -> 3/6 -> 2/4 -> 1/2 -> 0/0`;
+  final live-survivor and zombie-survivor evidence files were both empty
+- the product-surface and PII audits passed their known-positive controls with
+  no findings; the reload audit recorded exactly the four named public package
+  reload commands
 
 Downstream-shaped proof passed inside the focused real-daemon test: the
 production entrypoint loaded four owners at `256`/`2`, observed exactly eight
@@ -180,27 +209,22 @@ entity reconnects through `script/probe-hub-resources`, reloaded every owner,
 retired them stepwise through public disable, and ended with zero timer,
 queued-job, and in-flight-job resources.
 
-The Hub-owned registry prerequisite and Web consumption are complete without a
-sibling-worktree or local-tarball override. The exact-coordinate fresh campaign
-now stops at canonical TUI's revision-24 `UiChild` mismatch against the public
-revision-25 fixture. The failed run passed session lifecycle, package storage,
-terminal echo, and package install before `contract_matrix_render_sessions`
-rejected the stale DTO. The TUI dependency must close before the unchanged
-campaign can proceed into its final resource phases.
+The Hub-owned registry prerequisite and both separately routed consumers are
+complete without a sibling-worktree or local-tarball override. The exact
+coordinate-only fresh campaign passes through the actual production entry
+points and its selected redacted evidence is summarized and hashed in
+`docs/reports/bounded-hub-resources-fresh-campaign-evidence.json`.
 
 ## Unverified behavior and residual risk
 
-- The exact named-package fresh campaign cannot complete until TUI ticket
-  `ticket_1785438029_926883` repins to the current Hub-owned contract and passes
-  the public-fixture live proof. After that dependency closes, rerun the
-  unchanged campaign and retain its redacted evidence bundle.
 - The 250 ms Linux CPU assertion is implemented and selector-gated but was not
   executed on this macOS implementation host. The loaded Ubuntu selector is
   the authoritative environment for that threshold.
-- No full exact-package slow-consumer phase was added beyond the existing
-  focused connection lifecycle regression; the new production probe covers
-  normal and abrupt entity reconnects while the existing test remains the
-  deterministic slow-consumer oracle.
+- Slow-consumer behavior remains proven by the repository-owned real-daemon
+  focused connection/stalled-attach regressions executed by the campaign's
+  full Hub wrapper, rather than by a second slow-consumer generator inside the
+  exact-package resource probe. The exact-package probe itself covers normal
+  and abrupt entity reconnects and convergence.
 
 ## Missing vault guidance
 
