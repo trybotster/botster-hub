@@ -291,6 +291,24 @@
             "$bind"
           ],
           "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Valid only on identity-bearing descendants below a UiBindList.item_template root whose id is an item-relative binding. Keys are nonblank and unique across the complete authored item template.",
+          "properties": {
+            "$kind": {
+              "const": "bind_list_descendant_id"
+            },
+            "key": {
+              "pattern": "\\S",
+              "type": "string"
+            }
+          },
+          "required": [
+            "$kind",
+            "key"
+          ],
+          "type": "object"
         }
       ]
     },
@@ -820,7 +838,7 @@
       ]
     }
   },
-  "$id": "https://trybotster.dev/schemas/ui-contract-0.2.0.json",
+  "$id": "https://trybotster.dev/schemas/ui-contract-0.3.0.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "oneOf": [
     {

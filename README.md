@@ -151,7 +151,7 @@ contract instead of bypassing hub admission or calling raw core routers.
 Terminal attach is a terminal-stream handshake only. Session-list reads remain
 an operator/query API; stateful clients use the explicit held-open `session`
 entity subscription for an authoritative snapshot followed by ordered deltas.
-The reusable contract is published in `@trybotster/hub-test-support@0.1.18` as
+The reusable contract is prepared in `@trybotster/hub-test-support@0.1.19` as
 source-derived JSON fixtures and a Rust
 `run_session_lifecycle_subscription_conformance` runner over the real isolated
 Hub/Core/session-worker topology.
@@ -162,7 +162,9 @@ Every delivered session row includes required `lifecycle_class`:
 `indeterminate`. Plugin-authored trees may bind only the Hub-admitted
 `/session` family, keyed by canonical session UUID. Inside a BindList item
 template, authored `UiNode.id` may bind directly to a row field such as
-`@/session_uuid`; realized ids and action request/result `node_id` remain
+`@/session_uuid`. Descendants may use contract-owned keyed identity such as
+`bind_list_descendant_id/remove`, realized from that row through the canonical
+UTF-8 byte-length helper. Realized ids and action request/result `node_id` remain
 literal strings. A missing row alone means unknown/unavailable.
 That subscription hydrates no status, package, worktree, target, or plugin state.
 The local socket adapter admits at most 64 live connections and runs them as

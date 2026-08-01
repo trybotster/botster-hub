@@ -5222,22 +5222,57 @@ fn daemon_plugin_contract_matrix_fixture_exercises_public_package_contracts() {
             .collect::<Vec<_>>(),
         vec!["session-transition", "session-stable-current"]
     );
-    assert_eq!(report.session_action_node_id, "session-stable-current");
+    assert_eq!(
+        report.session_action_node_id,
+        "botster-ui-descendant-v1:22:session-stable-current6:rename"
+    );
     assert_eq!(
         report.session_action_payload,
         serde_json::json!({
-            "operation": "select_session",
+            "operation": "rename",
             "session_uuid": "session-stable-current"
         })
     );
     assert_eq!(report.session_action_state, "accepted");
     assert_eq!(
         report.session_action_result_node_id,
-        "session-stable-current"
+        "botster-ui-descendant-v1:22:session-stable-current6:rename"
     );
     assert_eq!(
         report.session_action_result_payload,
         report.session_action_payload
+    );
+    assert_eq!(
+        report.session_action_node_id,
+        botster_ui_contract::realize_bind_list_descendant_id("session-stable-current", "rename",)
+            .expect("fixture identity is valid")
+            .0
+    );
+    assert_eq!(
+        report.session_remove_action_node_id,
+        botster_ui_contract::realize_bind_list_descendant_id("session-stable-current", "remove",)
+            .expect("fixture identity is valid")
+            .0
+    );
+    assert_ne!(
+        report.session_action_node_id,
+        report.session_remove_action_node_id
+    );
+    assert_eq!(
+        report.session_remove_action_payload,
+        serde_json::json!({
+            "operation": "remove",
+            "session_uuid": "session-stable-current"
+        })
+    );
+    assert_eq!(report.session_remove_action_state, "accepted");
+    assert_eq!(
+        report.session_remove_action_result_node_id,
+        report.session_remove_action_node_id
+    );
+    assert_eq!(
+        report.session_remove_action_result_payload,
+        report.session_remove_action_payload
     );
     assert_eq!(report.dialog_presence_key, "contract-dialog");
     assert_eq!(report.selected_workspace_equality_key, "selected-workspace");

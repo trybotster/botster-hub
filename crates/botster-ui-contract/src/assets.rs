@@ -235,7 +235,7 @@ pub fn typescript_declarations() -> String {
 pub fn json_schema() -> Value {
     json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "$id": "https://trybotster.dev/schemas/ui-contract-0.2.0.json",
+        "$id": "https://trybotster.dev/schemas/ui-contract-0.3.0.json",
         "title": "Botster UI Contract",
         "oneOf": [
             { "$ref": "#/$defs/UiNode" },
@@ -257,6 +257,16 @@ pub fn json_schema() -> Value {
                         "required": ["$bind"],
                         "properties": {
                             "$bind": { "type": "string", "pattern": "^@/.+" }
+                        }
+                    },
+                    {
+                        "description": "Valid only on identity-bearing descendants below a UiBindList.item_template root whose id is an item-relative binding. Keys are nonblank and unique across the complete authored item template.",
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["$kind", "key"],
+                        "properties": {
+                            "$kind": { "const": "bind_list_descendant_id" },
+                            "key": { "type": "string", "pattern": "\\S" }
                         }
                     }
                 ]
@@ -588,7 +598,39 @@ pub fn json_schema() -> Value {
 #[must_use]
 pub fn conformance_fixtures_json() -> Value {
     json!({
-        "contract_version": "0.2.0",
+        "contract_version": "0.3.0",
+        "bind_list_descendant_identity_vectors": [
+            {
+                "row": "session-1",
+                "key": "remove",
+                "realized_id": "botster-ui-descendant-v1:9:session-16:remove"
+            },
+            {
+                "row": "1:ab",
+                "key": "23:c",
+                "realized_id": "botster-ui-descendant-v1:4:1:ab4:23:c"
+            },
+            {
+                "row": "  row  ",
+                "key": " spaced key ",
+                "realized_id": "botster-ui-descendant-v1:7:  row  12: spaced key "
+            },
+            {
+                "row": "café",
+                "key": "重命名",
+                "realized_id": "botster-ui-descendant-v1:5:café9:重命名"
+            },
+            {
+                "row": "会話-😀",
+                "key": "remove-🧹",
+                "realized_id": "botster-ui-descendant-v1:11:会話-😀11:remove-🧹"
+            },
+            {
+                "row": "botster-ui-descendant-v1:1:x",
+                "key": "0:prefix:9",
+                "realized_id": "botster-ui-descendant-v1:28:botster-ui-descendant-v1:1:x10:0:prefix:9"
+            }
+        ],
         "fixtures": {
             "package_presentation": {
                 "surfaces": [{
@@ -655,18 +697,22 @@ pub fn conformance_fixtures_json() -> Value {
                     "source": "/session",
                     "where": { "lifecycle_class": "current" },
                     "item_template": {
-                        "type": "button",
+                        "type": "inline",
                         "id": { "$bind": "@/session_uuid" },
-                        "props": {
-                            "label": "Select session",
-                            "action": {
-                                "id": "contract.action",
-                                "payload": {
-                                    "operation": "select_session",
-                                    "session_uuid": { "$bind": "@/session_uuid" }
+                        "children": [{
+                            "type": "button",
+                            "id": { "$kind": "bind_list_descendant_id", "key": "select" },
+                            "props": {
+                                "label": "Select session",
+                                "action": {
+                                    "id": "contract.action",
+                                    "payload": {
+                                        "operation": "select_session",
+                                        "session_uuid": { "$bind": "@/session_uuid" }
+                                    }
                                 }
                             }
-                        }
+                        }]
                     }
                 }]
             },
@@ -717,7 +763,12 @@ const TYPESCRIPT: &str = r#"
 export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 export type JsonObject = { [key: string]: JsonValue };
 export type UiNodeId = string;
-export type UiAuthoredNodeId = UiNodeId | UiBind;
+export declare const packageVersion: string;
+export declare const schema: JsonObject;
+export declare const conformanceFixtures: JsonObject;
+export declare function realizeBindListDescendantId(rowId: string, key: string): UiNodeId;
+export type UiBindListDescendantId = { $kind: "bind_list_descendant_id"; key: string };
+export type UiAuthoredNodeId = UiNodeId | UiBind | UiBindListDescendantId;
 export type UiActionId = string;
 export type UiSurfaceId = string;
 export type UiActionRequestId = string;

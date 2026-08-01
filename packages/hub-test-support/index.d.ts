@@ -11,7 +11,7 @@ export interface HubTestSupportMetadata {
   conformance_fixture_revision: number;
   ui_contract: {
     package_name: "@trybotster/ui-contract";
-    package_version: "0.2.0";
+    package_version: "0.3.0";
     conformance_fixture_export: "@trybotster/ui-contract/conformance-fixtures";
   };
   generated_by: string;
@@ -83,10 +83,14 @@ export function materializeSessionPluginBindings(
 ): Record<string, string>;
 export interface SessionPluginMaterializedRow {
   node_id: string;
-  action_payload: {
-    operation: "select_session";
-    session_uuid: string;
-  };
+  controls: Array<{
+    key: "spawn" | "rename" | "remove";
+    node_id: string;
+    action_payload: {
+      operation: "spawn" | "rename" | "remove";
+      session_uuid: string;
+    };
+  }>;
 }
 export function materializeSessionPluginRows(
   surface: Record<string, unknown>,
