@@ -31,7 +31,7 @@
       "row": "botster-ui-descendant-v1:1:x"
     }
   ],
-  "contract_version": "0.3.0",
+  "contract_version": "0.3.1",
   "fixtures": {
     "accepted": {
       "action_id": "ticket.create",
@@ -204,6 +204,154 @@
       "values": {
         "title": "Ship contract"
       }
+    },
+    "required_bindable_fields": {
+      "authored": [
+        {
+          "id": "bound-button",
+          "props": {
+            "action": {
+              "id": "contract.action"
+            },
+            "label": {
+              "$bind": "@/lifecycle_class"
+            }
+          },
+          "type": "button"
+        },
+        {
+          "id": "bound-icon-button",
+          "props": {
+            "action": {
+              "id": "contract.action"
+            },
+            "icon": "play",
+            "label": {
+              "$bind": "@/lifecycle_class"
+            }
+          },
+          "type": "icon_button"
+        },
+        {
+          "id": "bound-menu-item",
+          "props": {
+            "action": {
+              "id": "contract.action"
+            },
+            "label": {
+              "$bind": "@/lifecycle_class"
+            }
+          },
+          "type": "menu_item"
+        },
+        {
+          "id": "bound-form",
+          "props": {
+            "action": {
+              "id": "contract.submit"
+            },
+            "submit_label": {
+              "$bind": "@/lifecycle_class"
+            }
+          },
+          "type": "form"
+        },
+        {
+          "id": "bound-iframe-src",
+          "props": {
+            "src": {
+              "$bind": "@/url"
+            },
+            "title": "Session"
+          },
+          "type": "iframe"
+        },
+        {
+          "id": "bound-iframe-title",
+          "props": {
+            "src": "/session.html",
+            "title": {
+              "$bind": "@/lifecycle_class"
+            }
+          },
+          "type": "iframe"
+        },
+        {
+          "id": "bound-text",
+          "props": {
+            "text": {
+              "$bind": "@/lifecycle_class"
+            }
+          },
+          "type": "text"
+        }
+      ],
+      "realized": [
+        {
+          "id": "bound-button",
+          "props": {
+            "action": {
+              "id": "contract.action"
+            },
+            "label": "current"
+          },
+          "type": "button"
+        },
+        {
+          "id": "bound-icon-button",
+          "props": {
+            "action": {
+              "id": "contract.action"
+            },
+            "icon": "play",
+            "label": "current"
+          },
+          "type": "icon_button"
+        },
+        {
+          "id": "bound-menu-item",
+          "props": {
+            "action": {
+              "id": "contract.action"
+            },
+            "label": "current"
+          },
+          "type": "menu_item"
+        },
+        {
+          "id": "bound-form",
+          "props": {
+            "action": {
+              "id": "contract.submit"
+            },
+            "submit_label": "current"
+          },
+          "type": "form"
+        },
+        {
+          "id": "bound-iframe-src",
+          "props": {
+            "src": "/session.html",
+            "title": "Session"
+          },
+          "type": "iframe"
+        },
+        {
+          "id": "bound-iframe-title",
+          "props": {
+            "src": "/session.html",
+            "title": "current"
+          },
+          "type": "iframe"
+        },
+        {
+          "id": "bound-text",
+          "props": {
+            "text": "current"
+          },
+          "type": "text"
+        }
+      ]
     },
     "selected_workspace_equality": {
       "$kind": "presentation_if",

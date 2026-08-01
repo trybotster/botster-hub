@@ -70,6 +70,12 @@ fn generated_fixtures_deserialize_and_validate_through_rust_authority() {
     let form: UiNode = serde_json::from_value(fixtures["form"].clone()).expect("form node");
     let bound_row_identity: UiNode = serde_json::from_value(fixtures["bound_row_identity"].clone())
         .expect("bound row identity node");
+    let authored_required: Vec<UiNode> =
+        serde_json::from_value(fixtures["required_bindable_fields"]["authored"].clone())
+            .expect("authored required-bindable nodes");
+    let realized_required: Vec<UiNode> =
+        serde_json::from_value(fixtures["required_bindable_fields"]["realized"].clone())
+            .expect("realized required-bindable nodes");
     let request: UiActionRequest =
         serde_json::from_value(fixtures["request"].clone()).expect("action request");
     let accepted: UiActionResult =
@@ -85,6 +91,18 @@ fn generated_fixtures_deserialize_and_validate_through_rust_authority() {
     bound_row_identity
         .validate()
         .expect("bound row identity fixture validates");
+    assert_eq!(authored_required.len(), 7);
+    for node in authored_required {
+        node.validate_authored()
+            .expect("authored required binding fixture validates");
+        node.validate_realized()
+            .expect_err("authored required binding remains unresolved");
+    }
+    assert_eq!(realized_required.len(), 7);
+    for node in realized_required {
+        node.validate_realized()
+            .expect("materialized required binding fixture validates");
+    }
     accepted.validate().expect("accepted fixture validates");
     rejected.validate().expect("rejected fixture validates");
     assert!(request.values.is_some());
@@ -105,6 +123,13 @@ fn typescript_and_schema_encode_wire_names_and_optionality() {
         "export declare function realizeBindListDescendantId(rowId: string, key: string): UiNodeId;"
     ));
     assert!(typescript.contains("export interface UiNodeBase { id?: UiAuthoredNodeId;"));
+    assert!(typescript.contains("export type UiBindableString = string | UiBind;"));
+    assert!(typescript.contains("submit_label: UiBindableString"));
+    assert!(typescript.contains("label: UiBindableString"));
+    assert!(typescript.contains("text: UiAuthoredTextValue"));
+    assert!(typescript.contains("src: UiBindableString; title: UiBindableString"));
+    assert!(typescript.contains("name: string; label: string"));
+    assert!(typescript.contains("value: JsonValue; label: string"));
     let request_fields = interface_fields(&typescript, "UiActionRequest");
     let result_fields = interface_fields(&typescript, "UiActionResult");
     assert_eq!(
@@ -157,6 +182,42 @@ fn typescript_and_schema_encode_wire_names_and_optionality() {
         Some(
             "Schema validation is necessary but not sufficient: the Rust/Hub validator admits a bound id only on the direct UiBindList.item_template root, where row context exists."
         )
+    );
+    assert_eq!(
+        schema.pointer("/$defs/UiBindableString/oneOf/1/$ref"),
+        Some(&serde_json::json!("#/$defs/UiBind"))
+    );
+    assert_eq!(
+        schema.pointer("/$defs/UiNode/allOf/0/then/properties/props/properties/submit_label/$ref"),
+        Some(&serde_json::json!("#/$defs/UiBindableString"))
+    );
+    for index in [2, 3, 4] {
+        assert_eq!(
+            schema.pointer(&format!(
+                "/$defs/UiNode/allOf/{index}/then/properties/props/properties/label/$ref"
+            )),
+            Some(&serde_json::json!("#/$defs/UiBindableString"))
+        );
+    }
+    assert_eq!(
+        schema.pointer("/$defs/UiNode/allOf/5/then/properties/props/properties/text/$ref"),
+        Some(&serde_json::json!("#/$defs/UiAuthoredTextValue"))
+    );
+    for field in ["src", "title"] {
+        assert_eq!(
+            schema.pointer(&format!(
+                "/$defs/UiNode/allOf/6/then/properties/props/properties/{field}/$ref"
+            )),
+            Some(&serde_json::json!("#/$defs/UiBindableString"))
+        );
+    }
+    assert_eq!(
+        schema.pointer("/$defs/UiNode/allOf/7/then/properties/props/properties/name/type"),
+        Some(&serde_json::json!("string"))
+    );
+    assert_eq!(
+        schema.pointer("/$defs/UiNode/allOf/8/then/properties/props/properties/value/$ref"),
+        Some(&serde_json::json!("#/$defs/UiNonBindableValue"))
     );
 
     assert_serde_fields_match_typescript::<UiActionRequest>(

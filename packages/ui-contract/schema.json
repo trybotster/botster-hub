@@ -312,6 +312,34 @@
         }
       ]
     },
+    "UiAuthoredTextValue": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/UiBind"
+        },
+        {
+          "not": {
+            "required": [
+              "$bind"
+            ],
+            "type": "object"
+          }
+        }
+      ]
+    },
+    "UiBind": {
+      "additionalProperties": false,
+      "properties": {
+        "$bind": {
+          "pattern": "^(/|@/)",
+          "type": "string"
+        }
+      },
+      "required": [
+        "$bind"
+      ],
+      "type": "object"
+    },
     "UiBindIf": {
       "oneOf": [
         {
@@ -378,6 +406,17 @@
         "item_template"
       ],
       "type": "object"
+    },
+    "UiBindableString": {
+      "oneOf": [
+        {
+          "pattern": "\\S",
+          "type": "string"
+        },
+        {
+          "$ref": "#/$defs/UiBind"
+        }
+      ]
     },
     "UiCapabilityFallback": {
       "enum": [
@@ -520,8 +559,7 @@
                     "$ref": "#/$defs/UiAction"
                   },
                   "submit_label": {
-                    "pattern": "\\S",
-                    "type": "string"
+                    "$ref": "#/$defs/UiBindableString"
                   }
                 },
                 "required": [
@@ -593,12 +631,259 @@
                     "$ref": "#/$defs/UiAction"
                   },
                   "label": {
-                    "type": "string"
+                    "$ref": "#/$defs/UiBindableString"
                   }
                 },
                 "required": [
                   "label",
                   "action"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "props"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "icon_button"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "properties": {
+              "props": {
+                "properties": {
+                  "action": {
+                    "$ref": "#/$defs/UiAction"
+                  },
+                  "icon": {
+                    "type": "string"
+                  },
+                  "label": {
+                    "$ref": "#/$defs/UiBindableString"
+                  }
+                },
+                "required": [
+                  "label",
+                  "icon",
+                  "action"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "props"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "menu_item"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "properties": {
+              "props": {
+                "properties": {
+                  "action": {
+                    "$ref": "#/$defs/UiAction"
+                  },
+                  "label": {
+                    "$ref": "#/$defs/UiBindableString"
+                  }
+                },
+                "required": [
+                  "label",
+                  "action"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "props"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "text"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "properties": {
+              "props": {
+                "properties": {
+                  "text": {
+                    "$ref": "#/$defs/UiAuthoredTextValue"
+                  }
+                },
+                "required": [
+                  "text"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "props"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "iframe"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "properties": {
+              "props": {
+                "properties": {
+                  "src": {
+                    "$ref": "#/$defs/UiBindableString"
+                  },
+                  "title": {
+                    "$ref": "#/$defs/UiBindableString"
+                  }
+                },
+                "required": [
+                  "src",
+                  "title"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "props"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "enum": [
+                  "text_input",
+                  "textarea",
+                  "checkbox",
+                  "select"
+                ]
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "properties": {
+              "props": {
+                "properties": {
+                  "label": {
+                    "type": "string"
+                  },
+                  "name": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "name",
+                  "label"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "props"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "select_option"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "properties": {
+              "props": {
+                "properties": {
+                  "label": {
+                    "type": "string"
+                  },
+                  "value": {
+                    "$ref": "#/$defs/UiNonBindableValue"
+                  }
+                },
+                "required": [
+                  "value",
+                  "label"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "props"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "custom"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "properties": {
+              "props": {
+                "properties": {
+                  "component": {
+                    "type": "string"
+                  },
+                  "namespace": {
+                    "type": "string"
+                  },
+                  "reason": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "namespace",
+                  "component",
+                  "reason"
                 ],
                 "type": "object"
               }
@@ -685,6 +970,14 @@
         "iframe",
         "custom"
       ]
+    },
+    "UiNonBindableValue": {
+      "not": {
+        "required": [
+          "$bind"
+        ],
+        "type": "object"
+      }
     },
     "UiOrientation": {
       "enum": [
@@ -838,7 +1131,7 @@
       ]
     }
   },
-  "$id": "https://trybotster.dev/schemas/ui-contract-0.3.0.json",
+  "$id": "https://trybotster.dev/schemas/ui-contract-0.3.1.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "oneOf": [
     {

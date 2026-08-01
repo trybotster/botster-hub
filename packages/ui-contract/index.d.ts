@@ -32,6 +32,8 @@ export interface UiCapabilitySet { widthClasses?: UiWidthClass[]; heightClasses?
 export type UiSpaceToken = "none" | "xs" | "sm" | "md" | "lg" | "xl";
 export type UiColorToken = "default" | "muted" | "accent" | "success" | "warning" | "danger";
 export interface UiBind { $bind: string; }
+export type UiBindableString = string | UiBind;
+export type UiAuthoredTextValue = JsonValue | UiBind;
 export type UiPresentationOperation = { kind: "set"; key: UiPresentationKey; value: JsonValue } | { kind: "clear"; key: UiPresentationKey } | { kind: "toggle"; key: UiPresentationKey };
 export type UiPresentationPredicate = { kind: "present"; key: UiPresentationKey } | { kind: "truthy"; key: UiPresentationKey } | { kind: "equals"; key: UiPresentationKey; value: JsonValue };
 export interface UiResponsiveWidth { compact?: JsonValue; regular?: JsonValue; expanded?: JsonValue; }
@@ -42,15 +44,29 @@ export type UiConditional = { $kind: "when"; condition: UiCondition; node: UiNod
 export type UiBindList = { $kind: "bind_list"; source: string; where?: Record<string, JsonValue>; item_template: UiNode; empty_template?: UiNode };
 export type UiBindIf = { $kind: "bind_if"; path: string; node: UiNode } | { $kind: "presentation_if"; predicate: UiPresentationPredicate; node: UiNode };
 export type UiChild = UiConditional | UiNode | UiBindList | UiBindIf;
-export type UiFormProps = JsonObject & { action: UiAction; submit_label: string };
+export type UiFormProps = JsonObject & { action: UiAction; submit_label: UiBindableString };
 export type UiDialogProps = JsonObject & { title: string; presentation?: UiDialogPresentation; open?: never };
-export type UiButtonProps = JsonObject & { label: string; action: UiAction };
+export type UiButtonProps = JsonObject & { label: UiBindableString; action: UiAction };
+export type UiIconButtonProps = JsonObject & { label: UiBindableString; icon: string; action: UiAction };
+export type UiMenuItemProps = JsonObject & { label: UiBindableString; action: UiAction };
+export type UiTextProps = JsonObject & { text: UiAuthoredTextValue };
+export type UiIframeProps = JsonObject & { src: UiBindableString; title: UiBindableString };
+export type UiFieldControlProps = JsonObject & { name: string; label: string };
+export type UiSelectOptionProps = JsonObject & { value: JsonValue; label: string };
+export type UiCustomProps = JsonObject & { namespace: string; component: string; reason: string };
 export interface UiNodeBase { id?: UiAuthoredNodeId; children?: UiChild[]; slots?: Record<string, UiChild[]>; }
 export type UiNode =
   | (UiNodeBase & { type: "form"; props: UiFormProps })
   | (UiNodeBase & { type: "dialog"; props: UiDialogProps })
   | (UiNodeBase & { type: "button"; props: UiButtonProps })
-  | (UiNodeBase & { type: Exclude<UiNodeKind, "form" | "dialog" | "button">; props?: JsonObject });
+  | (UiNodeBase & { type: "icon_button"; props: UiIconButtonProps })
+  | (UiNodeBase & { type: "menu_item"; props: UiMenuItemProps })
+  | (UiNodeBase & { type: "text"; props: UiTextProps })
+  | (UiNodeBase & { type: "iframe"; props: UiIframeProps })
+  | (UiNodeBase & { type: "text_input" | "textarea" | "checkbox" | "select"; props: UiFieldControlProps })
+  | (UiNodeBase & { type: "select_option"; props: UiSelectOptionProps })
+  | (UiNodeBase & { type: "custom"; props: UiCustomProps })
+  | (UiNodeBase & { type: Exclude<UiNodeKind, "form" | "dialog" | "button" | "icon_button" | "menu_item" | "text" | "iframe" | "text_input" | "textarea" | "checkbox" | "select" | "select_option" | "custom">; props?: JsonObject });
 export type UiFieldKind = "text" | "textarea" | "checkbox" | "select";
 export interface UiFieldOption { value: JsonValue; label: string; disabled?: boolean; }
 export interface UiFieldValidationHints { minLength?: number; maxLength?: number; pattern?: string; min?: number; max?: number; oneOf?: JsonValue[]; }

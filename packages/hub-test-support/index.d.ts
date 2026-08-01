@@ -11,7 +11,7 @@ export interface HubTestSupportMetadata {
   conformance_fixture_revision: number;
   ui_contract: {
     package_name: "@trybotster/ui-contract";
-    package_version: "0.3.0";
+    package_version: "0.3.1";
     conformance_fixture_export: "@trybotster/ui-contract/conformance-fixtures";
   };
   generated_by: string;
@@ -86,6 +86,7 @@ export interface SessionPluginMaterializedRow {
   controls: Array<{
     key: "spawn" | "rename" | "remove";
     node_id: string;
+    label: string;
     action_payload: {
       operation: "spawn" | "rename" | "remove";
       session_uuid: string;

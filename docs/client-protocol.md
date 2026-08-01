@@ -10,8 +10,8 @@ The renderer-neutral UI contract used by those protocol DTOs lives in:
 - `crates/botster-ui-contract/src/lib.rs`
 - `packages/ui-contract`
 
-Rust clients consume `botster-ui-contract`; TypeScript clients consume
-`@trybotster/ui-contract@0.2.0`. The generated declarations, schema, and
+Rust clients consume `botster-ui-contract`; TypeScript clients consume the
+prepared `@trybotster/ui-contract@0.3.1`. The generated declarations, schema, and
 conformance fixtures are one contract surface and must not be copied into a
 client repository.
 
@@ -39,7 +39,7 @@ Node-based first-party clients can consume the same checked artifact without a
 sibling hub checkout through the public package:
 
 ```sh
-npm install --save-dev @trybotster/ui-contract@0.2.0 @trybotster/hub-test-support@0.1.18
+npm install --save-dev @trybotster/ui-contract@0.3.1 @trybotster/hub-test-support@0.1.20
 ```
 
 ```js
@@ -260,7 +260,9 @@ Rust uses `materialize_session_plugin_bindings`; Node uses
 `materializeSessionPluginBindingScenario`. The additive
 `materialize_session_plugin_rows` and `materializeSessionPluginRowScenario`
 helpers resolve the current-row Button's authored id and action payload after
-filtering. Only the direct BindList item-template root id accepts `@/field`;
+filtering. The Spawn Button's authored required label binds
+`@/lifecycle_class`; Rust and Node materializers resolve it to a literal before
+strict realized validation. Only the direct BindList item-template root id accepts `@/field`;
 roots outside BindList, item-template descendants, static children, empty
 templates, and action request/result `node_id` remain literal. Descendant
 identity for multi-control rows is separately tracked in
@@ -1043,7 +1045,10 @@ typed `UiNode` body and `ui_tree_snapshot` for browser/TUI rendering. The
 snapshot repeats `package_name` and `surface_id` and carries the same validated
 `UiNode`. Hub-owned code renders through `HubRuntime::render_plugin_surface`,
 deserializes against `botster-ui-contract`, and validates before serializing
-the response. Plugin actions use one canonical `UiActionRequest` envelope and
+the response. This is authored validation: Button/IconButton/MenuItem label,
+Form submit_label, Iframe src/title, and Text text accept valid sentinels before
+materialization. Clients own materialization and strict realized validation;
+Hub intentionally has no realized-tree caller. Plugin actions use one canonical `UiActionRequest` envelope and
 return a typed `UiActionResult`; the daemon and worker do not reconstruct split
 request fields. A result must echo the request's `request_id`, `surface_id`,
 `action_id`, and `node_id` exactly, including preserving an absent `node_id`.
@@ -1166,7 +1171,7 @@ Node client tests should use the declared npm dependency instead of a relative
 hub checkout:
 
 ```sh
-npm install --save-dev @trybotster/ui-contract@0.2.0 @trybotster/hub-test-support@0.1.18
+npm install --save-dev @trybotster/ui-contract@0.3.1 @trybotster/hub-test-support@0.1.20
 ```
 
 ```js
