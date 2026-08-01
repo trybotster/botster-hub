@@ -365,6 +365,10 @@ pub(crate) fn daemon_protocol_typescript() -> String {
                 "plugin_worker_counters?",
                 "DaemonPluginWorkerCounters | null",
             ),
+            (
+                "plugin_resource_counters?",
+                "DaemonPluginResourceCounters | null",
+            ),
             ("plugin_tools", "JsonValue[]"),
             ("plugin_tool_result", "JsonValue"),
             ("plugin_surface?", "DaemonPluginSurface | null"),
@@ -1051,6 +1055,11 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             ("queued_jobs", "number"),
             ("in_flight_jobs", "number"),
         ],
+    );
+    emit_interface(
+        &mut output,
+        "DaemonPluginResourceCounters",
+        &[("active_timer_resources", "number")],
     );
     emit_interface(
         &mut output,

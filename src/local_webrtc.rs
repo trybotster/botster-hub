@@ -1374,6 +1374,7 @@ fn response_with_diagnostic(diagnostic: DaemonDiagnostic) -> DaemonResponse {
         package_decision: None,
         lifecycle: Vec::new(),
         plugin_worker_counters: None,
+        plugin_resource_counters: None,
         plugin_tools: Vec::new(),
         plugin_tool_result: Value::Null,
         plugin_surface: None,

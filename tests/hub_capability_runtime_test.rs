@@ -951,6 +951,7 @@ fn hub_runtime_preserves_in_memory_websocket_stub() {
 fn hub_runtime_schedules_cancels_and_cleans_up_timers() {
     let mut runtime = explicit_runtime("timers");
     let plugin_key = PluginKey("project-pipelines".to_string());
+    assert_eq!(runtime.active_plugin_timer_resources(), 0);
     let handle = runtime
         .submit_capability_request(request(
             &plugin_key.0,
@@ -958,6 +959,7 @@ fn hub_runtime_schedules_cancels_and_cleans_up_timers() {
             CapabilityOperation::Timer(TimerCapabilityRequest::Once { delay_ms: 10 }),
         ))
         .expect("timer should submit");
+    assert_eq!(runtime.active_plugin_timer_resources(), 1);
     assert_eq!(
         handle.required_capability,
         Capability {
@@ -988,10 +990,12 @@ fn hub_runtime_schedules_cancels_and_cleans_up_timers() {
             CapabilityOperation::Timer(TimerCapabilityRequest::Interval { interval_ms: 5 }),
         ))
         .expect("interval timer should submit");
+    assert_eq!(runtime.active_plugin_timer_resources(), 1);
     let resource = interval.resource.expect("interval timer has resource");
     runtime
         .release_capability_resource(resource)
         .expect("release timer resource");
+    assert_eq!(runtime.active_plugin_timer_resources(), 0);
     let after_cancel = runtime
         .drain_capability_events_at(&plugin_key, 20)
         .expect("drain after cancel");
@@ -1073,12 +1077,14 @@ fn unload_cleans_up_capability_resources_for_plugin() {
         ))
         .expect("timer should submit");
     assert!(timer.resource.is_some());
+    assert_eq!(runtime.active_plugin_timer_resources(), 1);
 
     let cleanup = runtime
         .cleanup_plugin_capabilities(&plugin_key)
         .expect("capability cleanup should succeed");
     assert_eq!(cleanup.plugin_key, plugin_key);
     assert!(!cleanup.removed_resources.is_empty());
+    assert_eq!(runtime.active_plugin_timer_resources(), 0);
 
     let after_cleanup = runtime
         .drain_capability_events_at(&PluginKey("project-pipelines".to_string()), 10)

@@ -39,7 +39,7 @@ Node-based first-party clients can consume the same checked artifact without a
 sibling hub checkout through the public package:
 
 ```sh
-npm install --save-dev @trybotster/ui-contract@0.2.0 @trybotster/hub-test-support@0.1.17
+npm install --save-dev @trybotster/ui-contract@0.2.0 @trybotster/hub-test-support@0.1.18
 ```
 
 ```js
@@ -89,9 +89,9 @@ when checked assets are stale. The metadata's protocol version and conformance
 fixture revision are emitted by the Rust `botster-hub-test-support` asset
 generator instead of being maintained independently in JavaScript.
 
-After version 0.1.17 is published to the public npm registry, npm-based client
-repos such as botster-web should use the exact dependency spec
-`"@trybotster/hub-test-support": "0.1.17"` in `devDependencies` and let npm write
+Version 0.1.18 is published to the public npm registry. npm-based client repos
+such as botster-web use the exact dependency spec
+`"@trybotster/hub-test-support": "0.1.18"` in `devDependencies` and let npm write
 the corresponding package-lock entry from the public npm registry. The package
 is public, so registry install does not require a scoped `.npmrc` entry or CI
 auth token. After updating the lockfile, run the client smoke that imports the
@@ -229,7 +229,7 @@ but normal client reconciliation must not poll it or maintain a list-refresh
 fallback beside the entity stream.
 
 The prepared current contract ships from
-`@trybotster/hub-test-support@0.1.17` as
+`@trybotster/hub-test-support@0.1.18` as
 `session-lifecycle-subscription-conformance-fixture.json` and through
 `readSessionLifecycleSubscriptionConformanceFixture()`. The fixture serializes
 the public `DaemonEntityFrame` DTOs and normalizes only timestamps and sequence
@@ -437,6 +437,15 @@ diagnostics and required references, and an optional request mapping for actions
 the daemon can invoke. Unsupported reload and hub-restart style actions are
 reported as unavailable diagnostics; they are not hidden client policy and do
 not imply an implementation exists.
+
+`PluginLifecycleStatus` projects two sanitized aggregate observations. The
+optional `plugin_worker_counters` object carries Core-authored queue capacity,
+executor concurrency, live executor/worker, queued-job, and in-flight-job
+counters. The optional `plugin_resource_counters` object carries Hub-owned
+resource observations; currently it contains only `active_timer_resources`.
+Neither object exposes plugin identities, payloads, handler names, or resource
+IDs. Clients must treat absence as an older-daemon compatibility case rather
+than synthesizing a zero value.
 
 CLI operators can inspect the same daemon path:
 
@@ -1157,7 +1166,7 @@ Node client tests should use the declared npm dependency instead of a relative
 hub checkout:
 
 ```sh
-npm install --save-dev @trybotster/ui-contract@0.2.0 @trybotster/hub-test-support@0.1.17
+npm install --save-dev @trybotster/ui-contract@0.2.0 @trybotster/hub-test-support@0.1.18
 ```
 
 ```js
@@ -1172,7 +1181,9 @@ const fixturePath = materializePluginContractMatrixFixture(tempDirectory);
 
 Local environment variables may still point legacy drift checks at a checked-out
 hub artifact, but after publication the normal web-client dependency coordinate
-is `@trybotster/hub-test-support@0.1.17` from the public npm registry.
+is `@trybotster/hub-test-support@0.1.18` from the public npm registry. The
+published 0.1.17 artifact contains stale daemon protocol bytes and must not be
+used as contract authority.
 
 Each harness instance creates a disposable data directory and socket path under
 the configured test root, uses synthetic default hub identity, and attempts a

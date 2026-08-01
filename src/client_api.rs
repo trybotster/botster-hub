@@ -487,6 +487,9 @@ impl HubClientApi {
                         queued_jobs: snapshot.queued_jobs,
                         in_flight_jobs: snapshot.in_flight_jobs,
                     },
+                    resource_counters: HubClientPluginResourceCounters {
+                        active_timer_resources: runtime.active_plugin_timer_resources(),
+                    },
                 })
             }
             HubClientRequest::PluginSurfaceRender {
@@ -1736,6 +1739,13 @@ pub struct HubClientPluginLifecycle {
 pub struct HubClientPluginLifecycleReport {
     pub lifecycle: Vec<HubClientPluginLifecycle>,
     pub worker_counters: HubClientPluginWorkerCounters,
+    pub resource_counters: HubClientPluginResourceCounters,
+}
+
+/// Aggregate Hub-owned plugin resource counters without owner identities.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HubClientPluginResourceCounters {
+    pub active_timer_resources: usize,
 }
 
 /// Aggregate plugin-worker counters without plugin identities or payloads.
