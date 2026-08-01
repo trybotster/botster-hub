@@ -79,6 +79,13 @@
   versioned, injective UTF-8 byte-length-prefixed encoding. It explicitly
   rejects separate presentation-specific id fields in entity records,
   descendant full-id `$bind`, client-local encoding, and compatibility grammar.
+- Plan Review `review_1785603785_611568` returned four mechanism corrections.
+  This revision records the actual generation topology (`index.js` and the Node
+  materializer are hand-authored), makes Rust-generated golden vectors the npm
+  helper parity gate, classifies Hub root/static realized-collision detection
+  as new materializer work, scopes Web's missing collision detector as new
+  downstream work while retaining TUI's existing collector, and gates the
+  exported npm `packageVersion` against `package.json`.
 
 ## Contract decision
 
@@ -135,17 +142,26 @@ scalar values or UTF-16 code units. `<ROW>` and `<KEY>` are copied byte for
 byte. For row `session-1` and key `remove`, the result is
 `botster-ui-descendant-v1:9:session-16:remove`. Consumers do not concatenate,
 escape, hash, parse, or choose the prefix themselves. The Rust contract crate
-and generated npm package expose canonical realization helpers, and all Hub
-reference materializers and downstream consumers call those helpers.
+is the semantic authority and exposes the canonical realization helper. Its
+existing asset generator emits adversarial `(row, key, realized_id)` golden
+vectors into generated `conformance-fixtures.json`. The hand-authored npm
+runtime exports the matching helper, and `test.mjs` proves it reproduces every
+Rust-generated vector. The hand-authored Hub test-support Node materializer
+imports that npm helper instead of implementing the encoding.
 
 The emitted value is an ordinary literal `UiNodeId`. React keys, DOM
 `data-ui-node-id`, TUI focus/hit maps, and `UiActionRequest.node_id` receive
-that exact string. Existing final-tree collision checks still reject a
-generated id colliding with a root, static literal, sibling, or another row;
-clients never repair a collision. Direct item-root ids remain the producer row
-ids and are not rewritten. Literal descendant ids remain wire-valid for
-existing single-row/static use, but repeated realized literals remain subject
-to collision rejection.
+that exact string. Today the Hub-owned reference materializers reject only
+duplicate realized row ids; they do not compare materialized descendants with
+the surface root or static siblings. This ticket adds that realized-tree
+collision rejection to both strict Hub test-support materializers after row
+materialization; the authored-tree validator cannot own it because it has no
+entity rows. TUI already has a render-scoped collision check, while Web does
+not and must add one in its routed consumer ticket. No client repairs a
+collision. Direct item-root ids remain the producer row ids and are not
+rewritten. Literal descendant ids remain wire-valid for existing
+single-row/static use, but repeated realized literals are rejected once their
+rows coexist in a realized render.
 
 ## Scope
 
@@ -162,13 +178,21 @@ to collision rejection.
      A nested BindList validates in a fresh context. `empty_template` remains
      static. Reject absent/literal item-root sources, blank keys, duplicate
      keys anywhere in the authored template, and every misplaced new form.
-   - Put the canonical encoding and realization helpers in
-     `botster-ui-contract`. Rust and the generated JavaScript runtime must
-     produce byte-identical strings for ASCII, delimiter-like, whitespace,
-     multibyte, and emoji inputs. Do not make clients reimplement the formula.
-   - Regenerate Rust-derived TypeScript declarations, JSON Schema, package
-     runtime exports, and conformance fixtures. Document the direct-root and
-     descendant forms as distinct versioned semantics.
+   - Put the canonical Rust encoding and realization helper in
+     `botster-ui-contract`. Extend `conformance_fixtures_json()` with golden
+     vectors for ASCII, delimiter-like, whitespace, multibyte, and emoji
+     inputs. The existing `generate_assets.rs --check` and byte-equality test
+     then guard those vectors in generated
+     `packages/ui-contract/conformance-fixtures.json`.
+   - Add the matching helper to hand-authored
+     `packages/ui-contract/index.js`. Its Node test executes every generated
+     vector, so JavaScript counts UTF-8 bytes exactly without pretending
+     `index.js` is generator output. Do not make Web or Hub test support
+     reimplement the formula.
+   - Regenerate Rust-derived TypeScript declarations, JSON Schema, and
+     conformance fixtures. Update the hand-authored package runtime, tests, and
+     documentation explicitly; document the direct-root and descendant forms
+     as distinct versioned semantics.
 
 2. **Expand the canonical producer and strict materializers.**
    - Keep the existing `contract.sessions` lifecycle controls and direct-root
@@ -177,11 +201,20 @@ to collision rejection.
      `@/session_uuid` and whose nested Buttons use at least `spawn`, `rename`,
      and `remove` keys. Each action payload must retain the selected row id and
      literal operation so proof can distinguish row and control.
-   - Extend both authoritative Rust and generated Node reference
+   - Extend the authoritative Rust and hand-authored Node reference
      materializers to recursively realize every descendant through the
-     contract helper, in producer row and authored child order. Preserve
+     contract helper, in producer row and authored child order. The Node
+     materializer imports `realizeBindListDescendantId` from its declared
+     `@trybotster/ui-contract` dependency instead of copying the encoder.
+     Preserve
      strict rejection of malformed/extra canonical fixture shapes, unresolved
      values, blank root ids/keys, duplicate keys, and final collisions.
+   - Add new post-materialization collectors in both reference materializers.
+     For each realized fixture stage, compare materialized root/descendant ids
+     with the surrounding realized surface root and static siblings, reject
+     repeated literal descendants across rows, and reject every duplicate
+     final id. This is new Hub test-support work, not a retained validator
+     feature.
    - Publish stage expectations for multiple current rows, lifecycle changes,
      removal, and reconnect. Each stage records the exact root and descendant
      ids plus action payloads, rather than only aggregate counts.
@@ -189,8 +222,10 @@ to collision rejection.
      delimiter-like substrings, accented characters, CJK, and emoji to prove
      that distinct `(row, key)` pairs never collide across Rust and Node.
    - Edit the repo-root fixture as authority, synchronize the crate mirror, and
-     generate the npm mirror. Update every shipped fixture/package README that
-     describes revision 25's direct-root-only semantics.
+     generate the npm fixture mirror. Update the hand-authored Node
+     materializer/tests alongside the generated fixture. Update every shipped
+     fixture/package README that describes revision 25's direct-root-only
+     semantics.
 
 3. **Prove Hub admission and the real producer path.**
    - Exercise generic contract validation and Hub-specific render/replacement
@@ -217,9 +252,16 @@ to collision rejection.
    - Add no feature constant or protocol bump because daemon framing and
      request/response semantics do not change. Advance the conformance revision
      because published fixture content and renderer requirements do.
-   - Regenerate all package metadata, checksums, fixtures, declarations,
-     schemas, support matrices if implicated, READMEs, crate manifests, and
-     lockfiles from authoritative sources.
+   - Regenerate the assets that have generators: UI declarations/schema/golden
+     fixtures plus Hub test-support protocol, matrices, fixture JSON, metadata,
+     checksums, and synchronized fixture mirrors. Explicitly update and test
+     hand-authored `packages/ui-contract/index.js` and
+     `packages/hub-test-support/index.js`; do not describe them as generated.
+   - Make the hand-authored UI runtime's exported `packageVersion`
+     gate-enforced: `packages/ui-contract/test.mjs` reads `package.json` and
+     asserts exact equality instead of comparing two separately edited
+     literals. Update READMEs, crate/npm manifests, and lockfiles made stale by
+     the release.
    - Pack UI contract first, install that exact tarball into Hub test support,
      then pack Hub test support. Smoke both tarballs in clean external Rust and
      Node/TypeScript consumers. If npm credentials/2FA block publication,
@@ -270,7 +312,7 @@ to collision rejection.
   plugin-worker proof. It validates authored trees but has no entity-backed
   renderer store and therefore does not realize arbitrary live client trees.
 - **`botster-hub-test-support` in this repository** owns the canonical producer
-  fixture, strict Rust/Node reference materializers, generated package mirror,
+  fixture, strict Rust/hand-authored Node reference materializers, generated fixture mirror,
   public conformance report, and downstream-consumable scenario.
 - **`botster-hub-client` in this repository** owns conformance compatibility
   metadata. Only its fixture revision should change unless implementation
@@ -327,16 +369,17 @@ to collision rejection.
   `src/assets.rs`, `tests/ui_contract_test.rs`,
   `tests/generated_assets_test.rs`, examples/generators implicated by runtime
   JS export generation, and `Cargo.toml`.
-- Generated/published UI package: `packages/ui-contract/index.js`,
-  `index.d.ts`, `schema.json`, `conformance-fixtures.json`, `test.mjs`,
-  `README.md`, and `package.json`.
+- Published UI package: hand-authored `packages/ui-contract/index.js` and
+  `test.mjs`; generated `index.d.ts`, `schema.json`, and
+  `conformance-fixtures.json`; plus `README.md` and `package.json`.
 - Canonical producer source and synchronized mirrors:
   `fixtures/plugins/plugin-contract-matrix/{plugin.lua,README.md,botster-package.json}`,
   `crates/botster-hub-test-support/fixtures/plugin-contract-matrix/**`, and
   `packages/hub-test-support/fixtures/plugin-contract-matrix/**`.
-- Hub test support and generated npm assets:
+- Hub test support and npm assets:
   `crates/botster-hub-test-support/src/lib.rs`, relevant generator examples,
-  `packages/hub-test-support/index.js`, `index.d.ts`, `test.mjs`, `README.md`,
+  hand-authored `packages/hub-test-support/index.js`, `index.d.ts`, and
+  `test.mjs`; `README.md`,
   `session-plugin-binding-conformance-fixture.json`, `metadata.json`,
   `package.json`, and any source-derived support matrix/checksum files changed
   by regeneration.
@@ -366,13 +409,21 @@ required runtime/release proof.
   whole template before materialization.
 - **Unresolved identities enter renderer state:** keep `as_literal()` behavior
   literal-only and require materialization before any hit/focus/action path.
-- **Generated ids collide with literal/root ids:** retain final realized-tree
-  uniqueness checks and negative controls; never rewrite either side.
+- **Generated ids collide with literal/root ids:** build new strict
+  post-materialization collectors in Rust and Node test support, keep TUI's
+  existing render-scoped check, add Web's missing equivalent in its consumer
+  ticket, and never rewrite either side.
 - **Fixture exists but production is unwired:** require real package registry,
   plugin worker, Hub admission, daemon/client API action, and report evidence.
-- **Source/generated fixture drift:** edit only source/Rust generators, run
-  check-mode synchronization, and verify byte equality/checksums and packed
-  contents.
+- **Rust/JavaScript encoding drift:** check Rust-generated golden vectors into
+  the generated conformance fixture, require the hand-authored npm helper to
+  reproduce every vector, and require Hub test support to import that helper.
+- **Source/generated fixture drift:** run check-mode synchronization for actual
+  generated assets, separately test hand-authored runtime files, and verify
+  byte equality/checksums and packed contents without claiming runtime files
+  are generator-owned.
+- **Exported package version drifts:** compare `packageVersion` from
+  hand-authored `index.js` directly with `package.json` in `test.mjs`.
 - **Immutable version/revision collision:** recheck main and npm before version
   assignment and assert installed content, not metadata alone.
 - **Downstream duplicate contract sources:** route the TUI-kit repin first and
@@ -412,7 +463,8 @@ required runtime/release proof.
    - Multiple rows times `spawn`/`rename`/`remove` produce exact distinct ids in
      producer/child order, with matching row/control payloads at every fixture
      stage.
-   - Both materializers reject duplicate keys, missing roots/rows, non-string
+   - Both materializers' new post-materialization collectors reject duplicate
+     keys, missing roots/rows, non-string
      or blank row ids, unresolved values, malformed/extra fixture controls,
      repeated literal descendants, and collisions with root/static nodes.
    - Run:
@@ -459,6 +511,9 @@ required runtime/release proof.
      tarballs into clean temporary consumers. Assert versions, integrity,
      fixture revision/content, schema/declaration/runtime exports, exact golden
      ids, and strict TypeScript acceptance/rejection cases.
+   - The installed UI package smoke asserts exported `packageVersion` equals
+     the installed `package.json` version, then executes every Rust-generated
+     encoder vector through the hand-authored helper.
    - Publish UI contract before Hub test support. If credentials/2FA block the
      publish, attach exact verified operator commands and coordinates; after
      publication, repeat the external install proof from the registry.
@@ -468,7 +523,11 @@ required runtime/release proof.
      artifacts, call the canonical npm helper, render multiple rows/controls,
      and click/keyboard-activate an exact non-first control. Assert React/DOM
      identity, structured action-result evidence, reconnect, Unicode vectors,
-     duplicate diagnostics, and the real Hub transport path.
+     and the real Hub transport path. Web currently has no realized-tree
+     collision detector, so this ticket explicitly owns building one with the
+     render-scoped semantics from
+     [[post expansion identity uniqueness is scoped to one render not one tree]],
+     including actionable duplicate diagnostics and condition-branch controls.
    - TUI-kit ticket `ticket_1785602855_922302`: repin the exact Hub revision,
      keep unresolved variants out of renderer state, run kit format/test/clippy
      and conformance suites, and prove one contract source.
@@ -476,7 +535,9 @@ required runtime/release proof.
      render multiple rows/controls through the production frame/hit map, Tab to
      a non-first control, dispatch keyboard and mouse input, reconcile focus
      after removal, reconnect, assert Unicode vectors/duplicate diagnostics,
-     and run the published real producer scenario.
+     and run the published real producer scenario. TUI already owns the full
+     render-scoped duplicate-id collector; adapt and retain it rather than
+     treating collision detection as new TUI infrastructure.
    - Cross-client success requires Web and TUI to produce the same exact id for
      every shared golden vector. Hub completion proves the producer seam; it
      does not substitute for these separately owned runtime paths.
