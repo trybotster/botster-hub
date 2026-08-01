@@ -2430,12 +2430,16 @@ mod tests {
             "source": "/session",
             "where": { "lifecycle_class": "current" },
             "item_template": {
-                "type": "button",
+                "type": "inline",
                 "id": { "$bind": "@/session_uuid" },
-                "props": {
-                    "label": "Select session",
-                    "action": { "id": "contract.action" }
-                }
+                "children": [{
+                    "type": "button",
+                    "id": { "$kind": "bind_list_descendant_id", "key": "remove" },
+                    "props": {
+                        "label": "Remove session",
+                        "action": { "id": "contract.action" }
+                    }
+                }]
             }
         }));
         validate_plugin_surface_node(&admitted)
@@ -2468,6 +2472,39 @@ mod tests {
                 validate_plugin_surface_node(&node).expect_err("unresolved render id must fail");
             assert_eq!(error.code, "invalid_surface");
             assert!(error.message.contains("bind_list item_template"));
+        }
+
+        for rejected in [
+            serde_json::json!({
+                "type": "button",
+                "id": { "$kind": "bind_list_descendant_id", "key": "remove" },
+                "props": {
+                    "label": "Remove session",
+                    "action": { "id": "contract.action" }
+                }
+            }),
+            serde_json::json!({
+                "type": "panel",
+                "id": "binding-root",
+                "children": [{
+                    "$kind": "bind_list",
+                    "source": "/session",
+                    "item_template": {
+                        "type": "button",
+                        "id": { "$kind": "bind_list_descendant_id", "key": "remove" },
+                        "props": {
+                            "label": "Remove session",
+                            "action": { "id": "contract.action" }
+                        }
+                    }
+                }]
+            }),
+        ] {
+            let node = serde_json::from_value(rejected).expect("authored keyed UiNode");
+            let error = validate_plugin_surface_node(&node)
+                .expect_err("misplaced descendant identity must fail");
+            assert_eq!(error.code, "invalid_surface");
+            assert!(error.message.contains("bind_list descendant identity"));
         }
     }
 

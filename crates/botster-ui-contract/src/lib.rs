@@ -223,6 +223,57 @@ pub fn validate_package_presentation(
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct UiNodeId(pub String);
 
+/// Producer-authored key for identity-bearing descendants of a bound list row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "$kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum UiBindListDescendantId {
+    /// Compose the realized row identity with this stable control key.
+    BindListDescendantId {
+        /// Producer-owned key, unique within the complete item template.
+        key: String,
+    },
+}
+
+impl UiBindListDescendantId {
+    /// Return the producer-authored control key.
+    #[must_use]
+    pub fn key(&self) -> &str {
+        match self {
+            Self::BindListDescendantId { key } => key,
+        }
+    }
+}
+
+/// Error returned when a bound-list descendant identity cannot be realized.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum UiBindListDescendantIdError {
+    /// The realized row identity is blank.
+    #[error("bound list row identity cannot be blank")]
+    BlankRowId,
+    /// The producer-authored descendant key is blank.
+    #[error("bound list descendant identity key cannot be blank")]
+    BlankKey,
+}
+
+/// Realize a descendant identity from the canonical row id and authored key.
+pub fn realize_bind_list_descendant_id(
+    row_id: &str,
+    key: &str,
+) -> Result<UiNodeId, UiBindListDescendantIdError> {
+    if row_id.trim().is_empty() {
+        return Err(UiBindListDescendantIdError::BlankRowId);
+    }
+    if key.trim().is_empty() {
+        return Err(UiBindListDescendantIdError::BlankKey);
+    }
+
+    Ok(UiNodeId(format!(
+        "botster-ui-descendant-v1:{}:{row_id}{}:{key}",
+        row_id.len(),
+        key.len()
+    )))
+}
+
 /// Node identity as authored before any BindList row template is expanded.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -231,6 +282,8 @@ pub enum UiAuthoredNodeId {
     Literal(UiNodeId),
     /// Item-relative identity resolved from the current BindList row.
     Bind(UiBind),
+    /// Identity composed from the nearest realized BindList row and a stable key.
+    BindListDescendant(UiBindListDescendantId),
 }
 
 impl From<UiNodeId> for UiAuthoredNodeId {
@@ -245,7 +298,7 @@ impl UiAuthoredNodeId {
     pub fn as_literal(&self) -> Option<&UiNodeId> {
         match self {
             Self::Literal(id) => Some(id),
-            Self::Bind(_) => None,
+            Self::Bind(_) | Self::BindListDescendant(_) => None,
         }
     }
 }
@@ -830,7 +883,7 @@ impl UiNode {
 
 /// Validate one semantic UI node recursively.
 pub fn validate_ui_node(node: &UiNode) -> Result<(), UiValidationError> {
-    validate_ui_node_in_context(node, UiValidationContext::Static)
+    validate_ui_node_in_context(node, UiValidationContext::Static, &mut BTreeSet::new())
 }
 
 /// Validate one semantic UI node against renderer capabilities.
@@ -838,7 +891,7 @@ pub fn validate_ui_node_with_capabilities(
     node: &UiNode,
     capabilities: &UiCapabilitySet,
 ) -> Result<(), UiValidationError> {
-    validate_node(node, UiValidationContext::Static)
+    validate_node(node, UiValidationContext::Static, &mut BTreeSet::new())
         .and_then(|()| validate_node_capabilities(node, capabilities))
         .map_err(|error| UiValidationError::Node {
             id: node.id.clone(),
@@ -1384,6 +1437,14 @@ pub enum UiValidationError {
         /// Validation reason.
         reason: String,
     },
+    /// A bound-list descendant identity is misplaced or ambiguous.
+    #[error("invalid bind_list descendant identity key `{key}`: {reason}")]
+    InvalidBindListDescendantId {
+        /// Producer-authored descendant key.
+        key: String,
+        /// Validation reason.
+        reason: String,
+    },
     /// Renderer capability is unsupported and no fallback was declared.
     #[error("{kind:?} requires unsupported renderer capability `{capability}`: {reason}")]
     UnsupportedCapability {
@@ -1410,14 +1471,23 @@ pub enum UiValidationError {
 enum UiValidationContext {
     Static,
     BindListItemRoot,
-    BindListItemDescendant,
+    BoundBindListItemDescendant,
+    UnboundBindListItemDescendant,
 }
 
 impl UiValidationContext {
-    fn child(self) -> Self {
+    fn child(self, node: &UiNode) -> Self {
         match self {
             Self::Static => Self::Static,
-            Self::BindListItemRoot | Self::BindListItemDescendant => Self::BindListItemDescendant,
+            Self::BindListItemRoot => {
+                if matches!(node.id, Some(UiAuthoredNodeId::Bind(_))) {
+                    Self::BoundBindListItemDescendant
+                } else {
+                    Self::UnboundBindListItemDescendant
+                }
+            }
+            Self::BoundBindListItemDescendant => Self::BoundBindListItemDescendant,
+            Self::UnboundBindListItemDescendant => Self::UnboundBindListItemDescendant,
         }
     }
 }
@@ -1425,15 +1495,20 @@ impl UiValidationContext {
 fn validate_ui_node_in_context(
     node: &UiNode,
     context: UiValidationContext,
+    descendant_keys: &mut BTreeSet<String>,
 ) -> Result<(), UiValidationError> {
-    validate_node(node, context).map_err(|error| UiValidationError::Node {
+    validate_node(node, context, descendant_keys).map_err(|error| UiValidationError::Node {
         id: node.id.clone(),
         kind: node.kind,
         source: Box::new(error),
     })
 }
 
-fn validate_node(node: &UiNode, context: UiValidationContext) -> Result<(), UiValidationError> {
+fn validate_node(
+    node: &UiNode,
+    context: UiValidationContext,
+    descendant_keys: &mut BTreeSet<String>,
+) -> Result<(), UiValidationError> {
     let schema = schema_for(node.kind);
 
     for required in schema.required_props {
@@ -1461,10 +1536,11 @@ fn validate_node(node: &UiNode, context: UiValidationContext) -> Result<(), UiVa
 
     validate_prop_combinations(node)?;
     validate_custom_node(node)?;
-    validate_stable_id(node, context)?;
+    validate_stable_id(node, context, descendant_keys)?;
     validate_required_action(node)?;
     validate_required_label(node)?;
 
+    let child_context = context.child(node);
     for required in schema.required_slots {
         if !node.slots.contains_key(required) {
             return Err(UiValidationError::MissingSlot {
@@ -1482,34 +1558,41 @@ fn validate_node(node: &UiNode, context: UiValidationContext) -> Result<(), UiVa
             });
         }
         for child in children {
-            validate_child(child, context.child())?;
+            validate_child(child, child_context, descendant_keys)?;
         }
     }
 
     for child in &node.children {
-        validate_child(child, context.child())?;
+        validate_child(child, child_context, descendant_keys)?;
     }
 
     Ok(())
 }
 
-fn validate_child(child: &UiChild, context: UiValidationContext) -> Result<(), UiValidationError> {
+fn validate_child(
+    child: &UiChild,
+    context: UiValidationContext,
+    descendant_keys: &mut BTreeSet<String>,
+) -> Result<(), UiValidationError> {
     match child {
-        UiChild::Conditional(conditional) => validate_conditional(conditional, context),
-        UiChild::Node(node) => validate_ui_node_in_context(node, context),
+        UiChild::Conditional(conditional) => {
+            validate_conditional(conditional, context, descendant_keys)
+        }
+        UiChild::Node(node) => validate_ui_node_in_context(node, context, descendant_keys),
         UiChild::BindList(bind_list) => validate_bind_list(bind_list),
-        UiChild::BindIf(bind_if) => validate_bind_if(bind_if, context),
+        UiChild::BindIf(bind_if) => validate_bind_if(bind_if, context, descendant_keys),
     }
 }
 
 fn validate_conditional(
     conditional: &UiConditional,
     context: UiValidationContext,
+    descendant_keys: &mut BTreeSet<String>,
 ) -> Result<(), UiValidationError> {
     match conditional {
         UiConditional::When { condition: _, node }
         | UiConditional::Hidden { condition: _, node } => {
-            validate_ui_node_in_context(node, context)
+            validate_ui_node_in_context(node, context, descendant_keys)
         }
     }
 }
@@ -1530,7 +1613,11 @@ fn validate_bind_list(bind_list: &UiBindList) -> Result<(), UiValidationError> {
                 });
             }
             validate_bind_list_where(r#where)?;
-            validate_ui_node_in_context(item_template, UiValidationContext::BindListItemRoot)?;
+            validate_ui_node_in_context(
+                item_template,
+                UiValidationContext::BindListItemRoot,
+                &mut BTreeSet::new(),
+            )?;
             if let Some(template) = empty_template {
                 template.validate()?;
             }
@@ -1542,15 +1629,16 @@ fn validate_bind_list(bind_list: &UiBindList) -> Result<(), UiValidationError> {
 fn validate_bind_if(
     bind_if: &UiBindIf,
     context: UiValidationContext,
+    descendant_keys: &mut BTreeSet<String>,
 ) -> Result<(), UiValidationError> {
     match bind_if {
         UiBindIf::BindIf { path, node } => {
             validate_bind_path(path)?;
-            validate_ui_node_in_context(node, context)
+            validate_ui_node_in_context(node, context, descendant_keys)
         }
         UiBindIf::PresentationIf { predicate, node } => {
             validate_presentation_predicate(predicate)?;
-            validate_ui_node_in_context(node, context)
+            validate_ui_node_in_context(node, context, descendant_keys)
         }
     }
 }
@@ -2264,10 +2352,15 @@ fn is_custom_fallback_kind(kind: UiNodeKind) -> bool {
 fn validate_stable_id(
     node: &UiNode,
     context: UiValidationContext,
+    descendant_keys: &mut BTreeSet<String>,
 ) -> Result<(), UiValidationError> {
     if let Some(UiAuthoredNodeId::Bind(bind)) = &node.id {
         validate_bind_path(&bind.path)?;
-        if context == UiValidationContext::BindListItemDescendant {
+        if matches!(
+            context,
+            UiValidationContext::BoundBindListItemDescendant
+                | UiValidationContext::UnboundBindListItemDescendant
+        ) {
             return Err(UiValidationError::InvalidBindPath {
                 path: bind.path.clone(),
                 reason: "a bound node id is valid only on the bind_list item_template root, not on its descendants"
@@ -2278,6 +2371,30 @@ fn validate_stable_id(
             return Err(UiValidationError::InvalidBindPath {
                 path: bind.path.clone(),
                 reason: "bound node id requires an item-relative path on the bind_list item_template root"
+                    .to_string(),
+            });
+        }
+    }
+
+    if let Some(UiAuthoredNodeId::BindListDescendant(descendant_id)) = &node.id {
+        let key = descendant_id.key();
+        if key.trim().is_empty() {
+            return Err(UiValidationError::InvalidBindListDescendantId {
+                key: key.to_string(),
+                reason: "key cannot be blank".to_string(),
+            });
+        }
+        if context != UiValidationContext::BoundBindListItemDescendant {
+            return Err(UiValidationError::InvalidBindListDescendantId {
+                key: key.to_string(),
+                reason: "the keyed form is valid only below a bind_list item_template root with an item-relative bound id"
+                    .to_string(),
+            });
+        }
+        if !descendant_keys.insert(key.to_string()) {
+            return Err(UiValidationError::InvalidBindListDescendantId {
+                key: key.to_string(),
+                reason: "key must be unique across the complete bind_list item template"
                     .to_string(),
             });
         }
@@ -2308,7 +2425,7 @@ fn validate_stable_id(
 
     let missing_id = node.id.as_ref().is_none_or(|id| match id {
         UiAuthoredNodeId::Literal(id) => id.0.trim().is_empty(),
-        UiAuthoredNodeId::Bind(_) => false,
+        UiAuthoredNodeId::Bind(_) | UiAuthoredNodeId::BindListDescendant(_) => false,
     });
     if let Some(reason) = reason
         && missing_id

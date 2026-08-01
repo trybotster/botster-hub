@@ -132,14 +132,14 @@ function assertDialogFormComposition(source) {
 }
 
 assert.equal(metadata.package_name, "@trybotster/hub-test-support");
-assert.equal(metadata.package_version, "0.1.18");
+assert.equal(metadata.package_version, "0.1.19");
 assert.equal(metadata.protocol, "botster-hub-daemon-v1");
 assert.equal(metadata.protocol_version, 4);
-assert.equal(metadata.conformance_fixture_revision, 25);
+assert.equal(metadata.conformance_fixture_revision, 26);
 assert.deepEqual(metadata.ui_contract, {
   conformance_fixture_export: "@trybotster/ui-contract/conformance-fixtures",
   package_name: "@trybotster/ui-contract",
-  package_version: "0.2.0",
+  package_version: "0.3.0",
 });
 assert.deepEqual(metadata.application_primitives, {
   fixture_package_name: "botster.plugin-contract-matrix",
@@ -267,7 +267,7 @@ assert.deepEqual(supportMatrix.plugin_surfaces.authored_set_values, {
   "selected-workspace": "workspace-alpha",
 });
 
-assert.equal(sessionLifecycleFixture.conformance_fixture_revision, 25);
+assert.equal(sessionLifecycleFixture.conformance_fixture_revision, 26);
 assert.equal(sessionLifecycleFixture.entity_type, "session");
 assert.deepEqual(
   sessionLifecycleFixture.normalized_frames.map((frame) => frame.type),
@@ -282,7 +282,7 @@ assert.match(
   /node_modules[\\/]@trybotster[\\/]ui-contract[\\/]/,
 );
 const uiContractFixtures = await readUiContractConformanceFixtures();
-assert.equal(uiContractFixtures.contract_version, "0.2.0");
+assert.equal(uiContractFixtures.contract_version, "0.3.0");
 assert.equal(
   uiContractFixtures.fixtures.dialog_presence.predicate.key,
   "create-ticket-dialog",
@@ -305,7 +305,7 @@ assert.equal(
 assert.equal(sessionLifecycleFixture.overflow.snapshot_precedes_later_deltas, true);
 assert.equal(sessionLifecycleFixture.overflow.failed_snapshot_delivery_closes_subscription, true);
 
-assert.equal(sessionPluginBindingFixture.conformance_fixture_revision, 25);
+assert.equal(sessionPluginBindingFixture.conformance_fixture_revision, 26);
 assert.equal(sessionPluginBindingFixture.binding_family, "/session");
 const sessionPluginMaterialization = materializeSessionPluginBindingScenario(
   sessionPluginBindingFixture,
@@ -315,15 +315,19 @@ const sessionPluginRows = materializeSessionPluginRowScenario(
   sessionPluginBindingFixture,
 );
 for (const [stage, rows] of Object.entries(sessionPluginRows)) {
-  assert.deepEqual(
-    rows.map((row) => row.node_id),
-    sessionPluginBindingFixture.row_expected[stage],
-  );
+  assert.deepEqual(rows, sessionPluginBindingFixture.row_expected[stage]);
   for (const row of rows) {
-    assert.deepEqual(row.action_payload, {
-      operation: "select_session",
-      session_uuid: row.node_id,
-    });
+    assert.deepEqual(
+      row.controls.map((control) => control.key),
+      ["spawn", "rename", "remove"],
+    );
+    for (const control of row.controls) {
+      assert.deepEqual(control.action_payload, {
+        operation: control.key,
+        session_uuid: row.node_id,
+      });
+      assert.match(control.node_id, /^botster-ui-descendant-v1:/);
+    }
   }
 }
 assert.equal(
@@ -436,7 +440,19 @@ assert.throws(
       sessionPluginBindingFixture.surface,
       [sessionPluginBindingFixture.initial_snapshot, duplicateIdPatch],
     ),
-  /duplicate materialized session node id session-stable-current/,
+  /duplicate realized node id session-stable-current/,
+);
+const staticCollisionPatch = {
+  ...sessionPluginBindingFixture.transition_frames[0],
+  patch: { session_uuid: "contract-session-lifecycle-panel" },
+};
+assert.throws(
+  () =>
+    materializeSessionPluginRows(
+      sessionPluginBindingFixture.surface,
+      [sessionPluginBindingFixture.initial_snapshot, staticCollisionPatch],
+    ),
+  /duplicate realized node id contract-session-lifecycle-panel/,
 );
 
 const lateAttachFixture = readLateAttachHistoryConformanceFixture();

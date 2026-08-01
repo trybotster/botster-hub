@@ -76,10 +76,13 @@ paths.
   one exact-filter `bind_list` per reference against the Hub-owned `/session`
   family. Matching rows bind `@/lifecycle_class`; absent rows select
   `empty_template`. A second current-session `bind_list` is the canonical
-  multi-row identity oracle: its Button binds `id` and action-payload
-  `session_uuid` to `@/session_uuid`, and the surface supports both render and
-  action. The worker authors only paths and templates—it does not receive
-  session rows or arbitrary Hub state.
+  multi-row identity oracle: its Inline root binds `id` to
+  `@/session_uuid`, while nested Spawn, Rename, and Remove Buttons use
+  `bind_list_descendant_id` keys. Their exact realized IDs derive from the row
+  identity through the contract-owned UTF-8 byte-length helper, and each
+  action payload retains both operation and `session_uuid`. The worker authors
+  only paths, keys, and templates—it does not receive session rows or arbitrary
+  Hub state.
 - `contract.blocked`: render handler that fails deliberately so clients can assert the daemon `operator_error` response and continued daemon responsiveness.
 - `contract.invalid_body`: declared render surface whose handler returns malformed UiNode data so clients can assert `invalid_surface` and a structured `plugin_surface_render` diagnostic from hub validation.
 - `contract.settings`: settings surface returning sanitized effective configuration from `botster.capabilities.config.get()`.

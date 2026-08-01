@@ -10,15 +10,16 @@ use botster_ui_contract::{
 use botster_ui_contract::{
     UiActionId, UiActionKind, UiActionRequest, UiActionResult, UiActionResultState,
     UiActionResultValidationError, UiAuthoredNodeId, UiBind, UiBindIf, UiBindList,
-    UiCapabilityFallback, UiCapabilitySet, UiChild, UiCondition, UiConditional, UiDensity,
-    UiDialogPresentation, UiFieldErrors, UiFieldKind, UiFieldOption, UiFieldSchema,
-    UiFieldValidationHints, UiFormValues, UiHeightClass, UiIframeBridge, UiIframePermission,
-    UiIframeSandboxToken, UiKeyboardCapability, UiMetricTrend, UiMetricTrendDirection, UiNode,
-    UiNodeId, UiNodeKind, UiPointer, UiPresentationKey, UiPresentationOperation,
-    UiPresentationPredicate, UiResponsiveHeight, UiResponsiveValue, UiResponsiveWidth, UiSelection,
-    UiSelectionMode, UiSurfaceId, UiTableCell, UiTableColumn, UiTableColumnDescriptor, UiTableRow,
-    UiToolbarOverflow, UiValidationError, UiVariant, UiWidthClass, validate_package_presentation,
-    validate_ui_node, validate_ui_node_with_capabilities,
+    UiBindListDescendantIdError, UiCapabilityFallback, UiCapabilitySet, UiChild, UiCondition,
+    UiConditional, UiDensity, UiDialogPresentation, UiFieldErrors, UiFieldKind, UiFieldOption,
+    UiFieldSchema, UiFieldValidationHints, UiFormValues, UiHeightClass, UiIframeBridge,
+    UiIframePermission, UiIframeSandboxToken, UiKeyboardCapability, UiMetricTrend,
+    UiMetricTrendDirection, UiNode, UiNodeId, UiNodeKind, UiPointer, UiPresentationKey,
+    UiPresentationOperation, UiPresentationPredicate, UiResponsiveHeight, UiResponsiveValue,
+    UiResponsiveWidth, UiSelection, UiSelectionMode, UiSurfaceId, UiTableCell, UiTableColumn,
+    UiTableColumnDescriptor, UiTableRow, UiToolbarOverflow, UiValidationError, UiVariant,
+    UiWidthClass, realize_bind_list_descendant_id, validate_package_presentation, validate_ui_node,
+    validate_ui_node_with_capabilities,
 };
 use serde_json::{Map, Value, json};
 
@@ -2224,6 +2225,129 @@ fn bound_node_identity_is_valid_only_on_a_bind_list_item_template() {
     ] {
         let node = serde_json::from_value::<UiNode>(invalid).expect("invalid-context node");
         assert_error_contains(node, "bind_list item_template");
+    }
+}
+
+#[test]
+fn bound_list_descendant_identity_is_contextual_unique_and_utf8_stable() {
+    let valid = serde_json::from_value::<UiNode>(json!({
+        "type": "panel",
+        "id": "sessions",
+        "props": { "title": "Sessions" },
+        "children": [{
+            "$kind": "bind_list",
+            "source": "/session",
+            "item_template": {
+                "type": "inline",
+                "id": { "$bind": "@/session_uuid" },
+                "children": [{
+                    "type": "button",
+                    "id": { "$kind": "bind_list_descendant_id", "key": "rename" },
+                    "props": {
+                        "label": "Rename",
+                        "action": { "id": "contract.action" }
+                    }
+                }, {
+                    "$kind": "bind_list",
+                    "source": "/nested",
+                    "item_template": {
+                        "type": "inline",
+                        "id": { "$bind": "@/id" },
+                        "children": [{
+                            "type": "button",
+                            "id": { "$kind": "bind_list_descendant_id", "key": "rename" },
+                            "props": {
+                                "label": "Rename nested",
+                                "action": { "id": "contract.action" }
+                            }
+                        }]
+                    }
+                }]
+            }
+        }]
+    }))
+    .expect("keyed descendant tree");
+    valid
+        .validate()
+        .expect("nearest bound item root supplies descendant identity context");
+
+    assert_eq!(
+        realize_bind_list_descendant_id("会話-😀", "remove-🧹")
+            .expect("utf8 identity")
+            .0,
+        "botster-ui-descendant-v1:11:会話-😀11:remove-🧹"
+    );
+    assert_eq!(
+        realize_bind_list_descendant_id(" ", "remove"),
+        Err(UiBindListDescendantIdError::BlankRowId)
+    );
+    assert_eq!(
+        realize_bind_list_descendant_id("session-1", "\t"),
+        Err(UiBindListDescendantIdError::BlankKey)
+    );
+
+    for invalid in [
+        json!({
+            "type": "button",
+            "id": { "$kind": "bind_list_descendant_id", "key": "remove" },
+            "props": { "label": "Remove", "action": { "id": "contract.action" } }
+        }),
+        json!({
+            "type": "panel",
+            "id": "sessions",
+            "props": { "title": "Sessions" },
+            "children": [{
+                "$kind": "bind_list",
+                "source": "/session",
+                "item_template": {
+                    "type": "inline",
+                    "id": "literal-row",
+                    "children": [{
+                        "type": "button",
+                        "id": { "$kind": "bind_list_descendant_id", "key": "remove" },
+                        "props": { "label": "Remove", "action": { "id": "contract.action" } }
+                    }]
+                }
+            }]
+        }),
+        json!({
+            "type": "panel",
+            "id": "sessions",
+            "props": { "title": "Sessions" },
+            "children": [{
+                "$kind": "bind_list",
+                "source": "/session",
+                "item_template": {
+                    "type": "inline",
+                    "id": { "$bind": "@/session_uuid" },
+                    "children": [{
+                        "type": "button",
+                        "id": { "$kind": "bind_list_descendant_id", "key": "remove" },
+                        "props": { "label": "Remove", "action": { "id": "contract.action" } }
+                    }, {
+                        "type": "button",
+                        "id": { "$kind": "bind_list_descendant_id", "key": "remove" },
+                        "props": { "label": "Remove again", "action": { "id": "contract.action" } }
+                    }]
+                }
+            }]
+        }),
+    ] {
+        let node = serde_json::from_value::<UiNode>(invalid).expect("wire-valid keyed id");
+        assert_error_contains(node, "bind_list descendant identity");
+    }
+
+    for malformed in [
+        json!({ "$kind": "bind_list_descendant_id" }),
+        json!({ "$kind": "bind_list_descendant_id", "key": 1 }),
+        json!({ "$kind": "bind_list_descendant_id", "key": "remove", "extra": true }),
+    ] {
+        serde_json::from_value::<UiNode>(json!({
+            "type": "button",
+            "id": malformed,
+            "props": { "label": "Remove", "action": { "id": "contract.action" } }
+        }))
+        .expect_err("malformed descendant identity must fail deserialization");
     }
 }
 

@@ -27,6 +27,7 @@ use botster_hub_client::{
 use botster_ui_contract::{
     UiActionId, UiActionKind, UiActionRequest, UiActionRequestId, UiActionResult,
     UiActionResultState, UiFormValues, UiPresentationOperation, UiSurfaceId,
+    realize_bind_list_descendant_id,
 };
 use serde::{Deserialize, Serialize};
 
@@ -178,16 +179,24 @@ pub struct SessionPluginBindingExpectedStages {
 /// Expected realized row identities after each authoritative frame stage.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionPluginRowExpectedStages {
-    pub initial: Vec<String>,
-    pub after_ended_patch: Vec<String>,
-    pub after_indeterminate_patch: Vec<String>,
-    pub after_remove: Vec<String>,
-    pub after_reconnect: Vec<String>,
+    pub initial: Vec<SessionPluginMaterializedRow>,
+    pub after_ended_patch: Vec<SessionPluginMaterializedRow>,
+    pub after_indeterminate_patch: Vec<SessionPluginMaterializedRow>,
+    pub after_remove: Vec<SessionPluginMaterializedRow>,
+    pub after_reconnect: Vec<SessionPluginMaterializedRow>,
 }
 
 /// One producer-backed BindList row after authored identity materialization.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionPluginMaterializedRow {
+    pub node_id: String,
+    pub controls: Vec<SessionPluginMaterializedControl>,
+}
+
+/// One identity-bearing control realized below a producer-backed BindList row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionPluginMaterializedControl {
+    pub key: String,
     pub node_id: String,
     pub action_payload: serde_json::Value,
 }
@@ -821,11 +830,14 @@ pub fn session_plugin_binding_conformance_scenario() -> SessionPluginBindingConf
             after_reconnect: expected("unavailable"),
         },
         row_expected: SessionPluginRowExpectedStages {
-            initial: vec![TRANSITION.to_string(), STABLE.to_string()],
-            after_ended_patch: vec![STABLE.to_string()],
-            after_indeterminate_patch: vec![STABLE.to_string()],
-            after_remove: vec![STABLE.to_string()],
-            after_reconnect: vec![STABLE.to_string()],
+            initial: vec![
+                expected_session_plugin_materialized_row(TRANSITION),
+                expected_session_plugin_materialized_row(STABLE),
+            ],
+            after_ended_patch: vec![expected_session_plugin_materialized_row(STABLE)],
+            after_indeterminate_patch: vec![expected_session_plugin_materialized_row(STABLE)],
+            after_remove: vec![expected_session_plugin_materialized_row(STABLE)],
+            after_reconnect: vec![expected_session_plugin_materialized_row(STABLE)],
         },
     }
 }
@@ -856,21 +868,74 @@ fn session_plugin_binding_surface(references: &[String]) -> serde_json::Value {
             "source": "/session",
             "where": { "lifecycle_class": "current" },
             "item_template": {
-                "type": "button",
+                "type": "inline",
                 "id": { "$bind": "@/session_uuid" },
-                "props": {
-                    "label": "Select session",
-                    "action": {
-                        "id": "contract.action",
-                        "payload": {
-                            "operation": "select_session",
-                            "session_uuid": { "$bind": "@/session_uuid" }
+                "children": [
+                    {
+                        "type": "button",
+                        "id": { "$kind": "bind_list_descendant_id", "key": "spawn" },
+                        "props": {
+                            "label": "Spawn session",
+                            "action": {
+                                "id": "contract.action",
+                                "payload": {
+                                    "operation": "spawn",
+                                    "session_uuid": { "$bind": "@/session_uuid" }
+                                }
+                            }
+                        }
+                    },
+                    {
+                        "type": "button",
+                        "id": { "$kind": "bind_list_descendant_id", "key": "rename" },
+                        "props": {
+                            "label": "Rename session",
+                            "action": {
+                                "id": "contract.action",
+                                "payload": {
+                                    "operation": "rename",
+                                    "session_uuid": { "$bind": "@/session_uuid" }
+                                }
+                            }
+                        }
+                    },
+                    {
+                        "type": "button",
+                        "id": { "$kind": "bind_list_descendant_id", "key": "remove" },
+                        "props": {
+                            "label": "Remove session",
+                            "action": {
+                                "id": "contract.action",
+                                "payload": {
+                                    "operation": "remove",
+                                    "session_uuid": { "$bind": "@/session_uuid" }
+                                }
+                            }
                         }
                     }
-                }
+                ]
             }
         }))).collect::<Vec<_>>()
     })
+}
+
+fn expected_session_plugin_materialized_row(node_id: &str) -> SessionPluginMaterializedRow {
+    SessionPluginMaterializedRow {
+        node_id: node_id.to_string(),
+        controls: ["spawn", "rename", "remove"]
+            .into_iter()
+            .map(|key| SessionPluginMaterializedControl {
+                key: key.to_string(),
+                node_id: realize_bind_list_descendant_id(node_id, key)
+                    .expect("fixture row and control keys are nonblank")
+                    .0,
+                action_payload: serde_json::json!({
+                    "operation": key,
+                    "session_uuid": node_id
+                }),
+            })
+            .collect(),
+    }
 }
 
 fn inspect_session_plugin_surface(
@@ -912,25 +977,10 @@ fn inspect_session_plugin_surface(
             continue;
         }
 
-        let expected_oracle = serde_json::json!({
-            "$kind": "bind_list",
-            "source": "/session",
-            "where": { "lifecycle_class": "current" },
-            "item_template": {
-                "type": "button",
-                "id": { "$bind": "@/session_uuid" },
-                "props": {
-                    "label": "Select session",
-                    "action": {
-                        "id": "contract.action",
-                        "payload": {
-                            "operation": "select_session",
-                            "session_uuid": { "$bind": "@/session_uuid" }
-                        }
-                    }
-                }
-            }
-        });
+        let expected_oracle = session_plugin_binding_surface(&[])
+            .pointer("/children/0")
+            .cloned()
+            .expect("canonical surface always contains the identity oracle");
         if child != &expected_oracle {
             return Err("surface contains an unrecognized session binding child".to_string());
         }
@@ -1041,6 +1091,37 @@ pub fn materialize_session_plugin_rows(
         .ok_or_else(|| "canonical oracle is missing its lifecycle_class filter".to_string())?;
     let entities = materialize_session_entities(frames)?;
     let mut seen = BTreeSet::new();
+    if let Some(root_id) = surface.get("id").and_then(serde_json::Value::as_str) {
+        insert_realized_node_id(&mut seen, root_id)?;
+    }
+    for child in surface["children"]
+        .as_array()
+        .ok_or_else(|| "session binding surface children are missing".to_string())?
+    {
+        if std::ptr::eq(child, oracle) {
+            continue;
+        }
+        let session_uuid = child
+            .pointer("/where/session_uuid")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "canonical session reference is missing its filter".to_string())?;
+        let branch = if entities.iter().any(|(_, entity)| {
+            entity
+                .get("session_uuid")
+                .and_then(serde_json::Value::as_str)
+                == Some(session_uuid)
+        }) {
+            child.pointer("/item_template")
+        } else {
+            child.pointer("/empty_template")
+        }
+        .ok_or_else(|| "canonical session reference is missing its realized branch".to_string())?;
+        collect_literal_node_ids(branch, &mut seen)?;
+    }
+    let controls = oracle
+        .pointer("/item_template/children")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "canonical oracle is missing identity-bearing controls".to_string())?;
     let mut rows = Vec::new();
 
     for (_, entity) in entities {
@@ -1058,18 +1139,71 @@ pub fn materialize_session_plugin_rows(
         if node_id.trim().is_empty() {
             return Err("selected session row has blank session_uuid".to_string());
         }
-        if !seen.insert(node_id.to_string()) {
-            return Err(format!("duplicate materialized session node id {node_id}"));
-        }
+        insert_realized_node_id(&mut seen, node_id)?;
+        let controls = controls
+            .iter()
+            .map(|control| {
+                let key = control
+                    .pointer("/id/key")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| "identity-bearing control is missing string key".to_string())?;
+                let realized = realize_bind_list_descendant_id(node_id, key)
+                    .map_err(|error| error.to_string())?
+                    .0;
+                insert_realized_node_id(&mut seen, &realized)?;
+                Ok(SessionPluginMaterializedControl {
+                    key: key.to_string(),
+                    node_id: realized,
+                    action_payload: serde_json::json!({
+                        "operation": key,
+                        "session_uuid": node_id
+                    }),
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
         rows.push(SessionPluginMaterializedRow {
             node_id: node_id.to_string(),
-            action_payload: serde_json::json!({
-                "operation": "select_session",
-                "session_uuid": node_id
-            }),
+            controls,
         });
     }
     Ok(rows)
+}
+
+fn insert_realized_node_id(seen: &mut BTreeSet<String>, node_id: &str) -> Result<(), String> {
+    if node_id.trim().is_empty() {
+        return Err("realized node id cannot be blank".to_string());
+    }
+    if !seen.insert(node_id.to_string()) {
+        return Err(format!("duplicate realized node id {node_id}"));
+    }
+    Ok(())
+}
+
+fn collect_literal_node_ids(
+    value: &serde_json::Value,
+    seen: &mut BTreeSet<String>,
+) -> Result<(), String> {
+    match value {
+        serde_json::Value::Array(values) => {
+            for value in values {
+                collect_literal_node_ids(value, seen)?;
+            }
+        }
+        serde_json::Value::Object(object) => {
+            if object.contains_key("type")
+                && let Some(node_id) = object.get("id").and_then(serde_json::Value::as_str)
+            {
+                insert_realized_node_id(seen, node_id)?;
+            }
+            for (key, value) in object {
+                if key != "id" {
+                    collect_literal_node_ids(value, seen)?;
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn merge_patch(target: &mut serde_json::Value, patch: &serde_json::Value) {
@@ -3733,14 +3867,22 @@ pub fn run_plugin_contract_matrix_conformance(
                 operation: "contract_matrix_materialize_session_rows",
                 field: "rows[1]",
             })?;
-    let session_action_node_id = session_action_row.node_id.clone();
-    let session_action_payload = session_action_row.action_payload.clone();
+    let session_action_control =
+        session_action_row
+            .controls
+            .get(1)
+            .ok_or(ConformanceError::MissingJsonField {
+                operation: "contract_matrix_materialize_session_rows",
+                field: "rows[1].controls[1]",
+            })?;
+    let session_action_node_id = session_action_control.node_id.clone();
+    let session_action_payload = session_action_control.action_payload.clone();
     let session_action = request(
         hub.endpoint(),
         DaemonRequest::PluginSurfaceAction {
             package_name: PLUGIN_CONTRACT_MATRIX_PACKAGE.to_string(),
             request: ui_action_request(
-                "contract-action-select-session",
+                "contract-action-rename-session",
                 PLUGIN_CONTRACT_SESSION_SURFACE,
                 "contract.action",
                 &session_action_node_id,
@@ -6461,60 +6603,36 @@ mod tests {
     #[test]
     fn session_plugin_row_materializer_realizes_identity_and_payload_in_producer_order() {
         let scenario = session_plugin_binding_conformance_scenario();
-        let project = |rows: Vec<SessionPluginMaterializedRow>| {
-            rows.into_iter()
-                .map(|row| {
-                    assert_eq!(
-                        row.action_payload,
-                        serde_json::json!({
-                            "operation": "select_session",
-                            "session_uuid": row.node_id.clone()
-                        })
-                    );
-                    row.node_id
-                })
-                .collect::<Vec<_>>()
-        };
         let mut frames = vec![scenario.initial_snapshot.clone()];
         assert_eq!(
-            project(
-                materialize_session_plugin_rows(&scenario.surface, &frames)
-                    .expect("materialize initial current rows")
-            ),
+            materialize_session_plugin_rows(&scenario.surface, &frames)
+                .expect("materialize initial current rows"),
             scenario.row_expected.initial
         );
         frames.push(scenario.transition_frames[0].clone());
         assert_eq!(
-            project(
-                materialize_session_plugin_rows(&scenario.surface, &frames)
-                    .expect("materialize ended patch rows")
-            ),
+            materialize_session_plugin_rows(&scenario.surface, &frames)
+                .expect("materialize ended patch rows"),
             scenario.row_expected.after_ended_patch
         );
         frames.push(scenario.transition_frames[1].clone());
         assert_eq!(
-            project(
-                materialize_session_plugin_rows(&scenario.surface, &frames)
-                    .expect("materialize indeterminate patch rows")
-            ),
+            materialize_session_plugin_rows(&scenario.surface, &frames)
+                .expect("materialize indeterminate patch rows"),
             scenario.row_expected.after_indeterminate_patch
         );
         frames.push(scenario.transition_frames[2].clone());
         assert_eq!(
-            project(
-                materialize_session_plugin_rows(&scenario.surface, &frames)
-                    .expect("materialize removed rows")
-            ),
+            materialize_session_plugin_rows(&scenario.surface, &frames)
+                .expect("materialize removed rows"),
             scenario.row_expected.after_remove
         );
         assert_eq!(
-            project(
-                materialize_session_plugin_rows(
-                    &scenario.surface,
-                    std::slice::from_ref(&scenario.reconnect_snapshot)
-                )
-                .expect("materialize reconnect rows")
-            ),
+            materialize_session_plugin_rows(
+                &scenario.surface,
+                std::slice::from_ref(&scenario.reconnect_snapshot)
+            )
+            .expect("materialize reconnect rows"),
             scenario.row_expected.after_reconnect
         );
     }
@@ -6608,7 +6726,24 @@ mod tests {
                 &scenario.surface,
                 &[scenario.initial_snapshot.clone(), duplicate]
             ),
-            Err("duplicate materialized session node id session-stable-current".to_string())
+            Err("duplicate realized node id session-stable-current".to_string())
+        );
+
+        let static_collision = DaemonEntityFrame::Patch {
+            subscription_id: "session-plugin-binding-generation-1".to_string(),
+            entity_type: SESSION_LIFECYCLE_ENTITY_TYPE.to_string(),
+            snapshot_seq: 2,
+            id: "session-transition".to_string(),
+            patch: serde_json::json!({
+                "session_uuid": "contract-session-lifecycle-panel"
+            }),
+        };
+        assert_eq!(
+            materialize_session_plugin_rows(
+                &scenario.surface,
+                &[scenario.initial_snapshot.clone(), static_collision]
+            ),
+            Err("duplicate realized node id contract-session-lifecycle-panel".to_string())
         );
     }
 
