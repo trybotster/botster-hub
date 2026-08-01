@@ -39,6 +39,9 @@ log contains `idle_cpu_bound=observed_not_asserted`.
 
 ## Files changed
 
+- `docs/plans/execute-and-retain-focused-ubuntu-idle-cpu-resource-bound.md` —
+  synchronizes the reviewer-approved header-only survivor predicate with the
+  implemented audit.
 - `docs/reports/focused-ubuntu-idle-cpu-resource-bound-evidence.json` — bounded
   workflow inputs, provenance, 20 raw counter/result rows, corrected survivor
   predicates, final cleanup state, artifact identity, and raw-file SHA-256
