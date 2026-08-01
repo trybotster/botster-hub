@@ -845,10 +845,7 @@ fn handle_connection_cleanup(
             .live_attach_subscriptions
             .saturating_sub(1);
         state.released_attach_generations = state.released_attach_generations.saturating_add(1);
-        failed |= result.is_err()
-            || result
-                .as_ref()
-                .is_ok_and(|response| response.kind == DaemonResponseKind::OperatorError);
+        failed |= cleanup_detach_failed(&result);
     }
     if failed {
         state.lifecycle_counters.cleanup_failed =
@@ -856,6 +853,18 @@ fn handle_connection_cleanup(
     } else {
         state.lifecycle_counters.cleanup_completed =
             state.lifecycle_counters.cleanup_completed.saturating_add(1);
+    }
+}
+
+fn cleanup_detach_failed(result: &DaemonTransportResult<DaemonResponse>) -> bool {
+    match result {
+        Err(DaemonTransportError::Client(crate::HubClientError::Runtime {
+            operation: crate::HubClientOperation::Detach,
+            kind: crate::HubClientRuntimeErrorKind::UnknownSession,
+            ..
+        })) => false,
+        Ok(response) => response.kind == DaemonResponseKind::OperatorError,
+        Err(_) => true,
     }
 }
 
@@ -7270,6 +7279,27 @@ mod tests {
         let error = response.error.expect("operator error body");
         assert_eq!(error.code, "runtime_error");
         assert_eq!(error.operation, "read_mode_flags");
+    }
+
+    #[test]
+    fn connection_cleanup_ignores_only_an_already_removed_session() {
+        let unknown_session = Err(DaemonTransportError::Client(
+            crate::HubClientError::Runtime {
+                request_id: RequestId("cleanup-detach".to_string()),
+                operation: crate::HubClientOperation::Detach,
+                kind: crate::HubClientRuntimeErrorKind::UnknownSession,
+            },
+        ));
+        assert!(!cleanup_detach_failed(&unknown_session));
+
+        let unavailable_runtime: DaemonTransportResult<DaemonResponse> =
+            Err(DaemonTransportError::DaemonNotRunning);
+        assert!(cleanup_detach_failed(&unavailable_runtime));
+        assert!(cleanup_detach_failed(&Ok(entity_subscription_error(
+            "detach_failed",
+            "cleanup-detach",
+            "detach failed",
+        ))));
     }
 
     #[test]

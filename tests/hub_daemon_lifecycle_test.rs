@@ -9281,31 +9281,32 @@ fn focused_connection_lifecycle_is_bounded_event_driven_and_counter_visible() {
             session_id: "focused-idle-session-0".to_string(),
         },
     )
-    .expect("shutdown attached cleanup-failure fixture");
+    .expect("shutdown attached cleanup-race fixture");
     botster_hub_client::request(
         &endpoint,
         botster_hub_client::DaemonRequest::RemoveSession {
             session_id: "focused-idle-session-0".to_string(),
         },
     )
-    .expect("remove attached cleanup-failure fixture");
+    .expect("remove attached cleanup-race fixture");
     drop(attached);
 
-    let failed_cleanup_deadline = Instant::now() + Duration::from_secs(3);
+    let attached_cleanup_deadline = Instant::now() + Duration::from_secs(3);
     loop {
         let counters =
             botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status)
-                .expect("status while waiting for failed detach cleanup")
+                .expect("status while waiting for idempotent detach cleanup")
                 .status
-                .expect("failed cleanup status body")
+                .expect("idempotent cleanup status body")
                 .lifecycle_counters;
-        if counters.cleanup_failed > attached_counters.cleanup_failed {
+        if counters.cleanup_completed > attached_counters.cleanup_completed {
             assert_eq!(counters.live_attach_subscriptions, 0);
+            assert_eq!(counters.cleanup_failed, attached_counters.cleanup_failed);
             break;
         }
         assert!(
-            Instant::now() < failed_cleanup_deadline,
-            "cleanup failure producer did not settle: {counters:?}"
+            Instant::now() < attached_cleanup_deadline,
+            "idempotent cleanup did not settle: {counters:?}"
         );
         thread::sleep(Duration::from_millis(20));
     }
