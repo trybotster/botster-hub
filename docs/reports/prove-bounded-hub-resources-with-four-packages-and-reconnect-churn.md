@@ -62,7 +62,9 @@
 - `src/daemon_transport.rs` and `tests/hub_daemon_lifecycle_test.rs` — treat the
   typed `Detach + UnknownSession` race after an already-retired session as
   idempotent connection cleanup while retaining failure classification for
-  every other detach error.
+  every other detach error. The focused connection test owns its raw daemon
+  through the existing panic-safe guard, and the producer comment identifies
+  the designated positive predicate control for genuine cleanup failures.
 - `script/publish-npm-packages` — exact-integrity validation before an
   already-published prerequisite may be skipped.
 - `test.sh` — fails the repository wrapper when the Hub-owned npm assets drift.
@@ -201,6 +203,14 @@ Passed:
 - the product-surface and PII audits passed their known-positive controls with
   no findings; the reload audit recorded exactly the four named public package
   reload commands
+- a deliberate narrow ablation restored `Detach + UnknownSession` as a cleanup
+  failure: the focused connection test exited 101 at its intended assertion,
+  the panic-safe guard reaped the daemon with status 0, and an exact Hub/worker
+  executable census for this worktree was empty; after restoring the fix, the
+  same focused test passed
+- operator-facing Hub and package protocol documentation now states that
+  `@trybotster/hub-test-support@0.1.18` is published and is the current consumer
+  coordinate while retaining the immutable stale-0.1.17 warning
 
 Downstream-shaped proof passed inside the focused real-daemon test: the
 production entrypoint loaded four owners at `256`/`2`, observed exactly eight

@@ -9076,8 +9076,8 @@ fn focused_connection_lifecycle_is_bounded_event_driven_and_counter_visible() {
             .path
             .clone(),
     );
-    let child = start_cli_daemon(&data_dir);
-    let daemon_pid = child.id();
+    let daemon = PanicSafeCliDaemon::start(&data_dir, "connection lifecycle daemon evidence");
+    let daemon_pid = daemon.child.as_ref().expect("panic-safe daemon child").id();
     let startup_counters =
         botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status)
             .expect("status before first entity subscription")
@@ -9584,7 +9584,7 @@ fn focused_connection_lifecycle_is_bounded_event_driven_and_counter_visible() {
         .expect("remove focused session-count fixture");
     }
 
-    shutdown_cli_daemon(&data_dir, child);
+    daemon.shutdown();
 }
 
 #[test]
