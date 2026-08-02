@@ -37,7 +37,8 @@ step: botster_stack_plan
 - Workflow/artifact notes: [[plan steps need reviewable plan artifacts]],
   [[project pipelines checklist worker timeouts require artifact evidence
   fallback]], [[plan review must check open sibling tickets that own part of the
-  plan scope]], and [[acceptance smoke fixture driven tests prove plumbing]].
+  plan scope]], and [[fixture driven acceptance smoke tests can prove first
+  party package plumbing]].
 - The schema-upgrade note [[plugin db schema upgrades fail on required columns
   and unique constraints]] was loaded, but the current Hub store is a
   JSON-record filesystem store rather than the older SQLite-backed `plugin.db`
@@ -59,6 +60,10 @@ step: botster_stack_plan
   blocking dependencies. A same-project/same-target open-ticket search found no
   overlapping Hub sibling. Downstream ticket `ticket_1785635393_993057` already
   carries the dependency edge on this ticket.
+- Revision 2 resolves Plan Review `review_1785714442_638950`: it fixes the
+  whole-namespace lock span and artifact layout, adds `patch_failed`, makes the
+  synchronous-Lua-only reachability explicit, requires concurrent-write proof,
+  and moves crash recovery proof onto the public Lua runtime path.
 
 ## Scope
 
@@ -77,24 +82,35 @@ step: botster_stack_plan
    metadata; operational failure includes `ok = false` plus stable error kind,
    message, mutation index, and key where applicable. At minimum preserve the
    existing Core error classifications for `invalid_request`,
-   `revision_conflict`, `store_not_found`, `quota_exceeded`, and
-   `backend_failed`. Existing single-record helpers and their result/error
+   `revision_conflict`, `store_not_found`, `quota_exceeded`, `patch_failed`,
+   and `backend_failed`. Existing single-record helpers and their result/error
    shapes do not change.
 4. Prepare the batch through the same loaded-plugin namespace/capability check
    used by single-record Lua operations, release the shared capability-runtime
    lock, and execute filesystem work inside the already-isolated plugin worker.
    Do not reintroduce a second scheduling hop or convert the general async
    capability submit/event API into a synchronous API.
-5. Under the backend lock, load one namespace snapshot, validate every mutation
-   against a private candidate snapshot, and enforce record count, per-record
-   bytes, and final aggregate bytes against the complete candidate before
-   commit. A failed mutation leaves the live snapshot untouched.
-6. Commit the complete candidate with a bounded filesystem staging/swap
-   protocol under `plugin-data/<plugin>/`, synchronizing staged files and the
-   containing directory before reporting success. Recover deterministic
-   pre-commit and post-commit staging/backup shapes on the next store access so
-   restart never exposes a mixed generation. Reuse ordinary filesystem
-   primitives; add no storage dependency or plugin-visible filesystem handle.
+5. Acquire the `LocalPluginStoreBackend` mutex once and hold that same guard
+   continuously from recovery and namespace snapshot load through candidate
+   validation, staging, promotion, parent-directory synchronization, and
+   transaction-artifact cleanup. No `get`, `list`, `set`, `patch`, `delete`, or
+   second batch may observe or write the namespace between snapshot and the
+   promotion visibility point. Enforce record count, per-record bytes, and final
+   aggregate bytes against the complete candidate before staging; any failed
+   mutation leaves the live snapshot untouched.
+6. Commit the complete candidate with one fixed whole-namespace layout. The
+   live directory remains `plugin-data/<plugin>/`, containing only ordinary
+   `encode_key(key) + ".json"` record files. Staging and backup are sibling,
+   non-`.json` directories beneath `plugin-data/` (for example
+   `.<plugin>.batch-staging` and `.<plugin>.batch-backup`), so
+   `read_records()` can never enumerate a staged record or transaction artifact.
+   Synchronize staged files/directories and the `plugin-data/` parent before
+   reporting success. Recover deterministic pre-commit and post-commit sibling
+   directory shapes on the next store access, under the same mutex, so restart
+   never exposes a mixed generation; recovery may repair on-disk state during
+   `get` or `list` while preserving their existing Lua result shapes. Reuse
+   ordinary filesystem primitives; add no storage dependency or plugin-visible
+   filesystem handle.
 7. Document the batch request/result contract, atomicity/restart boundary, CAS
    requirement, limits, and worker-local synchronous behavior in the Hub-owned
    Lua ABI documentation.
@@ -135,7 +151,10 @@ step: botster_stack_plan
   implemented here.
 - Core remains authoritative for policy-free single-record operation/result,
   key, limit, record, error, and plugin-worker contracts. This plan deliberately
-  avoids adding a public batch variant to Core.
+  avoids adding a public batch variant to Core. The new batch is intentionally
+  reachable only through Hub's synchronous Lua helper; it is not added to
+  `CapabilityOperation::PluginStore`, the async submit/drain path, or a future
+  second `PluginStoreBackend` implementation.
 - The package owns when workflow records belong in one batch and when committed
   entities may be published. Hub sees only generic keys, JSON payloads,
   revisions, and mutation actions.
@@ -169,10 +188,19 @@ step: botster_stack_plan
   work across plugin workers. Worker isolation says where Lua executes, not that
   persistence is nonblocking; broad per-namespace concurrency is not required
   by this ticket.
-- Unknown: the smallest private staging representation (complete sibling
-  directory versus an equivalent generation file) should be chosen after a
-  focused prototype, provided one atomic visibility point and deterministic
-  restart recovery are proven. Do not retain two product read paths.
+- Assumption: the backend mutex covers the complete batch from recovery/snapshot
+  through durable promotion and cleanup. A concurrent single-record write
+  therefore either lands before the batch snapshot and is copied into the new
+  generation, or waits and lands after promotion; it is never silently reverted.
+- Assumption: the fixed whole-namespace staging and backup directories are
+  non-`.json` siblings of the live namespace under `plugin-data/`. No transaction
+  artifact is ever placed where `read_records()` could decode it as a live row.
+- Assumption: recovery is part of the next backend access, including `get` and
+  `list`. Those logical reads may repair transaction artifacts on disk under the
+  mutex, but their public record/list result shapes remain unchanged.
+- Assumption: `plugin_db.batch` is a synchronous Lua-only Hub ABI. The existing
+  asynchronous `CapabilityOperation::PluginStore` submit/event surface remains
+  single-record and unchanged.
 - Ask-human threshold: any need to weaken CAS, return success before the
   durability barrier, change Core public contracts, add a storage dependency,
   expose host storage handles, or waive real worker/restart/failure evidence.
@@ -209,10 +237,12 @@ step: botster_stack_plan
 2. Build and unit-test candidate application: validate all inputs/revisions,
    reject duplicate keys, compute ordered results, and enforce final-snapshot
    limits before touching the live namespace.
-3. Add the staged namespace commit and restart recovery state machine. Use a
-   private deterministic failure hook in unit tests only; inject failure after
+3. Add the fixed sibling-directory namespace commit and restart recovery state
+   machine while holding one backend mutex guard for the entire operation. Use
+   a private deterministic failure hook in unit tests only; inject failure after
    staged progress and at the promotion boundary, then assert byte-for-byte
-   unchanged old state or complete new state—never a mixture.
+   unchanged old state or complete new state—never a mixture or a live `.json`
+   transaction artifact.
 4. Wire `plugin_db.batch` into the Lua table and typed public response. Confirm
    the shared runtime mutex is dropped before disk I/O and that the plugin
    worker remains the execution boundary.
@@ -233,9 +263,17 @@ step: botster_stack_plan
 - A crash between directory renames can leave staging/backup artifacts. Recovery
   rules need exhaustive pre/post-commit tests, including initially empty
   namespaces, or restart can select the wrong generation.
-- Returning a runtime string error would discard the conflict/quota/backend
-  distinction required by the ticket. The new batch result must keep stable
-  machine-readable kinds and failing-mutation context.
+- Releasing the backend mutex between snapshot and whole-namespace promotion
+  can silently erase an unrelated single-record write. Hold one guard through
+  the durability barrier and test both before-snapshot and blocked-during-stage
+  interleavings.
+- A staged `.json` file or `.json` directory inside the live namespace can
+  collide nondeterministically by internal key or poison every store read.
+  Transaction artifacts must remain non-`.json` siblings outside the directory
+  enumerated by `read_records()`.
+- Returning a runtime string error would discard the conflict/quota/patch/
+  backend distinction required by the ticket. The new batch result must keep
+  stable machine-readable kinds and failing-mutation context.
 - Enforcing limits mutation-by-mutation can reject a valid delete-plus-create or
   admit an oversized final combination. Validate one final candidate snapshot.
 - Holding `SharedHubCapabilityRuntime` during staging/fsync would couple file I/O
@@ -255,6 +293,9 @@ step: botster_stack_plan
   product path. The ticket-shaped proof must originate in Lua inside an enabled
   package worker and read the committed state back through public helpers after
   restart.
+- Recovery on next access means existing `get` and `list` calls can repair disk
+  state. Public-path recovery tests must prove this side effect cannot alter
+  their result shape or expose staged/mixed records.
 
 ## Acceptance checks and tests
 
@@ -262,8 +303,15 @@ step: botster_stack_plan
 
 - `./test.sh --lib <new private-backend batch test filter>` proves set/patch/
   delete CAS, duplicate/invalid/missing handling, final-snapshot limits, ordered
-  typed results, deterministic mid-stage failure, commit-boundary failure, and
-  restart recovery shapes.
+  typed results including `patch_failed`, deterministic mid-stage failure,
+  commit-boundary failure, and restart recovery shapes.
+- Private concurrency tests prove both legal interleavings with an unrelated
+  single-record `set`: a write completed before snapshot remains in the promoted
+  generation, while a write attempted during staged progress blocks until
+  promotion and then commits with its own revision. A mid-stage `get`/`list`
+  likewise cannot complete through partial state; after release it returns the
+  complete promoted generation. No transaction artifact uses a live `.json`
+  filename, and recovery leaves none behind in the namespace directory.
 - `./test.sh --test hub_lua_runtime_test <new atomic batch public ABI test> -- --exact --nocapture`
   proves the enabled package/MCP/plugin-worker/Lua/Hub-backend path.
 - In that public test, seed an open ticket and counters, atomically create a run,
@@ -271,10 +319,19 @@ step: botster_stack_plan
   every returned revision and persisted payload. Recreate the runtime over the
   same explicit data directory and assert all records remain complete and
   readable.
-- Through the same public helper, inject a stale expected revision and an
-  over-limit final candidate. Assert stable typed `revision_conflict` and
-  `quota_exceeded` results, the failing index/key, and no changed ticket, run,
-  step, event, counter, or unrelated record.
+- Through the same public helper, inject a stale expected revision, malformed
+  merge patch, and over-limit final candidate. Assert stable typed
+  `revision_conflict`, `patch_failed`, and `quota_exceeded` results, the failing
+  index/key, and no changed ticket, run, step, event, counter, or unrelated
+  record.
+- Public-path crash recovery seeds each recoverable on-disk shape before boot:
+  live plus staging (discard pre-commit staging), backup plus staging with no
+  live namespace (restore the old generation), live plus backup (retain the
+  promoted generation), and staging-only for an initially empty namespace
+  (remain empty). For each case, start the real Hub runtime, invoke Lua
+  `plugin_db.get` and `list`, assert exactly the old or new generation—never a
+  mixture—verify transaction artifacts are repaired, then commit a subsequent
+  public Lua batch successfully.
 - Preserve existing single-operation behavior:
   `./test.sh --test hub_lua_runtime_test plugin_db_missing_get_returns_absent_record_shape_and_preserves_success_shape -- --exact --nocapture`
   and
@@ -293,9 +350,11 @@ step: botster_stack_plan
 - Run the complete `hub_lua_runtime_test` and `hub_capability_runtime_test`
   targets at default concurrency through `./test.sh`.
 - Prove the shared capability mutex is released before batch filesystem work,
-  the call executes in the loaded plugin worker, legacy async plugin-store
-  submission still publishes completion events, and no namespace string is
-  matched specially in batch code.
+  the batch then holds its separate backend mutex continuously from recovery/
+  snapshot through durable promotion, the call executes in the loaded plugin
+  worker, legacy async plugin-store submission still publishes completion
+  events, the batch is documented as synchronous-Lua-only, and no namespace
+  string is matched specially in batch code.
 - If timing or worker resource behavior changes under default concurrency, use
   the existing fixed-SHA `focused-lua-worker-suite` loaded workflow without
   reduced repetitions, altered stress, or retries. Any observed failure in the
