@@ -54,6 +54,9 @@ const DAEMON_PROTOCOL_TYPESCRIPT_ARTIFACT: &str =
 const PLUGIN_CONTRACT_APP_SURFACE: &str = "contract.app";
 const PLUGIN_CONTRACT_EMPTY_SURFACE: &str = "contract.empty";
 const PLUGIN_CONTRACT_SESSION_SURFACE: &str = "contract.sessions";
+const PLUGIN_CONTRACT_ENTITY_SURFACE: &str = "contract.entities";
+const PLUGIN_CONTRACT_ENTITY_FAMILY: &str =
+    "bns1_626f74737465722e706c7567696e2d636f6e74726163742d6d6174726978.run";
 const PLUGIN_CONTRACT_BLOCKED_SURFACE: &str = "contract.blocked";
 const PLUGIN_CONTRACT_INVALID_BODY_SURFACE: &str = "contract.invalid_body";
 const PLUGIN_CONTRACT_SETTINGS_SURFACE: &str = "contract.settings";
@@ -63,7 +66,7 @@ const PLUGIN_CONTRACT_DIALOG_FORM_NODE_ID: &str = "contract-app-form";
 const PLUGIN_CONTRACT_DIALOG_INPUT_NODE_ID: &str = "contract-app-message";
 const PLUGIN_CONTRACT_ACCEPTED_REPLACEMENT_SCOPE: &str = "whole_surface";
 const SUPPORTED_PLUGIN_SURFACE_JSON_ACTIONS: &str = "plugin_surface_json_actions";
-const UNSUPPORTED_PLUGIN_ENTITY_FRAMES: &str = "plugin_entity_frames";
+const SUPPORTED_PLUGIN_ENTITY_FRAMES: &str = "plugin_entity_frames";
 
 const DEFAULT_SOCKET_NAME: &str = "botster-hub.sock";
 const READY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -596,8 +599,11 @@ pub fn first_party_client_support_matrix() -> FirstPartyClientSupportMatrix {
             ]),
         },
         entity_actions: EntityActionSupport {
-            supported_capabilities: vec![SUPPORTED_PLUGIN_SURFACE_JSON_ACTIONS.to_string()],
-            unsupported_capabilities: vec![UNSUPPORTED_PLUGIN_ENTITY_FRAMES.to_string()],
+            supported_capabilities: vec![
+                SUPPORTED_PLUGIN_SURFACE_JSON_ACTIONS.to_string(),
+                SUPPORTED_PLUGIN_ENTITY_FRAMES.to_string(),
+            ],
+            unsupported_capabilities: Vec::new(),
         },
         late_attach_history: LateAttachHistorySupport {
             supported: true,
@@ -662,7 +668,7 @@ pub fn session_lifecycle_subscription_conformance_scenario()
                 entity_type: SESSION_LIFECYCLE_ENTITY_TYPE.to_string(),
                 snapshot_seq: 1,
                 id: SESSION_LIFECYCLE_SESSION_ID.to_string(),
-                entity,
+                entity: serde_json::to_value(entity).expect("serialize session entity"),
             },
             DaemonEntityFrame::Patch {
                 subscription_id: generation_one.to_string(),
@@ -736,16 +742,19 @@ pub fn session_plugin_binding_conformance_scenario() -> SessionPluginBindingConf
                registry_state: &str,
                lifecycle: Option<&str>,
                lifecycle_class: &str,
-               updated_at: u64| DaemonSessionEntity {
-        session_uuid: session_uuid.to_string(),
-        registry_state: registry_state.to_string(),
-        lifecycle: lifecycle.map(str::to_string),
-        lifecycle_class: lifecycle_class.to_string(),
-        rows: 24,
-        cols: 80,
-        updated_at,
-        exit_code: (lifecycle == Some("exited")).then_some(0),
-        failure_reason: None,
+               updated_at: u64| {
+        serde_json::to_value(DaemonSessionEntity {
+            session_uuid: session_uuid.to_string(),
+            registry_state: registry_state.to_string(),
+            lifecycle: lifecycle.map(str::to_string),
+            lifecycle_class: lifecycle_class.to_string(),
+            rows: 24,
+            cols: 80,
+            updated_at,
+            exit_code: (lifecycle == Some("exited")).then_some(0),
+            failure_reason: None,
+        })
+        .expect("serialize session entity")
     };
     let initial_items = vec![
         row(TRANSITION, "running", Some("running"), "current", 1),
@@ -1065,9 +1074,10 @@ fn materialize_session_entities(
                 entities = items
                     .iter()
                     .map(|item| {
-                        serde_json::to_value(item)
-                            .map(|value| (item.session_uuid.clone(), value))
-                            .map_err(|error| error.to_string())
+                        item.get("session_uuid")
+                            .and_then(serde_json::Value::as_str)
+                            .map(|id| (id.to_string(), item.clone()))
+                            .ok_or_else(|| "session entity requires session_uuid".to_string())
                     })
                     .collect::<Result<_, _>>()?;
             }
@@ -1077,7 +1087,7 @@ fn materialize_session_entities(
                 entity,
                 ..
             } if entity_type == SESSION_LIFECYCLE_ENTITY_TYPE => {
-                let value = serde_json::to_value(entity).map_err(|error| error.to_string())?;
+                let value = entity.clone();
                 if let Some((_, current)) =
                     entities.iter_mut().find(|(entity_id, _)| entity_id == id)
                 {
@@ -2879,6 +2889,11 @@ pub struct PluginContractMatrixConformanceReport {
     pub session_surface_binding_family: String,
     pub session_surface_references: Vec<String>,
     pub session_surface_matches_fixture: bool,
+    pub package_entity_surface_id: String,
+    pub package_entity_surface_node_id: String,
+    pub package_entity_binding_family: String,
+    pub package_entity_initial_snapshot: DaemonEntityFrame,
+    pub package_entity_reconnect_snapshot: DaemonEntityFrame,
     pub session_materialized_rows: Vec<SessionPluginMaterializedRow>,
     pub session_action_node_id: String,
     pub session_action_payload: serde_json::Value,
@@ -3599,7 +3614,7 @@ pub fn run_plugin_contract_matrix_conformance(
     expect_value(
         "contract_matrix_install",
         "surface_ids",
-        r#"["contract.app","contract.empty","contract.sessions","contract.blocked","contract.invalid_body","contract.settings"]"#,
+        r#"["contract.app","contract.empty","contract.sessions","contract.entities","contract.blocked","contract.invalid_body","contract.settings"]"#,
         &serde_json::to_string(&surface_ids).expect("surface ids serialize"),
     )?;
     let settings_surface_descriptor = surface_descriptor(
@@ -4381,6 +4396,136 @@ pub fn run_plugin_contract_matrix_conformance(
         });
     }
 
+    let package_entity_surface = render_plugin_surface(
+        hub,
+        PLUGIN_CONTRACT_ENTITY_SURFACE,
+        "contract_matrix_render_package_entities",
+    )?;
+    let package_entity_surface_body = serde_json::to_value(&package_entity_surface.body)?;
+    let package_entity_surface_node_id = value_string(
+        &package_entity_surface_body,
+        "id",
+        "contract_matrix_render_package_entities",
+    )?;
+    let package_entity_binding_family = package_entity_surface_body
+        .get("children")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|children| children.first())
+        .and_then(|child| child.get("source"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(|source| source.strip_prefix('/'))
+        .map(str::to_string)
+        .ok_or(ConformanceError::MissingJsonField {
+            operation: "contract_matrix_render_package_entities",
+            field: "children[0].source",
+        })?;
+    expect_value(
+        "contract_matrix_render_package_entities",
+        "children[0].source",
+        PLUGIN_CONTRACT_ENTITY_FAMILY,
+        &package_entity_binding_family,
+    )?;
+
+    let mut package_entity_snapshots = Vec::new();
+    for (subscription_id, expected_generation) in [
+        ("contract-package-entities-first", 1_u64),
+        ("contract-package-entities-reconnect", 2_u64),
+    ] {
+        let mut subscription = botster_hub_client::subscribe_entities(
+            hub.endpoint(),
+            PLUGIN_CONTRACT_ENTITY_FAMILY,
+            subscription_id,
+        )
+        .map_err(|source| ConformanceError::Client {
+            operation: "contract_matrix_subscribe_package_entities",
+            source,
+        })?;
+        subscription
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .map_err(|source| ConformanceError::Client {
+                operation: "contract_matrix_subscribe_package_entities",
+                source,
+            })?;
+        let frame = subscription
+            .next_frame()
+            .map_err(|source| ConformanceError::Client {
+                operation: "contract_matrix_subscribe_package_entities",
+                source,
+            })?;
+        let expected_status = format!("generation-{expected_generation}");
+        if !matches!(
+            &frame,
+            DaemonEntityFrame::Snapshot {
+                entity_type,
+                snapshot_seq,
+                items,
+                resync_reason: None,
+                ..
+            } if entity_type == PLUGIN_CONTRACT_ENTITY_FAMILY
+                && *snapshot_seq == expected_generation
+                && items.first().and_then(|item| item.get("id")).and_then(serde_json::Value::as_str)
+                    == Some("contract-run-1")
+                && items.first().and_then(|item| item.get("status")).and_then(serde_json::Value::as_str)
+                    == Some(expected_status.as_str())
+        ) {
+            return Err(ConformanceError::UnexpectedValue {
+                operation: "contract_matrix_subscribe_package_entities",
+                field: "snapshot",
+                expected: format!("authoritative generation {expected_generation}"),
+                actual: format!("{frame:?}"),
+            });
+        }
+        subscription
+            .unsubscribe()
+            .map_err(|source| ConformanceError::Client {
+                operation: "contract_matrix_unsubscribe_package_entities",
+                source,
+            })?;
+        package_entity_snapshots.push(frame);
+        if expected_generation == 1 {
+            let mutation = request(
+                hub.endpoint(),
+                DaemonRequest::SetPackageConfiguration {
+                    package_name: PLUGIN_CONTRACT_MATRIX_PACKAGE.to_string(),
+                    values: BTreeMap::from([
+                        (
+                            "endpoint".to_string(),
+                            serde_json::json!({"type":"url","value":"https://example.invalid/plugin-contract-matrix/acceptance"}),
+                        ),
+                        (
+                            "mode".to_string(),
+                            serde_json::json!({"type":"select","value":"read"}),
+                        ),
+                        (
+                            "api_token".to_string(),
+                            serde_json::json!({"type":"secret","state":"write_only"}),
+                        ),
+                    ]),
+                },
+                "contract_matrix_advance_package_entities",
+            )?;
+            expect_kind(
+                &mutation,
+                DaemonResponseKind::Packages,
+                "contract_matrix_advance_package_entities",
+            )?;
+            let reload = request(
+                hub.endpoint(),
+                DaemonRequest::ReloadPackage {
+                    package_name: PLUGIN_CONTRACT_MATRIX_PACKAGE.to_string(),
+                },
+                "contract_matrix_reload_package_entities",
+            )?;
+            expect_kind(
+                &reload,
+                DaemonResponseKind::PackageDecision,
+                "contract_matrix_reload_package_entities",
+            )?;
+        }
+    }
+    let package_entity_initial_snapshot = package_entity_snapshots.remove(0);
+    let package_entity_reconnect_snapshot = package_entity_snapshots.remove(0);
+
     let mut presentation_state = ScopedPresentationState::default();
     let original_rendered_tree = app_surface_snapshot_body.clone();
     let mut client_rendered_tree = original_rendered_tree.clone();
@@ -5008,6 +5153,11 @@ pub fn run_plugin_contract_matrix_conformance(
         session_surface_binding_family: session_binding_scenario.binding_family,
         session_surface_references: session_binding_scenario.references,
         session_surface_matches_fixture,
+        package_entity_surface_id: package_entity_surface.surface_id,
+        package_entity_surface_node_id,
+        package_entity_binding_family,
+        package_entity_initial_snapshot,
+        package_entity_reconnect_snapshot,
         session_materialized_rows,
         session_action_node_id,
         session_action_payload,
@@ -6731,13 +6881,14 @@ mod tests {
         let DaemonEntityFrame::Snapshot { items, .. } = &scenario.initial_snapshot else {
             panic!("initial frame must be a snapshot");
         };
-        let mut transition_row = serde_json::to_value(
-            items
-                .iter()
-                .find(|item| item.session_uuid == "session-transition")
-                .expect("transition row in initial snapshot"),
-        )
-        .expect("serialize transition row");
+        let mut transition_row = items
+            .iter()
+            .find(|item| {
+                item.get("session_uuid").and_then(serde_json::Value::as_str)
+                    == Some("session-transition")
+            })
+            .expect("transition row in initial snapshot")
+            .clone();
         for frame in &scenario.transition_frames[..2] {
             let DaemonEntityFrame::Patch { patch, .. } = frame else {
                 panic!("first two transition frames must be patches");
@@ -7274,7 +7425,7 @@ mod tests {
 
         let mut known = vec![
             SUPPORTED_PLUGIN_SURFACE_JSON_ACTIONS.to_string(),
-            UNSUPPORTED_PLUGIN_ENTITY_FRAMES.to_string(),
+            SUPPORTED_PLUGIN_ENTITY_FRAMES.to_string(),
         ];
         known.sort();
 
@@ -7312,6 +7463,7 @@ mod tests {
                     botster_hub_client::FEATURE_WORKTREES,
                     botster_hub_client::FEATURE_TERMINAL_READBACK,
                     botster_hub_client::FEATURE_SESSION_ENTITY_SUBSCRIPTIONS,
+                    botster_hub_client::FEATURE_PLUGIN_ENTITY_SUBSCRIPTIONS,
                 ],
                 "supported_features": [
                     botster_hub_client::FEATURE_SESSIONS,
@@ -7325,6 +7477,7 @@ mod tests {
                     botster_hub_client::FEATURE_WORKTREES,
                     botster_hub_client::FEATURE_TERMINAL_READBACK,
                     botster_hub_client::FEATURE_SESSION_ENTITY_SUBSCRIPTIONS,
+                    botster_hub_client::FEATURE_PLUGIN_ENTITY_SUBSCRIPTIONS,
                 ],
                 "diagnostic_kinds": [
                     "connected",
@@ -7409,8 +7562,11 @@ mod tests {
                     },
                 },
                 "entity_actions": {
-                    "supported_capabilities": [SUPPORTED_PLUGIN_SURFACE_JSON_ACTIONS],
-                    "unsupported_capabilities": [UNSUPPORTED_PLUGIN_ENTITY_FRAMES],
+                    "supported_capabilities": [
+                        SUPPORTED_PLUGIN_SURFACE_JSON_ACTIONS,
+                        SUPPORTED_PLUGIN_ENTITY_FRAMES,
+                    ],
+                    "unsupported_capabilities": [],
                 },
                 "late_attach_history": {
                     "supported": true,

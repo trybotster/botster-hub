@@ -151,7 +151,12 @@ contract instead of bypassing hub admission or calling raw core routers.
 Terminal attach is a terminal-stream handshake only. Session-list reads remain
 an operator/query API; stateful clients use the explicit held-open `session`
 entity subscription for an authoritative snapshot followed by ordered deltas.
-The reusable contract is prepared in `@trybotster/hub-test-support@0.1.20` as
+Enabled Lua packages may also declare exact package-namespaced
+`entity_provider` families. Their UiNode bindings are admitted only for the
+declaring package, and each subscribe or reconnect queries the isolated worker
+for a freshly validated whole-family snapshot before bounded daemon/WebRTC
+delivery.
+The reusable contract is prepared in `@trybotster/hub-test-support@0.1.21` as
 source-derived JSON fixtures and a Rust
 `run_session_lifecycle_subscription_conformance` runner over the real isolated
 Hub/Core/session-worker topology.

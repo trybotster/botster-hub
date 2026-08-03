@@ -19,7 +19,7 @@ node packages/hub-test-support/scripts/sync-assets.mjs
 ## Usage
 
 ```sh
-npm install --save-dev @trybotster/ui-contract@0.3.1 @trybotster/hub-test-support@0.1.20
+npm install --save-dev @trybotster/ui-contract@0.3.1 @trybotster/hub-test-support@0.1.21
 ```
 
 ```js
@@ -100,11 +100,12 @@ Only `read_screen_text` is renderable restored content; `snapshot` and
 version 0.1.5 / revision 12 exposes lossy string history. Neither is current
 binary-history contract authority.
 
-Version 0.1.20 is the next cold consumer coordinate. Version 0.1.18 is the
+Version 0.1.21 is the next cold consumer coordinate. Version 0.1.20 is the
 currently published coordinate. Version
 0.1.17 was published with stale protocol bytes and is not a valid consumer
-coordinate. Version 0.1.20 carries protocol version 4 /
-conformance revision 27 and
+coordinate. Version 0.1.21 carries protocol version 4 /
+conformance revision 28, generic package-owned entity records, the
+`plugin_entity_subscriptions` compatibility feature, and
 depends on `@trybotster/ui-contract@0.3.1` for the canonical UiNode,
 UiActionRequest, UiActionResult, package surface, and package navigation
 declarations and conformance fixtures. It also carries the optional
@@ -158,7 +159,9 @@ prove the same contract through the real Hub/Core/session-worker topology.
 open/form/toggle metadata through the real Hub/plugin worker, applies accepted
 `set`/`clear`/`toggle` results to scoped client-shaped state, and materializes
 the delivered tree against its Dialog presence and selected-workspace equality
-bindings. Revision 21 places the one canonical Form inside the active Dialog
+bindings. It also renders and subscribes to the dotted fixture package's exact
+encoded entity family twice, proving a fresh authoritative reconnect snapshot.
+Revision 21 places the one canonical Form inside the active Dialog
 and makes the browser-shaped consumer reject any actionable sibling Form.
 Rejected results retain the visible Dialog, Form, input, and field-error
 association; accepted results apply normalization and a whole-surface

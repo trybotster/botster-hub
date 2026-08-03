@@ -5,6 +5,7 @@
 //! load, invoke, reload, unload, and cleanup mechanics to `botster-core`.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
 
 use botster_core::{
@@ -16,6 +17,67 @@ use botster_core::{
 };
 
 use crate::packages::{PackageClassification, PackageRecord, PackageRegistry, PackageState};
+
+const PACKAGE_ENTITY_NAMESPACE_V1_MARKER: &str = "bns1_";
+
+/// Map an exact package id to its canonical single-segment entity owner token.
+#[must_use]
+pub fn package_entity_owner_token(package_id: &str) -> String {
+    if !package_id.is_empty()
+        && !package_id.contains('.')
+        && !package_id.starts_with(PACKAGE_ENTITY_NAMESPACE_V1_MARKER)
+    {
+        return package_id.to_string();
+    }
+
+    let mut token =
+        String::with_capacity(PACKAGE_ENTITY_NAMESPACE_V1_MARKER.len() + package_id.len() * 2);
+    token.push_str(PACKAGE_ENTITY_NAMESPACE_V1_MARKER);
+    for byte in package_id.as_bytes() {
+        write!(&mut token, "{byte:02x}").expect("writing hexadecimal bytes to String cannot fail");
+    }
+    token
+}
+
+/// Decode a canonical v1 entity owner token for round-trip contract tests.
+#[cfg(test)]
+fn package_id_from_entity_owner_token(token: &str) -> Result<String, String> {
+    let Some(encoded) = token.strip_prefix(PACKAGE_ENTITY_NAMESPACE_V1_MARKER) else {
+        if token.is_empty() || token.contains('.') {
+            return Err(
+                "identity entity owner token must be non-empty and single-segment".to_string(),
+            );
+        }
+        return Ok(token.to_string());
+    };
+    if encoded.len() % 2 != 0
+        || !encoded
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(
+            "encoded entity owner token requires canonical even-length lowercase hex".to_string(),
+        );
+    }
+    let bytes = encoded
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let digit = |byte: u8| match byte {
+                b'0'..=b'9' => byte - b'0',
+                b'a'..=b'f' => byte - b'a' + 10,
+                _ => unreachable!("hex was validated"),
+            };
+            digit(pair[0]) * 16 + digit(pair[1])
+        })
+        .collect::<Vec<_>>();
+    let package_id = String::from_utf8(bytes)
+        .map_err(|_| "encoded entity owner token must decode to valid UTF-8".to_string())?;
+    if package_entity_owner_token(&package_id) != token {
+        return Err("entity owner token is not the canonical v1 encoding".to_string());
+    }
+    Ok(package_id)
+}
 
 /// Hub-owned lifecycle adapter around core plugin worker mechanics.
 #[derive(Clone)]
@@ -178,6 +240,49 @@ impl HubPluginLifecycle {
             .collect()
     }
 
+    /// Return exact entity families provided by one loaded package.
+    #[must_use]
+    pub fn entity_provider_families_for(&self, package_name: &str) -> BTreeSet<String> {
+        self.descriptors
+            .lock()
+            .expect("hub plugin lifecycle descriptors lock")
+            .get(package_name)
+            .into_iter()
+            .flatten()
+            .filter(|descriptor| descriptor.descriptor.kind == PluginDescriptorKind::EntityProvider)
+            .map(|descriptor| descriptor.descriptor.descriptor_id.clone())
+            .collect()
+    }
+
+    /// Return whether an exact entity family has a loaded provider.
+    #[must_use]
+    pub fn has_entity_provider_family(&self, entity_type: &str) -> bool {
+        self.descriptors
+            .lock()
+            .expect("hub plugin lifecycle descriptors lock")
+            .values()
+            .flatten()
+            .any(|descriptor| {
+                descriptor.descriptor.kind == PluginDescriptorKind::EntityProvider
+                    && descriptor.descriptor.descriptor_id == entity_type
+            })
+    }
+
+    /// Return the one loaded provider descriptor for an exact entity family.
+    #[must_use]
+    pub fn entity_provider_descriptor(&self, entity_type: &str) -> Option<PluginOwnedDescriptor> {
+        self.descriptors
+            .lock()
+            .expect("hub plugin lifecycle descriptors lock")
+            .values()
+            .flatten()
+            .find(|descriptor| {
+                descriptor.descriptor.kind == PluginDescriptorKind::EntityProvider
+                    && descriptor.descriptor.descriptor_id == entity_type
+            })
+            .cloned()
+    }
+
     /// Return Event-kind plugin handlers subscribed to one exact event name.
     #[must_use]
     pub fn event_handlers_for(&self, event_name: &str) -> Vec<HubPluginEventHandler> {
@@ -320,4 +425,62 @@ fn registration_for(
 
 fn plugin_key_for(record: &PackageRecord) -> PluginKey {
     PluginKey(record.manifest.name.clone())
+}
+
+#[cfg(test)]
+mod namespace_tests {
+    use super::{package_entity_owner_token, package_id_from_entity_owner_token};
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn package_entity_namespace_v1_is_canonical_reversible_and_collision_free() {
+        let dotted_fixture = "bns1_626f74737465722e706c7567696e2d636f6e74726163742d6d6174726978";
+        assert_eq!(
+            package_entity_owner_token("project-pipelines"),
+            "project-pipelines"
+        );
+        assert_eq!(
+            package_entity_owner_token("botster.plugin-contract-matrix"),
+            dotted_fixture
+        );
+        assert_eq!(package_entity_owner_token(""), "bns1_");
+        assert_ne!(
+            package_entity_owner_token("a.b"),
+            package_entity_owner_token("a_b")
+        );
+
+        let values = [
+            "project-pipelines",
+            "botster.plugin-contract-matrix",
+            "a.b",
+            "a_b",
+            "bns1_612e62",
+            "会話.插件",
+            "é.x",
+            "e\u{301}.x",
+            "",
+        ];
+        let tokens = values
+            .iter()
+            .map(|value| package_entity_owner_token(value))
+            .collect::<Vec<_>>();
+        assert_eq!(tokens.iter().collect::<BTreeSet<_>>().len(), values.len());
+        for (value, token) in values.iter().zip(tokens) {
+            assert!(!token.contains('.'));
+            assert_eq!(
+                package_id_from_entity_owner_token(&token).expect("canonical token decodes"),
+                *value
+            );
+        }
+    }
+
+    #[test]
+    fn package_entity_namespace_v1_rejects_noncanonical_marked_tokens() {
+        for token in ["", "a.b", "bns1_0", "bns1_0A", "bns1_zz", "bns1_ff"] {
+            assert!(
+                package_id_from_entity_owner_token(token).is_err(),
+                "{token}"
+            );
+        }
+    }
 }

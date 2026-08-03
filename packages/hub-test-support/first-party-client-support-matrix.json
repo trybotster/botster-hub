@@ -1,7 +1,7 @@
 {
   "protocol": "botster-hub-daemon-v1",
   "protocol_version": 4,
-  "conformance_fixture_revision": 27,
+  "conformance_fixture_revision": 28,
   "required_features": [
     "sessions",
     "terminal_streaming",
@@ -13,7 +13,8 @@
     "spawn_targets",
     "worktrees",
     "terminal_readback",
-    "session_entity_subscriptions"
+    "session_entity_subscriptions",
+    "plugin_entity_subscriptions"
   ],
   "supported_features": [
     "sessions",
@@ -26,7 +27,8 @@
     "spawn_targets",
     "worktrees",
     "terminal_readback",
-    "session_entity_subscriptions"
+    "session_entity_subscriptions",
+    "plugin_entity_subscriptions"
   ],
   "diagnostic_kinds": [
     "connected",
@@ -120,11 +122,10 @@
   },
   "entity_actions": {
     "supported_capabilities": [
-      "plugin_surface_json_actions"
-    ],
-    "unsupported_capabilities": [
+      "plugin_surface_json_actions",
       "plugin_entity_frames"
-    ]
+    ],
+    "unsupported_capabilities": []
   },
   "late_attach_history": {
     "supported": true,
