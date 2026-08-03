@@ -3,7 +3,7 @@
 //! This module intentionally exposes a narrow ABI: plugin registration,
 //! handler invocation by stable id, and selected hub capability helpers.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
 use std::fmt;
 use std::path::Path;
@@ -14,21 +14,21 @@ use std::time::Duration;
 
 use botster_core::{
     BoundaryJson, CapabilityOperation, CapabilityOperationId, CapabilityRuntimeErrorKind,
-    CapabilityRuntimeRequest, EndpointId, EnvelopeCursor, EnvelopeId, EnvelopeTarget,
-    PluginCancellationToken, PluginCapabilityRuntime, PluginDescriptorKind, PluginDescriptorRef,
-    PluginHandlerKind, PluginHandlerRef, PluginHandlerRegistration, PluginInvocationFailure,
-    PluginInvocationFailureKind, PluginInvocationRequest, PluginInvocationResult,
-    PluginInvocationSuccess, PluginKey, PluginOwnedDescriptor, PluginResourceKind,
-    PluginResourceRef, PluginRuntime, PluginStoreCapabilityRequest, PluginStoreKey,
-    PluginStoreOperation, RoutedEnvelope, RoutedEnvelopeDrainOutcome, RoutedEnvelopePayload,
-    RoutedEnvelopePublishOutcome, TimerCapabilityRequest,
+    CapabilityRuntimeRequest, EndpointId, EntityContract, EntityKind, EnvelopeCursor, EnvelopeId,
+    EnvelopeTarget, PluginCancellationToken, PluginCapabilityRuntime, PluginDescriptorKind,
+    PluginDescriptorRef, PluginHandlerKind, PluginHandlerRef, PluginHandlerRegistration,
+    PluginInvocationFailure, PluginInvocationFailureKind, PluginInvocationRequest,
+    PluginInvocationResult, PluginInvocationSuccess, PluginKey, PluginOwnedDescriptor,
+    PluginResourceKind, PluginResourceRef, PluginRuntime, PluginStoreCapabilityRequest,
+    PluginStoreKey, PluginStoreOperation, RoutedEnvelope, RoutedEnvelopeDrainOutcome,
+    RoutedEnvelopePayload, RoutedEnvelopePublishOutcome, TimerCapabilityRequest,
 };
 use botster_core_daemon::RoutedEnvelopeDeliveryStateResult;
 use mlua::{Function, HookTriggers, Lua, LuaOptions, LuaSerdeExt, StdLib, Table, Value, VmState};
 use serde_json::json;
 
 use crate::capabilities::{HubCapabilityRuntime, PluginStoreBatchMutation, PluginStoreBatchResult};
-use crate::lifecycle::{HubPluginEventHandler, HubPluginRuntimeBundle};
+use crate::lifecycle::{HubPluginEventHandler, HubPluginRuntimeBundle, package_entity_owner_token};
 use crate::packages::{PackageConfigurationView, PackageRecord, PreparedLocalPackage};
 use crate::runtime::{SharedSessionTemplateSpawner, SharedSpawnTargets, SharedWorktrees};
 use crate::session_templates::{
@@ -382,6 +382,7 @@ impl LoadedLuaPlugin {
         let mut event_handlers = Vec::new();
         let mut descriptors = Vec::new();
         let mut resources = Vec::new();
+        let mut entity_provider_families = BTreeSet::new();
 
         for tool in registration.tools {
             let handler = PluginHandlerRef {
@@ -414,6 +415,11 @@ impl LoadedLuaPlugin {
         }
 
         for handler in registration.handlers {
+            if handler.id.trim().is_empty() {
+                return Err(LuaPluginRuntimeError::Lua(
+                    "plugin handler id must be non-empty".to_string(),
+                ));
+            }
             let descriptor_kind = descriptor_kind_for_handler_kind(handler.kind.clone());
             let handler_ref = PluginHandlerRef {
                 plugin_key: plugin_key.clone(),
@@ -424,6 +430,47 @@ impl LoadedLuaPlugin {
                 handler: handler_ref.clone(),
                 required_capability: None,
             });
+            if handler.kind == PluginHandlerKind::EntityProvider {
+                let entity_type = EntityKind(handler.descriptor_id.clone());
+                if EntityContract::is_reserved_builtin(&handler.descriptor_id) {
+                    return Err(LuaPluginRuntimeError::Lua(format!(
+                        "entity provider family {} is reserved by Hub/Core",
+                        handler.descriptor_id
+                    )));
+                }
+                let owner_token = package_entity_owner_token(&plugin_key.0);
+                EntityContract::validate_entity_type(&entity_type, Some(&owner_token))
+                    .map_err(|error| LuaPluginRuntimeError::Lua(error.to_string()))?;
+                let id_field = handler
+                    .body
+                    .get("id_field")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("id");
+                EntityContract::validate_id_field(&entity_type, id_field)
+                    .map_err(|error| LuaPluginRuntimeError::Lua(error.to_string()))?;
+                if handler
+                    .body
+                    .get("entity_type")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|declared| declared != handler.descriptor_id)
+                {
+                    return Err(LuaPluginRuntimeError::Lua(format!(
+                        "entity provider descriptor id must equal entity_type {}",
+                        handler.descriptor_id
+                    )));
+                }
+                if !entity_provider_families.insert(handler.descriptor_id.clone()) {
+                    return Err(LuaPluginRuntimeError::Lua(format!(
+                        "duplicate entity provider family: {}",
+                        handler.descriptor_id
+                    )));
+                }
+                resources.push(PluginResourceRef {
+                    plugin_key: plugin_key.clone(),
+                    kind: PluginResourceKind::EntityProvider,
+                    resource_id: handler.descriptor_id.clone(),
+                });
+            }
             if handler.kind == PluginHandlerKind::Event {
                 let event_name = handler.event_name.ok_or_else(|| {
                     LuaPluginRuntimeError::Lua(
@@ -591,6 +638,12 @@ fn install_botster_api(
                 let handler_id: String = custom_handler.get("id")?;
                 if let Ok(handler) = custom_handler.get::<Function>("call") {
                     handlers.set(handler_id, handler)?;
+                } else if custom_handler.get::<String>("kind").ok().as_deref()
+                    == Some("entity_provider")
+                {
+                    return Err(mlua::Error::RuntimeError(
+                        "entity provider declarations require a call handler".to_string(),
+                    ));
                 }
             }
         }
@@ -1391,6 +1444,7 @@ fn descriptor_kind_for_handler_kind(kind: PluginHandlerKind) -> Option<PluginDes
     match kind {
         PluginHandlerKind::SurfaceRoute => Some(PluginDescriptorKind::SurfaceRoute),
         PluginHandlerKind::UiAction => Some(PluginDescriptorKind::UiAction),
+        PluginHandlerKind::EntityProvider => Some(PluginDescriptorKind::EntityProvider),
         _ => None,
     }
 }
@@ -1405,6 +1459,7 @@ fn handler_kind_from_lua(kind: &str) -> Result<PluginHandlerKind, LuaPluginRunti
         "hook" => Ok(PluginHandlerKind::Hook),
         "timer" => Ok(PluginHandlerKind::Timer),
         "surface_route" => Ok(PluginHandlerKind::SurfaceRoute),
+        "entity_provider" => Ok(PluginHandlerKind::EntityProvider),
         other => Err(LuaPluginRuntimeError::Lua(format!(
             "unsupported lua handler kind: {other}"
         ))),

@@ -1,6 +1,8 @@
 -- Canonical package/plugin contract matrix fixture for hub and client conformance.
 
 local PACKAGE = "botster.plugin-contract-matrix"
+local ENTITY_OWNER = "bns1_626f74737465722e706c7567696e2d636f6e74726163742d6d6174726978"
+local ENTITY_FAMILY = ENTITY_OWNER .. ".run"
 
 local function action_result(arguments, state, extra)
   local result = {
@@ -518,6 +520,45 @@ local function contract_action(arguments)
   })
 end
 
+local function package_entity_surface(_arguments)
+  return {
+    type = "panel",
+    id = "contract-entities-panel",
+    children = {
+      {
+        ["$kind"] = "bind_list",
+        source = "/" .. ENTITY_FAMILY,
+        item_template = {
+          type = "text",
+          id = { ["$bind"] = "@/id" },
+          props = { text = { ["$bind"] = "@/status" } },
+        },
+      },
+    },
+  }
+end
+
+local function package_entity_snapshot(_arguments)
+  local config = botster.capabilities.config.get()
+  local mode = config.values.mode or {}
+  local generation = 1
+  if mode.value == "read" then
+    generation = 2
+  end
+  return {
+    type = "entity_snapshot",
+    entity_type = ENTITY_FAMILY,
+    snapshot_seq = generation,
+    items = {
+      {
+        id = "contract-run-1",
+        status = "generation-" .. generation,
+        package_name = PACKAGE,
+      },
+    },
+  }
+end
+
 return botster.register({
   handlers = {
     {
@@ -549,6 +590,26 @@ return botster.register({
         surface_id = "contract.sessions",
       },
       call = session_lifecycle_surface,
+    },
+    {
+      id = "contract_package_entity_surface",
+      kind = "surface_route",
+      descriptor_id = "contract.entities",
+      descriptor = {
+        title = "Package Entity Projection",
+        surface_id = "contract.entities",
+      },
+      call = package_entity_surface,
+    },
+    {
+      id = "contract_package_entity_provider",
+      kind = "entity_provider",
+      descriptor_id = ENTITY_FAMILY,
+      descriptor = {
+        entity_type = ENTITY_FAMILY,
+        id_field = "id",
+      },
+      call = package_entity_snapshot,
     },
     {
       id = "contract_blocked_surface",

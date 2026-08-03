@@ -42,6 +42,16 @@
       "supports": ["render", "action"]
     },
     {
+      "id": "contract.entities",
+      "kind": "app",
+      "title": "Package Entity Projection",
+      "description": "Conformance surface binding the dotted package namespace to its authoritative entity provider.",
+      "icon": "database",
+      "order": 27,
+      "category": "contract",
+      "supports": ["render"]
+    },
+    {
       "id": "contract.blocked",
       "kind": "app",
       "title": "Contract Blocked Surface",

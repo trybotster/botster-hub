@@ -35,10 +35,75 @@ Supported registration fields:
   object schema when omitted.
 - `handlers`: optional array for non-tool handlers with `id`, `kind`, and
   `call`. Initial supported kinds are `command`, `mcp_tool`, `event`, `hook`,
-  `timer`, and `surface_route`.
+  `timer`, `surface_route`, and `entity_provider`.
 
 Handler ids are stable strings. Hub registries store descriptor bodies and
 handler refs, not Lua closure identities.
+
+## Package-owned entity providers
+
+An enabled package may declare one worker-owned provider for each exact entity
+family in its package namespace:
+
+```lua
+{
+  id = "runs",
+  kind = "entity_provider",
+  descriptor_id = "project-pipelines.run",
+  descriptor = {
+    entity_type = "project-pipelines.run",
+    id_field = "id",
+  },
+  call = function(request)
+    return {
+      type = "entity_snapshot",
+      entity_type = request.entity_type,
+      snapshot_seq = 1,
+      items = {{ id = "run-1", status = "active" }},
+    }
+  end,
+}
+```
+
+Hub's protocol-visible package entity namespace v1 maps the authoritative
+manifest name to Core's required single-segment owner token:
+
+- a non-empty name with no `.` and no `bns1_` prefix is unchanged, so
+  `project-pipelines` owns `project-pipelines.run`;
+- every other name maps to `bns1_` followed by lowercase hexadecimal for its
+  exact UTF-8 bytes, with no Unicode normalization. For example,
+  `botster.plugin-contract-matrix` owns
+  `bns1_626f74737465722e706c7567696e2d636f6e74726163742d6d6174726978.run`.
+
+The reserved marker makes the identity and encoded ranges disjoint, and the
+byte encoding is reversible and collision-free. Marked tokens are canonical
+only when their suffix is even-length lowercase hex, decodes as UTF-8, and
+re-encodes to the same token. Package authors currently declare the resulting
+exact family in descriptors, snapshots, and UiNode paths; a Lua accessor is
+deliberately deferred until authoring friction justifies expanding the ABI.
+
+`descriptor_id` is the exact family and, when supplied, `entity_type` must
+match it. Plugin families use the default non-empty string `id` field. Reserved
+built-ins, foreign namespaces, malformed families, duplicate declarations,
+custom id fields, and missing `call` handlers fail package loading.
+
+`entity_provider` registration is deliberately capability-free: an enabled Lua
+package may publish read-only snapshots only inside its own exact mapped
+namespace, and Hub validates that ownership plus reserved-family exclusion at
+load time. Providers do not grant access to another Hub capability; any state
+they read still requires that state surface's normal manifest capability and
+Hub grant.
+
+Surface `bind_list`/`bind_if`/absolute `$bind` paths may use `/session` or an
+exact family declared by the same loaded package. Hub does not admit namespace
+prefixes, undeclared families, or another package's providers.
+
+Every `SubscribeEntities` connection invokes the provider through its isolated
+plugin worker with the standard one-second dispatch bound. The result must be
+an authoritative whole-family `entity_snapshot`; Hub validates the exact
+family and every record before bounded delivery. Reconnect invokes the provider
+again rather than replaying cached rows. Unload removes the descriptor and
+resource and closes held subscriptions for that family.
 
 ## Rust-Emitted Events
 

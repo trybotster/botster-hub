@@ -1142,7 +1142,7 @@ pub(crate) fn daemon_protocol_typescript() -> String {
                     ("subscription_id", "string"),
                     ("entity_type", "string"),
                     ("snapshot_seq", "number"),
-                    ("items", "DaemonSessionEntity[]"),
+                    ("items", "JsonValue[]"),
                     ("resync_reason?", "string | null"),
                 ],
             ),
@@ -1153,7 +1153,7 @@ pub(crate) fn daemon_protocol_typescript() -> String {
                     ("entity_type", "string"),
                     ("snapshot_seq", "number"),
                     ("id", "string"),
-                    ("entity", "DaemonSessionEntity"),
+                    ("entity", "JsonValue"),
                 ],
             ),
             (

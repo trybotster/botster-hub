@@ -3653,7 +3653,8 @@ impl EntityFrameSender {
 #[derive(Debug)]
 struct EntitySubscriptionState {
     sender: EntityFrameSender,
-    cursor: SessionLifecycleCursor,
+    entity_type: String,
+    cursor: Option<SessionLifecycleCursor>,
     entities: BTreeMap<String, DaemonSessionEntity>,
     resync_reason: Option<String>,
 }
@@ -3863,9 +3864,61 @@ fn register_entity_subscription(
             "entity subscription id is already active",
         ));
     }
-    let baseline = if let Some(cursor) = state.reconciliation.cursor.clone()
-        && entity_type == "session"
-    {
+    if entity_type != "session" {
+        let runtime = daemon
+            .runtime_mut()
+            .ok_or(DaemonTransportError::DaemonNotRunning)?;
+        let (snapshot_seq, items) =
+            match runtime.plugin_entity_snapshot(&entity_type, &subscription_id) {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    return Ok(entity_subscription_error(
+                        &error.code,
+                        &subscription_id,
+                        &error.message,
+                    ));
+                }
+            };
+        let snapshot = DaemonEntityFrame::Snapshot {
+            subscription_id: subscription_id.clone(),
+            entity_type: entity_type.clone(),
+            snapshot_seq,
+            items,
+            resync_reason: None,
+        };
+        if serde_json::to_vec(&snapshot)
+            .map_err(DaemonTransportError::Json)?
+            .len()
+            > DAEMON_MAX_FRAME_BYTES
+        {
+            return Ok(entity_subscription_error(
+                "entity_provider_frame_too_large",
+                &subscription_id,
+                "entity provider snapshot exceeds daemon frame limit",
+            ));
+        }
+        sender
+            .try_send(snapshot)
+            .map_err(|_| DaemonTransportError::ControlThreadStopped)?;
+        state.entity_subscriptions.insert(
+            subscription_id.clone(),
+            EntitySubscriptionState {
+                sender,
+                entity_type,
+                cursor: None,
+                entities: BTreeMap::new(),
+                resync_reason: None,
+            },
+        );
+        state.lifecycle_counters.live_entity_subscriptions =
+            state.entity_subscriptions.len() as u64;
+        state.lifecycle_counters.high_water_entity_subscriptions = state
+            .lifecycle_counters
+            .high_water_entity_subscriptions
+            .max(state.lifecycle_counters.live_entity_subscriptions);
+        return Ok(daemon_response_base(DaemonResponseKind::EntitySubscribed));
+    }
+    let baseline = if let Some(cursor) = state.reconciliation.cursor.clone() {
         SessionLifecycleBaseline {
             cursor,
             sessions: state.reconciliation.records.values().cloned().collect(),
@@ -3916,7 +3969,8 @@ fn register_entity_subscription(
         subscription_id.clone(),
         EntitySubscriptionState {
             sender,
-            cursor,
+            entity_type: "session".to_string(),
+            cursor: Some(cursor),
             entities,
             resync_reason: None,
         },
@@ -3968,6 +4022,11 @@ fn drive_entity_subscriptions(daemon: &mut HubDaemon, state: &mut DaemonControlS
         state.lifecycle_counters.live_entity_subscriptions = 0;
         return;
     };
+    state.entity_subscriptions.retain(|_, subscription| {
+        subscription.entity_type == "session"
+            || runtime.has_plugin_entity_provider_family(&subscription.entity_type)
+    });
+    state.lifecycle_counters.live_entity_subscriptions = state.entity_subscriptions.len() as u64;
 
     state.lifecycle_counters.reconciliation_wakes = state
         .lifecycle_counters
@@ -3977,11 +4036,9 @@ fn drive_entity_subscriptions(daemon: &mut HubDaemon, state: &mut DaemonControlS
     let Some(cursor) = state.reconciliation.cursor.clone() else {
         return;
     };
-    if state
-        .entity_subscriptions
-        .values()
-        .any(|subscription| subscription.resync_reason.is_some())
-    {
+    if state.entity_subscriptions.values().any(|subscription| {
+        subscription.entity_type == "session" && subscription.resync_reason.is_some()
+    }) {
         let baseline = SessionLifecycleBaseline {
             cursor: cursor.clone(),
             sessions: state.reconciliation.records.values().cloned().collect(),
@@ -3989,6 +4046,9 @@ fn drive_entity_subscriptions(daemon: &mut HubDaemon, state: &mut DaemonControlS
         state
             .entity_subscriptions
             .retain(|subscription_id, subscription| {
+                if subscription.entity_type != "session" {
+                    return true;
+                }
                 let Some(reason) = subscription.resync_reason.clone() else {
                     return true;
                 };
@@ -4029,6 +4089,9 @@ fn drive_entity_subscriptions(daemon: &mut HubDaemon, state: &mut DaemonControlS
         state
             .entity_subscriptions
             .retain(|subscription_id, subscription| {
+                if subscription.entity_type != "session" {
+                    return true;
+                }
                 try_resync_subscription(
                     subscription_id,
                     subscription,
@@ -4094,6 +4157,9 @@ fn drive_entity_subscriptions(daemon: &mut HubDaemon, state: &mut DaemonControlS
             state
                 .entity_subscriptions
                 .retain(|subscription_id, subscription| {
+                    if subscription.entity_type != "session" {
+                        return true;
+                    }
                     deliver_lifecycle_change(
                         subscription_id,
                         subscription,
@@ -4124,6 +4190,9 @@ fn drive_entity_subscriptions(daemon: &mut HubDaemon, state: &mut DaemonControlS
             state
                 .entity_subscriptions
                 .retain(|subscription_id, subscription| {
+                    if subscription.entity_type != "session" {
+                        return true;
+                    }
                     try_resync_subscription(
                         subscription_id,
                         subscription,
@@ -4204,12 +4273,12 @@ fn deliver_lifecycle_change(
                     entity_type: "session".to_string(),
                     snapshot_seq: sequence,
                     id,
-                    entity,
+                    entity: serde_json::to_value(entity).expect("serialize session entity"),
                 },
                 Some(previous) => {
                     let patch = session_entity_patch(&previous, &entity);
                     if patch.as_object().is_some_and(serde_json::Map::is_empty) {
-                        state.cursor = change.cursor.clone();
+                        state.cursor = Some(change.cursor.clone());
                         return true;
                     }
                     DaemonEntityFrame::Patch {
@@ -4241,7 +4310,7 @@ fn deliver_lifecycle_change(
         Ok(()) => {
             counters.entity_delivery_successes =
                 counters.entity_delivery_successes.saturating_add(1);
-            state.cursor = change.cursor.clone();
+            state.cursor = Some(change.cursor.clone());
             true
         }
         Err(EntityFrameTrySendError::Full) => {
@@ -4271,7 +4340,7 @@ fn try_resync_subscription(
             counters.entity_delivery_attempts = counters.entity_delivery_attempts.saturating_add(1);
             counters.entity_delivery_successes =
                 counters.entity_delivery_successes.saturating_add(1);
-            state.cursor = cursor;
+            state.cursor = Some(cursor);
             state.entities = entities;
             state.resync_reason = None;
             true
@@ -4305,7 +4374,10 @@ fn entity_snapshot(
         subscription_id: subscription_id.to_string(),
         entity_type: "session".to_string(),
         snapshot_seq: baseline.cursor.sequence,
-        items: entities.values().cloned().collect(),
+        items: entities
+            .values()
+            .map(|entity| serde_json::to_value(entity).expect("serialize session entity"))
+            .collect(),
         resync_reason,
     };
     (entities, frame)
@@ -7209,10 +7281,10 @@ mod tests {
             receiver.recv().expect("initial current snapshot"),
             DaemonEntityFrame::Snapshot { ref items, .. }
                 if items.iter().any(|entity| {
-                    entity.session_uuid == session_id.0
-                        && entity.registry_state == "running"
-                        && entity.lifecycle.as_deref() == Some("running")
-                        && entity.lifecycle_class == "current"
+                    entity.get("session_uuid").and_then(Value::as_str) == Some(&session_id.0)
+                        && entity.get("registry_state").and_then(Value::as_str) == Some("running")
+                        && entity.get("lifecycle").and_then(Value::as_str) == Some("running")
+                        && entity.get("lifecycle_class").and_then(Value::as_str) == Some("current")
                 })
         ));
 
@@ -7608,10 +7680,11 @@ mod tests {
             .expect("fill bounded subscriber queue");
         let mut state = EntitySubscriptionState {
             sender: EntityFrameSender::Blocking(sender),
-            cursor: SessionLifecycleCursor {
+            entity_type: "session".to_string(),
+            cursor: Some(SessionLifecycleCursor {
                 source_id: botster_core_daemon::SessionLifecycleSourceId("source".to_string()),
                 sequence: 8,
-            },
+            }),
             entities: BTreeMap::new(),
             resync_reason: Some(overflow_reason.clone()),
         };
@@ -7685,10 +7758,11 @@ mod tests {
             .expect("fill bounded async subscriber queue");
         let mut state = EntitySubscriptionState {
             sender: EntityFrameSender::Async(sender),
-            cursor: SessionLifecycleCursor {
+            entity_type: "session".to_string(),
+            cursor: Some(SessionLifecycleCursor {
                 source_id: botster_core_daemon::SessionLifecycleSourceId("source".to_string()),
                 sequence: 8,
-            },
+            }),
             entities: BTreeMap::new(),
             resync_reason: Some(overflow_reason.clone()),
         };

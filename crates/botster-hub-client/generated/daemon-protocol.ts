@@ -743,8 +743,8 @@ export interface DaemonSessionEntity {
 }
 
 export type DaemonEntityFrame =
-  | { type: "entity_snapshot"; subscription_id: string; entity_type: string; snapshot_seq: number; items: DaemonSessionEntity[]; resync_reason?: string | null }
-  | { type: "entity_upsert"; subscription_id: string; entity_type: string; snapshot_seq: number; id: string; entity: DaemonSessionEntity }
+  | { type: "entity_snapshot"; subscription_id: string; entity_type: string; snapshot_seq: number; items: JsonValue[]; resync_reason?: string | null }
+  | { type: "entity_upsert"; subscription_id: string; entity_type: string; snapshot_seq: number; id: string; entity: JsonValue }
   | { type: "entity_patch"; subscription_id: string; entity_type: string; snapshot_seq: number; id: string; patch: JsonValue }
   | { type: "entity_remove"; subscription_id: string; entity_type: string; snapshot_seq: number; id: string };
 
