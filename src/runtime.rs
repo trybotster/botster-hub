@@ -7,12 +7,13 @@
 
 use botster_core::{
     BotsterEngineObservation, BotsterEngineOutput, BoundaryJson, ClientId, CoreSession,
-    CoreSessionMetadata, EnvelopeId, EnvelopeTarget, ManagedSessionRuntimeError,
-    MultiplexerEngineError, PluginCapabilityRuntime, PluginCleanupResult, PluginHandlerKind,
-    PluginInvocationFailure, PluginInvocationFailureKind, PluginInvocationOutcome,
-    PluginInvocationRequest, PluginInvocationResult, PluginKey, PluginWorkerDebugSnapshot,
-    RequestId, RoutedEnvelope, RoutedEnvelopeDrainOutcome, RoutedEnvelopePublishOutcome, SessionId,
-    SessionLifecycleState, SessionRuntimeErrorKind, SessionSpawnRequest, SubscriptionId,
+    CoreSessionMetadata, EntityContract, EntityFrame, EntityKind, EnvelopeId, EnvelopeTarget,
+    ManagedSessionRuntimeError, MultiplexerEngineError, PluginCapabilityRuntime,
+    PluginCleanupResult, PluginHandlerKind, PluginInvocationFailure, PluginInvocationFailureKind,
+    PluginInvocationOutcome, PluginInvocationRequest, PluginInvocationResult, PluginKey,
+    PluginWorkerDebugSnapshot, RequestId, RoutedEnvelope, RoutedEnvelopeDrainOutcome,
+    RoutedEnvelopePublishOutcome, SessionId, SessionLifecycleState, SessionRuntimeErrorKind,
+    SessionSpawnRequest, SubscriptionId,
 };
 use botster_core_daemon::{
     AcknowledgeRoutedEnvelopeRequest, CaptureSnapshotRequest, CaptureSnapshotResult, CoreDaemon,
@@ -23,7 +24,7 @@ use botster_core_daemon::{
     SessionLifecycleBaseline, SessionLifecycleChanges, SessionLifecycleCursor, SpawnSessionRequest,
 };
 use botster_ui_contract::{UiActionRequest, UiActionResult, UiNode};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
 use std::fmt;
 use std::path::PathBuf;
@@ -39,6 +40,7 @@ use crate::credentials::{
 };
 use crate::lifecycle::{
     HubLifecycleResult, HubPluginLifecycle, HubPluginLifecycleStatus, HubPluginRuntimeBundle,
+    package_entity_owner_token,
 };
 use crate::lua_runtime::{
     HubCoordinationBridge, HubCoordinationResponse, LuaPluginHostApi, LuaPluginRuntime,
@@ -1259,7 +1261,7 @@ impl HubRuntime {
         let node: UiNode = serde_json::from_value(value).map_err(|error| {
             crate::McpToolError::new("invalid_surface", format!("invalid plugin UiNode: {error}"))
         })?;
-        validate_plugin_surface_node(&node)?;
+        validate_plugin_surface_node(&node, &self.plugin_entity_provider_families(package_name))?;
         Ok(node)
     }
 
@@ -1319,8 +1321,119 @@ impl HubRuntime {
                 format!("invalid plugin UiActionResult: {error}"),
             )
         })?;
-        validate_plugin_surface_action_result(&result, request)?;
+        validate_plugin_surface_action_result(
+            &result,
+            request,
+            &self.plugin_entity_provider_families(package_name),
+        )?;
         Ok(result)
+    }
+
+    /// Return exact entity families currently provided by one loaded package.
+    #[must_use]
+    pub fn plugin_entity_provider_families(&self, package_name: &str) -> BTreeSet<String> {
+        self.plugin_lifecycle
+            .entity_provider_families_for(package_name)
+    }
+
+    /// Return whether an exact mapped family still has a loaded provider.
+    #[must_use]
+    pub fn has_plugin_entity_provider_family(&self, entity_type: &str) -> bool {
+        self.plugin_lifecycle
+            .has_entity_provider_family(entity_type)
+    }
+
+    /// Query one loaded package-owned entity provider through its worker.
+    pub fn plugin_entity_snapshot(
+        &self,
+        entity_type: &str,
+        subscription_id: &str,
+    ) -> Result<(u64, Vec<serde_json::Value>), crate::McpToolError> {
+        let entity_kind = EntityKind(entity_type.to_string());
+        EntityContract::validate_entity_type(&entity_kind, None).map_err(|error| {
+            crate::McpToolError::new("invalid_entity_provider", error.to_string())
+        })?;
+        let descriptor = self
+            .plugin_lifecycle
+            .entity_provider_descriptor(entity_type)
+            .ok_or_else(|| {
+                crate::McpToolError::new(
+                    "entity_provider_unavailable",
+                    format!("no enabled package provides entity family {entity_type}"),
+                )
+            })?;
+        let package_name = descriptor.descriptor.plugin_key.0.clone();
+        let owner_token = package_entity_owner_token(&package_name);
+        EntityContract::validate_entity_type(&entity_kind, Some(&owner_token)).map_err(
+            |error| crate::McpToolError::new("invalid_entity_provider", error.to_string()),
+        )?;
+        let handler = descriptor.handler.ok_or_else(|| {
+            crate::McpToolError::new(
+                "entity_provider_unavailable",
+                format!("entity provider {entity_type} has no handler"),
+            )
+        })?;
+        let outcome = self.invoke_plugin(PluginInvocationRequest {
+            request_id: RequestId(format!("plugin-entity-provider-{subscription_id}")),
+            handler,
+            timeout_ms: PLUGIN_EVENT_TIMEOUT_MS,
+            context: botster_core::PluginInvocationContext {
+                client_id: None,
+                session_id: None,
+                subscription_id: Some(SubscriptionId(subscription_id.to_string())),
+                surface_id: None,
+                origin: Some("local-client-api".to_string()),
+                metadata: None,
+            },
+            payload: BoundaryJson(serde_json::json!({
+                "entity_type": entity_type,
+                "subscription_id": subscription_id,
+            })),
+        });
+        let value = completed_plugin_payload(outcome.result, "plugin entity provider")?;
+        let frame: EntityFrame = serde_json::from_value(value).map_err(|error| {
+            crate::McpToolError::new(
+                "invalid_entity_provider",
+                format!("invalid entity provider frame: {error}"),
+            )
+        })?;
+        if frame.entity_type() != &entity_kind {
+            return Err(crate::McpToolError::new(
+                "invalid_entity_provider",
+                format!(
+                    "entity provider returned wrong family: {}",
+                    frame.entity_type().as_str()
+                ),
+            ));
+        }
+        let EntityFrame::Snapshot {
+            snapshot_seq,
+            items,
+            ..
+        } = frame
+        else {
+            return Err(crate::McpToolError::new(
+                "invalid_entity_provider",
+                "entity provider must return an authoritative whole-family snapshot",
+            ));
+        };
+        let mut record_ids = BTreeSet::new();
+        for item in &items {
+            let record_id =
+                EntityContract::extract_record_id(&entity_kind, item).map_err(|error| {
+                    crate::McpToolError::new("invalid_entity_provider", error.to_string())
+                })?;
+            if !record_ids.insert(record_id.0.clone()) {
+                return Err(crate::McpToolError::new(
+                    "invalid_entity_provider",
+                    format!(
+                        "entity provider snapshot contains duplicate record id {}",
+                        record_id.0
+                    ),
+                ));
+            }
+        }
+        Ok((snapshot_seq, items))
     }
 
     /// Last capability cleanup produced by reload, unload, or explicit cleanup.
@@ -2282,44 +2395,48 @@ pub fn daemon_session_to_core_session(session: DaemonSession) -> CoreSession {
     CoreSession::new(session.session_id, lifecycle)
 }
 
-fn validate_plugin_surface_binding_families(node: &UiNode) -> Result<(), crate::McpToolError> {
+fn validate_plugin_surface_binding_families(
+    node: &UiNode,
+    admitted_families: &BTreeSet<String>,
+) -> Result<(), crate::McpToolError> {
     let value = serde_json::to_value(node).map_err(|error| {
         crate::McpToolError::new(
             "invalid_surface",
             format!("failed to inspect plugin UiNode bindings: {error}"),
         )
     })?;
-    validate_plugin_surface_binding_value(&value)
+    validate_plugin_surface_binding_value(&value, admitted_families)
 }
 
 fn validate_plugin_surface_binding_value(
     value: &serde_json::Value,
+    admitted_families: &BTreeSet<String>,
 ) -> Result<(), crate::McpToolError> {
     match value {
         serde_json::Value::Array(values) => {
             for value in values {
-                validate_plugin_surface_binding_value(value)?;
+                validate_plugin_surface_binding_value(value, admitted_families)?;
             }
         }
         serde_json::Value::Object(object) => {
             if let Some(path) = object.get("$bind").and_then(serde_json::Value::as_str) {
-                validate_plugin_surface_binding_path(path)?;
+                validate_plugin_surface_binding_path(path, admitted_families)?;
             }
             match object.get("$kind").and_then(serde_json::Value::as_str) {
                 Some("bind_list") => {
                     if let Some(path) = object.get("source").and_then(serde_json::Value::as_str) {
-                        validate_plugin_surface_binding_path(path)?;
+                        validate_plugin_surface_binding_path(path, admitted_families)?;
                     }
                 }
                 Some("bind_if") => {
                     if let Some(path) = object.get("path").and_then(serde_json::Value::as_str) {
-                        validate_plugin_surface_binding_path(path)?;
+                        validate_plugin_surface_binding_path(path, admitted_families)?;
                     }
                 }
                 _ => {}
             }
             for value in object.values() {
-                validate_plugin_surface_binding_value(value)?;
+                validate_plugin_surface_binding_value(value, admitted_families)?;
             }
         }
         _ => {}
@@ -2327,28 +2444,40 @@ fn validate_plugin_surface_binding_value(
     Ok(())
 }
 
-fn validate_plugin_surface_binding_path(path: &str) -> Result<(), crate::McpToolError> {
+fn validate_plugin_surface_binding_path(
+    path: &str,
+    admitted_families: &BTreeSet<String>,
+) -> Result<(), crate::McpToolError> {
     if !path.starts_with('/') || path == "/session" || path.starts_with("/session/") {
+        return Ok(());
+    }
+    if path
+        .strip_prefix('/')
+        .and_then(|path| path.split('/').next())
+        .is_some_and(|family| admitted_families.contains(family))
+    {
         return Ok(());
     }
     Err(crate::McpToolError::new(
         "invalid_surface",
-        format!(
-            "plugin UiNode binding family is not admitted by this Hub: {path}; only /session is available"
-        ),
+        format!("plugin UiNode binding family is not admitted by this Hub: {path}"),
     ))
 }
 
-fn validate_plugin_surface_node(node: &UiNode) -> Result<(), crate::McpToolError> {
+fn validate_plugin_surface_node(
+    node: &UiNode,
+    admitted_families: &BTreeSet<String>,
+) -> Result<(), crate::McpToolError> {
     node.validate_authored().map_err(|error| {
         crate::McpToolError::new("invalid_surface", format!("invalid plugin UiNode: {error}"))
     })?;
-    validate_plugin_surface_binding_families(node)
+    validate_plugin_surface_binding_families(node, admitted_families)
 }
 
 fn validate_plugin_surface_action_result(
     result: &UiActionResult,
     request: &UiActionRequest,
+    admitted_families: &BTreeSet<String>,
 ) -> Result<(), crate::McpToolError> {
     result.validate().map_err(|error| {
         crate::McpToolError::new(
@@ -2367,15 +2496,17 @@ fn validate_plugin_surface_action_result(
         ));
     }
     if let Some(replacement) = &result.replacement {
-        validate_plugin_surface_binding_families(replacement).map_err(|error| {
-            crate::McpToolError::new(
-                "invalid_action_result",
-                format!(
-                    "invalid plugin UiActionResult replacement: {}",
-                    error.message
-                ),
-            )
-        })?;
+        validate_plugin_surface_binding_families(replacement, admitted_families).map_err(
+            |error| {
+                crate::McpToolError::new(
+                    "invalid_action_result",
+                    format!(
+                        "invalid plugin UiActionResult replacement: {}",
+                        error.message
+                    ),
+                )
+            },
+        )?;
     }
     Ok(())
 }
@@ -2419,7 +2550,7 @@ mod tests {
             }
         }));
 
-        validate_plugin_surface_node(&node)
+        validate_plugin_surface_node(&node, &BTreeSet::new())
             .expect("/session and item-relative bindings are admitted");
     }
 
@@ -2442,7 +2573,7 @@ mod tests {
                 }]
             }
         }));
-        validate_plugin_surface_node(&admitted)
+        validate_plugin_surface_node(&admitted, &BTreeSet::new())
             .expect("render admission accepts bound item-template identity");
 
         for rejected in [
@@ -2468,8 +2599,8 @@ mod tests {
             }),
         ] {
             let node = serde_json::from_value(rejected).expect("authored UiNode");
-            let error =
-                validate_plugin_surface_node(&node).expect_err("unresolved render id must fail");
+            let error = validate_plugin_surface_node(&node, &BTreeSet::new())
+                .expect_err("unresolved render id must fail");
             assert_eq!(error.code, "invalid_surface");
             assert!(error.message.contains("bind_list item_template"));
         }
@@ -2501,7 +2632,7 @@ mod tests {
             }),
         ] {
             let node = serde_json::from_value(rejected).expect("authored keyed UiNode");
-            let error = validate_plugin_surface_node(&node)
+            let error = validate_plugin_surface_node(&node, &BTreeSet::new())
                 .expect_err("misplaced descendant identity must fail");
             assert_eq!(error.code, "invalid_surface");
             assert!(error.message.contains("bind_list descendant identity"));
@@ -2521,10 +2652,44 @@ mod tests {
                 }
             }));
             node.validate().expect("generic UiNode validation");
-            let error = validate_plugin_surface_binding_families(&node)
+            let error = validate_plugin_surface_binding_families(&node, &BTreeSet::new())
                 .expect_err("foreign absolute binding family must be rejected");
             assert_eq!(error.code, "invalid_surface");
             assert!(error.message.contains(source), "{error:?}");
+        }
+    }
+
+    #[test]
+    fn plugin_surface_binding_admission_accepts_only_exact_declared_plugin_family() {
+        let admitted = BTreeSet::from(["project-pipelines.run".to_string()]);
+        let node = binding_test_node(serde_json::json!({
+            "$kind": "bind_list",
+            "source": "/project-pipelines.run",
+            "item_template": {
+                "type": "text",
+                "id": "run-row",
+                "props": { "text": { "$bind": "@/id" } }
+            }
+        }));
+        validate_plugin_surface_binding_families(&node, &admitted)
+            .expect("exact declared plugin family is admitted");
+
+        for source in [
+            "/project-pipelines.ticket",
+            "/project-pipelines.runaway",
+            "/other.run",
+        ] {
+            let node = binding_test_node(serde_json::json!({
+                "$kind": "bind_list",
+                "source": source,
+                "item_template": {
+                    "type": "text",
+                    "id": "row",
+                    "props": { "text": "row" }
+                }
+            }));
+            validate_plugin_surface_binding_families(&node, &admitted)
+                .expect_err("undeclared or foreign family must remain rejected");
         }
     }
 
@@ -2568,11 +2733,11 @@ mod tests {
     #[test]
     fn plugin_surface_action_replacement_applies_binding_family_admission() {
         let (request, accepted) = binding_action_result("/session");
-        validate_plugin_surface_action_result(&accepted, &request)
+        validate_plugin_surface_action_result(&accepted, &request, &BTreeSet::new())
             .expect("/session replacement binding must be admitted");
 
         let (_, rejected) = binding_action_result("/workspace");
-        let error = validate_plugin_surface_action_result(&rejected, &request)
+        let error = validate_plugin_surface_action_result(&rejected, &request, &BTreeSet::new())
             .expect_err("foreign replacement binding must be rejected");
         assert_eq!(error.code, "invalid_action_result");
         assert!(error.message.contains("/workspace"), "{error:?}");
@@ -2590,7 +2755,7 @@ mod tests {
         }))
         .expect("authored button wire shape");
 
-        let error = validate_plugin_surface_node(&node)
+        let error = validate_plugin_surface_node(&node, &BTreeSet::new())
             .expect_err("malformed required label binding must fail Hub admission");
         assert_eq!(error.code, "invalid_surface");
         assert!(
@@ -2640,7 +2805,7 @@ mod tests {
                 "replacement": replacement
             }))
             .expect("action result");
-            let error = validate_plugin_surface_action_result(&result, &request)
+            let error = validate_plugin_surface_action_result(&result, &request, &BTreeSet::new())
                 .expect_err("unresolved replacement id must fail");
             assert_eq!(error.code, "invalid_action_result");
             assert!(error.message.contains("bind_list item_template"));
