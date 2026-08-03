@@ -104,6 +104,25 @@ The initial capability helper is:
   errors.
 - `botster.capabilities.plugin_db.list({ prefix = "..." })`: lists deterministic
   plugin-store record metadata.
+- `botster.capabilities.plugin_db.batch({ mutations = {...} })`: atomically
+  applies an ordered, non-empty set of `set`, `patch`, and `delete` mutations
+  to the loaded plugin's namespace. Every mutation requires
+  `expected_revision` (`0` when creating a record), and each key may appear at
+  most once. `set` also accepts `schema_version` (default `1`) and `payload`;
+  `patch` accepts an object merge `patch`; `delete` accepts only its key and
+  expected revision. Read/list operations and unknown fields are rejected.
+  Success returns `{ ok = true, results = {...} }` with one ordered result per
+  mutation. Failure returns `{ ok = false, error_kind, message,
+  mutation_index?, key? }`, where `mutation_index` is 1-based and stable kinds
+  include `invalid_request`, `revision_conflict`, `store_not_found`,
+  `quota_exceeded`, `patch_failed`, and `backend_failed`. A failed batch changes
+  no record. Mutation-specific failures include `mutation_index` and include
+  `key` when the failing mutation supplied a string key; a mutation rejected
+  for omitting `key` reports only its index. Whole-request validation failures
+  and namespace-wide `max_plugin_keys`/`max_plugin_bytes` quota failures omit
+  both. Capability or namespace denial raises a Lua runtime error instead
+  of returning this failure table; callers that must survive a missing or
+  revoked grant should invoke `plugin_db.batch` with `pcall`.
 - `botster.capabilities.config.get()`: returns the loaded plugin's own
   sanitized effective package configuration as `{ values = {...},
   missing_required = {...}, diagnostics = {...} }`. Values use the package
@@ -140,9 +159,24 @@ The initial capability helper is:
   absence in `pcall`.
 
 `plugin_db` helpers always use the loaded plugin key as the namespace; Lua code
-cannot select another plugin's namespace. Mutating helpers submit to
-`HubCapabilityRuntime` and drain the matching completion before returning, so a
-handler can read its just-committed state deterministically.
+cannot select another plugin's namespace. The synchronous Lua helpers prepare
+the admitted operation under `HubCapabilityRuntime`, release its shared lock,
+and execute the filesystem operation inside that plugin's isolated worker before
+returning. The general asynchronous `CapabilityOperation::PluginStore`
+submit/event surface remains single-record.
+
+`plugin_db.batch` validates revisions, patches, record size, final record count,
+and final aggregate namespace size before staging any durable change. It holds
+the concrete backend mutex continuously from restart recovery and snapshot load
+through staging, whole-namespace promotion, parent-directory synchronization,
+and cleanup, so existing single-record helpers cannot interleave or observe a
+partial generation. Staging and backup are private non-JSON sibling directories
+outside the live namespace. If a process stops between filesystem promotion
+steps, the next store access—including `get` or `list`—repairs the transaction
+shape under the same mutex and exposes either the complete old generation or
+the complete new generation. A successful return means the promoted namespace
+and its parent-directory durability barrier completed; a caller timeout remains
+ambiguous and should be reconciled with an authoritative read.
 
 `config.get` follows the same loaded-plugin namespace rule. It accepts no
 package name and cannot read another package's configuration. Package
