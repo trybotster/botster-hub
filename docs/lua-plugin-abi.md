@@ -116,10 +116,11 @@ The initial capability helper is:
   mutation_index?, key? }`, where `mutation_index` is 1-based and stable kinds
   include `invalid_request`, `revision_conflict`, `store_not_found`,
   `quota_exceeded`, `patch_failed`, and `backend_failed`. A failed batch changes
-  no record. Mutation-specific failures always include `mutation_index` and
-  `key`; namespace-wide `max_plugin_keys` and `max_plugin_bytes` quota failures
-  omit both because no single mutation owns them. Capability or namespace
-  denial raises a Lua runtime error instead
+  no record. Mutation-specific failures include `mutation_index` and include
+  `key` when the failing mutation supplied a string key; a mutation rejected
+  for omitting `key` reports only its index. Whole-request validation failures
+  and namespace-wide `max_plugin_keys`/`max_plugin_bytes` quota failures omit
+  both. Capability or namespace denial raises a Lua runtime error instead
   of returning this failure table; callers that must survive a missing or
   revoked grant should invoke `plugin_db.batch` with `pcall`.
 - `botster.capabilities.config.get()`: returns the loaded plugin's own

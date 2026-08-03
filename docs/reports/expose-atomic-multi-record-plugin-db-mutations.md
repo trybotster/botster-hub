@@ -52,8 +52,8 @@ target_id: tgt_7e208a0c76a44980a83b63af976b1f22
 - `tests/hub_lua_runtime_test.rs` — adds an enabled Project Pipelines-shaped
   package fixture and proves the MCP/plugin-worker/public-Lua path, typed
   no-change failures (including a late conflict and oversized-first batch),
-  live capability denial, runtime reconstruction, and all recoverable disk
-  shapes.
+  malformed missing-key attribution, live capability denial, runtime
+  reconstruction, and all recoverable disk shapes.
 - `docs/lua-plugin-abi.md` — documents the public request/result contract,
   synchronous worker-local reachability, limits, atomicity, durability, and
   read-path recovery.
@@ -82,7 +82,8 @@ edited in this run.
 - Empty batches, duplicate keys, unsupported operations, malformed/unknown
   fields, invalid keys, missing records, malformed patches, and final-snapshot
   quota violations return stable typed failures. A mutation-specific failure
-  includes a 1-based index and key; namespace-aggregate failures omit both.
+  includes a 1-based index and includes a key when the request supplied one;
+  whole-request and namespace-aggregate failures omit both.
   Final-snapshot key limits allow a delete+create replacement at the ceiling.
 - The final namespace candidate is complete before persistence begins. The
   backend mutex remains held from recovery/snapshot through validation,

@@ -957,6 +957,19 @@ return botster.register({
             key = "tickets/ticket-1",
           },
         } })
+        local missing_key = plugin_db.batch({ mutations = {
+          {
+            operation = "set",
+            key = "must-not-create-before-missing-key",
+            payload = { value = 1 },
+            expected_revision = 0,
+          },
+          {
+            operation = "set",
+            payload = { value = 2 },
+            expected_revision = 0,
+          },
+        } })
         local duplicate = plugin_db.batch({ mutations = {
           {
             operation = "set",
@@ -984,6 +997,7 @@ return botster.register({
           quota = quota,
           late_conflict = late_conflict,
           invalid = invalid,
+          missing_key = missing_key,
           duplicate = duplicate,
           missing = missing,
           records = plugin_db.list({}),
@@ -1377,6 +1391,10 @@ fn plugin_db_batch_atomically_commits_project_pipeline_lifecycle_and_returns_typ
         assert_eq!(failures[name]["mutation_index"], index, "{name} index");
         assert_eq!(failures[name]["key"], key, "{name} key");
     }
+    assert_eq!(failures["missing_key"]["ok"], false);
+    assert_eq!(failures["missing_key"]["error_kind"], "invalid_request");
+    assert_eq!(failures["missing_key"]["mutation_index"], 2);
+    assert!(failures["missing_key"]["key"].is_null());
     let entries = failures["records"]["entries"]
         .as_array()
         .expect("list entries after failures");
