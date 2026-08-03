@@ -91,7 +91,8 @@ edited in this run.
   Staging and backup are non-JSON sibling directories under `plugin-data/`.
   Unchanged records are hard-linked into staging, so only mutated records are
   JSON-encoded and file-synced; staging still performs a bounded namespace walk
-  and link operation per surviving record.
+  and link operation per surviving record. If a filesystem cannot create a
+  hard link, that record falls back to the ordinary encode/write/sync path.
 - Recovery deterministically discards pre-commit staging, restores a backed-up
   old generation when live is absent, retains a promoted live generation, and
   leaves an initially empty namespace empty. Existing `get` and `list` may
@@ -113,9 +114,10 @@ relevant existing tests were rerun instead.
 
 ## Verification and downstream proof
 
-- `./test.sh --lib plugin_store_batch -- --nocapture` — 5 passed, including
+- `./test.sh --lib plugin_store_batch -- --nocapture` — 6 passed, including
   exact per-record and aggregate quota attribution, legal replacement at the
-  key ceiling, failure injection, concurrency, hard-link reuse, and recovery.
+  key ceiling, failure injection, concurrency, hard-link reuse and fallback,
+  and recovery.
 - `./test.sh --test hub_lua_runtime_test plugin_db_batch_atomically_commits_project_pipeline_lifecycle_and_returns_typed_failures -- --exact --nocapture` — 1 passed; the complete enabled-package MCP → plugin worker → Lua → Hub store path completed in 0.23 seconds in the latest focused test process.
 - `./test.sh --test hub_lua_runtime_test plugin_db_batch_capability_denial_raises_a_lua_error -- --exact --nocapture` — 1 passed through an enabled MCP package without a `plugin_db` grant; `pcall` captured the raised namespace/capability denial.
 - `./test.sh --test hub_lua_runtime_test plugin_db_reads_recover_every_batch_directory_shape_before_a_subsequent_public_commit -- --exact --nocapture` — 1 passed across live+staging, backup+staging/no-live, live+backup, and initially-empty staging-only cases.

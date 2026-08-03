@@ -963,6 +963,7 @@ impl std::fmt::Debug for LocalPluginStoreBackend {
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BatchCommitPoint {
+    UnchangedRecordLinkAttempt,
     RecordStaged(usize),
     NamespaceBackedUp,
 }
@@ -1139,11 +1140,20 @@ impl LocalPluginStoreBackend {
         let mut staged_record_count = 0;
         for (key, record) in records {
             if namespace.exists() && !mutated_keys.contains(key) {
-                fs::hard_link(
-                    self.record_path(plugin_key, key),
-                    staging.join(format!("{}.json", encode_key(&key.0))),
-                )
-                .map_err(backend_error)?;
+                let destination = staging.join(format!("{}.json", encode_key(&key.0)));
+                #[cfg(test)]
+                let linked = self
+                    .run_batch_test_hook(BatchCommitPoint::UnchangedRecordLinkAttempt)
+                    .and_then(|()| {
+                        fs::hard_link(self.record_path(plugin_key, key), &destination)
+                            .map_err(backend_error)
+                    });
+                #[cfg(not(test))]
+                let linked = fs::hard_link(self.record_path(plugin_key, key), &destination)
+                    .map_err(backend_error);
+                if linked.is_err() {
+                    self.write_record_to(&staging, record)?;
+                }
             } else {
                 self.write_record_to(&staging, record)?;
             }
@@ -2332,6 +2342,74 @@ mod tests {
             ),
             preserved_inode,
             "unchanged records should be hard-linked into the promoted generation"
+        );
+    }
+
+    #[test]
+    fn plugin_store_batch_falls_back_to_writing_unchanged_records_when_linking_fails() {
+        let backend = test_backend("link-fallback");
+        let plugin_key = PluginKey("project-pipelines".to_string());
+        for (key, payload) in [
+            ("ticket", serde_json::json!({ "status": "open" })),
+            ("unchanged", serde_json::json!({ "value": "preserved" })),
+        ] {
+            backend
+                .set(
+                    &plugin_key,
+                    PluginStoreKey(key.to_string()),
+                    1,
+                    payload,
+                    Some(0),
+                    PluginStoreLimits::default(),
+                )
+                .expect("seed link fallback record");
+        }
+        #[cfg(unix)]
+        let original_inode = std::os::unix::fs::MetadataExt::ino(
+            &fs::metadata(
+                backend.record_path(&plugin_key, &PluginStoreKey("unchanged".to_string())),
+            )
+            .expect("stat unchanged record before fallback"),
+        );
+        backend.set_batch_test_hook(Arc::new(|point| {
+            if point == BatchCommitPoint::UnchangedRecordLinkAttempt {
+                return Err(CapabilityRuntimeError::new(
+                    CapabilityRuntimeErrorKind::BackendFailed,
+                    "injected unsupported hard link",
+                ));
+            }
+            Ok(())
+        }));
+
+        let result = backend.batch(
+            &plugin_key,
+            vec![set_mutation(
+                "ticket",
+                serde_json::json!({ "status": "active" }),
+                1,
+            )],
+            PluginStoreLimits::default(),
+        );
+
+        assert!(result.ok);
+        assert_eq!(
+            backend
+                .get(&plugin_key, &PluginStoreKey("unchanged".to_string()))
+                .expect("read unchanged fallback record")
+                .expect("unchanged fallback record exists")
+                .payload,
+            serde_json::json!({ "value": "preserved" })
+        );
+        #[cfg(unix)]
+        assert_ne!(
+            std::os::unix::fs::MetadataExt::ino(
+                &fs::metadata(
+                    backend.record_path(&plugin_key, &PluginStoreKey("unchanged".to_string())),
+                )
+                .expect("stat unchanged record after fallback"),
+            ),
+            original_inode,
+            "fallback should rewrite the unchanged record when linking fails"
         );
     }
 
