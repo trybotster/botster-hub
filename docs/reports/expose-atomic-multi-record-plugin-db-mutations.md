@@ -42,14 +42,18 @@ target_id: tgt_7e208a0c76a44980a83b63af976b1f22
 
 - `src/capabilities.rs` — adds the Hub-private batch model, final-candidate CAS/
   patch/quota validation, one-mutex whole-namespace staging/promotion/recovery,
-  typed results, deterministic failure hooks, concurrency proof, and recovery
-  tests.
+  typed results, hard-link reuse for unchanged records, deterministic failure
+  hooks, concurrency proof, and recovery tests. Per-record quota failures carry
+  their exact mutation index/key; namespace-aggregate quota failures do not
+  falsely attribute a mutation.
 - `src/lua_runtime.rs` — exposes `plugin_db.batch`, validates its strict Lua
   request shape, preserves failing mutation index/key, prepares under the shared
   capability runtime lock, and executes after releasing that lock.
 - `tests/hub_lua_runtime_test.rs` — adds an enabled Project Pipelines-shaped
   package fixture and proves the MCP/plugin-worker/public-Lua path, typed
-  no-change failures, runtime reconstruction, and all recoverable disk shapes.
+  no-change failures (including a late conflict and oversized-first batch),
+  live capability denial, runtime reconstruction, and all recoverable disk
+  shapes.
 - `docs/lua-plugin-abi.md` — documents the public request/result contract,
   synchronous worker-local reachability, limits, atomicity, durability, and
   read-path recovery.
@@ -78,12 +82,16 @@ edited in this run.
 - Empty batches, duplicate keys, unsupported operations, malformed/unknown
   fields, invalid keys, missing records, malformed patches, and final-snapshot
   quota violations return stable typed failures. A mutation-specific failure
-  includes a 1-based index and key.
+  includes a 1-based index and key; namespace-aggregate failures omit both.
+  Final-snapshot key limits allow a delete+create replacement at the ceiling.
 - The final namespace candidate is complete before persistence begins. The
   backend mutex remains held from recovery/snapshot through validation,
   staging, promotion, parent sync, and artifact cleanup.
 - Live records remain ordinary encoded `.json` files under the namespace.
   Staging and backup are non-JSON sibling directories under `plugin-data/`.
+  Unchanged records are hard-linked into staging, so only mutated records are
+  JSON-encoded and file-synced; staging still performs a bounded namespace walk
+  and link operation per surviving record.
 - Recovery deterministically discards pre-commit staging, restores a backed-up
   old generation when live is absent, retains a promoted live generation, and
   leaves an initially empty namespace empty. Existing `get` and `list` may
@@ -94,7 +102,10 @@ edited in this run.
 
 ## Deviations from plan
 
-None. The implementation follows approved plan revision 2. `README.md`,
+None. The implementation follows approved plan revision 2. Review corrections
+clarified typed quota attribution and capability-denial documentation, removed
+the test-only sequential production branch, and reduced staging write cost
+without changing the approved contract. `README.md`,
 `examples/project-pipelines/README.md`, `src/profile.rs`, and
 `tests/hub_capability_runtime_test.rs` did not need edits because the existing
 summary, capability grant, and async-runtime contract remain accurate; their
@@ -102,8 +113,11 @@ relevant existing tests were rerun instead.
 
 ## Verification and downstream proof
 
-- `./test.sh --lib plugin_store_batch -- --nocapture` — 4 passed.
-- `./test.sh --test hub_lua_runtime_test plugin_db_batch_atomically_commits_project_pipeline_lifecycle_and_returns_typed_failures -- --exact --nocapture` — 1 passed; the complete enabled-package MCP → plugin worker → Lua → Hub store path completed in 0.22 seconds in the latest focused test process.
+- `./test.sh --lib plugin_store_batch -- --nocapture` — 5 passed, including
+  exact per-record and aggregate quota attribution, legal replacement at the
+  key ceiling, failure injection, concurrency, hard-link reuse, and recovery.
+- `./test.sh --test hub_lua_runtime_test plugin_db_batch_atomically_commits_project_pipeline_lifecycle_and_returns_typed_failures -- --exact --nocapture` — 1 passed; the complete enabled-package MCP → plugin worker → Lua → Hub store path completed in 0.23 seconds in the latest focused test process.
+- `./test.sh --test hub_lua_runtime_test plugin_db_batch_capability_denial_raises_a_lua_error -- --exact --nocapture` — 1 passed through an enabled MCP package without a `plugin_db` grant; `pcall` captured the raised namespace/capability denial.
 - `./test.sh --test hub_lua_runtime_test plugin_db_reads_recover_every_batch_directory_shape_before_a_subsequent_public_commit -- --exact --nocapture` — 1 passed across live+staging, backup+staging/no-live, live+backup, and initially-empty staging-only cases.
 - Legacy Lua regression tests for missing get and missing patch/delete — both
   passed with their exact repository-wrapper commands.
@@ -114,10 +128,14 @@ relevant existing tests were rerun instead.
 - `cargo clippy --all-targets --all-features -- -D warnings` — passed.
 - `./test.sh` — passed: all default repository tests and doctests; 1 documented
   large local adversarial test remained ignored by the repository default.
-- Negative control:
-  `BOTSTER_PLUGIN_DB_BATCH_ABLATION=sequential ./test.sh --lib capabilities::tests::plugin_store_batch_failure_after_staged_progress_leaves_live_snapshot_unchanged -- --exact --nocapture`
-  failed with exit 101 because the ticket changed from `open` to `active` after
-  the injected first live write. The same exact test without the ablation passed.
+- Negative control: the production `LocalPluginStoreBackend::batch` was
+  temporarily reverted in this run worktree to write each mutation directly
+  and sequentially, with no environment switch or shipped alternate path.
+  `./test.sh --test hub_lua_runtime_test plugin_db_batch_atomically_commits_project_pipeline_lifecycle_and_returns_typed_failures -- --exact --nocapture`
+  failed with exit 101 at the late-conflict assertion (reported index 1 instead
+  of 2 after writing the first record). The temporary implementation was then
+  removed; `rg` confirmed no sequential-ablation symbol remained, and the same
+  exact public runtime test passed.
 - `git diff --check` — passed.
 - Provenance before the implementation commit: Hub plan HEAD
   `bf96da77ed6aea54cb6f1c50bd36889a91ccc81c`; base
@@ -129,7 +147,9 @@ relevant existing tests were rerun instead.
 
 - The existing backend mutex is global, so a batch's bounded filesystem sync
   window serializes plugin-store access across namespaces. The 1,024-key/4 MiB
-  limits bound the work; this ticket does not introduce per-namespace locks.
+  limits bound the work. Promotion performs a namespace walk and hard-link per
+  unchanged record but encodes and file-syncs only mutated records; this ticket
+  does not introduce per-namespace locks.
 - A host filesystem failure after rename visibility but before the final
   durability/cleanup barrier returns `backend_failed`; callers must reconcile
   ambiguous transport or storage failures with an authoritative read. Success

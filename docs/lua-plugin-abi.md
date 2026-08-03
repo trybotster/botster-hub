@@ -116,7 +116,9 @@ The initial capability helper is:
   mutation_index?, key? }`, where `mutation_index` is 1-based and stable kinds
   include `invalid_request`, `revision_conflict`, `store_not_found`,
   `quota_exceeded`, `patch_failed`, and `backend_failed`. A failed batch changes
-  no record.
+  no record. Capability or namespace denial raises a Lua runtime error instead
+  of returning this failure table; callers that must survive a missing or
+  revoked grant should invoke `plugin_db.batch` with `pcall`.
 - `botster.capabilities.config.get()`: returns the loaded plugin's own
   sanitized effective package configuration as `{ values = {...},
   missing_required = {...}, diagnostics = {...} }`. Values use the package

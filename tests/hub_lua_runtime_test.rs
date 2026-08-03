@@ -930,6 +930,26 @@ return botster.register({
             payload = { value = args.oversized },
             expected_revision = 0,
           },
+          {
+            operation = "set",
+            key = "small",
+            payload = { value = 1 },
+            expected_revision = 0,
+          },
+        } })
+        local late_conflict = plugin_db.batch({ mutations = {
+          {
+            operation = "patch",
+            key = "runs/run-1",
+            patch = { status = "must-not-commit" },
+            expected_revision = 1,
+          },
+          {
+            operation = "patch",
+            key = "tickets/ticket-1",
+            patch = { status = "must-not-commit" },
+            expected_revision = 1,
+          },
         } })
         local invalid = plugin_db.batch({ mutations = {
           {
@@ -962,6 +982,7 @@ return botster.register({
           conflict = conflict,
           patch = patch,
           quota = quota,
+          late_conflict = late_conflict,
           invalid = invalid,
           duplicate = duplicate,
           missing = missing,
@@ -1028,6 +1049,67 @@ return botster.register({
     policy
         .enable("project-pipelines", "enable atomic plugin-db package")
         .expect("enable atomic plugin-db package");
+    policy.registry().clone()
+}
+
+fn install_denied_plugin_db_batch_registry(name: &str) -> PackageRegistry {
+    let root = PathBuf::from("target")
+        .join("botster-hub-test-data")
+        .join("lua-runtime-packages")
+        .join(name);
+    let source_root = std::env::current_dir().expect("current dir").join(&root);
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).expect("create denied plugin-db package root");
+    fs::write(
+        root.join("plugin.lua"),
+        r#"
+local plugin_db = botster.capabilities.plugin_db
+
+return botster.register({
+  tools = {
+    {
+      name = "plugin_db_denied.batch",
+      description = "Prove plugin_db batch capability denial raises a Lua error.",
+      handler = "batch",
+      call = function()
+        local ok, err = pcall(plugin_db.batch, { mutations = {
+          {
+            operation = "set",
+            key = "forbidden",
+            payload = { value = true },
+            expected_revision = 0,
+          },
+        } })
+        return { ok = ok, error = tostring(err) }
+      end,
+    },
+  },
+})
+"#,
+    )
+    .expect("write denied plugin-db plugin");
+    fs::write(
+        root.join("botster-package.json"),
+        serde_json::json!({
+            "name": "plugin-db-denied",
+            "version": "1.0.0",
+            "kind": "plugin",
+            "botster": ">=0.1.0",
+            "source": { "type": "path", "path": source_root.display().to_string() },
+            "capabilities": [{ "surface": "mcp" }],
+            "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }]
+        })
+        .to_string(),
+    )
+    .expect("write denied plugin-db manifest");
+
+    let mut policy = default_package_policy();
+    policy
+        .install_local_path(&root, "install denied plugin-db lua package")
+        .expect("install denied plugin-db package");
+    policy
+        .enable("plugin-db-denied", "enable denied plugin-db package")
+        .expect("enable denied plugin-db package");
     policy.registry().clone()
 }
 
@@ -1285,6 +1367,7 @@ fn plugin_db_batch_atomically_commits_project_pipeline_lifecycle_and_returns_typ
         ("conflict", "revision_conflict", 1, "tickets/ticket-1"),
         ("patch", "patch_failed", 1, "tickets/ticket-1"),
         ("quota", "quota_exceeded", 1, "oversized"),
+        ("late_conflict", "revision_conflict", 2, "tickets/ticket-1"),
         ("invalid", "invalid_request", 1, "tickets/ticket-1"),
         ("duplicate", "invalid_request", 2, "duplicate"),
         ("missing", "store_not_found", 1, "missing"),
@@ -1312,6 +1395,7 @@ fn plugin_db_batch_atomically_commits_project_pipeline_lifecycle_and_returns_typ
     assert_eq!(unchanged["ticket"]["payload"]["status"], "active");
     assert_eq!(unchanged["ticket"]["revision"], 2);
     assert_eq!(unchanged["run"]["revision"], 1);
+    assert_eq!(unchanged["run"]["payload"]["status"], "active");
     assert_eq!(unchanged["step"]["revision"], 1);
     assert_eq!(unchanged["event"]["revision"], 1);
     drop(hub);
@@ -1336,6 +1420,30 @@ fn plugin_db_batch_atomically_commits_project_pipeline_lifecycle_and_returns_typ
             .expect("restarted list entries")
             .len(),
         4
+    );
+    let _ = fs::remove_dir_all(data_directory);
+}
+
+#[test]
+fn plugin_db_batch_capability_denial_raises_a_lua_error() {
+    let registry = install_denied_plugin_db_batch_registry("plugin-db-batch-denied");
+    let data_directory = unique_short_test_dir("plugin-db-batch-denied");
+    let mut hub = explicit_runtime_in("plugin-db-batch-denied", data_directory.clone());
+    hub.load_lua_plugin_package(&registry, "plugin-db-denied")
+        .expect("load package without plugin-db grant");
+
+    let denied = hub
+        .call_plugin_mcp_tool(botster_hub::McpCallRequest {
+            name: "plugin_db_denied.batch".to_string(),
+            arguments: serde_json::json!({}),
+        })
+        .expect("pcall should capture capability denial");
+    assert_eq!(denied["ok"], false);
+    assert!(
+        denied["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("plugin-store namespace must exactly match")),
+        "unexpected capability denial: {denied}"
     );
     let _ = fs::remove_dir_all(data_directory);
 }
