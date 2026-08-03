@@ -33,8 +33,22 @@ fn explicit_runtime(name: &str) -> HubRuntime {
 }
 
 fn explicit_runtime_in(name: &str, data_directory: PathBuf) -> HubRuntime {
+    explicit_runtime_in_with_cleanup(name, data_directory, true)
+}
+
+fn explicit_runtime_preserving(name: &str, data_directory: PathBuf) -> HubRuntime {
+    explicit_runtime_in_with_cleanup(name, data_directory, false)
+}
+
+fn explicit_runtime_in_with_cleanup(
+    name: &str,
+    data_directory: PathBuf,
+    clear_data_directory: bool,
+) -> HubRuntime {
     ensure_session_worker_binary();
-    let _ = std::fs::remove_dir_all(&data_directory);
+    if clear_data_directory {
+        let _ = std::fs::remove_dir_all(&data_directory);
+    }
     let config = HubStartupOptions {
         host: HostIdentityOptions {
             id: format!("hub-lua-runtime-test-{name}"),
@@ -66,6 +80,28 @@ fn unique_short_test_dir(name: &str) -> PathBuf {
         .expect("system time after epoch")
         .as_nanos();
     PathBuf::from("/tmp").join(format!("bh-{name}-{nanos}"))
+}
+
+fn write_plugin_store_generation(directory: &std::path::Path, status: &str, revision: u64) {
+    fs::create_dir_all(directory).expect("create plugin-store generation");
+    let key = "tickets/ticket-1";
+    let encoded_key = key
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    fs::write(
+        directory.join(format!("{encoded_key}.json")),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "plugin_key": "project-pipelines",
+            "key": key,
+            "schema_version": 1,
+            "revision": revision,
+            "payload": { "id": "ticket-1", "status": status }
+        }))
+        .expect("encode plugin-store fixture record"),
+    )
+    .expect("write plugin-store fixture record");
 }
 
 fn ui_action_request(
@@ -791,6 +827,306 @@ return botster.register({
     policy.registry().clone()
 }
 
+fn install_atomic_plugin_db_registry(name: &str) -> PackageRegistry {
+    let root = PathBuf::from("target")
+        .join("botster-hub-test-data")
+        .join("lua-runtime-packages")
+        .join(name);
+    let source_root = std::env::current_dir().expect("current dir").join(&root);
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).expect("create atomic plugin-db package root");
+    fs::write(
+        root.join("plugin.lua"),
+        r#"
+local plugin_db = botster.capabilities.plugin_db
+
+local function read(key)
+  return plugin_db.get({ key = key }).record
+end
+
+return botster.register({
+  tools = {
+    {
+      name = "plugin_db_atomic.lifecycle",
+      description = "Commit one Project Pipelines-shaped lifecycle transition.",
+      handler = "lifecycle",
+      call = function()
+        if read("tickets/ticket-1") == nil then
+          plugin_db.set({
+            key = "tickets/ticket-1",
+            schema_version = 1,
+            payload = { id = "ticket-1", status = "open" },
+            expected_revision = 0,
+          })
+        end
+        local result = plugin_db.batch({ mutations = {
+          {
+            operation = "patch",
+            key = "tickets/ticket-1",
+            patch = { status = "active", current_run_id = "run-1" },
+            expected_revision = 1,
+          },
+          {
+            operation = "set",
+            key = "runs/run-1",
+            schema_version = 1,
+            payload = { id = "run-1", ticket_id = "ticket-1", status = "active", current_step_id = "step-1" },
+            expected_revision = 0,
+          },
+          {
+            operation = "set",
+            key = "steps/step-1",
+            schema_version = 1,
+            payload = { id = "step-1", run_id = "run-1", status = "active" },
+            expected_revision = 0,
+          },
+          {
+            operation = "set",
+            key = "events/event-1",
+            schema_version = 1,
+            payload = { id = "event-1", run_id = "run-1", kind = "run.started" },
+            expected_revision = 0,
+          },
+        } })
+        return {
+          result = result,
+          ticket = read("tickets/ticket-1"),
+          run = read("runs/run-1"),
+          step = read("steps/step-1"),
+          event = read("events/event-1"),
+        }
+      end,
+    },
+    {
+      name = "plugin_db_atomic.failures",
+      description = "Return typed atomic conflict, patch, and quota failures.",
+      handler = "failures",
+      call = function(args)
+        local conflict = plugin_db.batch({ mutations = {
+          {
+            operation = "patch",
+            key = "tickets/ticket-1",
+            patch = { status = "closed" },
+            expected_revision = 1,
+          },
+          {
+            operation = "delete",
+            key = "runs/run-1",
+            expected_revision = 1,
+          },
+        } })
+        local patch = plugin_db.batch({ mutations = {
+          {
+            operation = "patch",
+            key = "tickets/ticket-1",
+            patch = "not-an-object",
+            expected_revision = 2,
+          },
+        } })
+        local quota = plugin_db.batch({ mutations = {
+          {
+            operation = "set",
+            key = "oversized",
+            payload = { value = args.oversized },
+            expected_revision = 0,
+          },
+          {
+            operation = "set",
+            key = "small",
+            payload = { value = 1 },
+            expected_revision = 0,
+          },
+        } })
+        local late_conflict = plugin_db.batch({ mutations = {
+          {
+            operation = "patch",
+            key = "runs/run-1",
+            patch = { status = "must-not-commit" },
+            expected_revision = 1,
+          },
+          {
+            operation = "patch",
+            key = "tickets/ticket-1",
+            patch = { status = "must-not-commit" },
+            expected_revision = 1,
+          },
+        } })
+        local invalid = plugin_db.batch({ mutations = {
+          {
+            operation = "get",
+            key = "tickets/ticket-1",
+          },
+        } })
+        local missing_key = plugin_db.batch({ mutations = {
+          {
+            operation = "set",
+            key = "must-not-create-before-missing-key",
+            payload = { value = 1 },
+            expected_revision = 0,
+          },
+          {
+            operation = "set",
+            payload = { value = 2 },
+            expected_revision = 0,
+          },
+        } })
+        local duplicate = plugin_db.batch({ mutations = {
+          {
+            operation = "set",
+            key = "duplicate",
+            payload = { value = 1 },
+            expected_revision = 0,
+          },
+          {
+            operation = "set",
+            key = "duplicate",
+            payload = { value = 2 },
+            expected_revision = 0,
+          },
+        } })
+        local missing = plugin_db.batch({ mutations = {
+          {
+            operation = "delete",
+            key = "missing",
+            expected_revision = 0,
+          },
+        } })
+        return {
+          conflict = conflict,
+          patch = patch,
+          quota = quota,
+          late_conflict = late_conflict,
+          invalid = invalid,
+          missing_key = missing_key,
+          duplicate = duplicate,
+          missing = missing,
+          records = plugin_db.list({}),
+        }
+      end,
+    },
+    {
+      name = "plugin_db_atomic.snapshot",
+      description = "Read the committed lifecycle after runtime reconstruction.",
+      handler = "snapshot",
+      call = function()
+        return {
+          ticket = read("tickets/ticket-1"),
+          run = read("runs/run-1"),
+          step = read("steps/step-1"),
+          event = read("events/event-1"),
+          records = plugin_db.list({}),
+        }
+      end,
+    },
+    {
+      name = "plugin_db_atomic.recovery_marker",
+      description = "Commit a batch after read-path recovery.",
+      handler = "recovery_marker",
+      call = function()
+        return plugin_db.batch({ mutations = {
+          {
+            operation = "set",
+            key = "recovery-marker",
+            payload = { recovered = true },
+            expected_revision = 0,
+          },
+        } })
+      end,
+    },
+  },
+})
+"#,
+    )
+    .expect("write atomic plugin-db plugin");
+    fs::write(
+        root.join("botster-package.json"),
+        serde_json::json!({
+            "name": "project-pipelines",
+            "version": "1.0.0",
+            "kind": "plugin",
+            "botster": ">=0.1.0",
+            "source": { "type": "path", "path": source_root.display().to_string() },
+            "capabilities": [
+                { "surface": "mcp" },
+                { "surface": "plugin_db", "scope": "project-pipelines" }
+            ],
+            "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }]
+        })
+        .to_string(),
+    )
+    .expect("write atomic plugin-db manifest");
+
+    let mut policy = default_package_policy();
+    policy
+        .install_local_path(&root, "install atomic plugin-db lua package")
+        .expect("install atomic plugin-db package");
+    policy
+        .enable("project-pipelines", "enable atomic plugin-db package")
+        .expect("enable atomic plugin-db package");
+    policy.registry().clone()
+}
+
+fn install_denied_plugin_db_batch_registry(name: &str) -> PackageRegistry {
+    let root = PathBuf::from("target")
+        .join("botster-hub-test-data")
+        .join("lua-runtime-packages")
+        .join(name);
+    let source_root = std::env::current_dir().expect("current dir").join(&root);
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).expect("create denied plugin-db package root");
+    fs::write(
+        root.join("plugin.lua"),
+        r#"
+local plugin_db = botster.capabilities.plugin_db
+
+return botster.register({
+  tools = {
+    {
+      name = "plugin_db_denied.batch",
+      description = "Prove plugin_db batch capability denial raises a Lua error.",
+      handler = "batch",
+      call = function()
+        local ok, err = pcall(plugin_db.batch, { mutations = {
+          {
+            operation = "set",
+            key = "forbidden",
+            payload = { value = true },
+            expected_revision = 0,
+          },
+        } })
+        return { ok = ok, error = tostring(err) }
+      end,
+    },
+  },
+})
+"#,
+    )
+    .expect("write denied plugin-db plugin");
+    fs::write(
+        root.join("botster-package.json"),
+        serde_json::json!({
+            "name": "plugin-db-denied",
+            "version": "1.0.0",
+            "kind": "plugin",
+            "botster": ">=0.1.0",
+            "source": { "type": "path", "path": source_root.display().to_string() },
+            "capabilities": [{ "surface": "mcp" }],
+            "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }]
+        })
+        .to_string(),
+    )
+    .expect("write denied plugin-db manifest");
+
+    let mut policy = default_package_policy();
+    policy
+        .install_local_path(&root, "install denied plugin-db lua package")
+        .expect("install denied plugin-db package");
+    policy
+        .enable("plugin-db-denied", "enable denied plugin-db package")
+        .expect("enable denied plugin-db package");
+    policy.registry().clone()
+}
+
 fn install_event_probe_registry(name: &str) -> PackageRegistry {
     let root = PathBuf::from("target")
         .join("botster-hub-test-data")
@@ -1004,6 +1340,231 @@ fn plugin_db_missing_patch_and_delete_still_raise_runtime_errors() {
             .unwrap()
             .contains("plugin_db operation failed: plugin-store record was not found")
     );
+}
+
+#[test]
+fn plugin_db_batch_atomically_commits_project_pipeline_lifecycle_and_returns_typed_failures() {
+    let registry = install_atomic_plugin_db_registry("plugin-db-atomic-lifecycle");
+    let data_directory = unique_short_test_dir("plugin-db-atomic");
+    let mut hub = explicit_runtime_in("plugin-db-atomic", data_directory.clone());
+    hub.load_lua_plugin_package(&registry, "project-pipelines")
+        .expect("load atomic plugin-db package");
+
+    let lifecycle = hub
+        .call_plugin_mcp_tool(botster_hub::McpCallRequest {
+            name: "plugin_db_atomic.lifecycle".to_string(),
+            arguments: serde_json::json!({}),
+        })
+        .expect("atomic lifecycle tool should complete");
+    assert_eq!(lifecycle["result"]["ok"], true);
+    assert_eq!(
+        lifecycle["result"]["results"]
+            .as_array()
+            .expect("ordered mutation results")
+            .len(),
+        4
+    );
+    assert_eq!(lifecycle["ticket"]["payload"]["status"], "active");
+    assert_eq!(lifecycle["ticket"]["revision"], 2);
+    assert_eq!(lifecycle["run"]["payload"]["current_step_id"], "step-1");
+    assert_eq!(lifecycle["run"]["revision"], 1);
+    assert_eq!(lifecycle["step"]["payload"]["status"], "active");
+    assert_eq!(lifecycle["event"]["payload"]["kind"], "run.started");
+
+    let failures = hub
+        .call_plugin_mcp_tool(botster_hub::McpCallRequest {
+            name: "plugin_db_atomic.failures".to_string(),
+            arguments: serde_json::json!({ "oversized": "x".repeat(65 * 1024) }),
+        })
+        .expect("typed failure probe should complete");
+    for (name, kind, index, key) in [
+        ("conflict", "revision_conflict", 1, "tickets/ticket-1"),
+        ("patch", "patch_failed", 1, "tickets/ticket-1"),
+        ("quota", "quota_exceeded", 1, "oversized"),
+        ("late_conflict", "revision_conflict", 2, "tickets/ticket-1"),
+        ("invalid", "invalid_request", 1, "tickets/ticket-1"),
+        ("duplicate", "invalid_request", 2, "duplicate"),
+        ("missing", "store_not_found", 1, "missing"),
+    ] {
+        assert_eq!(failures[name]["ok"], false, "{name} must fail");
+        assert_eq!(failures[name]["error_kind"], kind, "{name} kind");
+        assert_eq!(failures[name]["mutation_index"], index, "{name} index");
+        assert_eq!(failures[name]["key"], key, "{name} key");
+    }
+    assert_eq!(failures["missing_key"]["ok"], false);
+    assert_eq!(failures["missing_key"]["error_kind"], "invalid_request");
+    assert_eq!(failures["missing_key"]["mutation_index"], 2);
+    assert!(failures["missing_key"]["key"].is_null());
+    let entries = failures["records"]["entries"]
+        .as_array()
+        .expect("list entries after failures");
+    assert_eq!(entries.len(), 4, "failed batches must create no records");
+    assert!(entries.iter().all(|entry| {
+        entry["revision"]
+            .as_u64()
+            .is_some_and(|revision| revision <= 2)
+    }));
+    let unchanged = hub
+        .call_plugin_mcp_tool(botster_hub::McpCallRequest {
+            name: "plugin_db_atomic.snapshot".to_string(),
+            arguments: serde_json::json!({}),
+        })
+        .expect("failed batches leave lifecycle payloads readable");
+    assert_eq!(unchanged["ticket"]["payload"]["status"], "active");
+    assert_eq!(unchanged["ticket"]["revision"], 2);
+    assert_eq!(unchanged["run"]["revision"], 1);
+    assert_eq!(unchanged["run"]["payload"]["status"], "active");
+    assert_eq!(unchanged["step"]["revision"], 1);
+    assert_eq!(unchanged["event"]["revision"], 1);
+    drop(hub);
+
+    let mut restarted = explicit_runtime_preserving("plugin-db-atomic", data_directory.clone());
+    restarted
+        .load_lua_plugin_package(&registry, "project-pipelines")
+        .expect("reload atomic plugin-db package");
+    let snapshot = restarted
+        .call_plugin_mcp_tool(botster_hub::McpCallRequest {
+            name: "plugin_db_atomic.snapshot".to_string(),
+            arguments: serde_json::json!({}),
+        })
+        .expect("read committed lifecycle after restart");
+    assert_eq!(snapshot["ticket"]["payload"]["status"], "active");
+    assert_eq!(snapshot["run"]["payload"]["status"], "active");
+    assert_eq!(snapshot["step"]["payload"]["status"], "active");
+    assert_eq!(snapshot["event"]["payload"]["kind"], "run.started");
+    assert_eq!(
+        snapshot["records"]["entries"]
+            .as_array()
+            .expect("restarted list entries")
+            .len(),
+        4
+    );
+    let _ = fs::remove_dir_all(data_directory);
+}
+
+#[test]
+fn plugin_db_batch_capability_denial_raises_a_lua_error() {
+    let registry = install_denied_plugin_db_batch_registry("plugin-db-batch-denied");
+    let data_directory = unique_short_test_dir("plugin-db-batch-denied");
+    let mut hub = explicit_runtime_in("plugin-db-batch-denied", data_directory.clone());
+    hub.load_lua_plugin_package(&registry, "plugin-db-denied")
+        .expect("load package without plugin-db grant");
+
+    let denied = hub
+        .call_plugin_mcp_tool(botster_hub::McpCallRequest {
+            name: "plugin_db_denied.batch".to_string(),
+            arguments: serde_json::json!({}),
+        })
+        .expect("pcall should capture capability denial");
+    assert_eq!(denied["ok"], false);
+    assert!(
+        denied["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("plugin-store namespace must exactly match")),
+        "unexpected capability denial: {denied}"
+    );
+    let _ = fs::remove_dir_all(data_directory);
+}
+
+#[test]
+fn plugin_db_reads_recover_every_batch_directory_shape_before_a_subsequent_public_commit() {
+    let registry = install_atomic_plugin_db_registry("plugin-db-batch-recovery");
+    let cases = [
+        (
+            "live-staging",
+            Some(("old", 1)),
+            None,
+            Some(("staged", 2)),
+            Some("old"),
+        ),
+        (
+            "backup-staging",
+            None,
+            Some(("old", 1)),
+            Some(("staged", 2)),
+            Some("old"),
+        ),
+        (
+            "live-backup",
+            Some(("new", 2)),
+            Some(("old", 1)),
+            None,
+            Some("new"),
+        ),
+        (
+            "initially-empty-staging",
+            None,
+            None,
+            Some(("staged", 1)),
+            None,
+        ),
+    ];
+
+    for (name, live, backup, staging, expected_status) in cases {
+        let data_directory = unique_short_test_dir(name);
+        let plugin_data = data_directory.join("plugin-data");
+        let live_directory = plugin_data.join("project-pipelines");
+        let staging_directory = plugin_data.join(".project-pipelines.batch-staging");
+        let backup_directory = plugin_data.join(".project-pipelines.batch-backup");
+        if let Some((status, revision)) = live {
+            write_plugin_store_generation(&live_directory, status, revision);
+        }
+        if let Some((status, revision)) = backup {
+            write_plugin_store_generation(&backup_directory, status, revision);
+        }
+        if let Some((status, revision)) = staging {
+            write_plugin_store_generation(&staging_directory, status, revision);
+        }
+
+        let mut hub = explicit_runtime_preserving(name, data_directory.clone());
+        hub.load_lua_plugin_package(&registry, "project-pipelines")
+            .expect("load recovery probe package");
+        let snapshot = hub
+            .call_plugin_mcp_tool(botster_hub::McpCallRequest {
+                name: "plugin_db_atomic.snapshot".to_string(),
+                arguments: serde_json::json!({}),
+            })
+            .expect("public get/list should recover transaction artifacts");
+
+        match expected_status {
+            Some(status) => {
+                assert_eq!(snapshot["ticket"]["payload"]["status"], status, "{name}");
+                assert_eq!(
+                    snapshot["records"]["entries"]
+                        .as_array()
+                        .expect("recovered entries")
+                        .len(),
+                    1,
+                    "{name}"
+                );
+            }
+            None => {
+                assert!(snapshot["ticket"].is_null(), "{name}");
+                assert_eq!(
+                    snapshot["records"]["entries"]
+                        .as_array()
+                        .expect("empty recovered entries")
+                        .len(),
+                    0,
+                    "{name}"
+                );
+            }
+        }
+        assert!(!staging_directory.exists(), "{name} staging cleanup");
+        assert!(!backup_directory.exists(), "{name} backup cleanup");
+
+        let marker = hub
+            .call_plugin_mcp_tool(botster_hub::McpCallRequest {
+                name: "plugin_db_atomic.recovery_marker".to_string(),
+                arguments: serde_json::json!({}),
+            })
+            .expect("batch should commit after recovery");
+        assert_eq!(marker["ok"], true, "{name}");
+        assert!(!staging_directory.exists(), "{name} staging after commit");
+        assert!(!backup_directory.exists(), "{name} backup after commit");
+        drop(hub);
+        let _ = fs::remove_dir_all(data_directory);
+    }
 }
 
 #[test]

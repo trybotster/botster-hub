@@ -27,7 +27,7 @@ use botster_core_daemon::RoutedEnvelopeDeliveryStateResult;
 use mlua::{Function, HookTriggers, Lua, LuaOptions, LuaSerdeExt, StdLib, Table, Value, VmState};
 use serde_json::json;
 
-use crate::capabilities::HubCapabilityRuntime;
+use crate::capabilities::{HubCapabilityRuntime, PluginStoreBatchMutation, PluginStoreBatchResult};
 use crate::lifecycle::{HubPluginEventHandler, HubPluginRuntimeBundle};
 use crate::packages::{PackageConfigurationView, PackageRecord, PreparedLocalPackage};
 use crate::runtime::{SharedSessionTemplateSpawner, SharedSpawnTargets, SharedWorktrees};
@@ -1039,7 +1039,89 @@ fn plugin_db_table(
             })?,
         )?;
     }
+    let batch_runtime = capabilities.clone();
+    let batch_plugin_key = plugin_key.clone();
+    plugin_db.set(
+        "batch",
+        lua.create_function(move |lua, args: Value| {
+            execute_plugin_store_batch_for_lua(
+                lua,
+                batch_runtime.clone(),
+                batch_plugin_key.clone(),
+                args,
+            )
+        })?,
+    )?;
     Ok(plugin_db)
+}
+
+fn execute_plugin_store_batch_for_lua(
+    lua: &Lua,
+    capabilities: SharedHubCapabilityRuntime,
+    plugin_key: PluginKey,
+    args: Value,
+) -> Result<Value, mlua::Error> {
+    let value = lua.from_value::<serde_json::Value>(args)?;
+    let Some(object) = value.as_object() else {
+        return lua.to_value(&PluginStoreBatchResult::failure(
+            botster_core::CapabilityRuntimeError::new(
+                CapabilityRuntimeErrorKind::InvalidRequest,
+                "plugin_db.batch requires an object",
+            ),
+            None,
+            None,
+        ));
+    };
+    if object.len() != 1 || !object.contains_key("mutations") {
+        return lua.to_value(&PluginStoreBatchResult::failure(
+            botster_core::CapabilityRuntimeError::new(
+                CapabilityRuntimeErrorKind::InvalidRequest,
+                "plugin_db.batch accepts only mutations",
+            ),
+            None,
+            None,
+        ));
+    }
+    let Some(raw_mutations) = value.get("mutations").and_then(serde_json::Value::as_array) else {
+        return lua.to_value(&PluginStoreBatchResult::failure(
+            botster_core::CapabilityRuntimeError::new(
+                CapabilityRuntimeErrorKind::InvalidRequest,
+                "plugin_db.batch mutations must be an array",
+            ),
+            None,
+            None,
+        ));
+    };
+    let mut mutations = Vec::with_capacity(raw_mutations.len());
+    for (index, raw_mutation) in raw_mutations.iter().enumerate() {
+        match serde_json::from_value::<PluginStoreBatchMutation>(raw_mutation.clone()) {
+            Ok(mutation) => mutations.push(mutation),
+            Err(error) => {
+                let key = raw_mutation
+                    .get("key")
+                    .and_then(serde_json::Value::as_str)
+                    .map(|key| PluginStoreKey(key.to_string()));
+                return lua.to_value(&PluginStoreBatchResult::failure(
+                    botster_core::CapabilityRuntimeError::new(
+                        CapabilityRuntimeErrorKind::InvalidRequest,
+                        format!("plugin_db.batch mutations are invalid: {error}"),
+                    ),
+                    Some(index + 1),
+                    key,
+                ));
+            }
+        }
+    }
+    let prepared = {
+        let runtime = capabilities.lock().map_err(|_| {
+            mlua::Error::RuntimeError("capability runtime lock poisoned".to_string())
+        })?;
+        runtime
+            .prepare_plugin_store_batch(&plugin_key, &plugin_key.0, mutations)
+            .map_err(|error| mlua::Error::RuntimeError(error.to_string()))?
+    };
+
+    lua.to_value(&prepared.execute())
 }
 
 fn plugin_store_operation_from_lua(
