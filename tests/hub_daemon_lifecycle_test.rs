@@ -680,9 +680,48 @@ fn write_local_plugin_package(root: &Path) {
     }
   ]
 }
+
 "#,
     )
     .expect("write local package manifest");
+}
+
+fn write_entity_provider_plugin_package(root: &Path) {
+    fs::create_dir_all(root).expect("create entity provider package root");
+    fs::write(
+        root.join("botster-package.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "name": "botster.plugin-contract-matrix", "version": "1.0.0", "kind": "plugin",
+            "botster": ">=0.1.0",
+            "source": { "type": "path", "path": root.canonicalize().expect("provider package path") },
+            "capabilities": [{ "surface": "surfaces" }],
+            "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }],
+            "surfaces": [{ "id": "home", "kind": "app", "title": "Pipelines", "supports": ["render"] }]
+        }))
+        .expect("serialize entity provider manifest"),
+    )
+    .expect("write entity provider manifest");
+    fs::write(
+        root.join("plugin.lua"),
+        r#"
+local generation = 0
+local family = "bns1_626f74737465722e706c7567696e2d636f6e74726163742d6d6174726978.run"
+return botster.register({ handlers = {
+  { id = "home", kind = "surface_route", descriptor_id = "home", call = function()
+      return { type = "panel", id = "home", children = {{ ["$kind"] = "bind_list",
+        source = "/" .. family, item_template = { type = "text",
+          id = { ["$bind"] = "@/id" }, props = { text = { ["$bind"] = "@/status" } } } }} }
+    end },
+  { id = "runs", kind = "entity_provider", descriptor_id = family,
+    descriptor = { entity_type = family, id_field = "id" }, call = function()
+      generation = generation + 1
+      return { type = "entity_snapshot", entity_type = family, snapshot_seq = generation,
+        items = {{ id = "run-1", status = "generation-" .. generation }} }
+    end },
+} })
+"#,
+    )
+    .expect("write entity provider plugin");
 }
 
 fn write_resource_bound_plugin_package(root: &Path, package_name: &str) {
@@ -5097,6 +5136,182 @@ fn daemon_package_dtos_expose_declared_surfaces_and_validate_surface_operations(
 }
 
 #[test]
+fn daemon_package_entity_provider_streams_fresh_authoritative_reconnect_snapshot() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_short_test_dir("package-entity-provider");
+    let package_dir = unique_test_dir("daemon-package-entity-provider");
+    fs::create_dir_all(&package_dir).expect("create provider package");
+    fs::write(
+        package_dir.join("botster-package.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "name": "project-pipelines",
+            "version": "1.0.0",
+            "kind": "plugin",
+            "botster": ">=0.1.0",
+            "source": { "type": "path", "path": package_dir.canonicalize().expect("package path") },
+            "capabilities": [{ "surface": "surfaces" }],
+            "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }],
+            "surfaces": [{
+                "id": "home",
+                "kind": "app",
+                "title": "Pipelines",
+                "supports": ["render"]
+            }]
+        }))
+        .expect("serialize provider manifest"),
+    )
+    .expect("write provider manifest");
+    fs::write(
+        package_dir.join("plugin.lua"),
+        r#"
+local generation = 0
+return botster.register({ handlers = {
+  {
+    id = "home", kind = "surface_route", descriptor_id = "home",
+    call = function()
+      return { type = "panel", id = "home", children = {{
+        ["$kind"] = "bind_list", source = "/project-pipelines.run",
+        item_template = { type = "text", id = { ["$bind"] = "@/id" }, props = { text = { ["$bind"] = "@/status" } } },
+      }} }
+    end,
+  },
+  {
+    id = "runs", kind = "entity_provider", descriptor_id = "project-pipelines.run",
+    descriptor = { entity_type = "project-pipelines.run", id_field = "id" },
+    call = function()
+      generation = generation + 1
+      return { type = "entity_snapshot", entity_type = "project-pipelines.run", snapshot_seq = generation,
+        items = {{ id = "run-1", status = "generation-" .. generation }} }
+    end,
+  },
+} })
+"#,
+    )
+    .expect("write provider plugin");
+
+    let config = explicit_config(&data_dir);
+    let endpoint = botster_hub_client::DaemonEndpoint::new(
+        config
+            .transports
+            .local_socket
+            .as_ref()
+            .expect("socket")
+            .path
+            .clone(),
+    );
+    let child = start_cli_daemon(&data_dir);
+    let enabled = botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::EnablePackageLocalPath { path: package_dir },
+    )
+    .expect("enable provider package");
+    assert_eq!(
+        enabled.kind,
+        botster_hub_client::DaemonResponseKind::PackageDecision
+    );
+    let rendered = botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::PluginSurfaceRender {
+            package_name: "project-pipelines".to_string(),
+            surface_id: "home".to_string(),
+            payload: serde_json::json!({}),
+        },
+    )
+    .expect("render provider-bound surface");
+    assert_eq!(
+        rendered.kind,
+        botster_hub_client::DaemonResponseKind::PluginSurface
+    );
+
+    for (subscription_id, generation) in [("provider-first", 1_u64), ("provider-reconnect", 2_u64)]
+    {
+        let mut subscription = botster_hub_client::subscribe_entities(
+            &endpoint,
+            "project-pipelines.run",
+            subscription_id,
+        )
+        .expect("subscribe to package entity family");
+        let frame = subscription
+            .next_frame()
+            .expect("authoritative provider snapshot");
+        assert!(matches!(
+            frame,
+            botster_hub_client::DaemonEntityFrame::Snapshot {
+                snapshot_seq,
+                ref items,
+                ..
+            } if snapshot_seq == generation
+                && items.first().and_then(|item| item.get("id")).and_then(serde_json::Value::as_str) == Some("run-1")
+                && items.first().and_then(|item| item.get("status")).and_then(serde_json::Value::as_str)
+                    == Some(format!("generation-{generation}").as_str())
+        ));
+        subscription
+            .unsubscribe()
+            .expect("unsubscribe provider generation");
+    }
+    let mut held = botster_hub_client::subscribe_entities(
+        &endpoint,
+        "project-pipelines.run",
+        "provider-disable-cleanup",
+    )
+    .expect("subscribe before package disable");
+    held.set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("bound provider cleanup wait");
+    held.next_frame().expect("snapshot before package disable");
+    let provider_counters =
+        botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status)
+            .expect("status with live provider subscription")
+            .status
+            .expect("provider status body")
+            .lifecycle_counters;
+    assert_eq!(provider_counters.live_entity_subscriptions, 1);
+    assert!(provider_counters.high_water_entity_subscriptions >= 1);
+    let disabled = botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::DisablePackage {
+            package_name: "project-pipelines".to_string(),
+        },
+    )
+    .expect("disable provider package");
+    assert_eq!(
+        disabled.kind,
+        botster_hub_client::DaemonResponseKind::PackageDecision
+    );
+    assert!(
+        held.next_frame().is_err(),
+        "disabled provider subscription must close"
+    );
+    let cleanup_deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let counters =
+            botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status)
+                .expect("status after provider disable")
+                .status
+                .expect("provider cleanup status body")
+                .lifecycle_counters;
+        if counters.live_entity_subscriptions == 0 {
+            assert!(counters.high_water_entity_subscriptions >= 1);
+            break;
+        }
+        assert!(
+            Instant::now() < cleanup_deadline,
+            "provider subscription counter remained stale: {counters:?}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        botster_hub_client::subscribe_entities(
+            &endpoint,
+            "project-pipelines.run",
+            "provider-after-disable",
+        )
+        .is_err(),
+        "disabled provider family must not be admitted"
+    );
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
 fn daemon_plugin_contract_matrix_fixture_exercises_public_package_contracts() {
     let _guard = daemon_test_guard();
     let fixture_dir = botster_hub_test_support::copy_plugin_contract_matrix_fixture(
@@ -5151,6 +5366,7 @@ fn daemon_plugin_contract_matrix_fixture_exercises_public_package_contracts() {
             "contract.app",
             "contract.empty",
             "contract.sessions",
+            "contract.entities",
             "contract.blocked",
             "contract.invalid_body",
             "contract.settings",
@@ -5173,6 +5389,15 @@ fn daemon_plugin_contract_matrix_fixture_exercises_public_package_contracts() {
     assert!(report.list_surfaces_match_enabled);
     assert!(report.show_routes_match_list);
     assert_eq!(report.app_surface_node_id, "contract-app-panel");
+    assert_eq!(report.package_entity_surface_id, "contract.entities");
+    assert_eq!(
+        report.package_entity_surface_node_id,
+        "contract-entities-panel"
+    );
+    assert_eq!(
+        report.package_entity_binding_family,
+        "bns1_626f74737465722e706c7567696e2d636f6e74726163742d6d6174726978.run"
+    );
     assert_eq!(
         report.app_surface_node_kinds,
         vec![
@@ -8581,7 +8806,12 @@ fn session_entity_subscription_pushes_snapshot_ordered_deltas_and_fresh_reconnec
             ref entity,
             ..
         } if id == "entity-session" => {
-            assert_eq!(entity.lifecycle_class, "current");
+            assert_eq!(
+                entity
+                    .get("lifecycle_class")
+                    .and_then(serde_json::Value::as_str),
+                Some("current")
+            );
             snapshot_seq
         }
         other => panic!("expected first upsert, got {other:?}"),
@@ -8867,9 +9097,12 @@ fn session_entity_subscription_projects_stale_row_as_indeterminate() {
         snapshot,
         botster_hub_client::DaemonEntityFrame::Snapshot { ref items, .. }
             if items.iter().any(|entity| {
-                entity.session_uuid == session_id.0.as_str()
-                    && entity.registry_state == "stale"
-                    && entity.lifecycle_class == "indeterminate"
+                entity.get("session_uuid").and_then(serde_json::Value::as_str)
+                    == Some(session_id.0.as_str())
+                    && entity.get("registry_state").and_then(serde_json::Value::as_str)
+                        == Some("stale")
+                    && entity.get("lifecycle_class").and_then(serde_json::Value::as_str)
+                        == Some("indeterminate")
             })
     ));
     subscription
@@ -10190,7 +10423,9 @@ fn local_webrtc_chunks_oversized_encrypted_daemon_response() {
     let _guard = daemon_test_guard();
     let data_dir = unique_short_test_dir("web-webrtc");
     let package_dir = unique_test_dir("web-webrtc-package");
+    let provider_package_dir = unique_test_dir("web-webrtc-entity-provider-package");
     write_botster_web_package(&package_dir);
+    write_entity_provider_plugin_package(&provider_package_dir);
     let config = explicit_config(&data_dir);
     let socket_path = config
         .transports
@@ -10202,6 +10437,7 @@ fn local_webrtc_chunks_oversized_encrypted_daemon_response() {
     let endpoint = botster_hub_client::DaemonEndpoint::new(socket_path);
     let child = PanicSafeCliDaemon::start_with_local_webrtc_diagnostics(&data_dir);
     enable_supervised_package(&data_dir, &package_dir);
+    enable_supervised_package(&data_dir, &provider_package_dir);
 
     let web_listener_port = unused_loopback_port();
     let start = botster_hub_client::request(
@@ -10357,6 +10593,56 @@ fn local_webrtc_chunks_oversized_encrypted_daemon_response() {
                 ..
             } if subscription_id == "local-webrtc-entities" && items.is_empty()
         ));
+
+        for (subscription_id, generation) in [
+            ("local-webrtc-provider-first", 1_u64),
+            ("local-webrtc-provider-reconnect", 2_u64),
+        ] {
+            let subscribed = offer_peer
+                .encrypted_request(
+                    &stream_key,
+                    &botster_hub_client::DaemonRequest::SubscribeEntities {
+                        entity_type:
+                            "bns1_626f74737465722e706c7567696e2d636f6e74726163742d6d6174726978.run"
+                                .to_string(),
+                        subscription_id: subscription_id.to_string(),
+                    },
+                )
+                .await
+                .expect("subscribe to package entities over WebRTC");
+            assert_eq!(
+                subscribed.kind,
+                botster_hub_client::DaemonResponseKind::EntitySubscribed
+            );
+            assert!(matches!(
+                offer_peer
+                    .next_entity_frame(&stream_key)
+                    .await
+                    .expect("package entity snapshot over WebRTC"),
+                botster_hub_client::DaemonEntityFrame::Snapshot {
+                    snapshot_seq,
+                    ref entity_type,
+                    ref items,
+                    ..
+                } if snapshot_seq == generation
+                    && entity_type == "bns1_626f74737465722e706c7567696e2d636f6e74726163742d6d6174726978.run"
+                    && items.first().and_then(|item| item.get("status")).and_then(serde_json::Value::as_str)
+                        == Some(format!("generation-{generation}").as_str())
+            ));
+            let unsubscribed = offer_peer
+                .encrypted_request(
+                    &stream_key,
+                    &botster_hub_client::DaemonRequest::UnsubscribeEntities {
+                        subscription_id: subscription_id.to_string(),
+                    },
+                )
+                .await
+                .expect("unsubscribe package entities over WebRTC");
+            assert_eq!(
+                unsubscribed.kind,
+                botster_hub_client::DaemonResponseKind::EntityUnsubscribed
+            );
+        }
 
         let spawn = botster_hub_client::request(
             &endpoint,
@@ -10769,7 +11055,10 @@ fn botster_web_same_url_reload_issues_fresh_local_webrtc_bootstrap() {
                 .await
                 .expect("second generation fresh snapshot"),
             botster_hub_client::DaemonEntityFrame::Snapshot { ref items, .. }
-                if items.iter().any(|item| item.session_uuid == "local-webrtc-reload-session")
+                if items.iter().any(|item| {
+                    item.get("session_uuid").and_then(serde_json::Value::as_str)
+                        == Some("local-webrtc-reload-session")
+                })
         ));
         let generation_two_shutdown = reload_peer
             .encrypted_request(
@@ -10849,7 +11138,10 @@ fn botster_web_same_url_reload_issues_fresh_local_webrtc_bootstrap() {
                 .await
                 .expect("third generation fresh snapshot"),
             botster_hub_client::DaemonEntityFrame::Snapshot { ref items, .. }
-                if items.iter().any(|item| item.session_uuid == "local-webrtc-reload-session")
+                if items.iter().any(|item| {
+                    item.get("session_uuid").and_then(serde_json::Value::as_str)
+                        == Some("local-webrtc-reload-session")
+                })
         ));
         let current_generation_remove = final_peer
             .encrypted_request(

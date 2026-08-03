@@ -22,7 +22,7 @@ mod typescript;
 
 pub const PROTOCOL: &str = "botster-hub-daemon-v1";
 pub const PROTOCOL_VERSION: u16 = 4;
-pub const CONFORMANCE_FIXTURE_REVISION: u16 = 27;
+pub const CONFORMANCE_FIXTURE_REVISION: u16 = 28;
 /// Version of the local WebRTC delivery chunk framing protocol.
 pub const LOCAL_WEBRTC_DELIVERY_CHUNK_VERSION: u16 = 2;
 /// Serialized local WebRTC delivery frames must remain strictly below this size.
@@ -40,6 +40,7 @@ pub const FEATURE_SPAWN_TARGETS: &str = "spawn_targets";
 pub const FEATURE_WORKTREES: &str = "worktrees";
 pub const FEATURE_TERMINAL_READBACK: &str = "terminal_readback";
 pub const FEATURE_SESSION_ENTITY_SUBSCRIPTIONS: &str = "session_entity_subscriptions";
+pub const FEATURE_PLUGIN_ENTITY_SUBSCRIPTIONS: &str = "plugin_entity_subscriptions";
 const ATTACH_DRAIN_INTERVAL: Duration = Duration::from_millis(25);
 
 /// Authenticated plaintext carried by one complete local WebRTC delivery.
@@ -170,20 +171,30 @@ pub fn subscribe_session_entities(
     endpoint: &DaemonEndpoint,
     subscription_id: impl Into<String>,
 ) -> DaemonTransportResult<DaemonEntitySubscription> {
+    subscribe_entities(endpoint, "session", subscription_id)
+}
+
+/// Open a fresh held-open subscription for one admitted entity family.
+pub fn subscribe_entities(
+    endpoint: &DaemonEndpoint,
+    entity_type: impl Into<String>,
+    subscription_id: impl Into<String>,
+) -> DaemonTransportResult<DaemonEntitySubscription> {
+    let entity_type = entity_type.into();
     let subscription_id = subscription_id.into();
     let mut stream = connect_and_hello(endpoint)?;
     let mut reader = BufReader::new(stream.try_clone().map_err(normalize_socket_io_error)?);
     write_frame(
         &mut stream,
         &DaemonRequest::SubscribeEntities {
-            entity_type: "session".to_string(),
+            entity_type,
             subscription_id: subscription_id.clone(),
         },
     )?;
     let response = read_daemon_response_from_reader(&mut reader)?;
     if response.kind != DaemonResponseKind::EntitySubscribed {
         return Err(DaemonTransportError::Protocol(
-            "session entity subscription was not accepted",
+            "entity subscription was not accepted",
         ));
     }
     Ok(DaemonEntitySubscription {
@@ -646,6 +657,7 @@ fn current_feature_list() -> Vec<&'static str> {
         FEATURE_WORKTREES,
         FEATURE_TERMINAL_READBACK,
         FEATURE_SESSION_ENTITY_SUBSCRIPTIONS,
+        FEATURE_PLUGIN_ENTITY_SUBSCRIPTIONS,
     ]
 }
 
@@ -1779,7 +1791,10 @@ pub struct DaemonSessionEntity {
     pub failure_reason: Option<String>,
 }
 
-/// Existing entity-frame vocabulary scoped to one daemon subscription.
+/// Entity-frame vocabulary scoped to one daemon subscription.
+///
+/// Hub validates every record before transport. Session consumers can retain a
+/// typed projection by deserializing records as [`DaemonSessionEntity`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DaemonEntityFrame {
@@ -1788,7 +1803,7 @@ pub enum DaemonEntityFrame {
         subscription_id: String,
         entity_type: String,
         snapshot_seq: u64,
-        items: Vec<DaemonSessionEntity>,
+        items: Vec<Value>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         resync_reason: Option<String>,
     },
@@ -1798,7 +1813,7 @@ pub enum DaemonEntityFrame {
         entity_type: String,
         snapshot_seq: u64,
         id: String,
-        entity: DaemonSessionEntity,
+        entity: Value,
     },
     #[serde(rename = "entity_patch")]
     Patch {
@@ -2183,7 +2198,7 @@ mod tests {
                 subscription_id: "subscription".to_string(),
                 entity_type: "session".to_string(),
                 snapshot_seq: 1,
-                items: vec![entity.clone()],
+                items: vec![serde_json::to_value(&entity).expect("serialize session entity")],
                 resync_reason: None,
             },
             DaemonEntityFrame::Upsert {
@@ -2191,7 +2206,7 @@ mod tests {
                 entity_type: "session".to_string(),
                 snapshot_seq: 2,
                 id: "session".to_string(),
-                entity,
+                entity: serde_json::to_value(entity).expect("serialize session entity"),
             },
             DaemonEntityFrame::Patch {
                 subscription_id: "subscription".to_string(),

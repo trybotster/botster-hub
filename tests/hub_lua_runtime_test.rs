@@ -3004,3 +3004,208 @@ fn invoking_after_unload_fails_through_worker_stopped_path() {
         })
     ));
 }
+
+#[test]
+fn package_owned_entity_provider_drives_surface_admission_and_fresh_snapshots() {
+    let root = unique_short_test_dir("entity-provider");
+    fs::create_dir_all(&root).expect("create entity provider package");
+    fs::write(
+        root.join("botster-package.json"),
+        serde_json::json!({
+            "name": "project-pipelines",
+            "version": "1.0.0",
+            "kind": "plugin",
+            "botster": ">=0.1.0",
+            "source": { "type": "path", "path": root.canonicalize().expect("package path") },
+            "capabilities": [{ "surface": "surfaces" }],
+            "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }]
+        })
+        .to_string(),
+    )
+    .expect("write entity provider manifest");
+    fs::write(
+        root.join("plugin.lua"),
+        r#"
+local generation = 0
+return botster.register({
+  handlers = {
+    {
+      id = "home",
+      kind = "surface_route",
+      descriptor_id = "project-pipelines.home",
+      call = function()
+        return {
+          type = "panel",
+          id = "project-pipelines-home",
+          children = {{
+            ["$kind"] = "bind_list",
+            source = "/project-pipelines.run",
+            item_template = {
+              type = "text",
+              id = { ["$bind"] = "@/id" },
+              props = { text = { ["$bind"] = "@/status" } },
+            },
+          }},
+        }
+      end,
+    },
+    {
+      id = "runs",
+      kind = "entity_provider",
+      descriptor_id = "project-pipelines.run",
+      descriptor = { entity_type = "project-pipelines.run", id_field = "id" },
+      call = function(request)
+        generation = generation + 1
+        local items = {{
+          id = "run-1",
+          status = "generation-" .. generation,
+          requested_entity_type = request.entity_type,
+          subscription_id = request.subscription_id,
+        }}
+        if generation == 3 then
+          items = {
+            { id = "run-1", status = "duplicate-a" },
+            { id = "run-1", status = "duplicate-b" },
+          }
+        end
+        return {
+          type = "entity_snapshot",
+          entity_type = "project-pipelines.run",
+          snapshot_seq = generation,
+          items = items,
+        }
+      end,
+    },
+  },
+})
+"#,
+    )
+    .expect("write entity provider plugin");
+    let mut policy = default_package_policy();
+    policy
+        .install_local_path(&root, "install entity provider package")
+        .expect("install entity provider package");
+    policy
+        .enable("project-pipelines", "enable entity provider package")
+        .expect("enable entity provider package");
+    let registry = policy.registry().clone();
+    let mut hub = explicit_runtime("entity-provider");
+    hub.load_lua_plugin_package(&registry, "project-pipelines")
+        .expect("load entity provider package");
+
+    hub.render_plugin_surface(
+        "project-pipelines",
+        "project-pipelines.home",
+        serde_json::json!({}),
+    )
+    .expect("render surface bound to its declared family");
+    for (subscription_id, generation) in [("first", 1_u64), ("reconnect", 2_u64)] {
+        let (snapshot_seq, items) = hub
+            .plugin_entity_snapshot("project-pipelines.run", subscription_id)
+            .expect("query provider through Hub runtime worker boundary");
+        assert_eq!(snapshot_seq, generation);
+        assert_eq!(items[0]["id"], "run-1");
+        assert_eq!(items[0]["status"], format!("generation-{generation}"));
+        assert_eq!(items[0]["requested_entity_type"], "project-pipelines.run");
+        assert_eq!(items[0]["subscription_id"], subscription_id);
+    }
+
+    let duplicate_error = hub
+        .plugin_entity_snapshot("project-pipelines.run", "duplicate-output")
+        .expect_err("duplicate provider record ids must fail validation");
+    assert_eq!(duplicate_error.code, "invalid_entity_provider");
+    assert!(
+        duplicate_error
+            .message
+            .contains("duplicate record id run-1")
+    );
+
+    let cleanup = hub.unload_plugin_package(
+        RequestId("unload-entity-provider".to_string()),
+        "project-pipelines",
+    );
+    assert!(cleanup.removed_resources.iter().any(|resource| {
+        resource.kind == botster_core::PluginResourceKind::EntityProvider
+            && resource.resource_id == "project-pipelines.run"
+    }));
+    assert!(
+        hub.plugin_entity_snapshot("project-pipelines.run", "after-unload")
+            .is_err()
+    );
+}
+
+#[test]
+fn dotted_package_entity_provider_rejects_noncanonical_owner_tokens() {
+    for (label, entity_type, expected_error) in [
+        (
+            "raw-package-name",
+            "botster.plugin-contract-matrix.run",
+            "is not owned by plugin",
+        ),
+        (
+            "other-package-token",
+            "bns1_612e62.run",
+            "is not owned by plugin",
+        ),
+        ("malformed-token", "bns1_0.run", "is not owned by plugin"),
+        (
+            "reserved-session",
+            "session",
+            "entity provider family session is reserved by Hub/Core",
+        ),
+        (
+            "reserved-workspace",
+            "workspace",
+            "entity provider family workspace is reserved by Hub/Core",
+        ),
+    ] {
+        let root = unique_short_test_dir(label);
+        fs::create_dir_all(&root).expect("create invalid provider package");
+        fs::write(
+            root.join("botster-package.json"),
+            serde_json::json!({
+                "name": "botster.plugin-contract-matrix",
+                "version": "1.0.0",
+                "kind": "plugin",
+                "botster": ">=0.1.0",
+                "source": { "type": "path", "path": root.canonicalize().expect("package path") },
+                "capabilities": [{ "surface": "surfaces" }],
+                "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }]
+            })
+            .to_string(),
+        )
+        .expect("write invalid provider manifest");
+        fs::write(
+            root.join("plugin.lua"),
+            format!(
+                r#"
+return botster.register({{ handlers = {{
+  {{ id = "runs", kind = "entity_provider", descriptor_id = "{entity_type}",
+    descriptor = {{ entity_type = "{entity_type}", id_field = "id" }},
+    call = function() return {{ type = "entity_snapshot", entity_type = "{entity_type}", snapshot_seq = 1, items = {{}} }} end }},
+}} }})
+"#
+            ),
+        )
+        .expect("write invalid provider plugin");
+        let mut policy = default_package_policy();
+        policy
+            .install_local_path(&root, "install invalid provider package")
+            .expect("install invalid provider package");
+        policy
+            .enable(
+                "botster.plugin-contract-matrix",
+                "enable invalid provider package",
+            )
+            .expect("enable invalid provider package");
+        let registry = policy.registry().clone();
+        let mut hub = explicit_runtime(label);
+        let error = hub
+            .load_lua_plugin_package(&registry, "botster.plugin-contract-matrix")
+            .expect_err("noncanonical provider namespace must be rejected");
+        assert!(
+            error.to_string().contains(expected_error),
+            "{label}: {error}"
+        );
+    }
+}

@@ -119,7 +119,7 @@ operator UIs can show protocol diagnostics without opening a special endpoint.
 The current descriptor includes:
 
 - protocol name and version;
-- supported features: sessions, session entity subscriptions, terminal streaming, resize, terminal readback,
+- supported features: sessions, session and plugin entity subscriptions, terminal streaming, resize, terminal readback,
   plugin surface render, plugin surface action dispatch, package navigation
   discovery, and hub-owned spawn targets;
 - conformance fixture revision.
@@ -177,6 +177,19 @@ stable-id-ordered `entity_snapshot`; later `entity_upsert`, sparse
 `entity_patch`, and `entity_remove` frames carry strictly increasing sequence
 values from CoreDaemon's lifecycle cursor. Every frame includes the caller's
 connection-scoped `subscription_id` and `entity_type: "session"`.
+
+Package-owned families use the same held-open request and `DaemonEntityFrame`
+wire envelope with generic JSON records. They require the advertised
+`plugin_entity_subscriptions` feature. Hub admits only an exact family declared
+by its currently loaded owning package. The family owner is Hub's canonical
+single-segment package token: ordinary single-segment manifest names remain
+unchanged, while dotted or `bns1_`-prefixed names use `bns1_` plus lowercase
+hex of their exact UTF-8 bytes. Hub invokes that package's provider through
+the plugin worker, validates a whole-family snapshot and non-empty string `id`
+for every row, and sends that authoritative snapshot first. A reconnect is a
+new provider query; cached rows from the prior connection are not a baseline.
+The typed `DaemonSessionEntity` remains the convenience projection for the
+built-in `session` family, including omission of absent lifecycle/exit fields.
 
 The sanitized row contains `session_uuid`, registry/lifecycle state, terminal
 dimensions, update time, and optional exit/failure detail. It never contains
