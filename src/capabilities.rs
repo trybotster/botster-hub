@@ -951,6 +951,15 @@ struct LocalPluginStoreBackend {
     batch_test_hook: Mutex<Option<BatchTestHook>>,
 }
 
+impl std::fmt::Debug for LocalPluginStoreBackend {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LocalPluginStoreBackend")
+            .field("root", &self.root)
+            .finish_non_exhaustive()
+    }
+}
+
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BatchCommitPoint {
@@ -1096,18 +1105,16 @@ impl LocalPluginStoreBackend {
             Ok(records) => records,
             Err(error) => return PluginStoreBatchResult::failure(error, None, None),
         };
-        #[cfg(test)]
-        if std::env::var_os("BOTSTER_PLUGIN_DB_BATCH_ABLATION").as_deref()
-            == Some(std::ffi::OsStr::new("sequential"))
-        {
-            return self.batch_sequential_ablation(plugin_key, records, &mutations, limits);
-        }
         let (candidate, results) =
             match apply_plugin_store_batch(plugin_key, records, &mutations, limits) {
                 Ok(candidate) => candidate,
                 Err(failure) => return failure,
             };
-        if let Err(error) = self.commit_records(plugin_key, &candidate) {
+        let mutated_keys = mutations
+            .iter()
+            .map(|mutation| mutation.key().clone())
+            .collect::<BTreeSet<_>>();
+        if let Err(error) = self.commit_records(plugin_key, &candidate, &mutated_keys) {
             return match self.recover_transaction(plugin_key) {
                 Ok(()) => PluginStoreBatchResult::failure(error, None, None),
                 Err(recovery_error) => PluginStoreBatchResult::failure(recovery_error, None, None),
@@ -1116,64 +1123,11 @@ impl LocalPluginStoreBackend {
         PluginStoreBatchResult::success(results)
     }
 
-    #[cfg(test)]
-    fn batch_sequential_ablation(
-        &self,
-        plugin_key: &PluginKey,
-        mut records: BTreeMap<PluginStoreKey, PluginStoreRecord>,
-        mutations: &[PluginStoreBatchMutation],
-        limits: PluginStoreLimits,
-    ) -> PluginStoreBatchResult {
-        let mut results = Vec::with_capacity(mutations.len());
-        for (index, mutation) in mutations.iter().enumerate() {
-            let (candidate, mut mutation_results) = match apply_plugin_store_batch(
-                plugin_key,
-                records,
-                std::slice::from_ref(mutation),
-                limits,
-            ) {
-                Ok(candidate) => candidate,
-                Err(failure) => return failure,
-            };
-            match mutation {
-                PluginStoreBatchMutation::Set { key, .. }
-                | PluginStoreBatchMutation::Patch { key, .. } => {
-                    if let Err(error) = self.write_record(&candidate[key]) {
-                        return PluginStoreBatchResult::failure(
-                            error,
-                            Some(index + 1),
-                            Some(key.clone()),
-                        );
-                    }
-                }
-                PluginStoreBatchMutation::Delete { key, .. } => {
-                    if let Err(error) = fs::remove_file(self.record_path(plugin_key, key)) {
-                        return PluginStoreBatchResult::failure(
-                            backend_error(error),
-                            Some(index + 1),
-                            Some(key.clone()),
-                        );
-                    }
-                }
-            }
-            if let Err(error) = self.run_batch_test_hook(BatchCommitPoint::RecordStaged(index + 1))
-            {
-                return PluginStoreBatchResult::failure(
-                    error,
-                    Some(index + 1),
-                    Some(mutation.key().clone()),
-                );
-            }
-            records = candidate;
-            results.append(&mut mutation_results);
-        }
-        PluginStoreBatchResult::success(results)
-    }
-
     fn commit_records(
         &self,
         plugin_key: &PluginKey,
         records: &BTreeMap<PluginStoreKey, PluginStoreRecord>,
+        mutated_keys: &BTreeSet<PluginStoreKey>,
     ) -> Result<(), CapabilityRuntimeError> {
         fs::create_dir_all(&self.root).map_err(backend_error)?;
         let namespace = self.namespace_dir(plugin_key);
@@ -1183,8 +1137,16 @@ impl LocalPluginStoreBackend {
         fs::create_dir(&staging).map_err(backend_error)?;
         #[cfg(test)]
         let mut staged_record_count = 0;
-        for record in records.values() {
-            self.write_record_to(&staging, record)?;
+        for (key, record) in records {
+            if namespace.exists() && !mutated_keys.contains(key) {
+                fs::hard_link(
+                    self.record_path(plugin_key, key),
+                    staging.join(format!("{}.json", encode_key(&key.0))),
+                )
+                .map_err(backend_error)?;
+            } else {
+                self.write_record_to(&staging, record)?;
+            }
             #[cfg(test)]
             {
                 staged_record_count += 1;
@@ -1342,17 +1304,6 @@ fn apply_plugin_store_batch(
             None,
         ));
     }
-    if mutations.len() > limits.max_plugin_keys {
-        return Err(PluginStoreBatchResult::failure(
-            CapabilityRuntimeError::new(
-                CapabilityRuntimeErrorKind::InvalidRequest,
-                "plugin-store batch exceeds max_plugin_keys",
-            ),
-            None,
-            None,
-        ));
-    }
-
     let mut seen = BTreeSet::new();
     let mut results = Vec::with_capacity(mutations.len());
     for (index, mutation) in mutations.iter().enumerate() {
@@ -1448,13 +1399,26 @@ fn apply_plugin_store_batch(
                 }
             }
         };
+        let written_record = match &result {
+            PluginStoreBatchMutationResult::Set { record }
+            | PluginStoreBatchMutationResult::Patch { record } => Some(record),
+            PluginStoreBatchMutationResult::Delete { .. } => None,
+        };
+        if written_record.is_some_and(|record| record.payload_bytes() > limits.max_record_bytes) {
+            return Err(batch_mutation_failure(
+                CapabilityRuntimeError::new(
+                    CapabilityRuntimeErrorKind::QuotaExceeded,
+                    "plugin-store record exceeds max_record_bytes",
+                ),
+                index,
+                key,
+            ));
+        }
         results.push(result);
     }
 
-    enforce_plugin_store_snapshot_limits(&records, limits).map_err(|error| {
-        let index = mutations.len() - 1;
-        batch_mutation_failure(error, index, mutations[index].key())
-    })?;
+    enforce_plugin_store_snapshot_limits(&records, limits)
+        .map_err(|error| PluginStoreBatchResult::failure(error, None, None))?;
     Ok((records, results))
 }
 
@@ -1474,15 +1438,6 @@ fn enforce_plugin_store_snapshot_limits(
         return Err(CapabilityRuntimeError::new(
             CapabilityRuntimeErrorKind::QuotaExceeded,
             "plugin-store namespace exceeds max_plugin_keys",
-        ));
-    }
-    if records
-        .values()
-        .any(|record| record.payload_bytes() > limits.max_record_bytes)
-    {
-        return Err(CapabilityRuntimeError::new(
-            CapabilityRuntimeErrorKind::QuotaExceeded,
-            "plugin-store record exceeds max_record_bytes",
         ));
     }
     if records
@@ -2101,14 +2056,6 @@ mod tests {
                 }],
                 CapabilityRuntimeErrorKind::PatchFailed,
             ),
-            (
-                vec![set_mutation(
-                    "oversized",
-                    serde_json::json!({ "value": "x".repeat(65 * 1024) }),
-                    0,
-                )],
-                CapabilityRuntimeErrorKind::QuotaExceeded,
-            ),
         ] {
             let failed = backend.batch(&plugin_key, mutations, PluginStoreLimits::default());
             assert!(!failed.ok);
@@ -2123,6 +2070,32 @@ mod tests {
             );
         }
 
+        let oversized = backend.batch(
+            &plugin_key,
+            vec![
+                set_mutation(
+                    "oversized",
+                    serde_json::json!({ "value": "x".repeat(65 * 1024) }),
+                    0,
+                ),
+                set_mutation("small", serde_json::json!({ "value": 1 }), 0),
+            ],
+            PluginStoreLimits::default(),
+        );
+        assert!(!oversized.ok);
+        assert_eq!(
+            oversized.error_kind,
+            Some(CapabilityRuntimeErrorKind::QuotaExceeded)
+        );
+        assert_eq!(oversized.mutation_index, Some(1));
+        assert_eq!(oversized.key, Some(PluginStoreKey("oversized".to_string())));
+        assert_eq!(
+            backend
+                .read_records(&plugin_key)
+                .expect("read after per-record quota failure"),
+            records
+        );
+
         let empty = backend.batch(&plugin_key, Vec::new(), PluginStoreLimits::default());
         assert!(!empty.ok);
         assert_eq!(
@@ -2135,6 +2108,70 @@ mod tests {
                 .expect("read after empty batch"),
             records
         );
+    }
+
+    #[test]
+    fn plugin_store_batch_enforces_final_snapshot_quotas_without_false_mutation_attribution() {
+        let aggregate_backend = test_backend("aggregate-quota");
+        let plugin_key = PluginKey("project-pipelines".to_string());
+        let aggregate = aggregate_backend.batch(
+            &plugin_key,
+            vec![
+                set_mutation("first", serde_json::json!({ "value": "12345" }), 0),
+                set_mutation("second", serde_json::json!({ "value": "67890" }), 0),
+            ],
+            PluginStoreLimits {
+                max_record_bytes: 100,
+                max_plugin_keys: 10,
+                max_plugin_bytes: 20,
+            },
+        );
+        assert!(!aggregate.ok);
+        assert_eq!(
+            aggregate.error_kind,
+            Some(CapabilityRuntimeErrorKind::QuotaExceeded)
+        );
+        assert_eq!(aggregate.mutation_index, None);
+        assert_eq!(aggregate.key, None);
+        assert!(
+            aggregate_backend
+                .read_records(&plugin_key)
+                .expect("read after aggregate quota failure")
+                .is_empty()
+        );
+
+        let replacement_backend = test_backend("key-quota-replacement");
+        replacement_backend
+            .set(
+                &plugin_key,
+                PluginStoreKey("old".to_string()),
+                1,
+                serde_json::json!({ "value": "old" }),
+                Some(0),
+                PluginStoreLimits::default(),
+            )
+            .expect("seed record at key quota");
+        let replacement = replacement_backend.batch(
+            &plugin_key,
+            vec![
+                PluginStoreBatchMutation::Delete {
+                    key: PluginStoreKey("old".to_string()),
+                    expected_revision: 1,
+                },
+                set_mutation("new", serde_json::json!({ "value": "new" }), 0),
+            ],
+            PluginStoreLimits {
+                max_record_bytes: 100,
+                max_plugin_keys: 1,
+                max_plugin_bytes: 100,
+            },
+        );
+        assert!(replacement.ok);
+        let records = replacement_backend
+            .read_records(&plugin_key)
+            .expect("read legal replacement at key quota");
+        assert_eq!(records.len(), 1);
+        assert!(records.contains_key(&PluginStoreKey("new".to_string())));
     }
 
     #[test]
@@ -2161,6 +2198,13 @@ mod tests {
                 PluginStoreLimits::default(),
             )
             .expect("seed unrelated record before snapshot");
+        #[cfg(unix)]
+        let preserved_inode = std::os::unix::fs::MetadataExt::ino(
+            &fs::metadata(
+                backend.record_path(&plugin_key, &PluginStoreKey("before-snapshot".to_string())),
+            )
+            .expect("stat unrelated record before batch"),
+        );
 
         let stage_gate = Arc::new((Mutex::new(false), Condvar::new()));
         let release_gate = Arc::new((Mutex::new(false), Condvar::new()));
@@ -2276,6 +2320,18 @@ mod tests {
                 .expect("before-snapshot record exists")
                 .payload,
             serde_json::json!({ "value": "preserved" })
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            std::os::unix::fs::MetadataExt::ino(
+                &fs::metadata(
+                    backend
+                        .record_path(&plugin_key, &PluginStoreKey("before-snapshot".to_string()),)
+                )
+                .expect("stat unrelated record after batch"),
+            ),
+            preserved_inode,
+            "unchanged records should be hard-linked into the promoted generation"
         );
     }
 
