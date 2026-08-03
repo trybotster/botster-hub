@@ -5,7 +5,7 @@
 //! limits, policy-gated HTTP execution, and plugin cleanup.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::fs;
+use std::fs::{self, File};
 use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::sync::mpsc;
@@ -29,6 +29,7 @@ use botster_core::{
     TimerCapabilityRequest, WebSocketCapabilityRuntimeConfig, apply_plugin_store_merge_patch,
     plugin_store_payload_bytes,
 };
+use serde::{Deserialize, Serialize};
 
 use crate::config::HubConfig;
 
@@ -58,6 +59,104 @@ pub(crate) struct PreparedPluginStoreOperation {
     plugin_key: PluginKey,
     operation: PluginStoreOperation,
     limits: PluginStoreLimits,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum PluginStoreBatchMutation {
+    Set {
+        key: PluginStoreKey,
+        #[serde(default = "default_plugin_store_schema_version")]
+        schema_version: u64,
+        payload: serde_json::Value,
+        expected_revision: u64,
+    },
+    Patch {
+        key: PluginStoreKey,
+        patch: serde_json::Value,
+        expected_revision: u64,
+    },
+    Delete {
+        key: PluginStoreKey,
+        expected_revision: u64,
+    },
+}
+
+impl PluginStoreBatchMutation {
+    fn key(&self) -> &PluginStoreKey {
+        match self {
+            Self::Set { key, .. } | Self::Patch { key, .. } | Self::Delete { key, .. } => key,
+        }
+    }
+}
+
+fn default_plugin_store_schema_version() -> u64 {
+    1
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "operation", rename_all = "snake_case")]
+pub(crate) enum PluginStoreBatchMutationResult {
+    Set { record: PluginStoreRecord },
+    Patch { record: PluginStoreRecord },
+    Delete { key: PluginStoreKey, revision: u64 },
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct PluginStoreBatchResult {
+    pub(crate) ok: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) results: Vec<PluginStoreBatchMutationResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) error_kind: Option<CapabilityRuntimeErrorKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) mutation_index: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) key: Option<PluginStoreKey>,
+}
+
+impl PluginStoreBatchResult {
+    pub(crate) fn failure(
+        error: CapabilityRuntimeError,
+        mutation_index: Option<usize>,
+        key: Option<PluginStoreKey>,
+    ) -> Self {
+        Self {
+            ok: false,
+            results: Vec::new(),
+            error_kind: Some(error.kind),
+            message: Some(error.message),
+            mutation_index,
+            key,
+        }
+    }
+
+    fn success(results: Vec<PluginStoreBatchMutationResult>) -> Self {
+        Self {
+            ok: true,
+            results,
+            error_kind: None,
+            message: None,
+            mutation_index: None,
+            key: None,
+        }
+    }
+}
+
+pub(crate) struct PreparedPluginStoreBatch {
+    backend: Arc<LocalPluginStoreBackend>,
+    plugin_key: PluginKey,
+    mutations: Vec<PluginStoreBatchMutation>,
+    limits: PluginStoreLimits,
+}
+
+impl PreparedPluginStoreBatch {
+    pub(crate) fn execute(self) -> PluginStoreBatchResult {
+        self.backend
+            .batch(&self.plugin_key, self.mutations, self.limits)
+    }
 }
 
 impl PreparedPluginStoreOperation {
@@ -285,6 +384,22 @@ impl HubCapabilityRuntime {
             backend: self.plugin_store.clone(),
             plugin_key: plugin_key.clone(),
             operation: store.operation,
+            limits: self.plugin_store_limits,
+        })
+    }
+
+    pub(crate) fn prepare_plugin_store_batch(
+        &self,
+        plugin_key: &PluginKey,
+        namespace: &str,
+        mutations: Vec<PluginStoreBatchMutation>,
+    ) -> Result<PreparedPluginStoreBatch, CapabilityRuntimeError> {
+        self.ensure_plugin_namespace_grant(plugin_key, namespace)?;
+
+        Ok(PreparedPluginStoreBatch {
+            backend: self.plugin_store.clone(),
+            plugin_key: plugin_key.clone(),
+            mutations,
             limits: self.plugin_store_limits,
         })
     }
@@ -829,17 +944,49 @@ fn min_optional_limit(request: Option<u64>, grant: Option<u64>) -> Option<u64> {
     }
 }
 
-#[derive(Debug)]
 struct LocalPluginStoreBackend {
     root: PathBuf,
     lock: Mutex<()>,
+    #[cfg(test)]
+    batch_test_hook: Mutex<Option<BatchTestHook>>,
 }
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BatchCommitPoint {
+    RecordStaged(usize),
+    NamespaceBackedUp,
+}
+
+#[cfg(test)]
+type BatchTestHook =
+    Arc<dyn Fn(BatchCommitPoint) -> Result<(), CapabilityRuntimeError> + Send + Sync + 'static>;
 
 impl LocalPluginStoreBackend {
     fn new(root: PathBuf) -> Self {
         Self {
             root,
             lock: Mutex::new(()),
+            #[cfg(test)]
+            batch_test_hook: Mutex::new(None),
+        }
+    }
+
+    #[cfg(test)]
+    fn set_batch_test_hook(&self, hook: BatchTestHook) {
+        *self.batch_test_hook.lock().expect("batch test hook lock") = Some(hook);
+    }
+
+    #[cfg(test)]
+    fn run_batch_test_hook(&self, point: BatchCommitPoint) -> Result<(), CapabilityRuntimeError> {
+        let hook = self
+            .batch_test_hook
+            .lock()
+            .expect("batch test hook lock")
+            .clone();
+        match hook {
+            Some(hook) => hook(point),
+            None => Ok(()),
         }
     }
 
@@ -854,6 +1001,34 @@ impl LocalPluginStoreBackend {
     fn record_path(&self, plugin_key: &PluginKey, key: &PluginStoreKey) -> PathBuf {
         self.namespace_dir(plugin_key)
             .join(format!("{}.json", encode_key(&key.0)))
+    }
+
+    fn transaction_paths(&self, plugin_key: &PluginKey) -> (PathBuf, PathBuf) {
+        let namespace = sanitize_plugin_key(plugin_key);
+        (
+            self.root.join(format!(".{namespace}.batch-staging")),
+            self.root.join(format!(".{namespace}.batch-backup")),
+        )
+    }
+
+    fn recover_transaction(&self, plugin_key: &PluginKey) -> Result<(), CapabilityRuntimeError> {
+        let namespace = self.namespace_dir(plugin_key);
+        let (staging, backup) = self.transaction_paths(plugin_key);
+        if !self.root.exists() || (!staging.exists() && !backup.exists()) {
+            return Ok(());
+        }
+
+        if namespace.exists() {
+            remove_dir_if_exists(&staging)?;
+            remove_dir_if_exists(&backup)?;
+        } else if backup.exists() {
+            fs::rename(&backup, &namespace).map_err(backend_error)?;
+            remove_dir_if_exists(&staging)?;
+        } else {
+            remove_dir_if_exists(&staging)?;
+        }
+
+        sync_directory(&self.root)
     }
 
     fn read_records(
@@ -885,14 +1060,156 @@ impl LocalPluginStoreBackend {
 
     fn write_record(&self, record: &PluginStoreRecord) -> Result<(), CapabilityRuntimeError> {
         let namespace = self.namespace_dir(&record.plugin_key);
-        fs::create_dir_all(&namespace).map_err(backend_error)?;
+        self.write_record_to(&namespace, record)
+    }
+
+    fn write_record_to(
+        &self,
+        namespace: &Path,
+        record: &PluginStoreRecord,
+    ) -> Result<(), CapabilityRuntimeError> {
+        fs::create_dir_all(namespace).map_err(backend_error)?;
         let bytes = serde_json::to_vec_pretty(record).map_err(|error| {
             CapabilityRuntimeError::new(
                 CapabilityRuntimeErrorKind::BackendFailed,
                 format!("plugin-store record could not be encoded: {error}"),
             )
         })?;
-        fs::write(self.record_path(&record.plugin_key, &record.key), bytes).map_err(backend_error)
+        let path = namespace.join(format!("{}.json", encode_key(&record.key.0)));
+        fs::write(&path, bytes).map_err(backend_error)?;
+        File::open(path)
+            .and_then(|file| file.sync_all())
+            .map_err(backend_error)
+    }
+
+    fn batch(
+        &self,
+        plugin_key: &PluginKey,
+        mutations: Vec<PluginStoreBatchMutation>,
+        limits: PluginStoreLimits,
+    ) -> PluginStoreBatchResult {
+        let _guard = self.lock.lock().expect("plugin store lock poisoned");
+        if let Err(error) = self.recover_transaction(plugin_key) {
+            return PluginStoreBatchResult::failure(error, None, None);
+        }
+        let records = match self.read_records(plugin_key) {
+            Ok(records) => records,
+            Err(error) => return PluginStoreBatchResult::failure(error, None, None),
+        };
+        #[cfg(test)]
+        if std::env::var_os("BOTSTER_PLUGIN_DB_BATCH_ABLATION").as_deref()
+            == Some(std::ffi::OsStr::new("sequential"))
+        {
+            return self.batch_sequential_ablation(plugin_key, records, &mutations, limits);
+        }
+        let (candidate, results) =
+            match apply_plugin_store_batch(plugin_key, records, &mutations, limits) {
+                Ok(candidate) => candidate,
+                Err(failure) => return failure,
+            };
+        if let Err(error) = self.commit_records(plugin_key, &candidate) {
+            return match self.recover_transaction(plugin_key) {
+                Ok(()) => PluginStoreBatchResult::failure(error, None, None),
+                Err(recovery_error) => PluginStoreBatchResult::failure(recovery_error, None, None),
+            };
+        }
+        PluginStoreBatchResult::success(results)
+    }
+
+    #[cfg(test)]
+    fn batch_sequential_ablation(
+        &self,
+        plugin_key: &PluginKey,
+        mut records: BTreeMap<PluginStoreKey, PluginStoreRecord>,
+        mutations: &[PluginStoreBatchMutation],
+        limits: PluginStoreLimits,
+    ) -> PluginStoreBatchResult {
+        let mut results = Vec::with_capacity(mutations.len());
+        for (index, mutation) in mutations.iter().enumerate() {
+            let (candidate, mut mutation_results) = match apply_plugin_store_batch(
+                plugin_key,
+                records,
+                std::slice::from_ref(mutation),
+                limits,
+            ) {
+                Ok(candidate) => candidate,
+                Err(failure) => return failure,
+            };
+            match mutation {
+                PluginStoreBatchMutation::Set { key, .. }
+                | PluginStoreBatchMutation::Patch { key, .. } => {
+                    if let Err(error) = self.write_record(&candidate[key]) {
+                        return PluginStoreBatchResult::failure(
+                            error,
+                            Some(index + 1),
+                            Some(key.clone()),
+                        );
+                    }
+                }
+                PluginStoreBatchMutation::Delete { key, .. } => {
+                    if let Err(error) = fs::remove_file(self.record_path(plugin_key, key)) {
+                        return PluginStoreBatchResult::failure(
+                            backend_error(error),
+                            Some(index + 1),
+                            Some(key.clone()),
+                        );
+                    }
+                }
+            }
+            if let Err(error) = self.run_batch_test_hook(BatchCommitPoint::RecordStaged(index + 1))
+            {
+                return PluginStoreBatchResult::failure(
+                    error,
+                    Some(index + 1),
+                    Some(mutation.key().clone()),
+                );
+            }
+            records = candidate;
+            results.append(&mut mutation_results);
+        }
+        PluginStoreBatchResult::success(results)
+    }
+
+    fn commit_records(
+        &self,
+        plugin_key: &PluginKey,
+        records: &BTreeMap<PluginStoreKey, PluginStoreRecord>,
+    ) -> Result<(), CapabilityRuntimeError> {
+        fs::create_dir_all(&self.root).map_err(backend_error)?;
+        let namespace = self.namespace_dir(plugin_key);
+        let (staging, backup) = self.transaction_paths(plugin_key);
+        remove_dir_if_exists(&staging)?;
+        remove_dir_if_exists(&backup)?;
+        fs::create_dir(&staging).map_err(backend_error)?;
+        #[cfg(test)]
+        let mut staged_record_count = 0;
+        for record in records.values() {
+            self.write_record_to(&staging, record)?;
+            #[cfg(test)]
+            {
+                staged_record_count += 1;
+                self.run_batch_test_hook(BatchCommitPoint::RecordStaged(staged_record_count))?;
+            }
+        }
+        sync_directory(&staging)?;
+
+        let had_namespace = namespace.exists();
+        if had_namespace {
+            fs::rename(&namespace, &backup).map_err(backend_error)?;
+            sync_directory(&self.root)?;
+            #[cfg(test)]
+            self.run_batch_test_hook(BatchCommitPoint::NamespaceBackedUp)?;
+        }
+        if let Err(error) = fs::rename(&staging, &namespace).map_err(backend_error) {
+            if had_namespace {
+                let _ = fs::rename(&backup, &namespace);
+                let _ = sync_directory(&self.root);
+            }
+            return Err(error);
+        }
+        sync_directory(&self.root)?;
+        remove_dir_if_exists(&backup)?;
+        sync_directory(&self.root)
     }
 }
 
@@ -903,6 +1220,7 @@ impl PluginStoreBackend for LocalPluginStoreBackend {
         key: &PluginStoreKey,
     ) -> Result<Option<PluginStoreRecord>, CapabilityRuntimeError> {
         let _guard = self.lock.lock().expect("plugin store lock poisoned");
+        self.recover_transaction(plugin_key)?;
         Ok(self.read_records(plugin_key)?.get(key).cloned())
     }
 
@@ -916,6 +1234,7 @@ impl PluginStoreBackend for LocalPluginStoreBackend {
         limits: PluginStoreLimits,
     ) -> Result<PluginStoreRecord, CapabilityRuntimeError> {
         let _guard = self.lock.lock().expect("plugin store lock poisoned");
+        self.recover_transaction(plugin_key)?;
         let records = self.read_records(plugin_key)?;
         let revision = revision_for_write(records.get(&key), expected_revision)?;
         enforce_plugin_store_limits(&records, &key, &payload, limits)?;
@@ -936,6 +1255,7 @@ impl PluginStoreBackend for LocalPluginStoreBackend {
         key: &PluginStoreKey,
     ) -> Result<PluginStoreRecord, CapabilityRuntimeError> {
         let _guard = self.lock.lock().expect("plugin store lock poisoned");
+        self.recover_transaction(plugin_key)?;
         let record = self
             .read_records(plugin_key)?
             .get(key)
@@ -956,6 +1276,7 @@ impl PluginStoreBackend for LocalPluginStoreBackend {
         prefix: Option<&str>,
     ) -> Result<Vec<PluginStoreEntry>, CapabilityRuntimeError> {
         let _guard = self.lock.lock().expect("plugin store lock poisoned");
+        self.recover_transaction(plugin_key)?;
         Ok(self
             .read_records(plugin_key)?
             .values()
@@ -977,6 +1298,7 @@ impl PluginStoreBackend for LocalPluginStoreBackend {
         limits: PluginStoreLimits,
     ) -> Result<PluginStoreRecord, CapabilityRuntimeError> {
         let _guard = self.lock.lock().expect("plugin store lock poisoned");
+        self.recover_transaction(plugin_key)?;
         let records = self.read_records(plugin_key)?;
         let current = records.get(key).cloned().ok_or_else(|| {
             CapabilityRuntimeError::new(
@@ -996,6 +1318,199 @@ impl PluginStoreBackend for LocalPluginStoreBackend {
         self.write_record(&record)?;
         Ok(record)
     }
+}
+
+fn apply_plugin_store_batch(
+    plugin_key: &PluginKey,
+    mut records: BTreeMap<PluginStoreKey, PluginStoreRecord>,
+    mutations: &[PluginStoreBatchMutation],
+    limits: PluginStoreLimits,
+) -> Result<
+    (
+        BTreeMap<PluginStoreKey, PluginStoreRecord>,
+        Vec<PluginStoreBatchMutationResult>,
+    ),
+    PluginStoreBatchResult,
+> {
+    if mutations.is_empty() {
+        return Err(PluginStoreBatchResult::failure(
+            CapabilityRuntimeError::new(
+                CapabilityRuntimeErrorKind::InvalidRequest,
+                "plugin-store batch requires at least one mutation",
+            ),
+            None,
+            None,
+        ));
+    }
+    if mutations.len() > limits.max_plugin_keys {
+        return Err(PluginStoreBatchResult::failure(
+            CapabilityRuntimeError::new(
+                CapabilityRuntimeErrorKind::InvalidRequest,
+                "plugin-store batch exceeds max_plugin_keys",
+            ),
+            None,
+            None,
+        ));
+    }
+
+    let mut seen = BTreeSet::new();
+    let mut results = Vec::with_capacity(mutations.len());
+    for (index, mutation) in mutations.iter().enumerate() {
+        let key = mutation.key();
+        if !key.is_valid() {
+            return Err(batch_mutation_failure(
+                CapabilityRuntimeError::new(
+                    CapabilityRuntimeErrorKind::InvalidRequest,
+                    "plugin-store key is invalid",
+                ),
+                index,
+                key,
+            ));
+        }
+        if !seen.insert(key.clone()) {
+            return Err(batch_mutation_failure(
+                CapabilityRuntimeError::new(
+                    CapabilityRuntimeErrorKind::InvalidRequest,
+                    "plugin-store batch contains duplicate keys",
+                ),
+                index,
+                key,
+            ));
+        }
+
+        let result = match mutation {
+            PluginStoreBatchMutation::Set {
+                key,
+                schema_version,
+                payload,
+                expected_revision,
+            } => {
+                let revision = revision_for_write(records.get(key), Some(*expected_revision))
+                    .map_err(|error| batch_mutation_failure(error, index, key))?;
+                let record = PluginStoreRecord {
+                    plugin_key: plugin_key.clone(),
+                    key: key.clone(),
+                    schema_version: *schema_version,
+                    revision,
+                    payload: payload.clone(),
+                };
+                records.insert(key.clone(), record.clone());
+                PluginStoreBatchMutationResult::Set { record }
+            }
+            PluginStoreBatchMutation::Patch {
+                key,
+                patch,
+                expected_revision,
+            } => {
+                let current = records.get(key).cloned().ok_or_else(|| {
+                    batch_mutation_failure(
+                        CapabilityRuntimeError::new(
+                            CapabilityRuntimeErrorKind::StoreNotFound,
+                            "plugin-store record was not found",
+                        ),
+                        index,
+                        key,
+                    )
+                })?;
+                let revision = revision_for_write(Some(&current), Some(*expected_revision))
+                    .map_err(|error| batch_mutation_failure(error, index, key))?;
+                let mut payload = current.payload.clone();
+                apply_plugin_store_merge_patch(&mut payload, patch)
+                    .map_err(|error| batch_mutation_failure(error, index, key))?;
+                let record = PluginStoreRecord {
+                    revision,
+                    payload,
+                    ..current
+                };
+                records.insert(key.clone(), record.clone());
+                PluginStoreBatchMutationResult::Patch { record }
+            }
+            PluginStoreBatchMutation::Delete {
+                key,
+                expected_revision,
+            } => {
+                let current = records.get(key).cloned().ok_or_else(|| {
+                    batch_mutation_failure(
+                        CapabilityRuntimeError::new(
+                            CapabilityRuntimeErrorKind::StoreNotFound,
+                            "plugin-store record was not found",
+                        ),
+                        index,
+                        key,
+                    )
+                })?;
+                revision_for_write(Some(&current), Some(*expected_revision))
+                    .map_err(|error| batch_mutation_failure(error, index, key))?;
+                records.remove(key);
+                PluginStoreBatchMutationResult::Delete {
+                    key: key.clone(),
+                    revision: current.revision,
+                }
+            }
+        };
+        results.push(result);
+    }
+
+    enforce_plugin_store_snapshot_limits(&records, limits).map_err(|error| {
+        let index = mutations.len() - 1;
+        batch_mutation_failure(error, index, mutations[index].key())
+    })?;
+    Ok((records, results))
+}
+
+fn batch_mutation_failure(
+    error: CapabilityRuntimeError,
+    index: usize,
+    key: &PluginStoreKey,
+) -> PluginStoreBatchResult {
+    PluginStoreBatchResult::failure(error, Some(index + 1), Some(key.clone()))
+}
+
+fn enforce_plugin_store_snapshot_limits(
+    records: &BTreeMap<PluginStoreKey, PluginStoreRecord>,
+    limits: PluginStoreLimits,
+) -> Result<(), CapabilityRuntimeError> {
+    if records.len() > limits.max_plugin_keys {
+        return Err(CapabilityRuntimeError::new(
+            CapabilityRuntimeErrorKind::QuotaExceeded,
+            "plugin-store namespace exceeds max_plugin_keys",
+        ));
+    }
+    if records
+        .values()
+        .any(|record| record.payload_bytes() > limits.max_record_bytes)
+    {
+        return Err(CapabilityRuntimeError::new(
+            CapabilityRuntimeErrorKind::QuotaExceeded,
+            "plugin-store record exceeds max_record_bytes",
+        ));
+    }
+    if records
+        .values()
+        .map(PluginStoreRecord::payload_bytes)
+        .sum::<usize>()
+        > limits.max_plugin_bytes
+    {
+        return Err(CapabilityRuntimeError::new(
+            CapabilityRuntimeErrorKind::QuotaExceeded,
+            "plugin-store namespace exceeds max_plugin_bytes",
+        ));
+    }
+    Ok(())
+}
+
+fn remove_dir_if_exists(path: &Path) -> Result<(), CapabilityRuntimeError> {
+    match fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(backend_error(error)),
+    }
+}
+
+fn sync_directory(path: &Path) -> Result<(), CapabilityRuntimeError> {
+    File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(backend_error)
 }
 
 fn execute_plugin_store(
@@ -1426,5 +1941,389 @@ fn event_plugin_key(event: &CapabilityRuntimeEvent) -> Option<PluginKey> {
         | CapabilityRuntimeEvent::Failed(event) => Some(event.plugin_key.clone()),
         CapabilityRuntimeEvent::Backpressure(event) => event.route.plugin_key.clone(),
         CapabilityRuntimeEvent::CleanupCompleted(event) => Some(event.plugin_key.clone()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Condvar, mpsc};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    fn test_backend(name: &str) -> Arc<LocalPluginStoreBackend> {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time after epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "botster-plugin-store-{name}-{}-{nonce}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        Arc::new(LocalPluginStoreBackend::new(root))
+    }
+
+    fn set_mutation(
+        key: &str,
+        value: serde_json::Value,
+        expected_revision: u64,
+    ) -> PluginStoreBatchMutation {
+        PluginStoreBatchMutation::Set {
+            key: PluginStoreKey(key.to_string()),
+            schema_version: 1,
+            payload: value,
+            expected_revision,
+        }
+    }
+
+    #[test]
+    fn plugin_store_batch_failure_after_staged_progress_leaves_live_snapshot_unchanged() {
+        let backend = test_backend("stage-failure");
+        let plugin_key = PluginKey("project-pipelines".to_string());
+        backend
+            .set(
+                &plugin_key,
+                PluginStoreKey("ticket".to_string()),
+                1,
+                serde_json::json!({ "status": "open" }),
+                Some(0),
+                PluginStoreLimits::default(),
+            )
+            .expect("seed ticket");
+        backend.set_batch_test_hook(Arc::new(|point| {
+            if point == BatchCommitPoint::RecordStaged(1) {
+                return Err(CapabilityRuntimeError::new(
+                    CapabilityRuntimeErrorKind::BackendFailed,
+                    "injected failure after staged progress",
+                ));
+            }
+            Ok(())
+        }));
+
+        let result = backend.batch(
+            &plugin_key,
+            vec![
+                set_mutation("ticket", serde_json::json!({ "status": "active" }), 1),
+                set_mutation("run", serde_json::json!({ "status": "active" }), 0),
+            ],
+            PluginStoreLimits::default(),
+        );
+
+        assert!(!result.ok);
+        assert_eq!(
+            result.error_kind,
+            Some(CapabilityRuntimeErrorKind::BackendFailed)
+        );
+        assert_eq!(
+            backend
+                .get(&plugin_key, &PluginStoreKey("ticket".to_string()))
+                .expect("read ticket")
+                .expect("ticket exists")
+                .payload,
+            serde_json::json!({ "status": "open" })
+        );
+        assert!(
+            backend
+                .get(&plugin_key, &PluginStoreKey("run".to_string()))
+                .expect("read run")
+                .is_none()
+        );
+        let (staging, backup) = backend.transaction_paths(&plugin_key);
+        assert!(!staging.exists());
+        assert!(!backup.exists());
+    }
+
+    #[test]
+    fn plugin_store_batch_applies_ordered_set_patch_delete_and_rejects_typed_invalid_candidates() {
+        let backend = test_backend("candidate");
+        let plugin_key = PluginKey("project-pipelines".to_string());
+        for (key, payload) in [
+            ("ticket", serde_json::json!({ "status": "open" })),
+            ("obsolete", serde_json::json!({ "present": true })),
+        ] {
+            backend
+                .set(
+                    &plugin_key,
+                    PluginStoreKey(key.to_string()),
+                    1,
+                    payload,
+                    Some(0),
+                    PluginStoreLimits::default(),
+                )
+                .expect("seed record");
+        }
+
+        let result = backend.batch(
+            &plugin_key,
+            vec![
+                PluginStoreBatchMutation::Patch {
+                    key: PluginStoreKey("ticket".to_string()),
+                    patch: serde_json::json!({ "status": "active" }),
+                    expected_revision: 1,
+                },
+                PluginStoreBatchMutation::Delete {
+                    key: PluginStoreKey("obsolete".to_string()),
+                    expected_revision: 1,
+                },
+                set_mutation("run", serde_json::json!({ "status": "active" }), 0),
+            ],
+            PluginStoreLimits::default(),
+        );
+        assert!(result.ok);
+        assert!(matches!(
+            result.results.as_slice(),
+            [
+                PluginStoreBatchMutationResult::Patch { .. },
+                PluginStoreBatchMutationResult::Delete { .. },
+                PluginStoreBatchMutationResult::Set { .. }
+            ]
+        ));
+        let records = backend
+            .read_records(&plugin_key)
+            .expect("read committed batch");
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[&PluginStoreKey("ticket".to_string())].revision, 2);
+        assert!(!records.contains_key(&PluginStoreKey("obsolete".to_string())));
+
+        for (mutations, expected_kind) in [
+            (
+                vec![
+                    set_mutation("duplicate", serde_json::json!({ "value": 1 }), 0),
+                    set_mutation("duplicate", serde_json::json!({ "value": 2 }), 0),
+                ],
+                CapabilityRuntimeErrorKind::InvalidRequest,
+            ),
+            (
+                vec![PluginStoreBatchMutation::Patch {
+                    key: PluginStoreKey("ticket".to_string()),
+                    patch: serde_json::json!("invalid"),
+                    expected_revision: 2,
+                }],
+                CapabilityRuntimeErrorKind::PatchFailed,
+            ),
+            (
+                vec![set_mutation(
+                    "oversized",
+                    serde_json::json!({ "value": "x".repeat(65 * 1024) }),
+                    0,
+                )],
+                CapabilityRuntimeErrorKind::QuotaExceeded,
+            ),
+        ] {
+            let failed = backend.batch(&plugin_key, mutations, PluginStoreLimits::default());
+            assert!(!failed.ok);
+            assert_eq!(failed.error_kind, Some(expected_kind));
+            assert!(failed.mutation_index.is_some());
+            assert!(failed.key.is_some());
+            assert_eq!(
+                backend
+                    .read_records(&plugin_key)
+                    .expect("read unchanged batch"),
+                records
+            );
+        }
+
+        let empty = backend.batch(&plugin_key, Vec::new(), PluginStoreLimits::default());
+        assert!(!empty.ok);
+        assert_eq!(
+            empty.error_kind,
+            Some(CapabilityRuntimeErrorKind::InvalidRequest)
+        );
+        assert_eq!(
+            backend
+                .read_records(&plugin_key)
+                .expect("read after empty batch"),
+            records
+        );
+    }
+
+    #[test]
+    fn plugin_store_batch_serializes_concurrent_single_writes_until_promotion() {
+        let backend = test_backend("concurrency");
+        let plugin_key = PluginKey("project-pipelines".to_string());
+        backend
+            .set(
+                &plugin_key,
+                PluginStoreKey("ticket".to_string()),
+                1,
+                serde_json::json!({ "status": "open" }),
+                Some(0),
+                PluginStoreLimits::default(),
+            )
+            .expect("seed ticket");
+        backend
+            .set(
+                &plugin_key,
+                PluginStoreKey("before-snapshot".to_string()),
+                1,
+                serde_json::json!({ "value": "preserved" }),
+                Some(0),
+                PluginStoreLimits::default(),
+            )
+            .expect("seed unrelated record before snapshot");
+
+        let stage_gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let release_gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let stage_gate_for_hook = stage_gate.clone();
+        let release_gate_for_hook = release_gate.clone();
+        backend.set_batch_test_hook(Arc::new(move |point| {
+            if point == BatchCommitPoint::RecordStaged(1) {
+                let (lock, ready) = &*stage_gate_for_hook;
+                *lock.lock().expect("stage gate") = true;
+                ready.notify_all();
+                let (lock, release) = &*release_gate_for_hook;
+                let mut released = lock.lock().expect("release gate");
+                while !*released {
+                    released = release.wait(released).expect("release batch");
+                }
+            }
+            Ok(())
+        }));
+
+        let batch_backend = backend.clone();
+        let batch_plugin_key = plugin_key.clone();
+        let batch_thread = std::thread::spawn(move || {
+            batch_backend.batch(
+                &batch_plugin_key,
+                vec![set_mutation(
+                    "ticket",
+                    serde_json::json!({ "status": "active" }),
+                    1,
+                )],
+                PluginStoreLimits::default(),
+            )
+        });
+        let (lock, ready) = &*stage_gate;
+        let mut staged = lock.lock().expect("stage gate");
+        while !*staged {
+            staged = ready.wait(staged).expect("wait for staged record");
+        }
+
+        let (write_sender, write_receiver) = mpsc::channel();
+        let write_backend = backend.clone();
+        let write_plugin_key = plugin_key.clone();
+        let write_thread = std::thread::spawn(move || {
+            let written = write_backend.set(
+                &write_plugin_key,
+                PluginStoreKey("unrelated".to_string()),
+                1,
+                serde_json::json!({ "value": 1 }),
+                Some(0),
+                PluginStoreLimits::default(),
+            );
+            write_sender.send(written).expect("send write result");
+        });
+        let (read_sender, read_receiver) = mpsc::channel();
+        let read_backend = backend.clone();
+        let read_plugin_key = plugin_key.clone();
+        let read_thread = std::thread::spawn(move || {
+            let record = read_backend.get(&read_plugin_key, &PluginStoreKey("ticket".to_string()));
+            read_sender.send(record).expect("send read result");
+        });
+        assert!(
+            write_receiver
+                .recv_timeout(Duration::from_millis(50))
+                .is_err(),
+            "single write must remain blocked while the batch holds the backend mutex"
+        );
+        assert!(
+            read_receiver
+                .recv_timeout(Duration::from_millis(50))
+                .is_err(),
+            "get must remain blocked rather than observe a staged generation"
+        );
+
+        let (lock, release) = &*release_gate;
+        *lock.lock().expect("release gate") = true;
+        release.notify_all();
+        assert!(batch_thread.join().expect("join batch").ok);
+        write_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("single write completes after batch")
+            .expect("single write succeeds");
+        write_thread.join().expect("join writer");
+        assert_eq!(
+            read_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("read completes after batch")
+                .expect("read succeeds")
+                .expect("ticket remains present")
+                .payload,
+            serde_json::json!({ "status": "active" })
+        );
+        read_thread.join().expect("join reader");
+
+        assert_eq!(
+            backend
+                .get(&plugin_key, &PluginStoreKey("ticket".to_string()))
+                .expect("read ticket")
+                .expect("ticket exists")
+                .payload,
+            serde_json::json!({ "status": "active" })
+        );
+        assert_eq!(
+            backend
+                .get(&plugin_key, &PluginStoreKey("unrelated".to_string()))
+                .expect("read unrelated")
+                .expect("unrelated exists")
+                .revision,
+            1
+        );
+        assert_eq!(
+            backend
+                .get(&plugin_key, &PluginStoreKey("before-snapshot".to_string()))
+                .expect("read before-snapshot record")
+                .expect("before-snapshot record exists")
+                .payload,
+            serde_json::json!({ "value": "preserved" })
+        );
+    }
+
+    #[test]
+    fn plugin_store_batch_failure_at_promotion_boundary_restores_backup_immediately() {
+        let backend = test_backend("promotion-failure");
+        let plugin_key = PluginKey("project-pipelines".to_string());
+        backend
+            .set(
+                &plugin_key,
+                PluginStoreKey("ticket".to_string()),
+                1,
+                serde_json::json!({ "status": "open" }),
+                Some(0),
+                PluginStoreLimits::default(),
+            )
+            .expect("seed ticket");
+        backend.set_batch_test_hook(Arc::new(|point| {
+            if point == BatchCommitPoint::NamespaceBackedUp {
+                return Err(CapabilityRuntimeError::new(
+                    CapabilityRuntimeErrorKind::BackendFailed,
+                    "injected failure at promotion boundary",
+                ));
+            }
+            Ok(())
+        }));
+
+        let result = backend.batch(
+            &plugin_key,
+            vec![set_mutation(
+                "ticket",
+                serde_json::json!({ "status": "active" }),
+                1,
+            )],
+            PluginStoreLimits::default(),
+        );
+
+        assert!(!result.ok);
+        assert_eq!(
+            backend
+                .read_records(&plugin_key)
+                .expect("live snapshot restored without another public access")
+                [&PluginStoreKey("ticket".to_string())]
+                .payload,
+            serde_json::json!({ "status": "open" })
+        );
+        let (staging, backup) = backend.transaction_paths(&plugin_key);
+        assert!(!staging.exists());
+        assert!(!backup.exists());
     }
 }
