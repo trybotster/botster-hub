@@ -257,7 +257,7 @@ but normal client reconciliation must not poll it or maintain a list-refresh
 fallback beside the entity stream.
 
 The prepared current contract ships from
-`@trybotster/hub-test-support@0.1.22` as
+`@trybotster/hub-test-support@0.1.23` as
 `session-lifecycle-subscription-conformance-fixture.json` and through
 `readSessionLifecycleSubscriptionConformanceFixture()`. The fixture serializes
 the public `DaemonEntityFrame` DTOs and normalizes only timestamps and sequence
@@ -721,35 +721,38 @@ node payload must not carry raw HTML fields such as `html`, `raw_html`,
 than being injected into the client app DOM. The hub daemon does not currently
 serve that URL as a static HTTP asset endpoint.
 
-## Session Templates And Context
+## Authoritative Session Types And Context
 
-`session_templates` is a hub-owned package manifest extension for PTY session
-launch templates. Packages may contribute declarations, but the running hub
+`session_types` is a hub-owned package manifest extension for PTY session
+definitions. Packages may contribute declarations, but the running Hub
 validates and materializes them into the generic core spawn contract before
-calling core. Core receives only command, args, cwd, environment, metadata, and
-PTY size.
+calling Core. Definitions combine launch fields with bounded presentation
+metadata and orthogonal `role`, `interaction`, `traits`, and `lifecycle`
+descriptors. Core treats the classification metadata as opaque strings.
 
-Session templates are not `runnable_entrypoints`. Runnable entrypoints describe
-installed app/process launch contracts; session templates describe PTY sessions
-with trusted hub context. The protocol exposes `ListSessionTemplates`,
-`ShowSessionTemplate`, `ResolveSessionTemplate`, `SpawnSessionTemplate`, and
-`ReadSessionContext`.
+Session types are not `runnable_entrypoints`. Runnable entrypoints describe
+installed app/process launch contracts; session types describe PTY sessions
+with trusted hub context. The protocol exposes `ListSessionTypes`,
+`ShowSessionType`, `ResolveSessionType`, `SpawnSessionType`, and
+`ReadSessionContext`, plus source-aware `CreateSessionType`,
+`UpdateSessionType`, and `DeleteSessionType` requests.
 
 Resolution precedence is package < device < repo < explicit request values.
-Device template sources and admitted repo target roots are durable hub-state
-fields. They are additive v1 fields, so a `hub-state.json` written before these
-sources existed loads with empty device/repo sources rather than requiring a
-schema-version migration.
+Device definitions, admitted repo target roots, and a monotonic definition
+generation are durable Hub state. Schema 3 is a cold cut: older schema versions
+are rejected before the new shape is deserialized.
 
-Repo-local templates are read from `.botster/session-templates.json` under an
-admitted target root. The file uses the same `session_templates` array shape as
-package manifests. Repo-local files are rediscovered fresh for each
-list/show/resolve/spawn request; there is no separate reload command. Disabled
-or unadmitted targets do not contribute repo templates.
+Repo-local session types are read from `.botster/session-types.json` under an
+admitted target root. The file uses the same `session_types` array shape as
+package manifests. Device definitions support full CRUD. Repo definitions
+support CRUD only with an enabled admitted `target_id` and are atomically
+written beneath that target. Package definitions are read-only and mutation
+returns `read_only_session_type_source`. Disabled or unadmitted targets do not
+contribute repo definitions.
 
 Explicit environment overrides must appear in
 `allowed_environment_overrides`. Explicit cwd overrides must stay inside the
-selected source root. Unauthorized target, cwd, path, template, or environment
+selected source root. Unauthorized target, cwd, path, session type, or environment
 requests return operator errors before core spawn.
 
 Spawned scripts receive `BOTSTER_SESSION_ID`, `BOTSTER_CONTEXT_ID`,
@@ -764,13 +767,21 @@ List/show/resolve responses are sanitized and do not include prompt values or
 raw context payloads. `ReadSessionContext` is explicit user-path output for the
 spawned session or an admitted local operator.
 
+Effective rows expose `source`, `source_name`, `editable`,
+`overridden_sources`, and diagnostics. The built-in `session_type` entity family
+publishes an initial snapshot and ordered upsert/remove deltas at the durable
+generation. It is a Hub-owned lane, distinct from Core-backed `session` and
+plugin-provider families. Spawned `session` rows project session type id/source,
+role, traits, interaction, and lifecycle from Core lifecycle metadata across
+reconnect and restart; missing metadata is explicit absence.
+
 Lua plugins receive target-filtered
-`session_templates.list({target_id=...})` and
-`session_templates.show({target_id=..., template_id=...})` as ordinary read
-projections. The exact `session_template_managed_git_spawn` session-action
+`session_types.list({target_id=...})` and
+`session_types.show({target_id=..., session_type_id=...})` as ordinary read
+projections. The exact `session_type_managed_git_spawn` session-action
 scope gates only the single
-`session_templates.ensure_worktree_and_spawn(...)` mutation. The mutation
-accepts semantic target, branch, template, environment, prompt, ticket,
+`session_types.ensure_worktree_and_spawn(...)` mutation. The mutation
+accepts semantic target, branch, session type, environment, prompt, ticket,
 workspace, and safe metadata values. Hub rejects caller-supplied session id,
 cwd, repo/worktree path, branch/base facts, derives those values from the
 ensured worktree, and returns a tagged result with a canonical UUID plus
@@ -780,7 +791,7 @@ Managed Git creation uses the stored target `base_ref`, performs no fetch,
 pull, reset, clean, or prune, and reuses dirty exact matches without mutation.
 Branch/path/repository ownership conflicts are typed and path-neutral. Session
 spawn failure removes only resources created by that call; uncertain cleanup is
-reconciled and preserved. The existing `session_template_spawn` scope does not
+reconciled and preserved. The existing `session_type_spawn` scope does not
 grant managed Git mutation, and the daemon `CreateWorktree`/`DeleteWorktree`
 contract remains generic registered-record admission/removal rather than a Git
 operation. Hub-managed Git rows reject record-only deletion, and a target with
@@ -1039,7 +1050,7 @@ Adding the `refresh_local_packages` daemon request changes the request
 vocabulary, so `PROTOCOL_VERSION` advances to 3 alongside
 `CONFORMANCE_FIXTURE_REVISION` 18. This was a cold cut with no protocol-v2 parser
 or parallel fixture. Because `DaemonCompatibilityRequirement::current()`
-derives `minimum_protocol_version` from `PROTOCOL_VERSION`, clients built at
+derives `protocol_version` from `PROTOCOL_VERSION`, clients built at
 this identity require a Hub at protocol version 3 or later.
 
 Replacing revision-13 JSON byte arrays with validated `payload_base64`, literal
@@ -1168,6 +1179,15 @@ protocol 4 or conformance 28 before issuing the new request. A stale 4/28
 client accepts the newer descriptor and ignores additive status identity fields,
 but does not know or issue `CheckHubUpdate`. No feature constant is added; the
 protocol version is the single compatibility boundary.
+
+Cold-replacing the legacy operations and DTOs with authoritative session types
+advances `PROTOCOL_VERSION` to 6 and
+`CONFORMANCE_FIXTURE_REVISION` to 30. Protocol 6 requires exact protocol-version
+agreement and the `session_type_entity_subscriptions` feature before any request
+dispatch. It includes source-aware definition CRUD, provenance/editability,
+orthogonal role/interaction/traits/lifecycle fields, durable definition entity
+generations, and canonical session metadata projection. Protocol 5 clients fail
+the typed compatibility handshake; no aliases or dual readers remain.
 
 ## Isolated Integration Tests For External Clients
 

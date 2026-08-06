@@ -14,13 +14,13 @@ use botster_core::{
 };
 use botster_core_daemon::{GuardedWriteDecision, GuardedWriteDeliveryState, ReadinessEvidence};
 use botster_hub::{
-    DataDirectoryOption, DeviceSessionTemplateSource, FileHubStateStore, HostIdentityOptions,
+    DataDirectoryOption, DeviceSessionTypeSource, FileHubStateStore, HostIdentityOptions,
     HubClientAdmission, HubClientApi, HubClientError, HubClientEvent, HubClientIdentity,
     HubClientOperation, HubClientPackageClassification, HubClientPackageState, HubClientRequest,
     HubClientResponseBody, HubClientRole, HubPackageManifest, HubRuntime, HubStartupOptions,
-    HubStateStore, PackageProvenance, PackageRegistry, PackageSessionTemplate,
-    PackageSessionTemplateWorkingDirectory, RuntimeEnvironment, SessionDefaults, SpawnTarget,
-    TransportBindings,
+    HubStateStore, PackageProvenance, PackageRegistry, PackageSessionType,
+    PackageSessionTypeWorkingDirectory, RuntimeEnvironment, SessionDefaults,
+    SessionTypeMutationSource, SpawnTarget, TransportBindings,
 };
 use botster_ui_contract::{
     PackageNavigationEntry, PackageNavigationTarget, PackageSurfaceDescriptor, PackageSurfaceKind,
@@ -60,6 +60,195 @@ fn explicit_runtime(name: &str) -> HubRuntime {
     .expect("explicit runtime config should build");
 
     HubRuntime::new(config)
+}
+
+#[test]
+fn session_type_device_crud_is_authoritative_and_package_mutation_is_read_only() {
+    let mut runtime = explicit_runtime("session-type-device-crud");
+    let packages = PackageRegistry::new(Vec::<Capability>::new().into_iter().collect());
+    let api = HubClientApi::local_operator("session-type-device-crud-client");
+    let mut definition = session_type("bin/accessory.sh", "accessory");
+    definition.id = "terminal-accessory".to_string();
+    definition.label = "Terminal accessory".to_string();
+    definition.role = "botster.accessory".to_string();
+    definition.interaction = "interactive".to_string();
+    definition.traits = vec!["terminal".to_string()];
+    definition.lifecycle = "persistent".to_string();
+
+    let created = api
+        .handle_request(
+            &mut runtime,
+            &packages,
+            HubClientRequest::CreateSessionType {
+                request_id: request_id("create-device-session-type"),
+                source: SessionTypeMutationSource::Device,
+                definition: definition.clone(),
+            },
+        )
+        .expect("create device session type");
+    let HubClientResponseBody::SessionTypes(created) = created.body else {
+        panic!("session type response expected");
+    };
+    assert_eq!(created.len(), 1);
+    assert!(created[0].editable);
+    assert_eq!(created[0].role, "botster.accessory");
+    assert_eq!(runtime.state().session_type_generation, 1);
+
+    definition.label = "Updated terminal accessory".to_string();
+    api.handle_request(
+        &mut runtime,
+        &packages,
+        HubClientRequest::UpdateSessionType {
+            request_id: request_id("update-device-session-type"),
+            source: SessionTypeMutationSource::Device,
+            definition,
+        },
+    )
+    .expect("update device session type");
+    assert_eq!(runtime.state().session_type_generation, 2);
+
+    let rejected = api
+        .handle_request(
+            &mut runtime,
+            &packages,
+            HubClientRequest::DeleteSessionType {
+                request_id: request_id("delete-package-session-type"),
+                source: SessionTypeMutationSource::Package {
+                    package_name: "read-only.plugin".to_string(),
+                },
+                session_type_id: "terminal-accessory".to_string(),
+            },
+        )
+        .expect_err("package source is read-only");
+    assert!(matches!(
+        rejected,
+        HubClientError::SessionType {
+            kind: "read_only_session_type_source",
+            ..
+        }
+    ));
+
+    let deleted = api
+        .handle_request(
+            &mut runtime,
+            &packages,
+            HubClientRequest::DeleteSessionType {
+                request_id: request_id("delete-device-session-type"),
+                source: SessionTypeMutationSource::Device,
+                session_type_id: "terminal-accessory".to_string(),
+            },
+        )
+        .expect("delete device session type");
+    let HubClientResponseBody::SessionTypes(deleted) = deleted.body else {
+        panic!("session type response expected");
+    };
+    assert!(deleted.is_empty());
+    assert_eq!(runtime.state().session_type_generation, 3);
+}
+
+#[test]
+fn session_type_role_interaction_traits_and_lifecycle_are_orthogonal() {
+    let mut runtime = explicit_runtime("session-type-orthogonal-semantics");
+    let packages = empty_registry();
+    let api = HubClientApi::local_operator("session-type-orthogonal-semantics-client");
+    let cases = [
+        (
+            "interactive-agent",
+            "botster.agent",
+            "interactive",
+            vec!["terminal"],
+            "task",
+        ),
+        (
+            "interactive-accessory",
+            "botster.accessory",
+            "interactive",
+            vec!["terminal", "companion"],
+            "persistent",
+        ),
+        (
+            "service-accessory",
+            "botster.accessory",
+            "service",
+            vec!["background"],
+            "persistent",
+        ),
+    ];
+
+    for (id, role, interaction, traits, lifecycle) in cases {
+        let mut definition = session_type("bin/session.sh", id);
+        definition.id = id.to_string();
+        definition.label = id.replace('-', " ");
+        definition.role = role.to_string();
+        definition.interaction = interaction.to_string();
+        definition.traits = traits.into_iter().map(str::to_string).collect();
+        definition.lifecycle = lifecycle.to_string();
+        api.handle_request(
+            &mut runtime,
+            &packages,
+            HubClientRequest::CreateSessionType {
+                request_id: request_id(&format!("create-{id}")),
+                source: SessionTypeMutationSource::Device,
+                definition,
+            },
+        )
+        .expect("orthogonal session type should be accepted");
+    }
+
+    let response = api
+        .handle_request(
+            &mut runtime,
+            &packages,
+            HubClientRequest::ListSessionTypes {
+                request_id: request_id("list-orthogonal-session-types"),
+            },
+        )
+        .expect("list orthogonal session types");
+    let HubClientResponseBody::SessionTypes(session_types) = response.body else {
+        panic!("session type response expected");
+    };
+    let semantics = session_types
+        .into_iter()
+        .map(|session_type| {
+            (
+                session_type.id,
+                (
+                    session_type.role,
+                    session_type.interaction,
+                    session_type.traits,
+                    session_type.lifecycle,
+                ),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    assert_eq!(
+        semantics["interactive-agent"],
+        (
+            "botster.agent".to_string(),
+            "interactive".to_string(),
+            vec!["terminal".to_string()],
+            "task".to_string(),
+        )
+    );
+    assert_eq!(
+        semantics["interactive-accessory"],
+        (
+            "botster.accessory".to_string(),
+            "interactive".to_string(),
+            vec!["terminal".to_string(), "companion".to_string()],
+            "persistent".to_string(),
+        )
+    );
+    assert_eq!(
+        semantics["service-accessory"],
+        (
+            "botster.accessory".to_string(),
+            "service".to_string(),
+            vec!["background".to_string()],
+            "persistent".to_string(),
+        )
+    );
 }
 
 fn request_id(value: &str) -> RequestId {
@@ -120,8 +309,8 @@ fn session_entity_subscription_uses_core_baseline_and_rejects_other_families() {
     ));
 }
 
-fn write_session_template_package(root: &std::path::Path) {
-    write_named_session_template_package(root, "session-template.plugin");
+fn write_session_type_package(root: &std::path::Path) {
+    write_named_session_type_package(root, "session-type.plugin");
 }
 
 fn write_executable_script(root: &std::path::Path, relative: &str, contents: &str) {
@@ -133,12 +322,19 @@ fn write_executable_script(root: &std::path::Path, relative: &str, contents: &st
     fs::set_permissions(&path, permissions).expect("chmod script");
 }
 
-fn session_template(command: &str, mode: &str) -> PackageSessionTemplate {
-    PackageSessionTemplate {
+fn session_type(command: &str, mode: &str) -> PackageSessionType {
+    PackageSessionType {
         id: "init".to_string(),
+        label: "Test session".to_string(),
+        description: None,
+        icon: None,
+        role: "botster.agent".to_string(),
+        interaction: "interactive".to_string(),
+        traits: vec!["test".to_string()],
+        lifecycle: "task".to_string(),
         command: command.to_string(),
         args: Vec::new(),
-        working_directory: PackageSessionTemplateWorkingDirectory::PackageRoot,
+        working_directory: PackageSessionTypeWorkingDirectory::PackageRoot,
         environment: BTreeMap::from([("BOTSTER_MODE".to_string(), mode.to_string())]),
         allowed_environment_overrides: vec!["BOTSTER_MODE".to_string()],
         context: vec!["prompt".to_string()],
@@ -146,17 +342,17 @@ fn session_template(command: &str, mode: &str) -> PackageSessionTemplate {
     }
 }
 
-fn write_repo_session_templates(root: &std::path::Path, templates: serde_json::Value) {
+fn write_repo_session_types(root: &std::path::Path, templates: serde_json::Value) {
     fs::create_dir_all(root.join(".botster")).expect("create repo .botster dir");
     fs::write(
-        root.join(".botster/session-templates.json"),
-        serde_json::json!({ "session_templates": templates }).to_string(),
+        root.join(".botster/session-types.json"),
+        serde_json::json!({ "session_types": templates }).to_string(),
     )
-    .expect("write repo session templates");
+    .expect("write repo session types");
 }
 
-fn write_named_session_template_package(root: &std::path::Path, package_name: &str) {
-    fs::create_dir_all(root.join("bin")).expect("create session template package root");
+fn write_named_session_type_package(root: &std::path::Path, package_name: &str) {
+    fs::create_dir_all(root.join("bin")).expect("create session type package root");
     fs::write(root.join("plugin.lua"), "return botster.register({})\n")
         .expect("write plugin entrypoint");
     let script = root.join("bin/init.sh");
@@ -164,12 +360,12 @@ fn write_named_session_template_package(root: &std::path::Path, package_name: &s
         &script,
         "#!/bin/sh\nprintf 'template:%s:%s\\n' \"$BOTSTER_SESSION_ID\" \"$BOTSTER_MODE\"\n",
     )
-    .expect("write session template script");
+    .expect("write session type script");
     let mut permissions = fs::metadata(&script)
         .expect("script metadata")
         .permissions();
     permissions.set_mode(0o755);
-    fs::set_permissions(&script, permissions).expect("chmod session template script");
+    fs::set_permissions(&script, permissions).expect("chmod session type script");
     fs::write(
         root.join("botster-package.json"),
         r#"{
@@ -182,9 +378,14 @@ fn write_named_session_template_package(root: &std::path::Path, package_name: &s
   "entrypoints": [
     { "runtime": "lua", "path": "plugin.lua", "bootstrap": false }
   ],
-  "session_templates": [
+  "session_types": [
     {
       "id": "init",
+      "label": "Test agent",
+      "role": "botster.agent",
+      "interaction": "interactive",
+      "traits": ["test"],
+      "lifecycle": "task",
       "command": "bin/init.sh",
       "environment": { "BOTSTER_MODE": "default" },
       "allowed_environment_overrides": ["BOTSTER_MODE"],
@@ -195,7 +396,7 @@ fn write_named_session_template_package(root: &std::path::Path, package_name: &s
 "#
         .replace("__PACKAGE_NAME__", package_name),
     )
-    .expect("write session template package manifest");
+    .expect("write session type package manifest");
 }
 
 fn capability(surface: CapabilitySurface, scope: Option<&str>) -> Capability {
@@ -348,33 +549,32 @@ fn app_surface(id: &str, title: &str) -> PackageSurfaceDescriptor {
 }
 
 #[test]
-fn session_templates_resolve_spawn_context_and_reject_unadmitted_reads() {
-    let package_root = std::path::PathBuf::from(
-        "target/botster-hub-test-data/client-api-session-template-package",
-    );
+fn session_types_resolve_spawn_context_and_reject_unadmitted_reads() {
+    let package_root =
+        std::path::PathBuf::from("target/botster-hub-test-data/client-api-session-type-package");
     let _ = fs::remove_dir_all(&package_root);
-    write_session_template_package(&package_root);
+    write_session_type_package(&package_root);
     let mut packages = PackageRegistry::new(Vec::<Capability>::new().into_iter().collect());
     packages
-        .install_local_path(&package_root, "install session template package")
-        .expect("install session template package");
+        .install_local_path(&package_root, "install session type package")
+        .expect("install session type package");
     packages
-        .enable("session-template.plugin", "enable session template package")
-        .expect("enable session template package");
-    let mut runtime = explicit_runtime("session-template");
-    let api = HubClientApi::local_operator("session-template-client");
+        .enable("session-type.plugin", "enable session type package")
+        .expect("enable session type package");
+    let mut runtime = explicit_runtime("session-type");
+    let api = HubClientApi::local_operator("session-type-client");
 
     let list = api
         .handle_request(
             &mut runtime,
             &packages,
-            HubClientRequest::ListSessionTemplates {
-                request_id: request_id("list-session-templates"),
+            HubClientRequest::ListSessionTypes {
+                request_id: request_id("list-session-types"),
             },
         )
         .expect("list templates");
-    let HubClientResponseBody::SessionTemplates(templates) = list.body else {
-        panic!("session templates response expected");
+    let HubClientResponseBody::SessionTypes(templates) = list.body else {
+        panic!("session types response expected");
     };
     assert_eq!(templates.len(), 1);
     assert_eq!(templates[0].id, "init");
@@ -383,22 +583,22 @@ fn session_templates_resolve_spawn_context_and_reject_unadmitted_reads() {
         .handle_request(
             &mut runtime,
             &packages,
-            HubClientRequest::ResolveSessionTemplate {
+            HubClientRequest::ResolveSessionType {
                 request_id: request_id("resolve-rejected-env"),
-                template_id: "init".to_string(),
-                template_request: botster_hub::SessionTemplateRequest {
+                session_type_id: "init".to_string(),
+                session_type_request: botster_hub::SessionTypeRequest {
                     environment: BTreeMap::from([(
                         "BOTSTER_UNDECLARED".to_string(),
                         "no".to_string(),
                     )]),
-                    ..botster_hub::SessionTemplateRequest::default()
+                    ..botster_hub::SessionTypeRequest::default()
                 },
             },
         )
         .expect_err("undeclared env override rejected");
     assert!(matches!(
         rejected_env,
-        HubClientError::SessionTemplate {
+        HubClientError::SessionType {
             kind: "environment_not_admitted",
             ..
         }
@@ -408,19 +608,19 @@ fn session_templates_resolve_spawn_context_and_reject_unadmitted_reads() {
         .handle_request(
             &mut runtime,
             &packages,
-            HubClientRequest::ResolveSessionTemplate {
+            HubClientRequest::ResolveSessionType {
                 request_id: request_id("resolve-rejected-target"),
-                template_id: "init".to_string(),
-                template_request: botster_hub::SessionTemplateRequest {
+                session_type_id: "init".to_string(),
+                session_type_request: botster_hub::SessionTypeRequest {
                     target_id: Some("package:other-template.plugin".to_string()),
-                    ..botster_hub::SessionTemplateRequest::default()
+                    ..botster_hub::SessionTypeRequest::default()
                 },
             },
         )
         .expect_err("unadmitted target override rejected");
     assert!(matches!(
         rejected_target,
-        HubClientError::SessionTemplate {
+        HubClientError::SessionType {
             kind: "target_not_admitted",
             ..
         }
@@ -430,19 +630,19 @@ fn session_templates_resolve_spawn_context_and_reject_unadmitted_reads() {
         .handle_request(
             &mut runtime,
             &packages,
-            HubClientRequest::ResolveSessionTemplate {
+            HubClientRequest::ResolveSessionType {
                 request_id: request_id("resolve-rejected-cwd"),
-                template_id: "init".to_string(),
-                template_request: botster_hub::SessionTemplateRequest {
+                session_type_id: "init".to_string(),
+                session_type_request: botster_hub::SessionTypeRequest {
                     cwd: Some("/tmp/outside-template-root".to_string()),
-                    ..botster_hub::SessionTemplateRequest::default()
+                    ..botster_hub::SessionTypeRequest::default()
                 },
             },
         )
         .expect_err("unadmitted cwd override rejected");
     assert!(matches!(
         rejected_cwd,
-        HubClientError::SessionTemplate {
+        HubClientError::SessionType {
             kind: "cwd_not_admitted",
             ..
         }
@@ -452,27 +652,27 @@ fn session_templates_resolve_spawn_context_and_reject_unadmitted_reads() {
         .handle_request(
             &mut runtime,
             &packages,
-            HubClientRequest::ResolveSessionTemplate {
+            HubClientRequest::ResolveSessionType {
                 request_id: request_id("resolve-generic-template-id"),
-                template_id: "init".to_string(),
-                template_request: botster_hub::SessionTemplateRequest {
+                session_type_id: "init".to_string(),
+                session_type_request: botster_hub::SessionTypeRequest {
                     environment: BTreeMap::from([(
                         "BOTSTER_MODE".to_string(),
                         "override".to_string(),
                     )]),
-                    context: botster_hub::SessionTemplateContextInput {
+                    context: botster_hub::SessionTypeContextInput {
                         prompt: Some("hello from api".to_string()),
-                        ..botster_hub::SessionTemplateContextInput::default()
+                        ..botster_hub::SessionTypeContextInput::default()
                     },
-                    ..botster_hub::SessionTemplateRequest::default()
+                    ..botster_hub::SessionTypeRequest::default()
                 },
             },
         )
         .expect("resolve bare generic template id");
-    let HubClientResponseBody::ResolvedSessionTemplate(resolved) = resolved.body else {
+    let HubClientResponseBody::ResolvedSessionType(resolved) = resolved.body else {
         panic!("resolved template response expected");
     };
-    assert_eq!(resolved.template.id, "init");
+    assert_eq!(resolved.session_type.id, "init");
     assert_eq!(
         resolved.environment.get("BOTSTER_MODE").map(String::as_str),
         Some("override")
@@ -483,25 +683,25 @@ fn session_templates_resolve_spawn_context_and_reject_unadmitted_reads() {
         .handle_request(
             &mut runtime,
             &packages,
-            HubClientRequest::SpawnSessionTemplate {
-                request_id: request_id("spawn-session-template"),
-                template_id: "init".to_string(),
-                template_request: botster_hub::SessionTemplateRequest {
-                    session_id: Some(SessionId("session-template-api-session".to_string())),
-                    context: botster_hub::SessionTemplateContextInput {
+            HubClientRequest::SpawnSessionType {
+                request_id: request_id("spawn-session-type"),
+                session_type_id: "init".to_string(),
+                session_type_request: botster_hub::SessionTypeRequest {
+                    session_id: Some(SessionId("session-type-api-session".to_string())),
+                    context: botster_hub::SessionTypeContextInput {
                         prompt: Some("hello from spawn".to_string()),
-                        ..botster_hub::SessionTemplateContextInput::default()
+                        ..botster_hub::SessionTypeContextInput::default()
                     },
-                    ..botster_hub::SessionTemplateRequest::default()
+                    ..botster_hub::SessionTypeRequest::default()
                 },
                 now_seconds: 1,
             },
         )
-        .expect("spawn session template");
+        .expect("spawn session type");
     let HubClientResponseBody::Spawned(spawned) = spawn.body else {
         panic!("spawned response expected");
     };
-    assert_eq!(spawned.session.session_id.0, "session-template-api-session");
+    assert_eq!(spawned.session.session_id.0, "session-type-api-session");
 
     let context = api
         .handle_request(
@@ -509,7 +709,7 @@ fn session_templates_resolve_spawn_context_and_reject_unadmitted_reads() {
             &packages,
             HubClientRequest::ReadSessionContext {
                 request_id: request_id("read-session-context"),
-                session_id: SessionId("session-template-api-session".to_string()),
+                session_id: SessionId("session-type-api-session".to_string()),
                 context_id: None,
                 key: Some("prompt".to_string()),
             },
@@ -536,7 +736,7 @@ fn session_templates_resolve_spawn_context_and_reject_unadmitted_reads() {
             &packages,
             HubClientRequest::ReadSessionContext {
                 request_id: request_id("unadmitted-context-read"),
-                session_id: SessionId("session-template-api-session".to_string()),
+                session_id: SessionId("session-type-api-session".to_string()),
                 context_id: None,
                 key: None,
             },
@@ -546,55 +746,52 @@ fn session_templates_resolve_spawn_context_and_reject_unadmitted_reads() {
 }
 
 #[test]
-fn session_template_show_rejects_ambiguous_bare_ids() {
+fn session_type_show_rejects_ambiguous_bare_ids() {
     let first_root = std::path::PathBuf::from(
-        "target/botster-hub-test-data/client-api-session-template-first-package",
+        "target/botster-hub-test-data/client-api-session-type-first-package",
     );
     let second_root = std::path::PathBuf::from(
-        "target/botster-hub-test-data/client-api-session-template-second-package",
+        "target/botster-hub-test-data/client-api-session-type-second-package",
     );
     let _ = fs::remove_dir_all(&first_root);
     let _ = fs::remove_dir_all(&second_root);
-    write_named_session_template_package(&first_root, "first-template.plugin");
-    write_named_session_template_package(&second_root, "second-template.plugin");
+    write_named_session_type_package(&first_root, "first-template.plugin");
+    write_named_session_type_package(&second_root, "second-template.plugin");
 
     let mut packages = PackageRegistry::new(Vec::<Capability>::new().into_iter().collect());
     packages
-        .install_local_path(&first_root, "install first session template package")
-        .expect("install first session template package");
+        .install_local_path(&first_root, "install first session type package")
+        .expect("install first session type package");
     packages
-        .enable(
-            "first-template.plugin",
-            "enable first session template package",
-        )
-        .expect("enable first session template package");
+        .enable("first-template.plugin", "enable first session type package")
+        .expect("enable first session type package");
     packages
-        .install_local_path(&second_root, "install second session template package")
-        .expect("install second session template package");
+        .install_local_path(&second_root, "install second session type package")
+        .expect("install second session type package");
     packages
         .enable(
             "second-template.plugin",
-            "enable second session template package",
+            "enable second session type package",
         )
-        .expect("enable second session template package");
+        .expect("enable second session type package");
 
-    let mut runtime = explicit_runtime("session-template-show-ambiguous");
-    let api = HubClientApi::local_operator("session-template-show-ambiguous-client");
+    let mut runtime = explicit_runtime("session-type-show-ambiguous");
+    let api = HubClientApi::local_operator("session-type-show-ambiguous-client");
 
     let rejected = api
         .handle_request(
             &mut runtime,
             &packages,
-            HubClientRequest::ShowSessionTemplate {
+            HubClientRequest::ShowSessionType {
                 request_id: request_id("show-ambiguous-template"),
-                template_id: "init".to_string(),
+                session_type_id: "init".to_string(),
             },
         )
         .expect_err("ambiguous bare template id should be rejected");
     assert!(matches!(
         rejected,
-        HubClientError::SessionTemplate {
-            kind: "ambiguous_template",
+        HubClientError::SessionType {
+            kind: "ambiguous_session_type",
             ..
         }
     ));
@@ -603,34 +800,34 @@ fn session_template_show_rejects_ambiguous_bare_ids() {
         .handle_request(
             &mut runtime,
             &packages,
-            HubClientRequest::ShowSessionTemplate {
+            HubClientRequest::ShowSessionType {
                 request_id: request_id("show-full-template-id"),
-                template_id: "first-template.plugin/init".to_string(),
+                session_type_id: "first-template.plugin/init".to_string(),
             },
         )
         .expect("full template id remains unambiguous");
-    let HubClientResponseBody::SessionTemplates(templates) = shown.body else {
-        panic!("session templates response expected");
+    let HubClientResponseBody::SessionTypes(templates) = shown.body else {
+        panic!("session types response expected");
     };
     assert_eq!(templates.len(), 1);
-    assert_eq!(templates[0].template_id, "first-template.plugin/init");
+    assert_eq!(templates[0].session_type_id, "first-template.plugin/init");
 }
 
 #[test]
-fn session_template_sources_apply_device_repo_precedence_and_reload_from_state() {
+fn session_type_sources_apply_device_repo_precedence_and_reload_from_state() {
     let package_root = std::path::PathBuf::from(
-        "target/botster-hub-test-data/client-api-session-template-precedence-package",
+        "target/botster-hub-test-data/client-api-session-type-precedence-package",
     );
     let device_root = std::path::PathBuf::from(
-        "target/botster-hub-test-data/client-api-session-template-precedence-device",
+        "target/botster-hub-test-data/client-api-session-type-precedence-device",
     );
     let repo_root = std::path::PathBuf::from(
-        "target/botster-hub-test-data/client-api-session-template-precedence-repo",
+        "target/botster-hub-test-data/client-api-session-type-precedence-repo",
     );
     let _ = fs::remove_dir_all(&package_root);
     let _ = fs::remove_dir_all(&device_root);
     let _ = fs::remove_dir_all(&repo_root);
-    write_session_template_package(&package_root);
+    write_session_type_package(&package_root);
     write_executable_script(
         &device_root,
         "bin/device.sh",
@@ -643,10 +840,15 @@ fn session_template_sources_apply_device_repo_precedence_and_reload_from_state()
     );
     fs::create_dir_all(repo_root.join(".botster")).expect("create repo .botster dir");
     fs::write(
-        repo_root.join(".botster/session-templates.json"),
+        repo_root.join(".botster/session-types.json"),
         serde_json::json!({
-            "session_templates": [{
+            "session_types": [{
                 "id": "init",
+                "label": "Repo agent",
+                "role": "botster.agent",
+                "interaction": "interactive",
+                "traits": ["test"],
+                "lifecycle": "task",
                 "command": "bin/repo.sh",
                 "environment": { "BOTSTER_MODE": "repo" },
                 "allowed_environment_overrides": ["BOTSTER_MODE"],
@@ -655,25 +857,23 @@ fn session_template_sources_apply_device_repo_precedence_and_reload_from_state()
         })
         .to_string(),
     )
-    .expect("write repo session templates");
+    .expect("write repo session types");
 
     let mut packages = PackageRegistry::new(Vec::<Capability>::new().into_iter().collect());
     packages
         .install_local_path(&package_root, "install precedence package")
         .expect("install package");
     packages
-        .enable("session-template.plugin", "enable precedence package")
+        .enable("session-type.plugin", "enable precedence package")
         .expect("enable package");
 
-    let config = explicit_runtime("session-template-precedence")
-        .config()
-        .clone();
+    let config = explicit_runtime("session-type-precedence").config().clone();
     let store = FileHubStateStore::for_data_directory(&config.data_directory);
     store
         .update(&config, |state| {
-            state.device_session_template_sources = vec![DeviceSessionTemplateSource {
+            state.device_session_type_sources = vec![DeviceSessionTypeSource {
                 root: device_root.clone(),
-                session_templates: vec![session_template("bin/device.sh", "device")],
+                session_types: vec![session_type("bin/device.sh", "device")],
             }];
             state.spawn_targets = vec![SpawnTarget {
                 target_id: "repo:main".to_string(),
@@ -685,48 +885,54 @@ fn session_template_sources_apply_device_repo_precedence_and_reload_from_state()
                 metadata: BTreeMap::new(),
             }];
         })
-        .expect("persist session template sources");
+        .expect("persist session type sources");
 
     let mut runtime = HubRuntime::load_from_store(config, &store).expect("reload runtime state");
-    let api = HubClientApi::local_operator("session-template-precedence-client");
+    let api = HubClientApi::local_operator("session-type-precedence-client");
 
     let list = api
         .handle_request(
             &mut runtime,
             &packages,
-            HubClientRequest::ListSessionTemplates {
-                request_id: request_id("list-merged-session-templates"),
+            HubClientRequest::ListSessionTypes {
+                request_id: request_id("list-merged-session-types"),
             },
         )
         .expect("list merged templates");
-    let HubClientResponseBody::SessionTemplates(templates) = list.body else {
-        panic!("session templates response expected");
+    let HubClientResponseBody::SessionTypes(templates) = list.body else {
+        panic!("session types response expected");
     };
     assert_eq!(templates.len(), 1);
     assert_eq!(templates[0].source, "repo");
     assert_eq!(templates[0].target_id, "repo:main");
+    assert!(templates[0].editable);
+    assert_eq!(templates[0].overridden_sources.len(), 2);
+    assert_eq!(
+        templates[0].diagnostics,
+        vec!["overrides 2 lower-precedence definition(s)"]
+    );
 
     let resolved = api
         .handle_request(
             &mut runtime,
             &packages,
-            HubClientRequest::ResolveSessionTemplate {
+            HubClientRequest::ResolveSessionType {
                 request_id: request_id("resolve-repo-template"),
-                template_id: "init".to_string(),
-                template_request: botster_hub::SessionTemplateRequest {
+                session_type_id: "init".to_string(),
+                session_type_request: botster_hub::SessionTypeRequest {
                     environment: BTreeMap::from([(
                         "BOTSTER_MODE".to_string(),
                         "explicit".to_string(),
                     )]),
-                    ..botster_hub::SessionTemplateRequest::default()
+                    ..botster_hub::SessionTypeRequest::default()
                 },
             },
         )
         .expect("resolve repo override");
-    let HubClientResponseBody::ResolvedSessionTemplate(resolved) = resolved.body else {
-        panic!("resolved session template expected");
+    let HubClientResponseBody::ResolvedSessionType(resolved) = resolved.body else {
+        panic!("resolved session type expected");
     };
-    assert_eq!(resolved.template.source, "repo");
+    assert_eq!(resolved.session_type.source, "repo");
     assert_eq!(
         resolved.executable,
         repo_root.join("bin/repo.sh").display().to_string()
@@ -740,46 +946,84 @@ fn session_template_sources_apply_device_repo_precedence_and_reload_from_state()
         .handle_request(
             &mut runtime,
             &packages,
-            HubClientRequest::ResolveSessionTemplate {
+            HubClientRequest::ResolveSessionType {
                 request_id: request_id("resolve-repo-rejected-cwd"),
-                template_id: "init".to_string(),
-                template_request: botster_hub::SessionTemplateRequest {
+                session_type_id: "init".to_string(),
+                session_type_request: botster_hub::SessionTypeRequest {
                     cwd: Some(device_root.display().to_string()),
-                    ..botster_hub::SessionTemplateRequest::default()
+                    ..botster_hub::SessionTypeRequest::default()
                 },
             },
         )
         .expect_err("repo cwd outside target rejected");
     assert!(matches!(
         rejected,
-        HubClientError::SessionTemplate {
+        HubClientError::SessionType {
             kind: "cwd_not_admitted",
             ..
         }
     ));
+
+    let mut updated_repo = session_type("bin/repo.sh", "repo-updated");
+    updated_repo.label = "Updated repo agent".to_string();
+    api.handle_request(
+        &mut runtime,
+        &packages,
+        HubClientRequest::UpdateSessionType {
+            request_id: request_id("update-admitted-repo-session-type"),
+            source: SessionTypeMutationSource::Repo {
+                target_id: "repo:main".to_string(),
+            },
+            definition: updated_repo,
+        },
+    )
+    .expect("update repo definition through admitted target policy");
+    assert!(
+        fs::read_to_string(repo_root.join(".botster/session-types.json"))
+            .expect("read Hub-written repo session types")
+            .contains("Updated repo agent")
+    );
+    let deleted = api
+        .handle_request(
+            &mut runtime,
+            &packages,
+            HubClientRequest::DeleteSessionType {
+                request_id: request_id("delete-admitted-repo-session-type"),
+                source: SessionTypeMutationSource::Repo {
+                    target_id: "repo:main".to_string(),
+                },
+                session_type_id: "init".to_string(),
+            },
+        )
+        .expect("delete repo definition through admitted target policy");
+    let HubClientResponseBody::SessionTypes(after_delete) = deleted.body else {
+        panic!("session type response expected");
+    };
+    assert_eq!(after_delete[0].source, "device");
+    assert_eq!(runtime.state().session_type_generation, 2);
 }
 
 #[test]
-fn session_template_sources_apply_device_over_package_when_repo_disabled() {
+fn session_type_sources_apply_device_over_package_when_repo_disabled() {
     let package_root = std::path::PathBuf::from(
-        "target/botster-hub-test-data/client-api-session-template-device-package",
+        "target/botster-hub-test-data/client-api-session-type-device-package",
     );
     let device_root = std::path::PathBuf::from(
-        "target/botster-hub-test-data/client-api-session-template-device-root",
+        "target/botster-hub-test-data/client-api-session-type-device-root",
     );
     let repo_root = std::path::PathBuf::from(
-        "target/botster-hub-test-data/client-api-session-template-disabled-repo",
+        "target/botster-hub-test-data/client-api-session-type-disabled-repo",
     );
     let _ = fs::remove_dir_all(&package_root);
     let _ = fs::remove_dir_all(&device_root);
     let _ = fs::remove_dir_all(&repo_root);
-    write_session_template_package(&package_root);
+    write_session_type_package(&package_root);
     write_executable_script(
         &device_root,
         "bin/device.sh",
         "#!/bin/sh\nprintf 'device:%s\\n' \"$BOTSTER_MODE\"\n",
     );
-    write_repo_session_templates(
+    write_repo_session_types(
         &repo_root,
         serde_json::json!([{
             "id": "init",
@@ -793,18 +1037,18 @@ fn session_template_sources_apply_device_over_package_when_repo_disabled() {
         .install_local_path(&package_root, "install package")
         .expect("install package");
     packages
-        .enable("session-template.plugin", "enable package")
+        .enable("session-type.plugin", "enable package")
         .expect("enable package");
 
-    let config = explicit_runtime("session-template-device-over-package")
+    let config = explicit_runtime("session-type-device-over-package")
         .config()
         .clone();
     let store = FileHubStateStore::for_data_directory(&config.data_directory);
     store
         .update(&config, |state| {
-            state.device_session_template_sources = vec![DeviceSessionTemplateSource {
+            state.device_session_type_sources = vec![DeviceSessionTypeSource {
                 root: device_root.clone(),
-                session_templates: vec![session_template("bin/device.sh", "device")],
+                session_types: vec![session_type("bin/device.sh", "device")],
             }];
             state.spawn_targets = vec![SpawnTarget {
                 target_id: "repo:disabled".to_string(),
@@ -819,24 +1063,24 @@ fn session_template_sources_apply_device_over_package_when_repo_disabled() {
         .expect("persist sources");
 
     let mut runtime = HubRuntime::load_from_store(config, &store).expect("reload runtime state");
-    let api = HubClientApi::local_operator("session-template-device-over-package-client");
+    let api = HubClientApi::local_operator("session-type-device-over-package-client");
     let resolved = api
         .handle_request(
             &mut runtime,
             &packages,
-            HubClientRequest::ResolveSessionTemplate {
+            HubClientRequest::ResolveSessionType {
                 request_id: request_id("resolve-device-over-package"),
-                template_id: "init".to_string(),
-                template_request: botster_hub::SessionTemplateRequest::default(),
+                session_type_id: "init".to_string(),
+                session_type_request: botster_hub::SessionTypeRequest::default(),
             },
         )
         .expect("resolve device template");
-    let HubClientResponseBody::ResolvedSessionTemplate(resolved) = resolved.body else {
-        panic!("resolved session template expected");
+    let HubClientResponseBody::ResolvedSessionType(resolved) = resolved.body else {
+        panic!("resolved session type expected");
     };
 
-    assert_eq!(resolved.template.source, "device");
-    assert_eq!(resolved.template.target_id, "device:local");
+    assert_eq!(resolved.session_type.source, "device");
+    assert_eq!(resolved.session_type.target_id, "device:local");
     assert_eq!(
         resolved.executable,
         device_root.join("bin/device.sh").display().to_string()
@@ -844,34 +1088,34 @@ fn session_template_sources_apply_device_over_package_when_repo_disabled() {
 }
 
 #[test]
-fn session_template_sources_reject_duplicate_ids_within_device_source() {
+fn session_type_sources_reject_duplicate_ids_within_device_source() {
     let device_root = std::path::PathBuf::from(
-        "target/botster-hub-test-data/client-api-session-template-duplicate-device",
+        "target/botster-hub-test-data/client-api-session-type-duplicate-device",
     );
     let _ = fs::remove_dir_all(&device_root);
-    let config = explicit_runtime("session-template-duplicate-device")
+    let config = explicit_runtime("session-type-duplicate-device")
         .config()
         .clone();
     let store = FileHubStateStore::for_data_directory(&config.data_directory);
     store
         .update(&config, |state| {
-            state.device_session_template_sources = vec![DeviceSessionTemplateSource {
+            state.device_session_type_sources = vec![DeviceSessionTypeSource {
                 root: device_root.clone(),
-                session_templates: vec![
-                    session_template("bin/first.sh", "first"),
-                    session_template("bin/second.sh", "second"),
+                session_types: vec![
+                    session_type("bin/first.sh", "first"),
+                    session_type("bin/second.sh", "second"),
                 ],
             }];
         })
         .expect("persist duplicate device source");
 
     let mut runtime = HubRuntime::load_from_store(config, &store).expect("reload runtime state");
-    let api = HubClientApi::local_operator("session-template-duplicate-device-client");
+    let api = HubClientApi::local_operator("session-type-duplicate-device-client");
     let error = api
         .handle_request(
             &mut runtime,
             &empty_registry(),
-            HubClientRequest::ListSessionTemplates {
+            HubClientRequest::ListSessionTypes {
                 request_id: request_id("list-duplicate-device"),
             },
         )
@@ -879,27 +1123,27 @@ fn session_template_sources_reject_duplicate_ids_within_device_source() {
 
     assert!(matches!(
         error,
-        HubClientError::SessionTemplate {
-            kind: "invalid_device_session_templates",
+        HubClientError::SessionType {
+            kind: "invalid_device_session_types",
             ..
         }
     ));
 }
 
 #[test]
-fn session_template_sources_reject_duplicate_ids_within_repo_source() {
+fn session_type_sources_reject_duplicate_ids_within_repo_source() {
     let repo_root = std::path::PathBuf::from(
-        "target/botster-hub-test-data/client-api-session-template-duplicate-repo-root",
+        "target/botster-hub-test-data/client-api-session-type-duplicate-repo-root",
     );
     let _ = fs::remove_dir_all(&repo_root);
-    write_repo_session_templates(
+    write_repo_session_types(
         &repo_root,
         serde_json::json!([
             { "id": "init", "command": "bin/first.sh" },
             { "id": "init", "command": "bin/second.sh" }
         ]),
     );
-    let config = explicit_runtime("session-template-duplicate-repo")
+    let config = explicit_runtime("session-type-duplicate-repo")
         .config()
         .clone();
     let store = FileHubStateStore::for_data_directory(&config.data_directory);
@@ -918,12 +1162,12 @@ fn session_template_sources_reject_duplicate_ids_within_repo_source() {
         .expect("persist duplicate repo target");
 
     let mut runtime = HubRuntime::load_from_store(config, &store).expect("reload runtime state");
-    let api = HubClientApi::local_operator("session-template-duplicate-repo-client");
+    let api = HubClientApi::local_operator("session-type-duplicate-repo-client");
     let error = api
         .handle_request(
             &mut runtime,
             &empty_registry(),
-            HubClientRequest::ListSessionTemplates {
+            HubClientRequest::ListSessionTypes {
                 request_id: request_id("list-duplicate-repo"),
             },
         )
@@ -931,32 +1175,47 @@ fn session_template_sources_reject_duplicate_ids_within_repo_source() {
 
     assert!(matches!(
         error,
-        HubClientError::SessionTemplate {
-            kind: "invalid_repo_session_templates",
+        HubClientError::SessionType {
+            kind: "invalid_repo_session_types",
             ..
         }
     ));
 }
 
 #[test]
-fn session_template_sources_reject_ambiguous_same_rank_repo_ids() {
-    let first_repo = std::path::PathBuf::from(
-        "target/botster-hub-test-data/client-api-session-template-first-repo",
-    );
+fn session_type_sources_reject_ambiguous_same_rank_repo_ids() {
+    let first_repo =
+        std::path::PathBuf::from("target/botster-hub-test-data/client-api-session-type-first-repo");
     let second_repo = std::path::PathBuf::from(
-        "target/botster-hub-test-data/client-api-session-template-second-repo",
+        "target/botster-hub-test-data/client-api-session-type-second-repo",
     );
     let _ = fs::remove_dir_all(&first_repo);
     let _ = fs::remove_dir_all(&second_repo);
-    write_repo_session_templates(
+    write_repo_session_types(
         &first_repo,
-        serde_json::json!([{ "id": "init", "command": "bin/first.sh" }]),
+        serde_json::json!([{
+            "id": "init",
+            "label": "First repo agent",
+            "role": "botster.agent",
+            "interaction": "interactive",
+            "traits": ["test"],
+            "lifecycle": "task",
+            "command": "bin/first.sh"
+        }]),
     );
-    write_repo_session_templates(
+    write_repo_session_types(
         &second_repo,
-        serde_json::json!([{ "id": "init", "command": "bin/second.sh" }]),
+        serde_json::json!([{
+            "id": "init",
+            "label": "Second repo agent",
+            "role": "botster.agent",
+            "interaction": "interactive",
+            "traits": ["test"],
+            "lifecycle": "task",
+            "command": "bin/second.sh"
+        }]),
     );
-    let config = explicit_runtime("session-template-ambiguous-repos")
+    let config = explicit_runtime("session-type-ambiguous-repos")
         .config()
         .clone();
     let store = FileHubStateStore::for_data_directory(&config.data_directory);
@@ -986,22 +1245,22 @@ fn session_template_sources_reject_ambiguous_same_rank_repo_ids() {
         .expect("persist ambiguous repo targets");
 
     let mut runtime = HubRuntime::load_from_store(config, &store).expect("reload runtime state");
-    let api = HubClientApi::local_operator("session-template-ambiguous-repos-client");
+    let api = HubClientApi::local_operator("session-type-ambiguous-repos-client");
     let error = api
         .handle_request(
             &mut runtime,
             &empty_registry(),
-            HubClientRequest::ShowSessionTemplate {
+            HubClientRequest::ShowSessionType {
                 request_id: request_id("show-ambiguous-repo-template"),
-                template_id: "init".to_string(),
+                session_type_id: "init".to_string(),
             },
         )
         .expect_err("same-rank repo ids are ambiguous");
 
     assert!(matches!(
         error,
-        HubClientError::SessionTemplate {
-            kind: "ambiguous_template",
+        HubClientError::SessionType {
+            kind: "ambiguous_session_type",
             ..
         }
     ));

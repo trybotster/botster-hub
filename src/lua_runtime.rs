@@ -30,9 +30,9 @@ use serde_json::json;
 use crate::capabilities::{HubCapabilityRuntime, PluginStoreBatchMutation, PluginStoreBatchResult};
 use crate::lifecycle::{HubPluginEventHandler, HubPluginRuntimeBundle, package_entity_owner_token};
 use crate::packages::{PackageConfigurationView, PackageRecord, PreparedLocalPackage};
-use crate::runtime::{SharedSessionTemplateSpawner, SharedSpawnTargets, SharedWorktrees};
-use crate::session_templates::{
-    ManagedSessionTemplateRequest, SessionTemplateContextInput, SessionTemplateRequest,
+use crate::runtime::{SharedSessionTypeSpawner, SharedSpawnTargets, SharedWorktrees};
+use crate::session_types::{
+    ManagedSessionTypeRequest, SessionTypeContextInput, SessionTypeRequest,
 };
 
 const DEFAULT_INSTRUCTION_BUDGET: u64 = 500_000;
@@ -157,7 +157,7 @@ struct LuaHostApi {
     configuration: PackageConfigurationView,
     capabilities: SharedHubCapabilityRuntime,
     coordination: HubCoordinationBridge,
-    session_templates: SharedSessionTemplateSpawner,
+    session_types: SharedSessionTypeSpawner,
     spawn_targets: SharedSpawnTargets,
     worktrees: SharedWorktrees,
     package_records: Vec<PackageRecord>,
@@ -168,7 +168,7 @@ struct LuaHostApi {
 pub struct LuaPluginHostApi {
     pub capabilities: SharedHubCapabilityRuntime,
     pub coordination: HubCoordinationBridge,
-    pub session_templates: SharedSessionTemplateSpawner,
+    pub session_types: SharedSessionTypeSpawner,
     pub spawn_targets: SharedSpawnTargets,
     pub worktrees: SharedWorktrees,
 }
@@ -198,7 +198,7 @@ impl LuaPluginRuntime {
             configuration,
             capabilities: api.capabilities,
             coordination: api.coordination,
-            session_templates: api.session_templates,
+            session_types: api.session_types,
             spawn_targets: api.spawn_targets,
             worktrees: api.worktrees,
             package_records,
@@ -688,11 +688,11 @@ fn install_botster_api(
         plugin_db_table(lua, plugin_key.clone(), host_api.capabilities.clone())?,
     )?;
     capabilities_table.set(
-        "session_templates",
-        session_templates_table(
+        "session_types",
+        session_types_table(
             lua,
             plugin_key.clone(),
-            host_api.session_templates,
+            host_api.session_types,
             host_api.package_records,
         )?,
     )?;
@@ -830,70 +830,70 @@ fn config_table(lua: &Lua, configuration: PackageConfigurationView) -> Result<Ta
     Ok(config)
 }
 
-fn session_templates_table(
+fn session_types_table(
     lua: &Lua,
     plugin_key: PluginKey,
-    session_templates: SharedSessionTemplateSpawner,
+    session_types: SharedSessionTypeSpawner,
     package_records: Vec<PackageRecord>,
 ) -> Result<Table, mlua::Error> {
     let table = lua.create_table()?;
-    let list_templates = session_templates.clone();
+    let list_templates = session_types.clone();
     let list_records = package_records.clone();
     table.set(
         "list",
         lua.create_function(move |lua, args: Value| {
             let value = lua.from_value::<serde_json::Value>(args)?;
-            let target_id = required_string(&value, "target_id", "session_templates.list")?;
+            let target_id = required_string(&value, "target_id", "session_types.list")?;
             let templates = list_templates
                 .list(target_id, list_records.clone())
                 .map_err(|error| {
-                    mlua::Error::RuntimeError(format!("session_templates.list failed: {error}"))
+                    mlua::Error::RuntimeError(format!("session_types.list failed: {error}"))
                 })?;
             lua.to_value(&templates)
         })?,
     )?;
-    let show_templates = session_templates.clone();
+    let show_templates = session_types.clone();
     let show_records = package_records.clone();
     table.set(
         "show",
         lua.create_function(move |lua, args: Value| {
             let value = lua.from_value::<serde_json::Value>(args)?;
-            let target_id = required_string(&value, "target_id", "session_templates.show")?;
-            let template_id = required_string(&value, "template_id", "session_templates.show")?;
+            let target_id = required_string(&value, "target_id", "session_types.show")?;
+            let session_type_id = required_string(&value, "session_type_id", "session_types.show")?;
             let template = show_templates
-                .show(target_id, template_id, show_records.clone())
+                .show(target_id, session_type_id, show_records.clone())
                 .map_err(|error| {
-                    mlua::Error::RuntimeError(format!("session_templates.show failed: {error}"))
+                    mlua::Error::RuntimeError(format!("session_types.show failed: {error}"))
                 })?;
             lua.to_value(&template)
         })?,
     )?;
-    let spawn_templates = session_templates.clone();
+    let spawn_templates = session_types.clone();
     let spawn_plugin_key = plugin_key.clone();
     let spawn_records = package_records.clone();
     table.set(
         "spawn",
         lua.create_function(move |lua, args: Value| {
             let value = lua.from_value::<serde_json::Value>(args)?;
-            let template_id = value
-                .get("template_id")
+            let session_type_id = value
+                .get("session_type_id")
                 .or_else(|| value.get("id"))
                 .and_then(serde_json::Value::as_str)
                 .ok_or_else(|| {
                     mlua::Error::RuntimeError(
-                        "session_templates.spawn requires template_id".to_string(),
+                        "session_types.spawn requires session_type_id".to_string(),
                     )
                 })?;
-            let request = session_template_request_from_lua(&value)?;
+            let request = session_type_request_from_lua(&value)?;
             let result = spawn_templates
                 .spawn(
                     &spawn_plugin_key,
-                    template_id,
+                    session_type_id,
                     request,
                     spawn_records.clone(),
                 )
                 .map_err(|error| {
-                    mlua::Error::RuntimeError(format!("session_templates.spawn failed: {error}"))
+                    mlua::Error::RuntimeError(format!("session_types.spawn failed: {error}"))
                 })?;
             lua.to_value(&result)
         })?,
@@ -906,24 +906,21 @@ fn session_templates_table(
             let target_id = required_string(
                 &value,
                 "target_id",
-                "session_templates.ensure_worktree_and_spawn",
+                "session_types.ensure_worktree_and_spawn",
             )?;
-            let branch = required_string(
+            let branch =
+                required_string(&value, "branch", "session_types.ensure_worktree_and_spawn")?;
+            let session_type_id = required_string(
                 &value,
-                "branch",
-                "session_templates.ensure_worktree_and_spawn",
+                "session_type_id",
+                "session_types.ensure_worktree_and_spawn",
             )?;
-            let template_id = required_string(
-                &value,
-                "template_id",
-                "session_templates.ensure_worktree_and_spawn",
-            )?;
-            let request = managed_session_template_request_from_lua(&value)?;
-            match session_templates.ensure_worktree_and_spawn(
+            let request = managed_session_type_request_from_lua(&value)?;
+            match session_types.ensure_worktree_and_spawn(
                 &plugin_key,
                 target_id,
                 branch,
-                template_id,
+                session_type_id,
                 request,
                 package_records.clone(),
             ) {
@@ -973,23 +970,23 @@ fn reject_trusted_managed_fields(value: &serde_json::Value) -> Result<(), mlua::
             .is_some_and(|context| CONTEXT.iter().any(|key| context.contains_key(*key)))
     {
         return Err(mlua::Error::RuntimeError(
-            "session_templates.ensure_worktree_and_spawn rejects caller-supplied trusted fields"
+            "session_types.ensure_worktree_and_spawn rejects caller-supplied trusted fields"
                 .to_string(),
         ));
     }
     Ok(())
 }
 
-fn managed_session_template_request_from_lua(
+fn managed_session_type_request_from_lua(
     value: &serde_json::Value,
-) -> Result<ManagedSessionTemplateRequest, mlua::Error> {
+) -> Result<ManagedSessionTypeRequest, mlua::Error> {
     let context = value.get("context");
     if context.is_some_and(|context| !context.is_object()) {
         return Err(mlua::Error::RuntimeError(
-            "session_templates.ensure_worktree_and_spawn context must be an object".to_string(),
+            "session_types.ensure_worktree_and_spawn context must be an object".to_string(),
         ));
     }
-    Ok(ManagedSessionTemplateRequest {
+    Ok(ManagedSessionTypeRequest {
         environment: string_map(value.get("environment"), "environment")?,
         prompt: context.and_then(|value| optional_string(value, "prompt")),
         ticket_id: context.and_then(|value| optional_string(value, "ticket_id")),
@@ -1001,30 +998,30 @@ fn managed_session_template_request_from_lua(
     })
 }
 
-fn session_template_request_from_lua(
+fn session_type_request_from_lua(
     value: &serde_json::Value,
-) -> Result<SessionTemplateRequest, mlua::Error> {
-    Ok(SessionTemplateRequest {
+) -> Result<SessionTypeRequest, mlua::Error> {
+    Ok(SessionTypeRequest {
         target_id: optional_string(value, "target_id"),
         session_id: optional_string(value, "session_id").map(botster_core::SessionId),
         cwd: optional_string(value, "cwd"),
         environment: string_map(value.get("environment"), "environment")?,
-        context: session_template_context_from_lua(value.get("context"))?,
+        context: session_type_context_from_lua(value.get("context"))?,
     })
 }
 
-fn session_template_context_from_lua(
+fn session_type_context_from_lua(
     value: Option<&serde_json::Value>,
-) -> Result<SessionTemplateContextInput, mlua::Error> {
+) -> Result<SessionTypeContextInput, mlua::Error> {
     let Some(value) = value else {
-        return Ok(SessionTemplateContextInput::default());
+        return Ok(SessionTypeContextInput::default());
     };
     if !value.is_object() {
         return Err(mlua::Error::RuntimeError(
-            "session_templates.spawn context must be an object".to_string(),
+            "session_types.spawn context must be an object".to_string(),
         ));
     }
-    Ok(SessionTemplateContextInput {
+    Ok(SessionTypeContextInput {
         worktree_path: optional_string(value, "worktree_path"),
         repo_path: optional_string(value, "repo_path"),
         branch_name: optional_string(value, "branch_name"),
@@ -1051,7 +1048,7 @@ fn string_map(
     };
     let Some(object) = value.as_object() else {
         return Err(mlua::Error::RuntimeError(format!(
-            "session_templates.spawn {label} must be an object"
+            "session_types.spawn {label} must be an object"
         )));
     };
     object
@@ -1062,7 +1059,7 @@ fn string_map(
                 .map(|value| (key.clone(), value.to_string()))
                 .ok_or_else(|| {
                     mlua::Error::RuntimeError(format!(
-                        "session_templates.spawn {label}.{key} must be a string"
+                        "session_types.spawn {label}.{key} must be a string"
                     ))
                 })
         })

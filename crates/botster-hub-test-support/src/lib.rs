@@ -650,6 +650,12 @@ pub fn session_lifecycle_subscription_conformance_scenario()
         updated_at: 1,
         exit_code: None,
         failure_reason: None,
+        session_type_id: None,
+        session_type_source: None,
+        role: None,
+        traits: Vec::new(),
+        interaction: None,
+        session_type_lifecycle: None,
     };
 
     SessionLifecycleSubscriptionConformanceScenario {
@@ -753,6 +759,12 @@ pub fn session_plugin_binding_conformance_scenario() -> SessionPluginBindingConf
             updated_at,
             exit_code: (lifecycle == Some("exited")).then_some(0),
             failure_reason: None,
+            session_type_id: None,
+            session_type_source: None,
+            role: None,
+            traits: Vec::new(),
+            interaction: None,
+            session_type_lifecycle: None,
         })
         .expect("serialize session entity")
     };
@@ -5509,7 +5521,7 @@ stream.write(JSON.stringify({
   protocol: 'botster-hub-daemon-v1',
   compatibility: {
     protocol: 'botster-hub-daemon-v1',
-    minimum_protocol_version: 1,
+    protocol_version: 1,
     required_features: [],
     minimum_conformance_fixture_revision: 1,
     client_name: 'foreground-terminal-app-open-fixture',

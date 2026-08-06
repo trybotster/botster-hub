@@ -1016,7 +1016,7 @@ main() {
       test_command=(./test.sh --test hub_lua_runtime_test -- --nocapture)
       ;;
     focused-lua-session-worker-callers)
-      test_command=(./test.sh --test hub_lua_runtime_test session_template -- --nocapture)
+      test_command=(./test.sh --test hub_lua_runtime_test session_type -- --nocapture)
       ;;
     full-suite-contention)
       test_command=(./test.sh)

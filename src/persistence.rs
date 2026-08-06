@@ -21,11 +21,11 @@ use crate::config::{
 };
 use crate::credentials::{CredentialKeyPurpose, CredentialProviderKind};
 use crate::packages::PackageRegistrySnapshot;
-use crate::session_templates::PackageSessionTemplate;
+use crate::session_types::PackageSessionType;
 use crate::spawn_targets::SpawnTarget;
 use crate::worktrees::Worktree;
 
-const HUB_STATE_SCHEMA_VERSION: u16 = 2;
+const HUB_STATE_SCHEMA_VERSION: u16 = 3;
 const HUB_STATE_FILE_NAME: &str = "hub-state.json";
 const HUB_STATE_TEMP_FILE_NAME: &str = "hub-state.json.tmp";
 
@@ -43,7 +43,7 @@ pub enum PersistenceBucket {
 /// Versioned durable hub state aggregate.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HubState {
-    /// Version of this JSON schema. Version 2 rejects older schemas without migration.
+    /// Version of this JSON schema. Version 3 cold-cuts session types.
     pub schema_version: u16,
     /// Host identity metadata resolved from hub config.
     pub host: HostIdentity,
@@ -51,11 +51,14 @@ pub struct HubState {
     pub schema: SchemaMetadata,
     /// Package/provider registry records, grants, pins, provenance, and enabled state.
     pub package_registry: PackageRegistrySnapshot,
-    /// Device-owned session template sources persisted by the hub profile.
+    /// Device-owned session type sources persisted by the hub profile.
     #[serde(default)]
-    pub device_session_template_sources: Vec<DeviceSessionTemplateSource>,
+    pub device_session_type_sources: Vec<DeviceSessionTypeSource>,
+    /// Monotonic generation for the effective authoritative session type map.
+    #[serde(default)]
+    pub session_type_generation: u64,
     /// Hub-owned spawn targets admitted for client/plugin references.
-    #[serde(default, alias = "admitted_session_template_targets")]
+    #[serde(default)]
     pub spawn_targets: Vec<SpawnTarget>,
     /// Hub-owned worktree records scoped to admitted spawn targets.
     #[serde(default)]
@@ -88,7 +91,8 @@ impl HubState {
             host: config.host.clone(),
             schema: SchemaMetadata::v1(),
             package_registry: PackageRegistrySnapshot::empty(),
-            device_session_template_sources: Vec::new(),
+            device_session_type_sources: Vec::new(),
+            session_type_generation: 0,
             spawn_targets: Vec::new(),
             worktrees: Vec::new(),
             credential_keys: Vec::new(),
@@ -110,14 +114,14 @@ impl HubState {
     }
 }
 
-/// One durable device-level session template source.
+/// One durable device-level session type source.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DeviceSessionTemplateSource {
-    /// Root used to resolve relative template command and cwd policy paths.
+pub struct DeviceSessionTypeSource {
+    /// Root used to resolve relative session type command and cwd policy paths.
     pub root: PathBuf,
-    /// Device-owned template declarations.
+    /// Device-owned session type definitions.
     #[serde(default)]
-    pub session_templates: Vec<PackageSessionTemplate>,
+    pub session_types: Vec<PackageSessionType>,
 }
 
 /// Reference to credential-provider-owned secret material.
@@ -597,7 +601,7 @@ mod tests {
             .load_or_initialize(&config)
             .expect("load committed state");
 
-        assert_eq!(state.schema_version, 2);
+        assert_eq!(state.schema_version, 3);
         assert_eq!(reopened, state);
         assert_eq!(reopened.host.id, "state-test-host");
         assert_eq!(
@@ -607,13 +611,13 @@ mod tests {
     }
 
     #[test]
-    fn file_store_loads_v2_state_without_session_template_source_fields() {
-        let config = test_config("loads-v2-without-session-template-sources");
+    fn file_store_loads_current_state_with_defaulted_optional_collections() {
+        let config = test_config("loads-v2-without-session-type-sources");
         let store = FileHubStateStore::for_data_directory(&config.data_directory);
         let state = HubState::from_config(&config);
         let mut value = serde_json::to_value(&state).expect("serialize state value");
         let object = value.as_object_mut().expect("state serializes as object");
-        object.remove("device_session_template_sources");
+        object.remove("device_session_type_sources");
         object.insert(
             "spawn_targets".to_string(),
             serde_json::json!([{
@@ -641,9 +645,9 @@ mod tests {
 
         let reopened = store
             .load_or_initialize(&config)
-            .expect("load legacy-shaped v2 state");
+            .expect("load current state with omitted optional collections");
 
-        assert!(reopened.device_session_template_sources.is_empty());
+        assert!(reopened.device_session_type_sources.is_empty());
         assert_eq!(reopened.spawn_targets.len(), 1);
         assert_eq!(reopened.spawn_targets[0].kind, "directory");
         assert_eq!(reopened.spawn_targets[0].base_ref, None);
@@ -652,7 +656,36 @@ mod tests {
         assert!(reopened.credential_keys.is_empty());
         assert!(reopened.trusted_browser_identities.is_empty());
         assert!(reopened.bootstrap_grants.is_empty());
-        assert_eq!(reopened.schema_version, 2);
+        assert_eq!(reopened.schema_version, 3);
+    }
+
+    #[test]
+    fn file_store_rejects_v2_before_deserializing_cold_cut_session_types() {
+        let config = test_config("rejects-v2-session-types");
+        let store = FileHubStateStore::for_data_directory(&config.data_directory);
+        let mut value =
+            serde_json::to_value(HubState::from_config(&config)).expect("serialize current state");
+        let object = value.as_object_mut().expect("state object");
+        object.insert("schema_version".to_string(), serde_json::json!(2));
+        object.remove("device_session_type_sources");
+        object.remove("session_type_generation");
+        object.insert(
+            "device_session_template_sources".to_string(),
+            serde_json::json!([{"root": ".", "session_templates": []}]),
+        );
+        fs::create_dir_all(&config.data_directory).expect("create data dir");
+        fs::write(
+            store.path(),
+            serde_json::to_vec_pretty(&value).expect("serialize v2 state"),
+        )
+        .expect("write v2 state");
+
+        assert!(matches!(
+            store.load_or_initialize(&config),
+            Err(HubStateStoreError::State(
+                HubStateError::UnsupportedVersion(2)
+            ))
+        ));
     }
 
     #[test]

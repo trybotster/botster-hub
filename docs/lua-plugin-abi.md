@@ -193,17 +193,17 @@ The initial capability helper is:
   missing_required = {...}, diagnostics = {...} }`. Values use the package
   daemon DTO shape, including manifest defaults and operator-set non-secret
   values. Secret values are absent when unset and redacted when set.
-- `botster.capabilities.session_templates.spawn({ template_id = "...",
+- `botster.capabilities.session_types.spawn({ session_type_id = "...",
   session_id = nil, target_id = nil, cwd = nil, environment = {...},
-  context = {...} })`: requests a hub-owned session-template spawn for a
-  declared package template. The loaded plugin package must be enabled and
-  declare `{ surface = "session_actions", scope = "session_template_spawn" }`.
-  The hub reuses the same template materialization policy as the daemon path:
+  context = {...} })`: requests a hub-owned session-type spawn for a
+  declared package session type. The loaded plugin package must be enabled and
+  declare `{ surface = "session_actions", scope = "session_type_spawn" }`.
+  The hub reuses the same session-type materialization policy as the daemon path:
   admitted target id, cwd below the package root, declared environment
   overrides only, and hub-owned context injection. The hub stamps lifecycle time
   at fulfillment. On success the helper returns `{ session_id, lifecycle,
-  template_id, context_id, context_keys }`. Those fields are produced by the
-  materialized template and core spawn outcome. Policy and runtime failures
+  session_type_id, context_id, context_keys }`. Those fields are produced by the
+  materialized session type and Core spawn outcome. Policy and runtime failures
   raise Lua runtime errors rather than returning placeholder diagnostics fields.
 - `botster.capabilities.spawn_targets.list()`: returns sanitized hub-owned spawn
   target rows visible to plugins. Plugins receive ids, labels, enabled state,
@@ -248,12 +248,17 @@ package name and cannot read another package's configuration. Package
 configuration writes remain hub CLI/API responsibilities, not Lua plugin
 self-mutation.
 
-`session_templates.spawn` accepts template request fields only. It does not
+`session_types.spawn` accepts session-type request fields only. It does not
 accept command, args, shell, arbitrary process environment, or raw filesystem
 execution data, or caller-supplied lifecycle time; direct process spawning
 remains unsupported from Lua. Hub plugin invocations use a 30s timeout for this
 helper path, and the hub cleans up spawned sessions if the worker result cannot
 be delivered.
+
+Session-type definition CRUD intentionally remains on the admitted local
+daemon/CLI operator path. Lua workers can list, show, spawn, and invoke the
+separately granted managed-worktree operation, but cannot edit package, device,
+or repo authority directly. Package definitions are read-only on every surface.
 
 `spawn_targets` is intentionally read-only in Lua. Create, update, and delete
 are daemon/CLI operator responsibilities; exposing mutation helpers to plugin
@@ -261,7 +266,7 @@ workers would let plugins admit local host paths without the hub operator path.
 
 `worktrees` is also intentionally read-only in Lua. Hub-owned daemon/CLI APIs
 create, update, delete, persist, and emit lifecycle events for worktrees.
-Plugins may reference worktree ids and resolve paths for session-template
+Plugins may reference worktree ids and resolve paths for session-type
 context, but workflow ownership remains in plugin state while filesystem
 authority stays with the hub.
 
