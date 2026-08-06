@@ -786,14 +786,19 @@ fn find_source_session_type_with_row(
 ) -> SessionTypeResult<(SourceSessionType, HubSessionType)> {
     let sources = source_session_types(records, state)?;
     let matches = sources
-        .into_iter()
+        .iter()
         .filter(|source| {
             source.session_type.id == session_type_id
                 || source_session_type_id(source) == session_type_id
         })
+        .cloned()
         .collect::<Vec<_>>();
     let winner = choose_effective_session_type(matches.clone())?;
-    let row = effective_session_type_row(&winner, &matches);
+    let peers = sources
+        .into_iter()
+        .filter(|source| source.session_type.id == winner.session_type.id)
+        .collect::<Vec<_>>();
+    let row = effective_session_type_row(&winner, &peers);
     Ok((winner, row))
 }
 
