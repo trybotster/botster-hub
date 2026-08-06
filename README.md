@@ -156,7 +156,7 @@ Enabled Lua packages may also declare exact package-namespaced
 declaring package, and each subscribe or reconnect queries the isolated worker
 for a freshly validated whole-family snapshot before bounded daemon/WebRTC
 delivery.
-The reusable contract is prepared in `@trybotster/hub-test-support@0.1.22` as
+The reusable contract is prepared in `@trybotster/hub-test-support@0.1.23` as
 source-derived JSON fixtures and a Rust
 `run_session_lifecycle_subscription_conformance` runner over the real isolated
 Hub/Core/session-worker topology.
@@ -490,8 +490,8 @@ runtime=ready
 data_dir=resolved:$HOME/.botster/hub
 daemon=started
 protocol=botster-hub-daemon-v1
-protocol_version=5
-conformance_fixture_revision=29
+protocol_version=6
+conformance_fixture_revision=30
 package_count=2
 enabled_package_count=2
 app_count=2
@@ -843,11 +843,11 @@ explicit `target_id` and assigned worktree and records primitive-backed
 coordination evidence on the run: request id, agent name, owner plugin, routed
 envelope id, publish delivery status, drain cursor, and acknowledge delivery
 status. It then spawns the hub-owned `project-pipelines/agent-step` session
-template through the plugin worker `session_templates.spawn` path and records
-`session_uuid`, `session_template_id`, `session_context_id`, and
+template through the plugin worker `session_types.spawn` path and records
+`session_uuid`, `session_type_id`, `session_context_id`, and
 `session_lifecycle` on the run coordination record.
 
-Session templates are hub-owned PTY launch contracts, not Project Pipelines
+Session types are hub-owned PTY launch contracts, not Project Pipelines
 entrypoints or legacy monolith agent runners. The plugin supplies product
 workflow policy and context, while the hub validates and materializes the
 template into a generic session spawn. Project Pipelines prompts and tool calls
@@ -1078,14 +1078,21 @@ Local path manifest example:
 }
 ```
 
-Packages can also declare hub-owned `session_templates` for PTY session launches
+Packages can also declare hub-owned `session_types` for PTY session launches
 with trusted context injection:
 
 ```json
 {
-  "session_templates": [
+  "session_types": [
     {
       "id": "init",
+      "label": "Interactive agent",
+      "description": "A task-scoped interactive coding session.",
+      "icon": "terminal",
+      "role": "botster.agent",
+      "interaction": "interactive",
+      "traits": ["coding", "worktree-aware"],
+      "lifecycle": "task",
       "command": "bin/init.sh",
       "working_directory": { "policy": "package_root" },
       "environment": { "BOTSTER_MODE": "default" },
@@ -1096,28 +1103,34 @@ with trusted context injection:
 }
 ```
 
-The hub validates templates and materializes them into generic core spawn
-requests. Core remains unaware of template ids, Project Pipelines, Codex,
+The Hub validates session types and materializes them into generic Core spawn
+requests. Role, interaction, traits, and lifecycle are independent strings:
+`persistent` does not imply `botster.agent`, and `interactive` does not imply
+either an agent or accessory role. Core remains unaware of session type ids, Project Pipelines, Codex,
 Claude, agents, tickets, workspaces, and `botster context`. Explicit spawn
 overrides are admitted only when the template and target policy allow them.
 Spawned scripts receive `BOTSTER_SESSION_ID`, `BOTSTER_CONTEXT_ID`,
 `BOTSTER_HUB_DATA_DIR`, `BOTSTER_HUB_SOCKET`, and `BOTSTER_HUB_BIN`, and can read
 context with `"$BOTSTER_HUB_BIN" context --key prompt`.
 
-Template sources are layered by hub policy: package < device < repo < explicit
-request values. Device template sources and hub-owned spawn targets are durable
-fields in `hub-state.json`; the state schema stays additive within v1 so older
-files that omit those fields load with empty device/repo sources. Spawn targets
-replace the older admitted repo-template target list as the canonical source for
-repo-local template discovery.
-Repo-local templates are read only from admitted target roots at
-`.botster/session-templates.json`:
+Session type sources are layered by Hub policy: package < device < repo < explicit
+request values. Effective rows expose the winning `source`/`source_name`,
+`editable`, `overridden_sources`, and diagnostics. Device definitions and the
+monotonic session-type generation are durable in `hub-state.json`; schema 3 is a
+cold cut and rejects older state before decoding the new shape. Repo-local
+definitions are read and written only through enabled admitted target roots at
+`.botster/session-types.json`:
 
 ```json
 {
-  "session_templates": [
+  "session_types": [
     {
       "id": "init",
+      "label": "Repository agent",
+      "role": "botster.agent",
+      "interaction": "interactive",
+      "traits": ["coding"],
+      "lifecycle": "task",
       "command": "bin/repo-init.sh",
       "environment": { "BOTSTER_MODE": "repo" },
       "allowed_environment_overrides": ["BOTSTER_MODE"]
@@ -1126,11 +1139,22 @@ Repo-local templates are read only from admitted target roots at
 }
 ```
 
-The repo file uses the same template shape as package manifests. Repo files are
-rediscovered on each list/show/resolve/spawn request, so changing the file does
-not require a daemon reload. Disabled or unadmitted targets contribute no repo
-templates, and the final command, cwd, and environment are still checked against
-the selected source root before core spawn.
+The repo file uses the same definition shape as package manifests. Device rows
+support full CRUD, repo rows support CRUD scoped by `target_id`, and package rows
+return `read_only_session_type_source` for mutations. The daemon and
+`session-types create|update|delete` CLI are the mutation boundary; callers do
+not receive filesystem paths or raw state access. Each observable mutation
+advances the durable generation and publishes `session_type` entity upsert or
+remove frames, with bounded overflow recovering through a full snapshot.
+Disabled or unadmitted targets contribute no definitions, and final command,
+cwd, and environment remain checked against the selected source root.
+
+Spawn materialization writes only bounded classification facts into opaque Core
+host metadata: session type id/source, role, traits, interaction, and lifecycle.
+The canonical `session` entity projection reads those facts back from Core
+lifecycle records, including reconnect and Hub restart/adoption. Direct sessions
+with no session-type metadata expose explicit absence; Hub never infers a type
+from command, name, owner, or duration.
 
 Hub-owned spawn targets are local directory admissions with stable `target_id`,
 label, root, enabled state, kind, optional `base_ref`, and small sanitized metadata.
@@ -1162,19 +1186,19 @@ and their target cannot be deleted or reclassified while they remain recorded.
 
 All loaded plugins receive the same target-filtered template list/show
 projections as the existing target and worktree reads. Packages granted the
-exact `session_template_managed_git_spawn` session-action scope additionally
+exact `session_type_managed_git_spawn` session-action scope additionally
 receive one atomic Lua mutation:
 
 ```lua
-local templates = botster.capabilities.session_templates.list({
+local templates = botster.capabilities.session_types.list({
   target_id = "tgt_repo",
 })
 
 local result =
-  botster.capabilities.session_templates.ensure_worktree_and_spawn({
+  botster.capabilities.session_types.ensure_worktree_and_spawn({
     target_id = "tgt_repo",
     branch = "feature/example",
-    template_id = templates[1].template_id,
+    session_type_id = templates[1].session_type_id,
     context = { ticket_id = "ticket_example" },
   })
 ```
@@ -1186,7 +1210,7 @@ operation. Dirty matching worktrees are reused without reset or cleanup.
 Conflicting branch/path ownership is a typed failure. Spawn failure rolls back
 only the worktree and branch created by that call; pre-existing branches,
 worktrees, and dirty content are never deleted. The older
-`session_template_spawn` scope does not grant this operation, and generic
+`session_type_spawn` scope does not grant this operation, and generic
 registered-worktree CRUD remains a record-only, non-destructive API.
 
 Worktree CRUD emits client-visible `worktree_lifecycle` daemon events and

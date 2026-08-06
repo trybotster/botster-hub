@@ -213,7 +213,7 @@ return botster.register({
       description = "Spawn an eligible template contributed by another package.",
       handler = "atomic",
       call = function(args)
-        return botster.capabilities.session_templates.ensure_worktree_and_spawn(args)
+        return botster.capabilities.session_types.ensure_worktree_and_spawn(args)
       end,
     },
     {
@@ -222,10 +222,10 @@ return botster.register({
       handler = "inspect",
       call = function(args)
         return {
-          list = botster.capabilities.session_templates.list({ target_id = args.target_id }),
-          shown = botster.capabilities.session_templates.show({
+          list = botster.capabilities.session_types.list({ target_id = args.target_id }),
+          shown = botster.capabilities.session_types.show({
             target_id = args.target_id,
-            template_id = args.template_id,
+            session_type_id = args.session_type_id,
           }),
         }
       end,
@@ -240,7 +240,7 @@ return botster.register({
             { "surface": "mcp" },
             {
                 "surface": "session_actions",
-                "scope": "session_template_managed_git_spawn"
+                "scope": "session_type_managed_git_spawn"
             }
         ])
     } else {
@@ -309,15 +309,20 @@ fn write_cross_package_template_contributor(root: &std::path::Path, target_id: &
     fs::write(
         root.join("botster-package.json"),
         serde_json::to_vec_pretty(&serde_json::json!({
-            "name": "managed-session-template.plugin",
+            "name": "managed-session-type.plugin",
             "version": "1.0.0",
             "kind": "plugin",
             "botster": ">=0.1.0",
             "source": { "type": "path", "path": root },
             "capabilities": [],
             "entrypoints": [],
-            "session_templates": [{
+            "session_types": [{
                 "id": "init",
+                "label": "Managed agent",
+                "role": "botster.agent",
+                "interaction": "interactive",
+                "traits": ["test"],
+                "lifecycle": "task",
                 "command": "bin/init.sh",
                 "target_id": target_id
             }]
@@ -468,7 +473,7 @@ fn capability(surface: CapabilitySurface, scope: Option<&str>) -> Capability {
     }
 }
 
-fn install_session_template_spawn_registry(
+fn install_session_type_spawn_registry(
     name: &str,
     capabilities: Vec<Capability>,
 ) -> PackageRegistry {
@@ -478,7 +483,7 @@ fn install_session_template_spawn_registry(
         .join(name);
     let source_root = std::env::current_dir().expect("current dir").join(&root);
     let _ = fs::remove_dir_all(&root);
-    fs::create_dir_all(root.join("bin")).expect("create session-template package root");
+    fs::create_dir_all(root.join("bin")).expect("create session-type package root");
     fs::create_dir_all(root.join("subdir")).expect("create relative template directory");
     fs::write(
         root.join("plugin.lua"),
@@ -486,31 +491,31 @@ fn install_session_template_spawn_registry(
 return botster.register({
   tools = {
     {
-      name = "session_template.spawn",
-      description = "Spawn a declared session template through the production Lua capability.",
+      name = "session_type.spawn",
+      description = "Spawn a declared session type through the production Lua capability.",
       handler = "spawn",
       call = function(args)
-        return botster.capabilities.session_templates.spawn(args)
+        return botster.capabilities.session_types.spawn(args)
       end,
     },
     {
-      name = "session_template.atomic",
+      name = "session_type.atomic",
       description = "Atomically ensure a managed worktree and spawn its configured session.",
       handler = "atomic",
       call = function(args)
-        return botster.capabilities.session_templates.ensure_worktree_and_spawn(args)
+        return botster.capabilities.session_types.ensure_worktree_and_spawn(args)
       end,
     },
     {
-      name = "session_template.inspect",
+      name = "session_type.inspect",
       description = "Inspect target-filtered effective templates.",
       handler = "inspect",
       call = function(args)
         return {
-          list = botster.capabilities.session_templates.list({ target_id = args.target_id }),
-          shown = botster.capabilities.session_templates.show({
+          list = botster.capabilities.session_types.list({ target_id = args.target_id }),
+          shown = botster.capabilities.session_types.show({
             target_id = args.target_id,
-            template_id = args.template_id,
+            session_type_id = args.session_type_id,
           }),
         }
       end,
@@ -520,18 +525,18 @@ return botster.register({
     {
       id = "spawn_action",
       kind = "ui_action",
-      descriptor_id = "session_template.spawn_action",
+      descriptor_id = "session_type.spawn_action",
       descriptor = {
-        action_id = "session_template.spawn_action",
-        surface_id = "session-template-spawner.surface",
+        action_id = "session_type.spawn_action",
+        surface_id = "session-type-spawner.surface",
       },
       call = function(args)
-        local spawned = botster.capabilities.session_templates.spawn(args.payload)
+        local spawned = botster.capabilities.session_types.spawn(args.payload)
         return {
           request_id = args.request_id or "spawn-action",
-          surface_id = "session-template-spawner.surface",
-          action_id = "session_template.spawn_action",
-          node_id = "session-template-spawner-form",
+          surface_id = "session-type-spawner.surface",
+          action_id = "session_type.spawn_action",
+          node_id = "session-type-spawner-form",
           state = "accepted",
           payload = spawned,
         }
@@ -541,31 +546,36 @@ return botster.register({
 })
 "#,
     )
-    .expect("write session-template plugin");
+    .expect("write session-type plugin");
     let script = root.join("bin/init.sh");
     fs::write(
         &script,
         "#!/bin/sh\nprintf 'template:%s:%s\\n' \"$BOTSTER_SESSION_ID\" \"$BOTSTER_MODE\"\nprintf 'managed\\n' > template-executed.txt\n",
     )
-    .expect("write session-template script");
+    .expect("write session-type script");
     let mut permissions = fs::metadata(&script)
         .expect("script metadata")
         .permissions();
     permissions.set_mode(0o755);
-    fs::set_permissions(&script, permissions).expect("chmod session-template script");
+    fs::set_permissions(&script, permissions).expect("chmod session-type script");
     fs::write(
         root.join("botster-package.json"),
         serde_json::json!({
-            "name": "session-template-spawner.plugin",
+            "name": "session-type-spawner.plugin",
             "version": "1.0.0",
             "kind": "plugin",
             "botster": ">=0.1.0",
             "source": { "type": "path", "path": source_root.display().to_string() },
             "capabilities": capabilities,
             "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }],
-            "session_templates": [
+            "session_types": [
                 {
                     "id": "init",
+                    "label": "Managed agent",
+                    "role": "botster.agent",
+                    "interaction": "interactive",
+                    "traits": ["test"],
+                    "lifecycle": "task",
                     "command": "bin/init.sh",
                     "environment": { "BOTSTER_MODE": "default" },
                     "allowed_environment_overrides": ["BOTSTER_MODE"],
@@ -574,6 +584,11 @@ return botster.register({
                 },
                 {
                     "id": "relative",
+                    "label": "Relative managed agent",
+                    "role": "botster.agent",
+                    "interaction": "interactive",
+                    "traits": ["test"],
+                    "lifecycle": "task",
                     "command": "bin/init.sh",
                     "working_directory": { "policy": "relative", "path": "subdir" },
                     "environment": { "BOTSTER_MODE": "default" },
@@ -585,18 +600,15 @@ return botster.register({
         })
         .to_string(),
     )
-    .expect("write session-template package manifest");
+    .expect("write session-type package manifest");
 
     let mut policy = default_package_policy();
     policy
-        .install_local_path(&root, "install session-template spawn lua package")
-        .expect("install session-template package");
+        .install_local_path(&root, "install session-type spawn lua package")
+        .expect("install session-type package");
     policy
-        .enable(
-            "session-template-spawner.plugin",
-            "enable session-template package",
-        )
-        .expect("enable session-template package");
+        .enable("session-type-spawner.plugin", "enable session-type package")
+        .expect("enable session-type package");
     policy.registry().clone()
 }
 
@@ -1842,7 +1854,7 @@ fn exercise_cross_package_managed_spawn(
     name: &str,
     registry: &PackageRegistry,
     target_id: &str,
-    template_id: &str,
+    session_type_id: &str,
     inspect_template: bool,
     expected_marker: Option<&str>,
 ) -> (Option<serde_json::Value>, serde_json::Value) {
@@ -1883,7 +1895,7 @@ fn exercise_cross_package_managed_spawn(
             name: "cross_package.inspect".to_string(),
             arguments: serde_json::json!({
                 "target_id": target_id,
-                "template_id": template_id
+                "session_type_id": session_type_id
             }),
         })
         .expect("inspect cross-package template through real worker")
@@ -1894,7 +1906,7 @@ fn exercise_cross_package_managed_spawn(
             arguments: serde_json::json!({
                 "target_id": target_id,
                 "branch": format!("feature/{name}"),
-                "template_id": template_id
+                "session_type_id": session_type_id
             }),
         })
         .expect("spawn cross-package template through real worker");
@@ -1924,24 +1936,25 @@ fn exercise_cross_package_managed_spawn(
     (inspected, result)
 }
 
-fn assert_cross_package_template_is_listed(
+fn assert_cross_package_session_type_is_listed(
     inspected: &serde_json::Value,
-    template_id: &str,
-    package_name: &str,
+    session_type_id: &str,
+    source_name: &str,
 ) {
     let listed = inspected["list"]
         .as_array()
         .expect("cross-package template list");
     assert!(
-        listed.iter().any(|template| {
-            template["template_id"] == template_id && template["package_name"] == package_name
+        listed.iter().any(|session_type| {
+            session_type["session_type_id"] == session_type_id
+                && session_type["source_name"] == source_name
         }),
-        "{template_id} from {package_name} must be visible to the caller; list: {listed:?}"
+        "{session_type_id} from {source_name} must be visible to the caller; list: {listed:?}"
     );
 }
 
 #[test]
-fn real_lua_plugin_cross_package_managed_template_spawning() {
+fn real_lua_plugin_cross_package_managed_session_type_spawning() {
     let contributor_root = PathBuf::from("target")
         .join("botster-hub-test-data")
         .join("lua-runtime-packages")
@@ -1957,19 +1970,19 @@ fn real_lua_plugin_cross_package_managed_template_spawning() {
         "cross-package-explicit-target",
         &registry,
         "tgt_cross_package",
-        "managed-session-template.plugin/init",
+        "managed-session-type.plugin/init",
         true,
         Some("cross-package\n"),
     );
     let inspected = inspected.expect("cross-package inspection");
-    assert_cross_package_template_is_listed(
+    assert_cross_package_session_type_is_listed(
         &inspected,
-        "managed-session-template.plugin/init",
-        "managed-session-template.plugin",
+        "managed-session-type.plugin/init",
+        "managed-session-type.plugin",
     );
     assert_eq!(
-        inspected["shown"]["package_name"],
-        "managed-session-template.plugin"
+        inspected["shown"]["source_name"],
+        "managed-session-type.plugin"
     );
     assert_eq!(result["ok"], true, "cross-package result: {result}");
     assert_eq!(
@@ -1991,12 +2004,12 @@ fn real_lua_plugin_cross_package_managed_template_spawning() {
         None,
     );
     let inspected = inspected.expect("Project Pipelines inspection");
-    assert_cross_package_template_is_listed(
+    assert_cross_package_session_type_is_listed(
         &inspected,
         "project-pipelines/agent-step",
         "project-pipelines",
     );
-    assert_eq!(inspected["shown"]["package_name"], "project-pipelines");
+    assert_eq!(inspected["shown"]["source_name"], "project-pipelines");
     assert_eq!(result["ok"], true, "Project Pipelines result: {result}");
     assert_eq!(
         result["result"]["session_id"].as_str().map(str::len),
@@ -2012,7 +2025,7 @@ fn real_lua_plugin_cross_package_managed_template_spawning() {
         "cross-package-capability-denied",
         &denied_registry,
         "tgt_cross_package",
-        "managed-session-template.plugin/init",
+        "managed-session-type.plugin/init",
         false,
         None,
     );
@@ -2023,35 +2036,35 @@ fn real_lua_plugin_cross_package_managed_template_spawning() {
         "cross-package-target-mismatch",
         &registry,
         "tgt_other",
-        "managed-session-template.plugin/init",
+        "managed-session-type.plugin/init",
         false,
         None,
     );
     assert_eq!(mismatched["ok"], false);
-    assert_eq!(mismatched["error"]["kind"], "template_not_eligible");
+    assert_eq!(mismatched["error"]["kind"], "session_type_not_eligible");
 }
 
 #[test]
-fn real_lua_plugin_spawns_session_template_through_worker_capability() {
-    let registry = install_session_template_spawn_registry(
-        "session-template-spawn",
+fn real_lua_plugin_spawns_session_type_through_worker_capability() {
+    let registry = install_session_type_spawn_registry(
+        "session-type-spawn",
         vec![
             capability(CapabilitySurface::Mcp, None),
             capability(
                 CapabilitySurface::SessionActions,
-                Some("session_template_spawn"),
+                Some("session_type_spawn"),
             ),
         ],
     );
-    let mut hub = explicit_runtime("session-template-spawn");
-    hub.load_lua_plugin_package(&registry, "session-template-spawner.plugin")
-        .expect("load session-template plugin");
+    let mut hub = explicit_runtime("session-type-spawn");
+    hub.load_lua_plugin_package(&registry, "session-type-spawner.plugin")
+        .expect("load session-type plugin");
 
     let result = hub
         .call_plugin_mcp_tool(botster_hub::McpCallRequest {
-            name: "session_template.spawn".to_string(),
+            name: "session_type.spawn".to_string(),
             arguments: serde_json::json!({
-                "template_id": "session-template-spawner.plugin/init",
+                "session_type_id": "session-type-spawner.plugin/init",
                 "session_id": "lua-template-session",
                 "environment": { "BOTSTER_MODE": "worker" },
                 "context": {
@@ -2060,13 +2073,13 @@ fn real_lua_plugin_spawns_session_template_through_worker_capability() {
                 }
             }),
         })
-        .expect("spawn session template through real Lua worker");
+        .expect("spawn session type through real Lua worker");
 
     assert_eq!(result["session_id"], "lua-template-session");
     assert_eq!(result["lifecycle"], "running");
     assert_eq!(
-        result["template_id"],
-        "session-template-spawner.plugin/init"
+        result["session_type_id"],
+        "session-type-spawner.plugin/init"
     );
     assert_eq!(result["context_id"], "ctx-lua-template-session");
     assert_eq!(
@@ -2093,22 +2106,22 @@ fn real_lua_plugin_spawns_session_template_through_worker_capability() {
 
 #[test]
 fn real_lua_plugin_atomically_ensures_managed_worktree_and_spawns_session() {
-    let registry = install_session_template_spawn_registry(
-        "managed-session-template-spawn",
+    let registry = install_session_type_spawn_registry(
+        "managed-session-type-spawn",
         vec![
             capability(CapabilitySurface::Mcp, None),
             capability(
                 CapabilitySurface::SessionActions,
-                Some("session_template_managed_git_spawn"),
+                Some("session_type_managed_git_spawn"),
             ),
         ],
     );
     let data_directory = unique_short_test_dir("managed-lua");
-    let mut hub = explicit_runtime_in("managed-session-template-spawn", data_directory.clone());
+    let mut hub = explicit_runtime_in("managed-session-type-spawn", data_directory.clone());
     let repo_root = PathBuf::from("target")
         .join("botster-hub-test-data")
         .join("lua-runtime")
-        .join("managed-session-template-repository");
+        .join("managed-session-type-repository");
     let _ = fs::remove_dir_all(&repo_root);
     fs::create_dir_all(&repo_root).expect("create managed repository");
     run_git(None, &["init", "-b", "main", path_str(&repo_root)]);
@@ -2134,10 +2147,15 @@ fn real_lua_plugin_atomically_ensures_managed_worktree_and_spawns_session() {
     fs::set_permissions(&repo_script, repo_script_permissions).expect("chmod repo script");
     fs::create_dir_all(repo_root.join(".botster")).expect("create repo template directory");
     fs::write(
-        repo_root.join(".botster/session-templates.json"),
+        repo_root.join(".botster/session-types.json"),
         serde_json::json!({
-            "session_templates": [{
+            "session_types": [{
                 "id": "init",
+                "label": "Repo agent",
+                "role": "botster.agent",
+                "interaction": "interactive",
+                "traits": ["test"],
+                "lifecycle": "task",
                 "command": "bin/init.sh",
                 "target_id": "tgt_managed",
                 "context": ["prompt", "ticket_id"]
@@ -2171,29 +2189,49 @@ fn real_lua_plugin_atomically_ensures_managed_worktree_and_spawns_session() {
         metadata: BTreeMap::new(),
     }];
     hub.replace_state(state);
-    hub.load_lua_plugin_package(&registry, "session-template-spawner.plugin")
-        .expect("load managed session-template plugin");
+    hub.load_lua_plugin_package(&registry, "session-type-spawner.plugin")
+        .expect("load managed session-type plugin");
 
     let inspected = hub
         .call_plugin_mcp_tool(botster_hub::McpCallRequest {
-            name: "session_template.inspect".to_string(),
+            name: "session_type.inspect".to_string(),
             arguments: serde_json::json!({
                 "target_id": "tgt_managed",
-                "template_id": "tgt_managed/init"
+                "session_type_id": "tgt_managed/init"
             }),
         })
         .expect("inspect target-filtered templates");
     assert_eq!(inspected["list"].as_array().map(Vec::len), Some(2));
     assert_eq!(inspected["shown"]["target_id"], "tgt_managed");
     assert_eq!(inspected["shown"]["source"], "repo");
+    assert_eq!(
+        inspected["shown"]["overridden_sources"]
+            .as_array()
+            .map(Vec::len),
+        Some(1)
+    );
+    assert_eq!(
+        inspected["shown"]["diagnostics"],
+        serde_json::json!(["overrides 1 lower-precedence definition(s)"])
+    );
+    let inspected_bare = hub
+        .call_plugin_mcp_tool(botster_hub::McpCallRequest {
+            name: "session_type.inspect".to_string(),
+            arguments: serde_json::json!({
+                "target_id": "tgt_managed",
+                "session_type_id": "init"
+            }),
+        })
+        .expect("inspect target-filtered template by bare id");
+    assert_eq!(inspected_bare["shown"], inspected["shown"]);
 
     let result = hub
         .call_plugin_mcp_tool(botster_hub::McpCallRequest {
-            name: "session_template.atomic".to_string(),
+            name: "session_type.atomic".to_string(),
             arguments: serde_json::json!({
                 "target_id": "tgt_managed",
                 "branch": "feature/atomic",
-                "template_id": "tgt_managed/init",
+                "session_type_id": "tgt_managed/init",
                 "context": {
                     "prompt": "trusted managed spawn",
                     "ticket_id": "ticket-managed-proof",
@@ -2201,7 +2239,7 @@ fn real_lua_plugin_atomically_ensures_managed_worktree_and_spawns_session() {
                 }
             }),
         })
-        .expect("call atomic managed session-template capability");
+        .expect("call atomic managed session-type capability");
     assert_eq!(result["ok"], true, "atomic result: {result}");
     let spawned = &result["result"];
     let session_id = spawned["session_id"].as_str().expect("session UUID");
@@ -2247,11 +2285,11 @@ fn real_lua_plugin_atomically_ensures_managed_worktree_and_spawns_session() {
 
     let reused = hub
         .call_plugin_mcp_tool(botster_hub::McpCallRequest {
-            name: "session_template.atomic".to_string(),
+            name: "session_type.atomic".to_string(),
             arguments: serde_json::json!({
                 "target_id": "tgt_managed",
                 "branch": "feature/atomic",
-                "template_id": "tgt_managed/init"
+                "session_type_id": "tgt_managed/init"
             }),
         })
         .expect("reuse managed worktree through atomic capability");
@@ -2264,11 +2302,11 @@ fn real_lua_plugin_atomically_ensures_managed_worktree_and_spawns_session() {
 
     let relative = hub
         .call_plugin_mcp_tool(botster_hub::McpCallRequest {
-            name: "session_template.atomic".to_string(),
+            name: "session_type.atomic".to_string(),
             arguments: serde_json::json!({
                 "target_id": "tgt_managed",
                 "branch": "feature/relative",
-                "template_id": "session-template-spawner.plugin/relative"
+                "session_type_id": "session-type-spawner.plugin/relative"
             }),
         })
         .expect("spawn relative managed template");
@@ -2310,11 +2348,11 @@ fn real_lua_plugin_atomically_ensures_managed_worktree_and_spawns_session() {
     run_git(Some(&repo_root), &["switch", "main"]);
     let symlink_escape = hub
         .call_plugin_mcp_tool(botster_hub::McpCallRequest {
-            name: "session_template.atomic".to_string(),
+            name: "session_type.atomic".to_string(),
             arguments: serde_json::json!({
                 "target_id": "tgt_managed",
                 "branch": "feature/symlink-escape",
-                "template_id": "session-template-spawner.plugin/relative"
+                "session_type_id": "session-type-spawner.plugin/relative"
             }),
         })
         .expect("return tagged symlink escape failure");
@@ -2336,17 +2374,17 @@ fn real_lua_plugin_atomically_ensures_managed_worktree_and_spawns_session() {
     let package_script = PathBuf::from("target")
         .join("botster-hub-test-data")
         .join("lua-runtime-packages")
-        .join("managed-session-template-spawn")
+        .join("managed-session-type-spawn")
         .join("bin/init.sh");
     fs::remove_file(package_script).expect("force configured spawn failure");
 
     let new_branch_failure = hub
         .call_plugin_mcp_tool(botster_hub::McpCallRequest {
-            name: "session_template.atomic".to_string(),
+            name: "session_type.atomic".to_string(),
             arguments: serde_json::json!({
                 "target_id": "tgt_managed",
                 "branch": "feature/rollback-new",
-                "template_id": "session-template-spawner.plugin/relative"
+                "session_type_id": "session-type-spawner.plugin/relative"
             }),
         })
         .expect("return tagged new-branch spawn failure");
@@ -2368,11 +2406,11 @@ fn real_lua_plugin_atomically_ensures_managed_worktree_and_spawns_session() {
     run_git(Some(&repo_root), &["branch", "feature/rollback-existing"]);
     let existing_branch_failure = hub
         .call_plugin_mcp_tool(botster_hub::McpCallRequest {
-            name: "session_template.atomic".to_string(),
+            name: "session_type.atomic".to_string(),
             arguments: serde_json::json!({
                 "target_id": "tgt_managed",
                 "branch": "feature/rollback-existing",
-                "template_id": "session-template-spawner.plugin/relative"
+                "session_type_id": "session-type-spawner.plugin/relative"
             }),
         })
         .expect("return tagged existing-branch spawn failure");
@@ -2397,27 +2435,27 @@ fn real_lua_plugin_atomically_ensures_managed_worktree_and_spawns_session() {
 }
 
 #[test]
-fn managed_session_template_capability_denies_old_scope_and_trusted_field_smuggling() {
-    let registry = install_session_template_spawn_registry(
-        "managed-session-template-denied",
+fn managed_session_type_capability_denies_old_scope_and_trusted_field_smuggling() {
+    let registry = install_session_type_spawn_registry(
+        "managed-session-type-denied",
         vec![
             capability(CapabilitySurface::Mcp, None),
             capability(
                 CapabilitySurface::SessionActions,
-                Some("session_template_spawn"),
+                Some("session_type_spawn"),
             ),
         ],
     );
-    let mut hub = explicit_runtime("managed-session-template-denied");
-    hub.load_lua_plugin_package(&registry, "session-template-spawner.plugin")
-        .expect("load denied managed session-template plugin");
+    let mut hub = explicit_runtime("managed-session-type-denied");
+    hub.load_lua_plugin_package(&registry, "session-type-spawner.plugin")
+        .expect("load denied managed session-type plugin");
     let denied = hub
         .call_plugin_mcp_tool(botster_hub::McpCallRequest {
-            name: "session_template.atomic".to_string(),
+            name: "session_type.atomic".to_string(),
             arguments: serde_json::json!({
                 "target_id": "tgt_managed",
                 "branch": "feature/denied",
-                "template_id": "session-template-spawner.plugin/init"
+                "session_type_id": "session-type-spawner.plugin/init"
             }),
         })
         .expect("typed capability denial");
@@ -2426,11 +2464,11 @@ fn managed_session_template_capability_denies_old_scope_and_trusted_field_smuggl
 
     let smuggling = hub
         .call_plugin_mcp_tool(botster_hub::McpCallRequest {
-            name: "session_template.atomic".to_string(),
+            name: "session_type.atomic".to_string(),
             arguments: serde_json::json!({
                 "target_id": "tgt_managed",
                 "branch": "feature/denied",
-                "template_id": "session-template-spawner.plugin/init",
+                "session_type_id": "session-type-spawner.plugin/init",
                 "cwd": "/tmp/untrusted",
                 "context": { "worktree_path": "/tmp/untrusted" }
             }),
@@ -2465,32 +2503,32 @@ fn git_succeeds(root: &std::path::Path, args: &[&str]) -> bool {
 }
 
 #[test]
-fn session_template_spawn_helper_works_from_non_mcp_plugin_invocation_path() {
-    let registry = install_session_template_spawn_registry(
-        "session-template-spawn-action",
+fn session_type_spawn_helper_works_from_non_mcp_plugin_invocation_path() {
+    let registry = install_session_type_spawn_registry(
+        "session-type-spawn-action",
         vec![
             capability(CapabilitySurface::Mcp, None),
             capability(
                 CapabilitySurface::SessionActions,
-                Some("session_template_spawn"),
+                Some("session_type_spawn"),
             ),
         ],
     );
-    let mut hub = explicit_runtime("session-template-spawn-action");
-    hub.load_lua_plugin_package(&registry, "session-template-spawner.plugin")
-        .expect("load session-template plugin");
+    let mut hub = explicit_runtime("session-type-spawn-action");
+    hub.load_lua_plugin_package(&registry, "session-type-spawner.plugin")
+        .expect("load session-type plugin");
 
     let action = hub
         .dispatch_plugin_surface_action(
-            "session-template-spawner.plugin",
+            "session-type-spawner.plugin",
             &ui_action_request(
                 "spawn-action-non-mcp",
-                "session-template-spawner.surface",
-                "session_template.spawn_action",
-                "session-template-spawner-form",
+                "session-type-spawner.surface",
+                "session_type.spawn_action",
+                "session-type-spawner-form",
                 serde_json::json!({}),
                 serde_json::json!({
-                "template_id": "session-template-spawner.plugin/init",
+                "session_type_id": "session-type-spawner.plugin/init",
                 "session_id": "lua-template-action-session",
                 "environment": { "BOTSTER_MODE": "action" },
                 "context": {
@@ -2500,7 +2538,7 @@ fn session_template_spawn_helper_works_from_non_mcp_plugin_invocation_path() {
                 }),
             ),
         )
-        .expect("spawn session template through UI action worker path");
+        .expect("spawn session type through UI action worker path");
 
     assert_eq!(action.state, UiActionResultState::Accepted);
     assert_eq!(
@@ -2518,30 +2556,30 @@ fn session_template_spawn_helper_works_from_non_mcp_plugin_invocation_path() {
 }
 
 #[test]
-fn lua_session_template_spawn_requires_exact_scoped_package_capability() {
-    let registry = install_session_template_spawn_registry(
-        "session-template-spawn-unscoped",
+fn lua_session_type_spawn_requires_exact_scoped_package_capability() {
+    let registry = install_session_type_spawn_registry(
+        "session-type-spawn-unscoped",
         vec![
             capability(CapabilitySurface::Mcp, None),
             capability(CapabilitySurface::SessionActions, None),
         ],
     );
-    let mut hub = explicit_runtime("session-template-spawn-unscoped");
-    hub.load_lua_plugin_package(&registry, "session-template-spawner.plugin")
-        .expect("load unscoped session-template plugin");
+    let mut hub = explicit_runtime("session-type-spawn-unscoped");
+    hub.load_lua_plugin_package(&registry, "session-type-spawner.plugin")
+        .expect("load unscoped session-type plugin");
 
     let error = hub
         .call_plugin_mcp_tool(botster_hub::McpCallRequest {
-            name: "session_template.spawn".to_string(),
+            name: "session_type.spawn".to_string(),
             arguments: serde_json::json!({
-                "template_id": "session-template-spawner.plugin/init",
+                "session_type_id": "session-type-spawner.plugin/init",
                 "session_id": "lua-template-denied"
             }),
         })
         .expect_err("unscoped SessionActions grant must not allow template spawn");
 
     assert_eq!(error.code, "plugin_tool_failed");
-    assert!(error.message.contains("session_template_spawn capability"));
+    assert!(error.message.contains("session_type_spawn capability"));
     assert!(
         hub.session(&botster_core::SessionId("lua-template-denied".to_string()))
             .expect("list denied session")
@@ -2919,7 +2957,7 @@ fn reload_replaces_lua_tool_descriptors_and_removes_stale_handlers() {
         LuaPluginHostApi {
             capabilities: hub.capability_runtime(),
             coordination: hub.coordination_bridge(),
-            session_templates: hub.session_template_spawner(),
+            session_types: hub.session_type_spawner(),
             spawn_targets: hub.spawn_targets(),
             worktrees: hub.worktrees(),
         },

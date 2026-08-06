@@ -47,7 +47,7 @@ pub mod packages;
 pub mod persistence;
 pub mod profile;
 pub mod runtime;
-pub mod session_templates;
+pub mod session_types;
 pub mod spawn_targets;
 pub mod worktrees;
 
@@ -109,9 +109,10 @@ pub use daemon_transport::{
     DaemonPackageNavigationSource, DaemonPackagePin, DaemonPackageProcess,
     DaemonPackageRouteDescriptor, DaemonPackageRouteTarget, DaemonPackageRunnableEntrypoint,
     DaemonPackageWorkingDirectory, DaemonPluginLifecycle, DaemonPluginWorkerCounters,
-    DaemonRequest, DaemonResolvedAppLaunch, DaemonResolvedSessionTemplate, DaemonResponse,
+    DaemonRequest, DaemonResolvedAppLaunch, DaemonResolvedSessionType, DaemonResponse,
     DaemonResponseKind, DaemonSession, DaemonSessionCleanup, DaemonSessionContext,
-    DaemonSessionTemplate, DaemonSessionTemplateContextInput, DaemonSessionTemplateRequest,
+    DaemonSessionType, DaemonSessionTypeContextInput, DaemonSessionTypeDefinition,
+    DaemonSessionTypeMutationSource, DaemonSessionTypeRequest, DaemonSessionTypeWorkingDirectory,
     DaemonSoftwareIdentity, DaemonSpawnTarget, DaemonSpawnTargetValidation, DaemonStatus,
     DaemonTransportError, DaemonTransportResult, DaemonWorktree, DaemonWorktreeGitMetadata,
     request as daemon_transport_request, serve_daemon, stream_attach,
@@ -149,10 +150,10 @@ pub use packages::{
     resolve_foreground_launch_contract,
 };
 pub use persistence::{
-    BootstrapGrantRecord, CapabilityGrantRecord, CredentialKeyReference,
-    DeviceSessionTemplateSource, FileHubStateStore, HubAuditEntry, HubState, HubStateError,
-    HubStateResult, HubStateStore, HubStateStoreError, HubStateStoreResult, LocalRuntimeSettings,
-    PackageAdmissionDecision, SchemaMetadata, TrustedBrowserIdentity,
+    BootstrapGrantRecord, CapabilityGrantRecord, CredentialKeyReference, DeviceSessionTypeSource,
+    FileHubStateStore, HubAuditEntry, HubState, HubStateError, HubStateResult, HubStateStore,
+    HubStateStoreError, HubStateStoreResult, LocalRuntimeSettings, PackageAdmissionDecision,
+    SchemaMetadata, TrustedBrowserIdentity,
 };
 pub use profile::{
     CoreRuntimeRole, HostProfileManifest, HostProfileTrust, PolicyArea, Responsibility,
@@ -162,10 +163,11 @@ pub use runtime::{
     HubLuaPluginLoadError, HubRuntime, HubRuntimeError, HubRuntimeObservation, HubRuntimeOutput,
     daemon_session_to_core_session,
 };
-pub use session_templates::{
-    HubSessionContext, HubSessionTemplate, MaterializedSessionTemplate, PackageSessionTemplate,
-    PackageSessionTemplateWorkingDirectory, ResolvedSessionTemplate, SessionTemplateContextInput,
-    SessionTemplateError, SessionTemplateRequest,
+pub use session_types::{
+    HubSessionContext, HubSessionType, HubSessionTypeSource, MaterializedSessionType,
+    PackageSessionType, PackageSessionTypeWorkingDirectory, ResolvedSessionType,
+    SessionTypeContextInput, SessionTypeError, SessionTypeMutation, SessionTypeMutationSource,
+    SessionTypeRequest,
 };
 pub use spawn_targets::{
     SpawnTarget, SpawnTargetCreate, SpawnTargetError, SpawnTargetResult, SpawnTargetUpdate,
