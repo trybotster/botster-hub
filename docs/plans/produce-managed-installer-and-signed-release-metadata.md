@@ -70,6 +70,35 @@ accepted as legitimate. What changed:
   surfaced the bounded-execution requirement. Loaded, along with
   [[bounded command execution requires process group termination and reaping]].
 
+## Second revision after Plan Review
+
+`review_1786037923_438404` returned changes required with three further findings.
+All accepted. The first is a design change, not a wording fix:
+
+- **Two renames still permitted a mixed revision pair (high).** Calling step 7
+  "atomic" while replacing `botster-hub` and `botster-session-worker` as two
+  separate files left Hub-at-N+1-beside-worker-at-N reachable by SIGKILL or power
+  loss, and the crash table hid it by collapsing both renames into one row.
+  `question_1786037807_656385` refused to waive this, on the grounds that the
+  ticket's own "revision-coupled artifacts" and "exact Hub plus locked-Core worker
+  provenance" language exists precisely to forbid that state. Replaced with one
+  versioned generation directory per revision pair, a single atomic pointer
+  switch, pointer-reversal rollback, retention of the previous generation, and an
+  enforced-offline upgrade.
+- **Fixed receipt temp name contradicted idempotent recovery (high).** A crash
+  during the receipt write leaves `botster-hub.json.tmp`, and the plan's own
+  `O_EXCL`-plus-abort rule then made every subsequent re-run fail — so the
+  "re-run the idempotent installer" recovery contract was false. Fixed with a
+  unique temp name per attempt plus a bounded, fail-safe stale-temp sweep. The
+  durability sequence was also wrong: it `fsync`ed the directory *before* the
+  rename, which does not commit the rename. Now file `fsync` → `renameat` →
+  directory `fsync`.
+- **Receipt recorded the wrong signature subject (medium).** It stored a digest of
+  the whole release document while the signature covers only the decoded
+  manifest bytes, implying authentication of an envelope that was never signed.
+  Renamed to `signed_manifest_sha256` and defined as the digest of the exact
+  bytes passed to Ed25519 verification.
+
 ## Forward tolerance is not a compatibility shim
 
 This repository's standing posture is cold-cut replacement — see
@@ -184,9 +213,17 @@ product_id, binary_version, installation_mode, release_channel, provider, source
 build_revision           -- must equal the running binary's embedded revision
 artifacts[]              -- {name, sha256, size} installed-artifact checksum facts
 source_revisions         -- {botster_hub, botster_core}
-signature                -- {algorithm, key_id, release_metadata_sha256}  (facts, not a signature to check)
+signature                -- {algorithm, key_id, signed_manifest_sha256}  (facts, not a signature to check)
 installer                -- {id, version}
 ```
+
+`signed_manifest_sha256` is the digest of the **exact bytes passed to Ed25519
+verification** — the decoded `install_manifest` — not a hash of the whole release
+document. Those are different things: the envelope is unsigned, so a
+whole-document digest would record something the signature never covered and
+would imply authentication that did not happen. The receipt has to be able to
+say unambiguously *which payload was verified*. The whole-document hash is not
+recorded, because nothing needs it.
 
 Hub-side validation of the additive fields is **shape and agreement only**:
 sanitized 64-char lowercase hex for checksums, an `ed25519` algorithm allowlist,
@@ -224,31 +261,98 @@ which silently drops coverage. That is a hack, not a boundary.
 dependency weight, consistent with
 [[prefer framework and library components over custom solutions]].
 
-Install order — this is the ticket's central safety property:
+#### Generations: the pair is one indivisible unit
 
-1. Fetch release metadata. HTTPS required for any non-loopback host.
-2. Verify the signature against the trust anchor. **Fail closed.**
-3. Exact-match the envelope against the verified manifest per the authority
+The Hub and its locked-Core worker are **one revision-coupled generation**, never
+two independently replaceable files. Replacing them as two renames makes a mixed
+pair — Hub at N+1 beside worker at N — reachable by SIGKILL or power loss, and
+that is exactly the state the ticket's "revision-coupled artifacts" and "exact
+Hub plus locked-Core worker provenance" language exists to forbid. Required by
+`question_1786037807_656385`, which explicitly declined to waive it.
+
+Prefix layout:
+
+```
+<prefix>/
+  generations/
+    <hub-sha>-<core-sha>/
+      botster-hub
+      botster-session-worker
+  current -> generations/<hub-sha>-<core-sha>     # the pointer
+  bin/
+    botster-hub -> ../current/botster-hub
+```
+
+The generation id is the revision pair itself, so the directory name states the
+coupling rather than merely implying it.
+
+**The switch is exactly one atomic operation**: `symlinkat` the new target to a
+unique temp name in `generations`' parent, then `renameat` it over `current`.
+`rename(2)` over an existing symlink is atomic — a concurrent resolver sees the
+old target or the new one, never neither and never a blend. Before it the system
+is entirely on the old generation; after it, entirely on the new. **Rollback is
+that same single operation pointing back** at the retained previous generation,
+which is what makes rollback cheap and genuinely testable rather than a narrative
+claim. At least the previous generation is retained and is never deleted as part
+of a switch.
+
+`bin/botster-hub` is a stable symlink, so it never needs rewriting and `PATH`
+never changes. Note that `env::current_exe()` (`src/main.rs:1336`) resolves to
+the real path, so a Hub launched through `bin/botster-hub` sees
+`generations/<id>/botster-hub`, and `session_worker_bin` resolving the sibling
+(`src/main.rs:4169`) therefore finds the worker **from its own generation**. That
+is a useful property but it is *not* claimed as a licence for online upgrade; see
+below.
+
+**Do not generalise the symlink here to the receipt.** The generation pointer and
+the installation receipt are different objects with different rules. The receipt
+remains a regular file in a user-owned, non-world-writable directory, created and
+replaced through descriptor-relative operations and **never** through a symlink.
+A pointer file plus a launcher shim was considered and rejected: it adds a
+resolving indirection on every launch and changes `current_exe()` semantics, for
+no gain over an atomic `renameat` on a symlink.
+
+#### Upgrades are offline and the installer enforces it
+
+The installer detects a running managed Hub daemon and **refuses with a clear
+diagnostic** rather than racing it. Detection is a `connect()` attempt on
+`<data-dir>/botster-hub.sock` (default `$HOME/.botster/hub`, overridable with
+`--data-dir`); a successful connect means running, connection-refused means a
+stale socket and the install proceeds.
+
+Online upgrade is out of scope. Generation directories make it *conceivable* —
+a daemon that pinned its generation at startup would keep resolving its own
+generation after the pointer moved — but relying on that would require the Hub to
+resolve workers through a start-time-pinned generation path as a guaranteed
+contract rather than an incidental consequence of `current_exe()`. That is a Hub
+behavioural change beyond this installer, and the ticket says to keep apply
+mechanics out unless the existing contract can perform them safely. Recorded here
+so the future enabler is discoverable.
+
+#### Install order
+
+1. Refuse if a managed Hub daemon is running.
+2. Fetch release metadata. HTTPS required for any non-loopback host.
+3. Verify the signature against the trust anchor. **Fail closed.**
+4. Exact-match the envelope against the verified manifest per the authority
    boundary above; decode the manifest.
-4. Stage artifacts into a staging directory **inside the install prefix**, so the
-   later rename is same-filesystem and therefore atomic.
-5. Verify each staged artifact's size and SHA-256.
-6. Verify the staged Hub binary's *self-reported* identity via a new
-   `botster-hub version` subcommand, and require it to match the manifest's
-   `version` and `build_revision`. This proves receipt/binary agreement from the
-   binary itself before anything is committed. The binary is executed only
-   *after* its checksum and signature have been verified, so this is never
-   execution of unvalidated bytes.
-7. Atomically replace `bin/botster-hub` and `bin/botster-session-worker`,
-   retaining the previous bytes for rollback.
-8. Re-verify the installed Hub's identity after the swap.
-9. **Only then** create/validate `.botster/installations` and atomically write
-   the receipt.
+5. Stage both artifacts into a new `generations/<hub-sha>-<core-sha>/` directory
+   inside the prefix, so the pointer switch is same-filesystem.
+6. Verify each staged artifact's size and SHA-256.
+7. Verify the staged Hub binary's *self-reported* identity via a new
+   `botster-hub version` subcommand, requiring it to match the manifest's
+   `version` and `build_revision`. The binary is executed only *after* its
+   checksum and signature verify, so this is never execution of unvalidated
+   bytes.
+8. **Switch generations — the single atomic operation.**
+9. Verify the Hub resolved through `current` reports the expected version and
+   build revision.
+10. **Only then** write the receipt atomically.
 
-Steps 7–9 are ordered exactly as the ticket requires: replace and verify the
-binary before writing a receipt that requires the newer schema. Writing the
+Steps 8–10 preserve the ordering the ticket requires: the binaries are replaced
+and verified before a receipt requiring the newer schema is written. Writing the
 receipt first would turn a managed installation into an unmanaged one — the old
-binary would report `unsupported_receipt_schema` — until the binary caught up.
+binary would report `unsupported_receipt_schema` — until the binaries caught up.
 
 #### Network coordinate policy
 
@@ -273,26 +377,34 @@ The distinction between a *recoverable error* and *abrupt termination* is
 load-bearing, and conflating them is how an ordering guarantee turns into a
 contradiction.
 
-**Recoverable errors** — any returned error at or after step 7: restore **both**
-previous binaries, leave the previous receipt untouched, exit non-zero. No
-partial state is observable. This is the case that "no partial state" describes.
+**Recoverable errors** — any returned error at or after the switch: point
+`current` back at the previous generation with the same single operation, leave
+the previous receipt untouched, exit non-zero. No partial state is observable.
+This is the case that "no partial state" describes.
 
 **Abrupt termination** — SIGKILL, power loss, anything where no rollback code
 runs. No durable journal or crash-recovery mechanism is in scope; recovery is
-"re-run the installer", which is idempotent. What the ordering buys is that the
+"re-run the installer", which is idempotent. What the design buys is that the
 crash window is *bounded to safe states only*:
 
 | Crash point | On-disk state | Hub behavior |
 | --- | --- | --- |
-| Before step 7 | staged artifacts only | unchanged |
-| Between 7 and 9 | new binaries, **previous** receipt | `receipt_binary_mismatch` → unmanaged |
-| After step 9 | new binaries, new receipt | managed |
+| Before the switch | old generation; new generation staged but unreferenced | unchanged, still old pair |
+| **During** the switch | `current` resolves to old **or** new — never neither | coherent pair either way |
+| After switch, before receipt | new generation, **previous** receipt | stale coordinate / `receipt_binary_mismatch` → unmanaged |
+| During receipt write | new generation, previous receipt intact, unique stale temp may remain | unmanaged; re-run converges |
+| After receipt write | new generation, new receipt | managed |
 
-The middle row degrades honestly: the Hub reports unmanaged rather than falsely
-claiming a managed install. Critically, **no reachable state has a schema-2
-receipt beside an old binary**, because the receipt is written last. That is the
-invariant the ordering exists to protect, and it is what acceptance must test —
-distinctly from rollback, which is the recoverable-error path.
+Two properties matter here. First, **a mixed Hub/worker pair is unreachable by
+construction** — not merely unlikely — because both binaries are only ever
+referenced through one pointer that flips atomically. Second, every intermediate
+row degrades *honestly*: the Hub reports unmanaged rather than falsely claiming a
+managed install, and a re-run repairs it.
+
+**No reachable state has a schema-2 receipt beside an old binary**, because the
+receipt is written last. That is the invariant the ordering exists to protect,
+and acceptance tests it distinctly from rollback, which is the recoverable-error
+path.
 
 #### Race-resistant filesystem operations
 
@@ -311,9 +423,26 @@ descriptor-relative operations throughout (`libc` is already a direct dependency
 4. `fstat` **each directory fd** — owner equals the effective uid, not
    world-writable. Validating the fd rather than re-stating the path is what
    closes the race.
-5. `openat(installations_fd, "botster-hub.json.tmp",
-   O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC, 0o600)`, write, `fsync`.
-6. `fsync(installations_fd)`, then `renameat` within that same directory fd.
+5. `openat(installations_fd, "botster-hub.json.<random>.tmp",
+   O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC, 0o600)`, write, `fsync` the
+   file.
+6. `renameat` within that same directory fd, **then `fsync(installations_fd)`**
+   so the rename itself is durably committed.
+
+The temp name is **unique per attempt** (random suffix via `getrandom`, already a
+direct dependency), not the fixed `botster-hub.json.tmp` an earlier draft used. A
+crash during the receipt write leaves exactly one stale temp file; with a fixed
+name plus `O_EXCL`, every subsequent re-run would abort on it forever, which
+would have made the "re-run the idempotent installer" recovery contract false.
+`O_EXCL` is retained so a pre-placed or attacker-controlled file at the chosen
+name still fails closed rather than being overwritten.
+
+Stale temps are swept before writing, bounded and fail-safe: within the validated
+`installations_fd`, match only the installer's own name pattern, `openat` each
+candidate `O_NOFOLLOW`, require a regular file owned by the effective uid and not
+world-writable, then `unlinkat`. Anything failing those checks is left alone
+rather than removed — the sweep never follows a symlink and never deletes a file
+it cannot prove is its own.
 
 Because every component below `$HOME` is opened `O_NOFOLLOW` relative to an
 already-validated descriptor, a symlink substituted mid-sequence cannot redirect
@@ -383,6 +512,13 @@ remains authoritative for its embedded product version/build revision".
 - Publishing to a real origin; provisioning real signing keys; release CI.
 - Any `botster-hub-client` DTO change. `PROTOCOL_VERSION` stays **6** and
   `CONFORMANCE_FIXTURE_REVISION` stays **31**.
+- **Online upgrade.** Upgrades are offline and the installer refuses to run
+  against a live daemon. Making them safe would require the Hub to resolve its
+  worker through a start-time-pinned generation path as a guaranteed contract
+  rather than as an incidental consequence of `current_exe()` resolution — a Hub
+  behavioural change, and its own ticket.
+- Pruning old generations beyond retaining the previous one. A retention policy
+  is not this ticket's.
 - Auto-update daemons, background update application, sandboxing, notarization,
   multi-platform artifact matrices, delta updates, downgrade support.
 - Hub-side signature verification or startup re-hashing of installed binaries.
@@ -439,15 +575,24 @@ to fix.
    requires a directory owned by a different uid cannot be constructed without
    privilege. If it cannot be built, it is recorded as an explicit gap at the
    skip site naming what is unproven — never silently omitted.
-5. Retained rollback copies live beside the installed binaries in the prefix.
-   Whether they are pruned after a successful install is an installer detail;
-   the plan retains them for the duration of the install only.
-6. **Crash-safety scope is explicit and narrow.** No durable journal, no
+5. **Rollback is generation retention, not copied bytes.** The previous
+   generation directory stays in place, so rollback is a pointer reversal rather
+   than restoring saved copies. At least one previous generation is retained.
+6. **`rename(2)` over an existing symlink is atomic** on the target platforms —
+   a concurrent resolver observes the old target or the new one, never neither.
+   The design rests on this, so acceptance proves it under crash injection rather
+   than asserting it.
+7. **`env::current_exe()` resolves through the `bin/botster-hub` symlink** to the
+   real generation path, so a running Hub resolves its sibling worker within its
+   own generation. Verified against `src/main.rs:1336` and the sibling resolution
+   at `src/main.rs:4169`. This is relied on for coherence, *not* as a licence for
+   online upgrade — upgrades remain offline and enforced.
+8. **Crash-safety scope is explicit and narrow.** No durable journal, no
    crash-recovery state machine. Abrupt termination is bounded to the safe states
    tabulated above, and recovery is re-running the idempotent installer. Anything
    stronger — surviving power loss mid-`renameat` with automatic resume — is out
    of scope and would need its own ticket.
-7. `$HOME` itself is not constrained to be a non-symlink; only the two components
+9. `$HOME` itself is not constrained to be a non-symlink; only the two components
    below it are, matching what the existing Hub reader already validates.
    Constraining `$HOME` would break legitimate setups where a home directory is a
    symlink to another volume.
@@ -457,7 +602,7 @@ to fix.
 | Surface | Change |
 | --- | --- |
 | `crates/botster-hub-installation/` | New. Shared receipt contract; descriptor-relative (`openat`/`O_NOFOLLOW`) directory walk, fd-based ownership/permission validation, and atomic `renameat` write. Public API takes a directory fd, never a path. Uses `libc`, already a direct dependency. |
-| `crates/botster-hub-installer/` | New. Installer binary: fetch, signature verification, envelope/manifest equality, per-URL HTTPS policy, checksum verification, bounded process-group-owning child runner, ordered swap, rollback. |
+| `crates/botster-hub-installer/` | New. Installer binary: running-daemon refusal, fetch, signature verification, envelope/manifest equality, per-URL HTTPS policy, checksum verification, bounded process-group-owning child runner, generation staging, single atomic pointer switch, pointer-reversal rollback. |
 | `src/maintenance.rs` | Receipt reading delegates to the shared crate; receipt schema 2; release schema 2 + forward tolerance; asymmetry comment. |
 | `src/main.rs` | New `version` subcommand, dispatch, usage text. |
 | `Cargo.toml` | Workspace members. |
@@ -479,9 +624,13 @@ to fix.
    model *abrupt termination* for the ordering invariant and a *returned error*
    for rollback; using one mechanism for both is what made the first draft of
    this plan self-contradictory.
-3. **Rollback leaving a mixed pair.** Hub replaced, worker not, or vice versa.
-   Both binaries must be staged and verified before either is swapped, and
-   rollback must restore both.
+3. **A mixed Hub/worker pair.** The failure mode the generation design exists to
+   eliminate. Any implementation that touches the two binaries separately —
+   two renames, a rename plus a copy, an in-place overwrite of one — reintroduces
+   it. The pair must move only through the single pointer switch. This is a
+   defect class that would very likely never surface in testing and would be
+   deeply unpleasant in the field, which is why it is proven by crash injection
+   rather than by inspection.
 4. **Signature verification that never fails.** A verifier wired so that any
    input passes is worse than none. Mitigated by negative tests: tampered
    payload, wrong key, absent signature — each must abort the install.
@@ -560,66 +709,86 @@ evidence, not waved through.
     covered.
 15. A symlink pre-placed at the receipt path causes refusal and its target is
     provably byte-unchanged.
-16. An existing file at the temp path causes `O_EXCL` failure and aborts rather
-    than being overwritten.
-17. Deterministic injection of an adversarial mid-write symlink substitution is
+16. A pre-placed file at the chosen temp name causes `O_EXCL` failure and aborts
+    rather than being overwritten. Separately, a **stale temp left by a previous
+    crash does not block a re-run** — the regression that a fixed temp name would
+    have caused.
+17. The stale-temp sweep removes only installer-owned regular files matching its
+    own pattern, and leaves a symlink, a differently-owned file, and a
+    world-writable file in place rather than unlinking them.
+18. Deterministic injection of an adversarial mid-write symlink substitution is
     impractical, so race resistance is proven structurally instead: the shared
     crate exposes only descriptor-relative APIs, and a test asserts every receipt
     write and read goes through a validated directory fd with `O_NOFOLLOW`. This
     substitution is recorded as a deliberate limit of the evidence, not passed
     off as a race test.
 
+**Generation coupling and the atomic switch**
+
+19. Fresh install creates `generations/<hub-sha>-<core-sha>/` containing both
+    artifacts, and `current` resolving to it; `bin/botster-hub` resolves through
+    `current` to that generation's Hub.
+20. Upgrade creates a second generation and moves `current` to it while
+    **retaining** the previous generation directory intact.
+21. **A mixed pair is unreachable.** With crash injection immediately before and
+    immediately after the switch, assert in every case that the Hub and worker
+    reachable through `current` come from one and the same generation — never Hub
+    at N+1 beside worker at N or the reverse.
+22. Rollback is the same single operation reversed: `current` returns to the
+    previous generation and the pair is coherent there.
+23. The installer **refuses with a clear diagnostic** when a managed Hub daemon is
+    running on the target data directory, and proceeds when only a stale socket
+    remains.
+
 **Installer failure semantics**
 
-18. Byte-flipped artifact fails checksum verification and installs nothing.
-19. Upgrade replaces both binaries and the receipt, with no partial state
-    observable after a recoverable error.
-20. **Recoverable error after the swap** rolls **both** binaries back to their
-    previous bytes and leaves the previous receipt byte-identical.
-21. Post-swap identity verification failure produces the same full rollback.
-22. **Ordering invariant under abrupt termination**: SIGKILL the installer
-    between the binary swap and the receipt rename — modelling crash, not a
-    returned error, so no rollback runs. Assert the on-disk state is new binaries
-    plus the *previous* receipt, and that the Hub then reports
-    `receipt_binary_mismatch`/unmanaged rather than claiming a managed install.
-23. Re-running the installer after that abrupt-termination state converges to a
-    correct managed install, which is the whole of the crash-recovery contract.
-24. No reachable state places a schema-2 receipt beside an old binary — asserted
-    at the two injection points above.
+24. Byte-flipped artifact fails checksum verification and installs nothing; the
+    pointer never moves.
+25. **Recoverable error after the switch** reverses the pointer and leaves the
+    previous receipt byte-identical.
+26. Post-switch identity verification failure produces the same reversal.
+27. **Crash injection at each of the three boundaries** required by
+    `question_1786037807_656385` — immediately before the switch, after the switch
+    but before the receipt write, and *during* the receipt write. After each,
+    assert the Hub/worker pair is coherent, the receipt state is honest (the Hub
+    reports unmanaged rather than falsely claiming managed), and **a re-run
+    converges to a correct managed installation**.
+28. No reachable state places a schema-2 receipt beside an old generation —
+    asserted at every injection point above.
 
 **Bounded staged-binary execution**
 
-25. Hanging child is terminated at the deadline; a descendant PID captured before
+29. Hanging child is terminated at the deadline; a descendant PID captured before
     the timeout is provably gone afterwards, per
     [[bounded command execution requires process group termination and reaping]].
-26. Non-zero exit, oversized output, and malformed non-`key=value` output are
+30. Non-zero exit, oversized output, and malformed non-`key=value` output are
     each rejected.
-27. The process group leader is reaped and both drains reach EOF, and a second
+31. The process group leader is reaped and both drains reach EOF, and a second
     invocation through the same code path still succeeds — proving teardown left
     nothing wedged.
 
 **Real runtime — the production path, not scaffolding**
 
-28. Install the **actual** built `botster-hub` and `botster-session-worker` into
+32. Install the **actual** built `botster-hub` and `botster-session-worker` into
     an isolated prefix using the installer, then launch that **installed** Hub
     with `HOME` pointed at the prefix (reusing `start_cli_daemon_with_home`).
     Assert `status` reports `installation.mode=managed` with the expected channel
     and provider, and that `software.version`/`build_revision` come from the
     binary.
-29. Serialized status contains no `source_url`, no artifact checksum, no
+33. Serialized status contains no `source_url`, no artifact checksum, no
     signature, no installer identity, and no home path.
-30. `check-update` against a loopback schema-2 fixture returns
+34. `check-update` against a loopback schema-2 fixture returns
     `state=available` / `action=run_managed_installer`; the schema-3
     forward-compat fixture returns the same.
-31. Restart preserves identical `software` and `installation`.
-32. `botster-hub version` prints identity with no data directory and no daemon.
+35. Restart preserves identical `software` and `installation`.
+36. `botster-hub version` prints identity with no data directory and no daemon.
 
 **Provenance** — per the charter's live-binary requirement
 
-33. Record the Hub SHA and the `Cargo.lock`-pinned Core SHA **separately**,
+37. Record the Hub SHA and the `Cargo.lock`-pinned Core SHA **separately**,
     resolve both binary realpaths under the fresh checkout's target directory,
     and assert the receipt's `source_revisions` matches both.
-34. No orphaned processes or stale process groups remain after the installer's
+38. No orphaned processes or stale process groups remain after the installer's
     bounded-execution tests, checkable with the repo's existing
     `script/process-census`.
 
