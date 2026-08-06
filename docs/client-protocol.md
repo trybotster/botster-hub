@@ -236,13 +236,28 @@ During steady state the daemon reads one shared Core lifecycle journal cursor;
 the filesystem-backed baseline counter advances only for initial seeding or an
 explicit journal resync.
 
+`DaemonStatus.software` is the authoritative identity of the running binary:
+product id/name, `CARGO_PKG_VERSION`, and an optional sanitized build revision
+embedded at compile time. `DaemonStatus.installation` is a separate fact from
+host identity, protocol compatibility, durable schema, and package rows. It is
+resolved only from `$HOME/.botster/installations/botster-hub.json`; unsafe or
+mismatched receipts diagnose but never override the embedded binary identity.
+Receipt schema 1 is strict and contains exactly `schema_version`, `product_id`,
+`binary_version`, `installation_mode`, `release_channel`, `provider`, and
+`source_url`. Managed sources must use HTTPS; plaintext HTTP is accepted only
+for explicit loopback test fixtures. Additive receipt fields require a schema
+version bump. A Hub that does not recognize that schema reports
+`unsupported_receipt_schema` and falls back to development or unmanaged mode
+according to its build profile, so an installer must replace the Hub binary
+before atomically writing a receipt that requires the newer schema.
+
 `RemoveSession` forgets only an already-terminal session and produces the
 ordered remove delta. `ListSessions` remains available for operator queries,
 but normal client reconciliation must not poll it or maintain a list-refresh
 fallback beside the entity stream.
 
 The prepared current contract ships from
-`@trybotster/hub-test-support@0.1.18` as
+`@trybotster/hub-test-support@0.1.22` as
 `session-lifecycle-subscription-conformance-fixture.json` and through
 `readSessionLifecycleSubscriptionConformanceFixture()`. The fixture serializes
 the public `DaemonEntityFrame` DTOs and normalizes only timestamps and sequence
@@ -423,6 +438,13 @@ Current daemon requests:
   installed package rows.
 - `CheckPackageUpdate { package_name }` returns `DaemonPackageUpdateStatus`
   for the installed package without mutating state.
+- `CheckHubUpdate` is a distinct Hub-binary maintenance request. It returns
+  `DaemonHubUpdate` with typed `current`, `available`, or `unavailable` state,
+  optional release/build information, and reason/action metadata. It never
+  delegates to or reuses package-update state. `available_version` reports what
+  the configured source advertises and can be older than `current_version` when
+  state is `current` with reason `source_behind`; clients must branch on
+  `state`, never on the field's presence.
 - `PreviewPackageUpdate { package_name, pin }` returns
   `DaemonPackageUpdateStatus` plus a `DaemonPackageInstallPlan`-shaped preview
   that reuses `DaemonPackagePin` metadata and reports that no entrypoints start.
@@ -1137,6 +1159,15 @@ application-primitives package API and metadata alias over that already-revised
 fixture. This does not increment `CONFORMANCE_FIXTURE_REVISION` again because
 the daemon conformance surface, fixture bytes, protocol DTOs, and validated
 UiNode payload are unchanged from revision 8.
+
+Adding authoritative software/install identity, the `CheckHubUpdate`
+request/response family, and cold-removing inferred `hub_version` from public
+package compatibility advances `PROTOCOL_VERSION` to 5 and
+`CONFORMANCE_FIXTURE_REVISION` to 29. Current first-party requirements reject
+protocol 4 or conformance 28 before issuing the new request. A stale 4/28
+client accepts the newer descriptor and ignores additive status identity fields,
+but does not know or issue `CheckHubUpdate`. No feature constant is added; the
+protocol version is the single compatibility boundary.
 
 ## Isolated Integration Tests For External Clients
 

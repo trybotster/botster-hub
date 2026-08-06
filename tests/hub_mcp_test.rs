@@ -66,6 +66,10 @@ fn explicit_config(data_dir: &Path) -> botster_hub::HubConfig {
 }
 
 fn start_cli_daemon(data_dir: &Path) -> Child {
+    start_cli_daemon_with_environment(data_dir, &[])
+}
+
+fn start_cli_daemon_with_environment(data_dir: &Path, environment: &[(&str, &Path)]) -> Child {
     let mut command = Command::new(env!("CARGO_BIN_EXE_botster-hub"));
     command
         .arg("start")
@@ -73,6 +77,9 @@ fn start_cli_daemon(data_dir: &Path) -> Child {
         .arg(data_dir)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    for (name, value) in environment {
+        command.env(name, value);
+    }
     unsafe {
         command.pre_exec(|| {
             if libc::setpgid(0, 0) == -1 {
@@ -311,7 +318,9 @@ fn mcp_serve_supports_initialize_list_and_native_status_over_stdio() {
     let _guard = mcp_daemon_test_guard();
     let data_dir = unique_test_dir("status-round-trip");
     let _ = fs::remove_dir_all(&data_dir);
-    let daemon = start_cli_daemon(&data_dir);
+    let home = unique_test_dir("status-round-trip-home");
+    fs::create_dir_all(&home).expect("create empty MCP status home");
+    let daemon = start_cli_daemon_with_environment(&data_dir, &[("HOME", &home)]);
 
     let output = run_mcp_serve(
         &data_dir,
@@ -368,10 +377,84 @@ fn mcp_serve_supports_initialize_list_and_native_status_over_stdio() {
         messages[2]["result"]["structuredContent"]["core_initialized"],
         true
     );
+    let structured_status = &messages[2]["result"]["structuredContent"];
+    assert_eq!(structured_status["software"]["product_id"], "botster-hub");
+    assert_eq!(
+        structured_status["software"]["version"],
+        env!("CARGO_PKG_VERSION")
+    );
+    assert!(structured_status["installation"]["mode"].is_string());
+    assert!(structured_status["installation"]["provenance"].is_string());
+    assert_eq!(structured_status["installation"]["mode"], "development");
+    assert_eq!(
+        structured_status["installation"]["provenance"],
+        "development_build"
+    );
+    assert_eq!(
+        structured_status["compatibility"]["protocol"],
+        botster_hub_client::PROTOCOL
+    );
+    assert_eq!(structured_status["host_id"], "local");
+    assert!(structured_status["schema_version"].is_number());
+    assert!(
+        !serde_json::to_string(structured_status)
+            .expect("serialize MCP status")
+            .contains("source_url")
+    );
     assert!(
         String::from_utf8_lossy(&daemon_output.stdout).contains("event=stopped"),
         "daemon should shut down cleanly"
     );
+    fs::remove_dir_all(&home).expect("remove MCP status home");
+}
+
+#[test]
+fn mcp_status_reports_managed_receipt_without_receipt_path_or_source() {
+    let _guard = mcp_daemon_test_guard();
+    let data_dir = unique_test_dir("managed-status-round-trip");
+    let home = unique_test_dir("managed-status-round-trip-home");
+    let receipt = home.join(".botster/installations/botster-hub.json");
+    fs::create_dir_all(receipt.parent().expect("receipt parent"))
+        .expect("create managed MCP receipt parent");
+    fs::write(
+        &receipt,
+        serde_json::to_vec(&json!({
+            "schema_version": 1,
+            "product_id": "botster-hub",
+            "binary_version": env!("CARGO_PKG_VERSION"),
+            "installation_mode": "managed",
+            "release_channel": "stable",
+            "provider": "http_json",
+            "source_url": "https://releases.example.invalid/botster-hub.json"
+        }))
+        .expect("serialize managed MCP receipt"),
+    )
+    .expect("write managed MCP receipt");
+    let daemon = start_cli_daemon_with_environment(&data_dir, &[("HOME", &home)]);
+    let output = run_mcp_serve(
+        &data_dir,
+        &[
+            initialize_request(1),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": { "name": "hub.status", "arguments": {} }
+            }),
+        ],
+    );
+    shutdown_cli_daemon(&data_dir, daemon);
+
+    let messages = parse_mcp_output(output, "managed status");
+    let status = &messages[1]["result"]["structuredContent"];
+    assert_eq!(status["software"]["product_id"], "botster-hub");
+    assert_eq!(status["installation"]["mode"], "managed");
+    assert_eq!(status["installation"]["release_channel"], "stable");
+    assert_eq!(status["installation"]["provider"], "http_json");
+    let serialized = serde_json::to_string(status).expect("serialize managed MCP status");
+    assert!(!serialized.contains(&home.display().to_string()));
+    assert!(!serialized.contains("source_url"));
+    fs::remove_dir_all(&home).expect("remove managed MCP home");
 }
 
 #[test]
