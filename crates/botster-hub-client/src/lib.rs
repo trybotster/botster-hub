@@ -22,7 +22,7 @@ mod typescript;
 
 pub const PROTOCOL: &str = "botster-hub-daemon-v1";
 pub const PROTOCOL_VERSION: u16 = 6;
-pub const CONFORMANCE_FIXTURE_REVISION: u16 = 31;
+pub const CONFORMANCE_FIXTURE_REVISION: u16 = 32;
 /// Version of the local WebRTC delivery chunk framing protocol.
 pub const LOCAL_WEBRTC_DELIVERY_CHUNK_VERSION: u16 = 2;
 /// Serialized local WebRTC delivery frames must remain strictly below this size.
@@ -742,6 +742,9 @@ pub enum DaemonRequest {
     ShowSessionType {
         session_type_id: String,
     },
+    ShowSessionTypeDefinition {
+        session_type_id: String,
+    },
     CreateSessionType {
         source: DaemonSessionTypeMutationSource,
         definition: DaemonSessionTypeDefinition,
@@ -952,6 +955,8 @@ pub struct DaemonResponse {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub session_types: Vec<DaemonSessionType>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_type_definition: Option<DaemonSessionTypeEditableDefinition>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_session_type: Option<DaemonResolvedSessionType>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_context: Option<DaemonSessionContext>,
@@ -1038,6 +1043,7 @@ pub enum DaemonResponseKind {
     Spawned,
     Events,
     SessionTypes,
+    SessionTypeDefinition,
     ResolvedSessionType,
     SessionContext,
     ReadScreen,
@@ -1265,6 +1271,19 @@ pub struct DaemonSessionType {
 pub struct DaemonSessionTypeSource {
     pub kind: String,
     pub name: String,
+}
+
+/// Authored definition for one editable session type, plus the source that owns it.
+///
+/// `definition` is exactly the payload `UpdateSessionType` accepts, and `source`
+/// is exactly the mutation source it requires, so a client can read this row,
+/// change one field, and submit it back without losing the authored
+/// working-directory path or environment that `DaemonSessionType` omits.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonSessionTypeEditableDefinition {
+    pub session_type_id: String,
+    pub source: DaemonSessionTypeMutationSource,
+    pub definition: DaemonSessionTypeDefinition,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -4141,6 +4160,9 @@ mod tests {
             DaemonRequest::ShowSessionType {
                 session_type_id: "init".to_string(),
             },
+            DaemonRequest::ShowSessionTypeDefinition {
+                session_type_id: "init".to_string(),
+            },
             DaemonRequest::CreateSessionType {
                 source: DaemonSessionTypeMutationSource::Device,
                 definition: daemon_session_type_definition_example(),
@@ -4351,6 +4373,7 @@ mod tests {
             DaemonRequest::CaptureSnapshot { .. } => "capture_snapshot",
             DaemonRequest::ListSessionTypes => "list_session_types",
             DaemonRequest::ShowSessionType { .. } => "show_session_type",
+            DaemonRequest::ShowSessionTypeDefinition { .. } => "show_session_type_definition",
             DaemonRequest::CreateSessionType { .. } => "create_session_type",
             DaemonRequest::UpdateSessionType { .. } => "update_session_type",
             DaemonRequest::DeleteSessionType { .. } => "delete_session_type",
@@ -4414,6 +4437,7 @@ mod tests {
             DaemonResponseKind::Spawned,
             DaemonResponseKind::Events,
             DaemonResponseKind::SessionTypes,
+            DaemonResponseKind::SessionTypeDefinition,
             DaemonResponseKind::ResolvedSessionType,
             DaemonResponseKind::SessionContext,
             DaemonResponseKind::ReadScreen,
@@ -4460,6 +4484,7 @@ mod tests {
             DaemonResponseKind::Spawned => "spawned",
             DaemonResponseKind::Events => "events",
             DaemonResponseKind::SessionTypes => "session_types",
+            DaemonResponseKind::SessionTypeDefinition => "session_type_definition",
             DaemonResponseKind::ResolvedSessionType => "resolved_session_type",
             DaemonResponseKind::SessionContext => "session_context",
             DaemonResponseKind::ReadScreen => "read_screen",
@@ -4535,6 +4560,11 @@ mod tests {
                 lifecycle: "running".to_string(),
             }],
             session_types: vec![daemon_session_type_example()],
+            session_type_definition: Some(DaemonSessionTypeEditableDefinition {
+                session_type_id: "device/init".to_string(),
+                source: DaemonSessionTypeMutationSource::Device,
+                definition: daemon_session_type_definition_example(),
+            }),
             resolved_session_type: Some(DaemonResolvedSessionType {
                 session_type: daemon_session_type_example(),
                 session_id: "session".to_string(),
@@ -5076,9 +5106,9 @@ mod tests {
     }
 
     #[test]
-    fn protocol_six_and_conformance_thirty_one_define_the_cold_cut_boundary() {
+    fn protocol_six_and_conformance_thirty_two_define_the_cold_cut_boundary() {
         assert_eq!(PROTOCOL_VERSION, 6);
-        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 31);
+        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 32);
 
         let requirement = DaemonCompatibilityRequirement::current();
         let protocol_error = ensure_compatible(
@@ -5134,5 +5164,52 @@ mod tests {
         assert_eq!(stale.compatibility.protocol_version, 6);
         assert_eq!(stale.host_id, "hub");
         assert_eq!(stale.schema_version, 1);
+    }
+
+    #[test]
+    fn additive_session_type_definition_read_rides_the_conformance_floor() {
+        // `ensure_compatible` compares protocol version with exact equality and
+        // conformance revision with a floor, so an additive request must ride the
+        // conformance revision: bumping the protocol would break every existing
+        // first-party client that never issues this request.
+        assert_eq!(PROTOCOL_VERSION, 6);
+        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 32);
+        assert_eq!(
+            current_feature_list(),
+            vec![
+                FEATURE_SESSIONS,
+                FEATURE_TERMINAL_STREAMING,
+                FEATURE_RESIZE,
+                FEATURE_PLUGIN_SURFACE_RENDER,
+                FEATURE_PLUGIN_SURFACE_ACTION,
+                FEATURE_PACKAGE_ROUTES,
+                FEATURE_PACKAGE_NAVIGATION,
+                FEATURE_SPAWN_TARGETS,
+                FEATURE_WORKTREES,
+                FEATURE_TERMINAL_READBACK,
+                FEATURE_SESSION_ENTITY_SUBSCRIPTIONS,
+                FEATURE_SESSION_TYPE_ENTITY_SUBSCRIPTIONS,
+                FEATURE_PLUGIN_ENTITY_SUBSCRIPTIONS,
+            ],
+            "the authoring read is a request, not a negotiated capability",
+        );
+
+        let pinned_at_thirty_one = DaemonCompatibilityRequirement {
+            minimum_conformance_fixture_revision: 31,
+            ..DaemonCompatibilityRequirement::current()
+        };
+        ensure_compatible(&pinned_at_thirty_one, &DaemonCompatibility::current())
+            .expect("a protocol-6 client pinned at conformance 31 still accepts a revision-32 Hub");
+
+        assert_eq!(
+            daemon_request_tag(&DaemonRequest::ShowSessionTypeDefinition {
+                session_type_id: "init".to_string(),
+            }),
+            "show_session_type_definition"
+        );
+        assert_eq!(
+            daemon_response_kind_tag(DaemonResponseKind::SessionTypeDefinition),
+            "session_type_definition"
+        );
     }
 }
