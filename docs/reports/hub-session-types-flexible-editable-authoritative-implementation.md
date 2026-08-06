@@ -8,6 +8,7 @@
 - Approved plan: `docs/plans/make-session-types-flexible-editable-authoritative.md`
 - Rebased target authority: `origin/main@73d5c13bb5930205b102cb28cffb7b9e40ce2699`
 - Implementation commit: `802b511ece1324fc69fda157494f006b6aa736c0`
+- Review follow-up implementation commit: `8e3eb33`
 - Required Core dependency: `33ebcd98d19031d23e91b03d8da0ee3f8d1410d4`
 
 ## Guidance applied
@@ -40,11 +41,20 @@ source-explicit create/update/delete; package definitions are typed read-only.
 Repository writes remain confined to admitted roots and
 `.botster/session-types.json`.
 
-Definition changes advance a durable generation and drive a first-class
-`session_type` entity-frame family. Package install/update/reload/refresh,
+Definition changes and spawn-target admission changes advance a durable
+generation and drive a first-class `session_type` entity-frame family. Package
+install/update/reload/refresh,
 enable, disable, and remove compare effective maps and advance the generation
 only for observable changes. Overflow resynchronizes with a full snapshot and
-fresh connections receive the current authoritative generation.
+fresh connections receive the current authoritative generation. A resync
+snapshot that exceeds the daemon frame limit is replaced by a bounded
+`entity_error` with the typed `entity_provider_frame_too_large` code and the
+subscription is closed.
+
+List, show, target-scoped Lua show, and resolve/spawn share the same effective
+row projection, including lower-precedence source identities and override
+diagnostics. CRUD persistence mutates a freshly loaded durable state, so an
+unrelated write made after runtime construction is preserved.
 
 Materialized spawns attach opaque `botster.session_type.*` metadata to the Core
 spawn contract. The canonical session entity projection reads that metadata
@@ -53,11 +63,15 @@ restart and Core worker adoption.
 
 The daemon/client/CLI/Lua vocabulary is cold-renamed to session types. Protocol
 6 uses exact protocol-version agreement and requires
-`session_type_entity_subscriptions`. Conformance revision 30 and npm coordinate
-`@trybotster/hub-test-support@0.1.23` were allocated after rebasing the sibling
-identity ticket, whose protocol 5/revision 29/package 0.1.22 repository meaning
-was preserved. The published registry remained at 0.1.21 during the final
-collision check.
+`session_type_entity_subscriptions`. Review found that the TypeScript generator
+had hard-coded the `type` discriminator for Rust unions tagged with `source`
+and `policy`; the generator and serde-shaped tests now carry the discriminator
+explicitly. Conformance revision 31 and npm coordinate
+`@trybotster/hub-test-support@0.1.24` were allocated for the corrected bytes.
+The earlier 30/0.1.23 meaning is not reused. These coordinates follow the
+rebase of the sibling identity ticket, whose protocol 5/revision 29/package
+0.1.22 repository meaning was preserved. The published registry remained at
+0.1.21 during the final collision check.
 
 ## Files changed
 
@@ -93,12 +107,27 @@ delivered separately and is pinned at the commit above. Web and TUI adoption
 remain separately routed downstream work; this run only publishes their Hub
 contract authority.
 
+Review identified two installed first-party packages that still use the
+removed vocabulary. Separate dependent tickets were registered:
+
+- Project Pipelines `ticket_1785984129_564146`, target
+  `tgt_a72ca1a83d504385b8648f71409119ab`
+- Workspaces `ticket_1785984128_479155`, target
+  `tgt_71266a8d976d4535902ffed09c18a7ba`
+
+Both depend on this Hub ticket and cover manifest keys, capability scopes, the
+Lua capability table, and `session_type_id`. This run does not edit either
+downstream repository and adds no compatibility alias.
+
 ## Deviations and assumptions
 
 - The target branch advanced during implementation when the Hub identity/update
   ticket merged. The work was rebased before handoff and compatibility/package
   coordinates were reallocated from the superseded branch-local 5/29/0.1.22 to
   6/30/0.1.23. This is required collision handling, not a product-plan change.
+- Review then found incorrect generated discriminators in the newly allocated
+  30/0.1.23 artifact. Corrected bytes were reallocated to 31/0.1.24 rather than
+  changing an existing meaning.
 - The session-type definition lane uses full upserts for changed rows rather
   than sparse patches; the approved plan left that wire choice open.
 - Lua keeps the package-needed list/show/spawn/managed-worktree capability.
@@ -113,11 +142,13 @@ contract authority.
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
 - `node packages/hub-test-support/scripts/sync-assets.mjs --check`
 - `npm test --prefix packages/hub-test-support`
-- `./test.sh -p botster-hub-client` — 48 unit tests and 4 doctests passed
+- `cargo test -p botster-hub-client --lib` — 49 unit tests passed, including
+  actual serde JSON versus generated discriminator and field checks
+- `cargo test -p botster-hub-test-support` — 42 unit tests and 3 doctests passed
 - `./test.sh session_type` — persistence, 9 Hub client, 3 real daemon, and 5
   Lua session-type tests passed on the rebased target
-- Bare `./test.sh` — 172 library tests, 13 CLI tests, 14 capability tests, 26
-  client tests, 128 daemon lifecycle tests (one documented large local test
+- Bare `./test.sh` — 173 library tests, 13 CLI tests, 14 capability tests, 26
+  client tests, 129 daemon lifecycle tests (one documented large local test
   ignored), 1 local-runtime test, 26 Lua tests, 7 MCP tests, 7 plugin-lifecycle
   tests, 7 runtime tests, 2 conformance tests, and doctests passed
 - Real Hub/Core restart proof used
@@ -127,17 +158,27 @@ contract authority.
 - Definition entity proof observed device CRUD and package enable/disable
   upserts with durable generations, package read-only rejection, and reconnect
   snapshots without polling
+- A held-open real socket subscription observed an admitted repository
+  definition upsert immediately after `CreateSpawnTarget` and its remove after
+  `DeleteSpawnTarget`, at consecutive durable generations without polling or
+  reconnecting
+- List, show, resolve, and real Lua show proof assert identical override sources
+  and diagnostics for the same effective definition
+- A stale-runtime persistence regression writes an unrelated spawn target after
+  runtime load and proves subsequent session-type CRUD preserves it
+- Oversized session-type resync proof receives the bounded typed error frame and
+  verifies the unsendable snapshot is never queued
 - Orthogonality proof accepted interactive agent, interactive accessory, and
   service accessory definitions independently
 - Ablation: removing Core metadata projection made the restart proof fail with
   absent `session_type_id`; restoring it passed
 - Ablation: bypassing package-source immutability made the CRUD proof panic at
   the unreachable mutation path; restoring the typed read-only guard passed
-- Published 0.1.21 tarball bytes were inspected as protocol 4/revision 28 with
-  the removed vocabulary. The final 0.1.23 tarball was installed in a clean
-  external npm consumer and asserted protocol 6/revision 30, identity update,
-  session-type CRUD DTOs, required entity feature, and absence of the old wire
-  vocabulary
+- Published 0.1.21 remains the registry coordinate and repository 0.1.22 remains
+  the baseline coordinate. The final 0.1.24 tarball was installed in a clean
+  external npm consumer and asserted protocol 6/revision 31, exact `source` and
+  `policy` discriminators, the bounded entity-error DTO, checksums, and absence
+  of the incorrect `type`-tagged session-type union shapes
 - Final cold search found old persisted keys only inside the intentional schema
   v2 rejection fixture in `src/persistence.rs`
 
@@ -145,9 +186,9 @@ contract authority.
 
 - The npm artifact was packed and installed externally but was not published;
   publication remains a release action outside this implementation step.
-- Web/TUI clients were not edited or executed because their repositories require
-  separately routed tickets. Their consumable Hub contract was proven through
-  the packed external Node artifact.
+- Web/TUI, Project Pipelines, and Workspaces consumers were not edited or
+  executed because their repositories require separately routed tickets. Their
+  consumable Hub contract was proven through the packed external Node artifact.
 - Failure injection across the repository definition-file write and subsequent
   Hub generation-state write was not exercised. Each individual file write is
   atomic and normal/restart paths are covered, but a forced filesystem failure
