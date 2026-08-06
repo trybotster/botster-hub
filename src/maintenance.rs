@@ -5,6 +5,7 @@
 
 use std::env;
 use std::fs;
+use std::net::IpAddr;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -26,13 +27,13 @@ const MAX_RELEASE_BYTES: u64 = 64 * 1024;
 const RELEASE_CHECK_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum HubUpdateCheckPlan {
+pub(crate) enum HubUpdateCheckPlan {
     Immediate(DaemonHubUpdate),
     Managed(ManagedReleaseCheck),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ManagedReleaseCheck {
+pub(crate) struct ManagedReleaseCheck {
     source_url: String,
     release_channel: String,
 }
@@ -81,8 +82,11 @@ pub fn installation_identity() -> DaemonInstallationIdentity {
 }
 
 #[must_use]
-pub fn plan_hub_update_check() -> HubUpdateCheckPlan {
-    let resolution = resolve_receipt();
+pub(crate) fn plan_hub_update_check() -> HubUpdateCheckPlan {
+    plan_hub_update_check_for_resolution(resolve_receipt())
+}
+
+fn plan_hub_update_check_for_resolution(resolution: ReceiptResolution) -> HubUpdateCheckPlan {
     let current_version = software_identity().version;
     let Some(receipt) = resolution.receipt else {
         let invalid = !resolution.identity.diagnostics.is_empty();
@@ -91,20 +95,7 @@ pub fn plan_hub_update_check() -> HubUpdateCheckPlan {
             current_version,
             available_version: None,
             build_revision: None,
-            reason: Some(
-                if invalid {
-                    "invalid_installation_receipt"
-                } else {
-                    match resolution.identity.mode {
-                        DaemonInstallationMode::Development => "development_checkout",
-                        DaemonInstallationMode::Unmanaged => "unmanaged_installation",
-                        DaemonInstallationMode::Managed => {
-                            unreachable!("managed identity has receipt")
-                        }
-                    }
-                }
-                .to_string(),
-            ),
+            reason: Some(unavailable_reason(resolution.identity.mode, invalid).to_string()),
             action: Some("manual".to_string()),
         });
     };
@@ -116,7 +107,7 @@ pub fn plan_hub_update_check() -> HubUpdateCheckPlan {
 }
 
 #[must_use]
-pub fn execute_managed_update_check(check: ManagedReleaseCheck) -> DaemonHubUpdate {
+pub(crate) fn execute_managed_update_check(check: ManagedReleaseCheck) -> DaemonHubUpdate {
     execute_managed_update_check_with_fetch(check, fetch_release_metadata)
 }
 
@@ -339,14 +330,39 @@ fn validate_receipt(receipt: &InstallationReceipt) -> Option<DaemonInstallationD
             "installation receipt provider is unsupported",
         ));
     }
-    if !matches!(receipt.source_url.split_once(":"), Some(("http" | "https", rest)) if rest.starts_with("//") && rest.len() > 2)
-    {
+    if let Err(kind) = validate_release_source(&receipt.source_url) {
         return Some(diagnostic(
-            "invalid_release_source",
-            "installation receipt release source is invalid",
+            kind,
+            if kind == "insecure_release_source" {
+                "installation receipt release source must use HTTPS or loopback HTTP"
+            } else {
+                "installation receipt release source is invalid"
+            },
         ));
     }
     None
+}
+
+fn validate_release_source(source_url: &str) -> Result<(), &'static str> {
+    let uri = source_url
+        .parse::<ureq::http::Uri>()
+        .map_err(|_| "invalid_release_source")?;
+    let scheme = uri.scheme_str().ok_or("invalid_release_source")?;
+    let host = uri.host().ok_or("invalid_release_source")?;
+    match scheme {
+        "https" => Ok(()),
+        "http" if is_loopback_host(host) => Ok(()),
+        "http" => Err("insecure_release_source"),
+        _ => Err("invalid_release_source"),
+    }
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .trim_matches(['[', ']'])
+            .parse::<IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
 }
 
 fn validate_receipt_path(
@@ -408,11 +424,7 @@ fn validate_owned_private_metadata(
 }
 
 fn fallback_resolution(diagnostic: Option<DaemonInstallationDiagnostic>) -> ReceiptResolution {
-    let (mode, provenance) = if cfg!(debug_assertions) {
-        (DaemonInstallationMode::Development, "development_build")
-    } else {
-        (DaemonInstallationMode::Unmanaged, "manual_install")
-    };
+    let (mode, provenance) = fallback_installation(cfg!(debug_assertions));
     ReceiptResolution {
         identity: DaemonInstallationIdentity {
             mode,
@@ -422,6 +434,26 @@ fn fallback_resolution(diagnostic: Option<DaemonInstallationDiagnostic>) -> Rece
             diagnostics: diagnostic.into_iter().collect(),
         },
         receipt: None,
+    }
+}
+
+fn fallback_installation(debug_build: bool) -> (DaemonInstallationMode, &'static str) {
+    if debug_build {
+        (DaemonInstallationMode::Development, "development_build")
+    } else {
+        (DaemonInstallationMode::Unmanaged, "manual_install")
+    }
+}
+
+fn unavailable_reason(mode: DaemonInstallationMode, invalid: bool) -> &'static str {
+    if invalid {
+        "invalid_installation_receipt"
+    } else {
+        match mode {
+            DaemonInstallationMode::Development => "development_checkout",
+            DaemonInstallationMode::Unmanaged => "unmanaged_installation",
+            DaemonInstallationMode::Managed => unreachable!("managed identity has receipt"),
+        }
     }
 }
 
@@ -575,6 +607,78 @@ mod tests {
             assert_ne!(resolution.identity.mode, DaemonInstallationMode::Managed);
             assert_eq!(resolution.identity.diagnostics[0].kind, expected);
         }
+    }
+
+    #[test]
+    fn managed_release_sources_require_https_except_for_explicit_loopback_fixtures() {
+        for source in [
+            "https://releases.example.invalid/botster-hub.json",
+            "http://127.0.0.1:8123/botster-hub.json",
+            "http://[::1]:8123/botster-hub.json",
+            "http://localhost:8123/botster-hub.json",
+        ] {
+            assert_eq!(validate_release_source(source), Ok(()), "source={source}");
+        }
+        assert_eq!(
+            validate_release_source("http://192.0.2.10/botster-hub.json"),
+            Err("insecure_release_source")
+        );
+        assert_eq!(
+            validate_release_source("file:///tmp/botster-hub.json"),
+            Err("invalid_release_source")
+        );
+
+        let fixture = Fixture::new();
+        let mut receipt = valid_receipt();
+        receipt["source_url"] = serde_json::json!("http://192.0.2.10/botster-hub.json");
+        fixture.write(receipt);
+        let resolution = resolve_receipt_at(&fixture.receipt);
+        assert_ne!(resolution.identity.mode, DaemonInstallationMode::Managed);
+        assert_eq!(
+            resolution.identity.diagnostics[0].kind,
+            "insecure_release_source"
+        );
+    }
+
+    #[test]
+    fn fallback_modes_and_update_reasons_cover_development_unmanaged_and_invalid_receipts() {
+        assert_eq!(
+            fallback_installation(true),
+            (DaemonInstallationMode::Development, "development_build")
+        );
+        assert_eq!(
+            fallback_installation(false),
+            (DaemonInstallationMode::Unmanaged, "manual_install")
+        );
+        assert_eq!(
+            unavailable_reason(DaemonInstallationMode::Development, false),
+            "development_checkout"
+        );
+        assert_eq!(
+            unavailable_reason(DaemonInstallationMode::Unmanaged, false),
+            "unmanaged_installation"
+        );
+        assert_eq!(
+            unavailable_reason(DaemonInstallationMode::Development, true),
+            "invalid_installation_receipt"
+        );
+
+        let update = plan_hub_update_check_for_resolution(ReceiptResolution {
+            identity: DaemonInstallationIdentity {
+                mode: DaemonInstallationMode::Unmanaged,
+                provenance: "manual_install".to_string(),
+                release_channel: None,
+                provider: None,
+                diagnostics: Vec::new(),
+            },
+            receipt: None,
+        });
+        let HubUpdateCheckPlan::Immediate(update) = update else {
+            panic!("unmanaged installation must not query a provider");
+        };
+        assert_eq!(update.state, DaemonHubUpdateState::Unavailable);
+        assert_eq!(update.reason.as_deref(), Some("unmanaged_installation"));
+        assert_eq!(update.action.as_deref(), Some("manual"));
     }
 
     #[test]
