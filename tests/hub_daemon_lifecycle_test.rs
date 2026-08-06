@@ -3655,6 +3655,44 @@ fn real_daemon_missing_receipt_reports_development_manual_update() {
 }
 
 #[test]
+fn real_daemon_invalid_receipt_reports_diagnostic_and_manual_update() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_test_dir("invalid-hub-maintenance");
+    let home = unique_test_dir("invalid-hub-maintenance-home");
+    let receipt = home.join(".botster/installations/botster-hub.json");
+    fs::create_dir_all(receipt.parent().expect("receipt parent")).expect("create receipt parent");
+    fs::write(&receipt, b"{").expect("write malformed receipt");
+    let child = start_cli_daemon_with_home(&data_dir, &home);
+    let endpoint = botster_hub_client::DaemonEndpoint::new(data_dir.join("botster-hub.sock"));
+
+    let status = botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status)
+        .expect("read invalid-receipt daemon status")
+        .status
+        .expect("status payload");
+    assert_eq!(status.installation.diagnostics.len(), 1);
+    assert_eq!(status.installation.diagnostics[0].kind, "malformed_receipt");
+
+    let update =
+        botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::CheckHubUpdate)
+            .expect("check invalid-receipt Hub update")
+            .hub_update
+            .expect("Hub update payload");
+    assert_eq!(
+        update.state,
+        botster_hub_client::DaemonHubUpdateState::Unavailable
+    );
+    assert_eq!(
+        update.reason.as_deref(),
+        Some("invalid_installation_receipt")
+    );
+    assert_eq!(update.action.as_deref(), Some("manual"));
+
+    shutdown_cli_daemon(&data_dir, child);
+    fs::remove_dir_all(&data_dir).expect("remove maintenance data dir");
+    fs::remove_dir_all(&home).expect("remove maintenance home");
+}
+
+#[test]
 fn real_provider_reports_current_newer_source_behind_and_unavailable_states() {
     let _guard = daemon_test_guard();
     let data_dir = unique_test_dir("managed-hub-release-states");
@@ -3855,10 +3893,18 @@ fn daemon_shutdown_during_hub_update_check_is_bounded_and_leak_free() {
         started.elapsed()
     );
     assert!(daemon.status.success());
-    assert!(
-        update.join().expect("update request thread exits").is_err(),
-        "in-flight caller should receive a bounded transport terminal outcome"
+    let update = update
+        .join()
+        .expect("update request thread exits")
+        .expect("in-flight caller receives typed shutdown outcome")
+        .hub_update
+        .expect("shutdown update payload");
+    assert_eq!(
+        update.state,
+        botster_hub_client::DaemonHubUpdateState::Unavailable
     );
+    assert_eq!(update.reason.as_deref(), Some("daemon_shutdown"));
+    assert_eq!(update.action.as_deref(), Some("retry"));
     release_fixture
         .join()
         .expect("timeout release fixture exits");

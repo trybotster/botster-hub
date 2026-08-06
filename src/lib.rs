@@ -128,10 +128,7 @@ pub use local_webrtc::{LocalWebrtcError, LocalWebrtcTransport};
 pub use lua_runtime::{
     LuaPluginHostApi, LuaPluginRuntime, LuaPluginRuntimeError, SharedHubCapabilityRuntime,
 };
-pub use maintenance::{
-    HubUpdateCheckPlan, ManagedReleaseCheck, execute_managed_update_check, installation_identity,
-    plan_hub_update_check, software_identity,
-};
+pub use maintenance::{installation_identity, software_identity};
 pub use mcp::{
     McpCallRequest, McpServeError, McpToolDescriptor, McpToolError, McpToolProvider,
     McpToolRegistry, McpToolResult, NativeHubToolProvider, PluginHubToolProvider, serve_mcp_stdio,

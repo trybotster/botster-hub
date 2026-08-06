@@ -950,7 +950,9 @@ fn handle_control_message(
                         Ok(daemon_hub_update(update)),
                         response_delivery_rx,
                     ),
-                    HubUpdateCheckPlan::Managed(_check) if state.hub_update_in_flight => {
+                    HubUpdateCheckPlan::Managed(_check)
+                        if state.pending_hub_update_reply.is_some() =>
+                    {
                         send_control_response(
                             reply_tx,
                             Ok(daemon_hub_update(DaemonHubUpdate {
@@ -965,13 +967,12 @@ fn handle_control_message(
                         )
                     }
                     HubUpdateCheckPlan::Managed(check) => {
-                        state.hub_update_in_flight = true;
+                        state.pending_hub_update_reply = Some(reply_tx);
                         let completion_tx = control_tx.clone();
                         transport_handle.spawn_blocking(move || {
                             let update = execute_managed_update_check(check);
-                            let _ = completion_tx.blocking_send(
-                                ControlMessage::HubUpdateCheckCompleted { reply_tx, update },
-                            );
+                            let _ = completion_tx
+                                .blocking_send(ControlMessage::HubUpdateCheckCompleted { update });
                         });
                         false
                     }
@@ -1017,12 +1018,32 @@ fn handle_control_message(
                 drive_entity_subscriptions(daemon, state);
                 state.next_reconciliation = Instant::now() + ENTITY_RECONCILIATION_INTERVAL;
             }
+            if response
+                .as_ref()
+                .is_ok_and(|response| response.kind == DaemonResponseKind::Shutdown)
+                && let Some(update_reply_tx) = state.pending_hub_update_reply.take()
+            {
+                let _ = send_control_response(
+                    update_reply_tx,
+                    Ok(daemon_hub_update(DaemonHubUpdate {
+                        state: DaemonHubUpdateState::Unavailable,
+                        current_version: software_identity().version,
+                        available_version: None,
+                        build_revision: None,
+                        reason: Some("daemon_shutdown".to_string()),
+                        action: Some("retry".to_string()),
+                    })),
+                    None,
+                );
+            }
             send_control_response(reply_tx, response, response_delivery_rx)
         }
-        ControlMessage::HubUpdateCheckCompleted { reply_tx, update } => {
-            state.hub_update_in_flight = false;
-            send_control_response(reply_tx, Ok(daemon_hub_update(update)), None)
-        }
+        ControlMessage::HubUpdateCheckCompleted { update } => state
+            .pending_hub_update_reply
+            .take()
+            .is_some_and(|reply_tx| {
+                send_control_response(reply_tx, Ok(daemon_hub_update(update)), None)
+            }),
         ControlMessage::LocalWebrtcPeerClosed {
             grant_id,
             attached_subscriptions,
@@ -2204,6 +2225,9 @@ fn handle_runtime_control_request(
         }),
         DaemonRequest::IssueLocalWebrtcBootstrap { .. }
         | DaemonRequest::LocalWebrtcSignal { .. } => Err(DaemonTransportError::UnexpectedResponse),
+        DaemonRequest::CheckHubUpdate => {
+            unreachable!("Hub update checks are handled before runtime borrow")
+        }
         DaemonRequest::ListApps
         | DaemonRequest::ResolveAppLaunch { .. }
         | DaemonRequest::ResolvePackageRoute { .. }
@@ -2225,7 +2249,6 @@ fn handle_runtime_control_request(
         | DaemonRequest::InstallPackageRegistryEntry { .. }
         | DaemonRequest::InstallPackageLocalPath { .. }
         | DaemonRequest::CheckPackageUpdate { .. }
-        | DaemonRequest::CheckHubUpdate
         | DaemonRequest::PreviewPackageUpdate { .. }
         | DaemonRequest::ApplyPackageUpdate { .. }
         | DaemonRequest::ShowPackage { .. }
@@ -3657,7 +3680,6 @@ pub(crate) enum ControlMessage {
         response_delivery_rx: Option<mpsc::Receiver<()>>,
     },
     HubUpdateCheckCompleted {
-        reply_tx: ControlReplySender,
         update: DaemonHubUpdate,
     },
     EgressWriteFailed {
@@ -3735,7 +3757,7 @@ struct DaemonControlState {
     next_reconciliation: Instant,
     released_entity_generations: u64,
     released_attach_generations: u64,
-    hub_update_in_flight: bool,
+    pending_hub_update_reply: Option<ControlReplySender>,
 }
 
 impl Default for DaemonControlState {
@@ -3751,7 +3773,7 @@ impl Default for DaemonControlState {
             next_reconciliation: Instant::now(),
             released_entity_generations: 0,
             released_attach_generations: 0,
-            hub_update_in_flight: false,
+            pending_hub_update_reply: None,
         }
     }
 }
