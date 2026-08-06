@@ -7743,6 +7743,27 @@ mod tests {
                     "request_type": "read_mode_flags",
                     "response_kind": "read_mode_flags",
                 },
+                "session_type_authoring": {
+                    "supported": true,
+                    "request_type": "show_session_type_definition",
+                    "response_kind": "session_type_definition",
+                    "response_field": "session_type_definition",
+                    "definition_type": "botster_hub_client::DaemonSessionTypeEditableDefinition",
+                    "editable_sources": ["device", "repo"],
+                    "read_only_source": "package",
+                    "read_only_error_kind": "read_only_session_type_source",
+                    // Derived by differencing the authored and published shapes:
+                    // `working_directory` and `environment` are the data-loss
+                    // fields, and `context` is republished as `context_keys`.
+                    "authored_fields_absent_from_published_row": [
+                        "context",
+                        "environment",
+                        "working_directory",
+                    ],
+                    "admission_group": "allow_runtime",
+                    "runtime_regression":
+                        "session_type_definition_round_trips_authored_path_and_environment",
+                },
                 "known_limitations": [
                     "The matrix is a test/docs contract, not a daemon runtime endpoint.",
                     "Shipped Web/TUI binding resolution is owned by downstream client tickets; this Hub fixture is a producer/reference contract.",
