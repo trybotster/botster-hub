@@ -53,6 +53,7 @@ export interface DaemonCompatibilityRequirement {
 
 export type DaemonRequest =
   | { type: "status" }
+  | { type: "check_hub_update" }
   | { type: "list_sessions" }
   | { type: "subscribe_entities"; entity_type: string; subscription_id: string }
   | { type: "unsubscribe_entities"; subscription_id: string }
@@ -142,6 +143,7 @@ export interface DaemonResponse {
   available_packages?: DaemonAvailablePackage[];
   install_plan?: DaemonPackageInstallPlan | null;
   update_status?: DaemonPackageUpdateStatus | null;
+  hub_update?: DaemonHubUpdate | null;
   package_decision: DaemonPackageDecision | null;
   lifecycle: DaemonPluginLifecycle[];
   plugin_worker_counters?: DaemonPluginWorkerCounters | null;
@@ -203,6 +205,7 @@ export interface DaemonWorktreeLifecycleEvent {
 
 export type DaemonResponseKind =
   | "status"
+  | "hub_update"
   | "sessions"
   | "entity_subscribed"
   | "entity_unsubscribed"
@@ -593,7 +596,6 @@ export interface DaemonPackageUpdateStatus {
 
 export interface DaemonPackageCompatibility {
   botster_requirement: string;
-  hub_version: string;
   result: string;
   diagnostics: string[];
 }
@@ -683,6 +685,8 @@ export interface DaemonPluginResourceCounters {
 export interface DaemonStatus {
   lifecycle_state: string;
   compatibility: DaemonCompatibility;
+  software: DaemonSoftwareIdentity;
+  installation: DaemonInstallationIdentity;
   host_id: string;
   host_display_name: string;
   schema_version: number;
@@ -698,6 +702,45 @@ export interface DaemonStatus {
   stale_sessions: string[];
   lifecycle_counters?: DaemonLifecycleCounters;
   diagnostics?: DaemonDiagnostic[];
+}
+
+export interface DaemonSoftwareIdentity {
+  product_id: string;
+  product_name: string;
+  version: string;
+  build_revision?: string | null;
+}
+
+export type DaemonInstallationMode =
+  | "development"
+  | "unmanaged"
+  | "managed";
+
+export interface DaemonInstallationIdentity {
+  mode: DaemonInstallationMode;
+  provenance: string;
+  release_channel?: string | null;
+  provider?: string | null;
+  diagnostics?: DaemonInstallationDiagnostic[];
+}
+
+export interface DaemonInstallationDiagnostic {
+  kind: string;
+  message: string;
+}
+
+export type DaemonHubUpdateState =
+  | "current"
+  | "available"
+  | "unavailable";
+
+export interface DaemonHubUpdate {
+  state: DaemonHubUpdateState;
+  current_version: string;
+  available_version?: string | null;
+  build_revision?: string | null;
+  reason?: string | null;
+  action?: string | null;
 }
 
 export interface DaemonLifecycleCounters {

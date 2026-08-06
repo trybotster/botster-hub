@@ -21,8 +21,8 @@ use serde_json::Value;
 mod typescript;
 
 pub const PROTOCOL: &str = "botster-hub-daemon-v1";
-pub const PROTOCOL_VERSION: u16 = 4;
-pub const CONFORMANCE_FIXTURE_REVISION: u16 = 28;
+pub const PROTOCOL_VERSION: u16 = 5;
+pub const CONFORMANCE_FIXTURE_REVISION: u16 = 29;
 /// Version of the local WebRTC delivery chunk framing protocol.
 pub const LOCAL_WEBRTC_DELIVERY_CHUNK_VERSION: u16 = 2;
 /// Serialized local WebRTC delivery frames must remain strictly below this size.
@@ -666,6 +666,7 @@ fn current_feature_list() -> Vec<&'static str> {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DaemonRequest {
     Status,
+    CheckHubUpdate,
     ListSessions,
     SubscribeEntities {
         entity_type: String,
@@ -967,6 +968,8 @@ pub struct DaemonResponse {
     pub install_plan: Option<DaemonPackageInstallPlan>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub update_status: Option<DaemonPackageUpdateStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hub_update: Option<DaemonHubUpdate>,
     pub package_decision: Option<DaemonPackageDecision>,
     pub lifecycle: Vec<DaemonPluginLifecycle>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1013,6 +1016,7 @@ pub struct DaemonUiTreeSnapshot {
 #[serde(rename_all = "snake_case")]
 pub enum DaemonResponseKind {
     Status,
+    HubUpdate,
     Sessions,
     EntitySubscribed,
     EntityUnsubscribed,
@@ -1590,7 +1594,6 @@ pub struct DaemonPackageUpdateStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DaemonPackageCompatibility {
     pub botster_requirement: String,
-    pub hub_version: String,
     pub result: String,
     pub diagnostics: Vec<String>,
 }
@@ -1715,6 +1718,8 @@ pub struct DaemonPluginResourceCounters {
 pub struct DaemonStatus {
     pub lifecycle_state: String,
     pub compatibility: DaemonCompatibility,
+    pub software: DaemonSoftwareIdentity,
+    pub installation: DaemonInstallationIdentity,
     pub host_id: String,
     pub host_display_name: String,
     pub schema_version: u16,
@@ -1732,6 +1737,63 @@ pub struct DaemonStatus {
     pub lifecycle_counters: DaemonLifecycleCounters,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub diagnostics: Vec<DaemonDiagnostic>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonSoftwareIdentity {
+    pub product_id: String,
+    pub product_name: String,
+    pub version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_revision: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DaemonInstallationMode {
+    Development,
+    Unmanaged,
+    Managed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonInstallationIdentity {
+    pub mode: DaemonInstallationMode,
+    pub provenance: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_channel: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<DaemonInstallationDiagnostic>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonInstallationDiagnostic {
+    pub kind: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DaemonHubUpdateState {
+    Current,
+    Available,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonHubUpdate {
+    pub state: DaemonHubUpdateState,
+    pub current_version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub available_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_revision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
 }
 
 /// Sanitized daemon transport and subscription lifecycle observations.
@@ -2491,6 +2553,15 @@ mod tests {
             "status": {
                 "lifecycle_state": "running",
                 "compatibility": DaemonCompatibility::current(),
+                "software": {
+                    "product_id": "botster-hub",
+                    "product_name": "Botster Hub",
+                    "version": "0.1.0"
+                },
+                "installation": {
+                    "mode": "development",
+                    "provenance": "development_build"
+                },
                 "host_id": "hub",
                 "host_display_name": "Hub",
                 "schema_version": 1,
@@ -3751,6 +3822,7 @@ mod tests {
     fn daemon_request_examples() -> Vec<DaemonRequest> {
         vec![
             DaemonRequest::Status,
+            DaemonRequest::CheckHubUpdate,
             DaemonRequest::ListSessions,
             DaemonRequest::SubscribeEntities {
                 entity_type: "session".to_string(),
@@ -3998,6 +4070,7 @@ mod tests {
     fn daemon_request_tag(request: &DaemonRequest) -> &'static str {
         match request {
             DaemonRequest::Status => "status",
+            DaemonRequest::CheckHubUpdate => "check_hub_update",
             DaemonRequest::ListSessions => "list_sessions",
             DaemonRequest::SubscribeEntities { .. } => "subscribe_entities",
             DaemonRequest::UnsubscribeEntities { .. } => "unsubscribe_entities",
@@ -4071,6 +4144,7 @@ mod tests {
     fn daemon_response_kind_examples() -> Vec<DaemonResponseKind> {
         vec![
             DaemonResponseKind::Status,
+            DaemonResponseKind::HubUpdate,
             DaemonResponseKind::Sessions,
             DaemonResponseKind::EntitySubscribed,
             DaemonResponseKind::EntityUnsubscribed,
@@ -4116,6 +4190,7 @@ mod tests {
     fn daemon_response_kind_tag(kind: DaemonResponseKind) -> &'static str {
         match kind {
             DaemonResponseKind::Status => "status",
+            DaemonResponseKind::HubUpdate => "hub_update",
             DaemonResponseKind::Sessions => "sessions",
             DaemonResponseKind::EntitySubscribed => "entity_subscribed",
             DaemonResponseKind::EntityUnsubscribed => "entity_unsubscribed",
@@ -4164,6 +4239,19 @@ mod tests {
             status: Some(DaemonStatus {
                 lifecycle_state: "running".to_string(),
                 compatibility: DaemonCompatibility::current(),
+                software: DaemonSoftwareIdentity {
+                    product_id: "botster-hub".to_string(),
+                    product_name: "Botster Hub".to_string(),
+                    version: "0.1.0".to_string(),
+                    build_revision: Some("abc123".to_string()),
+                },
+                installation: DaemonInstallationIdentity {
+                    mode: DaemonInstallationMode::Managed,
+                    provenance: "managed_receipt".to_string(),
+                    release_channel: Some("stable".to_string()),
+                    provider: Some("http_json".to_string()),
+                    diagnostics: Vec::new(),
+                },
                 host_id: "hub".to_string(),
                 host_display_name: "Hub".to_string(),
                 schema_version: 1,
@@ -4379,7 +4467,6 @@ mod tests {
                 requested_capabilities: Vec::new(),
                 compatibility: DaemonPackageCompatibility {
                     botster_requirement: ">=0.1.0".to_string(),
-                    hub_version: "0.1.0".to_string(),
                     result: "compatible".to_string(),
                     diagnostics: Vec::new(),
                 },
@@ -4406,7 +4493,6 @@ mod tests {
                     requested_capabilities: Vec::new(),
                     compatibility: DaemonPackageCompatibility {
                         botster_requirement: ">=0.1.0".to_string(),
-                        hub_version: "0.1.0".to_string(),
                         result: "compatible".to_string(),
                         diagnostics: Vec::new(),
                     },
@@ -4432,6 +4518,14 @@ mod tests {
                     message: "update resolution is unavailable for this package source".to_string(),
                 }],
                 actions: Vec::new(),
+            }),
+            hub_update: Some(DaemonHubUpdate {
+                state: DaemonHubUpdateState::Current,
+                current_version: "0.1.0".to_string(),
+                available_version: Some("0.1.0".to_string()),
+                build_revision: Some("abc123".to_string()),
+                reason: Some("up_to_date".to_string()),
+                action: None,
             }),
             package_decision: Some(DaemonPackageDecision {
                 package_name: "workflow.plugin".to_string(),
@@ -4697,5 +4791,110 @@ mod tests {
         );
         assert!(daemon_protocol_typescript().contains("type DaemonLocalWebrtcDeliveryKind"));
         assert!(daemon_protocol_typescript().contains("interface DaemonLocalWebrtcDeliveryChunk"));
+    }
+
+    #[test]
+    fn hub_maintenance_contract_is_serde_stable_and_package_rows_do_not_claim_hub_identity() {
+        let response = daemon_response_example(DaemonResponseKind::HubUpdate);
+        let value = serde_json::to_value(&response).expect("serialize maintenance response");
+        assert_eq!(value["status"]["software"]["product_id"], "botster-hub");
+        assert_eq!(value["status"]["installation"]["mode"], "managed");
+        assert_eq!(value["hub_update"]["state"], "current");
+        assert_eq!(value["hub_update"]["reason"], "up_to_date");
+        assert!(
+            value["available_packages"][0]["compatibility"]
+                .get("hub_version")
+                .is_none()
+        );
+
+        let generated = daemon_protocol_typescript();
+        assert!(generated.contains("{ type: \"check_hub_update\" }"));
+        assert!(generated.contains("export interface DaemonSoftwareIdentity"));
+        assert!(generated.contains("export interface DaemonInstallationIdentity"));
+        assert!(generated.contains("export interface DaemonHubUpdate"));
+        assert!(generated.contains("hub_update?: DaemonHubUpdate | null;"));
+        assert!(!generated.contains("  hub_version: string;"));
+    }
+
+    #[test]
+    fn hub_maintenance_optional_fields_follow_serde_omission() {
+        let mut response = daemon_response_example(DaemonResponseKind::Status);
+        response.hub_update = None;
+        let status = response.status.as_mut().expect("status example");
+        status.software.build_revision = None;
+        status.installation.release_channel = None;
+        status.installation.provider = None;
+        status.installation.diagnostics.clear();
+        let value = serde_json::to_value(response).expect("serialize omitted maintenance fields");
+        assert!(value.get("hub_update").is_none());
+        assert!(value["status"]["software"].get("build_revision").is_none());
+        assert!(
+            value["status"]["installation"]
+                .get("release_channel")
+                .is_none()
+        );
+        assert!(value["status"]["installation"].get("provider").is_none());
+        assert!(value["status"]["installation"].get("diagnostics").is_none());
+    }
+
+    #[test]
+    fn protocol_five_and_conformance_twenty_nine_define_both_compatibility_directions() {
+        assert_eq!(PROTOCOL_VERSION, 5);
+        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 29);
+
+        let requirement = DaemonCompatibilityRequirement::current();
+        let protocol_error = ensure_compatible(
+            &requirement,
+            &DaemonCompatibility {
+                protocol_version: 4,
+                ..DaemonCompatibility::current()
+            },
+        )
+        .expect_err("new client rejects protocol four Hub");
+        assert!(
+            protocol_error
+                .diagnostic
+                .contains("unsupported protocol version 4")
+        );
+
+        let conformance_error = ensure_compatible(
+            &requirement,
+            &DaemonCompatibility {
+                conformance_fixture_revision: 28,
+                ..DaemonCompatibility::current()
+            },
+        )
+        .expect_err("new client rejects conformance twenty eight Hub");
+        assert!(
+            conformance_error
+                .diagnostic
+                .contains("unsupported conformance fixture revision 28")
+        );
+
+        let stale_requirement = DaemonCompatibilityRequirement {
+            minimum_protocol_version: 4,
+            minimum_conformance_fixture_revision: 28,
+            ..DaemonCompatibilityRequirement::current()
+        };
+        ensure_compatible(&stale_requirement, &DaemonCompatibility::current())
+            .expect("stale client requirement accepts newer additive Hub");
+
+        #[derive(Deserialize)]
+        struct StaleStatus {
+            compatibility: DaemonCompatibility,
+            host_id: String,
+            schema_version: u16,
+        }
+        let status_value = serde_json::to_value(
+            daemon_response_example(DaemonResponseKind::Status)
+                .status
+                .expect("status example"),
+        )
+        .expect("serialize current status");
+        let stale: StaleStatus =
+            serde_json::from_value(status_value).expect("stale status ignores additive identity");
+        assert_eq!(stale.compatibility.protocol_version, 5);
+        assert_eq!(stale.host_id, "hub");
+        assert_eq!(stale.schema_version, 1);
     }
 }

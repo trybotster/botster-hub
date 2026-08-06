@@ -132,10 +132,10 @@ function assertDialogFormComposition(source) {
 }
 
 assert.equal(metadata.package_name, "@trybotster/hub-test-support");
-assert.equal(metadata.package_version, "0.1.21");
+assert.equal(metadata.package_version, "0.1.22");
 assert.equal(metadata.protocol, "botster-hub-daemon-v1");
-assert.equal(metadata.protocol_version, 4);
-assert.equal(metadata.conformance_fixture_revision, 28);
+assert.equal(metadata.protocol_version, 5);
+assert.equal(metadata.conformance_fixture_revision, 29);
 assert.deepEqual(metadata.ui_contract, {
   conformance_fixture_export: "@trybotster/ui-contract/conformance-fixtures",
   package_name: "@trybotster/ui-contract",
@@ -187,6 +187,14 @@ assert.match(protocol, /entity_remove/);
 assert.match(protocol, /lifecycle_class: string/);
 assert.match(protocol, /resync_reason/);
 assert.match(protocol, /refresh_local_packages/);
+assert.match(protocol, /check_hub_update/);
+assert.match(protocol, /export interface DaemonSoftwareIdentity/);
+assert.match(protocol, /export interface DaemonInstallationIdentity/);
+assert.match(protocol, /export interface DaemonHubUpdate/);
+assert.match(protocol, /hub_update\?: DaemonHubUpdate \| null/);
+assert.match(protocol, /reason\?: string \| null/);
+assert.match(protocol, /action\?: string \| null/);
+assert.doesNotMatch(protocol, /hub_version: string/);
 
 assert.equal(
   fileURLToPath(import.meta.resolve("@trybotster/hub-test-support/session-lifecycle-subscription-conformance-fixture")),
@@ -267,7 +275,7 @@ assert.deepEqual(supportMatrix.plugin_surfaces.authored_set_values, {
   "selected-workspace": "workspace-alpha",
 });
 
-assert.equal(sessionLifecycleFixture.conformance_fixture_revision, 28);
+assert.equal(sessionLifecycleFixture.conformance_fixture_revision, 29);
 assert.equal(sessionLifecycleFixture.entity_type, "session");
 assert.deepEqual(
   sessionLifecycleFixture.normalized_frames.map((frame) => frame.type),
@@ -305,7 +313,7 @@ assert.equal(
 assert.equal(sessionLifecycleFixture.overflow.snapshot_precedes_later_deltas, true);
 assert.equal(sessionLifecycleFixture.overflow.failed_snapshot_delivery_closes_subscription, true);
 
-assert.equal(sessionPluginBindingFixture.conformance_fixture_revision, 28);
+assert.equal(sessionPluginBindingFixture.conformance_fixture_revision, 29);
 assert.equal(sessionPluginBindingFixture.binding_family, "/session");
 const sessionPluginMaterialization = materializeSessionPluginBindingScenario(
   sessionPluginBindingFixture,
