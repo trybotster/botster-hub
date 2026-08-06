@@ -38,6 +38,38 @@ settled rather than re-derivable from the ticket text.
    matching how `ticket_1785970233_522967` (contract) and `ticket_1785971560_802153`
    (publication) were split.
 
+## Revision after Plan Review
+
+`review_1786037088_177560` returned changes required with six findings, all
+accepted as legitimate. What changed:
+
+- **A real security hole (high).** The unsigned envelope duplicated four fields
+  that also appear in the signed manifest, with no equality rule. That let a
+  validly signed *old* manifest be advertised as a *new* release. Fixed by
+  naming the verified manifest as sole authority, requiring exact equality on all
+  four duplicated fields, adding `build_revision` to the manifest so it can be
+  covered, and adding one negative test per field.
+- **A self-contradiction (high).** Rollback promised the previous binaries were
+  restored on any failure after the swap, while the ordering acceptance check
+  asserted the new binaries stayed. Both cannot hold. Fixed by separating
+  recoverable errors (full rollback) from abrupt termination (no rollback runs;
+  crash window bounded to safe states), with a table of reachable states and
+  distinct tests for each path.
+- **Symlink safety was checks, not operations (high).** `symlink_metadata` then
+  `fs::write` is a check/use race. Replaced with a descriptor-relative
+  `openat`/`O_NOFOLLOW` sequence validated by `fstat` on the fds, and the shared
+  crate now exposes only fd-taking APIs so the race cannot be reintroduced.
+- **Unbounded child execution (medium).** Step 6 executes the staged binary with
+  no deadline, process-group teardown, or output bound. Fixed by reusing the
+  pattern already proven in `src/entrypoint_supervisor.rs`.
+- **HTTPS policy did not cover artifact URLs (medium).** The manifest introduces
+  independent network coordinates. Fixed with a per-URL policy and an explicit
+  no-redirect rule.
+- **Missing context (low).** [[cli-patterns]] was not loaded despite
+  [[botster-planner-playbook]] requiring it for a Rust CLI surface; it is what
+  surfaced the bounded-execution requirement. Loaded, along with
+  [[bounded command execution requires process group termination and reaping]].
+
 ## Forward tolerance is not a compatibility shim
 
 This repository's standing posture is cold-cut replacement — see
@@ -107,6 +139,7 @@ The decoded manifest carries:
   "product_id": "botster-hub",
   "release_channel": "stable",
   "version": "<semver>",
+  "build_revision": "<botster-hub git sha>",
   "source_revisions": { "botster_hub": "<sha>", "botster_core": "<locked sha>" },
   "artifacts": [
     { "name": "botster-hub",            "url": "...", "size": N, "sha256": "..." },
@@ -120,6 +153,28 @@ The decoded manifest carries:
 Hub SHA is the checkout, the Core SHA is the revision `Cargo.lock` pins for
 `botster-session-worker`. Filesystem colocation of the two binaries does not
 collapse their provenance.
+
+#### The signed/unsigned authority boundary
+
+Four fields — `product_id`, `release_channel`, `version`, `build_revision` —
+appear both in the unsigned envelope and in the signed manifest. That duplication
+is a genuine attack surface and needs an explicit rule, not an implied one.
+
+**The verified manifest is the sole authority for the installer.** The envelope's
+copies exist only so the Hub, which verifies nothing, can read version identity
+for `check-update`.
+
+The installer must exact-match all four duplicated fields between the envelope
+and the verified manifest and **fail closed on any mismatch**. Without that rule
+an attacker who cannot forge a signature can still wrap a legitimately signed
+*old* manifest in an envelope advertising a *new* version: the Hub would report
+that newer version as available, and the installer would silently install
+something else. Every duplicated field therefore gets its own negative
+acceptance test.
+
+`build_revision` is added to the manifest specifically so that this equality
+rule can cover it; without it the envelope's `build_revision` would be
+unverifiable.
 
 ### Receipt schema 2 (cold turkey, no schema-1 acceptance)
 
@@ -171,34 +226,127 @@ dependency weight, consistent with
 
 Install order — this is the ticket's central safety property:
 
-1. Fetch release metadata (HTTPS required; loopback HTTP allowed for tests).
+1. Fetch release metadata. HTTPS required for any non-loopback host.
 2. Verify the signature against the trust anchor. **Fail closed.**
-3. Exact-match `product_id` and `release_channel`; decode the manifest.
+3. Exact-match the envelope against the verified manifest per the authority
+   boundary above; decode the manifest.
 4. Stage artifacts into a staging directory **inside the install prefix**, so the
    later rename is same-filesystem and therefore atomic.
 5. Verify each staged artifact's size and SHA-256.
 6. Verify the staged Hub binary's *self-reported* identity via a new
-   `botster-hub version` subcommand, and require it to match the metadata's
+   `botster-hub version` subcommand, and require it to match the manifest's
    `version` and `build_revision`. This proves receipt/binary agreement from the
-   binary itself before anything is committed.
+   binary itself before anything is committed. The binary is executed only
+   *after* its checksum and signature have been verified, so this is never
+   execution of unvalidated bytes.
 7. Atomically replace `bin/botster-hub` and `bin/botster-session-worker`,
    retaining the previous bytes for rollback.
 8. Re-verify the installed Hub's identity after the swap.
 9. **Only then** create/validate `.botster/installations` and atomically write
    the receipt.
-10. On any failure at or after step 7, restore the previous binaries and leave
-    the previous receipt untouched.
 
 Steps 7–9 are ordered exactly as the ticket requires: replace and verify the
 binary before writing a receipt that requires the newer schema. Writing the
 receipt first would turn a managed installation into an unmanaged one — the old
 binary would report `unsupported_receipt_schema` — until the binary caught up.
 
-Directory and file safety, all fail-closed: `.botster/installations` is created
-`0700` if absent; if it exists it must be a real directory, not a symlink, owned
-by the effective uid, and not world-writable. The receipt is written to a temp
-file in that directory, `fchmod` `0600`, then renamed. The receipt path is never
-followed through a symlink.
+#### Network coordinate policy
+
+The manifest introduces artifact URLs, which are network coordinates in their own
+right. The ticket's HTTPS rule applies to **every** coordinate the installer
+fetches, not only the outer document:
+
+- Each artifact URL is an independently validated absolute URL. HTTPS is required
+  for any non-loopback host; loopback HTTP is accepted only for tests.
+- **Redirects are not followed**, for the metadata document or for artifacts. The
+  existing `fetch_release_metadata` already sets `max_redirects(0)`; the installer
+  matches it. A followed redirect could downgrade to plaintext or cross origins
+  after validation has already passed.
+- Same-origin with the metadata document is **not** required. Forbidding a
+  separate artifact host would rule out an ordinary CDN layout for no security
+  gain, since each URL is validated on its own and every artifact is checksum-
+  verified against the signed manifest regardless of where it came from.
+
+#### Failure, rollback, and the crash window
+
+The distinction between a *recoverable error* and *abrupt termination* is
+load-bearing, and conflating them is how an ordering guarantee turns into a
+contradiction.
+
+**Recoverable errors** — any returned error at or after step 7: restore **both**
+previous binaries, leave the previous receipt untouched, exit non-zero. No
+partial state is observable. This is the case that "no partial state" describes.
+
+**Abrupt termination** — SIGKILL, power loss, anything where no rollback code
+runs. No durable journal or crash-recovery mechanism is in scope; recovery is
+"re-run the installer", which is idempotent. What the ordering buys is that the
+crash window is *bounded to safe states only*:
+
+| Crash point | On-disk state | Hub behavior |
+| --- | --- | --- |
+| Before step 7 | staged artifacts only | unchanged |
+| Between 7 and 9 | new binaries, **previous** receipt | `receipt_binary_mismatch` → unmanaged |
+| After step 9 | new binaries, new receipt | managed |
+
+The middle row degrades honestly: the Hub reports unmanaged rather than falsely
+claiming a managed install. Critically, **no reachable state has a schema-2
+receipt beside an old binary**, because the receipt is written last. That is the
+invariant the ordering exists to protect, and it is what acceptance must test —
+distinctly from rollback, which is the recoverable-error path.
+
+#### Race-resistant filesystem operations
+
+"Never through a symlink" is a property of the *operations*, not of a preceding
+check. `symlink_metadata` followed by `fs::write` is a check/use race: the path
+can be substituted between the two. The receipt write therefore uses
+descriptor-relative operations throughout (`libc` is already a direct dependency):
+
+1. Open `$HOME` normally. `$HOME` itself may legitimately be a symlink and is not
+   constrained; the existing Hub reader likewise validates only the two
+   components below it.
+2. `openat(home_fd, ".botster", O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC)`, creating it
+   with `mkdirat(…, 0o700)` on `ENOENT`.
+3. `openat(botster_fd, "installations", O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC)`, same
+   creation rule.
+4. `fstat` **each directory fd** — owner equals the effective uid, not
+   world-writable. Validating the fd rather than re-stating the path is what
+   closes the race.
+5. `openat(installations_fd, "botster-hub.json.tmp",
+   O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC, 0o600)`, write, `fsync`.
+6. `fsync(installations_fd)`, then `renameat` within that same directory fd.
+
+Because every component below `$HOME` is opened `O_NOFOLLOW` relative to an
+already-validated descriptor, a symlink substituted mid-sequence cannot redirect
+the write — the open fails rather than following it.
+
+The shared crate's public API accepts a **directory descriptor, not a path**, so
+a path-based write is structurally unavailable to callers rather than merely
+discouraged. The Hub-side reader moves to the same `openat` walk and `fstat`s the
+opened fd; today it path-stats and then reads, which has the same race on the
+read side. That change is cleanup made necessary by moving this code into a
+shared crate, not opportunistic refactoring.
+
+#### Bounded execution of the staged binary
+
+Step 6 executes a child process, and a bare timeout does not bound a process
+tree — per
+[[bounded command execution requires process group termination and reaping]], a
+descendant can outlive the child, retain the stdout write end, and keep drains
+from reaching EOF.
+
+This repository already has the correct pattern in `src/entrypoint_supervisor.rs`
+(`setpgid(0,0)` via `pre_exec`, `signal_process_group_or_child` with a `killpg`
+→ `kill` fallback on `ESRCH`, `supervised_process_group_exists`, TERM→KILL
+escalation with a bounded grace period, and reaping). The installer reuses that
+pattern rather than inventing a second one:
+
+- Own process group via `setpgid(0, 0)` in `pre_exec`.
+- Concurrent stdout/stderr drains into fixed bounded tails, started before the
+  wait so a full pipe cannot deadlock the child.
+- On deadline: TERM the **group**, bounded grace, then KILL; reap the leader;
+  let both drains reach EOF.
+- Reject non-zero exit, output exceeding the bound, and output that does not
+  parse as the expected `key=value` identity lines.
 
 The trust anchor is **not embedded** in this ticket. The installer requires an
 explicit `--trust-anchor <path>` and refuses to run without one. No production
@@ -294,13 +442,22 @@ to fix.
 5. Retained rollback copies live beside the installed binaries in the prefix.
    Whether they are pruned after a successful install is an installer detail;
    the plan retains them for the duration of the install only.
+6. **Crash-safety scope is explicit and narrow.** No durable journal, no
+   crash-recovery state machine. Abrupt termination is bounded to the safe states
+   tabulated above, and recovery is re-running the idempotent installer. Anything
+   stronger — surviving power loss mid-`renameat` with automatic resume — is out
+   of scope and would need its own ticket.
+7. `$HOME` itself is not constrained to be a non-symlink; only the two components
+   below it are, matching what the existing Hub reader already validates.
+   Constraining `$HOME` would break legitimate setups where a home directory is a
+   symlink to another volume.
 
 ## Affected surfaces and files
 
 | Surface | Change |
 | --- | --- |
-| `crates/botster-hub-installation/` | New. Shared receipt contract, path/permission safety, atomic write. |
-| `crates/botster-hub-installer/` | New. Installer binary: fetch, verify, install, order, roll back. |
+| `crates/botster-hub-installation/` | New. Shared receipt contract; descriptor-relative (`openat`/`O_NOFOLLOW`) directory walk, fd-based ownership/permission validation, and atomic `renameat` write. Public API takes a directory fd, never a path. Uses `libc`, already a direct dependency. |
+| `crates/botster-hub-installer/` | New. Installer binary: fetch, signature verification, envelope/manifest equality, per-URL HTTPS policy, checksum verification, bounded process-group-owning child runner, ordered swap, rollback. |
 | `src/maintenance.rs` | Receipt reading delegates to the shared crate; receipt schema 2; release schema 2 + forward tolerance; asymmetry comment. |
 | `src/main.rs` | New `version` subcommand, dispatch, usage text. |
 | `Cargo.toml` | Workspace members. |
@@ -316,9 +473,12 @@ to fix.
    tests on all three and the source comment on the asymmetry.
 2. **Ordering regressions are invisible without a failure injection point.** A
    test that only checks the happy path cannot distinguish "binary before
-   receipt" from "receipt before binary". Mitigated by an injected failure
-   between the two, mirroring the prior art already in `src/persistence.rs`
-   (test-only injected failure between temp flush and rename).
+   receipt" from "receipt before binary". Mitigated by injection points at the
+   two boundaries, mirroring the prior art already in `src/persistence.rs`
+   (test-only injected failure between temp flush and rename). The injection must
+   model *abrupt termination* for the ordering invariant and a *returned error*
+   for rollback; using one mechanism for both is what made the first draft of
+   this plan self-contradictory.
 3. **Rollback leaving a mixed pair.** Hub replaced, worker not, or vice versa.
    Both binaries must be staged and verified before either is swapped, and
    rollback must restore both.
@@ -333,6 +493,18 @@ to fix.
    unmanaged fallback behavior.
 7. **Scope creep into a real release.** No hostname, no production key, nothing
    implying a live origin exists.
+8. **Trusting the unsigned envelope.** The easiest wrong implementation reads
+   `version` from the envelope because it is already parsed, bypassing the
+   equality rule entirely. Mitigated by four per-field negative tests rather than
+   a single "signature verifies" test.
+9. **Path-based convenience creeping back in.** A future caller reaching for
+   `fs::write(receipt_path, …)` silently reintroduces the check/use race.
+   Mitigated structurally: the shared crate's API takes a directory descriptor,
+   so no path-based write is exposed to reintroduce.
+10. **A bounded runner that is not actually bounded.** Killing only the direct
+    child leaves descendants holding pipe writers. Mitigated by reusing the
+    process-group pattern already proven in `src/entrypoint_supervisor.rs` and by
+    a descendant-PID survival test.
 
 ## Acceptance checks
 
@@ -360,52 +532,96 @@ evidence, not waved through.
 6. `product_id` mismatch and `release_channel` mismatch each still yield
    `invalid_release_metadata`.
 7. Schema below the minimum yields `invalid_release_metadata`.
-8. Non-loopback `http://` sources are rejected; `https://` and loopback `http://`
-   accepted.
+8. Non-loopback `http://` metadata sources are rejected; `https://` and loopback
+   `http://` accepted.
 
-**Installer**
+**Signed/unsigned authority boundary**
 
-9. Fresh install into an empty prefix: both binaries present, receipt written,
-   receipt `0600`, `installations` directory `0700`, both owned by the effective
-   uid.
-10. Refusal when `.botster/installations` is a symlink, a regular file, or
-    world-writable.
-11. A symlink pre-placed at the receipt path causes refusal, and the symlink's
-    target is provably untouched.
-12. Byte-flipped artifact fails checksum verification and installs nothing.
-13. Tampered manifest, wrong signing key, and absent signature each abort.
-14. Upgrade replaces both binaries and the receipt with no partial state.
-15. **Ordering**: injected failure between the binary swap and the receipt rename
-    leaves new binaries in place and the *previous* receipt intact — and the Hub
-    then honestly reports `receipt_binary_mismatch`/unmanaged rather than
-    claiming a managed install.
-16. **Staged-receipt failure**: when the binary swap fails after the receipt is
-    staged, the temp receipt is discarded and both the previous receipt and the
-    previous binaries are byte-identical to their pre-install state.
-17. Post-swap verification failure rolls both binaries back to their previous
-    bytes.
+9. Four separate negative tests — envelope `product_id`, `release_channel`,
+   `version`, and `build_revision` each disagreeing with the verified manifest —
+   every one aborting the install. The `version` case is the attack this rule
+   exists to stop: a validly signed old manifest advertised as a new release.
+10. Tampered manifest bytes, wrong signing key, and absent signature each abort.
+
+**Network coordinates**
+
+11. Non-loopback `http://` artifact URL rejected; `https://` accepted; loopback
+    `http://` accepted.
+12. A redirect response for the metadata document and for an artifact are each
+    rejected rather than followed.
+
+**Installer filesystem safety**
+
+13. Fresh install into an empty prefix: both binaries present, receipt written,
+    receipt `0600`, `installations` directory `0700`, both owned by the effective
+    uid.
+14. Refusal when `.botster` **or** `installations` is a symlink, when either is a
+    regular file, and when either is world-writable — six cases, both components
+    covered.
+15. A symlink pre-placed at the receipt path causes refusal and its target is
+    provably byte-unchanged.
+16. An existing file at the temp path causes `O_EXCL` failure and aborts rather
+    than being overwritten.
+17. Deterministic injection of an adversarial mid-write symlink substitution is
+    impractical, so race resistance is proven structurally instead: the shared
+    crate exposes only descriptor-relative APIs, and a test asserts every receipt
+    write and read goes through a validated directory fd with `O_NOFOLLOW`. This
+    substitution is recorded as a deliberate limit of the evidence, not passed
+    off as a race test.
+
+**Installer failure semantics**
+
+18. Byte-flipped artifact fails checksum verification and installs nothing.
+19. Upgrade replaces both binaries and the receipt, with no partial state
+    observable after a recoverable error.
+20. **Recoverable error after the swap** rolls **both** binaries back to their
+    previous bytes and leaves the previous receipt byte-identical.
+21. Post-swap identity verification failure produces the same full rollback.
+22. **Ordering invariant under abrupt termination**: SIGKILL the installer
+    between the binary swap and the receipt rename — modelling crash, not a
+    returned error, so no rollback runs. Assert the on-disk state is new binaries
+    plus the *previous* receipt, and that the Hub then reports
+    `receipt_binary_mismatch`/unmanaged rather than claiming a managed install.
+23. Re-running the installer after that abrupt-termination state converges to a
+    correct managed install, which is the whole of the crash-recovery contract.
+24. No reachable state places a schema-2 receipt beside an old binary — asserted
+    at the two injection points above.
+
+**Bounded staged-binary execution**
+
+25. Hanging child is terminated at the deadline; a descendant PID captured before
+    the timeout is provably gone afterwards, per
+    [[bounded command execution requires process group termination and reaping]].
+26. Non-zero exit, oversized output, and malformed non-`key=value` output are
+    each rejected.
+27. The process group leader is reaped and both drains reach EOF, and a second
+    invocation through the same code path still succeeds — proving teardown left
+    nothing wedged.
 
 **Real runtime — the production path, not scaffolding**
 
-18. Install the **actual** built `botster-hub` and `botster-session-worker` into
+28. Install the **actual** built `botster-hub` and `botster-session-worker` into
     an isolated prefix using the installer, then launch that **installed** Hub
     with `HOME` pointed at the prefix (reusing `start_cli_daemon_with_home`).
     Assert `status` reports `installation.mode=managed` with the expected channel
     and provider, and that `software.version`/`build_revision` come from the
     binary.
-19. Serialized status contains no `source_url`, no artifact checksum, no
+29. Serialized status contains no `source_url`, no artifact checksum, no
     signature, no installer identity, and no home path.
-20. `check-update` against a loopback schema-2 fixture returns
+30. `check-update` against a loopback schema-2 fixture returns
     `state=available` / `action=run_managed_installer`; the schema-3
     forward-compat fixture returns the same.
-21. Restart preserves identical `software` and `installation`.
-22. `botster-hub version` prints identity with no data directory and no daemon.
+31. Restart preserves identical `software` and `installation`.
+32. `botster-hub version` prints identity with no data directory and no daemon.
 
 **Provenance** — per the charter's live-binary requirement
 
-23. Record the Hub SHA and the `Cargo.lock`-pinned Core SHA **separately**,
+33. Record the Hub SHA and the `Cargo.lock`-pinned Core SHA **separately**,
     resolve both binary realpaths under the fresh checkout's target directory,
     and assert the receipt's `source_revisions` matches both.
+34. No orphaned processes or stale process groups remain after the installer's
+    bounded-execution tests, checkable with the repo's existing
+    `script/process-census`.
 
 ## Vault gaps worth capturing
 
