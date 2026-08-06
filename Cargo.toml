@@ -2,6 +2,8 @@
 members = [
   ".",
   "crates/botster-hub-client",
+  "crates/botster-hub-installation",
+  "crates/botster-hub-installer",
   "crates/botster-hub-test-support",
   "crates/botster-ui-contract",
 ]
@@ -16,6 +18,7 @@ license-file = "LICENSE"
 
 [dependencies]
 botster-hub-client = { path = "crates/botster-hub-client" }
+botster-hub-installation = { path = "crates/botster-hub-installation" }
 botster-ui-contract = { path = "crates/botster-ui-contract" }
 # botster-hub intentionally tracks botster-core main; Cargo.lock records the tested revision.
 botster-core = { git = "https://github.com/trybotster/botster-core", branch = "main" }

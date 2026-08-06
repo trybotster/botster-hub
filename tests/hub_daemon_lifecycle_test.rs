@@ -3422,6 +3422,39 @@ fn start_cli_daemon_with_home(data_dir: &Path, home: &Path) -> Child {
     child
 }
 
+/// A schema-2 managed installation receipt for real-daemon fixtures.
+///
+/// Schema 1 is cold-turkey rejected, so every fixture carries the full schema-2
+/// shape. The daemon under test is a development build with no embedded build
+/// revision, so `build_revision` agreement is skipped rather than failed: a
+/// value cannot disagree with the absence of one.
+fn managed_receipt(source_url: &str) -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": 2,
+        "product_id": "botster-hub",
+        "binary_version": env!("CARGO_PKG_VERSION"),
+        "installation_mode": "managed",
+        "release_channel": "stable",
+        "provider": "http_json",
+        "source_url": source_url,
+        "build_revision": "release1",
+        "artifacts": [
+            {"name": "botster-hub", "sha256": "a".repeat(64), "size": 1024},
+            {"name": "botster-session-worker", "sha256": "b".repeat(64), "size": 2048}
+        ],
+        "source_revisions": {
+            "botster_hub": "0".repeat(40),
+            "botster_core": "1".repeat(40)
+        },
+        "signature": {
+            "algorithm": "ed25519",
+            "key_id": "test-only-do-not-trust",
+            "signed_manifest_sha256": "c".repeat(64)
+        },
+        "installer": {"id": "botster-hub-installer", "version": "0.1.0"}
+    })
+}
+
 fn spawn_release_metadata_fixture(
     metadata: serde_json::Value,
     request_count: usize,
@@ -3546,7 +3579,7 @@ fn real_daemon_status_and_hub_update_use_managed_receipt_authority() {
     fs::create_dir_all(receipt.parent().expect("receipt parent")).expect("create receipt parent");
     let (source_url, release_fixture) = spawn_release_metadata_fixture(
         serde_json::json!({
-            "schema_version": 1,
+            "schema_version": 2,
             "product_id": "botster-hub",
             "release_channel": "stable",
             "version": "99.0.0",
@@ -3556,16 +3589,7 @@ fn real_daemon_status_and_hub_update_use_managed_receipt_authority() {
     );
     fs::write(
         &receipt,
-        serde_json::to_vec(&serde_json::json!({
-            "schema_version": 1,
-            "product_id": "botster-hub",
-            "binary_version": env!("CARGO_PKG_VERSION"),
-            "installation_mode": "managed",
-            "release_channel": "stable",
-            "provider": "http_json",
-            "source_url": source_url
-        }))
-        .expect("serialize receipt"),
+        serde_json::to_vec(&managed_receipt(&source_url)).expect("serialize receipt"),
     )
     .expect("write receipt");
 
@@ -3587,7 +3611,19 @@ fn real_daemon_status_and_hub_update_use_managed_receipt_authority() {
     );
     let serialized = serde_json::to_string(&status).expect("serialize status");
     assert!(!serialized.contains(&home.display().to_string()));
-    assert!(!serialized.contains("source_url"));
+    // Schema 2 added checksum, signature, provenance, and installer facts to the
+    // receipt, so the leak assertion covers every one of them: none may reach a
+    // client through the status DTO.
+    for private in [
+        "source_url",
+        "signed_manifest_sha256",
+        "sha256",
+        "key_id",
+        "installer",
+        "source_revisions",
+    ] {
+        assert!(!serialized.contains(private), "status leaked {private}");
+    }
 
     let update =
         botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::CheckHubUpdate)
@@ -3711,7 +3747,7 @@ fn real_provider_reports_current_newer_source_behind_and_unavailable_states() {
     fs::create_dir_all(receipt.parent().expect("receipt parent")).expect("create receipt parent");
     let release = |version: &str| {
         serde_json::json!({
-            "schema_version": 1,
+            "schema_version": 2,
             "product_id": "botster-hub",
             "release_channel": "stable",
             "version": version
@@ -3722,7 +3758,7 @@ fn real_provider_reports_current_newer_source_behind_and_unavailable_states() {
         release("99.0.0"),
         release("0.0.1"),
         serde_json::json!({
-            "schema_version": 1,
+            "schema_version": 2,
             "product_id": "other-product",
             "release_channel": "stable",
             "version": env!("CARGO_PKG_VERSION")
@@ -3730,16 +3766,7 @@ fn real_provider_reports_current_newer_source_behind_and_unavailable_states() {
     ]);
     fs::write(
         &receipt,
-        serde_json::to_vec(&serde_json::json!({
-            "schema_version": 1,
-            "product_id": "botster-hub",
-            "binary_version": env!("CARGO_PKG_VERSION"),
-            "installation_mode": "managed",
-            "release_channel": "stable",
-            "provider": "http_json",
-            "source_url": source_url
-        }))
-        .expect("serialize receipt"),
+        serde_json::to_vec(&managed_receipt(&source_url)).expect("serialize receipt"),
     )
     .expect("write receipt");
 
@@ -3794,23 +3821,14 @@ fn stalled_hub_update_check_keeps_status_responsive_and_second_check_is_busy() {
     fs::create_dir_all(receipt.parent().expect("receipt parent")).expect("create receipt parent");
     let (source_url, accepted_rx, release_tx, release_fixture) =
         spawn_stalled_release_metadata_fixture(serde_json::json!({
-            "schema_version": 1,
+            "schema_version": 2,
             "product_id": "botster-hub",
             "release_channel": "stable",
             "version": env!("CARGO_PKG_VERSION")
         }));
     fs::write(
         &receipt,
-        serde_json::to_vec(&serde_json::json!({
-            "schema_version": 1,
-            "product_id": "botster-hub",
-            "binary_version": env!("CARGO_PKG_VERSION"),
-            "installation_mode": "managed",
-            "release_channel": "stable",
-            "provider": "http_json",
-            "source_url": source_url
-        }))
-        .expect("serialize receipt"),
+        serde_json::to_vec(&managed_receipt(&source_url)).expect("serialize receipt"),
     )
     .expect("write receipt");
     let child = start_cli_daemon_with_home(&data_dir, &home);
@@ -3869,16 +3887,7 @@ fn daemon_shutdown_during_hub_update_check_is_bounded_and_leak_free() {
     let (source_url, accepted_rx, release_fixture) = spawn_timeout_release_metadata_fixture();
     fs::write(
         &receipt,
-        serde_json::to_vec(&serde_json::json!({
-            "schema_version": 1,
-            "product_id": "botster-hub",
-            "binary_version": env!("CARGO_PKG_VERSION"),
-            "installation_mode": "managed",
-            "release_channel": "stable",
-            "provider": "http_json",
-            "source_url": source_url
-        }))
-        .expect("serialize receipt"),
+        serde_json::to_vec(&managed_receipt(&source_url)).expect("serialize receipt"),
     )
     .expect("write receipt");
     let child = start_cli_daemon_with_home(&data_dir, &home);
@@ -17879,4 +17888,616 @@ fn assert_no_state_file_under(root: &Path) {
         !canonical_hub.exists(),
         "unexpected state file at {canonical_hub:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Managed distribution: the production path, not scaffolding.
+//
+// The installer's own integration suite proves install *mechanics* with
+// synthetic artifacts. What only this file can prove is the other half:
+// receipt/binary agreement against a **real** Hub, and the installation lease
+// enforced by real daemons launched through the installed entrypoint. Both
+// halves are needed; neither alone is sufficient.
+// ---------------------------------------------------------------------------
+
+/// One canned HTTP response: status plus body.
+type ManagedReleaseResponse = (u16, Vec<u8>);
+/// The mutable route table the managed release origin serves from.
+type ManagedReleaseRoutes = Arc<Mutex<BTreeMap<String, ManagedReleaseResponse>>>;
+
+/// A loopback origin whose routes can be replaced between requests.
+struct ManagedReleaseOrigin {
+    base: String,
+    routes: ManagedReleaseRoutes,
+    stopping: Arc<AtomicBool>,
+    address: String,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl ManagedReleaseOrigin {
+    fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind managed release origin");
+        let address = listener
+            .local_addr()
+            .expect("managed release origin address");
+        let routes: ManagedReleaseRoutes = Arc::new(Mutex::new(BTreeMap::new()));
+        let served = Arc::clone(&routes);
+        let stopping = Arc::new(AtomicBool::new(false));
+        let halt = Arc::clone(&stopping);
+        let handle = thread::spawn(move || {
+            for stream in listener.incoming() {
+                if halt.load(Ordering::Relaxed) {
+                    break;
+                }
+                let Ok(mut stream) = stream else { continue };
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                let mut buffer = [0_u8; 8192];
+                let Ok(read) = stream.read(&mut buffer) else {
+                    continue;
+                };
+                let request = String::from_utf8_lossy(&buffer[..read]);
+                let path = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or("/")
+                    .to_string();
+                let (status, body) = served
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(&path)
+                    .cloned()
+                    .unwrap_or((404_u16, Vec::new()));
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {status} OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(&body);
+                let _ = stream.flush();
+            }
+        });
+        Self {
+            base: format!("http://{address}"),
+            routes,
+            stopping,
+            address: address.to_string(),
+            handle: Some(handle),
+        }
+    }
+
+    fn serve(&self, path: &str, body: Vec<u8>) {
+        self.routes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(path.to_string(), (200_u16, body));
+    }
+
+    fn url(&self, path: &str) -> String {
+        format!("{}{path}", self.base)
+    }
+}
+
+impl Drop for ManagedReleaseOrigin {
+    fn drop(&mut self) {
+        self.stopping.store(true, Ordering::Relaxed);
+        let _ = TcpStream::connect(&self.address);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// The real, revision-coupled artifacts this repository produces.
+struct RealRelease {
+    hub_binary: PathBuf,
+    worker_binary: PathBuf,
+    hub_revision: String,
+    core_revision: String,
+}
+
+/// Build the actual Hub with an embedded build revision, plus the locked-Core
+/// worker.
+///
+/// The Hub is built into its own target directory: embedding a revision changes
+/// `build.rs` output, and sharing `target/debug` would rewrite the very
+/// `CARGO_BIN_EXE_botster-hub` other tests in this file are executing.
+fn build_real_release() -> &'static RealRelease {
+    static RELEASE: OnceLock<RealRelease> = OnceLock::new();
+    RELEASE.get_or_init(|| {
+        ensure_session_worker_binary();
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let hub_revision = String::from_utf8(
+            Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(manifest_dir)
+                .output()
+                .expect("read the Hub checkout revision")
+                .stdout,
+        )
+        .expect("Hub revision is UTF-8")
+        .trim()
+        .to_string();
+        assert_eq!(hub_revision.len(), 40, "git HEAD is a canonical object id");
+
+        // The Core revision is whatever Cargo.lock pins for the worker. Reading
+        // the pin keeps the coupling real instead of asserted, and keeps the two
+        // provenance identities distinct.
+        let lock = fs::read_to_string(manifest_dir.join("Cargo.lock")).expect("read Cargo.lock");
+        let core_revision = lock
+            .split("[[package]]")
+            .find(|block| block.contains("name = \"botster-core\"\n"))
+            .and_then(|block| block.lines().find(|line| line.starts_with("source = ")))
+            .and_then(|line| line.rsplit_once('#'))
+            .map(|(_, revision)| revision.trim_end_matches('"').to_string())
+            .expect("Cargo.lock pins a botster-core revision");
+        assert_eq!(
+            core_revision.len(),
+            40,
+            "the locked Core revision is a canonical object id"
+        );
+        assert_ne!(
+            hub_revision, core_revision,
+            "Hub and locked-Core provenance are distinct identities"
+        );
+
+        let target = manifest_dir.join("target").join("managed-install-proof");
+        let status = Command::new("cargo")
+            .args(["build", "--locked", "--bin", "botster-hub"])
+            .current_dir(manifest_dir)
+            .env("CARGO_TARGET_DIR", &target)
+            .env("BOTSTER_BUILD_REVISION", &hub_revision)
+            .status()
+            .expect("build the revisioned Hub binary");
+        assert!(status.success(), "the revisioned Hub binary should build");
+
+        let status = Command::new("cargo")
+            .args([
+                "build",
+                "--locked",
+                "-p",
+                "botster-hub-installer",
+                "--bin",
+                "botster-hub-installer",
+                "--bin",
+                "botster-hub-release-tool",
+            ])
+            .current_dir(manifest_dir)
+            .status()
+            .expect("build the installer binaries");
+        assert!(status.success(), "the installer binaries should build");
+
+        RealRelease {
+            hub_binary: target.join("debug").join("botster-hub"),
+            worker_binary: Path::new(env!("CARGO_BIN_EXE_botster-hub"))
+                .parent()
+                .expect("hub binary directory")
+                .join("botster-session-worker"),
+            hub_revision,
+            core_revision,
+        }
+    })
+}
+
+fn installer_binary() -> PathBuf {
+    Path::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .parent()
+        .expect("hub binary directory")
+        .join("botster-hub-installer")
+}
+
+fn release_tool_binary() -> PathBuf {
+    Path::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .parent()
+        .expect("hub binary directory")
+        .join("botster-hub-release-tool")
+}
+
+fn sha256_of(path: &Path) -> String {
+    let output = if Command::new("sha256sum").arg("--version").output().is_ok() {
+        Command::new("sha256sum").arg(path).output()
+    } else {
+        Command::new("shasum")
+            .args(["-a", "256"])
+            .arg(path)
+            .output()
+    }
+    .expect("compute artifact checksum");
+    String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .next()
+        .expect("checksum output")
+        .to_string()
+}
+
+/// Install the real built pair into an isolated prefix through the installer.
+///
+/// `HOME` points at the prefix, so the receipt, the generations, the pointer,
+/// the entrypoint, and the lease are all isolated from the developer's machine.
+fn install_real_release(
+    label: &str,
+    origin: &ManagedReleaseOrigin,
+) -> (PathBuf, &'static RealRelease) {
+    let release = build_real_release();
+    let prefix = unique_short_test_dir(label);
+    fs::create_dir_all(&prefix).expect("create managed prefix");
+
+    let hub_bytes = fs::read(&release.hub_binary).expect("read built Hub");
+    let worker_bytes = fs::read(&release.worker_binary).expect("read built worker");
+    origin.serve("/artifacts/botster-hub", hub_bytes.clone());
+    origin.serve("/artifacts/botster-session-worker", worker_bytes.clone());
+
+    let manifest = serde_json::json!({
+        "product_id": "botster-hub",
+        "release_channel": "stable",
+        "version": env!("CARGO_PKG_VERSION"),
+        "build_revision": release.hub_revision,
+        "source_revisions": {
+            "botster_hub": release.hub_revision,
+            "botster_core": release.core_revision,
+        },
+        "artifacts": [
+            {
+                "name": "botster-hub",
+                "url": origin.url("/artifacts/botster-hub"),
+                "size": hub_bytes.len(),
+                "sha256": sha256_of(&release.hub_binary),
+            },
+            {
+                "name": "botster-session-worker",
+                "url": origin.url("/artifacts/botster-session-worker"),
+                "size": worker_bytes.len(),
+                "sha256": sha256_of(&release.worker_binary),
+            },
+        ],
+    });
+
+    let manifest_path = prefix.join("install-manifest.json");
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec(&manifest).expect("serialize manifest"),
+    )
+    .expect("write manifest");
+    let document_path = prefix.join("release.json");
+    let signed =
+        Command::new(release_tool_binary())
+            .args(["sign", "--key"])
+            .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join(
+                "fixtures/release-signing/UNTRUSTED-TEST-ONLY-botster-hub-release-signing.pkcs8",
+            ))
+            .args(["--key-id", "test-only-do-not-trust", "--manifest"])
+            .arg(&manifest_path)
+            .arg("--out")
+            .arg(&document_path)
+            .output()
+            .expect("sign the release document");
+    assert!(signed.status.success(), "{}", command_output_text(&signed));
+    origin.serve(
+        "/botster-hub.json",
+        fs::read(&document_path).expect("read signed document"),
+    );
+
+    let installed =
+        Command::new(installer_binary())
+            .arg("install")
+            .arg("--prefix")
+            .arg(&prefix)
+            .arg("--source")
+            .arg(origin.url("/botster-hub.json"))
+            .arg("--trust-anchor")
+            .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join(
+                "fixtures/release-signing/UNTRUSTED-TEST-ONLY-botster-hub-release-signing.pub",
+            ))
+            .env("HOME", &prefix)
+            .output()
+            .expect("run the managed installer");
+    assert!(
+        installed.status.success(),
+        "{}",
+        command_output_text(&installed)
+    );
+
+    (prefix, release)
+}
+
+fn start_installed_daemon(prefix: &Path, data_dir: &Path, entrypoint: &Path) -> Child {
+    let mut command = Command::new(entrypoint);
+    command
+        .arg("start")
+        .arg("--data-dir")
+        .arg(data_dir)
+        .env("HOME", prefix)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    configure_test_process_group(&mut command);
+    let mut child = command.spawn().expect("spawn the installed Hub");
+    wait_for_status(data_dir, &mut child);
+    child
+}
+
+/// The production path: the actually-installed Hub, launched through the
+/// installed entrypoint, reporting a managed installation.
+#[test]
+fn a_real_managed_installation_reports_managed_status_and_distinct_provenance() {
+    let _guard = daemon_test_guard();
+    let origin = ManagedReleaseOrigin::start();
+    let (prefix, release) = install_real_release("managed-install", &origin);
+    let entrypoint = prefix.join("bin/botster-hub");
+    let generation = format!("{}-{}", release.hub_revision, release.core_revision);
+
+    // The generation directory holds the revision-coupled pair, and both
+    // binaries resolve under the prefix rather than the development checkout.
+    let generation_dir = prefix.join("generations").join(&generation);
+    let installed_hub = fs::canonicalize(&entrypoint).expect("resolve the installed Hub realpath");
+    assert_eq!(
+        installed_hub,
+        fs::canonicalize(generation_dir.join("botster-hub")).expect("generation Hub realpath"),
+        "bin/botster-hub resolves through current into its own generation"
+    );
+    assert!(
+        generation_dir.join("botster-session-worker").is_file(),
+        "the locked-Core worker is installed beside the Hub in the same generation"
+    );
+
+    // `version` needs no data directory and no daemon: it is how the installer
+    // verified a staged binary that had never been started.
+    let version = Command::new(&entrypoint)
+        .arg("version")
+        .env("HOME", &prefix)
+        .output()
+        .expect("run the installed Hub version subcommand");
+    assert!(
+        version.status.success(),
+        "{}",
+        command_output_text(&version)
+    );
+    let version_text = String::from_utf8_lossy(&version.stdout);
+    assert!(
+        version_text.contains("product_id=botster-hub"),
+        "{version_text}"
+    );
+    assert!(
+        version_text.contains(&format!("version={}", env!("CARGO_PKG_VERSION"))),
+        "{version_text}"
+    );
+    assert!(
+        version_text.contains(&format!("build_revision={}", release.hub_revision)),
+        "{version_text}"
+    );
+
+    // The receipt records both source identities separately.
+    let receipt: serde_json::Value = serde_json::from_slice(
+        &fs::read(prefix.join(".botster/installations/botster-hub.json")).expect("read receipt"),
+    )
+    .expect("parse receipt");
+    assert_eq!(receipt["schema_version"], 2);
+    assert_eq!(
+        receipt["source_revisions"]["botster_hub"],
+        release.hub_revision
+    );
+    assert_eq!(
+        receipt["source_revisions"]["botster_core"],
+        release.core_revision
+    );
+    assert_ne!(
+        receipt["source_revisions"]["botster_hub"], receipt["source_revisions"]["botster_core"],
+        "filesystem colocation does not collapse Hub and locked-Core provenance"
+    );
+
+    let data_dir = unique_short_test_dir("managed-install-data");
+    let child = start_installed_daemon(&prefix, &data_dir, &entrypoint);
+    let endpoint = botster_hub_client::DaemonEndpoint::new(data_dir.join("botster-hub.sock"));
+    let status = botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status)
+        .expect("read installed daemon status")
+        .status
+        .expect("status payload");
+    assert_eq!(
+        status.installation.mode,
+        botster_hub_client::DaemonInstallationMode::Managed
+    );
+    assert_eq!(status.installation.provenance, "managed_receipt");
+    assert_eq!(
+        status.installation.release_channel.as_deref(),
+        Some("stable")
+    );
+    assert_eq!(status.installation.provider.as_deref(), Some("http_json"));
+    assert!(status.installation.diagnostics.is_empty());
+    assert_eq!(status.software.version, env!("CARGO_PKG_VERSION"));
+    assert_eq!(
+        status.software.build_revision.as_deref(),
+        Some(release.hub_revision.as_str()),
+        "software identity comes from the binary, not from the receipt"
+    );
+
+    // Receipt-private data must not leak through the status DTO.
+    let serialized = serde_json::to_string(&status).expect("serialize status");
+    for leak in [
+        "source_url",
+        "signed_manifest_sha256",
+        "sha256",
+        "installer",
+        "key_id",
+        "source_revisions",
+    ] {
+        assert!(
+            !serialized.contains(leak),
+            "status leaked {leak}: {serialized}"
+        );
+    }
+    assert!(!serialized.contains(&prefix.display().to_string()));
+
+    // check-update against the managed source: schema 2, then a schema-3
+    // document carrying unknown future fields. Both must answer the same way.
+    for schema in [2, 3] {
+        origin.serve(
+            "/botster-hub.json",
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": schema,
+                "product_id": "botster-hub",
+                "release_channel": "stable",
+                "version": "99.0.0",
+                "build_revision": "0123456789abcdef0123456789abcdef01234567",
+                "install_manifest": "e30=",
+                "signature": {"algorithm": "ed25519", "key_id": "k", "value": "sig"},
+                "delta_updates": {"from": ["0.1.0"]},
+                "platform_matrix": ["aarch64-apple-darwin"]
+            }))
+            .expect("serialize forward-compatible document"),
+        );
+        let update = Command::new(&entrypoint)
+            .arg("check-update")
+            .arg("--data-dir")
+            .arg(&data_dir)
+            .env("HOME", &prefix)
+            .output()
+            .expect("run check-update through the installed Hub");
+        assert!(update.status.success(), "{}", command_output_text(&update));
+        let text = String::from_utf8_lossy(&update.stdout);
+        assert!(text.contains("state=available"), "schema={schema}: {text}");
+        assert!(
+            text.contains("action=run_managed_installer"),
+            "schema={schema}: {text}"
+        );
+    }
+
+    shutdown_cli_daemon(&data_dir, child);
+
+    // Restart preserves identical software and installation identity.
+    let restarted = start_installed_daemon(&prefix, &data_dir, &entrypoint);
+    let restarted_status =
+        botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status)
+            .expect("read restarted installed daemon status")
+            .status
+            .expect("status payload");
+    assert_eq!(restarted_status.software, status.software);
+    assert_eq!(restarted_status.installation, status.installation);
+    shutdown_cli_daemon(&data_dir, restarted);
+
+    let _ = fs::remove_dir_all(&data_dir);
+    let _ = fs::remove_dir_all(&prefix);
+}
+
+/// Offline enforcement, proven with real daemons.
+///
+/// A socket probe cannot deliver this: the Hub accepts an arbitrary data
+/// directory, so a daemon launched from the same installation under a *different*
+/// data directory would stay invisible to a probe. The lease is data-directory
+/// independent by construction, and this is where that is tested directly.
+#[test]
+fn real_daemons_on_custom_data_directories_hold_the_installation_lease() {
+    let _guard = daemon_test_guard();
+    let origin = ManagedReleaseOrigin::start();
+    let (prefix, release) = install_real_release("managed-lease", &origin);
+    let entrypoint = prefix.join("bin/botster-hub");
+    let generation_hub = prefix
+        .join("generations")
+        .join(format!(
+            "{}-{}",
+            release.hub_revision, release.core_revision
+        ))
+        .join("botster-hub");
+
+    let reinstall = || {
+        Command::new(installer_binary())
+            .arg("install")
+            .arg("--prefix")
+            .arg(&prefix)
+            .arg("--source")
+            .arg(origin.url("/botster-hub.json"))
+            .arg("--trust-anchor")
+            .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join(
+                "fixtures/release-signing/UNTRUSTED-TEST-ONLY-botster-hub-release-signing.pub",
+            ))
+            .env("HOME", &prefix)
+            .output()
+            .expect("run the managed installer")
+    };
+
+    // Two daemons, two *different* custom data directories, launched through
+    // two different paths — `bin/botster-hub` and the generation path directly.
+    // Prefix derivation matches layout shape rather than counting levels, so
+    // both resolve the same prefix and contend for the same lease.
+    let first_dir = unique_short_test_dir("managed-lease-a");
+    let second_dir = unique_short_test_dir("managed-lease-b");
+    let first = start_installed_daemon(&prefix, &first_dir, &entrypoint);
+    let second = start_installed_daemon(&prefix, &second_dir, &generation_hub);
+
+    let refused = reinstall();
+    assert!(
+        !refused.status.success(),
+        "{}",
+        command_output_text(&refused)
+    );
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("installation_busy"),
+        "{}",
+        command_output_text(&refused)
+    );
+
+    shutdown_cli_daemon(&first_dir, first);
+    let still_refused = reinstall();
+    assert!(
+        !still_refused.status.success(),
+        "the installer stays refused until every daemon exits: {}",
+        command_output_text(&still_refused)
+    );
+
+    // `flock` releases on process death, including SIGKILL. A crashed daemon
+    // must never leave an installation permanently unupgradeable.
+    let killed_pid = second.id();
+    signal_test_group_or_child(killed_pid, libc::SIGKILL).expect("kill the second daemon");
+    let mut second = second;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if second.try_wait().expect("poll killed daemon").is_some() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        second.try_wait().expect("poll killed daemon").is_some(),
+        "the SIGKILLed daemon must be reaped"
+    );
+
+    let allowed = reinstall();
+    assert!(
+        allowed.status.success(),
+        "a crashed daemon must not leave the installation unupgradeable: {}",
+        command_output_text(&allowed)
+    );
+
+    // A daemon that fails to start because the lease is held says so rather
+    // than hanging: acquisition is LOCK_SH|LOCK_NB.
+    let installer_lease = botster_hub_installation::lease::acquire(
+        &prefix,
+        botster_hub_installation::LeaseMode::Exclusive,
+    )
+    .expect("take an installer-shaped exclusive lease");
+    assert!(matches!(
+        installer_lease,
+        botster_hub_installation::LeaseOutcome::Acquired(_)
+    ));
+    let blocked_dir = unique_short_test_dir("managed-lease-blocked");
+    let blocked = Command::new(&entrypoint)
+        .arg("start")
+        .arg("--data-dir")
+        .arg(&blocked_dir)
+        .env("HOME", &prefix)
+        .output()
+        .expect("attempt a daemon start while the installer holds the lease");
+    assert!(
+        !blocked.status.success(),
+        "{}",
+        command_output_text(&blocked)
+    );
+    assert!(
+        String::from_utf8_lossy(&blocked.stderr).contains("being upgraded"),
+        "{}",
+        command_output_text(&blocked)
+    );
+
+    for directory in [&first_dir, &second_dir, &blocked_dir] {
+        let _ = fs::remove_dir_all(directory);
+    }
+    let _ = fs::remove_dir_all(&prefix);
 }

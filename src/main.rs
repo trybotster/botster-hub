@@ -131,6 +131,7 @@ fn dispatch_command(command: &str, args: Vec<String>) -> Result<CommandOutcome, 
         "check-update" => operator_check_update(args)
             .map(|()| CommandOutcome::Completed)
             .map_err(|error| error.to_string()),
+        "version" => print_binary_version(&args).map(|()| CommandOutcome::Completed),
         "sessions" => operator_sessions(args)
             .map(|()| CommandOutcome::Completed)
             .map_err(|error| error.to_string()),
@@ -376,6 +377,12 @@ fn start_daemon(args: Vec<String>) -> Result<(), StartError> {
         return serve_test_incompatible_daemon(&config).map_err(StartError::Transport);
     }
 
+    // The lease is taken before the daemon binds anything and held for the
+    // daemon's whole lifetime, so an installer can never switch generations
+    // underneath a live Hub. Kept here rather than in `daemon_transport.rs` so
+    // transport code stays free of installation-layout knowledge.
+    let _installation_lease = acquire_installation_lease()?;
+
     let stopped = serve_daemon(config)?;
     let status = DaemonStatus {
         lifecycle_state: lifecycle_state_label(stopped.lifecycle_state).to_string(),
@@ -408,6 +415,64 @@ fn start_daemon(args: Vec<String>) -> Result<(), StartError> {
     };
     print_daemon_transport_status("stopped", &status);
 
+    Ok(())
+}
+
+/// Take the shared installation lease for the lifetime of this daemon.
+///
+/// The Hub accepts an arbitrary data directory, so a socket probe cannot tell an
+/// installer that a daemon from this same installation is alive under a
+/// different data directory. The lease can: every managed daemon holds
+/// `LOCK_SH`, the installer takes `LOCK_EX`, and both are authoritative across
+/// any number of daemons and data directories because they all resolve through
+/// the same installation prefix.
+///
+/// `Ok(None)` is the development-layout answer: a binary that does not sit in a
+/// managed prefix derives no prefix and takes no lease. That is a positive
+/// behaviour, not an accident — a development checkout must never contend with
+/// an installed Hub.
+///
+/// Acquisition is `LOCK_SH|LOCK_NB`, so a daemon started while an installer holds
+/// the exclusive lease fails fast with a diagnostic rather than hanging until
+/// the install finishes.
+fn acquire_installation_lease()
+-> Result<Option<botster_hub_installation::InstallationLease>, StartError> {
+    let Ok(executable) = env::current_exe() else {
+        return Ok(None);
+    };
+    let Some(prefix) = botster_hub_installation::layout::derive_managed_prefix(&executable) else {
+        return Ok(None);
+    };
+    match botster_hub_installation::lease::acquire(
+        &prefix,
+        botster_hub_installation::LeaseMode::Shared,
+    ) {
+        Ok(botster_hub_installation::LeaseOutcome::Acquired(lease)) => Ok(Some(lease)),
+        Ok(botster_hub_installation::LeaseOutcome::Contended) => {
+            Err(StartError::InstallationLeaseHeld(prefix))
+        }
+        Err(problem) => Err(StartError::InstallationLeaseUnavailable(problem)),
+    }
+}
+
+/// Print this binary's embedded identity without a data directory or a daemon.
+///
+/// The installer must verify a staged, not-yet-running binary's embedded
+/// identity, and `status` needs a live daemon, so it cannot serve that purpose.
+/// This is also the honest expression of "the running Hub binary remains
+/// authoritative for its embedded product version and build revision".
+fn print_binary_version(args: &[String]) -> Result<(), String> {
+    if !args.is_empty() {
+        return Err(format!("unexpected arguments\n{}", usage_for("version")));
+    }
+    let identity = software_identity();
+    println!("product_id={}", identity.product_id);
+    println!("product_name={}", identity.product_name);
+    println!("version={}", identity.version);
+    println!(
+        "build_revision={}",
+        identity.build_revision.as_deref().unwrap_or("unknown")
+    );
     Ok(())
 }
 
@@ -5031,6 +5096,8 @@ enum StartError {
     Config(botster_hub::HubConfigError),
     Daemon(botster_hub::HubDaemonError),
     Transport(botster_hub::DaemonTransportError),
+    InstallationLeaseHeld(PathBuf),
+    InstallationLeaseUnavailable(botster_hub_installation::InstallationProblem),
 }
 
 #[derive(Debug)]
@@ -5168,6 +5235,15 @@ impl fmt::Display for StartError {
             Self::Config(error) => write!(formatter, "{error}"),
             Self::Daemon(error) => write!(formatter, "{error}"),
             Self::Transport(error) => write!(formatter, "{error}"),
+            Self::InstallationLeaseHeld(prefix) => write!(
+                formatter,
+                "the managed installation at {} is being upgraded by botster-hub-installer; wait for the install to finish and start again",
+                prefix.display()
+            ),
+            Self::InstallationLeaseUnavailable(problem) => write!(
+                formatter,
+                "the managed installation lease could not be taken: {problem}"
+            ),
         }
     }
 }
@@ -5432,6 +5508,7 @@ Daily runtime commands:
   botster-hub down [--data-dir <path>]
   botster-hub status [--data-dir <path>]
   botster-hub check-update [--data-dir <path>]
+  botster-hub version
   botster-hub doctor [--data-dir <path>]
   botster-hub smoke [--data-dir <path>] [...]
   botster-hub open web [--data-dir <path>]
@@ -5484,6 +5561,7 @@ Packages:
         }
         "status" => "usage: botster-hub status [--data-dir <path>]",
         "check-update" => "usage: botster-hub check-update [--data-dir <path>]",
+        "version" => "usage: botster-hub version",
         "sessions" => {
             "usage: botster-hub sessions <list|spawn|attach|send-input|resize|detach|shutdown> ..."
         }
@@ -5773,6 +5851,35 @@ mod cli_data_dir_tests {
             assert_eq!(resolved[insert_at], "--data-dir", "{command}");
             assert_eq!(resolved[insert_at + 1], expected, "{command}");
         }
+    }
+
+    /// `version` reports the binary's own embedded identity, so it must stay
+    /// stateless: no data directory is resolved for it and no daemon is
+    /// contacted. That is what lets the installer verify a staged binary that
+    /// has never been started.
+    #[test]
+    fn version_is_stateless_and_takes_no_data_directory() {
+        assert!(!stateful_command("version"));
+        assert_eq!(usage_for("version"), "usage: botster-hub version");
+        assert!(print_binary_version(&[]).is_ok());
+        assert!(print_binary_version(&["--data-dir".to_string()]).is_err());
+    }
+
+    /// A development build sits in no managed prefix, derives no prefix, and so
+    /// takes no lease — it can never contend with an installed Hub, and the
+    /// installer's refusal is never triggered by a source checkout.
+    #[test]
+    fn a_development_layout_derives_no_prefix_and_therefore_takes_no_lease() {
+        let executable = env::current_exe().expect("current test executable");
+        assert_eq!(
+            botster_hub_installation::layout::derive_managed_prefix(&executable),
+            None
+        );
+        assert!(
+            acquire_installation_lease()
+                .expect("a development layout never fails lease acquisition")
+                .is_none()
+        );
     }
 
     #[test]

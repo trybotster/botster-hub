@@ -1,0 +1,22 @@
+[package]
+name = "botster-hub-installer"
+version = "0.1.0"
+edition = "2024"
+description = "Managed installer for the revision-coupled botster-hub distribution"
+repository = "https://github.com/trybotster/botster-hub"
+license-file = "../../LICENSE"
+
+[[bin]]
+name = "botster-hub-installer"
+path = "src/main.rs"
+
+[dependencies]
+botster-hub-installation = { path = "../botster-hub-installation" }
+base64 = "0.22.1"
+libc = "0.2.177"
+# `ring` supplies SHA-256 and ed25519 verification and is already in Cargo.lock
+# transitively through rustls/webrtc, so this adds no new compiled dependency.
+ring = "0.17.14"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+ureq = { version = "3.3.0", default-features = false, features = ["rustls"] }

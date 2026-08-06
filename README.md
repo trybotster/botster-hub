@@ -1276,14 +1276,81 @@ The Hub now owns one read-only product maintenance path. `status` reports
 immutable embedded product identity plus installation provenance from exactly
 `$HOME/.botster/installations/botster-hub.json`; `check-update` lets a valid
 managed receipt query its configured authoritative HTTP JSON source without
-mutating packages, Git, the running binary, or durable Hub state. Development
-builds, manual/unmanaged installs, missing receipts, and invalid or unsafe
-receipts return an honest unavailable/manual result.
+mutating packages, Git, the running binary, or durable Hub state. `version`
+prints the binary's own `product_id`/`version`/`build_revision` with no data
+directory and no running daemon, which is how the installer verifies a staged
+binary that has never been started. Development builds, manual/unmanaged
+installs, missing receipts, and invalid or unsafe receipts return an honest
+unavailable/manual result.
 
-Deferred production concerns remain outside this contract slice: receipt
-writes, installer-managed apply or rollback, signed release publication,
-auto-update daemons, sandboxing, dependency solving, hosted marketplace
-resolution, and remote/cloud WebRTC launch paths.
+### Managed distribution
+
+`botster-hub-installer` writes the half the maintenance path only reads.
+
+The Hub and its locked-Core worker are **one revision-coupled generation**,
+never two independently replaceable files:
+
+```
+<prefix>/
+  daemon.lock                                   # the installation lease
+  generations/
+    <hub-sha>-<core-sha>/
+      botster-hub
+      botster-session-worker
+  current -> generations/<hub-sha>-<core-sha>   # the pointer
+  bin/
+    botster-hub -> ../current/botster-hub       # the stable entrypoint
+```
+
+Both binaries are reachable only through one pointer that flips with a single
+atomic `renameat`, so a mixed Hub-at-N+1-beside-worker-at-N pair is unreachable
+by construction rather than merely unlikely. Rollback is that same operation
+pointed back at the retained previous generation. Staging happens in a unique
+`.staging-<random>/` directory that is renamed into place, so the final
+generation name is complete by construction.
+
+```sh
+botster-hub-installer install \
+  --prefix ~/.local/share/botster \
+  --source https://releases.example/botster-hub.json \
+  --trust-anchor /path/to/release-signing.pub
+```
+
+- **Upgrades are offline.** Every managed Hub daemon takes `LOCK_SH|LOCK_NB` on
+  `<prefix>/daemon.lock` at startup and holds it for its lifetime; the installer
+  takes `LOCK_EX|LOCK_NB` and holds the same descriptor across switch,
+  verification, and receipt commit or rollback. This is authoritative across any
+  number of daemons and any data directories, which a socket probe could never
+  be. Both sides are non-blocking and fail fast with a diagnostic.
+- **Signature verification is installer-only.** The installer is the trust
+  boundary because it is the component that writes executables. The Hub holds no
+  trust anchor and verifies nothing; it records signature *facts*. The trust
+  anchor is not embedded — `--trust-anchor` is required.
+- **The verified manifest is the sole authority.** `product_id`,
+  `release_channel`, `version`, and `build_revision` appear in both the unsigned
+  envelope and the signed manifest, and the installer requires exact equality on
+  all four. Without that rule a validly signed *old* manifest could be wrapped in
+  an envelope advertising a *new* version.
+- **The receipt is written last**, so no reachable state places a schema-2
+  receipt beside an old generation. Intermediate crash states degrade honestly:
+  the Hub reports unmanaged rather than falsely claiming managed, and re-running
+  the idempotent installer converges.
+- **Durability has two strengths of claim.** `SIGKILL` safety is demonstrated by
+  crash injection at every boundary. Power-loss durability is *argued from the
+  fsync ordering* and is **not** demonstrated — this repository has no
+  fault-injection harness, and building one is out of scope.
+
+Release metadata is built and signed by `script/build-release-artifacts`, which
+reads the `Cargo.lock`-pinned `botster-core` revision rather than introducing a
+second pinning mechanism, so the Hub SHA and locked-Core SHA stay distinct
+identities in both the manifest and the receipt.
+
+Deferred production concerns remain outside this slice: publishing to a real
+origin, production key custody, release CI, online upgrade, generation pruning
+beyond retaining the previous one, auto-update daemons, sandboxing, notarization,
+multi-platform artifact matrices, delta updates, downgrade support, Hub-side
+signature verification or startup re-hashing, dependency solving, hosted
+marketplace resolution, and remote/cloud WebRTC launch paths.
 
 Compatibility remains deliberately narrow in this slice. The manifest `botster`
 field accepts only exact `MAJOR.MINOR.PATCH` or lower-bound

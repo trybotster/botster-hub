@@ -1,0 +1,160 @@
+#!/bin/sh
+# Build the revision-coupled botster-hub release pair and emit signed schema-2
+# release metadata.
+#
+# The Hub and its locked-Core worker are one revision-coupled generation. This
+# script records their two source identities *separately* — the Hub SHA is this
+# checkout, the Core SHA is the revision `Cargo.lock` pins for
+# `botster-session-worker` — because filesystem colocation of the two binaries
+# does not collapse their provenance.
+#
+# This ticket does not publish to a real origin and provisions no production
+# key. `--key` is caller-supplied; the committed test key under
+# fixtures/release-signing/ is unmistakably named and must never be used for a
+# real release.
+set -eu
+
+usage() {
+  cat <<'USAGE'
+usage: script/build-release-artifacts \
+    --out-dir <dir> \
+    --key <pkcs8-path> \
+    --key-id <id> \
+    --base-url <url-prefix> \
+    [--channel stable|beta|nightly] \
+    [--version <semver>]
+
+Builds botster-hub and botster-session-worker with --locked, computes their
+SHA-256 checksums, reads the Cargo.lock-pinned botster-core revision, writes the
+install manifest, and signs it into <out-dir>/botster-hub.json.
+
+--base-url is the prefix artifact URLs are published under; each artifact URL is
+validated by the installer on its own, and HTTPS is required for any non-loopback
+host.
+USAGE
+}
+
+OUT_DIR=""
+KEY=""
+KEY_ID=""
+BASE_URL=""
+CHANNEL="stable"
+VERSION=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --out-dir) OUT_DIR="${2:?--out-dir requires a value}"; shift 2 ;;
+    --key) KEY="${2:?--key requires a value}"; shift 2 ;;
+    --key-id) KEY_ID="${2:?--key-id requires a value}"; shift 2 ;;
+    --base-url) BASE_URL="${2:?--base-url requires a value}"; shift 2 ;;
+    --channel) CHANNEL="${2:?--channel requires a value}"; shift 2 ;;
+    --version) VERSION="${2:?--version requires a value}"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "unexpected argument: $1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+for required in OUT_DIR KEY KEY_ID BASE_URL; do
+  eval "value=\$$required"
+  if [ -z "$value" ]; then
+    echo "missing required option for $required" >&2
+    usage >&2
+    exit 2
+  fi
+done
+
+repo_root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
+cd "$repo_root"
+
+hub_revision=$(git rev-parse HEAD)
+# The Core revision is whatever Cargo.lock pins for the worker. Reading the pin
+# rather than introducing a second pinning mechanism is what keeps the coupling
+# real instead of asserted.
+core_revision=$(
+  awk '
+    /^name = "botster-core"$/ { in_core = 1; next }
+    in_core && /^source = / {
+      match($0, /#[0-9a-f]+/)
+      print substr($0, RSTART + 1, RLENGTH - 1)
+      exit
+    }
+  ' Cargo.lock
+)
+if [ -z "$core_revision" ]; then
+  echo "could not read the Cargo.lock-pinned botster-core revision" >&2
+  exit 1
+fi
+
+if [ -z "$VERSION" ]; then
+  VERSION=$(
+    awk '/^\[package\]$/ { in_package = 1; next }
+         in_package && /^version = / { gsub(/[",]/, "", $3); print $3; exit }' Cargo.toml
+  )
+fi
+
+echo "hub_revision=$hub_revision"
+echo "core_revision=$core_revision"
+echo "version=$VERSION"
+
+BOTSTER_BUILD_REVISION="$hub_revision" cargo build --locked --release
+cargo build --locked --release -p botster-core --bin botster-session-worker
+
+mkdir -p "$OUT_DIR"
+cp target/release/botster-hub "$OUT_DIR/botster-hub"
+cp target/release/botster-session-worker "$OUT_DIR/botster-session-worker"
+
+checksum() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | cut -d' ' -f1
+  else
+    shasum -a 256 "$1" | cut -d' ' -f1
+  fi
+}
+
+size_of() {
+  wc -c < "$1" | tr -d ' '
+}
+
+hub_sha=$(checksum "$OUT_DIR/botster-hub")
+hub_size=$(size_of "$OUT_DIR/botster-hub")
+worker_sha=$(checksum "$OUT_DIR/botster-session-worker")
+worker_size=$(size_of "$OUT_DIR/botster-session-worker")
+
+manifest="$OUT_DIR/install-manifest.json"
+cat > "$manifest" <<MANIFEST
+{
+  "product_id": "botster-hub",
+  "release_channel": "$CHANNEL",
+  "version": "$VERSION",
+  "build_revision": "$hub_revision",
+  "source_revisions": {
+    "botster_hub": "$hub_revision",
+    "botster_core": "$core_revision"
+  },
+  "artifacts": [
+    {
+      "name": "botster-hub",
+      "url": "$BASE_URL/botster-hub",
+      "size": $hub_size,
+      "sha256": "$hub_sha"
+    },
+    {
+      "name": "botster-session-worker",
+      "url": "$BASE_URL/botster-session-worker",
+      "size": $worker_size,
+      "sha256": "$worker_sha"
+    }
+  ]
+}
+MANIFEST
+
+cargo run --quiet -p botster-hub-installer --bin botster-hub-release-tool -- \
+  sign \
+  --key "$KEY" \
+  --key-id "$KEY_ID" \
+  --manifest "$manifest" \
+  --out "$OUT_DIR/botster-hub.json"
+
+echo "release_metadata=$OUT_DIR/botster-hub.json"
+echo "hub_sha256=$hub_sha"
+echo "worker_sha256=$worker_sha"
