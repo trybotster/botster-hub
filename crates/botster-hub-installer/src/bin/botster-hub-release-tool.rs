@@ -9,7 +9,7 @@
 //! an unmistakably-named test keypair; real key custody and a real HTTPS origin
 //! are a follow-up release ticket.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process;
 
 use base64::Engine as _;
@@ -76,6 +76,27 @@ fn option(parsed: &[(String, String)], name: &str) -> Result<String, String> {
         .ok_or_else(|| format!("--{name} is required\n{USAGE}"))
 }
 
+/// Create a file that must not already exist, with exact permission bits.
+///
+/// `create_new` makes the exclusivity a property of the open itself rather than
+/// of a preceding existence check, and `mode` is applied by the same call so the
+/// contents are never briefly visible at the umask default.
+fn write_new_file(path: &Path, contents: &str, mode: u32) -> Result<(), String> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .open(path)
+        .map_err(|error| format!("create {}: {error}", path.display()))?;
+    file.write_all(contents.as_bytes())
+        .map_err(|error| format!("write {}: {error}", path.display()))?;
+    file.sync_all()
+        .map_err(|error| format!("flush {}: {error}", path.display()))
+}
+
 fn generate_key(arguments: &[String]) -> Result<String, String> {
     let parsed = options(arguments)?;
     let out_dir = PathBuf::from(option(&parsed, "out-dir")?);
@@ -90,13 +111,37 @@ fn generate_key(arguments: &[String]) -> Result<String, String> {
     std::fs::create_dir_all(&out_dir).map_err(|error| format!("create {out_dir:?}: {error}"))?;
     let private = out_dir.join(format!("{name}.pkcs8"));
     let public = out_dir.join(format!("{name}.pub"));
-    std::fs::write(&private, format!("{}\n", BASE64.encode(document.as_ref())))
-        .map_err(|error| format!("write {private:?}: {error}"))?;
-    std::fs::write(
+
+    // Fail closed on either destination before writing anything. Silently
+    // replacing a keypair would destroy the trust relationship every already
+    // published release depends on, and it would do it with a zero exit code.
+    for existing in [&private, &public] {
+        if std::fs::symlink_metadata(existing).is_ok() {
+            return Err(format!(
+                "{} already exists; signing material is never replaced silently. Move or delete the existing keypair deliberately if you really mean to rotate it.",
+                existing.display()
+            ));
+        }
+    }
+
+    // `create_new` plus mode 0600 in one atomic open. Writing first and
+    // chmod-ing after would leave the private key world-readable for a window,
+    // and under a normal umask `fs::write` alone produces mode 0644.
+    write_new_file(
+        &private,
+        &format!("{}\n", BASE64.encode(document.as_ref())),
+        0o600,
+    )?;
+    if let Err(error) = write_new_file(
         &public,
-        format!("{}\n", BASE64.encode(pair.public_key().as_ref())),
-    )
-    .map_err(|error| format!("write {public:?}: {error}"))?;
+        &format!("{}\n", BASE64.encode(pair.public_key().as_ref())),
+        0o644,
+    ) {
+        // Never leave a private key behind without its public half; a partial
+        // pair is worse than no pair, because it looks usable.
+        let _ = std::fs::remove_file(&private);
+        return Err(error);
+    }
 
     Ok(format!(
         "private_key={}\npublic_key={}",

@@ -66,6 +66,27 @@ done
 repo_root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$repo_root"
 
+# Refuse a dirty checkout BEFORE building or signing anything.
+#
+# The manifest records source_revisions.botster_hub as HEAD and the receipt
+# repeats it, but cargo compiles the working tree. A modified or untracked
+# build-affecting file would therefore be compiled, checksummed, and signed while
+# the signed provenance claims only HEAD — making the one fact the receipt exists
+# to carry unauditable, and doing it under a valid signature.
+#
+# There is no --allow-dirty. A release whose bytes cannot be reproduced from the
+# revision it names is not a release.
+if ! git rev-parse --git-dir >/dev/null 2>&1; then
+  echo "release builds must run inside a git checkout so the built bytes can be tied to a revision" >&2
+  exit 1
+fi
+dirty=$(git status --porcelain)
+if [ -n "$dirty" ]; then
+  echo "refusing to build a release from a dirty checkout; the signed manifest would claim HEAD while the built bytes came from something else:" >&2
+  echo "$dirty" >&2
+  exit 1
+fi
+
 hub_revision=$(git rev-parse HEAD)
 # The Core revision is whatever Cargo.lock pins for the worker. Reading the pin
 # rather than introducing a second pinning mechanism is what keeps the coupling

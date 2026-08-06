@@ -26,6 +26,10 @@ use crate::error::{InstallerError, InstallerResult};
 pub const RUN_DEADLINE: Duration = Duration::from_secs(10);
 /// Bounded grace between TERM and KILL for the process group.
 const TERM_GRACE: Duration = Duration::from_millis(500);
+/// Bounded wait for the group to disappear after `SIGKILL`.
+const GROUP_KILL_GRACE: Duration = Duration::from_secs(2);
+/// Bounded wait for a drain reader to reach end of file.
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 /// Bound on captured output. Anything larger is rejected, not truncated: a
 /// binary that floods stdout is not one whose identity we should trust.
 pub const OUTPUT_LIMIT_BYTES: usize = 8 * 1024;
@@ -88,13 +92,24 @@ pub fn run_bounded(
         thread::sleep(POLL_INTERVAL);
     };
 
+    let group = child.id();
     let timed_out = status.is_none();
     if timed_out {
         terminate_group(&mut child);
     }
 
+    // The leader exiting proves nothing about its descendants, so the owned
+    // process group is swept on **every** path, not only the deadline path.
+    // This must happen before the drains are collected: a descendant holding an
+    // inherited pipe end is exactly what keeps a drain from reaching EOF.
+    let survivors = sweep_owned_group(group);
+
     let stdout = collect(stdout);
     let stderr = collect(stderr);
+    let stderr_text = stderr
+        .as_ref()
+        .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+        .unwrap_or_default();
 
     if timed_out {
         return Err(InstallerError::new(
@@ -106,6 +121,21 @@ pub fn run_bounded(
             ),
         ));
     }
+    if survivors {
+        return Err(InstallerError::new(
+            "staged_binary_left_descendants",
+            format!(
+                "{} exited but left processes alive in its own process group; they were terminated and the identity is rejected",
+                program.display()
+            ),
+        ));
+    }
+    // An unfinished drain is an explicit failure, not empty output. Returning
+    // empty here would let a probe that never finished writing be parsed as if
+    // it had, which is a silent wrong answer rather than a loud one.
+    let stdout = stdout.map_err(|()| unfinalized(program, "stdout"))?;
+    let stderr = stderr.map_err(|()| unfinalized(program, "stderr"))?;
+
     // Output size is checked *before* exit status on purpose. Once a drain
     // stops reading at the bound the child takes `EPIPE` and dies non-zero, so
     // checking status first would report the symptom and hide the cause.
@@ -122,14 +152,20 @@ pub fn run_bounded(
     if !status.success() {
         return Err(InstallerError::new(
             "staged_binary_failed",
-            format!(
-                "{} exited with {status}: {}",
-                program.display(),
-                String::from_utf8_lossy(&stderr)
-            ),
+            format!("{} exited with {status}: {stderr_text}", program.display()),
         ));
     }
     Ok(BoundedOutput { stdout, stderr })
+}
+
+fn unfinalized(program: &Path, stream: &str) -> InstallerError {
+    InstallerError::new(
+        "staged_binary_output_unfinalized",
+        format!(
+            "{} {stream} never reached end of file within the drain bound",
+            program.display()
+        ),
+    )
 }
 
 /// Parse `key=value` operator output into pairs, rejecting anything else.
@@ -177,10 +213,57 @@ fn spawn_drain(pipe: Option<impl Read + Send + 'static>) -> Option<mpsc::Receive
     Some(rx)
 }
 
-fn collect(drain: Option<mpsc::Receiver<Vec<u8>>>) -> Vec<u8> {
-    drain
-        .and_then(|rx| rx.recv_timeout(Duration::from_secs(2)).ok())
-        .unwrap_or_default()
+/// Collect a drain, distinguishing "finished" from "never reached EOF".
+///
+/// `Err(())` means the reader thread did not finish within the bound, which is
+/// a real failure to report rather than a reason to substitute empty output.
+fn collect(drain: Option<mpsc::Receiver<Vec<u8>>>) -> Result<Vec<u8>, ()> {
+    let Some(rx) = drain else {
+        return Ok(Vec::new());
+    };
+    rx.recv_timeout(DRAIN_TIMEOUT).map_err(|_| ())
+}
+
+/// Terminate and reap anything still alive in the process group we created.
+///
+/// A bounded *process tree* is the contract, and a child that forks a
+/// background process and exits zero satisfies a bounded-*child* check while
+/// leaving that descendant running. When the descendant also redirects its
+/// output, the drains reach EOF, the identity parses, and the probe looks
+/// entirely successful — which is precisely the branch a
+/// keep-the-child-alive-until-timeout test cannot reach.
+///
+/// `botster-hub version` must not fork, so survivors are grounds to reject the
+/// identity, not merely to clean up. Returns whether any were found.
+fn sweep_owned_group(group: u32) -> bool {
+    if !process_group_exists(group) {
+        return false;
+    }
+    // Group-only signalling here. The leader has already been reaped, so the
+    // `kill(pid, …)` fallback used on the deadline path could land on a recycled
+    // pid; `killpg` can only ever reach the group we created.
+    signal_group(group, libc::SIGTERM);
+    if wait_for_group_exit(group, TERM_GRACE) {
+        return true;
+    }
+    signal_group(group, libc::SIGKILL);
+    wait_for_group_exit(group, GROUP_KILL_GRACE);
+    true
+}
+
+fn signal_group(group: u32, signal: libc::c_int) {
+    unsafe { libc::killpg(group as libc::pid_t, signal) };
+}
+
+fn wait_for_group_exit(group: u32, grace: Duration) -> bool {
+    let deadline = Instant::now() + grace;
+    while Instant::now() < deadline {
+        if !process_group_exists(group) {
+            return true;
+        }
+        thread::sleep(POLL_INTERVAL);
+    }
+    !process_group_exists(group)
 }
 
 /// TERM the group, wait a bounded grace, then KILL, then reap the leader.
@@ -312,5 +395,91 @@ mod tests {
         let output = run_bounded(Path::new("/bin/sh"), &["-c", "echo ok=1"], RUN_DEADLINE)
             .expect("a second invocation through the same path still succeeds");
         assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "ok=1");
+    }
+
+    /// The branch a keep-the-child-alive-until-timeout test cannot reach.
+    ///
+    /// Here the direct child prints a perfectly valid identity, backgrounds a
+    /// descendant that redirects its own output — so both drains reach EOF and
+    /// nothing hangs — and exits zero. Every deadline, parse, and exit-status
+    /// check passes, and the descendant would still be running afterwards. Only
+    /// sweeping the owned process group on the success path catches it.
+    #[test]
+    fn a_descendant_backgrounded_by_a_successful_child_is_killed_and_rejects_the_identity() {
+        let pidfile = std::env::temp_dir().join(format!(
+            "botster-hub-installer-clean-exit-descendant-{}.pid",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&pidfile);
+        let script = format!(
+            "echo product_id=botster-hub; \
+             echo version=9.9.9; \
+             ( sleep 60 >/dev/null 2>&1 & echo $! > {} ); \
+             exit 0",
+            pidfile.display()
+        );
+
+        let error = run_bounded(Path::new("/bin/sh"), &["-c", &script], RUN_DEADLINE)
+            .expect_err("a probe that leaves its group populated must be rejected");
+        assert_eq!(error.kind(), "staged_binary_left_descendants");
+
+        let descendant: i32 = std::fs::read_to_string(&pidfile)
+            .expect("descendant recorded its pid")
+            .trim()
+            .parse()
+            .expect("descendant pid parses");
+        let _ = std::fs::remove_file(&pidfile);
+
+        let mut remaining = 100;
+        while remaining > 0 && unsafe { libc::kill(descendant, 0) } == 0 {
+            thread::sleep(POLL_INTERVAL);
+            remaining -= 1;
+        }
+        assert_ne!(
+            unsafe { libc::kill(descendant, 0) },
+            0,
+            "the exact descendant backgrounded by a cleanly exiting child must be gone"
+        );
+
+        let output = run_bounded(Path::new("/bin/sh"), &["-c", "echo ok=1"], RUN_DEADLINE)
+            .expect("a second invocation through the same path still succeeds");
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "ok=1");
+    }
+
+    /// The same sweep runs on the error path, so a nonzero exit cannot leave a
+    /// descendant behind either.
+    #[test]
+    fn a_descendant_backgrounded_by_a_failing_child_is_also_swept() {
+        let pidfile = std::env::temp_dir().join(format!(
+            "botster-hub-installer-failed-exit-descendant-{}.pid",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&pidfile);
+        let script = format!(
+            "( sleep 60 >/dev/null 2>&1 & echo $! > {} ); exit 7",
+            pidfile.display()
+        );
+
+        let error = run_bounded(Path::new("/bin/sh"), &["-c", &script], RUN_DEADLINE)
+            .expect_err("a failing probe that leaves its group populated must be rejected");
+        assert_eq!(error.kind(), "staged_binary_left_descendants");
+
+        let descendant: i32 = std::fs::read_to_string(&pidfile)
+            .expect("descendant recorded its pid")
+            .trim()
+            .parse()
+            .expect("descendant pid parses");
+        let _ = std::fs::remove_file(&pidfile);
+
+        let mut remaining = 100;
+        while remaining > 0 && unsafe { libc::kill(descendant, 0) } == 0 {
+            thread::sleep(POLL_INTERVAL);
+            remaining -= 1;
+        }
+        assert_ne!(
+            unsafe { libc::kill(descendant, 0) },
+            0,
+            "the descendant of a failing child must be gone too"
+        );
     }
 }
