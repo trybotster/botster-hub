@@ -1345,6 +1345,9 @@ fn entity_frame_subscription_id(frame: &DaemonEntityFrame) -> &str {
         }
         | DaemonEntityFrame::Remove {
             subscription_id, ..
+        }
+        | DaemonEntityFrame::Error {
+            subscription_id, ..
         } => subscription_id,
     }
 }

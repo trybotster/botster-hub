@@ -65,6 +65,21 @@ fn explicit_runtime(name: &str) -> HubRuntime {
 #[test]
 fn session_type_device_crud_is_authoritative_and_package_mutation_is_read_only() {
     let mut runtime = explicit_runtime("session-type-device-crud");
+    let config = runtime.config().clone();
+    let store = FileHubStateStore::for_data_directory(&config.data_directory);
+    store
+        .update(&config, |state| {
+            state.spawn_targets.push(SpawnTarget {
+                target_id: "repo:concurrent".to_string(),
+                label: "Concurrently persisted target".to_string(),
+                root: std::path::PathBuf::from("."),
+                enabled: false,
+                kind: "directory".to_string(),
+                base_ref: None,
+                metadata: BTreeMap::new(),
+            });
+        })
+        .expect("persist state after runtime loaded");
     let packages = PackageRegistry::new(Vec::<Capability>::new().into_iter().collect());
     let api = HubClientApi::local_operator("session-type-device-crud-client");
     let mut definition = session_type("bin/accessory.sh", "accessory");
@@ -93,6 +108,11 @@ fn session_type_device_crud_is_authoritative_and_package_mutation_is_read_only()
     assert!(created[0].editable);
     assert_eq!(created[0].role, "botster.accessory");
     assert_eq!(runtime.state().session_type_generation, 1);
+    assert_eq!(
+        runtime.state().spawn_targets[0].target_id,
+        "repo:concurrent",
+        "session type CRUD must mutate freshly loaded state without overwriting unrelated writes"
+    );
 
     definition.label = "Updated terminal accessory".to_string();
     api.handle_request(
@@ -911,6 +931,22 @@ fn session_type_sources_apply_device_repo_precedence_and_reload_from_state() {
         templates[0].diagnostics,
         vec!["overrides 2 lower-precedence definition(s)"]
     );
+    let listed = templates[0].clone();
+
+    let shown = api
+        .handle_request(
+            &mut runtime,
+            &packages,
+            HubClientRequest::ShowSessionType {
+                request_id: request_id("show-repo-template"),
+                session_type_id: "init".to_string(),
+            },
+        )
+        .expect("show repo override");
+    let HubClientResponseBody::SessionTypes(shown) = shown.body else {
+        panic!("shown session type expected");
+    };
+    assert_eq!(shown, vec![listed.clone()]);
 
     let resolved = api
         .handle_request(
@@ -933,6 +969,7 @@ fn session_type_sources_apply_device_repo_precedence_and_reload_from_state() {
         panic!("resolved session type expected");
     };
     assert_eq!(resolved.session_type.source, "repo");
+    assert_eq!(resolved.session_type, listed);
     assert_eq!(
         resolved.executable,
         repo_root.join("bin/repo.sh").display().to_string()

@@ -14630,6 +14630,102 @@ fn session_type_crud_pushes_authoritative_entity_deltas_without_polling() {
     shutdown_cli_daemon(&data_dir, child);
 }
 
+#[test]
+fn spawn_target_admission_pushes_repo_session_type_deltas_without_polling() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_short_test_dir("session-type-target-admission");
+    let repo_dir = data_dir.join("admitted-repo");
+    fs::create_dir_all(repo_dir.join(".botster")).expect("create admitted repo fixture");
+    fs::write(
+        repo_dir.join(".botster/session-types.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "session_types": [{
+                "id": "repo-agent",
+                "label": "Repo agent",
+                "role": "botster.agent",
+                "interaction": "interactive",
+                "lifecycle": "task",
+                "command": "bin/agent"
+            }]
+        }))
+        .expect("serialize repo session type"),
+    )
+    .expect("write repo session type");
+    let repo_dir = repo_dir.canonicalize().expect("canonical admitted repo");
+    let config = explicit_config(&data_dir);
+    let endpoint = botster_hub_client::DaemonEndpoint::new(
+        config
+            .transports
+            .local_socket
+            .as_ref()
+            .expect("test config has local socket")
+            .path
+            .clone(),
+    );
+    let child = start_cli_daemon(&data_dir);
+    let mut subscription = botster_hub_client::subscribe_entities(
+        &endpoint,
+        "session_type",
+        "session-type-target-admission",
+    )
+    .expect("subscribe before target admission");
+    subscription
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("bound target admission entity reads");
+    assert!(matches!(
+        subscription.next_frame().expect("initial empty snapshot"),
+        botster_hub_client::DaemonEntityFrame::Snapshot {
+            snapshot_seq: 0,
+            ref items,
+            ..
+        } if items.is_empty()
+    ));
+
+    botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::CreateSpawnTarget {
+            target_id: Some("repo:admitted".to_string()),
+            label: Some("Admitted repo".to_string()),
+            root: repo_dir,
+            enabled: true,
+            kind: Some("directory".to_string()),
+            base_ref: None,
+            metadata: BTreeMap::new(),
+        },
+    )
+    .expect("admit repo target through public socket");
+    assert!(matches!(
+        subscription.next_frame().expect("repo definition upsert"),
+        botster_hub_client::DaemonEntityFrame::Upsert {
+            snapshot_seq: 1,
+            ref id,
+            ref entity,
+            ..
+        } if id == "repo:admitted/repo-agent"
+            && entity["source"] == "repo"
+            && entity["target_id"] == "repo:admitted"
+    ));
+
+    botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::DeleteSpawnTarget {
+            target_id: "repo:admitted".to_string(),
+        },
+    )
+    .expect("delete repo target through public socket");
+    assert!(matches!(
+        subscription.next_frame().expect("repo definition remove"),
+        botster_hub_client::DaemonEntityFrame::Remove {
+            snapshot_seq: 2,
+            ref id,
+            ..
+        } if id == "repo:admitted/repo-agent"
+    ));
+
+    drop(subscription);
+    shutdown_cli_daemon(&data_dir, child);
+}
+
 fn wait_for_session_type_metadata(
     subscription: &mut botster_hub_client::DaemonEntitySubscription,
     session_id: &str,

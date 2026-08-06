@@ -22,7 +22,7 @@ mod typescript;
 
 pub const PROTOCOL: &str = "botster-hub-daemon-v1";
 pub const PROTOCOL_VERSION: u16 = 6;
-pub const CONFORMANCE_FIXTURE_REVISION: u16 = 30;
+pub const CONFORMANCE_FIXTURE_REVISION: u16 = 31;
 /// Version of the local WebRTC delivery chunk framing protocol.
 pub const LOCAL_WEBRTC_DELIVERY_CHUNK_VERSION: u16 = 2;
 /// Serialized local WebRTC delivery frames must remain strictly below this size.
@@ -1985,6 +1985,13 @@ pub enum DaemonEntityFrame {
         snapshot_seq: u64,
         id: String,
     },
+    #[serde(rename = "entity_error")]
+    Error {
+        subscription_id: String,
+        entity_type: String,
+        code: String,
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2336,7 +2343,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     #[test]
-    fn session_entity_frames_round_trip_existing_wire_vocabulary() {
+    fn entity_frames_round_trip_canonical_wire_vocabulary() {
         let entity = DaemonSessionEntity {
             session_uuid: "session".to_string(),
             registry_state: "running".to_string(),
@@ -2381,6 +2388,12 @@ mod tests {
                 entity_type: "session".to_string(),
                 snapshot_seq: 4,
                 id: "session".to_string(),
+            },
+            DaemonEntityFrame::Error {
+                subscription_id: "subscription".to_string(),
+                entity_type: "session_type".to_string(),
+                code: "entity_provider_frame_too_large".to_string(),
+                message: "session type snapshot exceeds daemon frame limit".to_string(),
             },
         ];
 
@@ -3657,7 +3670,7 @@ mod tests {
             let value = serde_json::to_value(&request).expect("request serializes");
 
             assert_eq!(value["type"], expected_tag);
-            assert_generated_union_variant_fields("DaemonRequest", expected_tag, &value);
+            assert_generated_union_variant_fields("DaemonRequest", "type", expected_tag, &value);
 
             let round_tripped: DaemonRequest =
                 serde_json::from_value(value).expect("request deserializes");
@@ -3692,7 +3705,7 @@ mod tests {
             let value = serde_json::to_value(&event).expect("event serializes");
 
             assert_eq!(value["type"], expected_tag);
-            assert_generated_union_variant_fields("DaemonEvent", expected_tag, &value);
+            assert_generated_union_variant_fields("DaemonEvent", "type", expected_tag, &value);
 
             let round_tripped: DaemonEvent =
                 serde_json::from_value(value).expect("event deserializes");
@@ -3898,11 +3911,70 @@ mod tests {
         fields
     }
 
-    fn assert_generated_union_variant_fields(union_name: &str, tag: &str, value: &Value) {
+    #[test]
+    fn session_type_tagged_unions_are_serde_stable_and_generated() {
+        let sources = [
+            DaemonSessionTypeMutationSource::Device,
+            DaemonSessionTypeMutationSource::Repo {
+                target_id: "target-1".to_string(),
+            },
+            DaemonSessionTypeMutationSource::Package {
+                package_name: "botster.example".to_string(),
+            },
+        ];
+        for source in sources {
+            let value = serde_json::to_value(&source).expect("mutation source serializes");
+            let tag = value["source"]
+                .as_str()
+                .expect("mutation source has source discriminator");
+            assert_generated_union_variant_fields(
+                "DaemonSessionTypeMutationSource",
+                "source",
+                tag,
+                &value,
+            );
+            assert_eq!(
+                serde_json::from_value::<DaemonSessionTypeMutationSource>(value)
+                    .expect("mutation source deserializes"),
+                source
+            );
+        }
+
+        let policies = [
+            DaemonSessionTypeWorkingDirectory::PackageRoot,
+            DaemonSessionTypeWorkingDirectory::Relative {
+                path: "subdir".to_string(),
+            },
+        ];
+        for policy in policies {
+            let value = serde_json::to_value(&policy).expect("working directory serializes");
+            let tag = value["policy"]
+                .as_str()
+                .expect("working directory has policy discriminator");
+            assert_generated_union_variant_fields(
+                "DaemonSessionTypeWorkingDirectory",
+                "policy",
+                tag,
+                &value,
+            );
+            assert_eq!(
+                serde_json::from_value::<DaemonSessionTypeWorkingDirectory>(value)
+                    .expect("working directory deserializes"),
+                policy
+            );
+        }
+    }
+
+    fn assert_generated_union_variant_fields(
+        union_name: &str,
+        discriminator: &str,
+        tag: &str,
+        value: &Value,
+    ) {
         let object = value
             .as_object()
             .unwrap_or_else(|| panic!("{union_name}::{tag} serde example should be an object"));
-        let variant = generated_union_variant(union_name, tag);
+        let variant = generated_union_variant(union_name, discriminator, tag);
         for key in object.keys() {
             assert!(
                 variant.contains(&format!("; {key}:"))
@@ -3926,10 +3998,20 @@ mod tests {
         rest[..end + 3].to_string()
     }
 
-    fn generated_union_variant(union_name: &str, tag: &str) -> String {
-        daemon_protocol_typescript()
+    fn generated_union_variant(union_name: &str, discriminator: &str, tag: &str) -> String {
+        let generated = daemon_protocol_typescript();
+        let start = generated
+            .find(&format!("export type {union_name} ="))
+            .unwrap_or_else(|| panic!("generated TypeScript should include {union_name}"));
+        generated[start..]
             .lines()
-            .find(|line| line.contains(&format!("type: \"{tag}\"")))
+            .take_while(|line| !line.trim_end().ends_with(';'))
+            .chain(
+                generated[start..]
+                    .lines()
+                    .find(|line| line.trim_end().ends_with(';')),
+            )
+            .find(|line| line.contains(&format!("{discriminator}: \"{tag}\"")))
             .unwrap_or_else(|| {
                 panic!("generated TypeScript {union_name} should include variant {tag}")
             })
@@ -4994,9 +5076,9 @@ mod tests {
     }
 
     #[test]
-    fn protocol_six_and_conformance_thirty_define_the_cold_cut_boundary() {
+    fn protocol_six_and_conformance_thirty_one_define_the_cold_cut_boundary() {
         assert_eq!(PROTOCOL_VERSION, 6);
-        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 30);
+        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 31);
 
         let requirement = DaemonCompatibilityRequirement::current();
         let protocol_error = ensure_compatible(

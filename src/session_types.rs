@@ -392,7 +392,8 @@ pub fn materialize_session_type(
     session_type_id: &str,
     request: SessionTypeRequest,
 ) -> SessionTypeResult<MaterializedSessionType> {
-    let source = find_source_session_type(records, state, session_type_id)?;
+    let (source, effective_row) =
+        find_source_session_type_with_row(records, state, session_type_id)?;
     if !source.available {
         return Err(SessionTypeError::new(
             "session_type_unavailable",
@@ -466,7 +467,7 @@ pub fn materialize_session_type(
     );
     inject_context_environment(config, &mut environment, &session_id, &context_id);
 
-    let row = session_type_row_from_source(&source);
+    let row = effective_row;
     let metadata = session_type_metadata(&row);
     let resolved = ResolvedSessionType {
         session_type: row,
@@ -518,7 +519,8 @@ pub(crate) fn materialize_managed_session_type(
     request: ManagedSessionTypeRequest,
     ensured: &EnsuredManagedWorktree,
 ) -> SessionTypeResult<MaterializedSessionType> {
-    let source = find_source_session_type(records, state, session_type_id)?;
+    let (source, effective_row) =
+        find_source_session_type_with_row(records, state, session_type_id)?;
     if !source.available {
         return Err(SessionTypeError::new(
             "session_type_unavailable",
@@ -603,7 +605,7 @@ pub(crate) fn materialize_managed_session_type(
     } else {
         &source.root
     };
-    let row = session_type_row_from_source(&source);
+    let row = effective_row;
     let metadata = session_type_metadata(&row);
     let resolved = ResolvedSessionType {
         session_type: row,
@@ -679,8 +681,7 @@ pub fn show_session_type(
     state: &HubState,
     session_type_id: &str,
 ) -> SessionTypeResult<HubSessionType> {
-    find_source_session_type(records, state, session_type_id)
-        .map(|source| session_type_row_from_source(&source))
+    find_source_session_type_with_row(records, state, session_type_id).map(|(_, row)| row)
 }
 
 fn session_type_row_from_source(source: &SourceSessionType) -> HubSessionType {
@@ -727,22 +728,7 @@ fn effective_session_type_rows(
         .into_values()
         .map(|sources| {
             let winner = choose_effective_session_type(sources.clone())?;
-            let mut row = session_type_row_from_source(&winner);
-            row.overridden_sources = sources
-                .iter()
-                .filter(|source| source.rank < winner.rank)
-                .map(|source| HubSessionTypeSource {
-                    kind: source.source.clone(),
-                    name: source.source_name.clone(),
-                })
-                .collect();
-            if !row.overridden_sources.is_empty() {
-                row.diagnostics.push(format!(
-                    "overrides {} lower-precedence definition(s)",
-                    row.overridden_sources.len()
-                ));
-            }
-            Ok(row)
+            Ok(effective_session_type_row(&winner, &sources))
         })
         .collect()
 }
@@ -793,11 +779,11 @@ fn source_default_target_id(source: &SourceSessionType) -> String {
         })
 }
 
-fn find_source_session_type(
+fn find_source_session_type_with_row(
     records: &[&PackageRecord],
     state: &HubState,
     session_type_id: &str,
-) -> SessionTypeResult<SourceSessionType> {
+) -> SessionTypeResult<(SourceSessionType, HubSessionType)> {
     let sources = source_session_types(records, state)?;
     let matches = sources
         .into_iter()
@@ -806,7 +792,31 @@ fn find_source_session_type(
                 || source_session_type_id(source) == session_type_id
         })
         .collect::<Vec<_>>();
-    choose_effective_session_type(matches)
+    let winner = choose_effective_session_type(matches.clone())?;
+    let row = effective_session_type_row(&winner, &matches);
+    Ok((winner, row))
+}
+
+fn effective_session_type_row(
+    winner: &SourceSessionType,
+    sources: &[SourceSessionType],
+) -> HubSessionType {
+    let mut row = session_type_row_from_source(winner);
+    row.overridden_sources = sources
+        .iter()
+        .filter(|source| source.rank < winner.rank)
+        .map(|source| HubSessionTypeSource {
+            kind: source.source.clone(),
+            name: source.source_name.clone(),
+        })
+        .collect();
+    if !row.overridden_sources.is_empty() {
+        row.diagnostics.push(format!(
+            "overrides {} lower-precedence definition(s)",
+            row.overridden_sources.len()
+        ));
+    }
+    row
 }
 
 fn choose_effective_session_type(

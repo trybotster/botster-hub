@@ -7361,11 +7361,12 @@ mod tests {
         let sequences = scenario
             .normalized_frames
             .iter()
-            .map(|frame| match frame {
+            .filter_map(|frame| match frame {
                 DaemonEntityFrame::Snapshot { snapshot_seq, .. }
                 | DaemonEntityFrame::Upsert { snapshot_seq, .. }
                 | DaemonEntityFrame::Patch { snapshot_seq, .. }
-                | DaemonEntityFrame::Remove { snapshot_seq, .. } => *snapshot_seq,
+                | DaemonEntityFrame::Remove { snapshot_seq, .. } => Some(*snapshot_seq),
+                DaemonEntityFrame::Error { .. } => None,
             })
             .collect::<Vec<_>>();
 
@@ -7475,6 +7476,7 @@ mod tests {
                     botster_hub_client::FEATURE_WORKTREES,
                     botster_hub_client::FEATURE_TERMINAL_READBACK,
                     botster_hub_client::FEATURE_SESSION_ENTITY_SUBSCRIPTIONS,
+                    botster_hub_client::FEATURE_SESSION_TYPE_ENTITY_SUBSCRIPTIONS,
                     botster_hub_client::FEATURE_PLUGIN_ENTITY_SUBSCRIPTIONS,
                 ],
                 "supported_features": [
@@ -7489,6 +7491,7 @@ mod tests {
                     botster_hub_client::FEATURE_WORKTREES,
                     botster_hub_client::FEATURE_TERMINAL_READBACK,
                     botster_hub_client::FEATURE_SESSION_ENTITY_SUBSCRIPTIONS,
+                    botster_hub_client::FEATURE_SESSION_TYPE_ENTITY_SUBSCRIPTIONS,
                     botster_hub_client::FEATURE_PLUGIN_ENTITY_SUBSCRIPTIONS,
                 ],
                 "diagnostic_kinds": [

@@ -90,7 +90,7 @@ pub struct HubRuntime {
 
 type SharedCoreDaemon = Mutex<CoreDaemon>;
 type SharedSessionContexts = Arc<Mutex<BTreeMap<String, HubSessionContext>>>;
-const SESSION_TEMPLATE_SPAWN_TIMEOUT_MS: u64 = 30_000;
+const SESSION_TYPE_SPAWN_TIMEOUT_MS: u64 = 30_000;
 const PLUGIN_EVENT_TIMEOUT_MS: u64 = 1_000;
 
 /// Shared hub-owned session-type spawn bridge exposed to Lua plugin workers.
@@ -357,15 +357,23 @@ impl HubRuntime {
         source: SessionTypeMutationSource,
         mutation: SessionTypeMutation,
     ) -> Result<HubState, SessionTypeError> {
-        let next = mutate_session_type(&self.config, &self.state(), source, mutation)?;
-        FileHubStateStore::for_data_directory(&self.config.data_directory)
-            .save(&next)
+        let mut mutation_result = None;
+        let next = FileHubStateStore::for_data_directory(&self.config.data_directory)
+            .update(&self.config, |state| {
+                let result =
+                    mutate_session_type(&self.config, state, source.clone(), mutation.clone());
+                if let Ok(next) = &result {
+                    *state = next.clone();
+                }
+                mutation_result = Some(result);
+            })
             .map_err(|_| {
                 SessionTypeError::new(
                     "session_type_state_write_failed",
                     "session type state could not be persisted",
                 )
             })?;
+        mutation_result.expect("state update closure always records a mutation result")?;
         self.replace_state(next.clone());
         Ok(next)
     }
@@ -699,7 +707,7 @@ impl HubRuntime {
         let request = PluginInvocationRequest {
             request_id: RequestId(format!("mcp-tool-{}", call.name)),
             handler,
-            timeout_ms: SESSION_TEMPLATE_SPAWN_TIMEOUT_MS,
+            timeout_ms: SESSION_TYPE_SPAWN_TIMEOUT_MS,
             context: botster_core::PluginInvocationContext {
                 client_id: None,
                 session_id: None,
@@ -1265,7 +1273,7 @@ impl HubRuntime {
         let outcome = self.invoke_plugin(PluginInvocationRequest {
             request_id,
             handler,
-            timeout_ms: SESSION_TEMPLATE_SPAWN_TIMEOUT_MS,
+            timeout_ms: SESSION_TYPE_SPAWN_TIMEOUT_MS,
             context: botster_core::PluginInvocationContext {
                 client_id: None,
                 session_id: None,
@@ -1317,7 +1325,7 @@ impl HubRuntime {
                 kind: PluginHandlerKind::UiAction,
                 ..handler
             },
-            timeout_ms: SESSION_TEMPLATE_SPAWN_TIMEOUT_MS,
+            timeout_ms: SESSION_TYPE_SPAWN_TIMEOUT_MS,
             context: botster_core::PluginInvocationContext {
                 client_id: None,
                 session_id: None,
@@ -1916,7 +1924,7 @@ impl HubSessionTypeSpawner {
         }
 
         receiver
-            .recv_timeout(Duration::from_millis(SESSION_TEMPLATE_SPAWN_TIMEOUT_MS))
+            .recv_timeout(Duration::from_millis(SESSION_TYPE_SPAWN_TIMEOUT_MS))
             .map_err(|_| "session-type spawn did not complete before timeout".to_string())?
     }
 
@@ -1972,7 +1980,7 @@ impl HubSessionTypeSpawner {
                 response,
             });
         receiver
-            .recv_timeout(Duration::from_millis(SESSION_TEMPLATE_SPAWN_TIMEOUT_MS))
+            .recv_timeout(Duration::from_millis(SESSION_TYPE_SPAWN_TIMEOUT_MS))
             .map_err(|_| "session-type read did not complete before timeout".to_string())?
     }
 
@@ -2011,7 +2019,7 @@ impl HubSessionTypeSpawner {
         });
         drop(managed);
         receiver
-            .recv_timeout(Duration::from_millis(SESSION_TEMPLATE_SPAWN_TIMEOUT_MS))
+            .recv_timeout(Duration::from_millis(SESSION_TYPE_SPAWN_TIMEOUT_MS))
             .map_err(|_| {
                 ManagedGitError::new(
                     "ensure_timed_out",
