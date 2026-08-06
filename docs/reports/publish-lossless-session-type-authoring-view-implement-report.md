@@ -249,20 +249,32 @@ client-API test pins the full published `session_type` row key set and asserts
   wired into `./test.sh` or CI. The install was done to run the smoke and then
   removed, so the branch carries no `package-lock.json` or `node_modules`.
 
-## Missing vault guidance discovered
+## Vault guidance that already covered the false green
 
-0. **A workspace-root package with no `default-members` makes bare `cargo test` a
-   false green.** This branch reported a passing "workspace" gate that had never
-   executed a single sibling-crate test, and it took Review to catch it. `main`
-   `c4f217a` fixed the wrapper with a load-bearing comment, but the underlying
-   trap — a repo whose root is both the workspace and a member — is not captured
-   anywhere and is not specific to this repository. It is also a sharpening of
-   [[adding a hub client feature constant is a three site change]], which already
-   says "bare `./test.sh` is the right gate for `CONFORMANCE_FIXTURE_REVISION`
-   changes": that advice was correct in intent but, on the old wrapper, did not
-   deliver what it promised. Worth a gotcha note including the symptom (test
-   binaries compile, target count is suspiciously low) and the check
-   (`cargo test --workspace`, and count the `Running` lines).
+The workspace test-scope trap behind the round-2 blocker is **already captured**,
+and an earlier draft of this report wrongly claimed it was not. Correcting that
+here rather than leaving a false gap claim in a durable artifact
+(`finding_1786051724_703118`):
+
+- [[a root package workspace silently scopes cargo test to one package]] is the
+  exact note. It states the mechanism (root manifest carrying both `[workspace]`
+  and `[package]` with no `default-members`), the misleading symptom (members
+  compile, and `clippy --workspace` still lints them, while their test binaries
+  never execute), the reliable evidence (the command's `Running` target list, not
+  the aggregate pass count), and the fix (`cargo test --workspace "$@"` in the
+  wrapper). This run is a second instance validating it: my round-1 evidence cited
+  an aggregate "412 passed" total for exactly the reason the note warns against.
+- [[botster hub test sh was not workspace equivalent before b64bb9b]] records this
+  repository's incident specifically, which is why `main` `c4f217a` exists.
+- [[test counts must be extracted from the cited command log]] is the discipline I
+  failed: aggregate arithmetic reported omitted member tests as part of the
+  standard gate.
+
+Nothing new needs capturing for this trap. The practical lesson for me is that
+these notes were reachable and I did not consult them before asserting a
+workspace-scope claim; the three entries below are the genuinely uncaptured ones.
+
+## Missing vault guidance discovered
 
 1. **Wholesale-replacement mutations require a lossless authoring read.** The
    general shape — a sanitized projection plus a replace-everything update is a
