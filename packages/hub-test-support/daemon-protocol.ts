@@ -75,6 +75,7 @@ export type DaemonRequest =
   | { type: "capture_snapshot"; session_id: string }
   | { type: "list_session_types" }
   | { type: "show_session_type"; session_type_id: string }
+  | { type: "show_session_type_definition"; session_type_id: string }
   | { type: "create_session_type"; source: DaemonSessionTypeMutationSource; definition: DaemonSessionTypeDefinition }
   | { type: "update_session_type"; source: DaemonSessionTypeMutationSource; definition: DaemonSessionTypeDefinition }
   | { type: "delete_session_type"; source: DaemonSessionTypeMutationSource; session_type_id: string }
@@ -130,6 +131,7 @@ export interface DaemonResponse {
   status: DaemonStatus | null;
   sessions: DaemonSession[];
   session_types?: DaemonSessionType[];
+  session_type_definition?: DaemonSessionTypeEditableDefinition | null;
   resolved_session_type?: DaemonResolvedSessionType | null;
   session_context?: DaemonSessionContext | null;
   read_screen?: DaemonReadScreen | null;
@@ -216,6 +218,7 @@ export type DaemonResponseKind =
   | "spawned"
   | "events"
   | "session_types"
+  | "session_type_definition"
   | "resolved_session_type"
   | "session_context"
   | "read_screen"
@@ -380,6 +383,12 @@ export interface DaemonSessionTypeDefinition {
 export interface DaemonSessionTypeSource {
   kind: string;
   name: string;
+}
+
+export interface DaemonSessionTypeEditableDefinition {
+  session_type_id: string;
+  source: DaemonSessionTypeMutationSource;
+  definition: DaemonSessionTypeDefinition;
 }
 
 export interface DaemonSessionType {

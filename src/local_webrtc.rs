@@ -1358,6 +1358,7 @@ fn response_with_diagnostic(diagnostic: DaemonDiagnostic) -> DaemonResponse {
         status: None,
         sessions: Vec::new(),
         session_types: Vec::new(),
+        session_type_definition: None,
         resolved_session_type: None,
         session_context: None,
         read_screen: None,

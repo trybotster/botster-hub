@@ -134,6 +134,18 @@ pub struct HubSessionType {
     pub available: bool,
 }
 
+/// Authored session_type definition exposed to a caller permitted to edit it.
+///
+/// Unlike [`HubSessionType`], which is sanitized for every subscriber, this
+/// carries the authored working-directory policy *and* path plus the authored
+/// environment — exactly the payload [`SessionTypeMutation::Update`] consumes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HubSessionTypeDefinition {
+    pub session_type_id: String,
+    pub source: SessionTypeMutationSource,
+    pub definition: PackageSessionType,
+}
+
 /// Resolved session_type DTO exposed before spawn.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedSessionType {
@@ -682,6 +694,43 @@ pub fn show_session_type(
     session_type_id: &str,
 ) -> SessionTypeResult<HubSessionType> {
     find_source_session_type_with_row(records, state, session_type_id).map(|(_, row)| row)
+}
+
+/// Return the authored definition backing one editable session_type.
+///
+/// The sanitized [`HubSessionType`] row derives a working-directory policy string
+/// and omits the authored environment, so a client that reads a row and submits it
+/// through [`SessionTypeMutation::Update`] — which replaces the definition
+/// wholesale — silently drops both. This read returns exactly what `Update`
+/// consumes, so a read-modify-write edit is lossless. Package-owned ids are
+/// refused with the same error kind [`mutate_session_type`] returns, so
+/// package-authored environments are never exposed.
+pub fn show_session_type_definition(
+    records: &[&PackageRecord],
+    state: &HubState,
+    session_type_id: &str,
+) -> SessionTypeResult<HubSessionTypeDefinition> {
+    let (source, row) = find_source_session_type_with_row(records, state, session_type_id)?;
+    let mutation_source = match source.rank {
+        SessionTypeSourceRank::Device => SessionTypeMutationSource::Device,
+        SessionTypeSourceRank::Repo => SessionTypeMutationSource::Repo {
+            target_id: source.source_name.clone(),
+        },
+        SessionTypeSourceRank::Package => {
+            return Err(SessionTypeError::new(
+                "read_only_session_type_source",
+                format!(
+                    "package session types are read-only: {}",
+                    source.source_name
+                ),
+            ));
+        }
+    };
+    Ok(HubSessionTypeDefinition {
+        session_type_id: row.session_type_id,
+        source: mutation_source,
+        definition: source.session_type,
+    })
 }
 
 fn session_type_row_from_source(source: &SourceSessionType) -> HubSessionType {
