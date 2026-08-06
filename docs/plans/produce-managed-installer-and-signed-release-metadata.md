@@ -637,7 +637,13 @@ evidence, not waved through.
    executables verifies; the read-only reporter does not" is a reusable
    allocation rule, and a counterweight to reflexively adding verification
    everywhere.
-4. Possible extension of
+4. **Fields duplicated across a signed/unsigned boundary need an explicit
+   equality rule.** Found by Plan Review on this ticket: without it, a validly
+   signed *old* payload can be wrapped in an unsigned envelope advertising
+   something newer, and signature verification still passes. Probably the most
+   transferable item here, because the hole recurs anywhere a signed payload sits
+   inside an unsigned wrapper.
+5. Possible extension of
    [[lorester production installs revision coupled cli and worker with a build receipt]]
    to cover Botster Hub, since this makes the Hub the second product installing a
    revision-coupled CLI/worker pair with a provenance receipt.
