@@ -3,10 +3,48 @@
 - Target repository: `trybotster/botster-hub`
 - Target id: `tgt_7e208a0c76a44980a83b63af976b1f22`
 - Ticket / run: `ticket_1786039258_173310` / `run_1786042047_208281`
-- Branch base: `origin/main` at `8a60bd58841179f8b1fd4040d9362d18ea244230`
-  (`HEAD`, `origin/main`, and `merge-base` were all identical at implementation time).
+- Branch base: `origin/main` at `b64bb9bdac587a2f3815fb58d4228beafcf8692a`
+  (rebased from `8a60bd5` after Review; see "Review round 2" below).
 - Plan followed: `docs/plans/publish-lossless-session-type-authoring-view.md`
   (revision 2, approved by `review_1786043613_956773`).
+
+## Review round 2 — blocker resolved
+
+`review_1786050793_126679` raised one blocker,
+`finding_1786050793_710073`, and it was correct on both counts.
+
+`first_party_client_support_matrix()` gained a `session_type_authoring` object,
+but `tests::support_matrix_serializes_to_stable_json_shape` still compared
+against an expected `json!` literal that had no such field, so the guard
+rejected the new section.
+
+The reason it was not caught is the more important half. On the previous base
+`8a60bd5`, `test.sh` ran a bare `cargo test`. The workspace root is itself a
+package and declares no `default-members`, so that command tests **only the root
+package**: every sibling crate's test binary compiled but never executed. The
+first report's "412 passed" was therefore a root-package-only result presented as
+a workspace gate — a false green. `crates/botster-hub-test-support` and
+`crates/botster-hub-client` unit tests, including two this branch added or
+renamed, were never run.
+
+Fix applied:
+
+1. Added the source-derived `session_type_authoring` shape to the expected stable
+   JSON literal in `crates/botster-hub-test-support/src/lib.rs`.
+2. Rebased onto current `main` `b64bb9b`, whose `c4f217a` corrects `test.sh` to
+   `cargo test --workspace` so the wrapper actually executes every member.
+
+Reviewer's exact reproduction command now passes:
+`cargo test -p botster-hub-test-support support_matrix_serializes_to_stable_json_shape -- --nocapture`
+→ 1 passed, exit 0 (it failed at `lib.rs:7606` with exit 101 before).
+
+All gates below were rerun on the rebased tree under the corrected wrapper. The
+real workspace run is **28 targets, 657 passed, 0 failed, 1 pre-existing
+ignored** — versus the 12 targets and 412 the old wrapper reached. The
+red-on-revert ablation was also re-executed after the rebase and still goes red.
+
+Conformance revision 32 remains unique: `main` at `b64bb9b` is still at 31, and
+the newest published `@trybotster/hub-test-support@0.1.24` still reports 31.
 
 ## Guidance applied
 
@@ -137,9 +175,14 @@ decisions, scope, and acceptance checks still hold as written.
 
 All commands run from the run worktree.
 
+All commands below were run on the rebased tree at base `b64bb9b`, under the
+corrected `cargo test --workspace` wrapper.
+
 | Gate | Command | Result |
 | --- | --- | --- |
-| Workspace suite (required: conformance revision moved) | `./test.sh` | exit 0 — 412 passed, 0 failed, 1 pre-existing ignored, across 12 targets |
+| Workspace suite (required: conformance revision moved) | `./test.sh` | exit 0 — 657 passed, 0 failed, 1 pre-existing ignored, across 28 targets |
+| Blocker reproduction | `cargo test -p botster-hub-test-support support_matrix_serializes_to_stable_json_shape -- --nocapture` | exit 0, 1 passed (was exit 101 before the fix) |
+| Sibling crates the old wrapper skipped | `cargo test -p botster-hub-client` | exit 0, 54 passed |
 | Strict lints | `cargo clippy --workspace --all-targets -- -D warnings` | exit 0 |
 | Format | `cargo fmt --check` | exit 0 |
 | Generated artifact drift | `cargo run -p botster-hub-client --example generate_typescript -- --check` | exit 0 |
@@ -182,7 +225,9 @@ client-API test pins the full published `session_type` row key set and asserts
   registry. Downstream consumers get the new types only after
   `ticket_1786042460_231768` allocates and publishes a coordinate above 0.1.24.
   Registry-install proof of the *new* content is that ticket's gate, not this one.
-- **Revision uniqueness is a merge-time property.** 32 was verified unique
+- **Revision uniqueness is a merge-time property.** 32 was re-verified unique
+  after the rebase (`main` `b64bb9b` is at 31, published 0.1.24 is at 31), but 32
+  was verified unique
   against published 0.1.24 and against `origin/main` at implementation time. A
   sibling Hub branch could still claim 32 for different bytes before merge;
   recheck at merge per
@@ -205,6 +250,19 @@ client-API test pins the full published `session_type` row key set and asserts
   removed, so the branch carries no `package-lock.json` or `node_modules`.
 
 ## Missing vault guidance discovered
+
+0. **A workspace-root package with no `default-members` makes bare `cargo test` a
+   false green.** This branch reported a passing "workspace" gate that had never
+   executed a single sibling-crate test, and it took Review to catch it. `main`
+   `c4f217a` fixed the wrapper with a load-bearing comment, but the underlying
+   trap — a repo whose root is both the workspace and a member — is not captured
+   anywhere and is not specific to this repository. It is also a sharpening of
+   [[adding a hub client feature constant is a three site change]], which already
+   says "bare `./test.sh` is the right gate for `CONFORMANCE_FIXTURE_REVISION`
+   changes": that advice was correct in intent but, on the old wrapper, did not
+   deliver what it promised. Worth a gotcha note including the symptom (test
+   binaries compile, target count is suspiciously low) and the check
+   (`cargo test --workspace`, and count the `Running` lines).
 
 1. **Wholesale-replacement mutations require a lossless authoring read.** The
    general shape — a sanitized projection plus a replace-everything update is a
