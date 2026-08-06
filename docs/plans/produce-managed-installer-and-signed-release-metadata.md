@@ -99,6 +99,34 @@ All accepted. The first is a design change, not a wording fix:
   Renamed to `signed_manifest_sha256` and defined as the digest of the exact
   bytes passed to Ed25519 verification.
 
+## Third revision after Plan Review
+
+`review_1786038724_991747` returned changes required with four findings. All
+accepted. Three were fixed directly; the fourth was a scope fork resolved by
+`question_1786038859_466233`:
+
+- **The atomic switch was not durably committed (high).** `renameat` is atomic to
+  a live observer, but the plan claimed power-loss safety while never `fsync`ing
+  the artifacts, the staged generation, `generations`, or the pointer's parent.
+  The receipt write had that discipline; the generation switch did not. Full
+  sequence now specified — and the guarantee is now stated at its true strength:
+  SIGKILL-safe is demonstrated, power-loss-safe is *argued from the ordering*, not
+  demonstrated.
+- **Final-name staging was not crash-idempotent (high).** Writing directly into
+  `generations/<hub-sha>-<core-sha>/` let a crash leave a partial generation under
+  the deterministic name, which a re-run could not distinguish from a good one.
+  Now staged into a unique `.staging-<random>/` and renamed in, so the final name
+  is complete by construction, with fail-closed handling of an existing final name.
+- **Offline enforcement checked one data directory (high).** A socket probe cannot
+  detect a daemon on a different data directory, so the installer could switch
+  generations under a live Hub. Resolved by `question_1786038859_466233` as an
+  authorised scope expansion: an installation-scoped `flock` lease held by every
+  managed daemon.
+- **Fresh-install failure and bootstrap states were undefined (medium).** Every
+  post-switch rollback reversed to a "previous generation" that a first install
+  does not have, and `bin/botster-hub` was created outside the install order and
+  crash table entirely. Both now specified.
+
 ## Forward tolerance is not a compatibility shim
 
 This repository's standing posture is cold-cut replacement — see
@@ -296,6 +324,50 @@ which is what makes rollback cheap and genuinely testable rather than a narrativ
 claim. At least the previous generation is retained and is never deleted as part
 of a switch.
 
+#### Staging is crash-idempotent, and the switch is durably committed
+
+Atomicity to a live observer and durability across power loss are different
+properties, and an earlier draft of this plan claimed the second while
+specifying only the first.
+
+**Staging never writes into the final generation name.** Artifacts are written
+into a unique `generations/.staging-<random>/` directory, and only a fully
+written, checksum-verified, fsynced staging directory is `renameat`ed into
+`generations/<hub-sha>-<core-sha>/`. Directory rename is atomic, so the final
+generation name is **complete by construction** — a crash mid-download can only
+ever leave a partial *staging* directory, never a partial generation. Staging
+directly into the deterministic name would have left a half-written generation
+that a re-run could not distinguish from a good one.
+
+Handling of an existing final generation name is fail-closed: verify every
+artifact's ownership, mode, size, and SHA-256 against the manifest and reuse it
+only on an exact match; otherwise abort with a diagnostic rather than deleting or
+overwriting it. Installer-owned stale staging directories are cleaned up with the
+same bounded, fail-safe discipline as stale receipt temps — pattern-matched,
+`O_NOFOLLOW`, owner- and mode-checked, and left alone when any check fails.
+
+**Durability sequence**, in order, all descriptor-relative:
+
+1. Write each artifact; `fsync` **each file**.
+2. `fsync` the staging directory.
+3. `renameat` staging → `generations/<hub-sha>-<core-sha>`.
+4. `fsync` the `generations` directory, so the generation's existence is committed
+   before anything points at it.
+5. `symlinkat` the new pointer to a unique temp name; `renameat` it over
+   `current`.
+6. `fsync` the **pointer's parent directory**, so the switch itself is committed.
+
+Steps 4 and 6 are the ones an earlier draft omitted. Without step 4 a power loss
+could leave `current` referencing a generation whose directory entry was never
+committed; without step 6 the switch itself could be lost. The same discipline
+the receipt write already follows now applies to the generation.
+
+**Evidence limit, stated rather than implied:** genuine power-loss testing needs
+fault injection this repository has no harness for. SIGKILL states are proven
+empirically, and the fsync sequence is proven structurally by asserting the
+ordering of the operations. True power-loss durability is therefore *argued from
+the sequence*, not demonstrated. That limit is recorded at the test site.
+
 `bin/botster-hub` is a stable symlink, so it never needs rewriting and `PATH`
 never changes. Note that `env::current_exe()` (`src/main.rs:1336`) resolves to
 the real path, so a Hub launched through `bin/botster-hub` sees
@@ -312,13 +384,56 @@ A pointer file plus a launcher shim was considered and rejected: it adds a
 resolving indirection on every launch and changes `current_exe()` semantics, for
 no gain over an atomic `renameat` on a symlink.
 
-#### Upgrades are offline and the installer enforces it
+#### Upgrades are offline, enforced by an installation-scoped lease
 
 The installer detects a running managed Hub daemon and **refuses with a clear
-diagnostic** rather than racing it. Detection is a `connect()` attempt on
-`<data-dir>/botster-hub.sock` (default `$HOME/.botster/hub`, overridable with
-`--data-dir`); a successful connect means running, connection-refused means a
-stale socket and the install proceeds.
+diagnostic** rather than racing it.
+
+A socket probe cannot deliver that. An earlier draft checked
+`<data-dir>/botster-hub.sock`, but the Hub accepts an arbitrary data directory
+(`src/config.rs` `DataDirectoryOption`), so a daemon launched from this same
+installation under a different data directory stays invisible — and the installer
+would then switch generations underneath a live Hub, reaching the exact coupling
+violation the generation design exists to prevent, by another route.
+
+**Authorised scope expansion.** `question_1786038859_466233` approves a small Hub
+startup change, on the reasoning that a mechanism which is the minimum needed to
+deliver an already-required property is in scope by construction — the
+alternative is shipping the requirement unmet. This is recorded explicitly so
+Review does not read Hub startup changes in a distribution ticket as drift. It is
+**startup lease acquisition only**: it does not touch worker resolution, and so is
+not the pinned-generation change deliberately set aside as beyond this installer.
+
+- Every managed Hub daemon takes **`LOCK_SH`** on `<prefix>/daemon.lock` at
+  startup and holds it for its lifetime. The installer requires
+  **`LOCK_EX|LOCK_NB`** before switching and refuses otherwise. This is
+  authoritative across any number of daemons and any data directories, because
+  they all resolve through the same installation.
+- **`flock` releases on process death**, including `SIGKILL` and power loss. That
+  is the reason to prefer it over a pidfile: a crashed daemon must never leave an
+  installation permanently unupgradeable.
+- The lock file lives at `<prefix>/daemon.lock`, **above `generations/`**, so it
+  survives generation switches. A lock inside a generation would be swapped out
+  from under its own holder.
+- It is created with the same discipline the receipt already requires:
+  user-owned, non-world-writable, `O_NOFOLLOW`, never through a symlink. A
+  world-writable lock would be a denial-of-upgrade vector.
+- **`flock` is advisory and unreliable over NFS.** The install prefix is local, so
+  this is acceptable — stated rather than left as an unexamined assumption.
+
+**Prefix derivation is shape-matched, not level-counted.** The Hub derives its
+prefix from `env::current_exe()` by recognising either
+`<prefix>/generations/<id>/botster-hub` or `<prefix>/bin/botster-hub`, and
+additionally requiring that the candidate prefix contain both `generations/` and
+`current`. Matching the layout shape rather than blindly walking up a fixed number
+of levels makes the derivation correct whether or not `current_exe()` resolves the
+`bin` symlink on a given platform. Anything not matching a managed layout — a
+development build — derives no prefix and takes **no lock**, which is a positive
+tested behaviour rather than an accident.
+
+There is no bootstrap gap: no managed installation exists yet, so every managed
+Hub carries the lease from v1 and there is no unlocked legacy daemon to reason
+about.
 
 Online upgrade is out of scope. Generation directories make it *conceivable* —
 a daemon that pinned its generation at startup would keep resolving its own
@@ -336,15 +451,19 @@ so the future enabler is discoverable.
 3. Verify the signature against the trust anchor. **Fail closed.**
 4. Exact-match the envelope against the verified manifest per the authority
    boundary above; decode the manifest.
-5. Stage both artifacts into a new `generations/<hub-sha>-<core-sha>/` directory
-   inside the prefix, so the pointer switch is same-filesystem.
-6. Verify each staged artifact's size and SHA-256.
+5. Stage both artifacts into a unique `generations/.staging-<random>/` directory
+   inside the prefix, so the later renames are same-filesystem.
+6. Verify each staged artifact's size and SHA-256, `fsync` them and the staging
+   directory, then `renameat` staging into
+   `generations/<hub-sha>-<core-sha>/` and `fsync` `generations`.
 7. Verify the staged Hub binary's *self-reported* identity via a new
    `botster-hub version` subcommand, requiring it to match the manifest's
    `version` and `build_revision`. The binary is executed only *after* its
    checksum and signature verify, so this is never execution of unvalidated
    bytes.
-8. **Switch generations — the single atomic operation.**
+8. **Switch generations — the single atomic operation** — then `fsync` the
+   pointer's parent so the switch is durably committed. On a first install, also
+   create `bin/botster-hub` by the same temp-plus-`renameat` discipline.
 9. Verify the Hub resolved through `current` reports the expected version and
    build revision.
 10. **Only then** write the receipt atomically.
@@ -385,15 +504,66 @@ This is the case that "no partial state" describes.
 **Abrupt termination** — SIGKILL, power loss, anything where no rollback code
 runs. No durable journal or crash-recovery mechanism is in scope; recovery is
 "re-run the installer", which is idempotent. What the design buys is that the
-crash window is *bounded to safe states only*:
+crash window is *bounded to safe states only*.
+
+**Two different strengths of claim, and the report must not blur them:**
+
+- **SIGKILL-safe — demonstrated.** Every row below is proven empirically by
+  killing the installer at that boundary.
+- **Power-loss-safe — argued, not demonstrated.** The fsync sequence above is
+  correct and is implemented exactly as specified, but no fault-injection harness
+  exists in this repository, so durability across power loss rests on the
+  ordering argument. Building such a harness is real infrastructure and is not
+  what this ticket is for; recording the limit is the right cost.
+
+The phrase "power-loss safe" must not appear unqualified in the implementation
+report or documentation, and the presence of the fsync sequence must not be
+allowed to imply it was tested. A gap that is named is acceptable; a gap that
+reads as a pass is not.
 
 | Crash point | On-disk state | Hub behavior |
 | --- | --- | --- |
-| Before the switch | old generation; new generation staged but unreferenced | unchanged, still old pair |
-| **During** the switch | `current` resolves to old **or** new — never neither | coherent pair either way |
+| During artifact write | old generation; **partial staging dir** under `.staging-<random>` | unchanged; staging is unreferenced and swept on re-run |
+| Staging complete, before its rename | old generation; complete but unpublished staging dir | unchanged |
+| **During** the staging rename | the final generation name exists completely or not at all | unchanged; nothing points at it yet |
+| Before the pointer switch | old generation; new generation complete and unreferenced | unchanged, still old pair |
+| **During** the pointer switch | `current` resolves to old **or** new — never neither | coherent pair either way |
 | After switch, before receipt | new generation, **previous** receipt | stale coordinate / `receipt_binary_mismatch` → unmanaged |
 | During receipt write | new generation, previous receipt intact, unique stale temp may remain | unmanaged; re-run converges |
 | After receipt write | new generation, new receipt | managed |
+
+The first three rows are what an earlier draft collapsed into a single "new
+generation staged" state, hiding the reachable partial-staging case. They are
+listed separately because that grouping is precisely what concealed the
+two-rename mixed-pair bug in the previous revision, and the same mistake is easy
+to repeat one level down.
+
+#### First install has no previous generation
+
+Every recoverable post-switch error above reverses `current` to the retained
+previous generation — which does not exist on a first install. Bootstrap
+therefore has its own ordering and its own cleanup, and `bin/botster-hub` is a
+separately created object that belongs in the install order rather than outside
+it.
+
+First-install order: stage and publish the generation → create `current` →
+create `bin/botster-hub` → verify the Hub *through* `bin/botster-hub` → write the
+receipt.
+
+Both `current` and `bin/botster-hub` are created by `symlinkat` to a unique temp
+name followed by `renameat`, the same single-atomic-operation discipline as a
+switch. If `bin/botster-hub` already exists as anything other than a symlink the
+installer **aborts** rather than replacing it — it does not clobber an object it
+cannot prove it owns.
+
+Recoverable error on a first install, at any point after `current` is created:
+remove `bin/botster-hub` and `current` if this run created them, leaving no
+installation and, critically, **no receipt**. There is never a receipt without a
+complete generation behind it, so no state can falsely report managed.
+
+Abrupt termination during bootstrap leaves at worst binaries plus a dangling or
+absent `current`/`bin` and no receipt. The Hub is then unmanaged or not
+launchable through `bin` — honest either way — and a re-run converges.
 
 Two properties matter here. First, **a mixed Hub/worker pair is unreachable by
 construction** — not merely unlikely — because both binaries are only ever
@@ -512,6 +682,13 @@ remains authoritative for its embedded product version/build revision".
 - Publishing to a real origin; provisioning real signing keys; release CI.
 - Any `botster-hub-client` DTO change. `PROTOCOL_VERSION` stays **6** and
   `CONFORMANCE_FIXTURE_REVISION` stays **31**.
+- Any Hub change beyond **acquiring the installation lease at startup**. That one
+  addition is authorised by `question_1786038859_466233` as the minimum needed to
+  deliver offline enforcement; worker resolution, update application, and every
+  other runtime behaviour stay untouched.
+- A power-loss fault-injection harness. Real infrastructure, explicitly out of
+  scope, and the reason the durability guarantee is stated as argued rather than
+  demonstrated.
 - **Online upgrade.** Upgrades are offline and the installer refuses to run
   against a live daemon. Making them safe would require the Hub to resolve its
   worker through a start-time-pinned generation path as a guaranteed contract
@@ -596,15 +773,27 @@ to fix.
    below it are, matching what the existing Hub reader already validates.
    Constraining `$HOME` would break legitimate setups where a home directory is a
    symlink to another volume.
+10. **`flock` is advisory and unreliable over NFS.** The install prefix is local,
+    so this is acceptable — recorded rather than left as an unexamined
+    assumption.
+11. **The installation lease is a Hub startup change**, authorised by
+    `question_1786038859_466233` as the minimum mechanism delivering the offline
+    enforcement already required. Worker resolution and every other runtime
+    behaviour stay untouched.
+12. **Durability claims have two strengths.** SIGKILL-safety is demonstrated;
+    power-loss durability is argued from the fsync ordering and is *not*
+    demonstrated, because no fault-injection harness exists here and building one
+    is out of scope. The implementation report must preserve that distinction and
+    must never write "power-loss safe" unqualified.
 
 ## Affected surfaces and files
 
 | Surface | Change |
 | --- | --- |
-| `crates/botster-hub-installation/` | New. Shared receipt contract; descriptor-relative (`openat`/`O_NOFOLLOW`) directory walk, fd-based ownership/permission validation, and atomic `renameat` write. Public API takes a directory fd, never a path. Uses `libc`, already a direct dependency. |
+| `crates/botster-hub-installation/` | New. Shared receipt contract; descriptor-relative (`openat`/`O_NOFOLLOW`) directory walk, fd-based ownership/permission validation, and atomic `renameat` write. Public API takes a directory fd, never a path. Also owns shape-matched prefix derivation and the `flock` lease, so the Hub and installer cannot disagree about either. Uses `libc`, already a direct dependency. |
 | `crates/botster-hub-installer/` | New. Installer binary: running-daemon refusal, fetch, signature verification, envelope/manifest equality, per-URL HTTPS policy, checksum verification, bounded process-group-owning child runner, generation staging, single atomic pointer switch, pointer-reversal rollback. |
 | `src/maintenance.rs` | Receipt reading delegates to the shared crate; receipt schema 2; release schema 2 + forward tolerance; asymmetry comment. |
-| `src/main.rs` | New `version` subcommand, dispatch, usage text. |
+| `src/main.rs` | New `version` subcommand, dispatch, usage text. **Acquire the installation lease before `serve_daemon` (`:378`) and hold it for the daemon's lifetime** — the authorised scope expansion. Kept here rather than in `daemon_transport.rs` so transport code stays free of installation-layout knowledge. |
 | `Cargo.toml` | Workspace members. |
 | `script/build-release-artifacts` | New. Revision-coupled build, checksums, metadata generation, signing. |
 | `fixtures/release-signing/` | New. Test-only keypair, unmistakably named. |
@@ -654,6 +843,19 @@ to fix.
     child leaves descendants holding pipe writers. Mitigated by reusing the
     process-group pattern already proven in `src/entrypoint_supervisor.rs` and by
     a descendant-PID survival test.
+11. **A lease that outlives its holder.** If the lease were a pidfile rather than
+    `flock`, a crashed daemon would leave the installation permanently
+    unupgradeable. `flock` releases on process death; the SIGKILL-then-acquire
+    test is what keeps that property from silently regressing.
+12. **Prefix derivation drifting from the pointer mechanism.** If derivation
+    counted path levels instead of matching layout shape, a platform difference in
+    `current_exe()` symlink resolution would silently produce two different
+    prefixes and two independent leases — enforcement that appears to work and
+    does not. Mitigated by shape matching plus the both-launch-paths test.
+13. **A tested-looking durability claim.** The fsync sequence is easy to mistake
+    for evidence. Mitigated by stating the SIGKILL/power-loss asymmetry in the
+    plan, at the test site, and as an explicit instruction for the implementation
+    report.
 
 ## Acceptance checks
 
@@ -736,59 +938,107 @@ evidence, not waved through.
     at N+1 beside worker at N or the reverse.
 22. Rollback is the same single operation reversed: `current` returns to the
     previous generation and the pair is coherent there.
-23. The installer **refuses with a clear diagnostic** when a managed Hub daemon is
-    running on the target data directory, and proceeds when only a stale socket
-    remains.
+23. The installer **refuses with a clear diagnostic** when a managed Hub daemon
+    holds the installation lease, and proceeds when no daemon holds it.
+
+**Installation lease — offline enforcement**
+
+24. A daemon running on a **non-default custom data directory** still blocks the
+    upgrade. This is the case a socket probe missed, and is the reason the lease
+    exists; it must be tested directly rather than inferred.
+25. Two concurrent daemons on different data directories both hold `LOCK_SH`, and
+    the installer is refused until **both** exit.
+26. **`SIGKILL` a daemon holding the lease, then assert the installer acquires
+    `LOCK_EX`** — a crashed daemon must never leave an installation permanently
+    unupgradeable.
+27. A Hub launched **through `bin/botster-hub`** and one launched **by its direct
+    `generations/<id>/botster-hub` path** derive the *same* prefix and contend for
+    the same lease, so the derivation is correct regardless of how `current_exe()`
+    treats the symlink.
+28. **Positive dev-build test:** a binary in a development layout derives no
+    prefix, takes no lease, and does not trigger the installer's refusal.
+29. `daemon.lock` is user-owned and non-world-writable, is opened `O_NOFOLLOW`,
+    and a symlink pre-placed at its path causes refusal rather than being
+    followed.
+
+**Crash-idempotent staging and durable commit**
+
+30. Crash injection **during each artifact write** leaves only a
+    `.staging-<random>/` directory; the final generation name never appears
+    partial, and a re-run converges.
+31. A pre-existing final generation name is reused only after every artifact's
+    ownership, mode, size, and SHA-256 match the manifest exactly; on any mismatch
+    the installer **aborts** rather than deleting or overwriting it.
+32. The stale-staging sweep removes only installer-owned directories matching its
+    pattern and leaves anything failing its `O_NOFOLLOW`/owner/mode checks in
+    place.
+33. The durability sequence is asserted in order: `fsync` each artifact, `fsync`
+    staging, rename staging into the final name, `fsync` `generations`, rename the
+    pointer, `fsync` the pointer's parent. **Evidence limit:** this proves the
+    ordering structurally; genuine power-loss fault injection is not available in
+    this repository, so power-loss durability is argued from the sequence rather
+    than demonstrated, and the test site says so.
+
+**First install — no previous generation to fall back to**
+
+34. Recoverable error after `current` is created on a first install removes
+    `bin/botster-hub` and `current` if this run created them, and leaves **no
+    receipt**, so nothing can report managed.
+35. `bin/botster-hub` existing as a regular file (not a symlink) causes an abort
+    rather than replacement.
+36. Crash injection at each bootstrap boundary — after `current`, after
+    `bin/botster-hub`, and during post-switch verification — leaves no receipt and
+    no falsely-managed state, and a re-run converges to a correct managed install.
 
 **Installer failure semantics**
 
-24. Byte-flipped artifact fails checksum verification and installs nothing; the
+37. Byte-flipped artifact fails checksum verification and installs nothing; the
     pointer never moves.
-25. **Recoverable error after the switch** reverses the pointer and leaves the
+38. **Recoverable error after the switch** reverses the pointer and leaves the
     previous receipt byte-identical.
-26. Post-switch identity verification failure produces the same reversal.
-27. **Crash injection at each of the three boundaries** required by
+39. Post-switch identity verification failure produces the same reversal.
+40. **Crash injection at each of the three boundaries** required by
     `question_1786037807_656385` — immediately before the switch, after the switch
     but before the receipt write, and *during* the receipt write. After each,
     assert the Hub/worker pair is coherent, the receipt state is honest (the Hub
     reports unmanaged rather than falsely claiming managed), and **a re-run
     converges to a correct managed installation**.
-28. No reachable state places a schema-2 receipt beside an old generation —
+41. No reachable state places a schema-2 receipt beside an old generation —
     asserted at every injection point above.
 
 **Bounded staged-binary execution**
 
-29. Hanging child is terminated at the deadline; a descendant PID captured before
+42. Hanging child is terminated at the deadline; a descendant PID captured before
     the timeout is provably gone afterwards, per
     [[bounded command execution requires process group termination and reaping]].
-30. Non-zero exit, oversized output, and malformed non-`key=value` output are
+43. Non-zero exit, oversized output, and malformed non-`key=value` output are
     each rejected.
-31. The process group leader is reaped and both drains reach EOF, and a second
+44. The process group leader is reaped and both drains reach EOF, and a second
     invocation through the same code path still succeeds — proving teardown left
     nothing wedged.
 
 **Real runtime — the production path, not scaffolding**
 
-32. Install the **actual** built `botster-hub` and `botster-session-worker` into
+45. Install the **actual** built `botster-hub` and `botster-session-worker` into
     an isolated prefix using the installer, then launch that **installed** Hub
     with `HOME` pointed at the prefix (reusing `start_cli_daemon_with_home`).
     Assert `status` reports `installation.mode=managed` with the expected channel
     and provider, and that `software.version`/`build_revision` come from the
     binary.
-33. Serialized status contains no `source_url`, no artifact checksum, no
+46. Serialized status contains no `source_url`, no artifact checksum, no
     signature, no installer identity, and no home path.
-34. `check-update` against a loopback schema-2 fixture returns
+47. `check-update` against a loopback schema-2 fixture returns
     `state=available` / `action=run_managed_installer`; the schema-3
     forward-compat fixture returns the same.
-35. Restart preserves identical `software` and `installation`.
-36. `botster-hub version` prints identity with no data directory and no daemon.
+48. Restart preserves identical `software` and `installation`.
+49. `botster-hub version` prints identity with no data directory and no daemon.
 
 **Provenance** — per the charter's live-binary requirement
 
-37. Record the Hub SHA and the `Cargo.lock`-pinned Core SHA **separately**,
+50. Record the Hub SHA and the `Cargo.lock`-pinned Core SHA **separately**,
     resolve both binary realpaths under the fresh checkout's target directory,
     and assert the receipt's `source_revisions` matches both.
-38. No orphaned processes or stale process groups remain after the installer's
+51. No orphaned processes or stale process groups remain after the installer's
     bounded-execution tests, checkable with the repo's existing
     `script/process-census`.
 
