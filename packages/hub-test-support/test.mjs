@@ -135,7 +135,7 @@ assert.equal(metadata.package_name, "@trybotster/hub-test-support");
 assert.equal(metadata.package_version, "0.1.24");
 assert.equal(metadata.protocol, "botster-hub-daemon-v1");
 assert.equal(metadata.protocol_version, 6);
-assert.equal(metadata.conformance_fixture_revision, 31);
+assert.equal(metadata.conformance_fixture_revision, 32);
 assert.deepEqual(metadata.ui_contract, {
   conformance_fixture_export: "@trybotster/ui-contract/conformance-fixtures",
   package_name: "@trybotster/ui-contract",
@@ -171,7 +171,14 @@ assert.match(protocol, /export type DaemonRequest/);
 assert.match(protocol, /create_session_type/);
 assert.match(protocol, /update_session_type/);
 assert.match(protocol, /delete_session_type/);
+assert.match(protocol, /show_session_type_definition/);
 assert.match(protocol, /export interface DaemonSessionTypeDefinition/);
+assert.match(protocol, /export interface DaemonSessionTypeEditableDefinition/);
+assert.match(
+  protocol,
+  /session_type_definition\?: DaemonSessionTypeEditableDefinition \| null/,
+);
+assert.match(protocol, /\| "session_type_definition"/);
 assert.match(protocol, /\{ source: "device" \}/);
 assert.match(protocol, /\{ source: "repo"; target_id: string \}/);
 assert.match(protocol, /\{ policy: "package_root" \}/);
@@ -291,7 +298,38 @@ assert.deepEqual(supportMatrix.plugin_surfaces.authored_set_values, {
   "selected-workspace": "workspace-alpha",
 });
 
-assert.equal(sessionLifecycleFixture.conformance_fixture_revision, 31);
+// The lossless authoring read: an editor must be able to reconstruct exactly what
+// update_session_type consumes, which the sanitized session_type row cannot do.
+assert.equal(supportMatrix.session_type_authoring.supported, true);
+assert.equal(
+  supportMatrix.session_type_authoring.request_type,
+  "show_session_type_definition",
+);
+assert.equal(
+  supportMatrix.session_type_authoring.response_kind,
+  "session_type_definition",
+);
+assert.equal(
+  supportMatrix.session_type_authoring.response_field,
+  "session_type_definition",
+);
+assert.equal(
+  supportMatrix.session_type_authoring.definition_type,
+  "botster_hub_client::DaemonSessionTypeEditableDefinition",
+);
+assert.deepEqual(supportMatrix.session_type_authoring.editable_sources, ["device", "repo"]);
+assert.equal(supportMatrix.session_type_authoring.read_only_source, "package");
+assert.equal(
+  supportMatrix.session_type_authoring.read_only_error_kind,
+  "read_only_session_type_source",
+);
+assert.deepEqual(
+  supportMatrix.session_type_authoring.authored_fields_absent_from_published_row,
+  ["context", "environment", "working_directory"],
+);
+assert.equal(supportMatrix.session_type_authoring.admission_group, "allow_runtime");
+
+assert.equal(sessionLifecycleFixture.conformance_fixture_revision, 32);
 assert.equal(sessionLifecycleFixture.entity_type, "session");
 assert.deepEqual(
   sessionLifecycleFixture.normalized_frames.map((frame) => frame.type),
@@ -329,7 +367,7 @@ assert.equal(
 assert.equal(sessionLifecycleFixture.overflow.snapshot_precedes_later_deltas, true);
 assert.equal(sessionLifecycleFixture.overflow.failed_snapshot_delivery_closes_subscription, true);
 
-assert.equal(sessionPluginBindingFixture.conformance_fixture_revision, 31);
+assert.equal(sessionPluginBindingFixture.conformance_fixture_revision, 32);
 assert.equal(sessionPluginBindingFixture.binding_family, "/session");
 const sessionPluginMaterialization = materializeSessionPluginBindingScenario(
   sessionPluginBindingFixture,

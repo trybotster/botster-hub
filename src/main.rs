@@ -2326,6 +2326,20 @@ fn operator_session_types(args: Vec<String>) -> Result<(), OperatorError> {
             )?;
             print_daemon_response(response)?;
         }
+        "definition" => {
+            if args.len() != 4 {
+                return Err(OperatorError::Usage("session-types definition"));
+            }
+            let options = DataArgs::parse(args[1..3].to_vec(), "session-types definition")?;
+            let config = explicit_config(options.data_directory)?;
+            let response = daemon_transport_request(
+                &config,
+                DaemonRequest::ShowSessionTypeDefinition {
+                    session_type_id: args[3].clone(),
+                },
+            )?;
+            print_daemon_response(response)?;
+        }
         "resolve" => {
             if args.len() < 4 {
                 return Err(OperatorError::Usage("session-types resolve"));
@@ -3499,6 +3513,23 @@ fn print_daemon_response(response: DaemonResponse) -> Result<(), OperatorError> 
                     session_type.source_name,
                     session_type.available,
                     session_type.target_id
+                );
+            }
+        }
+        DaemonResponseKind::SessionTypeDefinition => {
+            println!("response=session_type_definition");
+            if let Some(editable) = response.session_type_definition {
+                println!("session_type_id={}", editable.session_type_id);
+                println!(
+                    "source={}",
+                    serde_json::to_string(&editable.source).map_err(OperatorError::Serialize)?
+                );
+                // The authored definition is printed whole so the operator can edit
+                // one field and pipe it straight back through `session-types update`.
+                println!(
+                    "definition={}",
+                    serde_json::to_string(&editable.definition)
+                        .map_err(OperatorError::Serialize)?
                 );
             }
         }
@@ -5565,10 +5596,15 @@ Packages:
         "sessions" => {
             "usage: botster-hub sessions <list|spawn|attach|send-input|resize|detach|shutdown> ..."
         }
-        "session-types" => "usage: botster-hub session-types <list|show|resolve|spawn> ...",
+        "session-types" => {
+            "usage: botster-hub session-types <list|show|definition|resolve|spawn> ..."
+        }
         "session-types list" => "usage: botster-hub session-types list [--data-dir <path>]",
         "session-types show" => {
             "usage: botster-hub session-types show [--data-dir <path>] <session-type-id>"
+        }
+        "session-types definition" => {
+            "usage: botster-hub session-types definition [--data-dir <path>] <session-type-id>"
         }
         "session-types resolve" => {
             "usage: botster-hub session-types resolve [--data-dir <path>] <session-type-id> [--target-id <id>] [--cwd <path>] [--env NAME=value] [--prompt <text>] [--branch <name>] [--ticket-id <id>] [--workspace-id <id>]"

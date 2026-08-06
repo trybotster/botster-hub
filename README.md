@@ -1143,7 +1143,21 @@ The repo file uses the same definition shape as package manifests. Device rows
 support full CRUD, repo rows support CRUD scoped by `target_id`, and package rows
 return `read_only_session_type_source` for mutations. The daemon and
 `session-types create|update|delete` CLI are the mutation boundary; callers do
-not receive filesystem paths or raw state access. Each observable mutation
+not receive filesystem paths or raw state access.
+
+Update replaces a definition wholesale, and the ordinary list/show row is
+sanitized — it derives a `working_directory_policy` string and omits the
+authored environment — so an editor cannot rebuild a complete definition from
+it. `session-types definition <session-type-id>` is the editor-scoped read that
+closes that gap: it returns the authored definition exactly as update consumes
+it, plus the mutation source, so a read-modify-write edit preserves the authored
+working-directory path and environment. It covers device and repo definitions
+only; a package-owned id returns `read_only_session_type_source`, and it is
+admitted under the same editor authority as create/update/delete rather than the
+broader sanitized-read category. Ordinary list/show rows and `session_type`
+entity frames are unchanged and still carry no authored environment or path.
+
+Each observable mutation
 advances the durable generation and publishes `session_type` entity upsert or
 remove frames, with bounded overflow recovering through a full snapshot.
 Disabled or unadmitted targets contribute no definitions, and final command,

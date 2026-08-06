@@ -51,11 +51,12 @@ pub use botster_hub_client::{
     DaemonReadScreen, DaemonRequest, DaemonResolvedAppLaunch, DaemonResolvedSessionType,
     DaemonResponse, DaemonResponseKind, DaemonSession, DaemonSessionCleanup, DaemonSessionContext,
     DaemonSessionEntity, DaemonSessionType, DaemonSessionTypeContextInput,
-    DaemonSessionTypeDefinition, DaemonSessionTypeMutationSource, DaemonSessionTypeRequest,
-    DaemonSessionTypeWorkingDirectory, DaemonSoftwareIdentity, DaemonSpawnTarget,
-    DaemonSpawnTargetValidation, DaemonStatus, DaemonUiTreeSnapshot, DaemonWorktree,
-    DaemonWorktreeGitMetadata, DaemonWorktreeLifecycleEvent, FEATURE_PLUGIN_SURFACE_ACTION,
-    FEATURE_PLUGIN_SURFACE_RENDER, PROTOCOL, read_frame, read_frame_from_reader, write_frame,
+    DaemonSessionTypeDefinition, DaemonSessionTypeEditableDefinition,
+    DaemonSessionTypeMutationSource, DaemonSessionTypeRequest, DaemonSessionTypeWorkingDirectory,
+    DaemonSoftwareIdentity, DaemonSpawnTarget, DaemonSpawnTargetValidation, DaemonStatus,
+    DaemonUiTreeSnapshot, DaemonWorktree, DaemonWorktreeGitMetadata, DaemonWorktreeLifecycleEvent,
+    FEATURE_PLUGIN_SURFACE_ACTION, FEATURE_PLUGIN_SURFACE_RENDER, PROTOCOL, read_frame,
+    read_frame_from_reader, write_frame,
 };
 use botster_ui_contract::{
     PackageSurfaceDescriptor, PackageSurfaceKind, UiActionResult, UiActionResultState,
@@ -1979,6 +1980,20 @@ fn handle_runtime_control_request(
             };
             Ok(daemon_session_types(templates))
         }
+        DaemonRequest::ShowSessionTypeDefinition { session_type_id } => {
+            let response = api.handle_request(
+                runtime,
+                &packages,
+                HubClientRequest::ShowSessionTypeDefinition {
+                    request_id: request_id("daemon-session-types-definition"),
+                    session_type_id,
+                },
+            )?;
+            let HubClientResponseBody::SessionTypeDefinition(definition) = response.body else {
+                return Err(DaemonTransportError::UnexpectedResponse);
+            };
+            Ok(daemon_session_type_definition(*definition))
+        }
         DaemonRequest::CreateSessionType { source, definition } => {
             let response = api.handle_request(
                 runtime,
@@ -2279,6 +2294,7 @@ fn handle_runtime_control_request(
             )),
             sessions: Vec::new(),
             session_types: Vec::new(),
+            session_type_definition: None,
             resolved_session_type: None,
             session_context: None,
             read_screen: None,
@@ -4862,6 +4878,7 @@ fn daemon_response_base(kind: DaemonResponseKind) -> DaemonResponse {
         status: None,
         sessions: Vec::new(),
         session_types: Vec::new(),
+        session_type_definition: None,
         resolved_session_type: None,
         session_context: None,
         read_screen: None,
@@ -4997,6 +5014,16 @@ fn daemon_session_types(templates: Vec<crate::HubSessionType>) -> DaemonResponse
         .into_iter()
         .map(daemon_session_type_from_client)
         .collect();
+    response
+}
+
+fn daemon_session_type_definition(definition: crate::HubSessionTypeDefinition) -> DaemonResponse {
+    let mut response = daemon_response_base(DaemonResponseKind::SessionTypeDefinition);
+    response.session_type_definition = Some(DaemonSessionTypeEditableDefinition {
+        session_type_id: definition.session_type_id,
+        source: daemon_session_type_mutation_source(definition.source),
+        definition: daemon_session_type_definition_from_client(definition.definition),
+    });
     response
 }
 
@@ -5342,6 +5369,49 @@ fn session_type_mutation_source_from_daemon(
         DaemonSessionTypeMutationSource::Package { package_name } => {
             SessionTypeMutationSource::Package { package_name }
         }
+    }
+}
+
+fn daemon_session_type_mutation_source(
+    source: SessionTypeMutationSource,
+) -> DaemonSessionTypeMutationSource {
+    match source {
+        SessionTypeMutationSource::Device => DaemonSessionTypeMutationSource::Device,
+        SessionTypeMutationSource::Repo { target_id } => {
+            DaemonSessionTypeMutationSource::Repo { target_id }
+        }
+        SessionTypeMutationSource::Package { package_name } => {
+            DaemonSessionTypeMutationSource::Package { package_name }
+        }
+    }
+}
+
+fn daemon_session_type_definition_from_client(
+    definition: PackageSessionType,
+) -> DaemonSessionTypeDefinition {
+    DaemonSessionTypeDefinition {
+        id: definition.id,
+        label: definition.label,
+        description: definition.description,
+        icon: definition.icon,
+        role: definition.role,
+        interaction: definition.interaction,
+        traits: definition.traits,
+        lifecycle: definition.lifecycle,
+        command: definition.command,
+        args: definition.args,
+        working_directory: match definition.working_directory {
+            PackageSessionTypeWorkingDirectory::PackageRoot => {
+                DaemonSessionTypeWorkingDirectory::PackageRoot
+            }
+            PackageSessionTypeWorkingDirectory::Relative { path } => {
+                DaemonSessionTypeWorkingDirectory::Relative { path }
+            }
+        },
+        environment: definition.environment,
+        allowed_environment_overrides: definition.allowed_environment_overrides,
+        context: definition.context,
+        target_id: definition.target_id,
     }
 }
 
@@ -7233,6 +7303,7 @@ fn operation_label(operation: crate::HubClientOperation) -> &'static str {
         crate::HubClientOperation::ListPackageNavigation => "list_package_navigation",
         crate::HubClientOperation::ListSessionTypes => "list_session_types",
         crate::HubClientOperation::ShowSessionType => "show_session_type",
+        crate::HubClientOperation::ShowSessionTypeDefinition => "show_session_type_definition",
         crate::HubClientOperation::CreateSessionType => "create_session_type",
         crate::HubClientOperation::UpdateSessionType => "update_session_type",
         crate::HubClientOperation::DeleteSessionType => "delete_session_type",

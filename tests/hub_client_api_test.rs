@@ -166,6 +166,350 @@ fn session_type_device_crud_is_authoritative_and_package_mutation_is_read_only()
     assert_eq!(runtime.state().session_type_generation, 3);
 }
 
+/// A definition that the sanitized row provably cannot reconstruct: a relative
+/// working-directory path and a non-empty authored environment.
+fn authored_session_type(id: &str) -> PackageSessionType {
+    PackageSessionType {
+        id: id.to_string(),
+        label: "Authored agent".to_string(),
+        description: Some("Carries an authored path and environment".to_string()),
+        icon: Some("terminal".to_string()),
+        role: "botster.agent".to_string(),
+        interaction: "interactive".to_string(),
+        traits: vec!["terminal".to_string(), "authoring".to_string()],
+        lifecycle: "task".to_string(),
+        command: "bin/authored.sh".to_string(),
+        args: vec!["--json".to_string()],
+        working_directory: PackageSessionTypeWorkingDirectory::Relative {
+            path: "nested/dir".to_string(),
+        },
+        environment: BTreeMap::from([
+            ("BOTSTER_MODE".to_string(), "authored".to_string()),
+            (
+                "AUTHORED_SECRET_NAME".to_string(),
+                "authored-value".to_string(),
+            ),
+        ]),
+        allowed_environment_overrides: vec!["BOTSTER_MODE".to_string()],
+        context: vec!["prompt".to_string()],
+        target_id: None,
+    }
+}
+
+fn read_definition(
+    api: &HubClientApi,
+    runtime: &mut HubRuntime,
+    packages: &PackageRegistry,
+    label: &str,
+    session_type_id: &str,
+) -> botster_hub::HubSessionTypeDefinition {
+    let response = api
+        .handle_request(
+            runtime,
+            packages,
+            HubClientRequest::ShowSessionTypeDefinition {
+                request_id: request_id(label),
+                session_type_id: session_type_id.to_string(),
+            },
+        )
+        .expect("read authored session type definition");
+    let HubClientResponseBody::SessionTypeDefinition(definition) = response.body else {
+        panic!("session type definition response expected");
+    };
+    *definition
+}
+
+fn shown_row(
+    api: &HubClientApi,
+    runtime: &mut HubRuntime,
+    packages: &PackageRegistry,
+    label: &str,
+    session_type_id: &str,
+) -> botster_hub::HubSessionType {
+    let response = api
+        .handle_request(
+            runtime,
+            packages,
+            HubClientRequest::ShowSessionType {
+                request_id: request_id(label),
+                session_type_id: session_type_id.to_string(),
+            },
+        )
+        .expect("show sanitized session type row");
+    let HubClientResponseBody::SessionTypes(mut rows) = response.body else {
+        panic!("session types response expected");
+    };
+    assert_eq!(rows.len(), 1);
+    rows.remove(0)
+}
+
+#[test]
+fn session_type_definition_round_trips_authored_path_and_environment() {
+    let mut runtime = explicit_runtime("session-type-definition-round-trip");
+    let packages = empty_registry();
+    let api = HubClientApi::local_operator("session-type-definition-round-trip-client");
+
+    // Two definitions: one with every optional field set, one with them all unset,
+    // so a `skip_serializing_if` None-versus-absent slip cannot pass silently.
+    let populated = authored_session_type("authored-populated");
+    let mut sparse = authored_session_type("authored-sparse");
+    sparse.description = None;
+    sparse.icon = None;
+    sparse.target_id = None;
+    sparse.args = Vec::new();
+    sparse.traits = Vec::new();
+
+    for definition in [populated.clone(), sparse.clone()] {
+        api.handle_request(
+            &mut runtime,
+            &packages,
+            HubClientRequest::CreateSessionType {
+                request_id: request_id(&format!("create-{}", definition.id)),
+                source: SessionTypeMutationSource::Device,
+                definition,
+            },
+        )
+        .expect("create authored device session type");
+    }
+
+    for authored in [populated, sparse] {
+        let read = read_definition(
+            &api,
+            &mut runtime,
+            &packages,
+            &format!("definition-{}", authored.id),
+            &authored.id,
+        );
+
+        // The read is lossless and carries the exact mutation source Update needs.
+        assert_eq!(read.definition, authored, "authoring read must be lossless");
+        assert_eq!(read.source, SessionTypeMutationSource::Device);
+        assert_eq!(read.session_type_id, format!("device/{}", authored.id));
+        assert_eq!(
+            read.definition.id, authored.id,
+            "definition.id must be the bare id Update matches on, not the composite id"
+        );
+
+        // Submit the read back unchanged; the stored definition must be identical.
+        api.handle_request(
+            &mut runtime,
+            &packages,
+            HubClientRequest::UpdateSessionType {
+                request_id: request_id(&format!("round-trip-{}", authored.id)),
+                source: read.source.clone(),
+                definition: read.definition.clone(),
+            },
+        )
+        .expect("submit the authoring read back through Update");
+
+        let stored = runtime
+            .state()
+            .device_session_type_sources
+            .iter()
+            .flat_map(|source| source.session_types.iter())
+            .find(|stored| stored.id == authored.id)
+            .cloned()
+            .expect("round-tripped definition is still stored");
+        assert_eq!(
+            stored, authored,
+            "read-modify-write must not lose the authored working-directory path or environment"
+        );
+        assert_eq!(
+            stored.working_directory,
+            PackageSessionTypeWorkingDirectory::Relative {
+                path: "nested/dir".to_string()
+            }
+        );
+        assert!(!stored.environment.is_empty());
+    }
+}
+
+#[test]
+fn sanitized_session_type_row_still_cannot_reconstruct_the_authored_definition() {
+    let mut runtime = explicit_runtime("session-type-sanitized-row-is-lossy");
+    let packages = empty_registry();
+    let api = HubClientApi::local_operator("session-type-sanitized-row-client");
+    let authored = authored_session_type("authored-lossy");
+    api.handle_request(
+        &mut runtime,
+        &packages,
+        HubClientRequest::CreateSessionType {
+            request_id: request_id("create-lossy-source"),
+            source: SessionTypeMutationSource::Device,
+            definition: authored.clone(),
+        },
+    )
+    .expect("create authored device session type");
+
+    // What a client could reconstruct before this seam existed: the row derives a
+    // policy string and has no environment field at all, so both are destroyed.
+    let row = shown_row(&api, &mut runtime, &packages, "show-lossy", &authored.id);
+    assert_eq!(row.working_directory_policy, "relative");
+    let reconstructed_from_row = PackageSessionType {
+        id: row.id.clone(),
+        label: row.label.clone(),
+        description: row.description.clone(),
+        icon: row.icon.clone(),
+        role: row.role.clone(),
+        interaction: row.interaction.clone(),
+        traits: row.traits.clone(),
+        lifecycle: row.lifecycle.clone(),
+        command: row.command.clone(),
+        args: row.args.clone(),
+        working_directory: PackageSessionTypeWorkingDirectory::default(),
+        environment: BTreeMap::new(),
+        allowed_environment_overrides: row.allowed_environment_overrides.clone(),
+        context: row.context_keys.clone(),
+        target_id: None,
+    };
+    assert_ne!(
+        reconstructed_from_row, authored,
+        "the sanitized row must remain insufficient to rebuild an authored definition"
+    );
+    assert_eq!(
+        reconstructed_from_row.working_directory,
+        PackageSessionTypeWorkingDirectory::PackageRoot
+    );
+    assert!(reconstructed_from_row.environment.is_empty());
+
+    // And the sanitized surfaces did not move: no authored environment value and no
+    // authored path appears in the published row, in list, or in the entity payload.
+    let listed = api
+        .handle_request(
+            &mut runtime,
+            &packages,
+            HubClientRequest::ListSessionTypes {
+                request_id: request_id("list-lossy"),
+            },
+        )
+        .expect("list session types");
+    let HubClientResponseBody::SessionTypes(listed) = listed.body else {
+        panic!("session types response expected");
+    };
+    assert_eq!(listed, vec![row.clone()]);
+
+    let published = serde_json::to_value(&row).expect("session_type entity payload serializes");
+    let published_keys = published
+        .as_object()
+        .expect("row serializes as an object")
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    // serde_json orders object keys alphabetically.
+    assert_eq!(
+        published_keys,
+        vec![
+            "allowed_environment_overrides",
+            "args",
+            "available",
+            "command",
+            "context_keys",
+            "description",
+            "diagnostics",
+            "editable",
+            "icon",
+            "id",
+            "interaction",
+            "label",
+            "lifecycle",
+            "overridden_sources",
+            "role",
+            "session_type_id",
+            "source",
+            "source_name",
+            "target_id",
+            "traits",
+            "working_directory_policy",
+        ],
+        "the published session_type row shape must not move"
+    );
+    let published_text = published.to_string();
+    assert!(!published_text.contains("nested/dir"));
+    assert!(!published_text.contains("authored-value"));
+    assert!(!published_text.contains("AUTHORED_SECRET_NAME"));
+}
+
+#[test]
+fn session_type_definition_refuses_package_sources_and_denied_admission() {
+    let package_root = std::path::PathBuf::from(
+        "target/botster-hub-test-data/client-api-session-type-definition-package",
+    );
+    let _ = fs::remove_dir_all(&package_root);
+    write_session_type_package(&package_root);
+    let mut packages = PackageRegistry::new(Vec::<Capability>::new().into_iter().collect());
+    packages
+        .install_local_path(&package_root, "install definition package")
+        .expect("install package");
+    packages
+        .enable("session-type.plugin", "enable definition package")
+        .expect("enable package");
+
+    let mut runtime = explicit_runtime("session-type-definition-package-refusal");
+    let api = HubClientApi::local_operator("session-type-definition-package-client");
+
+    let refused = api
+        .handle_request(
+            &mut runtime,
+            &packages,
+            HubClientRequest::ShowSessionTypeDefinition {
+                request_id: request_id("definition-package-source"),
+                session_type_id: "init".to_string(),
+            },
+        )
+        .expect_err("package-owned definitions stay read-only");
+    assert!(matches!(
+        refused,
+        HubClientError::SessionType {
+            kind: "read_only_session_type_source",
+            ..
+        }
+    ));
+
+    let unknown = api
+        .handle_request(
+            &mut runtime,
+            &packages,
+            HubClientRequest::ShowSessionTypeDefinition {
+                request_id: request_id("definition-unknown"),
+                session_type_id: "missing".to_string(),
+            },
+        )
+        .expect_err("unknown ids stay typed");
+    assert!(matches!(
+        unknown,
+        HubClientError::SessionType {
+            kind: "unknown_session_type",
+            ..
+        }
+    ));
+
+    // The production denial path: an unadmitted caller cannot read authored data.
+    let denied_api = HubClientApi::new(
+        HubClientIdentity {
+            client_id: botster_core::ClientId("denied-definition-client".to_string()),
+            role: HubClientRole::LocalOperator,
+        },
+        HubClientAdmission::deny_all(),
+    );
+    let denied = denied_api
+        .handle_request(
+            &mut runtime,
+            &packages,
+            HubClientRequest::ShowSessionTypeDefinition {
+                request_id: request_id("definition-denied"),
+                session_type_id: "init".to_string(),
+            },
+        )
+        .expect_err("unadmitted callers are refused before policy runs");
+    assert!(matches!(
+        denied,
+        HubClientError::AdmissionDenied {
+            operation: HubClientOperation::ShowSessionTypeDefinition,
+            ..
+        }
+    ));
+}
+
 #[test]
 fn session_type_role_interaction_traits_and_lifecycle_are_orthogonal() {
     let mut runtime = explicit_runtime("session-type-orthogonal-semantics");
@@ -1042,6 +1386,215 @@ fn session_type_sources_apply_device_repo_precedence_and_reload_from_state() {
     };
     assert_eq!(after_delete[0].source, "device");
     assert_eq!(runtime.state().session_type_generation, 2);
+}
+
+#[test]
+fn session_type_definition_round_trips_repo_sources_and_preserves_selection() {
+    let device_root = std::path::PathBuf::from(
+        "target/botster-hub-test-data/client-api-session-type-definition-device",
+    );
+    let repo_root = std::path::PathBuf::from(
+        "target/botster-hub-test-data/client-api-session-type-definition-repo",
+    );
+    let _ = fs::remove_dir_all(&device_root);
+    let _ = fs::remove_dir_all(&repo_root);
+    write_executable_script(
+        &device_root,
+        "bin/authored.sh",
+        "#!/bin/sh\nprintf 'device:%s\\n' \"$BOTSTER_MODE\"\n",
+    );
+    write_executable_script(
+        &repo_root,
+        "bin/authored.sh",
+        "#!/bin/sh\nprintf 'repo:%s\\n' \"$BOTSTER_MODE\"\n",
+    );
+
+    // Same bare id in both device and repo, so repo wins on precedence and the
+    // device definition is only reachable through its qualified id.
+    let mut device_authored = authored_session_type("authored-shared");
+    device_authored.label = "Device authored agent".to_string();
+    device_authored.working_directory = PackageSessionTypeWorkingDirectory::Relative {
+        path: "device/nested".to_string(),
+    };
+    let mut repo_authored = authored_session_type("authored-shared");
+    repo_authored.label = "Repo authored agent".to_string();
+    repo_authored.working_directory = PackageSessionTypeWorkingDirectory::Relative {
+        path: "repo/nested".to_string(),
+    };
+    write_repo_session_types(
+        &repo_root,
+        serde_json::to_value([&repo_authored]).expect("serialize repo definitions"),
+    );
+
+    let config = explicit_runtime("session-type-definition-repo")
+        .config()
+        .clone();
+    let store = FileHubStateStore::for_data_directory(&config.data_directory);
+    store
+        .update(&config, |state| {
+            state.device_session_type_sources = vec![DeviceSessionTypeSource {
+                root: device_root.clone(),
+                session_types: vec![device_authored.clone()],
+            }];
+            state.spawn_targets = vec![SpawnTarget {
+                target_id: "repo:authoring".to_string(),
+                label: "repo:authoring".to_string(),
+                root: repo_root.clone(),
+                enabled: true,
+                kind: "directory".to_string(),
+                base_ref: None,
+                metadata: BTreeMap::new(),
+            }];
+        })
+        .expect("persist authored session type sources");
+
+    let mut runtime = HubRuntime::load_from_store(config, &store).expect("reload runtime state");
+    let packages = empty_registry();
+    let api = HubClientApi::local_operator("session-type-definition-repo-client");
+
+    // A bare id selects the effective winner, matching ShowSessionType.
+    let effective = read_definition(
+        &api,
+        &mut runtime,
+        &packages,
+        "definition-bare-id",
+        "authored-shared",
+    );
+    assert_eq!(effective.definition, repo_authored);
+    assert_eq!(
+        effective.source,
+        SessionTypeMutationSource::Repo {
+            target_id: "repo:authoring".to_string()
+        }
+    );
+    assert_eq!(effective.session_type_id, "repo:authoring/authored-shared");
+
+    // A qualified id still reaches the overridden source's authored definition.
+    let overridden = read_definition(
+        &api,
+        &mut runtime,
+        &packages,
+        "definition-qualified-id",
+        "device/authored-shared",
+    );
+    assert_eq!(overridden.definition, device_authored);
+    assert_eq!(overridden.source, SessionTypeMutationSource::Device);
+    assert_eq!(overridden.session_type_id, "device/authored-shared");
+
+    // Repo round trip through the atomic file-write path.
+    api.handle_request(
+        &mut runtime,
+        &packages,
+        HubClientRequest::UpdateSessionType {
+            request_id: request_id("round-trip-repo-definition"),
+            source: effective.source.clone(),
+            definition: effective.definition.clone(),
+        },
+    )
+    .expect("submit the repo authoring read back through Update");
+    let written = fs::read_to_string(repo_root.join(".botster/session-types.json"))
+        .expect("read Hub-written repo session types");
+    let written: serde_json::Value =
+        serde_json::from_str(&written).expect("repo session types parse");
+    let stored: Vec<PackageSessionType> =
+        serde_json::from_value(written["session_types"].clone()).expect("repo definitions decode");
+    assert_eq!(stored, vec![repo_authored.clone()]);
+
+    let round_tripped = read_definition(
+        &api,
+        &mut runtime,
+        &packages,
+        "definition-after-repo-round-trip",
+        "authored-shared",
+    );
+    assert_eq!(round_tripped.definition, repo_authored);
+}
+
+#[test]
+fn session_type_definition_rejects_ambiguous_bare_ids() {
+    let first_root = std::path::PathBuf::from(
+        "target/botster-hub-test-data/client-api-session-type-definition-ambiguous-first",
+    );
+    let second_root = std::path::PathBuf::from(
+        "target/botster-hub-test-data/client-api-session-type-definition-ambiguous-second",
+    );
+    let _ = fs::remove_dir_all(&first_root);
+    let _ = fs::remove_dir_all(&second_root);
+    write_repo_session_types(
+        &first_root,
+        serde_json::to_value([authored_session_type("authored-ambiguous")])
+            .expect("serialize first repo definitions"),
+    );
+    write_repo_session_types(
+        &second_root,
+        serde_json::to_value([authored_session_type("authored-ambiguous")])
+            .expect("serialize second repo definitions"),
+    );
+
+    let config = explicit_runtime("session-type-definition-ambiguous")
+        .config()
+        .clone();
+    let store = FileHubStateStore::for_data_directory(&config.data_directory);
+    store
+        .update(&config, |state| {
+            state.spawn_targets = vec![
+                SpawnTarget {
+                    target_id: "repo:first".to_string(),
+                    label: "repo:first".to_string(),
+                    root: first_root.clone(),
+                    enabled: true,
+                    kind: "directory".to_string(),
+                    base_ref: None,
+                    metadata: BTreeMap::new(),
+                },
+                SpawnTarget {
+                    target_id: "repo:second".to_string(),
+                    label: "repo:second".to_string(),
+                    root: second_root.clone(),
+                    enabled: true,
+                    kind: "directory".to_string(),
+                    base_ref: None,
+                    metadata: BTreeMap::new(),
+                },
+            ];
+        })
+        .expect("persist ambiguous repo targets");
+
+    let mut runtime = HubRuntime::load_from_store(config, &store).expect("reload runtime state");
+    let packages = empty_registry();
+    let api = HubClientApi::local_operator("session-type-definition-ambiguous-client");
+
+    let ambiguous = api
+        .handle_request(
+            &mut runtime,
+            &packages,
+            HubClientRequest::ShowSessionTypeDefinition {
+                request_id: request_id("definition-ambiguous"),
+                session_type_id: "authored-ambiguous".to_string(),
+            },
+        )
+        .expect_err("ambiguous bare ids stay ambiguous for the authoring read");
+    assert!(matches!(
+        ambiguous,
+        HubClientError::SessionType {
+            kind: "ambiguous_session_type",
+            ..
+        }
+    ));
+
+    let qualified = read_definition(
+        &api,
+        &mut runtime,
+        &packages,
+        "definition-ambiguous-qualified",
+        "repo:second/authored-ambiguous",
+    );
+    assert_eq!(
+        qualified.source,
+        SessionTypeMutationSource::Repo {
+            target_id: "repo:second".to_string()
+        }
+    );
 }
 
 #[test]

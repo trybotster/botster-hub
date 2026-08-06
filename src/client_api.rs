@@ -30,9 +30,9 @@ use crate::packages::{
     PackageRunnableProcessState, PackageRunnableWorkingDirectory, PackageState,
 };
 use crate::session_types::{
-    HubSessionContext, HubSessionType, PackageSessionType, ResolvedSessionType,
-    SessionTypeMutation, SessionTypeMutationSource, SessionTypeRequest, list_session_types,
-    materialize_session_type, show_session_type,
+    HubSessionContext, HubSessionType, HubSessionTypeDefinition, PackageSessionType,
+    ResolvedSessionType, SessionTypeMutation, SessionTypeMutationSource, SessionTypeRequest,
+    list_session_types, materialize_session_type, show_session_type, show_session_type_definition,
 };
 use crate::{HubRuntime, HubRuntimeError, daemon_session_to_core_session, host_profile};
 
@@ -377,6 +377,20 @@ impl HubClientApi {
                     })?;
                 HubClientResponseBody::SessionTypes(vec![template])
             }
+            HubClientRequest::ShowSessionTypeDefinition {
+                session_type_id, ..
+            } => {
+                let records = packages.packages();
+                let definition =
+                    show_session_type_definition(&records, &runtime.state(), &session_type_id)
+                        .map_err(|error| HubClientError::SessionType {
+                            request_id: request_id.clone(),
+                            operation,
+                            kind: error.kind,
+                            message: error.message,
+                        })?;
+                HubClientResponseBody::SessionTypeDefinition(Box::new(definition))
+            }
             HubClientRequest::CreateSessionType {
                 source, definition, ..
             } => {
@@ -698,7 +712,11 @@ impl HubClientAdmission {
             HubClientOperation::ListSessionTypes
             | HubClientOperation::ShowSessionType
             | HubClientOperation::ResolveSessionType => self.allow_packages,
-            HubClientOperation::CreateSessionType
+            // The authoring read carries the authored environment and
+            // working-directory path, so it is gated by the same editor authority
+            // as the mutations, not by the sanitized-read category.
+            HubClientOperation::ShowSessionTypeDefinition
+            | HubClientOperation::CreateSessionType
             | HubClientOperation::UpdateSessionType
             | HubClientOperation::DeleteSessionType
             | HubClientOperation::SpawnSessionType
@@ -845,6 +863,11 @@ pub enum HubClientRequest {
         request_id: RequestId,
         session_type_id: String,
     },
+    /// Return the authored definition for one editable session type.
+    ShowSessionTypeDefinition {
+        request_id: RequestId,
+        session_type_id: String,
+    },
     /// Create a session type in an editable authoritative source.
     CreateSessionType {
         request_id: RequestId,
@@ -927,6 +950,7 @@ impl HubClientRequest {
             | Self::ListPackageNavigation { request_id }
             | Self::ListSessionTypes { request_id }
             | Self::ShowSessionType { request_id, .. }
+            | Self::ShowSessionTypeDefinition { request_id, .. }
             | Self::CreateSessionType { request_id, .. }
             | Self::UpdateSessionType { request_id, .. }
             | Self::DeleteSessionType { request_id, .. }
@@ -965,6 +989,7 @@ impl HubClientRequest {
             Self::ListPackageNavigation { .. } => HubClientOperation::ListPackageNavigation,
             Self::ListSessionTypes { .. } => HubClientOperation::ListSessionTypes,
             Self::ShowSessionType { .. } => HubClientOperation::ShowSessionType,
+            Self::ShowSessionTypeDefinition { .. } => HubClientOperation::ShowSessionTypeDefinition,
             Self::CreateSessionType { .. } => HubClientOperation::CreateSessionType,
             Self::UpdateSessionType { .. } => HubClientOperation::UpdateSessionType,
             Self::DeleteSessionType { .. } => HubClientOperation::DeleteSessionType,
@@ -1005,6 +1030,7 @@ pub enum HubClientOperation {
     ListPackageNavigation,
     ListSessionTypes,
     ShowSessionType,
+    ShowSessionTypeDefinition,
     CreateSessionType,
     UpdateSessionType,
     DeleteSessionType,
@@ -1044,6 +1070,7 @@ pub enum HubClientResponseBody {
     Packages(Vec<HubClientPackage>),
     PackageNavigation(Vec<HubClientPackageNavigationEntry>),
     SessionTypes(Vec<HubSessionType>),
+    SessionTypeDefinition(Box<HubSessionTypeDefinition>),
     ResolvedSessionType(Box<ResolvedSessionType>),
     SessionContext(HubSessionContext),
     PluginLifecycle(HubClientPluginLifecycleReport),
@@ -2158,6 +2185,39 @@ fn package_allows_guarded_write(packages: &PackageRegistry, package_name: &str) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_type_authoring_read_is_gated_by_editor_authority_not_package_reads() {
+        // `local_operator()` and `deny_all()` move `allow_runtime` and
+        // `allow_packages` together, so a wrong grouping would pass every
+        // constructor-driven test. Set the booleans independently instead.
+        let sanitized_reader_only = HubClientAdmission {
+            allow_status: true,
+            allow_runtime: false,
+            allow_packages: true,
+            allow_lifecycle: false,
+        };
+        assert!(sanitized_reader_only.allows(HubClientOperation::ListSessionTypes));
+        assert!(sanitized_reader_only.allows(HubClientOperation::ShowSessionType));
+        assert!(sanitized_reader_only.allows(HubClientOperation::ResolveSessionType));
+        assert!(
+            !sanitized_reader_only.allows(HubClientOperation::ShowSessionTypeDefinition),
+            "authored environments and paths must not ride the sanitized-read category"
+        );
+        assert!(!sanitized_reader_only.allows(HubClientOperation::UpdateSessionType));
+
+        let editor_only = HubClientAdmission {
+            allow_status: true,
+            allow_runtime: true,
+            allow_packages: false,
+            allow_lifecycle: false,
+        };
+        assert!(editor_only.allows(HubClientOperation::ShowSessionTypeDefinition));
+        assert!(editor_only.allows(HubClientOperation::CreateSessionType));
+        assert!(editor_only.allows(HubClientOperation::UpdateSessionType));
+        assert!(editor_only.allows(HubClientOperation::DeleteSessionType));
+        assert!(!editor_only.allows(HubClientOperation::ShowSessionType));
+    }
 
     #[test]
     fn drain_projection_preserves_snapshot_and_scrollback_payloads_before_live_output() {

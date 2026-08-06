@@ -164,10 +164,10 @@ pub use runtime::{
     daemon_session_to_core_session,
 };
 pub use session_types::{
-    HubSessionContext, HubSessionType, HubSessionTypeSource, MaterializedSessionType,
-    PackageSessionType, PackageSessionTypeWorkingDirectory, ResolvedSessionType,
-    SessionTypeContextInput, SessionTypeError, SessionTypeMutation, SessionTypeMutationSource,
-    SessionTypeRequest,
+    HubSessionContext, HubSessionType, HubSessionTypeDefinition, HubSessionTypeSource,
+    MaterializedSessionType, PackageSessionType, PackageSessionTypeWorkingDirectory,
+    ResolvedSessionType, SessionTypeContextInput, SessionTypeError, SessionTypeMutation,
+    SessionTypeMutationSource, SessionTypeRequest,
 };
 pub use spawn_targets::{
     SpawnTarget, SpawnTargetCreate, SpawnTargetError, SpawnTargetResult, SpawnTargetUpdate,
