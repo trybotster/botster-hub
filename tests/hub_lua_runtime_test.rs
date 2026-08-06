@@ -2197,7 +2197,7 @@ fn real_lua_plugin_atomically_ensures_managed_worktree_and_spawns_session() {
             name: "session_type.inspect".to_string(),
             arguments: serde_json::json!({
                 "target_id": "tgt_managed",
-                "session_type_id": "init"
+                "session_type_id": "tgt_managed/init"
             }),
         })
         .expect("inspect target-filtered templates");
@@ -2214,6 +2214,16 @@ fn real_lua_plugin_atomically_ensures_managed_worktree_and_spawns_session() {
         inspected["shown"]["diagnostics"],
         serde_json::json!(["overrides 1 lower-precedence definition(s)"])
     );
+    let inspected_bare = hub
+        .call_plugin_mcp_tool(botster_hub::McpCallRequest {
+            name: "session_type.inspect".to_string(),
+            arguments: serde_json::json!({
+                "target_id": "tgt_managed",
+                "session_type_id": "init"
+            }),
+        })
+        .expect("inspect target-filtered template by bare id");
+    assert_eq!(inspected_bare["shown"], inspected["shown"]);
 
     let result = hub
         .call_plugin_mcp_tool(botster_hub::McpCallRequest {

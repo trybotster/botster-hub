@@ -933,51 +933,55 @@ fn session_type_sources_apply_device_repo_precedence_and_reload_from_state() {
     );
     let listed = templates[0].clone();
 
-    let shown = api
-        .handle_request(
-            &mut runtime,
-            &packages,
-            HubClientRequest::ShowSessionType {
-                request_id: request_id("show-repo-template"),
-                session_type_id: "init".to_string(),
-            },
-        )
-        .expect("show repo override");
-    let HubClientResponseBody::SessionTypes(shown) = shown.body else {
-        panic!("shown session type expected");
-    };
-    assert_eq!(shown, vec![listed.clone()]);
-
-    let resolved = api
-        .handle_request(
-            &mut runtime,
-            &packages,
-            HubClientRequest::ResolveSessionType {
-                request_id: request_id("resolve-repo-template"),
-                session_type_id: "init".to_string(),
-                session_type_request: botster_hub::SessionTypeRequest {
-                    environment: BTreeMap::from([(
-                        "BOTSTER_MODE".to_string(),
-                        "explicit".to_string(),
-                    )]),
-                    ..botster_hub::SessionTypeRequest::default()
+    for (suffix, session_type_id) in [
+        ("bare", "init".to_string()),
+        ("qualified", listed.session_type_id.clone()),
+    ] {
+        let shown = api
+            .handle_request(
+                &mut runtime,
+                &packages,
+                HubClientRequest::ShowSessionType {
+                    request_id: request_id(&format!("show-{suffix}-repo-template")),
+                    session_type_id: session_type_id.clone(),
                 },
-            },
-        )
-        .expect("resolve repo override");
-    let HubClientResponseBody::ResolvedSessionType(resolved) = resolved.body else {
-        panic!("resolved session type expected");
-    };
-    assert_eq!(resolved.session_type.source, "repo");
-    assert_eq!(resolved.session_type, listed);
-    assert_eq!(
-        resolved.executable,
-        repo_root.join("bin/repo.sh").display().to_string()
-    );
-    assert_eq!(
-        resolved.environment.get("BOTSTER_MODE").map(String::as_str),
-        Some("explicit")
-    );
+            )
+            .expect("show repo override");
+        let HubClientResponseBody::SessionTypes(shown) = shown.body else {
+            panic!("shown session type expected");
+        };
+        assert_eq!(shown, vec![listed.clone()]);
+
+        let resolved = api
+            .handle_request(
+                &mut runtime,
+                &packages,
+                HubClientRequest::ResolveSessionType {
+                    request_id: request_id(&format!("resolve-{suffix}-repo-template")),
+                    session_type_id,
+                    session_type_request: botster_hub::SessionTypeRequest {
+                        environment: BTreeMap::from([(
+                            "BOTSTER_MODE".to_string(),
+                            "explicit".to_string(),
+                        )]),
+                        ..botster_hub::SessionTypeRequest::default()
+                    },
+                },
+            )
+            .expect("resolve repo override");
+        let HubClientResponseBody::ResolvedSessionType(resolved) = resolved.body else {
+            panic!("resolved session type expected");
+        };
+        assert_eq!(resolved.session_type, listed);
+        assert_eq!(
+            resolved.executable,
+            repo_root.join("bin/repo.sh").display().to_string()
+        );
+        assert_eq!(
+            resolved.environment.get("BOTSTER_MODE").map(String::as_str),
+            Some("explicit")
+        );
+    }
 
     let rejected = api
         .handle_request(
