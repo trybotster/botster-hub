@@ -1,6 +1,6 @@
 {
   "binding_family": "/session",
-  "conformance_fixture_revision": 29,
+  "conformance_fixture_revision": 30,
   "entity_type": "session",
   "expected": {
     "after_ended_patch": {
@@ -49,6 +49,7 @@
         "registry_state": "running",
         "rows": 24,
         "session_uuid": "session-transition",
+        "traits": [],
         "updated_at": 1
       },
       {
@@ -58,6 +59,7 @@
         "registry_state": "running",
         "rows": 24,
         "session_uuid": "session-stable-current",
+        "traits": [],
         "updated_at": 1
       },
       {
@@ -68,6 +70,7 @@
         "registry_state": "exited",
         "rows": 24,
         "session_uuid": "session-ended",
+        "traits": [],
         "updated_at": 1
       },
       {
@@ -77,6 +80,7 @@
         "registry_state": "stale",
         "rows": 24,
         "session_uuid": "session-indeterminate",
+        "traits": [],
         "updated_at": 1
       }
     ],
@@ -95,6 +99,7 @@
         "registry_state": "running",
         "rows": 24,
         "session_uuid": "session-stable-current",
+        "traits": [],
         "updated_at": 4
       },
       {
@@ -105,6 +110,7 @@
         "registry_state": "exited",
         "rows": 24,
         "session_uuid": "session-ended",
+        "traits": [],
         "updated_at": 4
       },
       {
@@ -113,6 +119,7 @@
         "registry_state": "stale",
         "rows": 24,
         "session_uuid": "session-indeterminate",
+        "traits": [],
         "updated_at": 4
       }
     ],

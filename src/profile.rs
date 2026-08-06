@@ -189,11 +189,11 @@ fn default_capability_grants() -> Vec<Capability> {
         },
         Capability {
             surface: CapabilitySurface::SessionActions,
-            scope: Some("session_template_spawn".to_string()),
+            scope: Some("session_type_spawn".to_string()),
         },
         Capability {
             surface: CapabilitySurface::SessionActions,
-            scope: Some("session_template_managed_git_spawn".to_string()),
+            scope: Some("session_type_managed_git_spawn".to_string()),
         },
         Capability {
             surface: CapabilitySurface::Mcp,

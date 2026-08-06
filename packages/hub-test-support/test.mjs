@@ -132,10 +132,10 @@ function assertDialogFormComposition(source) {
 }
 
 assert.equal(metadata.package_name, "@trybotster/hub-test-support");
-assert.equal(metadata.package_version, "0.1.22");
+assert.equal(metadata.package_version, "0.1.23");
 assert.equal(metadata.protocol, "botster-hub-daemon-v1");
-assert.equal(metadata.protocol_version, 5);
-assert.equal(metadata.conformance_fixture_revision, 29);
+assert.equal(metadata.protocol_version, 6);
+assert.equal(metadata.conformance_fixture_revision, 30);
 assert.deepEqual(metadata.ui_contract, {
   conformance_fixture_export: "@trybotster/ui-contract/conformance-fixtures",
   package_name: "@trybotster/ui-contract",
@@ -168,6 +168,10 @@ assert.deepEqual(metadata.application_primitives, {
 const protocol = readDaemonProtocolTypescript();
 assert.equal(protocol, readFileSync(daemonProtocolTypescriptPath(), "utf8"));
 assert.match(protocol, /export type DaemonRequest/);
+assert.match(protocol, /create_session_type/);
+assert.match(protocol, /update_session_type/);
+assert.match(protocol, /delete_session_type/);
+assert.match(protocol, /export interface DaemonSessionTypeDefinition/);
 assert.match(protocol, /export interface DaemonCompatibility/);
 assert.match(protocol, /read_screen/);
 assert.match(protocol, /read_mode_flags/);
@@ -227,6 +231,10 @@ const sessionPluginBindingFixture = readSessionPluginBindingConformanceFixture()
 assert.equal(supportMatrix.late_attach_history.supported, true);
 assert.equal(supportMatrix.required_features.includes("terminal_readback"), true);
 assert.equal(supportMatrix.required_features.includes("session_entity_subscriptions"), true);
+assert.equal(
+  supportMatrix.required_features.includes("session_type_entity_subscriptions"),
+  true,
+);
 assert.equal(supportMatrix.session_entities.supported, true);
 assert.equal(supportMatrix.session_entities.bounded_delivery, true);
 assert.equal(supportMatrix.session_entities.explicit_snapshot_resync, true);
@@ -248,6 +256,10 @@ assert.equal(
   "botster_hub_test_support::session_lifecycle_subscription_conformance_fixture_json",
 );
 assert.equal(supportMatrix.supported_features.includes("terminal_readback"), true);
+assert.equal(
+  supportMatrix.supported_features.includes("session_type_entity_subscriptions"),
+  true,
+);
 assert.equal(
   supportMatrix.plugin_surfaces.runtime_runner,
   "botster_hub_test_support::run_plugin_contract_matrix_conformance",
@@ -275,7 +287,7 @@ assert.deepEqual(supportMatrix.plugin_surfaces.authored_set_values, {
   "selected-workspace": "workspace-alpha",
 });
 
-assert.equal(sessionLifecycleFixture.conformance_fixture_revision, 29);
+assert.equal(sessionLifecycleFixture.conformance_fixture_revision, 30);
 assert.equal(sessionLifecycleFixture.entity_type, "session");
 assert.deepEqual(
   sessionLifecycleFixture.normalized_frames.map((frame) => frame.type),
@@ -313,7 +325,7 @@ assert.equal(
 assert.equal(sessionLifecycleFixture.overflow.snapshot_precedes_later_deltas, true);
 assert.equal(sessionLifecycleFixture.overflow.failed_snapshot_delivery_closes_subscription, true);
 
-assert.equal(sessionPluginBindingFixture.conformance_fixture_revision, 29);
+assert.equal(sessionPluginBindingFixture.conformance_fixture_revision, 30);
 assert.equal(sessionPluginBindingFixture.binding_family, "/session");
 const sessionPluginMaterialization = materializeSessionPluginBindingScenario(
   sessionPluginBindingFixture,

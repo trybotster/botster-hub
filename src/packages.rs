@@ -29,7 +29,7 @@ use botster_ui_contract::{
 use serde::{Deserialize, Serialize};
 
 use crate::host_profile;
-use crate::session_templates::{PackageSessionTemplate, validate_session_templates};
+use crate::session_types::{PackageSessionType, validate_session_types};
 
 /// Conventional manifest filename used when installing a local package directory.
 pub const LOCAL_PACKAGE_MANIFEST_FILE: &str = "botster-package.json";
@@ -181,7 +181,7 @@ struct PackageInstallOptions {
     provenance: PackageProvenance,
     trust: PackageTrust,
     runnable_entrypoints: Vec<PackageRunnableEntrypoint>,
-    session_templates: Vec<PackageSessionTemplate>,
+    session_types: Vec<PackageSessionType>,
     source_metadata: Option<PackageSourceMetadata>,
     pin: Option<PackagePin>,
     audit_reason: String,
@@ -237,7 +237,7 @@ impl PackageRegistry {
         provenance: PackageProvenance,
         trust: PackageTrust,
         runnable_entrypoints: Vec<PackageRunnableEntrypoint>,
-        session_templates: Vec<PackageSessionTemplate>,
+        session_types: Vec<PackageSessionType>,
         audit_reason: impl Into<String>,
     ) -> PackageRegistryResult<&PackageRecord> {
         self.install_with_options(PackageInstallOptions {
@@ -245,7 +245,7 @@ impl PackageRegistry {
             provenance,
             trust,
             runnable_entrypoints,
-            session_templates,
+            session_types,
             source_metadata: None,
             pin: None,
             audit_reason: audit_reason.into(),
@@ -261,7 +261,7 @@ impl PackageRegistry {
             provenance,
             trust,
             runnable_entrypoints,
-            session_templates,
+            session_types,
             source_metadata,
             pin,
             audit_reason,
@@ -327,7 +327,7 @@ impl PackageRegistry {
             admitted_capabilities: Vec::new(),
             compatibility,
             runnable_entrypoints,
-            session_templates,
+            session_types,
             configuration: PackageConfigurationState::default(),
             installed_at: None,
             updated_at: None,
@@ -359,11 +359,11 @@ impl PackageRegistry {
             PackageAction::Install,
             audit_reason.clone(),
         )?;
-        validate_session_templates(&local_manifest.session_templates).map_err(|reason| {
+        validate_session_types(&local_manifest.session_types).map_err(|reason| {
             PackageRegistryError::without_record(
                 manifest.name.clone(),
                 PackageAction::Install,
-                PackageAdmissionReason::UnsafeSessionTemplate(reason),
+                PackageAdmissionReason::UnsafeSessionType(reason),
                 audit_reason.clone(),
             )
         })?;
@@ -380,7 +380,7 @@ impl PackageRegistry {
             provenance,
             PackageTrust::local_development(),
             local_manifest.runnable_entrypoints,
-            local_manifest.session_templates,
+            local_manifest.session_types,
             audit_reason,
         )
     }
@@ -508,11 +508,11 @@ impl PackageRegistry {
             &local_manifest.runnable_entrypoints,
             audit_reason.clone(),
         )?;
-        validate_session_templates(&local_manifest.session_templates).map_err(|reason| {
+        validate_session_types(&local_manifest.session_types).map_err(|reason| {
             PackageRegistryError::with_record(
                 package_name,
                 PackageAction::Reload,
-                PackageAdmissionReason::UnsafeSessionTemplate(reason),
+                PackageAdmissionReason::UnsafeSessionType(reason),
                 current.state,
                 current.classification,
                 audit_reason.clone(),
@@ -549,7 +549,7 @@ impl PackageRegistry {
                 admitted_capabilities: Vec::new(),
                 compatibility,
                 runnable_entrypoints: local_manifest.runnable_entrypoints,
-                session_templates: local_manifest.session_templates,
+                session_types: local_manifest.session_types,
                 configuration: current.configuration,
                 installed_at: current.installed_at,
                 updated_at: current.updated_at,
@@ -636,7 +636,7 @@ impl PackageRegistry {
             provenance: prepared.provenance,
             trust,
             runnable_entrypoints: prepared.runnable_entrypoints,
-            session_templates: prepared.session_templates,
+            session_types: prepared.session_types,
             source_metadata: Some(source_metadata),
             pin: prepared.pin,
             audit_reason: audit_reason.into(),
@@ -967,8 +967,8 @@ impl PackageRegistry {
                 &package_name,
                 &record.runnable_entrypoints,
             )?;
-            validate_session_templates(&record.session_templates).map_err(|reason| {
-                PackageRegistrySnapshotError::SessionTemplate {
+            validate_session_types(&record.session_types).map_err(|reason| {
+                PackageRegistrySnapshotError::SessionType {
                     package_name: package_name.clone(),
                     reason,
                 }
@@ -1172,9 +1172,9 @@ pub struct PackageRecord {
     /// Hub-owned local/dev runnable entrypoint declarations.
     #[serde(default)]
     pub runnable_entrypoints: Vec<PackageRunnableEntrypoint>,
-    /// Hub-owned local/dev session template declarations.
+    /// Hub-owned local/dev session type declarations.
     #[serde(default)]
-    pub session_templates: Vec<PackageSessionTemplate>,
+    pub session_types: Vec<PackageSessionType>,
     /// Hub-owned persisted package configuration values.
     #[serde(default)]
     pub configuration: PackageConfigurationState,
@@ -1937,9 +1937,9 @@ pub enum PackageRegistrySnapshotError {
         /// Sanitized validation reason.
         reason: String,
     },
-    /// Persisted session template declarations no longer validate.
-    SessionTemplate {
-        /// Package whose persisted session templates could not be re-derived.
+    /// Persisted session type declarations no longer validate.
+    SessionType {
+        /// Package whose persisted session types could not be re-derived.
         package_name: String,
         /// Sanitized validation reason.
         reason: String,
@@ -1991,12 +1991,12 @@ impl fmt::Display for PackageRegistrySnapshotError {
                 formatter,
                 "persisted package {package_name} has invalid runnable entrypoints: {reason}"
             ),
-            Self::SessionTemplate {
+            Self::SessionType {
                 package_name,
                 reason,
             } => write!(
                 formatter,
-                "persisted package {package_name} has invalid session templates: {reason}"
+                "persisted package {package_name} has invalid session types: {reason}"
             ),
         }
     }
@@ -2081,8 +2081,8 @@ pub enum PackageAdmissionReason {
     InvalidPresentation(String),
     /// Local package entrypoint was absent or unsafe.
     UnsafeEntrypoint(String),
-    /// Local package session template was absent or unsafe.
-    UnsafeSessionTemplate(String),
+    /// Local package session type was absent or unsafe.
+    UnsafeSessionType(String),
     /// Capability surface is not governed by the current host profile.
     UngovernedCapabilitySurface(CapabilitySurface),
     /// Manifest requested a capability not present in the hub-owned grant set.
@@ -2582,7 +2582,7 @@ struct PackageRegistryEntry {
     #[serde(default)]
     runnable_entrypoints: Vec<PackageRunnableEntrypoint>,
     #[serde(default)]
-    session_templates: Vec<PackageSessionTemplate>,
+    session_types: Vec<PackageSessionType>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2631,7 +2631,7 @@ struct PreparedRegistryEntry {
     manifest: HubPackageManifest,
     provenance: PackageProvenance,
     runnable_entrypoints: Vec<PackageRunnableEntrypoint>,
-    session_templates: Vec<PackageSessionTemplate>,
+    session_types: Vec<PackageSessionType>,
     pin: Option<PackagePin>,
 }
 
@@ -2659,10 +2659,10 @@ impl PreparedRegistryEntry {
                 } else {
                     entry.runnable_entrypoints.clone()
                 };
-                let session_templates = if entry.session_templates.is_empty() {
-                    local_manifest.session_templates
+                let session_types = if entry.session_types.is_empty() {
+                    local_manifest.session_types
                 } else {
-                    entry.session_templates.clone()
+                    entry.session_types.clone()
                 };
                 validate_runnable_entrypoints(
                     &manifest.name,
@@ -2670,11 +2670,11 @@ impl PreparedRegistryEntry {
                     PackageAction::Install,
                     "load registry local package".to_string(),
                 )?;
-                validate_session_templates(&session_templates).map_err(|reason| {
+                validate_session_types(&session_types).map_err(|reason| {
                     PackageRegistryError::without_record(
                         manifest.name.clone(),
                         PackageAction::Install,
-                        PackageAdmissionReason::UnsafeSessionTemplate(reason),
+                        PackageAdmissionReason::UnsafeSessionType(reason),
                         "load registry local package".to_string(),
                     )
                 })?;
@@ -2688,7 +2688,7 @@ impl PreparedRegistryEntry {
                         checksum: None,
                     },
                     runnable_entrypoints,
-                    session_templates,
+                    session_types,
                     pin: None,
                 })
             }
@@ -2720,7 +2720,7 @@ impl PreparedRegistryEntry {
                         checksum: None,
                     },
                     runnable_entrypoints: entry.runnable_entrypoints.clone(),
-                    session_templates: entry.session_templates.clone(),
+                    session_types: entry.session_types.clone(),
                     pin: Some(PackagePin {
                         revision,
                         branch: branch.clone(),
@@ -2861,7 +2861,7 @@ struct LocalPackageManifest {
     #[serde(default)]
     runnable_entrypoints: Vec<PackageRunnableEntrypoint>,
     #[serde(default)]
-    session_templates: Vec<PackageSessionTemplate>,
+    session_types: Vec<PackageSessionType>,
 }
 
 #[derive(Debug, Clone)]
@@ -3342,7 +3342,7 @@ mod tests {
             update_policy: PackageUpdatePolicy::Manual,
             admitted_capabilities: Vec::new(),
             runnable_entrypoints: Vec::new(),
-            session_templates: Vec::new(),
+            session_types: Vec::new(),
             configuration: PackageConfigurationState::default(),
             installed_at: None,
             updated_at: None,

@@ -341,8 +341,8 @@ local function coordination_for(ticket_id, run_number, target_id, worktree_id, w
     target = target,
     envelope_id = envelope.id,
   })
-  local spawned = botster.capabilities.session_templates.spawn({
-    template_id = "project-pipelines/agent-step",
+  local spawned = botster.capabilities.session_types.spawn({
+    session_type_id = "project-pipelines/agent-step",
     session_id = session_id,
     context = {
       prompt = "Project Pipelines local step for " .. ticket_id,
@@ -363,7 +363,7 @@ local function coordination_for(ticket_id, run_number, target_id, worktree_id, w
     owner_plugin = primitive.owner_plugin,
     agent_name = primitive.agent_name,
     session_uuid = spawned.session_id,
-    session_template_id = spawned.template_id,
+    session_type_id = spawned.session_type_id,
     session_context_id = spawned.context_id,
     session_lifecycle = spawned.lifecycle,
     envelope_id = envelope.id,

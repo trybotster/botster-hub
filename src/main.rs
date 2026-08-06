@@ -26,7 +26,8 @@ use botster_hub::{
 };
 use botster_hub_client::{
     DaemonDiagnostic, DaemonLocalWebrtcBootstrap, DaemonLocalWebrtcDeliveryChunk,
-    DaemonLocalWebrtcDeliveryKind, DaemonPackageUpdateStatus, LOCAL_WEBRTC_DELIVERY_CHUNK_VERSION,
+    DaemonLocalWebrtcDeliveryKind, DaemonPackageUpdateStatus, DaemonSessionTypeDefinition,
+    DaemonSessionTypeMutationSource, LOCAL_WEBRTC_DELIVERY_CHUNK_VERSION,
     LOCAL_WEBRTC_MAX_DELIVERY_BYTES, LOCAL_WEBRTC_MAX_FRAME_BYTES,
 };
 use serde::{Deserialize, Serialize};
@@ -133,7 +134,7 @@ fn dispatch_command(command: &str, args: Vec<String>) -> Result<CommandOutcome, 
         "sessions" => operator_sessions(args)
             .map(|()| CommandOutcome::Completed)
             .map_err(|error| error.to_string()),
-        "session-templates" => operator_session_templates(args)
+        "session-types" => operator_session_types(args)
             .map(|()| CommandOutcome::Completed)
             .map_err(|error| error.to_string()),
         "spawn-targets" => operator_spawn_targets(args)
@@ -250,7 +251,7 @@ fn stateful_command(command: &str) -> bool {
             | "status"
             | "check-update"
             | "sessions"
-            | "session-templates"
+            | "session-types"
             | "spawn-targets"
             | "context"
             | "shutdown"
@@ -315,7 +316,7 @@ fn canonicalize_data_dir_args_for_environment(
     } else if matches!(
         command,
         "sessions"
-            | "session-templates"
+            | "session-types"
             | "spawn-targets"
             | "open"
             | "reload"
@@ -348,7 +349,7 @@ fn command_usage(command: &str) -> &'static str {
         "status" => "status",
         "check-update" => "check-update",
         "sessions" => "sessions",
-        "session-templates" => "session-templates",
+        "session-types" => "session-types",
         "spawn-targets" => "spawn-targets",
         "context" => "context",
         "shutdown" => "shutdown",
@@ -2232,45 +2233,45 @@ fn operator_sessions(args: Vec<String>) -> Result<(), OperatorError> {
     Ok(())
 }
 
-fn operator_session_templates(args: Vec<String>) -> Result<(), OperatorError> {
+fn operator_session_types(args: Vec<String>) -> Result<(), OperatorError> {
     let Some(action) = args.first().map(String::as_str) else {
-        return Err(OperatorError::Usage("session-templates"));
+        return Err(OperatorError::Usage("session-types"));
     };
     match action {
         "list" => {
-            let options = DataArgs::parse(args[1..].to_vec(), "session-templates list")?;
+            let options = DataArgs::parse(args[1..].to_vec(), "session-types list")?;
             if !options.arguments.is_empty() {
-                return Err(OperatorError::Usage("session-templates list"));
+                return Err(OperatorError::Usage("session-types list"));
             }
             let config = explicit_config(options.data_directory)?;
-            let response = daemon_transport_request(&config, DaemonRequest::ListSessionTemplates)?;
+            let response = daemon_transport_request(&config, DaemonRequest::ListSessionTypes)?;
             print_daemon_response(response)?;
         }
         "show" => {
             if args.len() != 4 {
-                return Err(OperatorError::Usage("session-templates show"));
+                return Err(OperatorError::Usage("session-types show"));
             }
-            let options = DataArgs::parse(args[1..3].to_vec(), "session-templates show")?;
+            let options = DataArgs::parse(args[1..3].to_vec(), "session-types show")?;
             let config = explicit_config(options.data_directory)?;
             let response = daemon_transport_request(
                 &config,
-                DaemonRequest::ShowSessionTemplate {
-                    template_id: args[3].clone(),
+                DaemonRequest::ShowSessionType {
+                    session_type_id: args[3].clone(),
                 },
             )?;
             print_daemon_response(response)?;
         }
         "resolve" => {
             if args.len() < 4 {
-                return Err(OperatorError::Usage("session-templates resolve"));
+                return Err(OperatorError::Usage("session-types resolve"));
             }
-            let options = DataArgs::parse(args[1..3].to_vec(), "session-templates resolve")?;
+            let options = DataArgs::parse(args[1..3].to_vec(), "session-types resolve")?;
             let config = explicit_config(options.data_directory)?;
-            let request = parse_session_template_request(&args[4..])?;
+            let request = parse_session_type_request(&args[4..])?;
             let response = daemon_transport_request(
                 &config,
-                DaemonRequest::ResolveSessionTemplate {
-                    template_id: args[3].clone(),
+                DaemonRequest::ResolveSessionType {
+                    session_type_id: args[3].clone(),
                     request,
                 },
             )?;
@@ -2278,24 +2279,74 @@ fn operator_session_templates(args: Vec<String>) -> Result<(), OperatorError> {
         }
         "spawn" => {
             if args.len() < 6 || args.get(4).map(String::as_str) != Some("--session-id") {
-                return Err(OperatorError::Usage("session-templates spawn"));
+                return Err(OperatorError::Usage("session-types spawn"));
             }
-            let options = DataArgs::parse(args[1..3].to_vec(), "session-templates spawn")?;
+            let options = DataArgs::parse(args[1..3].to_vec(), "session-types spawn")?;
             let config = explicit_config(options.data_directory)?;
-            let request = parse_session_template_request(&args[6..])?;
+            let request = parse_session_type_request(&args[6..])?;
             let response = daemon_transport_request(
                 &config,
-                DaemonRequest::SpawnSessionTemplate {
-                    template_id: args[3].clone(),
+                DaemonRequest::SpawnSessionType {
+                    session_type_id: args[3].clone(),
                     session_id: args[5].clone(),
                     request,
                 },
             )?;
             print_daemon_response(response)?;
         }
-        _ => return Err(OperatorError::Usage("session-templates")),
+        "create" | "update" => {
+            let options = DataArgs::parse(args[1..].to_vec(), "session-types mutation")?;
+            let (source, definition_json) =
+                parse_session_type_mutation_arguments(&options.arguments)?;
+            let definition: DaemonSessionTypeDefinition = serde_json::from_str(definition_json)
+                .map_err(|_| OperatorError::Usage("session-types mutation"))?;
+            let request = if action == "create" {
+                DaemonRequest::CreateSessionType { source, definition }
+            } else {
+                DaemonRequest::UpdateSessionType { source, definition }
+            };
+            let config = explicit_config(options.data_directory)?;
+            print_daemon_response(daemon_transport_request(&config, request)?)?;
+        }
+        "delete" => {
+            let options = DataArgs::parse(args[1..].to_vec(), "session-types delete")?;
+            let (source, session_type_id) =
+                parse_session_type_mutation_arguments(&options.arguments)?;
+            let config = explicit_config(options.data_directory)?;
+            print_daemon_response(daemon_transport_request(
+                &config,
+                DaemonRequest::DeleteSessionType {
+                    source,
+                    session_type_id: session_type_id.to_string(),
+                },
+            )?)?;
+        }
+        _ => return Err(OperatorError::Usage("session-types")),
     }
     Ok(())
+}
+
+fn parse_session_type_mutation_arguments(
+    arguments: &[String],
+) -> Result<(DaemonSessionTypeMutationSource, &str), OperatorError> {
+    match arguments {
+        [source, value] if source == "device" => {
+            Ok((DaemonSessionTypeMutationSource::Device, value))
+        }
+        [source, target_id, value] if source == "repo" => Ok((
+            DaemonSessionTypeMutationSource::Repo {
+                target_id: target_id.clone(),
+            },
+            value,
+        )),
+        [source, package_name, value] if source == "package" => Ok((
+            DaemonSessionTypeMutationSource::Package {
+                package_name: package_name.clone(),
+            },
+            value,
+        )),
+        _ => Err(OperatorError::Usage("session-types mutation")),
+    }
 }
 
 fn operator_spawn_targets(args: Vec<String>) -> Result<(), OperatorError> {
@@ -2564,33 +2615,33 @@ fn operator_context(args: Vec<String>) -> Result<(), OperatorError> {
     }
 }
 
-fn parse_session_template_request(
+fn parse_session_type_request(
     args: &[String],
-) -> Result<botster_hub::DaemonSessionTemplateRequest, OperatorError> {
-    let mut request = botster_hub::DaemonSessionTemplateRequest::default();
+) -> Result<botster_hub::DaemonSessionTypeRequest, OperatorError> {
+    let mut request = botster_hub::DaemonSessionTypeRequest::default();
     let mut cursor = 0;
     while cursor < args.len() {
         match args[cursor].as_str() {
             "--target-id" => {
                 let Some(value) = args.get(cursor + 1) else {
-                    return Err(OperatorError::Usage("session-templates"));
+                    return Err(OperatorError::Usage("session-types"));
                 };
                 request.target_id = Some(value.clone());
                 cursor += 2;
             }
             "--cwd" => {
                 let Some(value) = args.get(cursor + 1) else {
-                    return Err(OperatorError::Usage("session-templates"));
+                    return Err(OperatorError::Usage("session-types"));
                 };
                 request.cwd = Some(value.clone());
                 cursor += 2;
             }
             "--env" => {
                 let Some(value) = args.get(cursor + 1) else {
-                    return Err(OperatorError::Usage("session-templates"));
+                    return Err(OperatorError::Usage("session-types"));
                 };
                 let Some((name, value)) = value.split_once('=') else {
-                    return Err(OperatorError::Usage("session-templates"));
+                    return Err(OperatorError::Usage("session-types"));
                 };
                 request
                     .environment
@@ -2599,33 +2650,33 @@ fn parse_session_template_request(
             }
             "--prompt" => {
                 let Some(value) = args.get(cursor + 1) else {
-                    return Err(OperatorError::Usage("session-templates"));
+                    return Err(OperatorError::Usage("session-types"));
                 };
                 request.context.prompt = Some(value.clone());
                 cursor += 2;
             }
             "--branch" => {
                 let Some(value) = args.get(cursor + 1) else {
-                    return Err(OperatorError::Usage("session-templates"));
+                    return Err(OperatorError::Usage("session-types"));
                 };
                 request.context.branch_name = Some(value.clone());
                 cursor += 2;
             }
             "--ticket-id" => {
                 let Some(value) = args.get(cursor + 1) else {
-                    return Err(OperatorError::Usage("session-templates"));
+                    return Err(OperatorError::Usage("session-types"));
                 };
                 request.context.ticket_id = Some(value.clone());
                 cursor += 2;
             }
             "--workspace-id" => {
                 let Some(value) = args.get(cursor + 1) else {
-                    return Err(OperatorError::Usage("session-templates"));
+                    return Err(OperatorError::Usage("session-types"));
                 };
                 request.context.workspace_id = Some(value.clone());
                 cursor += 2;
             }
-            _ => return Err(OperatorError::Usage("session-templates")),
+            _ => return Err(OperatorError::Usage("session-types")),
         }
     }
     Ok(request)
@@ -3373,20 +3424,23 @@ fn print_daemon_response(response: DaemonResponse) -> Result<(), OperatorError> 
             println!("response=events");
             print_daemon_events(&response.events);
         }
-        DaemonResponseKind::SessionTemplates => {
-            println!("response=session_templates");
-            println!("template_count={}", response.session_templates.len());
-            for template in response.session_templates {
+        DaemonResponseKind::SessionTypes => {
+            println!("response=session_types");
+            println!("session_type_count={}", response.session_types.len());
+            for session_type in response.session_types {
                 println!(
-                    "template id={} package={} available={} target={}",
-                    template.id, template.package_name, template.available, template.target_id
+                    "session_type id={} source={} available={} target={}",
+                    session_type.id,
+                    session_type.source_name,
+                    session_type.available,
+                    session_type.target_id
                 );
             }
         }
-        DaemonResponseKind::ResolvedSessionTemplate => {
-            println!("response=resolved_session_template");
-            if let Some(resolved) = response.resolved_session_template {
-                println!("template_id={}", resolved.template.template_id);
+        DaemonResponseKind::ResolvedSessionType => {
+            println!("response=resolved_session_type");
+            if let Some(resolved) = response.resolved_session_type {
+                println!("session_type_id={}", resolved.session_type.session_type_id);
                 println!("session_id={}", resolved.session_id);
                 println!("command_present={}", !resolved.executable.is_empty());
                 println!("args={}", resolved.arguments.len());
@@ -5433,16 +5487,16 @@ Packages:
         "sessions" => {
             "usage: botster-hub sessions <list|spawn|attach|send-input|resize|detach|shutdown> ..."
         }
-        "session-templates" => "usage: botster-hub session-templates <list|show|resolve|spawn> ...",
-        "session-templates list" => "usage: botster-hub session-templates list [--data-dir <path>]",
-        "session-templates show" => {
-            "usage: botster-hub session-templates show [--data-dir <path>] <template-id>"
+        "session-types" => "usage: botster-hub session-types <list|show|resolve|spawn> ...",
+        "session-types list" => "usage: botster-hub session-types list [--data-dir <path>]",
+        "session-types show" => {
+            "usage: botster-hub session-types show [--data-dir <path>] <session-type-id>"
         }
-        "session-templates resolve" => {
-            "usage: botster-hub session-templates resolve [--data-dir <path>] <template-id> [--target-id <id>] [--cwd <path>] [--env NAME=value] [--prompt <text>] [--branch <name>] [--ticket-id <id>] [--workspace-id <id>]"
+        "session-types resolve" => {
+            "usage: botster-hub session-types resolve [--data-dir <path>] <session-type-id> [--target-id <id>] [--cwd <path>] [--env NAME=value] [--prompt <text>] [--branch <name>] [--ticket-id <id>] [--workspace-id <id>]"
         }
-        "session-templates spawn" => {
-            "usage: botster-hub session-templates spawn [--data-dir <path>] <template-id> --session-id <id> [--target-id <id>] [--cwd <path>] [--env NAME=value] [--prompt <text>] [--branch <name>] [--ticket-id <id>] [--workspace-id <id>]"
+        "session-types spawn" => {
+            "usage: botster-hub session-types spawn [--data-dir <path>] <session-type-id> --session-id <id> [--target-id <id>] [--cwd <path>] [--env NAME=value] [--prompt <text>] [--branch <name>] [--ticket-id <id>] [--workspace-id <id>]"
         }
         "spawn-targets" | "spawn-targets list" => {
             "usage: botster-hub spawn-targets list [--data-dir <path>]"
@@ -5698,7 +5752,7 @@ mod cli_data_dir_tests {
             ("mcp-serve", vec![], 0),
             ("inspect", vec!["session"], 0),
             ("sessions", vec!["list"], 1),
-            ("session-templates", vec!["list"], 1),
+            ("session-types", vec!["list"], 1),
             ("spawn-targets", vec!["list"], 1),
             ("context", vec!["--session-id", "session"], 0),
             ("open", vec!["web"], 1),
@@ -5829,7 +5883,7 @@ mod cli_data_dir_tests {
             "start",
             "smoke",
             "sessions list",
-            "session-templates list",
+            "session-types list",
             "apps list",
             "packages list",
             "mcp-serve",

@@ -53,11 +53,11 @@ use crate::managed_git_worktrees::{
 };
 use crate::packages::{PackageRecord, PackageRegistry, PackageRegistryError, PackageState};
 use crate::persistence::{FileHubStateStore, HubState, HubStateStore, HubStateStoreError};
-use crate::session_templates::{
-    EnsuredManagedWorktree, HubSessionContext, HubSessionTemplate, ManagedSessionTemplateRequest,
-    SessionTemplateRequest, list_session_templates_for_target,
-    materialize_managed_session_template, materialize_session_template,
-    show_session_template_for_target,
+use crate::session_types::{
+    EnsuredManagedWorktree, HubSessionContext, HubSessionType, ManagedSessionTypeRequest,
+    SessionTypeError, SessionTypeMutation, SessionTypeMutationSource, SessionTypeRequest,
+    list_session_types_for_target, materialize_managed_session_type, materialize_session_type,
+    mutate_session_type, show_session_type_for_target,
 };
 use crate::spawn_targets::SpawnTarget;
 use crate::worktrees::Worktree;
@@ -80,7 +80,7 @@ pub struct HubRuntime {
     capability_runtime: SharedHubCapabilityRuntime,
     spawn_targets: SharedSpawnTargets,
     worktrees: SharedWorktrees,
-    session_template_spawner: SharedSessionTemplateSpawner,
+    session_type_spawner: SharedSessionTypeSpawner,
     managed_git_coordinator: ManagedGitCoordinator,
     managed_git_operations: Mutex<Vec<PendingManagedGitOperation>>,
     coordination_bridge: HubCoordinationBridge,
@@ -93,46 +93,46 @@ type SharedSessionContexts = Arc<Mutex<BTreeMap<String, HubSessionContext>>>;
 const SESSION_TEMPLATE_SPAWN_TIMEOUT_MS: u64 = 30_000;
 const PLUGIN_EVENT_TIMEOUT_MS: u64 = 1_000;
 
-/// Shared hub-owned session-template spawn bridge exposed to Lua plugin workers.
-pub type SharedSessionTemplateSpawner = Arc<HubSessionTemplateSpawner>;
+/// Shared hub-owned session-type spawn bridge exposed to Lua plugin workers.
+pub type SharedSessionTypeSpawner = Arc<HubSessionTypeSpawner>;
 /// Shared hub-owned spawn-target projection exposed to Lua plugin workers.
 pub type SharedSpawnTargets = Arc<Mutex<Vec<SpawnTarget>>>;
 /// Shared hub-owned worktree projection exposed to Lua plugin workers.
 pub type SharedWorktrees = Arc<Mutex<Vec<Worktree>>>;
 
-/// Hub-owned policy bridge for plugin-safe session-template spawns.
-pub struct HubSessionTemplateSpawner {
-    pending: Mutex<VecDeque<PendingSessionTemplateSpawn>>,
-    reads: Mutex<VecDeque<PendingSessionTemplateRead>>,
+/// Hub-owned policy bridge for plugin-safe session-type spawns.
+pub struct HubSessionTypeSpawner {
+    pending: Mutex<VecDeque<PendingSessionTypeSpawn>>,
+    reads: Mutex<VecDeque<PendingSessionTypeRead>>,
     managed: Mutex<VecDeque<PendingManagedSessionSpawn>>,
 }
 
-struct PendingSessionTemplateSpawn {
+struct PendingSessionTypeSpawn {
     plugin_key: PluginKey,
-    template_id: String,
-    request: SessionTemplateRequest,
+    session_type_id: String,
+    request: SessionTypeRequest,
     package_records: Vec<PackageRecord>,
-    response: mpsc::Sender<Result<PluginSessionTemplateSpawned, String>>,
+    response: mpsc::Sender<Result<PluginSessionTypeSpawned, String>>,
 }
 
-enum SessionTemplateRead {
+enum SessionTypeRead {
     List,
-    Show { template_id: String },
+    Show { session_type_id: String },
 }
 
-struct PendingSessionTemplateRead {
+struct PendingSessionTypeRead {
     target_id: String,
-    operation: SessionTemplateRead,
+    operation: SessionTypeRead,
     package_records: Vec<PackageRecord>,
-    response: mpsc::Sender<Result<Vec<HubSessionTemplate>, String>>,
+    response: mpsc::Sender<Result<Vec<HubSessionType>, String>>,
 }
 
 struct PendingManagedSessionSpawn {
     plugin_key: PluginKey,
     target_id: String,
     branch: String,
-    template_id: String,
-    request: ManagedSessionTemplateRequest,
+    session_type_id: String,
+    request: ManagedSessionTypeRequest,
     package_records: Vec<PackageRecord>,
     accepted_at: Instant,
     response: mpsc::Sender<Result<PluginManagedSessionSpawned, ManagedGitError>>,
@@ -177,12 +177,12 @@ struct PendingManagedGitOperation {
     response_delivered: bool,
 }
 
-/// Structured Lua-facing session-template spawn response.
+/// Structured Lua-facing session-type spawn response.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-pub struct PluginSessionTemplateSpawned {
+pub struct PluginSessionTypeSpawned {
     pub session_id: String,
     pub lifecycle: String,
-    pub template_id: String,
+    pub session_type_id: String,
     pub context_id: String,
     pub context_keys: Vec<String>,
 }
@@ -223,7 +223,7 @@ impl HubRuntime {
             capability_runtime: Arc::new(Mutex::new(HubCapabilityRuntime::from_config(&config))),
             spawn_targets: Arc::new(Mutex::new(state.spawn_targets.clone())),
             worktrees: Arc::new(Mutex::new(state.worktrees.clone())),
-            session_template_spawner: Arc::new(HubSessionTemplateSpawner::new()),
+            session_type_spawner: Arc::new(HubSessionTypeSpawner::new()),
             managed_git_coordinator: ManagedGitCoordinator::new(),
             managed_git_operations: Mutex::new(Vec::new()),
             coordination_bridge: HubCoordinationBridge::new(),
@@ -295,7 +295,7 @@ impl HubRuntime {
             capability_runtime: Arc::new(Mutex::new(HubCapabilityRuntime::from_config(&config))),
             spawn_targets: Arc::new(Mutex::new(state.spawn_targets.clone())),
             worktrees: Arc::new(Mutex::new(state.worktrees.clone())),
-            session_template_spawner: Arc::new(HubSessionTemplateSpawner::new()),
+            session_type_spawner: Arc::new(HubSessionTypeSpawner::new()),
             managed_git_coordinator: ManagedGitCoordinator::new(),
             managed_git_operations: Mutex::new(Vec::new()),
             coordination_bridge: HubCoordinationBridge::new(),
@@ -329,10 +329,10 @@ impl HubRuntime {
         self.coordination_bridge.clone()
     }
 
-    /// Return the shared session-template spawn bridge used by Lua helpers.
+    /// Return the shared session-type spawn bridge used by Lua helpers.
     #[must_use]
-    pub fn session_template_spawner(&self) -> SharedSessionTemplateSpawner {
-        self.session_template_spawner.clone()
+    pub fn session_type_spawner(&self) -> SharedSessionTypeSpawner {
+        self.session_type_spawner.clone()
     }
 
     /// Return the durable hub state loaded for this runtime.
@@ -351,6 +351,25 @@ impl HubRuntime {
         *self.state.write().expect("hub state lock") = state;
     }
 
+    /// Apply and persist one Hub-authorized session type mutation.
+    pub fn mutate_session_type(
+        &self,
+        source: SessionTypeMutationSource,
+        mutation: SessionTypeMutation,
+    ) -> Result<HubState, SessionTypeError> {
+        let next = mutate_session_type(&self.config, &self.state(), source, mutation)?;
+        FileHubStateStore::for_data_directory(&self.config.data_directory)
+            .save(&next)
+            .map_err(|_| {
+                SessionTypeError::new(
+                    "session_type_state_write_failed",
+                    "session type state could not be persisted",
+                )
+            })?;
+        self.replace_state(next.clone());
+        Ok(next)
+    }
+
     /// Return the shared spawn-target projection used by Lua helpers.
     #[must_use]
     pub fn spawn_targets(&self) -> SharedSpawnTargets {
@@ -367,7 +386,7 @@ impl HubRuntime {
         LuaPluginHostApi {
             capabilities: self.capability_runtime.clone(),
             coordination: self.coordination_bridge(),
-            session_templates: self.session_template_spawner.clone(),
+            session_types: self.session_type_spawner.clone(),
             spawn_targets: self.spawn_targets.clone(),
             worktrees: self.worktrees.clone(),
         }
@@ -703,30 +722,30 @@ impl HubRuntime {
         }
     }
 
-    fn fulfill_pending_session_template_spawns(&self) {
-        while let Some(pending) = self.session_template_spawner.take_pending() {
-            let result = self.fulfill_session_template_spawn(&pending);
+    fn fulfill_pending_session_type_spawns(&self) {
+        while let Some(pending) = self.session_type_spawner.take_pending() {
+            let result = self.fulfill_session_type_spawn(&pending);
             if pending.response.send(result.clone()).is_err()
                 && let Ok(spawned) = result
             {
-                self.cleanup_undelivered_session_template_spawn(&spawned);
+                self.cleanup_undelivered_session_type_spawn(&spawned);
             }
         }
     }
 
-    fn fulfill_pending_session_template_reads(&self) {
-        while let Some(pending) = self.session_template_spawner.take_read() {
+    fn fulfill_pending_session_type_reads(&self) {
+        while let Some(pending) = self.session_type_spawner.take_read() {
             let records = pending.package_records.iter().collect::<Vec<_>>();
             let state = self.state();
             let result = match pending.operation {
-                SessionTemplateRead::List => {
-                    list_session_templates_for_target(&records, &state, &pending.target_id)
+                SessionTypeRead::List => {
+                    list_session_types_for_target(&records, &state, &pending.target_id)
                 }
-                SessionTemplateRead::Show { template_id } => show_session_template_for_target(
+                SessionTypeRead::Show { session_type_id } => show_session_type_for_target(
                     &records,
                     &state,
                     &pending.target_id,
-                    &template_id,
+                    &session_type_id,
                 )
                 .map(|template| vec![template]),
             }
@@ -736,7 +755,7 @@ impl HubRuntime {
     }
 
     fn accept_pending_managed_git_operations(&self) {
-        while let Some(pending) = self.session_template_spawner.take_managed() {
+        while let Some(pending) = self.session_type_spawner.take_managed() {
             let validation = self.validate_managed_git_request(&pending);
             let request = match validation {
                 Ok(request) => request,
@@ -779,7 +798,7 @@ impl HubRuntime {
         if !package_allows_managed_git_spawn(&pending.package_records, &pending.plugin_key) {
             return Err(ManagedGitError::new(
                 "capability_denied",
-                "plugin package lacks managed session-template spawn capability",
+                "plugin package lacks managed session-type spawn capability",
             ));
         }
         let state = self.state();
@@ -792,11 +811,11 @@ impl HubRuntime {
                 ManagedGitError::new("target_not_found", "spawn target was not found")
             })?;
         let records = pending.package_records.iter().collect::<Vec<_>>();
-        show_session_template_for_target(
+        show_session_type_for_target(
             &records,
             &state,
             &pending.target_id,
-            &pending.template_id,
+            &pending.session_type_id,
         )
         .map_err(|error| ManagedGitError::new(error.kind, error.message))?;
         let worktree_id = managed_worktree_id(&pending.target_id, &pending.branch);
@@ -947,8 +966,8 @@ impl HubRuntime {
         let state = store
             .update(&config, |state| {
                 state.spawn_targets = current_state.spawn_targets.clone();
-                state.device_session_template_sources =
-                    current_state.device_session_template_sources.clone();
+                state.device_session_type_sources =
+                    current_state.device_session_type_sources.clone();
                 if let Some(existing) = state
                     .worktrees
                     .iter_mut()
@@ -1009,11 +1028,11 @@ impl HubRuntime {
         let session_id = generated_session_uuid()?;
         let records = pending.package_records.iter().collect::<Vec<_>>();
         let state = self.state();
-        let materialized = materialize_managed_session_template(
+        let materialized = materialize_managed_session_type(
             &self.config,
             &records,
             &state,
-            &pending.template_id,
+            &pending.session_type_id,
             session_id,
             pending.request.clone(),
             &EnsuredManagedWorktree {
@@ -1028,6 +1047,7 @@ impl HubRuntime {
         .map_err(|error| ManagedGitError::new(error.kind, error.message))?;
         drop(state);
         let context = materialized.context.clone();
+        let metadata = session_type_plugin_metadata(materialized.metadata, &pending.plugin_key);
         {
             let mut contexts = self.session_contexts.lock().map_err(|_| {
                 ManagedGitError::new("spawn_failed", "session context state is unavailable")
@@ -1042,7 +1062,7 @@ impl HubRuntime {
             .spawn(
                 SpawnSessionRequest {
                     request: materialized.spawn_request,
-                    metadata: plugin_session_metadata(&pending.plugin_key),
+                    metadata,
                 },
                 current_unix_seconds(),
             )
@@ -1085,8 +1105,8 @@ impl HubRuntime {
 
     fn fulfill_pending_plugin_requests(&self) {
         self.fulfill_pending_coordination_requests();
-        self.fulfill_pending_session_template_reads();
-        self.fulfill_pending_session_template_spawns();
+        self.fulfill_pending_session_type_reads();
+        self.fulfill_pending_session_type_spawns();
         self.accept_pending_managed_git_operations();
         self.advance_managed_git_operations();
     }
@@ -1143,7 +1163,7 @@ impl HubRuntime {
         }
     }
 
-    fn cleanup_undelivered_session_template_spawn(&self, spawned: &PluginSessionTemplateSpawned) {
+    fn cleanup_undelivered_session_type_spawn(&self, spawned: &PluginSessionTypeSpawned) {
         let session_id = SessionId(spawned.session_id.clone());
         if let Ok(mut daemon) = self.core_daemon.lock() {
             let _ = daemon.shutdown(Some(session_id.clone()), current_unix_seconds());
@@ -1154,26 +1174,27 @@ impl HubRuntime {
         }
     }
 
-    fn fulfill_session_template_spawn(
+    fn fulfill_session_type_spawn(
         &self,
-        pending: &PendingSessionTemplateSpawn,
-    ) -> Result<PluginSessionTemplateSpawned, String> {
-        if !package_allows_session_template_spawn(&pending.package_records, &pending.plugin_key) {
-            return Err("plugin package lacks session_template_spawn capability".to_string());
+        pending: &PendingSessionTypeSpawn,
+    ) -> Result<PluginSessionTypeSpawned, String> {
+        if !package_allows_session_type_spawn(&pending.package_records, &pending.plugin_key) {
+            return Err("plugin package lacks session_type_spawn capability".to_string());
         }
 
         let records = pending.package_records.iter().collect::<Vec<_>>();
         let state = self.state();
-        let materialized = materialize_session_template(
+        let materialized = materialize_session_type(
             &self.config,
             &records,
             &state,
-            &pending.template_id,
+            &pending.session_type_id,
             pending.request.clone(),
         )
         .map_err(|error| format!("{}: {}", error.kind, error.message))?;
         drop(state);
         let context = materialized.context.clone();
+        let metadata = session_type_plugin_metadata(materialized.metadata, &pending.plugin_key);
         {
             let mut contexts = self
                 .session_contexts
@@ -1190,29 +1211,27 @@ impl HubRuntime {
             .spawn(
                 SpawnSessionRequest {
                     request: materialized.spawn_request,
-                    metadata: plugin_session_metadata(&pending.plugin_key),
+                    metadata,
                 },
                 current_unix_seconds(),
             )
-            .map_err(|error| {
-                match self.session_contexts.lock() {
-                    Ok(mut contexts) => {
-                        contexts.remove(&context.context_id);
-                        contexts.remove(&context.session_id.0);
-                        format!("session template spawn failed: {error}")
-                    }
-                    Err(_) => {
-                        format!(
-                            "session template spawn failed: {error}; session context rollback lock poisoned"
-                        )
-                    }
+            .map_err(|error| match self.session_contexts.lock() {
+                Ok(mut contexts) => {
+                    contexts.remove(&context.context_id);
+                    contexts.remove(&context.session_id.0);
+                    format!("session type spawn failed: {error}")
+                }
+                Err(_) => {
+                    format!(
+                        "session type spawn failed: {error}; session context rollback lock poisoned"
+                    )
                 }
             })?;
 
-        Ok(PluginSessionTemplateSpawned {
+        Ok(PluginSessionTypeSpawned {
             session_id: outcome.session_id.0,
             lifecycle: session_lifecycle_label(outcome.lifecycle).to_string(),
-            template_id: materialized.resolved.template.template_id,
+            session_type_id: materialized.resolved.session_type.session_type_id,
             context_id: materialized.resolved.context_id,
             context_keys: materialized.resolved.context_keys,
         })
@@ -1864,7 +1883,7 @@ impl HubRuntime {
     }
 }
 
-impl HubSessionTemplateSpawner {
+impl HubSessionTypeSpawner {
     fn new() -> Self {
         Self {
             pending: Mutex::new(VecDeque::new()),
@@ -1873,23 +1892,23 @@ impl HubSessionTemplateSpawner {
         }
     }
 
-    /// Queue a session-template spawn for the hub owner and wait for its result.
+    /// Queue a session-type spawn for the hub owner and wait for its result.
     pub fn spawn(
         &self,
         plugin_key: &PluginKey,
-        template_id: &str,
-        request: SessionTemplateRequest,
+        session_type_id: &str,
+        request: SessionTypeRequest,
         package_records: Vec<PackageRecord>,
-    ) -> Result<PluginSessionTemplateSpawned, String> {
+    ) -> Result<PluginSessionTypeSpawned, String> {
         let (response, receiver) = mpsc::channel();
         {
             let mut pending = self
                 .pending
                 .lock()
-                .map_err(|_| "session-template spawn queue lock poisoned".to_string())?;
-            pending.push_back(PendingSessionTemplateSpawn {
+                .map_err(|_| "session-type spawn queue lock poisoned".to_string())?;
+            pending.push_back(PendingSessionTypeSpawn {
                 plugin_key: plugin_key.clone(),
-                template_id: template_id.to_string(),
+                session_type_id: session_type_id.to_string(),
                 request,
                 package_records,
                 response,
@@ -1898,13 +1917,13 @@ impl HubSessionTemplateSpawner {
 
         receiver
             .recv_timeout(Duration::from_millis(SESSION_TEMPLATE_SPAWN_TIMEOUT_MS))
-            .map_err(|_| "session-template spawn did not complete before timeout".to_string())?
+            .map_err(|_| "session-type spawn did not complete before timeout".to_string())?
     }
 
-    fn take_pending(&self) -> Option<PendingSessionTemplateSpawn> {
+    fn take_pending(&self) -> Option<PendingSessionTypeSpawn> {
         self.pending
             .lock()
-            .expect("session-template spawn queue lock")
+            .expect("session-type spawn queue lock")
             .pop_front()
     }
 
@@ -1913,40 +1932,40 @@ impl HubSessionTemplateSpawner {
         &self,
         target_id: &str,
         package_records: Vec<PackageRecord>,
-    ) -> Result<Vec<HubSessionTemplate>, String> {
-        self.read(target_id, SessionTemplateRead::List, package_records)
+    ) -> Result<Vec<HubSessionType>, String> {
+        self.read(target_id, SessionTypeRead::List, package_records)
     }
 
     /// Show one enabled effective template admitted for one target.
     pub fn show(
         &self,
         target_id: &str,
-        template_id: &str,
+        session_type_id: &str,
         package_records: Vec<PackageRecord>,
-    ) -> Result<HubSessionTemplate, String> {
+    ) -> Result<HubSessionType, String> {
         self.read(
             target_id,
-            SessionTemplateRead::Show {
-                template_id: template_id.to_string(),
+            SessionTypeRead::Show {
+                session_type_id: session_type_id.to_string(),
             },
             package_records,
         )?
         .into_iter()
         .next()
-        .ok_or_else(|| "session template was not found".to_string())
+        .ok_or_else(|| "session type was not found".to_string())
     }
 
     fn read(
         &self,
         target_id: &str,
-        operation: SessionTemplateRead,
+        operation: SessionTypeRead,
         package_records: Vec<PackageRecord>,
-    ) -> Result<Vec<HubSessionTemplate>, String> {
+    ) -> Result<Vec<HubSessionType>, String> {
         let (response, receiver) = mpsc::channel();
         self.reads
             .lock()
-            .map_err(|_| "session-template read queue lock poisoned".to_string())?
-            .push_back(PendingSessionTemplateRead {
+            .map_err(|_| "session-type read queue lock poisoned".to_string())?
+            .push_back(PendingSessionTypeRead {
                 target_id: target_id.to_string(),
                 operation,
                 package_records,
@@ -1954,7 +1973,7 @@ impl HubSessionTemplateSpawner {
             });
         receiver
             .recv_timeout(Duration::from_millis(SESSION_TEMPLATE_SPAWN_TIMEOUT_MS))
-            .map_err(|_| "session-template read did not complete before timeout".to_string())?
+            .map_err(|_| "session-type read did not complete before timeout".to_string())?
     }
 
     /// Queue the one atomic managed-worktree/session spawn operation.
@@ -1963,8 +1982,8 @@ impl HubSessionTemplateSpawner {
         plugin_key: &PluginKey,
         target_id: &str,
         branch: &str,
-        template_id: &str,
-        request: ManagedSessionTemplateRequest,
+        session_type_id: &str,
+        request: ManagedSessionTypeRequest,
         package_records: Vec<PackageRecord>,
     ) -> Result<PluginManagedSessionSpawned, ManagedGitError> {
         let (response, receiver) = mpsc::channel();
@@ -1984,7 +2003,7 @@ impl HubSessionTemplateSpawner {
             plugin_key: plugin_key.clone(),
             target_id: target_id.to_string(),
             branch: branch.to_string(),
-            template_id: template_id.to_string(),
+            session_type_id: session_type_id.to_string(),
             request,
             package_records,
             accepted_at: Instant::now(),
@@ -2001,10 +2020,10 @@ impl HubSessionTemplateSpawner {
             })?
     }
 
-    fn take_read(&self) -> Option<PendingSessionTemplateRead> {
+    fn take_read(&self) -> Option<PendingSessionTypeRead> {
         self.reads
             .lock()
-            .expect("session-template read queue lock")
+            .expect("session-type read queue lock")
             .pop_front()
     }
 
@@ -2142,7 +2161,7 @@ fn finalize_prepared_managed_worktree(
     }
 }
 
-fn package_allows_session_template_spawn(
+fn package_allows_session_type_spawn(
     package_records: &[PackageRecord],
     plugin_key: &PluginKey,
 ) -> bool {
@@ -2151,7 +2170,7 @@ fn package_allows_session_template_spawn(
             && matches!(record.state, PackageState::Enabled)
             && record.manifest.capabilities.iter().any(|capability| {
                 capability.surface == botster_core::CapabilitySurface::SessionActions
-                    && capability.scope.as_deref() == Some("session_template_spawn")
+                    && capability.scope.as_deref() == Some("session_type_spawn")
             })
     })
 }
@@ -2165,7 +2184,7 @@ fn package_allows_managed_git_spawn(
             && matches!(record.state, PackageState::Enabled)
             && record.manifest.capabilities.iter().any(|capability| {
                 capability.surface == botster_core::CapabilitySurface::SessionActions
-                    && capability.scope.as_deref() == Some("session_template_managed_git_spawn")
+                    && capability.scope.as_deref() == Some("session_type_managed_git_spawn")
             })
     })
 }
@@ -2212,11 +2231,14 @@ fn managed_worktree_root(config: &HubConfig) -> PathBuf {
     data_directory.join("managed-worktrees")
 }
 
-fn plugin_session_metadata(plugin_key: &PluginKey) -> CoreSessionMetadata {
-    CoreSessionMetadata::from_entries(BTreeMap::from([(
-        "client".to_string(),
-        format!("plugin:{}", plugin_key.0),
-    )]))
+fn session_type_plugin_metadata(
+    mut metadata: CoreSessionMetadata,
+    plugin_key: &PluginKey,
+) -> CoreSessionMetadata {
+    metadata
+        .entries
+        .insert("client".to_string(), format!("plugin:{}", plugin_key.0));
+    metadata
 }
 
 fn session_lifecycle_label(lifecycle: SessionLifecycleState) -> &'static str {

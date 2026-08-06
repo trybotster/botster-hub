@@ -21,8 +21,8 @@ use serde_json::Value;
 mod typescript;
 
 pub const PROTOCOL: &str = "botster-hub-daemon-v1";
-pub const PROTOCOL_VERSION: u16 = 5;
-pub const CONFORMANCE_FIXTURE_REVISION: u16 = 29;
+pub const PROTOCOL_VERSION: u16 = 6;
+pub const CONFORMANCE_FIXTURE_REVISION: u16 = 30;
 /// Version of the local WebRTC delivery chunk framing protocol.
 pub const LOCAL_WEBRTC_DELIVERY_CHUNK_VERSION: u16 = 2;
 /// Serialized local WebRTC delivery frames must remain strictly below this size.
@@ -40,6 +40,7 @@ pub const FEATURE_SPAWN_TARGETS: &str = "spawn_targets";
 pub const FEATURE_WORKTREES: &str = "worktrees";
 pub const FEATURE_TERMINAL_READBACK: &str = "terminal_readback";
 pub const FEATURE_SESSION_ENTITY_SUBSCRIPTIONS: &str = "session_entity_subscriptions";
+pub const FEATURE_SESSION_TYPE_ENTITY_SUBSCRIPTIONS: &str = "session_type_entity_subscriptions";
 pub const FEATURE_PLUGIN_ENTITY_SUBSCRIPTIONS: &str = "plugin_entity_subscriptions";
 const ATTACH_DRAIN_INTERVAL: Duration = Duration::from_millis(25);
 
@@ -499,7 +500,7 @@ impl DaemonCompatibility {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DaemonCompatibilityRequirement {
     pub protocol: String,
-    pub minimum_protocol_version: u16,
+    pub protocol_version: u16,
     pub required_features: Vec<String>,
     pub minimum_conformance_fixture_revision: u16,
     pub client_name: String,
@@ -524,7 +525,7 @@ impl DaemonCompatibilityRequirement {
     pub fn current() -> Self {
         Self {
             protocol: PROTOCOL.to_string(),
-            minimum_protocol_version: PROTOCOL_VERSION,
+            protocol_version: PROTOCOL_VERSION,
             required_features: current_feature_list()
                 .into_iter()
                 .map(str::to_string)
@@ -570,13 +571,13 @@ pub fn ensure_compatible(
         ));
     }
 
-    if compatibility.protocol_version < requirement.minimum_protocol_version {
+    if compatibility.protocol_version != requirement.protocol_version {
         return Err(compatibility_error(
             requirement,
             compatibility,
             format!(
-                "unsupported protocol version {}; requires at least {}",
-                compatibility.protocol_version, requirement.minimum_protocol_version
+                "unsupported protocol version {}; client requires {}",
+                compatibility.protocol_version, requirement.protocol_version
             ),
         ));
     }
@@ -622,7 +623,7 @@ fn compatibility_error(
             requirement.client_name,
             reason,
             requirement.protocol,
-            requirement.minimum_protocol_version,
+            requirement.protocol_version,
             requirement.required_features.join(","),
             requirement.minimum_conformance_fixture_revision,
             compatibility.protocol,
@@ -657,6 +658,7 @@ fn current_feature_list() -> Vec<&'static str> {
         FEATURE_WORKTREES,
         FEATURE_TERMINAL_READBACK,
         FEATURE_SESSION_ENTITY_SUBSCRIPTIONS,
+        FEATURE_SESSION_TYPE_ENTITY_SUBSCRIPTIONS,
         FEATURE_PLUGIN_ENTITY_SUBSCRIPTIONS,
     ]
 }
@@ -736,20 +738,32 @@ pub enum DaemonRequest {
     CaptureSnapshot {
         session_id: String,
     },
-    ListSessionTemplates,
-    ShowSessionTemplate {
-        template_id: String,
+    ListSessionTypes,
+    ShowSessionType {
+        session_type_id: String,
     },
-    ResolveSessionTemplate {
-        template_id: String,
+    CreateSessionType {
+        source: DaemonSessionTypeMutationSource,
+        definition: DaemonSessionTypeDefinition,
+    },
+    UpdateSessionType {
+        source: DaemonSessionTypeMutationSource,
+        definition: DaemonSessionTypeDefinition,
+    },
+    DeleteSessionType {
+        source: DaemonSessionTypeMutationSource,
+        session_type_id: String,
+    },
+    ResolveSessionType {
+        session_type_id: String,
         #[serde(default)]
-        request: DaemonSessionTemplateRequest,
+        request: DaemonSessionTypeRequest,
     },
-    SpawnSessionTemplate {
-        template_id: String,
+    SpawnSessionType {
+        session_type_id: String,
         session_id: String,
         #[serde(default)]
-        request: DaemonSessionTemplateRequest,
+        request: DaemonSessionTypeRequest,
     },
     ReadSessionContext {
         session_id: String,
@@ -936,9 +950,9 @@ pub struct DaemonResponse {
     pub status: Option<DaemonStatus>,
     pub sessions: Vec<DaemonSession>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub session_templates: Vec<DaemonSessionTemplate>,
+    pub session_types: Vec<DaemonSessionType>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub resolved_session_template: Option<DaemonResolvedSessionTemplate>,
+    pub resolved_session_type: Option<DaemonResolvedSessionType>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_context: Option<DaemonSessionContext>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1023,8 +1037,8 @@ pub enum DaemonResponseKind {
     SessionRemoved,
     Spawned,
     Events,
-    SessionTemplates,
-    ResolvedSessionTemplate,
+    SessionTypes,
+    ResolvedSessionType,
     SessionContext,
     ReadScreen,
     ReadModeFlags,
@@ -1139,7 +1153,7 @@ pub struct DaemonNotify {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DaemonSessionTemplateRequest {
+pub struct DaemonSessionTypeRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1147,11 +1161,57 @@ pub struct DaemonSessionTemplateRequest {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub environment: BTreeMap<String, String>,
     #[serde(default)]
-    pub context: DaemonSessionTemplateContextInput,
+    pub context: DaemonSessionTypeContextInput,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "source", rename_all = "snake_case")]
+pub enum DaemonSessionTypeMutationSource {
+    Device,
+    Repo { target_id: String },
+    Package { package_name: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonSessionTypeDefinition {
+    pub id: String,
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+    pub role: String,
+    pub interaction: String,
+    #[serde(default)]
+    pub traits: Vec<String>,
+    pub lifecycle: String,
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub working_directory: DaemonSessionTypeWorkingDirectory,
+    #[serde(default)]
+    pub environment: BTreeMap<String, String>,
+    #[serde(default)]
+    pub allowed_environment_overrides: Vec<String>,
+    #[serde(default)]
+    pub context: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DaemonSessionTemplateContextInput {
+#[serde(tag = "policy", rename_all = "snake_case")]
+pub enum DaemonSessionTypeWorkingDirectory {
+    #[default]
+    PackageRoot,
+    Relative {
+        path: String,
+    },
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonSessionTypeContextInput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1169,11 +1229,26 @@ pub struct DaemonSessionTemplateContextInput {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DaemonSessionTemplate {
-    pub template_id: String,
-    pub package_name: String,
+pub struct DaemonSessionType {
+    pub session_type_id: String,
+    pub source_name: String,
     pub id: String,
     pub source: String,
+    pub editable: bool,
+    #[serde(default)]
+    pub overridden_sources: Vec<DaemonSessionTypeSource>,
+    #[serde(default)]
+    pub diagnostics: Vec<String>,
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+    pub role: String,
+    pub interaction: String,
+    #[serde(default)]
+    pub traits: Vec<String>,
+    pub lifecycle: String,
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
@@ -1187,8 +1262,14 @@ pub struct DaemonSessionTemplate {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DaemonResolvedSessionTemplate {
-    pub template: DaemonSessionTemplate,
+pub struct DaemonSessionTypeSource {
+    pub kind: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonResolvedSessionType {
+    pub session_type: DaemonSessionType,
     pub session_id: String,
     pub executable: String,
     #[serde(default)]
@@ -1851,6 +1932,18 @@ pub struct DaemonSessionEntity {
     pub exit_code: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_type_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_type_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(default)]
+    pub traits: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interaction: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_type_lifecycle: Option<String>,
 }
 
 /// Entity-frame vocabulary scoped to one daemon subscription.
@@ -2254,6 +2347,12 @@ mod tests {
             updated_at: 7,
             exit_code: None,
             failure_reason: None,
+            session_type_id: None,
+            session_type_source: None,
+            role: None,
+            traits: Vec::new(),
+            interaction: None,
+            session_type_lifecycle: None,
         };
         let frames = vec![
             DaemonEntityFrame::Snapshot {
@@ -2494,7 +2593,7 @@ mod tests {
     #[test]
     fn compatibility_reports_unsupported_protocol_version() {
         let mut requirement = DaemonCompatibilityRequirement::current();
-        requirement.minimum_protocol_version = PROTOCOL_VERSION + 1;
+        requirement.protocol_version = PROTOCOL_VERSION + 1;
         requirement.client_name = "version-test-client".to_string();
 
         let error = ensure_compatible(&requirement, &DaemonCompatibility::current())
@@ -2502,9 +2601,27 @@ mod tests {
 
         assert!(error.diagnostic.contains("version-test-client"));
         assert!(error.diagnostic.contains(&format!(
-            "unsupported protocol version {PROTOCOL_VERSION}; requires at least {}",
+            "unsupported protocol version {PROTOCOL_VERSION}; client requires {}",
             PROTOCOL_VERSION + 1
         )));
+    }
+
+    #[test]
+    fn compatibility_rejects_a_stale_client_before_removed_operations_dispatch() {
+        let mut stale = DaemonCompatibilityRequirement::current();
+        stale.protocol_version = PROTOCOL_VERSION - 1;
+        stale.minimum_conformance_fixture_revision = CONFORMANCE_FIXTURE_REVISION - 1;
+        stale
+            .required_features
+            .retain(|feature| feature != FEATURE_SESSION_TYPE_ENTITY_SUBSCRIPTIONS);
+        stale.client_name = "stale-first-party-client".to_string();
+
+        let error = ensure_compatible(&stale, &DaemonCompatibility::current())
+            .expect_err("stale request semantics must fail before dispatch");
+
+        assert!(error.diagnostic.contains("stale-first-party-client"));
+        assert!(error.diagnostic.contains("unsupported protocol version"));
+        assert!(!error.diagnostic.contains("unknown_operation"));
     }
 
     #[test]
@@ -3819,6 +3936,52 @@ mod tests {
             .to_string()
     }
 
+    fn daemon_session_type_definition_example() -> DaemonSessionTypeDefinition {
+        DaemonSessionTypeDefinition {
+            id: "init".to_string(),
+            label: "Workflow agent".to_string(),
+            description: Some("Interactive workflow agent".to_string()),
+            icon: Some("terminal".to_string()),
+            role: "botster.agent".to_string(),
+            interaction: "interactive".to_string(),
+            traits: vec!["pipeline-step".to_string()],
+            lifecycle: "task".to_string(),
+            command: "bin/init".to_string(),
+            args: vec!["--json".to_string()],
+            working_directory: DaemonSessionTypeWorkingDirectory::PackageRoot,
+            environment: BTreeMap::new(),
+            allowed_environment_overrides: vec!["BOTSTER_MODE".to_string()],
+            context: vec!["prompt".to_string()],
+            target_id: None,
+        }
+    }
+
+    fn daemon_session_type_example() -> DaemonSessionType {
+        DaemonSessionType {
+            session_type_id: "workflow.plugin/init".to_string(),
+            source_name: "workflow.plugin".to_string(),
+            id: "init".to_string(),
+            source: "package".to_string(),
+            editable: false,
+            overridden_sources: Vec::new(),
+            diagnostics: Vec::new(),
+            label: "Workflow agent".to_string(),
+            description: Some("Interactive workflow agent".to_string()),
+            icon: Some("terminal".to_string()),
+            role: "botster.agent".to_string(),
+            interaction: "interactive".to_string(),
+            traits: vec!["pipeline-step".to_string()],
+            lifecycle: "task".to_string(),
+            command: "bin/init".to_string(),
+            args: vec!["--json".to_string()],
+            working_directory_policy: "package_root".to_string(),
+            allowed_environment_overrides: vec!["BOTSTER_MODE".to_string()],
+            context_keys: vec!["prompt".to_string()],
+            target_id: "package:workflow.plugin".to_string(),
+            available: true,
+        }
+    }
+
     fn daemon_request_examples() -> Vec<DaemonRequest> {
         vec![
             DaemonRequest::Status,
@@ -3892,18 +4055,32 @@ mod tests {
             DaemonRequest::CaptureSnapshot {
                 session_id: "session".to_string(),
             },
-            DaemonRequest::ListSessionTemplates,
-            DaemonRequest::ShowSessionTemplate {
-                template_id: "init".to_string(),
+            DaemonRequest::ListSessionTypes,
+            DaemonRequest::ShowSessionType {
+                session_type_id: "init".to_string(),
             },
-            DaemonRequest::ResolveSessionTemplate {
-                template_id: "init".to_string(),
-                request: DaemonSessionTemplateRequest::default(),
+            DaemonRequest::CreateSessionType {
+                source: DaemonSessionTypeMutationSource::Device,
+                definition: daemon_session_type_definition_example(),
             },
-            DaemonRequest::SpawnSessionTemplate {
-                template_id: "init".to_string(),
+            DaemonRequest::UpdateSessionType {
+                source: DaemonSessionTypeMutationSource::Repo {
+                    target_id: "repo:main".to_string(),
+                },
+                definition: daemon_session_type_definition_example(),
+            },
+            DaemonRequest::DeleteSessionType {
+                source: DaemonSessionTypeMutationSource::Device,
+                session_type_id: "init".to_string(),
+            },
+            DaemonRequest::ResolveSessionType {
+                session_type_id: "init".to_string(),
+                request: DaemonSessionTypeRequest::default(),
+            },
+            DaemonRequest::SpawnSessionType {
+                session_type_id: "init".to_string(),
                 session_id: "session".to_string(),
-                request: DaemonSessionTemplateRequest::default(),
+                request: DaemonSessionTypeRequest::default(),
             },
             DaemonRequest::ReadSessionContext {
                 session_id: "session".to_string(),
@@ -4090,10 +4267,13 @@ mod tests {
             DaemonRequest::ReadScreen { .. } => "read_screen",
             DaemonRequest::ReadModeFlags { .. } => "read_mode_flags",
             DaemonRequest::CaptureSnapshot { .. } => "capture_snapshot",
-            DaemonRequest::ListSessionTemplates => "list_session_templates",
-            DaemonRequest::ShowSessionTemplate { .. } => "show_session_template",
-            DaemonRequest::ResolveSessionTemplate { .. } => "resolve_session_template",
-            DaemonRequest::SpawnSessionTemplate { .. } => "spawn_session_template",
+            DaemonRequest::ListSessionTypes => "list_session_types",
+            DaemonRequest::ShowSessionType { .. } => "show_session_type",
+            DaemonRequest::CreateSessionType { .. } => "create_session_type",
+            DaemonRequest::UpdateSessionType { .. } => "update_session_type",
+            DaemonRequest::DeleteSessionType { .. } => "delete_session_type",
+            DaemonRequest::ResolveSessionType { .. } => "resolve_session_type",
+            DaemonRequest::SpawnSessionType { .. } => "spawn_session_type",
             DaemonRequest::ReadSessionContext { .. } => "read_session_context",
             DaemonRequest::ListSpawnTargets => "list_spawn_targets",
             DaemonRequest::ShowSpawnTarget { .. } => "show_spawn_target",
@@ -4151,8 +4331,8 @@ mod tests {
             DaemonResponseKind::SessionRemoved,
             DaemonResponseKind::Spawned,
             DaemonResponseKind::Events,
-            DaemonResponseKind::SessionTemplates,
-            DaemonResponseKind::ResolvedSessionTemplate,
+            DaemonResponseKind::SessionTypes,
+            DaemonResponseKind::ResolvedSessionType,
             DaemonResponseKind::SessionContext,
             DaemonResponseKind::ReadScreen,
             DaemonResponseKind::ReadModeFlags,
@@ -4197,8 +4377,8 @@ mod tests {
             DaemonResponseKind::SessionRemoved => "session_removed",
             DaemonResponseKind::Spawned => "spawned",
             DaemonResponseKind::Events => "events",
-            DaemonResponseKind::SessionTemplates => "session_templates",
-            DaemonResponseKind::ResolvedSessionTemplate => "resolved_session_template",
+            DaemonResponseKind::SessionTypes => "session_types",
+            DaemonResponseKind::ResolvedSessionType => "resolved_session_type",
             DaemonResponseKind::SessionContext => "session_context",
             DaemonResponseKind::ReadScreen => "read_screen",
             DaemonResponseKind::ReadModeFlags => "read_mode_flags",
@@ -4272,33 +4452,9 @@ mod tests {
                 session_id: "session".to_string(),
                 lifecycle: "running".to_string(),
             }],
-            session_templates: vec![DaemonSessionTemplate {
-                template_id: "workflow.plugin/init".to_string(),
-                package_name: "workflow.plugin".to_string(),
-                id: "init".to_string(),
-                source: "package".to_string(),
-                command: "bin/init".to_string(),
-                args: vec!["--json".to_string()],
-                working_directory_policy: "package_root".to_string(),
-                allowed_environment_overrides: vec!["BOTSTER_MODE".to_string()],
-                context_keys: vec!["prompt".to_string()],
-                target_id: "package:workflow.plugin".to_string(),
-                available: true,
-            }],
-            resolved_session_template: Some(DaemonResolvedSessionTemplate {
-                template: DaemonSessionTemplate {
-                    template_id: "workflow.plugin/init".to_string(),
-                    package_name: "workflow.plugin".to_string(),
-                    id: "init".to_string(),
-                    source: "package".to_string(),
-                    command: "bin/init".to_string(),
-                    args: vec!["--json".to_string()],
-                    working_directory_policy: "package_root".to_string(),
-                    allowed_environment_overrides: vec!["BOTSTER_MODE".to_string()],
-                    context_keys: vec!["prompt".to_string()],
-                    target_id: "package:workflow.plugin".to_string(),
-                    available: true,
-                },
+            session_types: vec![daemon_session_type_example()],
+            resolved_session_type: Some(DaemonResolvedSessionType {
+                session_type: daemon_session_type_example(),
                 session_id: "session".to_string(),
                 executable: "/tmp/workflow.plugin/bin/init".to_string(),
                 arguments: vec!["--json".to_string()],
@@ -4838,46 +4994,46 @@ mod tests {
     }
 
     #[test]
-    fn protocol_five_and_conformance_twenty_nine_define_both_compatibility_directions() {
-        assert_eq!(PROTOCOL_VERSION, 5);
-        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 29);
+    fn protocol_six_and_conformance_thirty_define_the_cold_cut_boundary() {
+        assert_eq!(PROTOCOL_VERSION, 6);
+        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 30);
 
         let requirement = DaemonCompatibilityRequirement::current();
         let protocol_error = ensure_compatible(
             &requirement,
             &DaemonCompatibility {
-                protocol_version: 4,
+                protocol_version: 5,
                 ..DaemonCompatibility::current()
             },
         )
-        .expect_err("new client rejects protocol four Hub");
+        .expect_err("new client rejects protocol five Hub");
         assert!(
             protocol_error
                 .diagnostic
-                .contains("unsupported protocol version 4")
+                .contains("unsupported protocol version 5")
         );
 
         let conformance_error = ensure_compatible(
             &requirement,
             &DaemonCompatibility {
-                conformance_fixture_revision: 28,
+                conformance_fixture_revision: 29,
                 ..DaemonCompatibility::current()
             },
         )
-        .expect_err("new client rejects conformance twenty eight Hub");
+        .expect_err("new client rejects conformance twenty nine Hub");
         assert!(
             conformance_error
                 .diagnostic
-                .contains("unsupported conformance fixture revision 28")
+                .contains("unsupported conformance fixture revision 29")
         );
 
         let stale_requirement = DaemonCompatibilityRequirement {
-            minimum_protocol_version: 4,
-            minimum_conformance_fixture_revision: 28,
+            protocol_version: 5,
+            minimum_conformance_fixture_revision: 29,
             ..DaemonCompatibilityRequirement::current()
         };
         ensure_compatible(&stale_requirement, &DaemonCompatibility::current())
-            .expect("stale client requirement accepts newer additive Hub");
+            .expect_err("stale client rejects the cold-cut protocol");
 
         #[derive(Deserialize)]
         struct StaleStatus {
@@ -4893,7 +5049,7 @@ mod tests {
         .expect("serialize current status");
         let stale: StaleStatus =
             serde_json::from_value(status_value).expect("stale status ignores additive identity");
-        assert_eq!(stale.compatibility.protocol_version, 5);
+        assert_eq!(stale.compatibility.protocol_version, 6);
         assert_eq!(stale.host_id, "hub");
         assert_eq!(stale.schema_version, 1);
     }

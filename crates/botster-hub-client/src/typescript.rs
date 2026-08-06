@@ -82,7 +82,7 @@ pub(crate) fn daemon_protocol_typescript() -> String {
         "DaemonCompatibilityRequirement",
         &[
             ("protocol", "string"),
-            ("minimum_protocol_version", "number"),
+            ("protocol_version", "number"),
             ("required_features", "string[]"),
             ("minimum_conformance_fixture_revision", "number"),
             ("client_name", "string"),
@@ -154,21 +154,42 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             ("read_screen", &[("session_id", "string")]),
             ("read_mode_flags", &[("session_id", "string")]),
             ("capture_snapshot", &[("session_id", "string")]),
-            ("list_session_templates", &[]),
-            ("show_session_template", &[("template_id", "string")]),
+            ("list_session_types", &[]),
+            ("show_session_type", &[("session_type_id", "string")]),
             (
-                "resolve_session_template",
+                "create_session_type",
                 &[
-                    ("template_id", "string"),
-                    ("request", "DaemonSessionTemplateRequest"),
+                    ("source", "DaemonSessionTypeMutationSource"),
+                    ("definition", "DaemonSessionTypeDefinition"),
                 ],
             ),
             (
-                "spawn_session_template",
+                "update_session_type",
                 &[
-                    ("template_id", "string"),
+                    ("source", "DaemonSessionTypeMutationSource"),
+                    ("definition", "DaemonSessionTypeDefinition"),
+                ],
+            ),
+            (
+                "delete_session_type",
+                &[
+                    ("source", "DaemonSessionTypeMutationSource"),
+                    ("session_type_id", "string"),
+                ],
+            ),
+            (
+                "resolve_session_type",
+                &[
+                    ("session_type_id", "string"),
+                    ("request", "DaemonSessionTypeRequest"),
+                ],
+            ),
+            (
+                "spawn_session_type",
+                &[
+                    ("session_type_id", "string"),
                     ("session_id", "string"),
-                    ("request", "DaemonSessionTemplateRequest"),
+                    ("request", "DaemonSessionTypeRequest"),
                 ],
             ),
             (
@@ -334,11 +355,8 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             ("kind", "DaemonResponseKind"),
             ("status", "DaemonStatus | null"),
             ("sessions", "DaemonSession[]"),
-            ("session_templates?", "DaemonSessionTemplate[]"),
-            (
-                "resolved_session_template?",
-                "DaemonResolvedSessionTemplate | null",
-            ),
+            ("session_types?", "DaemonSessionType[]"),
+            ("resolved_session_type?", "DaemonResolvedSessionType | null"),
             ("session_context?", "DaemonSessionContext | null"),
             ("read_screen?", "DaemonReadScreen | null"),
             ("mode_flags?", "DaemonModeFlags | null"),
@@ -453,8 +471,8 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             "session_removed",
             "spawned",
             "events",
-            "session_templates",
-            "resolved_session_template",
+            "session_types",
+            "resolved_session_type",
             "session_context",
             "read_screen",
             "read_mode_flags",
@@ -606,17 +624,17 @@ pub(crate) fn daemon_protocol_typescript() -> String {
     );
     emit_interface(
         &mut output,
-        "DaemonSessionTemplateRequest",
+        "DaemonSessionTypeRequest",
         &[
             ("target_id?", "string | null"),
             ("cwd?", "string | null"),
             ("environment?", "Record<string, string>"),
-            ("context", "DaemonSessionTemplateContextInput"),
+            ("context", "DaemonSessionTypeContextInput"),
         ],
     );
     emit_interface(
         &mut output,
-        "DaemonSessionTemplateContextInput",
+        "DaemonSessionTypeContextInput",
         &[
             ("worktree_path?", "string | null"),
             ("repo_path?", "string | null"),
@@ -627,14 +645,64 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             ("metadata?", "Record<string, string>"),
         ],
     );
+    emit_union(
+        &mut output,
+        "DaemonSessionTypeMutationSource",
+        &[
+            ("device", &[]),
+            ("repo", &[("target_id", "string")]),
+            ("package", &[("package_name", "string")]),
+        ],
+    );
+    emit_union(
+        &mut output,
+        "DaemonSessionTypeWorkingDirectory",
+        &[("package_root", &[]), ("relative", &[("path", "string")])],
+    );
     emit_interface(
         &mut output,
-        "DaemonSessionTemplate",
+        "DaemonSessionTypeDefinition",
         &[
-            ("template_id", "string"),
-            ("package_name", "string"),
+            ("id", "string"),
+            ("label", "string"),
+            ("description?", "string | null"),
+            ("icon?", "string | null"),
+            ("role", "string"),
+            ("interaction", "string"),
+            ("traits?", "string[]"),
+            ("lifecycle", "string"),
+            ("command", "string"),
+            ("args?", "string[]"),
+            ("working_directory?", "DaemonSessionTypeWorkingDirectory"),
+            ("environment?", "Record<string, string>"),
+            ("allowed_environment_overrides?", "string[]"),
+            ("context?", "string[]"),
+            ("target_id?", "string | null"),
+        ],
+    );
+    emit_interface(
+        &mut output,
+        "DaemonSessionTypeSource",
+        &[("kind", "string"), ("name", "string")],
+    );
+    emit_interface(
+        &mut output,
+        "DaemonSessionType",
+        &[
+            ("session_type_id", "string"),
+            ("source_name", "string"),
             ("id", "string"),
             ("source", "string"),
+            ("editable", "boolean"),
+            ("overridden_sources?", "DaemonSessionTypeSource[]"),
+            ("diagnostics?", "string[]"),
+            ("label", "string"),
+            ("description?", "string | null"),
+            ("icon?", "string | null"),
+            ("role", "string"),
+            ("interaction", "string"),
+            ("traits?", "string[]"),
+            ("lifecycle", "string"),
             ("command", "string"),
             ("args?", "string[]"),
             ("working_directory_policy", "string"),
@@ -646,9 +714,9 @@ pub(crate) fn daemon_protocol_typescript() -> String {
     );
     emit_interface(
         &mut output,
-        "DaemonResolvedSessionTemplate",
+        "DaemonResolvedSessionType",
         &[
-            ("template", "DaemonSessionTemplate"),
+            ("session_type", "DaemonSessionType"),
             ("session_id", "string"),
             ("executable", "string"),
             ("arguments?", "string[]"),
@@ -1182,6 +1250,12 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             ("updated_at", "number"),
             ("exit_code?", "number | null"),
             ("failure_reason?", "string | null"),
+            ("session_type_id?", "string | null"),
+            ("session_type_source?", "string | null"),
+            ("role?", "string | null"),
+            ("traits?", "string[]"),
+            ("interaction?", "string | null"),
+            ("session_type_lifecycle?", "string | null"),
         ],
     );
     emit_union(

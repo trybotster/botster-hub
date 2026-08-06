@@ -1,5 +1,5 @@
 {
-  "conformance_fixture_revision": 29,
+  "conformance_fixture_revision": 30,
   "entity_type": "session",
   "fresh_subscription": {
     "prior_generation_frames_discarded": true,
@@ -28,6 +28,7 @@
         "registry_state": "active",
         "rows": 24,
         "session_uuid": "slc-session",
+        "traits": [],
         "updated_at": 1
       },
       "entity_type": "session",
