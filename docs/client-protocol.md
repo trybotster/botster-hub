@@ -242,14 +242,39 @@ embedded at compile time. `DaemonStatus.installation` is a separate fact from
 host identity, protocol compatibility, durable schema, and package rows. It is
 resolved only from `$HOME/.botster/installations/botster-hub.json`; unsafe or
 mismatched receipts diagnose but never override the embedded binary identity.
-Receipt schema 1 is strict and contains exactly `schema_version`, `product_id`,
-`binary_version`, `installation_mode`, `release_channel`, `provider`, and
-`source_url`. Managed sources must use HTTPS; plaintext HTTP is accepted only
-for explicit loopback test fixtures. Additive receipt fields require a schema
-version bump. A Hub that does not recognize that schema reports
+Receipt schema **2** is strict and contains exactly `schema_version`,
+`product_id`, `binary_version`, `installation_mode`, `release_channel`,
+`provider`, `source_url`, `build_revision`, `artifacts`, `source_revisions`,
+`signature`, and `installer`. Managed sources must use HTTPS; plaintext HTTP is
+accepted only for explicit loopback test fixtures. Additive receipt fields
+require a schema version bump; schema 1 is not accepted alongside schema 2. A
+Hub that does not recognize the receipt schema reports
 `unsupported_receipt_schema` and falls back to development or unmanaged mode
 according to its build profile, so an installer must replace the Hub binary
 before atomically writing a receipt that requires the newer schema.
+
+Hub-side validation of the additive fields is **shape and agreement only**:
+64-character lowercase-hex checksums, an `ed25519` algorithm allowlist,
+sanitized `key_id`/installer strings, a known-artifact-name allowlist, canonical
+lowercase-hex `source_revisions`, and `build_revision` agreement against the
+embedded revision when the binary carries one. `signature.signed_manifest_sha256`
+is the digest of the exact bytes passed to Ed25519 verification — the decoded
+install manifest — not a digest of the whole release document, because the
+envelope is unsigned and a whole-document digest would imply an authentication
+that never happened. The Hub does **not** re-hash installed binaries at startup
+and does **not** verify signatures. None of the receipt fields appear in
+serialized `DaemonStatus`.
+
+Release metadata is schema **2** and is read *forward-tolerantly*: unknown
+fields are ignored and `schema_version` is compared with `>=`, so a Hub that
+understands schema 2 still parses a schema 3 document well enough to answer
+available/current. `product_id` and `release_channel` stay exact matches —
+those are identity, not versioning. This asymmetry with the strict receipt is
+deliberate: release metadata is read by binaries already in the field that we
+cannot reach, and a Hub that cannot parse a newer document cannot tell its user
+that an update exists, which would disable the very channel that ships the fix.
+The receipt is local state written by our own installer, where both ends are
+controlled and the upgrade ordering depends on strictness.
 
 `RemoveSession` forgets only an already-terminal session and produces the
 ordered remove delta. `ListSessions` remains available for operator queries,

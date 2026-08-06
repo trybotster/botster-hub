@@ -1,12 +1,18 @@
 //! Authoritative Hub software identity and installation-aware update checks.
 //!
 //! Binary identity is embedded at build time. Installation provenance comes
-//! only from the cold-turkey receipt at `$HOME/.botster/installations/botster-hub.json`.
+//! only from the cold-turkey receipt at `$HOME/.botster/installations/botster-hub.json`,
+//! whose shape, safety rules, and atomic write live in `botster-hub-installation`
+//! so the installer that writes it and the Hub that reads it cannot disagree.
+//!
+//! The Hub verifies **no** signature and holds **no** trust anchor. The
+//! installer is the trust boundary because it is the component that writes
+//! executables to disk; `check-update` is read-only and non-destructive, so
+//! forged metadata yields at worst a misleading "update available" that the
+//! installer then refuses. The receipt's signature fields are recorded facts,
+//! not something checked here.
 
 use std::env;
-use std::fs;
-use std::net::IpAddr;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -14,16 +20,15 @@ use botster_hub_client::{
     DaemonHubUpdate, DaemonHubUpdateState, DaemonInstallationDiagnostic,
     DaemonInstallationIdentity, DaemonInstallationMode, DaemonSoftwareIdentity,
 };
+use botster_hub_installation::{
+    InstallationProblem, InstallationReceipt, InstallationsDirectory, MAX_RELEASE_BYTES,
+    MINIMUM_RELEASE_SCHEMA_VERSION,
+};
 use semver::Version;
 use serde::Deserialize;
 
 const PRODUCT_ID: &str = "botster-hub";
 const PRODUCT_NAME: &str = "Botster Hub";
-const RECEIPT_SCHEMA_VERSION: u16 = 1;
-const RELEASE_SCHEMA_VERSION: u16 = 1;
-const RECEIPT_RELATIVE_PATH: &str = ".botster/installations/botster-hub.json";
-const MAX_RECEIPT_BYTES: u64 = 64 * 1024;
-const MAX_RELEASE_BYTES: u64 = 64 * 1024;
 const RELEASE_CHECK_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,20 +43,23 @@ pub(crate) struct ManagedReleaseCheck {
     release_channel: String,
 }
 
+/// The Hub's forward-tolerant read of a release document.
+///
+/// Deliberately *not* `deny_unknown_fields`, and deliberately compared with
+/// `>=` rather than `==` on `schema_version`. Release metadata is read by
+/// binaries already in the field that we cannot reach, and a Hub that cannot
+/// parse a newer document cannot tell its user an update exists — so strictness
+/// here would disable the very channel that ships the fix for the strictness.
+///
+/// The asymmetry with the receipt is intentional. `RECEIPT_SCHEMA_VERSION`
+/// stays exact because the receipt is local state written by our own installer,
+/// both ends are controlled, and the ticket's upgrade ordering *depends* on an
+/// older Hub rejecting a receipt schema it does not know.
+///
+/// `product_id` and `release_channel` stay **exact** matches: those are
+/// identity, not versioning, and a mismatch means the document is not for this
+/// installation.
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct InstallationReceipt {
-    schema_version: u16,
-    product_id: String,
-    binary_version: String,
-    installation_mode: String,
-    release_channel: String,
-    provider: String,
-    source_url: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct ReleaseMetadata {
     schema_version: u16,
     product_id: String,
@@ -72,8 +80,19 @@ pub fn software_identity() -> DaemonSoftwareIdentity {
         product_id: PRODUCT_ID.to_string(),
         product_name: PRODUCT_NAME.to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
-        build_revision: option_env!("BOTSTER_EMBEDDED_BUILD_REVISION").map(str::to_string),
+        build_revision: embedded_build_revision().map(str::to_string),
     }
+}
+
+/// The build revision compiled into this binary, if any.
+///
+/// `None` in a development build. The receipt's `build_revision` agreement
+/// check is skipped in that case rather than failed: a value cannot disagree
+/// with the absence of one, and failing would perturb development and unmanaged
+/// behavior that this ticket does not touch.
+#[must_use]
+pub fn embedded_build_revision() -> Option<&'static str> {
+    option_env!("BOTSTER_EMBEDDED_BUILD_REVISION")
 }
 
 #[must_use]
@@ -121,14 +140,14 @@ fn execute_managed_update_check_with_fetch(
         Err(reason) => return unavailable_update(current_version, reason, "retry"),
     };
 
-    if metadata.schema_version != RELEASE_SCHEMA_VERSION
+    if metadata.schema_version < MINIMUM_RELEASE_SCHEMA_VERSION
         || metadata.product_id != PRODUCT_ID
         || metadata.release_channel != check.release_channel
-        || !is_supported_channel(&metadata.release_channel)
+        || !botster_hub_installation::is_supported_channel(&metadata.release_channel)
         || metadata
             .build_revision
             .as_deref()
-            .is_some_and(|revision| !is_sanitized_revision(revision))
+            .is_some_and(|revision| !botster_hub_installation::is_sanitized_revision(revision))
     {
         return unavailable_update(
             current_version,
@@ -231,54 +250,30 @@ fn resolve_receipt() -> ReceiptResolution {
             "HOME is required to resolve the Hub installation receipt",
         )));
     };
-    resolve_receipt_at(&PathBuf::from(home).join(RECEIPT_RELATIVE_PATH))
+    resolve_receipt_under_home(&PathBuf::from(home))
 }
 
-fn resolve_receipt_at(path: &Path) -> ReceiptResolution {
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return fallback_resolution(None);
-        }
-        Err(error) => {
-            return fallback_resolution(Some(diagnostic(
-                io_diagnostic_kind(&error),
-                "installation receipt could not be inspected",
-            )));
-        }
+/// Resolve the receipt below `home` through the shared descriptor-relative
+/// reader.
+///
+/// The reader moved to the shared crate's `openat`/`O_NOFOLLOW` walk with
+/// `fstat` on the opened descriptors. The previous path-stat-then-read had the
+/// same check/use race on the read side that the write side needed closing;
+/// fixing it is cleanup made necessary by sharing the code, not opportunistic
+/// refactoring.
+fn resolve_receipt_under_home(home: &Path) -> ReceiptResolution {
+    let directory = match InstallationsDirectory::open(home) {
+        Ok(Some(directory)) => directory,
+        Ok(None) => return fallback_resolution(None),
+        Err(problem) => return fallback_resolution(Some(problem_diagnostic(&problem))),
     };
-
-    if let Err(problem) = validate_receipt_path(path, &metadata) {
-        return fallback_resolution(Some(problem));
-    }
-    if metadata.len() > MAX_RECEIPT_BYTES {
-        return fallback_resolution(Some(diagnostic(
-            "receipt_too_large",
-            "installation receipt exceeds the size limit",
-        )));
-    }
-
-    let bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            return fallback_resolution(Some(diagnostic(
-                io_diagnostic_kind(&error),
-                "installation receipt could not be read",
-            )));
-        }
+    let receipt = match directory.read_receipt() {
+        Ok(Some(receipt)) => receipt,
+        Ok(None) => return fallback_resolution(None),
+        Err(problem) => return fallback_resolution(Some(problem_diagnostic(&problem))),
     };
-    let receipt: InstallationReceipt = match serde_json::from_slice(&bytes) {
-        Ok(receipt) => receipt,
-        Err(_) => {
-            return fallback_resolution(Some(diagnostic(
-                "malformed_receipt",
-                "installation receipt is not valid supported JSON",
-            )));
-        }
-    };
-
-    if let Some(problem) = validate_receipt(&receipt) {
-        return fallback_resolution(Some(problem));
+    if let Err(problem) = receipt.validate(env!("CARGO_PKG_VERSION"), embedded_build_revision()) {
+        return fallback_resolution(Some(problem_diagnostic(&problem)));
     }
 
     ReceiptResolution {
@@ -291,136 +286,6 @@ fn resolve_receipt_at(path: &Path) -> ReceiptResolution {
         },
         receipt: Some(receipt),
     }
-}
-
-fn validate_receipt(receipt: &InstallationReceipt) -> Option<DaemonInstallationDiagnostic> {
-    if receipt.schema_version != RECEIPT_SCHEMA_VERSION {
-        return Some(diagnostic(
-            "unsupported_receipt_schema",
-            "installation receipt schema is unsupported",
-        ));
-    }
-    if receipt.product_id != PRODUCT_ID {
-        return Some(diagnostic(
-            "receipt_product_mismatch",
-            "installation receipt names a different product",
-        ));
-    }
-    if receipt.binary_version != env!("CARGO_PKG_VERSION") {
-        return Some(diagnostic(
-            "receipt_binary_mismatch",
-            "installation receipt does not match the running binary version",
-        ));
-    }
-    if receipt.installation_mode != "managed" {
-        return Some(diagnostic(
-            "unsupported_installation_mode",
-            "installation receipt mode is unsupported",
-        ));
-    }
-    if !is_supported_channel(&receipt.release_channel) {
-        return Some(diagnostic(
-            "unsupported_release_channel",
-            "installation receipt release channel is unsupported",
-        ));
-    }
-    if receipt.provider != "http_json" {
-        return Some(diagnostic(
-            "unsupported_release_provider",
-            "installation receipt provider is unsupported",
-        ));
-    }
-    if let Err(kind) = validate_release_source(&receipt.source_url) {
-        return Some(diagnostic(
-            kind,
-            if kind == "insecure_release_source" {
-                "installation receipt release source must use HTTPS or loopback HTTP"
-            } else {
-                "installation receipt release source is invalid"
-            },
-        ));
-    }
-    None
-}
-
-fn validate_release_source(source_url: &str) -> Result<(), &'static str> {
-    let uri = source_url
-        .parse::<ureq::http::Uri>()
-        .map_err(|_| "invalid_release_source")?;
-    let scheme = uri.scheme_str().ok_or("invalid_release_source")?;
-    let host = uri.host().ok_or("invalid_release_source")?;
-    match scheme {
-        "https" => Ok(()),
-        "http" if is_loopback_host(host) => Ok(()),
-        "http" => Err("insecure_release_source"),
-        _ => Err("invalid_release_source"),
-    }
-}
-
-fn is_loopback_host(host: &str) -> bool {
-    host.eq_ignore_ascii_case("localhost")
-        || host
-            .trim_matches(['[', ']'])
-            .parse::<IpAddr>()
-            .is_ok_and(|address| address.is_loopback())
-}
-
-fn validate_receipt_path(
-    path: &Path,
-    metadata: &fs::Metadata,
-) -> Result<(), DaemonInstallationDiagnostic> {
-    if metadata.file_type().is_symlink() {
-        return Err(diagnostic(
-            "receipt_symlink",
-            "installation receipt must not be a symbolic link",
-        ));
-    }
-    if !metadata.file_type().is_file() {
-        return Err(diagnostic(
-            "receipt_not_regular_file",
-            "installation receipt must be a regular file",
-        ));
-    }
-    validate_owned_private_metadata(metadata, "receipt")?;
-
-    let mut directory = path.parent();
-    for _ in 0..2 {
-        let Some(path) = directory else { break };
-        let metadata = fs::symlink_metadata(path).map_err(|error| {
-            diagnostic(
-                io_diagnostic_kind(&error),
-                "installation receipt directory could not be inspected",
-            )
-        })?;
-        if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
-            return Err(diagnostic(
-                "unsafe_receipt_directory",
-                "installation receipt directory is not a safe regular directory",
-            ));
-        }
-        validate_owned_private_metadata(&metadata, "receipt_directory")?;
-        directory = path.parent();
-    }
-    Ok(())
-}
-
-fn validate_owned_private_metadata(
-    metadata: &fs::Metadata,
-    subject: &'static str,
-) -> Result<(), DaemonInstallationDiagnostic> {
-    if metadata.uid() != unsafe { libc::geteuid() } {
-        return Err(diagnostic(
-            "receipt_wrong_owner",
-            format!("installation {subject} is not owned by the current user"),
-        ));
-    }
-    if metadata.mode() & 0o002 != 0 {
-        return Err(diagnostic(
-            "receipt_world_writable",
-            format!("installation {subject} must not be world-writable"),
-        ));
-    }
-    Ok(())
 }
 
 fn fallback_resolution(diagnostic: Option<DaemonInstallationDiagnostic>) -> ReceiptResolution {
@@ -464,28 +329,18 @@ fn diagnostic(kind: impl Into<String>, message: impl Into<String>) -> DaemonInst
     }
 }
 
-fn io_diagnostic_kind(error: &std::io::Error) -> &'static str {
-    match error.kind() {
-        std::io::ErrorKind::PermissionDenied => "receipt_permission_denied",
-        _ => "receipt_io_error",
-    }
-}
-
-fn is_supported_channel(channel: &str) -> bool {
-    matches!(channel, "stable" | "beta" | "nightly")
-}
-
-fn is_sanitized_revision(revision: &str) -> bool {
-    !revision.is_empty()
-        && revision.len() <= 64
-        && revision
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+fn problem_diagnostic(problem: &InstallationProblem) -> DaemonInstallationDiagnostic {
+    diagnostic(problem.kind(), problem.message())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use botster_hub_installation::{
+        RECEIPT_SCHEMA_VERSION, ReceiptArtifact, ReceiptInstaller, ReceiptSignature,
+        ReceiptSourceRevisions,
+    };
+    use std::fs;
     use std::os::unix::fs::{PermissionsExt, symlink};
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -503,7 +358,7 @@ mod tests {
                 std::process::id(),
                 FIXTURE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
             ));
-            let receipt = root.join(RECEIPT_RELATIVE_PATH);
+            let receipt = root.join(botster_hub_installation::RECEIPT_RELATIVE_PATH);
             fs::create_dir_all(receipt.parent().expect("receipt parent")).expect("create fixture");
             Self { root, receipt }
         }
@@ -515,6 +370,10 @@ mod tests {
             )
             .expect("write receipt");
         }
+
+        fn resolve(&self) -> ReceiptResolution {
+            resolve_receipt_under_home(&self.root)
+        }
     }
 
     impl Drop for Fixture {
@@ -524,15 +383,42 @@ mod tests {
     }
 
     fn valid_receipt() -> serde_json::Value {
-        serde_json::json!({
-            "schema_version": 1,
-            "product_id": PRODUCT_ID,
-            "binary_version": env!("CARGO_PKG_VERSION"),
-            "installation_mode": "managed",
-            "release_channel": "stable",
-            "provider": "http_json",
-            "source_url": "https://releases.example.invalid/botster-hub.json"
+        serde_json::to_value(InstallationReceipt {
+            schema_version: RECEIPT_SCHEMA_VERSION,
+            product_id: PRODUCT_ID.to_string(),
+            binary_version: env!("CARGO_PKG_VERSION").to_string(),
+            installation_mode: "managed".to_string(),
+            release_channel: "stable".to_string(),
+            provider: "http_json".to_string(),
+            source_url: "https://releases.example.invalid/botster-hub.json".to_string(),
+            build_revision: "release1".to_string(),
+            artifacts: vec![
+                ReceiptArtifact {
+                    name: "botster-hub".to_string(),
+                    sha256: "a".repeat(64),
+                    size: 1024,
+                },
+                ReceiptArtifact {
+                    name: "botster-session-worker".to_string(),
+                    sha256: "b".repeat(64),
+                    size: 2048,
+                },
+            ],
+            source_revisions: ReceiptSourceRevisions {
+                botster_hub: "0".repeat(40),
+                botster_core: "1".repeat(40),
+            },
+            signature: ReceiptSignature {
+                algorithm: "ed25519".to_string(),
+                key_id: "test-only-do-not-trust".to_string(),
+                signed_manifest_sha256: "c".repeat(64),
+            },
+            installer: ReceiptInstaller {
+                id: "botster-hub-installer".to_string(),
+                version: "0.1.0".to_string(),
+            },
         })
+        .expect("serialize valid receipt")
     }
 
     #[test]
@@ -551,7 +437,7 @@ mod tests {
     fn valid_receipt_is_managed_and_binary_authoritative() {
         let fixture = Fixture::new();
         fixture.write(valid_receipt());
-        let resolution = resolve_receipt_at(&fixture.receipt);
+        let resolution = fixture.resolve();
         assert_eq!(resolution.identity.mode, DaemonInstallationMode::Managed);
         assert_eq!(
             resolution.identity.release_channel.as_deref(),
@@ -561,18 +447,52 @@ mod tests {
         assert!(resolution.receipt.is_some());
     }
 
+    /// Cold turkey: schema 1 is not accepted alongside schema 2, it is rejected
+    /// as unsupported and the installation degrades to unmanaged. That rejection
+    /// is load-bearing — the ticket's upgrade ordering depends on an older Hub
+    /// refusing a receipt schema it does not know.
+    #[test]
+    fn schema_one_receipts_are_rejected_as_unsupported_and_treated_as_unmanaged() {
+        let fixture = Fixture::new();
+        fixture.write(serde_json::json!({
+            "schema_version": 1,
+            "product_id": PRODUCT_ID,
+            "binary_version": env!("CARGO_PKG_VERSION"),
+            "installation_mode": "managed",
+            "release_channel": "stable",
+            "provider": "http_json",
+            "source_url": "https://releases.example.invalid/botster-hub.json"
+        }));
+        let resolution = fixture.resolve();
+        assert_ne!(resolution.identity.mode, DaemonInstallationMode::Managed);
+        // A schema-1 document lacks every schema-2 field, so the strict receipt
+        // reader rejects the shape before the version check ever runs. Either
+        // way it never becomes managed, which is the property that matters.
+        assert_eq!(resolution.identity.diagnostics[0].kind, "malformed_receipt");
+
+        let mut future = valid_receipt();
+        future["schema_version"] = serde_json::json!(3);
+        fixture.write(future);
+        let resolution = fixture.resolve();
+        assert_ne!(resolution.identity.mode, DaemonInstallationMode::Managed);
+        assert_eq!(
+            resolution.identity.diagnostics[0].kind,
+            "unsupported_receipt_schema"
+        );
+    }
+
     #[test]
     fn malformed_and_mismatched_receipts_never_become_managed() {
         let fixture = Fixture::new();
         fs::write(&fixture.receipt, b"{").expect("write malformed receipt");
-        let malformed = resolve_receipt_at(&fixture.receipt);
+        let malformed = fixture.resolve();
         assert_ne!(malformed.identity.mode, DaemonInstallationMode::Managed);
         assert_eq!(malformed.identity.diagnostics[0].kind, "malformed_receipt");
 
         let mut mismatched = valid_receipt();
         mismatched["binary_version"] = serde_json::json!("999.0.0");
         fixture.write(mismatched);
-        let mismatched = resolve_receipt_at(&fixture.receipt);
+        let mismatched = fixture.resolve();
         assert_ne!(mismatched.identity.mode, DaemonInstallationMode::Managed);
         assert_eq!(
             mismatched.identity.diagnostics[0].kind,
@@ -584,11 +504,6 @@ mod tests {
     fn unsupported_receipt_fields_are_diagnosed() {
         for (field, value, expected) in [
             (
-                "schema_version",
-                serde_json::json!(2),
-                "unsupported_receipt_schema",
-            ),
-            (
                 "provider",
                 serde_json::json!("git"),
                 "unsupported_release_provider",
@@ -598,45 +513,114 @@ mod tests {
                 serde_json::json!("custom"),
                 "unsupported_release_channel",
             ),
+            (
+                "installation_mode",
+                serde_json::json!("linked"),
+                "unsupported_installation_mode",
+            ),
         ] {
             let fixture = Fixture::new();
             let mut receipt = valid_receipt();
             receipt[field] = value;
             fixture.write(receipt);
-            let resolution = resolve_receipt_at(&fixture.receipt);
+            let resolution = fixture.resolve();
             assert_ne!(resolution.identity.mode, DaemonInstallationMode::Managed);
             assert_eq!(resolution.identity.diagnostics[0].kind, expected);
         }
     }
 
+    /// The additive schema-2 fields get shape validation, not trust: malformed
+    /// hex, an unknown algorithm, and an unrecognized artifact name each
+    /// diagnose rather than being accepted as facts.
+    #[test]
+    fn additive_schema_two_fields_are_shape_validated() {
+        for (pointer, value, expected) in [
+            (
+                "/artifacts/0/sha256",
+                serde_json::json!("not-hex"),
+                "malformed_receipt_checksum",
+            ),
+            (
+                "/signature/algorithm",
+                serde_json::json!("rsa-pss"),
+                "unsupported_signature_algorithm",
+            ),
+            (
+                "/artifacts/1/name",
+                serde_json::json!("botster-unexpected"),
+                "unknown_receipt_artifact",
+            ),
+            (
+                "/source_revisions/botster_core",
+                serde_json::json!("../escape"),
+                "malformed_receipt_revision",
+            ),
+            (
+                "/signature/signed_manifest_sha256",
+                serde_json::json!("abc"),
+                "malformed_receipt_checksum",
+            ),
+            (
+                "/installer/id",
+                serde_json::json!("installer/../../etc"),
+                "malformed_receipt_field",
+            ),
+        ] {
+            let fixture = Fixture::new();
+            let mut receipt = valid_receipt();
+            *receipt.pointer_mut(pointer).expect("pointer exists") = value;
+            fixture.write(receipt);
+            let resolution = fixture.resolve();
+            assert_ne!(resolution.identity.mode, DaemonInstallationMode::Managed);
+            assert_eq!(
+                resolution.identity.diagnostics[0].kind, expected,
+                "pointer={pointer}"
+            );
+        }
+    }
+
+    /// `build_revision` agreement applies only when the running binary carries
+    /// an embedded revision. A development build has none, and skipping the
+    /// check there is what keeps this ticket from perturbing development or
+    /// unmanaged behavior.
+    #[test]
+    fn build_revision_agreement_applies_only_to_a_binary_with_an_embedded_revision() {
+        let receipt: InstallationReceipt =
+            serde_json::from_value(valid_receipt()).expect("parse receipt");
+        assert_eq!(receipt.validate(env!("CARGO_PKG_VERSION"), None), Ok(()));
+        assert_eq!(
+            receipt.validate(env!("CARGO_PKG_VERSION"), Some("release1")),
+            Ok(())
+        );
+        assert_eq!(
+            receipt
+                .validate(env!("CARGO_PKG_VERSION"), Some("release2"))
+                .expect_err("a disagreeing embedded revision diagnoses")
+                .kind(),
+            "receipt_build_revision_mismatch"
+        );
+    }
+
     #[test]
     fn managed_release_sources_require_https_except_for_explicit_loopback_fixtures() {
-        for source in [
-            "https://releases.example.invalid/botster-hub.json",
-            "http://127.0.0.1:8123/botster-hub.json",
-            "http://[::1]:8123/botster-hub.json",
-            "http://localhost:8123/botster-hub.json",
-        ] {
-            assert_eq!(validate_release_source(source), Ok(()), "source={source}");
-        }
-        assert_eq!(
-            validate_release_source("http://192.0.2.10/botster-hub.json"),
-            Err("insecure_release_source")
-        );
-        assert_eq!(
-            validate_release_source("file:///tmp/botster-hub.json"),
-            Err("invalid_release_source")
-        );
-
         let fixture = Fixture::new();
         let mut receipt = valid_receipt();
         receipt["source_url"] = serde_json::json!("http://192.0.2.10/botster-hub.json");
         fixture.write(receipt);
-        let resolution = resolve_receipt_at(&fixture.receipt);
+        let resolution = fixture.resolve();
         assert_ne!(resolution.identity.mode, DaemonInstallationMode::Managed);
         assert_eq!(
             resolution.identity.diagnostics[0].kind,
             "insecure_release_source"
+        );
+
+        let fixture = Fixture::new();
+        let mut receipt = valid_receipt();
+        receipt["source_url"] = serde_json::json!("http://127.0.0.1:8123/botster-hub.json");
+        fixture.write(receipt);
+        assert_eq!(
+            fixture.resolve().identity.mode,
+            DaemonInstallationMode::Managed
         );
     }
 
@@ -690,7 +674,7 @@ mod tests {
             .permissions();
         permissions.set_mode(0o666);
         fs::set_permissions(&fixture.receipt, permissions).expect("set permissions");
-        let world_writable = resolve_receipt_at(&fixture.receipt);
+        let world_writable = fixture.resolve();
         assert_eq!(
             world_writable.identity.diagnostics[0].kind,
             "receipt_world_writable"
@@ -701,7 +685,7 @@ mod tests {
         fs::write(&target, serde_json::to_vec(&valid_receipt()).expect("json"))
             .expect("write target");
         symlink(&target, &fixture.receipt).expect("symlink receipt");
-        let symlinked = resolve_receipt_at(&fixture.receipt);
+        let symlinked = fixture.resolve();
         assert_eq!(symlinked.identity.diagnostics[0].kind, "receipt_symlink");
     }
 
@@ -710,7 +694,7 @@ mod tests {
         let fixture = Fixture::new();
         fs::remove_file(&fixture.receipt).ok();
         fs::create_dir(&fixture.receipt).expect("create receipt directory");
-        let non_regular = resolve_receipt_at(&fixture.receipt);
+        let non_regular = fixture.resolve();
         assert_eq!(
             non_regular.identity.diagnostics[0].kind,
             "receipt_not_regular_file"
@@ -723,7 +707,7 @@ mod tests {
             .permissions();
         permissions.set_mode(0o000);
         fs::set_permissions(&fixture.receipt, permissions).expect("deny receipt reads");
-        let denied = resolve_receipt_at(&fixture.receipt);
+        let denied = fixture.resolve();
         assert_eq!(
             denied.identity.diagnostics[0].kind,
             "receipt_permission_denied"
@@ -738,7 +722,7 @@ mod tests {
             permissions,
         )
         .expect("make receipt parent world-writable");
-        let unsafe_directory = resolve_receipt_at(&fixture.receipt);
+        let unsafe_directory = fixture.resolve();
         assert_eq!(
             unsafe_directory.identity.diagnostics[0].kind,
             "receipt_world_writable"
@@ -752,7 +736,7 @@ mod tests {
             release_channel: "stable".to_string(),
         };
         let result = |version: &str| ReleaseMetadata {
-            schema_version: 1,
+            schema_version: MINIMUM_RELEASE_SCHEMA_VERSION,
             product_id: PRODUCT_ID.to_string(),
             release_channel: "stable".to_string(),
             version: version.to_string(),
@@ -772,6 +756,77 @@ mod tests {
         assert_eq!(behind.state, DaemonHubUpdateState::Current);
         assert_eq!(behind.reason.as_deref(), Some("source_behind"));
         assert_eq!(behind.action.as_deref(), Some("no_downgrade"));
+    }
+
+    /// The guarantee test for forward tolerance. Deleting `deny_unknown_fields`
+    /// is only a deleted attribute until something asserts that a *newer* schema
+    /// carrying an *unknown* field still produces the right answer.
+    #[test]
+    fn a_newer_schema_with_unknown_fields_still_answers_available_or_current() {
+        let document = |version: &str| {
+            serde_json::json!({
+                "schema_version": MINIMUM_RELEASE_SCHEMA_VERSION + 1,
+                "product_id": PRODUCT_ID,
+                "release_channel": "stable",
+                "version": version,
+                "build_revision": "release99",
+                "install_manifest": "aGVsbG8=",
+                "signature": { "algorithm": "ed25519", "key_id": "k", "value": "sig" },
+                "delta_updates": { "from": ["0.1.0"], "patch_url": "https://example.invalid/p" },
+                "platform_matrix": ["aarch64-apple-darwin"]
+            })
+        };
+        let check = || ManagedReleaseCheck {
+            source_url: "https://example.invalid/releases.json".to_string(),
+            release_channel: "stable".to_string(),
+        };
+
+        let available = execute_managed_update_check_with_fetch(check(), |_| {
+            serde_json::from_value(document("99.0.0")).map_err(|_| "invalid_release_metadata")
+        });
+        assert_eq!(available.state, DaemonHubUpdateState::Available);
+        assert_eq!(available.available_version.as_deref(), Some("99.0.0"));
+        assert_eq!(available.action.as_deref(), Some("run_managed_installer"));
+
+        let current = execute_managed_update_check_with_fetch(check(), |_| {
+            serde_json::from_value(document(env!("CARGO_PKG_VERSION")))
+                .map_err(|_| "invalid_release_metadata")
+        });
+        assert_eq!(current.state, DaemonHubUpdateState::Current);
+        assert_eq!(current.reason.as_deref(), Some("up_to_date"));
+    }
+
+    /// Forward tolerance is bounded. Identity stays exact and a schema below the
+    /// minimum is still refused, so nobody can read "forward tolerant" as
+    /// licence to loosen the whole validator.
+    #[test]
+    fn identity_stays_exact_and_a_schema_below_the_minimum_is_still_refused() {
+        let check = || ManagedReleaseCheck {
+            source_url: "https://example.invalid/releases.json".to_string(),
+            release_channel: "stable".to_string(),
+        };
+        let metadata = |schema: u16, product: &str, channel: &str| ReleaseMetadata {
+            schema_version: schema,
+            product_id: product.to_string(),
+            release_channel: channel.to_string(),
+            version: "99.0.0".to_string(),
+            build_revision: Some("release99".to_string()),
+        };
+
+        for (schema, product, channel) in [
+            (MINIMUM_RELEASE_SCHEMA_VERSION - 1, PRODUCT_ID, "stable"),
+            (MINIMUM_RELEASE_SCHEMA_VERSION, "botster-core", "stable"),
+            (MINIMUM_RELEASE_SCHEMA_VERSION, PRODUCT_ID, "beta"),
+        ] {
+            let update = execute_managed_update_check_with_fetch(check(), |_| {
+                Ok(metadata(schema, product, channel))
+            });
+            assert_eq!(
+                update.reason.as_deref(),
+                Some("invalid_release_metadata"),
+                "schema={schema} product={product} channel={channel}"
+            );
+        }
     }
 
     #[test]
