@@ -165,8 +165,8 @@ pub(crate) fn command_action(words: &[String]) -> ConsoleAction {
         "apps" if words.get(1).map(String::as_str) == Some("open") && words.get(2).is_some() => {
             ConsoleAction::Command(CommandMode::ResolveApp(words[2].clone()))
         }
-        "up" | "doctor" | "smoke" | "status" | "sessions" | "session-templates"
-        | "spawn-targets" | "context" | "reload" | "apps" | "packages" | "providers" => {
+        "up" | "doctor" | "smoke" | "status" | "sessions" | "session-types" | "spawn-targets"
+        | "context" | "reload" | "apps" | "packages" | "providers" => {
             ConsoleAction::Command(CommandMode::Inline)
         }
         _ => ConsoleAction::Command(CommandMode::ExternalOnly),
@@ -505,7 +505,7 @@ mod tests {
             ("status", CommandMode::Inline),
             ("sessions list", CommandMode::Inline),
             ("sessions attach abc", CommandMode::ExternalOnly),
-            ("session-templates list", CommandMode::Inline),
+            ("session-types list", CommandMode::Inline),
             ("spawn-targets list", CommandMode::Inline),
             ("context", CommandMode::Inline),
             ("shutdown", CommandMode::Stop),

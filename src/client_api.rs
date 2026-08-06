@@ -29,9 +29,10 @@ use crate::packages::{
     PackageClassification, PackageConfigurationView, PackageRecord, PackageRegistry,
     PackageRunnableProcessState, PackageRunnableWorkingDirectory, PackageState,
 };
-use crate::session_templates::{
-    HubSessionContext, HubSessionTemplate, ResolvedSessionTemplate, SessionTemplateRequest,
-    list_session_templates, materialize_session_template, show_session_template,
+use crate::session_types::{
+    HubSessionContext, HubSessionType, PackageSessionType, ResolvedSessionType,
+    SessionTypeMutation, SessionTypeMutationSource, SessionTypeRequest, list_session_types,
+    materialize_session_type, show_session_type,
 };
 use crate::{HubRuntime, HubRuntimeError, daemon_session_to_core_session, host_profile};
 
@@ -350,76 +351,155 @@ impl HubClientApi {
                         .collect(),
                 )
             }
-            HubClientRequest::ListSessionTemplates { .. } => {
+            HubClientRequest::ListSessionTypes { .. } => {
                 let records = packages.packages();
                 let templates =
-                    list_session_templates(&records, &runtime.state()).map_err(|error| {
-                        HubClientError::SessionTemplate {
+                    list_session_types(&records, &runtime.state()).map_err(|error| {
+                        HubClientError::SessionType {
                             request_id: request_id.clone(),
                             operation,
                             kind: error.kind,
                             message: error.message,
                         }
                     })?;
-                HubClientResponseBody::SessionTemplates(templates)
+                HubClientResponseBody::SessionTypes(templates)
             }
-            HubClientRequest::ShowSessionTemplate { template_id, .. } => {
+            HubClientRequest::ShowSessionType {
+                session_type_id, ..
+            } => {
                 let records = packages.packages();
-                let template = show_session_template(&records, &runtime.state(), &template_id)
-                    .map_err(|error| HubClientError::SessionTemplate {
+                let template = show_session_type(&records, &runtime.state(), &session_type_id)
+                    .map_err(|error| HubClientError::SessionType {
                         request_id: request_id.clone(),
                         operation,
                         kind: error.kind,
                         message: error.message,
                     })?;
-                HubClientResponseBody::SessionTemplates(vec![template])
+                HubClientResponseBody::SessionTypes(vec![template])
             }
-            HubClientRequest::ResolveSessionTemplate {
-                template_id,
-                template_request,
+            HubClientRequest::CreateSessionType {
+                source, definition, ..
+            } => {
+                runtime
+                    .mutate_session_type(source, SessionTypeMutation::Create(definition))
+                    .map_err(|error| HubClientError::SessionType {
+                        request_id: request_id.clone(),
+                        operation,
+                        kind: error.kind,
+                        message: error.message,
+                    })?;
+                let records = packages.packages();
+                HubClientResponseBody::SessionTypes(
+                    list_session_types(&records, &runtime.state()).map_err(|error| {
+                        HubClientError::SessionType {
+                            request_id: request_id.clone(),
+                            operation,
+                            kind: error.kind,
+                            message: error.message,
+                        }
+                    })?,
+                )
+            }
+            HubClientRequest::UpdateSessionType {
+                source, definition, ..
+            } => {
+                runtime
+                    .mutate_session_type(source, SessionTypeMutation::Update(definition))
+                    .map_err(|error| HubClientError::SessionType {
+                        request_id: request_id.clone(),
+                        operation,
+                        kind: error.kind,
+                        message: error.message,
+                    })?;
+                let records = packages.packages();
+                HubClientResponseBody::SessionTypes(
+                    list_session_types(&records, &runtime.state()).map_err(|error| {
+                        HubClientError::SessionType {
+                            request_id: request_id.clone(),
+                            operation,
+                            kind: error.kind,
+                            message: error.message,
+                        }
+                    })?,
+                )
+            }
+            HubClientRequest::DeleteSessionType {
+                source,
+                session_type_id,
+                ..
+            } => {
+                runtime
+                    .mutate_session_type(
+                        source,
+                        SessionTypeMutation::Delete {
+                            id: session_type_id,
+                        },
+                    )
+                    .map_err(|error| HubClientError::SessionType {
+                        request_id: request_id.clone(),
+                        operation,
+                        kind: error.kind,
+                        message: error.message,
+                    })?;
+                let records = packages.packages();
+                HubClientResponseBody::SessionTypes(
+                    list_session_types(&records, &runtime.state()).map_err(|error| {
+                        HubClientError::SessionType {
+                            request_id: request_id.clone(),
+                            operation,
+                            kind: error.kind,
+                            message: error.message,
+                        }
+                    })?,
+                )
+            }
+            HubClientRequest::ResolveSessionType {
+                session_type_id,
+                session_type_request,
                 ..
             } => {
                 let records = packages.packages();
-                let materialized = materialize_session_template(
+                let materialized = materialize_session_type(
                     runtime.config(),
                     &records,
                     &runtime.state(),
-                    &template_id,
-                    template_request,
+                    &session_type_id,
+                    session_type_request,
                 )
-                .map_err(|error| HubClientError::SessionTemplate {
+                .map_err(|error| HubClientError::SessionType {
                     request_id: request_id.clone(),
                     operation,
                     kind: error.kind,
                     message: error.message,
                 })?;
-                HubClientResponseBody::ResolvedSessionTemplate(materialized.resolved)
+                HubClientResponseBody::ResolvedSessionType(Box::new(materialized.resolved))
             }
-            HubClientRequest::SpawnSessionTemplate {
-                template_id,
-                template_request,
+            HubClientRequest::SpawnSessionType {
+                session_type_id,
+                session_type_request,
                 now_seconds,
                 ..
             } => {
                 let records = packages.packages();
-                let materialized = materialize_session_template(
+                let materialized = materialize_session_type(
                     runtime.config(),
                     &records,
                     &runtime.state(),
-                    &template_id,
-                    template_request,
+                    &session_type_id,
+                    session_type_request,
                 )
-                .map_err(|error| HubClientError::SessionTemplate {
+                .map_err(|error| HubClientError::SessionType {
                     request_id: request_id.clone(),
                     operation,
                     kind: error.kind,
                     message: error.message,
                 })?;
                 let context = materialized.context.clone();
+                let metadata = session_type_client_metadata(materialized.metadata);
                 runtime.record_session_context(context.clone());
                 let outcome = match runtime.spawn_session(
                     materialized.spawn_request,
-                    client_session_metadata(),
+                    metadata,
                     now_seconds,
                 ) {
                     Ok(outcome) => outcome,
@@ -440,16 +520,17 @@ impl HubClientApi {
                 ..
             } => {
                 let lookup = context_id.as_deref().unwrap_or(session_id.0.as_str());
-                let context = runtime.session_context(lookup).ok_or_else(|| {
-                    HubClientError::SessionTemplate {
-                        request_id: request_id.clone(),
-                        operation,
-                        kind: "unknown_context",
-                        message: "session context was not found".to_string(),
-                    }
-                })?;
+                let context =
+                    runtime
+                        .session_context(lookup)
+                        .ok_or_else(|| HubClientError::SessionType {
+                            request_id: request_id.clone(),
+                            operation,
+                            kind: "unknown_context",
+                            message: "session context was not found".to_string(),
+                        })?;
                 if context.session_id != session_id {
-                    return Err(HubClientError::SessionTemplate {
+                    return Err(HubClientError::SessionType {
                         request_id,
                         operation,
                         kind: "context_session_mismatch",
@@ -614,12 +695,14 @@ impl HubClientAdmission {
             HubClientOperation::ListPackages | HubClientOperation::ListPackageNavigation => {
                 self.allow_packages
             }
-            HubClientOperation::ListSessionTemplates
-            | HubClientOperation::ShowSessionTemplate
-            | HubClientOperation::ResolveSessionTemplate => self.allow_packages,
-            HubClientOperation::SpawnSessionTemplate | HubClientOperation::ReadSessionContext => {
-                self.allow_runtime
-            }
+            HubClientOperation::ListSessionTypes
+            | HubClientOperation::ShowSessionType
+            | HubClientOperation::ResolveSessionType => self.allow_packages,
+            HubClientOperation::CreateSessionType
+            | HubClientOperation::UpdateSessionType
+            | HubClientOperation::DeleteSessionType
+            | HubClientOperation::SpawnSessionType
+            | HubClientOperation::ReadSessionContext => self.allow_runtime,
             HubClientOperation::PluginLifecycleStatus
             | HubClientOperation::PluginSurfaceRender
             | HubClientOperation::PluginSurfaceAction => self.allow_lifecycle,
@@ -755,24 +838,42 @@ pub enum HubClientRequest {
     ListPackages { request_id: RequestId },
     /// Return hub-admitted package navigation intent rows.
     ListPackageNavigation { request_id: RequestId },
-    /// Return sanitized session template rows.
-    ListSessionTemplates { request_id: RequestId },
-    /// Return one sanitized session template row.
-    ShowSessionTemplate {
+    /// Return sanitized session type rows.
+    ListSessionTypes { request_id: RequestId },
+    /// Return one sanitized session type row.
+    ShowSessionType {
         request_id: RequestId,
-        template_id: String,
+        session_type_id: String,
     },
-    /// Resolve a session template without spawning it.
-    ResolveSessionTemplate {
+    /// Create a session type in an editable authoritative source.
+    CreateSessionType {
         request_id: RequestId,
-        template_id: String,
-        template_request: SessionTemplateRequest,
+        source: SessionTypeMutationSource,
+        definition: PackageSessionType,
     },
-    /// Spawn a session from a hub-owned session template.
-    SpawnSessionTemplate {
+    /// Replace a session type in an editable authoritative source.
+    UpdateSessionType {
         request_id: RequestId,
-        template_id: String,
-        template_request: SessionTemplateRequest,
+        source: SessionTypeMutationSource,
+        definition: PackageSessionType,
+    },
+    /// Delete a session type from an editable authoritative source.
+    DeleteSessionType {
+        request_id: RequestId,
+        source: SessionTypeMutationSource,
+        session_type_id: String,
+    },
+    /// Resolve a session type without spawning it.
+    ResolveSessionType {
+        request_id: RequestId,
+        session_type_id: String,
+        session_type_request: SessionTypeRequest,
+    },
+    /// Spawn a session from a hub-owned session type.
+    SpawnSessionType {
+        request_id: RequestId,
+        session_type_id: String,
+        session_type_request: SessionTypeRequest,
         now_seconds: u64,
     },
     /// Read trusted hub context for one spawned template session.
@@ -824,10 +925,13 @@ impl HubClientRequest {
             | Self::CaptureSnapshot { request_id, .. }
             | Self::ListPackages { request_id }
             | Self::ListPackageNavigation { request_id }
-            | Self::ListSessionTemplates { request_id }
-            | Self::ShowSessionTemplate { request_id, .. }
-            | Self::ResolveSessionTemplate { request_id, .. }
-            | Self::SpawnSessionTemplate { request_id, .. }
+            | Self::ListSessionTypes { request_id }
+            | Self::ShowSessionType { request_id, .. }
+            | Self::CreateSessionType { request_id, .. }
+            | Self::UpdateSessionType { request_id, .. }
+            | Self::DeleteSessionType { request_id, .. }
+            | Self::ResolveSessionType { request_id, .. }
+            | Self::SpawnSessionType { request_id, .. }
             | Self::ReadSessionContext { request_id, .. }
             | Self::PluginLifecycleStatus { request_id }
             | Self::PluginSurfaceRender { request_id, .. }
@@ -859,10 +963,13 @@ impl HubClientRequest {
             Self::CaptureSnapshot { .. } => HubClientOperation::CaptureSnapshot,
             Self::ListPackages { .. } => HubClientOperation::ListPackages,
             Self::ListPackageNavigation { .. } => HubClientOperation::ListPackageNavigation,
-            Self::ListSessionTemplates { .. } => HubClientOperation::ListSessionTemplates,
-            Self::ShowSessionTemplate { .. } => HubClientOperation::ShowSessionTemplate,
-            Self::ResolveSessionTemplate { .. } => HubClientOperation::ResolveSessionTemplate,
-            Self::SpawnSessionTemplate { .. } => HubClientOperation::SpawnSessionTemplate,
+            Self::ListSessionTypes { .. } => HubClientOperation::ListSessionTypes,
+            Self::ShowSessionType { .. } => HubClientOperation::ShowSessionType,
+            Self::CreateSessionType { .. } => HubClientOperation::CreateSessionType,
+            Self::UpdateSessionType { .. } => HubClientOperation::UpdateSessionType,
+            Self::DeleteSessionType { .. } => HubClientOperation::DeleteSessionType,
+            Self::ResolveSessionType { .. } => HubClientOperation::ResolveSessionType,
+            Self::SpawnSessionType { .. } => HubClientOperation::SpawnSessionType,
             Self::ReadSessionContext { .. } => HubClientOperation::ReadSessionContext,
             Self::PluginLifecycleStatus { .. } => HubClientOperation::PluginLifecycleStatus,
             Self::PluginSurfaceRender { .. } => HubClientOperation::PluginSurfaceRender,
@@ -896,10 +1003,13 @@ pub enum HubClientOperation {
     CaptureSnapshot,
     ListPackages,
     ListPackageNavigation,
-    ListSessionTemplates,
-    ShowSessionTemplate,
-    ResolveSessionTemplate,
-    SpawnSessionTemplate,
+    ListSessionTypes,
+    ShowSessionType,
+    CreateSessionType,
+    UpdateSessionType,
+    DeleteSessionType,
+    ResolveSessionType,
+    SpawnSessionType,
     ReadSessionContext,
     PluginLifecycleStatus,
     PluginSurfaceRender,
@@ -933,8 +1043,8 @@ pub enum HubClientResponseBody {
     CaptureSnapshot(HubClientCaptureSnapshot),
     Packages(Vec<HubClientPackage>),
     PackageNavigation(Vec<HubClientPackageNavigationEntry>),
-    SessionTemplates(Vec<HubSessionTemplate>),
-    ResolvedSessionTemplate(ResolvedSessionTemplate),
+    SessionTypes(Vec<HubSessionType>),
+    ResolvedSessionType(Box<ResolvedSessionType>),
     SessionContext(HubSessionContext),
     PluginLifecycle(HubClientPluginLifecycleReport),
     PluginSurface(HubClientPluginSurface),
@@ -1792,7 +1902,7 @@ pub enum HubClientError {
         operation: HubClientOperation,
         package_name: String,
     },
-    SessionTemplate {
+    SessionType {
         request_id: RequestId,
         operation: HubClientOperation,
         kind: &'static str,
@@ -1945,6 +2055,13 @@ fn client_session_metadata() -> CoreSessionMetadata {
         "session_type".to_string(),
         "local_client_api".to_string(),
     )]))
+}
+
+fn session_type_client_metadata(mut metadata: CoreSessionMetadata) -> CoreSessionMetadata {
+    metadata
+        .entries
+        .insert("client".to_string(), "local_client_api".to_string());
+    metadata
 }
 
 pub(crate) fn events_from_drain(output: botster_core_daemon::DrainResult) -> Vec<HubClientEvent> {

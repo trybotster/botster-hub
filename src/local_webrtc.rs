@@ -1345,6 +1345,9 @@ fn entity_frame_subscription_id(frame: &DaemonEntityFrame) -> &str {
         }
         | DaemonEntityFrame::Remove {
             subscription_id, ..
+        }
+        | DaemonEntityFrame::Error {
+            subscription_id, ..
         } => subscription_id,
     }
 }
@@ -1354,8 +1357,8 @@ fn response_with_diagnostic(diagnostic: DaemonDiagnostic) -> DaemonResponse {
         kind: botster_hub_client::DaemonResponseKind::OperatorError,
         status: None,
         sessions: Vec::new(),
-        session_templates: Vec::new(),
-        resolved_session_template: None,
+        session_types: Vec::new(),
+        resolved_session_type: None,
         session_context: None,
         read_screen: None,
         mode_flags: None,

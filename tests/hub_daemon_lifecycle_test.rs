@@ -757,7 +757,7 @@ return botster.register({
     description = "Exercise the live Hub managed Git session path.",
     handler = "live_spawn",
     call = function(args)
-      return botster.capabilities.session_templates.ensure_worktree_and_spawn(args)
+      return botster.capabilities.session_types.ensure_worktree_and_spawn(args)
     end,
   }},
 })
@@ -785,14 +785,19 @@ return botster.register({
                 { "surface": "mcp" },
                 {
                     "surface": "session_actions",
-                    "scope": "session_template_managed_git_spawn"
+                    "scope": "session_type_managed_git_spawn"
                 }
             ],
             "entrypoints": [
                 { "runtime": "lua", "path": "plugin.lua", "bootstrap": false }
             ],
-            "session_templates": [{
+            "session_types": [{
                 "id": "init",
+                "label": "Managed agent",
+                "role": "botster.agent",
+                "interaction": "interactive",
+                "traits": ["test"],
+                "lifecycle": "task",
                 "command": "bin/init.sh",
                 "target_id": "tgt_live_managed"
             }]
@@ -1085,23 +1090,23 @@ fn write_supervised_package(root: &Path, package_name: &str, command: &str, args
     .expect("write supervised package manifest");
 }
 
-fn write_session_template_context_package(root: &Path) {
-    fs::create_dir_all(root.join("bin")).expect("create session template package root");
+fn write_session_type_context_package(root: &Path) {
+    fs::create_dir_all(root.join("bin")).expect("create session type package root");
     fs::write(root.join("plugin.lua"), "return botster.register({})\n")
-        .expect("write session template plugin entrypoint");
+        .expect("write session type plugin entrypoint");
     let script = root.join("bin/init.sh");
     fs::write(
         &script,
         "#!/bin/sh\nprintf 'started\\n' > context-started.txt\n\"$BOTSTER_HUB_BIN\" context --key prompt > context-output.json 2> context-error.txt\nsleep 1\n",
     )
-    .expect("write session template script");
+    .expect("write session type script");
     let mut permissions = fs::metadata(&script)
         .expect("script metadata")
         .permissions();
     permissions.set_mode(0o755);
-    fs::set_permissions(&script, permissions).expect("chmod session template script");
+    fs::set_permissions(&script, permissions).expect("chmod session type script");
     let manifest = serde_json::json!({
-        "name": "runtime.session-template",
+        "name": "runtime.session-type",
         "version": "1.0.0",
         "kind": "plugin",
         "botster": ">=0.1.0",
@@ -1110,8 +1115,13 @@ fn write_session_template_context_package(root: &Path) {
         "entrypoints": [
             { "runtime": "lua", "path": "plugin.lua", "bootstrap": false }
         ],
-        "session_templates": [{
+        "session_types": [{
             "id": "init",
+            "label": "Daemon agent",
+            "role": "botster.agent",
+            "interaction": "interactive",
+            "traits": ["test"],
+            "lifecycle": "task",
             "command": "bin/init.sh",
             "context": ["prompt"],
             "allowed_environment_overrides": ["BOTSTER_MODE"],
@@ -1120,9 +1130,9 @@ fn write_session_template_context_package(root: &Path) {
     });
     fs::write(
         root.join("botster-package.json"),
-        serde_json::to_string_pretty(&manifest).expect("serialize session template manifest"),
+        serde_json::to_string_pretty(&manifest).expect("serialize session type manifest"),
     )
-    .expect("write session template package manifest");
+    .expect("write session type package manifest");
 }
 
 fn write_app_registry_package(root: &Path) {
@@ -1372,7 +1382,7 @@ let boundPort = null;
 function currentRequirement() {
   return {
     protocol: 'botster-hub-daemon-v1',
-    minimum_protocol_version: 1,
+    protocol_version: 1,
     required_features: [
       'sessions',
       'terminal_streaming',
@@ -7001,11 +7011,7 @@ fn cli_daily_commands_share_canonical_default_data_directory() {
         ("packages", &["list"][..], "response=packages"),
         ("apps", &["list"][..], "response=apps"),
         ("sessions", &["list"][..], "response=sessions"),
-        (
-            "session-templates",
-            &["list"][..],
-            "response=session_templates",
-        ),
+        ("session-types", &["list"][..], "response=session_types"),
         ("spawn-targets", &["list"][..], "response=spawn_targets"),
     ] {
         let output = run_daily(command, args);
@@ -7030,9 +7036,9 @@ fn cli_daily_commands_share_canonical_default_data_directory() {
         ("apps", &["list", "extra"][..], "apps list"),
         ("sessions", &["list", "extra"][..], "sessions list"),
         (
-            "session-templates",
+            "session-types",
             &["list", "extra"][..],
-            "session-templates list",
+            "session-types list",
         ),
         (
             "spawn-targets",
@@ -8180,7 +8186,7 @@ fn daemon_starts_empty_state_reports_status_uses_core_and_stops_idempotently() {
     assert_eq!(status.state_source, HubStateLoadSource::Initialized);
     assert_eq!(status.host_id, "hub-daemon-test");
     assert_eq!(status.host_display_name, "Hub Daemon Test");
-    assert_eq!(status.schema_version, 2);
+    assert_eq!(status.schema_version, 3);
     assert!(status.data_dir_configured);
     assert!(status.core_initialized);
     assert_eq!(status.package_count, 0);
@@ -8207,7 +8213,7 @@ fn daemon_starts_empty_state_reports_status_uses_core_and_stops_idempotently() {
     let reopened = store
         .load_or_initialize(&config)
         .expect("reload committed daemon state");
-    assert_eq!(reopened.schema_version, 2);
+    assert_eq!(reopened.schema_version, 3);
     assert_eq!(reopened.host.id, "hub-daemon-test");
 }
 
@@ -8525,7 +8531,7 @@ fn daemon_restores_existing_provider_policy_records_through_snapshot_admission()
     assert_eq!(status.enabled_package_count, 1);
     assert_eq!(status.provider_count, 1);
     assert_eq!(status.enabled_provider_count, 1);
-    assert_eq!(status.schema_version, 2);
+    assert_eq!(status.schema_version, 3);
 
     daemon.stop();
     let reopened = store
@@ -8555,7 +8561,7 @@ fn cli_start_and_status_print_scrubbed_lifecycle_status() {
     let stdout = String::from_utf8(output.stdout).expect("stdout is utf8");
     assert!(stdout.contains("event=status"));
     assert!(stdout.contains("lifecycle_state=running"));
-    assert!(stdout.contains("schema_version=2"));
+    assert!(stdout.contains("schema_version=3"));
     assert!(stdout.contains("core_initialized=true"));
     assert!(stdout.contains("state_source=initialized"));
     assert!(!stdout.contains(data_dir.to_string_lossy().as_ref()));
@@ -12288,30 +12294,27 @@ fn external_hub_client_reports_compatibility_descriptor_and_mismatch_diagnostics
     assert!(status.diagnostics.is_empty());
 
     let mut stale_requirement = botster_hub_client::DaemonCompatibilityRequirement::current();
-    stale_requirement.client_name = "stale-4-28-client".to_string();
-    stale_requirement.minimum_protocol_version = 4;
-    stale_requirement.minimum_conformance_fixture_revision = 28;
+    stale_requirement.client_name = "stale-5-29-client".to_string();
+    stale_requirement.protocol_version = 5;
+    stale_requirement.minimum_conformance_fixture_revision = 29;
     for attempt in ["initial connect", "reconnect"] {
-        let mut stale_stream =
+        let error =
             botster_hub_client::connect_and_hello_with_requirement(&endpoint, &stale_requirement)
-                .unwrap_or_else(|error| panic!("stale client {attempt} failed: {error}"));
-        botster_hub_client::write_frame(
-            &mut stale_stream,
-            &botster_hub_client::DaemonRequest::Status,
-        )
-        .expect("stale client writes status request");
-        let response: botster_hub_client::DaemonResponse =
-            botster_hub_client::read_frame(&mut stale_stream)
-                .expect("stale client reads additive status response");
-        let stale_status = response.status.expect("stale client status payload");
-        assert_eq!(stale_status.compatibility.protocol_version, 5);
-        assert_eq!(stale_status.compatibility.conformance_fixture_revision, 29);
-        assert_eq!(stale_status.software.product_id, "botster-hub");
+                .expect_err("stale client must fail before dispatching a removed operation");
+        let message = error.to_string();
+        assert!(
+            message.contains("stale-5-29-client"),
+            "{attempt}: {message}"
+        );
+        assert!(
+            message.contains("unsupported protocol version 6"),
+            "{attempt}: {message}"
+        );
     }
 
     let mut version_requirement = botster_hub_client::DaemonCompatibilityRequirement::current();
     version_requirement.client_name = "future-version-client".to_string();
-    version_requirement.minimum_protocol_version = botster_hub_client::PROTOCOL_VERSION + 1;
+    version_requirement.protocol_version = botster_hub_client::PROTOCOL_VERSION + 1;
     let version_error =
         botster_hub_client::connect_and_hello_with_requirement(&endpoint, &version_requirement)
             .expect_err("future protocol version should fail compatibility");
@@ -13776,11 +13779,11 @@ fn daemon_list_apps_projects_installed_package_entrypoints() {
 }
 
 #[test]
-fn daemon_spawns_session_template_and_script_reads_botster_context() {
+fn daemon_spawns_session_type_and_script_reads_botster_context() {
     let _guard = daemon_test_guard();
-    let data_dir = unique_short_test_dir("session-template-context");
-    let package_root = unique_test_dir("session-template-context-package");
-    write_session_template_context_package(&package_root);
+    let data_dir = unique_short_test_dir("session-type-context");
+    let package_root = unique_test_dir("session-type-context-package");
+    write_session_type_context_package(&package_root);
     let config = explicit_config(&data_dir);
     let child = start_cli_daemon(&data_dir);
 
@@ -13790,7 +13793,7 @@ fn daemon_spawns_session_template_and_script_reads_botster_context() {
             path: package_root.clone(),
         },
     )
-    .expect("enable session template package");
+    .expect("enable session type package");
     assert_eq!(
         enable.kind,
         botster_hub::DaemonResponseKind::PackageDecision
@@ -13798,21 +13801,21 @@ fn daemon_spawns_session_template_and_script_reads_botster_context() {
 
     let templates = botster_hub::daemon_transport_request(
         &config,
-        botster_hub::DaemonRequest::ListSessionTemplates,
+        botster_hub::DaemonRequest::ListSessionTypes,
     )
-    .expect("list session templates");
+    .expect("list session types");
     assert_eq!(
-        templates.session_templates[0].template_id,
-        "runtime.session-template/init"
+        templates.session_types[0].session_type_id,
+        "runtime.session-type/init"
     );
 
     let rejected = botster_hub::daemon_transport_request(
         &config,
-        botster_hub::DaemonRequest::ResolveSessionTemplate {
-            template_id: "init".to_string(),
-            request: botster_hub::DaemonSessionTemplateRequest {
+        botster_hub::DaemonRequest::ResolveSessionType {
+            session_type_id: "init".to_string(),
+            request: botster_hub::DaemonSessionTypeRequest {
                 cwd: Some("/tmp".to_string()),
-                ..botster_hub::DaemonSessionTemplateRequest::default()
+                ..botster_hub::DaemonSessionTypeRequest::default()
             },
         },
     )
@@ -13828,20 +13831,20 @@ fn daemon_spawns_session_template_and_script_reads_botster_context() {
 
     let spawn = botster_hub::daemon_transport_request(
         &config,
-        botster_hub::DaemonRequest::SpawnSessionTemplate {
-            template_id: "init".to_string(),
-            session_id: "session-template-context".to_string(),
-            request: botster_hub::DaemonSessionTemplateRequest {
-                context: botster_hub::DaemonSessionTemplateContextInput {
+        botster_hub::DaemonRequest::SpawnSessionType {
+            session_type_id: "init".to_string(),
+            session_id: "session-type-context".to_string(),
+            request: botster_hub::DaemonSessionTypeRequest {
+                context: botster_hub::DaemonSessionTypeContextInput {
                     prompt: Some("pipeline prompt".to_string()),
                     ticket_id: Some("ticket-123".to_string()),
-                    ..botster_hub::DaemonSessionTemplateContextInput::default()
+                    ..botster_hub::DaemonSessionTypeContextInput::default()
                 },
-                ..botster_hub::DaemonSessionTemplateRequest::default()
+                ..botster_hub::DaemonSessionTypeRequest::default()
             },
         },
     )
-    .expect("spawn session template");
+    .expect("spawn session type");
     assert_eq!(spawn.kind, botster_hub::DaemonResponseKind::Spawned);
 
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
@@ -14265,20 +14268,20 @@ fn daemon_worktree_crud_scopes_paths_to_spawn_targets_without_requiring_git() {
 }
 
 #[test]
-fn daemon_spawns_repo_local_session_template_after_state_reload() {
+fn daemon_spawns_repo_local_session_type_after_state_reload() {
     let _guard = daemon_test_guard();
-    let data_dir = unique_short_test_dir("repo-session-template");
-    let package_root = unique_test_dir("repo-session-template-package");
+    let data_dir = unique_short_test_dir("repo-session-type");
+    let package_root = unique_test_dir("repo-session-type-package");
     let repo_root = std::env::current_dir()
         .expect("current dir")
-        .join(unique_test_dir("repo-session-template-repo"));
-    write_session_template_context_package(&package_root);
+        .join(unique_test_dir("repo-session-type-repo"));
+    write_session_type_context_package(&package_root);
     fs::create_dir_all(repo_root.join(".botster")).expect("create repo .botster dir");
     fs::create_dir_all(repo_root.join("bin")).expect("create repo bin dir");
     let script = repo_root.join("bin/repo-template.sh");
     fs::write(
         &script,
-        "#!/bin/sh\nprintf 'repo:%s\\n' \"$BOTSTER_MODE\" > repo-template-output.txt\nsleep 1\n",
+        "#!/bin/sh\nprintf 'repo:%s\\n' \"$BOTSTER_MODE\" > repo-template-output.txt\nsleep 30\n",
     )
     .expect("write repo template script");
     let mut permissions = fs::metadata(&script)
@@ -14287,10 +14290,15 @@ fn daemon_spawns_repo_local_session_template_after_state_reload() {
     permissions.set_mode(0o755);
     fs::set_permissions(&script, permissions).expect("chmod repo script");
     fs::write(
-        repo_root.join(".botster/session-templates.json"),
+        repo_root.join(".botster/session-types.json"),
         serde_json::to_string_pretty(&serde_json::json!({
-            "session_templates": [{
+            "session_types": [{
                 "id": "init",
+                "label": "Repo agent",
+                "role": "botster.agent",
+                "interaction": "interactive",
+                "traits": ["test"],
+                "lifecycle": "task",
                 "command": "bin/repo-template.sh",
                 "environment": { "BOTSTER_MODE": "repo" },
                 "allowed_environment_overrides": ["BOTSTER_MODE"]
@@ -14323,7 +14331,7 @@ fn daemon_spawns_repo_local_session_template_after_state_reload() {
             path: package_root.clone(),
         },
     )
-    .expect("enable package session template baseline");
+    .expect("enable package session type baseline");
     assert_eq!(
         enable.kind,
         botster_hub::DaemonResponseKind::PackageDecision
@@ -14331,25 +14339,25 @@ fn daemon_spawns_repo_local_session_template_after_state_reload() {
 
     let templates = botster_hub::daemon_transport_request(
         &config,
-        botster_hub::DaemonRequest::ListSessionTemplates,
+        botster_hub::DaemonRequest::ListSessionTypes,
     )
-    .expect("list session templates");
-    assert_eq!(templates.session_templates.len(), 1);
-    assert_eq!(templates.session_templates[0].source, "repo");
-    assert_eq!(templates.session_templates[0].target_id, "repo:runtime");
+    .expect("list session types");
+    assert_eq!(templates.session_types.len(), 1);
+    assert_eq!(templates.session_types[0].source, "repo");
+    assert_eq!(templates.session_types[0].target_id, "repo:runtime");
 
     let spawn = botster_hub::daemon_transport_request(
         &config,
-        botster_hub::DaemonRequest::SpawnSessionTemplate {
-            template_id: "init".to_string(),
-            session_id: "repo-session-template".to_string(),
-            request: botster_hub::DaemonSessionTemplateRequest {
+        botster_hub::DaemonRequest::SpawnSessionType {
+            session_type_id: "init".to_string(),
+            session_id: "repo-session-type".to_string(),
+            request: botster_hub::DaemonSessionTypeRequest {
                 environment: BTreeMap::from([("BOTSTER_MODE".to_string(), "explicit".to_string())]),
-                ..botster_hub::DaemonSessionTemplateRequest::default()
+                ..botster_hub::DaemonSessionTypeRequest::default()
             },
         },
     )
-    .expect("spawn repo session template");
+    .expect("spawn repo session type");
     assert_eq!(
         spawn.kind,
         botster_hub::DaemonResponseKind::Spawned,
@@ -14370,8 +14378,395 @@ fn daemon_spawns_repo_local_session_template_after_state_reload() {
         thread::sleep(Duration::from_millis(30));
     }
     assert_eq!(output.trim(), "repo:explicit");
+    let endpoint = botster_hub_client::DaemonEndpoint::new(
+        config
+            .transports
+            .local_socket
+            .as_ref()
+            .expect("test config has local socket")
+            .path
+            .clone(),
+    );
+    let mut first =
+        botster_hub_client::subscribe_session_entities(&endpoint, "repo-session-type-first")
+            .expect("subscribe session entity metadata before restart");
+    first
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("bound first metadata snapshot");
+    wait_for_session_type_metadata(&mut first, "repo-session-type", "repo:runtime/init");
+    drop(first);
 
     shutdown_cli_daemon(&data_dir, child);
+    let restarted = start_cli_daemon(&data_dir);
+    let mut second =
+        botster_hub_client::subscribe_session_entities(&endpoint, "repo-session-type-restarted")
+            .expect("subscribe session entity metadata after restart");
+    second
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("bound restarted metadata snapshot");
+    wait_for_session_type_metadata(&mut second, "repo-session-type", "repo:runtime/init");
+    drop(second);
+    botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::ShutdownSession {
+            session_id: "repo-session-type".to_string(),
+        },
+    )
+    .expect("shut down durable session worker");
+    shutdown_cli_daemon(&data_dir, restarted);
+}
+
+#[test]
+fn session_type_crud_pushes_authoritative_entity_deltas_without_polling() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_short_test_dir("session-type-entity-crud");
+    let config = explicit_config(&data_dir);
+    let endpoint = botster_hub_client::DaemonEndpoint::new(
+        config
+            .transports
+            .local_socket
+            .as_ref()
+            .expect("test config has local socket")
+            .path
+            .clone(),
+    );
+    let child = start_cli_daemon(&data_dir);
+    let mut subscription = botster_hub_client::subscribe_entities(
+        &endpoint,
+        "session_type",
+        "session-type-definitions",
+    )
+    .expect("subscribe authoritative session type family");
+    subscription
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("bound session type entity reads");
+    assert!(matches!(
+        subscription.next_frame().expect("initial definition snapshot"),
+        botster_hub_client::DaemonEntityFrame::Snapshot {
+            snapshot_seq: 0,
+            ref items,
+            ..
+        } if items.is_empty()
+    ));
+
+    let mut definition = botster_hub_client::DaemonSessionTypeDefinition {
+        id: "terminal-accessory".to_string(),
+        label: "Terminal accessory".to_string(),
+        description: Some("Interactive terminal companion".to_string()),
+        icon: Some("terminal".to_string()),
+        role: "botster.accessory".to_string(),
+        interaction: "interactive".to_string(),
+        traits: vec!["terminal".to_string()],
+        lifecycle: "persistent".to_string(),
+        command: "bin/accessory.sh".to_string(),
+        args: Vec::new(),
+        working_directory: botster_hub_client::DaemonSessionTypeWorkingDirectory::PackageRoot,
+        environment: BTreeMap::new(),
+        allowed_environment_overrides: Vec::new(),
+        context: Vec::new(),
+        target_id: None,
+    };
+    botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::CreateSessionType {
+            source: botster_hub_client::DaemonSessionTypeMutationSource::Device,
+            definition: definition.clone(),
+        },
+    )
+    .expect("create device session type through public socket");
+    assert!(matches!(
+        subscription.next_frame().expect("create upsert"),
+        botster_hub_client::DaemonEntityFrame::Upsert {
+            snapshot_seq: 1,
+            ref id,
+            ref entity,
+            ..
+        } if id == "device/terminal-accessory"
+            && entity["role"] == "botster.accessory"
+            && entity["interaction"] == "interactive"
+    ));
+
+    definition.label = "Updated terminal accessory".to_string();
+    botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::UpdateSessionType {
+            source: botster_hub_client::DaemonSessionTypeMutationSource::Device,
+            definition,
+        },
+    )
+    .expect("update device session type through public socket");
+    assert!(matches!(
+        subscription.next_frame().expect("update upsert"),
+        botster_hub_client::DaemonEntityFrame::Upsert {
+            snapshot_seq: 2,
+            ref entity,
+            ..
+        } if entity["label"] == "Updated terminal accessory"
+    ));
+
+    let rejected = botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::DeleteSessionType {
+            source: botster_hub_client::DaemonSessionTypeMutationSource::Package {
+                package_name: "immutable.plugin".to_string(),
+            },
+            session_type_id: "terminal-accessory".to_string(),
+        },
+    )
+    .expect("package mutation returns typed operator response");
+    assert_eq!(
+        rejected.kind,
+        botster_hub_client::DaemonResponseKind::OperatorError
+    );
+    assert_eq!(
+        rejected.error.as_ref().map(|error| error.code.as_str()),
+        Some("read_only_session_type_source")
+    );
+
+    botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::DeleteSessionType {
+            source: botster_hub_client::DaemonSessionTypeMutationSource::Device,
+            session_type_id: "terminal-accessory".to_string(),
+        },
+    )
+    .expect("delete device session type through public socket");
+    assert!(matches!(
+        subscription.next_frame().expect("delete remove"),
+        botster_hub_client::DaemonEntityFrame::Remove {
+            snapshot_seq: 3,
+            ref id,
+            ..
+        } if id == "device/terminal-accessory"
+    ));
+
+    let package_dir = unique_test_dir("session-type-entity-package");
+    fs::create_dir_all(&package_dir).expect("create session type entity package");
+    fs::write(
+        package_dir.join("plugin.lua"),
+        "return botster.register({})\n",
+    )
+    .expect("write session type entity plugin");
+    fs::write(
+        package_dir.join("botster-package.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "name": "session-type.entity-plugin",
+            "version": "1.0.0",
+            "kind": "plugin",
+            "botster": ">=0.1.0",
+            "source": { "type": "path", "path": package_dir.canonicalize().expect("package path") },
+            "capabilities": [],
+            "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }],
+            "session_types": [{
+                "id": "package-accessory",
+                "label": "Package accessory",
+                "role": "botster.accessory",
+                "interaction": "service",
+                "traits": ["background"],
+                "lifecycle": "persistent",
+                "command": "bin/accessory"
+            }]
+        }))
+        .expect("serialize session type entity package"),
+    )
+    .expect("write session type entity package manifest");
+    botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::EnablePackageLocalPath { path: package_dir },
+    )
+    .expect("enable package session type");
+    assert!(matches!(
+        subscription.next_frame().expect("package enable upsert"),
+        botster_hub_client::DaemonEntityFrame::Upsert {
+            snapshot_seq: 4,
+            ref id,
+            ref entity,
+            ..
+        } if id == "session-type.entity-plugin/package-accessory"
+            && entity["editable"] == false
+            && entity["interaction"] == "service"
+    ));
+    botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::DisablePackage {
+            package_name: "session-type.entity-plugin".to_string(),
+        },
+    )
+    .expect("disable package session type");
+    let package_disable_frame = subscription.next_frame().expect("package disable update");
+    assert!(
+        matches!(
+            package_disable_frame,
+            botster_hub_client::DaemonEntityFrame::Upsert {
+                snapshot_seq: 5,
+                ref id,
+                ref entity,
+                ..
+            } if id == "session-type.entity-plugin/package-accessory"
+                && entity["available"] == false
+        ),
+        "unexpected package disable frame: {package_disable_frame:?}"
+    );
+    drop(subscription);
+
+    let mut reconnected = botster_hub_client::subscribe_entities(
+        &endpoint,
+        "session_type",
+        "session-type-definitions-reconnected",
+    )
+    .expect("reconnect authoritative session type family");
+    reconnected
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("bound reconnect read");
+    assert!(matches!(
+        reconnected.next_frame().expect("reconnect snapshot"),
+        botster_hub_client::DaemonEntityFrame::Snapshot {
+            snapshot_seq: 5,
+            ref items,
+            ..
+        } if items.len() == 1 && items[0]["available"] == false
+    ));
+    drop(reconnected);
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
+fn spawn_target_admission_pushes_repo_session_type_deltas_without_polling() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_short_test_dir("session-type-target-admission");
+    let repo_dir = data_dir.join("admitted-repo");
+    fs::create_dir_all(repo_dir.join(".botster")).expect("create admitted repo fixture");
+    fs::write(
+        repo_dir.join(".botster/session-types.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "session_types": [{
+                "id": "repo-agent",
+                "label": "Repo agent",
+                "role": "botster.agent",
+                "interaction": "interactive",
+                "lifecycle": "task",
+                "command": "bin/agent"
+            }]
+        }))
+        .expect("serialize repo session type"),
+    )
+    .expect("write repo session type");
+    let repo_dir = repo_dir.canonicalize().expect("canonical admitted repo");
+    let config = explicit_config(&data_dir);
+    let endpoint = botster_hub_client::DaemonEndpoint::new(
+        config
+            .transports
+            .local_socket
+            .as_ref()
+            .expect("test config has local socket")
+            .path
+            .clone(),
+    );
+    let child = start_cli_daemon(&data_dir);
+    let mut subscription = botster_hub_client::subscribe_entities(
+        &endpoint,
+        "session_type",
+        "session-type-target-admission",
+    )
+    .expect("subscribe before target admission");
+    subscription
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("bound target admission entity reads");
+    assert!(matches!(
+        subscription.next_frame().expect("initial empty snapshot"),
+        botster_hub_client::DaemonEntityFrame::Snapshot {
+            snapshot_seq: 0,
+            ref items,
+            ..
+        } if items.is_empty()
+    ));
+
+    botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::CreateSpawnTarget {
+            target_id: Some("repo:admitted".to_string()),
+            label: Some("Admitted repo".to_string()),
+            root: repo_dir,
+            enabled: true,
+            kind: Some("directory".to_string()),
+            base_ref: None,
+            metadata: BTreeMap::new(),
+        },
+    )
+    .expect("admit repo target through public socket");
+    assert!(matches!(
+        subscription.next_frame().expect("repo definition upsert"),
+        botster_hub_client::DaemonEntityFrame::Upsert {
+            snapshot_seq: 1,
+            ref id,
+            ref entity,
+            ..
+        } if id == "repo:admitted/repo-agent"
+            && entity["source"] == "repo"
+            && entity["target_id"] == "repo:admitted"
+    ));
+
+    botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::DeleteSpawnTarget {
+            target_id: "repo:admitted".to_string(),
+        },
+    )
+    .expect("delete repo target through public socket");
+    assert!(matches!(
+        subscription.next_frame().expect("repo definition remove"),
+        botster_hub_client::DaemonEntityFrame::Remove {
+            snapshot_seq: 2,
+            ref id,
+            ..
+        } if id == "repo:admitted/repo-agent"
+    ));
+
+    drop(subscription);
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+fn wait_for_session_type_metadata(
+    subscription: &mut botster_hub_client::DaemonEntitySubscription,
+    session_id: &str,
+    session_type_id: &str,
+) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let entity = loop {
+        assert!(
+            Instant::now() < deadline,
+            "session metadata entity timed out"
+        );
+        let frame = subscription
+            .next_frame()
+            .expect("read session metadata frame");
+        let candidate = match frame {
+            botster_hub_client::DaemonEntityFrame::Snapshot { items, .. } => items
+                .into_iter()
+                .filter_map(|item| {
+                    serde_json::from_value::<botster_hub_client::DaemonSessionEntity>(item).ok()
+                })
+                .find(|entity| entity.session_uuid == session_id),
+            botster_hub_client::DaemonEntityFrame::Upsert { id, entity, .. }
+                if id == session_id =>
+            {
+                Some(
+                    serde_json::from_value::<botster_hub_client::DaemonSessionEntity>(entity)
+                        .expect("deserialize session entity upsert"),
+                )
+            }
+            _ => None,
+        };
+        if let Some(entity) = candidate {
+            break entity;
+        }
+    };
+    assert_eq!(entity.session_type_id.as_deref(), Some(session_type_id));
+    assert_eq!(entity.session_type_source.as_deref(), Some("repo"));
+    assert_eq!(entity.role.as_deref(), Some("botster.agent"));
+    assert_eq!(entity.interaction.as_deref(), Some("interactive"));
+    assert_eq!(entity.session_type_lifecycle.as_deref(), Some("task"));
+    assert_eq!(entity.traits, vec!["test"]);
 }
 
 #[test]
@@ -15769,7 +16164,7 @@ fn live_hub_managed_git_spawn_reconciles_and_reuses_after_restart() {
                 arguments: serde_json::json!({
                     "target_id": "tgt_live_managed",
                     "branch": "feature/live-restart",
-                    "template_id": "managed-git.live-plugin/init"
+                    "session_type_id": "managed-git.live-plugin/init"
                 }),
             },
         )

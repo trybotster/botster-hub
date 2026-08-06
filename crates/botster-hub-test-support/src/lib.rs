@@ -650,6 +650,12 @@ pub fn session_lifecycle_subscription_conformance_scenario()
         updated_at: 1,
         exit_code: None,
         failure_reason: None,
+        session_type_id: None,
+        session_type_source: None,
+        role: None,
+        traits: Vec::new(),
+        interaction: None,
+        session_type_lifecycle: None,
     };
 
     SessionLifecycleSubscriptionConformanceScenario {
@@ -753,6 +759,12 @@ pub fn session_plugin_binding_conformance_scenario() -> SessionPluginBindingConf
             updated_at,
             exit_code: (lifecycle == Some("exited")).then_some(0),
             failure_reason: None,
+            session_type_id: None,
+            session_type_source: None,
+            role: None,
+            traits: Vec::new(),
+            interaction: None,
+            session_type_lifecycle: None,
         })
         .expect("serialize session entity")
     };
@@ -5509,7 +5521,7 @@ stream.write(JSON.stringify({
   protocol: 'botster-hub-daemon-v1',
   compatibility: {
     protocol: 'botster-hub-daemon-v1',
-    minimum_protocol_version: 1,
+    protocol_version: 1,
     required_features: [],
     minimum_conformance_fixture_revision: 1,
     client_name: 'foreground-terminal-app-open-fixture',
@@ -7349,11 +7361,12 @@ mod tests {
         let sequences = scenario
             .normalized_frames
             .iter()
-            .map(|frame| match frame {
+            .filter_map(|frame| match frame {
                 DaemonEntityFrame::Snapshot { snapshot_seq, .. }
                 | DaemonEntityFrame::Upsert { snapshot_seq, .. }
                 | DaemonEntityFrame::Patch { snapshot_seq, .. }
-                | DaemonEntityFrame::Remove { snapshot_seq, .. } => *snapshot_seq,
+                | DaemonEntityFrame::Remove { snapshot_seq, .. } => Some(*snapshot_seq),
+                DaemonEntityFrame::Error { .. } => None,
             })
             .collect::<Vec<_>>();
 
@@ -7463,6 +7476,7 @@ mod tests {
                     botster_hub_client::FEATURE_WORKTREES,
                     botster_hub_client::FEATURE_TERMINAL_READBACK,
                     botster_hub_client::FEATURE_SESSION_ENTITY_SUBSCRIPTIONS,
+                    botster_hub_client::FEATURE_SESSION_TYPE_ENTITY_SUBSCRIPTIONS,
                     botster_hub_client::FEATURE_PLUGIN_ENTITY_SUBSCRIPTIONS,
                 ],
                 "supported_features": [
@@ -7477,6 +7491,7 @@ mod tests {
                     botster_hub_client::FEATURE_WORKTREES,
                     botster_hub_client::FEATURE_TERMINAL_READBACK,
                     botster_hub_client::FEATURE_SESSION_ENTITY_SUBSCRIPTIONS,
+                    botster_hub_client::FEATURE_SESSION_TYPE_ENTITY_SUBSCRIPTIONS,
                     botster_hub_client::FEATURE_PLUGIN_ENTITY_SUBSCRIPTIONS,
                 ],
                 "diagnostic_kinds": [

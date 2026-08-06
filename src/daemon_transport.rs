@@ -48,10 +48,11 @@ pub use botster_hub_client::{
     DaemonPackageRouteDescriptor, DaemonPackageRouteTarget, DaemonPackageRunnableEntrypoint,
     DaemonPackageUpdateStatus, DaemonPackageWorkingDirectory, DaemonPluginLifecycle,
     DaemonPluginResourceCounters, DaemonPluginSurface, DaemonPluginWorkerCounters,
-    DaemonReadScreen, DaemonRequest, DaemonResolvedAppLaunch, DaemonResolvedSessionTemplate,
+    DaemonReadScreen, DaemonRequest, DaemonResolvedAppLaunch, DaemonResolvedSessionType,
     DaemonResponse, DaemonResponseKind, DaemonSession, DaemonSessionCleanup, DaemonSessionContext,
-    DaemonSessionEntity, DaemonSessionTemplate, DaemonSessionTemplateContextInput,
-    DaemonSessionTemplateRequest, DaemonSoftwareIdentity, DaemonSpawnTarget,
+    DaemonSessionEntity, DaemonSessionType, DaemonSessionTypeContextInput,
+    DaemonSessionTypeDefinition, DaemonSessionTypeMutationSource, DaemonSessionTypeRequest,
+    DaemonSessionTypeWorkingDirectory, DaemonSoftwareIdentity, DaemonSpawnTarget,
     DaemonSpawnTargetValidation, DaemonStatus, DaemonUiTreeSnapshot, DaemonWorktree,
     DaemonWorktreeGitMetadata, DaemonWorktreeLifecycleEvent, FEATURE_PLUGIN_SURFACE_ACTION,
     FEATURE_PLUGIN_SURFACE_RENDER, PROTOCOL, read_frame, read_frame_from_reader, write_frame,
@@ -86,8 +87,9 @@ use crate::{
     HubClientResponseBody, HubClientSession, HubConfig, HubDaemon, HubDaemonStatus,
     HubStateLoadSource, HubStateStore, McpToolDescriptor, PackageAction, PackageAdmissionReason,
     PackageCompatibilityResult, PackageDecision, PackageInstallPlan, PackagePin, PackageRegistry,
-    PackageRegistryEntrySourceKind, PackageRegistryError, PackageState, PackageUpdatePolicy,
-    ResolvedSessionTemplate, SessionTemplateContextInput, SessionTemplateRequest,
+    PackageRegistryEntrySourceKind, PackageRegistryError, PackageSessionType,
+    PackageSessionTypeWorkingDirectory, PackageState, PackageUpdatePolicy, ResolvedSessionType,
+    SessionTypeContextInput, SessionTypeMutationSource, SessionTypeRequest,
     resolve_foreground_launch_contract,
 };
 use crate::{EntrypointProcessSnapshot, EntrypointSupervisorError};
@@ -1230,20 +1232,25 @@ fn handle_control_request(
             kind,
             base_ref,
             metadata,
-        } => mutate_spawn_targets_response(daemon, |targets| {
-            crate::create_spawn_target(
-                targets,
-                SpawnTargetCreate {
-                    target_id,
-                    label,
-                    root,
-                    enabled,
-                    kind,
-                    base_ref,
-                    metadata,
-                },
-            )
-        }),
+        } => {
+            let before_session_types = session_type_definition_map(daemon)?;
+            let response = mutate_spawn_targets_response(daemon, |targets| {
+                crate::create_spawn_target(
+                    targets,
+                    SpawnTargetCreate {
+                        target_id,
+                        label,
+                        root,
+                        enabled,
+                        kind,
+                        base_ref,
+                        metadata,
+                    },
+                )
+            })?;
+            advance_session_type_generation_if_changed(daemon, &before_session_types)?;
+            Ok(response)
+        }
         DaemonRequest::UpdateSpawnTarget {
             target_id,
             label,
@@ -1252,42 +1259,55 @@ fn handle_control_request(
             kind,
             base_ref,
             metadata,
-        } => mutate_spawn_targets_with_worktrees_response(daemon, |targets, worktrees| {
-            if kind.as_deref().is_some_and(|kind| kind != "git")
-                && worktrees.iter().any(|worktree| {
-                    worktree.target_id == target_id && worktree.management == "hub_managed_git"
-                })
-            {
-                return Err(SpawnTargetError::new(
-                    "managed_worktrees_exist",
-                    "Git target cannot be reclassified while managed worktrees reference it",
-                ));
-            }
-            crate::update_spawn_target(
-                targets,
-                &target_id,
-                SpawnTargetUpdate {
-                    label,
-                    root,
-                    enabled,
-                    kind,
-                    base_ref,
-                    metadata,
+        } => {
+            let before_session_types = session_type_definition_map(daemon)?;
+            let response = mutate_spawn_targets_with_worktrees_response(
+                daemon,
+                |targets, worktrees| {
+                    if kind.as_deref().is_some_and(|kind| kind != "git")
+                        && worktrees.iter().any(|worktree| {
+                            worktree.target_id == target_id
+                                && worktree.management == "hub_managed_git"
+                        })
+                    {
+                        return Err(SpawnTargetError::new(
+                            "managed_worktrees_exist",
+                            "Git target cannot be reclassified while managed worktrees reference it",
+                        ));
+                    }
+                    crate::update_spawn_target(
+                        targets,
+                        &target_id,
+                        SpawnTargetUpdate {
+                            label,
+                            root,
+                            enabled,
+                            kind,
+                            base_ref,
+                            metadata,
+                        },
+                    )
                 },
-            )
-        }),
+            )?;
+            advance_session_type_generation_if_changed(daemon, &before_session_types)?;
+            Ok(response)
+        }
         DaemonRequest::DeleteSpawnTarget { target_id } => {
-            mutate_spawn_targets_with_worktrees_response(daemon, |targets, worktrees| {
-                if worktrees.iter().any(|worktree| {
-                    worktree.target_id == target_id && worktree.management == "hub_managed_git"
-                }) {
-                    return Err(SpawnTargetError::new(
-                        "managed_worktrees_exist",
-                        "Git target cannot be deleted while managed worktrees reference it",
-                    ));
-                }
-                crate::delete_spawn_target(targets, &target_id)
-            })
+            let before_session_types = session_type_definition_map(daemon)?;
+            let response =
+                mutate_spawn_targets_with_worktrees_response(daemon, |targets, worktrees| {
+                    if worktrees.iter().any(|worktree| {
+                        worktree.target_id == target_id && worktree.management == "hub_managed_git"
+                    }) {
+                        return Err(SpawnTargetError::new(
+                            "managed_worktrees_exist",
+                            "Git target cannot be deleted while managed worktrees reference it",
+                        ));
+                    }
+                    crate::delete_spawn_target(targets, &target_id)
+                })?;
+            advance_session_type_generation_if_changed(daemon, &before_session_types)?;
+            Ok(response)
         }
         DaemonRequest::ValidateSpawnTarget { target_id } => Ok(daemon_spawn_target_validation(
             crate::validate_spawn_target(
@@ -1345,6 +1365,7 @@ fn handle_control_request(
             registry_path,
             entry_id,
         } => {
+            let before_session_types = session_type_definition_map(daemon)?;
             let decision = {
                 let record = daemon.package_registry_mut().install_registry_entry(
                     registry_path,
@@ -1361,10 +1382,12 @@ fn handle_control_request(
                 }
             };
             persist_package_registry(daemon)?;
+            advance_session_type_generation_if_changed(daemon, &before_session_types)?;
             package_decision_response(daemon, decision)
         }
         DaemonRequest::PluginLifecycleStatus => plugin_lifecycle_response(daemon),
         DaemonRequest::InstallPackageLocalPath { path } => {
+            let before_session_types = session_type_definition_map(daemon)?;
             let decision = {
                 let record = daemon
                     .package_registry_mut()
@@ -1379,6 +1402,7 @@ fn handle_control_request(
                 }
             };
             persist_package_registry(daemon)?;
+            advance_session_type_generation_if_changed(daemon, &before_session_types)?;
             package_decision_response(daemon, decision)
         }
         DaemonRequest::CheckPackageUpdate { package_name } => {
@@ -1388,6 +1412,7 @@ fn handle_control_request(
             preview_package_update_response(daemon, &package_name, pin)
         }
         DaemonRequest::ApplyPackageUpdate { package_name, pin } => {
+            let before_session_types = session_type_definition_map(daemon)?;
             let update_status = package_update_status(daemon, &package_name, Some(pin.clone()))?;
             let decision = {
                 let pin = package_pin_from_daemon(pin)?;
@@ -1406,6 +1431,7 @@ fn handle_control_request(
                 }
             };
             persist_package_registry(daemon)?;
+            advance_session_type_generation_if_changed(daemon, &before_session_types)?;
             let mut response = package_decision_response(daemon, decision)?;
             response.update_status = Some(update_status);
             Ok(response)
@@ -1447,6 +1473,7 @@ fn handle_control_request(
             show_package_response(daemon, &package_name)
         }
         DaemonRequest::ReloadPackage { package_name } => {
+            let before_session_types = session_type_definition_map(daemon)?;
             let running_entrypoints = daemon
                 .entrypoint_supervisor()
                 .snapshots()
@@ -1464,10 +1491,17 @@ fn handle_control_request(
                 reload_package_after_reload(daemon, &package_name)?;
             }
             restart_running_package_entrypoints(daemon, &package_name, &running_entrypoints)?;
+            advance_session_type_generation_if_changed(daemon, &before_session_types)?;
             package_decision_response(daemon, decision)
         }
-        DaemonRequest::RefreshLocalPackages => refresh_local_packages_response(daemon),
+        DaemonRequest::RefreshLocalPackages => {
+            let before_session_types = session_type_definition_map(daemon)?;
+            let response = refresh_local_packages_response(daemon)?;
+            advance_session_type_generation_if_changed(daemon, &before_session_types)?;
+            Ok(response)
+        }
         DaemonRequest::EnablePackageLocalPath { path } => {
+            let before_session_types = session_type_definition_map(daemon)?;
             let package_name = {
                 let record = daemon
                     .package_registry_mut()
@@ -1479,32 +1513,39 @@ fn handle_control_request(
                 .enable(&package_name, "daemon socket enable local package")?;
             persist_package_registry(daemon)?;
             load_package_after_enable(daemon, &package_name)?;
+            advance_session_type_generation_if_changed(daemon, &before_session_types)?;
             package_decision_response(daemon, decision)
         }
         DaemonRequest::EnablePackage { package_name } => {
+            let before_session_types = session_type_definition_map(daemon)?;
             let decision = daemon
                 .package_registry_mut()
                 .enable(&package_name, "daemon socket enable package")?;
             persist_package_registry(daemon)?;
             load_package_after_enable(daemon, &package_name)?;
+            advance_session_type_generation_if_changed(daemon, &before_session_types)?;
             package_decision_response(daemon, decision)
         }
         DaemonRequest::DisablePackage { package_name } => {
+            let before_session_types = session_type_definition_map(daemon)?;
             daemon.entrypoint_supervisor().stop_package(&package_name);
             let decision = daemon
                 .package_registry_mut()
                 .disable(&package_name, "daemon socket disable package")?;
             persist_package_registry(daemon)?;
             unload_package_after_disable(daemon, &package_name)?;
+            advance_session_type_generation_if_changed(daemon, &before_session_types)?;
             package_decision_response(daemon, decision)
         }
         DaemonRequest::RemovePackage { package_name } => {
+            let before_session_types = session_type_definition_map(daemon)?;
             daemon.entrypoint_supervisor().stop_package(&package_name);
             unload_package_after_disable(daemon, &package_name)?;
             let decision = daemon
                 .package_registry_mut()
                 .remove(&package_name, "daemon socket remove package")?;
             persist_package_registry(daemon)?;
+            advance_session_type_generation_if_changed(daemon, &before_session_types)?;
             package_decision_response(daemon, decision)
         }
         DaemonRequest::StartPackageEntrypoint {
@@ -1911,63 +1952,111 @@ fn handle_runtime_control_request(
             };
             Ok(daemon_capture_snapshot(snapshot))
         }
-        DaemonRequest::ListSessionTemplates => {
+        DaemonRequest::ListSessionTypes => {
             let response = api.handle_request(
                 runtime,
                 &packages,
-                HubClientRequest::ListSessionTemplates {
-                    request_id: request_id("daemon-session-templates-list"),
+                HubClientRequest::ListSessionTypes {
+                    request_id: request_id("daemon-session-types-list"),
                 },
             )?;
-            let HubClientResponseBody::SessionTemplates(templates) = response.body else {
+            let HubClientResponseBody::SessionTypes(templates) = response.body else {
                 return Err(DaemonTransportError::UnexpectedResponse);
             };
-            Ok(daemon_session_templates(templates))
+            Ok(daemon_session_types(templates))
         }
-        DaemonRequest::ShowSessionTemplate { template_id } => {
+        DaemonRequest::ShowSessionType { session_type_id } => {
             let response = api.handle_request(
                 runtime,
                 &packages,
-                HubClientRequest::ShowSessionTemplate {
-                    request_id: request_id("daemon-session-templates-show"),
-                    template_id,
+                HubClientRequest::ShowSessionType {
+                    request_id: request_id("daemon-session-types-show"),
+                    session_type_id,
                 },
             )?;
-            let HubClientResponseBody::SessionTemplates(templates) = response.body else {
+            let HubClientResponseBody::SessionTypes(templates) = response.body else {
                 return Err(DaemonTransportError::UnexpectedResponse);
             };
-            Ok(daemon_session_templates(templates))
+            Ok(daemon_session_types(templates))
         }
-        DaemonRequest::ResolveSessionTemplate {
-            template_id,
+        DaemonRequest::CreateSessionType { source, definition } => {
+            let response = api.handle_request(
+                runtime,
+                &packages,
+                HubClientRequest::CreateSessionType {
+                    request_id: request_id("daemon-session-types-create"),
+                    source: session_type_mutation_source_from_daemon(source),
+                    definition: session_type_definition_from_daemon(definition),
+                },
+            )?;
+            let HubClientResponseBody::SessionTypes(session_types) = response.body else {
+                return Err(DaemonTransportError::UnexpectedResponse);
+            };
+            Ok(daemon_session_types(session_types))
+        }
+        DaemonRequest::UpdateSessionType { source, definition } => {
+            let response = api.handle_request(
+                runtime,
+                &packages,
+                HubClientRequest::UpdateSessionType {
+                    request_id: request_id("daemon-session-types-update"),
+                    source: session_type_mutation_source_from_daemon(source),
+                    definition: session_type_definition_from_daemon(definition),
+                },
+            )?;
+            let HubClientResponseBody::SessionTypes(session_types) = response.body else {
+                return Err(DaemonTransportError::UnexpectedResponse);
+            };
+            Ok(daemon_session_types(session_types))
+        }
+        DaemonRequest::DeleteSessionType {
+            source,
+            session_type_id,
+        } => {
+            let response = api.handle_request(
+                runtime,
+                &packages,
+                HubClientRequest::DeleteSessionType {
+                    request_id: request_id("daemon-session-types-delete"),
+                    source: session_type_mutation_source_from_daemon(source),
+                    session_type_id,
+                },
+            )?;
+            let HubClientResponseBody::SessionTypes(session_types) = response.body else {
+                return Err(DaemonTransportError::UnexpectedResponse);
+            };
+            Ok(daemon_session_types(session_types))
+        }
+        DaemonRequest::ResolveSessionType {
+            session_type_id,
             request,
         } => {
             let response = api.handle_request(
                 runtime,
                 &packages,
-                HubClientRequest::ResolveSessionTemplate {
-                    request_id: request_id("daemon-session-templates-resolve"),
-                    template_id,
-                    template_request: session_template_request_from_daemon(None, request),
+                HubClientRequest::ResolveSessionType {
+                    request_id: request_id("daemon-session-types-resolve"),
+                    session_type_id,
+                    session_type_request: session_type_request_from_daemon(None, request),
                 },
             )?;
-            let HubClientResponseBody::ResolvedSessionTemplate(resolved) = response.body else {
+            let HubClientResponseBody::ResolvedSessionType(resolved) = response.body else {
                 return Err(DaemonTransportError::UnexpectedResponse);
             };
-            Ok(daemon_resolved_session_template(resolved))
+            Ok(daemon_resolved_session_type(*resolved))
         }
-        DaemonRequest::SpawnSessionTemplate {
-            template_id,
+        DaemonRequest::SpawnSessionType {
+            session_type_id,
             session_id,
             request,
         } => {
             let response = api.handle_request(
                 runtime,
                 &packages,
-                HubClientRequest::SpawnSessionTemplate {
-                    request_id: request_id("daemon-session-templates-spawn"),
-                    template_id,
-                    template_request: session_template_request_from_daemon(
+                HubClientRequest::SpawnSessionType {
+                    request_id: request_id("daemon-session-types-spawn"),
+                    session_type_id,
+                    session_type_request: session_type_request_from_daemon(
                         Some(SessionId(session_id)),
                         request,
                     ),
@@ -2189,8 +2278,8 @@ fn handle_runtime_control_request(
                 lifecycle_counters.clone(),
             )),
             sessions: Vec::new(),
-            session_templates: Vec::new(),
-            resolved_session_template: None,
+            session_types: Vec::new(),
+            resolved_session_type: None,
             session_context: None,
             read_screen: None,
             mode_flags: None,
@@ -3724,12 +3813,21 @@ impl EntityFrameSender {
     }
 }
 
+fn entity_frame_exceeds_limit(frame: &DaemonEntityFrame) -> bool {
+    serde_json::to_vec(frame)
+        .expect("daemon entity frame values always serialize")
+        .len()
+        > DAEMON_MAX_FRAME_BYTES
+}
+
 #[derive(Debug)]
 struct EntitySubscriptionState {
     sender: EntityFrameSender,
     entity_type: String,
     cursor: Option<SessionLifecycleCursor>,
     entities: BTreeMap<String, DaemonSessionEntity>,
+    definition_generation: u64,
+    definition_entities: BTreeMap<String, Value>,
     resync_reason: Option<String>,
 }
 
@@ -3940,6 +4038,45 @@ fn register_entity_subscription(
             "entity subscription id is already active",
         ));
     }
+    if entity_type == "session_type" {
+        let (snapshot_seq, entities) = session_type_entity_snapshot(daemon)?;
+        let snapshot = DaemonEntityFrame::Snapshot {
+            subscription_id: subscription_id.clone(),
+            entity_type: entity_type.clone(),
+            snapshot_seq,
+            items: entities.values().cloned().collect(),
+            resync_reason: None,
+        };
+        if entity_frame_exceeds_limit(&snapshot) {
+            return Ok(entity_subscription_error(
+                "entity_provider_frame_too_large",
+                &subscription_id,
+                "session type snapshot exceeds daemon frame limit",
+            ));
+        }
+        sender
+            .try_send(snapshot)
+            .map_err(|_| DaemonTransportError::ControlThreadStopped)?;
+        state.entity_subscriptions.insert(
+            subscription_id.clone(),
+            EntitySubscriptionState {
+                sender,
+                entity_type,
+                cursor: None,
+                entities: BTreeMap::new(),
+                definition_generation: snapshot_seq,
+                definition_entities: entities,
+                resync_reason: None,
+            },
+        );
+        state.lifecycle_counters.live_entity_subscriptions =
+            state.entity_subscriptions.len() as u64;
+        state.lifecycle_counters.high_water_entity_subscriptions = state
+            .lifecycle_counters
+            .high_water_entity_subscriptions
+            .max(state.lifecycle_counters.live_entity_subscriptions);
+        return Ok(daemon_response_base(DaemonResponseKind::EntitySubscribed));
+    }
     if entity_type != "session" {
         let runtime = daemon
             .runtime_mut()
@@ -3962,11 +4099,7 @@ fn register_entity_subscription(
             items,
             resync_reason: None,
         };
-        if serde_json::to_vec(&snapshot)
-            .map_err(DaemonTransportError::Json)?
-            .len()
-            > DAEMON_MAX_FRAME_BYTES
-        {
+        if entity_frame_exceeds_limit(&snapshot) {
             return Ok(entity_subscription_error(
                 "entity_provider_frame_too_large",
                 &subscription_id,
@@ -3983,6 +4116,8 @@ fn register_entity_subscription(
                 entity_type,
                 cursor: None,
                 entities: BTreeMap::new(),
+                definition_generation: 0,
+                definition_entities: BTreeMap::new(),
                 resync_reason: None,
             },
         );
@@ -4048,6 +4183,8 @@ fn register_entity_subscription(
             entity_type: "session".to_string(),
             cursor: Some(cursor),
             entities,
+            definition_generation: 0,
+            definition_entities: BTreeMap::new(),
             resync_reason: None,
         },
     );
@@ -4089,10 +4226,147 @@ fn seed_lifecycle_reconciliation(daemon: &mut HubDaemon, state: &mut DaemonContr
         .collect();
 }
 
+fn session_type_entity_snapshot(
+    daemon: &mut HubDaemon,
+) -> DaemonTransportResult<(u64, BTreeMap<String, Value>)> {
+    let packages = daemon.package_registry().clone();
+    let records = packages.packages();
+    let runtime = daemon
+        .runtime_mut()
+        .ok_or(DaemonTransportError::DaemonNotRunning)?;
+    let state = runtime.state();
+    let generation = state.session_type_generation;
+    let session_types = crate::session_types::list_session_types(&records, &state)
+        .map_err(|_| DaemonTransportError::UnexpectedResponse)?;
+    let entities = session_types
+        .into_iter()
+        .map(daemon_session_type_from_client)
+        .map(|session_type| {
+            let id = session_type.session_type_id.clone();
+            serde_json::to_value(session_type)
+                .map(|value| (id, value))
+                .map_err(DaemonTransportError::Json)
+        })
+        .collect::<DaemonTransportResult<BTreeMap<_, _>>>()?;
+    Ok((generation, entities))
+}
+
+fn session_type_definition_map(
+    daemon: &mut HubDaemon,
+) -> DaemonTransportResult<BTreeMap<String, Value>> {
+    session_type_entity_snapshot(daemon).map(|(_, entities)| entities)
+}
+
+fn advance_session_type_generation_if_changed(
+    daemon: &mut HubDaemon,
+    before: &BTreeMap<String, Value>,
+) -> DaemonTransportResult<()> {
+    if session_type_definition_map(daemon)? == *before {
+        return Ok(());
+    }
+
+    let runtime = daemon
+        .runtime()
+        .ok_or(DaemonTransportError::DaemonNotRunning)?;
+    let config = runtime.config().clone();
+    let store = FileHubStateStore::for_data_directory(&config.data_directory);
+    let state = store.update(&config, |state| {
+        state.session_type_generation = state.session_type_generation.saturating_add(1);
+    })?;
+    daemon.replace_state(state);
+    Ok(())
+}
+
+fn drive_session_type_subscriptions(
+    subscriptions: &mut BTreeMap<String, EntitySubscriptionState>,
+    generation: u64,
+    entities: &BTreeMap<String, Value>,
+) {
+    subscriptions.retain(|subscription_id, subscription| {
+        if subscription.entity_type != "session_type" {
+            return true;
+        }
+
+        if let Some(reason) = subscription.resync_reason.clone() {
+            let frame = DaemonEntityFrame::Snapshot {
+                subscription_id: subscription_id.clone(),
+                entity_type: "session_type".to_string(),
+                snapshot_seq: generation,
+                items: entities.values().cloned().collect(),
+                resync_reason: Some(reason),
+            };
+            if entity_frame_exceeds_limit(&frame) {
+                let error = DaemonEntityFrame::Error {
+                    subscription_id: subscription_id.clone(),
+                    entity_type: "session_type".to_string(),
+                    code: "entity_provider_frame_too_large".to_string(),
+                    message: "session type snapshot exceeds daemon frame limit".to_string(),
+                };
+                return match subscription.sender.try_send(error) {
+                    Ok(()) | Err(EntityFrameTrySendError::Disconnected) => false,
+                    Err(EntityFrameTrySendError::Full) => true,
+                };
+            }
+            return match subscription.sender.try_send(frame) {
+                Ok(()) => {
+                    subscription.definition_generation = generation;
+                    subscription.definition_entities = entities.clone();
+                    subscription.resync_reason = None;
+                    true
+                }
+                Err(EntityFrameTrySendError::Full) => true,
+                Err(EntityFrameTrySendError::Disconnected) => false,
+            };
+        }
+
+        if subscription.definition_generation == generation {
+            return true;
+        }
+
+        let mut frames = subscription
+            .definition_entities
+            .keys()
+            .filter(|id| !entities.contains_key(*id))
+            .map(|id| DaemonEntityFrame::Remove {
+                subscription_id: subscription_id.clone(),
+                entity_type: "session_type".to_string(),
+                snapshot_seq: generation,
+                id: id.clone(),
+            })
+            .collect::<Vec<_>>();
+        frames.extend(
+            entities
+                .iter()
+                .filter(|(id, entity)| subscription.definition_entities.get(*id) != Some(*entity))
+                .map(|(id, entity)| DaemonEntityFrame::Upsert {
+                    subscription_id: subscription_id.clone(),
+                    entity_type: "session_type".to_string(),
+                    snapshot_seq: generation,
+                    id: id.clone(),
+                    entity: entity.clone(),
+                }),
+        );
+        for frame in frames {
+            match subscription.sender.try_send(frame) {
+                Ok(()) => {}
+                Err(EntityFrameTrySendError::Full) => {
+                    subscription.resync_reason = Some("subscriber_overflow".to_string());
+                    return true;
+                }
+                Err(EntityFrameTrySendError::Disconnected) => return false,
+            }
+        }
+        subscription.definition_generation = generation;
+        subscription.definition_entities = entities.clone();
+        true
+    });
+}
+
 fn drive_entity_subscriptions(daemon: &mut HubDaemon, state: &mut DaemonControlState) {
     if state.entity_subscriptions.is_empty() {
         return;
     }
+    let packages = daemon.package_registry().clone();
     let Some(runtime) = daemon.runtime_mut() else {
         state.entity_subscriptions.clear();
         state.lifecycle_counters.live_entity_subscriptions = 0;
@@ -4100,6 +4374,7 @@ fn drive_entity_subscriptions(daemon: &mut HubDaemon, state: &mut DaemonControlS
     };
     state.entity_subscriptions.retain(|_, subscription| {
         subscription.entity_type == "session"
+            || subscription.entity_type == "session_type"
             || runtime.has_plugin_entity_provider_family(&subscription.entity_type)
     });
     state.lifecycle_counters.live_entity_subscriptions = state.entity_subscriptions.len() as u64;
@@ -4108,6 +4383,35 @@ fn drive_entity_subscriptions(daemon: &mut HubDaemon, state: &mut DaemonControlS
         .lifecycle_counters
         .reconciliation_wakes
         .saturating_add(1);
+
+    if state
+        .entity_subscriptions
+        .values()
+        .any(|subscription| subscription.entity_type == "session_type")
+    {
+        let records = packages.packages();
+        let runtime_state = runtime.state();
+        let generation = runtime_state.session_type_generation;
+        if let Ok(session_types) =
+            crate::session_types::list_session_types(&records, &runtime_state)
+        {
+            let entities = session_types
+                .into_iter()
+                .map(daemon_session_type_from_client)
+                .filter_map(|session_type| {
+                    let id = session_type.session_type_id.clone();
+                    serde_json::to_value(session_type)
+                        .ok()
+                        .map(|value| (id, value))
+                })
+                .collect::<BTreeMap<_, _>>();
+            drive_session_type_subscriptions(
+                &mut state.entity_subscriptions,
+                generation,
+                &entities,
+            );
+        }
+    }
 
     let Some(cursor) = state.reconciliation.cursor.clone() else {
         return;
@@ -4472,6 +4776,11 @@ fn project_session_entity(record: &SessionLifecycleRecord) -> DaemonSessionEntit
     };
     let lifecycle_class =
         session_lifecycle_class(&record.session.registry_state, record.lifecycle.as_ref());
+    let metadata = &record.metadata.entries;
+    let traits = metadata
+        .get("botster.session_type.traits")
+        .and_then(|value| serde_json::from_str::<Vec<String>>(value).ok())
+        .unwrap_or_default();
     DaemonSessionEntity {
         session_uuid: record.session.session_id.0.clone(),
         registry_state: match record.session.registry_state {
@@ -4488,6 +4797,12 @@ fn project_session_entity(record: &SessionLifecycleRecord) -> DaemonSessionEntit
         updated_at: record.session.updated_at,
         exit_code,
         failure_reason,
+        session_type_id: metadata.get("botster.session_type.id").cloned(),
+        session_type_source: metadata.get("botster.session_type.source").cloned(),
+        role: metadata.get("botster.session_type.role").cloned(),
+        traits,
+        interaction: metadata.get("botster.session_type.interaction").cloned(),
+        session_type_lifecycle: metadata.get("botster.session_type.lifecycle").cloned(),
     }
 }
 
@@ -4546,8 +4861,8 @@ fn daemon_response_base(kind: DaemonResponseKind) -> DaemonResponse {
         kind,
         status: None,
         sessions: Vec::new(),
-        session_templates: Vec::new(),
-        resolved_session_template: None,
+        session_types: Vec::new(),
+        resolved_session_type: None,
         session_context: None,
         read_screen: None,
         mode_flags: None,
@@ -4676,19 +4991,19 @@ fn daemon_package_navigation(
     response
 }
 
-fn daemon_session_templates(templates: Vec<crate::HubSessionTemplate>) -> DaemonResponse {
-    let mut response = daemon_response_base(DaemonResponseKind::SessionTemplates);
-    response.session_templates = templates
+fn daemon_session_types(templates: Vec<crate::HubSessionType>) -> DaemonResponse {
+    let mut response = daemon_response_base(DaemonResponseKind::SessionTypes);
+    response.session_types = templates
         .into_iter()
-        .map(daemon_session_template_from_client)
+        .map(daemon_session_type_from_client)
         .collect();
     response
 }
 
-fn daemon_resolved_session_template(resolved: ResolvedSessionTemplate) -> DaemonResponse {
-    let mut response = daemon_response_base(DaemonResponseKind::ResolvedSessionTemplate);
-    response.resolved_session_template = Some(DaemonResolvedSessionTemplate {
-        template: daemon_session_template_from_client(resolved.template),
+fn daemon_resolved_session_type(resolved: ResolvedSessionType) -> DaemonResponse {
+    let mut response = daemon_response_base(DaemonResponseKind::ResolvedSessionType);
+    response.resolved_session_type = Some(DaemonResolvedSessionType {
+        session_type: daemon_session_type_from_client(resolved.session_type),
         session_id: resolved.session_id.0,
         executable: resolved.executable,
         arguments: resolved.arguments,
@@ -4970,14 +5285,29 @@ fn daemon_worktree(worktree: Worktree) -> DaemonWorktree {
     }
 }
 
-fn daemon_session_template_from_client(
-    template: crate::HubSessionTemplate,
-) -> DaemonSessionTemplate {
-    DaemonSessionTemplate {
-        template_id: template.template_id,
-        package_name: template.package_name,
+fn daemon_session_type_from_client(template: crate::HubSessionType) -> DaemonSessionType {
+    DaemonSessionType {
+        session_type_id: template.session_type_id,
+        source_name: template.source_name,
         id: template.id,
         source: template.source,
+        editable: template.editable,
+        overridden_sources: template
+            .overridden_sources
+            .into_iter()
+            .map(|source| botster_hub_client::DaemonSessionTypeSource {
+                kind: source.kind,
+                name: source.name,
+            })
+            .collect(),
+        diagnostics: template.diagnostics,
+        label: template.label,
+        description: template.description,
+        icon: template.icon,
+        role: template.role,
+        interaction: template.interaction,
+        traits: template.traits,
+        lifecycle: template.lifecycle,
         command: template.command,
         args: template.args,
         working_directory_policy: template.working_directory_policy,
@@ -4988,23 +5318,66 @@ fn daemon_session_template_from_client(
     }
 }
 
-fn session_template_request_from_daemon(
+fn session_type_request_from_daemon(
     session_id: Option<SessionId>,
-    request: DaemonSessionTemplateRequest,
-) -> SessionTemplateRequest {
-    SessionTemplateRequest {
+    request: DaemonSessionTypeRequest,
+) -> SessionTypeRequest {
+    SessionTypeRequest {
         target_id: request.target_id,
         session_id,
         cwd: request.cwd,
         environment: request.environment,
-        context: session_template_context_from_daemon(request.context),
+        context: session_type_context_from_daemon(request.context),
     }
 }
 
-fn session_template_context_from_daemon(
-    context: DaemonSessionTemplateContextInput,
-) -> SessionTemplateContextInput {
-    SessionTemplateContextInput {
+fn session_type_mutation_source_from_daemon(
+    source: DaemonSessionTypeMutationSource,
+) -> SessionTypeMutationSource {
+    match source {
+        DaemonSessionTypeMutationSource::Device => SessionTypeMutationSource::Device,
+        DaemonSessionTypeMutationSource::Repo { target_id } => {
+            SessionTypeMutationSource::Repo { target_id }
+        }
+        DaemonSessionTypeMutationSource::Package { package_name } => {
+            SessionTypeMutationSource::Package { package_name }
+        }
+    }
+}
+
+fn session_type_definition_from_daemon(
+    definition: DaemonSessionTypeDefinition,
+) -> PackageSessionType {
+    PackageSessionType {
+        id: definition.id,
+        label: definition.label,
+        description: definition.description,
+        icon: definition.icon,
+        role: definition.role,
+        interaction: definition.interaction,
+        traits: definition.traits,
+        lifecycle: definition.lifecycle,
+        command: definition.command,
+        args: definition.args,
+        working_directory: match definition.working_directory {
+            DaemonSessionTypeWorkingDirectory::PackageRoot => {
+                PackageSessionTypeWorkingDirectory::PackageRoot
+            }
+            DaemonSessionTypeWorkingDirectory::Relative { path } => {
+                PackageSessionTypeWorkingDirectory::Relative { path }
+            }
+        },
+        environment: definition.environment,
+        allowed_environment_overrides: definition.allowed_environment_overrides,
+        context: definition.context,
+        target_id: definition.target_id,
+    }
+}
+
+fn session_type_context_from_daemon(
+    context: DaemonSessionTypeContextInput,
+) -> SessionTypeContextInput {
+    SessionTypeContextInput {
         worktree_path: context.worktree_path,
         repo_path: context.repo_path,
         branch_name: context.branch_name,
@@ -6437,7 +6810,7 @@ fn daemon_operator_error_from_client(error: crate::HubClientError) -> DaemonOper
             message: format!("{package_name} is not allowed to run {operation:?}"),
             diagnostics: Vec::new(),
         },
-        crate::HubClientError::SessionTemplate {
+        crate::HubClientError::SessionType {
             request_id,
             operation,
             kind,
@@ -6858,10 +7231,13 @@ fn operation_label(operation: crate::HubClientOperation) -> &'static str {
         crate::HubClientOperation::CaptureSnapshot => "capture_snapshot",
         crate::HubClientOperation::ListPackages => "list_packages",
         crate::HubClientOperation::ListPackageNavigation => "list_package_navigation",
-        crate::HubClientOperation::ListSessionTemplates => "list_session_templates",
-        crate::HubClientOperation::ShowSessionTemplate => "show_session_template",
-        crate::HubClientOperation::ResolveSessionTemplate => "resolve_session_template",
-        crate::HubClientOperation::SpawnSessionTemplate => "spawn_session_template",
+        crate::HubClientOperation::ListSessionTypes => "list_session_types",
+        crate::HubClientOperation::ShowSessionType => "show_session_type",
+        crate::HubClientOperation::CreateSessionType => "create_session_type",
+        crate::HubClientOperation::UpdateSessionType => "update_session_type",
+        crate::HubClientOperation::DeleteSessionType => "delete_session_type",
+        crate::HubClientOperation::ResolveSessionType => "resolve_session_type",
+        crate::HubClientOperation::SpawnSessionType => "spawn_session_type",
         crate::HubClientOperation::ReadSessionContext => "read_session_context",
         crate::HubClientOperation::PluginLifecycleStatus => "plugin_lifecycle_status",
         crate::HubClientOperation::PluginSurfaceRender => "plugin_surface_render",
@@ -7274,6 +7650,12 @@ mod tests {
                 updated_at: 1,
                 exit_code: None,
                 failure_reason: None,
+                session_type_id: None,
+                session_type_source: None,
+                role: None,
+                traits: Vec::new(),
+                interaction: None,
+                session_type_lifecycle: None,
             }
         };
         let current = entity("running", Some("running"), "current");
@@ -7769,6 +8151,8 @@ mod tests {
                 sequence: 8,
             }),
             entities: BTreeMap::new(),
+            definition_generation: 0,
+            definition_entities: BTreeMap::new(),
             resync_reason: Some(overflow_reason.clone()),
         };
         let mut counters = DaemonLifecycleCounters::default();
@@ -7819,6 +8203,45 @@ mod tests {
     }
 
     #[test]
+    fn session_type_resync_replaces_oversized_snapshot_with_typed_error() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let mut subscriptions = BTreeMap::from([(
+            "oversized-session-types".to_string(),
+            EntitySubscriptionState {
+                sender: EntityFrameSender::Blocking(sender),
+                entity_type: "session_type".to_string(),
+                cursor: None,
+                entities: BTreeMap::new(),
+                definition_generation: 1,
+                definition_entities: BTreeMap::new(),
+                resync_reason: Some("subscriber_overflow".to_string()),
+            },
+        )]);
+        let entities = BTreeMap::from([(
+            "device/oversized".to_string(),
+            serde_json::json!({ "description": "x".repeat(DAEMON_MAX_FRAME_BYTES) }),
+        )]);
+
+        drive_session_type_subscriptions(&mut subscriptions, 2, &entities);
+
+        assert!(
+            subscriptions.is_empty(),
+            "typed error closes the subscription"
+        );
+        assert!(matches!(
+            receiver.recv().expect("receive bounded typed error"),
+            DaemonEntityFrame::Error {
+                ref subscription_id,
+                ref entity_type,
+                ref code,
+                ..
+            } if subscription_id == "oversized-session-types"
+                && entity_type == "session_type"
+                && code == "entity_provider_frame_too_large"
+        ));
+    }
+
+    #[test]
     fn async_entity_overflow_requires_empty_snapshot_resync_and_closed_delivery_disconnects() {
         let overflow_reason = "subscriber_overflow".to_string();
         let cursor = SessionLifecycleCursor {
@@ -7847,6 +8270,8 @@ mod tests {
                 sequence: 8,
             }),
             entities: BTreeMap::new(),
+            definition_generation: 0,
+            definition_entities: BTreeMap::new(),
             resync_reason: Some(overflow_reason.clone()),
         };
         let mut counters = DaemonLifecycleCounters::default();

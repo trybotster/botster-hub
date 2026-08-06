@@ -24,15 +24,15 @@ Supported in this milestone:
   presentation-clear effects from `@trybotster/ui-contract`
 - routed-envelope-backed start coordination with publish, drain, and
   acknowledge delivery evidence
-- session-template spawn on `start`, returning `session_uuid`,
-  `session_template_id`, `session_context_id`, and `session_lifecycle` from the
-  spawned step session through the plugin worker `session_templates.spawn`
+- session-type spawn on `start`, returning `session_uuid`,
+  `session_type_id`, `session_context_id`, and `session_lifecycle` from the
+  spawned step session through the plugin worker `session_types.spawn`
   capability
 
 `project_pipelines.start` accepts `target_id` and `worktree_id`. The hub owns
 spawn target and worktree CRUD; this fixture resolves the supplied worktree id
 through `botster.capabilities.worktrees.show()` and passes the resolved
-`worktree_path` only to the session-template context needed to start the local
+`worktree_path` only to the session-type context needed to start the local
 step. Project Pipelines keeps workflow/run state and references the hub-owned
 ids; it does not create worktrees or treat caller-supplied raw paths as the
 workflow contract.

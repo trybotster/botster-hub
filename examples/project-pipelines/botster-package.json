@@ -7,7 +7,7 @@
   "capabilities": [
     { "surface": "mcp" },
     { "surface": "plugin_db", "scope": "project-pipelines" },
-    { "surface": "session_actions", "scope": "session_template_spawn" },
+    { "surface": "session_actions", "scope": "session_type_spawn" },
     { "surface": "surfaces" }
   ],
   "entrypoints": [
@@ -22,9 +22,16 @@
       "supports": ["render", "action"]
     }
   ],
-  "session_templates": [
+  "session_types": [
     {
       "id": "agent-step",
+      "label": "Pipeline agent step",
+      "description": "Interactive agent session owned by a Project Pipelines run step.",
+      "icon": "terminal",
+      "role": "botster.agent",
+      "interaction": "interactive",
+      "traits": ["pipeline-step", "worktree-aware"],
+      "lifecycle": "task",
       "command": "bin/agent-step.sh",
       "context": ["prompt", "ticket_id", "worktree_path", "metadata.request_id", "metadata.agent_name", "metadata.worktree_id"]
     }
