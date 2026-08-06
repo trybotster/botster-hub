@@ -22,7 +22,9 @@ use botster_hub_client::{
     DaemonCompatibility, DaemonCompatibilityRequirement, DaemonConnection, DaemonDiagnostic,
     DaemonDiagnosticKind, DaemonEndpoint, DaemonEntityFrame, DaemonEvent, DaemonModeFlags,
     DaemonOperatorError, DaemonRequest, DaemonResponse, DaemonResponseKind, DaemonSessionEntity,
-    DaemonTransportError, ensure_compatible,
+    DaemonSessionType, DaemonSessionTypeDefinition, DaemonSessionTypeMutationSource,
+    DaemonSessionTypeSource, DaemonSessionTypeWorkingDirectory, DaemonTransportError,
+    ensure_compatible,
 };
 use botster_ui_contract::{
     UiActionId, UiActionKind, UiActionRequest, UiActionRequestId, UiActionResult,
@@ -106,7 +108,32 @@ pub struct FirstPartyClientSupportMatrix {
     pub entity_actions: EntityActionSupport,
     pub late_attach_history: LateAttachHistorySupport,
     pub terminal_mode_flags: TerminalModeFlagsSupport,
+    pub session_type_authoring: SessionTypeAuthoringSupport,
     pub known_limitations: Vec<String>,
+}
+
+/// Lossless session-type authoring read published for first-party editors.
+///
+/// The sanitized `DaemonSessionType` row cannot reconstruct the authored
+/// definition that `update_session_type` replaces wholesale, so an editor reads
+/// `show_session_type_definition` instead. Every enumerated field here derives
+/// from the public client DTOs rather than a hand-maintained list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionTypeAuthoringSupport {
+    pub supported: bool,
+    pub request_type: String,
+    pub response_kind: String,
+    pub response_field: String,
+    pub definition_type: String,
+    pub editable_sources: Vec<String>,
+    pub read_only_source: String,
+    pub read_only_error_kind: String,
+    /// Authored keys whose names never appear in the published `DaemonSessionType`
+    /// row. `working_directory` and `environment` are the data-loss fields this
+    /// read exists for; `context` is republished under the name `context_keys`.
+    pub authored_fields_absent_from_published_row: Vec<String>,
+    pub admission_group: String,
+    pub runtime_regression: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -625,12 +652,130 @@ pub fn first_party_client_support_matrix() -> FirstPartyClientSupportMatrix {
             request_type: "read_mode_flags".to_string(),
             response_kind: "read_mode_flags".to_string(),
         },
+        session_type_authoring: session_type_authoring_support(),
         known_limitations: vec![
             "The matrix is a test/docs contract, not a daemon runtime endpoint.".to_string(),
             "Shipped Web/TUI binding resolution is owned by downstream client tickets; this Hub fixture is a producer/reference contract."
                 .to_string(),
             "Clients own renderer-specific presentation policy for diagnostics.".to_string(),
         ],
+    }
+}
+
+/// Derive the session-type authoring claims from the public client DTOs.
+///
+/// Every enumerated value comes from serializing a real DTO, so adding a
+/// mutation source, renaming the request tag, or promoting an authored field
+/// into the published row changes this output and fails the pinned snapshot.
+fn session_type_authoring_support() -> SessionTypeAuthoringSupport {
+    let request_type = serde_json::to_value(DaemonRequest::ShowSessionTypeDefinition {
+        session_type_id: "init".to_string(),
+    })
+    .expect("serialize authoring request")["type"]
+        .as_str()
+        .expect("daemon requests are tagged by type")
+        .to_string();
+    let response_kind = serde_json::to_value(DaemonResponseKind::SessionTypeDefinition)
+        .expect("serialize authoring response kind")
+        .as_str()
+        .expect("response kinds serialize as strings")
+        .to_string();
+    let source_tag = |source: DaemonSessionTypeMutationSource| {
+        serde_json::to_value(source).expect("serialize mutation source")["source"]
+            .as_str()
+            .expect("mutation sources are tagged by source")
+            .to_string()
+    };
+
+    let authored_keys = json_object_keys(&fully_populated_session_type_definition());
+    let published_keys = json_object_keys(&fully_populated_session_type_row());
+
+    SessionTypeAuthoringSupport {
+        supported: true,
+        request_type,
+        response_kind,
+        response_field: "session_type_definition".to_string(),
+        definition_type: "botster_hub_client::DaemonSessionTypeEditableDefinition".to_string(),
+        editable_sources: vec![
+            source_tag(DaemonSessionTypeMutationSource::Device),
+            source_tag(DaemonSessionTypeMutationSource::Repo {
+                target_id: "repo:main".to_string(),
+            }),
+        ],
+        read_only_source: source_tag(DaemonSessionTypeMutationSource::Package {
+            package_name: "read-only.plugin".to_string(),
+        }),
+        read_only_error_kind: "read_only_session_type_source".to_string(),
+        authored_fields_absent_from_published_row: authored_keys
+            .difference(&published_keys)
+            .cloned()
+            .collect(),
+        admission_group: "allow_runtime".to_string(),
+        runtime_regression: "session_type_definition_round_trips_authored_path_and_environment"
+            .to_string(),
+    }
+}
+
+fn json_object_keys<T: Serialize>(value: &T) -> BTreeSet<String> {
+    serde_json::to_value(value)
+        .expect("serialize session type shape")
+        .as_object()
+        .expect("session type shapes serialize as objects")
+        .keys()
+        .cloned()
+        .collect()
+}
+
+/// A definition with every optional field set, so `skip_serializing_if` cannot
+/// hide an authored key from the published-row comparison above.
+fn fully_populated_session_type_definition() -> DaemonSessionTypeDefinition {
+    DaemonSessionTypeDefinition {
+        id: "init".to_string(),
+        label: "Init".to_string(),
+        description: Some("Authoring example".to_string()),
+        icon: Some("terminal".to_string()),
+        role: "botster.agent".to_string(),
+        interaction: "interactive".to_string(),
+        traits: vec!["terminal".to_string()],
+        lifecycle: "task".to_string(),
+        command: "bin/init.sh".to_string(),
+        args: vec!["--json".to_string()],
+        working_directory: DaemonSessionTypeWorkingDirectory::Relative {
+            path: "nested/dir".to_string(),
+        },
+        environment: BTreeMap::from([("BOTSTER_MODE".to_string(), "authoring".to_string())]),
+        allowed_environment_overrides: vec!["BOTSTER_MODE".to_string()],
+        context: vec!["prompt".to_string()],
+        target_id: Some("device:local".to_string()),
+    }
+}
+
+fn fully_populated_session_type_row() -> DaemonSessionType {
+    DaemonSessionType {
+        session_type_id: "device/init".to_string(),
+        source_name: "device".to_string(),
+        id: "init".to_string(),
+        source: "device".to_string(),
+        editable: true,
+        overridden_sources: vec![DaemonSessionTypeSource {
+            kind: "package".to_string(),
+            name: "workflow.plugin".to_string(),
+        }],
+        diagnostics: vec!["overrides 1 lower-precedence definition(s)".to_string()],
+        label: "Init".to_string(),
+        description: Some("Authoring example".to_string()),
+        icon: Some("terminal".to_string()),
+        role: "botster.agent".to_string(),
+        interaction: "interactive".to_string(),
+        traits: vec!["terminal".to_string()],
+        lifecycle: "task".to_string(),
+        command: "bin/init.sh".to_string(),
+        args: vec!["--json".to_string()],
+        working_directory_policy: "relative".to_string(),
+        allowed_environment_overrides: vec!["BOTSTER_MODE".to_string()],
+        context_keys: vec!["prompt".to_string()],
+        target_id: "device:local".to_string(),
+        available: true,
     }
 }
 
@@ -7597,6 +7742,27 @@ mod tests {
                     "json_helper": "botster_hub_test_support::mode_flags_conformance_fixture_json",
                     "request_type": "read_mode_flags",
                     "response_kind": "read_mode_flags",
+                },
+                "session_type_authoring": {
+                    "supported": true,
+                    "request_type": "show_session_type_definition",
+                    "response_kind": "session_type_definition",
+                    "response_field": "session_type_definition",
+                    "definition_type": "botster_hub_client::DaemonSessionTypeEditableDefinition",
+                    "editable_sources": ["device", "repo"],
+                    "read_only_source": "package",
+                    "read_only_error_kind": "read_only_session_type_source",
+                    // Derived by differencing the authored and published shapes:
+                    // `working_directory` and `environment` are the data-loss
+                    // fields, and `context` is republished as `context_keys`.
+                    "authored_fields_absent_from_published_row": [
+                        "context",
+                        "environment",
+                        "working_directory",
+                    ],
+                    "admission_group": "allow_runtime",
+                    "runtime_regression":
+                        "session_type_definition_round_trips_authored_path_and_environment",
                 },
                 "known_limitations": [
                     "The matrix is a test/docs contract, not a daemon runtime endpoint.",

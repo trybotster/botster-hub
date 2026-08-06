@@ -758,9 +758,9 @@ descriptors. Core treats the classification metadata as opaque strings.
 Session types are not `runnable_entrypoints`. Runnable entrypoints describe
 installed app/process launch contracts; session types describe PTY sessions
 with trusted hub context. The protocol exposes `ListSessionTypes`,
-`ShowSessionType`, `ResolveSessionType`, `SpawnSessionType`, and
-`ReadSessionContext`, plus source-aware `CreateSessionType`,
-`UpdateSessionType`, and `DeleteSessionType` requests.
+`ShowSessionType`, `ShowSessionTypeDefinition`, `ResolveSessionType`,
+`SpawnSessionType`, and `ReadSessionContext`, plus source-aware
+`CreateSessionType`, `UpdateSessionType`, and `DeleteSessionType` requests.
 
 Resolution precedence is package < device < repo < explicit request values.
 Device definitions, admitted repo target roots, and a monotonic definition
@@ -791,6 +791,41 @@ guessing a session or context id.
 List/show/resolve responses are sanitized and do not include prompt values or
 raw context payloads. `ReadSessionContext` is explicit user-path output for the
 spawned session or an admitted local operator.
+
+`UpdateSessionType` replaces a definition wholesale, but the sanitized
+`DaemonSessionType` row cannot reconstruct one: it carries a derived
+`working_directory_policy` string instead of the authored
+`working_directory`, and it has no `environment` field at all. A client that
+read a row and submitted it back therefore destroyed the authored
+working-directory path and the authored environment.
+`ShowSessionTypeDefinition { session_type_id }` closes that gap. It returns
+`DaemonResponseKind::SessionTypeDefinition` with a
+`session_type_definition: DaemonSessionTypeEditableDefinition` payload carrying
+the qualified `session_type_id`, the exact `DaemonSessionTypeMutationSource`
+`UpdateSessionType` requires, and the authored `DaemonSessionTypeDefinition`
+itself — so read, edit one field, and submit back is byte-identical for every
+untouched field. `definition.id` is the bare id `UpdateSessionType` matches on,
+not the composite `source_name/id`.
+
+Selection matches `ShowSessionType` exactly: a bare id resolves to the effective
+winner, a qualified `source_name/id` targets that source even when a
+higher-precedence source overrides it, an ambiguous bare id returns
+`ambiguous_session_type`, and an unknown id returns `unknown_session_type`. A
+package-owned id returns `read_only_session_type_source`, the same refusal
+mutations get, so package-authored environments are never exposed.
+
+The read is admitted under `allow_runtime` alongside `CreateSessionType` /
+`UpdateSessionType` / `DeleteSessionType`, not under the `allow_packages` group
+that gates the sanitized `ListSessionTypes` / `ShowSessionType` /
+`ResolveSessionType` reads: the caller permitted to read an authored definition
+is exactly the caller permitted to write it. This widens what an *editor* sees
+for a type it may edit. It does not widen the subscription boundary —
+`list_session_types`, `show_session_type`, and `session_type` entity frames stay
+byte-identical and still carry no authored environment or path.
+
+The operator path is `botster-hub session-types definition <session-type-id>`,
+which prints the mutation source and the authored definition as JSON suitable
+for piping straight back through `session-types update`.
 
 Effective rows expose `source`, `source_name`, `editable`,
 `overridden_sources`, and diagnostics. The built-in `session_type` entity family
@@ -1217,6 +1252,19 @@ dispatch. It includes source-aware definition CRUD, provenance/editability,
 orthogonal role/interaction/traits/lifecycle fields, durable definition entity
 generations, and canonical session metadata projection. Protocol 5 clients fail
 the typed compatibility handshake; no aliases or dual readers remain.
+
+Adding the lossless `ShowSessionTypeDefinition` authoring read advances
+`CONFORMANCE_FIXTURE_REVISION` to 32 and leaves `PROTOCOL_VERSION` at 6.
+`ensure_compatible` compares protocol version with **exact equality** and
+conformance revision with a **floor**, so a protocol bump is a stack-wide flag
+day while a conformance bump is not. Under those semantics `PROTOCOL_VERSION` is
+reserved for changes that break existing request or response semantics; a purely
+additive request rides the conformance revision. Nothing existing changed shape:
+the request is new, `session_type_definition` is a new optional response field,
+`session_type_definition` is a new response kind, and `current_feature_list()` is
+untouched. A protocol-6 client pinned at conformance 31 keeps working against a
+Hub reporting 32 and simply never issues the new request, so `botster-tui` and
+`botster-web` need no repin.
 
 ## Isolated Integration Tests For External Clients
 

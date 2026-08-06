@@ -7050,6 +7050,11 @@ fn cli_daily_commands_share_canonical_default_data_directory() {
             "session-types list",
         ),
         (
+            "session-types",
+            &["definition"][..],
+            "session-types definition",
+        ),
+        (
             "spawn-targets",
             &["list", "extra"][..],
             "spawn-targets list",
@@ -14458,7 +14463,9 @@ fn session_type_crud_pushes_authoritative_entity_deltas_without_polling() {
         } if items.is_empty()
     ));
 
-    let mut definition = botster_hub_client::DaemonSessionTypeDefinition {
+    // Authored with a relative working-directory path and a non-empty environment:
+    // exactly the two fields the sanitized row cannot carry.
+    let definition = botster_hub_client::DaemonSessionTypeDefinition {
         id: "terminal-accessory".to_string(),
         label: "Terminal accessory".to_string(),
         description: Some("Interactive terminal companion".to_string()),
@@ -14469,9 +14476,11 @@ fn session_type_crud_pushes_authoritative_entity_deltas_without_polling() {
         lifecycle: "persistent".to_string(),
         command: "bin/accessory.sh".to_string(),
         args: Vec::new(),
-        working_directory: botster_hub_client::DaemonSessionTypeWorkingDirectory::PackageRoot,
-        environment: BTreeMap::new(),
-        allowed_environment_overrides: Vec::new(),
+        working_directory: botster_hub_client::DaemonSessionTypeWorkingDirectory::Relative {
+            path: "nested/dir".to_string(),
+        },
+        environment: BTreeMap::from([("BOTSTER_MODE".to_string(), "authored".to_string())]),
+        allowed_environment_overrides: vec!["BOTSTER_MODE".to_string()],
         context: Vec::new(),
         target_id: None,
     };
@@ -14495,12 +14504,61 @@ fn session_type_crud_pushes_authoritative_entity_deltas_without_polling() {
             && entity["interaction"] == "interactive"
     ));
 
-    definition.label = "Updated terminal accessory".to_string();
+    // The published row cannot rebuild the authored definition: it derives a policy
+    // string and has no environment field at all.
+    let sanitized = botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::ShowSessionType {
+            session_type_id: "terminal-accessory".to_string(),
+        },
+    )
+    .expect("show sanitized session type through public socket");
+    assert_eq!(sanitized.session_types.len(), 1);
+    assert_eq!(
+        sanitized.session_types[0].working_directory_policy,
+        "relative"
+    );
+    let sanitized_text =
+        serde_json::to_string(&sanitized.session_types[0]).expect("serialize sanitized row");
+    assert!(!sanitized_text.contains("nested/dir"));
+    assert!(!sanitized_text.contains("authored"));
+
+    // The authoring read returns exactly what UpdateSessionType consumes.
+    let authoring = botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::ShowSessionTypeDefinition {
+            session_type_id: "terminal-accessory".to_string(),
+        },
+    )
+    .expect("read authored session type definition through public socket");
+    assert_eq!(
+        authoring.kind,
+        botster_hub_client::DaemonResponseKind::SessionTypeDefinition
+    );
+    let editable = authoring
+        .session_type_definition
+        .clone()
+        .expect("authoring response carries the editable definition");
+    assert_eq!(editable.session_type_id, "device/terminal-accessory");
+    assert_eq!(
+        editable.source,
+        botster_hub_client::DaemonSessionTypeMutationSource::Device
+    );
+    assert_eq!(
+        editable.definition, definition,
+        "the socket authoring read must be lossless"
+    );
+
+    // Read, change exactly one field, submit the rest back untouched. Before this
+    // seam a client had to rebuild from the sanitized row and silently dropped the
+    // authored path and environment here.
+    let mut edited = editable.definition.clone();
+    edited.label = "Updated terminal accessory".to_string();
     botster_hub_client::request(
         &endpoint,
         botster_hub_client::DaemonRequest::UpdateSessionType {
-            source: botster_hub_client::DaemonSessionTypeMutationSource::Device,
-            definition,
+            source: editable.source.clone(),
+            definition: edited.clone(),
         },
     )
     .expect("update device session type through public socket");
@@ -14512,6 +14570,60 @@ fn session_type_crud_pushes_authoritative_entity_deltas_without_polling() {
             ..
         } if entity["label"] == "Updated terminal accessory"
     ));
+
+    let after_edit = botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::ShowSessionTypeDefinition {
+            session_type_id: "terminal-accessory".to_string(),
+        },
+    )
+    .expect("re-read authored definition after the edit")
+    .session_type_definition
+    .expect("authoring response carries the editable definition");
+    assert_eq!(
+        after_edit.definition, edited,
+        "only the edited field changed; the authored path and environment survived"
+    );
+    assert_eq!(
+        after_edit.definition.working_directory,
+        botster_hub_client::DaemonSessionTypeWorkingDirectory::Relative {
+            path: "nested/dir".to_string()
+        }
+    );
+    assert_eq!(
+        after_edit
+            .definition
+            .environment
+            .get("BOTSTER_MODE")
+            .map(String::as_str),
+        Some("authored")
+    );
+
+    // The operator entry point reaches the same seam through the real daemon.
+    let cli = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("session-types")
+        .arg("definition")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("terminal-accessory")
+        .output()
+        .expect("run Hub session-types definition CLI");
+    assert!(cli.status.success(), "{}", command_output_text(&cli));
+    let cli_text = String::from_utf8_lossy(&cli.stdout);
+    assert!(
+        cli_text.contains("response=session_type_definition"),
+        "{cli_text}"
+    );
+    assert!(
+        cli_text.contains("session_type_id=device/terminal-accessory"),
+        "{cli_text}"
+    );
+    assert!(cli_text.contains(r#""source":"device""#), "{cli_text}");
+    assert!(cli_text.contains(r#""path":"nested/dir""#), "{cli_text}");
+    assert!(
+        cli_text.contains(r#""BOTSTER_MODE":"authored""#),
+        "{cli_text}"
+    );
 
     let rejected = botster_hub_client::request(
         &endpoint,
@@ -14595,6 +14707,28 @@ fn session_type_crud_pushes_authoritative_entity_deltas_without_polling() {
             && entity["editable"] == false
             && entity["interaction"] == "service"
     ));
+
+    // Package-authored definitions stay read-only over the real socket too, so
+    // package environments are never newly exposed by the authoring read.
+    let package_refusal = botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::ShowSessionTypeDefinition {
+            session_type_id: "package-accessory".to_string(),
+        },
+    )
+    .expect("package authoring read returns a typed operator response");
+    assert_eq!(
+        package_refusal.kind,
+        botster_hub_client::DaemonResponseKind::OperatorError
+    );
+    assert_eq!(
+        package_refusal
+            .error
+            .as_ref()
+            .map(|error| error.code.as_str()),
+        Some("read_only_session_type_source")
+    );
+    assert!(package_refusal.session_type_definition.is_none());
     botster_hub_client::request(
         &endpoint,
         botster_hub_client::DaemonRequest::DisablePackage {

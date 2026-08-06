@@ -1,6 +1,6 @@
 {
   "binding_family": "/session",
-  "conformance_fixture_revision": 31,
+  "conformance_fixture_revision": 32,
   "entity_type": "session",
   "expected": {
     "after_ended_patch": {
