@@ -40,6 +40,7 @@ pub mod entrypoint_supervisor;
 pub mod lifecycle;
 pub mod local_webrtc;
 pub mod lua_runtime;
+pub mod maintenance;
 pub mod managed_git_worktrees;
 pub mod mcp;
 pub mod packages;
@@ -96,12 +97,13 @@ pub use daemon::{
 pub use daemon_transport::{
     DaemonApp, DaemonAppLaunchTarget, DaemonAvailablePackage, DaemonCapability,
     DaemonCompatibility, DaemonConnection, DaemonCoordination, DaemonEnvelope, DaemonEnvelopeAck,
-    DaemonEnvelopeDelivery, DaemonEnvelopePublish, DaemonEvent, DaemonIdentity, DaemonModeFlags,
-    DaemonNotify, DaemonOperatorError, DaemonPackage, DaemonPackageActionRequest,
-    DaemonPackageActionRequiredReference, DaemonPackageActionState, DaemonPackageActionStatus,
-    DaemonPackageAvailability, DaemonPackageAvailabilityReason, DaemonPackageAvailabilityState,
-    DaemonPackageCompatibility, DaemonPackageConfiguration, DaemonPackageDecision,
-    DaemonPackageDependencyAvailability, DaemonPackageDiagnostic,
+    DaemonEnvelopeDelivery, DaemonEnvelopePublish, DaemonEvent, DaemonHubUpdate,
+    DaemonHubUpdateState, DaemonIdentity, DaemonInstallationDiagnostic, DaemonInstallationIdentity,
+    DaemonInstallationMode, DaemonModeFlags, DaemonNotify, DaemonOperatorError, DaemonPackage,
+    DaemonPackageActionRequest, DaemonPackageActionRequiredReference, DaemonPackageActionState,
+    DaemonPackageActionStatus, DaemonPackageAvailability, DaemonPackageAvailabilityReason,
+    DaemonPackageAvailabilityState, DaemonPackageCompatibility, DaemonPackageConfiguration,
+    DaemonPackageDecision, DaemonPackageDependencyAvailability, DaemonPackageDiagnostic,
     DaemonPackageEnvironmentRequirement, DaemonPackageFeatureAvailability,
     DaemonPackageInstallEffect, DaemonPackageInstallPlan, DaemonPackageNavigationEntry,
     DaemonPackageNavigationSource, DaemonPackagePin, DaemonPackageProcess,
@@ -110,8 +112,8 @@ pub use daemon_transport::{
     DaemonRequest, DaemonResolvedAppLaunch, DaemonResolvedSessionTemplate, DaemonResponse,
     DaemonResponseKind, DaemonSession, DaemonSessionCleanup, DaemonSessionContext,
     DaemonSessionTemplate, DaemonSessionTemplateContextInput, DaemonSessionTemplateRequest,
-    DaemonSpawnTarget, DaemonSpawnTargetValidation, DaemonStatus, DaemonTransportError,
-    DaemonTransportResult, DaemonWorktree, DaemonWorktreeGitMetadata,
+    DaemonSoftwareIdentity, DaemonSpawnTarget, DaemonSpawnTargetValidation, DaemonStatus,
+    DaemonTransportError, DaemonTransportResult, DaemonWorktree, DaemonWorktreeGitMetadata,
     request as daemon_transport_request, serve_daemon, stream_attach,
 };
 pub use entrypoint_supervisor::{
@@ -125,6 +127,10 @@ pub use lifecycle::{
 pub use local_webrtc::{LocalWebrtcError, LocalWebrtcTransport};
 pub use lua_runtime::{
     LuaPluginHostApi, LuaPluginRuntime, LuaPluginRuntimeError, SharedHubCapabilityRuntime,
+};
+pub use maintenance::{
+    HubUpdateCheckPlan, ManagedReleaseCheck, execute_managed_update_check, installation_identity,
+    plan_hub_update_check, software_identity,
 };
 pub use mcp::{
     McpCallRequest, McpServeError, McpToolDescriptor, McpToolError, McpToolProvider,

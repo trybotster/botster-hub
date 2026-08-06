@@ -570,6 +570,8 @@ fn daemon_tool_result(
                     "features": status.compatibility.features,
                     "conformance_fixture_revision": status.compatibility.conformance_fixture_revision,
                 },
+                "software": status.software,
+                "installation": status.installation,
                 "host_id": status.host_id,
                 "host_display_name": status.host_display_name,
                 "schema_version": status.schema_version,

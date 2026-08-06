@@ -94,6 +94,7 @@ pub(crate) fn daemon_protocol_typescript() -> String {
         "DaemonRequest",
         &[
             ("status", &[]),
+            ("check_hub_update", &[]),
             ("list_sessions", &[]),
             (
                 "subscribe_entities",
@@ -359,6 +360,7 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             ("available_packages?", "DaemonAvailablePackage[]"),
             ("install_plan?", "DaemonPackageInstallPlan | null"),
             ("update_status?", "DaemonPackageUpdateStatus | null"),
+            ("hub_update?", "DaemonHubUpdate | null"),
             ("package_decision", "DaemonPackageDecision | null"),
             ("lifecycle", "DaemonPluginLifecycle[]"),
             (
@@ -444,6 +446,7 @@ pub(crate) fn daemon_protocol_typescript() -> String {
         "DaemonResponseKind",
         &[
             "status",
+            "hub_update",
             "sessions",
             "entity_subscribed",
             "entity_unsubscribed",
@@ -949,7 +952,6 @@ pub(crate) fn daemon_protocol_typescript() -> String {
         "DaemonPackageCompatibility",
         &[
             ("botster_requirement", "string"),
-            ("hub_version", "string"),
             ("result", "string"),
             ("diagnostics", "string[]"),
         ],
@@ -1067,6 +1069,8 @@ pub(crate) fn daemon_protocol_typescript() -> String {
         &[
             ("lifecycle_state", "string"),
             ("compatibility", "DaemonCompatibility"),
+            ("software", "DaemonSoftwareIdentity"),
+            ("installation", "DaemonInstallationIdentity"),
             ("host_id", "string"),
             ("host_display_name", "string"),
             ("schema_version", "number"),
@@ -1082,6 +1086,54 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             ("stale_sessions", "string[]"),
             ("lifecycle_counters?", "DaemonLifecycleCounters"),
             ("diagnostics?", "DaemonDiagnostic[]"),
+        ],
+    );
+    emit_interface(
+        &mut output,
+        "DaemonSoftwareIdentity",
+        &[
+            ("product_id", "string"),
+            ("product_name", "string"),
+            ("version", "string"),
+            ("build_revision?", "string | null"),
+        ],
+    );
+    emit_string_union(
+        &mut output,
+        "DaemonInstallationMode",
+        &["development", "unmanaged", "managed"],
+    );
+    emit_interface(
+        &mut output,
+        "DaemonInstallationIdentity",
+        &[
+            ("mode", "DaemonInstallationMode"),
+            ("provenance", "string"),
+            ("release_channel?", "string | null"),
+            ("provider?", "string | null"),
+            ("diagnostics?", "DaemonInstallationDiagnostic[]"),
+        ],
+    );
+    emit_interface(
+        &mut output,
+        "DaemonInstallationDiagnostic",
+        &[("kind", "string"), ("message", "string")],
+    );
+    emit_string_union(
+        &mut output,
+        "DaemonHubUpdateState",
+        &["current", "available", "unavailable"],
+    );
+    emit_interface(
+        &mut output,
+        "DaemonHubUpdate",
+        &[
+            ("state", "DaemonHubUpdateState"),
+            ("current_version", "string"),
+            ("available_version?", "string | null"),
+            ("build_revision?", "string | null"),
+            ("reason?", "string | null"),
+            ("action?", "string | null"),
         ],
     );
     emit_interface(

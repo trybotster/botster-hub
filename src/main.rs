@@ -22,7 +22,7 @@ use botster_hub::{
     HubClientApi, HubClientRequest, HubClientResponseBody, HubDaemon, HubDaemonState, HubRuntime,
     HubStartupOptions, HubStateLoadSource, LOCAL_RUNTIME_DAEMON_READINESS_BUDGET,
     RuntimeEnvironment, SessionDefaults, TransportBindings, daemon_transport_request, host_profile,
-    serve_daemon, serve_mcp_stdio, stream_attach,
+    installation_identity, serve_daemon, serve_mcp_stdio, software_identity, stream_attach,
 };
 use botster_hub_client::{
     DaemonDiagnostic, DaemonLocalWebrtcBootstrap, DaemonLocalWebrtcDeliveryChunk,
@@ -125,6 +125,9 @@ fn dispatch_command(command: &str, args: Vec<String>) -> Result<CommandOutcome, 
             .map(|()| CommandOutcome::Completed)
             .map_err(|error| error.to_string()),
         "status" => operator_status(args)
+            .map(|()| CommandOutcome::Completed)
+            .map_err(|error| error.to_string()),
+        "check-update" => operator_check_update(args)
             .map(|()| CommandOutcome::Completed)
             .map_err(|error| error.to_string()),
         "sessions" => operator_sessions(args)
@@ -245,6 +248,7 @@ fn stateful_command(command: &str) -> bool {
             | "doctor"
             | "smoke"
             | "status"
+            | "check-update"
             | "sessions"
             | "session-templates"
             | "spawn-targets"
@@ -342,6 +346,7 @@ fn command_usage(command: &str) -> &'static str {
         "doctor" => "doctor",
         "smoke" => "smoke",
         "status" => "status",
+        "check-update" => "check-update",
         "sessions" => "sessions",
         "session-templates" => "session-templates",
         "spawn-targets" => "spawn-targets",
@@ -374,6 +379,8 @@ fn start_daemon(args: Vec<String>) -> Result<(), StartError> {
     let status = DaemonStatus {
         lifecycle_state: lifecycle_state_label(stopped.lifecycle_state).to_string(),
         compatibility: DaemonCompatibility::current(),
+        software: software_identity(),
+        installation: installation_identity(),
         host_id: stopped.host_id,
         host_display_name: stopped.host_display_name,
         schema_version: stopped.schema_version,
@@ -2115,6 +2122,36 @@ fn operator_status(args: Vec<String>) -> Result<(), OperatorError> {
     Ok(())
 }
 
+fn operator_check_update(args: Vec<String>) -> Result<(), OperatorError> {
+    let options = DataArgs::parse(args, "check-update")?;
+    if !options.arguments.is_empty() {
+        return Err(OperatorError::Usage("check-update"));
+    }
+    let config = explicit_config(options.data_directory)?;
+    let response = daemon_transport_request(&config, DaemonRequest::CheckHubUpdate)?;
+    let Some(update) = response.hub_update else {
+        return Err(OperatorError::UnexpectedResponse("hub update"));
+    };
+    println!(
+        "state={}",
+        format!("{:?}", update.state).to_ascii_lowercase()
+    );
+    println!("current_version={}", update.current_version);
+    if let Some(version) = update.available_version {
+        println!("available_version={version}");
+    }
+    if let Some(revision) = update.build_revision {
+        println!("build_revision={revision}");
+    }
+    if let Some(reason) = update.reason {
+        println!("reason={reason}");
+    }
+    if let Some(action) = update.action {
+        println!("action={action}");
+    }
+    Ok(())
+}
+
 fn operator_sessions(args: Vec<String>) -> Result<(), OperatorError> {
     let command = SessionCommand::parse(args)?;
     let config = explicit_config(command.data_directory)?;
@@ -3249,6 +3286,29 @@ fn print_daemon_transport_status(label: &str, status: &DaemonStatus) {
         status.compatibility.conformance_fixture_revision
     );
     println!("features={}", status.compatibility.features.join(","));
+    println!("product_id={}", status.software.product_id);
+    println!("product_name={}", status.software.product_name);
+    println!("product_version={}", status.software.version);
+    if let Some(revision) = &status.software.build_revision {
+        println!("build_revision={revision}");
+    }
+    println!(
+        "installation_mode={}",
+        format!("{:?}", status.installation.mode).to_ascii_lowercase()
+    );
+    println!("installation_provenance={}", status.installation.provenance);
+    if let Some(channel) = &status.installation.release_channel {
+        println!("release_channel={channel}");
+    }
+    if let Some(provider) = &status.installation.provider {
+        println!("release_provider={provider}");
+    }
+    for diagnostic in &status.installation.diagnostics {
+        println!(
+            "installation_diagnostic kind={} message={}",
+            diagnostic.kind, diagnostic.message
+        );
+    }
     println!("host_id={}", status.host_id);
     println!("host_display_name={}", status.host_display_name);
     println!("schema_version={}", status.schema_version);
@@ -3279,6 +3339,16 @@ fn print_daemon_response(response: DaemonResponse) -> Result<(), OperatorError> 
         DaemonResponseKind::Status => {
             if let Some(status) = response.status {
                 print_daemon_transport_status("status", &status);
+            }
+        }
+        DaemonResponseKind::HubUpdate => {
+            println!("response=hub_update");
+            if let Some(update) = response.hub_update {
+                println!(
+                    "state={}",
+                    format!("{:?}", update.state).to_ascii_lowercase()
+                );
+                println!("current_version={}", update.current_version);
             }
         }
         DaemonResponseKind::Sessions => {
@@ -5307,6 +5377,7 @@ Daily runtime commands:
   botster-hub up [--data-dir <path>] [...]
   botster-hub down [--data-dir <path>]
   botster-hub status [--data-dir <path>]
+  botster-hub check-update [--data-dir <path>]
   botster-hub doctor [--data-dir <path>]
   botster-hub smoke [--data-dir <path>] [...]
   botster-hub open web [--data-dir <path>]
@@ -5358,6 +5429,7 @@ Packages:
             "usage: botster-hub smoke [--data-dir <path>] [--session-worker-bin <path>]"
         }
         "status" => "usage: botster-hub status [--data-dir <path>]",
+        "check-update" => "usage: botster-hub check-update [--data-dir <path>]",
         "sessions" => {
             "usage: botster-hub sessions <list|spawn|attach|send-input|resize|detach|shutdown> ..."
         }

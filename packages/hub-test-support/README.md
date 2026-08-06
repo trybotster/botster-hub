@@ -19,7 +19,7 @@ node packages/hub-test-support/scripts/sync-assets.mjs
 ## Usage
 
 ```sh
-npm install --save-dev @trybotster/ui-contract@0.3.1 @trybotster/hub-test-support@0.1.21
+npm install --save-dev @trybotster/ui-contract@0.3.1 @trybotster/hub-test-support@0.1.22
 ```
 
 ```js
@@ -79,13 +79,14 @@ Use this exact package spec in npm-based client repos:
 ```json
 {
   "devDependencies": {
-    "@trybotster/hub-test-support": "0.1.18"
+    "@trybotster/hub-test-support": "0.1.22"
   }
 }
 ```
 
-`@trybotster/hub-test-support@0.1.18` is published to the public npm registry,
-so no scoped `.npmrc` entry or CI auth token is required for install.
+`@trybotster/hub-test-support@0.1.22` is the prepared coordinate for the Hub
+maintenance contract. Publication is owned by the separately routed release
+ticket; consumers must not pin it until that ticket records registry integrity.
 
 The support matrix is generated from the Rust compatibility descriptors.
 `terminal_readback` appears in both `supported_features` and
@@ -100,11 +101,13 @@ Only `read_screen_text` is renderable restored content; `snapshot` and
 version 0.1.5 / revision 12 exposes lossy string history. Neither is current
 binary-history contract authority.
 
-Version 0.1.21 is the next cold consumer coordinate. Version 0.1.20 is the
+Version 0.1.22 is the next cold consumer coordinate. Version 0.1.21 is the
 currently published coordinate. Version
 0.1.17 was published with stale protocol bytes and is not a valid consumer
-coordinate. Version 0.1.21 carries protocol version 4 /
-conformance revision 28, generic package-owned entity records, the
+coordinate. Version 0.1.22 carries protocol version 5 /
+conformance revision 29, authoritative software/install identity,
+`CheckHubUpdate`, and the cold removal of package compatibility `hub_version`.
+It retains the generic package-owned entity records and the
 `plugin_entity_subscriptions` compatibility feature, and
 depends on `@trybotster/ui-contract@0.3.1` for the canonical UiNode,
 UiActionRequest, UiActionResult, package surface, and package navigation

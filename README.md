@@ -156,7 +156,7 @@ Enabled Lua packages may also declare exact package-namespaced
 declaring package, and each subscribe or reconnect queries the isolated worker
 for a freshly validated whole-family snapshot before bounded daemon/WebRTC
 delivery.
-The reusable contract is prepared in `@trybotster/hub-test-support@0.1.21` as
+The reusable contract is prepared in `@trybotster/hub-test-support@0.1.22` as
 source-derived JSON fixtures and a Rust
 `run_session_lifecycle_subscription_conformance` runner over the real isolated
 Hub/Core/session-worker topology.
@@ -490,8 +490,8 @@ runtime=ready
 data_dir=resolved:$HOME/.botster/hub
 daemon=started
 protocol=botster-hub-daemon-v1
-protocol_version=4
-conformance_fixture_revision=24
+protocol_version=5
+conformance_fixture_revision=29
 package_count=2
 enabled_package_count=2
 app_count=2
@@ -1248,9 +1248,18 @@ pin revision/checksum, update policy, trust classification, enabled state,
 admitted capabilities, compatibility result/diagnostics, runnable entrypoint
 contracts, optional install/update timestamps, and the latest audit reason.
 
-Deferred production concerns remain outside this contract slice: signing,
-sandboxing, dependency solving, installer-managed binaries, hosted marketplace
-resolution, browser WebRTC parity, and remote/cloud WebRTC launch paths.
+The Hub now owns one read-only product maintenance path. `status` reports
+immutable embedded product identity plus installation provenance from exactly
+`$HOME/.botster/installations/botster-hub.json`; `check-update` lets a valid
+managed receipt query its configured authoritative HTTP JSON source without
+mutating packages, Git, the running binary, or durable Hub state. Development
+builds, manual/unmanaged installs, missing receipts, and invalid or unsafe
+receipts return an honest unavailable/manual result.
+
+Deferred production concerns remain outside this contract slice: receipt
+writes, installer-managed apply or rollback, signed release publication,
+auto-update daemons, sandboxing, dependency solving, hosted marketplace
+resolution, and remote/cloud WebRTC launch paths.
 
 Compatibility remains deliberately narrow in this slice. The manifest `botster`
 field accepts only exact `MAJOR.MINOR.PATCH` or lower-bound

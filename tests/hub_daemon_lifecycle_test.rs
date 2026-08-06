@@ -3396,6 +3396,477 @@ fn start_cli_daemon(data_dir: &Path) -> Child {
     child
 }
 
+fn start_cli_daemon_with_home(data_dir: &Path, home: &Path) -> Child {
+    ensure_session_worker_binary();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_botster-hub"));
+    command
+        .arg("start")
+        .arg("--data-dir")
+        .arg(data_dir)
+        .env("HOME", home)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    configure_test_process_group(&mut command);
+    let mut child = command.spawn().expect("spawn botster-hub start");
+    wait_for_status(data_dir, &mut child);
+    child
+}
+
+fn spawn_release_metadata_fixture(
+    metadata: serde_json::Value,
+    request_count: usize,
+) -> (String, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind release metadata fixture");
+    let address = listener.local_addr().expect("release fixture address");
+    let body = serde_json::to_vec(&metadata).expect("serialize release metadata");
+    let handle = thread::spawn(move || {
+        for _ in 0..request_count {
+            let (mut stream, _) = listener.accept().expect("accept release metadata request");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("set release fixture read timeout");
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request);
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .expect("write release response headers");
+            stream
+                .write_all(&body)
+                .expect("write release response body");
+        }
+    });
+    (format!("http://{address}/botster-hub.json"), handle)
+}
+
+fn spawn_release_metadata_sequence_fixture(
+    metadata: Vec<serde_json::Value>,
+) -> (String, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind release metadata sequence");
+    let address = listener.local_addr().expect("release sequence address");
+    let handle = thread::spawn(move || {
+        for metadata in metadata {
+            let body = serde_json::to_vec(&metadata).expect("serialize release metadata");
+            let (mut stream, _) = listener.accept().expect("accept release metadata request");
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request);
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .expect("write release response headers");
+            stream
+                .write_all(&body)
+                .expect("write release response body");
+        }
+    });
+    (format!("http://{address}/botster-hub.json"), handle)
+}
+
+fn spawn_stalled_release_metadata_fixture(
+    metadata: serde_json::Value,
+) -> (
+    String,
+    mpsc::Receiver<()>,
+    mpsc::Sender<()>,
+    thread::JoinHandle<()>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind stalled release fixture");
+    let address = listener.local_addr().expect("stalled fixture address");
+    let body = serde_json::to_vec(&metadata).expect("serialize stalled release metadata");
+    let (accepted_tx, accepted_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let handle = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept stalled release request");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set stalled fixture read timeout");
+        let mut request = [0_u8; 4096];
+        let _ = stream.read(&mut request);
+        accepted_tx.send(()).expect("report stalled request");
+        release_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("release stalled request");
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .expect("write stalled response headers");
+        stream
+            .write_all(&body)
+            .expect("write stalled response body");
+    });
+    (
+        format!("http://{address}/botster-hub.json"),
+        accepted_rx,
+        release_tx,
+        handle,
+    )
+}
+
+fn spawn_timeout_release_metadata_fixture() -> (String, mpsc::Receiver<()>, thread::JoinHandle<()>)
+{
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind timeout release fixture");
+    let address = listener.local_addr().expect("timeout fixture address");
+    let (accepted_tx, accepted_rx) = mpsc::channel();
+    let handle = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept timeout release request");
+        let mut request = [0_u8; 4096];
+        let _ = stream.read(&mut request);
+        accepted_tx.send(()).expect("report timeout request");
+        thread::sleep(Duration::from_secs(4));
+    });
+    (
+        format!("http://{address}/botster-hub.json"),
+        accepted_rx,
+        handle,
+    )
+}
+
+#[test]
+fn real_daemon_status_and_hub_update_use_managed_receipt_authority() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_test_dir("managed-hub-maintenance");
+    let home = unique_test_dir("managed-hub-maintenance-home");
+    let receipt = home.join(".botster/installations/botster-hub.json");
+    fs::create_dir_all(receipt.parent().expect("receipt parent")).expect("create receipt parent");
+    let (source_url, release_fixture) = spawn_release_metadata_fixture(
+        serde_json::json!({
+            "schema_version": 1,
+            "product_id": "botster-hub",
+            "release_channel": "stable",
+            "version": "99.0.0",
+            "build_revision": "release99"
+        }),
+        2,
+    );
+    fs::write(
+        &receipt,
+        serde_json::to_vec(&serde_json::json!({
+            "schema_version": 1,
+            "product_id": "botster-hub",
+            "binary_version": env!("CARGO_PKG_VERSION"),
+            "installation_mode": "managed",
+            "release_channel": "stable",
+            "provider": "http_json",
+            "source_url": source_url
+        }))
+        .expect("serialize receipt"),
+    )
+    .expect("write receipt");
+
+    let child = start_cli_daemon_with_home(&data_dir, &home);
+    let endpoint = botster_hub_client::DaemonEndpoint::new(data_dir.join("botster-hub.sock"));
+    let status = botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status)
+        .expect("read authoritative daemon status")
+        .status
+        .expect("status payload");
+    assert_eq!(status.software.product_id, "botster-hub");
+    assert_eq!(status.software.version, env!("CARGO_PKG_VERSION"));
+    assert_eq!(
+        status.installation.mode,
+        botster_hub_client::DaemonInstallationMode::Managed
+    );
+    assert_eq!(
+        status.installation.release_channel.as_deref(),
+        Some("stable")
+    );
+    let serialized = serde_json::to_string(&status).expect("serialize status");
+    assert!(!serialized.contains(&home.display().to_string()));
+    assert!(!serialized.contains("source_url"));
+
+    let update =
+        botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::CheckHubUpdate)
+            .expect("check managed Hub update")
+            .hub_update
+            .expect("Hub update payload");
+    assert_eq!(
+        update.state,
+        botster_hub_client::DaemonHubUpdateState::Available
+    );
+    assert_eq!(update.available_version.as_deref(), Some("99.0.0"));
+    assert_eq!(update.action.as_deref(), Some("run_managed_installer"));
+
+    let cli = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("check-update")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .output()
+        .expect("run Hub check-update CLI");
+    assert!(cli.status.success(), "{}", command_output_text(&cli));
+    assert!(String::from_utf8_lossy(&cli.stdout).contains("state=available"));
+    assert!(String::from_utf8_lossy(&cli.stdout).contains("action=run_managed_installer"));
+
+    release_fixture.join().expect("release fixture exits");
+    shutdown_cli_daemon(&data_dir, child);
+
+    let restarted_child = start_cli_daemon_with_home(&data_dir, &home);
+    let restarted_status =
+        botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status)
+            .expect("read authoritative status after restart")
+            .status
+            .expect("restarted status payload");
+    assert_eq!(restarted_status.software, status.software);
+    assert_eq!(restarted_status.installation, status.installation);
+    shutdown_cli_daemon(&data_dir, restarted_child);
+
+    fs::remove_dir_all(&data_dir).expect("remove maintenance data dir");
+    fs::remove_dir_all(&home).expect("remove maintenance home");
+}
+
+#[test]
+fn real_daemon_missing_receipt_reports_development_manual_update() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_test_dir("development-hub-maintenance");
+    let home = unique_test_dir("development-hub-maintenance-home");
+    fs::create_dir_all(&home).expect("create empty home");
+    let child = start_cli_daemon_with_home(&data_dir, &home);
+    let endpoint = botster_hub_client::DaemonEndpoint::new(data_dir.join("botster-hub.sock"));
+
+    let status = botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status)
+        .expect("read development daemon status")
+        .status
+        .expect("status payload");
+    assert_eq!(
+        status.installation.mode,
+        botster_hub_client::DaemonInstallationMode::Development
+    );
+    assert_eq!(status.installation.provenance, "development_build");
+
+    let update =
+        botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::CheckHubUpdate)
+            .expect("check development Hub update")
+            .hub_update
+            .expect("Hub update payload");
+    assert_eq!(
+        update.state,
+        botster_hub_client::DaemonHubUpdateState::Unavailable
+    );
+    assert_eq!(update.reason.as_deref(), Some("development_checkout"));
+    assert_eq!(update.action.as_deref(), Some("manual"));
+
+    shutdown_cli_daemon(&data_dir, child);
+    fs::remove_dir_all(&data_dir).expect("remove maintenance data dir");
+    fs::remove_dir_all(&home).expect("remove maintenance home");
+}
+
+#[test]
+fn real_provider_reports_current_newer_source_behind_and_unavailable_states() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_test_dir("managed-hub-release-states");
+    let home = unique_test_dir("managed-hub-release-states-home");
+    let receipt = home.join(".botster/installations/botster-hub.json");
+    fs::create_dir_all(receipt.parent().expect("receipt parent")).expect("create receipt parent");
+    let release = |version: &str| {
+        serde_json::json!({
+            "schema_version": 1,
+            "product_id": "botster-hub",
+            "release_channel": "stable",
+            "version": version
+        })
+    };
+    let (source_url, release_fixture) = spawn_release_metadata_sequence_fixture(vec![
+        release(env!("CARGO_PKG_VERSION")),
+        release("99.0.0"),
+        release("0.0.1"),
+        serde_json::json!({
+            "schema_version": 1,
+            "product_id": "other-product",
+            "release_channel": "stable",
+            "version": env!("CARGO_PKG_VERSION")
+        }),
+    ]);
+    fs::write(
+        &receipt,
+        serde_json::to_vec(&serde_json::json!({
+            "schema_version": 1,
+            "product_id": "botster-hub",
+            "binary_version": env!("CARGO_PKG_VERSION"),
+            "installation_mode": "managed",
+            "release_channel": "stable",
+            "provider": "http_json",
+            "source_url": source_url
+        }))
+        .expect("serialize receipt"),
+    )
+    .expect("write receipt");
+
+    let child = start_cli_daemon_with_home(&data_dir, &home);
+    let endpoint = botster_hub_client::DaemonEndpoint::new(data_dir.join("botster-hub.sock"));
+    for (state, reason, action) in [
+        (
+            botster_hub_client::DaemonHubUpdateState::Current,
+            "up_to_date",
+            None,
+        ),
+        (
+            botster_hub_client::DaemonHubUpdateState::Available,
+            "newer_release_available",
+            Some("run_managed_installer"),
+        ),
+        (
+            botster_hub_client::DaemonHubUpdateState::Current,
+            "source_behind",
+            Some("no_downgrade"),
+        ),
+        (
+            botster_hub_client::DaemonHubUpdateState::Unavailable,
+            "invalid_release_metadata",
+            Some("contact_provider"),
+        ),
+    ] {
+        let update = botster_hub_client::request(
+            &endpoint,
+            botster_hub_client::DaemonRequest::CheckHubUpdate,
+        )
+        .expect("check managed Hub release state")
+        .hub_update
+        .expect("Hub update payload");
+        assert_eq!(update.state, state);
+        assert_eq!(update.reason.as_deref(), Some(reason));
+        assert_eq!(update.action.as_deref(), action);
+    }
+
+    release_fixture.join().expect("release fixture exits");
+    shutdown_cli_daemon(&data_dir, child);
+    fs::remove_dir_all(&data_dir).expect("remove maintenance data dir");
+    fs::remove_dir_all(&home).expect("remove maintenance home");
+}
+
+#[test]
+fn stalled_hub_update_check_keeps_status_responsive_and_second_check_is_busy() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_test_dir("stalled-hub-maintenance");
+    let home = unique_test_dir("stalled-hub-maintenance-home");
+    let receipt = home.join(".botster/installations/botster-hub.json");
+    fs::create_dir_all(receipt.parent().expect("receipt parent")).expect("create receipt parent");
+    let (source_url, accepted_rx, release_tx, release_fixture) =
+        spawn_stalled_release_metadata_fixture(serde_json::json!({
+            "schema_version": 1,
+            "product_id": "botster-hub",
+            "release_channel": "stable",
+            "version": env!("CARGO_PKG_VERSION")
+        }));
+    fs::write(
+        &receipt,
+        serde_json::to_vec(&serde_json::json!({
+            "schema_version": 1,
+            "product_id": "botster-hub",
+            "binary_version": env!("CARGO_PKG_VERSION"),
+            "installation_mode": "managed",
+            "release_channel": "stable",
+            "provider": "http_json",
+            "source_url": source_url
+        }))
+        .expect("serialize receipt"),
+    )
+    .expect("write receipt");
+    let child = start_cli_daemon_with_home(&data_dir, &home);
+    let endpoint = botster_hub_client::DaemonEndpoint::new(data_dir.join("botster-hub.sock"));
+    let first_endpoint = endpoint.clone();
+    let first = thread::spawn(move || {
+        botster_hub_client::request(
+            &first_endpoint,
+            botster_hub_client::DaemonRequest::CheckHubUpdate,
+        )
+        .expect("first stalled update response")
+    });
+    accepted_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("provider observes first update check");
+
+    let started = Instant::now();
+    let status = botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status)
+        .expect("status stays responsive during provider stall");
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert!(status.status.is_some());
+
+    let busy =
+        botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::CheckHubUpdate)
+            .expect("second update check returns typed busy")
+            .hub_update
+            .expect("busy update payload");
+    assert_eq!(
+        busy.state,
+        botster_hub_client::DaemonHubUpdateState::Unavailable
+    );
+    assert_eq!(busy.reason.as_deref(), Some("busy"));
+    assert_eq!(busy.action.as_deref(), Some("retry"));
+
+    release_tx.send(()).expect("release provider response");
+    let first = first.join().expect("first update thread exits");
+    assert_eq!(
+        first.hub_update.expect("first update payload").state,
+        botster_hub_client::DaemonHubUpdateState::Current
+    );
+    release_fixture
+        .join()
+        .expect("stalled release fixture exits");
+    shutdown_cli_daemon(&data_dir, child);
+    fs::remove_dir_all(&data_dir).expect("remove maintenance data dir");
+    fs::remove_dir_all(&home).expect("remove maintenance home");
+}
+
+#[test]
+fn daemon_shutdown_during_hub_update_check_is_bounded_and_leak_free() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_test_dir("shutdown-hub-maintenance");
+    let home = unique_test_dir("shutdown-hub-maintenance-home");
+    let receipt = home.join(".botster/installations/botster-hub.json");
+    fs::create_dir_all(receipt.parent().expect("receipt parent")).expect("create receipt parent");
+    let (source_url, accepted_rx, release_fixture) = spawn_timeout_release_metadata_fixture();
+    fs::write(
+        &receipt,
+        serde_json::to_vec(&serde_json::json!({
+            "schema_version": 1,
+            "product_id": "botster-hub",
+            "binary_version": env!("CARGO_PKG_VERSION"),
+            "installation_mode": "managed",
+            "release_channel": "stable",
+            "provider": "http_json",
+            "source_url": source_url
+        }))
+        .expect("serialize receipt"),
+    )
+    .expect("write receipt");
+    let child = start_cli_daemon_with_home(&data_dir, &home);
+    let endpoint = botster_hub_client::DaemonEndpoint::new(data_dir.join("botster-hub.sock"));
+    let update_endpoint = endpoint.clone();
+    let update = thread::spawn(move || {
+        botster_hub_client::request(
+            &update_endpoint,
+            botster_hub_client::DaemonRequest::CheckHubUpdate,
+        )
+    });
+    accepted_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("provider observes in-flight update check");
+
+    let started = Instant::now();
+    let shutdown = request_cli_daemon_shutdown(&data_dir).expect("request daemon shutdown");
+    let daemon = wait_for_cli_daemon_shutdown(&shutdown, child);
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "shutdown exceeded bounded provider timeout: {:?}",
+        started.elapsed()
+    );
+    assert!(daemon.status.success());
+    assert!(
+        update.join().expect("update request thread exits").is_err(),
+        "in-flight caller should receive a bounded transport terminal outcome"
+    );
+    release_fixture
+        .join()
+        .expect("timeout release fixture exits");
+    assert!(!data_dir.join("botster-hub.sock").exists());
+    fs::remove_dir_all(&data_dir).expect("remove maintenance data dir");
+    fs::remove_dir_all(&home).expect("remove maintenance home");
+}
+
 fn start_owned_incompatible_local_runtime_daemon(data_dir: &Path) -> Child {
     ensure_session_worker_binary();
     fs::create_dir_all(data_dir).expect("create data dir");
@@ -10559,6 +11030,25 @@ fn local_webrtc_chunks_oversized_encrypted_daemon_response() {
             .expect("status over encrypted WebRTC data channel");
         assert_eq!(status.kind, botster_hub_client::DaemonResponseKind::Status);
 
+        let update = offer_peer
+            .encrypted_request(
+                &stream_key,
+                &botster_hub_client::DaemonRequest::CheckHubUpdate,
+            )
+            .await
+            .expect("Hub update check over encrypted WebRTC data channel");
+        assert_eq!(
+            update.kind,
+            botster_hub_client::DaemonResponseKind::HubUpdate
+        );
+        assert_eq!(
+            update
+                .hub_update
+                .expect("WebRTC Hub update payload")
+                .current_version,
+            env!("CARGO_PKG_VERSION")
+        );
+
         let list = offer_peer
             .encrypted_request(
                 &stream_key,
@@ -11750,6 +12240,28 @@ fn external_hub_client_reports_compatibility_descriptor_and_mismatch_diagnostics
     let status = status.status.expect("status response body");
     assert_eq!(status.compatibility, ack.compatibility);
     assert!(status.diagnostics.is_empty());
+
+    let mut stale_requirement = botster_hub_client::DaemonCompatibilityRequirement::current();
+    stale_requirement.client_name = "stale-4-28-client".to_string();
+    stale_requirement.minimum_protocol_version = 4;
+    stale_requirement.minimum_conformance_fixture_revision = 28;
+    for attempt in ["initial connect", "reconnect"] {
+        let mut stale_stream =
+            botster_hub_client::connect_and_hello_with_requirement(&endpoint, &stale_requirement)
+                .unwrap_or_else(|error| panic!("stale client {attempt} failed: {error}"));
+        botster_hub_client::write_frame(
+            &mut stale_stream,
+            &botster_hub_client::DaemonRequest::Status,
+        )
+        .expect("stale client writes status request");
+        let response: botster_hub_client::DaemonResponse =
+            botster_hub_client::read_frame(&mut stale_stream)
+                .expect("stale client reads additive status response");
+        let stale_status = response.status.expect("stale client status payload");
+        assert_eq!(stale_status.compatibility.protocol_version, 5);
+        assert_eq!(stale_status.compatibility.conformance_fixture_revision, 29);
+        assert_eq!(stale_status.software.product_id, "botster-hub");
+    }
 
     let mut version_requirement = botster_hub_client::DaemonCompatibilityRequirement::current();
     version_requirement.client_name = "future-version-client".to_string();

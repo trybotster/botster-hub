@@ -34,12 +34,14 @@ pub use botster_hub_client::{
     DaemonCaptureSnapshot, DaemonCompatibility, DaemonConnection as ClientDaemonConnection,
     DaemonCoordination, DaemonDiagnostic, DaemonEndpoint, DaemonEntityFrame, DaemonEnvelope,
     DaemonEnvelopeAck, DaemonEnvelopeDelivery, DaemonEnvelopePublish, DaemonEvent, DaemonHello,
-    DaemonHelloAck, DaemonIdentity, DaemonLifecycleCounters, DaemonLocalWebrtcAnswer,
-    DaemonLocalWebrtcBootstrap, DaemonModeFlags, DaemonNotify, DaemonOperatorError, DaemonPackage,
-    DaemonPackageActionRequest, DaemonPackageActionRequiredReference, DaemonPackageActionState,
-    DaemonPackageActionStatus, DaemonPackageAvailability, DaemonPackageAvailabilityReason,
-    DaemonPackageAvailabilityState, DaemonPackageCompatibility, DaemonPackageConfiguration,
-    DaemonPackageDecision, DaemonPackageDependencyAvailability, DaemonPackageDiagnostic,
+    DaemonHelloAck, DaemonHubUpdate, DaemonHubUpdateState, DaemonIdentity,
+    DaemonInstallationDiagnostic, DaemonInstallationIdentity, DaemonInstallationMode,
+    DaemonLifecycleCounters, DaemonLocalWebrtcAnswer, DaemonLocalWebrtcBootstrap, DaemonModeFlags,
+    DaemonNotify, DaemonOperatorError, DaemonPackage, DaemonPackageActionRequest,
+    DaemonPackageActionRequiredReference, DaemonPackageActionState, DaemonPackageActionStatus,
+    DaemonPackageAvailability, DaemonPackageAvailabilityReason, DaemonPackageAvailabilityState,
+    DaemonPackageCompatibility, DaemonPackageConfiguration, DaemonPackageDecision,
+    DaemonPackageDependencyAvailability, DaemonPackageDiagnostic,
     DaemonPackageEnvironmentRequirement, DaemonPackageFeatureAvailability,
     DaemonPackageInstallEffect, DaemonPackageInstallPlan, DaemonPackageNavigationEntry,
     DaemonPackageNavigationSource, DaemonPackagePin, DaemonPackageProcess,
@@ -49,10 +51,10 @@ pub use botster_hub_client::{
     DaemonReadScreen, DaemonRequest, DaemonResolvedAppLaunch, DaemonResolvedSessionTemplate,
     DaemonResponse, DaemonResponseKind, DaemonSession, DaemonSessionCleanup, DaemonSessionContext,
     DaemonSessionEntity, DaemonSessionTemplate, DaemonSessionTemplateContextInput,
-    DaemonSessionTemplateRequest, DaemonSpawnTarget, DaemonSpawnTargetValidation, DaemonStatus,
-    DaemonUiTreeSnapshot, DaemonWorktree, DaemonWorktreeGitMetadata, DaemonWorktreeLifecycleEvent,
-    FEATURE_PLUGIN_SURFACE_ACTION, FEATURE_PLUGIN_SURFACE_RENDER, PROTOCOL, read_frame,
-    read_frame_from_reader, write_frame,
+    DaemonSessionTemplateRequest, DaemonSoftwareIdentity, DaemonSpawnTarget,
+    DaemonSpawnTargetValidation, DaemonStatus, DaemonUiTreeSnapshot, DaemonWorktree,
+    DaemonWorktreeGitMetadata, DaemonWorktreeLifecycleEvent, FEATURE_PLUGIN_SURFACE_ACTION,
+    FEATURE_PLUGIN_SURFACE_RENDER, PROTOCOL, read_frame, read_frame_from_reader, write_frame,
 };
 use botster_ui_contract::{
     PackageSurfaceDescriptor, PackageSurfaceKind, UiActionResult, UiActionResultState,
@@ -68,6 +70,10 @@ use tokio::task::JoinHandle;
 use crate::local_webrtc::{
     LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_FILE, LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_MAX_BYTES,
     LocalWebrtcAttachedSubscription, LocalWebrtcSenderTerminalRecord, LocalWebrtcSignalRequest,
+};
+use crate::maintenance::{
+    HubUpdateCheckPlan, execute_managed_update_check, installation_identity, plan_hub_update_check,
+    software_identity,
 };
 use crate::packages::{PackageResolvedEntrypointLaunch, resolve_entrypoint_launch_contract};
 use crate::{
@@ -208,6 +214,7 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
                         &mut daemon,
                         &mut control_state,
                         &local_webrtc_terminal_record_path,
+                        transport_runtime.handle(),
                         control_tx.clone(),
                         message,
                     ) {
@@ -891,6 +898,7 @@ fn handle_control_message(
     daemon: &mut HubDaemon,
     state: &mut DaemonControlState,
     local_webrtc_terminal_record_path: &Path,
+    transport_handle: &tokio::runtime::Handle,
     control_tx: ControlSender,
     message: ControlMessage,
 ) -> bool {
@@ -935,6 +943,40 @@ fn handle_control_message(
             reply_tx,
             response_delivery_rx,
         } => {
+            if matches!(request.as_ref(), DaemonRequest::CheckHubUpdate) {
+                return match plan_hub_update_check() {
+                    HubUpdateCheckPlan::Immediate(update) => send_control_response(
+                        reply_tx,
+                        Ok(daemon_hub_update(update)),
+                        response_delivery_rx,
+                    ),
+                    HubUpdateCheckPlan::Managed(_check) if state.hub_update_in_flight => {
+                        send_control_response(
+                            reply_tx,
+                            Ok(daemon_hub_update(DaemonHubUpdate {
+                                state: DaemonHubUpdateState::Unavailable,
+                                current_version: software_identity().version,
+                                available_version: None,
+                                build_revision: None,
+                                reason: Some("busy".to_string()),
+                                action: Some("retry".to_string()),
+                            })),
+                            response_delivery_rx,
+                        )
+                    }
+                    HubUpdateCheckPlan::Managed(check) => {
+                        state.hub_update_in_flight = true;
+                        let completion_tx = control_tx.clone();
+                        transport_handle.spawn_blocking(move || {
+                            let update = execute_managed_update_check(check);
+                            let _ = completion_tx.blocking_send(
+                                ControlMessage::HubUpdateCheckCompleted { reply_tx, update },
+                            );
+                        });
+                        false
+                    }
+                };
+            }
             let attached_change = AttachedSubscriptionChange::from_request(&request);
             let reconcile_after_request = matches!(
                 request.as_ref(),
@@ -976,6 +1018,10 @@ fn handle_control_message(
                 state.next_reconciliation = Instant::now() + ENTITY_RECONCILIATION_INTERVAL;
             }
             send_control_response(reply_tx, response, response_delivery_rx)
+        }
+        ControlMessage::HubUpdateCheckCompleted { reply_tx, update } => {
+            state.hub_update_in_flight = false;
+            send_control_response(reply_tx, Ok(daemon_hub_update(update)), None)
         }
         ControlMessage::LocalWebrtcPeerClosed {
             grant_id,
@@ -2139,6 +2185,7 @@ fn handle_runtime_control_request(
             available_packages: Vec::new(),
             install_plan: None,
             update_status: None,
+            hub_update: None,
             package_decision: None,
             lifecycle: Vec::new(),
             plugin_worker_counters: None,
@@ -2178,6 +2225,7 @@ fn handle_runtime_control_request(
         | DaemonRequest::InstallPackageRegistryEntry { .. }
         | DaemonRequest::InstallPackageLocalPath { .. }
         | DaemonRequest::CheckPackageUpdate { .. }
+        | DaemonRequest::CheckHubUpdate
         | DaemonRequest::PreviewPackageUpdate { .. }
         | DaemonRequest::ApplyPackageUpdate { .. }
         | DaemonRequest::ShowPackage { .. }
@@ -3608,6 +3656,10 @@ pub(crate) enum ControlMessage {
         reply_tx: ControlReplySender,
         response_delivery_rx: Option<mpsc::Receiver<()>>,
     },
+    HubUpdateCheckCompleted {
+        reply_tx: ControlReplySender,
+        update: DaemonHubUpdate,
+    },
     EgressWriteFailed {
         delivery_kind: DaemonDeliveryKind,
     },
@@ -3683,6 +3735,7 @@ struct DaemonControlState {
     next_reconciliation: Instant,
     released_entity_generations: u64,
     released_attach_generations: u64,
+    hub_update_in_flight: bool,
 }
 
 impl Default for DaemonControlState {
@@ -3698,6 +3751,7 @@ impl Default for DaemonControlState {
             next_reconciliation: Instant::now(),
             released_entity_generations: 0,
             released_attach_generations: 0,
+            hub_update_in_flight: false,
         }
     }
 }
@@ -4487,6 +4541,7 @@ fn daemon_response_base(kind: DaemonResponseKind) -> DaemonResponse {
         available_packages: Vec::new(),
         install_plan: None,
         update_status: None,
+        hub_update: None,
         package_decision: None,
         lifecycle: Vec::new(),
         plugin_worker_counters: None,
@@ -4520,6 +4575,12 @@ fn daemon_status(
     ));
     response.diagnostics = vec![DaemonDiagnostic::connected("status")];
     response.diagnostics.append(&mut egress_diagnostics);
+    response
+}
+
+fn daemon_hub_update(update: DaemonHubUpdate) -> DaemonResponse {
+    let mut response = daemon_response_base(DaemonResponseKind::HubUpdate);
+    response.hub_update = Some(update);
     response
 }
 
@@ -5522,7 +5583,6 @@ fn daemon_available_package_from_policy(
             .collect(),
         compatibility: DaemonPackageCompatibility {
             botster_requirement: package.compatibility.botster_requirement,
-            hub_version: package.compatibility.hub_version,
             result: package_compatibility_label(package.compatibility.result).to_string(),
             diagnostics: package.compatibility.diagnostics,
         },
@@ -6176,7 +6236,6 @@ fn package_update_plan(
                 .collect(),
             compatibility: DaemonPackageCompatibility {
                 botster_requirement: record.compatibility.botster_requirement.clone(),
-                hub_version: record.compatibility.hub_version.clone(),
                 result: package_compatibility_label(record.compatibility.result).to_string(),
                 diagnostics: record.compatibility.diagnostics.clone(),
             },
@@ -6264,6 +6323,8 @@ fn daemon_status_from_status(
         }
         .to_string(),
         compatibility: DaemonCompatibility::current(),
+        software: software_identity(),
+        installation: installation_identity(),
         host_id: status.host_id.clone(),
         host_display_name: status.host_display_name.clone(),
         schema_version: status.schema_version,
