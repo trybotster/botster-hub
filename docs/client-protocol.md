@@ -257,7 +257,7 @@ but normal client reconciliation must not poll it or maintain a list-refresh
 fallback beside the entity stream.
 
 The prepared current contract ships from
-`@trybotster/hub-test-support@0.1.23` as
+`@trybotster/hub-test-support@0.1.24` as
 `session-lifecycle-subscription-conformance-fixture.json` and through
 `readSessionLifecycleSubscriptionConformanceFixture()`. The fixture serializes
 the public `DaemonEntityFrame` DTOs and normalizes only timestamps and sequence
@@ -1050,8 +1050,9 @@ Adding the `refresh_local_packages` daemon request changes the request
 vocabulary, so `PROTOCOL_VERSION` advances to 3 alongside
 `CONFORMANCE_FIXTURE_REVISION` 18. This was a cold cut with no protocol-v2 parser
 or parallel fixture. Because `DaemonCompatibilityRequirement::current()`
-derives `protocol_version` from `PROTOCOL_VERSION`, clients built at
-this identity require a Hub at protocol version 3 or later.
+derived `protocol_version` from `PROTOCOL_VERSION`, clients built at that
+historical identity required a Hub advertising protocol version 3. Current
+protocol identities require an exact version match.
 
 Replacing revision-13 JSON byte arrays with validated `payload_base64`, literal
 `payload_encoding: "base64"`, and decoded `bytes` fields increments
@@ -1182,7 +1183,10 @@ protocol version is the single compatibility boundary.
 
 Cold-replacing the legacy operations and DTOs with authoritative session types
 advances `PROTOCOL_VERSION` to 6 and
-`CONFORMANCE_FIXTURE_REVISION` to 30. Protocol 6 requires exact protocol-version
+`CONFORMANCE_FIXTURE_REVISION` to 31. Revision 31 corrects the generated
+TypeScript discriminators for the Rust `source`- and `policy`-tagged unions and
+adds the bounded `entity_error` frame used when a resync snapshot exceeds the
+daemon frame limit. Protocol 6 requires exact protocol-version
 agreement and the `session_type_entity_subscriptions` feature before any request
 dispatch. It includes source-aware definition CRUD, provenance/editability,
 orthogonal role/interaction/traits/lifecycle fields, durable definition entity

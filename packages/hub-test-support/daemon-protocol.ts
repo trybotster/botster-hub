@@ -351,13 +351,13 @@ export interface DaemonSessionTypeContextInput {
 }
 
 export type DaemonSessionTypeMutationSource =
-  | { type: "device" }
-  | { type: "repo"; target_id: string }
-  | { type: "package"; package_name: string };
+  | { source: "device" }
+  | { source: "repo"; target_id: string }
+  | { source: "package"; package_name: string };
 
 export type DaemonSessionTypeWorkingDirectory =
-  | { type: "package_root" }
-  | { type: "relative"; path: string };
+  | { policy: "package_root" }
+  | { policy: "relative"; path: string };
 
 export interface DaemonSessionTypeDefinition {
   id: string;
@@ -840,7 +840,8 @@ export type DaemonEntityFrame =
   | { type: "entity_snapshot"; subscription_id: string; entity_type: string; snapshot_seq: number; items: JsonValue[]; resync_reason?: string | null }
   | { type: "entity_upsert"; subscription_id: string; entity_type: string; snapshot_seq: number; id: string; entity: JsonValue }
   | { type: "entity_patch"; subscription_id: string; entity_type: string; snapshot_seq: number; id: string; patch: JsonValue }
-  | { type: "entity_remove"; subscription_id: string; entity_type: string; snapshot_seq: number; id: string };
+  | { type: "entity_remove"; subscription_id: string; entity_type: string; snapshot_seq: number; id: string }
+  | { type: "entity_error"; subscription_id: string; entity_type: string; code: string; message: string };
 
 export interface DaemonSessionCleanup {
   session_id: string;

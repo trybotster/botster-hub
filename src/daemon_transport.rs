@@ -1232,20 +1232,25 @@ fn handle_control_request(
             kind,
             base_ref,
             metadata,
-        } => mutate_spawn_targets_response(daemon, |targets| {
-            crate::create_spawn_target(
-                targets,
-                SpawnTargetCreate {
-                    target_id,
-                    label,
-                    root,
-                    enabled,
-                    kind,
-                    base_ref,
-                    metadata,
-                },
-            )
-        }),
+        } => {
+            let before_session_types = session_type_definition_map(daemon)?;
+            let response = mutate_spawn_targets_response(daemon, |targets| {
+                crate::create_spawn_target(
+                    targets,
+                    SpawnTargetCreate {
+                        target_id,
+                        label,
+                        root,
+                        enabled,
+                        kind,
+                        base_ref,
+                        metadata,
+                    },
+                )
+            })?;
+            advance_session_type_generation_if_changed(daemon, &before_session_types)?;
+            Ok(response)
+        }
         DaemonRequest::UpdateSpawnTarget {
             target_id,
             label,
@@ -1254,42 +1259,55 @@ fn handle_control_request(
             kind,
             base_ref,
             metadata,
-        } => mutate_spawn_targets_with_worktrees_response(daemon, |targets, worktrees| {
-            if kind.as_deref().is_some_and(|kind| kind != "git")
-                && worktrees.iter().any(|worktree| {
-                    worktree.target_id == target_id && worktree.management == "hub_managed_git"
-                })
-            {
-                return Err(SpawnTargetError::new(
-                    "managed_worktrees_exist",
-                    "Git target cannot be reclassified while managed worktrees reference it",
-                ));
-            }
-            crate::update_spawn_target(
-                targets,
-                &target_id,
-                SpawnTargetUpdate {
-                    label,
-                    root,
-                    enabled,
-                    kind,
-                    base_ref,
-                    metadata,
+        } => {
+            let before_session_types = session_type_definition_map(daemon)?;
+            let response = mutate_spawn_targets_with_worktrees_response(
+                daemon,
+                |targets, worktrees| {
+                    if kind.as_deref().is_some_and(|kind| kind != "git")
+                        && worktrees.iter().any(|worktree| {
+                            worktree.target_id == target_id
+                                && worktree.management == "hub_managed_git"
+                        })
+                    {
+                        return Err(SpawnTargetError::new(
+                            "managed_worktrees_exist",
+                            "Git target cannot be reclassified while managed worktrees reference it",
+                        ));
+                    }
+                    crate::update_spawn_target(
+                        targets,
+                        &target_id,
+                        SpawnTargetUpdate {
+                            label,
+                            root,
+                            enabled,
+                            kind,
+                            base_ref,
+                            metadata,
+                        },
+                    )
                 },
-            )
-        }),
+            )?;
+            advance_session_type_generation_if_changed(daemon, &before_session_types)?;
+            Ok(response)
+        }
         DaemonRequest::DeleteSpawnTarget { target_id } => {
-            mutate_spawn_targets_with_worktrees_response(daemon, |targets, worktrees| {
-                if worktrees.iter().any(|worktree| {
-                    worktree.target_id == target_id && worktree.management == "hub_managed_git"
-                }) {
-                    return Err(SpawnTargetError::new(
-                        "managed_worktrees_exist",
-                        "Git target cannot be deleted while managed worktrees reference it",
-                    ));
-                }
-                crate::delete_spawn_target(targets, &target_id)
-            })
+            let before_session_types = session_type_definition_map(daemon)?;
+            let response =
+                mutate_spawn_targets_with_worktrees_response(daemon, |targets, worktrees| {
+                    if worktrees.iter().any(|worktree| {
+                        worktree.target_id == target_id && worktree.management == "hub_managed_git"
+                    }) {
+                        return Err(SpawnTargetError::new(
+                            "managed_worktrees_exist",
+                            "Git target cannot be deleted while managed worktrees reference it",
+                        ));
+                    }
+                    crate::delete_spawn_target(targets, &target_id)
+                })?;
+            advance_session_type_generation_if_changed(daemon, &before_session_types)?;
+            Ok(response)
         }
         DaemonRequest::ValidateSpawnTarget { target_id } => Ok(daemon_spawn_target_validation(
             crate::validate_spawn_target(
@@ -3795,6 +3813,13 @@ impl EntityFrameSender {
     }
 }
 
+fn entity_frame_exceeds_limit(frame: &DaemonEntityFrame) -> bool {
+    serde_json::to_vec(frame)
+        .expect("daemon entity frame values always serialize")
+        .len()
+        > DAEMON_MAX_FRAME_BYTES
+}
+
 #[derive(Debug)]
 struct EntitySubscriptionState {
     sender: EntityFrameSender,
@@ -4022,11 +4047,7 @@ fn register_entity_subscription(
             items: entities.values().cloned().collect(),
             resync_reason: None,
         };
-        if serde_json::to_vec(&snapshot)
-            .map_err(DaemonTransportError::Json)?
-            .len()
-            > DAEMON_MAX_FRAME_BYTES
-        {
+        if entity_frame_exceeds_limit(&snapshot) {
             return Ok(entity_subscription_error(
                 "entity_provider_frame_too_large",
                 &subscription_id,
@@ -4078,11 +4099,7 @@ fn register_entity_subscription(
             items,
             resync_reason: None,
         };
-        if serde_json::to_vec(&snapshot)
-            .map_err(DaemonTransportError::Json)?
-            .len()
-            > DAEMON_MAX_FRAME_BYTES
-        {
+        if entity_frame_exceeds_limit(&snapshot) {
             return Ok(entity_subscription_error(
                 "entity_provider_frame_too_large",
                 &subscription_id,
@@ -4278,6 +4295,18 @@ fn drive_session_type_subscriptions(
                 items: entities.values().cloned().collect(),
                 resync_reason: Some(reason),
             };
+            if entity_frame_exceeds_limit(&frame) {
+                let error = DaemonEntityFrame::Error {
+                    subscription_id: subscription_id.clone(),
+                    entity_type: "session_type".to_string(),
+                    code: "entity_provider_frame_too_large".to_string(),
+                    message: "session type snapshot exceeds daemon frame limit".to_string(),
+                };
+                return match subscription.sender.try_send(error) {
+                    Ok(()) | Err(EntityFrameTrySendError::Disconnected) => false,
+                    Err(EntityFrameTrySendError::Full) => true,
+                };
+            }
             return match subscription.sender.try_send(frame) {
                 Ok(()) => {
                     subscription.definition_generation = generation;
@@ -8171,6 +8200,45 @@ mod tests {
         assert_eq!(counters.entity_delivery_successes, 1);
         assert_eq!(counters.entity_delivery_overflows, 1);
         assert_eq!(counters.entity_delivery_failures, 1);
+    }
+
+    #[test]
+    fn session_type_resync_replaces_oversized_snapshot_with_typed_error() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let mut subscriptions = BTreeMap::from([(
+            "oversized-session-types".to_string(),
+            EntitySubscriptionState {
+                sender: EntityFrameSender::Blocking(sender),
+                entity_type: "session_type".to_string(),
+                cursor: None,
+                entities: BTreeMap::new(),
+                definition_generation: 1,
+                definition_entities: BTreeMap::new(),
+                resync_reason: Some("subscriber_overflow".to_string()),
+            },
+        )]);
+        let entities = BTreeMap::from([(
+            "device/oversized".to_string(),
+            serde_json::json!({ "description": "x".repeat(DAEMON_MAX_FRAME_BYTES) }),
+        )]);
+
+        drive_session_type_subscriptions(&mut subscriptions, 2, &entities);
+
+        assert!(
+            subscriptions.is_empty(),
+            "typed error closes the subscription"
+        );
+        assert!(matches!(
+            receiver.recv().expect("receive bounded typed error"),
+            DaemonEntityFrame::Error {
+                ref subscription_id,
+                ref entity_type,
+                ref code,
+                ..
+            } if subscription_id == "oversized-session-types"
+                && entity_type == "session_type"
+                && code == "entity_provider_frame_too_large"
+        ));
     }
 
     #[test]

@@ -132,10 +132,10 @@ function assertDialogFormComposition(source) {
 }
 
 assert.equal(metadata.package_name, "@trybotster/hub-test-support");
-assert.equal(metadata.package_version, "0.1.23");
+assert.equal(metadata.package_version, "0.1.24");
 assert.equal(metadata.protocol, "botster-hub-daemon-v1");
 assert.equal(metadata.protocol_version, 6);
-assert.equal(metadata.conformance_fixture_revision, 30);
+assert.equal(metadata.conformance_fixture_revision, 31);
 assert.deepEqual(metadata.ui_contract, {
   conformance_fixture_export: "@trybotster/ui-contract/conformance-fixtures",
   package_name: "@trybotster/ui-contract",
@@ -172,6 +172,10 @@ assert.match(protocol, /create_session_type/);
 assert.match(protocol, /update_session_type/);
 assert.match(protocol, /delete_session_type/);
 assert.match(protocol, /export interface DaemonSessionTypeDefinition/);
+assert.match(protocol, /\{ source: "device" \}/);
+assert.match(protocol, /\{ source: "repo"; target_id: string \}/);
+assert.match(protocol, /\{ policy: "package_root" \}/);
+assert.match(protocol, /\{ policy: "relative"; path: string \}/);
 assert.match(protocol, /export interface DaemonCompatibility/);
 assert.match(protocol, /read_screen/);
 assert.match(protocol, /read_mode_flags/);
@@ -287,7 +291,7 @@ assert.deepEqual(supportMatrix.plugin_surfaces.authored_set_values, {
   "selected-workspace": "workspace-alpha",
 });
 
-assert.equal(sessionLifecycleFixture.conformance_fixture_revision, 30);
+assert.equal(sessionLifecycleFixture.conformance_fixture_revision, 31);
 assert.equal(sessionLifecycleFixture.entity_type, "session");
 assert.deepEqual(
   sessionLifecycleFixture.normalized_frames.map((frame) => frame.type),
@@ -325,7 +329,7 @@ assert.equal(
 assert.equal(sessionLifecycleFixture.overflow.snapshot_precedes_later_deltas, true);
 assert.equal(sessionLifecycleFixture.overflow.failed_snapshot_delivery_closes_subscription, true);
 
-assert.equal(sessionPluginBindingFixture.conformance_fixture_revision, 30);
+assert.equal(sessionPluginBindingFixture.conformance_fixture_revision, 31);
 assert.equal(sessionPluginBindingFixture.binding_family, "/session");
 const sessionPluginMaterialization = materializeSessionPluginBindingScenario(
   sessionPluginBindingFixture,

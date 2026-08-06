@@ -92,6 +92,7 @@ pub(crate) fn daemon_protocol_typescript() -> String {
     emit_union(
         &mut output,
         "DaemonRequest",
+        "type",
         &[
             ("status", &[]),
             ("check_hub_update", &[]),
@@ -648,6 +649,7 @@ pub(crate) fn daemon_protocol_typescript() -> String {
     emit_union(
         &mut output,
         "DaemonSessionTypeMutationSource",
+        "source",
         &[
             ("device", &[]),
             ("repo", &[("target_id", "string")]),
@@ -657,6 +659,7 @@ pub(crate) fn daemon_protocol_typescript() -> String {
     emit_union(
         &mut output,
         "DaemonSessionTypeWorkingDirectory",
+        "policy",
         &[("package_root", &[]), ("relative", &[("path", "string")])],
     );
     emit_interface(
@@ -1261,6 +1264,7 @@ pub(crate) fn daemon_protocol_typescript() -> String {
     emit_union(
         &mut output,
         "DaemonEntityFrame",
+        "type",
         &[
             (
                 "entity_snapshot",
@@ -1299,6 +1303,15 @@ pub(crate) fn daemon_protocol_typescript() -> String {
                     ("entity_type", "string"),
                     ("snapshot_seq", "number"),
                     ("id", "string"),
+                ],
+            ),
+            (
+                "entity_error",
+                &[
+                    ("subscription_id", "string"),
+                    ("entity_type", "string"),
+                    ("code", "string"),
+                    ("message", "string"),
                 ],
             ),
         ],
@@ -1347,6 +1360,7 @@ pub(crate) fn daemon_protocol_typescript() -> String {
     emit_union(
         &mut output,
         "DaemonEvent",
+        "type",
         &[
             (
                 "session_lifecycle",
@@ -1433,11 +1447,16 @@ fn emit_string_union(output: &mut String, name: &str, values: &[&str]) {
     line(output, "");
 }
 
-fn emit_union(output: &mut String, name: &str, variants: &[(&str, &[(&str, &str)])]) {
+fn emit_union(
+    output: &mut String,
+    name: &str,
+    discriminator: &str,
+    variants: &[(&str, &[(&str, &str)])],
+) {
     line(output, &format!("export type {name} ="));
     for (index, (tag, fields)) in variants.iter().enumerate() {
         let suffix = if index + 1 == variants.len() { ";" } else { "" };
-        let mut body = format!("{{ type: \"{tag}\"");
+        let mut body = format!("{{ {discriminator}: \"{tag}\"");
         for (field, ty) in *fields {
             body.push_str(&format!("; {field}: {ty}"));
         }

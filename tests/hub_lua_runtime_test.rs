@@ -2197,13 +2197,23 @@ fn real_lua_plugin_atomically_ensures_managed_worktree_and_spawns_session() {
             name: "session_type.inspect".to_string(),
             arguments: serde_json::json!({
                 "target_id": "tgt_managed",
-                "session_type_id": "tgt_managed/init"
+                "session_type_id": "init"
             }),
         })
         .expect("inspect target-filtered templates");
     assert_eq!(inspected["list"].as_array().map(Vec::len), Some(2));
     assert_eq!(inspected["shown"]["target_id"], "tgt_managed");
     assert_eq!(inspected["shown"]["source"], "repo");
+    assert_eq!(
+        inspected["shown"]["overridden_sources"]
+            .as_array()
+            .map(Vec::len),
+        Some(1)
+    );
+    assert_eq!(
+        inspected["shown"]["diagnostics"],
+        serde_json::json!(["overrides 1 lower-precedence definition(s)"])
+    );
 
     let result = hub
         .call_plugin_mcp_tool(botster_hub::McpCallRequest {
