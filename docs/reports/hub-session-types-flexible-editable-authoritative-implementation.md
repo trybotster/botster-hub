@@ -9,6 +9,7 @@
 - Rebased target authority: `origin/main@73d5c13bb5930205b102cb28cffb7b9e40ce2699`
 - Implementation commit: `802b511ece1324fc69fda157494f006b6aa736c0`
 - Review follow-up implementation commit: `8e3eb33`
+- Qualified-ID follow-up implementation commit: `bd794ce`
 - Required Core dependency: `33ebcd98d19031d23e91b03d8da0ee3f8d1410d4`
 
 ## Guidance applied
@@ -53,8 +54,11 @@ subscription is closed.
 
 List, show, target-scoped Lua show, and resolve/spawn share the same effective
 row projection, including lower-precedence source identities and override
-diagnostics. CRUD persistence mutates a freshly loaded durable state, so an
-unrelated write made after runtime construction is preserved.
+diagnostics. Both bare IDs and fully-qualified `session_type_id` values retain
+that projection: the query-matched subset selects the winner, while all sources
+with the winner's bare ID supply lower-precedence diagnostics. CRUD persistence
+mutates a freshly loaded durable state, so an unrelated write made after
+runtime construction is preserved.
 
 Materialized spawns attach opaque `botster.session_type.*` metadata to the Core
 spawn contract. The canonical session entity projection reads that metadata
@@ -111,9 +115,11 @@ Review identified two installed first-party packages that still use the
 removed vocabulary. Separate dependent tickets were registered:
 
 - Project Pipelines `ticket_1785984129_564146`, target
-  `tgt_a72ca1a83d504385b8648f71409119ab`
+  `tgt_a72ca1a83d504385b8648f71409119ab`, project target
+  `project_target_1785985435_859966`
 - Workspaces `ticket_1785984128_479155`, target
-  `tgt_71266a8d976d4535902ffed09c18a7ba`
+  `tgt_71266a8d976d4535902ffed09c18a7ba`, project target
+  `project_target_1785985436_995496`
 
 Both depend on this Hub ticket and cover manifest keys, capability scopes, the
 Lua capability table, and `session_type_id`. This run does not edit either
@@ -145,6 +151,11 @@ downstream repository and adds no compatibility alias.
 - `cargo test -p botster-hub-client --lib` — 49 unit tests passed, including
   actual serde JSON versus generated discriminator and field checks
 - `cargo test -p botster-hub-test-support` — 42 unit tests and 3 doctests passed
+- `./test.sh --test hub_client_api_test -- --test-threads=1` — all 26 client
+  integration tests passed, including bare/qualified lookup equality and
+  preserved ambiguous-bare-ID rejection
+- `./test.sh --test hub_lua_runtime_test` — all 26 Lua integration tests passed,
+  including identical bare and fully-qualified show projections
 - `./test.sh session_type` — persistence, 9 Hub client, 3 real daemon, and 5
   Lua session-type tests passed on the rebased target
 - Bare `./test.sh` — 173 library tests, 13 CLI tests, 14 capability tests, 26
@@ -163,7 +174,8 @@ downstream repository and adds no compatibility alias.
   `DeleteSpawnTarget`, at consecutive durable generations without polling or
   reconnecting
 - List, show, resolve, and real Lua show proof assert identical override sources
-  and diagnostics for the same effective definition
+  and diagnostics for the same effective definition using both its bare ID and
+  the fully-qualified `session_type_id` returned to clients
 - A stale-runtime persistence regression writes an unrelated spawn target after
   runtime load and proves subsequent session-type CRUD preserves it
 - Oversized session-type resync proof receives the bounded typed error frame and
