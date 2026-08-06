@@ -418,14 +418,33 @@ fn mcp_status_reports_managed_receipt_without_receipt_path_or_source() {
         .expect("create managed MCP receipt parent");
     fs::write(
         &receipt,
+        // Schema 1 is cold-turkey rejected, so this fixture carries the full
+        // schema-2 shape. The daemon under test is a development build with no
+        // embedded build revision, so `build_revision` agreement is skipped
+        // rather than failed.
         serde_json::to_vec(&json!({
-            "schema_version": 1,
+            "schema_version": 2,
             "product_id": "botster-hub",
             "binary_version": env!("CARGO_PKG_VERSION"),
             "installation_mode": "managed",
             "release_channel": "stable",
             "provider": "http_json",
-            "source_url": "https://releases.example.invalid/botster-hub.json"
+            "source_url": "https://releases.example.invalid/botster-hub.json",
+            "build_revision": "release1",
+            "artifacts": [
+                {"name": "botster-hub", "sha256": "a".repeat(64), "size": 1024},
+                {"name": "botster-session-worker", "sha256": "b".repeat(64), "size": 2048}
+            ],
+            "source_revisions": {
+                "botster_hub": "0".repeat(40),
+                "botster_core": "1".repeat(40)
+            },
+            "signature": {
+                "algorithm": "ed25519",
+                "key_id": "test-only-do-not-trust",
+                "signed_manifest_sha256": "c".repeat(64)
+            },
+            "installer": {"id": "botster-hub-installer", "version": "0.1.0"}
         }))
         .expect("serialize managed MCP receipt"),
     )
@@ -453,7 +472,19 @@ fn mcp_status_reports_managed_receipt_without_receipt_path_or_source() {
     assert_eq!(status["installation"]["provider"], "http_json");
     let serialized = serde_json::to_string(status).expect("serialize managed MCP status");
     assert!(!serialized.contains(&home.display().to_string()));
-    assert!(!serialized.contains("source_url"));
+    // Schema 2 added checksum, signature, provenance, and installer facts to the
+    // receipt, so the leak assertion covers every one of them: none may reach a
+    // client through the status DTO.
+    for private in [
+        "source_url",
+        "signed_manifest_sha256",
+        "sha256",
+        "key_id",
+        "installer",
+        "source_revisions",
+    ] {
+        assert!(!serialized.contains(private), "status leaked {private}");
+    }
     fs::remove_dir_all(&home).expect("remove managed MCP home");
 }
 

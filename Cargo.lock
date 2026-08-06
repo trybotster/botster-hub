@@ -440,6 +440,7 @@ dependencies = [
  "botster-core-daemon",
  "botster-core-test-support",
  "botster-hub-client",
+ "botster-hub-installation",
  "botster-hub-test-support",
  "botster-ui-contract",
  "getrandom 0.3.4",
@@ -466,6 +467,30 @@ dependencies = [
  "botster-ui-contract",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "botster-hub-installation"
+version = "0.1.0"
+dependencies = [
+ "getrandom 0.3.4",
+ "http",
+ "libc",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "botster-hub-installer"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "botster-hub-installation",
+ "libc",
+ "ring",
+ "serde",
+ "serde_json",
+ "ureq",
 ]
 
 [[package]]
