@@ -1234,6 +1234,12 @@ fn handle_control_request(
             base_ref,
             metadata,
         } => {
+            // Only pre-check session-types once the root is known to be a directory.
+            // Non-directory roots must fall through to create_spawn_target's
+            // root_not_directory rather than a misleading invalid_repo_session_types.
+            if enabled && root.is_dir() {
+                ensure_repo_session_types_valid_for_enabled_root(&root)?;
+            }
             let before_session_types = session_type_definition_map(daemon)?;
             let response = mutate_spawn_targets_response(daemon, |targets| {
                 crate::create_spawn_target(
@@ -1261,7 +1267,22 @@ fn handle_control_request(
             base_ref,
             metadata,
         } => {
-            let before_session_types = session_type_definition_map(daemon)?;
+            let recovery_disable = enabled == Some(false);
+            if !recovery_disable {
+                ensure_update_would_not_enable_invalid_repo_session_types(
+                    daemon,
+                    &target_id,
+                    root.as_ref(),
+                    enabled,
+                )?;
+            }
+            let before_session_types = match session_type_definition_map(daemon) {
+                Ok(before) => Some(before),
+                Err(error) if recovery_disable && is_invalid_repo_session_types_error(&error) => {
+                    None
+                }
+                Err(error) => return Err(error),
+            };
             let response = mutate_spawn_targets_with_worktrees_response(
                 daemon,
                 |targets, worktrees| {
@@ -1290,11 +1311,22 @@ fn handle_control_request(
                     )
                 },
             )?;
-            advance_session_type_generation_if_changed(daemon, &before_session_types)?;
+            match before_session_types {
+                Some(before) => {
+                    advance_session_type_generation_if_changed(daemon, &before)?;
+                }
+                None => {
+                    force_advance_session_type_generation(daemon)?;
+                }
+            }
             Ok(response)
         }
         DaemonRequest::DeleteSpawnTarget { target_id } => {
-            let before_session_types = session_type_definition_map(daemon)?;
+            let before_session_types = match session_type_definition_map(daemon) {
+                Ok(before) => Some(before),
+                Err(error) if is_invalid_repo_session_types_error(&error) => None,
+                Err(error) => return Err(error),
+            };
             let response =
                 mutate_spawn_targets_with_worktrees_response(daemon, |targets, worktrees| {
                     if worktrees.iter().any(|worktree| {
@@ -1307,7 +1339,14 @@ fn handle_control_request(
                     }
                     crate::delete_spawn_target(targets, &target_id)
                 })?;
-            advance_session_type_generation_if_changed(daemon, &before_session_types)?;
+            match before_session_types {
+                Some(before) => {
+                    advance_session_type_generation_if_changed(daemon, &before)?;
+                }
+                None => {
+                    force_advance_session_type_generation(daemon)?;
+                }
+            }
             Ok(response)
         }
         DaemonRequest::ValidateSpawnTarget { target_id } => Ok(daemon_spawn_target_validation(
@@ -4055,7 +4094,19 @@ fn register_entity_subscription(
         ));
     }
     if entity_type == "session_type" {
-        let (snapshot_seq, entities) = session_type_entity_snapshot(daemon)?;
+        let (snapshot_seq, entities) = match session_type_entity_snapshot(daemon) {
+            Ok(snapshot) => snapshot,
+            Err(DaemonTransportError::Client(crate::HubClientError::SessionType {
+                kind,
+                message,
+                ..
+            })) => {
+                // Keep entity-subscription operator frames on the subscribe_entities
+                // convention (request_id = subscription_id), not list_session_types.
+                return Ok(entity_subscription_error(kind, &subscription_id, &message));
+            }
+            Err(error) => return Err(error),
+        };
         let snapshot = DaemonEntityFrame::Snapshot {
             subscription_id: subscription_id.clone(),
             entity_type: entity_type.clone(),
@@ -4252,8 +4303,15 @@ fn session_type_entity_snapshot(
         .ok_or(DaemonTransportError::DaemonNotRunning)?;
     let state = runtime.state();
     let generation = state.session_type_generation;
-    let session_types = crate::session_types::list_session_types(&records, &state)
-        .map_err(|_| DaemonTransportError::UnexpectedResponse)?;
+    let session_types =
+        crate::session_types::list_session_types(&records, &state).map_err(|error| {
+            DaemonTransportError::Client(crate::HubClientError::SessionType {
+                request_id: request_id("daemon-session-types-list"),
+                operation: crate::HubClientOperation::ListSessionTypes,
+                kind: error.kind,
+                message: error.message,
+            })
+        })?;
     let entities = session_types
         .into_iter()
         .map(daemon_session_type_from_client)
@@ -4273,6 +4331,57 @@ fn session_type_definition_map(
     session_type_entity_snapshot(daemon).map(|(_, entities)| entities)
 }
 
+fn is_invalid_repo_session_types_error(error: &DaemonTransportError) -> bool {
+    matches!(
+        error,
+        DaemonTransportError::Client(crate::HubClientError::SessionType {
+            kind: "invalid_repo_session_types",
+            ..
+        })
+    )
+}
+
+fn ensure_repo_session_types_valid_for_enabled_root(root: &Path) -> DaemonTransportResult<()> {
+    crate::session_types::validate_repo_session_types_at(root).map_err(|error| {
+        DaemonTransportError::Client(crate::HubClientError::SessionType {
+            request_id: request_id("daemon-session-types-list"),
+            operation: crate::HubClientOperation::ListSessionTypes,
+            kind: error.kind,
+            message: error.message,
+        })
+    })
+}
+
+fn ensure_update_would_not_enable_invalid_repo_session_types(
+    daemon: &HubDaemon,
+    target_id: &str,
+    root: Option<&PathBuf>,
+    enabled: Option<bool>,
+) -> DaemonTransportResult<()> {
+    let runtime = daemon
+        .runtime()
+        .ok_or(DaemonTransportError::DaemonNotRunning)?;
+    let state = runtime.state();
+    let Some(target) = state
+        .spawn_targets
+        .iter()
+        .find(|target| target.target_id == target_id)
+    else {
+        // Let the later update path return not_found.
+        return Ok(());
+    };
+    let resulting_enabled = enabled.unwrap_or(target.enabled);
+    if !resulting_enabled {
+        return Ok(());
+    }
+    let resulting_root = root.cloned().unwrap_or_else(|| target.root.clone());
+    // Defer non-directory roots to update_spawn_target's root_not_directory.
+    if !resulting_root.is_dir() {
+        return Ok(());
+    }
+    ensure_repo_session_types_valid_for_enabled_root(&resulting_root)
+}
+
 fn advance_session_type_generation_if_changed(
     daemon: &mut HubDaemon,
     before: &BTreeMap<String, Value>,
@@ -4280,7 +4389,10 @@ fn advance_session_type_generation_if_changed(
     if session_type_definition_map(daemon)? == *before {
         return Ok(());
     }
+    force_advance_session_type_generation(daemon)
+}
 
+fn force_advance_session_type_generation(daemon: &mut HubDaemon) -> DaemonTransportResult<()> {
     let runtime = daemon
         .runtime()
         .ok_or(DaemonTransportError::DaemonNotRunning)?;
