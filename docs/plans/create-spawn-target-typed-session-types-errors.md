@@ -13,7 +13,7 @@
 | --- | --- |
 | Target repository | `botster-hub` (`trybotster/botster-hub`) |
 | `target_id` | `tgt_7e208a0c76a44980a83b63af976b1f22` |
-| Base target path | `/Users/jasonconigliari/Projects/botster-hub` |
+| Base target path | hub base target checkout (`tgt_7e208a0c76a44980a83b63af976b1f22`) |
 | Pipeline worktree | session workspace on branch `project-pipelines/ticket_1786066158_557371` |
 | Ticket / run | `ticket_1786066158_557371` / `run_1786070914_398826` |
 | Pipeline | `botster_stack_delivery` step `botster_stack_plan` |
@@ -136,20 +136,20 @@ Implementation shape (smallest surgical): do **not** soft-fail global ListSessio
 
 - Tests: `./test.sh` (workspace; `BOTSTER_ENV=test cargo test --workspace`)
 - Focused: `./test.sh --test hub_daemon_lifecycle_test <filter>`
-- Strict lints (charter + prior hub runs):  
-  `cargo clippy --workspace --all-targets --all-features -- -D warnings`  
+- Strict lints (charter + prior hub runs):
+  `cargo clippy --workspace --all-targets --all-features -- -D warnings`
   `cargo fmt --all -- --check`
 - CI workflow `loaded-daemon-lifecycle.yml` does **not** run clippy/fmt — these remain **manual named gates** for Implement/Verify.
 
 ## Scope
 
-1. **Preserve operator frames on session-type snapshot failures**  
+1. **Preserve operator frames on session-type snapshot failures**
    Map `SessionTypeError` from `list_session_types` in `session_type_entity_snapshot` (and any peer hard path still using `UnexpectedResponse` for this class) to `DaemonTransportError::Client(HubClientError::SessionType { kind, message, … })` so control `or_else` returns a typed frame and keeps transport open.
 
-2. **Pre-admission validation for create / non-recovery update**  
+2. **Pre-admission validation for create / non-recovery update**
    Before persisting CreateSpawnTarget / UpdateSpawnTarget when the resulting target would be **enabled** and contribute repo session types, validate the root’s `.botster/session-types.json` with the same loader ListSessionTypes uses (`repo_session_types` + `validate_session_types`, or a thin shared wrapper). On failure: framed `invalid_repo_session_types`, **do not** admit/persist, daemon remains usable.
 
-3. **Pinned recovery path for already-admitted poison**  
+3. **Pinned recovery path for already-admitted poison**
    Implement the table above: Delete and Update(enabled=false) must succeed even when pre-mutation `session_type_definition_map` fails with `invalid_repo_session_types`. Force-advance generation after those recovery mutations. Do **not** leave recovery as “edit the file only.” Document one operator line if README/spawn-targets docs currently imply all mutations require healthy session-types materialization (only if false/misleading).
 
 4. **Regression proof** (daemon lifecycle, real daemon child / `daemon_transport_request`):
@@ -160,7 +160,7 @@ Implementation shape (smallest surgical): do **not** soft-fail global ListSessio
    - **Post-reject usability:** after rejected create, ListSpawnTargets/Status still works.
    - **Ablation:** fix reverted → create path regresses (disconnect / UnexpectedResponse / half-admit); recovery path may again be blocked — record red/green.
 
-5. **Docs**  
+5. **Docs**
    Minimal only: if needed, one sentence that invalid repo session-types reject **enabled** admission with `invalid_repo_session_types`, and that disable/delete remain the recovery path when an admitted root’s file later goes bad. No broad rewrite.
 
 ## Non-scope
@@ -257,8 +257,8 @@ Implementation shape (smallest surgical): do **not** soft-fail global ListSessio
 7. **Ablation:** fix reverted → create path fails old way; recovery path blocked or disconnects — recorded.
 8. **Focused tests:** `./test.sh --test hub_daemon_lifecycle_test <new filters>` (and any new unit tests).
 9. **Workspace tests:** `./test.sh` (or workspace form required by repo) green on post-cutover pin.
-10. **Strict Rust gates (finding_1786071655_429309):**  
-    - `cargo clippy --workspace --all-targets --all-features -- -D warnings` (zero diagnostics)  
+10. **Strict Rust gates (finding_1786071655_429309):**
+    - `cargo clippy --workspace --all-targets --all-features -- -D warnings` (zero diagnostics)
     - `cargo fmt --all -- --check`
 
 **Downstream proof**
