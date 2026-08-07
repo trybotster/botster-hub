@@ -97,9 +97,16 @@ hub-native routed envelopes and guarded notification writes:
 | Surface | Status on the product path |
 | --- | --- |
 | Attach + drain terminal egress | Product. Control ops ack through CoreDaemon; bytes arrive via drain/subscription. Late attach may replay prior output as Snapshot/Scrollback/TerminalOutput events when the worker path emits them. |
-| Hub `ReadScreen` / `ReadModeFlags` / `CaptureSnapshot` | Product. Routes `HubClientApi` → `HubRuntime` → `CoreDaemon` readback. `ReadScreen` returns session text; targeted `ReadModeFlags` returns the authoritative session id and exact `mouse_mode: u8`; `CaptureSnapshot` returns metadata only (rows/cols/format/byte count). Errors stay errors rather than fabricated mouse-off results, and mode readback has no pushed event. Opaque snapshot bytes stay on the attach/drain data plane. |
+| Hub `ReadScreen` / `ReadModeFlags` / `CaptureSnapshot` | Product. Routes `HubClientApi` → `HubRuntime` → `CoreDaemon` readback. `ReadScreen` returns session text; targeted `ReadModeFlags` returns the authoritative session id and exact `mouse_mode: u8`; `CaptureSnapshot` returns metadata only (rows/cols/format/byte count). Errors stay errors rather than fabricated mouse-off results, and mode readback has no pushed event. Opaque snapshot bytes stay on the attach/drain data plane. Hub never decodes snapshot wire magic (`GHOSTSNP`) or asserts payload layout — cold cutover is enforced in core/restty, not hub. |
 | Subscription history | Product. History and live terminal output flow through attach/drain events, not through readback responses. |
 | `report_delivery_*` pressure helpers | Still unfinished. Not exposed on the hub client product surface yet. |
+
+**Ghostty snapshot cutover:** locking hub to a core rev that emits
+`ghostty-terminal-snapshot-v1` / `GHOSTSNP` does **not** prove end-to-end
+restorability. Green hub CI only proves hub builds, opaque pass-through, and
+metadata labeling. Restorability proof lives in core + restty (and updated
+clients/WASM). Pre-cutover snapshot bytes are invalid against the new wire;
+downstream clients must consume the post-cutover restty/WASM stack.
 
 ### Product today vs still unfinished
 

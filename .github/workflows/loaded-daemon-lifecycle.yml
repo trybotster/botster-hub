@@ -109,10 +109,11 @@ jobs:
           fi
 
       - name: Install pinned Zig toolchain
-        # botster-terminal-ghostty's libghostty-vt build requires Zig 0.15.2.
+        # botster-terminal-ghostty's libghostty-vt build requires Zig 0.16.0
+        # (exact pin; matches botster-core ghostty bump / GHOSTTY_SHA build path).
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
-          version: 0.15.2
+          version: 0.16.0
           use-cache: false
 
       - name: Install pinned Rust toolchain

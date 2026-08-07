@@ -111,7 +111,7 @@ workers. The bounded run deadline therefore measures test execution under load,
 not a fresh dependency build competing with the load generators.
 
 GitHub Actions run `29439289277` proved that
-`botster-terminal-ghostty`'s `libghostty-vt` build requires Zig `0.15.2`.
+`botster-terminal-ghostty`'s `libghostty-vt` build requires Zig `0.16.0`.
 
 Each repetition has a 15-minute outer deadline. The campaign has a 330-minute
 inner deadline inside the 360-minute GitHub job timeout, leaving 30 minutes for
