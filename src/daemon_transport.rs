@@ -1234,7 +1234,10 @@ fn handle_control_request(
             base_ref,
             metadata,
         } => {
-            if enabled {
+            // Only pre-check session-types once the root is known to be a directory.
+            // Non-directory roots must fall through to create_spawn_target's
+            // root_not_directory rather than a misleading invalid_repo_session_types.
+            if enabled && root.is_dir() {
                 ensure_repo_session_types_valid_for_enabled_root(&root)?;
             }
             let before_session_types = session_type_definition_map(daemon)?;
@@ -4091,7 +4094,19 @@ fn register_entity_subscription(
         ));
     }
     if entity_type == "session_type" {
-        let (snapshot_seq, entities) = session_type_entity_snapshot(daemon)?;
+        let (snapshot_seq, entities) = match session_type_entity_snapshot(daemon) {
+            Ok(snapshot) => snapshot,
+            Err(DaemonTransportError::Client(crate::HubClientError::SessionType {
+                kind,
+                message,
+                ..
+            })) => {
+                // Keep entity-subscription operator frames on the subscribe_entities
+                // convention (request_id = subscription_id), not list_session_types.
+                return Ok(entity_subscription_error(kind, &subscription_id, &message));
+            }
+            Err(error) => return Err(error),
+        };
         let snapshot = DaemonEntityFrame::Snapshot {
             subscription_id: subscription_id.clone(),
             entity_type: entity_type.clone(),
@@ -4360,6 +4375,10 @@ fn ensure_update_would_not_enable_invalid_repo_session_types(
         return Ok(());
     }
     let resulting_root = root.cloned().unwrap_or_else(|| target.root.clone());
+    // Defer non-directory roots to update_spawn_target's root_not_directory.
+    if !resulting_root.is_dir() {
+        return Ok(());
+    }
     ensure_repo_session_types_valid_for_enabled_root(&resulting_root)
 }
 

@@ -14062,12 +14062,35 @@ fn write_repo_session_types_file(root: &Path, body: &str) {
         .expect("write repo session-types.json");
 }
 
+fn init_git_repo_with_main(root: &Path) {
+    fs::create_dir_all(root).expect("create git root");
+    run_fixture_git(None, &["init", "-b", "main", path_str(root)]);
+    run_fixture_git(Some(root), &["config", "user.email", "test@example.com"]);
+    run_fixture_git(Some(root), &["config", "user.name", "Test"]);
+    fs::write(root.join("README.md"), "session-types fixture\n").expect("write readme");
+    run_fixture_git(Some(root), &["add", "README.md"]);
+    run_fixture_git(Some(root), &["commit", "-m", "init"]);
+}
+
+fn daemon_endpoint(config: &botster_hub::HubConfig) -> botster_hub_client::DaemonEndpoint {
+    botster_hub_client::DaemonEndpoint::new(
+        config
+            .transports
+            .local_socket
+            .as_ref()
+            .expect("test config has local socket")
+            .path
+            .clone(),
+    )
+}
+
 #[test]
 fn create_spawn_target_rejects_incomplete_repo_session_types_with_typed_operator_error() {
     let _guard = daemon_test_guard();
     let data_dir = unique_short_test_dir("st-create-reject");
+    // Ticket reproduction shape: kind=git with base_ref=main.
     let target_root = unique_short_test_dir("st-create-reject-root");
-    fs::create_dir_all(&target_root).expect("create target root");
+    init_git_repo_with_main(&target_root);
     write_repo_session_types_file(&target_root, &incomplete_repo_session_types_json());
     let config = explicit_config(&data_dir);
     let child = start_cli_daemon(&data_dir);
@@ -14079,8 +14102,8 @@ fn create_spawn_target_rejects_incomplete_repo_session_types_with_typed_operator
             label: Some("Invalid Session Types".to_string()),
             root: target_root.clone(),
             enabled: true,
-            kind: Some("directory".to_string()),
-            base_ref: None,
+            kind: Some("git".to_string()),
+            base_ref: Some("main".to_string()),
             metadata: BTreeMap::new(),
         },
     )
@@ -14095,8 +14118,8 @@ fn create_spawn_target_rejects_incomplete_repo_session_types_with_typed_operator
     let error = rejected.error.as_ref().expect("operator error body");
     assert_eq!(error.code, "invalid_repo_session_types");
     assert!(
-        error.message.contains("label") || error.message.contains("invalid"),
-        "message should diagnose invalid session-types: {}",
+        error.message.contains("label"),
+        "message should diagnose missing label field: {}",
         error.message
     );
 
@@ -14120,7 +14143,7 @@ fn create_spawn_target_rejects_incomplete_repo_session_types_with_typed_operator
 
     // Positive control: complete PackageSessionType shape admits and qualifies.
     let good_root = unique_short_test_dir("st-create-good-root");
-    fs::create_dir_all(&good_root).expect("create good root");
+    init_git_repo_with_main(&good_root);
     write_repo_session_types_file(&good_root, &complete_repo_session_types_json("acceptance"));
     let created = botster_hub::daemon_transport_request(
         &config,
@@ -14129,8 +14152,8 @@ fn create_spawn_target_rejects_incomplete_repo_session_types_with_typed_operator
             label: Some("Valid Session Types".to_string()),
             root: good_root,
             enabled: true,
-            kind: Some("directory".to_string()),
-            base_ref: None,
+            kind: Some("git".to_string()),
+            base_ref: Some("main".to_string()),
             metadata: BTreeMap::new(),
         },
     )
@@ -14157,6 +14180,42 @@ fn create_spawn_target_rejects_incomplete_repo_session_types_with_typed_operator
             .iter()
             .map(|row| &row.session_type_id)
             .collect::<Vec<_>>()
+    );
+
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
+fn create_spawn_target_enabled_file_root_returns_root_not_directory() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_short_test_dir("st-create-file-root");
+    let file_root = unique_short_test_dir("st-create-file-root-path");
+    fs::write(&file_root, "not a directory\n").expect("write regular file as root");
+    let config = explicit_config(&data_dir);
+    let child = start_cli_daemon(&data_dir);
+
+    let rejected = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::CreateSpawnTarget {
+            target_id: Some("tgt_file_root".to_string()),
+            label: Some("File Root".to_string()),
+            root: file_root,
+            enabled: true,
+            kind: Some("directory".to_string()),
+            base_ref: None,
+            metadata: BTreeMap::new(),
+        },
+    )
+    .expect("file root create must keep transport open");
+    assert_eq!(
+        rejected.kind,
+        botster_hub::DaemonResponseKind::OperatorError
+    );
+    assert_eq!(
+        rejected.error.as_ref().map(|error| error.code.as_str()),
+        Some("root_not_directory"),
+        "enabled pre-check must not replace root_not_directory with invalid_repo_session_types: {:?}",
+        rejected.error
     );
 
     shutdown_cli_daemon(&data_dir, child);
@@ -14224,6 +14283,72 @@ fn update_spawn_target_rejects_enable_with_invalid_repo_session_types() {
 }
 
 #[test]
+fn update_spawn_target_rejects_repoint_to_invalid_repo_session_types() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_short_test_dir("st-update-repoint");
+    let good_root = unique_short_test_dir("st-update-repoint-good");
+    let bad_root = unique_short_test_dir("st-update-repoint-bad");
+    fs::create_dir_all(&good_root).expect("create good root");
+    fs::create_dir_all(&bad_root).expect("create bad root");
+    write_repo_session_types_file(&good_root, &complete_repo_session_types_json("repo-agent"));
+    write_repo_session_types_file(&bad_root, &incomplete_repo_session_types_json());
+    let config = explicit_config(&data_dir);
+    let child = start_cli_daemon(&data_dir);
+
+    let created = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::CreateSpawnTarget {
+            target_id: Some("tgt_repoint".to_string()),
+            label: Some("Repoint Target".to_string()),
+            root: good_root.clone(),
+            enabled: true,
+            kind: Some("directory".to_string()),
+            base_ref: None,
+            metadata: BTreeMap::new(),
+        },
+    )
+    .expect("admit valid target");
+    assert_eq!(created.kind, botster_hub::DaemonResponseKind::SpawnTargets);
+    let original_root = created.spawn_targets[0].root.clone();
+
+    let rejected = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::UpdateSpawnTarget {
+            target_id: "tgt_repoint".to_string(),
+            label: None,
+            root: Some(bad_root),
+            enabled: None,
+            kind: None,
+            base_ref: None,
+            metadata: None,
+        },
+    )
+    .expect("repoint to invalid session-types must keep transport open");
+    assert_eq!(
+        rejected.kind,
+        botster_hub::DaemonResponseKind::OperatorError
+    );
+    assert_eq!(
+        rejected.error.as_ref().map(|error| error.code.as_str()),
+        Some("invalid_repo_session_types")
+    );
+
+    let shown = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::ShowSpawnTarget {
+            target_id: "tgt_repoint".to_string(),
+        },
+    )
+    .expect("show after rejected repoint");
+    assert_eq!(
+        shown.spawn_targets[0].root, original_root,
+        "rejected repoint must leave stored root unchanged"
+    );
+
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
 fn poison_recovery_delete_succeeds_under_invalid_repo_session_types() {
     let _guard = daemon_test_guard();
     let data_dir = unique_short_test_dir("st-poison-delete");
@@ -14234,11 +14359,28 @@ fn poison_recovery_delete_succeeds_under_invalid_repo_session_types() {
         &complete_repo_session_types_json("repo-agent"),
     );
     let config = explicit_config(&data_dir);
+    let endpoint = daemon_endpoint(&config);
     let child = start_cli_daemon(&data_dir);
 
-    let created = botster_hub::daemon_transport_request(
-        &config,
-        botster_hub::DaemonRequest::CreateSpawnTarget {
+    // Subscriber oracle pins force_advance_session_type_generation on recovery.
+    let mut subscription =
+        botster_hub_client::subscribe_entities(&endpoint, "session_type", "st-poison-delete-sub")
+            .expect("subscribe before admit");
+    subscription
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("bound entity reads");
+    assert!(matches!(
+        subscription.next_frame().expect("initial empty snapshot"),
+        botster_hub_client::DaemonEntityFrame::Snapshot {
+            snapshot_seq: 0,
+            ref items,
+            ..
+        } if items.is_empty()
+    ));
+
+    botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::CreateSpawnTarget {
             target_id: Some("tgt_poison_delete".to_string()),
             label: Some("Poison Delete".to_string()),
             root: target_root.clone(),
@@ -14249,7 +14391,14 @@ fn poison_recovery_delete_succeeds_under_invalid_repo_session_types() {
         },
     )
     .expect("admit valid target before poison");
-    assert_eq!(created.kind, botster_hub::DaemonResponseKind::SpawnTargets);
+    assert!(matches!(
+        subscription.next_frame().expect("repo definition upsert"),
+        botster_hub_client::DaemonEntityFrame::Upsert {
+            snapshot_seq: 1,
+            ref id,
+            ..
+        } if id == "tgt_poison_delete/repo-agent"
+    ));
 
     write_repo_session_types_file(&target_root, &incomplete_repo_session_types_json());
 
@@ -14270,6 +14419,59 @@ fn poison_recovery_delete_succeeds_under_invalid_repo_session_types() {
         Some("invalid_repo_session_types")
     );
 
+    // Non-recovery mutation under already-admitted poison must frame, not disconnect.
+    let second_root = unique_short_test_dir("st-poison-delete-second");
+    fs::create_dir_all(&second_root).expect("create second root");
+    write_repo_session_types_file(
+        &second_root,
+        &complete_repo_session_types_json("second-agent"),
+    );
+    let create_while_poisoned = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::CreateSpawnTarget {
+            target_id: Some("tgt_while_poisoned".to_string()),
+            label: Some("While Poisoned".to_string()),
+            root: second_root,
+            enabled: true,
+            kind: Some("directory".to_string()),
+            base_ref: None,
+            metadata: BTreeMap::new(),
+        },
+    )
+    .expect("create under global poison must keep transport open");
+    assert_eq!(
+        create_while_poisoned.kind,
+        botster_hub::DaemonResponseKind::OperatorError
+    );
+    assert_eq!(
+        create_while_poisoned
+            .error
+            .as_ref()
+            .map(|error| error.code.as_str()),
+        Some("invalid_repo_session_types")
+    );
+
+    // Subscribe after poison: entity surface must frame with subscribe_entities, not disconnect.
+    let subscribe_poisoned = botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::SubscribeEntities {
+            entity_type: "session_type".to_string(),
+            subscription_id: "st-poison-delete-late-sub".to_string(),
+        },
+    )
+    .expect("subscribe under poison must keep transport open");
+    assert_eq!(
+        subscribe_poisoned.kind,
+        botster_hub_client::DaemonResponseKind::OperatorError
+    );
+    let sub_error = subscribe_poisoned
+        .error
+        .as_ref()
+        .expect("subscribe operator error");
+    assert_eq!(sub_error.code, "invalid_repo_session_types");
+    assert_eq!(sub_error.operation, "subscribe_entities");
+    assert_eq!(sub_error.request_id, "st-poison-delete-late-sub");
+
     // Independent recovery case: Delete under poison with no prior disable.
     let deleted = botster_hub::daemon_transport_request(
         &config,
@@ -14280,6 +14482,18 @@ fn poison_recovery_delete_succeeds_under_invalid_repo_session_types() {
     .expect("delete under poison must keep transport open");
     assert_eq!(deleted.kind, botster_hub::DaemonResponseKind::SpawnTargets);
     assert_eq!(deleted.spawn_targets[0].target_id, "tgt_poison_delete");
+
+    // Forced generation advance is required for subscribers to converge after recovery.
+    assert!(matches!(
+        subscription
+            .next_frame()
+            .expect("remove after poison delete recovery"),
+        botster_hub_client::DaemonEntityFrame::Remove {
+            snapshot_seq,
+            ref id,
+            ..
+        } if snapshot_seq > 1 && id == "tgt_poison_delete/repo-agent"
+    ));
 
     let listed = botster_hub::daemon_transport_request(
         &config,
@@ -14305,6 +14519,7 @@ fn poison_recovery_delete_succeeds_under_invalid_repo_session_types() {
         botster_hub::DaemonResponseKind::SessionTypes
     );
 
+    drop(subscription);
     shutdown_cli_daemon(&data_dir, child);
 }
 
@@ -14319,11 +14534,27 @@ fn poison_recovery_disable_succeeds_under_invalid_repo_session_types() {
         &complete_repo_session_types_json("repo-agent"),
     );
     let config = explicit_config(&data_dir);
+    let endpoint = daemon_endpoint(&config);
     let child = start_cli_daemon(&data_dir);
 
-    let created = botster_hub::daemon_transport_request(
-        &config,
-        botster_hub::DaemonRequest::CreateSpawnTarget {
+    let mut subscription =
+        botster_hub_client::subscribe_entities(&endpoint, "session_type", "st-poison-disable-sub")
+            .expect("subscribe before admit");
+    subscription
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("bound entity reads");
+    assert!(matches!(
+        subscription.next_frame().expect("initial empty snapshot"),
+        botster_hub_client::DaemonEntityFrame::Snapshot {
+            snapshot_seq: 0,
+            ref items,
+            ..
+        } if items.is_empty()
+    ));
+
+    botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::CreateSpawnTarget {
             target_id: Some("tgt_poison_disable".to_string()),
             label: Some("Poison Disable".to_string()),
             root: target_root.clone(),
@@ -14334,7 +14565,14 @@ fn poison_recovery_disable_succeeds_under_invalid_repo_session_types() {
         },
     )
     .expect("admit valid target before poison");
-    assert_eq!(created.kind, botster_hub::DaemonResponseKind::SpawnTargets);
+    assert!(matches!(
+        subscription.next_frame().expect("repo definition upsert"),
+        botster_hub_client::DaemonEntityFrame::Upsert {
+            snapshot_seq: 1,
+            ref id,
+            ..
+        } if id == "tgt_poison_disable/repo-agent"
+    ));
 
     write_repo_session_types_file(&target_root, &incomplete_repo_session_types_json());
 
@@ -14372,6 +14610,17 @@ fn poison_recovery_disable_succeeds_under_invalid_repo_session_types() {
     assert_eq!(disabled.kind, botster_hub::DaemonResponseKind::SpawnTargets);
     assert!(!disabled.spawn_targets[0].enabled);
 
+    assert!(matches!(
+        subscription
+            .next_frame()
+            .expect("remove after poison disable recovery"),
+        botster_hub_client::DaemonEntityFrame::Remove {
+            snapshot_seq,
+            ref id,
+            ..
+        } if snapshot_seq > 1 && id == "tgt_poison_disable/repo-agent"
+    ));
+
     let recovered_list = botster_hub::daemon_transport_request(
         &config,
         botster_hub::DaemonRequest::ListSessionTypes,
@@ -14405,6 +14654,7 @@ fn poison_recovery_disable_succeeds_under_invalid_repo_session_types() {
         Some("invalid_repo_session_types")
     );
 
+    drop(subscription);
     shutdown_cli_daemon(&data_dir, child);
 }
 
