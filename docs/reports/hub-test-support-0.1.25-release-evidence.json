@@ -1,0 +1,96 @@
+{
+  "ticket_id": "ticket_1786042460_231768",
+  "run_id": "run_1786060049_244982",
+  "target_repository": "trybotster/botster-hub",
+  "target_id": "tgt_7e208a0c76a44980a83b63af976b1f22",
+  "coordinate": "@trybotster/hub-test-support@0.1.25",
+  "release_tree_commit": "c57d3889916f8ff35438565efd34b1ac4ada82aa",
+  "source_contract_commit": "6ad6dfadef61cccd559fecc6536f2d391888cac2",
+  "source_pr": "https://github.com/trybotster/botster-hub/pull/195",
+  "branch": "project-pipelines/ticket_1786042460_231768",
+  "pr_url": "https://github.com/trybotster/botster-hub/pull/196",
+  "do_not_republish": true,
+  "publisher": {
+    "npm_whoami": "tonksthebear",
+    "path": "human operator after npm token fix; not agent-run publish",
+    "question_id": "question_1786061672_263057"
+  },
+  "registry": {
+    "version": "0.1.25",
+    "dist_integrity": "sha512-hQl9j0a01tBC9y3KrtTb0bGDO3KYjlC+2kJ07WdGAgAzJhMKlsVcVTqboCVsYioXG7fHg6VwCMbyiIGtoS5LFQ==",
+    "dist_shasum": "2feb30d45c95465e9ff2b04f2b8afbfbe18637f5",
+    "dist_tarball": "https://registry.npmjs.org/@trybotster/hub-test-support/-/hub-test-support-0.1.25.tgz"
+  },
+  "dry_run": {
+    "command": "script/publish-npm-packages --dry-run",
+    "exit_code": 0,
+    "local_hub_tarball_integrity_matches_registry": true,
+    "accepted_as_publication": false
+  },
+  "local_pack_accepted_as_final_proof": false,
+  "metadata": {
+    "package_version": "0.1.25",
+    "protocol_version": 6,
+    "conformance_fixture_revision": 32,
+    "daemon_protocol_sha256": "fb441d038011b940db43618864bfab061bdd5baf586bfe274eea3270d3e46d69",
+    "ui_contract": "@trybotster/ui-contract@0.3.1"
+  },
+  "external_smoke": {
+    "method": "fresh temp directory; npm install @trybotster/hub-test-support@0.1.25 --prefer-online",
+    "results": {
+      "E1_import": true,
+      "E2_package_version": "0.1.25",
+      "E3_protocol_version": 6,
+      "E4_conformance_fixture_revision": 32,
+      "E5_verifyPackageAssets": true,
+      "E6_show_session_type_definition": true,
+      "E6_session_type_definition_editable": true,
+      "E7_direct_daemon_protocol_sha256": "fb441d038011b940db43618864bfab061bdd5baf586bfe274eea3270d3e46d69",
+      "E7_metadata_daemon_protocol_sha256": "fb441d038011b940db43618864bfab061bdd5baf586bfe274eea3270d3e46d69",
+      "E7_match": true,
+      "E8_matrix_request_type": "show_session_type_definition",
+      "E9_matrix_read_only_error_kind": "read_only_session_type_source",
+      "E9_protocol_ts_lacks_refusal_token": true,
+      "E10_install_command_names_0_1_25": true,
+      "E10_package_spec_names_0_1_25": true,
+      "E10_published_coordinate_sentence_names_0_1_25": true,
+      "E10_pin_sites_name_0_1_25": true,
+      "E10b_published_narrative_block_stale_for_0_1_24": true,
+      "E10b_status": "known_defect_in_published_0.1.25_not_repairable_in_registry"
+    },
+    "all_machine_checks_passed": true,
+    "pin_site_checks_passed": true,
+    "narrative_block_in_published_tarball": "known_defect"
+  },
+  "known_defect_published_0_1_25_readme_narrative": {
+    "do_not_republish": true,
+    "do_not_allocate_0_1_26_for_prose": true,
+    "published_tarball": "coordinate-narrative block still names 0.1.24 as next cold consumer coordinate and attributes session-type request/response to revision 31",
+    "in_repo_fix": "README narrative rewritten to 0.1.25 / conformance 32 / authoring view; 0.1.24 and 0.1.21 demoted to past tense; pin-site test guard added",
+    "consumer_guidance": "ticket_1786039279_917823 must pin from install command, package-spec JSON, and published-coordinate sentence — not the historical narrative block in the published tarball"
+  },
+  "readme_published_coordinate_wording": "@trybotster/hub-test-support@0.1.25 is the published coordinate that carries the session-type authoring view (show_session_type_definition, conformance fixture revision 32, protocol version 6). First-party clients should pin this coordinate for authoring-view support.",
+  "files_changed": [
+    "packages/hub-test-support/package.json",
+    "packages/hub-test-support/README.md",
+    "packages/hub-test-support/metadata.json",
+    "packages/hub-test-support/test.mjs",
+    "docs/plans/publish-session-type-authoring-view-test-support-coordinate.md",
+    "docs/reports/hub-test-support-0.1.25-release.md",
+    "docs/reports/hub-test-support-0.1.25-release-evidence.json"
+  ],
+  "deviations_from_plan": [
+    "test.mjs package_version assert updated to 0.1.25 (suite companion)",
+    "publish performed by human operator tonksthebear after auth fix, not agent-run script/publish-npm-packages",
+    "post-Review: in-repo README narrative rewrite + pin-site suite guard + E10/E10b evidence honesty + PR link registration; no republish"
+  ],
+  "review_findings_addressed": [
+    "finding_1786063163_457357",
+    "finding_1786063163_431508",
+    "finding_1786063163_828549",
+    "finding_1786063163_755834"
+  ],
+  "review_findings_info_no_action": [
+    "finding_1786063163_551882"
+  ]
+}
