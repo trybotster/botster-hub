@@ -979,6 +979,15 @@ fn repo_session_types(root: &Path) -> SessionTypeResult<Vec<PackageSessionType>>
     }
 }
 
+/// Validate repo-local `.botster/session-types.json` at `root` with the same
+/// loader ListSessionTypes uses. Missing file is valid (empty contribution).
+pub fn validate_repo_session_types_at(root: &Path) -> SessionTypeResult<()> {
+    let session_types = repo_session_types(root)?;
+    validate_session_types(&session_types)
+        .map_err(|message| SessionTypeError::new("invalid_repo_session_types", message))?;
+    Ok(())
+}
+
 fn validate_session_type(session_type: &PackageSessionType) -> SessionTypeResult<()> {
     if !bounded_token(&session_type.id, 128, false) {
         return Err(SessionTypeError::new(

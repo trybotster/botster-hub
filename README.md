@@ -1179,7 +1179,11 @@ from command, name, owner, or duration.
 
 Hub-owned spawn targets are local directory admissions with stable `target_id`,
 label, root, enabled state, kind, optional `base_ref`, and small sanitized metadata.
-They are hub policy state, not `botster-core` state. Plugins reference target
+They are hub policy state, not `botster-core` state. Enabling or admitting a target
+whose root has invalid `.botster/session-types.json` returns a typed
+`invalid_repo_session_types` operator error without dropping the daemon connection;
+disable or delete remain the recovery path when an already-admitted root's file later
+goes bad. Plugins reference target
 ids and may list or validate them through Lua capabilities, while create,
 update, and delete stay on the daemon/CLI operator path. `kind = "directory"`
 keeps the generic behavior and does not imply Git even when the directory is a
