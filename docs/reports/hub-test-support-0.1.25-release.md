@@ -43,9 +43,9 @@ session-type authoring view as a new unused npm coordinate above `0.1.24`.
 Files changed on the release branch:
 
 - `packages/hub-test-support/package.json` — version `0.1.25`
-- `packages/hub-test-support/README.md` — install pin, package-spec JSON, published-coordinate sentence (final wording: pinable authoring-view coordinate)
+- `packages/hub-test-support/README.md` — install pin, package-spec JSON, published-coordinate sentence, and (post-Review) current-contract narrative for 0.1.25 / rev 32 authoring view
 - `packages/hub-test-support/metadata.json` — regenerated `package_version` `0.1.25`
-- `packages/hub-test-support/test.mjs` — package_version assert `0.1.25` (suite companion)
+- `packages/hub-test-support/test.mjs` — package_version assert `0.1.25` plus README pin-site guard
 - `docs/plans/publish-session-type-authoring-view-test-support-coordinate.md` — approved plan rev 2
 - `docs/reports/hub-test-support-0.1.25-release.md` — this report
 - `docs/reports/hub-test-support-0.1.25-release-evidence.json` — machine-readable evidence
@@ -76,9 +76,9 @@ ui-contract, daemon Rust admission code, `docs/client-protocol.md`, root `README
 
 Integrity matches the dry-run local packed hub tarball.
 
-## README published-coordinate wording (E10)
+## README published-coordinate wording (E10 pin sites)
 
-Shipped in the tarball:
+Pin sites present in both the published tarball and the in-repo HEAD:
 
 > `@trybotster/hub-test-support@0.1.25` is the published coordinate that carries
 > the session-type authoring view (`show_session_type_definition`, conformance
@@ -87,6 +87,34 @@ Shipped in the tarball:
 
 Install line pins `@trybotster/hub-test-support@0.1.25`. Package-spec JSON uses `"0.1.25"`.
 The old “separately routed release ticket / must not pin until integrity” caveat was **not** carried forward.
+
+Downstream consumers (`ticket_1786039279_917823`) should pin from the install
+command, the package-spec JSON, and the published-coordinate sentence above —
+not from the historical coordinate-narrative block described next.
+
+## Known defect in the published 0.1.25 tarball
+
+**Do not republish and do not allocate 0.1.26** for this prose-only defect.
+Machine-checkable package bytes (protocol, metadata, matrix, fixtures) are
+correct and publication provenance matches release tree `c57d388`.
+
+The **published** `@trybotster/hub-test-support@0.1.25` tarball README’s
+coordinate-narrative block (approximately lines 105–119 at publish time) still
+says “Version 0.1.24 is the next cold consumer coordinate”, claims “0.1.21
+remains the currently published npm coordinate”, and attributes “authoritative
+session-type request/response” to 0.1.24 / revision 31. That block is **not**
+repairable inside immutable 0.1.25.
+
+In-repo (this branch, post-Review), that narrative is rewritten so the current
+contract paragraph describes 0.1.25 / conformance revision 32 / the authoring
+view, and demotes 0.1.24 / 0.1.21 to past-tense history without a self-referential
+“next cold consumer coordinate” claim. A package-suite guard now ties README
+install / package-spec pin sites to `package.json` version.
+
+| Surface | Authoring pin sites | Narrative block :105–119 |
+| --- | --- | --- |
+| Published 0.1.25 tarball | correct (`0.1.25`) | **stale** (0.1.24 / rev 31 language) — known defect |
+| In-repo branch after Review fix | correct (`0.1.25`) | corrected (0.1.25 / rev 32 authoring view) |
 
 ## Tests and proof
 
@@ -130,13 +158,14 @@ npm install @trybotster/hub-test-support@0.1.25 --prefer-online
 | E7 | Direct SHA-256 of installed `daemon-protocol.ts` = `fb441d038011b940db43618864bfab061bdd5baf586bfe274eea3270d3e46d69` and equals metadata | pass |
 | E8 | matrix `session_type_authoring.request_type === "show_session_type_definition"` | pass |
 | E9 | matrix `read_only_error_kind === "read_only_session_type_source"`; token **absent** from protocol.ts (expected) | pass |
-| E10 | Installed README names `@trybotster/hub-test-support@0.1.25` and does not instruct `0.1.24` as the authoring pin | pass |
+| E10 | Installed README install command, package-spec JSON, and published-coordinate sentence all name `0.1.25` | pass (pin sites only) |
+| E10b | Installed README coordinate-narrative block still names 0.1.24 as next cold consumer / attributes session-type request-response to rev 31 | **known defect in published 0.1.25**; not repairable in-registry; fixed in-repo post-Review |
 
 ## Deviations from plan
 
 1. **`packages/hub-test-support/test.mjs` version assert** updated to `0.1.25`. Required for the package suite (established per-release practice); not listed under “expected edits” but implied by acceptance check 5.
 2. **Publish executed by human operator** (`tonksthebear`) outside the agent environment after fixing the rejected npm token, rather than the agent running `script/publish-npm-packages`. Sanctioned path; identity recorded. Agent did not invent an alternate channel.
-3. No other deviations.
+3. **Post-Review (no republish):** rewrite in-repo README coordinate narrative for 0.1.25/rev 32; add README pin-site suite guard; correct evidence honesty for E10/E10b; register PR link with Project Pipelines. Does not change the immutable published tarball.
 
 ## Cross-repo / residual
 

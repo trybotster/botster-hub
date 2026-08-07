@@ -136,6 +136,45 @@ assert.equal(metadata.package_version, "0.1.25");
 assert.equal(metadata.protocol, "botster-hub-daemon-v1");
 assert.equal(metadata.protocol_version, 6);
 assert.equal(metadata.conformance_fixture_revision, 32);
+
+// Package README ships in the npm tarball; keep install pin sites tied to package.json.
+{
+  const packageJson = JSON.parse(
+    readFileSync(new URL("./package.json", import.meta.url), "utf8"),
+  );
+  const readme = readFileSync(new URL("./README.md", import.meta.url), "utf8");
+  const version = packageJson.version;
+  assert.equal(metadata.package_version, version);
+  assert.match(
+    readme,
+    new RegExp(
+      String.raw`npm install --save-dev @trybotster/ui-contract@0\.3\.1 @trybotster/hub-test-support@${version.replaceAll(".", String.raw`\.`)}`,
+    ),
+    "README install command must pin the package.json version",
+  );
+  assert.match(
+    readme,
+    new RegExp(
+      String.raw`"@trybotster/hub-test-support": "${version.replaceAll(".", String.raw`\.`)}"`,
+    ),
+    "README package-spec JSON must pin the package.json version",
+  );
+  const pinCoords = [
+    ...readme.matchAll(/@trybotster\/hub-test-support@(\d+\.\d+\.\d+)/g),
+  ].map((match) => match[1]);
+  assert.ok(pinCoords.length > 0, "README must name the published package coordinate");
+  for (const pinned of pinCoords) {
+    assert.equal(
+      pinned,
+      version,
+      `README package coordinate pin must be ${version}, found @${pinned}`,
+    );
+  }
+  const packageSpecPins = [
+    ...readme.matchAll(/"@trybotster\/hub-test-support":\s*"([^"]+)"/g),
+  ].map((match) => match[1]);
+  assert.deepEqual(packageSpecPins, [version]);
+}
 assert.deepEqual(metadata.ui_contract, {
   conformance_fixture_export: "@trybotster/ui-contract/conformance-fixtures",
   package_name: "@trybotster/ui-contract",
