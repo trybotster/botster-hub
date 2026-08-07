@@ -2626,11 +2626,29 @@ fn late_attach_receives_opaque_history_before_later_live_output() {
         !history_data.is_empty(),
         "late subscription should receive opaque initial state, got {events:?}"
     );
+    // Opacity is typed pass-through (Snapshot/Scrollback via history_payload), not
+    // UTF-8 absence. ghostty-terminal-snapshot-v1 / GHOSTSNP embeds screen cell
+    // bytes that may contain the same text as ReadScreen; hub must not re-emit
+    // that prior live content as TerminalOutput, decode wire magic, or use
+    // opaque bytes as the renderable surface. ReadScreen (asserted above)
+    // remains the authority for visible text.
+    // Falsifiable: late sub must not re-receive prior live TerminalOutput for
+    // the before-late marker (history_payload-prefiltered Snapshot/Scrollback
+    // checks are tautological and intentionally omitted).
+    let initial_history_as_terminal_output = events.iter().any(|event| {
+        matches!(
+            event,
+            HubClientEvent::TerminalOutput {
+                subscription_id,
+                data,
+                ..
+            } if subscription_id == &late_subscription
+                && data.windows(b"before-late".len()).any(|window| window == b"before-late")
+        )
+    });
     assert!(
-        !history_data
-            .windows(b"before-late".len())
-            .any(|window| window == b"before-late"),
-        "opaque snapshot bytes must not be treated as the renderable ReadScreen marker"
+        !initial_history_as_terminal_output,
+        "renderable prior output must not be re-emitted as TerminalOutput history for the late subscription, got {events:?}"
     );
     let history_index = history_events
         .first()
