@@ -102,21 +102,26 @@ Only `read_screen_text` is renderable restored content; `snapshot` and
 version 0.1.5 / revision 12 exposes lossy string history. Neither is current
 binary-history contract authority.
 
-Version 0.1.24 is the next cold consumer coordinate. Version 0.1.22 is the
-repository baseline coordinate, while version 0.1.21 remains the currently
-published npm coordinate. Version
-0.1.17 was published with stale protocol bytes and is not a valid consumer
-coordinate. Version 0.1.24 carries protocol version 6 / conformance revision
-31, authoritative software/install identity,
-`CheckHubUpdate`, and the cold removal of package compatibility `hub_version`.
-It retains the generic package-owned entity records and the
-`plugin_entity_subscriptions` compatibility feature, adds authoritative
-session-type request/response and entity records, and requires the
-`session_type_entity_subscriptions` feature. It
+Version 0.1.25 is the published npm coordinate for this package. It carries
+protocol version 6 / conformance revision 32 and the session-type authoring
+view (`show_session_type_definition`, editable `session_type_definition`
+response vocabulary, and the support-matrix `session_type_authoring` section
+including the `read_only_session_type_source` refusal). It retains the generic
+package-owned entity records and the `plugin_entity_subscriptions`
+compatibility feature, authoritative session-type request/response and entity
+records, and requires the `session_type_entity_subscriptions` feature. It
 depends on `@trybotster/ui-contract@0.3.1` for the canonical UiNode,
 UiActionRequest, UiActionResult, package surface, and package navigation
 declarations and conformance fixtures. It also carries the optional
 aggregate plugin-worker counters prepared in the unpublished 0.1.15 artifact.
+
+Version 0.1.24 was the prior published coordinate at protocol version 6 /
+conformance revision 31 (authoritative software/install identity,
+`CheckHubUpdate`, and the cold removal of package compatibility `hub_version`,
+without the authoring-view request). Version 0.1.22 was the repository
+baseline coordinate. Version 0.1.21 was an earlier published npm coordinate.
+Version 0.1.17 was published with stale protocol bytes and is not a valid
+consumer coordinate.
 Revision 20 remains the already-published version 0.1.12 application-primitives
 contract; revision 21 adds spawn-target `base_ref` and worktree `management`
 without reusing those bytes; revision 22 makes the live presentation Dialog

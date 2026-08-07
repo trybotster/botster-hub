@@ -8,6 +8,8 @@
   "source_contract_commit": "6ad6dfadef61cccd559fecc6536f2d391888cac2",
   "source_pr": "https://github.com/trybotster/botster-hub/pull/195",
   "branch": "project-pipelines/ticket_1786042460_231768",
+  "pr_url": "https://github.com/trybotster/botster-hub/pull/196",
+  "do_not_republish": true,
   "publisher": {
     "npm_whoami": "tonksthebear",
     "path": "human operator after npm token fix; not agent-run publish",
@@ -49,11 +51,23 @@
       "E8_matrix_request_type": "show_session_type_definition",
       "E9_matrix_read_only_error_kind": "read_only_session_type_source",
       "E9_protocol_ts_lacks_refusal_token": true,
-      "E10_readme_names_0_1_25": true,
-      "E10_install_pin_0_1_25": true,
-      "E10_not_instructing_0_1_24_as_authoring_pin": true
+      "E10_install_command_names_0_1_25": true,
+      "E10_package_spec_names_0_1_25": true,
+      "E10_published_coordinate_sentence_names_0_1_25": true,
+      "E10_pin_sites_name_0_1_25": true,
+      "E10b_published_narrative_block_stale_for_0_1_24": true,
+      "E10b_status": "known_defect_in_published_0.1.25_not_repairable_in_registry"
     },
-    "all_passed": true
+    "all_machine_checks_passed": true,
+    "pin_site_checks_passed": true,
+    "narrative_block_in_published_tarball": "known_defect"
+  },
+  "known_defect_published_0_1_25_readme_narrative": {
+    "do_not_republish": true,
+    "do_not_allocate_0_1_26_for_prose": true,
+    "published_tarball": "coordinate-narrative block still names 0.1.24 as next cold consumer coordinate and attributes session-type request/response to revision 31",
+    "in_repo_fix": "README narrative rewritten to 0.1.25 / conformance 32 / authoring view; 0.1.24 and 0.1.21 demoted to past tense; pin-site test guard added",
+    "consumer_guidance": "ticket_1786039279_917823 must pin from install command, package-spec JSON, and published-coordinate sentence — not the historical narrative block in the published tarball"
   },
   "readme_published_coordinate_wording": "@trybotster/hub-test-support@0.1.25 is the published coordinate that carries the session-type authoring view (show_session_type_definition, conformance fixture revision 32, protocol version 6). First-party clients should pin this coordinate for authoring-view support.",
   "files_changed": [
@@ -67,7 +81,16 @@
   ],
   "deviations_from_plan": [
     "test.mjs package_version assert updated to 0.1.25 (suite companion)",
-    "publish performed by human operator tonksthebear after auth fix, not agent-run script/publish-npm-packages"
+    "publish performed by human operator tonksthebear after auth fix, not agent-run script/publish-npm-packages",
+    "post-Review: in-repo README narrative rewrite + pin-site suite guard + E10/E10b evidence honesty + PR link registration; no republish"
   ],
-  "do_not_republish": true
+  "review_findings_addressed": [
+    "finding_1786063163_457357",
+    "finding_1786063163_431508",
+    "finding_1786063163_828549",
+    "finding_1786063163_755834"
+  ],
+  "review_findings_info_no_action": [
+    "finding_1786063163_551882"
+  ]
 }
