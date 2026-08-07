@@ -19,7 +19,7 @@ node packages/hub-test-support/scripts/sync-assets.mjs
 ## Usage
 
 ```sh
-npm install --save-dev @trybotster/ui-contract@0.3.1 @trybotster/hub-test-support@0.1.24
+npm install --save-dev @trybotster/ui-contract@0.3.1 @trybotster/hub-test-support@0.1.25
 ```
 
 ```js
@@ -79,14 +79,15 @@ Use this exact package spec in npm-based client repos:
 ```json
 {
   "devDependencies": {
-    "@trybotster/hub-test-support": "0.1.24"
+    "@trybotster/hub-test-support": "0.1.25"
   }
 }
 ```
 
-`@trybotster/hub-test-support@0.1.24` is the prepared coordinate for the Hub
-maintenance contract. Publication is owned by the separately routed release
-ticket; consumers must not pin it until that ticket records registry integrity.
+`@trybotster/hub-test-support@0.1.25` is the published coordinate that carries
+the session-type authoring view (`show_session_type_definition`, conformance
+fixture revision 32, protocol version 6). First-party clients should pin this
+coordinate for authoring-view support.
 
 The support matrix is generated from the Rust compatibility descriptors.
 `terminal_readback` appears in both `supported_features` and
