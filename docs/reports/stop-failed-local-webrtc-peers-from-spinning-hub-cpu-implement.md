@@ -222,3 +222,9 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings   # exit 0
 | Finding | Severity | Fix |
 | --- | --- | --- |
 | Attach proof leaks session workers | high | `PeerHarness` records owned sessions immediately after Spawn and always runs production `ShutdownSession` + `RemoveSession` on `Drop` before `HubDaemon::stop`. Fail-closed test asserts no new worktree session workers remain. `local_webrtc_spawned_session_is_cleaned_even_if_attach_proof_panics_after_ready` proves Drop reaps workers after a deliberate panic. Prior orphan workers from this worktree were cleaned. |
+
+## Review return (sequence 21) — fixes
+
+| Finding | Severity | Fix |
+| --- | --- | --- |
+| Session cleanup proof worktree-specific / not unwind-safe | high | Cleanup validates `ShutdownSession` responses, waits for terminal lifecycle, requires `SessionRemoved`, and asserts the logical session is gone before marking cleaned. Worker census uses portable process-name + PID delta (no fixed checkout path). Deliberate-panic test keeps the harness live until panic so `Drop` runs on catch_unwind unwind. |

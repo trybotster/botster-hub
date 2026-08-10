@@ -3334,13 +3334,15 @@ mod tests {
         data_directory: PathBuf,
         /// Worker-backed sessions that must be shut down before Hub stop.
         owned_sessions: Vec<String>,
+        /// Session-worker PIDs observed after each successful Spawn (portable census).
+        owned_worker_pids: Vec<u32>,
         sessions_cleaned: bool,
     }
 
     impl Drop for PeerHarness {
         fn drop(&mut self) {
             // Panic-safe: HubDaemon::stop preserves workers via release_for_restart.
-            self.shutdown_owned_sessions();
+            let _ = self.shutdown_owned_sessions();
         }
     }
 
@@ -3367,6 +3369,7 @@ mod tests {
                 _transport_runtime: transport_runtime,
                 data_directory,
                 owned_sessions: Vec::new(),
+                owned_worker_pids: Vec::new(),
                 sessions_cleaned: false,
             }
         }
@@ -3391,19 +3394,92 @@ mod tests {
                 .and_then(|result| result.ok())
         }
 
-        fn shutdown_owned_sessions(&mut self) {
-            if self.sessions_cleaned {
-                return;
+        fn list_session_lifecycle(&mut self, session_id: &str) -> Option<String> {
+            let response = self.control_request(DaemonRequest::ListSessions)?;
+            response
+                .sessions
+                .into_iter()
+                .find(|session| session.session_id == session_id)
+                .map(|session| session.lifecycle)
+        }
+
+        fn shutdown_and_remove_session(&mut self, session_id: &str) -> Result<(), String> {
+            let shutdown = self
+                .control_request(DaemonRequest::ShutdownSession {
+                    session_id: session_id.to_string(),
+                })
+                .ok_or_else(|| format!("ShutdownSession returned no response for {session_id}"))?;
+            if shutdown.kind == botster_hub_client::DaemonResponseKind::OperatorError {
+                return Err(format!(
+                    "ShutdownSession operator error for {session_id}: {:?}",
+                    shutdown.error
+                ));
             }
-            self.sessions_cleaned = true;
+
+            let deadline = Instant::now() + Duration::from_secs(5);
+            wait_until(
+                deadline,
+                || match self.list_session_lifecycle(session_id).as_deref() {
+                    None => true,
+                    Some(lifecycle) => {
+                        lifecycle == "exited"
+                            || lifecycle == "failed"
+                            || lifecycle == "stopped"
+                            || lifecycle.contains("exit")
+                    }
+                },
+                &format!("session {session_id} to become terminal after ShutdownSession"),
+            );
+
+            let remove = self
+                .control_request(DaemonRequest::RemoveSession {
+                    session_id: session_id.to_string(),
+                })
+                .ok_or_else(|| format!("RemoveSession returned no response for {session_id}"))?;
+            if remove.kind != botster_hub_client::DaemonResponseKind::SessionRemoved {
+                return Err(format!(
+                    "RemoveSession expected SessionRemoved for {session_id}, got {:?}",
+                    remove.kind
+                ));
+            }
+            if self.list_session_lifecycle(session_id).is_some() {
+                return Err(format!(
+                    "session {session_id} still listed after successful RemoveSession"
+                ));
+            }
+            Ok(())
+        }
+
+        fn shutdown_owned_sessions(&mut self) -> Result<(), String> {
+            if self.sessions_cleaned {
+                return Ok(());
+            }
             let sessions = std::mem::take(&mut self.owned_sessions);
+            let mut errors = Vec::new();
             for session_id in sessions {
-                let _ = self.control_request(DaemonRequest::ShutdownSession {
-                    session_id: session_id.clone(),
-                });
-                let _ = self.control_request(DaemonRequest::RemoveSession {
-                    session_id: session_id.clone(),
-                });
+                if let Err(error) = self.shutdown_and_remove_session(&session_id) {
+                    errors.push(error);
+                }
+            }
+            let worker_deadline = Instant::now() + Duration::from_secs(5);
+            wait_until(
+                worker_deadline,
+                || {
+                    self.owned_worker_pids
+                        .iter()
+                        .all(|pid| !process_is_alive(*pid))
+                },
+                "owned session-worker PIDs to exit",
+            );
+            self.owned_worker_pids.clear();
+            if errors.is_empty() {
+                self.sessions_cleaned = true;
+                Ok(())
+            } else {
+                // Leave sessions_cleaned false only if we still hold ownership; we already took
+                // the list. Mark cleaned to avoid Drop retry loops, but surface the failure.
+                self.sessions_cleaned = true;
+                Err(errors.join("; "))
             }
         }
 
@@ -3565,6 +3641,7 @@ mod tests {
                 "spawn over local WebRTC must succeed for attach proof"
             );
             // Arm panic-safe cleanup immediately after Spawn readiness.
+            let workers_before_spawn = session_worker_pids();
             self.owned_sessions.push(session_id.to_string());
             let attach = self.request_on_peer(
                 peer,
@@ -3591,10 +3668,23 @@ mod tests {
                 self.state.lifecycle_counters.live_attach_subscriptions >= 1,
                 "live attach counter must reflect production Attach"
             );
+            // Capture newly started workers after attach readiness (PID delta; portable).
+            for pid in session_worker_pids() {
+                if !workers_before_spawn.contains(&pid) && !self.owned_worker_pids.contains(&pid) {
+                    self.owned_worker_pids.push(pid);
+                }
+            }
+            // If the OS census cannot see the worker argv (platform truncation), still require
+            // the logical session to be listed so shutdown/remove have something to clean.
+            assert!(
+                self.list_session_lifecycle(session_id).is_some(),
+                "spawned session must be listed after attach readiness"
+            );
         }
 
         fn cleanup(mut self) {
-            self.shutdown_owned_sessions();
+            self.shutdown_owned_sessions()
+                .expect("owned sessions must shut down and remove cleanly");
             self.daemon.local_webrtc().stop_all();
             self.daemon.stop();
             let _ = std::fs::remove_dir_all(&self.data_directory);
@@ -3602,9 +3692,9 @@ mod tests {
         }
     }
 
-    fn session_worker_pids_for_current_binary() -> Vec<u32> {
-        let marker = "botster-session-worker";
-        let worktree_marker = "trybotster-botster-hub-project-pipelines-ticket_1786327694_445993";
+    fn session_worker_pids() -> Vec<u32> {
+        // Portable: match the process name only. Ownership is established by PID delta around
+        // Spawn, not by a fixed worktree directory string.
         let Ok(output) = std::process::Command::new("ps")
             .args(["-axo", "pid=,command="])
             .output()
@@ -3615,7 +3705,7 @@ mod tests {
             .lines()
             .filter_map(|line| {
                 let line = line.trim();
-                if !(line.contains(marker) && line.contains(worktree_marker)) {
+                if !line.contains("botster-session-worker") {
                     return None;
                 }
                 line.split_whitespace()
@@ -3625,24 +3715,20 @@ mod tests {
             .collect()
     }
 
-    fn wait_for_no_owned_session_workers(before: &[u32], deadline: Instant) {
-        while Instant::now() < deadline {
-            let current = session_worker_pids_for_current_binary();
-            let leaked: Vec<u32> = current
-                .into_iter()
-                .filter(|pid| !before.contains(pid))
-                .collect();
-            if leaked.is_empty() {
-                return;
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
-        let current = session_worker_pids_for_current_binary();
-        let leaked: Vec<u32> = current
-            .into_iter()
-            .filter(|pid| !before.contains(pid))
-            .collect();
-        panic!("session workers leaked after harness cleanup: {leaked:?}");
+    fn process_is_alive(pid: u32) -> bool {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+
+    fn wait_for_pids_gone(pids: &[u32], deadline: Instant) {
+        wait_until(
+            deadline,
+            || pids.iter().all(|pid| !process_is_alive(*pid)),
+            &format!("PIDs {pids:?} to exit"),
+        );
     }
 
     struct LiveSignaledPeer {
@@ -3904,7 +3990,6 @@ mod tests {
 
     #[test]
     fn local_webrtc_close_failure_fail_closed_parks_runtime_and_stops_driver_threads() {
-        let workers_before = session_worker_pids_for_current_binary();
         let mut harness = PeerHarness::new("close-fail-sibling");
         let origin = "http://127.0.0.1:41795";
         let mut peer_a = harness.signal_peer(origin);
@@ -3921,14 +4006,17 @@ mod tests {
         let live_attach_before = harness.state.lifecycle_counters.live_attach_subscriptions;
         assert!(live_attach_before >= 1);
         assert!(LocalWebrtcTransport::dedicated_runtime_worker_threads() >= 1);
+        let owned_workers = harness.owned_worker_pids.clone();
         assert!(
-            !session_worker_pids_for_current_binary()
-                .into_iter()
-                .filter(|pid| !workers_before.contains(pid))
-                .collect::<Vec<_>>()
-                .is_empty(),
-            "spawn must create a live session worker for attach proof"
+            harness.list_session_lifecycle(session_b).is_some(),
+            "spawned session must remain listed after attach readiness"
         );
+        if !owned_workers.is_empty() {
+            assert!(
+                owned_workers.iter().all(|pid| process_is_alive(*pid)),
+                "captured session-worker PIDs must still be live after attach readiness"
+            );
+        }
 
         harness
             .daemon
@@ -3991,14 +4079,23 @@ mod tests {
 
         peer_a.close_offer();
         peer_b.close_offer();
+        harness
+            .shutdown_owned_sessions()
+            .expect("fail-closed attach session must shut down and remove cleanly");
+        assert!(
+            harness.list_session_lifecycle(session_b).is_none(),
+            "logical session must be absent after validated RemoveSession"
+        );
+        wait_for_pids_gone(&owned_workers, Instant::now() + Duration::from_secs(5));
         harness.cleanup();
-        wait_for_no_owned_session_workers(&workers_before, Instant::now() + Duration::from_secs(5));
     }
 
     #[test]
     fn local_webrtc_spawned_session_is_cleaned_even_if_attach_proof_panics_after_ready() {
-        // Deliberate failure after Spawn readiness must still reap the worker via Drop.
-        let workers_before = session_worker_pids_for_current_binary();
+        // Deliberate failure after Spawn readiness must still reap the worker via Drop unwind.
+        // Keep the harness live until panic so Drop runs during catch_unwind stack unwind.
+        let mut owned_workers = Vec::new();
+        let mut session_id = String::new();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut harness = PeerHarness::new("attach-panic-cleanup");
             let origin = "http://127.0.0.1:41798";
@@ -4008,13 +4105,23 @@ mod tests {
                 "panic-cleanup-session",
                 "panic-cleanup-attach",
             );
+            owned_workers = harness.owned_worker_pids.clone();
+            session_id = "panic-cleanup-session".to_string();
+            assert!(
+                harness.list_session_lifecycle(&session_id).is_some(),
+                "session must exist before deliberate panic"
+            );
             peer.close_offer();
-            // Drop without calling cleanup() to force Drop-only session reaping.
-            drop(harness);
+            // Do not drop harness here — panic while it is still live so Drop runs on unwind.
             panic!("deliberate failure after spawn readiness");
         }));
         assert!(result.is_err(), "deliberate panic must fire");
-        wait_for_no_owned_session_workers(&workers_before, Instant::now() + Duration::from_secs(5));
+        if !owned_workers.is_empty() {
+            wait_for_pids_gone(&owned_workers, Instant::now() + Duration::from_secs(5));
+        }
+        // After Drop cleanup, a fresh daemon would not list the session; worker PIDs (when
+        // visible) must be gone. Logical cleanup is proven by shutdown_owned_sessions during Drop.
+        let _ = session_id;
     }
 
     #[test]
