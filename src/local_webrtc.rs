@@ -118,7 +118,6 @@ enum ClosePeerOutcome {
 pub(crate) struct PeerRemoveResult {
     pub removed_grant_ids: Vec<String>,
     pub attached_subscriptions: Vec<LocalWebrtcAttachedSubscription>,
-    pub fail_closed: bool,
 }
 
 #[cfg(test)]
@@ -293,8 +292,7 @@ impl LocalWebrtcTransport {
             .cloned()
             .chain(stale.keys().cloned())
             .collect();
-        let mut result = self.take_remove_result(removed_grants);
-        result.fail_closed = true;
+        let result = self.take_remove_result(removed_grants);
         #[cfg(test)]
         self.peer_handlers.clear();
         if let Some(runtime) = self.runtime.take() {
@@ -3243,26 +3241,42 @@ mod tests {
                 .send_text(&serde_json::to_string(&envelope).expect("serialize envelope"))
                 .await
                 .expect("send encrypted request");
-            let mut encrypted = String::new();
-            let mut next_chunk_index = 0u32;
             loop {
-                let response = timeout(Duration::from_secs(10), self.data_channel_message_rx.recv())
-                    .await
-                    .expect("response frame timeout")
-                    .expect("data channel remains open for response");
-                let chunk: DaemonLocalWebrtcDeliveryChunk =
-                    serde_json::from_str(&response).expect("parse delivery chunk");
-                assert_eq!(chunk.chunk_index, next_chunk_index);
-                encrypted.push_str(&chunk.payload);
-                next_chunk_index += 1;
-                if chunk.chunk_index + 1 == chunk.chunk_count {
-                    break;
+                let mut encrypted = String::new();
+                let mut next_chunk_index = 0u32;
+                let mut delivery_kind = None;
+                loop {
+                    let response =
+                        timeout(Duration::from_secs(10), self.data_channel_message_rx.recv())
+                            .await
+                            .expect("response frame timeout")
+                            .expect("data channel remains open for response");
+                    let chunk: DaemonLocalWebrtcDeliveryChunk =
+                        serde_json::from_str(&response).expect("parse delivery chunk");
+                    if let Some(kind) = delivery_kind {
+                        assert_eq!(kind, chunk.delivery_kind);
+                    } else {
+                        delivery_kind = Some(chunk.delivery_kind);
+                    }
+                    assert_eq!(chunk.chunk_index, next_chunk_index);
+                    encrypted.push_str(&chunk.payload);
+                    next_chunk_index += 1;
+                    if chunk.chunk_index + 1 == chunk.chunk_count {
+                        break;
+                    }
+                }
+                let envelope: AesGcmEnvelope =
+                    serde_json::from_str(&encrypted).expect("parse response envelope");
+                let plaintext = decrypt_aes_gcm(key, &envelope).expect("decrypt response");
+                match delivery_kind.expect("complete delivery declares a kind") {
+                    DaemonLocalWebrtcDeliveryKind::DaemonResponse => {
+                        return serde_json::from_slice(&plaintext).expect("parse daemon response");
+                    }
+                    DaemonLocalWebrtcDeliveryKind::DaemonEntityFrame => {
+                        // Entity frames can interleave while a subscription is live; keep waiting.
+                    }
                 }
             }
-            let envelope: AesGcmEnvelope =
-                serde_json::from_str(&encrypted).expect("parse response envelope");
-            let plaintext = decrypt_aes_gcm(key, &envelope).expect("decrypt response");
-            serde_json::from_slice(&plaintext).expect("parse daemon response")
         }
     }
 
@@ -3415,20 +3429,17 @@ mod tests {
             }
         }
 
-        fn subscribe_entities(
+        fn request_on_peer(
             &mut self,
             peer: &mut LiveSignaledPeer,
-            subscription_id: &str,
+            request: DaemonRequest,
+            label: &str,
         ) -> DaemonResponse {
-            let request = DaemonRequest::SubscribeEntities {
-                entity_type: "session".to_string(),
-                subscription_id: subscription_id.to_string(),
-            };
             let key = peer.stream_key.clone();
             let mut offer_peer = peer
                 .offer_peer
                 .take()
-                .expect("offer peer available for subscribe");
+                .expect("offer peer available for request");
             let (response_tx, response_rx) = std::sync::mpsc::channel();
             let offer_handle = peer.offer_runtime.handle().clone();
             let worker = thread::spawn(move || {
@@ -3436,7 +3447,7 @@ mod tests {
                     offer_handle.block_on(offer_peer.encrypted_request(&key, &request));
                 response_tx
                     .send((offer_peer, response))
-                    .expect("return subscribe response");
+                    .expect("return encrypted response");
             });
 
             let deadline = Instant::now() + Duration::from_secs(15);
@@ -3445,7 +3456,7 @@ mod tests {
                     break result;
                 }
                 if Instant::now() >= deadline {
-                    panic!("timed out waiting for SubscribeEntities response");
+                    panic!("timed out waiting for {label} response");
                 }
                 match self.control_rx.try_recv() {
                     Ok(message) => {
@@ -3462,13 +3473,74 @@ mod tests {
                         thread::sleep(Duration::from_millis(5));
                     }
                     Err(tokio_mpsc::error::TryRecvError::Disconnected) => {
-                        panic!("control channel closed during SubscribeEntities");
+                        panic!("control channel closed during {label}");
                     }
                 }
             };
-            worker.join().expect("subscribe worker joins");
+            worker.join().expect("request worker joins");
             peer.offer_peer = Some(offer_peer);
             response
+        }
+
+        fn subscribe_entities(
+            &mut self,
+            peer: &mut LiveSignaledPeer,
+            subscription_id: &str,
+        ) -> DaemonResponse {
+            self.request_on_peer(
+                peer,
+                DaemonRequest::SubscribeEntities {
+                    entity_type: "session".to_string(),
+                    subscription_id: subscription_id.to_string(),
+                },
+                "SubscribeEntities",
+            )
+        }
+
+        fn spawn_and_attach_on_peer(
+            &mut self,
+            peer: &mut LiveSignaledPeer,
+            session_id: &str,
+            subscription_id: &str,
+        ) {
+            let spawn = self.request_on_peer(
+                peer,
+                DaemonRequest::Spawn {
+                    session_id: session_id.to_string(),
+                    command: "printf 'webrtc-attach-ready\\n'; while IFS= read -r line; do printf 'a:%s\\n' \"$line\"; done".to_string(),
+                },
+                "Spawn",
+            );
+            assert_eq!(
+                spawn.kind,
+                botster_hub_client::DaemonResponseKind::Spawned,
+                "spawn over local WebRTC must succeed for attach proof"
+            );
+            let attach = self.request_on_peer(
+                peer,
+                DaemonRequest::Attach {
+                    session_id: session_id.to_string(),
+                    subscription_id: subscription_id.to_string(),
+                },
+                "Attach",
+            );
+            assert_eq!(
+                attach.kind,
+                botster_hub_client::DaemonResponseKind::Events,
+                "attach over local WebRTC must succeed"
+            );
+            assert!(
+                self.state
+                    .pending_runtime
+                    .active_subscriptions
+                    .get(session_id)
+                    .is_some_and(|subs| subs.contains(subscription_id)),
+                "daemon must track active attach subscription after production Attach"
+            );
+            assert!(
+                self.state.lifecycle_counters.live_attach_subscriptions >= 1,
+                "live attach counter must reflect production Attach"
+            );
         }
 
         fn cleanup(mut self) {
@@ -3743,10 +3815,15 @@ mod tests {
         let mut peer_b = harness.signal_peer(origin);
         let grant_a = peer_a.grant_id.clone();
         let grant_b = peer_b.grant_id.clone();
+        let session_b = "fail-closed-sibling-session";
+        let attach_b = "fail-closed-sibling-attach";
 
         let _ = harness.subscribe_entities(&mut peer_a, "entity-fail-a");
         let _ = harness.subscribe_entities(&mut peer_b, "entity-fail-b");
+        harness.spawn_and_attach_on_peer(&mut peer_b, session_b, attach_b);
         assert!(harness.state.entity_subscriptions.contains_key("entity-fail-b"));
+        let live_attach_before = harness.state.lifecycle_counters.live_attach_subscriptions;
+        assert!(live_attach_before >= 1);
         assert!(LocalWebrtcTransport::dedicated_runtime_worker_threads() >= 1);
 
         harness
@@ -3783,6 +3860,24 @@ mod tests {
         assert_eq!(
             harness.state.lifecycle_counters.live_entity_subscriptions,
             0
+        );
+        assert!(
+            !harness
+                .state
+                .pending_runtime
+                .active_subscriptions
+                .get(session_b)
+                .is_some_and(|subs| subs.contains(attach_b)),
+            "fail-closed sibling attach must be detached from runtime active subscriptions"
+        );
+        assert_eq!(
+            harness.state.lifecycle_counters.live_attach_subscriptions,
+            0,
+            "live attach counter must reach zero after fail-closed sibling detach"
+        );
+        assert!(
+            harness.state.released_attach_generations >= 1,
+            "released attach generations must account for sibling detach"
         );
         wait_until(
             Instant::now() + Duration::from_secs(2),

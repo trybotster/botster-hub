@@ -209,3 +209,10 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings   # exit 0
 | Fail-closed abandoned sibling daemon ownership | high | `remove_peer` returns `PeerRemoveResult` with every removed grant and attach list from stored `peer_states`. PeerClosed sweeps entity rows for all those grants and detaches sibling attaches. Test asserts peer B entity row is gone after A fail-close. |
 | Stale snapshot can delete replacement owner | medium | Snapshot entity IDs are removed only when the current row is unowned or owned by a removed grant. Test: `local_webrtc_stale_peer_snapshot_does_not_remove_replacement_subscription_owner` |
 | Lifecycle target flake | medium | Default-parallel `./test.sh --test hub_daemon_lifecycle_test` green on rerun: **137 passed, 0 failed, 1 ignored** (~76s). Prior independent failure of `cli_local_runtime_up_starts_reuses_and_down_stops_runtime` is intermittent and not reproduced on the green rerun |
+
+## Review return (sequence 17) — fixes
+
+| Finding | Severity | Fix |
+| --- | --- | --- |
+| Unused `fail_closed` flag | low | Removed from `PeerRemoveResult` |
+| Fail-closed sibling attach unproven | medium | Fail-closed test spawns+attaches peer B over production WebRTC Attach path; asserts active attach subscription cleared, `live_attach_subscriptions == 0`, released attach generations, and entity/runtime oracles |
