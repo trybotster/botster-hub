@@ -3201,6 +3201,16 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    /// Serializes Spawn → worker census capture. Session-worker sockets may not live under the
+    /// hub data directory (core uses a separate control-socket path), so capture relies on a
+    /// process-global "new pid" baseline that is only safe while no other harness is spawning.
+    fn spawn_capture_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     struct TestOfferHandler {
         gather_complete_tx: AsyncSender<()>,
         connected_tx: AsyncSender<()>,
@@ -3758,6 +3768,9 @@ mod tests {
             session_id: &str,
             subscription_id: &str,
         ) {
+            // Hold spawn capture lock for the full baseline → Spawn → census window so
+            // process-global "new pid" adoption cannot pick a sibling test's worker.
+            let _spawn_capture = spawn_capture_lock();
             // Baseline MUST be taken before Spawn returns a worker-backed session.
             // Census matches true worker binaries only (not hub --session-worker-bin args).
             let workers_before_spawn = session_worker_identities();
@@ -3782,40 +3795,51 @@ mod tests {
                 .iter()
                 .map(|worker| worker.pid)
                 .collect();
-            // Wait for any new true worker binary (pre-Spawn PID baseline). Prefer
-            // control sockets under this harness data dir when present.
+            // Under spawn_capture_lock, the first live new worker after baseline is ours.
+            // Prefer data-dir ownership when the control socket/argv is attributable; never
+            // adopt a pid that is already dead at census time.
             wait_until(
                 Instant::now() + Duration::from_secs(5),
                 || {
-                    session_worker_identities()
-                        .into_iter()
-                        .any(|worker| !before_pids.contains(&worker.pid))
+                    session_worker_identities().into_iter().any(|worker| {
+                        !before_pids.contains(&worker.pid) && process_is_alive(worker.pid)
+                    })
                 },
-                "session-worker process to appear after Spawn",
+                "live session-worker process to appear after Spawn",
             );
-            let new_workers: Vec<OwnedWorkerIdentity> = session_worker_identities()
+            let live_new: Vec<OwnedWorkerIdentity> = session_worker_identities()
                 .into_iter()
-                .filter(|worker| !before_pids.contains(&worker.pid))
+                .filter(|worker| !before_pids.contains(&worker.pid) && process_is_alive(worker.pid))
                 .collect();
-            let under_data_dir: Vec<OwnedWorkerIdentity> = new_workers
+            let owned_by_dir: Vec<OwnedWorkerIdentity> = live_new
                 .iter()
-                .filter(|worker| worker.socket_under_data_dir(&data_dir))
+                .filter(|worker| worker.belongs_to_data_dir(&data_dir))
                 .cloned()
                 .collect();
-            self.owned_workers = if !under_data_dir.is_empty() {
-                under_data_dir
+            self.owned_workers = if !owned_by_dir.is_empty() {
+                owned_by_dir
             } else {
-                new_workers
+                // Core places control sockets outside hub data_dir on some platforms; with
+                // spawn_capture_lock held, live_new is still this harness's spawn set.
+                live_new
             };
             assert!(
                 !self.owned_workers.is_empty(),
-                "spawn must observe at least one new botster-session-worker with pid/pgid/socket; baseline_before={before_pids:?} data_dir={}",
+                "spawn must observe a live botster-session-worker after Spawn; baseline_before={before_pids:?} data_dir={}",
                 data_dir.display()
             );
             // Capture worker + descendant tree (shell children). Do not treat every
             // ambient process-group member as owned — workers often share a pgid with
             // the hub daemon, and mass-killing that group would terminate the harness.
             thread::sleep(Duration::from_millis(50));
+            // Drop any pid that died during settle (should not happen for our worker under lock).
+            self.owned_workers
+                .retain(|worker| process_is_alive(worker.pid));
+            assert!(
+                !self.owned_workers.is_empty(),
+                "owned worker died during readiness settle; data_dir={}",
+                data_dir.display()
+            );
             for worker in &mut self.owned_workers {
                 worker.group_member_pids = worker_owned_process_tree(worker.pid);
                 assert!(
@@ -3887,6 +3911,8 @@ mod tests {
         pid: u32,
         pgid: u32,
         control_socket: PathBuf,
+        /// Full `ps` command remainder after pid/pgid (used for harness data-dir matching).
+        command: String,
         /// Exact live PIDs observed in this worker's process group at Spawn readiness.
         /// Absence proof is over this captured set, not the ambient group forever
         /// (workers may share a pgid with hub/test processes on some platforms).
@@ -3928,6 +3954,22 @@ mod tests {
                     .zip(data_dir.canonicalize().ok())
                     .is_some_and(|(socket, root)| socket.starts_with(root))
         }
+
+        /// True when this worker was started for `data_dir` (socket path or any argv token).
+        /// Prefer this over process-global "first new pid" adoption under parallel tests.
+        fn belongs_to_data_dir(&self, data_dir: &Path) -> bool {
+            if self.socket_under_data_dir(data_dir) {
+                return true;
+            }
+            let dir = data_dir.to_string_lossy();
+            if dir.is_empty() {
+                return false;
+            }
+            self.command.contains(dir.as_ref())
+                || data_dir.canonicalize().ok().is_some_and(|canon| {
+                    self.command.contains(&canon.to_string_lossy().to_string())
+                })
+        }
     }
 
     fn session_worker_identities() -> Vec<OwnedWorkerIdentity> {
@@ -3956,6 +3998,7 @@ mod tests {
                     return None;
                 }
                 let rest = parts.collect::<Vec<_>>().join(" ");
+                let command = format!("{argv0} {rest}");
                 let control_socket = std::iter::once(argv0)
                     .chain(rest.split_whitespace())
                     .skip_while(|token| *token != "--control-socket")
@@ -3966,6 +4009,7 @@ mod tests {
                     pid,
                     pgid,
                     control_socket,
+                    command,
                     // Refined after settle to worker + descendant tree.
                     group_member_pids: vec![pid],
                 })

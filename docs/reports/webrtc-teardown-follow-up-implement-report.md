@@ -24,6 +24,7 @@
 | Fail-closed leaves primary `peer_state` | Failed primary grant passed into `fail_closed_drop_dedicated_runtime` so `take_remove_result` sweeps it; `peer_state_count()` oracle asserts 0 after hang + error fail-closed |
 | Hang test lacks external hard-stop | Parent spawns child process; parent kills after `HANG_CLOSE_CHILD_DEADLINE` if child never exits — finite red if production timeout ablated |
 | Hard-stop child can orphan session worker | Hang child uses entity subscriptions only (no Spawn/Attach); sibling attach fail-closed remains on forced-error test |
+| Global worker-readiness race | `spawn_capture_lock` serializes Spawn→census; only adopt live new PIDs (prefer data-dir ownership when attributable); 3× default-concurrency `./test.sh local_webrtc` green |
 | Report/plan whitespace + clippy | Plan trailing spaces stripped; `git diff main...HEAD --check` + workspace clippy `-D warnings` exit 0 |
 | PR test evidence stale | PR body updated to 36 tests + stale attach snapshot proof |
 
