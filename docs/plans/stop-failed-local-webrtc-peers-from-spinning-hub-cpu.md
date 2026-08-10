@@ -6,7 +6,7 @@
 | --- | --- |
 | Target repository | `botster-hub` (`trybotster/botster-hub`) |
 | `target_id` | `tgt_7e208a0c76a44980a83b63af976b1f22` |
-| Authoritative path | `/Users/jasonconigliari/Projects/botster-hub` |
+| Authoritative path | spawn target `botster-hub` (`tgt_7e208a0c76a44980a83b63af976b1f22`) |
 | Pipeline worktree | this session worktree (branch `project-pipelines/ticket_1786327694_445993`) |
 | Ticket | `ticket_1786327694_445993` |
 | Run | `run_1786327694_835389` |

@@ -6,14 +6,14 @@
 | --- | --- |
 | Target repository | `botster-hub` (`trybotster/botster-hub`) |
 | `target_id` | `tgt_7e208a0c76a44980a83b63af976b1f22` |
-| Authoritative path | `/Users/jasonconigliari/Projects/botster-hub` |
+| Authoritative path | spawn target `botster-hub` (`tgt_7e208a0c76a44980a83b63af976b1f22`) |
 | Pipeline worktree | this session worktree (`project-pipelines/ticket_1786327694_445993`) |
 | Ticket | `ticket_1786327694_445993` |
 | Run | `run_1786327694_835389` |
 | Step | `bsg_implement` (`run_step_1786329302_759836`) |
 | Approved plan | `docs/plans/stop-failed-local-webrtc-peers-from-spinning-hub-cpu.md` (sequence 7) |
 
-Routing verified via `list_spawn_targets`: `tgt_7e208a0c76a44980a83b63af976b1f22` → `botster-hub` @ `/Users/jasonconigliari/Projects/botster-hub`. Plan artifact used the same `target_id`.
+Routing verified via `list_spawn_targets`: `tgt_7e208a0c76a44980a83b63af976b1f22` → `botster-hub` @ `trybotster/botster-hub`. Plan artifact used the same `target_id`.
 
 ## Repository playbook and other playbooks/notes applied
 
@@ -165,3 +165,29 @@ None that blocked implementation. Plan-time capture decision stands: after ship,
 | Hub local WebRTC transport / peer registry | Yes |
 | Hub daemon control-plane `LocalWebrtcPeerClosed` | Call site unchanged; forget semantics fixed |
 | Core / hub-client / web / packages | No |
+
+## Review return (sequence 11) — fixes
+
+Addresses open Review findings on run `run_1786327694_835389`.
+
+| Finding | Severity | Fix |
+| --- | --- | --- |
+| Late queued entity subscriptions after PeerClosed | high | `ControlMessage::SubscribeEntities` / `UnsubscribeEntities` carry optional `grant_id`. WebRTC path sets `Some(grant_id)`; socket path keeps `None`. Admission rejects when grant peer is no longer live (`local_webrtc_peer_gone`). Test: `local_webrtc_late_subscribe_entities_after_peer_closed_does_not_recreate_state` |
+| Close error with sibling runtime | high | Retry close once; on ultimate failure quarantine peer Arc in `stale_close_peers` while siblings keep the shared runtime; when live map is empty, re-close quarantine then `runtime.take()`. Test: `local_webrtc_close_failure_with_sibling_quarantines_failed_peer_without_killing_runtime` |
+| Strict workspace clippy | high | Production path logs `grant_id` on close failure (no unused param). `cargo clippy --workspace --all-targets --all-features -- -D warnings` exits 0 |
+| Full suite unresolved failures | medium | Exact isolation on **branch and base** (`main` @ `1c6a41e`): both named CLI tests exit 0. Full default-parallel `./test.sh --test hub_daemon_lifecycle_test` on branch: **137 passed, 0 failed** (~84s). Not branch-attributable |
+| Absolute user path in plan/report | medium | Replaced with path-neutral `target_id` / `trybotster/botster-hub` references; raw scan of this plan/report has zero `/Users/jasonconigliari` matches |
+
+### Additional verification (post-review)
+
+```sh
+cargo clippy --workspace --all-targets --all-features -- -D warnings   # exit 0
+./test.sh --lib local_webrtc   # 27 passed (includes H1–H3 + late-subscribe + close-failure)
+./test.sh --test hub_daemon_lifecycle_test cli_daily_commands_share_canonical_default_data_directory -- --exact  # branch 0, base 0
+./test.sh --test hub_daemon_lifecycle_test cli_local_runtime_up_starts_reuses_and_down_stops_runtime -- --exact  # branch 0, base 0
+./test.sh --test hub_daemon_lifecycle_test  # branch: 137 passed, 0 failed
+```
+
+### Residual risk update
+
+- If `PeerConnection::close` fails while siblings remain, the failed peer is quarantined (not map-live) until the last live peer parks the shared runtime; driver work for a quarantined peer may continue until that park. This is the sibling-safe bound without a per-peer runtime or crate-level abort API.
