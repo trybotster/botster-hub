@@ -1115,24 +1115,38 @@ pub(crate) fn handle_control_message(
                     error.kind()
                 );
             }
-            daemon.local_webrtc().remove_peer(&grant_id);
-            // Cleanup is independent of the peer-side snapshot: remove every daemon entity
-            // subscription owned by this grant (covers Subscribe-first races where cleanup_once
-            // ran before the subscribe reply added the id to the peer set).
-            let mut removed = BTreeSet::new();
+            let remove_result = daemon.local_webrtc().remove_peer(&grant_id);
+            let mut removed_grants: BTreeSet<String> =
+                remove_result.removed_grant_ids.into_iter().collect();
+            // Always include the closing grant so entity/attach sweep runs even if the peer
+            // map entry was already gone (idempotent PeerClosed).
+            removed_grants.insert(grant_id.clone());
+
+            // Snapshot IDs are only removed when the current row is unowned or still owned by a
+            // removed grant. A reused subscription_id owned by a different live peer is preserved.
+            let mut removed_entity_ids = BTreeSet::new();
             for subscription_id in entity_subscription_ids {
-                removed.insert(subscription_id);
+                let should_remove = match state.entity_subscriptions.get(&subscription_id) {
+                    None => false,
+                    Some(subscription) => match subscription.owner_grant_id.as_deref() {
+                        None => true,
+                        Some(owner) => removed_grants.contains(owner),
+                    },
+                };
+                if should_remove {
+                    removed_entity_ids.insert(subscription_id);
+                }
             }
-            let owned: Vec<String> = state
-                .entity_subscriptions
-                .iter()
-                .filter(|(_, subscription)| {
-                    subscription.owner_grant_id.as_deref() == Some(grant_id.as_str())
-                })
-                .map(|(id, _)| id.clone())
-                .collect();
-            removed.extend(owned);
-            for subscription_id in removed {
+            // Independent of the peer-side snapshot: remove every daemon entity subscription
+            // owned by any grant this forget removed (primary + fail-closed siblings).
+            for (id, subscription) in &state.entity_subscriptions {
+                if let Some(owner) = subscription.owner_grant_id.as_deref()
+                    && removed_grants.contains(owner)
+                {
+                    removed_entity_ids.insert(id.clone());
+                }
+            }
+            for subscription_id in removed_entity_ids {
                 if state
                     .entity_subscriptions
                     .remove(&subscription_id)
@@ -1146,13 +1160,24 @@ pub(crate) fn handle_control_message(
                         state.released_entity_generations.saturating_add(1);
                 }
             }
+
+            // Merge attach owners from the PeerClosed snapshot and any fail-closed siblings.
+            let mut detach_list = attached_subscriptions;
+            for subscription in remove_result.attached_subscriptions {
+                if !detach_list.iter().any(|existing| {
+                    existing.session_id == subscription.session_id
+                        && existing.subscription_id == subscription.subscription_id
+                }) {
+                    detach_list.push(subscription);
+                }
+            }
             state.lifecycle_counters.live_attach_subscriptions = state
                 .lifecycle_counters
                 .live_attach_subscriptions
-                .saturating_sub(attached_subscriptions.len() as u64);
+                .saturating_sub(detach_list.len() as u64);
             state.released_attach_generations = state
                 .released_attach_generations
-                .saturating_add(attached_subscriptions.len() as u64);
+                .saturating_add(detach_list.len() as u64);
             detach_local_webrtc_subscriptions(
                 daemon,
                 &mut state.logical_clock,
@@ -1163,7 +1188,7 @@ pub(crate) fn handle_control_message(
                     egress: &state.egress_diagnostics,
                     lifecycle: &state.lifecycle_counters,
                 },
-                attached_subscriptions,
+                detach_list,
             );
             false
         }
