@@ -19,7 +19,7 @@ node packages/hub-test-support/scripts/sync-assets.mjs
 ## Usage
 
 ```sh
-npm install --save-dev @trybotster/ui-contract@0.3.1 @trybotster/hub-test-support@0.1.25
+npm install --save-dev @trybotster/ui-contract@0.3.1 @trybotster/hub-test-support@0.1.26
 ```
 
 ```js
@@ -79,15 +79,16 @@ Use this exact package spec in npm-based client repos:
 ```json
 {
   "devDependencies": {
-    "@trybotster/hub-test-support": "0.1.25"
+    "@trybotster/hub-test-support": "0.1.26"
   }
 }
 ```
 
-`@trybotster/hub-test-support@0.1.25` is the published coordinate that carries
-the session-type authoring view (`show_session_type_definition`, conformance
-fixture revision 32, protocol version 6). First-party clients should pin this
-coordinate for authoring-view support.
+`@trybotster/hub-test-support@0.1.26` is the published coordinate that carries
+spawn-point session-type listing (`list_session_types_for_target`) plus the
+session-type authoring view (`show_session_type_definition`), conformance
+fixture revision 33, protocol version 6. First-party clients should pin this
+coordinate for spawn-picker and authoring-view support.
 
 The support matrix is generated from the Rust compatibility descriptors.
 `terminal_readback` appears in both `supported_features` and
@@ -102,11 +103,12 @@ Only `read_screen_text` is renderable restored content; `snapshot` and
 version 0.1.5 / revision 12 exposes lossy string history. Neither is current
 binary-history contract authority.
 
-Version 0.1.25 is the published npm coordinate for this package. It carries
-protocol version 6 / conformance revision 32 and the session-type authoring
-view (`show_session_type_definition`, editable `session_type_definition`
-response vocabulary, and the support-matrix `session_type_authoring` section
-including the `read_only_session_type_source` refusal). It retains the generic
+Version 0.1.26 is the published npm coordinate for this package. It carries
+protocol version 6 / conformance revision 33, spawn-point session-type listing
+(`list_session_types_for_target`), and the session-type authoring view
+(`show_session_type_definition`, editable `session_type_definition` response
+vocabulary, and the support-matrix `session_type_authoring` section including
+the `read_only_session_type_source` refusal). It retains the generic
 package-owned entity records and the `plugin_entity_subscriptions`
 compatibility feature, authoritative session-type request/response and entity
 records, and requires the `session_type_entity_subscriptions` feature. It

@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::HubConfig;
 use crate::packages::{PackageRecord, PackageState};
 use crate::persistence::HubState;
-use crate::spawn_targets::list_spawn_targets;
+use crate::spawn_targets::{SpawnTarget, list_spawn_targets};
 
 /// Package-, device-, or repo-provided session type definition.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -404,8 +404,12 @@ pub fn materialize_session_type(
     session_type_id: &str,
     request: SessionTypeRequest,
 ) -> SessionTypeResult<MaterializedSessionType> {
-    let (source, effective_row) =
-        find_source_session_type_with_row(records, state, session_type_id)?;
+    let (source, mut effective_row, spawn_target) = resolve_materialization_source(
+        records,
+        state,
+        session_type_id,
+        request.target_id.as_deref(),
+    )?;
     if !source.available {
         return Err(SessionTypeError::new(
             "session_type_unavailable",
@@ -415,24 +419,25 @@ pub fn materialize_session_type(
 
     let session_type = &source.session_type;
     validate_session_type(session_type)?;
-    let source_root = source.root.clone();
-    let default_target_id = source_default_target_id(&source);
-    let resolved_target_id = request
-        .target_id
-        .clone()
+    // Command always resolves under the definition's source root (device/package/repo).
+    let command_root = source.root.clone();
+    // Cwd binds to the admitted spawn point when spawning at T (Option A dual-root).
+    let cwd_root = spawn_target
+        .as_ref()
+        .map(|target| target.root.clone())
+        .unwrap_or_else(|| source.root.clone());
+    let resolved_target_id = spawn_target
+        .as_ref()
+        .map(|target| target.target_id.clone())
+        .or_else(|| request.target_id.clone())
         .or_else(|| session_type.target_id.clone())
-        .unwrap_or_else(|| default_target_id.clone());
-    if resolved_target_id != default_target_id {
-        return Err(SessionTypeError::new(
-            "target_not_admitted",
-            "requested spawn target is not admitted for this session_type",
-        ));
-    }
+        .unwrap_or_else(|| source_default_target_id(&source));
+    effective_row.target_id = resolved_target_id.clone();
 
-    let default_cwd = resolve_working_directory(&source_root, session_type)?;
+    let default_cwd = resolve_working_directory(&cwd_root, session_type)?;
     let working_directory = if let Some(cwd) = &request.cwd {
         let path = PathBuf::from(cwd);
-        if !path.is_absolute() || !path.starts_with(&source_root) {
+        if !path.is_absolute() || !path.starts_with(&cwd_root) {
             return Err(SessionTypeError::new(
                 "cwd_not_admitted",
                 "requested cwd is outside the admitted spawn target",
@@ -442,6 +447,12 @@ pub fn materialize_session_type(
     } else {
         default_cwd
     };
+    if !working_directory.starts_with(&cwd_root) {
+        return Err(SessionTypeError::new(
+            "cwd_not_admitted",
+            "session_type working directory escapes the admitted spawn target",
+        ));
+    }
 
     let mut environment = session_type.environment.clone();
     let allowed = session_type
@@ -468,7 +479,7 @@ pub fn materialize_session_type(
         session_id: &session_id,
         context_id: &context_id,
         target_id: &resolved_target_id,
-        package_root: &source_root,
+        package_root: &command_root,
         working_directory: &working_directory,
     };
     let context = assemble_context(
@@ -484,7 +495,7 @@ pub fn materialize_session_type(
     let resolved = ResolvedSessionType {
         session_type: row,
         session_id: session_id.clone(),
-        executable: resolve_command_path(&source_root, &session_type.command)
+        executable: resolve_command_path(&command_root, &session_type.command)
             .display()
             .to_string(),
         arguments: session_type.args.clone(),
@@ -531,8 +542,8 @@ pub(crate) fn materialize_managed_session_type(
     request: ManagedSessionTypeRequest,
     ensured: &EnsuredManagedWorktree,
 ) -> SessionTypeResult<MaterializedSessionType> {
-    let (source, effective_row) =
-        find_source_session_type_with_row(records, state, session_type_id)?;
+    let (source, mut effective_row) =
+        find_source_session_type_for_target(records, state, session_type_id, &ensured.target_id)?;
     if !source.available {
         return Err(SessionTypeError::new(
             "session_type_unavailable",
@@ -540,12 +551,7 @@ pub(crate) fn materialize_managed_session_type(
         ));
     }
     validate_session_type(&source.session_type)?;
-    if source_default_target_id(&source) != ensured.target_id {
-        return Err(SessionTypeError::new(
-            "target_not_admitted",
-            "requested spawn target is not admitted for this session_type",
-        ));
-    }
+    effective_row.target_id = ensured.target_id.clone();
     let managed_root = ensured.worktree_path.canonicalize().map_err(|_| {
         SessionTypeError::new(
             "managed_worktree_unavailable",
@@ -658,33 +664,63 @@ pub(crate) fn materialize_managed_session_type(
     })
 }
 
-/// Return only enabled effective session_types admitted for one target.
+/// Return only enabled effective session_types eligible at one admitted spawn point.
+///
+/// Target eligibility is applied **before** package < device < repo precedence so a
+/// repo-only bare id on another target cannot hide a device Global type at `T`.
+/// Rows project `target_id = T` (list context), not storage provenance. Sorted by
+/// `session_type_id` lexicographic.
 pub fn list_session_types_for_target(
     records: &[&PackageRecord],
     state: &HubState,
     target_id: &str,
 ) -> SessionTypeResult<Vec<HubSessionType>> {
-    Ok(list_session_types(records, state)?
+    let _target = ensure_enabled_admitted_target(state, target_id)?;
+    let sources = source_session_types(records, state)?;
+    let eligible = sources
         .into_iter()
-        .filter(|session_type| session_type.available && session_type.target_id == target_id)
-        .collect())
+        .filter(|source| is_eligible_for_target(source, target_id))
+        .collect::<Vec<_>>();
+    let mut rows = effective_session_type_rows(eligible)?;
+    for row in &mut rows {
+        row.target_id = target_id.to_string();
+    }
+    rows.retain(|row| row.available);
+    rows.sort_by(|left, right| left.session_type_id.cmp(&right.session_type_id));
+    Ok(rows)
 }
 
-/// Return one enabled effective session_type admitted for one target.
+/// Return one enabled effective session_type eligible at one admitted spawn point.
 pub fn show_session_type_for_target(
     records: &[&PackageRecord],
     state: &HubState,
     target_id: &str,
     session_type_id: &str,
 ) -> SessionTypeResult<HubSessionType> {
-    let session_type = show_session_type(records, state, session_type_id)?;
-    if !session_type.available || session_type.target_id != target_id {
-        return Err(SessionTypeError::new(
-            "session_type_not_eligible",
-            "session type is not eligible for the requested target",
-        ));
+    match find_source_session_type_for_target(records, state, session_type_id, target_id) {
+        Ok((source, mut row)) => {
+            if !source.available || !row.available {
+                return Err(SessionTypeError::new(
+                    "session_type_not_eligible",
+                    "session type is not eligible for the requested target",
+                ));
+            }
+            row.target_id = target_id.to_string();
+            Ok(row)
+        }
+        Err(error) if error.kind == "unknown_session_type" => {
+            // Distinguish "id does not exist anywhere" from "exists but not at T".
+            // Global unknown stays unknown; ineligible-at-T becomes session_type_not_eligible.
+            match find_source_session_type_with_row(records, state, session_type_id) {
+                Ok(_) => Err(SessionTypeError::new(
+                    "session_type_not_eligible",
+                    "session type is not eligible for the requested target",
+                )),
+                Err(global_error) => Err(global_error),
+            }
+        }
+        Err(error) => Err(error),
     }
-    Ok(session_type)
 }
 
 /// Return one effective session_type row by bare or full id.
@@ -828,6 +864,48 @@ fn source_default_target_id(source: &SourceSessionType) -> String {
         })
 }
 
+/// Validate that `target_id` names an enabled admitted spawn point.
+fn ensure_enabled_admitted_target(
+    state: &HubState,
+    target_id: &str,
+) -> SessionTypeResult<SpawnTarget> {
+    match list_spawn_targets(&state.spawn_targets)
+        .into_iter()
+        .find(|target| target.target_id == target_id)
+    {
+        Some(target) if target.enabled => Ok(target),
+        Some(_) => Err(SessionTypeError::new(
+            "target_not_admitted",
+            "spawn target is not enabled",
+        )),
+        None => Err(SessionTypeError::new(
+            "target_not_found",
+            "spawn target was not found",
+        )),
+    }
+}
+
+/// Option A eligibility: device Global types are multi-target at every admitted T.
+///
+/// - **Device**: eligible at every enabled admitted T unless an exclusive authored
+///   `target_id` pin points elsewhere.
+/// - **Repo**: only for that target's repo source (`source_name == T`).
+/// - **Package**: default `package:{name}` pin or explicit authored `target_id` must equal T.
+fn is_eligible_for_target(source: &SourceSessionType, target_id: &str) -> bool {
+    if !source.available {
+        return false;
+    }
+    match source.rank {
+        SessionTypeSourceRank::Device => match source.session_type.target_id.as_deref() {
+            Some(pin) => pin == target_id,
+            None => true,
+        },
+        SessionTypeSourceRank::Repo => source.source_name == target_id,
+        SessionTypeSourceRank::Package => source_default_target_id(source) == target_id,
+    }
+}
+
+/// Management-catalog lookup: global sources, then package < device < repo precedence.
 fn find_source_session_type_with_row(
     records: &[&PackageRecord],
     state: &HubState,
@@ -849,6 +927,109 @@ fn find_source_session_type_with_row(
         .collect::<Vec<_>>();
     let row = effective_session_type_row(&winner, &peers);
     Ok((winner, row))
+}
+
+/// Spawn-point lookup: validate T, filter eligible sources for T, then precedence.
+fn find_source_session_type_for_target(
+    records: &[&PackageRecord],
+    state: &HubState,
+    session_type_id: &str,
+    target_id: &str,
+) -> SessionTypeResult<(SourceSessionType, HubSessionType)> {
+    let _target = ensure_enabled_admitted_target(state, target_id)?;
+    let sources = source_session_types(records, state)?;
+    let eligible = sources
+        .into_iter()
+        .filter(|source| is_eligible_for_target(source, target_id))
+        .collect::<Vec<_>>();
+    let matches = eligible
+        .iter()
+        .filter(|source| {
+            source.session_type.id == session_type_id
+                || source_session_type_id(source) == session_type_id
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let winner = choose_effective_session_type(matches)?;
+    let peers = eligible
+        .into_iter()
+        .filter(|source| source.session_type.id == winner.session_type.id)
+        .collect::<Vec<_>>();
+    let mut row = effective_session_type_row(&winner, &peers);
+    row.target_id = target_id.to_string();
+    Ok((winner, row))
+}
+
+/// Resolve the definition and optional admitted spawn point for materialization.
+fn resolve_materialization_source(
+    records: &[&PackageRecord],
+    state: &HubState,
+    session_type_id: &str,
+    request_target_id: Option<&str>,
+) -> SessionTypeResult<(SourceSessionType, HubSessionType, Option<SpawnTarget>)> {
+    if let Some(target_id) = request_target_id {
+        // Enabled admitted spawn points use target-scoped eligibility (Option A).
+        match ensure_enabled_admitted_target(state, target_id) {
+            Ok(target) => {
+                let (source, row) = find_source_session_type_for_target(
+                    records,
+                    state,
+                    session_type_id,
+                    target_id,
+                )?;
+                return Ok((source, row, Some(target)));
+            }
+            Err(error) if error.kind == "target_not_admitted" => {
+                // Known but disabled spawn point — fail closed with the same kind.
+                return Err(error);
+            }
+            Err(_) => {
+                // Not an admitted spawn point. May still be a source pin
+                // (`package:{name}`, `device:local`). Wrong pins stay
+                // `target_not_admitted` for package/repo compatibility.
+                let (source, row) =
+                    find_source_session_type_with_row(records, state, session_type_id)?;
+                let default_target_id = source_default_target_id(&source);
+                if target_id != default_target_id {
+                    return Err(SessionTypeError::new(
+                        "target_not_admitted",
+                        "requested spawn target is not admitted for this session_type",
+                    ));
+                }
+                return Ok((source, row, None));
+            }
+        }
+    }
+
+    let (source, row) = find_source_session_type_with_row(records, state, session_type_id)?;
+    let default_target_id = source_default_target_id(&source);
+    let resolved_target_id = source
+        .session_type
+        .target_id
+        .clone()
+        .unwrap_or_else(|| default_target_id.clone());
+
+    // Bare resolve without an explicit target keeps prior default-target semantics
+    // (device:local / package:name / repo target). When that id is an enabled
+    // admitted spawn point, bind cwd to it; device Global bare resolve stays on
+    // the device source root.
+    if let Ok(target) = ensure_enabled_admitted_target(state, &resolved_target_id) {
+        if !is_eligible_for_target(&source, &target.target_id) {
+            return Err(SessionTypeError::new(
+                "target_not_admitted",
+                "requested spawn target is not admitted for this session_type",
+            ));
+        }
+        return Ok((source, row, Some(target)));
+    }
+
+    if resolved_target_id != default_target_id {
+        return Err(SessionTypeError::new(
+            "target_not_admitted",
+            "requested spawn target is not admitted for this session_type",
+        ));
+    }
+    Ok((source, row, None))
 }
 
 fn effective_session_type_row(

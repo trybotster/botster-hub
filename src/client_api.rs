@@ -32,7 +32,8 @@ use crate::packages::{
 use crate::session_types::{
     HubSessionContext, HubSessionType, HubSessionTypeDefinition, PackageSessionType,
     ResolvedSessionType, SessionTypeMutation, SessionTypeMutationSource, SessionTypeRequest,
-    list_session_types, materialize_session_type, show_session_type, show_session_type_definition,
+    list_session_types, list_session_types_for_target, materialize_session_type, show_session_type,
+    show_session_type_definition,
 };
 use crate::{HubRuntime, HubRuntimeError, daemon_session_to_core_session, host_profile};
 
@@ -362,6 +363,19 @@ impl HubClientApi {
                             message: error.message,
                         }
                     })?;
+                HubClientResponseBody::SessionTypes(templates)
+            }
+            HubClientRequest::ListSessionTypesForTarget { target_id, .. } => {
+                let records = packages.packages();
+                let templates =
+                    list_session_types_for_target(&records, &runtime.state(), &target_id).map_err(
+                        |error| HubClientError::SessionType {
+                            request_id: request_id.clone(),
+                            operation,
+                            kind: error.kind,
+                            message: error.message,
+                        },
+                    )?;
                 HubClientResponseBody::SessionTypes(templates)
             }
             HubClientRequest::ShowSessionType {
@@ -710,6 +724,7 @@ impl HubClientAdmission {
                 self.allow_packages
             }
             HubClientOperation::ListSessionTypes
+            | HubClientOperation::ListSessionTypesForTarget
             | HubClientOperation::ShowSessionType
             | HubClientOperation::ResolveSessionType => self.allow_packages,
             // The authoring read carries the authored environment and
@@ -858,6 +873,11 @@ pub enum HubClientRequest {
     ListPackageNavigation { request_id: RequestId },
     /// Return sanitized session type rows.
     ListSessionTypes { request_id: RequestId },
+    /// Return sanitized session type rows eligible at one admitted spawn point.
+    ListSessionTypesForTarget {
+        request_id: RequestId,
+        target_id: String,
+    },
     /// Return one sanitized session type row.
     ShowSessionType {
         request_id: RequestId,
@@ -949,6 +969,7 @@ impl HubClientRequest {
             | Self::ListPackages { request_id }
             | Self::ListPackageNavigation { request_id }
             | Self::ListSessionTypes { request_id }
+            | Self::ListSessionTypesForTarget { request_id, .. }
             | Self::ShowSessionType { request_id, .. }
             | Self::ShowSessionTypeDefinition { request_id, .. }
             | Self::CreateSessionType { request_id, .. }
@@ -988,6 +1009,7 @@ impl HubClientRequest {
             Self::ListPackages { .. } => HubClientOperation::ListPackages,
             Self::ListPackageNavigation { .. } => HubClientOperation::ListPackageNavigation,
             Self::ListSessionTypes { .. } => HubClientOperation::ListSessionTypes,
+            Self::ListSessionTypesForTarget { .. } => HubClientOperation::ListSessionTypesForTarget,
             Self::ShowSessionType { .. } => HubClientOperation::ShowSessionType,
             Self::ShowSessionTypeDefinition { .. } => HubClientOperation::ShowSessionTypeDefinition,
             Self::CreateSessionType { .. } => HubClientOperation::CreateSessionType,
@@ -1029,6 +1051,7 @@ pub enum HubClientOperation {
     ListPackages,
     ListPackageNavigation,
     ListSessionTypes,
+    ListSessionTypesForTarget,
     ShowSessionType,
     ShowSessionTypeDefinition,
     CreateSessionType,
@@ -2198,6 +2221,7 @@ mod tests {
             allow_lifecycle: false,
         };
         assert!(sanitized_reader_only.allows(HubClientOperation::ListSessionTypes));
+        assert!(sanitized_reader_only.allows(HubClientOperation::ListSessionTypesForTarget));
         assert!(sanitized_reader_only.allows(HubClientOperation::ShowSessionType));
         assert!(sanitized_reader_only.allows(HubClientOperation::ResolveSessionType));
         assert!(

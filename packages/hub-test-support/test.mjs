@@ -132,10 +132,10 @@ function assertDialogFormComposition(source) {
 }
 
 assert.equal(metadata.package_name, "@trybotster/hub-test-support");
-assert.equal(metadata.package_version, "0.1.25");
+assert.equal(metadata.package_version, "0.1.26");
 assert.equal(metadata.protocol, "botster-hub-daemon-v1");
 assert.equal(metadata.protocol_version, 6);
-assert.equal(metadata.conformance_fixture_revision, 32);
+assert.equal(metadata.conformance_fixture_revision, 33);
 
 // Package README ships in the npm tarball; keep install pin sites tied to package.json.
 {
@@ -211,6 +211,7 @@ assert.match(protocol, /create_session_type/);
 assert.match(protocol, /update_session_type/);
 assert.match(protocol, /delete_session_type/);
 assert.match(protocol, /show_session_type_definition/);
+assert.match(protocol, /list_session_types_for_target/);
 assert.match(protocol, /export interface DaemonSessionTypeDefinition/);
 assert.match(protocol, /export interface DaemonSessionTypeEditableDefinition/);
 assert.match(
@@ -368,7 +369,7 @@ assert.deepEqual(
 );
 assert.equal(supportMatrix.session_type_authoring.admission_group, "allow_runtime");
 
-assert.equal(sessionLifecycleFixture.conformance_fixture_revision, 32);
+assert.equal(sessionLifecycleFixture.conformance_fixture_revision, 33);
 assert.equal(sessionLifecycleFixture.entity_type, "session");
 assert.deepEqual(
   sessionLifecycleFixture.normalized_frames.map((frame) => frame.type),
@@ -406,7 +407,7 @@ assert.equal(
 assert.equal(sessionLifecycleFixture.overflow.snapshot_precedes_later_deltas, true);
 assert.equal(sessionLifecycleFixture.overflow.failed_snapshot_delivery_closes_subscription, true);
 
-assert.equal(sessionPluginBindingFixture.conformance_fixture_revision, 32);
+assert.equal(sessionPluginBindingFixture.conformance_fixture_revision, 33);
 assert.equal(sessionPluginBindingFixture.binding_family, "/session");
 const sessionPluginMaterialization = materializeSessionPluginBindingScenario(
   sessionPluginBindingFixture,

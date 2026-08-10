@@ -156,6 +156,7 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             ("read_mode_flags", &[("session_id", "string")]),
             ("capture_snapshot", &[("session_id", "string")]),
             ("list_session_types", &[]),
+            ("list_session_types_for_target", &[("target_id", "string")]),
             ("show_session_type", &[("session_type_id", "string")]),
             (
                 "show_session_type_definition",
