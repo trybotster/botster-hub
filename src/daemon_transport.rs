@@ -511,6 +511,7 @@ async fn handle_entity_subscription_async(
             subscription_id: subscription_id.clone(),
             frame_tx: EntityFrameSender::Async(frame_tx),
             reply_tx,
+            grant_id: None,
         })
         .await
         .map_err(|_| DaemonTransportError::ControlThreadStopped)?;
@@ -566,6 +567,7 @@ async fn handle_entity_subscription_async(
                     .send(ControlMessage::UnsubscribeEntities {
                         subscription_id: subscription_id.clone(),
                         reply_tx: Some(reply_tx),
+                        grant_id: None,
                     })
                     .await
                     .map_err(|_| DaemonTransportError::ControlThreadStopped)?;
@@ -897,7 +899,7 @@ fn apply_attached_subscription_change(
     }
 }
 
-fn handle_control_message(
+pub(crate) fn handle_control_message(
     daemon: &mut HubDaemon,
     state: &mut DaemonControlState,
     local_webrtc_terminal_record_path: &Path,
@@ -912,16 +914,59 @@ fn handle_control_message(
             subscription_id,
             frame_tx,
             reply_tx,
+            grant_id,
         } => {
-            let response =
-                register_entity_subscription(daemon, state, entity_type, subscription_id, frame_tx);
+            // Late WebRTC control messages after PeerClosed must not recreate peer-owned state.
+            if let Some(grant_id) = grant_id.as_deref()
+                && !daemon.local_webrtc().has_live_peer(grant_id)
+            {
+                let _ = reply_tx.send(Ok(entity_subscription_error(
+                    "local_webrtc_peer_gone",
+                    &subscription_id,
+                    "local WebRTC peer is no longer live",
+                )));
+                return false;
+            }
+            let response = register_entity_subscription(
+                daemon,
+                state,
+                entity_type,
+                subscription_id,
+                frame_tx,
+                grant_id,
+            );
             let _ = reply_tx.send(response);
             false
         }
         ControlMessage::UnsubscribeEntities {
             subscription_id,
             reply_tx,
+            grant_id,
         } => {
+            if let Some(grant_id) = grant_id.as_deref()
+                && !daemon.local_webrtc().has_live_peer(grant_id)
+            {
+                // Peer already gone: still drop any residual daemon entry if present, but do not
+                // invent new ownership. Reply unsubscribed for idempotent client cleanup.
+                if state
+                    .entity_subscriptions
+                    .remove(&subscription_id)
+                    .is_some()
+                {
+                    state.lifecycle_counters.live_entity_subscriptions = state
+                        .lifecycle_counters
+                        .live_entity_subscriptions
+                        .saturating_sub(1);
+                    state.released_entity_generations =
+                        state.released_entity_generations.saturating_add(1);
+                }
+                if let Some(reply_tx) = reply_tx {
+                    let _ = reply_tx.send(Ok(daemon_response_base(
+                        DaemonResponseKind::EntityUnsubscribed,
+                    )));
+                }
+                return false;
+            }
             if state
                 .entity_subscriptions
                 .remove(&subscription_id)
@@ -1070,8 +1115,38 @@ fn handle_control_message(
                     error.kind()
                 );
             }
-            daemon.local_webrtc().remove_peer(&grant_id);
+            let remove_result = daemon.local_webrtc().remove_peer(&grant_id);
+            let mut removed_grants: BTreeSet<String> =
+                remove_result.removed_grant_ids.into_iter().collect();
+            // Always include the closing grant so entity/attach sweep runs even if the peer
+            // map entry was already gone (idempotent PeerClosed).
+            removed_grants.insert(grant_id.clone());
+
+            // Snapshot IDs are only removed when the current row is unowned or still owned by a
+            // removed grant. A reused subscription_id owned by a different live peer is preserved.
+            let mut removed_entity_ids = BTreeSet::new();
             for subscription_id in entity_subscription_ids {
+                let should_remove = match state.entity_subscriptions.get(&subscription_id) {
+                    None => false,
+                    Some(subscription) => match subscription.owner_grant_id.as_deref() {
+                        None => true,
+                        Some(owner) => removed_grants.contains(owner),
+                    },
+                };
+                if should_remove {
+                    removed_entity_ids.insert(subscription_id);
+                }
+            }
+            // Independent of the peer-side snapshot: remove every daemon entity subscription
+            // owned by any grant this forget removed (primary + fail-closed siblings).
+            for (id, subscription) in &state.entity_subscriptions {
+                if let Some(owner) = subscription.owner_grant_id.as_deref()
+                    && removed_grants.contains(owner)
+                {
+                    removed_entity_ids.insert(id.clone());
+                }
+            }
+            for subscription_id in removed_entity_ids {
                 if state
                     .entity_subscriptions
                     .remove(&subscription_id)
@@ -1085,13 +1160,24 @@ fn handle_control_message(
                         state.released_entity_generations.saturating_add(1);
                 }
             }
+
+            // Merge attach owners from the PeerClosed snapshot and any fail-closed siblings.
+            let mut detach_list = attached_subscriptions;
+            for subscription in remove_result.attached_subscriptions {
+                if !detach_list.iter().any(|existing| {
+                    existing.session_id == subscription.session_id
+                        && existing.subscription_id == subscription.subscription_id
+                }) {
+                    detach_list.push(subscription);
+                }
+            }
             state.lifecycle_counters.live_attach_subscriptions = state
                 .lifecycle_counters
                 .live_attach_subscriptions
-                .saturating_sub(attached_subscriptions.len() as u64);
+                .saturating_sub(detach_list.len() as u64);
             state.released_attach_generations = state
                 .released_attach_generations
-                .saturating_add(attached_subscriptions.len() as u64);
+                .saturating_add(detach_list.len() as u64);
             detach_local_webrtc_subscriptions(
                 daemon,
                 &mut state.logical_clock,
@@ -1102,7 +1188,7 @@ fn handle_control_message(
                     egress: &state.egress_diagnostics,
                     lifecycle: &state.lifecycle_counters,
                 },
-                attached_subscriptions,
+                detach_list,
             );
             false
         }
@@ -3813,10 +3899,15 @@ pub(crate) enum ControlMessage {
         subscription_id: String,
         frame_tx: EntityFrameSender,
         reply_tx: ControlReplySender,
+        /// When set, admission requires a still-live local WebRTC peer for this grant.
+        /// Socket-path subscriptions leave this `None`.
+        grant_id: Option<String>,
     },
     UnsubscribeEntities {
         subscription_id: String,
         reply_tx: Option<ControlReplySender>,
+        /// Same live-peer guard as `SubscribeEntities` when the request originated on WebRTC.
+        grant_id: Option<String>,
     },
     Request {
         request: Box<DaemonRequest>,
@@ -3876,7 +3967,7 @@ fn entity_frame_exceeds_limit(frame: &DaemonEntityFrame) -> bool {
 }
 
 #[derive(Debug)]
-struct EntitySubscriptionState {
+pub(crate) struct EntitySubscriptionState {
     sender: EntityFrameSender,
     entity_type: String,
     cursor: Option<SessionLifecycleCursor>,
@@ -3884,6 +3975,9 @@ struct EntitySubscriptionState {
     definition_generation: u64,
     definition_entities: BTreeMap<String, Value>,
     resync_reason: Option<String>,
+    /// Local WebRTC grant that owns this subscription, when registered over DataChannel.
+    /// Used so PeerClosed can sweep rows that arrived after cleanup_once's id snapshot.
+    pub(crate) owner_grant_id: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -3893,23 +3987,23 @@ struct EntityReconciliationState {
 }
 
 #[derive(Debug, Default)]
-struct PendingRuntimeState {
+pub(crate) struct PendingRuntimeState {
     events: BTreeMap<String, Vec<HubClientEvent>>,
-    active_subscriptions: BTreeMap<String, BTreeSet<String>>,
+    pub(crate) active_subscriptions: BTreeMap<String, BTreeSet<String>>,
 }
 
 #[derive(Debug)]
-struct DaemonControlState {
+pub(crate) struct DaemonControlState {
     logical_clock: u64,
     drain_cursors: BTreeMap<String, u64>,
     egress_diagnostics: DaemonEgressDiagnostics,
-    entity_subscriptions: BTreeMap<String, EntitySubscriptionState>,
+    pub(crate) entity_subscriptions: BTreeMap<String, EntitySubscriptionState>,
     reconciliation: EntityReconciliationState,
-    pending_runtime: PendingRuntimeState,
-    lifecycle_counters: DaemonLifecycleCounters,
+    pub(crate) pending_runtime: PendingRuntimeState,
+    pub(crate) lifecycle_counters: DaemonLifecycleCounters,
     next_reconciliation: Instant,
     released_entity_generations: u64,
-    released_attach_generations: u64,
+    pub(crate) released_attach_generations: u64,
     pending_hub_update_reply: Option<ControlReplySender>,
 }
 
@@ -4085,6 +4179,7 @@ fn register_entity_subscription(
     entity_type: String,
     subscription_id: String,
     sender: EntityFrameSender,
+    owner_grant_id: Option<String>,
 ) -> DaemonTransportResult<DaemonResponse> {
     if state.entity_subscriptions.contains_key(&subscription_id) {
         return Ok(entity_subscription_error(
@@ -4134,6 +4229,7 @@ fn register_entity_subscription(
                 definition_generation: snapshot_seq,
                 definition_entities: entities,
                 resync_reason: None,
+                owner_grant_id,
             },
         );
         state.lifecycle_counters.live_entity_subscriptions =
@@ -4186,6 +4282,7 @@ fn register_entity_subscription(
                 definition_generation: 0,
                 definition_entities: BTreeMap::new(),
                 resync_reason: None,
+                owner_grant_id,
             },
         );
         state.lifecycle_counters.live_entity_subscriptions =
@@ -4253,6 +4350,7 @@ fn register_entity_subscription(
             definition_generation: 0,
             definition_entities: BTreeMap::new(),
             resync_reason: None,
+            owner_grant_id,
         },
     );
     state.lifecycle_counters.live_entity_subscriptions = state
@@ -7922,6 +8020,7 @@ mod tests {
             "session".to_string(),
             "stale-transition-subscription".to_string(),
             EntityFrameSender::Blocking(sender),
+            None,
         )
         .expect("register entity subscription");
         assert_eq!(response.kind, DaemonResponseKind::EntitySubscribed);
@@ -8337,6 +8436,7 @@ mod tests {
             definition_generation: 0,
             definition_entities: BTreeMap::new(),
             resync_reason: Some(overflow_reason.clone()),
+            owner_grant_id: None,
         };
         let mut counters = DaemonLifecycleCounters::default();
 
@@ -8398,6 +8498,7 @@ mod tests {
                 definition_generation: 1,
                 definition_entities: BTreeMap::new(),
                 resync_reason: Some("subscriber_overflow".to_string()),
+                owner_grant_id: None,
             },
         )]);
         let entities = BTreeMap::from([(
@@ -8456,6 +8557,7 @@ mod tests {
             definition_generation: 0,
             definition_entities: BTreeMap::new(),
             resync_reason: Some(overflow_reason.clone()),
+            owner_grant_id: None,
         };
         let mut counters = DaemonLifecycleCounters::default();
 
