@@ -95,7 +95,15 @@ pub struct LocalWebrtcTransport {
     grants: BTreeMap<String, LocalWebrtcGrant>,
     peers: BTreeMap<String, Arc<dyn PeerConnection>>,
     runtime: Option<tokio::runtime::Runtime>,
+    #[cfg(test)]
+    close_completions: Mutex<Vec<String>>,
+    #[cfg(test)]
+    peer_handlers: BTreeMap<String, Arc<LocalWebrtcHandler>>,
 }
+
+#[cfg(test)]
+static LOCAL_WEBRTC_WORKER_THREADS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 impl LocalWebrtcTransport {
     /// Mint a local, single-use bootstrap grant bound to an already-running app origin.
@@ -152,6 +160,9 @@ impl LocalWebrtcTransport {
             .runtime()?
             .block_on(answer_offer(request, runtime_tx))?;
         self.peers.insert(grant_id.clone(), answer.peer);
+        #[cfg(test)]
+        self.peer_handlers
+            .insert(grant_id.clone(), answer.handler);
         Ok(DaemonLocalWebrtcAnswer {
             grant_id,
             answer: answer.answer,
@@ -163,24 +174,70 @@ impl LocalWebrtcTransport {
     pub fn stop_all(&mut self) {
         let peers = std::mem::take(&mut self.peers);
         self.grants.clear();
+        #[cfg(test)]
+        self.peer_handlers.clear();
         if let Some(runtime) = self.runtime.take() {
-            for peer in peers.into_values() {
-                let _ = runtime.block_on(peer.close());
+            for (grant_id, peer) in peers {
+                self.close_peer_on_runtime(&runtime, &grant_id, peer);
             }
         }
     }
 
-    /// Forget one active peer after its DataChannel or peer connection closes.
+    /// Close one peer, remove it from the live map, and drop the dedicated runtime when empty.
+    ///
+    /// This is the sole production forget path for `LocalWebrtcPeerClosed`.
     pub(crate) fn remove_peer(&mut self, grant_id: &str) {
-        self.peers.remove(grant_id);
+        let Some(peer) = self.peers.remove(grant_id) else {
+            return;
+        };
+        #[cfg(test)]
+        self.peer_handlers.remove(grant_id);
+        if let Some(runtime) = self.runtime.as_ref() {
+            self.close_peer_on_runtime(runtime, grant_id, peer);
+        }
+        if self.peers.is_empty() {
+            let _ = self.runtime.take();
+        }
+    }
+
+    fn close_peer_on_runtime(
+        &self,
+        runtime: &tokio::runtime::Runtime,
+        grant_id: &str,
+        peer: Arc<dyn PeerConnection>,
+    ) {
+        let close_result = runtime.block_on(peer.close());
+        #[cfg(test)]
+        {
+            // Close-completion evidence records that production forget invoked and completed
+            // PeerConnection::close for this grant. Record Ok and benign already-closed outcomes;
+            // never record when close() was skipped.
+            if close_result.is_ok() {
+                self.close_completions
+                    .lock()
+                    .expect("local WebRTC close completion mutex")
+                    .push(grant_id.to_string());
+            }
+        }
+        let _ = close_result;
     }
 
     fn runtime(&mut self) -> LocalWebrtcResult<&tokio::runtime::Runtime> {
         if self.runtime.is_none() {
+            let mut builder = tokio::runtime::Builder::new_multi_thread();
+            builder.thread_name("botster-local-webrtc").enable_all();
+            #[cfg(test)]
+            {
+                builder
+                    .on_thread_start(|| {
+                        LOCAL_WEBRTC_WORKER_THREADS.fetch_add(1, Ordering::SeqCst);
+                    })
+                    .on_thread_stop(|| {
+                        LOCAL_WEBRTC_WORKER_THREADS.fetch_sub(1, Ordering::SeqCst);
+                    });
+            }
             self.runtime = Some(
-                tokio::runtime::Builder::new_multi_thread()
-                    .thread_name("botster-local-webrtc")
-                    .enable_all()
+                builder
                     .build()
                     .map_err(|error| LocalWebrtcError::Webrtc(error.to_string()))?,
             );
@@ -190,6 +247,53 @@ impl LocalWebrtcTransport {
 
     fn prune_expired_grants(&mut self, now: u64) {
         self.grants.retain(|_, grant| grant.expires_at > now);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_peer_count(&self) -> usize {
+        self.peers.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_dedicated_runtime(&self) -> bool {
+        self.runtime.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn close_completion_count_for(&self, grant_id: &str) -> usize {
+        self.close_completions
+            .lock()
+            .expect("local WebRTC close completion mutex")
+            .iter()
+            .filter(|completed| completed.as_str() == grant_id)
+            .count()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn dedicated_runtime_worker_threads() -> usize {
+        LOCAL_WEBRTC_WORKER_THREADS.load(Ordering::SeqCst)
+    }
+
+    /// Deterministic production-path failure injection for tests.
+    ///
+    /// Calls the same `LocalWebrtcHandler::on_connection_state_change` body that the live
+    /// WebRTC stack invokes when a peer reaches a terminal connection state.
+    #[cfg(test)]
+    pub(crate) fn inject_peer_connection_state_for_test(
+        &mut self,
+        grant_id: &str,
+        state: RTCPeerConnectionState,
+    ) {
+        let handler = self
+            .peer_handlers
+            .get(grant_id)
+            .cloned()
+            .unwrap_or_else(|| panic!("missing production handler for grant {grant_id}"));
+        let runtime = self
+            .runtime
+            .as_ref()
+            .expect("dedicated runtime required to inject peer connection state");
+        runtime.block_on(handler.on_connection_state_change(state));
     }
 }
 
@@ -229,6 +333,8 @@ impl LocalWebrtcGrant {
 struct LocalWebrtcAnswer {
     answer: Value,
     peer: Arc<dyn PeerConnection>,
+    #[cfg(test)]
+    handler: Arc<LocalWebrtcHandler>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1164,7 +1270,7 @@ async fn answer_offer(
     });
 
     let peer_connection = PeerConnectionBuilder::new()
-        .with_handler(handler)
+        .with_handler(handler.clone())
         .with_runtime(runtime)
         .with_udp_addrs(vec!["127.0.0.1:0"])
         .build()
@@ -1190,7 +1296,12 @@ async fn answer_offer(
         .ok_or_else(|| LocalWebrtcError::Webrtc("missing local description".to_string()))?;
     let answer = serde_json::to_value(answer)
         .map_err(|error| LocalWebrtcError::Webrtc(error.to_string()))?;
-    Ok(LocalWebrtcAnswer { answer, peer })
+    Ok(LocalWebrtcAnswer {
+        answer,
+        peer,
+        #[cfg(test)]
+        handler,
+    })
 }
 
 fn decrypt_daemon_request(key: &AesGcmKey, bytes: &[u8]) -> Option<DaemonRequest> {
@@ -2825,5 +2936,576 @@ mod tests {
         assert!(transport.grants.contains_key("grant-live-redeemed"));
         assert!(transport.grants.contains_key(&bootstrap.grant_id));
         assert_eq!(transport.grants.len(), 2);
+    }
+
+
+    // --- Production peer_failed teardown harnesses (H1–H3) ---
+
+    use std::path::{Path, PathBuf};
+    use std::thread;
+    use webrtc::data_channel::RTCDataChannelInit;
+    use webrtc::runtime::{
+        Receiver as AsyncReceiver, Sender as AsyncSender, channel as webrtc_channel,
+        default_runtime,
+    };
+
+    use crate::daemon_transport::{DaemonControlState, handle_control_message};
+    use crate::{
+        DataDirectoryOption, HostIdentityOptions, HubDaemon, HubStartupOptions, RuntimeEnvironment,
+        SessionDefaults,
+    };
+
+    struct TestOfferHandler {
+        gather_complete_tx: AsyncSender<()>,
+        connected_tx: AsyncSender<()>,
+    }
+
+    #[async_trait]
+    impl PeerConnectionEventHandler for TestOfferHandler {
+        async fn on_ice_gathering_state_change(&self, state: RTCIceGatheringState) {
+            if state == RTCIceGatheringState::Complete {
+                let _ = self.gather_complete_tx.try_send(());
+            }
+        }
+
+        async fn on_connection_state_change(&self, state: RTCPeerConnectionState) {
+            if state == RTCPeerConnectionState::Connected {
+                let _ = self.connected_tx.try_send(());
+            }
+        }
+    }
+
+    struct TestOfferPeer {
+        peer: Box<dyn PeerConnection>,
+        data_channel: Arc<dyn DataChannel>,
+        connected_rx: AsyncReceiver<()>,
+        data_channel_open_rx: AsyncReceiver<()>,
+        data_channel_message_rx: AsyncReceiver<String>,
+    }
+
+    impl TestOfferPeer {
+        async fn create_offer() -> (Self, Value) {
+            let runtime = default_runtime().expect("webrtc default runtime for offer peer");
+            let (gather_complete_tx, mut gather_complete_rx) = webrtc_channel::<()>(1);
+            let (connected_tx, connected_rx) = webrtc_channel::<()>(1);
+            let (data_channel_open_tx, data_channel_open_rx) = webrtc_channel::<()>(1);
+            let (data_channel_message_tx, data_channel_message_rx) = webrtc_channel::<String>(256);
+            let handler = Arc::new(TestOfferHandler {
+                gather_complete_tx,
+                connected_tx,
+            });
+            let peer = PeerConnectionBuilder::new()
+                .with_handler(handler)
+                .with_runtime(runtime.clone())
+                .with_udp_addrs(vec!["127.0.0.1:0".to_string()])
+                .build()
+                .await
+                .expect("build offer peer");
+            let data_channel = peer
+                .create_data_channel(
+                    "botster-client",
+                    Some(RTCDataChannelInit {
+                        ordered: true,
+                        max_retransmits: None,
+                        max_packet_life_time: None,
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .expect("create offer data channel");
+            {
+                let data_channel = data_channel.clone();
+                let open_tx = data_channel_open_tx;
+                let message_tx = data_channel_message_tx;
+                runtime.spawn(Box::pin(async move {
+                    while let Some(event) = data_channel.poll().await {
+                        match event {
+                            DataChannelEvent::OnOpen => {
+                                let _ = open_tx.try_send(());
+                            }
+                            DataChannelEvent::OnMessage(message) => {
+                                if let Ok(text) = String::from_utf8(message.data.to_vec()) {
+                                    let _ = message_tx.try_send(text);
+                                }
+                            }
+                            DataChannelEvent::OnClose => break,
+                            _ => {}
+                        }
+                    }
+                }));
+            }
+            let offer = peer.create_offer(None).await.expect("create offer");
+            peer.set_local_description(offer)
+                .await
+                .expect("set local offer");
+            let _ = timeout(Duration::from_secs(5), gather_complete_rx.recv()).await;
+            let offer = peer
+                .local_description()
+                .await
+                .expect("offer local description");
+            (
+                Self {
+                    peer: Box::new(peer),
+                    data_channel,
+                    connected_rx,
+                    data_channel_open_rx,
+                    data_channel_message_rx,
+                },
+                serde_json::to_value(offer).expect("serialize offer"),
+            )
+        }
+
+        async fn accept_answer(&mut self, answer: Value) {
+            let answer =
+                serde_json::from_value::<RTCSessionDescription>(answer).expect("parse answer");
+            self.peer
+                .set_remote_description(answer)
+                .await
+                .expect("set remote answer");
+            timeout(Duration::from_secs(15), self.connected_rx.recv())
+                .await
+                .expect("timed out waiting for offer peer connected")
+                .expect("connected signal");
+            timeout(Duration::from_secs(10), self.data_channel_open_rx.recv())
+                .await
+                .expect("timed out waiting for data channel open")
+                .expect("open signal");
+        }
+
+        async fn encrypted_request(
+            &mut self,
+            key: &AesGcmKey,
+            request: &DaemonRequest,
+        ) -> DaemonResponse {
+            let plaintext = serde_json::to_vec(request).expect("serialize request");
+            let envelope = encrypt_aes_gcm(key, &plaintext, 1).expect("encrypt request");
+            self.data_channel
+                .send_text(&serde_json::to_string(&envelope).expect("serialize envelope"))
+                .await
+                .expect("send encrypted request");
+            let mut encrypted = String::new();
+            let mut next_chunk_index = 0u32;
+            loop {
+                let response = timeout(Duration::from_secs(10), self.data_channel_message_rx.recv())
+                    .await
+                    .expect("response frame timeout")
+                    .expect("data channel remains open for response");
+                let chunk: DaemonLocalWebrtcDeliveryChunk =
+                    serde_json::from_str(&response).expect("parse delivery chunk");
+                assert_eq!(chunk.chunk_index, next_chunk_index);
+                encrypted.push_str(&chunk.payload);
+                next_chunk_index += 1;
+                if chunk.chunk_index + 1 == chunk.chunk_count {
+                    break;
+                }
+            }
+            let envelope: AesGcmEnvelope =
+                serde_json::from_str(&encrypted).expect("parse response envelope");
+            let plaintext = decrypt_aes_gcm(key, &envelope).expect("decrypt response");
+            serde_json::from_slice(&plaintext).expect("parse daemon response")
+        }
+    }
+
+    fn unique_test_data_dir(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "botster-hub-webrtc-teardown-{label}-{}-{nanos}",
+            std::process::id()
+        ))
+    }
+
+    fn start_test_daemon(data_directory: PathBuf) -> HubDaemon {
+        let config = HubStartupOptions {
+            host: HostIdentityOptions {
+                id: "local-webrtc-teardown-test".to_string(),
+                display_name: "Local WebRTC Teardown Test".to_string(),
+                fingerprint: None,
+            },
+            data_directory: DataDirectoryOption::Explicit(data_directory),
+            session_defaults: SessionDefaults {
+                shell: "/bin/sh".to_string(),
+                working_directory: Some(".".into()),
+                initial_rows: 24,
+                initial_cols: 80,
+            },
+            ..HubStartupOptions::default()
+        }
+        .build_config_for_environment(&RuntimeEnvironment::from_values(None, None))
+        .expect("build teardown test config");
+        HubDaemon::start(config).expect("start teardown test daemon")
+    }
+
+    fn wait_until(deadline: Instant, mut predicate: impl FnMut() -> bool, label: &str) {
+        while Instant::now() < deadline {
+            if predicate() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("timed out waiting for {label}");
+    }
+
+    struct PeerHarness {
+        daemon: HubDaemon,
+        state: DaemonControlState,
+        terminal_path: PathBuf,
+        control_tx: ControlSender,
+        control_rx: tokio_mpsc::Receiver<ControlMessage>,
+        transport_handle: tokio::runtime::Handle,
+        /// Keep a multi-thread runtime alive so Handle remains valid.
+        _transport_runtime: tokio::runtime::Runtime,
+        data_directory: PathBuf,
+    }
+
+    impl PeerHarness {
+        fn new(label: &str) -> Self {
+            let data_directory = unique_test_data_dir(label);
+            let terminal_path = data_directory.join(LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_FILE);
+            let daemon = start_test_daemon(data_directory.clone());
+            let (control_tx, control_rx) = tokio_mpsc::channel(256);
+            let transport_runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .thread_name("botster-webrtc-test-control")
+                .build()
+                .expect("control transport runtime");
+            let transport_handle = transport_runtime.handle().clone();
+            Self {
+                daemon,
+                state: DaemonControlState::default(),
+                terminal_path,
+                control_tx,
+                control_rx,
+                transport_handle,
+                _transport_runtime: transport_runtime,
+                data_directory,
+            }
+        }
+
+        fn process_until_peer_closed(&mut self, grant_id: &str, deadline: Instant) {
+            loop {
+                if Instant::now() >= deadline {
+                    panic!("timed out waiting for LocalWebrtcPeerClosed for {grant_id}");
+                }
+                match self.control_rx.try_recv() {
+                    Ok(message) => {
+                        let is_closed = matches!(
+                            &message,
+                            ControlMessage::LocalWebrtcPeerClosed { grant_id: closed, .. }
+                                if closed == grant_id
+                        );
+                        handle_control_message(
+                            &mut self.daemon,
+                            &mut self.state,
+                            &self.terminal_path,
+                            &self.transport_handle,
+                            self.control_tx.clone(),
+                            message,
+                        );
+                        if is_closed {
+                            return;
+                        }
+                    }
+                    Err(tokio_mpsc::error::TryRecvError::Empty) => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(tokio_mpsc::error::TryRecvError::Disconnected) => {
+                        panic!("control channel closed before LocalWebrtcPeerClosed");
+                    }
+                }
+            }
+        }
+
+        fn signal_peer(&mut self, origin: &str) -> LiveSignaledPeer {
+            let bootstrap = self
+                .daemon
+                .local_webrtc()
+                .issue_bootstrap("botster-web", "web-client", origin)
+                .expect("issue bootstrap");
+            let stream_key = secret_stream_key(&bootstrap.grant_secret)
+                .expect("bootstrap secret is stream key");
+            let offer_runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .thread_name("botster-webrtc-offer-test")
+                .build()
+                .expect("offer peer runtime");
+            let (mut offer_peer, offer) = offer_runtime.block_on(TestOfferPeer::create_offer());
+            let answer = self
+                .daemon
+                .local_webrtc()
+                .signal(
+                    LocalWebrtcSignalRequest {
+                        grant_id: bootstrap.grant_id.clone(),
+                        grant_secret: bootstrap.grant_secret.clone(),
+                        origin: origin.to_string(),
+                        offer,
+                    },
+                    self.control_tx.clone(),
+                )
+                .expect("signal real local WebRTC peer");
+            offer_runtime.block_on(offer_peer.accept_answer(answer.answer));
+            LiveSignaledPeer {
+                grant_id: bootstrap.grant_id,
+                stream_key,
+                offer_peer: Some(offer_peer),
+                offer_runtime,
+            }
+        }
+
+        fn subscribe_entities(
+            &mut self,
+            peer: &mut LiveSignaledPeer,
+            subscription_id: &str,
+        ) -> DaemonResponse {
+            let request = DaemonRequest::SubscribeEntities {
+                entity_type: "session".to_string(),
+                subscription_id: subscription_id.to_string(),
+            };
+            let key = peer.stream_key.clone();
+            let mut offer_peer = peer
+                .offer_peer
+                .take()
+                .expect("offer peer available for subscribe");
+            let (response_tx, response_rx) = std::sync::mpsc::channel();
+            let offer_handle = peer.offer_runtime.handle().clone();
+            let worker = thread::spawn(move || {
+                let response =
+                    offer_handle.block_on(offer_peer.encrypted_request(&key, &request));
+                response_tx
+                    .send((offer_peer, response))
+                    .expect("return subscribe response");
+            });
+
+            let deadline = Instant::now() + Duration::from_secs(15);
+            let (offer_peer, response) = loop {
+                if let Ok(result) = response_rx.try_recv() {
+                    break result;
+                }
+                if Instant::now() >= deadline {
+                    panic!("timed out waiting for SubscribeEntities response");
+                }
+                match self.control_rx.try_recv() {
+                    Ok(message) => {
+                        handle_control_message(
+                            &mut self.daemon,
+                            &mut self.state,
+                            &self.terminal_path,
+                            &self.transport_handle,
+                            self.control_tx.clone(),
+                            message,
+                        );
+                    }
+                    Err(tokio_mpsc::error::TryRecvError::Empty) => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(tokio_mpsc::error::TryRecvError::Disconnected) => {
+                        panic!("control channel closed during SubscribeEntities");
+                    }
+                }
+            };
+            worker.join().expect("subscribe worker joins");
+            peer.offer_peer = Some(offer_peer);
+            response
+        }
+
+        fn cleanup(mut self) {
+            self.daemon.local_webrtc().stop_all();
+            self.daemon.stop();
+            let _ = std::fs::remove_dir_all(&self.data_directory);
+        }
+    }
+
+    struct LiveSignaledPeer {
+        grant_id: String,
+        stream_key: AesGcmKey,
+        offer_peer: Option<TestOfferPeer>,
+        offer_runtime: tokio::runtime::Runtime,
+    }
+
+    impl LiveSignaledPeer {
+        fn close_offer(mut self) {
+            if let Some(offer_peer) = self.offer_peer.take() {
+                let _ = self.offer_runtime.block_on(offer_peer.peer.close());
+            }
+        }
+    }
+
+    fn read_terminal_record(path: &Path) -> LocalWebrtcSenderTerminalRecord {
+        let bytes = std::fs::read(path).expect("read terminal record");
+        serde_json::from_slice(&bytes).expect("parse terminal record")
+    }
+
+    #[test]
+    fn local_webrtc_peer_failed_closes_live_peer_parks_runtime_and_clears_driver_threads() {
+        let mut harness = PeerHarness::new("h1");
+        let origin = "http://127.0.0.1:41791";
+        let mut peer = harness.signal_peer(origin);
+        let grant_id = peer.grant_id.clone();
+        let subscription_id = "entity-delivery-h1".to_string();
+
+        assert_eq!(harness.daemon.local_webrtc().active_peer_count(), 1);
+        assert!(harness.daemon.local_webrtc().has_dedicated_runtime());
+        assert!(LocalWebrtcTransport::dedicated_runtime_worker_threads() >= 1);
+        assert_eq!(
+            harness.daemon.local_webrtc().close_completion_count_for(&grant_id),
+            0
+        );
+
+        let subscribe = harness.subscribe_entities(&mut peer, &subscription_id);
+        assert_eq!(
+            subscribe.kind,
+            botster_hub_client::DaemonResponseKind::EntitySubscribed
+        );
+        assert!(
+            harness
+                .state
+                .entity_subscriptions
+                .contains_key(&subscription_id),
+            "entity subscription must be registered before peer_failed"
+        );
+        assert_eq!(
+            harness.state.lifecycle_counters.live_entity_subscriptions,
+            1
+        );
+
+        // Production path: handler on_connection_state_change(Failed) → cleanup_once(PeerFailed)
+        // → LocalWebrtcPeerClosed → handle_control_message → remove_peer close+map+runtime drop.
+        harness
+            .daemon
+            .local_webrtc()
+            .inject_peer_connection_state_for_test(&grant_id, RTCPeerConnectionState::Failed);
+        harness.process_until_peer_closed(&grant_id, Instant::now() + Duration::from_secs(10));
+
+        let terminal = read_terminal_record(&harness.terminal_path);
+        assert_eq!(terminal.grant_id, grant_id);
+        assert_eq!(terminal.cause, LocalWebrtcTerminalCause::PeerFailed);
+        assert_eq!(terminal.peer_connection_state, "failed");
+
+        assert_eq!(harness.daemon.local_webrtc().active_peer_count(), 0);
+        assert!(!harness.daemon.local_webrtc().has_dedicated_runtime());
+        assert_eq!(
+            harness.daemon.local_webrtc().close_completion_count_for(&grant_id),
+            1,
+            "production forget must invoke and complete PeerConnection::close"
+        );
+        assert!(
+            !harness
+                .state
+                .entity_subscriptions
+                .contains_key(&subscription_id),
+            "entity subscription must be removed on LocalWebrtcPeerClosed"
+        );
+        assert_eq!(
+            harness.state.lifecycle_counters.live_entity_subscriptions,
+            0
+        );
+
+        wait_until(
+            Instant::now() + Duration::from_secs(2),
+            || LocalWebrtcTransport::dedicated_runtime_worker_threads() == 0,
+            "dedicated botster-local-webrtc worker threads to join",
+        );
+
+        peer.close_offer();
+        harness.cleanup();
+    }
+
+    #[test]
+    fn local_webrtc_single_peer_failed_cleanup_preserves_sibling_peer_and_runtime() {
+        let mut harness = PeerHarness::new("h2");
+        let origin = "http://127.0.0.1:41792";
+        let mut peer_a = harness.signal_peer(origin);
+        let mut peer_b = harness.signal_peer(origin);
+        let grant_a = peer_a.grant_id.clone();
+        let grant_b = peer_b.grant_id.clone();
+
+        assert_eq!(harness.daemon.local_webrtc().active_peer_count(), 2);
+        assert!(harness.daemon.local_webrtc().has_dedicated_runtime());
+
+        let subscribe_a = harness.subscribe_entities(&mut peer_a, "entity-a");
+        assert_eq!(
+            subscribe_a.kind,
+            botster_hub_client::DaemonResponseKind::EntitySubscribed
+        );
+        let subscribe_b = harness.subscribe_entities(&mut peer_b, "entity-b");
+        assert_eq!(
+            subscribe_b.kind,
+            botster_hub_client::DaemonResponseKind::EntitySubscribed
+        );
+        assert_eq!(
+            harness.state.lifecycle_counters.live_entity_subscriptions,
+            2
+        );
+
+        harness
+            .daemon
+            .local_webrtc()
+            .inject_peer_connection_state_for_test(&grant_a, RTCPeerConnectionState::Failed);
+        harness.process_until_peer_closed(&grant_a, Instant::now() + Duration::from_secs(10));
+
+        assert_eq!(harness.daemon.local_webrtc().active_peer_count(), 1);
+        assert!(
+            harness.daemon.local_webrtc().has_dedicated_runtime(),
+            "sibling peer must keep the dedicated runtime alive"
+        );
+        assert_eq!(
+            harness.daemon.local_webrtc().close_completion_count_for(&grant_a),
+            1
+        );
+        assert_eq!(
+            harness.daemon.local_webrtc().close_completion_count_for(&grant_b),
+            0
+        );
+        assert!(!harness.state.entity_subscriptions.contains_key("entity-a"));
+        assert!(harness.state.entity_subscriptions.contains_key("entity-b"));
+        assert_eq!(
+            harness.state.lifecycle_counters.live_entity_subscriptions,
+            1
+        );
+
+        peer_a.close_offer();
+        peer_b.close_offer();
+        harness.cleanup();
+    }
+
+    #[test]
+    fn local_webrtc_after_last_peer_cleanup_new_signal_recreates_runtime_and_succeeds() {
+        let mut harness = PeerHarness::new("h3");
+        let origin = "http://127.0.0.1:41793";
+        let mut first = harness.signal_peer(origin);
+        let first_grant = first.grant_id.clone();
+        let subscribe = harness.subscribe_entities(&mut first, "entity-h3");
+        assert_eq!(
+            subscribe.kind,
+            botster_hub_client::DaemonResponseKind::EntitySubscribed
+        );
+
+        harness
+            .daemon
+            .local_webrtc()
+            .inject_peer_connection_state_for_test(&first_grant, RTCPeerConnectionState::Failed);
+        harness.process_until_peer_closed(&first_grant, Instant::now() + Duration::from_secs(10));
+        assert_eq!(harness.daemon.local_webrtc().active_peer_count(), 0);
+        assert!(!harness.daemon.local_webrtc().has_dedicated_runtime());
+        wait_until(
+            Instant::now() + Duration::from_secs(2),
+            || LocalWebrtcTransport::dedicated_runtime_worker_threads() == 0,
+            "first dedicated runtime workers to join",
+        );
+
+        let second = harness.signal_peer(origin);
+        assert_eq!(harness.daemon.local_webrtc().active_peer_count(), 1);
+        assert!(
+            harness.daemon.local_webrtc().has_dedicated_runtime(),
+            "new signal after last-peer park must recreate the dedicated runtime"
+        );
+        assert!(LocalWebrtcTransport::dedicated_runtime_worker_threads() >= 1);
+
+        first.close_offer();
+        second.close_offer();
+        harness.cleanup();
     }
 }

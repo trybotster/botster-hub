@@ -897,7 +897,7 @@ fn apply_attached_subscription_change(
     }
 }
 
-fn handle_control_message(
+pub(crate) fn handle_control_message(
     daemon: &mut HubDaemon,
     state: &mut DaemonControlState,
     local_webrtc_terminal_record_path: &Path,
@@ -3876,7 +3876,7 @@ fn entity_frame_exceeds_limit(frame: &DaemonEntityFrame) -> bool {
 }
 
 #[derive(Debug)]
-struct EntitySubscriptionState {
+pub(crate) struct EntitySubscriptionState {
     sender: EntityFrameSender,
     entity_type: String,
     cursor: Option<SessionLifecycleCursor>,
@@ -3899,14 +3899,14 @@ struct PendingRuntimeState {
 }
 
 #[derive(Debug)]
-struct DaemonControlState {
+pub(crate) struct DaemonControlState {
     logical_clock: u64,
     drain_cursors: BTreeMap<String, u64>,
     egress_diagnostics: DaemonEgressDiagnostics,
-    entity_subscriptions: BTreeMap<String, EntitySubscriptionState>,
+    pub(crate) entity_subscriptions: BTreeMap<String, EntitySubscriptionState>,
     reconciliation: EntityReconciliationState,
     pending_runtime: PendingRuntimeState,
-    lifecycle_counters: DaemonLifecycleCounters,
+    pub(crate) lifecycle_counters: DaemonLifecycleCounters,
     next_reconciliation: Instant,
     released_entity_generations: u64,
     released_attach_generations: u64,
