@@ -187,3 +187,44 @@ Same gaps as plan (capture after merge if still true):
 ## Convention conflicts
 
 None.
+
+## Review round 2 — changes_required fixes
+
+`review_1786391050_549577` returned three findings.
+
+### 1. List/spawn acceptance same set (high) — fixed
+
+`find_source_session_type_for_target` previously matched any eligible source by
+qualified id before precedence, so `materialize(device/zebra, T)` succeeded
+while list only returned the repo winner `tgt_hub/zebra`.
+
+Now both list and materialize use one helper,
+`target_scoped_effective_winners`: validate T → filter eligible → precedence →
+winners only. Selection accepts only bare id of the winner or the winner's
+qualified effective id. Hidden losers return `session_type_not_eligible`.
+
+Tests:
+- client: resolve of `device/zebra` at hub is rejected
+- daemon: real `SpawnSessionType` for every listed id, then shutdown
+
+### 2. PR link (medium) — fixed
+
+Linked `trybotster/botster-hub` PR 202 via `project_pipelines_link_pr`
+(`pr_1786391185_835377`).
+
+### 3. npm registry publish (high) — blocked on auth
+
+Local `npm whoami` still returns **401 Unauthorized**. Packed-tarball smoke
+remains green for 0.1.26 / conformance 33 / `list_session_types_for_target`.
+Requires a credentialed human `npm publish --access public` from
+`packages/hub-test-support`, then clean registry install smoke.
+
+### Screenshots (Web empty picker)
+
+The New session empty state for spawn point Hub is the **product bug this Hub
+ticket enables**, but Web still fat-filters the management catalog
+(`sessionType.target_id === spawnPointTargetId`). That path is owned by
+`ticket_1786387865_686375`. Even after Hub merge, the running Hub binary must
+include this branch for daemon list-for-target to help; Web must stop
+re-deriving eligibility.
+

@@ -15065,14 +15065,29 @@ fn daemon_list_session_types_for_target_includes_device_globals() {
     let target_root = std::env::current_dir()
         .expect("current dir")
         .join(unique_test_dir("list-for-target-device-global-root"));
+    let device_root = std::env::current_dir()
+        .expect("current dir")
+        .join(unique_test_dir("list-for-target-device-global-device"));
     fs::create_dir_all(&target_root).expect("create admitted target root");
+    fs::create_dir_all(device_root.join("bin")).expect("create device bin");
+    let script = device_root.join("bin/noop.sh");
+    fs::write(
+        &script,
+        "#!/bin/sh\nprintf 'spawned:%s\\n' \"$BOTSTER_SESSION_ID\"\nsleep 30\n",
+    )
+    .expect("write device spawn script");
+    let mut permissions = fs::metadata(&script)
+        .expect("script metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&script, permissions).expect("chmod device script");
 
     let config = explicit_config(&data_dir);
     let store = FileHubStateStore::for_data_directory(&config.data_directory);
     store
         .update(&config, |state| {
             state.device_session_type_sources = vec![botster_hub::DeviceSessionTypeSource {
-                root: config.data_directory.join("session-types"),
+                root: device_root.clone(),
                 session_types: vec![botster_hub::PackageSessionType {
                     id: "global-agent".to_string(),
                     label: "Global agent".to_string(),
@@ -15126,6 +15141,54 @@ fn daemon_list_session_types_for_target_includes_device_globals() {
             .map(|row| (&row.session_type_id, &row.target_id, &row.source))
             .collect::<Vec<_>>()
     );
+    assert!(
+        !listed.session_types.is_empty(),
+        "list-for-target must return at least one row for spawn parity"
+    );
+
+    // Real daemon SpawnSessionType for every listed id, then shut down and reap.
+    for (index, row) in listed.session_types.iter().enumerate() {
+        let session_id = format!("list-parity-{index}");
+        let spawned = botster_hub::daemon_transport_request(
+            &config,
+            botster_hub::DaemonRequest::SpawnSessionType {
+                session_type_id: row.session_type_id.clone(),
+                session_id: session_id.clone(),
+                request: botster_hub_client::DaemonSessionTypeRequest {
+                    target_id: Some("tgt_hub".to_string()),
+                    ..botster_hub_client::DaemonSessionTypeRequest::default()
+                },
+            },
+        )
+        .unwrap_or_else(|error| {
+            panic!(
+                "spawn listed id {} through daemon: {error:?}",
+                row.session_type_id
+            )
+        });
+        assert_eq!(
+            spawned.kind,
+            botster_hub::DaemonResponseKind::Spawned,
+            "spawn listed id {}: {:?}",
+            row.session_type_id,
+            spawned
+        );
+        botster_hub_client::request(
+            &botster_hub_client::DaemonEndpoint::new(
+                config
+                    .transports
+                    .local_socket
+                    .as_ref()
+                    .expect("local socket")
+                    .path
+                    .clone(),
+            ),
+            botster_hub_client::DaemonRequest::ShutdownSession {
+                session_id: session_id.clone(),
+            },
+        )
+        .expect("shutdown spawned parity session");
+    }
 
     // Management catalog still projects storage provenance device:local.
     let catalog = botster_hub::daemon_transport_request(
