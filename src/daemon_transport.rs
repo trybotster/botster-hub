@@ -469,6 +469,7 @@ async fn handle_connection_async(
                 request: Box::new(request),
                 reply_tx,
                 response_delivery_rx,
+                grant_id: None,
             })
             .await
             .map_err(|_| DaemonTransportError::ControlThreadStopped)?;
@@ -946,12 +947,20 @@ pub(crate) fn handle_control_message(
             if let Some(grant_id) = grant_id.as_deref()
                 && !daemon.local_webrtc().has_live_peer(grant_id)
             {
-                // Peer already gone: still drop any residual daemon entry if present, but do not
-                // invent new ownership. Reply unsubscribed for idempotent client cleanup.
-                if state
-                    .entity_subscriptions
-                    .remove(&subscription_id)
-                    .is_some()
+                // Peer already gone: owner-checked residual cleanup only. Never delete a row now
+                // owned by a different live grant (subscription-id reuse after PeerClosed).
+                let should_remove = match state.entity_subscriptions.get(&subscription_id) {
+                    None => false,
+                    Some(subscription) => match subscription.owner_grant_id.as_deref() {
+                        None => true,
+                        Some(owner) => owner == grant_id,
+                    },
+                };
+                if should_remove
+                    && state
+                        .entity_subscriptions
+                        .remove(&subscription_id)
+                        .is_some()
                 {
                     state.lifecycle_counters.live_entity_subscriptions = state
                         .lifecycle_counters
@@ -961,6 +970,8 @@ pub(crate) fn handle_control_message(
                         state.released_entity_generations.saturating_add(1);
                 }
                 if let Some(reply_tx) = reply_tx {
+                    // Idempotent unsubscribed reply for the stale client even when the row is
+                    // preserved for a replacement owner.
                     let _ = reply_tx.send(Ok(daemon_response_base(
                         DaemonResponseKind::EntityUnsubscribed,
                     )));
@@ -990,7 +1001,20 @@ pub(crate) fn handle_control_message(
             request,
             reply_tx,
             response_delivery_rx,
+            grant_id,
         } => {
+            // Late WebRTC Requests after PeerClosed must not create durable ownership or run
+            // stale control against a gone peer. Socket path leaves grant_id = None.
+            if let Some(grant_id) = grant_id.as_deref()
+                && !daemon.local_webrtc().has_live_peer(grant_id)
+            {
+                let operation = control_request_operation_label(request.as_ref());
+                return send_control_response(
+                    reply_tx,
+                    Ok(local_webrtc_peer_gone_request_error(operation)),
+                    response_delivery_rx,
+                );
+            }
             if matches!(request.as_ref(), DaemonRequest::CheckHubUpdate) {
                 return match plan_hub_update_check() {
                     HubUpdateCheckPlan::Immediate(update) => send_control_response(
@@ -1060,7 +1084,7 @@ pub(crate) fn handle_control_message(
                 .as_ref()
                 .is_ok_and(|response| response.kind != DaemonResponseKind::OperatorError)
             {
-                record_attached_subscription_change(state, attached_change);
+                record_attached_subscription_change(state, attached_change, grant_id.as_deref());
             }
             if reconcile_after_request && !state.entity_subscriptions.is_empty() {
                 drive_entity_subscriptions(daemon, state);
@@ -1161,16 +1185,60 @@ pub(crate) fn handle_control_message(
                 }
             }
 
-            // Merge attach owners from the PeerClosed snapshot and any fail-closed siblings.
-            let mut detach_list = attached_subscriptions;
+            // Merge attach candidates from the PeerClosed snapshot and any fail-closed siblings.
+            // Owner-check every row: a delayed snapshot must not detach an attach that a
+            // different live grant now owns after (session_id, subscription_id) reuse.
+            let mut detach_candidates = attached_subscriptions;
             for subscription in remove_result.attached_subscriptions {
-                if !detach_list.iter().any(|existing| {
+                if !detach_candidates.iter().any(|existing| {
                     existing.session_id == subscription.session_id
                         && existing.subscription_id == subscription.subscription_id
                 }) {
-                    detach_list.push(subscription);
+                    detach_candidates.push(subscription);
                 }
             }
+            // Independent of the peer-side snapshot: include every attach currently owned by a
+            // removed grant so residual Attach rows that raced after cleanup_once still get cleaned.
+            for ((session_id, subscription_id), owner) in
+                &state.pending_runtime.attach_owner_grant_ids
+            {
+                if removed_grants.contains(owner.as_str())
+                    && !detach_candidates.iter().any(|existing| {
+                        existing.session_id == *session_id
+                            && existing.subscription_id == *subscription_id
+                    })
+                {
+                    detach_candidates.push(LocalWebrtcAttachedSubscription {
+                        session_id: session_id.clone(),
+                        subscription_id: subscription_id.clone(),
+                    });
+                }
+            }
+            let detach_list: Vec<LocalWebrtcAttachedSubscription> = detach_candidates
+                .into_iter()
+                .filter(|subscription| {
+                    match state
+                        .pending_runtime
+                        .attach_owner_grant_ids
+                        .get(&(
+                            subscription.session_id.clone(),
+                            subscription.subscription_id.clone(),
+                        ))
+                        .map(String::as_str)
+                    {
+                        // Unowned residual (socket path or missing index): allow cleanup.
+                        None => true,
+                        // Only detach when the current owner is one of the grants this forget removes.
+                        Some(owner) => removed_grants.contains(owner),
+                    }
+                })
+                .collect();
+            // Drop owner index rows for removed grants before Detach so counters stay consistent
+            // even if Detach is a no-op for an already-gone session. Preserve replacement owners.
+            state
+                .pending_runtime
+                .attach_owner_grant_ids
+                .retain(|_, owner| !removed_grants.contains(owner.as_str()));
             state.lifecycle_counters.live_attach_subscriptions = state
                 .lifecycle_counters
                 .live_attach_subscriptions
@@ -3834,6 +3902,7 @@ fn install_signal_forwarder(control_tx: ControlSender) -> DaemonTransportResult<
                 request: Box::new(DaemonRequest::DaemonShutdown),
                 reply_tx,
                 response_delivery_rx: None,
+                grant_id: None,
             });
         }
     });
@@ -3913,6 +3982,9 @@ pub(crate) enum ControlMessage {
         request: Box<DaemonRequest>,
         reply_tx: ControlReplySender,
         response_delivery_rx: Option<mpsc::Receiver<()>>,
+        /// When set, admission requires a still-live local WebRTC peer for this grant.
+        /// Socket-path and signal-handler requests leave this `None`.
+        grant_id: Option<String>,
     },
     HubUpdateCheckCompleted {
         update: DaemonHubUpdate,
@@ -3990,6 +4062,10 @@ struct EntityReconciliationState {
 pub(crate) struct PendingRuntimeState {
     events: BTreeMap<String, Vec<HubClientEvent>>,
     pub(crate) active_subscriptions: BTreeMap<String, BTreeSet<String>>,
+    /// WebRTC grant that owns each attach row created with a tagged Request.
+    /// Key is (session_id, subscription_id). Used so PeerClosed can sweep residual
+    /// attaches even when the peer-side ownership snapshot was empty.
+    pub(crate) attach_owner_grant_ids: BTreeMap<(String, String), String>,
 }
 
 #[derive(Debug)]
@@ -4119,12 +4195,13 @@ enum AttachedSubscriptionChange {
 fn record_attached_subscription_change(
     state: &mut DaemonControlState,
     change: Option<AttachedSubscriptionChange>,
+    owner_grant_id: Option<&str>,
 ) {
     let Some(change) = change else {
         return;
     };
     match change {
-        AttachedSubscriptionChange::Attach(_) => {
+        AttachedSubscriptionChange::Attach(subscription) => {
             if state.released_attach_generations > 0 {
                 state.released_attach_generations -= 1;
                 state.lifecycle_counters.reconnect_registrations = state
@@ -4140,15 +4217,61 @@ fn record_attached_subscription_change(
                 .lifecycle_counters
                 .high_water_attach_subscriptions
                 .max(state.lifecycle_counters.live_attach_subscriptions);
+            if let Some(grant_id) = owner_grant_id {
+                state.pending_runtime.attach_owner_grant_ids.insert(
+                    (
+                        subscription.session_id.clone(),
+                        subscription.subscription_id.clone(),
+                    ),
+                    grant_id.to_string(),
+                );
+            }
         }
-        AttachedSubscriptionChange::Detach(_) => {
+        AttachedSubscriptionChange::Detach(subscription) => {
             state.lifecycle_counters.live_attach_subscriptions = state
                 .lifecycle_counters
                 .live_attach_subscriptions
                 .saturating_sub(1);
             state.released_attach_generations = state.released_attach_generations.saturating_add(1);
+            state
+                .pending_runtime
+                .attach_owner_grant_ids
+                .remove(&(subscription.session_id, subscription.subscription_id));
         }
     }
+}
+
+fn control_request_operation_label(request: &DaemonRequest) -> &'static str {
+    match request {
+        DaemonRequest::Status => "status",
+        DaemonRequest::ListSessions => "list_sessions",
+        DaemonRequest::Spawn { .. } => "spawn",
+        DaemonRequest::Attach { .. } => "attach",
+        DaemonRequest::Detach { .. } => "detach",
+        DaemonRequest::SendInput { .. } => "send_input",
+        DaemonRequest::Drain { .. } => "drain",
+        DaemonRequest::Resize { .. } => "resize",
+        DaemonRequest::ShutdownSession { .. } => "shutdown_session",
+        DaemonRequest::RemoveSession { .. } => "remove_session",
+        DaemonRequest::DaemonShutdown => "daemon_shutdown",
+        DaemonRequest::CheckHubUpdate => "check_hub_update",
+        _ => "request",
+    }
+}
+
+fn local_webrtc_peer_gone_request_error(operation: &str) -> DaemonResponse {
+    let mut response = daemon_response_base(DaemonResponseKind::OperatorError);
+    response.error = Some(DaemonOperatorError {
+        code: "local_webrtc_peer_gone".to_string(),
+        request_id: format!("local-webrtc-{operation}"),
+        operation: operation.to_string(),
+        message: "local WebRTC peer is no longer live".to_string(),
+        diagnostics: vec![DaemonDiagnostic::action_failure(
+            operation,
+            "local WebRTC peer is no longer live",
+        )],
+    });
+    response
 }
 
 impl AttachedSubscriptionChange {
@@ -7869,6 +7992,7 @@ fn handle_connection(stream: UnixStream, control_tx: ControlSender) -> DaemonTra
                     }),
                     reply_tx,
                     response_delivery_rx: None,
+                    grant_id: None,
                 })
                 .is_ok()
             {
@@ -8365,11 +8489,16 @@ mod tests {
             request,
             reply_tx,
             response_delivery_rx,
+            grant_id,
         } = receive_test_control_message(&mut control_rx)
         else {
             panic!("expected shutdown control request");
         };
         assert!(matches!(*request, DaemonRequest::DaemonShutdown));
+        assert_eq!(
+            grant_id, None,
+            "socket path must leave Request grant_id unset"
+        );
         let response_delivery_rx = response_delivery_rx.expect("shutdown has delivery receiver");
         server_control
             .shutdown(Shutdown::Write)
