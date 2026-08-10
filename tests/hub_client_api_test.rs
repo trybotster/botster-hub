@@ -2106,6 +2106,38 @@ fn device_global_session_types_eligible_at_admitted_spawn_point() {
         assert_eq!(resolved.session_type.target_id, "tgt_hub");
     }
 
+    // Precedence loser is not listed and must not materialize at T.
+    assert!(
+        !listed
+            .iter()
+            .any(|row| row.session_type_id == "device/zebra"),
+        "device/zebra is overridden by repo at hub and must not appear in list"
+    );
+    let loser_rejected = api
+        .handle_request(
+            &mut runtime,
+            &packages,
+            HubClientRequest::ResolveSessionType {
+                request_id: request_id("resolve-hidden-device-zebra"),
+                session_type_id: "device/zebra".to_string(),
+                session_type_request: botster_hub::SessionTypeRequest {
+                    target_id: Some("tgt_hub".to_string()),
+                    ..botster_hub::SessionTypeRequest::default()
+                },
+            },
+        )
+        .expect_err("qualified precedence loser must not spawn at T");
+    assert!(
+        matches!(
+            loser_rejected,
+            HubClientError::SessionType {
+                kind: "session_type_not_eligible" | "unknown_session_type",
+                ..
+            }
+        ),
+        "expected not-eligible/unknown for hidden loser, got {loser_rejected:?}"
+    );
+
     // Relative device cwd binds under T root, not device root.
     let relative = api
         .handle_request(

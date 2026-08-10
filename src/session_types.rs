@@ -670,22 +670,20 @@ pub(crate) fn materialize_managed_session_type(
 /// repo-only bare id on another target cannot hide a device Global type at `T`.
 /// Rows project `target_id = T` (list context), not storage provenance. Sorted by
 /// `session_type_id` lexicographic.
+///
+/// This is the same set materialize/show/resolve accept for `target_id = T`
+/// (available winners only). Overridden qualified losers are not listed and
+/// cannot spawn at T.
 pub fn list_session_types_for_target(
     records: &[&PackageRecord],
     state: &HubState,
     target_id: &str,
 ) -> SessionTypeResult<Vec<HubSessionType>> {
-    let _target = ensure_enabled_admitted_target(state, target_id)?;
-    let sources = source_session_types(records, state)?;
-    let eligible = sources
+    let mut rows = target_scoped_effective_winners(records, state, target_id)?
         .into_iter()
-        .filter(|source| is_eligible_for_target(source, target_id))
+        .map(|(_, row)| row)
+        .filter(|row| row.available)
         .collect::<Vec<_>>();
-    let mut rows = effective_session_type_rows(eligible)?;
-    for row in &mut rows {
-        row.target_id = target_id.to_string();
-    }
-    rows.retain(|row| row.available);
     rows.sort_by(|left, right| left.session_type_id.cmp(&right.session_type_id));
     Ok(rows)
 }
@@ -698,19 +696,18 @@ pub fn show_session_type_for_target(
     session_type_id: &str,
 ) -> SessionTypeResult<HubSessionType> {
     match find_source_session_type_for_target(records, state, session_type_id, target_id) {
-        Ok((source, mut row)) => {
+        Ok((source, row)) => {
             if !source.available || !row.available {
                 return Err(SessionTypeError::new(
                     "session_type_not_eligible",
                     "session type is not eligible for the requested target",
                 ));
             }
-            row.target_id = target_id.to_string();
             Ok(row)
         }
         Err(error) if error.kind == "unknown_session_type" => {
-            // Distinguish "id does not exist anywhere" from "exists but not at T".
-            // Global unknown stays unknown; ineligible-at-T becomes session_type_not_eligible.
+            // Distinguish "id does not exist anywhere" from "exists but not at T"
+            // (including qualified ids of precedence losers that list omits).
             match find_source_session_type_with_row(records, state, session_type_id) {
                 Ok(_) => Err(SessionTypeError::new(
                     "session_type_not_eligible",
@@ -929,35 +926,68 @@ fn find_source_session_type_with_row(
     Ok((winner, row))
 }
 
-/// Spawn-point lookup: validate T, filter eligible sources for T, then precedence.
-fn find_source_session_type_for_target(
+/// Canonical target-scoped effective winners used by list, show, resolve, and spawn.
+///
+/// Steps: validate T → filter sources eligible for T → package < device < repo
+/// precedence within that set → project `target_id = T`. Selection for spawn must
+/// match only these winners (bare id or the winner's qualified id), never an
+/// overridden loser's qualified id that list does not return.
+fn target_scoped_effective_winners(
     records: &[&PackageRecord],
     state: &HubState,
-    session_type_id: &str,
     target_id: &str,
-) -> SessionTypeResult<(SourceSessionType, HubSessionType)> {
+) -> SessionTypeResult<Vec<(SourceSessionType, HubSessionType)>> {
     let _target = ensure_enabled_admitted_target(state, target_id)?;
     let sources = source_session_types(records, state)?;
     let eligible = sources
         .into_iter()
         .filter(|source| is_eligible_for_target(source, target_id))
         .collect::<Vec<_>>();
-    let matches = eligible
-        .iter()
-        .filter(|source| {
-            source.session_type.id == session_type_id
-                || source_session_type_id(source) == session_type_id
+
+    let mut by_id = BTreeMap::<String, Vec<SourceSessionType>>::new();
+    for source in eligible {
+        by_id
+            .entry(source.session_type.id.clone())
+            .or_default()
+            .push(source);
+    }
+
+    by_id
+        .into_values()
+        .map(|peers| {
+            let winner = choose_effective_session_type(peers.clone())?;
+            let mut row = effective_session_type_row(&winner, &peers);
+            row.target_id = target_id.to_string();
+            Ok((winner, row))
         })
-        .cloned()
-        .collect::<Vec<_>>();
-    let winner = choose_effective_session_type(matches)?;
-    let peers = eligible
+        .collect()
+}
+
+/// Spawn-point lookup: select only from the same effective set list returns.
+fn find_source_session_type_for_target(
+    records: &[&PackageRecord],
+    state: &HubState,
+    session_type_id: &str,
+    target_id: &str,
+) -> SessionTypeResult<(SourceSessionType, HubSessionType)> {
+    let winners = target_scoped_effective_winners(records, state, target_id)?;
+    // Bare id matches the winner only. Qualified id must be the winner's
+    // effective id — never a lower-precedence peer that list hides.
+    let matches = winners
         .into_iter()
-        .filter(|source| source.session_type.id == winner.session_type.id)
+        .filter(|(_, row)| row.id == session_type_id || row.session_type_id == session_type_id)
         .collect::<Vec<_>>();
-    let mut row = effective_session_type_row(&winner, &peers);
-    row.target_id = target_id.to_string();
-    Ok((winner, row))
+    match matches.len() {
+        0 => Err(SessionTypeError::new(
+            "unknown_session_type",
+            "session type was not found",
+        )),
+        1 => Ok(matches.into_iter().next().expect("len checked")),
+        _ => Err(SessionTypeError::new(
+            "ambiguous_session_type",
+            "session type id matches more than one source at the same precedence",
+        )),
+    }
 }
 
 /// Resolve the definition and optional admitted spawn point for materialization.
