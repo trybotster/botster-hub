@@ -37,17 +37,23 @@
 - None. Live oracle preparation uses production hub CLI (`packages enable`, `apps open`) already owned by this repository.
 
 ## Deviations from plan
-- None material. Plan v6 command order is the acceptance order for Verify.
-- Attach/Subscribe late-order admission and early-order owner sweeps implemented as specified.
-- Focused in-process peer_failed test drives the production handler Arc retained on `LocalWebrtcPeerHandle` after `signal()`.
+- **First Implement pass (commit 825a863):** the two-grant Attach proof was under-specified relative to Plan v4/v6. The suite only had an owner-map unit insert test (`attach_owner_map_is_grant_selective_on_peer_closed`) plus peer-map independence. That was a material acceptance gap (finding_1786330602_859086).
+- **Returned Implement pass:** replaced that weak test with `two_live_grant_attach_isolation_preserves_sibling_delivery`, which:
+  1. signals two live peers through `signal()`
+  2. drives Attach for each through the production grant-tagged `ControlMessage::Request` path
+  3. fails peer A via the production handler callback + `LocalWebrtcPeerClosed` cleanup
+  4. asserts A detached/owner removed, B still attached/live, and B still delivers a SendInput/Drain terminal round-trip
+  5. fails B and asserts empty owner map, zero live attaches, and `webrtc_peer_failed == 2`
+- Plan v6 command order remains the acceptance order for Verify.
+- Focused in-process peer_failed test still drives the production handler Arc retained on `LocalWebrtcPeerHandle` after `signal()`.
 
 ## Production entry point
 `IssueLocalWebrtcBootstrap` → `LocalWebrtcSignal` → `LocalWebrtcTransport::signal` (per-peer runtime + `answer_offer`) → `LocalWebrtcHandler::on_connection_state_change(Failed)` → `cleanup_once` → `ControlMessage::LocalWebrtcPeerClosed` → `close_peer` (peer.close + runtime.shutdown_timeout) + grant-owned attach/entity sweeps.
 
 ## Tests and downstream proof run
 ```
-BOTSTER_ENV=test cargo test --lib -- production_handler_peer_failed close_peer_is_idempotent two_peer_independence late_subscribe early_entity attach_owner_map
-# 6 passed
+BOTSTER_ENV=test cargo test --lib -- two_live_grant_attach_isolation production_handler_peer_failed close_peer_is_idempotent two_peer_independence late_subscribe early_entity
+# 6 passed (includes production two-live-grant Attach isolation)
 
 BOTSTER_ENV=test cargo test --lib -- local_webrtc
 # 25 passed
@@ -63,7 +69,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 ## Unverified behavior / residual risk
 - Full live no-spin oracle (debug hub + offerer + kill -9 + ps/sample CPU bounds within 40s) is Verify-stage evidence, not re-run here as a complete multi-minute campaign.
 - rtc-ice failed timeout remains lockfile-pinned (~25s); oracle bound is 40s as planned.
-- Two-grant live delivery isolation beyond owner-map unit coverage is partially covered by two-peer independence (runtime isolation) plus grant-selective owner map unit test; full dual-grant attach round-trip under a running hub remains available to Verify via the offerer example.
+- Two-grant Attach isolation is now proven in-process through production signal/handler/control paths. Browser-side DataChannel framing of Attach is the same control request after decrypt; end-to-end browser framing remains oracle/smoke coverage.
 
 ## Missing vault guidance discovered
 - Candidate (from plan): webrtc-rs PeerConnectionDriver exits only on explicit Close; dropping the handle alone does not stop the driver.
