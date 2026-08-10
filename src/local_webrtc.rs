@@ -245,8 +245,10 @@ impl LocalWebrtcTransport {
                         "local WebRTC peer close failed ultimately; fail-closed drop of dedicated runtime: grant_id={grant_id}"
                     );
                     // Drop the failed peer Arc without another close wait; runtime drop is the hard stop.
+                    // Primary grant is already out of `peers` — pass it so peer_states / ownership
+                    // are still swept (fail_closed only sees remaining live/stale map keys).
                     drop(peer);
-                    self.fail_closed_drop_dedicated_runtime()
+                    self.fail_closed_drop_dedicated_runtime(Some(grant_id.to_string()))
                 }
             }
         } else {
@@ -295,11 +297,22 @@ impl LocalWebrtcTransport {
     /// Ownership is removed and the dedicated runtime is dropped immediately. Do **not**
     /// sequentially re-close peers here: each close can wait up to
     /// [`LOCAL_WEBRTC_PEER_CLOSE_BOUND`], and N peers would make handler latency unbounded.
-    fn fail_closed_drop_dedicated_runtime(&mut self) -> PeerRemoveResult {
+    ///
+    /// `primary_grant` is the grant already removed from `peers` whose close failed/timed out;
+    /// it must still be ownership-swept even though it is no longer in the live map.
+    fn fail_closed_drop_dedicated_runtime(
+        &mut self,
+        primary_grant: Option<String>,
+    ) -> PeerRemoveResult {
         let live = std::mem::take(&mut self.peers);
         let stale = std::mem::take(&mut self.stale_close_peers);
-        let removed_grants: Vec<String> =
+        let mut removed_grants: Vec<String> =
             live.keys().cloned().chain(stale.keys().cloned()).collect();
+        if let Some(primary) = primary_grant {
+            if !removed_grants.iter().any(|grant| grant == &primary) {
+                removed_grants.push(primary);
+            }
+        }
         let result = self.take_remove_result(removed_grants);
         #[cfg(test)]
         self.peer_handlers.clear();
@@ -459,6 +472,12 @@ impl LocalWebrtcTransport {
     #[cfg(test)]
     pub(crate) fn dedicated_runtime_worker_threads() -> usize {
         LOCAL_WEBRTC_WORKER_THREADS.load(Ordering::SeqCst)
+    }
+
+    /// Live peer ownership records remaining in the transport (test oracle).
+    #[cfg(test)]
+    pub(crate) fn peer_state_count(&self) -> usize {
+        self.peer_states.len()
     }
 
     /// Next `close()` for this grant is treated as a hard failure (driver not stopped).
@@ -4406,6 +4425,11 @@ mod tests {
         assert!(!harness.daemon.local_webrtc().has_live_peer(&grant_b));
         assert_eq!(harness.daemon.local_webrtc().stale_close_peer_count(), 0);
         assert!(!harness.daemon.local_webrtc().has_dedicated_runtime());
+        assert_eq!(
+            harness.daemon.local_webrtc().peer_state_count(),
+            0,
+            "fail-closed must remove primary + sibling peer_states, not only the live peer map"
+        );
         assert!(
             !harness
                 .state
@@ -5193,8 +5217,14 @@ mod tests {
         harness.cleanup();
     }
 
-    #[test]
-    fn local_webrtc_close_hang_fail_closed_returns_handler_within_deadline() {
+    /// Child env for the hang-close subprocess oracle. Parent kills the child when the
+    /// whole-child deadline is exceeded so ablating the production close timeout yields a
+    /// finite red result instead of hanging the suite.
+    const HANG_CLOSE_CHILD_ENV: &str = "BOTSTER_HUB_WEBRTC_HANG_CLOSE_CHILD";
+    /// Whole-child budget: setup (signal/spawn/attach) + close bound + fail-closed + cleanup.
+    const HANG_CLOSE_CHILD_DEADLINE: Duration = Duration::from_secs(25);
+
+    fn run_close_hang_fail_closed_body() {
         let _teardown_guard = teardown_test_lock();
         // Deterministic hang on production remove_peer/close path. Handler must return within
         // HANDLER_JOIN_DEADLINE and take the fail-closed sibling path (timeout ≡ ultimate failure).
@@ -5265,9 +5295,7 @@ mod tests {
         };
 
         // Production PeerClosed handler under forced hang must return within HANDLER_JOIN_DEADLINE.
-        // Hang inject goes through the production timeout wrapper around the close future; if that
-        // bound is ablated the close future never completes and this assertion never runs
-        // (red-on-revert hangs this test only — not a process-wide abort, so parallel tests stay safe).
+        // Hang inject goes through the production timeout wrapper around the close future.
         let handler_started = Instant::now();
         handle_control_message(
             &mut harness.daemon,
@@ -5292,6 +5320,11 @@ mod tests {
         assert!(
             !harness.daemon.local_webrtc().has_dedicated_runtime(),
             "fail-closed hang path must drop dedicated runtime"
+        );
+        assert_eq!(
+            harness.daemon.local_webrtc().peer_state_count(),
+            0,
+            "fail-closed hang path must clear primary + sibling peer_states"
         );
         assert!(!harness.daemon.local_webrtc().has_live_peer(&grant_a));
         assert!(
@@ -5333,5 +5366,53 @@ mod tests {
         peer_a.close_offer();
         peer_b.close_offer();
         harness.cleanup();
+    }
+
+    #[test]
+    fn local_webrtc_close_hang_fail_closed_returns_handler_within_deadline() {
+        // External hard-stop oracle: parent process waits on a child that runs the production
+        // hang path. If the production close timeout is ablated, the child never exits and the
+        // parent kills it after HANG_CLOSE_CHILD_DEADLINE — finite red, not suite hang.
+        if std::env::var_os(HANG_CLOSE_CHILD_ENV).is_some() {
+            run_close_hang_fail_closed_body();
+            return;
+        }
+
+        let exe = std::env::current_exe().expect("test executable path");
+        let mut child = std::process::Command::new(&exe)
+            .env(HANG_CLOSE_CHILD_ENV, "1")
+            .env("RUST_BACKTRACE", "0")
+            .args([
+                "--exact",
+                "local_webrtc::tests::local_webrtc_close_hang_fail_closed_returns_handler_within_deadline",
+                "--nocapture",
+            ])
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
+            .expect("spawn hang-close oracle child");
+
+        let deadline = Instant::now() + HANG_CLOSE_CHILD_DEADLINE;
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    assert!(
+                        status.success(),
+                        "hang-close child must exit 0 when production close bound is present; status={status}"
+                    );
+                    return;
+                }
+                Ok(None) if Instant::now() >= deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!(
+                        "hang-close child exceeded {:?}; production close timeout missing or hang path blocked (red-on-revert hard stop)",
+                        HANG_CLOSE_CHILD_DEADLINE
+                    );
+                }
+                Ok(None) => thread::sleep(Duration::from_millis(20)),
+                Err(error) => panic!("hang-close child wait failed: {error}"),
+            }
+        }
     }
 }
