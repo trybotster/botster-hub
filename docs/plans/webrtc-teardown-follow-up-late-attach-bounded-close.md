@@ -150,7 +150,7 @@ On `Err` after retry: quarantine + `fail_closed_drop_dedicated_runtime` (sibling
 - Implement runs in this pipeline worktree on hub `target_id` above.
 - Base is post-#200 main; do not re-land #200.
 - Tests via `./test.sh` (sets `BOTSTER_ENV=test`, `--workspace`).
-- Spawn-bearing tests require prebuilt session worker (README):  
+- Spawn-bearing tests require prebuilt session worker (README):
   `cargo build --locked -p botster-core --bin botster-session-worker`
 
 ## Scope
@@ -293,16 +293,16 @@ On `Err` after retry: quarantine + `fail_closed_drop_dedicated_runtime` (sibling
 3. **Late Subscribe after PeerClosed** — existing test remains green.
 4. **Late Unsubscribe does not delete replacement owner (seq 5)** — Peer A subscribed with id S then closed (or A unsubscribed and B took S while A is not live); grant A not live; send `UnsubscribeEntities` for S with `grant_id=A`. **Must preserve** B's row, `owner_grant_id=B`, and entity counters. Red-on-revert: restore blind remove → B's row deleted.
 5. **Attach residual owner sweep** — Attach succeeds while peer live; PeerClosed with empty attach snapshot still detaches grant-owned attach.
-6. **Bounded close with production-handler deadline**  
-   - Deterministic close-hang on production `remove_peer` / PeerClosed path.  
-   - Run handler on dedicated thread with bounded join.  
-   - Named constants (e.g. `PEER_CLOSE_BOUND = 3s`, `HANDLER_JOIN_DEADLINE = 5s`).  
-   - Assert order: (1) handler returns within `HANDLER_JOIN_DEADLINE`; (2) fail-closed postconditions (map empty, runtime park, worker join, sibling cleanup).  
+6. **Bounded close with production-handler deadline**
+   - Deterministic close-hang on production `remove_peer` / PeerClosed path.
+   - Run handler on dedicated thread with bounded join.
+   - Named constants (e.g. `PEER_CLOSE_BOUND = 3s`, `HANDLER_JOIN_DEADLINE = 5s`).
+   - Assert order: (1) handler returns within `HANDLER_JOIN_DEADLINE`; (2) fail-closed postconditions (map empty, runtime park, worker join, sibling cleanup).
    - Red-on-revert: unbounded `block_on` → handler join deadline fails.
 7. **Sibling policy** — success: sibling survives; fail-closed/timeout: siblings cleaned.
 8. **#200 regression suite** — map empty, park, close completion, fail-closed Err, reused entity id on PeerClosed, subscribe-first, session worker cleanup stay green.
 9. **Red-on-revert** — late Attach, late Unsubscribe-reuse, hang-handler deadline each shown red when their fix is removed.
-10. **Commands**  
+10. **Commands**
     ```sh
     cargo build --locked -p botster-core --bin botster-session-worker
     ./test.sh local_webrtc
