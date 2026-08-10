@@ -83,17 +83,16 @@ already hit the same helper.
 | Web `ticket_1786387865_686375` | open dependency on this Hub ticket |
 | TUI `ticket_1786387865_677482` | open dependency on this Hub ticket |
 | Workspaces | already consumes `session_types.list({target_id})`; no new ticket |
-| npm registry publish of `@trybotster/hub-test-support@0.1.26` | **blocked** — local npm auth returns 401; packed tarball external smoke passed |
+| npm registry `@trybotster/hub-test-support@0.1.26` | **published** — `npm view` latest is 0.1.26; clean external registry install smoke passed (rev 33, `list_session_types_for_target`) |
 
 ## Deviations from plan
 
-1. **Registry npm publish** could not complete in this agent environment
-   (`npm whoami` → 401 Unauthorized; `npm publish` → 404 which npm uses for
-   unauthorized scoped publish). Prepared coordinate is `0.1.26` / conformance
-   revision `33`. Packed-tarball external smoke asserts version, revision, and
-   `list_session_types_for_target` tokens. A credentialed human must run
-   `npm publish --access public` from `packages/hub-test-support` after merge
-   (or with a valid token) and re-run registry install smoke.
+1. **Registry npm publish path:** agent-local `npm whoami` returned 401, so a
+   human published `@trybotster/hub-test-support@0.1.26` from a credentialed
+   environment (`question_1786391269_330902`). **Current status is published**,
+   not blocked. Implement then ran clean external registry install smoke and
+   asserted package_version 0.1.26, protocol 6, conformance 33,
+   `verifyPackageAssets()`, `list_session_types_for_target`, and fixtures.
 2. No red-on-revert ablation run (time); positive focused + workspace gates
    cover the path. Critical helper is single-path (no dual eligibility branch).
 
@@ -148,15 +147,21 @@ No exhaustive-match compile break observed in current TUI (does not match on
 the full `DaemonRequest` enum). Source-break risk remains for any consumer that
 does exhaustively match the public request enum.
 
-### External package smoke (packed tarball)
+### External package smoke (registry install — load-bearing)
+
 ```
-tarball sha256: d552353be13c2c7172586214cd5135e33c110456b76d4881a4a733d0fb76db8c
+npm install --prefer-online @trybotster/hub-test-support@0.1.26 @trybotster/ui-contract@0.3.1
+# npm view @trybotster/hub-test-support version → 0.1.26
 package_version: 0.1.26
 protocol_version: 6
 conformance_fixture_revision: 33
 list_session_types_for_target: present
 verifyPackageAssets(): ok
+plugin-contract-matrix fixture: materializes
 ```
+
+Intermediate packed-tarball smoke (pre-publish) is historical only; registry
+install is the release-chain proof.
 
 ## Production entry points
 
