@@ -4,13 +4,23 @@
 | --- | --- |
 | Ticket | `ticket_1786385940_304814` |
 | Run | `run_1786386094_979398` |
-| Step | `botster_stack_implement` (`run_step_1786387410_678472`) |
+| Step | `botster_stack_implement` (review rework; sequence 9+) |
 | Target repository | `botster-hub` (`trybotster/botster-hub`) |
 | `target_id` | `tgt_7e208a0c76a44980a83b63af976b1f22` |
 | Base | `main` @ `26f1673` (PR #200 merged) |
 | Branch | `project-pipelines/ticket_1786385940_304814` |
 | Plan | `docs/plans/webrtc-teardown-follow-up-late-attach-bounded-close.md` (sequence 5) |
 | Class | runtime-teardown (`teardown_class_applies: yes`) |
+| PR | https://github.com/trybotster/botster-hub/pull/201 |
+
+## Review rework (findings resolved)
+
+| Finding | Resolution |
+| --- | --- |
+| Stale PeerClosed attach snapshot can detach replacement owner | Snapshot/fail-closed attach candidates owner-checked against `attach_owner_grant_ids`; preserve foreign owners. Test: `local_webrtc_stale_peer_attach_snapshot_does_not_detach_replacement_owner` |
+| Fail-closed teardown has no handler-wide close bound | `fail_closed_drop_dedicated_runtime`, `park_runtime_if_idle`, and `stop_all` drop runtime/peers immediately without sequential re-close waits |
+| Hang oracle bypasses production peer.close timeout | Hang inject uses the **same** `timeout(BOUND, close_future)` path; hang = `pending()` before `peer.close()` so only the production bound cancels. Elapsed assert ≤ `HANDLER_JOIN_DEADLINE` |
+| Format/whitespace gates fail | `cargo fmt --all` + `git diff --check` clean |
 
 ## Repository playbook and notes applied
 
@@ -60,20 +70,21 @@
 
 ## Deviations from plan
 
-1. **Test-only close bound duration:** production uses 3s; under `cfg(test)` bound is 200ms (handler deadline 2s) so hang injection does not starve parallel worker-join oracles that share the process-global dedicated-runtime worker counter. Semantics (timeout → fail-closed) unchanged.
-2. **Handler deadline measurement:** `HubDaemon` is `!Send`, so the hang test measures production-handler elapsed time on the control thread with `LOCAL_WEBRTC_PEER_CLOSE_HANDLER_JOIN_DEADLINE` instead of a cross-thread join of the whole harness.
-3. **Live CPU/no-spin sample:** not implemented at Implement; in-process worker-join + map empty + runtime park remain hard-stop oracles. Verify may add live CPU sample or formal waiver/dependency with residual battery risk named.
-
-No plan acceptance-check resync required beyond these implement details; mandatory late Attach/Spawn/Unsubscribe-reuse/hang/attach-sweep checks are covered.
+1. **Test-only close bound duration:** production uses 3s; under `cfg(test)` bound is 200ms (handler deadline 2s) so hang injection stays CI-cheap. Semantics (timeout → fail-closed) unchanged.
+2. **Handler deadline measurement:** `HubDaemon` is `!Send`, so hang test measures production-handler elapsed time on the control thread. Red-on-revert of the production timeout hangs this test (close future never completes).
+3. **Fail-closed no longer best-effort re-closes siblings:** runtime drop alone is the hard stop (matches review: no N×bound sequential waits).
+4. **Live CPU/no-spin sample:** still Verify-stage preferred path or same-repo waiver/dependency.
 
 ## Tests and downstream proof
 
 ```sh
 cargo build --locked -p botster-core --bin botster-session-worker
-./test.sh local_webrtc
+cargo fmt --all -- --check   # exit 0
+git diff --check             # exit 0
+./test.sh local_webrtc       # 36 lib tests passed
 ```
 
-Result: **35** `local_webrtc` lib tests passed (including new late Attach, late Spawn, late Unsubscribe reuse, attach owner empty-snapshot sweep, hang fail-closed handler deadline) plus existing #200 suite; filtered integration/client WebRTC tests green. Exit 0.
+Result: **36** `local_webrtc` lib tests passed (including late Attach/Spawn/Unsubscribe-reuse, attach owner empty-snapshot sweep, stale attach snapshot preserve, hang fail-closed handler deadline) plus existing #200 suite; integration/client WebRTC filters green.
 
 Production entry points:
 
