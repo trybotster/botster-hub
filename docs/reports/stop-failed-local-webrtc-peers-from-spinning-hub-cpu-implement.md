@@ -216,3 +216,9 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings   # exit 0
 | --- | --- | --- |
 | Unused `fail_closed` flag | low | Removed from `PeerRemoveResult` |
 | Fail-closed sibling attach unproven | medium | Fail-closed test spawns+attaches peer B over production WebRTC Attach path; asserts active attach subscription cleared, `live_attach_subscriptions == 0`, released attach generations, and entity/runtime oracles |
+
+## Review return (sequence 19) — fixes
+
+| Finding | Severity | Fix |
+| --- | --- | --- |
+| Attach proof leaks session workers | high | `PeerHarness` records owned sessions immediately after Spawn and always runs production `ShutdownSession` + `RemoveSession` on `Drop` before `HubDaemon::stop`. Fail-closed test asserts no new worktree session workers remain. `local_webrtc_spawned_session_is_cleaned_even_if_attach_proof_panics_after_ready` proves Drop reaps workers after a deliberate panic. Prior orphan workers from this worktree were cleaned. |
