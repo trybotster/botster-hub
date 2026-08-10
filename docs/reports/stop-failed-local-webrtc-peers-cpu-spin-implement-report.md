@@ -38,12 +38,14 @@
 
 ## Deviations from plan
 - **First Implement pass (commit 825a863):** the two-grant Attach proof was under-specified relative to Plan v4/v6. The suite only had an owner-map unit insert test (`attach_owner_map_is_grant_selective_on_peer_closed`) plus peer-map independence. That was a material acceptance gap (finding_1786330602_859086).
-- **Returned Implement pass:** replaced that weak test with `two_live_grant_attach_isolation_preserves_sibling_delivery`, which:
-  1. signals two live peers through `signal()`
-  2. drives Attach for each through the production grant-tagged `ControlMessage::Request` path
-  3. fails peer A via the production handler callback + `LocalWebrtcPeerClosed` cleanup
-  4. asserts A detached/owner removed, B still attached/live, and B still delivers a SendInput/Drain terminal round-trip
-  5. fails B and asserts empty owner map, zero live attaches, and `webrtc_peer_failed == 2`
+- **Returned Implement pass 1:** replaced the owner-map insert test, but still injected `local_webrtc_grant_id` into `ControlMessage::Request` (finding_1786331425_582493). Ablation that cleared the production tag at `run_data_channel` still passed.
+- **Returned Implement pass 2:** rewrote `two_live_grant_attach_isolation_preserves_sibling_delivery` to use the production WebRTC DataChannel path:
+  1. real offer/answer peers via `signal()` with open DataChannels
+  2. encrypted Attach over each peer DataChannel so `run_data_channel` stamps the grant
+  3. asserts observed Attach control messages carry `Some(grant_a)` / `Some(grant_b)` (fails if production tag is cleared)
+  4. fails peer A via the production handler + pumped `LocalWebrtcPeerClosed`
+  5. SendInput/Drain over peer B's DataChannel after A fails, still delivery-proven
+  6. fails B to baseline (`webrtc_peer_failed == 2`, empty owner map)
 - Plan v6 command order remains the acceptance order for Verify.
 - Focused in-process peer_failed test still drives the production handler Arc retained on `LocalWebrtcPeerHandle` after `signal()`.
 
