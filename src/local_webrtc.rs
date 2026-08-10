@@ -308,10 +308,10 @@ impl LocalWebrtcTransport {
         let stale = std::mem::take(&mut self.stale_close_peers);
         let mut removed_grants: Vec<String> =
             live.keys().cloned().chain(stale.keys().cloned()).collect();
-        if let Some(primary) = primary_grant {
-            if !removed_grants.iter().any(|grant| grant == &primary) {
-                removed_grants.push(primary);
-            }
+        if let Some(primary) = primary_grant
+            && !removed_grants.iter().any(|grant| grant == &primary)
+        {
+            removed_grants.push(primary);
         }
         let result = self.take_remove_result(removed_grants);
         #[cfg(test)]
@@ -5221,30 +5221,35 @@ mod tests {
     /// whole-child deadline is exceeded so ablating the production close timeout yields a
     /// finite red result instead of hanging the suite.
     const HANG_CLOSE_CHILD_ENV: &str = "BOTSTER_HUB_WEBRTC_HANG_CLOSE_CHILD";
-    /// Whole-child budget: setup (signal/spawn/attach) + close bound + fail-closed + cleanup.
-    const HANG_CLOSE_CHILD_DEADLINE: Duration = Duration::from_secs(25);
+    /// Whole-child budget: signal peers + entity subscribe + close bound + fail-closed + cleanup.
+    /// Intentionally avoids durable session workers so a parent kill cannot orphan them.
+    const HANG_CLOSE_CHILD_DEADLINE: Duration = Duration::from_secs(15);
 
     fn run_close_hang_fail_closed_body() {
         let _teardown_guard = teardown_test_lock();
         // Deterministic hang on production remove_peer/close path. Handler must return within
         // HANDLER_JOIN_DEADLINE and take the fail-closed sibling path (timeout ≡ ultimate failure).
+        // No Spawn/Attach: durable session workers would be orphaned if the parent hard-kills the
+        // child after timeout ablation. Sibling attach fail-closed is covered by the forced-error
+        // path (`local_webrtc_close_failure_fail_closed_parks_runtime_and_stops_driver_threads`).
         let mut harness = PeerHarness::new("close-hang-sibling");
         let origin = "http://127.0.0.1:41803";
         let mut peer_a = harness.signal_peer(origin);
         let mut peer_b = harness.signal_peer(origin);
         let grant_a = peer_a.grant_id.clone();
         let grant_b = peer_b.grant_id.clone();
-        let session_b = "hang-sibling-session";
-        let attach_b = "hang-sibling-attach";
 
         let _ = harness.subscribe_entities(&mut peer_a, "entity-hang-a");
         let _ = harness.subscribe_entities(&mut peer_b, "entity-hang-b");
-        harness.spawn_and_attach_on_peer(&mut peer_b, session_b, attach_b);
         assert!(
             harness
                 .state
                 .entity_subscriptions
                 .contains_key("entity-hang-b")
+        );
+        assert!(
+            harness.owned_workers.is_empty(),
+            "hang hard-stop child must not create durable session workers"
         );
         assert!(LocalWebrtcTransport::dedicated_runtime_worker_threads() >= 1);
 
@@ -5344,17 +5349,8 @@ mod tests {
                 .contains_key("entity-hang-b"),
             "fail-closed hang path must clear sibling entity ownership"
         );
-        assert!(
-            !harness
-                .state
-                .pending_runtime
-                .active_subscriptions
-                .get(session_b)
-                .is_some_and(|subs| subs.contains(attach_b)),
-            "fail-closed hang path must detach sibling attach"
-        );
         assert_eq!(
-            harness.state.lifecycle_counters.live_attach_subscriptions,
+            harness.state.lifecycle_counters.live_entity_subscriptions,
             0
         );
         wait_until(

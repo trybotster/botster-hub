@@ -22,7 +22,9 @@
 | Hang oracle bypasses production peer.close timeout | Hang inject uses the **same** `timeout(BOUND, close_future)` path; hang = `pending()` before `peer.close()` so only the production bound cancels |
 | Format/whitespace gates fail | `cargo fmt --all` + `git diff --check` clean |
 | Fail-closed leaves primary `peer_state` | Failed primary grant passed into `fail_closed_drop_dedicated_runtime` so `take_remove_result` sweeps it; `peer_state_count()` oracle asserts 0 after hang + error fail-closed |
-| Hang test lacks external hard-stop | Parent spawns child test process; parent kills after `HANG_CLOSE_CHILD_DEADLINE` (25s) if child never exits — finite red if production timeout ablated |
+| Hang test lacks external hard-stop | Parent spawns child process; parent kills after `HANG_CLOSE_CHILD_DEADLINE` if child never exits — finite red if production timeout ablated |
+| Hard-stop child can orphan session worker | Hang child uses entity subscriptions only (no Spawn/Attach); sibling attach fail-closed remains on forced-error test |
+| Report/plan whitespace + clippy | Plan trailing spaces stripped; `git diff main...HEAD --check` + workspace clippy `-D warnings` exit 0 |
 | PR test evidence stale | PR body updated to 36 tests + stale attach snapshot proof |
 
 ## Repository playbook and notes applied
@@ -74,7 +76,7 @@
 ## Deviations from plan
 
 1. **Test-only close bound duration:** production uses 3s; under `cfg(test)` bound is 200ms (handler deadline 2s) so hang injection stays CI-cheap. Semantics (timeout → fail-closed) unchanged.
-2. **Handler deadline measurement:** `HubDaemon` is `!Send`, so hang test measures production-handler elapsed time on the control thread. Red-on-revert of the production timeout hangs this test (close future never completes).
+2. **Handler hard-stop:** hang body runs in a child process; parent kills after `HANG_CLOSE_CHILD_DEADLINE` if child never exits (finite red on timeout ablation). Child uses entity subscriptions only (no durable session workers).
 3. **Fail-closed no longer best-effort re-closes siblings:** runtime drop alone is the hard stop (matches review: no N×bound sequential waits).
 4. **Live CPU/no-spin sample:** still Verify-stage preferred path or same-repo waiver/dependency.
 
@@ -82,12 +84,13 @@
 
 ```sh
 cargo build --locked -p botster-core --bin botster-session-worker
-cargo fmt --all -- --check   # exit 0
-git diff --check             # exit 0
-./test.sh local_webrtc       # 36 lib tests passed
+cargo fmt --all -- --check                                          # exit 0
+git diff main...HEAD --check                                        # exit 0 (branch-range)
+cargo clippy --workspace --all-targets --all-features -- -D warnings  # exit 0
+./test.sh local_webrtc                                              # 36 lib tests passed
 ```
 
-Result: **36** `local_webrtc` lib tests passed (including late Attach/Spawn/Unsubscribe-reuse, attach owner empty-snapshot sweep, stale attach snapshot preserve, hang fail-closed with subprocess hard-stop + `peer_state_count==0`) plus existing #200 suite; integration/client WebRTC filters green.
+Result: **36** `local_webrtc` lib tests passed (including late Attach/Spawn/Unsubscribe-reuse, attach owner empty-snapshot sweep, stale attach snapshot preserve, hang fail-closed subprocess hard-stop without durable workers + `peer_state_count==0`) plus existing #200 suite; integration/client WebRTC filters green.
 
 Production entry points:
 
@@ -98,7 +101,7 @@ Production entry points:
 
 - Multi-hour battery / multi-core spin under real browser offerer not sampled at Implement (Verify or waiver).
 - Close bound of 3s may false-fail-close under extreme load; sibling sacrifice is intentional and tested.
-- Red-on-revert for hang path hangs the suite if bound is removed (by design); not automated as a separate “revert patch” job.
+- Timeout ablation red is the hang child's parent kill after `HANG_CLOSE_CHILD_DEADLINE` (finite nonzero), not a permanent ablation patch kept in CI.
 
 ## Missing vault guidance discovered
 
