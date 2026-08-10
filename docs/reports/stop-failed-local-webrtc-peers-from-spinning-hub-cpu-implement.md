@@ -182,7 +182,7 @@ Addresses open Review findings on run `run_1786327694_835389`.
 
 ```sh
 cargo clippy --workspace --all-targets --all-features -- -D warnings   # exit 0
-./test.sh --lib local_webrtc   # 28 passed (H1–H3 + late-subscribe + subscribe-first sweep + fail-closed close)
+./test.sh --lib local_webrtc   # 29 passed (H1–H3 + late-subscribe + subscribe-first + fail-closed + stale-snapshot)
 ./test.sh --test hub_daemon_lifecycle_test cli_daily_commands_share_canonical_default_data_directory -- --exact  # branch 0, base 0
 ./test.sh --test hub_daemon_lifecycle_test cli_local_runtime_up_starts_reuses_and_down_stops_runtime -- --exact  # branch 0, base 0
 ./test.sh --test hub_daemon_lifecycle_test  # branch: 137 passed, 0 failed
@@ -201,3 +201,11 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings   # exit 0
 | Close quarantine left hot drivers | high | Fail-closed: ultimate close failure tears down the dedicated runtime (and remaining peers) so worker threads join. Test: `local_webrtc_close_failure_fail_closed_parks_runtime_and_stops_driver_threads` |
 | Report path-scan prose | medium | Removed absolute home-path literals from report prose; scan of plan+report is clean |
 | Stale PR body | medium | PR body updated with current test counts and fail-closed disposition |
+
+## Review return (sequence 15) — fixes
+
+| Finding | Severity | Fix |
+| --- | --- | --- |
+| Fail-closed abandoned sibling daemon ownership | high | `remove_peer` returns `PeerRemoveResult` with every removed grant and attach list from stored `peer_states`. PeerClosed sweeps entity rows for all those grants and detaches sibling attaches. Test asserts peer B entity row is gone after A fail-close. |
+| Stale snapshot can delete replacement owner | medium | Snapshot entity IDs are removed only when the current row is unowned or owned by a removed grant. Test: `local_webrtc_stale_peer_snapshot_does_not_remove_replacement_subscription_owner` |
+| Lifecycle target flake | medium | Default-parallel `./test.sh --test hub_daemon_lifecycle_test` green on rerun: **137 passed, 0 failed, 1 ignored** (~76s). Prior independent failure of `cli_local_runtime_up_starts_reuses_and_down_stops_runtime` is intermittent and not reproduced on the green rerun |
