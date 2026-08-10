@@ -1185,38 +1185,56 @@ pub(crate) fn handle_control_message(
                 }
             }
 
-            // Merge attach owners from the PeerClosed snapshot and any fail-closed siblings.
-            let mut detach_list = attached_subscriptions;
+            // Merge attach candidates from the PeerClosed snapshot and any fail-closed siblings.
+            // Owner-check every row: a delayed snapshot must not detach an attach that a
+            // different live grant now owns after (session_id, subscription_id) reuse.
+            let mut detach_candidates = attached_subscriptions;
             for subscription in remove_result.attached_subscriptions {
-                if !detach_list.iter().any(|existing| {
+                if !detach_candidates.iter().any(|existing| {
                     existing.session_id == subscription.session_id
                         && existing.subscription_id == subscription.subscription_id
                 }) {
-                    detach_list.push(subscription);
+                    detach_candidates.push(subscription);
                 }
             }
-            // Independent of the peer-side snapshot: detach every attach owned by a removed grant
-            // so residual Attach rows that raced after cleanup_once still get cleaned.
-            let grant_owned_attaches: Vec<LocalWebrtcAttachedSubscription> = state
-                .pending_runtime
-                .attach_owner_grant_ids
-                .iter()
-                .filter(|(_, owner)| removed_grants.contains(owner.as_str()))
-                .map(|((session_id, subscription_id), _)| LocalWebrtcAttachedSubscription {
-                    session_id: session_id.clone(),
-                    subscription_id: subscription_id.clone(),
+            // Independent of the peer-side snapshot: include every attach currently owned by a
+            // removed grant so residual Attach rows that raced after cleanup_once still get cleaned.
+            for ((session_id, subscription_id), owner) in
+                &state.pending_runtime.attach_owner_grant_ids
+            {
+                if removed_grants.contains(owner.as_str())
+                    && !detach_candidates.iter().any(|existing| {
+                        existing.session_id == *session_id
+                            && existing.subscription_id == *subscription_id
+                    })
+                {
+                    detach_candidates.push(LocalWebrtcAttachedSubscription {
+                        session_id: session_id.clone(),
+                        subscription_id: subscription_id.clone(),
+                    });
+                }
+            }
+            let detach_list: Vec<LocalWebrtcAttachedSubscription> = detach_candidates
+                .into_iter()
+                .filter(|subscription| {
+                    match state
+                        .pending_runtime
+                        .attach_owner_grant_ids
+                        .get(&(
+                            subscription.session_id.clone(),
+                            subscription.subscription_id.clone(),
+                        ))
+                        .map(String::as_str)
+                    {
+                        // Unowned residual (socket path or missing index): allow cleanup.
+                        None => true,
+                        // Only detach when the current owner is one of the grants this forget removes.
+                        Some(owner) => removed_grants.contains(owner),
+                    }
                 })
                 .collect();
-            for subscription in grant_owned_attaches {
-                if !detach_list.iter().any(|existing| {
-                    existing.session_id == subscription.session_id
-                        && existing.subscription_id == subscription.subscription_id
-                }) {
-                    detach_list.push(subscription);
-                }
-            }
             // Drop owner index rows for removed grants before Detach so counters stay consistent
-            // even if Detach is a no-op for an already-gone session.
+            // even if Detach is a no-op for an already-gone session. Preserve replacement owners.
             state
                 .pending_runtime
                 .attach_owner_grant_ids
@@ -8477,7 +8495,10 @@ mod tests {
             panic!("expected shutdown control request");
         };
         assert!(matches!(*request, DaemonRequest::DaemonShutdown));
-        assert_eq!(grant_id, None, "socket path must leave Request grant_id unset");
+        assert_eq!(
+            grant_id, None,
+            "socket path must leave Request grant_id unset"
+        );
         let response_delivery_rx = response_delivery_rx.expect("shutdown has delivery receiver");
         server_control
             .shutdown(Shutdown::Write)
