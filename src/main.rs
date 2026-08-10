@@ -2305,11 +2305,19 @@ fn operator_session_types(args: Vec<String>) -> Result<(), OperatorError> {
     match action {
         "list" => {
             let options = DataArgs::parse(args[1..].to_vec(), "session-types list")?;
-            if !options.arguments.is_empty() {
-                return Err(OperatorError::Usage("session-types list"));
-            }
             let config = explicit_config(options.data_directory)?;
-            let response = daemon_transport_request(&config, DaemonRequest::ListSessionTypes)?;
+            let response = match options.arguments.as_slice() {
+                [] => daemon_transport_request(&config, DaemonRequest::ListSessionTypes)?,
+                [flag, target_id] if flag == "--target" || flag == "--target-id" => {
+                    daemon_transport_request(
+                        &config,
+                        DaemonRequest::ListSessionTypesForTarget {
+                            target_id: target_id.clone(),
+                        },
+                    )?
+                }
+                _ => return Err(OperatorError::Usage("session-types list")),
+            };
             print_daemon_response(response)?;
         }
         "show" => {
@@ -5599,7 +5607,9 @@ Packages:
         "session-types" => {
             "usage: botster-hub session-types <list|show|definition|resolve|spawn> ..."
         }
-        "session-types list" => "usage: botster-hub session-types list [--data-dir <path>]",
+        "session-types list" => {
+            "usage: botster-hub session-types list [--data-dir <path>] [--target <target-id>]"
+        }
         "session-types show" => {
             "usage: botster-hub session-types show [--data-dir <path>] <session-type-id>"
         }

@@ -1861,6 +1861,382 @@ fn session_type_sources_reject_ambiguous_same_rank_repo_ids() {
 }
 
 #[test]
+fn device_global_session_types_eligible_at_admitted_spawn_point() {
+    let device_root = std::path::PathBuf::from(
+        "target/botster-hub-test-data/client-api-device-global-eligible-device",
+    );
+    let target_root = std::path::PathBuf::from(
+        "target/botster-hub-test-data/client-api-device-global-eligible-target",
+    );
+    let other_root = std::path::PathBuf::from(
+        "target/botster-hub-test-data/client-api-device-global-eligible-other",
+    );
+    let _ = fs::remove_dir_all(&device_root);
+    let _ = fs::remove_dir_all(&target_root);
+    let _ = fs::remove_dir_all(&other_root);
+    fs::create_dir_all(&target_root).expect("create target root");
+    fs::create_dir_all(target_root.join("nested")).expect("create relative cwd dir");
+    fs::create_dir_all(&other_root).expect("create other root");
+    write_executable_script(
+        &device_root,
+        "bin/device.sh",
+        "#!/bin/sh\nprintf 'device:%s\\n' \"$BOTSTER_MODE\"\n",
+    );
+
+    let mut device_global = session_type("bin/device.sh", "device");
+    device_global.id = "alpha".to_string();
+    device_global.label = "Device Alpha".to_string();
+    let mut device_relative = session_type("bin/device.sh", "relative");
+    device_relative.id = "relative".to_string();
+    device_relative.label = "Device Relative".to_string();
+    device_relative.working_directory = PackageSessionTypeWorkingDirectory::Relative {
+        path: "nested".to_string(),
+    };
+    let mut device_zebra = session_type("bin/device.sh", "zebra");
+    device_zebra.id = "zebra".to_string();
+    device_zebra.label = "Device Zebra".to_string();
+
+    // Repo on T2 only shares bare id "alpha" with device — must not hide device at T.
+    write_repo_session_types(
+        &other_root,
+        serde_json::json!([{
+            "id": "alpha",
+            "label": "Repo Alpha On Other",
+            "role": "botster.agent",
+            "interaction": "interactive",
+            "traits": ["test"],
+            "lifecycle": "task",
+            "command": "bin/repo.sh",
+            "environment": { "BOTSTER_MODE": "repo" },
+            "allowed_environment_overrides": ["BOTSTER_MODE"],
+            "context": ["prompt"]
+        }]),
+    );
+    write_executable_script(&other_root, "bin/repo.sh", "#!/bin/sh\nprintf 'repo\\n'\n");
+
+    // Repo on T wins bare id "zebra" over device for list/spawn at T.
+    write_repo_session_types(
+        &target_root,
+        serde_json::json!([{
+            "id": "zebra",
+            "label": "Repo Zebra",
+            "role": "botster.agent",
+            "interaction": "interactive",
+            "traits": ["test"],
+            "lifecycle": "task",
+            "command": "bin/repo.sh",
+            "environment": { "BOTSTER_MODE": "repo" },
+            "allowed_environment_overrides": ["BOTSTER_MODE"],
+            "context": ["prompt"]
+        }]),
+    );
+    write_executable_script(
+        &target_root,
+        "bin/repo.sh",
+        "#!/bin/sh\nprintf 'repo-t\\n'\n",
+    );
+
+    let config = explicit_runtime("device-global-eligible").config().clone();
+    let store = FileHubStateStore::for_data_directory(&config.data_directory);
+    store
+        .update(&config, |state| {
+            state.device_session_type_sources = vec![DeviceSessionTypeSource {
+                root: device_root.clone(),
+                session_types: vec![device_global, device_relative, device_zebra],
+            }];
+            state.spawn_targets = vec![
+                SpawnTarget {
+                    target_id: "tgt_hub".to_string(),
+                    label: "Hub".to_string(),
+                    root: target_root.clone(),
+                    enabled: true,
+                    kind: "directory".to_string(),
+                    base_ref: None,
+                    metadata: BTreeMap::new(),
+                },
+                SpawnTarget {
+                    target_id: "tgt_other".to_string(),
+                    label: "Other".to_string(),
+                    root: other_root.clone(),
+                    enabled: true,
+                    kind: "directory".to_string(),
+                    base_ref: None,
+                    metadata: BTreeMap::new(),
+                },
+                SpawnTarget {
+                    target_id: "tgt_disabled".to_string(),
+                    label: "Disabled".to_string(),
+                    root: target_root.clone(),
+                    enabled: false,
+                    kind: "directory".to_string(),
+                    base_ref: None,
+                    metadata: BTreeMap::new(),
+                },
+            ];
+        })
+        .expect("persist device global sources");
+
+    let mut runtime = HubRuntime::load_from_store(config, &store).expect("reload runtime");
+    let api = HubClientApi::local_operator("device-global-eligible-client");
+    let packages = empty_registry();
+
+    // Management catalog keeps the global effective path and storage provenance.
+    // Non-colliding device relative stays as device with device:local provenance.
+    let catalog = api
+        .handle_request(
+            &mut runtime,
+            &packages,
+            HubClientRequest::ListSessionTypes {
+                request_id: request_id("catalog-device-global"),
+            },
+        )
+        .expect("management catalog");
+    let HubClientResponseBody::SessionTypes(catalog) = catalog.body else {
+        panic!("session types response expected");
+    };
+    let catalog_device_relative = catalog
+        .iter()
+        .find(|row| row.session_type_id == "device/relative")
+        .expect("device relative remains in management catalog");
+    assert_eq!(catalog_device_relative.target_id, "device:local");
+    assert_eq!(catalog_device_relative.source, "device");
+    // Bare alpha collides globally with repo-on-other: catalog winner is repo (unchanged).
+    let catalog_alpha = catalog
+        .iter()
+        .find(|row| row.id == "alpha")
+        .expect("alpha row in management catalog");
+    assert_eq!(catalog_alpha.source, "repo");
+    assert_eq!(catalog_alpha.session_type_id, "tgt_other/alpha");
+
+    // List-for-T includes device Global with list-context target_id = T.
+    let listed = api
+        .handle_request(
+            &mut runtime,
+            &packages,
+            HubClientRequest::ListSessionTypesForTarget {
+                request_id: request_id("list-for-hub"),
+                target_id: "tgt_hub".to_string(),
+            },
+        )
+        .expect("list for admitted hub target");
+    let HubClientResponseBody::SessionTypes(listed) = listed.body else {
+        panic!("session types response expected");
+    };
+    let ids = listed
+        .iter()
+        .map(|row| row.session_type_id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        ids,
+        vec!["device/alpha", "device/relative", "tgt_hub/zebra"],
+        "device globals eligible; repo wins zebra; stable lexical order"
+    );
+    for row in &listed {
+        assert_eq!(row.target_id, "tgt_hub");
+        assert!(row.available);
+    }
+    let zebra = listed
+        .iter()
+        .find(|row| row.session_type_id == "tgt_hub/zebra")
+        .expect("repo zebra");
+    assert_eq!(zebra.source, "repo");
+    assert!(
+        zebra
+            .overridden_sources
+            .iter()
+            .any(|source| source.kind == "device"),
+        "repo overrides device on T"
+    );
+
+    // Cross-target collision: other target's repo alpha must not hide device alpha on hub.
+    let other_list = api
+        .handle_request(
+            &mut runtime,
+            &packages,
+            HubClientRequest::ListSessionTypesForTarget {
+                request_id: request_id("list-for-other"),
+                target_id: "tgt_other".to_string(),
+            },
+        )
+        .expect("list for other target");
+    let HubClientResponseBody::SessionTypes(other_list) = other_list.body else {
+        panic!("session types response expected");
+    };
+    let other_ids = other_list
+        .iter()
+        .map(|row| row.session_type_id.as_str())
+        .collect::<Vec<_>>();
+    assert!(other_ids.contains(&"tgt_other/alpha"));
+    assert!(
+        other_ids.contains(&"device/relative"),
+        "device relative remains multi-target"
+    );
+    assert!(
+        !other_ids.contains(&"tgt_hub/zebra"),
+        "hub-only repo type must not appear on other"
+    );
+    // On other, bare alpha is repo winner.
+    let other_alpha = other_list
+        .iter()
+        .find(|row| row.id == "alpha")
+        .expect("alpha on other");
+    assert_eq!(other_alpha.source, "repo");
+    assert_eq!(other_alpha.session_type_id, "tgt_other/alpha");
+
+    // List/spawn parity for every listed hub row.
+    for row in &listed {
+        let resolved = api
+            .handle_request(
+                &mut runtime,
+                &packages,
+                HubClientRequest::ResolveSessionType {
+                    request_id: request_id(&format!("resolve-{}", row.session_type_id)),
+                    session_type_id: row.session_type_id.clone(),
+                    session_type_request: botster_hub::SessionTypeRequest {
+                        target_id: Some("tgt_hub".to_string()),
+                        ..botster_hub::SessionTypeRequest::default()
+                    },
+                },
+            )
+            .unwrap_or_else(|error| panic!("resolve {} at hub: {error:?}", row.session_type_id));
+        let HubClientResponseBody::ResolvedSessionType(resolved) = resolved.body else {
+            panic!("resolved session type expected");
+        };
+        assert_eq!(resolved.session_type.session_type_id, row.session_type_id);
+        assert_eq!(resolved.session_type.target_id, "tgt_hub");
+    }
+
+    // Precedence loser is not listed and must not materialize at T.
+    assert!(
+        !listed
+            .iter()
+            .any(|row| row.session_type_id == "device/zebra"),
+        "device/zebra is overridden by repo at hub and must not appear in list"
+    );
+    let loser_rejected = api
+        .handle_request(
+            &mut runtime,
+            &packages,
+            HubClientRequest::ResolveSessionType {
+                request_id: request_id("resolve-hidden-device-zebra"),
+                session_type_id: "device/zebra".to_string(),
+                session_type_request: botster_hub::SessionTypeRequest {
+                    target_id: Some("tgt_hub".to_string()),
+                    ..botster_hub::SessionTypeRequest::default()
+                },
+            },
+        )
+        .expect_err("qualified precedence loser must not spawn at T");
+    assert!(
+        matches!(
+            loser_rejected,
+            HubClientError::SessionType {
+                kind: "session_type_not_eligible" | "unknown_session_type",
+                ..
+            }
+        ),
+        "expected not-eligible/unknown for hidden loser, got {loser_rejected:?}"
+    );
+
+    // Relative device cwd binds under T root, not device root.
+    let relative = api
+        .handle_request(
+            &mut runtime,
+            &packages,
+            HubClientRequest::ResolveSessionType {
+                request_id: request_id("resolve-relative-at-hub"),
+                session_type_id: "device/relative".to_string(),
+                session_type_request: botster_hub::SessionTypeRequest {
+                    target_id: Some("tgt_hub".to_string()),
+                    ..botster_hub::SessionTypeRequest::default()
+                },
+            },
+        )
+        .expect("resolve relative device at hub");
+    let HubClientResponseBody::ResolvedSessionType(relative) = relative.body else {
+        panic!("resolved session type expected");
+    };
+    assert_eq!(
+        relative.working_directory,
+        target_root.join("nested").display().to_string()
+    );
+    assert_eq!(
+        relative.executable,
+        device_root.join("bin/device.sh").display().to_string(),
+        "command still under device source root"
+    );
+
+    // Explicit cwd outside T is rejected.
+    let cwd_rejected = api
+        .handle_request(
+            &mut runtime,
+            &packages,
+            HubClientRequest::ResolveSessionType {
+                request_id: request_id("resolve-cwd-escape"),
+                session_type_id: "device/alpha".to_string(),
+                session_type_request: botster_hub::SessionTypeRequest {
+                    target_id: Some("tgt_hub".to_string()),
+                    cwd: Some(device_root.display().to_string()),
+                    ..botster_hub::SessionTypeRequest::default()
+                },
+            },
+        )
+        .expect_err("cwd outside admitted T rejected");
+    assert!(matches!(
+        cwd_rejected,
+        HubClientError::SessionType {
+            kind: "cwd_not_admitted",
+            ..
+        }
+    ));
+
+    // Disabled / missing targets typed-reject (never empty-list-as-no-types).
+    let disabled = api
+        .handle_request(
+            &mut runtime,
+            &packages,
+            HubClientRequest::ListSessionTypesForTarget {
+                request_id: request_id("list-disabled"),
+                target_id: "tgt_disabled".to_string(),
+            },
+        )
+        .expect_err("disabled target rejected");
+    assert!(matches!(
+        disabled,
+        HubClientError::SessionType {
+            kind: "target_not_admitted",
+            ..
+        }
+    ));
+    let missing = api
+        .handle_request(
+            &mut runtime,
+            &packages,
+            HubClientRequest::ListSessionTypesForTarget {
+                request_id: request_id("list-missing"),
+                target_id: "tgt_missing".to_string(),
+            },
+        )
+        .expect_err("missing target rejected");
+    assert!(matches!(
+        missing,
+        HubClientError::SessionType {
+            kind: "target_not_found",
+            ..
+        }
+    ));
+
+    // Device without repo collision on a clean target still lists device zebra.
+    // (hub has repo zebra; other has only device relative + device zebra + repo alpha)
+    assert!(
+        other_list
+            .iter()
+            .any(|row| row.session_type_id == "device/zebra"),
+        "device zebra remains available where repo does not override"
+    );
+}
+
+#[test]
 fn package_configuration_client_package_rows_are_sanitized() {
     let api = HubClientApi::local_operator("package-configuration-client");
     let capability = capability(CapabilitySurface::Surfaces, None);

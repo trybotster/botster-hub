@@ -757,10 +757,33 @@ descriptors. Core treats the classification metadata as opaque strings.
 
 Session types are not `runnable_entrypoints`. Runnable entrypoints describe
 installed app/process launch contracts; session types describe PTY sessions
-with trusted hub context. The protocol exposes `ListSessionTypes`,
+with trusted hub context. The protocol exposes `ListSessionTypes` (management
+catalog), `ListSessionTypesForTarget` (spawn-point picker),
 `ShowSessionType`, `ShowSessionTypeDefinition`, `ResolveSessionType`,
 `SpawnSessionType`, and `ReadSessionContext`, plus source-aware
 `CreateSessionType`, `UpdateSessionType`, and `DeleteSessionType` requests.
+
+`ListSessionTypes` is the management catalog. It applies package < device <
+repo precedence across every source and projects storage provenance
+(`device:local` for unpinned device types). It is **not** the New session
+authority.
+
+`ListSessionTypesForTarget { target_id }` is the spawn-point list. Hub first
+validates that `target_id` is an enabled admitted spawn point (typed
+`target_not_found` / `target_not_admitted` otherwise — never an empty list that
+looks like "no types"), then filters source rows eligible for that target, then
+applies package < device < repo precedence **within the eligible set**, and
+projects list-context `target_id = T`. Rows are ordered by `session_type_id`
+lexicographic. Device-authored Global types (device rank without an exclusive
+`target_id` pin) are eligible at every enabled admitted spawn point. Package
+types remain pinned to `package:{name}` or an authored pin; repo types are
+eligible only for their target's repo source.
+
+Spawn/materialize with `target_id = T` uses the same eligibility path.
+Device-at-T dual-root policy: the command resolves under the device source
+root; the default working directory binds to T's admitted root (Relative paths
+resolve under T). Explicit cwd must stay under T. Spawn picker consumers must
+call list-for-target and use the returned qualified ids verbatim.
 
 Resolution precedence is package < device < repo < explicit request values.
 Device definitions, admitted repo target roots, and a monotonic definition
@@ -816,16 +839,18 @@ mutations get, so package-authored environments are never exposed.
 
 The read is admitted under `allow_runtime` alongside `CreateSessionType` /
 `UpdateSessionType` / `DeleteSessionType`, not under the `allow_packages` group
-that gates the sanitized `ListSessionTypes` / `ShowSessionType` /
-`ResolveSessionType` reads: the caller permitted to read an authored definition
-is exactly the caller permitted to write it. This widens what an *editor* sees
-for a type it may edit. It does not widen the subscription boundary —
-`list_session_types`, `show_session_type`, and `session_type` entity frames stay
-byte-identical and still carry no authored environment or path.
+that gates the sanitized `ListSessionTypes` / `ListSessionTypesForTarget` /
+`ShowSessionType` / `ResolveSessionType` reads: the caller permitted to read an
+authored definition is exactly the caller permitted to write it. This widens
+what an *editor* sees for a type it may edit. It does not widen the subscription
+boundary — `list_session_types`, `show_session_type`, and `session_type` entity
+frames stay sanitized and still carry no authored environment or path.
 
 The operator path is `botster-hub session-types definition <session-type-id>`,
 which prints the mutation source and the authored definition as JSON suitable
-for piping straight back through `session-types update`.
+for piping straight back through `session-types update`. Spawn-point listing is
+`botster-hub session-types list --target <target-id>` (or `--target-id`); bare
+`session-types list` remains the management catalog.
 
 Effective rows expose `source`, `source_name`, `editable`,
 `overridden_sources`, and diagnostics. The built-in `session_type` entity family
