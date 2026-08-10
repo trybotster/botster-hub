@@ -927,8 +927,14 @@ pub(crate) fn handle_control_message(
                 )));
                 return false;
             }
-            let response =
-                register_entity_subscription(daemon, state, entity_type, subscription_id, frame_tx);
+            let response = register_entity_subscription(
+                daemon,
+                state,
+                entity_type,
+                subscription_id,
+                frame_tx,
+                grant_id,
+            );
             let _ = reply_tx.send(response);
             false
         }
@@ -1110,7 +1116,23 @@ pub(crate) fn handle_control_message(
                 );
             }
             daemon.local_webrtc().remove_peer(&grant_id);
+            // Cleanup is independent of the peer-side snapshot: remove every daemon entity
+            // subscription owned by this grant (covers Subscribe-first races where cleanup_once
+            // ran before the subscribe reply added the id to the peer set).
+            let mut removed = BTreeSet::new();
             for subscription_id in entity_subscription_ids {
+                removed.insert(subscription_id);
+            }
+            let owned: Vec<String> = state
+                .entity_subscriptions
+                .iter()
+                .filter(|(_, subscription)| {
+                    subscription.owner_grant_id.as_deref() == Some(grant_id.as_str())
+                })
+                .map(|(id, _)| id.clone())
+                .collect();
+            removed.extend(owned);
+            for subscription_id in removed {
                 if state
                     .entity_subscriptions
                     .remove(&subscription_id)
@@ -3928,6 +3950,9 @@ pub(crate) struct EntitySubscriptionState {
     definition_generation: u64,
     definition_entities: BTreeMap<String, Value>,
     resync_reason: Option<String>,
+    /// Local WebRTC grant that owns this subscription, when registered over DataChannel.
+    /// Used so PeerClosed can sweep rows that arrived after cleanup_once's id snapshot.
+    pub(crate) owner_grant_id: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -4129,6 +4154,7 @@ fn register_entity_subscription(
     entity_type: String,
     subscription_id: String,
     sender: EntityFrameSender,
+    owner_grant_id: Option<String>,
 ) -> DaemonTransportResult<DaemonResponse> {
     if state.entity_subscriptions.contains_key(&subscription_id) {
         return Ok(entity_subscription_error(
@@ -4178,6 +4204,7 @@ fn register_entity_subscription(
                 definition_generation: snapshot_seq,
                 definition_entities: entities,
                 resync_reason: None,
+                owner_grant_id,
             },
         );
         state.lifecycle_counters.live_entity_subscriptions =
@@ -4230,6 +4257,7 @@ fn register_entity_subscription(
                 definition_generation: 0,
                 definition_entities: BTreeMap::new(),
                 resync_reason: None,
+                owner_grant_id,
             },
         );
         state.lifecycle_counters.live_entity_subscriptions =
@@ -4297,6 +4325,7 @@ fn register_entity_subscription(
             definition_generation: 0,
             definition_entities: BTreeMap::new(),
             resync_reason: None,
+            owner_grant_id,
         },
     );
     state.lifecycle_counters.live_entity_subscriptions = state
@@ -7966,6 +7995,7 @@ mod tests {
             "session".to_string(),
             "stale-transition-subscription".to_string(),
             EntityFrameSender::Blocking(sender),
+            None,
         )
         .expect("register entity subscription");
         assert_eq!(response.kind, DaemonResponseKind::EntitySubscribed);
@@ -8381,6 +8411,7 @@ mod tests {
             definition_generation: 0,
             definition_entities: BTreeMap::new(),
             resync_reason: Some(overflow_reason.clone()),
+            owner_grant_id: None,
         };
         let mut counters = DaemonLifecycleCounters::default();
 
@@ -8442,6 +8473,7 @@ mod tests {
                 definition_generation: 1,
                 definition_entities: BTreeMap::new(),
                 resync_reason: Some("subscriber_overflow".to_string()),
+                owner_grant_id: None,
             },
         )]);
         let entities = BTreeMap::from([(
@@ -8500,6 +8532,7 @@ mod tests {
             definition_generation: 0,
             definition_entities: BTreeMap::new(),
             resync_reason: Some(overflow_reason.clone()),
+            owner_grant_id: None,
         };
         let mut counters = DaemonLifecycleCounters::default();
 

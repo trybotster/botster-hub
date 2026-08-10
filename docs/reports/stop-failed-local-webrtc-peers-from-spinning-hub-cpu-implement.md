@@ -173,16 +173,16 @@ Addresses open Review findings on run `run_1786327694_835389`.
 | Finding | Severity | Fix |
 | --- | --- | --- |
 | Late queued entity subscriptions after PeerClosed | high | `ControlMessage::SubscribeEntities` / `UnsubscribeEntities` carry optional `grant_id`. WebRTC path sets `Some(grant_id)`; socket path keeps `None`. Admission rejects when grant peer is no longer live (`local_webrtc_peer_gone`). Test: `local_webrtc_late_subscribe_entities_after_peer_closed_does_not_recreate_state` |
-| Close error with sibling runtime | high | Retry close once; on ultimate failure quarantine peer Arc in `stale_close_peers` while siblings keep the shared runtime; when live map is empty, re-close quarantine then `runtime.take()`. Test: `local_webrtc_close_failure_with_sibling_quarantines_failed_peer_without_killing_runtime` |
+| Close error with sibling runtime | high | Retry close once; on ultimate failure fail-close the dedicated runtime (best-effort close remaining peers + drop runtime) so driver threads stop. Superseded/refined in sequence 13. |
 | Strict workspace clippy | high | Production path logs `grant_id` on close failure (no unused param). `cargo clippy --workspace --all-targets --all-features -- -D warnings` exits 0 |
 | Full suite unresolved failures | medium | Exact isolation on **branch and base** (`main` @ `1c6a41e`): both named CLI tests exit 0. Full default-parallel `./test.sh --test hub_daemon_lifecycle_test` on branch: **137 passed, 0 failed** (~84s). Not branch-attributable |
-| Absolute user path in plan/report | medium | Replaced with path-neutral `target_id` / `trybotster/botster-hub` references; raw scan of this plan/report has zero `/Users/jasonconigliari` matches |
+| Absolute user path in plan/report | medium | Plan/report use path-neutral `target_id` and `trybotster/botster-hub` only. Absolute home-directory path scan of these two artifacts is clean |
 
 ### Additional verification (post-review)
 
 ```sh
 cargo clippy --workspace --all-targets --all-features -- -D warnings   # exit 0
-./test.sh --lib local_webrtc   # 27 passed (includes H1–H3 + late-subscribe + close-failure)
+./test.sh --lib local_webrtc   # 28 passed (H1–H3 + late-subscribe + subscribe-first sweep + fail-closed close)
 ./test.sh --test hub_daemon_lifecycle_test cli_daily_commands_share_canonical_default_data_directory -- --exact  # branch 0, base 0
 ./test.sh --test hub_daemon_lifecycle_test cli_local_runtime_up_starts_reuses_and_down_stops_runtime -- --exact  # branch 0, base 0
 ./test.sh --test hub_daemon_lifecycle_test  # branch: 137 passed, 0 failed
@@ -190,4 +190,14 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings   # exit 0
 
 ### Residual risk update
 
-- If `PeerConnection::close` fails while siblings remain, the failed peer is quarantined (not map-live) until the last live peer parks the shared runtime; driver work for a quarantined peer may continue until that park. This is the sibling-safe bound without a per-peer runtime or crate-level abort API.
+- Ultimate `PeerConnection::close` failure fail-closes the entire dedicated local-WebRTC runtime (best-effort close of remaining peers, then runtime drop) so residual driver work cannot continue. Sibling peers on that runtime are sacrificed on this hard-failure path only; the normal successful-close path still preserves siblings (H2).
+- Subscribe-first races are covered by `owner_grant_id` sweep on PeerClosed in addition to the live-peer admission guard for PeerClosed-first ordering.
+
+## Review return (sequence 13) — fixes
+
+| Finding | Severity | Fix |
+| --- | --- | --- |
+| Subscribe-first terminal race | high | Store `owner_grant_id` on daemon entity subscriptions; PeerClosed removes every matching row even when the peer snapshot is empty. Test: `local_webrtc_subscribe_before_peer_closed_is_swept_by_owner_grant` |
+| Close quarantine left hot drivers | high | Fail-closed: ultimate close failure tears down the dedicated runtime (and remaining peers) so worker threads join. Test: `local_webrtc_close_failure_fail_closed_parks_runtime_and_stops_driver_threads` |
+| Report path-scan prose | medium | Removed absolute home-path literals from report prose; scan of plan+report is clean |
+| Stale PR body | medium | PR body updated with current test counts and fail-closed disposition |
