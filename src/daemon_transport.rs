@@ -2159,6 +2159,20 @@ fn handle_runtime_control_request(
             };
             Ok(daemon_session_types(templates))
         }
+        DaemonRequest::ListSessionTypesForTarget { target_id } => {
+            let response = api.handle_request(
+                runtime,
+                &packages,
+                HubClientRequest::ListSessionTypesForTarget {
+                    request_id: request_id("daemon-session-types-list-for-target"),
+                    target_id,
+                },
+            )?;
+            let HubClientResponseBody::SessionTypes(templates) = response.body else {
+                return Err(DaemonTransportError::UnexpectedResponse);
+            };
+            Ok(daemon_session_types(templates))
+        }
         DaemonRequest::ShowSessionType { session_type_id } => {
             let response = api.handle_request(
                 runtime,
@@ -7635,6 +7649,7 @@ fn operation_label(operation: crate::HubClientOperation) -> &'static str {
         crate::HubClientOperation::ListPackages => "list_packages",
         crate::HubClientOperation::ListPackageNavigation => "list_package_navigation",
         crate::HubClientOperation::ListSessionTypes => "list_session_types",
+        crate::HubClientOperation::ListSessionTypesForTarget => "list_session_types_for_target",
         crate::HubClientOperation::ShowSessionType => "show_session_type",
         crate::HubClientOperation::ShowSessionTypeDefinition => "show_session_type_definition",
         crate::HubClientOperation::CreateSessionType => "create_session_type",

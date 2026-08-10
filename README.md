@@ -1121,7 +1121,15 @@ Spawned scripts receive `BOTSTER_SESSION_ID`, `BOTSTER_CONTEXT_ID`,
 context with `"$BOTSTER_HUB_BIN" context --key prompt`.
 
 Session type sources are layered by Hub policy: package < device < repo < explicit
-request values. Effective rows expose the winning `source`/`source_name`,
+request values. The management catalog (`ListSessionTypes` /
+`session-types list`) applies that precedence globally and projects storage
+provenance. The spawn-point list (`ListSessionTypesForTarget` /
+`session-types list --target <id>`, and Lua `session_types.list({target_id})`)
+validates an enabled admitted target first, filters sources eligible for that
+target, then applies precedence within that set. Device Global types (no
+exclusive pin) are eligible at every enabled admitted spawn point; materialize
+with `target_id=T` binds cwd to T while commands still resolve under the device
+source root. Effective rows expose the winning `source`/`source_name`,
 `editable`, `overridden_sources`, and diagnostics. Device definitions and the
 monotonic session-type generation are durable in `hub-state.json`; schema 3 is a
 cold cut and rejects older state before decoding the new shape. Repo-local
@@ -1167,8 +1175,10 @@ entity frames are unchanged and still carry no authored environment or path.
 Each observable mutation
 advances the durable generation and publishes `session_type` entity upsert or
 remove frames, with bounded overflow recovering through a full snapshot.
-Disabled or unadmitted targets contribute no definitions, and final command,
-cwd, and environment remain checked against the selected source root.
+Disabled or unadmitted targets contribute no repo definitions. Spawn-point list
+and spawn against a missing or disabled target return a typed error rather than
+an empty list. Final command paths resolve under the definition's source root;
+cwd is checked against the admitted spawn-point root when spawning at T.
 
 Spawn materialization writes only bounded classification facts into opaque Core
 host metadata: session type id/source, role, traits, interaction, and lifecycle.

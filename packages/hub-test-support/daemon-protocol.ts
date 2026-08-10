@@ -74,6 +74,7 @@ export type DaemonRequest =
   | { type: "read_mode_flags"; session_id: string }
   | { type: "capture_snapshot"; session_id: string }
   | { type: "list_session_types" }
+  | { type: "list_session_types_for_target"; target_id: string }
   | { type: "show_session_type"; session_type_id: string }
   | { type: "show_session_type_definition"; session_type_id: string }
   | { type: "create_session_type"; source: DaemonSessionTypeMutationSource; definition: DaemonSessionTypeDefinition }

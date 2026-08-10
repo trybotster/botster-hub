@@ -15059,6 +15059,188 @@ fn daemon_spawns_repo_local_session_type_after_state_reload() {
 }
 
 #[test]
+fn daemon_list_session_types_for_target_includes_device_globals() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_short_test_dir("list-for-target-device-global");
+    let target_root = std::env::current_dir()
+        .expect("current dir")
+        .join(unique_test_dir("list-for-target-device-global-root"));
+    let device_root = std::env::current_dir()
+        .expect("current dir")
+        .join(unique_test_dir("list-for-target-device-global-device"));
+    fs::create_dir_all(&target_root).expect("create admitted target root");
+    fs::create_dir_all(device_root.join("bin")).expect("create device bin");
+    let script = device_root.join("bin/noop.sh");
+    fs::write(
+        &script,
+        "#!/bin/sh\nprintf 'spawned:%s\\n' \"$BOTSTER_SESSION_ID\"\nsleep 30\n",
+    )
+    .expect("write device spawn script");
+    let mut permissions = fs::metadata(&script)
+        .expect("script metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&script, permissions).expect("chmod device script");
+
+    let config = explicit_config(&data_dir);
+    let store = FileHubStateStore::for_data_directory(&config.data_directory);
+    store
+        .update(&config, |state| {
+            state.device_session_type_sources = vec![botster_hub::DeviceSessionTypeSource {
+                root: device_root.clone(),
+                session_types: vec![botster_hub::PackageSessionType {
+                    id: "global-agent".to_string(),
+                    label: "Global agent".to_string(),
+                    description: None,
+                    icon: None,
+                    role: "botster.agent".to_string(),
+                    interaction: "interactive".to_string(),
+                    traits: vec!["test".to_string()],
+                    lifecycle: "task".to_string(),
+                    command: "bin/noop.sh".to_string(),
+                    args: Vec::new(),
+                    working_directory: botster_hub::PackageSessionTypeWorkingDirectory::PackageRoot,
+                    environment: BTreeMap::new(),
+                    allowed_environment_overrides: Vec::new(),
+                    context: Vec::new(),
+                    target_id: None,
+                }],
+            }];
+            state.spawn_targets = vec![SpawnTarget {
+                target_id: "tgt_hub".to_string(),
+                label: "Hub".to_string(),
+                root: target_root.clone(),
+                enabled: true,
+                kind: "directory".to_string(),
+                base_ref: None,
+                metadata: BTreeMap::new(),
+            }];
+        })
+        .expect("persist device global and admitted target");
+
+    let child = start_cli_daemon(&data_dir);
+    let listed = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::ListSessionTypesForTarget {
+            target_id: "tgt_hub".to_string(),
+        },
+    )
+    .expect("list session types for admitted target through daemon");
+    assert_eq!(listed.kind, botster_hub::DaemonResponseKind::SessionTypes);
+    assert!(
+        listed
+            .session_types
+            .iter()
+            .any(|row| row.session_type_id == "device/global-agent"
+                && row.target_id == "tgt_hub"
+                && row.source == "device"),
+        "device Global must be eligible at admitted spawn point: {:?}",
+        listed
+            .session_types
+            .iter()
+            .map(|row| (&row.session_type_id, &row.target_id, &row.source))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        !listed.session_types.is_empty(),
+        "list-for-target must return at least one row for spawn parity"
+    );
+
+    // Real daemon SpawnSessionType for every listed id, then shut down and reap.
+    for (index, row) in listed.session_types.iter().enumerate() {
+        let session_id = format!("list-parity-{index}");
+        let spawned = botster_hub::daemon_transport_request(
+            &config,
+            botster_hub::DaemonRequest::SpawnSessionType {
+                session_type_id: row.session_type_id.clone(),
+                session_id: session_id.clone(),
+                request: botster_hub_client::DaemonSessionTypeRequest {
+                    target_id: Some("tgt_hub".to_string()),
+                    ..botster_hub_client::DaemonSessionTypeRequest::default()
+                },
+            },
+        )
+        .unwrap_or_else(|error| {
+            panic!(
+                "spawn listed id {} through daemon: {error:?}",
+                row.session_type_id
+            )
+        });
+        assert_eq!(
+            spawned.kind,
+            botster_hub::DaemonResponseKind::Spawned,
+            "spawn listed id {}: {:?}",
+            row.session_type_id,
+            spawned
+        );
+        botster_hub_client::request(
+            &botster_hub_client::DaemonEndpoint::new(
+                config
+                    .transports
+                    .local_socket
+                    .as_ref()
+                    .expect("local socket")
+                    .path
+                    .clone(),
+            ),
+            botster_hub_client::DaemonRequest::ShutdownSession {
+                session_id: session_id.clone(),
+            },
+        )
+        .expect("shutdown spawned parity session");
+    }
+
+    // Management catalog still projects storage provenance device:local.
+    let catalog = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::ListSessionTypes,
+    )
+    .expect("management catalog");
+    assert!(
+        catalog
+            .session_types
+            .iter()
+            .any(|row| row.session_type_id == "device/global-agent"
+                && row.target_id == "device:local"),
+        "management catalog keeps device:local provenance"
+    );
+
+    // CLI path hits the same daemon request.
+    let cli = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("session-types")
+        .arg("list")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("--target")
+        .arg("tgt_hub")
+        .output()
+        .expect("run session-types list --target");
+    assert!(cli.status.success(), "{}", command_output_text(&cli));
+    let cli_text = String::from_utf8_lossy(&cli.stdout);
+    assert!(
+        cli_text.contains("id=global-agent")
+            && cli_text.contains("source=device")
+            && cli_text.contains("target=tgt_hub"),
+        "CLI list-for-target must surface device Global at T: {cli_text}"
+    );
+
+    let missing = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::ListSessionTypesForTarget {
+            target_id: "tgt_missing".to_string(),
+        },
+    )
+    .expect("missing target returns typed operator error");
+    assert_eq!(missing.kind, botster_hub::DaemonResponseKind::OperatorError);
+    assert_eq!(
+        missing.error.as_ref().map(|error| error.code.as_str()),
+        Some("target_not_found")
+    );
+
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
 fn session_type_crud_pushes_authoritative_entity_deltas_without_polling() {
     let _guard = daemon_test_guard();
     let data_dir = unique_short_test_dir("session-type-entity-crud");
