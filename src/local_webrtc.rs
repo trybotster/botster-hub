@@ -3332,6 +3332,16 @@ mod tests {
         /// Keep a multi-thread runtime alive so Handle remains valid.
         _transport_runtime: tokio::runtime::Runtime,
         data_directory: PathBuf,
+        /// Worker-backed sessions that must be shut down before Hub stop.
+        owned_sessions: Vec<String>,
+        sessions_cleaned: bool,
+    }
+
+    impl Drop for PeerHarness {
+        fn drop(&mut self) {
+            // Panic-safe: HubDaemon::stop preserves workers via release_for_restart.
+            self.shutdown_owned_sessions();
+        }
     }
 
     impl PeerHarness {
@@ -3356,6 +3366,44 @@ mod tests {
                 transport_handle,
                 _transport_runtime: transport_runtime,
                 data_directory,
+                owned_sessions: Vec::new(),
+                sessions_cleaned: false,
+            }
+        }
+
+        fn control_request(&mut self, request: DaemonRequest) -> Option<DaemonResponse> {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            handle_control_message(
+                &mut self.daemon,
+                &mut self.state,
+                &self.terminal_path,
+                &self.transport_handle,
+                self.control_tx.clone(),
+                ControlMessage::Request {
+                    request: Box::new(request),
+                    reply_tx,
+                    response_delivery_rx: None,
+                },
+            );
+            reply_rx
+                .blocking_recv()
+                .ok()
+                .and_then(|result| result.ok())
+        }
+
+        fn shutdown_owned_sessions(&mut self) {
+            if self.sessions_cleaned {
+                return;
+            }
+            self.sessions_cleaned = true;
+            let sessions = std::mem::take(&mut self.owned_sessions);
+            for session_id in sessions {
+                let _ = self.control_request(DaemonRequest::ShutdownSession {
+                    session_id: session_id.clone(),
+                });
+                let _ = self.control_request(DaemonRequest::RemoveSession {
+                    session_id: session_id.clone(),
+                });
             }
         }
 
@@ -3516,6 +3564,8 @@ mod tests {
                 botster_hub_client::DaemonResponseKind::Spawned,
                 "spawn over local WebRTC must succeed for attach proof"
             );
+            // Arm panic-safe cleanup immediately after Spawn readiness.
+            self.owned_sessions.push(session_id.to_string());
             let attach = self.request_on_peer(
                 peer,
                 DaemonRequest::Attach {
@@ -3544,10 +3594,55 @@ mod tests {
         }
 
         fn cleanup(mut self) {
+            self.shutdown_owned_sessions();
             self.daemon.local_webrtc().stop_all();
             self.daemon.stop();
             let _ = std::fs::remove_dir_all(&self.data_directory);
+            // Drop runs after this; sessions_cleaned prevents double work.
         }
+    }
+
+    fn session_worker_pids_for_current_binary() -> Vec<u32> {
+        let marker = "botster-session-worker";
+        let worktree_marker = "trybotster-botster-hub-project-pipelines-ticket_1786327694_445993";
+        let Ok(output) = std::process::Command::new("ps")
+            .args(["-axo", "pid=,command="])
+            .output()
+        else {
+            return Vec::new();
+        };
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| {
+                let line = line.trim();
+                if !(line.contains(marker) && line.contains(worktree_marker)) {
+                    return None;
+                }
+                line.split_whitespace()
+                    .next()
+                    .and_then(|pid| pid.parse::<u32>().ok())
+            })
+            .collect()
+    }
+
+    fn wait_for_no_owned_session_workers(before: &[u32], deadline: Instant) {
+        while Instant::now() < deadline {
+            let current = session_worker_pids_for_current_binary();
+            let leaked: Vec<u32> = current
+                .into_iter()
+                .filter(|pid| !before.contains(pid))
+                .collect();
+            if leaked.is_empty() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        let current = session_worker_pids_for_current_binary();
+        let leaked: Vec<u32> = current
+            .into_iter()
+            .filter(|pid| !before.contains(pid))
+            .collect();
+        panic!("session workers leaked after harness cleanup: {leaked:?}");
     }
 
     struct LiveSignaledPeer {
@@ -3809,6 +3904,7 @@ mod tests {
 
     #[test]
     fn local_webrtc_close_failure_fail_closed_parks_runtime_and_stops_driver_threads() {
+        let workers_before = session_worker_pids_for_current_binary();
         let mut harness = PeerHarness::new("close-fail-sibling");
         let origin = "http://127.0.0.1:41795";
         let mut peer_a = harness.signal_peer(origin);
@@ -3825,6 +3921,14 @@ mod tests {
         let live_attach_before = harness.state.lifecycle_counters.live_attach_subscriptions;
         assert!(live_attach_before >= 1);
         assert!(LocalWebrtcTransport::dedicated_runtime_worker_threads() >= 1);
+        assert!(
+            !session_worker_pids_for_current_binary()
+                .into_iter()
+                .filter(|pid| !workers_before.contains(pid))
+                .collect::<Vec<_>>()
+                .is_empty(),
+            "spawn must create a live session worker for attach proof"
+        );
 
         harness
             .daemon
@@ -3888,6 +3992,29 @@ mod tests {
         peer_a.close_offer();
         peer_b.close_offer();
         harness.cleanup();
+        wait_for_no_owned_session_workers(&workers_before, Instant::now() + Duration::from_secs(5));
+    }
+
+    #[test]
+    fn local_webrtc_spawned_session_is_cleaned_even_if_attach_proof_panics_after_ready() {
+        // Deliberate failure after Spawn readiness must still reap the worker via Drop.
+        let workers_before = session_worker_pids_for_current_binary();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut harness = PeerHarness::new("attach-panic-cleanup");
+            let origin = "http://127.0.0.1:41798";
+            let mut peer = harness.signal_peer(origin);
+            harness.spawn_and_attach_on_peer(
+                &mut peer,
+                "panic-cleanup-session",
+                "panic-cleanup-attach",
+            );
+            peer.close_offer();
+            // Drop without calling cleanup() to force Drop-only session reaping.
+            drop(harness);
+            panic!("deliberate failure after spawn readiness");
+        }));
+        assert!(result.is_err(), "deliberate panic must fire");
+        wait_for_no_owned_session_workers(&workers_before, Instant::now() + Duration::from_secs(5));
     }
 
     #[test]
