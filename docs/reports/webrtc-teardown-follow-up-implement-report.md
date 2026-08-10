@@ -19,8 +19,11 @@
 | --- | --- |
 | Stale PeerClosed attach snapshot can detach replacement owner | Snapshot/fail-closed attach candidates owner-checked against `attach_owner_grant_ids`; preserve foreign owners. Test: `local_webrtc_stale_peer_attach_snapshot_does_not_detach_replacement_owner` |
 | Fail-closed teardown has no handler-wide close bound | `fail_closed_drop_dedicated_runtime`, `park_runtime_if_idle`, and `stop_all` drop runtime/peers immediately without sequential re-close waits |
-| Hang oracle bypasses production peer.close timeout | Hang inject uses the **same** `timeout(BOUND, close_future)` path; hang = `pending()` before `peer.close()` so only the production bound cancels. Elapsed assert ≤ `HANDLER_JOIN_DEADLINE` |
+| Hang oracle bypasses production peer.close timeout | Hang inject uses the **same** `timeout(BOUND, close_future)` path; hang = `pending()` before `peer.close()` so only the production bound cancels |
 | Format/whitespace gates fail | `cargo fmt --all` + `git diff --check` clean |
+| Fail-closed leaves primary `peer_state` | Failed primary grant passed into `fail_closed_drop_dedicated_runtime` so `take_remove_result` sweeps it; `peer_state_count()` oracle asserts 0 after hang + error fail-closed |
+| Hang test lacks external hard-stop | Parent spawns child test process; parent kills after `HANG_CLOSE_CHILD_DEADLINE` (25s) if child never exits — finite red if production timeout ablated |
+| PR test evidence stale | PR body updated to 36 tests + stale attach snapshot proof |
 
 ## Repository playbook and notes applied
 
@@ -84,7 +87,7 @@ git diff --check             # exit 0
 ./test.sh local_webrtc       # 36 lib tests passed
 ```
 
-Result: **36** `local_webrtc` lib tests passed (including late Attach/Spawn/Unsubscribe-reuse, attach owner empty-snapshot sweep, stale attach snapshot preserve, hang fail-closed handler deadline) plus existing #200 suite; integration/client WebRTC filters green.
+Result: **36** `local_webrtc` lib tests passed (including late Attach/Spawn/Unsubscribe-reuse, attach owner empty-snapshot sweep, stale attach snapshot preserve, hang fail-closed with subprocess hard-stop + `peer_state_count==0`) plus existing #200 suite; integration/client WebRTC filters green.
 
 Production entry points:
 
