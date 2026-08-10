@@ -3490,27 +3490,17 @@ mod tests {
                     errors.push(error);
                 }
             }
-            // Soft-wait for natural exit after validated RemoveSession.
-            let mut wait_deadline = Instant::now() + Duration::from_secs(3);
-            let _ = soft_wait_until(wait_deadline, &mut || {
+            // Production-path wait only: ShutdownSession + RemoveSession must reap the
+            // worker tree and control socket without harness kill/unlink assistance.
+            let production_deadline = Instant::now() + Duration::from_secs(5);
+            let production_gone = soft_wait_until(production_deadline, &mut || {
                 workers.iter().all(|worker| worker.is_fully_gone())
             });
-            // Last-resort harness reap: exact worker PID, residual group members,
-            // then unlink the control socket so absence proofs are non-vacuous.
-            for worker in &workers {
-                if !worker.is_fully_gone() {
-                    reap_owned_worker(worker);
-                }
-            }
-            wait_deadline = Instant::now() + Duration::from_secs(2);
-            let all_gone = soft_wait_until(wait_deadline, &mut || {
-                workers.iter().all(|worker| worker.is_fully_gone())
-            });
-            if !all_gone {
+            if !production_gone {
                 for worker in &workers {
                     if !worker.is_fully_gone() {
                         errors.push(format!(
-                            "owned worker still present after cleanup: {worker:?} (pid_alive={} socket_exists={} residual_owned_pids={:?})",
+                            "production ShutdownSession/RemoveSession left survivor (before harness reap): {worker:?} (pid_alive={} socket_exists={} residual_owned_pids={:?})",
                             process_is_alive(worker.pid),
                             !worker.control_socket.as_os_str().is_empty()
                                 && worker.control_socket.exists(),
@@ -3518,6 +3508,18 @@ mod tests {
                         ));
                     }
                 }
+                // Hygiene only: kill/unlink residual processes so the suite does not
+                // leave orphans. This MUST NOT clear the production-survivor error —
+                // tests must fail when production cleanup leaked.
+                for worker in &workers {
+                    if !worker.is_fully_gone() {
+                        reap_owned_worker(worker);
+                    }
+                }
+                let hygiene_deadline = Instant::now() + Duration::from_secs(2);
+                let _ = soft_wait_until(hygiene_deadline, &mut || {
+                    workers.iter().all(|worker| worker.is_fully_gone())
+                });
             }
             if errors.is_empty() {
                 Ok(())
@@ -3996,25 +3998,14 @@ mod tests {
     }
 
     fn wait_for_owned_workers_gone(workers: &[OwnedWorkerIdentity], deadline: Instant) {
-        // Allow residual shell children a brief natural exit, then reap hard.
-        let soft_deadline = Instant::now() + Duration::from_millis(
-            deadline
-                .saturating_duration_since(Instant::now())
-                .as_millis()
-                .min(1500) as u64,
-        );
-        let _ = soft_wait_until(soft_deadline, &mut || {
-            workers.iter().all(|worker| worker.is_fully_gone())
-        });
-        for worker in workers {
-            if !worker.is_fully_gone() {
-                reap_owned_worker(worker);
-            }
-        }
+        // Observation only: do not hard-reap here. Harness kill/unlink belongs solely
+        // inside shutdown_owned_sessions as post-error hygiene, never as a greenwash.
         wait_until(
             deadline,
             || workers.iter().all(|worker| worker.is_fully_gone()),
-            &format!("owned workers to fully exit: {workers:?}"),
+            &format!(
+                "owned workers to fully exit after production cleanup: {workers:?}"
+            ),
         );
     }
 

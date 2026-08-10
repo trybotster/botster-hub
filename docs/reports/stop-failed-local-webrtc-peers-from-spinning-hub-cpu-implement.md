@@ -249,3 +249,21 @@ cargo clippy -p botster-hub --lib --tests -- -D warnings   # exit 0
 
 - Session-worker process-group identity is proven via readiness-captured worker+descendant tree and post-cleanup absence of the worker PID from the pgid census. Mass-killing an ambient shared pgid is intentionally avoided: workers can share a process group with the hub daemon, and group-wide signals would terminate the harness.
 - Hard reap after validated `ShutdownSession`/`RemoveSession` is harness-only insurance so absence proofs remain non-vacuous when production teardown is slow; production path still owns the primary cleanup.
+
+## Review return (sequence 25) — fixes
+
+Addresses open finding `finding_1786335499_344576`.
+
+| Finding | Severity | Fix |
+| --- | --- | --- |
+| Hard reaper converts a production cleanup survivor into test success | high | After validated `ShutdownSession`/`RemoveSession`, soft-wait for the owned worker tree + socket to exit via production cleanup alone. If any survivor remains, record a production-survivor error with captured evidence, then hard-reap **only for suite hygiene**. The production-survivor error is retained so normal-path `.expect` and panic-path `LAST_SESSION_CLEANUP_ERROR` still fail. `wait_for_owned_workers_gone` is observation-only (no kill/unlink). |
+
+### Sequence 25 verification
+
+```sh
+./test.sh --lib local_webrtc
+# 30 passed, 0 failed
+cargo clippy -p botster-hub --lib --tests -- -D warnings   # exit 0
+```
+
+Production `ShutdownSession`/`RemoveSession` reaps the observed worker tree without harness kill on the green path.
