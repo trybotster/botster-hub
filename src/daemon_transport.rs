@@ -469,6 +469,7 @@ async fn handle_connection_async(
                 request: Box::new(request),
                 reply_tx,
                 response_delivery_rx,
+                local_webrtc_grant_id: None,
             })
             .await
             .map_err(|_| DaemonTransportError::ControlThreadStopped)?;
@@ -511,6 +512,7 @@ async fn handle_entity_subscription_async(
             subscription_id: subscription_id.clone(),
             frame_tx: EntityFrameSender::Async(frame_tx),
             reply_tx,
+            local_webrtc_grant_id: None,
         })
         .await
         .map_err(|_| DaemonTransportError::ControlThreadStopped)?;
@@ -912,9 +914,16 @@ fn handle_control_message(
             subscription_id,
             frame_tx,
             reply_tx,
+            local_webrtc_grant_id,
         } => {
-            let response =
-                register_entity_subscription(daemon, state, entity_type, subscription_id, frame_tx);
+            let response = register_entity_subscription(
+                daemon,
+                state,
+                entity_type,
+                subscription_id,
+                frame_tx,
+                local_webrtc_grant_id,
+            );
             let _ = reply_tx.send(response);
             false
         }
@@ -945,6 +954,7 @@ fn handle_control_message(
             request,
             reply_tx,
             response_delivery_rx,
+            local_webrtc_grant_id,
         } => {
             if matches!(request.as_ref(), DaemonRequest::CheckHubUpdate) {
                 return match plan_hub_update_check() {
@@ -981,6 +991,22 @@ fn handle_control_message(
                     }
                 };
             }
+            if let Some(grant_id) = local_webrtc_grant_id.as_ref()
+                && let DaemonRequest::Attach {
+                    subscription_id, ..
+                } = request.as_ref()
+                && !daemon.local_webrtc().has_live_peer(grant_id)
+            {
+                return send_control_response(
+                    reply_tx,
+                    Ok(stale_local_webrtc_peer_error(
+                        "attach",
+                        subscription_id,
+                        "local WebRTC peer is no longer live",
+                    )),
+                    response_delivery_rx,
+                );
+            }
             let attached_change = AttachedSubscriptionChange::from_request(&request);
             let reconcile_after_request = matches!(
                 request.as_ref(),
@@ -1015,7 +1041,11 @@ fn handle_control_message(
                 .as_ref()
                 .is_ok_and(|response| response.kind != DaemonResponseKind::OperatorError)
             {
-                record_attached_subscription_change(state, attached_change);
+                record_attached_subscription_change(
+                    state,
+                    attached_change,
+                    local_webrtc_grant_id.as_deref(),
+                );
             }
             if reconcile_after_request && !state.entity_subscriptions.is_empty() {
                 drive_entity_subscriptions(daemon, state);
@@ -1070,28 +1100,63 @@ fn handle_control_message(
                     error.kind()
                 );
             }
-            daemon.local_webrtc().remove_peer(&grant_id);
+            // Close the live peer and its dedicated runtime before sweeping grant-owned
+            // daemon state. Terminal record alone is not proof the driver stopped.
+            daemon.local_webrtc().close_peer(&grant_id);
+
+            let mut removed_entity_ids = BTreeSet::new();
+            state
+                .entity_subscriptions
+                .retain(|subscription_id, subscription| {
+                    if subscription.local_webrtc_grant_id.as_deref() == Some(grant_id.as_str()) {
+                        removed_entity_ids.insert(subscription_id.clone());
+                        false
+                    } else {
+                        true
+                    }
+                });
             for subscription_id in entity_subscription_ids {
                 if state
                     .entity_subscriptions
                     .remove(&subscription_id)
                     .is_some()
                 {
-                    state.lifecycle_counters.live_entity_subscriptions = state
-                        .lifecycle_counters
-                        .live_entity_subscriptions
-                        .saturating_sub(1);
-                    state.released_entity_generations =
-                        state.released_entity_generations.saturating_add(1);
+                    removed_entity_ids.insert(subscription_id);
                 }
             }
+            let removed_entity_count = removed_entity_ids.len() as u64;
+            state.lifecycle_counters.live_entity_subscriptions = state
+                .lifecycle_counters
+                .live_entity_subscriptions
+                .saturating_sub(removed_entity_count);
+            state.released_entity_generations = state
+                .released_entity_generations
+                .saturating_add(removed_entity_count);
+
+            let mut detach_by_id = BTreeMap::new();
+            for subscription in attached_subscriptions {
+                detach_by_id.insert(subscription.subscription_id.clone(), subscription);
+            }
+            state
+                .local_webrtc_attach_owners
+                .retain(|subscription_id, owner| {
+                    if owner.grant_id == grant_id {
+                        detach_by_id.insert(subscription_id.clone(), owner.subscription.clone());
+                        false
+                    } else {
+                        true
+                    }
+                });
+            let detach_subscriptions: Vec<LocalWebrtcAttachedSubscription> =
+                detach_by_id.into_values().collect();
+            let detach_count = detach_subscriptions.len() as u64;
             state.lifecycle_counters.live_attach_subscriptions = state
                 .lifecycle_counters
                 .live_attach_subscriptions
-                .saturating_sub(attached_subscriptions.len() as u64);
+                .saturating_sub(detach_count);
             state.released_attach_generations = state
                 .released_attach_generations
-                .saturating_add(attached_subscriptions.len() as u64);
+                .saturating_add(detach_count);
             detach_local_webrtc_subscriptions(
                 daemon,
                 &mut state.logical_clock,
@@ -1102,7 +1167,7 @@ fn handle_control_message(
                     egress: &state.egress_diagnostics,
                     lifecycle: &state.lifecycle_counters,
                 },
-                attached_subscriptions,
+                detach_subscriptions,
             );
             false
         }
@@ -3748,6 +3813,7 @@ fn install_signal_forwarder(control_tx: ControlSender) -> DaemonTransportResult<
                 request: Box::new(DaemonRequest::DaemonShutdown),
                 reply_tx,
                 response_delivery_rx: None,
+                local_webrtc_grant_id: None,
             });
         }
     });
@@ -3813,6 +3879,8 @@ pub(crate) enum ControlMessage {
         subscription_id: String,
         frame_tx: EntityFrameSender,
         reply_tx: ControlReplySender,
+        /// Present when the subscribe came from a local WebRTC peer data channel.
+        local_webrtc_grant_id: Option<String>,
     },
     UnsubscribeEntities {
         subscription_id: String,
@@ -3822,6 +3890,8 @@ pub(crate) enum ControlMessage {
         request: Box<DaemonRequest>,
         reply_tx: ControlReplySender,
         response_delivery_rx: Option<mpsc::Receiver<()>>,
+        /// Present when the request came from a local WebRTC peer data channel.
+        local_webrtc_grant_id: Option<String>,
     },
     HubUpdateCheckCompleted {
         update: DaemonHubUpdate,
@@ -3884,6 +3954,14 @@ struct EntitySubscriptionState {
     definition_generation: u64,
     definition_entities: BTreeMap<String, Value>,
     resync_reason: Option<String>,
+    /// Owning local WebRTC grant when the subscription was peer-originated.
+    local_webrtc_grant_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct LocalWebrtcAttachOwner {
+    grant_id: String,
+    subscription: LocalWebrtcAttachedSubscription,
 }
 
 #[derive(Debug, Default)]
@@ -3904,6 +3982,8 @@ struct DaemonControlState {
     drain_cursors: BTreeMap<String, u64>,
     egress_diagnostics: DaemonEgressDiagnostics,
     entity_subscriptions: BTreeMap<String, EntitySubscriptionState>,
+    /// Grant-owned Attach records keyed by subscription_id.
+    local_webrtc_attach_owners: BTreeMap<String, LocalWebrtcAttachOwner>,
     reconciliation: EntityReconciliationState,
     pending_runtime: PendingRuntimeState,
     lifecycle_counters: DaemonLifecycleCounters,
@@ -3920,6 +4000,7 @@ impl Default for DaemonControlState {
             drain_cursors: BTreeMap::new(),
             egress_diagnostics: DaemonEgressDiagnostics::default(),
             entity_subscriptions: BTreeMap::new(),
+            local_webrtc_attach_owners: BTreeMap::new(),
             reconciliation: EntityReconciliationState::default(),
             pending_runtime: PendingRuntimeState::default(),
             lifecycle_counters: DaemonLifecycleCounters::default(),
@@ -4025,12 +4106,25 @@ enum AttachedSubscriptionChange {
 fn record_attached_subscription_change(
     state: &mut DaemonControlState,
     change: Option<AttachedSubscriptionChange>,
+    local_webrtc_grant_id: Option<&str>,
 ) {
     let Some(change) = change else {
         return;
     };
     match change {
-        AttachedSubscriptionChange::Attach(_) => {
+        AttachedSubscriptionChange::Attach(subscription) => {
+            if let Some(grant_id) = local_webrtc_grant_id {
+                state.local_webrtc_attach_owners.insert(
+                    subscription.subscription_id.clone(),
+                    LocalWebrtcAttachOwner {
+                        grant_id: grant_id.to_string(),
+                        subscription: LocalWebrtcAttachedSubscription {
+                            session_id: subscription.session_id.clone(),
+                            subscription_id: subscription.subscription_id.clone(),
+                        },
+                    },
+                );
+            }
             if state.released_attach_generations > 0 {
                 state.released_attach_generations -= 1;
                 state.lifecycle_counters.reconnect_registrations = state
@@ -4047,7 +4141,10 @@ fn record_attached_subscription_change(
                 .high_water_attach_subscriptions
                 .max(state.lifecycle_counters.live_attach_subscriptions);
         }
-        AttachedSubscriptionChange::Detach(_) => {
+        AttachedSubscriptionChange::Detach(subscription) => {
+            state
+                .local_webrtc_attach_owners
+                .remove(&subscription.subscription_id);
             state.lifecycle_counters.live_attach_subscriptions = state
                 .lifecycle_counters
                 .live_attach_subscriptions
@@ -4085,7 +4182,17 @@ fn register_entity_subscription(
     entity_type: String,
     subscription_id: String,
     sender: EntityFrameSender,
+    local_webrtc_grant_id: Option<String>,
 ) -> DaemonTransportResult<DaemonResponse> {
+    if let Some(grant_id) = local_webrtc_grant_id.as_ref()
+        && !daemon.local_webrtc().has_live_peer(grant_id)
+    {
+        return Ok(entity_subscription_error(
+            "stale_local_webrtc_peer",
+            &subscription_id,
+            "local WebRTC peer is no longer live",
+        ));
+    }
     if state.entity_subscriptions.contains_key(&subscription_id) {
         return Ok(entity_subscription_error(
             "duplicate_entity_subscription",
@@ -4134,6 +4241,7 @@ fn register_entity_subscription(
                 definition_generation: snapshot_seq,
                 definition_entities: entities,
                 resync_reason: None,
+                local_webrtc_grant_id: local_webrtc_grant_id.clone(),
             },
         );
         state.lifecycle_counters.live_entity_subscriptions =
@@ -4186,6 +4294,7 @@ fn register_entity_subscription(
                 definition_generation: 0,
                 definition_entities: BTreeMap::new(),
                 resync_reason: None,
+                local_webrtc_grant_id: local_webrtc_grant_id.clone(),
             },
         );
         state.lifecycle_counters.live_entity_subscriptions =
@@ -4253,6 +4362,7 @@ fn register_entity_subscription(
             definition_generation: 0,
             definition_entities: BTreeMap::new(),
             resync_reason: None,
+            local_webrtc_grant_id: local_webrtc_grant_id.clone(),
         },
     );
     state.lifecycle_counters.live_entity_subscriptions = state
@@ -4980,6 +5090,22 @@ fn entity_subscription_error(code: &str, subscription_id: &str, message: &str) -
             "subscribe_entities",
             message,
         )],
+    });
+    response
+}
+
+fn stale_local_webrtc_peer_error(
+    operation: &str,
+    request_id: &str,
+    message: &str,
+) -> DaemonResponse {
+    let mut response = daemon_response_base(DaemonResponseKind::OperatorError);
+    response.error = Some(DaemonOperatorError {
+        code: "stale_local_webrtc_peer".to_string(),
+        request_id: request_id.to_string(),
+        operation: operation.to_string(),
+        message: message.to_string(),
+        diagnostics: vec![DaemonDiagnostic::action_failure(operation, message)],
     });
     response
 }
@@ -7771,6 +7897,7 @@ fn handle_connection(stream: UnixStream, control_tx: ControlSender) -> DaemonTra
                     }),
                     reply_tx,
                     response_delivery_rx: None,
+                    local_webrtc_grant_id: None,
                 })
                 .is_ok()
             {
@@ -7922,6 +8049,7 @@ mod tests {
             "session".to_string(),
             "stale-transition-subscription".to_string(),
             EntityFrameSender::Blocking(sender),
+            None,
         )
         .expect("register entity subscription");
         assert_eq!(response.kind, DaemonResponseKind::EntitySubscribed);
@@ -8266,6 +8394,7 @@ mod tests {
             request,
             reply_tx,
             response_delivery_rx,
+            local_webrtc_grant_id: None,
         } = receive_test_control_message(&mut control_rx)
         else {
             panic!("expected shutdown control request");
@@ -8337,6 +8466,7 @@ mod tests {
             definition_generation: 0,
             definition_entities: BTreeMap::new(),
             resync_reason: Some(overflow_reason.clone()),
+            local_webrtc_grant_id: None,
         };
         let mut counters = DaemonLifecycleCounters::default();
 
@@ -8398,6 +8528,7 @@ mod tests {
                 definition_generation: 1,
                 definition_entities: BTreeMap::new(),
                 resync_reason: Some("subscriber_overflow".to_string()),
+                local_webrtc_grant_id: None,
             },
         )]);
         let entities = BTreeMap::from([(
@@ -8456,6 +8587,7 @@ mod tests {
             definition_generation: 0,
             definition_entities: BTreeMap::new(),
             resync_reason: Some(overflow_reason.clone()),
+            local_webrtc_grant_id: None,
         };
         let mut counters = DaemonLifecycleCounters::default();
 
@@ -8503,5 +8635,185 @@ mod tests {
         assert_eq!(counters.entity_delivery_successes, 1);
         assert_eq!(counters.entity_delivery_overflows, 1);
         assert_eq!(counters.entity_delivery_failures, 1);
+    }
+
+    fn test_daemon_for_local_webrtc_control() -> (HubDaemon, std::path::PathBuf) {
+        let data_directory = std::env::temp_dir().join(format!(
+            "botster-hub-local-webrtc-control-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after epoch")
+                .as_nanos()
+        ));
+        let config = crate::HubStartupOptions {
+            host: crate::HostIdentityOptions {
+                id: "local-webrtc-control-test".to_string(),
+                display_name: "Local WebRTC Control Test".to_string(),
+                fingerprint: None,
+            },
+            data_directory: crate::DataDirectoryOption::Explicit(data_directory.clone()),
+            session_defaults: crate::SessionDefaults {
+                shell: "/bin/sh".to_string(),
+                working_directory: Some(".".into()),
+                initial_rows: 24,
+                initial_cols: 80,
+            },
+            transports: crate::TransportBindings::default(),
+            ..crate::HubStartupOptions::default()
+        }
+        .build_config_for_environment(&crate::RuntimeEnvironment::from_values(None, None))
+        .expect("build local webrtc control config");
+        let daemon = HubDaemon::start(config).expect("start local webrtc control daemon");
+        (daemon, data_directory)
+    }
+
+    #[test]
+    fn late_subscribe_after_peer_closed_is_rejected() {
+        let (mut daemon, data_directory) = test_daemon_for_local_webrtc_control();
+        let mut state = DaemonControlState::default();
+        let (sender, _receiver) = mpsc::sync_channel(1);
+        let response = register_entity_subscription(
+            &mut daemon,
+            &mut state,
+            "session_type".to_string(),
+            "late-sub".to_string(),
+            EntityFrameSender::Blocking(sender),
+            Some("missing-grant".to_string()),
+        )
+        .expect("register returns operator error frame");
+        assert_eq!(response.kind, DaemonResponseKind::OperatorError);
+        let error = response.error.expect("stale peer operator error");
+        assert_eq!(error.code, "stale_local_webrtc_peer");
+        assert!(state.entity_subscriptions.is_empty());
+        let _ = std::fs::remove_dir_all(data_directory);
+    }
+
+    #[test]
+    fn early_entity_subscription_owner_is_swept_on_peer_closed() {
+        let (mut daemon, data_directory) = test_daemon_for_local_webrtc_control();
+        let mut state = DaemonControlState::default();
+        let (sender, _receiver) = mpsc::sync_channel(4);
+        state.entity_subscriptions.insert(
+            "early-sub".to_string(),
+            EntitySubscriptionState {
+                sender: EntityFrameSender::Blocking(sender),
+                entity_type: "session_type".to_string(),
+                cursor: None,
+                entities: BTreeMap::new(),
+                definition_generation: 0,
+                definition_entities: BTreeMap::new(),
+                resync_reason: None,
+                local_webrtc_grant_id: Some("grant-early".to_string()),
+            },
+        );
+        state.lifecycle_counters.live_entity_subscriptions = 1;
+
+        let (control_tx, _control_rx) = tokio_mpsc::channel(8);
+        let terminal = crate::local_webrtc::LocalWebrtcSenderTerminalRecord {
+            schema_version: 1,
+            grant_id: "grant-early".to_string(),
+            request_operation: "status".to_string(),
+            message_id: None,
+            next_chunk_index: 0,
+            last_sent_chunk_index: None,
+            total_chunks: 0,
+            pressured: false,
+            peer_connection_state: "failed".to_string(),
+            channel_terminal_signal: crate::local_webrtc::LocalWebrtcChannelTerminalSignal::None,
+            cause: crate::local_webrtc::LocalWebrtcTerminalCause::PeerFailed,
+            cleanup_disposition: crate::local_webrtc::LocalWebrtcCleanupDisposition::NewlySent,
+        };
+        let path = data_directory.join("local-webrtc-sender-terminal.json");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let handle = runtime.handle().clone();
+        let _ = handle_control_message(
+            &mut daemon,
+            &mut state,
+            &path,
+            &handle,
+            control_tx,
+            ControlMessage::LocalWebrtcPeerClosed {
+                grant_id: "grant-early".to_string(),
+                attached_subscriptions: Vec::new(),
+                entity_subscription_ids: Vec::new(),
+                terminal_record: terminal,
+            },
+        );
+        assert!(
+            state.entity_subscriptions.is_empty(),
+            "owner-tagged entity subscription must be swept even when absent from snapshot"
+        );
+        assert_eq!(state.lifecycle_counters.live_entity_subscriptions, 0);
+        let _ = std::fs::remove_dir_all(data_directory);
+    }
+
+    #[test]
+    fn attach_owner_map_is_grant_selective_on_peer_closed() {
+        let (mut daemon, data_directory) = test_daemon_for_local_webrtc_control();
+        let mut state = DaemonControlState::default();
+        state.local_webrtc_attach_owners.insert(
+            "sub-a".to_string(),
+            LocalWebrtcAttachOwner {
+                grant_id: "grant-a".to_string(),
+                subscription: LocalWebrtcAttachedSubscription {
+                    session_id: "session-a".to_string(),
+                    subscription_id: "sub-a".to_string(),
+                },
+            },
+        );
+        state.local_webrtc_attach_owners.insert(
+            "sub-b".to_string(),
+            LocalWebrtcAttachOwner {
+                grant_id: "grant-b".to_string(),
+                subscription: LocalWebrtcAttachedSubscription {
+                    session_id: "session-b".to_string(),
+                    subscription_id: "sub-b".to_string(),
+                },
+            },
+        );
+        state.lifecycle_counters.live_attach_subscriptions = 2;
+
+        let (control_tx, _control_rx) = tokio_mpsc::channel(8);
+        let terminal = crate::local_webrtc::LocalWebrtcSenderTerminalRecord {
+            schema_version: 1,
+            grant_id: "grant-a".to_string(),
+            request_operation: "attach".to_string(),
+            message_id: None,
+            next_chunk_index: 0,
+            last_sent_chunk_index: None,
+            total_chunks: 0,
+            pressured: false,
+            peer_connection_state: "failed".to_string(),
+            channel_terminal_signal: crate::local_webrtc::LocalWebrtcChannelTerminalSignal::None,
+            cause: crate::local_webrtc::LocalWebrtcTerminalCause::PeerFailed,
+            cleanup_disposition: crate::local_webrtc::LocalWebrtcCleanupDisposition::NewlySent,
+        };
+        let path = data_directory.join("local-webrtc-sender-terminal.json");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let handle = runtime.handle().clone();
+        let _ = handle_control_message(
+            &mut daemon,
+            &mut state,
+            &path,
+            &handle,
+            control_tx,
+            ControlMessage::LocalWebrtcPeerClosed {
+                grant_id: "grant-a".to_string(),
+                attached_subscriptions: Vec::new(),
+                entity_subscription_ids: Vec::new(),
+                terminal_record: terminal,
+            },
+        );
+        assert!(!state.local_webrtc_attach_owners.contains_key("sub-a"));
+        assert!(state.local_webrtc_attach_owners.contains_key("sub-b"));
+        assert_eq!(state.lifecycle_counters.live_attach_subscriptions, 1);
+        let _ = std::fs::remove_dir_all(data_directory);
     }
 }

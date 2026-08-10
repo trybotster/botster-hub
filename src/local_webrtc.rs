@@ -44,6 +44,8 @@ const LOCAL_WEBRTC_PENDING_REQUESTS: usize = 16;
 const LOCAL_WEBRTC_EVENT_PROBE: Duration = Duration::ZERO;
 const LOCAL_WEBRTC_BUFFERED_AMOUNT_LOW: u32 = LOCAL_WEBRTC_MAX_FRAME_BYTES as u32;
 const LOCAL_WEBRTC_BUFFERED_AMOUNT_HIGH: u32 = (LOCAL_WEBRTC_MAX_FRAME_BYTES * 2) as u32;
+const LOCAL_WEBRTC_PEER_CLOSE_BOUND: Duration = Duration::from_secs(3);
+const LOCAL_WEBRTC_RUNTIME_SHUTDOWN_BOUND: Duration = Duration::from_secs(5);
 const TEST_CLOSE_LOCAL_WEBRTC_OPERATION_ENV: &str = "BOTSTER_HUB_TEST_CLOSE_LOCAL_WEBRTC_OPERATION";
 pub(crate) const LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_FILE: &str =
     "local-webrtc-sender-terminal.json";
@@ -90,11 +92,22 @@ where
     }
 }
 /// Ephemeral local WebRTC admission and peer registry.
+///
+/// Each live peer owns its own multi-thread Tokio runtime so terminal cleanup can
+/// shut that peer's `PeerConnectionDriver` down without waiting on other peers.
 #[derive(Default)]
 pub struct LocalWebrtcTransport {
     grants: BTreeMap<String, LocalWebrtcGrant>,
-    peers: BTreeMap<String, Arc<dyn PeerConnection>>,
-    runtime: Option<tokio::runtime::Runtime>,
+    peers: BTreeMap<String, LocalWebrtcPeerHandle>,
+}
+
+struct LocalWebrtcPeerHandle {
+    peer: Arc<dyn PeerConnection>,
+    runtime: tokio::runtime::Runtime,
+    /// Production callback object installed during answer_offer. Retained so focused
+    /// tests can drive the exact peer_failed path signal() registered.
+    #[cfg_attr(not(test), allow(dead_code))]
+    handler: Arc<LocalWebrtcHandler>,
 }
 
 impl LocalWebrtcTransport {
@@ -148,10 +161,21 @@ impl LocalWebrtcTransport {
         grant.redeemed = true;
         let grant_id = grant.grant_id.clone();
 
-        let answer = self
-            .runtime()?
-            .block_on(answer_offer(request, runtime_tx))?;
-        self.peers.insert(grant_id.clone(), answer.peer);
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .thread_name("botster-local-webrtc")
+            .enable_all()
+            .build()
+            .map_err(|error| LocalWebrtcError::Webrtc(error.to_string()))?;
+        let answer = runtime.block_on(answer_offer(request, runtime_tx))?;
+        self.peers.insert(
+            grant_id.clone(),
+            LocalWebrtcPeerHandle {
+                peer: answer.peer,
+                runtime,
+                handler: answer.handler,
+            },
+        );
         Ok(DaemonLocalWebrtcAnswer {
             grant_id,
             answer: answer.answer,
@@ -159,33 +183,60 @@ impl LocalWebrtcTransport {
         })
     }
 
+    /// Close one peer and shut down its dedicated runtime. Idempotent.
+    pub(crate) fn close_peer(&mut self, grant_id: &str) {
+        let Some(handle) = self.peers.remove(grant_id) else {
+            return;
+        };
+        let LocalWebrtcPeerHandle {
+            peer,
+            runtime,
+            handler: _,
+        } = handle;
+        runtime.block_on(async {
+            let _ = tokio::time::timeout(LOCAL_WEBRTC_PEER_CLOSE_BOUND, peer.close()).await;
+        });
+        runtime.shutdown_timeout(LOCAL_WEBRTC_RUNTIME_SHUTDOWN_BOUND);
+    }
+
     /// Close all active local peers. Used during daemon shutdown.
     pub fn stop_all(&mut self) {
-        let peers = std::mem::take(&mut self.peers);
+        let grant_ids: Vec<String> = self.peers.keys().cloned().collect();
+        for grant_id in grant_ids {
+            self.close_peer(&grant_id);
+        }
         self.grants.clear();
-        if let Some(runtime) = self.runtime.take() {
-            for peer in peers.into_values() {
-                let _ = runtime.block_on(peer.close());
-            }
-        }
     }
 
-    /// Forget one active peer after its DataChannel or peer connection closes.
-    pub(crate) fn remove_peer(&mut self, grant_id: &str) {
-        self.peers.remove(grant_id);
+    /// True when a grant still owns a live peer handle.
+    pub(crate) fn has_live_peer(&self, grant_id: &str) -> bool {
+        self.peers.contains_key(grant_id)
     }
 
-    fn runtime(&mut self) -> LocalWebrtcResult<&tokio::runtime::Runtime> {
-        if self.runtime.is_none() {
-            self.runtime = Some(
-                tokio::runtime::Builder::new_multi_thread()
-                    .thread_name("botster-local-webrtc")
-                    .enable_all()
-                    .build()
-                    .map_err(|error| LocalWebrtcError::Webrtc(error.to_string()))?,
-            );
-        }
-        Ok(self.runtime.as_ref().expect("runtime was initialized"))
+    /// Number of live local WebRTC peers.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn live_peer_count(&self) -> usize {
+        self.peers.len()
+    }
+
+    /// Production handler installed for a live peer. Used by focused cleanup tests.
+    #[cfg(test)]
+    pub(crate) fn peer_handler(&self, grant_id: &str) -> Option<Arc<LocalWebrtcHandler>> {
+        self.peers
+            .get(grant_id)
+            .map(|handle| handle.handler.clone())
+    }
+
+    /// Run work on a live peer's dedicated runtime.
+    #[cfg(test)]
+    pub(crate) fn block_on_peer<R>(
+        &self,
+        grant_id: &str,
+        work: impl std::future::Future<Output = R>,
+    ) -> Option<R> {
+        self.peers
+            .get(grant_id)
+            .map(|handle| handle.runtime.block_on(work))
     }
 
     fn prune_expired_grants(&mut self, now: u64) {
@@ -229,6 +280,7 @@ impl LocalWebrtcGrant {
 struct LocalWebrtcAnswer {
     answer: Value,
     peer: Arc<dyn PeerConnection>,
+    handler: Arc<LocalWebrtcHandler>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -654,7 +706,7 @@ fn local_webrtc_peer_connection_state(state: RTCPeerConnectionState) -> &'static
 }
 
 #[derive(Clone)]
-struct LocalWebrtcHandler {
+pub(crate) struct LocalWebrtcHandler {
     stream_key: AesGcmKey,
     runtime: Arc<dyn Runtime>,
     peer_state: Arc<LocalWebrtcPeerState>,
@@ -913,6 +965,7 @@ where
                         subscription_id,
                         frame_tx: EntityFrameSender::Async(entity_frame_tx.clone()),
                         reply_tx,
+                        local_webrtc_grant_id: Some(peer_state.grant_id.clone()),
                     })
                     .await
             }
@@ -930,6 +983,7 @@ where
                         request: Box::new(request),
                         reply_tx,
                         response_delivery_rx,
+                        local_webrtc_grant_id: Some(peer_state.grant_id.clone()),
                     })
                     .await
             }
@@ -1164,7 +1218,7 @@ async fn answer_offer(
     });
 
     let peer_connection = PeerConnectionBuilder::new()
-        .with_handler(handler)
+        .with_handler(handler.clone())
         .with_runtime(runtime)
         .with_udp_addrs(vec!["127.0.0.1:0"])
         .build()
@@ -1190,7 +1244,11 @@ async fn answer_offer(
         .ok_or_else(|| LocalWebrtcError::Webrtc("missing local description".to_string()))?;
     let answer = serde_json::to_value(answer)
         .map_err(|error| LocalWebrtcError::Webrtc(error.to_string()))?;
-    Ok(LocalWebrtcAnswer { answer, peer })
+    Ok(LocalWebrtcAnswer {
+        answer,
+        peer,
+        handler,
+    })
 }
 
 fn decrypt_daemon_request(key: &AesGcmKey, bytes: &[u8]) -> Option<DaemonRequest> {
@@ -1691,6 +1749,7 @@ mod tests {
                 request,
                 reply_tx,
                 response_delivery_rx,
+                ..
             } = receive_test_runtime_message(&mut runtime_rx)
             else {
                 panic!("expected daemon shutdown request");
@@ -1763,6 +1822,7 @@ mod tests {
                 subscription_id,
                 frame_tx,
                 reply_tx,
+                ..
             } = receive_test_runtime_message(&mut runtime_rx)
             else {
                 panic!("expected WebRTC entity subscription registration");
@@ -2825,5 +2885,187 @@ mod tests {
         assert!(transport.grants.contains_key("grant-live-redeemed"));
         assert!(transport.grants.contains_key(&bootstrap.grant_id));
         assert_eq!(transport.grants.len(), 2);
+    }
+
+    fn make_offer_sdp() -> (
+        tokio::runtime::Runtime,
+        serde_json::Value,
+        Arc<dyn PeerConnection>,
+    ) {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("offer runtime");
+        let (offer, peer) = runtime.block_on(async {
+            let webrtc_runtime = default_runtime().expect("ambient runtime for offerer");
+            let (gather_complete_tx, mut gather_complete_rx) = channel::<()>(1);
+            let handler = Arc::new(TestOffererHandler { gather_complete_tx });
+            let peer = PeerConnectionBuilder::new()
+                .with_handler(handler)
+                .with_runtime(webrtc_runtime.clone())
+                .with_udp_addrs(vec!["127.0.0.1:0"])
+                .build()
+                .await
+                .expect("build offerer peer");
+            let _dc = peer
+                .create_data_channel("botster-client", None)
+                .await
+                .expect("create data channel");
+            let offer = peer.create_offer(None).await.expect("create offer");
+            peer.set_local_description(offer)
+                .await
+                .expect("set local description");
+            let _ = timeout(Duration::from_secs(5), gather_complete_rx.recv()).await;
+            let local = peer.local_description().await.expect("local description");
+            let offer = serde_json::to_value(local).expect("serialize offer");
+            let peer: Arc<dyn PeerConnection> = Arc::new(peer);
+            (offer, peer)
+        });
+        (runtime, offer, peer)
+    }
+
+    struct TestOffererHandler {
+        gather_complete_tx: AsyncSender<()>,
+    }
+
+    #[async_trait]
+    impl PeerConnectionEventHandler for TestOffererHandler {
+        async fn on_ice_gathering_state_change(&self, state: RTCIceGatheringState) {
+            if state == RTCIceGatheringState::Complete {
+                let _ = self.gather_complete_tx.try_send(());
+            }
+        }
+    }
+
+    fn signal_live_peer(
+        transport: &mut LocalWebrtcTransport,
+        origin: &str,
+        offer: serde_json::Value,
+        runtime_tx: ControlSender,
+    ) -> String {
+        let bootstrap = transport
+            .issue_bootstrap("botster-web", "web-client", origin)
+            .expect("issue bootstrap");
+        let grant_id = bootstrap.grant_id.clone();
+        transport
+            .signal(
+                LocalWebrtcSignalRequest {
+                    grant_id: bootstrap.grant_id,
+                    grant_secret: bootstrap.grant_secret,
+                    origin: origin.to_string(),
+                    offer,
+                },
+                runtime_tx,
+            )
+            .expect("signal peer");
+        grant_id
+    }
+
+    #[test]
+    fn close_peer_is_idempotent_and_stop_all_uses_the_same_path() {
+        let (offer_runtime, offer, offer_peer) = make_offer_sdp();
+        let (runtime_tx, _runtime_rx) = tokio_mpsc::channel(8);
+        let mut transport = LocalWebrtcTransport::default();
+        let grant_id =
+            signal_live_peer(&mut transport, "http://127.0.0.1:41791", offer, runtime_tx);
+        assert_eq!(transport.live_peer_count(), 1);
+        assert!(transport.has_live_peer(&grant_id));
+
+        transport.close_peer(&grant_id);
+        assert_eq!(transport.live_peer_count(), 0);
+        assert!(!transport.has_live_peer(&grant_id));
+        // second close is a no-op
+        transport.close_peer(&grant_id);
+        transport.stop_all();
+        assert_eq!(transport.live_peer_count(), 0);
+        drop(offer_peer);
+        drop(offer_runtime);
+    }
+
+    #[test]
+    fn production_handler_peer_failed_closes_peer_and_parks_runtime() {
+        let (offer_runtime, offer, offer_peer) = make_offer_sdp();
+        let (runtime_tx, mut runtime_rx) = tokio_mpsc::channel(8);
+        let mut transport = LocalWebrtcTransport::default();
+        let grant_id =
+            signal_live_peer(&mut transport, "http://127.0.0.1:41792", offer, runtime_tx);
+        let handler = transport
+            .peer_handler(&grant_id)
+            .expect("production handler retained on peer handle");
+
+        // Drive the exact production callback object installed by signal()/answer_offer.
+        transport
+            .block_on_peer(&grant_id, async {
+                handler
+                    .on_connection_state_change(RTCPeerConnectionState::Failed)
+                    .await;
+            })
+            .expect("peer runtime present");
+
+        let message = receive_test_runtime_message(&mut runtime_rx);
+        let ControlMessage::LocalWebrtcPeerClosed {
+            grant_id: closed_grant,
+            terminal_record,
+            ..
+        } = message
+        else {
+            panic!("expected LocalWebrtcPeerClosed after peer_failed callback");
+        };
+        assert_eq!(closed_grant, grant_id);
+        assert_eq!(terminal_record.cause, LocalWebrtcTerminalCause::PeerFailed);
+
+        // Mimic daemon control: close_peer on LocalWebrtcPeerClosed.
+        transport.close_peer(&grant_id);
+        assert_eq!(transport.live_peer_count(), 0);
+        assert!(!transport.has_live_peer(&grant_id));
+        // Idempotent second close after terminal cleanup.
+        transport.close_peer(&grant_id);
+        drop(offer_peer);
+        drop(offer_runtime);
+    }
+
+    #[test]
+    fn two_peer_independence_failed_peer_does_not_take_sibling_runtime() {
+        let (offer_runtime_a, offer_a, offer_peer_a) = make_offer_sdp();
+        let (offer_runtime_b, offer_b, offer_peer_b) = make_offer_sdp();
+        let (runtime_tx_a, mut runtime_rx_a) = tokio_mpsc::channel(8);
+        let (runtime_tx_b, _runtime_rx_b) = tokio_mpsc::channel(8);
+        let mut transport = LocalWebrtcTransport::default();
+        let grant_a = signal_live_peer(
+            &mut transport,
+            "http://127.0.0.1:41793",
+            offer_a,
+            runtime_tx_a,
+        );
+        let grant_b = signal_live_peer(
+            &mut transport,
+            "http://127.0.0.1:41794",
+            offer_b,
+            runtime_tx_b,
+        );
+        assert_eq!(transport.live_peer_count(), 2);
+
+        let handler_a = transport.peer_handler(&grant_a).expect("handler a");
+        transport
+            .block_on_peer(&grant_a, async {
+                handler_a
+                    .on_connection_state_change(RTCPeerConnectionState::Failed)
+                    .await;
+            })
+            .expect("runtime a");
+        let _ = receive_test_runtime_message(&mut runtime_rx_a);
+        transport.close_peer(&grant_a);
+
+        assert!(!transport.has_live_peer(&grant_a));
+        assert!(transport.has_live_peer(&grant_b));
+        assert_eq!(transport.live_peer_count(), 1);
+
+        transport.close_peer(&grant_b);
+        assert_eq!(transport.live_peer_count(), 0);
+        drop(offer_peer_a);
+        drop(offer_peer_b);
+        drop(offer_runtime_a);
+        drop(offer_runtime_b);
     }
 }
