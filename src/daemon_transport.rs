@@ -8751,69 +8751,423 @@ mod tests {
         let _ = std::fs::remove_dir_all(data_directory);
     }
 
-    #[test]
-    fn attach_owner_map_is_grant_selective_on_peer_closed() {
-        let (mut daemon, data_directory) = test_daemon_for_local_webrtc_control();
-        let mut state = DaemonControlState::default();
-        state.local_webrtc_attach_owners.insert(
-            "sub-a".to_string(),
-            LocalWebrtcAttachOwner {
-                grant_id: "grant-a".to_string(),
-                subscription: LocalWebrtcAttachedSubscription {
-                    session_id: "session-a".to_string(),
-                    subscription_id: "sub-a".to_string(),
-                },
-            },
-        );
-        state.local_webrtc_attach_owners.insert(
-            "sub-b".to_string(),
-            LocalWebrtcAttachOwner {
-                grant_id: "grant-b".to_string(),
-                subscription: LocalWebrtcAttachedSubscription {
-                    session_id: "session-b".to_string(),
-                    subscription_id: "sub-b".to_string(),
-                },
-            },
-        );
-        state.lifecycle_counters.live_attach_subscriptions = 2;
+    struct TwoGrantOfferHelper {
+        runtime: tokio::runtime::Runtime,
+        offer: Value,
+        peer: Arc<dyn webrtc::peer_connection::PeerConnection>,
+    }
 
-        let (control_tx, _control_rx) = tokio_mpsc::channel(8);
-        let terminal = crate::local_webrtc::LocalWebrtcSenderTerminalRecord {
-            schema_version: 1,
-            grant_id: "grant-a".to_string(),
-            request_operation: "attach".to_string(),
-            message_id: None,
-            next_chunk_index: 0,
-            last_sent_chunk_index: None,
-            total_chunks: 0,
-            pressured: false,
-            peer_connection_state: "failed".to_string(),
-            channel_terminal_signal: crate::local_webrtc::LocalWebrtcChannelTerminalSignal::None,
-            cause: crate::local_webrtc::LocalWebrtcTerminalCause::PeerFailed,
-            cleanup_disposition: crate::local_webrtc::LocalWebrtcCleanupDisposition::NewlySent,
-        };
-        let path = data_directory.join("local-webrtc-sender-terminal.json");
-        let runtime = tokio::runtime::Builder::new_current_thread()
+    struct TwoGrantOfferHandler {
+        gather_complete_tx: webrtc::runtime::Sender<()>,
+    }
+
+    #[async_trait::async_trait]
+    impl webrtc::peer_connection::PeerConnectionEventHandler for TwoGrantOfferHandler {
+        async fn on_ice_gathering_state_change(
+            &self,
+            state: webrtc::peer_connection::RTCIceGatheringState,
+        ) {
+            if state == webrtc::peer_connection::RTCIceGatheringState::Complete {
+                let _ = self.gather_complete_tx.try_send(());
+            }
+        }
+    }
+
+    fn make_two_grant_offer() -> TwoGrantOfferHelper {
+        use webrtc::peer_connection::{PeerConnection, PeerConnectionBuilder};
+        use webrtc::runtime::{channel, default_runtime, timeout};
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
             .enable_all()
             .build()
-            .expect("test runtime");
-        let handle = runtime.handle().clone();
+            .expect("offer runtime");
+        let (offer, peer) = runtime.block_on(async {
+            let webrtc_runtime = default_runtime().expect("ambient runtime for offerer");
+            let (gather_complete_tx, mut gather_complete_rx) = channel::<()>(1);
+            let handler = Arc::new(TwoGrantOfferHandler { gather_complete_tx });
+            let peer = PeerConnectionBuilder::new()
+                .with_handler(handler)
+                .with_runtime(webrtc_runtime.clone())
+                .with_udp_addrs(vec!["127.0.0.1:0"])
+                .build()
+                .await
+                .expect("build offerer peer");
+            let _ = peer
+                .create_data_channel("botster-client", None)
+                .await
+                .expect("create data channel");
+            let offer = peer.create_offer(None).await.expect("create offer");
+            peer.set_local_description(offer)
+                .await
+                .expect("set local description");
+            let _ = timeout(Duration::from_secs(5), gather_complete_rx.recv()).await;
+            let local = peer.local_description().await.expect("local description");
+            let offer = serde_json::to_value(local).expect("serialize offer");
+            let peer: Arc<dyn PeerConnection> = Arc::new(peer);
+            (offer, peer)
+        });
+        TwoGrantOfferHelper {
+            runtime,
+            offer,
+            peer,
+        }
+    }
+
+    fn signal_live_grant(
+        daemon: &mut HubDaemon,
+        control_tx: ControlSender,
+        origin: &str,
+        offer: Value,
+    ) -> String {
+        let bootstrap = daemon
+            .local_webrtc()
+            .issue_bootstrap("botster-web", "web-client", origin)
+            .expect("issue bootstrap");
+        let grant_id = bootstrap.grant_id.clone();
+        daemon
+            .local_webrtc()
+            .signal(
+                LocalWebrtcSignalRequest {
+                    grant_id: bootstrap.grant_id,
+                    grant_secret: bootstrap.grant_secret,
+                    origin: origin.to_string(),
+                    offer,
+                },
+                control_tx,
+            )
+            .expect("signal live peer");
+        grant_id
+    }
+
+    fn spawn_echo_session(daemon: &mut HubDaemon, session_id: &str) {
+        daemon
+            .runtime_mut()
+            .expect("runtime initialized")
+            .spawn_session(
+                botster_core::SessionSpawnRequest {
+                    request_id: RequestId(format!("spawn-{session_id}")),
+                    session_id: SessionId(session_id.to_string()),
+                    executable: "/bin/sh".to_string(),
+                    arguments: vec![
+                        "-c".to_string(),
+                        "while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done"
+                            .to_string(),
+                    ],
+                    working_directory: botster_core::SpawnWorkingDirectory {
+                        path: ".".to_string(),
+                    },
+                    environment: botster_core::SpawnEnvironment::default(),
+                    initial_pty_size: Some(botster_core::ResizePayload { rows: 24, cols: 80 }),
+                },
+                botster_core::CoreSessionMetadata::new(),
+                1,
+            )
+            .expect("spawn worker-backed session");
+    }
+
+    fn send_control_request(
+        daemon: &mut HubDaemon,
+        state: &mut DaemonControlState,
+        terminal_path: &Path,
+        transport_handle: &tokio::runtime::Handle,
+        control_tx: ControlSender,
+        request: DaemonRequest,
+        local_webrtc_grant_id: Option<String>,
+    ) -> DaemonResponse {
+        let (reply_tx, reply_rx) = oneshot::channel();
         let _ = handle_control_message(
-            &mut daemon,
-            &mut state,
-            &path,
-            &handle,
+            daemon,
+            state,
+            terminal_path,
+            transport_handle,
             control_tx,
-            ControlMessage::LocalWebrtcPeerClosed {
-                grant_id: "grant-a".to_string(),
-                attached_subscriptions: Vec::new(),
-                entity_subscription_ids: Vec::new(),
-                terminal_record: terminal,
+            ControlMessage::Request {
+                request: Box::new(request),
+                reply_tx,
+                response_delivery_rx: None,
+                local_webrtc_grant_id,
             },
         );
-        assert!(!state.local_webrtc_attach_owners.contains_key("sub-a"));
+        reply_rx
+            .blocking_recv()
+            .expect("control reply")
+            .expect("control request result")
+    }
+
+    fn fail_live_peer_and_process_cleanup(
+        daemon: &mut HubDaemon,
+        state: &mut DaemonControlState,
+        terminal_path: &Path,
+        transport_handle: &tokio::runtime::Handle,
+        control_tx: ControlSender,
+        control_rx: &mut tokio_mpsc::Receiver<ControlMessage>,
+        grant_id: &str,
+    ) {
+        let handler = daemon
+            .local_webrtc()
+            .peer_handler(grant_id)
+            .expect("production handler retained for grant");
+        daemon
+            .local_webrtc()
+            .block_on_peer(grant_id, async {
+                use webrtc::peer_connection::PeerConnectionEventHandler;
+                handler
+                    .on_connection_state_change(
+                        webrtc::peer_connection::RTCPeerConnectionState::Failed,
+                    )
+                    .await;
+            })
+            .expect("peer runtime present");
+
+        let closed = {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("receive runtime");
+            runtime.block_on(async {
+                tokio::time::timeout(Duration::from_secs(2), control_rx.recv())
+                    .await
+                    .expect("timed out waiting for LocalWebrtcPeerClosed")
+                    .expect("control sender remains live")
+            })
+        };
+        let ControlMessage::LocalWebrtcPeerClosed {
+            grant_id: closed_grant,
+            terminal_record,
+            ..
+        } = &closed
+        else {
+            panic!("expected LocalWebrtcPeerClosed after production peer_failed callback");
+        };
+        assert_eq!(closed_grant, grant_id);
+        assert_eq!(
+            terminal_record.cause,
+            crate::local_webrtc::LocalWebrtcTerminalCause::PeerFailed
+        );
+        let _ = handle_control_message(
+            daemon,
+            state,
+            terminal_path,
+            transport_handle,
+            control_tx,
+            closed,
+        );
+    }
+
+    #[test]
+    fn two_live_grant_attach_isolation_preserves_sibling_delivery() {
+        let (mut daemon, data_directory) = test_daemon_for_local_webrtc_control();
+        let mut state = DaemonControlState::default();
+        let terminal_path = data_directory.join("local-webrtc-sender-terminal.json");
+        let (control_tx, mut control_rx) = tokio_mpsc::channel(16);
+        let transport_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("transport runtime");
+        let transport_handle = transport_runtime.handle().clone();
+
+        spawn_echo_session(&mut daemon, "session-a");
+        spawn_echo_session(&mut daemon, "session-b");
+
+        let offer_a = make_two_grant_offer();
+        let offer_b = make_two_grant_offer();
+        let grant_a = signal_live_grant(
+            &mut daemon,
+            control_tx.clone(),
+            "http://127.0.0.1:41801",
+            offer_a.offer.clone(),
+        );
+        let grant_b = signal_live_grant(
+            &mut daemon,
+            control_tx.clone(),
+            "http://127.0.0.1:41802",
+            offer_b.offer.clone(),
+        );
+        assert_eq!(daemon.local_webrtc().live_peer_count(), 2);
+
+        let attach_a = send_control_request(
+            &mut daemon,
+            &mut state,
+            &terminal_path,
+            &transport_handle,
+            control_tx.clone(),
+            DaemonRequest::Attach {
+                session_id: "session-a".to_string(),
+                subscription_id: "sub-a".to_string(),
+            },
+            Some(grant_a.clone()),
+        );
+        assert_ne!(
+            attach_a.kind,
+            DaemonResponseKind::OperatorError,
+            "peer A Attach must succeed: {attach_a:?}"
+        );
+        let attach_b = send_control_request(
+            &mut daemon,
+            &mut state,
+            &terminal_path,
+            &transport_handle,
+            control_tx.clone(),
+            DaemonRequest::Attach {
+                session_id: "session-b".to_string(),
+                subscription_id: "sub-b".to_string(),
+            },
+            Some(grant_b.clone()),
+        );
+        assert_ne!(
+            attach_b.kind,
+            DaemonResponseKind::OperatorError,
+            "peer B Attach must succeed: {attach_b:?}"
+        );
+        assert!(state.local_webrtc_attach_owners.contains_key("sub-a"));
         assert!(state.local_webrtc_attach_owners.contains_key("sub-b"));
+        assert_eq!(state.lifecycle_counters.live_attach_subscriptions, 2);
+        assert!(
+            state
+                .pending_runtime
+                .active_subscriptions
+                .get("session-a")
+                .is_some_and(|subs| subs.contains("sub-a"))
+        );
+        assert!(
+            state
+                .pending_runtime
+                .active_subscriptions
+                .get("session-b")
+                .is_some_and(|subs| subs.contains("sub-b"))
+        );
+
+        fail_live_peer_and_process_cleanup(
+            &mut daemon,
+            &mut state,
+            &terminal_path,
+            &transport_handle,
+            control_tx.clone(),
+            &mut control_rx,
+            &grant_a,
+        );
+
+        assert!(
+            !daemon.local_webrtc().has_live_peer(&grant_a),
+            "failed peer A must leave the live peer map"
+        );
+        assert!(
+            daemon.local_webrtc().has_live_peer(&grant_b),
+            "sibling peer B must remain live"
+        );
+        assert!(
+            !state.local_webrtc_attach_owners.contains_key("sub-a"),
+            "owner map must drop grant A attach"
+        );
+        assert!(
+            state.local_webrtc_attach_owners.contains_key("sub-b"),
+            "owner map must preserve grant B attach"
+        );
         assert_eq!(state.lifecycle_counters.live_attach_subscriptions, 1);
+        assert!(
+            !state
+                .pending_runtime
+                .active_subscriptions
+                .get("session-a")
+                .is_some_and(|subs| subs.contains("sub-a")),
+            "session A attach must be detached by cleanup"
+        );
+        assert!(
+            state
+                .pending_runtime
+                .active_subscriptions
+                .get("session-b")
+                .is_some_and(|subs| subs.contains("sub-b")),
+            "session B attach must remain active"
+        );
+        assert_eq!(
+            state
+                .lifecycle_counters
+                .cleanup_by_reason
+                .get("webrtc_peer_failed")
+                .copied()
+                .unwrap_or(0),
+            1
+        );
+
+        // Live round-trip on B after A's cleanup: send input and drain through the
+        // same grant-tagged control path a surviving peer would use.
+        let send_b = send_control_request(
+            &mut daemon,
+            &mut state,
+            &terminal_path,
+            &transport_handle,
+            control_tx.clone(),
+            DaemonRequest::SendInput {
+                session_id: "session-b".to_string(),
+                data: "from-sibling-after-a-failed\n".to_string(),
+            },
+            Some(grant_b.clone()),
+        );
+        assert_ne!(send_b.kind, DaemonResponseKind::OperatorError, "{send_b:?}");
+
+        let mut observed = String::new();
+        for _ in 0..80 {
+            let drain_b = send_control_request(
+                &mut daemon,
+                &mut state,
+                &terminal_path,
+                &transport_handle,
+                control_tx.clone(),
+                DaemonRequest::Drain {
+                    session_id: "session-b".to_string(),
+                },
+                Some(grant_b.clone()),
+            );
+            assert_ne!(
+                drain_b.kind,
+                DaemonResponseKind::OperatorError,
+                "B drain after A cleanup must succeed: {drain_b:?}"
+            );
+            for event in &drain_b.events {
+                if let DaemonEvent::TerminalOutput { data, .. } = event {
+                    observed.push_str(data);
+                }
+            }
+            if observed.contains("echo:from-sibling-after-a-failed") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(
+            observed.contains("echo:from-sibling-after-a-failed"),
+            "sibling B must still deliver terminal output after A cleanup; observed={observed:?}"
+        );
+
+        fail_live_peer_and_process_cleanup(
+            &mut daemon,
+            &mut state,
+            &terminal_path,
+            &transport_handle,
+            control_tx.clone(),
+            &mut control_rx,
+            &grant_b,
+        );
+
+        assert_eq!(daemon.local_webrtc().live_peer_count(), 0);
+        assert!(state.local_webrtc_attach_owners.is_empty());
+        assert_eq!(state.lifecycle_counters.live_attach_subscriptions, 0);
+        assert!(state.pending_runtime.active_subscriptions.is_empty());
+        assert_eq!(
+            state
+                .lifecycle_counters
+                .cleanup_by_reason
+                .get("webrtc_peer_failed")
+                .copied()
+                .unwrap_or(0),
+            2
+        );
+
+        drop(offer_a.peer);
+        drop(offer_b.peer);
+        drop(offer_a.runtime);
+        drop(offer_b.runtime);
         let _ = std::fs::remove_dir_all(data_directory);
     }
 }
