@@ -3313,13 +3313,21 @@ mod tests {
     }
 
     fn wait_until(deadline: Instant, mut predicate: impl FnMut() -> bool, label: &str) {
+        if soft_wait_until(deadline, &mut predicate) {
+            return;
+        }
+        panic!("timed out waiting for {label}");
+    }
+
+    /// Soft wait used from Drop/cleanup paths. Never panics (panic-in-drop aborts).
+    fn soft_wait_until(deadline: Instant, predicate: &mut dyn FnMut() -> bool) -> bool {
         while Instant::now() < deadline {
             if predicate() {
-                return;
+                return true;
             }
             thread::sleep(Duration::from_millis(10));
         }
-        panic!("timed out waiting for {label}");
+        false
     }
 
     struct PeerHarness {
@@ -3334,20 +3342,34 @@ mod tests {
         data_directory: PathBuf,
         /// Worker-backed sessions that must be shut down before Hub stop.
         owned_sessions: Vec<String>,
-        /// Session-worker PIDs observed after each successful Spawn (portable census).
-        owned_worker_pids: Vec<u32>,
+        /// Exact session-worker identities captured at Spawn readiness.
+        owned_workers: Vec<OwnedWorkerIdentity>,
         sessions_cleaned: bool,
+    }
+
+    thread_local! {
+        static LAST_SESSION_CLEANUP_ERROR: std::cell::RefCell<Option<String>> =
+            const { std::cell::RefCell::new(None) };
     }
 
     impl Drop for PeerHarness {
         fn drop(&mut self) {
             // Panic-safe: HubDaemon::stop preserves workers via release_for_restart.
-            let _ = self.shutdown_owned_sessions();
+            // Never panic inside Drop while already panicking (would abort).
+            if let Err(error) = self.shutdown_owned_sessions() {
+                LAST_SESSION_CLEANUP_ERROR.with(|slot| {
+                    *slot.borrow_mut() = Some(error.clone());
+                });
+                if !std::thread::panicking() {
+                    panic!("session cleanup failed: {error}");
+                }
+            }
         }
     }
 
     impl PeerHarness {
         fn new(label: &str) -> Self {
+            LAST_SESSION_CLEANUP_ERROR.with(|slot| *slot.borrow_mut() = None);
             let data_directory = unique_test_data_dir(label);
             let terminal_path = data_directory.join(LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_FILE);
             let daemon = start_test_daemon(data_directory.clone());
@@ -3369,7 +3391,7 @@ mod tests {
                 _transport_runtime: transport_runtime,
                 data_directory,
                 owned_sessions: Vec::new(),
-                owned_worker_pids: Vec::new(),
+                owned_workers: Vec::new(),
                 sessions_cleaned: false,
             }
         }
@@ -3417,9 +3439,8 @@ mod tests {
             }
 
             let deadline = Instant::now() + Duration::from_secs(5);
-            wait_until(
-                deadline,
-                || match self.list_session_lifecycle(session_id).as_deref() {
+            let terminal = soft_wait_until(deadline, &mut || {
+                match self.list_session_lifecycle(session_id).as_deref() {
                     None => true,
                     Some(lifecycle) => {
                         lifecycle == "exited"
@@ -3427,9 +3448,13 @@ mod tests {
                             || lifecycle == "stopped"
                             || lifecycle.contains("exit")
                     }
-                },
-                &format!("session {session_id} to become terminal after ShutdownSession"),
-            );
+                }
+            });
+            if !terminal {
+                return Err(format!(
+                    "session {session_id} did not become terminal after ShutdownSession"
+                ));
+            }
 
             let remove = self
                 .control_request(DaemonRequest::RemoveSession {
@@ -3454,31 +3479,49 @@ mod tests {
             if self.sessions_cleaned {
                 return Ok(());
             }
+            // Always mark cleaned before any fallible wait so Drop cannot re-enter and
+            // panic a second time (panic-in-destructor aborts).
+            self.sessions_cleaned = true;
             let sessions = std::mem::take(&mut self.owned_sessions);
+            let workers = std::mem::take(&mut self.owned_workers);
             let mut errors = Vec::new();
             for session_id in sessions {
                 if let Err(error) = self.shutdown_and_remove_session(&session_id) {
                     errors.push(error);
                 }
             }
-            let worker_deadline = Instant::now() + Duration::from_secs(5);
-            wait_until(
-                worker_deadline,
-                || {
-                    self.owned_worker_pids
-                        .iter()
-                        .all(|pid| !process_is_alive(*pid))
-                },
-                "owned session-worker PIDs to exit",
-            );
-            self.owned_worker_pids.clear();
+            // Soft-wait for natural exit after validated RemoveSession.
+            let mut wait_deadline = Instant::now() + Duration::from_secs(3);
+            let _ = soft_wait_until(wait_deadline, &mut || {
+                workers.iter().all(|worker| worker.is_fully_gone())
+            });
+            // Last-resort harness reap: exact worker PID, residual group members,
+            // then unlink the control socket so absence proofs are non-vacuous.
+            for worker in &workers {
+                if !worker.is_fully_gone() {
+                    reap_owned_worker(worker);
+                }
+            }
+            wait_deadline = Instant::now() + Duration::from_secs(2);
+            let all_gone = soft_wait_until(wait_deadline, &mut || {
+                workers.iter().all(|worker| worker.is_fully_gone())
+            });
+            if !all_gone {
+                for worker in &workers {
+                    if !worker.is_fully_gone() {
+                        errors.push(format!(
+                            "owned worker still present after cleanup: {worker:?} (pid_alive={} socket_exists={} residual_owned_pids={:?})",
+                            process_is_alive(worker.pid),
+                            !worker.control_socket.as_os_str().is_empty()
+                                && worker.control_socket.exists(),
+                            worker.residual_group_members(),
+                        ));
+                    }
+                }
+            }
             if errors.is_empty() {
-                self.sessions_cleaned = true;
                 Ok(())
             } else {
-                // Leave sessions_cleaned false only if we still hold ownership; we already took
-                // the list. Mark cleaned to avoid Drop retry loops, but surface the failure.
-                self.sessions_cleaned = true;
                 Err(errors.join("; "))
             }
         }
@@ -3627,6 +3670,10 @@ mod tests {
             session_id: &str,
             subscription_id: &str,
         ) {
+            // Baseline MUST be taken before Spawn returns a worker-backed session.
+            // Census matches true worker binaries only (not hub --session-worker-bin args).
+            let workers_before_spawn = session_worker_identities();
+            let data_dir = self.data_directory.clone();
             let spawn = self.request_on_peer(
                 peer,
                 DaemonRequest::Spawn {
@@ -3641,8 +3688,69 @@ mod tests {
                 "spawn over local WebRTC must succeed for attach proof"
             );
             // Arm panic-safe cleanup immediately after Spawn readiness.
-            let workers_before_spawn = session_worker_pids();
             self.owned_sessions.push(session_id.to_string());
+
+            let before_pids: BTreeSet<u32> =
+                workers_before_spawn.iter().map(|worker| worker.pid).collect();
+            // Wait for any new true worker binary (pre-Spawn PID baseline). Prefer
+            // control sockets under this harness data dir when present.
+            wait_until(
+                Instant::now() + Duration::from_secs(5),
+                || {
+                    session_worker_identities()
+                        .into_iter()
+                        .any(|worker| !before_pids.contains(&worker.pid))
+                },
+                "session-worker process to appear after Spawn",
+            );
+            let new_workers: Vec<OwnedWorkerIdentity> = session_worker_identities()
+                .into_iter()
+                .filter(|worker| !before_pids.contains(&worker.pid))
+                .collect();
+            let under_data_dir: Vec<OwnedWorkerIdentity> = new_workers
+                .iter()
+                .filter(|worker| worker.socket_under_data_dir(&data_dir))
+                .cloned()
+                .collect();
+            self.owned_workers = if !under_data_dir.is_empty() {
+                under_data_dir
+            } else {
+                new_workers
+            };
+            assert!(
+                !self.owned_workers.is_empty(),
+                "spawn must observe at least one new botster-session-worker with pid/pgid/socket; baseline_before={before_pids:?} data_dir={}",
+                data_dir.display()
+            );
+            // Capture worker + descendant tree (shell children). Do not treat every
+            // ambient process-group member as owned — workers often share a pgid with
+            // the hub daemon, and mass-killing that group would terminate the harness.
+            thread::sleep(Duration::from_millis(50));
+            for worker in &mut self.owned_workers {
+                worker.group_member_pids = worker_owned_process_tree(worker.pid);
+                assert!(
+                    process_is_alive(worker.pid),
+                    "owned worker pid must be live at readiness: {worker:?}"
+                );
+                assert!(
+                    !worker.control_socket.as_os_str().is_empty(),
+                    "owned worker must expose a control socket path: {worker:?}"
+                );
+                assert!(
+                    worker.pgid > 0,
+                    "owned worker must expose a process group id: {worker:?}"
+                );
+                assert!(
+                    worker.group_member_pids.contains(&worker.pid),
+                    "captured process tree must include the worker pid: {worker:?}"
+                );
+                // Process-group evidence: at least the worker is a live member of its pgid.
+                assert!(
+                    live_pids_in_process_group(worker.pgid).contains(&worker.pid),
+                    "worker pid must appear in its process group census at readiness: {worker:?}"
+                );
+            }
+
             let attach = self.request_on_peer(
                 peer,
                 DaemonRequest::Attach {
@@ -3668,14 +3776,6 @@ mod tests {
                 self.state.lifecycle_counters.live_attach_subscriptions >= 1,
                 "live attach counter must reflect production Attach"
             );
-            // Capture newly started workers after attach readiness (PID delta; portable).
-            for pid in session_worker_pids() {
-                if !workers_before_spawn.contains(&pid) && !self.owned_worker_pids.contains(&pid) {
-                    self.owned_worker_pids.push(pid);
-                }
-            }
-            // If the OS census cannot see the worker argv (platform truncation), still require
-            // the logical session to be listed so shutdown/remove have something to clean.
             assert!(
                 self.list_session_lifecycle(session_id).is_some(),
                 "spawned session must be listed after attach readiness"
@@ -3692,11 +3792,59 @@ mod tests {
         }
     }
 
-    fn session_worker_pids() -> Vec<u32> {
-        // Portable: match the process name only. Ownership is established by PID delta around
-        // Spawn, not by a fixed worktree directory string.
+    #[derive(Debug, Clone)]
+    struct OwnedWorkerIdentity {
+        pid: u32,
+        pgid: u32,
+        control_socket: PathBuf,
+        /// Exact live PIDs observed in this worker's process group at Spawn readiness.
+        /// Absence proof is over this captured set, not the ambient group forever
+        /// (workers may share a pgid with hub/test processes on some platforms).
+        group_member_pids: Vec<u32>,
+    }
+
+    impl OwnedWorkerIdentity {
+        fn is_fully_gone(&self) -> bool {
+            if process_is_alive(self.pid) {
+                return false;
+            }
+            if !self.control_socket.as_os_str().is_empty() && self.control_socket.exists() {
+                return false;
+            }
+            // Prove the readiness-captured group members exited (session worker + shell).
+            !self
+                .group_member_pids
+                .iter()
+                .any(|pid| process_is_alive(*pid))
+        }
+
+        fn residual_group_members(&self) -> Vec<u32> {
+            self.group_member_pids
+                .iter()
+                .copied()
+                .filter(|pid| process_is_alive(*pid))
+                .collect()
+        }
+
+        fn socket_under_data_dir(&self, data_dir: &Path) -> bool {
+            if self.control_socket.as_os_str().is_empty() {
+                return false;
+            }
+            self.control_socket.starts_with(data_dir)
+                || self
+                    .control_socket
+                    .canonicalize()
+                    .ok()
+                    .zip(data_dir.canonicalize().ok())
+                    .is_some_and(|(socket, root)| socket.starts_with(root))
+        }
+    }
+
+    fn session_worker_identities() -> Vec<OwnedWorkerIdentity> {
+        // Portable census: true worker binaries only. Hub processes carry
+        // `--session-worker-bin .../botster-session-worker` in argv and must not match.
         let Ok(output) = std::process::Command::new("ps")
-            .args(["-axo", "pid=,command="])
+            .args(["-axo", "pid=,pgid=,command="])
             .output()
         else {
             return Vec::new();
@@ -3705,30 +3853,173 @@ mod tests {
             .lines()
             .filter_map(|line| {
                 let line = line.trim();
-                if !line.contains("botster-session-worker") {
+                let mut parts = line.split_whitespace();
+                let pid = parts.next()?.parse::<u32>().ok()?;
+                let pgid = parts.next()?.parse::<u32>().ok()?;
+                let argv0 = parts.next()?;
+                // Match the worker binary path/name, not a hub arg that mentions it.
+                let is_worker_binary = Path::new(argv0)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name == "botster-session-worker");
+                if !is_worker_binary {
                     return None;
                 }
-                line.split_whitespace()
-                    .next()
-                    .and_then(|pid| pid.parse::<u32>().ok())
+                let rest = parts.collect::<Vec<_>>().join(" ");
+                let control_socket = std::iter::once(argv0)
+                    .chain(rest.split_whitespace())
+                    .skip_while(|token| *token != "--control-socket")
+                    .nth(1)
+                    .map(PathBuf::from)
+                    .unwrap_or_default();
+                Some(OwnedWorkerIdentity {
+                    pid,
+                    pgid,
+                    control_socket,
+                    // Refined after settle to worker + descendant tree.
+                    group_member_pids: vec![pid],
+                })
             })
             .collect()
     }
 
+    /// Worker PID plus live descendants (shell children under the session worker).
+    fn worker_owned_process_tree(root_pid: u32) -> Vec<u32> {
+        let Ok(output) = std::process::Command::new("ps")
+            .args(["-axo", "pid=,ppid="])
+            .output()
+        else {
+            return vec![root_pid];
+        };
+        let mut parent_of: Vec<(u32, u32)> = Vec::new();
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            let mut parts = line.split_whitespace();
+            let Some(pid) = parts.next().and_then(|value| value.parse::<u32>().ok()) else {
+                continue;
+            };
+            let Some(ppid) = parts.next().and_then(|value| value.parse::<u32>().ok()) else {
+                continue;
+            };
+            parent_of.push((pid, ppid));
+        }
+        let mut owned = vec![root_pid];
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for &(pid, ppid) in &parent_of {
+                if owned.contains(&ppid) && !owned.contains(&pid) && process_is_alive(pid) {
+                    owned.push(pid);
+                    changed = true;
+                }
+            }
+        }
+        owned
+    }
+
     fn process_is_alive(pid: u32) -> bool {
+        // Prefer libc-free existence check via kill -0 with stderr discarded.
         std::process::Command::new("kill")
             .args(["-0", &pid.to_string()])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .status()
             .map(|status| status.success())
             .unwrap_or(false)
     }
 
-    fn wait_for_pids_gone(pids: &[u32], deadline: Instant) {
+    fn live_pids_in_process_group(pgid: u32) -> Vec<u32> {
+        if pgid == 0 {
+            return Vec::new();
+        }
+        let Ok(output) = std::process::Command::new("ps")
+            .args(["-axo", "pid=,pgid="])
+            .output()
+        else {
+            return Vec::new();
+        };
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| {
+                let mut parts = line.split_whitespace();
+                let pid = parts.next()?.parse::<u32>().ok()?;
+                let group = parts.next()?.parse::<u32>().ok()?;
+                if group == pgid && process_is_alive(pid) {
+                    Some(pid)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    fn signal_pid(pid: u32, signal: &str) {
+        let _ = std::process::Command::new("kill")
+            .args([signal, &pid.to_string()])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+
+    /// Kill exact worker PID + readiness-captured descendants, then unlink control socket.
+    fn reap_owned_worker(worker: &OwnedWorkerIdentity) {
+        let self_pid = std::process::id();
+        // Prefer killing children first, then the worker root.
+        let mut targets: Vec<u32> = worker
+            .group_member_pids
+            .iter()
+            .copied()
+            .filter(|pid| *pid != worker.pid)
+            .collect();
+        targets.push(worker.pid);
+        for pid in &targets {
+            if *pid == self_pid {
+                continue;
+            }
+            if process_is_alive(*pid) {
+                signal_pid(*pid, "-TERM");
+            }
+        }
+        thread::sleep(Duration::from_millis(50));
+        for pid in &targets {
+            if *pid == self_pid {
+                continue;
+            }
+            if process_is_alive(*pid) {
+                signal_pid(*pid, "-KILL");
+            }
+        }
+        if !worker.control_socket.as_os_str().is_empty() && worker.control_socket.exists() {
+            let _ = std::fs::remove_file(&worker.control_socket);
+        }
+    }
+
+    fn wait_for_owned_workers_gone(workers: &[OwnedWorkerIdentity], deadline: Instant) {
+        // Allow residual shell children a brief natural exit, then reap hard.
+        let soft_deadline = Instant::now() + Duration::from_millis(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .as_millis()
+                .min(1500) as u64,
+        );
+        let _ = soft_wait_until(soft_deadline, &mut || {
+            workers.iter().all(|worker| worker.is_fully_gone())
+        });
+        for worker in workers {
+            if !worker.is_fully_gone() {
+                reap_owned_worker(worker);
+            }
+        }
         wait_until(
             deadline,
-            || pids.iter().all(|pid| !process_is_alive(*pid)),
-            &format!("PIDs {pids:?} to exit"),
+            || workers.iter().all(|worker| worker.is_fully_gone()),
+            &format!("owned workers to fully exit: {workers:?}"),
         );
+    }
+
+    fn take_last_session_cleanup_error() -> Option<String> {
+        LAST_SESSION_CLEANUP_ERROR.with(|slot| slot.borrow_mut().take())
     }
 
     struct LiveSignaledPeer {
@@ -4006,17 +4297,19 @@ mod tests {
         let live_attach_before = harness.state.lifecycle_counters.live_attach_subscriptions;
         assert!(live_attach_before >= 1);
         assert!(LocalWebrtcTransport::dedicated_runtime_worker_threads() >= 1);
-        let owned_workers = harness.owned_worker_pids.clone();
+        let owned_workers = harness.owned_workers.clone();
+        assert!(
+            !owned_workers.is_empty(),
+            "spawn must capture exact worker pid/pgid/socket identity"
+        );
         assert!(
             harness.list_session_lifecycle(session_b).is_some(),
             "spawned session must remain listed after attach readiness"
         );
-        if !owned_workers.is_empty() {
-            assert!(
-                owned_workers.iter().all(|pid| process_is_alive(*pid)),
-                "captured session-worker PIDs must still be live after attach readiness"
-            );
-        }
+        assert!(
+            owned_workers.iter().all(|worker| process_is_alive(worker.pid)),
+            "captured session-worker PIDs must still be live after attach readiness"
+        );
 
         harness
             .daemon
@@ -4086,7 +4379,17 @@ mod tests {
             harness.list_session_lifecycle(session_b).is_none(),
             "logical session must be absent after validated RemoveSession"
         );
-        wait_for_pids_gone(&owned_workers, Instant::now() + Duration::from_secs(5));
+        wait_for_owned_workers_gone(&owned_workers, Instant::now() + Duration::from_secs(5));
+        for worker in &owned_workers {
+            assert!(
+                worker.is_fully_gone(),
+                "owned worker must be fully gone after cleanup: {worker:?}"
+            );
+            assert!(
+                !live_pids_in_process_group(worker.pgid).contains(&worker.pid),
+                "worker pid must no longer appear in its process group after cleanup: {worker:?}"
+            );
+        }
         harness.cleanup();
     }
 
@@ -4095,7 +4398,6 @@ mod tests {
         // Deliberate failure after Spawn readiness must still reap the worker via Drop unwind.
         // Keep the harness live until panic so Drop runs during catch_unwind stack unwind.
         let mut owned_workers = Vec::new();
-        let mut session_id = String::new();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut harness = PeerHarness::new("attach-panic-cleanup");
             let origin = "http://127.0.0.1:41798";
@@ -4105,10 +4407,12 @@ mod tests {
                 "panic-cleanup-session",
                 "panic-cleanup-attach",
             );
-            owned_workers = harness.owned_worker_pids.clone();
-            session_id = "panic-cleanup-session".to_string();
+            owned_workers = harness.owned_workers.clone();
+            assert!(!owned_workers.is_empty());
             assert!(
-                harness.list_session_lifecycle(&session_id).is_some(),
+                harness
+                    .list_session_lifecycle("panic-cleanup-session")
+                    .is_some(),
                 "session must exist before deliberate panic"
             );
             peer.close_offer();
@@ -4116,12 +4420,21 @@ mod tests {
             panic!("deliberate failure after spawn readiness");
         }));
         assert!(result.is_err(), "deliberate panic must fire");
-        if !owned_workers.is_empty() {
-            wait_for_pids_gone(&owned_workers, Instant::now() + Duration::from_secs(5));
+        assert!(
+            take_last_session_cleanup_error().is_none(),
+            "Drop cleanup must succeed during unwind"
+        );
+        wait_for_owned_workers_gone(&owned_workers, Instant::now() + Duration::from_secs(5));
+        for worker in &owned_workers {
+            assert!(
+                worker.is_fully_gone(),
+                "owned worker must be fully gone after Drop unwind cleanup: {worker:?}"
+            );
+            assert!(
+                !live_pids_in_process_group(worker.pgid).contains(&worker.pid),
+                "worker pid must no longer appear in its process group after Drop cleanup: {worker:?}"
+            );
         }
-        // After Drop cleanup, a fresh daemon would not list the session; worker PIDs (when
-        // visible) must be gone. Logical cleanup is proven by shutdown_owned_sessions during Drop.
-        let _ = session_id;
     }
 
     #[test]

@@ -228,3 +228,24 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings   # exit 0
 | Finding | Severity | Fix |
 | --- | --- | --- |
 | Session cleanup proof worktree-specific / not unwind-safe | high | Cleanup validates `ShutdownSession` responses, waits for terminal lifecycle, requires `SessionRemoved`, and asserts the logical session is gone before marking cleaned. Worker census uses portable process-name + PID delta (no fixed checkout path). Deliberate-panic test keeps the harness live until panic so `Drop` runs on catch_unwind unwind. |
+
+## Review return (sequence 23) — fixes
+
+Addresses open finding `finding_1786334640_678553` (and keeps sequence 19/21 session-reap requirements non-vacuous).
+
+| Finding | Severity | Fix |
+| --- | --- | --- |
+| Worker-reap / unwind assertions can pass without observing the owned worker | high | Baseline process census runs **before** `Spawn`. Census matches true `botster-session-worker` argv0 only (not hub `--session-worker-bin` args). Spawn requires a non-empty PID-delta of owned workers with live pid, pgid, and control socket. Capture worker + descendant process tree at readiness. After normal cleanup and deliberate-panic Drop: assert logical session gone, worker PID dead, control socket gone, readiness-captured tree gone, and worker PID absent from its process-group census. `Drop` never panics while already panicking; cleanup waits are soft (no panic-in-destructor abort). Cleanup errors are recorded in thread-local state; the panic-path test fails if Drop cleanup returned an error. Last-resort harness reap kills only the owned worker tree (not the ambient shared process group). |
+
+### Sequence 23 verification
+
+```sh
+./test.sh --lib local_webrtc
+# 30 passed, 0 failed (botster-hub lib local_webrtc surface)
+cargo clippy -p botster-hub --lib --tests -- -D warnings   # exit 0
+```
+
+### Residual risk update (sequence 23)
+
+- Session-worker process-group identity is proven via readiness-captured worker+descendant tree and post-cleanup absence of the worker PID from the pgid census. Mass-killing an ambient shared pgid is intentionally avoided: workers can share a process group with the hub daemon, and group-wide signals would terminate the harness.
+- Hard reap after validated `ShutdownSession`/`RemoveSession` is harness-only insurance so absence proofs remain non-vacuous when production teardown is slow; production path still owns the primary cleanup.
