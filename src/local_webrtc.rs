@@ -3795,23 +3795,29 @@ mod tests {
                 .iter()
                 .map(|worker| worker.pid)
                 .collect();
-            // Under spawn_capture_lock, the first live new worker after baseline is ours.
-            // Prefer data-dir ownership when the control socket/argv is attributable; never
-            // adopt a pid that is already dead at census time.
+            // Never adopt host-global "any new pid" — other pipeline worktrees spawn workers
+            // concurrently. Require this worktree's session-worker executable path, then prefer
+            // data-dir attribution when available. No fallback to foreign executables.
             wait_until(
                 Instant::now() + Duration::from_secs(5),
                 || {
                     session_worker_identities().into_iter().any(|worker| {
-                        !before_pids.contains(&worker.pid) && process_is_alive(worker.pid)
+                        !before_pids.contains(&worker.pid)
+                            && process_is_alive(worker.pid)
+                            && worker.executable_from_this_worktree()
                     })
                 },
-                "live session-worker process to appear after Spawn",
+                "live this-worktree session-worker after Spawn",
             );
-            let live_new: Vec<OwnedWorkerIdentity> = session_worker_identities()
+            let live_ours: Vec<OwnedWorkerIdentity> = session_worker_identities()
                 .into_iter()
-                .filter(|worker| !before_pids.contains(&worker.pid) && process_is_alive(worker.pid))
+                .filter(|worker| {
+                    !before_pids.contains(&worker.pid)
+                        && process_is_alive(worker.pid)
+                        && worker.executable_from_this_worktree()
+                })
                 .collect();
-            let owned_by_dir: Vec<OwnedWorkerIdentity> = live_new
+            let owned_by_dir: Vec<OwnedWorkerIdentity> = live_ours
                 .iter()
                 .filter(|worker| worker.belongs_to_data_dir(&data_dir))
                 .cloned()
@@ -3819,14 +3825,22 @@ mod tests {
             self.owned_workers = if !owned_by_dir.is_empty() {
                 owned_by_dir
             } else {
-                // Core places control sockets outside hub data_dir on some platforms; with
-                // spawn_capture_lock held, live_new is still this harness's spawn set.
-                live_new
+                // Core control sockets may sit outside hub data_dir; still require this
+                // worktree's executable (never a foreign ticket's worker binary).
+                live_ours
             };
             assert!(
                 !self.owned_workers.is_empty(),
-                "spawn must observe a live botster-session-worker after Spawn; baseline_before={before_pids:?} data_dir={}",
-                data_dir.display()
+                "spawn must observe a live botster-session-worker from this worktree after Spawn; baseline_before={before_pids:?} data_dir={} worktree={}",
+                data_dir.display(),
+                env!("CARGO_MANIFEST_DIR")
+            );
+            assert!(
+                self.owned_workers
+                    .iter()
+                    .all(|worker| worker.executable_from_this_worktree()),
+                "owned workers must not include foreign worktree executables: {:?}",
+                self.owned_workers
             );
             // Capture worker + descendant tree (shell children). Do not treat every
             // ambient process-group member as owned — workers often share a pgid with
@@ -3969,6 +3983,24 @@ mod tests {
                 || data_dir.canonicalize().ok().is_some_and(|canon| {
                     self.command.contains(&canon.to_string_lossy().to_string())
                 })
+        }
+
+        /// True when argv0 / command is this hub worktree's `botster-session-worker` binary.
+        /// Rejects workers from other pipeline tickets / worktrees on the same host.
+        fn executable_from_this_worktree(&self) -> bool {
+            let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+            let argv0 = self.command.split_whitespace().next().unwrap_or("");
+            if argv0.is_empty() {
+                return false;
+            }
+            let exe = Path::new(argv0);
+            if exe.starts_with(root) {
+                return true;
+            }
+            match (exe.canonicalize(), root.canonicalize()) {
+                (Ok(exe), Ok(root)) => exe.starts_with(root),
+                _ => self.command.contains(&root.display().to_string()),
+            }
         }
     }
 
