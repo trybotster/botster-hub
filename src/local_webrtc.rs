@@ -94,11 +94,21 @@ where
 pub struct LocalWebrtcTransport {
     grants: BTreeMap<String, LocalWebrtcGrant>,
     peers: BTreeMap<String, Arc<dyn PeerConnection>>,
+    /// Peers whose `close()` failed while siblings kept the shared runtime alive.
+    /// Retained so a later empty-map park / `stop_all` can still force driver stop.
+    stale_close_peers: BTreeMap<String, Arc<dyn PeerConnection>>,
     runtime: Option<tokio::runtime::Runtime>,
     #[cfg(test)]
     close_completions: Mutex<Vec<String>>,
     #[cfg(test)]
     peer_handlers: BTreeMap<String, Arc<LocalWebrtcHandler>>,
+    #[cfg(test)]
+    force_close_errors: Mutex<BTreeSet<String>>,
+}
+
+enum ClosePeerOutcome {
+    Closed,
+    Failed(Arc<dyn PeerConnection>),
 }
 
 #[cfg(test)]
@@ -173,12 +183,13 @@ impl LocalWebrtcTransport {
     /// Close all active local peers. Used during daemon shutdown.
     pub fn stop_all(&mut self) {
         let peers = std::mem::take(&mut self.peers);
+        let stale = std::mem::take(&mut self.stale_close_peers);
         self.grants.clear();
         #[cfg(test)]
         self.peer_handlers.clear();
         if let Some(runtime) = self.runtime.take() {
-            for (grant_id, peer) in peers {
-                self.close_peer_on_runtime(&runtime, &grant_id, peer);
+            for (grant_id, peer) in peers.into_iter().chain(stale) {
+                let _ = self.close_peer_on_runtime(&runtime, &grant_id, peer);
             }
         }
     }
@@ -193,11 +204,37 @@ impl LocalWebrtcTransport {
         #[cfg(test)]
         self.peer_handlers.remove(grant_id);
         if let Some(runtime) = self.runtime.as_ref() {
-            self.close_peer_on_runtime(runtime, grant_id, peer);
+            match self.close_peer_on_runtime(runtime, grant_id, peer) {
+                ClosePeerOutcome::Closed => {}
+                ClosePeerOutcome::Failed(peer) => {
+                    // Keep ownership so a later empty-map runtime drop (or stop_all) can still
+                    // force-stop the driver without silently abandoning it while siblings live.
+                    self.stale_close_peers.insert(grant_id.to_string(), peer);
+                }
+            }
         }
-        if self.peers.is_empty() {
-            let _ = self.runtime.take();
+        self.park_runtime_if_idle();
+    }
+
+    /// True while a signaled peer still occupies the live peer map.
+    pub(crate) fn has_live_peer(&self, grant_id: &str) -> bool {
+        self.peers.contains_key(grant_id)
+    }
+
+    fn park_runtime_if_idle(&mut self) {
+        if !self.peers.is_empty() {
+            return;
         }
+        // No live peers: best-effort re-close quarantined peers, then drop the runtime so any
+        // residual driver tasks on this runtime stop. Safe because no sibling live peer remains.
+        if let Some(runtime) = self.runtime.as_ref() {
+            for (grant_id, peer) in std::mem::take(&mut self.stale_close_peers) {
+                let _ = self.close_peer_on_runtime(runtime, &grant_id, peer);
+            }
+        } else {
+            self.stale_close_peers.clear();
+        }
+        let _ = self.runtime.take();
     }
 
     fn close_peer_on_runtime(
@@ -205,21 +242,54 @@ impl LocalWebrtcTransport {
         runtime: &tokio::runtime::Runtime,
         grant_id: &str,
         peer: Arc<dyn PeerConnection>,
-    ) {
-        let close_result = runtime.block_on(peer.close());
+    ) -> ClosePeerOutcome {
         #[cfg(test)]
+        if self
+            .force_close_errors
+            .lock()
+            .expect("force close error mutex")
+            .remove(grant_id)
         {
-            // Close-completion evidence records that production forget invoked and completed
-            // PeerConnection::close for this grant. Record Ok and benign already-closed outcomes;
-            // never record when close() was skipped.
-            if close_result.is_ok() {
-                self.close_completions
-                    .lock()
-                    .expect("local WebRTC close completion mutex")
-                    .push(grant_id.to_string());
-            }
+            // Simulate close() failing before the driver is stopped (webrtc can fail in
+            // core.close() before abort). Keep the peer for quarantine ownership tests.
+            eprintln!(
+                "local WebRTC peer close forced failure for test: grant_id={grant_id}"
+            );
+            return ClosePeerOutcome::Failed(peer);
         }
-        let _ = close_result;
+
+        let first = runtime.block_on(peer.close());
+        let close_result = match first {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                eprintln!(
+                    "local WebRTC peer close failed (retrying once): grant_id={grant_id} error={error}"
+                );
+                runtime.block_on(peer.close()).map_err(|retry_error| {
+                    eprintln!(
+                        "local WebRTC peer close failed after retry: grant_id={grant_id} error={retry_error}"
+                    );
+                    retry_error
+                })
+            }
+        };
+
+        match close_result {
+            Ok(()) => {
+                #[cfg(test)]
+                {
+                    // Close-completion evidence records that production forget invoked and
+                    // completed PeerConnection::close for this grant. Never record when close()
+                    // was skipped or ultimately failed.
+                    self.close_completions
+                        .lock()
+                        .expect("local WebRTC close completion mutex")
+                        .push(grant_id.to_string());
+                }
+                ClosePeerOutcome::Closed
+            }
+            Err(_) => ClosePeerOutcome::Failed(peer),
+        }
     }
 
     fn runtime(&mut self) -> LocalWebrtcResult<&tokio::runtime::Runtime> {
@@ -260,6 +330,16 @@ impl LocalWebrtcTransport {
     }
 
     #[cfg(test)]
+    pub(crate) fn stale_close_peer_count(&self) -> usize {
+        self.stale_close_peers.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_stale_close_peer(&self, grant_id: &str) -> bool {
+        self.stale_close_peers.contains_key(grant_id)
+    }
+
+    #[cfg(test)]
     pub(crate) fn close_completion_count_for(&self, grant_id: &str) -> usize {
         self.close_completions
             .lock()
@@ -272,6 +352,15 @@ impl LocalWebrtcTransport {
     #[cfg(test)]
     pub(crate) fn dedicated_runtime_worker_threads() -> usize {
         LOCAL_WEBRTC_WORKER_THREADS.load(Ordering::SeqCst)
+    }
+
+    /// Next `close()` for this grant is treated as a hard failure (driver not stopped).
+    #[cfg(test)]
+    pub(crate) fn force_next_close_error_for_test(&self, grant_id: &str) {
+        self.force_close_errors
+            .lock()
+            .expect("force close error mutex")
+            .insert(grant_id.to_string());
     }
 
     /// Deterministic production-path failure injection for tests.
@@ -1019,6 +1108,7 @@ where
                         subscription_id,
                         frame_tx: EntityFrameSender::Async(entity_frame_tx.clone()),
                         reply_tx,
+                        grant_id: Some(peer_state.grant_id.clone()),
                     })
                     .await
             }
@@ -1027,6 +1117,7 @@ where
                     .send(ControlMessage::UnsubscribeEntities {
                         subscription_id,
                         reply_tx: Some(reply_tx),
+                        grant_id: Some(peer_state.grant_id.clone()),
                     })
                     .await
             }
@@ -1874,12 +1965,14 @@ mod tests {
                 subscription_id,
                 frame_tx,
                 reply_tx,
+                grant_id,
             } = receive_test_runtime_message(&mut runtime_rx)
             else {
                 panic!("expected WebRTC entity subscription registration");
             };
             assert_eq!(entity_type, "session");
             assert_eq!(subscription_id, "entity-fixture");
+            assert_eq!(grant_id.as_deref(), Some("grant-entity-fixture"));
             let mut subscribed = response_with_diagnostic(DaemonDiagnostic::connected("fixture"));
             subscribed.kind = botster_hub_client::DaemonResponseKind::EntitySubscribed;
             reply_tx.send(Ok(subscribed)).unwrap();
@@ -2949,7 +3042,9 @@ mod tests {
         default_runtime,
     };
 
-    use crate::daemon_transport::{DaemonControlState, handle_control_message};
+    use crate::daemon_transport::{
+        DaemonControlState, EntityFrameSender, handle_control_message,
+    };
     use crate::{
         DataDirectoryOption, HostIdentityOptions, HubDaemon, HubStartupOptions, RuntimeEnvironment,
         SessionDefaults,
@@ -3506,6 +3601,136 @@ mod tests {
 
         first.close_offer();
         second.close_offer();
+        harness.cleanup();
+    }
+
+    #[test]
+    fn local_webrtc_late_subscribe_entities_after_peer_closed_does_not_recreate_state() {
+        let mut harness = PeerHarness::new("late-subscribe");
+        let origin = "http://127.0.0.1:41794";
+        let peer = harness.signal_peer(origin);
+        let grant_id = peer.grant_id.clone();
+        let subscription_id = "late-entity".to_string();
+
+        // Terminal cleanup wins first (adverse queue order vs a still-queued SubscribeEntities).
+        harness
+            .daemon
+            .local_webrtc()
+            .inject_peer_connection_state_for_test(&grant_id, RTCPeerConnectionState::Failed);
+        harness.process_until_peer_closed(&grant_id, Instant::now() + Duration::from_secs(10));
+        assert_eq!(harness.daemon.local_webrtc().active_peer_count(), 0);
+        assert!(!harness.daemon.local_webrtc().has_live_peer(&grant_id));
+
+        let (frame_tx, _frame_rx) = tokio_mpsc::channel(ENTITY_SUBSCRIPTION_QUEUE_CAPACITY);
+        let (reply_tx, reply_rx) = oneshot::channel();
+        handle_control_message(
+            &mut harness.daemon,
+            &mut harness.state,
+            &harness.terminal_path,
+            &harness.transport_handle,
+            harness.control_tx.clone(),
+            ControlMessage::SubscribeEntities {
+                entity_type: "session".to_string(),
+                subscription_id: subscription_id.clone(),
+                frame_tx: EntityFrameSender::Async(frame_tx),
+                reply_tx,
+                grant_id: Some(grant_id.clone()),
+            },
+        );
+
+        let response = reply_rx
+            .blocking_recv()
+            .expect("reply channel open")
+            .expect("daemon returns operator response");
+        assert_eq!(
+            response.kind,
+            botster_hub_client::DaemonResponseKind::OperatorError
+        );
+        assert_eq!(
+            response
+                .error
+                .as_ref()
+                .map(|error| error.code.as_str()),
+            Some("local_webrtc_peer_gone")
+        );
+        assert!(
+            !harness
+                .state
+                .entity_subscriptions
+                .contains_key(&subscription_id),
+            "late SubscribeEntities must not recreate daemon entity ownership after PeerClosed"
+        );
+        assert_eq!(
+            harness.state.lifecycle_counters.live_entity_subscriptions,
+            0
+        );
+        assert!(!harness.daemon.local_webrtc().has_live_peer(&grant_id));
+
+        peer.close_offer();
+        harness.cleanup();
+    }
+
+    #[test]
+    fn local_webrtc_close_failure_with_sibling_quarantines_failed_peer_without_killing_runtime() {
+        let mut harness = PeerHarness::new("close-fail-sibling");
+        let origin = "http://127.0.0.1:41795";
+        let mut peer_a = harness.signal_peer(origin);
+        let mut peer_b = harness.signal_peer(origin);
+        let grant_a = peer_a.grant_id.clone();
+        let grant_b = peer_b.grant_id.clone();
+
+        let _ = harness.subscribe_entities(&mut peer_a, "entity-fail-a");
+        let _ = harness.subscribe_entities(&mut peer_b, "entity-fail-b");
+
+        harness
+            .daemon
+            .local_webrtc()
+            .force_next_close_error_for_test(&grant_a);
+        harness
+            .daemon
+            .local_webrtc()
+            .inject_peer_connection_state_for_test(&grant_a, RTCPeerConnectionState::Failed);
+        harness.process_until_peer_closed(&grant_a, Instant::now() + Duration::from_secs(10));
+
+        assert_eq!(harness.daemon.local_webrtc().active_peer_count(), 1);
+        assert!(harness.daemon.local_webrtc().has_live_peer(&grant_b));
+        assert!(
+            harness.daemon.local_webrtc().has_stale_close_peer(&grant_a),
+            "failed close must quarantine the failed peer while siblings keep the runtime"
+        );
+        assert_eq!(harness.daemon.local_webrtc().stale_close_peer_count(), 1);
+        assert!(
+            harness.daemon.local_webrtc().has_dedicated_runtime(),
+            "sibling must keep the dedicated runtime alive"
+        );
+        assert_eq!(
+            harness
+                .daemon
+                .local_webrtc()
+                .close_completion_count_for(&grant_a),
+            0,
+            "failed close must not record successful close-completion evidence"
+        );
+        assert!(!harness.state.entity_subscriptions.contains_key("entity-fail-a"));
+        assert!(harness.state.entity_subscriptions.contains_key("entity-fail-b"));
+
+        // Last live peer cleanup parks the runtime and drains quarantine ownership.
+        harness
+            .daemon
+            .local_webrtc()
+            .inject_peer_connection_state_for_test(&grant_b, RTCPeerConnectionState::Failed);
+        harness.process_until_peer_closed(&grant_b, Instant::now() + Duration::from_secs(10));
+        assert_eq!(harness.daemon.local_webrtc().active_peer_count(), 0);
+        assert_eq!(harness.daemon.local_webrtc().stale_close_peer_count(), 0);
+        assert!(!harness.daemon.local_webrtc().has_dedicated_runtime());
+        wait_until(
+            Instant::now() + Duration::from_secs(2),
+            || LocalWebrtcTransport::dedicated_runtime_worker_threads() == 0,
+            "runtime workers to join after last peer and quarantine drain",
+        );
+
+        peer_a.close_offer();
+        peer_b.close_offer();
         harness.cleanup();
     }
 }

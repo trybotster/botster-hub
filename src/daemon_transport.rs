@@ -511,6 +511,7 @@ async fn handle_entity_subscription_async(
             subscription_id: subscription_id.clone(),
             frame_tx: EntityFrameSender::Async(frame_tx),
             reply_tx,
+            grant_id: None,
         })
         .await
         .map_err(|_| DaemonTransportError::ControlThreadStopped)?;
@@ -566,6 +567,7 @@ async fn handle_entity_subscription_async(
                     .send(ControlMessage::UnsubscribeEntities {
                         subscription_id: subscription_id.clone(),
                         reply_tx: Some(reply_tx),
+                        grant_id: None,
                     })
                     .await
                     .map_err(|_| DaemonTransportError::ControlThreadStopped)?;
@@ -912,7 +914,19 @@ pub(crate) fn handle_control_message(
             subscription_id,
             frame_tx,
             reply_tx,
+            grant_id,
         } => {
+            // Late WebRTC control messages after PeerClosed must not recreate peer-owned state.
+            if let Some(grant_id) = grant_id.as_deref()
+                && !daemon.local_webrtc().has_live_peer(grant_id)
+            {
+                let _ = reply_tx.send(Ok(entity_subscription_error(
+                    "local_webrtc_peer_gone",
+                    &subscription_id,
+                    "local WebRTC peer is no longer live",
+                )));
+                return false;
+            }
             let response =
                 register_entity_subscription(daemon, state, entity_type, subscription_id, frame_tx);
             let _ = reply_tx.send(response);
@@ -921,7 +935,32 @@ pub(crate) fn handle_control_message(
         ControlMessage::UnsubscribeEntities {
             subscription_id,
             reply_tx,
+            grant_id,
         } => {
+            if let Some(grant_id) = grant_id.as_deref()
+                && !daemon.local_webrtc().has_live_peer(grant_id)
+            {
+                // Peer already gone: still drop any residual daemon entry if present, but do not
+                // invent new ownership. Reply unsubscribed for idempotent client cleanup.
+                if state
+                    .entity_subscriptions
+                    .remove(&subscription_id)
+                    .is_some()
+                {
+                    state.lifecycle_counters.live_entity_subscriptions = state
+                        .lifecycle_counters
+                        .live_entity_subscriptions
+                        .saturating_sub(1);
+                    state.released_entity_generations =
+                        state.released_entity_generations.saturating_add(1);
+                }
+                if let Some(reply_tx) = reply_tx {
+                    let _ = reply_tx.send(Ok(daemon_response_base(
+                        DaemonResponseKind::EntityUnsubscribed,
+                    )));
+                }
+                return false;
+            }
             if state
                 .entity_subscriptions
                 .remove(&subscription_id)
@@ -3813,10 +3852,15 @@ pub(crate) enum ControlMessage {
         subscription_id: String,
         frame_tx: EntityFrameSender,
         reply_tx: ControlReplySender,
+        /// When set, admission requires a still-live local WebRTC peer for this grant.
+        /// Socket-path subscriptions leave this `None`.
+        grant_id: Option<String>,
     },
     UnsubscribeEntities {
         subscription_id: String,
         reply_tx: Option<ControlReplySender>,
+        /// Same live-peer guard as `SubscribeEntities` when the request originated on WebRTC.
+        grant_id: Option<String>,
     },
     Request {
         request: Box<DaemonRequest>,
