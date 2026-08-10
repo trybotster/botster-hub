@@ -216,8 +216,7 @@ Linked `trybotster/botster-hub` PR 202 via `project_pipelines_link_pr`
 
 Local `npm whoami` still returns **401 Unauthorized**. Packed-tarball smoke
 remains green for 0.1.26 / conformance 33 / `list_session_types_for_target`.
-Requires a credentialed human `npm publish --access public` from
-`packages/hub-test-support`, then clean registry install smoke.
+Registry publish completed by human; clean external install smoke below.
 
 ### Screenshots (Web empty picker)
 
@@ -227,4 +226,27 @@ ticket enables**, but Web still fat-filters the management catalog
 `ticket_1786387865_686375`. Even after Hub merge, the running Hub binary must
 include this branch for daemon list-for-target to help; Web must stop
 re-deriving eligibility.
+
+### 3. npm registry publish (high) — resolved
+
+Human published `@trybotster/hub-test-support@0.1.26` to the public registry
+(`question_1786391269_330902`).
+
+Clean external registry install smoke (not packed tarball):
+
+```
+npm install --prefer-online @trybotster/hub-test-support@0.1.26 @trybotster/ui-contract@0.3.1
+```
+
+Asserted from the installed package:
+
+- `metadata.package_version === "0.1.26"`
+- `metadata.protocol_version === 6`
+- `metadata.conformance_fixture_revision === 33`
+- `verifyPackageAssets()` ok
+- generated protocol contains `list_session_types_for_target`
+- support matrix + session-lifecycle fixture revision 33
+- plugin-contract-matrix fixture materializes
+
+`npm view @trybotster/hub-test-support version` → `0.1.26`
 
