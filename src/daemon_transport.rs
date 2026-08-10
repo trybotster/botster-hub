@@ -3987,9 +3987,9 @@ struct EntityReconciliationState {
 }
 
 #[derive(Debug, Default)]
-struct PendingRuntimeState {
+pub(crate) struct PendingRuntimeState {
     events: BTreeMap<String, Vec<HubClientEvent>>,
-    active_subscriptions: BTreeMap<String, BTreeSet<String>>,
+    pub(crate) active_subscriptions: BTreeMap<String, BTreeSet<String>>,
 }
 
 #[derive(Debug)]
@@ -3999,11 +3999,11 @@ pub(crate) struct DaemonControlState {
     egress_diagnostics: DaemonEgressDiagnostics,
     pub(crate) entity_subscriptions: BTreeMap<String, EntitySubscriptionState>,
     reconciliation: EntityReconciliationState,
-    pending_runtime: PendingRuntimeState,
+    pub(crate) pending_runtime: PendingRuntimeState,
     pub(crate) lifecycle_counters: DaemonLifecycleCounters,
     next_reconciliation: Instant,
     released_entity_generations: u64,
-    released_attach_generations: u64,
+    pub(crate) released_attach_generations: u64,
     pending_hub_update_reply: Option<ControlReplySender>,
 }
 
