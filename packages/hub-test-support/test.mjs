@@ -132,7 +132,7 @@ function assertDialogFormComposition(source) {
 }
 
 assert.equal(metadata.package_name, "@trybotster/hub-test-support");
-assert.equal(metadata.package_version, "0.1.26");
+assert.equal(metadata.package_version, "0.1.27");
 assert.equal(metadata.protocol, "botster-hub-daemon-v1");
 assert.equal(metadata.protocol_version, 6);
 assert.equal(metadata.conformance_fixture_revision, 33);
@@ -207,6 +207,9 @@ assert.deepEqual(metadata.application_primitives, {
 const protocol = readDaemonProtocolTypescript();
 assert.equal(protocol, readFileSync(daemonProtocolTypescriptPath(), "utf8"));
 assert.match(protocol, /export type DaemonRequest/);
+assert.match(protocol, /export type DaemonSessionTypeExecution/);
+assert.match(protocol, /mode: "relative_executable"/);
+assert.match(protocol, /mode: "shell_command"/);
 assert.match(protocol, /create_session_type/);
 assert.match(protocol, /update_session_type/);
 assert.match(protocol, /delete_session_type/);
