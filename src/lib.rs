@@ -112,10 +112,11 @@ pub use daemon_transport::{
     DaemonRequest, DaemonResolvedAppLaunch, DaemonResolvedSessionType, DaemonResponse,
     DaemonResponseKind, DaemonSession, DaemonSessionCleanup, DaemonSessionContext,
     DaemonSessionType, DaemonSessionTypeContextInput, DaemonSessionTypeDefinition,
-    DaemonSessionTypeMutationSource, DaemonSessionTypeRequest, DaemonSessionTypeWorkingDirectory,
-    DaemonSoftwareIdentity, DaemonSpawnTarget, DaemonSpawnTargetValidation, DaemonStatus,
-    DaemonTransportError, DaemonTransportResult, DaemonWorktree, DaemonWorktreeGitMetadata,
-    request as daemon_transport_request, serve_daemon, stream_attach,
+    DaemonSessionTypeExecution, DaemonSessionTypeMutationSource, DaemonSessionTypeRequest,
+    DaemonSessionTypeWorkingDirectory, DaemonSoftwareIdentity, DaemonSpawnTarget,
+    DaemonSpawnTargetValidation, DaemonStatus, DaemonTransportError, DaemonTransportResult,
+    DaemonWorktree, DaemonWorktreeGitMetadata, request as daemon_transport_request, serve_daemon,
+    stream_attach,
 };
 pub use entrypoint_supervisor::{
     EntrypointDiagnostic, EntrypointProcessSnapshot, EntrypointSupervisor,
@@ -165,9 +166,9 @@ pub use runtime::{
 };
 pub use session_types::{
     HubSessionContext, HubSessionType, HubSessionTypeDefinition, HubSessionTypeSource,
-    MaterializedSessionType, PackageSessionType, PackageSessionTypeWorkingDirectory,
-    ResolvedSessionType, SessionTypeContextInput, SessionTypeError, SessionTypeMutation,
-    SessionTypeMutationSource, SessionTypeRequest,
+    MaterializedSessionType, PackageSessionType, PackageSessionTypeExecution,
+    PackageSessionTypeWorkingDirectory, ResolvedSessionType, SessionTypeContextInput,
+    SessionTypeError, SessionTypeMutation, SessionTypeMutationSource, SessionTypeRequest,
 };
 pub use spawn_targets::{
     SpawnTarget, SpawnTargetCreate, SpawnTargetError, SpawnTargetResult, SpawnTargetUpdate,

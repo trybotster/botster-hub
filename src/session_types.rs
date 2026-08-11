@@ -32,6 +32,8 @@ pub struct PackageSessionType {
     #[serde(default)]
     pub traits: Vec<String>,
     pub lifecycle: String,
+    #[serde(default)]
+    pub execution: PackageSessionTypeExecution,
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
@@ -45,6 +47,17 @@ pub struct PackageSessionType {
     pub context: Vec<String>,
     #[serde(default)]
     pub target_id: Option<String>,
+}
+
+/// Hub-owned command execution policy for a session type.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum PackageSessionTypeExecution {
+    /// Resolve `command` as a safe relative executable under the source root.
+    #[default]
+    RelativeExecutable,
+    /// Run `command` through the Hub-configured shell as one complete command.
+    ShellCommand,
 }
 
 /// Working-directory policy for a package session type.
@@ -125,6 +138,7 @@ pub struct HubSessionType {
     pub interaction: String,
     pub traits: Vec<String>,
     pub lifecycle: String,
+    pub execution: PackageSessionTypeExecution,
     pub command: String,
     pub args: Vec<String>,
     pub working_directory_policy: String,
@@ -492,13 +506,12 @@ pub fn materialize_session_type(
 
     let row = effective_row;
     let metadata = session_type_metadata(&row);
+    let (executable, arguments) = resolve_execution(config, &command_root, session_type);
     let resolved = ResolvedSessionType {
         session_type: row,
         session_id: session_id.clone(),
-        executable: resolve_command_path(&command_root, &session_type.command)
-            .display()
-            .to_string(),
-        arguments: session_type.args.clone(),
+        executable,
+        arguments,
         working_directory: working_directory.display().to_string(),
         environment: environment.clone(),
         context_id: context_id.clone(),
@@ -625,13 +638,12 @@ pub(crate) fn materialize_managed_session_type(
     };
     let row = effective_row;
     let metadata = session_type_metadata(&row);
+    let (executable, arguments) = resolve_execution(config, command_root, &source.session_type);
     let resolved = ResolvedSessionType {
         session_type: row,
         session_id: session_id.clone(),
-        executable: resolve_command_path(command_root, &source.session_type.command)
-            .display()
-            .to_string(),
-        arguments: source.session_type.args.clone(),
+        executable,
+        arguments,
         working_directory: working_directory.display().to_string(),
         environment: environment.clone(),
         context_id: context_id.clone(),
@@ -782,6 +794,7 @@ fn session_type_row_from_source(source: &SourceSessionType) -> HubSessionType {
         interaction: source.session_type.interaction.clone(),
         traits: source.session_type.traits.clone(),
         lifecycle: source.session_type.lifecycle.clone(),
+        execution: source.session_type.execution.clone(),
         command: source.session_type.command.clone(),
         args: source.session_type.args.clone(),
         working_directory_policy: match &source.session_type.working_directory {
@@ -1252,7 +1265,19 @@ fn validate_session_type(session_type: &PackageSessionType) -> SessionTypeResult
             "session type traits must be unique bounded tokens",
         ));
     }
-    validate_relative_manifest_path(&session_type.command, "command")?;
+    match session_type.execution {
+        PackageSessionTypeExecution::RelativeExecutable => {
+            validate_relative_manifest_path(&session_type.command, "command")?;
+        }
+        PackageSessionTypeExecution::ShellCommand => {
+            if session_type.command.trim().is_empty() {
+                return Err(SessionTypeError::new(
+                    "invalid_session_type_command",
+                    "session type shell command must not be empty",
+                ));
+            }
+        }
+    }
     if let PackageSessionTypeWorkingDirectory::Relative { path } = &session_type.working_directory {
         validate_relative_manifest_path(path, "working directory")?;
     }
@@ -1307,6 +1332,30 @@ fn resolve_working_directory(
 
 fn resolve_command_path(package_root: &Path, command: &str) -> PathBuf {
     package_root.join(command)
+}
+
+fn resolve_execution(
+    config: &HubConfig,
+    command_root: &Path,
+    session_type: &PackageSessionType,
+) -> (String, Vec<String>) {
+    match session_type.execution {
+        PackageSessionTypeExecution::RelativeExecutable => (
+            resolve_command_path(command_root, &session_type.command)
+                .display()
+                .to_string(),
+            session_type.args.clone(),
+        ),
+        PackageSessionTypeExecution::ShellCommand => {
+            let mut arguments = vec![
+                "-c".to_string(),
+                session_type.command.clone(),
+                "botster-session-type".to_string(),
+            ];
+            arguments.extend(session_type.args.clone());
+            (config.session_defaults.shell.clone(), arguments)
+        }
+    }
 }
 
 fn validate_relative_manifest_path(value: &str, label: &str) -> SessionTypeResult<()> {
