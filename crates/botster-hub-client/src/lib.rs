@@ -1194,6 +1194,8 @@ pub struct DaemonSessionTypeDefinition {
     #[serde(default)]
     pub traits: Vec<String>,
     pub lifecycle: String,
+    #[serde(default)]
+    pub execution: DaemonSessionTypeExecution,
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
@@ -1207,6 +1209,14 @@ pub struct DaemonSessionTypeDefinition {
     pub context: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum DaemonSessionTypeExecution {
+    #[default]
+    RelativeExecutable,
+    ShellCommand,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1258,6 +1268,8 @@ pub struct DaemonSessionType {
     #[serde(default)]
     pub traits: Vec<String>,
     pub lifecycle: String,
+    #[serde(default)]
+    pub execution: DaemonSessionTypeExecution,
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
@@ -3985,6 +3997,42 @@ mod tests {
                 policy
             );
         }
+
+        let executions = [
+            DaemonSessionTypeExecution::RelativeExecutable,
+            DaemonSessionTypeExecution::ShellCommand,
+        ];
+        for execution in executions {
+            let value = serde_json::to_value(&execution).expect("execution serializes");
+            let tag = value["mode"]
+                .as_str()
+                .expect("execution has mode discriminator");
+            assert_generated_union_variant_fields(
+                "DaemonSessionTypeExecution",
+                "mode",
+                tag,
+                &value,
+            );
+            assert_eq!(
+                serde_json::from_value::<DaemonSessionTypeExecution>(value)
+                    .expect("execution deserializes"),
+                execution
+            );
+        }
+
+        let defaulted: DaemonSessionTypeDefinition = serde_json::from_value(serde_json::json!({
+            "id": "init",
+            "label": "Init",
+            "role": "botster.agent",
+            "interaction": "interactive",
+            "lifecycle": "task",
+            "command": "bin/init"
+        }))
+        .expect("definition without execution uses the compatible default");
+        assert_eq!(
+            defaulted.execution,
+            DaemonSessionTypeExecution::RelativeExecutable
+        );
     }
 
     fn assert_generated_union_variant_fields(
@@ -4050,6 +4098,7 @@ mod tests {
             interaction: "interactive".to_string(),
             traits: vec!["pipeline-step".to_string()],
             lifecycle: "task".to_string(),
+            execution: DaemonSessionTypeExecution::RelativeExecutable,
             command: "bin/init".to_string(),
             args: vec!["--json".to_string()],
             working_directory: DaemonSessionTypeWorkingDirectory::PackageRoot,
@@ -4076,6 +4125,7 @@ mod tests {
             interaction: "interactive".to_string(),
             traits: vec!["pipeline-step".to_string()],
             lifecycle: "task".to_string(),
+            execution: DaemonSessionTypeExecution::RelativeExecutable,
             command: "bin/init".to_string(),
             args: vec!["--json".to_string()],
             working_directory_policy: "package_root".to_string(),

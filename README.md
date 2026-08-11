@@ -1100,6 +1100,7 @@ with trusted context injection:
       "interaction": "interactive",
       "traits": ["coding", "worktree-aware"],
       "lifecycle": "task",
+      "execution": { "mode": "relative_executable" },
       "command": "bin/init.sh",
       "working_directory": { "policy": "package_root" },
       "environment": { "BOTSTER_MODE": "default" },
@@ -1119,6 +1120,14 @@ overrides are admitted only when the template and target policy allow them.
 Spawned scripts receive `BOTSTER_SESSION_ID`, `BOTSTER_CONTEXT_ID`,
 `BOTSTER_HUB_DATA_DIR`, `BOTSTER_HUB_SOCKET`, and `BOTSTER_HUB_BIN`, and can read
 context with `"$BOTSTER_HUB_BIN" context --key prompt`.
+
+Session types use `execution.mode = relative_executable` by default. Hub resolves
+the command under the definition source root and does not search `PATH`.
+Explicit `execution.mode = shell_command` runs the command through the
+Hub-configured shell. Hub uses `shell -c command botster-session-type ...args`,
+so the first authored argument is `$1`. Hub never infers shell mode from the
+command text. A client must not couple a user-interface Shell preset to this
+execution mode.
 
 Session type sources are layered by Hub policy: package < device < repo < explicit
 request values. The management catalog (`ListSessionTypes` /
