@@ -126,29 +126,61 @@ for (const step of timeline.timeline) {
 }
 
 // Duplicate values with equal order keys: record-id UTF-8 order decides,
-// independent of Object.entries insertion order.
+// independent of Object.entries insertion order. Distinct non-order metadata
+// (spawn_point) proves which physical record survived — same label alone cannot.
 const dupDescriptor = {
   $kind: "entity_options",
   source: "/session",
   value_field: "session_uuid",
-  display_fields: ["label"],
+  display_fields: ["label", "spawn_point"],
   order: ["label"],
 };
 const dupZFirst = {
-  "z-late": { session_uuid: "dup", label: "Same" },
-  "a-early": { session_uuid: "dup", label: "Same" },
+  "z-late": {
+    session_uuid: "dup",
+    label: "Same",
+    spawn_point: "from-z-late",
+  },
+  "a-early": {
+    session_uuid: "dup",
+    label: "Same",
+    spawn_point: "from-a-early",
+  },
 };
 const dupAFirst = {
-  "a-early": { session_uuid: "dup", label: "Same" },
-  "z-late": { session_uuid: "dup", label: "Same" },
+  "a-early": {
+    session_uuid: "dup",
+    label: "Same",
+    spawn_point: "from-a-early",
+  },
+  "z-late": {
+    session_uuid: "dup",
+    label: "Same",
+    spawn_point: "from-z-late",
+  },
+};
+const dupExpected = {
+  options: [
+    {
+      value: "dup",
+      label: "Same",
+      metadata: { label: "Same", spawn_point: "from-a-early" },
+    },
+  ],
+  selection_valid: true,
 };
 assert.deepEqual(
   projectEntityOptions(dupDescriptor, dupZFirst, {}, null),
   projectEntityOptions(dupDescriptor, dupAFirst, {}, null),
 );
+assert.deepEqual(
+  projectEntityOptions(dupDescriptor, dupZFirst, {}, null),
+  dupExpected,
+);
 assert.equal(
-  projectEntityOptions(dupDescriptor, dupZFirst, {}, null).options[0].value,
-  "dup",
+  projectEntityOptions(dupDescriptor, dupZFirst, {}, null).options[0].metadata
+    .spawn_point,
+  "from-a-early",
 );
 
 // String where equality is exact; non-string where expected fails closed.

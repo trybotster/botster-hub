@@ -3600,57 +3600,51 @@ fn entity_options_duplicate_values_use_record_id_utf8_tiebreak() {
         kind: UiEntityOptionsKind::EntityOptions,
         source: "/session".to_string(),
         value_field: "session_uuid".to_string(),
-        display_fields: vec!["label".to_string()],
+        // spawn_point is display/metadata only — not an order key — so the
+        // winner's distinct metadata proves which record survived the id tie.
+        display_fields: vec!["label".to_string(), "spawn_point".to_string()],
         order: vec!["label".to_string()],
         r#where: BTreeMap::new(),
         exclude: None,
     };
-    // Equal order key + equal value; record id decides. Opposite map insertion
-    // order must not change the winner (BTreeMap sorts by id regardless).
-    let mut records_a_first = BTreeMap::new();
-    records_a_first.insert(
-        "z-late".to_string(),
-        json!({ "session_uuid": "dup", "label": "Same" })
-            .as_object()
-            .cloned()
-            .unwrap(),
-    );
-    records_a_first.insert(
-        "a-early".to_string(),
-        json!({ "session_uuid": "dup", "label": "Same" })
-            .as_object()
-            .cloned()
-            .unwrap(),
-    );
+    // Equal order key + equal value; lower UTF-8 record id ("a-early") wins.
+    // Distinct non-order metadata would diverge under insertion-order picks.
+    let early = json!({
+        "session_uuid": "dup",
+        "label": "Same",
+        "spawn_point": "from-a-early"
+    });
+    let late = json!({
+        "session_uuid": "dup",
+        "label": "Same",
+        "spawn_point": "from-z-late"
+    });
     let mut records_z_first = BTreeMap::new();
-    records_z_first.insert(
-        "a-early".to_string(),
-        json!({ "session_uuid": "dup", "label": "Same" })
-            .as_object()
-            .cloned()
-            .unwrap(),
-    );
-    records_z_first.insert(
-        "z-late".to_string(),
-        json!({ "session_uuid": "dup", "label": "Same" })
-            .as_object()
-            .cloned()
-            .unwrap(),
-    );
+    records_z_first.insert("z-late".to_string(), late.as_object().cloned().unwrap());
+    records_z_first.insert("a-early".to_string(), early.as_object().cloned().unwrap());
+    let mut records_a_first = BTreeMap::new();
+    records_a_first.insert("a-early".to_string(), early.as_object().cloned().unwrap());
+    records_a_first.insert("z-late".to_string(), late.as_object().cloned().unwrap());
     let empty = BTreeMap::new();
-    let left = project_entity_options(&descriptor, &records_a_first, &empty, None);
-    let right = project_entity_options(&descriptor, &records_z_first, &empty, None);
+    let left = project_entity_options(&descriptor, &records_z_first, &empty, None);
+    let right = project_entity_options(&descriptor, &records_a_first, &empty, None);
     assert_eq!(left, right);
+    let expected = EntityOptionsProjection {
+        options: vec![EntityOption {
+            value: "dup".to_string(),
+            label: "Same".to_string(),
+            metadata: BTreeMap::from([
+                ("label".to_string(), "Same".to_string()),
+                ("spawn_point".to_string(), "from-a-early".to_string()),
+            ]),
+        }],
+        selection_valid: true,
+    };
+    assert_eq!(left, expected);
     assert_eq!(
-        left,
-        EntityOptionsProjection {
-            options: vec![EntityOption {
-                value: "dup".to_string(),
-                label: "Same".to_string(),
-                metadata: BTreeMap::from([("label".to_string(), "Same".to_string())]),
-            }],
-            selection_valid: true,
-        }
+        left.options[0].metadata.get("spawn_point").map(String::as_str),
+        Some("from-a-early"),
+        "winner must be lower UTF-8 record id a-early, not insertion-order first"
     );
 }
 

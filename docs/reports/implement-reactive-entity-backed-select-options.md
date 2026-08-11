@@ -96,11 +96,13 @@ Implementation choices within plan latitude:
 
 | Finding | Resolution |
 | --- | --- |
-| `finding_1786478573_477450` publish hub-test-support registry pin | `packages/hub-test-support/package.json` depends on `@trybotster/ui-contract@0.3.2` (registry coordinate). Pre-publish smoke uses a temporary tarball install without rewriting the committed manifest. |
+| `finding_1786478573_477450` publish hub-test-support registry pin | `packages/hub-test-support/package.json` depends on `@trybotster/ui-contract@0.3.2` (registry coordinate). Pre-publish smoke uses `npm install --no-save` or a temp consumer dir — never a bare tarball install that rewrites the manifest. |
 | `finding_1786478573_670996` duplicate insertion order | Projector sorts `order` keys → option value → **source record id** (UTF-8 bytes) in Rust and JS; first-after-sort wins. Dual tests with opposite insertion order. |
 | `finding_1786478573_703595` where equality domain | Authored `where` values are **JSON strings only** (validation + schema + TS). Runtime compare is exact string identity (no `JSON.stringify`). |
 | `finding_1786478573_794752` absolute paths in report | Binary paths recorded as ticket-worktree-relative `target/debug/...`. |
 | `finding_1786478573_892237` trailing whitespace | Plan markdown trailing spaces removed; `git diff --check origin/main...HEAD` clean. |
+| `finding_1786479209_216628` smoke rewrites pin | Documented hub-test-support smoke uses `--no-save` + pin guards + pack inspection; no bare `npm install *.tgz` in the package tree. |
+| `finding_1786479209_162150` unobservable duplicate winner | Duplicate tests give equal order keys but distinct non-order `spawn_point` metadata; both insertion orders must yield `from-a-early`. |
 
 ## Production path evidence
 
@@ -154,10 +156,32 @@ cd packages/ui-contract && npm pack
 
 ### hub-test-support
 
+Committed `package.json` must keep the **registry** pin
+`"@trybotster/ui-contract": "0.3.2"`. Do **not** run a bare
+`npm install path/to.tgz` in `packages/hub-test-support` — that rewrites the
+manifest to a `file:` dependency by default.
+
 ```sh
 node packages/hub-test-support/scripts/sync-assets.mjs --check
-cd packages/hub-test-support && npm install ../ui-contract/trybotster-ui-contract-0.3.2.tgz && npm test
+cd packages/ui-contract && npm pack
+cd ../hub-test-support
+# Pre-publication local smoke only: --no-save leaves package.json unchanged.
+npm install --no-save ../ui-contract/trybotster-ui-contract-0.3.2.tgz
+# Guard: committed pin must remain the registry coordinate.
+node -e "const d=require('./package.json').dependencies['@trybotster/ui-contract']; if (d!=='0.3.2') process.exit(1)"
+# Guard: packed package.json ships the same registry coordinate.
+npm pack
+tar -xOf trybotster-hub-test-support-*.tgz package/package.json | \
+  node -e "let s='';process.stdin.on('data',d=>s+=d);process.stdin.on('end',()=>{const d=JSON.parse(s).dependencies['@trybotster/ui-contract']; if(d!=='0.3.2') process.exit(1)})"
+npm test
+# Clean local install residue; never commit node_modules or rewritten pins.
+rm -rf node_modules trybotster-hub-test-support-*.tgz
+rm -f ../ui-contract/trybotster-ui-contract-*.tgz
 ```
+
+Alternatively, install both packed tarballs in a **separate temporary consumer
+directory** (outside the repo package trees) so no workspace `package.json` is
+touched.
 
 ### Provenance (live binary evidence)
 
