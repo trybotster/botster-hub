@@ -396,7 +396,6 @@ checksum = "dc0b364ead1874514c8c2855ab558056ebfeb775653e7ae45ff72f28f8f3166c"
 [[package]]
 name = "botster-core"
 version = "0.1.0"
-source = "git+https://github.com/trybotster/botster-core?branch=main#ff115694caf61e435bfb3d7ffcc5a6459689c8d9"
 dependencies = [
  "aes-gcm",
  "base64",
@@ -412,7 +411,6 @@ dependencies = [
 [[package]]
 name = "botster-core-daemon"
 version = "0.1.0"
-source = "git+https://github.com/trybotster/botster-core?branch=main#ff115694caf61e435bfb3d7ffcc5a6459689c8d9"
 dependencies = [
  "botster-core",
  "botster-terminal-ghostty",
@@ -424,9 +422,9 @@ dependencies = [
 [[package]]
 name = "botster-core-test-support"
 version = "0.1.0"
-source = "git+https://github.com/trybotster/botster-core?branch=main#ff115694caf61e435bfb3d7ffcc5a6459689c8d9"
 dependencies = [
  "botster-core",
+ "botster-terminal-ghostty",
  "serde",
  "serde_json",
 ]
@@ -508,7 +506,6 @@ dependencies = [
 [[package]]
 name = "botster-terminal-ghostty"
 version = "0.1.0"
-source = "git+https://github.com/trybotster/botster-core?branch=main#ff115694caf61e435bfb3d7ffcc5a6459689c8d9"
 dependencies = [
  "botster-core",
 ]
