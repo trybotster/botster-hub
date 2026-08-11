@@ -18,7 +18,7 @@ node packages/hub-test-support/scripts/sync-assets.mjs
 
 ## Usage
 
-Use this command after version 0.1.27 is published:
+Use this command for version 0.1.27:
 
 ```sh
 npm install --save-dev @trybotster/ui-contract@0.3.1 @trybotster/hub-test-support@0.1.27
@@ -86,12 +86,12 @@ Use this exact package spec in npm-based client repos:
 }
 ```
 
-`@trybotster/hub-test-support@0.1.27` is the prepared, unpublished coordinate.
-It carries explicit session-type execution modes, spawn-point session-type
-listing (`list_session_types_for_target`), and the session-type authoring view
+`@trybotster/hub-test-support@0.1.27` carries explicit session-type execution
+modes, spawn-point session-type listing (`list_session_types_for_target`), and
+the session-type authoring view
 (`show_session_type_definition`). It uses conformance fixture revision 33 and
-protocol version 6. First-party clients must wait for publication before they
-pin this coordinate.
+protocol version 6. First-party clients should pin this coordinate when they
+use these contracts.
 
 The support matrix is generated from the Rust compatibility descriptors.
 `terminal_readback` appears in both `supported_features` and
@@ -106,9 +106,9 @@ Only `read_screen_text` is renderable restored content; `snapshot` and
 version 0.1.5 / revision 12 exposes lossy string history. Neither is current
 binary-history contract authority.
 
-Version 0.1.27 is prepared but not published. It carries protocol version 6 /
-conformance revision 33 and the `DaemonSessionTypeExecution` contract. The
-contract defines the explicit `relative_executable` and `shell_command` modes.
+Version 0.1.27 carries protocol version 6 / conformance revision 33 and the
+`DaemonSessionTypeExecution` contract. The contract defines the explicit
+`relative_executable` and `shell_command` modes.
 It also carries spawn-point session-type listing
 (`list_session_types_for_target`) and the session-type authoring view
 (`show_session_type_definition`, editable `session_type_definition` response
