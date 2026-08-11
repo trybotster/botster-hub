@@ -1135,6 +1135,66 @@ fn write_session_type_context_package(root: &Path) {
     .expect("write session type package manifest");
 }
 
+fn write_session_type_execution_package(root: &Path) {
+    fs::create_dir_all(root.join("bin")).expect("create execution package root");
+    fs::write(root.join("plugin.lua"), "return botster.register({})\n")
+        .expect("write execution plugin entrypoint");
+    let relative_script = root.join("bin/relative.sh");
+    fs::write(
+        &relative_script,
+        "#!/bin/sh\nprintf 'relative:%s\\n' \"$1\" > relative-output.txt\nsleep 30\n",
+    )
+    .expect("write relative executable");
+    fs::set_permissions(&relative_script, fs::Permissions::from_mode(0o755))
+        .expect("make relative executable runnable");
+    let manifest = serde_json::json!({
+        "name": "runtime.session-type-execution",
+        "version": "1.0.0",
+        "kind": "plugin",
+        "botster": ">=0.1.0",
+        "source": { "type": "path", "path": "." },
+        "capabilities": [{ "surface": "surfaces" }],
+        "entrypoints": [
+            { "runtime": "lua", "path": "plugin.lua", "bootstrap": false }
+        ],
+        "session_types": [
+            {
+                "id": "relative",
+                "label": "Relative executable",
+                "role": "botster.agent",
+                "interaction": "interactive",
+                "lifecycle": "task",
+                "execution": { "mode": "relative_executable" },
+                "command": "bin/relative.sh",
+                "args": ["explicit"]
+            },
+            {
+                "id": "shell",
+                "label": "Shell command",
+                "role": "botster.agent",
+                "interaction": "interactive",
+                "lifecycle": "task",
+                "execution": { "mode": "shell_command" },
+                "command": "printf 'shell:%s:%s\\n' \"$1\" \"$2\" > shell-output.txt; sleep 30",
+                "args": ["alpha", "beta"]
+            },
+            {
+                "id": "not-inferred",
+                "label": "Shell-looking relative executable",
+                "role": "botster.agent",
+                "interaction": "interactive",
+                "lifecycle": "task",
+                "command": "printf shell-must-not-run > inferred-shell-output.txt"
+            }
+        ]
+    });
+    fs::write(
+        root.join("botster-package.json"),
+        serde_json::to_vec_pretty(&manifest).expect("serialize execution package"),
+    )
+    .expect("write execution package manifest");
+}
+
 fn write_app_registry_package(root: &Path) {
     fs::create_dir_all(root).expect("create app registry package root");
     fs::write(root.join("plugin.lua"), "return botster.register({})\n")
@@ -13887,6 +13947,145 @@ fn daemon_spawns_session_type_and_script_reads_botster_context() {
 }
 
 #[test]
+fn daemon_session_types_use_only_the_explicit_execution_mode() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_short_test_dir("session-type-execution");
+    let package_root = unique_test_dir("session-type-execution-package");
+    write_session_type_execution_package(&package_root);
+    let config = explicit_config(&data_dir);
+    let child = start_cli_daemon(&data_dir);
+
+    let enable = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::EnablePackageLocalPath {
+            path: package_root.clone(),
+        },
+    )
+    .expect("enable execution package");
+    assert_eq!(
+        enable.kind,
+        botster_hub::DaemonResponseKind::PackageDecision
+    );
+
+    let endpoint = botster_hub_client::DaemonEndpoint::new(
+        config
+            .transports
+            .local_socket
+            .as_ref()
+            .expect("test config has local socket")
+            .path
+            .clone(),
+    );
+    let mut connection =
+        botster_hub_client::DaemonConnection::connect(&endpoint).expect("connect to real daemon");
+
+    let relative = connection
+        .request(&botster_hub_client::DaemonRequest::SpawnSessionType {
+            session_type_id: "relative".to_string(),
+            session_id: "relative-execution".to_string(),
+            request: botster_hub_client::DaemonSessionTypeRequest::default(),
+        })
+        .expect("spawn explicit relative executable");
+    assert_eq!(
+        relative.kind,
+        botster_hub_client::DaemonResponseKind::Spawned
+    );
+
+    let shell_resolved = connection
+        .request(&botster_hub_client::DaemonRequest::ResolveSessionType {
+            session_type_id: "shell".to_string(),
+            request: botster_hub_client::DaemonSessionTypeRequest::default(),
+        })
+        .expect("resolve explicit shell command");
+    let shell_contract = shell_resolved
+        .resolved_session_type
+        .expect("resolved shell contract");
+    assert_eq!(
+        shell_contract.executable,
+        botster_hub::SessionDefaults::default().shell,
+        "the real daemon must use its configured default shell"
+    );
+    assert_eq!(
+        shell_contract.arguments,
+        vec![
+            "-c",
+            "printf 'shell:%s:%s\\n' \"$1\" \"$2\" > shell-output.txt; sleep 30",
+            "botster-session-type",
+            "alpha",
+            "beta",
+        ]
+    );
+
+    let shell = connection
+        .request(&botster_hub_client::DaemonRequest::SpawnSessionType {
+            session_type_id: "shell".to_string(),
+            session_id: "shell-execution".to_string(),
+            request: botster_hub_client::DaemonSessionTypeRequest::default(),
+        })
+        .expect("spawn explicit shell command");
+    assert_eq!(shell.kind, botster_hub_client::DaemonResponseKind::Spawned);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while std::time::Instant::now() < deadline
+        && (!package_root.join("relative-output.txt").exists()
+            || !package_root.join("shell-output.txt").exists())
+    {
+        thread::sleep(Duration::from_millis(30));
+    }
+    assert_eq!(
+        fs::read_to_string(package_root.join("relative-output.txt"))
+            .expect("relative executable output")
+            .trim(),
+        "relative:explicit"
+    );
+    assert_eq!(
+        fs::read_to_string(package_root.join("shell-output.txt"))
+            .expect("shell command output")
+            .trim(),
+        "shell:alpha:beta"
+    );
+
+    let not_inferred = connection
+        .request(&botster_hub_client::DaemonRequest::SpawnSessionType {
+            session_type_id: "not-inferred".to_string(),
+            session_id: "not-inferred-execution".to_string(),
+            request: botster_hub_client::DaemonSessionTypeRequest::default(),
+        })
+        .expect("shell-looking relative executable returns an operator response");
+    assert_eq!(
+        not_inferred.kind,
+        botster_hub_client::DaemonResponseKind::OperatorError
+    );
+    let error = not_inferred.error.as_ref().expect("operator error body");
+    assert_eq!(error.code, "spawn_failed");
+    assert_eq!(error.operation, "spawn_session_type");
+    assert!(not_inferred.diagnostics.iter().any(|diagnostic| {
+        diagnostic.kind == botster_hub_client::DaemonDiagnosticKind::ActionFailure
+            && diagnostic.operation.as_deref() == Some("spawn_session_type")
+            && diagnostic
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("session type command"))
+    }));
+    assert!(!package_root.join("inferred-shell-output.txt").exists());
+
+    let status = connection
+        .request(&botster_hub_client::DaemonRequest::Status)
+        .expect("transport remains open after nested spawn failure");
+    assert_eq!(status.kind, botster_hub_client::DaemonResponseKind::Status);
+
+    for session_id in ["relative-execution", "shell-execution"] {
+        connection
+            .request(&botster_hub_client::DaemonRequest::ShutdownSession {
+                session_id: session_id.to_string(),
+            })
+            .expect("shutdown execution test session");
+    }
+    drop(connection);
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
 fn daemon_spawn_target_crud_persists_plain_non_git_directory_and_cli_lists_it() {
     let _guard = daemon_test_guard();
     let data_dir = unique_short_test_dir("spawn-target-crud");
@@ -15097,6 +15296,7 @@ fn daemon_list_session_types_for_target_includes_device_globals() {
                     interaction: "interactive".to_string(),
                     traits: vec!["test".to_string()],
                     lifecycle: "task".to_string(),
+                    execution: botster_hub::PackageSessionTypeExecution::RelativeExecutable,
                     command: "bin/noop.sh".to_string(),
                     args: Vec::new(),
                     working_directory: botster_hub::PackageSessionTypeWorkingDirectory::PackageRoot,
@@ -15284,6 +15484,7 @@ fn session_type_crud_pushes_authoritative_entity_deltas_without_polling() {
         interaction: "interactive".to_string(),
         traits: vec!["terminal".to_string()],
         lifecycle: "persistent".to_string(),
+        execution: botster_hub_client::DaemonSessionTypeExecution::RelativeExecutable,
         command: "bin/accessory.sh".to_string(),
         args: Vec::new(),
         working_directory: botster_hub_client::DaemonSessionTypeWorkingDirectory::Relative {

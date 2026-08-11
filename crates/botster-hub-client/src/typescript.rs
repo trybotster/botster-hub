@@ -672,6 +672,12 @@ pub(crate) fn daemon_protocol_typescript() -> String {
         "policy",
         &[("package_root", &[]), ("relative", &[("path", "string")])],
     );
+    emit_union(
+        &mut output,
+        "DaemonSessionTypeExecution",
+        "mode",
+        &[("relative_executable", &[]), ("shell_command", &[])],
+    );
     emit_interface(
         &mut output,
         "DaemonSessionTypeDefinition",
@@ -684,6 +690,7 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             ("interaction", "string"),
             ("traits?", "string[]"),
             ("lifecycle", "string"),
+            ("execution?", "DaemonSessionTypeExecution"),
             ("command", "string"),
             ("args?", "string[]"),
             ("working_directory?", "DaemonSessionTypeWorkingDirectory"),
@@ -725,6 +732,7 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             ("interaction", "string"),
             ("traits?", "string[]"),
             ("lifecycle", "string"),
+            ("execution?", "DaemonSessionTypeExecution"),
             ("command", "string"),
             ("args?", "string[]"),
             ("working_directory_policy", "string"),

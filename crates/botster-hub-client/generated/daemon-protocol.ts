@@ -363,6 +363,10 @@ export type DaemonSessionTypeWorkingDirectory =
   | { policy: "package_root" }
   | { policy: "relative"; path: string };
 
+export type DaemonSessionTypeExecution =
+  | { mode: "relative_executable" }
+  | { mode: "shell_command" };
+
 export interface DaemonSessionTypeDefinition {
   id: string;
   label: string;
@@ -372,6 +376,7 @@ export interface DaemonSessionTypeDefinition {
   interaction: string;
   traits?: string[];
   lifecycle: string;
+  execution?: DaemonSessionTypeExecution;
   command: string;
   args?: string[];
   working_directory?: DaemonSessionTypeWorkingDirectory;
@@ -407,6 +412,7 @@ export interface DaemonSessionType {
   interaction: string;
   traits?: string[];
   lifecycle: string;
+  execution?: DaemonSessionTypeExecution;
   command: string;
   args?: string[];
   working_directory_policy: string;

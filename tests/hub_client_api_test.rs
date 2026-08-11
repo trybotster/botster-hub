@@ -19,8 +19,8 @@ use botster_hub::{
     HubClientOperation, HubClientPackageClassification, HubClientPackageState, HubClientRequest,
     HubClientResponseBody, HubClientRole, HubPackageManifest, HubRuntime, HubStartupOptions,
     HubStateStore, PackageProvenance, PackageRegistry, PackageSessionType,
-    PackageSessionTypeWorkingDirectory, RuntimeEnvironment, SessionDefaults,
-    SessionTypeMutationSource, SpawnTarget, TransportBindings,
+    PackageSessionTypeExecution, PackageSessionTypeWorkingDirectory, RuntimeEnvironment,
+    SessionDefaults, SessionTypeMutationSource, SpawnTarget, TransportBindings,
 };
 use botster_ui_contract::{
     PackageNavigationEntry, PackageNavigationTarget, PackageSurfaceDescriptor, PackageSurfaceKind,
@@ -178,6 +178,7 @@ fn authored_session_type(id: &str) -> PackageSessionType {
         interaction: "interactive".to_string(),
         traits: vec!["terminal".to_string(), "authoring".to_string()],
         lifecycle: "task".to_string(),
+        execution: PackageSessionTypeExecution::RelativeExecutable,
         command: "bin/authored.sh".to_string(),
         args: vec!["--json".to_string()],
         working_directory: PackageSessionTypeWorkingDirectory::Relative {
@@ -354,6 +355,7 @@ fn sanitized_session_type_row_still_cannot_reconstruct_the_authored_definition()
         interaction: row.interaction.clone(),
         traits: row.traits.clone(),
         lifecycle: row.lifecycle.clone(),
+        execution: row.execution.clone(),
         command: row.command.clone(),
         args: row.args.clone(),
         working_directory: PackageSessionTypeWorkingDirectory::default(),
@@ -407,6 +409,7 @@ fn sanitized_session_type_row_still_cannot_reconstruct_the_authored_definition()
             "description",
             "diagnostics",
             "editable",
+            "execution",
             "icon",
             "id",
             "interaction",
@@ -421,7 +424,7 @@ fn sanitized_session_type_row_still_cannot_reconstruct_the_authored_definition()
             "traits",
             "working_directory_policy",
         ],
-        "the published session_type row shape must not move"
+        "the published session_type row shape must match the explicit contract"
     );
     let published_text = published.to_string();
     assert!(!published_text.contains("nested/dir"));
@@ -696,6 +699,7 @@ fn session_type(command: &str, mode: &str) -> PackageSessionType {
         interaction: "interactive".to_string(),
         traits: vec!["test".to_string()],
         lifecycle: "task".to_string(),
+        execution: PackageSessionTypeExecution::RelativeExecutable,
         command: command.to_string(),
         args: Vec::new(),
         working_directory: PackageSessionTypeWorkingDirectory::PackageRoot,
