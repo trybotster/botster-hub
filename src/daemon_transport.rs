@@ -51,7 +51,7 @@ pub use botster_hub_client::{
     DaemonReadScreen, DaemonRequest, DaemonResolvedAppLaunch, DaemonResolvedSessionType,
     DaemonResponse, DaemonResponseKind, DaemonSession, DaemonSessionCleanup, DaemonSessionContext,
     DaemonSessionEntity, DaemonSessionType, DaemonSessionTypeContextInput,
-    DaemonSessionTypeDefinition, DaemonSessionTypeEditableDefinition,
+    DaemonSessionTypeDefinition, DaemonSessionTypeEditableDefinition, DaemonSessionTypeExecution,
     DaemonSessionTypeMutationSource, DaemonSessionTypeRequest, DaemonSessionTypeWorkingDirectory,
     DaemonSoftwareIdentity, DaemonSpawnTarget, DaemonSpawnTargetValidation, DaemonStatus,
     DaemonUiTreeSnapshot, DaemonWorktree, DaemonWorktreeGitMetadata, DaemonWorktreeLifecycleEvent,
@@ -5682,6 +5682,14 @@ fn daemon_session_type_from_client(template: crate::HubSessionType) -> DaemonSes
         interaction: template.interaction,
         traits: template.traits,
         lifecycle: template.lifecycle,
+        execution: match template.execution {
+            crate::PackageSessionTypeExecution::RelativeExecutable => {
+                botster_hub_client::DaemonSessionTypeExecution::RelativeExecutable
+            }
+            crate::PackageSessionTypeExecution::ShellCommand => {
+                botster_hub_client::DaemonSessionTypeExecution::ShellCommand
+            }
+        },
         command: template.command,
         args: template.args,
         working_directory_policy: template.working_directory_policy,
@@ -5745,6 +5753,14 @@ fn daemon_session_type_definition_from_client(
         interaction: definition.interaction,
         traits: definition.traits,
         lifecycle: definition.lifecycle,
+        execution: match definition.execution {
+            crate::PackageSessionTypeExecution::RelativeExecutable => {
+                botster_hub_client::DaemonSessionTypeExecution::RelativeExecutable
+            }
+            crate::PackageSessionTypeExecution::ShellCommand => {
+                botster_hub_client::DaemonSessionTypeExecution::ShellCommand
+            }
+        },
         command: definition.command,
         args: definition.args,
         working_directory: match definition.working_directory {
@@ -5774,6 +5790,14 @@ fn session_type_definition_from_daemon(
         interaction: definition.interaction,
         traits: definition.traits,
         lifecycle: definition.lifecycle,
+        execution: match definition.execution {
+            botster_hub_client::DaemonSessionTypeExecution::RelativeExecutable => {
+                crate::PackageSessionTypeExecution::RelativeExecutable
+            }
+            botster_hub_client::DaemonSessionTypeExecution::ShellCommand => {
+                crate::PackageSessionTypeExecution::ShellCommand
+            }
+        },
         command: definition.command,
         args: definition.args,
         working_directory: match definition.working_directory {
@@ -7555,9 +7579,10 @@ fn runtime_error_code(
         (_, crate::HubClientRuntimeErrorKind::UnknownSession) => "unknown_session",
         (_, crate::HubClientRuntimeErrorKind::SessionAlreadyExists) => "session_already_exists",
         (_, crate::HubClientRuntimeErrorKind::SpawnFailed)
-        | (crate::HubClientOperation::Spawn, crate::HubClientRuntimeErrorKind::Runtime) => {
-            "spawn_failed"
-        }
+        | (
+            crate::HubClientOperation::Spawn | crate::HubClientOperation::SpawnSessionType,
+            crate::HubClientRuntimeErrorKind::Runtime,
+        ) => "spawn_failed",
         (_, crate::HubClientRuntimeErrorKind::Runtime) => "runtime_error",
         (_, crate::HubClientRuntimeErrorKind::State) => "state_error",
     }
@@ -7576,6 +7601,16 @@ fn runtime_error_message(
             "spawn failed before the session started; verify the configured session worker and command"
                 .to_string()
         }
+        (
+            crate::HubClientOperation::SpawnSessionType,
+            crate::HubClientRuntimeErrorKind::SessionAlreadyExists,
+        ) => "session type spawn rejected because a session with that id already exists".to_string(),
+        (
+            crate::HubClientOperation::SpawnSessionType,
+            crate::HubClientRuntimeErrorKind::SpawnFailed
+            | crate::HubClientRuntimeErrorKind::Runtime,
+        ) => "session type spawn failed before the session started; verify the configured session worker and session type command"
+            .to_string(),
         _ => format!("runtime failed while handling {operation:?}: {kind:?}"),
     }
 }
@@ -7585,24 +7620,42 @@ fn runtime_error_diagnostics(
     kind: crate::HubClientRuntimeErrorKind,
     message: &str,
 ) -> Vec<DaemonDiagnostic> {
-    if matches!(operation, crate::HubClientOperation::Spawn) {
+    if matches!(
+        operation,
+        crate::HubClientOperation::Spawn | crate::HubClientOperation::SpawnSessionType
+    ) {
         match kind {
             crate::HubClientRuntimeErrorKind::SessionAlreadyExists => {
+                let message = if operation == crate::HubClientOperation::SpawnSessionType {
+                    "session type spawn rejected because a session with that id already exists"
+                } else {
+                    "spawn rejected because a session with that id already exists"
+                };
                 return vec![DaemonDiagnostic::action_failure(
                     operation_label(operation),
-                    "spawn rejected because a session with that id already exists",
+                    message,
                 )];
             }
             crate::HubClientRuntimeErrorKind::SpawnFailed => {
+                let message = if operation == crate::HubClientOperation::SpawnSessionType {
+                    "session type spawn failed before the session started; verify the configured session worker and session type command"
+                } else {
+                    "spawn failed before the session started; verify the configured session worker and command"
+                };
                 return vec![DaemonDiagnostic::action_failure(
                     operation_label(operation),
-                    "spawn failed before the session started; verify the configured session worker and command",
+                    message,
                 )];
             }
             crate::HubClientRuntimeErrorKind::Runtime => {
+                let message = if operation == crate::HubClientOperation::SpawnSessionType {
+                    "session type spawn failed before the session started; verify the configured session worker and session type command"
+                } else {
+                    "spawn failed before the session started; verify the configured session worker and command"
+                };
                 return vec![DaemonDiagnostic::action_failure(
                     operation_label(operation),
-                    "spawn failed before the session started; verify the configured session worker and command",
+                    message,
                 )];
             }
             _ => {}

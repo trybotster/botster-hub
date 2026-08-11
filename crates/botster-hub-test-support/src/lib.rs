@@ -22,9 +22,9 @@ use botster_hub_client::{
     DaemonCompatibility, DaemonCompatibilityRequirement, DaemonConnection, DaemonDiagnostic,
     DaemonDiagnosticKind, DaemonEndpoint, DaemonEntityFrame, DaemonEvent, DaemonModeFlags,
     DaemonOperatorError, DaemonRequest, DaemonResponse, DaemonResponseKind, DaemonSessionEntity,
-    DaemonSessionType, DaemonSessionTypeDefinition, DaemonSessionTypeMutationSource,
-    DaemonSessionTypeSource, DaemonSessionTypeWorkingDirectory, DaemonTransportError,
-    ensure_compatible,
+    DaemonSessionType, DaemonSessionTypeDefinition, DaemonSessionTypeExecution,
+    DaemonSessionTypeMutationSource, DaemonSessionTypeSource, DaemonSessionTypeWorkingDirectory,
+    DaemonTransportError, ensure_compatible,
 };
 use botster_ui_contract::{
     UiActionId, UiActionKind, UiActionRequest, UiActionRequestId, UiActionResult,
@@ -738,6 +738,7 @@ fn fully_populated_session_type_definition() -> DaemonSessionTypeDefinition {
         interaction: "interactive".to_string(),
         traits: vec!["terminal".to_string()],
         lifecycle: "task".to_string(),
+        execution: DaemonSessionTypeExecution::RelativeExecutable,
         command: "bin/init.sh".to_string(),
         args: vec!["--json".to_string()],
         working_directory: DaemonSessionTypeWorkingDirectory::Relative {
@@ -769,6 +770,7 @@ fn fully_populated_session_type_row() -> DaemonSessionType {
         interaction: "interactive".to_string(),
         traits: vec!["terminal".to_string()],
         lifecycle: "task".to_string(),
+        execution: DaemonSessionTypeExecution::RelativeExecutable,
         command: "bin/init.sh".to_string(),
         args: vec!["--json".to_string()],
         working_directory_policy: "relative".to_string(),

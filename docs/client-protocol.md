@@ -785,6 +785,25 @@ root; the default working directory binds to T's admitted root (Relative paths
 resolve under T). Explicit cwd must stay under T. Spawn picker consumers must
 call list-for-target and use the returned qualified ids verbatim.
 
+Each definition has an explicit `execution` contract. An absent contract is
+`{"mode":"relative_executable"}`. In this mode, Hub resolves `command` as a
+safe relative executable under the definition source root. Hub passes `args`
+as executable arguments. Hub does not search `PATH` for the primary executable.
+
+`{"mode":"shell_command"}` is the only shell command mode. Hub runs `command`
+with the shell from `session_defaults.shell`. The argument vector is `-c`, the
+command body, the fixed value `botster-session-type`, and each authored `args`
+value. The fixed value supplies shell argument zero. Therefore, the first
+authored argument is available as `$1`. Hub does not join arguments into the
+command body. Hub does not infer this mode from spaces, operators, or other
+command text.
+
+`DaemonSessionTypeDefinition.execution` and `DaemonSessionType.execution`
+expose this contract to clients. Both fields are additive and default to
+relative executable mode when an older frame omits them. A client must preserve
+the authored field when it updates a definition. A user-interface semantic
+preset named Shell does not select shell command execution automatically.
+
 Resolution precedence is package < device < repo < explicit request values.
 Device definitions, admitted repo target roots, and a monotonic definition
 generation are durable Hub state. Schema 3 is a cold cut: older schema versions
@@ -802,6 +821,10 @@ Explicit environment overrides must appear in
 `allowed_environment_overrides`. Explicit cwd overrides must stay inside the
 selected source root. Unauthorized target, cwd, path, session type, or environment
 requests return operator errors before core spawn.
+
+A nested `SpawnSessionType` process failure returns `spawn_failed` with
+operation `spawn_session_type`. The response includes an `action_failure`
+diagnostic for the same operation. The daemon keeps the client transport open.
 
 Spawned scripts receive `BOTSTER_SESSION_ID`, `BOTSTER_CONTEXT_ID`,
 `BOTSTER_HUB_DATA_DIR`, `BOTSTER_HUB_SOCKET`, and `BOTSTER_HUB_BIN`. Scripts can
