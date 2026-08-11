@@ -495,6 +495,73 @@
         "fullscreen"
       ]
     },
+    "UiEntityOptionsExclude": {
+      "additionalProperties": false,
+      "properties": {
+        "source": {
+          "pattern": "^/[^/]+$",
+          "type": "string"
+        },
+        "value_field": {
+          "pattern": "\\S",
+          "type": "string"
+        },
+        "where": {
+          "type": "object"
+        }
+      },
+      "required": [
+        "source",
+        "value_field"
+      ],
+      "type": "object"
+    },
+    "UiEntityOptionsSource": {
+      "additionalProperties": false,
+      "properties": {
+        "$kind": {
+          "const": "entity_options"
+        },
+        "display_fields": {
+          "items": {
+            "pattern": "\\S",
+            "type": "string"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "exclude": {
+          "$ref": "#/$defs/UiEntityOptionsExclude"
+        },
+        "order": {
+          "items": {
+            "pattern": "\\S",
+            "type": "string"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "source": {
+          "pattern": "^/[^/]+$",
+          "type": "string"
+        },
+        "value_field": {
+          "pattern": "\\S",
+          "type": "string"
+        },
+        "where": {
+          "type": "object"
+        }
+      },
+      "required": [
+        "$kind",
+        "source",
+        "value_field",
+        "display_fields",
+        "order"
+      ],
+      "type": "object"
+    },
     "UiFieldKind": {
       "enum": [
         "text",
@@ -1153,8 +1220,7 @@
                 "enum": [
                   "text_input",
                   "textarea",
-                  "checkbox",
-                  "select"
+                  "checkbox"
                 ]
               }
             },
@@ -1171,6 +1237,43 @@
                   },
                   "name": {
                     "$ref": "#/$defs/UiNonBindableValue"
+                  }
+                },
+                "required": [
+                  "name",
+                  "label"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "props"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "select"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "properties": {
+              "props": {
+                "properties": {
+                  "label": {
+                    "$ref": "#/$defs/UiNonBindableValue"
+                  },
+                  "name": {
+                    "$ref": "#/$defs/UiNonBindableValue"
+                  },
+                  "options_source": {
+                    "$ref": "#/$defs/UiEntityOptionsSource"
                   }
                 },
                 "required": [
@@ -1495,7 +1598,7 @@
       ]
     }
   },
-  "$id": "https://trybotster.dev/schemas/ui-contract-0.3.1.json",
+  "$id": "https://trybotster.dev/schemas/ui-contract-0.3.2.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "oneOf": [
     {

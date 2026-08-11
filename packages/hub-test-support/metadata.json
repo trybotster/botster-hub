@@ -1,13 +1,13 @@
 {
   "package_name": "@trybotster/hub-test-support",
-  "package_version": "0.1.27",
+  "package_version": "0.1.28",
   "protocol": "botster-hub-daemon-v1",
   "protocol_version": 6,
   "conformance_fixture_revision": 33,
   "ui_contract": {
     "conformance_fixture_export": "@trybotster/ui-contract/conformance-fixtures",
     "package_name": "@trybotster/ui-contract",
-    "package_version": "0.3.1"
+    "package_version": "0.3.2"
   },
   "generated_by": "cargo run -p botster-hub-test-support --example node_package_assets",
   "daemon_protocol": {

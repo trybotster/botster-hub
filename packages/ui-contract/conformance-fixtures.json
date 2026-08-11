@@ -31,7 +31,854 @@
       "row": "botster-ui-descendant-v1:1:x"
     }
   ],
-  "contract_version": "0.3.1",
+  "contract_version": "0.3.2",
+  "entity_options_reactive_timeline": {
+    "collector_from_sample_node": [
+      "project-pipelines.run",
+      "session"
+    ],
+    "collector_vectors": [
+      {
+        "authored_path": "/session",
+        "subscription_id": "session"
+      },
+      {
+        "authored_path": "/project-pipelines.run",
+        "subscription_id": "project-pipelines.run"
+      },
+      {
+        "authored_path": "/bns1_626f74737465722e706c7567696e2d636f6e74726163742d6d6174726978.run",
+        "subscription_id": "bns1_626f74737465722e706c7567696e2d636f6e74726163742d6d6174726978.run"
+      },
+      {
+        "authored_path": "/session/sess-1/label",
+        "subscription_id": null
+      },
+      {
+        "authored_path": "session",
+        "subscription_id": null
+      }
+    ],
+    "descriptor": {
+      "$kind": "entity_options",
+      "display_fields": [
+        "label",
+        "lifecycle_class",
+        "session_type",
+        "spawn_point"
+      ],
+      "exclude": {
+        "source": "/project-pipelines.run",
+        "value_field": "session_uuid",
+        "where": {
+          "status": "active"
+        }
+      },
+      "order": [
+        "label",
+        "session_uuid"
+      ],
+      "source": "/session",
+      "value_field": "session_uuid",
+      "where": {
+        "lifecycle_class": "current"
+      }
+    },
+    "sample_node": {
+      "id": "session-select",
+      "props": {
+        "label": "Session",
+        "name": "session",
+        "options_source": {
+          "$kind": "entity_options",
+          "display_fields": [
+            "label",
+            "lifecycle_class",
+            "session_type",
+            "spawn_point"
+          ],
+          "exclude": {
+            "source": "/project-pipelines.run",
+            "value_field": "session_uuid",
+            "where": {
+              "status": "active"
+            }
+          },
+          "order": [
+            "label",
+            "session_uuid"
+          ],
+          "source": "/session",
+          "value_field": "session_uuid",
+          "where": {
+            "lifecycle_class": "current"
+          }
+        }
+      },
+      "type": "select"
+    },
+    "selection": "sess-alpha",
+    "timeline": [
+      {
+        "expected_projection": {
+          "options": [
+            {
+              "label": "Alpha",
+              "metadata": {
+                "label": "Alpha",
+                "lifecycle_class": "current",
+                "session_type": "agent",
+                "spawn_point": "local"
+              },
+              "value": "sess-alpha"
+            },
+            {
+              "label": "Bravo",
+              "metadata": {
+                "label": "Bravo",
+                "lifecycle_class": "current",
+                "session_type": "agent",
+                "spawn_point": "local"
+              },
+              "value": "sess-bravo"
+            }
+          ],
+          "selection_valid": true
+        },
+        "expected_store": {
+          "session": {
+            "sess-alpha": {
+              "id": "sess-alpha",
+              "label": "Alpha",
+              "lifecycle_class": "current",
+              "session_type": "agent",
+              "session_uuid": "sess-alpha",
+              "spawn_point": "local"
+            },
+            "sess-bravo": {
+              "id": "sess-bravo",
+              "label": "Bravo",
+              "lifecycle_class": "current",
+              "session_type": "agent",
+              "session_uuid": "sess-bravo",
+              "spawn_point": "local"
+            },
+            "sess-stale": {
+              "id": "sess-stale",
+              "label": "Stale",
+              "lifecycle_class": "exited",
+              "session_type": "agent",
+              "session_uuid": "sess-stale",
+              "spawn_point": "local"
+            }
+          }
+        },
+        "frames": [
+          {
+            "entity_type": "session",
+            "items": [
+              {
+                "id": "sess-alpha",
+                "label": "Alpha",
+                "lifecycle_class": "current",
+                "session_type": "agent",
+                "session_uuid": "sess-alpha",
+                "spawn_point": "local"
+              },
+              {
+                "id": "sess-bravo",
+                "label": "Bravo",
+                "lifecycle_class": "current",
+                "session_type": "agent",
+                "session_uuid": "sess-bravo",
+                "spawn_point": "local"
+              },
+              {
+                "id": "sess-stale",
+                "label": "Stale",
+                "lifecycle_class": "exited",
+                "session_type": "agent",
+                "session_uuid": "sess-stale",
+                "spawn_point": "local"
+              }
+            ],
+            "snapshot_seq": 1,
+            "type": "snapshot"
+          }
+        ],
+        "name": "source_snapshot"
+      },
+      {
+        "expected_projection": {
+          "options": [
+            {
+              "label": "Alpha",
+              "metadata": {
+                "label": "Alpha",
+                "lifecycle_class": "current",
+                "session_type": "agent",
+                "spawn_point": "local"
+              },
+              "value": "sess-alpha"
+            }
+          ],
+          "selection_valid": true
+        },
+        "expected_store": {
+          "project-pipelines.run": {
+            "run-1": {
+              "id": "run-1",
+              "session_uuid": "sess-bravo",
+              "status": "active"
+            }
+          },
+          "session": {
+            "sess-alpha": {
+              "id": "sess-alpha",
+              "label": "Alpha",
+              "lifecycle_class": "current",
+              "session_type": "agent",
+              "session_uuid": "sess-alpha",
+              "spawn_point": "local"
+            },
+            "sess-bravo": {
+              "id": "sess-bravo",
+              "label": "Bravo",
+              "lifecycle_class": "current",
+              "session_type": "agent",
+              "session_uuid": "sess-bravo",
+              "spawn_point": "local"
+            },
+            "sess-stale": {
+              "id": "sess-stale",
+              "label": "Stale",
+              "lifecycle_class": "exited",
+              "session_type": "agent",
+              "session_uuid": "sess-stale",
+              "spawn_point": "local"
+            }
+          }
+        },
+        "frames": [
+          {
+            "entity_type": "project-pipelines.run",
+            "items": [
+              {
+                "id": "run-1",
+                "session_uuid": "sess-bravo",
+                "status": "active"
+              }
+            ],
+            "snapshot_seq": 1,
+            "type": "snapshot"
+          }
+        ],
+        "name": "exclude_snapshot"
+      },
+      {
+        "expected_projection": {
+          "options": [
+            {
+              "label": "Alpha",
+              "metadata": {
+                "label": "Alpha",
+                "lifecycle_class": "current",
+                "session_type": "agent",
+                "spawn_point": "local"
+              },
+              "value": "sess-alpha"
+            },
+            {
+              "label": "Charlie",
+              "metadata": {
+                "label": "Charlie",
+                "lifecycle_class": "current",
+                "session_type": "agent",
+                "spawn_point": "remote"
+              },
+              "value": "sess-charlie"
+            }
+          ],
+          "selection_valid": true
+        },
+        "expected_store": {
+          "project-pipelines.run": {
+            "run-1": {
+              "id": "run-1",
+              "session_uuid": "sess-bravo",
+              "status": "active"
+            }
+          },
+          "session": {
+            "sess-alpha": {
+              "id": "sess-alpha",
+              "label": "Alpha",
+              "lifecycle_class": "current",
+              "session_type": "agent",
+              "session_uuid": "sess-alpha",
+              "spawn_point": "local"
+            },
+            "sess-bravo": {
+              "id": "sess-bravo",
+              "label": "Bravo",
+              "lifecycle_class": "current",
+              "session_type": "agent",
+              "session_uuid": "sess-bravo",
+              "spawn_point": "local"
+            },
+            "sess-charlie": {
+              "id": "sess-charlie",
+              "label": "Charlie",
+              "lifecycle_class": "current",
+              "session_type": "agent",
+              "session_uuid": "sess-charlie",
+              "spawn_point": "remote"
+            },
+            "sess-stale": {
+              "id": "sess-stale",
+              "label": "Stale",
+              "lifecycle_class": "exited",
+              "session_type": "agent",
+              "session_uuid": "sess-stale",
+              "spawn_point": "local"
+            }
+          }
+        },
+        "frames": [
+          {
+            "entity_type": "session",
+            "fields": {
+              "label": "Charlie",
+              "lifecycle_class": "current",
+              "session_type": "agent",
+              "session_uuid": "sess-charlie",
+              "spawn_point": "remote"
+            },
+            "id": "sess-charlie",
+            "seq": 2,
+            "type": "upsert"
+          }
+        ],
+        "name": "source_upsert"
+      },
+      {
+        "expected_projection": {
+          "options": [
+            {
+              "label": "Alpha Z",
+              "metadata": {
+                "label": "Alpha Z",
+                "lifecycle_class": "current",
+                "session_type": "agent",
+                "spawn_point": "local"
+              },
+              "value": "sess-alpha"
+            },
+            {
+              "label": "Charlie",
+              "metadata": {
+                "label": "Charlie",
+                "lifecycle_class": "current",
+                "session_type": "agent",
+                "spawn_point": "remote"
+              },
+              "value": "sess-charlie"
+            }
+          ],
+          "selection_valid": true
+        },
+        "expected_store": {
+          "project-pipelines.run": {
+            "run-1": {
+              "id": "run-1",
+              "session_uuid": "sess-bravo",
+              "status": "active"
+            }
+          },
+          "session": {
+            "sess-alpha": {
+              "id": "sess-alpha",
+              "label": "Alpha Z",
+              "lifecycle_class": "current",
+              "session_type": "agent",
+              "session_uuid": "sess-alpha",
+              "spawn_point": "local"
+            },
+            "sess-bravo": {
+              "id": "sess-bravo",
+              "label": "Bravo",
+              "lifecycle_class": "current",
+              "session_type": "agent",
+              "session_uuid": "sess-bravo",
+              "spawn_point": "local"
+            },
+            "sess-charlie": {
+              "id": "sess-charlie",
+              "label": "Charlie",
+              "lifecycle_class": "current",
+              "session_type": "agent",
+              "session_uuid": "sess-charlie",
+              "spawn_point": "remote"
+            },
+            "sess-stale": {
+              "id": "sess-stale",
+              "label": "Stale",
+              "lifecycle_class": "exited",
+              "session_type": "agent",
+              "session_uuid": "sess-stale",
+              "spawn_point": "local"
+            }
+          }
+        },
+        "frames": [
+          {
+            "entity_type": "session",
+            "fields": {
+              "label": "Alpha Z"
+            },
+            "id": "sess-alpha",
+            "seq": 3,
+            "type": "patch"
+          }
+        ],
+        "name": "source_patch"
+      },
+      {
+        "expected_projection": {
+          "options": [
+            {
+              "label": "Alpha Z",
+              "metadata": {
+                "label": "Alpha Z",
+                "lifecycle_class": "current",
+                "session_type": "agent",
+                "spawn_point": "local"
+              },
+              "value": "sess-alpha"
+            }
+          ],
+          "selection_valid": true
+        },
+        "expected_store": {
+          "project-pipelines.run": {
+            "run-1": {
+              "id": "run-1",
+              "session_uuid": "sess-bravo",
+              "status": "active"
+            }
+          },
+          "session": {
+            "sess-alpha": {
+              "id": "sess-alpha",
+              "label": "Alpha Z",
+              "lifecycle_class": "current",
+              "session_type": "agent",
+              "session_uuid": "sess-alpha",
+              "spawn_point": "local"
+            },
+            "sess-bravo": {
+              "id": "sess-bravo",
+              "label": "Bravo",
+              "lifecycle_class": "current",
+              "session_type": "agent",
+              "session_uuid": "sess-bravo",
+              "spawn_point": "local"
+            },
+            "sess-stale": {
+              "id": "sess-stale",
+              "label": "Stale",
+              "lifecycle_class": "exited",
+              "session_type": "agent",
+              "session_uuid": "sess-stale",
+              "spawn_point": "local"
+            }
+          }
+        },
+        "frames": [
+          {
+            "entity_type": "session",
+            "id": "sess-charlie",
+            "seq": 4,
+            "type": "remove"
+          }
+        ],
+        "name": "source_remove"
+      },
+      {
+        "expected_projection": {
+          "options": [
+            {
+              "label": "Alpha Z",
+              "metadata": {
+                "label": "Alpha Z",
+                "lifecycle_class": "current",
+                "session_type": "agent",
+                "spawn_point": "local"
+              },
+              "value": "sess-alpha"
+            },
+            {
+              "label": "Bravo",
+              "metadata": {
+                "label": "Bravo",
+                "lifecycle_class": "current",
+                "session_type": "agent",
+                "spawn_point": "local"
+              },
+              "value": "sess-bravo"
+            }
+          ],
+          "selection_valid": true
+        },
+        "expected_store": {
+          "project-pipelines.run": {},
+          "session": {
+            "sess-alpha": {
+              "id": "sess-alpha",
+              "label": "Alpha Z",
+              "lifecycle_class": "current",
+              "session_type": "agent",
+              "session_uuid": "sess-alpha",
+              "spawn_point": "local"
+            },
+            "sess-bravo": {
+              "id": "sess-bravo",
+              "label": "Bravo",
+              "lifecycle_class": "current",
+              "session_type": "agent",
+              "session_uuid": "sess-bravo",
+              "spawn_point": "local"
+            },
+            "sess-stale": {
+              "id": "sess-stale",
+              "label": "Stale",
+              "lifecycle_class": "exited",
+              "session_type": "agent",
+              "session_uuid": "sess-stale",
+              "spawn_point": "local"
+            }
+          }
+        },
+        "frames": [
+          {
+            "entity_type": "project-pipelines.run",
+            "id": "run-1",
+            "seq": 2,
+            "type": "remove"
+          }
+        ],
+        "name": "exclude_remove"
+      },
+      {
+        "expected_projection": {
+          "options": [
+            {
+              "label": "Alpha",
+              "metadata": {
+                "label": "Alpha",
+                "lifecycle_class": "current",
+                "session_type": "agent",
+                "spawn_point": "local"
+              },
+              "value": "dup-value"
+            }
+          ],
+          "selection_valid": false
+        },
+        "expected_store": {
+          "project-pipelines.run": {},
+          "session": {
+            "row-a": {
+              "id": "row-a",
+              "label": "Zulu",
+              "lifecycle_class": "current",
+              "session_type": "agent",
+              "session_uuid": "dup-value",
+              "spawn_point": "local"
+            },
+            "row-b": {
+              "id": "row-b",
+              "label": "Alpha",
+              "lifecycle_class": "current",
+              "session_type": "agent",
+              "session_uuid": "dup-value",
+              "spawn_point": "local"
+            }
+          }
+        },
+        "frames": [
+          {
+            "entity_type": "session",
+            "items": [
+              {
+                "id": "row-a",
+                "label": "Zulu",
+                "lifecycle_class": "current",
+                "session_type": "agent",
+                "session_uuid": "dup-value",
+                "spawn_point": "local"
+              },
+              {
+                "id": "row-b",
+                "label": "Alpha",
+                "lifecycle_class": "current",
+                "session_type": "agent",
+                "session_uuid": "dup-value",
+                "spawn_point": "local"
+              }
+            ],
+            "snapshot_seq": 5,
+            "type": "snapshot"
+          }
+        ],
+        "name": "duplicate_values"
+      },
+      {
+        "expected_projection": {
+          "options": [
+            {
+              "label": "café",
+              "metadata": {
+                "label": "café",
+                "lifecycle_class": "current",
+                "session_type": "agent",
+                "spawn_point": "local"
+              },
+              "value": "sess-café"
+            },
+            {
+              "label": "会話-😀",
+              "metadata": {
+                "label": "会話-😀",
+                "lifecycle_class": "current",
+                "session_type": "agent",
+                "spawn_point": "local"
+              },
+              "value": "sess-会話"
+            }
+          ],
+          "selection_valid": false
+        },
+        "expected_store": {
+          "project-pipelines.run": {},
+          "session": {
+            "sess-cafe": {
+              "id": "sess-cafe",
+              "label": "café",
+              "lifecycle_class": "current",
+              "session_type": "agent",
+              "session_uuid": "sess-café",
+              "spawn_point": "local"
+            },
+            "sess-jp": {
+              "id": "sess-jp",
+              "label": "会話-😀",
+              "lifecycle_class": "current",
+              "session_type": "agent",
+              "session_uuid": "sess-会話",
+              "spawn_point": "local"
+            }
+          }
+        },
+        "frames": [
+          {
+            "entity_type": "session",
+            "items": [
+              {
+                "id": "sess-cafe",
+                "label": "café",
+                "lifecycle_class": "current",
+                "session_type": "agent",
+                "session_uuid": "sess-café",
+                "spawn_point": "local"
+              },
+              {
+                "id": "sess-jp",
+                "label": "会話-😀",
+                "lifecycle_class": "current",
+                "session_type": "agent",
+                "session_uuid": "sess-会話",
+                "spawn_point": "local"
+              }
+            ],
+            "snapshot_seq": 6,
+            "type": "snapshot"
+          }
+        ],
+        "name": "unicode_labels"
+      },
+      {
+        "expected_projection": {
+          "options": [
+            {
+              "label": "Alpha",
+              "metadata": {
+                "label": "Alpha",
+                "lifecycle_class": "current",
+                "session_type": "agent",
+                "spawn_point": "local"
+              },
+              "value": "sess-alpha"
+            }
+          ],
+          "selection_valid": true
+        },
+        "expected_store": {
+          "project-pipelines.run": {},
+          "session": {
+            "sess-alpha": {
+              "id": "sess-alpha",
+              "label": "Alpha",
+              "lifecycle_class": "current",
+              "session_type": "agent",
+              "session_uuid": "sess-alpha",
+              "spawn_point": "local"
+            }
+          }
+        },
+        "frames": [
+          {
+            "entity_type": "session",
+            "items": [
+              {
+                "id": "sess-alpha",
+                "label": "Alpha",
+                "lifecycle_class": "current",
+                "session_type": "agent",
+                "session_uuid": "sess-alpha",
+                "spawn_point": "local"
+              }
+            ],
+            "resync_reason": "reconnect",
+            "snapshot_seq": 10,
+            "type": "snapshot"
+          },
+          {
+            "entity_type": "project-pipelines.run",
+            "items": [],
+            "resync_reason": "reconnect",
+            "snapshot_seq": 10,
+            "type": "snapshot"
+          }
+        ],
+        "name": "reconnect_snapshot"
+      },
+      {
+        "expected_projection": {
+          "options": [
+            {
+              "label": "Alpha",
+              "metadata": {
+                "label": "Alpha",
+                "lifecycle_class": "current",
+                "session_type": "agent",
+                "spawn_point": "local"
+              },
+              "value": "sess-alpha"
+            },
+            {
+              "label": "Delta",
+              "metadata": {
+                "label": "Delta",
+                "lifecycle_class": "current",
+                "session_type": "agent",
+                "spawn_point": "local"
+              },
+              "value": "sess-delta"
+            }
+          ],
+          "selection_valid": true
+        },
+        "expected_store": {
+          "project-pipelines.run": {},
+          "session": {
+            "sess-alpha": {
+              "id": "sess-alpha",
+              "label": "Alpha",
+              "lifecycle_class": "current",
+              "session_type": "agent",
+              "session_uuid": "sess-alpha",
+              "spawn_point": "local"
+            },
+            "sess-delta": {
+              "id": "sess-delta",
+              "label": "Delta",
+              "lifecycle_class": "current",
+              "session_type": "agent",
+              "session_uuid": "sess-delta",
+              "spawn_point": "local"
+            }
+          }
+        },
+        "frames": [
+          {
+            "entity_type": "session",
+            "items": [
+              {
+                "id": "sess-alpha",
+                "label": "Alpha",
+                "lifecycle_class": "current",
+                "session_type": "agent",
+                "session_uuid": "sess-alpha",
+                "spawn_point": "local"
+              },
+              {
+                "id": "sess-delta",
+                "label": "Delta",
+                "lifecycle_class": "current",
+                "session_type": "agent",
+                "session_uuid": "sess-delta",
+                "spawn_point": "local"
+              }
+            ],
+            "resync_reason": "gap",
+            "snapshot_seq": 20,
+            "type": "snapshot"
+          }
+        ],
+        "name": "gap_recovery_snapshot"
+      },
+      {
+        "expected_projection": {
+          "options": [
+            {
+              "label": "Delta",
+              "metadata": {
+                "label": "Delta",
+                "lifecycle_class": "current",
+                "session_type": "agent",
+                "spawn_point": "local"
+              },
+              "value": "sess-delta"
+            }
+          ],
+          "selection_valid": false
+        },
+        "expected_store": {
+          "project-pipelines.run": {},
+          "session": {
+            "sess-delta": {
+              "id": "sess-delta",
+              "label": "Delta",
+              "lifecycle_class": "current",
+              "session_type": "agent",
+              "session_uuid": "sess-delta",
+              "spawn_point": "local"
+            }
+          }
+        },
+        "frames": [
+          {
+            "entity_type": "session",
+            "id": "sess-alpha",
+            "seq": 21,
+            "type": "remove"
+          }
+        ],
+        "name": "selection_invalid"
+      }
+    ]
+  },
   "fixtures": {
     "accepted": {
       "action_id": "ticket.create",

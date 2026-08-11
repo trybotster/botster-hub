@@ -3173,6 +3173,197 @@ return botster.register({
 }
 
 #[test]
+fn entity_options_select_admits_dual_families_and_serves_fresh_snapshots() {
+    let root = unique_short_test_dir("entity-options-select");
+    fs::create_dir_all(&root).expect("create entity-options package");
+    fs::write(
+        root.join("botster-package.json"),
+        serde_json::json!({
+            "name": "project-pipelines",
+            "version": "1.0.0",
+            "kind": "plugin",
+            "botster": ">=0.1.0",
+            "source": { "type": "path", "path": root.canonicalize().expect("package path") },
+            "capabilities": [{ "surface": "surfaces" }],
+            "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }]
+        })
+        .to_string(),
+    )
+    .expect("write entity-options manifest");
+    fs::write(
+        root.join("plugin.lua"),
+        r#"
+local generation = 0
+return botster.register({
+  handlers = {
+    {
+      id = "picker",
+      kind = "surface_route",
+      descriptor_id = "project-pipelines.picker",
+      call = function()
+        return {
+          type = "select",
+          id = "session-picker",
+          props = {
+            name = "session",
+            label = "Session",
+            options_source = {
+              ["$kind"] = "entity_options",
+              source = "/session",
+              value_field = "session_uuid",
+              display_fields = { "label", "lifecycle_class" },
+              order = { "label", "session_uuid" },
+              where = { lifecycle_class = "current" },
+              exclude = {
+                source = "/project-pipelines.run",
+                value_field = "session_uuid",
+                where = { status = "active" },
+              },
+            },
+          },
+        }
+      end,
+    },
+    {
+      id = "runs",
+      kind = "entity_provider",
+      descriptor_id = "project-pipelines.run",
+      descriptor = { entity_type = "project-pipelines.run", id_field = "id" },
+      call = function(request)
+        generation = generation + 1
+        return {
+          type = "entity_snapshot",
+          entity_type = "project-pipelines.run",
+          snapshot_seq = generation,
+          items = {{
+            id = "run-1",
+            session_uuid = "sess-alpha",
+            status = "active",
+            subscription_id = request.subscription_id,
+          }},
+        }
+      end,
+    },
+  },
+})
+"#,
+    )
+    .expect("write entity-options plugin");
+    let mut policy = default_package_policy();
+    policy
+        .install_local_path(&root, "install entity-options package")
+        .expect("install entity-options package");
+    policy
+        .enable("project-pipelines", "enable entity-options package")
+        .expect("enable entity-options package");
+    let registry = policy.registry().clone();
+    let mut hub = explicit_runtime("entity-options-select");
+    hub.load_lua_plugin_package(&registry, "project-pipelines")
+        .expect("load entity-options package");
+
+    let surface = hub
+        .render_plugin_surface(
+            "project-pipelines",
+            "project-pipelines.picker",
+            serde_json::json!({}),
+        )
+        .expect("render entity-options select surface");
+    let families = botster_ui_contract::collect_entity_option_families(&surface);
+    assert_eq!(
+        families,
+        vec![
+            "project-pipelines.run".to_string(),
+            "session".to_string()
+        ]
+    );
+
+    for (subscription_id, generation) in [("first", 1_u64), ("reconnect", 2_u64)] {
+        let (snapshot_seq, items) = hub
+            .plugin_entity_snapshot("project-pipelines.run", subscription_id)
+            .expect("subscribe exclude family through Hub worker");
+        assert_eq!(snapshot_seq, generation);
+        assert_eq!(items[0]["session_uuid"], "sess-alpha");
+        assert_eq!(items[0]["subscription_id"], subscription_id);
+    }
+
+    // Foreign exclude family is rejected as invalid_surface without loading.
+    fs::write(
+        root.join("plugin.lua"),
+        r#"
+return botster.register({
+  handlers = {
+    {
+      id = "picker",
+      kind = "surface_route",
+      descriptor_id = "project-pipelines.picker",
+      call = function()
+        return {
+          type = "select",
+          id = "session-picker",
+          props = {
+            name = "session",
+            label = "Session",
+            options_source = {
+              ["$kind"] = "entity_options",
+              source = "/session",
+              value_field = "session_uuid",
+              display_fields = { "label" },
+              order = { "label" },
+              exclude = {
+                source = "/project-pipelines.ticket",
+                value_field = "session_uuid",
+              },
+            },
+          },
+        }
+      end,
+    },
+    {
+      id = "runs",
+      kind = "entity_provider",
+      descriptor_id = "project-pipelines.run",
+      descriptor = { entity_type = "project-pipelines.run", id_field = "id" },
+      call = function()
+        return {
+          type = "entity_snapshot",
+          entity_type = "project-pipelines.run",
+          snapshot_seq = 1,
+          items = {},
+        }
+      end,
+    },
+  },
+})
+"#,
+    )
+    .expect("write foreign exclude plugin");
+    let mut foreign_policy = default_package_policy();
+    foreign_policy
+        .install_local_path(&root, "reinstall foreign exclude package")
+        .expect("reinstall");
+    foreign_policy
+        .enable("project-pipelines", "enable foreign exclude package")
+        .expect("enable");
+    let foreign_registry = foreign_policy.registry().clone();
+    let mut foreign_hub = explicit_runtime("entity-options-foreign");
+    foreign_hub
+        .load_lua_plugin_package(&foreign_registry, "project-pipelines")
+        .expect("load foreign exclude package");
+    let error = foreign_hub
+        .render_plugin_surface(
+            "project-pipelines",
+            "project-pipelines.picker",
+            serde_json::json!({}),
+        )
+        .expect_err("undeclared exclude family must fail admission");
+    assert_eq!(error.code, "invalid_surface");
+    assert!(
+        error.message.contains("/project-pipelines.ticket"),
+        "{error:?}"
+    );
+}
+
+#[test]
 fn dotted_package_entity_provider_rejects_noncanonical_owner_tokens() {
     for (label, entity_type, expected_error) in [
         (

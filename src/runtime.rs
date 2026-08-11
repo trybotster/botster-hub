@@ -2463,6 +2463,16 @@ fn validate_plugin_surface_binding_value(
                         validate_plugin_surface_binding_path(path, admitted_families)?;
                     }
                 }
+                Some("entity_options") => {
+                    if let Some(path) = object.get("source").and_then(serde_json::Value::as_str) {
+                        validate_plugin_surface_binding_path(path, admitted_families)?;
+                    }
+                    if let Some(exclude) = object.get("exclude").and_then(serde_json::Value::as_object)
+                        && let Some(path) = exclude.get("source").and_then(serde_json::Value::as_str)
+                    {
+                        validate_plugin_surface_binding_path(path, admitted_families)?;
+                    }
+                }
                 _ => {}
             }
             for value in object.values() {
@@ -2721,6 +2731,126 @@ mod tests {
             validate_plugin_surface_binding_families(&node, &admitted)
                 .expect_err("undeclared or foreign family must remain rejected");
         }
+    }
+
+    #[test]
+    fn plugin_surface_entity_options_admission_accepts_session_and_declared_exclude() {
+        let admitted = BTreeSet::from(["project-pipelines.run".to_string()]);
+        let node = binding_test_node(serde_json::json!({
+            "type": "select",
+            "id": "session-select",
+            "props": {
+                "name": "session",
+                "label": "Session",
+                "options_source": {
+                    "$kind": "entity_options",
+                    "source": "/session",
+                    "value_field": "session_uuid",
+                    "display_fields": ["label"],
+                    "order": ["label", "session_uuid"],
+                    "exclude": {
+                        "source": "/project-pipelines.run",
+                        "value_field": "session_uuid"
+                    }
+                }
+            }
+        }));
+        validate_plugin_surface_node(&node, &admitted)
+            .expect("session source and declared package exclude are admitted");
+    }
+
+    #[test]
+    fn plugin_surface_entity_options_admission_rejects_undeclared_source_and_exclude() {
+        let admitted = BTreeSet::from(["project-pipelines.run".to_string()]);
+        for options_source in [
+            serde_json::json!({
+                "$kind": "entity_options",
+                "source": "/project-pipelines.ticket",
+                "value_field": "id",
+                "display_fields": ["label"],
+                "order": ["label"]
+            }),
+            serde_json::json!({
+                "$kind": "entity_options",
+                "source": "/session",
+                "value_field": "session_uuid",
+                "display_fields": ["label"],
+                "order": ["label"],
+                "exclude": {
+                    "source": "/project-pipelines.ticket",
+                    "value_field": "session_uuid"
+                }
+            }),
+        ] {
+            let node = binding_test_node(serde_json::json!({
+                "type": "select",
+                "id": "session-select",
+                "props": {
+                    "name": "session",
+                    "label": "Session",
+                    "options_source": options_source
+                }
+            }));
+            let error = validate_plugin_surface_node(&node, &admitted)
+                .expect_err("undeclared entity-options family must fail");
+            assert_eq!(error.code, "invalid_surface");
+        }
+    }
+
+    #[test]
+    fn plugin_surface_entity_options_action_result_uses_same_admission() {
+        let admitted = BTreeSet::from(["project-pipelines.run".to_string()]);
+        let (request, mut result) = binding_action_result("/session");
+        result.replacement = Some(Box::new(
+            serde_json::from_value(serde_json::json!({
+                "type": "select",
+                "id": "session-select",
+                "props": {
+                    "name": "session",
+                    "label": "Session",
+                    "options_source": {
+                        "$kind": "entity_options",
+                        "source": "/session",
+                        "value_field": "session_uuid",
+                        "display_fields": ["label"],
+                        "order": ["label"],
+                        "exclude": {
+                            "source": "/project-pipelines.run",
+                            "value_field": "session_uuid"
+                        }
+                    }
+                }
+            }))
+            .expect("entity-options replacement"),
+        ));
+        validate_plugin_surface_action_result(&result, &request, &admitted)
+            .expect("action-result entity-options admitted with declared families");
+
+        result.replacement = Some(Box::new(
+            serde_json::from_value(serde_json::json!({
+                "type": "select",
+                "id": "session-select",
+                "props": {
+                    "name": "session",
+                    "label": "Session",
+                    "options_source": {
+                        "$kind": "entity_options",
+                        "source": "/session",
+                        "value_field": "session_uuid",
+                        "display_fields": ["label"],
+                        "order": ["label"],
+                        "exclude": {
+                            "source": "/project-pipelines.ticket",
+                            "value_field": "session_uuid"
+                        }
+                    }
+                }
+            }))
+            .expect("rejected entity-options replacement"),
+        ));
+        let error = validate_plugin_surface_action_result(&result, &request, &admitted)
+            .expect_err("undeclared exclude family must fail action result");
+        assert_eq!(error.code, "invalid_action_result");
     }
 
     fn binding_action_result(source: &str) -> (UiActionRequest, UiActionResult) {

@@ -30,8 +30,16 @@ use serde_json::{Map, Value};
 use thiserror::Error;
 
 mod assets;
+mod entity_options;
 
 pub use assets::{conformance_fixtures_json, json_schema, typescript_declarations};
+pub use entity_options::{
+    EntityFamilyStore, EntityOption, EntityOptionsFrame, EntityOptionsProjection,
+    EntityRecordItem, UiEntityOptionsExclude, UiEntityOptionsKind, UiEntityOptionsSource,
+    apply_entity_options_frame, apply_entity_options_frames, collect_entity_option_families,
+    entity_family_subscription_id, project_entity_options, project_entity_options_from_store,
+    validate_entity_options_source,
+};
 
 /// Transport-neutral UI surface metadata carried by a package manifest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1805,6 +1813,10 @@ fn validate_prop_value(
                 })?;
                 validate_token_value(kind, prop, value)?;
             }
+            "entity_options" if kind == UiNodeKind::Select && prop == "options_source" => {
+                let descriptor = deserialize_prop::<UiEntityOptionsSource>(kind, prop, value)?;
+                validate_entity_options_source(kind, prop, &descriptor)?;
+            }
             other => {
                 return Err(UiValidationError::InvalidProp {
                     kind,
@@ -1821,6 +1833,17 @@ fn validate_prop_value(
         (UiNodeKind::FormField, "schema") => {
             let schema = deserialize_prop::<UiFieldSchema>(kind, prop, value)?;
             validate_field_schema(kind, prop, &schema)?;
+        }
+        (UiNodeKind::Select, "options_source") => {
+            // Validated in the `$kind: entity_options` branch above. Reject
+            // non-entity_options shapes that slipped past without a $kind arm.
+            if value.get("$kind").and_then(Value::as_str) != Some("entity_options") {
+                return Err(UiValidationError::InvalidProp {
+                    kind,
+                    prop: prop.to_string(),
+                    reason: "options_source must use $kind entity_options".to_string(),
+                });
+            }
         }
         (
             UiNodeKind::TextInput
@@ -2437,6 +2460,44 @@ fn validate_prop_combinations(node: &UiNode) -> Result<(), UiValidationError> {
             kind: node.kind,
             prop: "title",
         });
+    }
+
+    if node.kind == UiNodeKind::Select {
+        let has_static_options = node
+            .slots
+            .get("options")
+            .is_some_and(|children| !children.is_empty());
+        let has_entity_options = node.props.contains_key("options_source");
+        match (has_static_options, has_entity_options) {
+            (true, false) | (false, true) => {}
+            (true, true) => {
+                return Err(UiValidationError::InvalidProp {
+                    kind: node.kind,
+                    prop: "options_source".to_string(),
+                    reason: "select cannot combine static options with options_source".to_string(),
+                });
+            }
+            (false, false) => {
+                return Err(UiValidationError::MissingSlot {
+                    kind: node.kind,
+                    slot: "options",
+                });
+            }
+        }
+        if has_static_options {
+            for child in node.slots.get("options").into_iter().flatten() {
+                match child {
+                    UiChild::Node(option) if option.kind == UiNodeKind::SelectOption => {}
+                    _ => {
+                        return Err(UiValidationError::InvalidProp {
+                            kind: node.kind,
+                            prop: "options".to_string(),
+                            reason: "options slot may only contain select_option nodes".to_string(),
+                        });
+                    }
+                }
+            }
+        }
     }
 
     Ok(())
@@ -3181,10 +3242,12 @@ fn schema_for(kind: UiNodeKind) -> UiNodeSchema {
                 "loading",
                 "error",
                 "validation",
+                "options_source",
             ],
             &["name", "label"],
             &["options"],
-            &["options"],
+            // options xor options_source enforced in validate_prop_combinations
+            &[],
         ),
         UiNodeKind::SelectOption => schema(
             &["value", "label", "disabled"],
