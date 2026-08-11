@@ -92,6 +92,16 @@ Implementation choices within plan latitude:
 1. Live proof vehicle: dedicated `tests/hub_lua_runtime_test.rs` package surface (not plugin-contract-matrix extension) — plan allowed either.
 2. hub-test-support package version bumped **0.1.27 → 0.1.28** solely for the ui-contract pin string.
 
+## Review findings addressed (revisit)
+
+| Finding | Resolution |
+| --- | --- |
+| `finding_1786478573_477450` publish hub-test-support registry pin | `packages/hub-test-support/package.json` depends on `@trybotster/ui-contract@0.3.2` (registry coordinate). Pre-publish smoke uses a temporary tarball install without rewriting the committed manifest. |
+| `finding_1786478573_670996` duplicate insertion order | Projector sorts `order` keys → option value → **source record id** (UTF-8 bytes) in Rust and JS; first-after-sort wins. Dual tests with opposite insertion order. |
+| `finding_1786478573_703595` where equality domain | Authored `where` values are **JSON strings only** (validation + schema + TS). Runtime compare is exact string identity (no `JSON.stringify`). |
+| `finding_1786478573_794752` absolute paths in report | Binary paths recorded as ticket-worktree-relative `target/debug/...`. |
+| `finding_1786478573_892237` trailing whitespace | Plan markdown trailing spaces removed; `git diff --check origin/main...HEAD` clean. |
+
 ## Production path evidence
 
 1. **Author** — package surface returns `ui.select` with `props.options_source.$kind = entity_options`.
@@ -156,8 +166,8 @@ cd packages/hub-test-support && npm install ../ui-contract/trybotster-ui-contrac
 | Hub source SHA (branch tip) | `e06036e` on `project-pipelines/ticket_1786474779_865884` |
 | PR | https://github.com/trybotster/botster-hub/pull/205 |
 | Locked Core SHA (`Cargo.lock`) | `ff115694caf61e435bfb3d7ffcc5a6459689c8d9` |
-| `botster-hub` binary realpath | `/Users/jasonconigliari/botster-sessions/trybotster-botster-hub-project-pipelines-ticket_1786474779_865884/target/debug/botster-hub` |
-| `botster-session-worker` binary realpath | `/Users/jasonconigliari/botster-sessions/trybotster-botster-hub-project-pipelines-ticket_1786474779_865884/target/debug/botster-session-worker` |
+| `botster-hub` binary realpath | ticket-worktree `target/debug/botster-hub` |
+| `botster-session-worker` binary realpath | ticket-worktree `target/debug/botster-session-worker` |
 
 ## Unverified behavior / residual risk
 

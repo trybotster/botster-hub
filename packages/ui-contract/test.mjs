@@ -125,6 +125,63 @@ for (const step of timeline.timeline) {
   );
 }
 
+// Duplicate values with equal order keys: record-id UTF-8 order decides,
+// independent of Object.entries insertion order.
+const dupDescriptor = {
+  $kind: "entity_options",
+  source: "/session",
+  value_field: "session_uuid",
+  display_fields: ["label"],
+  order: ["label"],
+};
+const dupZFirst = {
+  "z-late": { session_uuid: "dup", label: "Same" },
+  "a-early": { session_uuid: "dup", label: "Same" },
+};
+const dupAFirst = {
+  "a-early": { session_uuid: "dup", label: "Same" },
+  "z-late": { session_uuid: "dup", label: "Same" },
+};
+assert.deepEqual(
+  projectEntityOptions(dupDescriptor, dupZFirst, {}, null),
+  projectEntityOptions(dupDescriptor, dupAFirst, {}, null),
+);
+assert.equal(
+  projectEntityOptions(dupDescriptor, dupZFirst, {}, null).options[0].value,
+  "dup",
+);
+
+// String where equality is exact; non-string where expected fails closed.
+assert.deepEqual(
+  projectEntityOptions(
+    {
+      ...dupDescriptor,
+      where: { lifecycle_class: "current" },
+    },
+    {
+      s1: { session_uuid: "a", label: "A", lifecycle_class: "current" },
+      s2: { session_uuid: "b", label: "B", lifecycle_class: "exited" },
+    },
+    {},
+    null,
+  ).options.map((o) => o.value),
+  ["a"],
+);
+assert.deepEqual(
+  projectEntityOptions(
+    {
+      ...dupDescriptor,
+      where: { lifecycle_class: { nested: true } },
+    },
+    {
+      s1: { session_uuid: "a", label: "A", lifecycle_class: "current" },
+    },
+    {},
+    null,
+  ).options,
+  [],
+);
+
 const declarations = fs.readFileSync(
   new URL("./index.d.ts", import.meta.url),
   "utf8",

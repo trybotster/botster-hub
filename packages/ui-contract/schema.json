@@ -507,6 +507,9 @@
           "type": "string"
         },
         "where": {
+          "additionalProperties": {
+            "type": "string"
+          },
           "type": "object"
         }
       },
@@ -550,6 +553,9 @@
           "type": "string"
         },
         "where": {
+          "additionalProperties": {
+            "type": "string"
+          },
           "type": "object"
         }
       },

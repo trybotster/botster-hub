@@ -18,8 +18,8 @@ export declare function collectEntityOptionFamilies(node: JsonObject): string[];
 export declare function entityFamilySubscriptionId(authoredPath: string): string | null;
 export type UiBindListDescendantId = { $kind: "bind_list_descendant_id"; key: string };
 export type UiEntityOptionsKind = "entity_options";
-export interface UiEntityOptionsExclude { source: string; value_field: string; where?: Record<string, JsonValue>; }
-export interface UiEntityOptionsSource { $kind: UiEntityOptionsKind; source: string; value_field: string; display_fields: string[]; order: string[]; where?: Record<string, JsonValue>; exclude?: UiEntityOptionsExclude; }
+export interface UiEntityOptionsExclude { source: string; value_field: string; where?: Record<string, string>; }
+export interface UiEntityOptionsSource { $kind: UiEntityOptionsKind; source: string; value_field: string; display_fields: string[]; order: string[]; where?: Record<string, string>; exclude?: UiEntityOptionsExclude; }
 export interface EntityOption { value: string; label: string; metadata?: Record<string, string>; }
 export interface EntityOptionsProjection { options: EntityOption[]; selection_valid: boolean; }
 export type UiAuthoredNodeId = UiNodeId | UiBind | UiBindListDescendantId;

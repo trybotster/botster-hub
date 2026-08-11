@@ -3589,6 +3589,94 @@ fn entity_options_xor_static_options_and_validates_descriptor() {
 }
 
 #[test]
+fn entity_options_duplicate_values_use_record_id_utf8_tiebreak() {
+    use botster_ui_contract::{
+        EntityOption, EntityOptionsProjection, UiEntityOptionsKind, UiEntityOptionsSource,
+        project_entity_options,
+    };
+    use std::collections::BTreeMap;
+
+    let descriptor = UiEntityOptionsSource {
+        kind: UiEntityOptionsKind::EntityOptions,
+        source: "/session".to_string(),
+        value_field: "session_uuid".to_string(),
+        display_fields: vec!["label".to_string()],
+        order: vec!["label".to_string()],
+        r#where: BTreeMap::new(),
+        exclude: None,
+    };
+    // Equal order key + equal value; record id decides. Opposite map insertion
+    // order must not change the winner (BTreeMap sorts by id regardless).
+    let mut records_a_first = BTreeMap::new();
+    records_a_first.insert(
+        "z-late".to_string(),
+        json!({ "session_uuid": "dup", "label": "Same" })
+            .as_object()
+            .cloned()
+            .unwrap(),
+    );
+    records_a_first.insert(
+        "a-early".to_string(),
+        json!({ "session_uuid": "dup", "label": "Same" })
+            .as_object()
+            .cloned()
+            .unwrap(),
+    );
+    let mut records_z_first = BTreeMap::new();
+    records_z_first.insert(
+        "a-early".to_string(),
+        json!({ "session_uuid": "dup", "label": "Same" })
+            .as_object()
+            .cloned()
+            .unwrap(),
+    );
+    records_z_first.insert(
+        "z-late".to_string(),
+        json!({ "session_uuid": "dup", "label": "Same" })
+            .as_object()
+            .cloned()
+            .unwrap(),
+    );
+    let empty = BTreeMap::new();
+    let left = project_entity_options(&descriptor, &records_a_first, &empty, None);
+    let right = project_entity_options(&descriptor, &records_z_first, &empty, None);
+    assert_eq!(left, right);
+    assert_eq!(
+        left,
+        EntityOptionsProjection {
+            options: vec![EntityOption {
+                value: "dup".to_string(),
+                label: "Same".to_string(),
+                metadata: BTreeMap::from([("label".to_string(), "Same".to_string())]),
+            }],
+            selection_valid: true,
+        }
+    );
+}
+
+#[test]
+fn entity_options_where_values_must_be_json_strings() {
+    assert_error_contains(
+        node(
+            UiNodeKind::Select,
+            json!({
+                "name": "session",
+                "label": "Session",
+                "options_source": {
+                    "$kind": "entity_options",
+                    "source": "/session",
+                    "value_field": "session_uuid",
+                    "display_fields": ["label"],
+                    "order": ["label"],
+                    "where": { "lifecycle_class": { "nested": true } }
+                }
+            }),
+        ),
+        "where values must be JSON strings",
+    );
+}
+
+#[test]
 fn entity_options_timeline_fixture_matches_projector_and_collector() {
     use botster_ui_contract::{
         EntityOptionsFrame, apply_entity_options_frame, collect_entity_option_families,
