@@ -1,13 +1,15 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use botster_ui_contract::{
-    PackageNavigationEntry, PackageSurfaceDescriptor, PackageSurfaceKind, PackageSurfaceOperation,
-    UiActionKind, UiActionRequest, UiActionResult, UiActionResultState, UiBindIf,
-    UiCapabilityFallback, UiColorToken, UiDensity, UiDialogPresentation, UiFieldKind,
+    EntityOptionsFrame, PackageNavigationEntry, PackageSurfaceDescriptor, PackageSurfaceKind,
+    PackageSurfaceOperation, UiActionKind, UiActionRequest, UiActionResult, UiActionResultState,
+    UiBindIf, UiCapabilityFallback, UiColorToken, UiDensity, UiDialogPresentation, UiFieldKind,
     UiHeightClass, UiIframePermission, UiIframeSandboxToken, UiMetricTrendDirection, UiNode,
     UiNodeKind, UiOrientation, UiPointer, UiSelectionMode, UiSpaceToken, UiTableColumnAlign,
-    UiToolbarOverflow, UiVariant, UiWidthClass, conformance_fixtures_json, json_schema,
-    realize_bind_list_descendant_id, typescript_declarations,
+    UiToolbarOverflow, UiVariant, UiWidthClass, apply_entity_options_frame,
+    collect_entity_option_families, conformance_fixtures_json, entity_family_subscription_id,
+    json_schema, project_entity_options_from_store, realize_bind_list_descendant_id,
+    typescript_declarations,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -108,6 +110,37 @@ fn generated_fixtures_deserialize_and_validate_through_rust_authority() {
     rejected.validate().expect("rejected fixture validates");
     assert!(request.values.is_some());
     assert!(request.payload.is_some());
+
+    let timeline = &conformance["entity_options_reactive_timeline"];
+    let sample: UiNode =
+        serde_json::from_value(timeline["sample_node"].clone()).expect("entity-options sample");
+    sample
+        .validate_authored()
+        .expect("entity-options sample validates");
+    assert_eq!(
+        collect_entity_option_families(&sample),
+        serde_json::from_value::<Vec<String>>(timeline["collector_from_sample_node"].clone())
+            .expect("collector families")
+    );
+    let descriptor: botster_ui_contract::UiEntityOptionsSource =
+        serde_json::from_value(timeline["descriptor"].clone()).expect("descriptor");
+    let mut store = botster_ui_contract::EntityFamilyStore::new();
+    for step in timeline["timeline"].as_array().expect("timeline") {
+        let frames: Vec<EntityOptionsFrame> =
+            serde_json::from_value(step["frames"].clone()).expect("frames");
+        for frame in &frames {
+            apply_entity_options_frame(&mut store, frame);
+        }
+        let projection = project_entity_options_from_store(
+            &descriptor,
+            &store,
+            timeline["selection"].as_str(),
+        );
+        let expected: botster_ui_contract::EntityOptionsProjection =
+            serde_json::from_value(step["expected_projection"].clone()).expect("projection");
+        assert_eq!(projection, expected);
+        assert!(entity_family_subscription_id("/session").as_deref() == Some("session"));
+    }
 }
 
 #[test]

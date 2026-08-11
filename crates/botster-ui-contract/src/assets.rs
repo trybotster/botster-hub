@@ -1,12 +1,15 @@
 use crate::{
-    PackageSurfaceKind, PackageSurfaceOperation, UiActionKind, UiActionResultState,
-    UiCapabilityFallback, UiColorToken, UiDensity, UiDialogPresentation, UiFieldKind,
-    UiHeightClass, UiIframePermission, UiIframeSandboxToken, UiMetricTrendDirection, UiNodeKind,
-    UiOrientation, UiPointer, UiSelectionMode, UiSpaceToken, UiTableColumnAlign, UiToolbarOverflow,
-    UiVariant, UiWidthClass,
+    EntityOptionsFrame, EntityRecordItem, PackageSurfaceKind, PackageSurfaceOperation,
+    UiActionKind, UiActionResultState, UiCapabilityFallback, UiColorToken, UiDensity,
+    UiDialogPresentation, UiEntityOptionsExclude, UiEntityOptionsKind, UiEntityOptionsSource,
+    UiFieldKind, UiHeightClass, UiIframePermission, UiIframeSandboxToken, UiMetricTrendDirection,
+    UiNodeKind, UiOrientation, UiPointer, UiSelectionMode, UiSpaceToken, UiTableColumnAlign,
+    UiToolbarOverflow, UiVariant, UiWidthClass, apply_entity_options_frame,
+    project_entity_options_from_store,
 };
 use serde::Serialize;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
+use std::collections::BTreeMap;
 
 trait WireEnum: Copy + Serialize + 'static {
     fn variants() -> &'static [Self];
@@ -235,7 +238,7 @@ pub fn typescript_declarations() -> String {
 pub fn json_schema() -> Value {
     json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "$id": "https://trybotster.dev/schemas/ui-contract-0.3.1.json",
+        "$id": "https://trybotster.dev/schemas/ui-contract-0.3.2.json",
         "title": "Botster UI Contract",
         "oneOf": [
             { "$ref": "#/$defs/UiNode" },
@@ -595,7 +598,7 @@ pub fn json_schema() -> Value {
                     {
                         "if": {
                             "properties": {
-                                "type": { "enum": ["text_input", "textarea", "checkbox", "select"] }
+                                "type": { "enum": ["text_input", "textarea", "checkbox"] }
                             },
                             "required": ["type"]
                         },
@@ -608,6 +611,26 @@ pub fn json_schema() -> Value {
                                     "properties": {
                                         "name": { "$ref": "#/$defs/UiNonBindableValue" },
                                         "label": { "$ref": "#/$defs/UiNonBindableValue" }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    {
+                        "if": {
+                            "properties": { "type": { "const": "select" } },
+                            "required": ["type"]
+                        },
+                        "then": {
+                            "required": ["props"],
+                            "properties": {
+                                "props": {
+                                    "type": "object",
+                                    "required": ["name", "label"],
+                                    "properties": {
+                                        "name": { "$ref": "#/$defs/UiNonBindableValue" },
+                                        "label": { "$ref": "#/$defs/UiNonBindableValue" },
+                                        "options_source": { "$ref": "#/$defs/UiEntityOptionsSource" }
                                     }
                                 }
                             }
@@ -680,6 +703,38 @@ pub fn json_schema() -> Value {
                     "where": { "type": "object" },
                     "item_template": { "$ref": "#/$defs/UiNode" },
                     "empty_template": { "$ref": "#/$defs/UiNode" }
+                }
+            },
+            "UiEntityOptionsExclude": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["source", "value_field"],
+                "properties": {
+                    "source": { "type": "string", "pattern": "^/[^/]+$" },
+                    "value_field": { "type": "string", "pattern": "\\S" },
+                    "where": { "type": "object" }
+                }
+            },
+            "UiEntityOptionsSource": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["$kind", "source", "value_field", "display_fields", "order"],
+                "properties": {
+                    "$kind": { "const": "entity_options" },
+                    "source": { "type": "string", "pattern": "^/[^/]+$" },
+                    "value_field": { "type": "string", "pattern": "\\S" },
+                    "display_fields": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": { "type": "string", "pattern": "\\S" }
+                    },
+                    "order": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": { "type": "string", "pattern": "\\S" }
+                    },
+                    "where": { "type": "object" },
+                    "exclude": { "$ref": "#/$defs/UiEntityOptionsExclude" }
                 }
             },
             "UiBindIf": {
@@ -762,11 +817,336 @@ pub fn json_schema() -> Value {
     })
 }
 
+fn entity_options_reactive_timeline_fixture() -> Value {
+    let descriptor = UiEntityOptionsSource {
+        kind: UiEntityOptionsKind::EntityOptions,
+        source: "/session".to_string(),
+        value_field: "session_uuid".to_string(),
+        display_fields: vec![
+            "label".to_string(),
+            "lifecycle_class".to_string(),
+            "session_type".to_string(),
+            "spawn_point".to_string(),
+        ],
+        order: vec!["label".to_string(), "session_uuid".to_string()],
+        r#where: BTreeMap::from([("lifecycle_class".to_string(), json!("current"))]),
+        exclude: Some(UiEntityOptionsExclude {
+            source: "/project-pipelines.run".to_string(),
+            value_field: "session_uuid".to_string(),
+            r#where: BTreeMap::from([("status".to_string(), json!("active"))]),
+        }),
+    };
+
+    let selection = "sess-alpha";
+    let mut store = crate::EntityFamilyStore::new();
+    let mut timeline = Vec::new();
+
+    let mut push_step = |name: &str, frames: Vec<EntityOptionsFrame>, store: &mut crate::EntityFamilyStore| {
+        for frame in &frames {
+            apply_entity_options_frame(store, frame);
+        }
+        let projection = project_entity_options_from_store(&descriptor, store, Some(selection));
+        timeline.push(json!({
+            "name": name,
+            "frames": frames,
+            "expected_store": store,
+            "expected_projection": projection,
+        }));
+    };
+
+    push_step(
+        "source_snapshot",
+        vec![EntityOptionsFrame::Snapshot {
+            entity_type: "session".to_string(),
+            snapshot_seq: 1,
+            resync_reason: None,
+            items: vec![
+                entity_item(
+                    "sess-alpha",
+                    json!({
+                        "session_uuid": "sess-alpha",
+                        "label": "Alpha",
+                        "lifecycle_class": "current",
+                        "session_type": "agent",
+                        "spawn_point": "local"
+                    }),
+                ),
+                entity_item(
+                    "sess-bravo",
+                    json!({
+                        "session_uuid": "sess-bravo",
+                        "label": "Bravo",
+                        "lifecycle_class": "current",
+                        "session_type": "agent",
+                        "spawn_point": "local"
+                    }),
+                ),
+                entity_item(
+                    "sess-stale",
+                    json!({
+                        "session_uuid": "sess-stale",
+                        "label": "Stale",
+                        "lifecycle_class": "exited",
+                        "session_type": "agent",
+                        "spawn_point": "local"
+                    }),
+                ),
+            ],
+        }],
+        &mut store,
+    );
+
+    push_step(
+        "exclude_snapshot",
+        vec![EntityOptionsFrame::Snapshot {
+            entity_type: "project-pipelines.run".to_string(),
+            snapshot_seq: 1,
+            resync_reason: None,
+            items: vec![entity_item(
+                "run-1",
+                json!({
+                    "id": "run-1",
+                    "session_uuid": "sess-bravo",
+                    "status": "active"
+                }),
+            )],
+        }],
+        &mut store,
+    );
+
+    push_step(
+        "source_upsert",
+        vec![EntityOptionsFrame::Upsert {
+            entity_type: "session".to_string(),
+            id: "sess-charlie".to_string(),
+            seq: 2,
+            fields: object_fields(json!({
+                "session_uuid": "sess-charlie",
+                "label": "Charlie",
+                "lifecycle_class": "current",
+                "session_type": "agent",
+                "spawn_point": "remote"
+            })),
+        }],
+        &mut store,
+    );
+
+    push_step(
+        "source_patch",
+        vec![EntityOptionsFrame::Patch {
+            entity_type: "session".to_string(),
+            id: "sess-alpha".to_string(),
+            seq: 3,
+            fields: object_fields(json!({ "label": "Alpha Z" })),
+        }],
+        &mut store,
+    );
+
+    push_step(
+        "source_remove",
+        vec![EntityOptionsFrame::Remove {
+            entity_type: "session".to_string(),
+            id: "sess-charlie".to_string(),
+            seq: 4,
+        }],
+        &mut store,
+    );
+
+    push_step(
+        "exclude_remove",
+        vec![EntityOptionsFrame::Remove {
+            entity_type: "project-pipelines.run".to_string(),
+            id: "run-1".to_string(),
+            seq: 2,
+        }],
+        &mut store,
+    );
+
+    push_step(
+        "duplicate_values",
+        vec![EntityOptionsFrame::Snapshot {
+            entity_type: "session".to_string(),
+            snapshot_seq: 5,
+            resync_reason: None,
+            items: vec![
+                entity_item(
+                    "row-a",
+                    json!({
+                        "session_uuid": "dup-value",
+                        "label": "Zulu",
+                        "lifecycle_class": "current",
+                        "session_type": "agent",
+                        "spawn_point": "local"
+                    }),
+                ),
+                entity_item(
+                    "row-b",
+                    json!({
+                        "session_uuid": "dup-value",
+                        "label": "Alpha",
+                        "lifecycle_class": "current",
+                        "session_type": "agent",
+                        "spawn_point": "local"
+                    }),
+                ),
+            ],
+        }],
+        &mut store,
+    );
+
+    push_step(
+        "unicode_labels",
+        vec![EntityOptionsFrame::Snapshot {
+            entity_type: "session".to_string(),
+            snapshot_seq: 6,
+            resync_reason: None,
+            items: vec![
+                entity_item(
+                    "sess-cafe",
+                    json!({
+                        "session_uuid": "sess-café",
+                        "label": "café",
+                        "lifecycle_class": "current",
+                        "session_type": "agent",
+                        "spawn_point": "local"
+                    }),
+                ),
+                entity_item(
+                    "sess-jp",
+                    json!({
+                        "session_uuid": "sess-会話",
+                        "label": "会話-😀",
+                        "lifecycle_class": "current",
+                        "session_type": "agent",
+                        "spawn_point": "local"
+                    }),
+                ),
+            ],
+        }],
+        &mut store,
+    );
+
+    push_step(
+        "reconnect_snapshot",
+        vec![
+            EntityOptionsFrame::Snapshot {
+                entity_type: "session".to_string(),
+                snapshot_seq: 10,
+                resync_reason: Some("reconnect".to_string()),
+                items: vec![entity_item(
+                    "sess-alpha",
+                    json!({
+                        "session_uuid": "sess-alpha",
+                        "label": "Alpha",
+                        "lifecycle_class": "current",
+                        "session_type": "agent",
+                        "spawn_point": "local"
+                    }),
+                )],
+            },
+            EntityOptionsFrame::Snapshot {
+                entity_type: "project-pipelines.run".to_string(),
+                snapshot_seq: 10,
+                resync_reason: Some("reconnect".to_string()),
+                items: vec![],
+            },
+        ],
+        &mut store,
+    );
+
+    push_step(
+        "gap_recovery_snapshot",
+        vec![EntityOptionsFrame::Snapshot {
+            entity_type: "session".to_string(),
+            snapshot_seq: 20,
+            resync_reason: Some("gap".to_string()),
+            items: vec![
+                entity_item(
+                    "sess-alpha",
+                    json!({
+                        "session_uuid": "sess-alpha",
+                        "label": "Alpha",
+                        "lifecycle_class": "current",
+                        "session_type": "agent",
+                        "spawn_point": "local"
+                    }),
+                ),
+                entity_item(
+                    "sess-delta",
+                    json!({
+                        "session_uuid": "sess-delta",
+                        "label": "Delta",
+                        "lifecycle_class": "current",
+                        "session_type": "agent",
+                        "spawn_point": "local"
+                    }),
+                ),
+            ],
+        }],
+        &mut store,
+    );
+
+    push_step(
+        "selection_invalid",
+        vec![EntityOptionsFrame::Remove {
+            entity_type: "session".to_string(),
+            id: "sess-alpha".to_string(),
+            seq: 21,
+        }],
+        &mut store,
+    );
+
+    let sample_node = json!({
+        "type": "select",
+        "id": "session-select",
+        "props": {
+            "name": "session",
+            "label": "Session",
+            "options_source": descriptor
+        }
+    });
+    let sample_ui: crate::UiNode =
+        serde_json::from_value(sample_node.clone()).expect("sample select node");
+    let collector_from_sample_node = crate::collect_entity_option_families(&sample_ui);
+
+    json!({
+        "descriptor": descriptor,
+        "selection": selection,
+        "sample_node": sample_node,
+        "collector_vectors": [
+            { "authored_path": "/session", "subscription_id": "session" },
+            { "authored_path": "/project-pipelines.run", "subscription_id": "project-pipelines.run" },
+            {
+                "authored_path": "/bns1_626f74737465722e706c7567696e2d636f6e74726163742d6d6174726978.run",
+                "subscription_id": "bns1_626f74737465722e706c7567696e2d636f6e74726163742d6d6174726978.run"
+            },
+            { "authored_path": "/session/sess-1/label", "subscription_id": null },
+            { "authored_path": "session", "subscription_id": null }
+        ],
+        "collector_from_sample_node": collector_from_sample_node,
+        "timeline": timeline
+    })
+}
+
+fn entity_item(id: &str, fields: Value) -> EntityRecordItem {
+    EntityRecordItem {
+        id: id.to_string(),
+        fields: object_fields(fields),
+    }
+}
+
+fn object_fields(value: Value) -> Map<String, Value> {
+    value
+        .as_object()
+        .cloned()
+        .expect("entity fields must be an object")
+}
+
 /// Generate renderer-neutral fixtures from the Rust-owned wire vocabulary.
 #[must_use]
 pub fn conformance_fixtures_json() -> Value {
     json!({
-        "contract_version": "0.3.1",
+        "contract_version": "0.3.2",
         "bind_list_descendant_identity_vectors": [
             {
                 "row": "session-1",
@@ -799,6 +1179,7 @@ pub fn conformance_fixtures_json() -> Value {
                 "realized_id": "botster-ui-descendant-v1:28:botster-ui-descendant-v1:1:x10:0:prefix:9"
             }
         ],
+        "entity_options_reactive_timeline": entity_options_reactive_timeline_fixture(),
         "fixtures": {
             "package_presentation": {
                 "surfaces": [{
@@ -984,7 +1365,20 @@ export declare const packageVersion: string;
 export declare const schema: JsonObject;
 export declare const conformanceFixtures: JsonObject;
 export declare function realizeBindListDescendantId(rowId: string, key: string): UiNodeId;
+export declare function projectEntityOptions(
+  descriptor: UiEntityOptionsSource,
+  sourceRecords: Record<string, JsonObject>,
+  excludeRecords: Record<string, JsonObject>,
+  selection?: string | null,
+): EntityOptionsProjection;
+export declare function collectEntityOptionFamilies(node: JsonObject): string[];
+export declare function entityFamilySubscriptionId(authoredPath: string): string | null;
 export type UiBindListDescendantId = { $kind: "bind_list_descendant_id"; key: string };
+export type UiEntityOptionsKind = "entity_options";
+export interface UiEntityOptionsExclude { source: string; value_field: string; where?: Record<string, JsonValue>; }
+export interface UiEntityOptionsSource { $kind: UiEntityOptionsKind; source: string; value_field: string; display_fields: string[]; order: string[]; where?: Record<string, JsonValue>; exclude?: UiEntityOptionsExclude; }
+export interface EntityOption { value: string; label: string; metadata?: Record<string, string>; }
+export interface EntityOptionsProjection { options: EntityOption[]; selection_valid: boolean; }
 export type UiAuthoredNodeId = UiNodeId | UiBind | UiBindListDescendantId;
 export type UiActionId = string;
 export type UiSurfaceId = string;
@@ -1030,6 +1424,7 @@ export type UiMenuItemProps = JsonObject & { label: UiBindableString; action: Ui
 export type UiTextProps = JsonObject & { text: UiAuthoredTextValue };
 export type UiIframeProps = JsonObject & { src: UiBindableString; title: UiBindableString };
 export type UiFieldControlProps = JsonObject & { name: UiNonBindableValue; label: UiNonBindableValue };
+export type UiSelectProps = JsonObject & { name: UiNonBindableValue; label: UiNonBindableValue; options_source?: UiEntityOptionsSource };
 export type UiSelectOptionProps = JsonObject & { value: UiNonBindableValue; label: UiNonBindableValue };
 export type UiCustomProps = JsonObject & { namespace: string; component: string; reason: string };
 export interface UiNodeBase { id?: UiAuthoredNodeId; children?: UiChild[]; slots?: Record<string, UiChild[]>; }
@@ -1051,7 +1446,8 @@ export type UiNode =
   | (UiNodeBase & { type: "menu_item"; props: UiMenuItemProps })
   | (UiNodeBase & { type: "text"; props: UiTextProps })
   | (UiNodeBase & { type: "iframe"; props: UiIframeProps })
-  | (UiNodeBase & { type: "text_input" | "textarea" | "checkbox" | "select"; props: UiFieldControlProps })
+  | (UiNodeBase & { type: "text_input" | "textarea" | "checkbox"; props: UiFieldControlProps })
+  | (UiNodeBase & { type: "select"; props: UiSelectProps })
   | (UiNodeBase & { type: "select_option"; props: UiSelectOptionProps })
   | (UiNodeBase & { type: "terminal_view"; props: UiRequiredNonBindableProps<"session_id"> })
   | (UiNodeBase & { type: "connection_code_view"; props: UiRequiredNonBindableProps<"code"> })

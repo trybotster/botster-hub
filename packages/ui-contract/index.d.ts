@@ -8,7 +8,20 @@ export declare const packageVersion: string;
 export declare const schema: JsonObject;
 export declare const conformanceFixtures: JsonObject;
 export declare function realizeBindListDescendantId(rowId: string, key: string): UiNodeId;
+export declare function projectEntityOptions(
+  descriptor: UiEntityOptionsSource,
+  sourceRecords: Record<string, JsonObject>,
+  excludeRecords: Record<string, JsonObject>,
+  selection?: string | null,
+): EntityOptionsProjection;
+export declare function collectEntityOptionFamilies(node: JsonObject): string[];
+export declare function entityFamilySubscriptionId(authoredPath: string): string | null;
 export type UiBindListDescendantId = { $kind: "bind_list_descendant_id"; key: string };
+export type UiEntityOptionsKind = "entity_options";
+export interface UiEntityOptionsExclude { source: string; value_field: string; where?: Record<string, JsonValue>; }
+export interface UiEntityOptionsSource { $kind: UiEntityOptionsKind; source: string; value_field: string; display_fields: string[]; order: string[]; where?: Record<string, JsonValue>; exclude?: UiEntityOptionsExclude; }
+export interface EntityOption { value: string; label: string; metadata?: Record<string, string>; }
+export interface EntityOptionsProjection { options: EntityOption[]; selection_valid: boolean; }
 export type UiAuthoredNodeId = UiNodeId | UiBind | UiBindListDescendantId;
 export type UiActionId = string;
 export type UiSurfaceId = string;
@@ -54,6 +67,7 @@ export type UiMenuItemProps = JsonObject & { label: UiBindableString; action: Ui
 export type UiTextProps = JsonObject & { text: UiAuthoredTextValue };
 export type UiIframeProps = JsonObject & { src: UiBindableString; title: UiBindableString };
 export type UiFieldControlProps = JsonObject & { name: UiNonBindableValue; label: UiNonBindableValue };
+export type UiSelectProps = JsonObject & { name: UiNonBindableValue; label: UiNonBindableValue; options_source?: UiEntityOptionsSource };
 export type UiSelectOptionProps = JsonObject & { value: UiNonBindableValue; label: UiNonBindableValue };
 export type UiCustomProps = JsonObject & { namespace: string; component: string; reason: string };
 export interface UiNodeBase { id?: UiAuthoredNodeId; children?: UiChild[]; slots?: Record<string, UiChild[]>; }
@@ -75,7 +89,8 @@ export type UiNode =
   | (UiNodeBase & { type: "menu_item"; props: UiMenuItemProps })
   | (UiNodeBase & { type: "text"; props: UiTextProps })
   | (UiNodeBase & { type: "iframe"; props: UiIframeProps })
-  | (UiNodeBase & { type: "text_input" | "textarea" | "checkbox" | "select"; props: UiFieldControlProps })
+  | (UiNodeBase & { type: "text_input" | "textarea" | "checkbox"; props: UiFieldControlProps })
+  | (UiNodeBase & { type: "select"; props: UiSelectProps })
   | (UiNodeBase & { type: "select_option"; props: UiSelectOptionProps })
   | (UiNodeBase & { type: "terminal_view"; props: UiRequiredNonBindableProps<"session_id"> })
   | (UiNodeBase & { type: "connection_code_view"; props: UiRequiredNonBindableProps<"code"> })

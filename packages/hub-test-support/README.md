@@ -18,10 +18,10 @@ node packages/hub-test-support/scripts/sync-assets.mjs
 
 ## Usage
 
-Use this command for version 0.1.27:
+Use this command for version 0.1.28:
 
 ```sh
-npm install --save-dev @trybotster/ui-contract@0.3.1 @trybotster/hub-test-support@0.1.27
+npm install --save-dev @trybotster/ui-contract@0.3.2 @trybotster/hub-test-support@0.1.28
 ```
 
 ```js
@@ -81,12 +81,12 @@ Use this exact package spec in npm-based client repos:
 ```json
 {
   "devDependencies": {
-    "@trybotster/hub-test-support": "0.1.27"
+    "@trybotster/hub-test-support": "0.1.28"
   }
 }
 ```
 
-`@trybotster/hub-test-support@0.1.27` carries explicit session-type execution
+`@trybotster/hub-test-support@0.1.28` carries explicit session-type execution
 modes, spawn-point session-type listing (`list_session_types_for_target`), and
 the session-type authoring view
 (`show_session_type_definition`). It uses conformance fixture revision 33 and
@@ -106,7 +106,7 @@ Only `read_screen_text` is renderable restored content; `snapshot` and
 version 0.1.5 / revision 12 exposes lossy string history. Neither is current
 binary-history contract authority.
 
-Version 0.1.27 carries protocol version 6 / conformance revision 33 and the
+Version 0.1.28 carries protocol version 6 / conformance revision 33 and the
 `DaemonSessionTypeExecution` contract. The contract defines the explicit
 `relative_executable` and `shell_command` modes.
 It also carries spawn-point session-type listing
@@ -117,7 +117,7 @@ the `read_only_session_type_source` refusal). It retains the generic
 package-owned entity records and the `plugin_entity_subscriptions`
 compatibility feature, authoritative session-type request/response and entity
 records, and requires the `session_type_entity_subscriptions` feature. It
-depends on `@trybotster/ui-contract@0.3.1` for the canonical UiNode,
+depends on `@trybotster/ui-contract@0.3.2` for the canonical UiNode,
 UiActionRequest, UiActionResult, package surface, and package navigation
 declarations and conformance fixtures. It also carries the optional
 aggregate plugin-worker counters prepared in the unpublished 0.1.15 artifact.
@@ -155,7 +155,7 @@ row's literal class and reject unresolved required values; the Rust path also
 passes the materialized Button through strict realized UiNode validation.
 The coordinated UI contract also closes earlier accidental authored acceptance
 of sentinels on required fields outside the explicit seven-field allowlist;
-0.3.1 is the intended prepared coordinate for that narrowing because the
+0.3.2 is the intended prepared coordinate for that narrowing because the
 distinct unpublished 0.3.0 bytes may already have been packed or consumed.
 The Node reference materializer proves matching `current`, `ended`,
 and `indeterminate` rows before an absent UUID selects the unavailable path,

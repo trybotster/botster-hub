@@ -30,6 +30,16 @@ authored item template. The canonical helper realizes them as
 `botster-ui-descendant-v1:<row-bytes>:<row><key-bytes>:<key>`; consumers must
 call the exported helper rather than synthesize IDs locally.
 
+`ui.select` may produce options either as static `select_option` children or via
+`props.options_source` with `$kind: "entity_options"`. The entity-options
+producer projects string values only from admitted entity families, excludes
+values from an optional second family, and sorts with exact UTF-8 byte order.
+Shared helpers `projectEntityOptions` and `collectEntityOptionFamilies` (Rust
+and npm) plus the `entity_options_reactive_timeline` conformance fixture are
+the dual-runtime authority for that projection. Clients walk the rendered body,
+issue explicit `SubscribeEntities` for collected families, and project over the
+entity store; Hub admits and serves those families but does not auto-subscribe.
+
 Clients filter rows, resolve the direct root, then realize descendants before
 any identity enters renderer, focus, hit, or action state. The new keyed form
 is invalid on the item root, outside a bound item template, under
@@ -43,7 +53,7 @@ Authored validation accepts a structurally valid `UiBind` for
 require a nonblank string. `Text.text` retains its existing presence-only
 literal contract, including empty strings, numbers, and null; only its authored
 binding sentinel receives structural validation. Other required fields remain
-non-bindable. Version 0.3.1 intentionally closes an earlier permissive gap:
+non-bindable. Version 0.3.2 intentionally closes an earlier permissive gap:
 required fields outside this seven-field allowlist now reject a binding
 sentinel that an earlier authored validator could admit accidentally.
 

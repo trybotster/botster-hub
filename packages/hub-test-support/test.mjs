@@ -132,7 +132,7 @@ function assertDialogFormComposition(source) {
 }
 
 assert.equal(metadata.package_name, "@trybotster/hub-test-support");
-assert.equal(metadata.package_version, "0.1.27");
+assert.equal(metadata.package_version, "0.1.28");
 assert.equal(metadata.protocol, "botster-hub-daemon-v1");
 assert.equal(metadata.protocol_version, 6);
 assert.equal(metadata.conformance_fixture_revision, 33);
@@ -148,7 +148,7 @@ assert.equal(metadata.conformance_fixture_revision, 33);
   assert.match(
     readme,
     new RegExp(
-      String.raw`npm install --save-dev @trybotster/ui-contract@0\.3\.1 @trybotster/hub-test-support@${version.replaceAll(".", String.raw`\.`)}`,
+      String.raw`npm install --save-dev @trybotster/ui-contract@0\.3\.2 @trybotster/hub-test-support@${version.replaceAll(".", String.raw`\.`)}`,
     ),
     "README install command must pin the package.json version",
   );
@@ -178,7 +178,7 @@ assert.equal(metadata.conformance_fixture_revision, 33);
 assert.deepEqual(metadata.ui_contract, {
   conformance_fixture_export: "@trybotster/ui-contract/conformance-fixtures",
   package_name: "@trybotster/ui-contract",
-  package_version: "0.3.1",
+  package_version: "0.3.2",
 });
 assert.deepEqual(metadata.application_primitives, {
   fixture_package_name: "botster.plugin-contract-matrix",
@@ -387,7 +387,7 @@ assert.match(
   /node_modules[\\/]@trybotster[\\/]ui-contract[\\/]/,
 );
 const uiContractFixtures = await readUiContractConformanceFixtures();
-assert.equal(uiContractFixtures.contract_version, "0.3.1");
+assert.equal(uiContractFixtures.contract_version, "0.3.2");
 assert.equal(
   uiContractFixtures.fixtures.dialog_presence.predicate.key,
   "create-ticket-dialog",

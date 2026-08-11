@@ -3515,3 +3515,127 @@ fn crate_root_iframe_policy_types_use_the_wire_vocabulary() {
         botster_ui_contract::UiIframePermission::Fullscreen
     );
 }
+
+#[test]
+fn entity_options_xor_static_options_and_validates_descriptor() {
+    let mut static_only = node(
+        UiNodeKind::Select,
+        json!({ "name": "status", "label": "Status" }),
+    );
+    static_only.slots.insert(
+        "options".to_string(),
+        vec![UiChild::Node(Box::new(node(
+            UiNodeKind::SelectOption,
+            json!({ "value": "open", "label": "Open" }),
+        )))],
+    );
+    static_only
+        .validate()
+        .expect("static select options remain valid");
+
+    let entity_only = node(
+        UiNodeKind::Select,
+        json!({
+            "name": "session",
+            "label": "Session",
+            "options_source": {
+                "$kind": "entity_options",
+                "source": "/session",
+                "value_field": "session_uuid",
+                "display_fields": ["label"],
+                "order": ["label", "session_uuid"]
+            }
+        }),
+    );
+    entity_only
+        .validate()
+        .expect("entity-options select validates");
+
+    let mut both = entity_only.clone();
+    both.slots.insert(
+        "options".to_string(),
+        vec![UiChild::Node(Box::new(node(
+            UiNodeKind::SelectOption,
+            json!({ "value": "open", "label": "Open" }),
+        )))],
+    );
+    assert_error_contains(both, "cannot combine static options");
+
+    assert_error_contains(
+        node(
+            UiNodeKind::Select,
+            json!({ "name": "session", "label": "Session" }),
+        ),
+        "options",
+    );
+
+    assert_error_contains(
+        node(
+            UiNodeKind::Select,
+            json!({
+                "name": "session",
+                "label": "Session",
+                "options_source": {
+                    "$kind": "entity_options",
+                    "source": "session",
+                    "value_field": "session_uuid",
+                    "display_fields": ["label"],
+                    "order": ["label"]
+                }
+            }),
+        ),
+        "absolute entity family path",
+    );
+}
+
+#[test]
+fn entity_options_timeline_fixture_matches_projector_and_collector() {
+    use botster_ui_contract::{
+        EntityOptionsFrame, apply_entity_options_frame, collect_entity_option_families,
+        conformance_fixtures_json, entity_family_subscription_id, project_entity_options_from_store,
+    };
+
+    let conformance = conformance_fixtures_json();
+    let fixture = &conformance["entity_options_reactive_timeline"];
+    let descriptor: botster_ui_contract::UiEntityOptionsSource =
+        serde_json::from_value(fixture["descriptor"].clone()).expect("descriptor");
+    let selection = fixture["selection"].as_str();
+    let sample: UiNode =
+        serde_json::from_value(fixture["sample_node"].clone()).expect("sample node");
+    sample.validate().expect("sample entity-options select");
+    assert_eq!(
+        collect_entity_option_families(&sample),
+        serde_json::from_value::<Vec<String>>(fixture["collector_from_sample_node"].clone())
+            .expect("collector families")
+    );
+
+    for vector in fixture["collector_vectors"].as_array().expect("vectors") {
+        let authored = vector["authored_path"].as_str().expect("path");
+        let expected = vector["subscription_id"].as_str().map(str::to_string);
+        assert_eq!(
+            entity_family_subscription_id(authored),
+            expected,
+            "collector oracle for {authored}"
+        );
+    }
+
+    let mut store = botster_ui_contract::EntityFamilyStore::new();
+    for step in fixture["timeline"].as_array().expect("timeline") {
+        let frames: Vec<EntityOptionsFrame> =
+            serde_json::from_value(step["frames"].clone()).expect("frames");
+        for frame in &frames {
+            apply_entity_options_frame(&mut store, frame);
+        }
+        let expected_store: botster_ui_contract::EntityFamilyStore =
+            serde_json::from_value(step["expected_store"].clone()).expect("store");
+        assert_eq!(store, expected_store, "store after {}", step["name"]);
+        let projection = project_entity_options_from_store(&descriptor, &store, selection);
+        let expected: botster_ui_contract::EntityOptionsProjection =
+            serde_json::from_value(step["expected_projection"].clone()).expect("projection");
+        assert_eq!(
+            projection, expected,
+            "projection after {}",
+            step["name"]
+        );
+    }
+}

@@ -1,8 +1,12 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import {
+  applyEntityOptionsFrame,
+  collectEntityOptionFamilies,
   conformanceFixtures,
+  entityFamilySubscriptionId,
   packageVersion,
+  projectEntityOptions,
   realizeBindListDescendantId,
   schema,
 } from "./index.js";
@@ -25,10 +29,6 @@ assert.equal(
   "clear",
 );
 assert.equal(
-  conformanceFixtures.fixtures.selected_workspace_equality.predicate.kind,
-  "equals",
-);
-assert.equal(
   Object.hasOwn(conformanceFixtures.fixtures.dialog_presence.node.props, "open"),
   false,
 );
@@ -36,7 +36,7 @@ assert.deepEqual(
   conformanceFixtures.fixtures.bound_row_identity.children[0].item_template.id,
   { $bind: "@/session_uuid" },
 );
-assert.equal(conformanceFixtures.contract_version, "0.3.1");
+assert.equal(conformanceFixtures.contract_version, "0.3.2");
 assert.equal(
   conformanceFixtures.fixtures.required_bindable_fields.authored.length,
   7,
@@ -80,6 +80,50 @@ assert.equal(
   "#/$defs/UiBind",
 );
 assert.deepEqual(schema.$defs.UiNonBindableValue.not.required, ["$bind"]);
+assert.equal(schema.$defs.UiEntityOptionsSource.properties.$kind.const, "entity_options");
+
+const timeline = conformanceFixtures.entity_options_reactive_timeline;
+assert.ok(timeline, "entity_options_reactive_timeline fixture present");
+assert.equal(timeline.descriptor.$kind, "entity_options");
+
+for (const vector of timeline.collector_vectors) {
+  assert.equal(
+    entityFamilySubscriptionId(vector.authored_path),
+    vector.subscription_id,
+    `collector oracle for ${vector.authored_path}`,
+  );
+}
+assert.deepEqual(
+  collectEntityOptionFamilies(timeline.sample_node),
+  timeline.collector_from_sample_node,
+);
+
+const store = {};
+for (const step of timeline.timeline) {
+  for (const frame of step.frames) {
+    applyEntityOptionsFrame(store, frame);
+  }
+  assert.deepEqual(
+    store,
+    step.expected_store,
+    `store after step ${step.name}`,
+  );
+  const sourceKey = entityFamilySubscriptionId(timeline.descriptor.source);
+  const excludeKey = entityFamilySubscriptionId(
+    timeline.descriptor.exclude?.source,
+  );
+  const projection = projectEntityOptions(
+    timeline.descriptor,
+    store[sourceKey] ?? {},
+    excludeKey ? (store[excludeKey] ?? {}) : {},
+    timeline.selection,
+  );
+  assert.deepEqual(
+    projection,
+    step.expected_projection,
+    `projection after step ${step.name}`,
+  );
+}
 
 const declarations = fs.readFileSync(
   new URL("./index.d.ts", import.meta.url),
@@ -94,6 +138,11 @@ for (const token of [
   "UiIframeProps",
   "UiFieldControlProps",
   "UiSelectOptionProps",
+  "UiSelectProps",
+  "UiEntityOptionsSource",
+  "projectEntityOptions",
+  "collectEntityOptionFamilies",
+  "entityFamilySubscriptionId",
   "UiAuthoredNodeId",
   "UiBindListDescendantId",
   "realizeBindListDescendantId",
