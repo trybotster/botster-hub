@@ -153,7 +153,8 @@ cd packages/hub-test-support && npm install ../ui-contract/trybotster-ui-contrac
 
 | Identity | Value |
 | --- | --- |
-| Hub source SHA (implementation commit) | `c6539b65c011794a4f3952c3f02a55bd7c800c79` |
+| Hub source SHA (branch tip) | `e06036e` on `project-pipelines/ticket_1786474779_865884` |
+| PR | https://github.com/trybotster/botster-hub/pull/205 |
 | Locked Core SHA (`Cargo.lock`) | `ff115694caf61e435bfb3d7ffcc5a6459689c8d9` |
 | `botster-hub` binary realpath | `/Users/jasonconigliari/botster-sessions/trybotster-botster-hub-project-pipelines-ticket_1786474779_865884/target/debug/botster-hub` |
 | `botster-session-worker` binary realpath | `/Users/jasonconigliari/botster-sessions/trybotster-botster-hub-project-pipelines-ticket_1786474779_865884/target/debug/botster-session-worker` |
