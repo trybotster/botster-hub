@@ -18,8 +18,10 @@ node packages/hub-test-support/scripts/sync-assets.mjs
 
 ## Usage
 
+Use this command for version 0.1.27:
+
 ```sh
-npm install --save-dev @trybotster/ui-contract@0.3.1 @trybotster/hub-test-support@0.1.26
+npm install --save-dev @trybotster/ui-contract@0.3.1 @trybotster/hub-test-support@0.1.27
 ```
 
 ```js
@@ -79,16 +81,17 @@ Use this exact package spec in npm-based client repos:
 ```json
 {
   "devDependencies": {
-    "@trybotster/hub-test-support": "0.1.26"
+    "@trybotster/hub-test-support": "0.1.27"
   }
 }
 ```
 
-`@trybotster/hub-test-support@0.1.26` is the published coordinate that carries
-spawn-point session-type listing (`list_session_types_for_target`) plus the
-session-type authoring view (`show_session_type_definition`), conformance
-fixture revision 33, protocol version 6. First-party clients should pin this
-coordinate for spawn-picker and authoring-view support.
+`@trybotster/hub-test-support@0.1.27` carries explicit session-type execution
+modes, spawn-point session-type listing (`list_session_types_for_target`), and
+the session-type authoring view
+(`show_session_type_definition`). It uses conformance fixture revision 33 and
+protocol version 6. First-party clients should pin this coordinate when they
+use these contracts.
 
 The support matrix is generated from the Rust compatibility descriptors.
 `terminal_readback` appears in both `supported_features` and
@@ -103,9 +106,11 @@ Only `read_screen_text` is renderable restored content; `snapshot` and
 version 0.1.5 / revision 12 exposes lossy string history. Neither is current
 binary-history contract authority.
 
-Version 0.1.26 is the published npm coordinate for this package. It carries
-protocol version 6 / conformance revision 33, spawn-point session-type listing
-(`list_session_types_for_target`), and the session-type authoring view
+Version 0.1.27 carries protocol version 6 / conformance revision 33 and the
+`DaemonSessionTypeExecution` contract. The contract defines the explicit
+`relative_executable` and `shell_command` modes.
+It also carries spawn-point session-type listing
+(`list_session_types_for_target`) and the session-type authoring view
 (`show_session_type_definition`, editable `session_type_definition` response
 vocabulary, and the support-matrix `session_type_authoring` section including
 the `read_only_session_type_source` refusal). It retains the generic
@@ -117,7 +122,9 @@ UiActionRequest, UiActionResult, package surface, and package navigation
 declarations and conformance fixtures. It also carries the optional
 aggregate plugin-worker counters prepared in the unpublished 0.1.15 artifact.
 
-Version 0.1.24 was the prior published coordinate at protocol version 6 /
+Version 0.1.26 was the prior published coordinate. It did not include the
+explicit session-type execution contract.
+Version 0.1.24 was an earlier published coordinate at protocol version 6 /
 conformance revision 31 (authoritative software/install identity,
 `CheckHubUpdate`, and the cold removal of package compatibility `hub_version`,
 without the authoring-view request). Version 0.1.22 was the repository
