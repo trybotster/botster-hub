@@ -44,8 +44,13 @@ function matchesWhere(record, where) {
   if (!where || typeof where !== "object") {
     return true;
   }
+  // Authored where values are JSON strings only (Rust validation). Compare
+  // exact string identity — never JSON.stringify, which is key-order fragile.
   for (const [key, expected] of Object.entries(where)) {
-    if (JSON.stringify(record?.[key]) !== JSON.stringify(expected)) {
+    if (typeof expected !== "string") {
+      return false;
+    }
+    if (typeof record?.[key] !== "string" || record[key] !== expected) {
       return false;
     }
   }
@@ -105,7 +110,7 @@ export function projectEntityOptions(
   }
 
   const ranked = [];
-  for (const record of Object.values(sourceRecords ?? {})) {
+  for (const [recordId, record] of Object.entries(sourceRecords ?? {})) {
     if (!matchesWhere(record, descriptor.where)) {
       continue;
     }
@@ -130,9 +135,12 @@ export function projectEntityOptions(
     ranked.push({
       option: { value, label, metadata },
       orderKeys,
+      recordId: String(recordId),
     });
   }
 
+  // order keys → option value → record id (UTF-8 bytes). Record id makes
+  // first-after-sort independent of Object.entries insertion order.
   ranked.sort((left, right) => {
     for (let i = 0; i < left.orderKeys.length; i += 1) {
       const cmp = compareOptionalUtf8Strings(left.orderKeys[i], right.orderKeys[i]);
@@ -140,7 +148,11 @@ export function projectEntityOptions(
         return cmp;
       }
     }
-    return utf8ByteCompare(left.option.value, right.option.value);
+    const valueCmp = utf8ByteCompare(left.option.value, right.option.value);
+    if (valueCmp !== 0) {
+      return valueCmp;
+    }
+    return utf8ByteCompare(left.recordId, right.recordId);
   });
 
   const seen = new Set();

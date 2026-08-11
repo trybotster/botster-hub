@@ -37,7 +37,7 @@
     "fixtures/plugin-contract-matrix"
   ],
   "dependencies": {
-    "@trybotster/ui-contract": "file:../ui-contract/trybotster-ui-contract-0.3.2.tgz"
+    "@trybotster/ui-contract": "0.3.2"
   },
   "scripts": {
     "sync": "node scripts/sync-assets.mjs",

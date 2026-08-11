@@ -168,6 +168,7 @@ Rules:
 
 - Exactly one options producer: static `slots.options` of `select_option` **xor** `props.options_source` with `$kind: entity_options`.
 - Absolute family paths only; exact top-level `where` equality only (BindList grammar).
+- Authored `where` values are **JSON strings only** (UTF-8 byte equality); non-string where values fail validation.
 - `value_field`, non-empty `display_fields`, non-empty `order` required; `exclude` optional but when present requires `source` + `value_field`.
 - Default product surface for this ticket is **`UiNodeKind::Select` only** (not `UiFieldSchema` form-schema options) unless Implement finds schema-driven Select is the live plugin path.
 
@@ -186,7 +187,7 @@ Rules:
 | Metadata | For each `display_fields` entry present as a **string** on the record, copy into option metadata under that field name. Non-string or missing fields omitted from metadata. |
 | Order keys | For each key in `order`: missing field sorts **after** present; present non-string order keys sort **after** present strings (and are ordered only by presence/type rank among non-strings as equal rank, then fall through); string keys compare by **UTF-8 byte order** (Rust: `a.as_bytes().cmp(b.as_bytes())`; JS: compare `TextEncoder().encode` byte sequences lexicographically — **not** `localeCompare`, **not** UTF-16 code units). |
 | Final value tie-break | Same UTF-8 byte order on the option `value` string. |
-| Duplicates | After full sort, first option wins for a given `value`; later duplicates dropped. |
+| Duplicates | After full sort (`order` keys → option `value` → source **record id**, all UTF-8 byte order), first option wins for a given `value`; later duplicates dropped. Record-id tie-break makes selection independent of map insertion order in Rust and JavaScript. |
 | Exclusion | Exclude set = strings from exclude-family records' `exclude.value_field` (string gate). Omit source options whose value is in that set. |
 | Selection invalidation | `selection` must be a string or absent. If `Some(s)` and no projected option equals `s` by UTF-8 bytes, `selection_valid = false`. Contract never auto-picks. |
 | Reconnect / gap | Projector is pure over current family **record maps**. Callers rebuild maps by applying the shared frame timeline (below). |
@@ -280,7 +281,7 @@ If a failure remains, Implement must attribute it with exact test name + unrelat
 
 #### Isolated live Hub scenario (required)
 
-Use an owner-authored package surface on the real path  
+Use an owner-authored package surface on the real path
 `HubDaemon/HubRuntime → plugin worker → PluginSurfaceRender/Action → SubscribeEntities`:
 
 Preferred vehicle: extend **plugin-contract-matrix** fixture (or a surgical sibling surface in that package) so it stays hub-owned conformance material — **or** a minimal path-local test package in `tests/` following `package_owned_entity_provider_drives_surface_admission_and_fresh_snapshots`.

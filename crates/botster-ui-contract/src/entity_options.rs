@@ -219,7 +219,7 @@ fn validate_exact_where(
     prop: &str,
     r#where: &BTreeMap<String, Value>,
 ) -> Result<(), UiValidationError> {
-    for key in r#where.keys() {
+    for (key, value) in r#where {
         if key.trim().is_empty() {
             return Err(UiValidationError::InvalidProp {
                 kind,
@@ -232,6 +232,16 @@ fn validate_exact_where(
                 kind,
                 prop: prop.to_string(),
                 reason: "where filters exact top-level fields only".to_string(),
+            });
+        }
+        // Smallest exact dual-runtime domain: JSON strings only (UTF-8 byte
+        // equality). Objects/numbers/bools would diverge under JSON.stringify
+        // vs serde_json::Value identity.
+        if !value.is_string() {
+            return Err(UiValidationError::InvalidProp {
+                kind,
+                prop: prop.to_string(),
+                reason: "where values must be JSON strings".to_string(),
             });
         }
     }
@@ -322,7 +332,7 @@ pub fn project_entity_options(
 ) -> EntityOptionsProjection {
     let excluded = build_exclusion_set(descriptor, exclude_records);
     let mut ranked = Vec::new();
-    for record in source_records.values() {
+    for (record_id, record) in source_records {
         if !matches_where(record, &descriptor.r#where) {
             continue;
         }
@@ -357,10 +367,13 @@ pub fn project_entity_options(
                 metadata,
             },
             order_keys,
+            record_id.as_str(),
         ));
     }
 
-    ranked.sort_by(|(left, left_keys), (right, right_keys)| {
+    // order keys → option value → record id (UTF-8 bytes). Record id makes
+    // first-after-sort independent of map insertion order across runtimes.
+    ranked.sort_by(|(left, left_keys, left_id), (right, right_keys, right_id)| {
         for (left_key, right_key) in left_keys.iter().zip(right_keys.iter()) {
             let cmp =
                 compare_optional_utf8_strings(left_key.as_deref(), right_key.as_deref());
@@ -368,13 +381,13 @@ pub fn project_entity_options(
                 return cmp;
             }
         }
-        utf8_byte_cmp(&left.value, &right.value)
+        utf8_byte_cmp(&left.value, &right.value).then_with(|| utf8_byte_cmp(left_id, right_id))
     });
 
     // First-after-sort wins for duplicate values.
     let mut seen = BTreeSet::new();
     let mut options = Vec::with_capacity(ranked.len());
-    for (option, _) in ranked {
+    for (option, _, _) in ranked {
         if seen.insert(option.value.clone()) {
             options.push(option);
         }
@@ -411,9 +424,12 @@ fn build_exclusion_set(
 }
 
 fn matches_where(record: &Map<String, Value>, r#where: &BTreeMap<String, Value>) -> bool {
-    r#where
-        .iter()
-        .all(|(key, expected)| record.get(key) == Some(expected))
+    r#where.iter().all(|(key, expected)| {
+        let Some(expected_str) = expected.as_str() else {
+            return false;
+        };
+        record.get(key).and_then(Value::as_str) == Some(expected_str)
+    })
 }
 
 fn string_field(record: &Map<String, Value>, field: &str) -> Option<String> {
