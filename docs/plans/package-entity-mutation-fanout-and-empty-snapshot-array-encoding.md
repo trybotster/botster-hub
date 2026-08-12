@@ -229,11 +229,11 @@ Unknown (detail): exact diagnostic channel for `resync_degraded` (status counter
 7. `daemon_package_entity_publish_gap_pending_then_accepts_in_order`
 8. `daemon_package_entity_publish_out_of_order_with_behind_provider_converges_all_subscribers`
 9. `daemon_package_entity_publish_concurrent_out_of_order_preserves_family_order`
-10. `daemon_package_entity_publish_outside_pending_window_sets_high_water_and_converges`  
+10. `daemon_package_entity_publish_outside_pending_window_sets_high_water_and_converges`
     Publish with `seq > last + 16`; provider initially behind; **no permanent loss**; all subs eventually reach durable high-water state **without package re-publish**; resync attempt count stays within the locked budget.
-11. `daemon_package_entity_second_subscriber_behind_snapshot_does_not_roll_advanced_subscriber`  
+11. `daemon_package_entity_second_subscriber_behind_snapshot_does_not_roll_advanced_subscriber`
     Sub A at N; Sub B’s first provider snapshot is N−1; **Sub A must not receive the N−1 snapshot** and must retain applied N state; Sub B catches up via later non-behind snapshot; family floor never decreases; no duplicate backward delta to A.
-12. `daemon_package_entity_resync_under_stale_provider_is_pressure_bounded`  
+12. `daemon_package_entity_resync_under_stale_provider_is_pressure_bounded`
     Force resync need with a provider that stays behind or slow; assert ≤ locked max attempts / rate; unrelated control requests (e.g. Status) still complete within a bound; degraded path observable.
 13. `daemon_package_entity_held_open_fanout_over_local_webrtc`
 14. `daemon_package_entity_publish_unload_closes_held_subscription`

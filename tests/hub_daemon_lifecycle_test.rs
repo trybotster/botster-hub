@@ -20485,6 +20485,7 @@ fn daemon_package_entity_resync_under_stale_provider_is_pressure_bounded() {
     // Poll Status repeatedly while resync runs under backoff; daemon must stay responsive.
     let started = Instant::now();
     let mut saw_degraded = false;
+    let mut attempts_at_degraded = 0_u64;
     while started.elapsed() < Duration::from_secs(20) {
         let status =
             botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status)
@@ -20498,6 +20499,7 @@ fn daemon_package_entity_resync_under_stale_provider_is_pressure_bounded() {
             .clone();
         if counters.package_entity_resync_degraded > 0 {
             saw_degraded = true;
+            attempts_at_degraded = counters.package_entity_resync_attempts;
             assert!(
                 counters.package_entity_resync_attempts <= 16,
                 "attempts stayed near locked budget, got {}",
@@ -20511,6 +20513,25 @@ fn daemon_package_entity_resync_under_stale_provider_is_pressure_bounded() {
         saw_degraded,
         "stale provider must enter resync_degraded under max attempts"
     );
+    // Unchanged catching_up / stale provider must not start another attempt cycle.
+    let post = Instant::now();
+    while post.elapsed() < Duration::from_secs(3) {
+        let status =
+            botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status)
+                .expect("status remains responsive after degraded");
+        let counters = status
+            .status
+            .as_ref()
+            .expect("status body")
+            .lifecycle_counters
+            .clone();
+        assert_eq!(
+            counters.package_entity_resync_attempts, attempts_at_degraded,
+            "degraded family must not re-arm attempts without a new publish/subscribe"
+        );
+        assert!(counters.package_entity_resync_degraded >= 1);
+        thread::sleep(Duration::from_millis(100));
+    }
 
     let _ = held.unsubscribe();
     shutdown_cli_daemon(&data_dir, child);
