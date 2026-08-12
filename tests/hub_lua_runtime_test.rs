@@ -2957,6 +2957,7 @@ fn reload_replaces_lua_tool_descriptors_and_removes_stale_handlers() {
         LuaPluginHostApi {
             capabilities: hub.capability_runtime(),
             coordination: hub.coordination_bridge(),
+            entity_publish: hub.entity_publish_bridge(),
             session_types: hub.session_type_spawner(),
             spawn_targets: hub.spawn_targets(),
             worktrees: hub.worktrees(),
@@ -3271,10 +3272,7 @@ return botster.register({
     let families = botster_ui_contract::collect_entity_option_families(&surface);
     assert_eq!(
         families,
-        vec![
-            "project-pipelines.run".to_string(),
-            "session".to_string()
-        ]
+        vec!["project-pipelines.run".to_string(), "session".to_string()]
     );
 
     for (subscription_id, generation) in [("first", 1_u64), ("reconnect", 2_u64)] {
@@ -3436,5 +3434,243 @@ return botster.register({{ handlers = {{
             error.to_string().contains(expected_error),
             "{label}: {error}"
         );
+    }
+}
+
+#[test]
+fn entity_provider_empty_items_table_becomes_json_array() {
+    let root = unique_short_test_dir("empty-items");
+    fs::create_dir_all(&root).expect("create package");
+    fs::write(
+        root.join("botster-package.json"),
+        serde_json::json!({
+            "name": "project-pipelines",
+            "version": "1.0.0",
+            "kind": "plugin",
+            "botster": ">=0.1.0",
+            "source": { "type": "path", "path": root.canonicalize().expect("path") },
+            "capabilities": [{ "surface": "surfaces" }],
+            "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }]
+        })
+        .to_string(),
+    )
+    .expect("manifest");
+    fs::write(
+        root.join("plugin.lua"),
+        r#"
+return botster.register({
+  handlers = {
+    {
+      id = "runs",
+      kind = "entity_provider",
+      descriptor_id = "project-pipelines.run",
+      descriptor = { entity_type = "project-pipelines.run", id_field = "id" },
+      call = function()
+        return {
+          type = "entity_snapshot",
+          entity_type = "project-pipelines.run",
+          snapshot_seq = 1,
+          items = {},
+        }
+      end,
+    },
+  },
+})
+"#,
+    )
+    .expect("plugin");
+    let mut policy = default_package_policy();
+    policy
+        .install_local_path(&root, "install")
+        .expect("install");
+    policy
+        .enable("project-pipelines", "enable")
+        .expect("enable");
+    let registry = policy.registry().clone();
+    let mut hub = explicit_runtime("empty-items");
+    hub.load_lua_plugin_package(&registry, "project-pipelines")
+        .expect("load");
+    let (snapshot_seq, items) = hub
+        .plugin_entity_snapshot("project-pipelines.run", "empty-sub")
+        .expect("empty items snapshot must decode as array");
+    assert_eq!(snapshot_seq, 1);
+    assert!(items.is_empty(), "items must be empty Vec, got {items:?}");
+}
+
+#[test]
+fn entity_provider_empty_items_preserves_nested_empty_object_fields() {
+    let root = unique_short_test_dir("nested-empty");
+    fs::create_dir_all(&root).expect("create package");
+    fs::write(
+        root.join("botster-package.json"),
+        serde_json::json!({
+            "name": "project-pipelines",
+            "version": "1.0.0",
+            "kind": "plugin",
+            "botster": ">=0.1.0",
+            "source": { "type": "path", "path": root.canonicalize().expect("path") },
+            "capabilities": [{ "surface": "surfaces" }],
+            "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }]
+        })
+        .to_string(),
+    )
+    .expect("manifest");
+    fs::write(
+        root.join("plugin.lua"),
+        r#"
+return botster.register({
+  handlers = {
+    {
+      id = "runs",
+      kind = "entity_provider",
+      descriptor_id = "project-pipelines.run",
+      descriptor = { entity_type = "project-pipelines.run", id_field = "id" },
+      call = function()
+        return {
+          type = "entity_snapshot",
+          entity_type = "project-pipelines.run",
+          snapshot_seq = 1,
+          items = {
+            { id = "run-1", meta = {}, labels = {} },
+          },
+        }
+      end,
+    },
+  },
+})
+"#,
+    )
+    .expect("plugin");
+    let mut policy = default_package_policy();
+    policy
+        .install_local_path(&root, "install")
+        .expect("install");
+    policy
+        .enable("project-pipelines", "enable")
+        .expect("enable");
+    let registry = policy.registry().clone();
+    let mut hub = explicit_runtime("nested-empty");
+    hub.load_lua_plugin_package(&registry, "project-pipelines")
+        .expect("load");
+    let (_, items) = hub
+        .plugin_entity_snapshot("project-pipelines.run", "nested-sub")
+        .expect("snapshot");
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["meta"], serde_json::json!({}));
+    // Nested empty tables become empty objects under default mlua conversion.
+    assert!(
+        items[0]["labels"].is_object(),
+        "nested empty table must remain object, got {}",
+        items[0]["labels"]
+    );
+}
+
+#[test]
+fn entity_publish_patch_nested_empty_object_remains_object() {
+    let root = unique_short_test_dir("publish-nested");
+    fs::create_dir_all(&root).expect("create package");
+    fs::write(
+        root.join("botster-package.json"),
+        serde_json::json!({
+            "name": "project-pipelines",
+            "version": "1.0.0",
+            "kind": "plugin",
+            "botster": ">=0.1.0",
+            "source": { "type": "path", "path": root.canonicalize().expect("path") },
+            "capabilities": [{ "surface": "surfaces" }],
+            "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }]
+        })
+        .to_string(),
+    )
+    .expect("manifest");
+    fs::write(
+        root.join("plugin.lua"),
+        r#"
+return botster.register({
+  handlers = {
+    {
+      id = "runs",
+      kind = "entity_provider",
+      descriptor_id = "project-pipelines.run",
+      descriptor = { entity_type = "project-pipelines.run", id_field = "id" },
+      call = function()
+        return {
+          type = "entity_snapshot",
+          entity_type = "project-pipelines.run",
+          snapshot_seq = 0,
+          items = {},
+        }
+      end,
+    },
+    {
+      id = "patch",
+      kind = "ui_action",
+      descriptor_id = "project-pipelines.patch",
+      descriptor = {
+        action_id = "project-pipelines.patch",
+        surface_id = "project-pipelines.home",
+      },
+      call = function(args)
+        local published = botster.entity_publish({
+          type = "entity_patch",
+          entity_type = "project-pipelines.run",
+          snapshot_seq = 1,
+          id = "run-1",
+          patch = { meta = {}, status = "patched" },
+        })
+        return {
+          request_id = args.request_id,
+          surface_id = "project-pipelines.home",
+          action_id = "project-pipelines.patch",
+          node_id = args.node_id,
+          state = "accepted",
+          payload = published,
+        }
+      end,
+    },
+  },
+})
+"#,
+    )
+    .expect("plugin");
+    let mut policy = default_package_policy();
+    policy
+        .install_local_path(&root, "install")
+        .expect("install");
+    policy
+        .enable("project-pipelines", "enable")
+        .expect("enable");
+    let registry = policy.registry().clone();
+    let mut hub = explicit_runtime("publish-nested");
+    hub.load_lua_plugin_package(&registry, "project-pipelines")
+        .expect("load");
+    let result = hub
+        .dispatch_plugin_surface_action(
+            "project-pipelines",
+            &ui_action_request(
+                "patch-nested",
+                "project-pipelines.home",
+                "project-pipelines.patch",
+                "form",
+                serde_json::json!({}),
+                serde_json::json!({}),
+            ),
+        )
+        .expect("publish patch");
+    assert_eq!(result.state, UiActionResultState::Accepted);
+    let payload = result.payload.expect("publish payload");
+    assert_eq!(payload["ok"], true);
+    assert_eq!(payload["status"], "accepted");
+    let ready = hub.take_package_entity_fanout();
+    assert_eq!(ready.len(), 1);
+    match &ready[0] {
+        botster_hub::package_entity_fanout::PackageEntityMutation::Patch { patch, .. } => {
+            assert_eq!(patch["meta"], serde_json::json!({}));
+            assert!(
+                patch["meta"].is_object(),
+                "nested empty patch field must remain object"
+            );
+        }
+        other => panic!("expected patch mutation, got {other:?}"),
     }
 }

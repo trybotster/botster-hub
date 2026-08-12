@@ -1108,7 +1108,11 @@ pub(crate) fn handle_control_message(
                     None,
                 );
             }
-            send_control_response(reply_tx, response, response_delivery_rx)
+            // Reply first so surface-action publish can return before fanout delivery.
+            let reply_result = send_control_response(reply_tx, response, response_delivery_rx);
+            drive_package_entity_fanout(daemon, state);
+            drive_package_entity_resync(daemon, state);
+            reply_result
         }
         ControlMessage::HubUpdateCheckCompleted { update } => state
             .pending_hub_update_reply
@@ -4064,6 +4068,11 @@ pub(crate) struct EntitySubscriptionState {
     /// Local WebRTC grant that owns this subscription, when registered over DataChannel.
     /// Used so PeerClosed can sweep rows that arrived after cleanup_once's id snapshot.
     pub(crate) owner_grant_id: Option<String>,
+    /// Highest package-entity snapshot/delta seq successfully applied to this stream.
+    /// Built-in `session` / `session_type` families leave this `None`.
+    package_last_applied_seq: Option<u64>,
+    /// Package-entity subscriber is gated to targeted snapshots until caught up.
+    package_catching_up: bool,
 }
 
 #[derive(Debug, Default)]
@@ -4367,6 +4376,8 @@ fn register_entity_subscription(
                 definition_entities: entities,
                 resync_reason: None,
                 owner_grant_id,
+                package_last_applied_seq: None,
+                package_catching_up: false,
             },
         );
         state.lifecycle_counters.live_entity_subscriptions =
@@ -4378,20 +4389,36 @@ fn register_entity_subscription(
         return Ok(daemon_response_base(DaemonResponseKind::EntitySubscribed));
     }
     if entity_type != "session" {
-        let runtime = daemon
-            .runtime_mut()
-            .ok_or(DaemonTransportError::DaemonNotRunning)?;
-        let (snapshot_seq, items) =
-            match runtime.plugin_entity_snapshot(&entity_type, &subscription_id) {
-                Ok(snapshot) => snapshot,
-                Err(error) => {
-                    return Ok(entity_subscription_error(
-                        &error.code,
-                        &subscription_id,
-                        &error.message,
-                    ));
-                }
-            };
+        let (snapshot_seq, items, catching_up) = {
+            let runtime = daemon
+                .runtime_mut()
+                .ok_or(DaemonTransportError::DaemonNotRunning)?;
+            let (snapshot_seq, items) =
+                match runtime.plugin_entity_snapshot(&entity_type, &subscription_id) {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => {
+                        return Ok(entity_subscription_error(
+                            &error.code,
+                            &subscription_id,
+                            &error.message,
+                        ));
+                    }
+                };
+            // Advance monotonic family floor from provider; never lower it.
+            let _ = runtime.apply_package_entity_provider_snapshot(&entity_type, snapshot_seq);
+            let family_floor = runtime
+                .package_entity_family_state(&entity_type)
+                .map(|family| family.last_accepted_seq)
+                .unwrap_or(snapshot_seq);
+            // New subscriber may receive this snapshot (never-applied). Behind
+            // relative to family floor means catching_up; advanced peers are not
+            // touched here because we only deliver to this subscription.
+            let catching_up = snapshot_seq < family_floor;
+            if catching_up {
+                runtime.mark_package_entity_resync_needed(&entity_type);
+            }
+            (snapshot_seq, items, catching_up)
+        };
         let snapshot = DaemonEntityFrame::Snapshot {
             subscription_id: subscription_id.clone(),
             entity_type: entity_type.clone(),
@@ -4420,6 +4447,8 @@ fn register_entity_subscription(
                 definition_entities: BTreeMap::new(),
                 resync_reason: None,
                 owner_grant_id,
+                package_last_applied_seq: Some(snapshot_seq),
+                package_catching_up: catching_up,
             },
         );
         state.lifecycle_counters.live_entity_subscriptions =
@@ -4428,6 +4457,8 @@ fn register_entity_subscription(
             .lifecycle_counters
             .high_water_entity_subscriptions
             .max(state.lifecycle_counters.live_entity_subscriptions);
+        // Fanout any pending mutations unlocked by the floor advance.
+        drive_package_entity_fanout(daemon, state);
         return Ok(daemon_response_base(DaemonResponseKind::EntitySubscribed));
     }
     let baseline = if let Some(cursor) = state.reconciliation.cursor.clone() {
@@ -4488,6 +4519,8 @@ fn register_entity_subscription(
             definition_entities: BTreeMap::new(),
             resync_reason: None,
             owner_grant_id,
+            package_last_applied_seq: None,
+            package_catching_up: false,
         },
     );
     state.lifecycle_counters.live_entity_subscriptions = state
@@ -4726,6 +4759,11 @@ fn drive_session_type_subscriptions(
 }
 
 fn drive_entity_subscriptions(daemon: &mut HubDaemon, state: &mut DaemonControlState) {
+    // Package mutation fanout and bounded provider resync run even when only
+    // session subscriptions exist, so call them before the empty early-return.
+    drive_package_entity_fanout(daemon, state);
+    drive_package_entity_resync(daemon, state);
+
     if state.entity_subscriptions.is_empty() {
         return;
     }
@@ -4993,6 +5031,305 @@ fn drive_entity_subscriptions(daemon: &mut HubDaemon, state: &mut DaemonControlS
                     .entry(session_id)
                     .or_default()
                     .extend(events);
+            }
+        }
+    }
+    state.lifecycle_counters.live_entity_subscriptions = state.entity_subscriptions.len() as u64;
+}
+
+fn drive_package_entity_fanout(daemon: &mut HubDaemon, state: &mut DaemonControlState) {
+    let Some(runtime) = daemon.runtime() else {
+        return;
+    };
+    let mutations = runtime.take_package_entity_fanout();
+    if mutations.is_empty() {
+        return;
+    }
+    for mutation in mutations {
+        state.lifecycle_counters.package_entity_publish_accepted = state
+            .lifecycle_counters
+            .package_entity_publish_accepted
+            .saturating_add(1);
+        let entity_type = mutation.entity_type().to_string();
+        let seq = mutation.snapshot_seq();
+        let mut dead = Vec::new();
+        for (subscription_id, subscription) in state.entity_subscriptions.iter_mut() {
+            if subscription.entity_type != entity_type {
+                continue;
+            }
+            // Catching_up subscribers receive only targeted resync snapshots.
+            // Do not treat applied < family_floor alone as catching_up here: the
+            // sequential next delta always has applied == floor-1 before delivery.
+            if subscription.package_catching_up {
+                continue;
+            }
+            let Some(applied) = subscription.package_last_applied_seq else {
+                subscription.package_catching_up = true;
+                runtime.mark_package_entity_resync_needed(&entity_type);
+                continue;
+            };
+            if seq < applied + 1 {
+                // Already applied or behind relative to this subscriber.
+                continue;
+            }
+            if seq > applied + 1 {
+                // Gap relative to this subscriber — schedule targeted resync.
+                subscription.package_catching_up = true;
+                runtime.mark_package_entity_resync_needed(&entity_type);
+                continue;
+            }
+            // seq == applied + 1
+            let frame = package_mutation_to_daemon_frame(subscription_id, &mutation);
+            state.lifecycle_counters.entity_delivery_attempts = state
+                .lifecycle_counters
+                .entity_delivery_attempts
+                .saturating_add(1);
+            match subscription.sender.try_send(frame) {
+                Ok(()) => {
+                    state.lifecycle_counters.entity_delivery_successes = state
+                        .lifecycle_counters
+                        .entity_delivery_successes
+                        .saturating_add(1);
+                    subscription.package_last_applied_seq = Some(seq);
+                    subscription.package_catching_up = false;
+                }
+                Err(EntityFrameTrySendError::Full) => {
+                    state.lifecycle_counters.entity_delivery_overflows = state
+                        .lifecycle_counters
+                        .entity_delivery_overflows
+                        .saturating_add(1);
+                    subscription.package_catching_up = true;
+                    subscription.resync_reason = Some("subscriber_overflow".to_string());
+                    runtime.mark_package_entity_resync_needed(&entity_type);
+                }
+                Err(EntityFrameTrySendError::Disconnected) => {
+                    state.lifecycle_counters.entity_delivery_failures = state
+                        .lifecycle_counters
+                        .entity_delivery_failures
+                        .saturating_add(1);
+                    dead.push(subscription_id.clone());
+                }
+            }
+        }
+        for subscription_id in dead {
+            state.entity_subscriptions.remove(&subscription_id);
+        }
+    }
+    state.lifecycle_counters.live_entity_subscriptions = state.entity_subscriptions.len() as u64;
+}
+
+fn package_mutation_to_daemon_frame(
+    subscription_id: &str,
+    mutation: &crate::package_entity_fanout::PackageEntityMutation,
+) -> DaemonEntityFrame {
+    match mutation {
+        crate::package_entity_fanout::PackageEntityMutation::Upsert {
+            entity_type,
+            snapshot_seq,
+            id,
+            entity,
+        } => DaemonEntityFrame::Upsert {
+            subscription_id: subscription_id.to_string(),
+            entity_type: entity_type.clone(),
+            snapshot_seq: *snapshot_seq,
+            id: id.clone(),
+            entity: entity.clone(),
+        },
+        crate::package_entity_fanout::PackageEntityMutation::Patch {
+            entity_type,
+            snapshot_seq,
+            id,
+            patch,
+        } => DaemonEntityFrame::Patch {
+            subscription_id: subscription_id.to_string(),
+            entity_type: entity_type.clone(),
+            snapshot_seq: *snapshot_seq,
+            id: id.clone(),
+            patch: patch.clone(),
+        },
+        crate::package_entity_fanout::PackageEntityMutation::Remove {
+            entity_type,
+            snapshot_seq,
+            id,
+        } => DaemonEntityFrame::Remove {
+            subscription_id: subscription_id.to_string(),
+            entity_type: entity_type.clone(),
+            snapshot_seq: *snapshot_seq,
+            id: id.clone(),
+        },
+    }
+}
+
+fn drive_package_entity_resync(daemon: &mut HubDaemon, state: &mut DaemonControlState) {
+    // Ensure catching_up / overflow subscribers re-arm coalesced resync need.
+    if let Some(runtime) = daemon.runtime() {
+        for subscription in state.entity_subscriptions.values() {
+            if subscription.package_catching_up || subscription.resync_reason.is_some() {
+                runtime.mark_package_entity_resync_needed(&subscription.entity_type);
+            }
+        }
+    }
+    let eligible = {
+        let Some(runtime) = daemon.runtime() else {
+            return;
+        };
+        runtime.package_entity_resync_eligible_families()
+    };
+    if eligible.is_empty() {
+        return;
+    }
+    for entity_type in eligible {
+        // Also resync when any subscriber is catching_up even without a gap.
+        let has_catching_up = state.entity_subscriptions.values().any(|subscription| {
+            subscription.entity_type == entity_type && subscription.package_catching_up
+        });
+        let family_needs = daemon
+            .runtime()
+            .and_then(|runtime| runtime.package_entity_family_state(&entity_type))
+            .is_some_and(|family| {
+                family.resync.needed
+                    || family.last_accepted_seq < family.high_water_seq
+                    || !family.pending_by_seq.is_empty()
+            });
+        if !has_catching_up && !family_needs {
+            continue;
+        }
+
+        let degraded = {
+            let Some(runtime) = daemon.runtime() else {
+                return;
+            };
+            state.lifecycle_counters.package_entity_resync_attempts = state
+                .lifecycle_counters
+                .package_entity_resync_attempts
+                .saturating_add(1);
+            runtime.record_package_entity_resync_attempt(&entity_type)
+        };
+        if degraded {
+            state.lifecycle_counters.package_entity_resync_degraded = state
+                .lifecycle_counters
+                .package_entity_resync_degraded
+                .saturating_add(1);
+            continue;
+        }
+
+        let subscription_id_for_provider = state
+            .entity_subscriptions
+            .iter()
+            .find(|(_, subscription)| subscription.entity_type == entity_type)
+            .map(|(id, _)| id.clone())
+            .unwrap_or_else(|| format!("package-entity-resync-{entity_type}"));
+
+        let provider_result = {
+            let Some(runtime) = daemon.runtime_mut() else {
+                return;
+            };
+            runtime.plugin_entity_snapshot(&entity_type, &subscription_id_for_provider)
+        };
+        let Ok((snapshot_seq, items)) = provider_result else {
+            // Failed provider: keep schedule (attempt already recorded with backoff).
+            continue;
+        };
+
+        let ready = {
+            let Some(runtime) = daemon.runtime() else {
+                return;
+            };
+            runtime.apply_package_entity_provider_snapshot(&entity_type, snapshot_seq)
+        };
+        if !ready.is_empty() {
+            // Queue drained pending for the shared fanout path.
+            // apply_package_entity_provider_snapshot already enqueued them.
+        }
+
+        let family_floor = daemon
+            .runtime()
+            .and_then(|runtime| runtime.package_entity_family_state(&entity_type))
+            .map(|family| family.last_accepted_seq)
+            .unwrap_or(snapshot_seq);
+
+        let mut dead = Vec::new();
+        for (subscription_id, subscription) in state.entity_subscriptions.iter_mut() {
+            if subscription.entity_type != entity_type {
+                continue;
+            }
+            // Targeted delivery: only catching_up / overflow / never-applied, and never
+            // roll an advanced subscriber backward.
+            let applied = subscription.package_last_applied_seq;
+            let needs_snapshot = subscription.package_catching_up
+                || subscription.resync_reason.is_some()
+                || applied.is_none()
+                || applied.is_some_and(|seq| seq < family_floor);
+            if !needs_snapshot {
+                continue;
+            }
+            if applied.is_some_and(|seq| snapshot_seq < seq) {
+                // Behind for this advanced subscriber — skip.
+                continue;
+            }
+            let frame = DaemonEntityFrame::Snapshot {
+                subscription_id: subscription_id.clone(),
+                entity_type: entity_type.clone(),
+                snapshot_seq,
+                items: items.clone(),
+                resync_reason: subscription
+                    .resync_reason
+                    .clone()
+                    .or_else(|| Some("package_entity_resync".to_string())),
+            };
+            if entity_frame_exceeds_limit(&frame) {
+                continue;
+            }
+            state.lifecycle_counters.entity_delivery_attempts = state
+                .lifecycle_counters
+                .entity_delivery_attempts
+                .saturating_add(1);
+            match subscription.sender.try_send(frame) {
+                Ok(()) => {
+                    state.lifecycle_counters.entity_delivery_successes = state
+                        .lifecycle_counters
+                        .entity_delivery_successes
+                        .saturating_add(1);
+                    subscription.package_last_applied_seq = Some(snapshot_seq);
+                    subscription.package_catching_up = snapshot_seq < family_floor;
+                    subscription.resync_reason = None;
+                }
+                Err(EntityFrameTrySendError::Full) => {
+                    state.lifecycle_counters.entity_delivery_overflows = state
+                        .lifecycle_counters
+                        .entity_delivery_overflows
+                        .saturating_add(1);
+                    subscription.package_catching_up = true;
+                    subscription.resync_reason = Some("subscriber_overflow".to_string());
+                    if let Some(runtime) = daemon.runtime() {
+                        runtime.mark_package_entity_resync_needed(&entity_type);
+                    }
+                }
+                Err(EntityFrameTrySendError::Disconnected) => {
+                    state.lifecycle_counters.entity_delivery_failures = state
+                        .lifecycle_counters
+                        .entity_delivery_failures
+                        .saturating_add(1);
+                    dead.push(subscription_id.clone());
+                }
+            }
+        }
+        for subscription_id in dead {
+            state.entity_subscriptions.remove(&subscription_id);
+        }
+
+        // After snapshot floor advance, fanout any drained pending deltas.
+        drive_package_entity_fanout(daemon, state);
+
+        // Clear need when floor matches high water and no catching_up remains.
+        if let Some(runtime) = daemon.runtime() {
+            let still_catching_up = state.entity_subscriptions.values().any(|subscription| {
+                subscription.entity_type == entity_type && subscription.package_catching_up
+            });
+            if !still_catching_up {
+                runtime.recompute_package_entity_resync(&entity_type);
+            } else {
+                runtime.mark_package_entity_resync_needed(&entity_type);
             }
         }
     }
@@ -8634,6 +8971,8 @@ mod tests {
             definition_entities: BTreeMap::new(),
             resync_reason: Some(overflow_reason.clone()),
             owner_grant_id: None,
+            package_last_applied_seq: None,
+            package_catching_up: false,
         };
         let mut counters = DaemonLifecycleCounters::default();
 
@@ -8696,6 +9035,8 @@ mod tests {
                 definition_entities: BTreeMap::new(),
                 resync_reason: Some("subscriber_overflow".to_string()),
                 owner_grant_id: None,
+                package_last_applied_seq: None,
+                package_catching_up: false,
             },
         )]);
         let entities = BTreeMap::from([(
@@ -8755,6 +9096,8 @@ mod tests {
             definition_entities: BTreeMap::new(),
             resync_reason: Some(overflow_reason.clone()),
             owner_grant_id: None,
+            package_last_applied_seq: None,
+            package_catching_up: false,
         };
         let mut counters = DaemonLifecycleCounters::default();
 

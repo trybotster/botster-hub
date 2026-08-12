@@ -37,6 +37,7 @@ use crate::session_types::{
 
 const DEFAULT_INSTRUCTION_BUDGET: u64 = 500_000;
 const COORDINATION_REQUEST_TIMEOUT_MS: u64 = 1_000;
+const ENTITY_PUBLISH_REQUEST_TIMEOUT_MS: u64 = 1_000;
 /// Shared host capability runtime used by Lua capability helpers.
 pub type SharedHubCapabilityRuntime = Arc<Mutex<HubCapabilityRuntime>>;
 
@@ -45,6 +46,61 @@ pub type SharedHubCapabilityRuntime = Arc<Mutex<HubCapabilityRuntime>>;
 pub struct HubCoordinationBridge {
     owner_thread: thread::ThreadId,
     pending: Arc<Mutex<VecDeque<PendingCoordinationRequest>>>,
+}
+
+/// HubRuntime-backed package entity publish bridge pumped during `invoke_plugin`.
+#[derive(Clone)]
+pub struct HubEntityPublishBridge {
+    owner_thread: thread::ThreadId,
+    pending: Arc<Mutex<VecDeque<PendingEntityPublishRequest>>>,
+}
+
+impl HubEntityPublishBridge {
+    pub(crate) fn new() -> Self {
+        Self {
+            owner_thread: thread::current().id(),
+            pending: Arc::new(Mutex::new(VecDeque::new())),
+        }
+    }
+
+    fn publish(
+        &self,
+        plugin_key: PluginKey,
+        frame: serde_json::Value,
+    ) -> Result<crate::package_entity_fanout::PackageEntityPublishResult, String> {
+        if thread::current().id() == self.owner_thread {
+            return Err(
+                "botster.entity_publish is only available during handler invocation, not at plugin load"
+                    .to_string(),
+            );
+        }
+        let (response, receiver) = mpsc::channel();
+        self.pending
+            .lock()
+            .map_err(|_| "entity publish queue lock poisoned".to_string())?
+            .push_back(PendingEntityPublishRequest {
+                plugin_key,
+                frame,
+                response,
+            });
+        receiver
+            .recv_timeout(Duration::from_millis(ENTITY_PUBLISH_REQUEST_TIMEOUT_MS))
+            .map_err(|_| "entity publish request did not complete before timeout".to_string())?
+    }
+
+    pub(crate) fn take_pending(&self) -> Option<PendingEntityPublishRequest> {
+        self.pending
+            .lock()
+            .expect("entity publish queue lock")
+            .pop_front()
+    }
+}
+
+pub(crate) struct PendingEntityPublishRequest {
+    pub(crate) plugin_key: PluginKey,
+    pub(crate) frame: serde_json::Value,
+    pub(crate) response:
+        mpsc::Sender<Result<crate::package_entity_fanout::PackageEntityPublishResult, String>>,
 }
 
 impl HubCoordinationBridge {
@@ -157,6 +213,7 @@ struct LuaHostApi {
     configuration: PackageConfigurationView,
     capabilities: SharedHubCapabilityRuntime,
     coordination: HubCoordinationBridge,
+    entity_publish: HubEntityPublishBridge,
     session_types: SharedSessionTypeSpawner,
     spawn_targets: SharedSpawnTargets,
     worktrees: SharedWorktrees,
@@ -168,6 +225,7 @@ struct LuaHostApi {
 pub struct LuaPluginHostApi {
     pub capabilities: SharedHubCapabilityRuntime,
     pub coordination: HubCoordinationBridge,
+    pub entity_publish: HubEntityPublishBridge,
     pub session_types: SharedSessionTypeSpawner,
     pub spawn_targets: SharedSpawnTargets,
     pub worktrees: SharedWorktrees,
@@ -198,6 +256,7 @@ impl LuaPluginRuntime {
             configuration,
             capabilities: api.capabilities,
             coordination: api.coordination,
+            entity_publish: api.entity_publish,
             session_types: api.session_types,
             spawn_targets: api.spawn_targets,
             worktrees: api.worktrees,
@@ -333,11 +392,17 @@ impl PluginRuntime for LuaPluginRuntime {
                 payload: None,
             }),
             Ok(value) => match lua.from_value::<serde_json::Value>(value) {
-                Ok(value) => PluginInvocationResult::Completed(PluginInvocationSuccess {
-                    request_id: request.request_id,
-                    handler: request.handler,
-                    payload: Some(BoundaryJson(value)),
-                }),
+                Ok(value) => {
+                    // Field-exact empty items for entity frames: only top-level
+                    // `items: {}` becomes `[]`. Nested empty tables stay objects.
+                    let value =
+                        crate::package_entity_fanout::coerce_entity_frame_empty_items(value);
+                    PluginInvocationResult::Completed(PluginInvocationSuccess {
+                        request_id: request.request_id,
+                        handler: request.handler,
+                        payload: Some(BoundaryJson(value)),
+                    })
+                }
                 Err(error) => failed(
                     request,
                     PluginInvocationFailureKind::HandlerFailed,
@@ -708,10 +773,35 @@ fn install_botster_api(
     botster.set("capabilities", capabilities_table)?;
     botster.set(
         "coordination",
-        coordination_table(lua, plugin_key, host_api.coordination)?,
+        coordination_table(lua, plugin_key.clone(), host_api.coordination)?,
+    )?;
+    botster.set(
+        "entity_publish",
+        entity_publish_function(lua, plugin_key, host_api.entity_publish)?,
     )?;
     globals.set("botster", botster)?;
     Ok(())
+}
+
+fn entity_publish_function(
+    lua: &Lua,
+    plugin_key: PluginKey,
+    bridge: HubEntityPublishBridge,
+) -> Result<Function, mlua::Error> {
+    lua.create_function(move |lua, args: Value| {
+        let value = lua.from_value::<serde_json::Value>(args)?;
+        let result = bridge
+            .publish(plugin_key.clone(), value)
+            .map_err(mlua::Error::RuntimeError)?;
+        lua.to_value(&json!({
+            "ok": result.ok,
+            "status": result.status.as_str(),
+            "last_accepted_seq": result.last_accepted_seq,
+            "high_water_seq": result.high_water_seq,
+            "resync_needed": result.resync_needed,
+            "resync_degraded": result.resync_degraded,
+        }))
+    })
 }
 
 fn spawn_targets_table(lua: &Lua, spawn_targets: SharedSpawnTargets) -> Result<Table, mlua::Error> {
