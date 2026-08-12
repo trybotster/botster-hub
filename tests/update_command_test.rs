@@ -220,6 +220,8 @@ fn update_all_missing_package_contract_leaves_the_running_daemon_unchanged() {
     fs::create_dir_all(&data_dir).unwrap();
     let source = create_clean_update_source(&root, true);
     let package = create_direct_local_package(&root);
+    let head_before = git_output(&source, &["rev-parse", "HEAD"]);
+    let lock_before = fs::read(source.join("Cargo.lock")).unwrap();
     let hub_bin = PathBuf::from(env!("CARGO_BIN_EXE_botster-hub"))
         .canonicalize()
         .unwrap();
@@ -281,6 +283,7 @@ fn update_all_missing_package_contract_leaves_the_running_daemon_unchanged() {
         .arg(&data_dir)
         .env("BOTSTER_ENV", "test")
         .env("BOTSTER_HUB_TEST_UPDATE_SOURCE_ROOT", &source)
+        .env("BOTSTER_UPDATE_TEST_MARKER", root.join("cargo-was-run"))
         .env("PATH", path)
         .output()
         .expect("run update all without package contract");
@@ -291,6 +294,12 @@ fn update_all_missing_package_contract_leaves_the_running_daemon_unchanged() {
         stderr.contains("requires") && stderr.contains("botster-update.json"),
         "{stderr}"
     );
+    assert!(
+        !root.join("cargo-was-run").exists(),
+        "package contract preflight ran after Cargo changed source inputs"
+    );
+    assert_eq!(git_output(&source, &["rev-parse", "HEAD"]), head_before);
+    assert_eq!(fs::read(source.join("Cargo.lock")).unwrap(), lock_before);
     assert!(daemon.try_wait().unwrap().is_none());
     let metadata: serde_json::Value = serde_json::from_slice(
         &fs::read(data_dir.join(".botster-hub-runtime-daemon.json")).unwrap(),
@@ -315,6 +324,16 @@ fn git(root: &Path, args: &[&str]) {
         .status()
         .expect("run fixture git command");
     assert!(status.success(), "git {}", args.join(" "));
+}
+
+fn git_output(root: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(root)
+        .output()
+        .expect("run fixture git command");
+    assert!(output.status.success(), "git {}", args.join(" "));
+    String::from_utf8(output.stdout).unwrap().trim().to_string()
 }
 
 fn create_clean_update_source(root: &Path, builds_succeed: bool) -> PathBuf {
@@ -350,7 +369,9 @@ source = "git+https://example.invalid/core#abc123"
     let build_status = if builds_succeed { 0 } else { 23 };
     fs::write(
         &cargo,
-        format!("#!/bin/sh\nif [ \"$1\" = update ]; then exit 0; fi\nexit {build_status}\n"),
+        format!(
+            "#!/bin/sh\nif [ -n \"$BOTSTER_UPDATE_TEST_MARKER\" ]; then touch \"$BOTSTER_UPDATE_TEST_MARKER\"; fi\nif [ \"$1\" = update ]; then exit 0; fi\nexit {build_status}\n"
+        ),
     )
     .unwrap();
     fs::set_permissions(&cargo, fs::Permissions::from_mode(0o755)).unwrap();
