@@ -501,10 +501,12 @@ version = "0.1.0"
 dependencies = [
  "botster-core",
  "botster-hub-client",
+ "botster-terminal-ghostty",
  "botster-ui-contract",
  "libc",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
 ]
 
 [[package]]

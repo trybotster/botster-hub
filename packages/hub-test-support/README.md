@@ -18,10 +18,10 @@ node packages/hub-test-support/scripts/sync-assets.mjs
 
 ## Usage
 
-Use this command for version 0.1.29:
+Use this command for version 0.1.30:
 
 ```sh
-npm install --save-dev @trybotster/ui-contract@0.3.2 @trybotster/hub-test-support@0.1.29
+npm install --save-dev @trybotster/ui-contract@0.3.2 @trybotster/hub-test-support@0.1.30
 ```
 
 ```js
@@ -81,33 +81,37 @@ Use this exact package spec in npm-based client repos:
 ```json
 {
   "devDependencies": {
-    "@trybotster/hub-test-support": "0.1.29"
+    "@trybotster/hub-test-support": "0.1.30"
   }
 }
 ```
 
-`@trybotster/hub-test-support@0.1.29` carries explicit session-type execution
-modes, spawn-point session-type listing (`list_session_types_for_target`), and
-the session-type authoring view
-(`show_session_type_definition`). It uses conformance fixture revision 34 and
-protocol version 6, including the `mode_gated_input` feature and full
-`ModeFlags` freshness fields. First-party clients should pin this coordinate when they
-use these contracts.
+`@trybotster/hub-test-support@0.1.30` carries authentic dual GHOSTSNP late-attach
+fixtures (conformance revision 35): history Snapshot is a frozen
+history-marker golden and no-history Snapshot is a distinct blank golden.
+Import-visible state matches the ReadScreen oracles; do not dual-use a
+history-bearing golden as no-history. Protocol version remains 6, including
+the `mode_gated_input` feature, full `ModeFlags` freshness fields, explicit
+session-type execution modes, spawn-point session-type listing
+(`list_session_types_for_target`), and the session-type authoring view
+(`show_session_type_definition`). First-party clients should pin this
+coordinate when they use these contracts.
 
 The support matrix is generated from the Rust compatibility descriptors.
 `terminal_readback` appears in both `supported_features` and
 `required_features`; downstream compatibility checks must implement it rather
 than treating it as optional. The late-attach fixture is generated from the
-Rust serde scenario and preserves `attaching -> optional initial state ->
-attached -> live` ordering. An opaque authoritative snapshot may represent a
-blank terminal; clients must not infer visible history from payload byte length.
-Only `read_screen_text` is renderable restored content; `snapshot` and
-`scrollback` base64 payloads must never be appended as terminal text. Version
-0.1.6 / conformance revision 13 uses superseded JSON number arrays, while
-version 0.1.5 / revision 12 exposes lossy string history. Neither is current
-binary-history contract authority.
+Rust serde scenario and preserves `attaching -> Snapshot -> attached -> live`
+ordering for both history and no-history sequences. An opaque authoritative
+snapshot may represent a blank terminal; clients must not infer visible
+history from payload byte length. Only `read_screen_text` is renderable
+restored content; `snapshot` and `scrollback` base64 payloads must never be
+appended as terminal text. Version 0.1.6 / conformance revision 13 uses
+superseded JSON number arrays, while version 0.1.5 / revision 12 exposes
+lossy string history. Neither is current binary-history contract authority.
 
-Version 0.1.29 carries protocol version 6 / conformance revision 34,
+Version 0.1.30 carries protocol version 6 / conformance revision 35 with
+distinct frozen GHOSTSNP goldens (history marker vs blank idle),
 `mode_gated_input` ModeGatedInput + ModeFlags freshness, Snapshot-only
 GHOSTSNP rules, and the `DaemonSessionTypeExecution` contract. The contract
 defines the explicit `relative_executable` and `shell_command` modes.
@@ -124,7 +128,10 @@ UiActionRequest, UiActionResult, package surface, and package navigation
 declarations and conformance fixtures. It also carries the optional
 aggregate plugin-worker counters prepared in the unpublished 0.1.15 artifact.
 
-Version 0.1.26 was the prior published coordinate. It did not include the
+Version 0.1.29 was the prior published coordinate (revision 34) and still
+carried the non-GHOSTSNP placeholder history Snapshot bytes plus Snapshot-less
+no-history sequence; it is not current late-attach contract authority.
+Version 0.1.26 was an earlier published coordinate. It did not include the
 explicit session-type execution contract.
 Version 0.1.24 was an earlier published coordinate at protocol version 6 /
 conformance revision 31 (authoritative software/install identity,

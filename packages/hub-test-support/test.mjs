@@ -132,10 +132,10 @@ function assertDialogFormComposition(source) {
 }
 
 assert.equal(metadata.package_name, "@trybotster/hub-test-support");
-assert.equal(metadata.package_version, "0.1.29");
+assert.equal(metadata.package_version, "0.1.30");
 assert.equal(metadata.protocol, "botster-hub-daemon-v1");
 assert.equal(metadata.protocol_version, 6);
-assert.equal(metadata.conformance_fixture_revision, 34);
+assert.equal(metadata.conformance_fixture_revision, 35);
 
 // Package README ships in the npm tarball; keep install pin sites tied to package.json.
 {
@@ -372,7 +372,7 @@ assert.deepEqual(
 );
 assert.equal(supportMatrix.session_type_authoring.admission_group, "allow_runtime");
 
-assert.equal(sessionLifecycleFixture.conformance_fixture_revision, 34);
+assert.equal(sessionLifecycleFixture.conformance_fixture_revision, 35);
 assert.equal(sessionLifecycleFixture.entity_type, "session");
 assert.deepEqual(
   sessionLifecycleFixture.normalized_frames.map((frame) => frame.type),
@@ -410,7 +410,7 @@ assert.equal(
 assert.equal(sessionLifecycleFixture.overflow.snapshot_precedes_later_deltas, true);
 assert.equal(sessionLifecycleFixture.overflow.failed_snapshot_delivery_closes_subscription, true);
 
-assert.equal(sessionPluginBindingFixture.conformance_fixture_revision, 34);
+assert.equal(sessionPluginBindingFixture.conformance_fixture_revision, 35);
 assert.equal(sessionPluginBindingFixture.binding_family, "/session");
 const sessionPluginMaterialization = materializeSessionPluginBindingScenario(
   sessionPluginBindingFixture,
@@ -613,6 +613,11 @@ assert.equal(
   createHash("sha256").update(reassembledLargePayload).digest("hex"),
   largeScenario.reassembled_sha256,
 );
+const GHOSTSNP_MAGIC = Buffer.from("GHOSTSNP");
+const GOLDEN_A_SHA256 =
+  "fc8664159efdc7bd6959dd294485c6bc2f87ad8ea2fb3a0a16ab78b2eb87fd77";
+const GOLDEN_B_SHA256 =
+  "b0e28fe69ba590f067236a2a0b1eb8b05d2aa0be74fda4324e55a6066eac328c";
 const historyIndex = lateAttachFixture.history_then_live.findIndex(
   (event) =>
     (event.type === "snapshot" || event.type === "scrollback") &&
@@ -633,12 +638,21 @@ assert.notEqual(attachedIndex, -1);
 assert.equal(attachingIndex < historyIndex, true);
 assert.equal(historyIndex < attachedIndex, true);
 assert.equal(attachedIndex < liveIndex, true);
+const historySnapshot = lateAttachFixture.history_then_live[historyIndex];
+assert.equal(historySnapshot.type, "snapshot");
+const historyPayload = Buffer.from(historySnapshot.payload_base64, "base64");
+assert.equal(historySnapshot.bytes, historyPayload.length);
+assert.equal(historySnapshot.payload_encoding, "base64");
+assert.equal(historyPayload.subarray(0, 8).equals(GHOSTSNP_MAGIC), true);
+assert.equal(createHash("sha256").update(historyPayload).digest("hex"), GOLDEN_A_SHA256);
+// Authentic GHOSTSNP may embed screen glyphs in binary form; clients must restore
+// via Ghostty import / ReadScreen, never by appending snapshot bytes as text.
 for (const event of lateAttachFixture.history_then_live) {
   if (event.type === "snapshot" || event.type === "scrollback") {
     const payload = Buffer.from(event.payload_base64, "base64");
     assert.equal(event.bytes, payload.length);
     assert.equal(event.payload_encoding, "base64");
-    assert.equal(payload.toString("utf8").includes("history-before-live"), false);
+    assert.equal(payload.subarray(0, 8).equals(GHOSTSNP_MAGIC), true);
   }
 }
 assert.equal(lateAttachFixture.read_screen_text.match(/history-before-live/g)?.length, 1);
@@ -657,6 +671,9 @@ assert.equal(
 const noHistoryAttachingIndex = lateAttachFixture.no_history_then_live.findIndex(
   (event) => event.type === "attach_state" && event.state === "attaching",
 );
+const noHistorySnapshotIndex = lateAttachFixture.no_history_then_live.findIndex(
+  (event) => event.type === "snapshot",
+);
 const noHistoryAttachedIndex = lateAttachFixture.no_history_then_live.findIndex(
   (event) => event.type === "attach_state" && event.state === "attached",
 );
@@ -674,13 +691,28 @@ assert.equal(
   lateAttachFixture.no_history_then_live.some((event) => event.type === "scrollback"),
   false,
 );
-assert.equal(noHistoryAttachingIndex < noHistoryAttachedIndex, true);
+assert.notEqual(noHistorySnapshotIndex, -1);
+assert.equal(noHistoryAttachingIndex < noHistorySnapshotIndex, true);
+assert.equal(noHistorySnapshotIndex < noHistoryAttachedIndex, true);
 assert.equal(
   noHistoryLastInitialStateIndex === -1 || noHistoryLastInitialStateIndex < noHistoryAttachedIndex,
   true,
 );
 assert.equal(noHistoryAttachedIndex < noHistoryFirstTerminalOutputIndex, true);
 assert.equal(noHistoryAttachedIndex < noHistoryLiveIndex, true);
+const noHistorySnapshot = lateAttachFixture.no_history_then_live[noHistorySnapshotIndex];
+const noHistoryPayload = Buffer.from(noHistorySnapshot.payload_base64, "base64");
+assert.equal(noHistorySnapshot.bytes, noHistoryPayload.length);
+assert.equal(noHistoryPayload.subarray(0, 8).equals(GHOSTSNP_MAGIC), true);
+assert.equal(createHash("sha256").update(noHistoryPayload).digest("hex"), GOLDEN_B_SHA256);
+assert.notEqual(GOLDEN_A_SHA256, GOLDEN_B_SHA256);
+assert.equal(historyPayload.equals(noHistoryPayload), false);
+// Exactly one Snapshot on no_history and empty ReadScreen oracle.
+assert.equal(
+  lateAttachFixture.no_history_then_live.filter((event) => event.type === "snapshot").length,
+  1,
+);
+assert.equal(lateAttachFixture.conformance_fixture_revision, 35);
 
 const verification = verifyPackageAssets();
 assert.deepEqual(verification, { ok: true, failures: [] });

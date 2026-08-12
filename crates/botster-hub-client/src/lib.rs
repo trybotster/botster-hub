@@ -22,7 +22,7 @@ mod typescript;
 
 pub const PROTOCOL: &str = "botster-hub-daemon-v1";
 pub const PROTOCOL_VERSION: u16 = 6;
-pub const CONFORMANCE_FIXTURE_REVISION: u16 = 34;
+pub const CONFORMANCE_FIXTURE_REVISION: u16 = 35;
 /// Version of the local WebRTC delivery chunk framing protocol.
 pub const LOCAL_WEBRTC_DELIVERY_CHUNK_VERSION: u16 = 2;
 /// Serialized local WebRTC delivery frames must remain strictly below this size.
@@ -5415,7 +5415,7 @@ mod tests {
     #[test]
     fn protocol_six_and_conformance_thirty_two_define_the_cold_cut_boundary() {
         assert_eq!(PROTOCOL_VERSION, 6);
-        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 34);
+        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 35);
 
         let requirement = DaemonCompatibilityRequirement::current();
         let protocol_error = ensure_compatible(
@@ -5480,7 +5480,7 @@ mod tests {
         // conformance revision: bumping the protocol would break every existing
         // first-party client that never issues this request.
         assert_eq!(PROTOCOL_VERSION, 6);
-        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 34);
+        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 35);
         assert_eq!(
             current_feature_list(),
             vec![
