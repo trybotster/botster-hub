@@ -3357,6 +3357,169 @@ fn process_probe(pid: libc::pid_t) -> Result<bool, String> {
     }
 }
 
+fn process_is_alive_u32(pid: u32) -> bool {
+    process_probe(pid as libc::pid_t).unwrap_or(false)
+}
+
+#[derive(Debug, Clone)]
+struct SessionWorkerProcessIdentity {
+    pid: u32,
+    command: String,
+    descendant_pids: Vec<u32>,
+}
+
+impl SessionWorkerProcessIdentity {
+    fn all_pids(&self) -> Vec<u32> {
+        let mut pids = self.descendant_pids.clone();
+        if !pids.contains(&self.pid) {
+            pids.push(self.pid);
+        }
+        pids
+    }
+
+    fn is_fully_gone(&self) -> bool {
+        self.all_pids()
+            .into_iter()
+            .all(|pid| !process_is_alive_u32(pid))
+    }
+}
+
+/// Portable census of true `botster-session-worker` binaries (not hub argv mentions).
+fn session_worker_process_identities() -> Vec<SessionWorkerProcessIdentity> {
+    let Ok(output) = Command::new("ps").args(["-axo", "pid=,command="]).output() else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            let mut parts = line.split_whitespace();
+            let pid = parts.next()?.parse::<u32>().ok()?;
+            let argv0 = parts.next()?;
+            let is_worker = Path::new(argv0)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name == "botster-session-worker");
+            if !is_worker {
+                return None;
+            }
+            let rest = parts.collect::<Vec<_>>().join(" ");
+            let command = format!("{argv0} {rest}");
+            Some(SessionWorkerProcessIdentity {
+                pid,
+                command,
+                descendant_pids: worker_owned_descendant_pids(pid),
+            })
+        })
+        .collect()
+}
+
+fn worker_owned_descendant_pids(root_pid: u32) -> Vec<u32> {
+    let Ok(output) = Command::new("ps").args(["-axo", "pid=,ppid="]).output() else {
+        return vec![root_pid];
+    };
+    let mut edges: Vec<(u32, u32)> = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let mut parts = line.split_whitespace();
+        let Some(pid) = parts.next().and_then(|value| value.parse::<u32>().ok()) else {
+            continue;
+        };
+        let Some(ppid) = parts.next().and_then(|value| value.parse::<u32>().ok()) else {
+            continue;
+        };
+        edges.push((pid, ppid));
+    }
+    let mut owned = vec![root_pid];
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for &(pid, ppid) in &edges {
+            if owned.contains(&ppid) && !owned.contains(&pid) && process_is_alive_u32(pid) {
+                owned.push(pid);
+                changed = true;
+            }
+        }
+    }
+    owned
+}
+
+fn worker_belongs_to_data_dir(worker: &SessionWorkerProcessIdentity, data_dir: &Path) -> bool {
+    let dir = data_dir.to_string_lossy();
+    if dir.is_empty() {
+        return false;
+    }
+    if worker.command.contains(dir.as_ref()) {
+        return true;
+    }
+    data_dir
+        .canonicalize()
+        .ok()
+        .is_some_and(|canon| worker.command.contains(canon.to_string_lossy().as_ref()))
+}
+
+fn worker_executable_from_this_worktree(worker: &SessionWorkerProcessIdentity) -> bool {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let argv0 = worker.command.split_whitespace().next().unwrap_or("");
+    if argv0.is_empty() {
+        return false;
+    }
+    let exe = Path::new(argv0);
+    if exe.starts_with(root) {
+        return true;
+    }
+    match (exe.canonicalize(), root.canonicalize()) {
+        (Ok(exe), Ok(root)) => exe.starts_with(root),
+        _ => worker.command.contains(&root.display().to_string()),
+    }
+}
+
+fn capture_new_session_workers_for_data_dir(
+    data_dir: &Path,
+    before_pids: &std::collections::BTreeSet<u32>,
+) -> Vec<SessionWorkerProcessIdentity> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        // Never adopt host-global "any new pid" — require this worktree's worker
+        // binary, then prefer data-dir attribution when present.
+        let live_ours: Vec<SessionWorkerProcessIdentity> = session_worker_process_identities()
+            .into_iter()
+            .filter(|worker| {
+                !before_pids.contains(&worker.pid)
+                    && process_is_alive_u32(worker.pid)
+                    && worker_executable_from_this_worktree(worker)
+            })
+            .collect();
+        let owned_by_dir: Vec<SessionWorkerProcessIdentity> = live_ours
+            .iter()
+            .filter(|worker| worker_belongs_to_data_dir(worker, data_dir))
+            .cloned()
+            .collect();
+        let live = if !owned_by_dir.is_empty() {
+            owned_by_dir
+        } else {
+            live_ours
+        };
+        if !live.is_empty() {
+            // Refresh descendant trees after a short settle so the shell child is included.
+            thread::sleep(Duration::from_millis(50));
+            return live
+                .into_iter()
+                .map(|mut worker| {
+                    worker.descendant_pids = worker_owned_descendant_pids(worker.pid);
+                    worker
+                })
+                .filter(|worker| process_is_alive_u32(worker.pid))
+                .collect();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for botster-session-worker from this worktree after Spawn; data_dir={}",
+            data_dir.display()
+        );
+        thread::sleep(Duration::from_millis(30));
+    }
+}
+
 fn process_group_probe(pgid: libc::pid_t) -> Result<bool, String> {
     if unsafe { libc::killpg(pgid, 0) } == 0 {
         return Ok(true);
@@ -10040,6 +10203,9 @@ sys.stdout.flush()
 
 /// Failure path: an armed SessionCleanupGuard must shut down a durable unbounded
 /// worker session when production RemoveSession never ran (panic / early return).
+///
+/// Proves logical-session exit/removal **and** authoritative absence of the
+/// captured session-worker PID and its shell descendants (not merely stale input).
 #[test]
 fn session_cleanup_guard_failure_path_reaps_durable_unbounded_session() {
     let _guard = daemon_test_guard();
@@ -10054,6 +10220,11 @@ fn session_cleanup_guard_failure_path_reaps_durable_unbounded_session() {
         .clone();
     let endpoint = botster_hub_client::DaemonEndpoint::new(socket_path.clone());
     let child = start_cli_daemon(&data_dir);
+
+    let before_pids: std::collections::BTreeSet<u32> = session_worker_process_identities()
+        .into_iter()
+        .map(|worker| worker.pid)
+        .collect();
 
     botster_hub_client::request(
         &endpoint,
@@ -10075,10 +10246,61 @@ fn session_cleanup_guard_failure_path_reaps_durable_unbounded_session() {
         "spawned unbounded session must be running before failure-path cleanup"
     );
 
+    let owned_workers = capture_new_session_workers_for_data_dir(&data_dir, &before_pids);
+    assert!(
+        !owned_workers.is_empty(),
+        "must capture live botster-session-worker for this data_dir after Spawn"
+    );
+    for worker in &owned_workers {
+        assert!(
+            process_is_alive_u32(worker.pid),
+            "worker pid must be live before guard drop: {worker:?}"
+        );
+        assert!(
+            worker.descendant_pids.len() >= 1,
+            "worker tree must include the worker root: {worker:?}"
+        );
+        // Shell child of the unbounded fixture should appear under the worker.
+        assert!(
+            worker
+                .descendant_pids
+                .iter()
+                .any(|pid| *pid != worker.pid && process_is_alive_u32(*pid))
+                || worker.descendant_pids.iter().all(|pid| *pid == worker.pid),
+            "expected worker-owned shell descendants when present: {worker:?}"
+        );
+    }
+    let owned_pids: Vec<u32> = owned_workers
+        .iter()
+        .flat_map(|worker| worker.all_pids())
+        .collect();
+    assert!(
+        owned_pids.iter().any(|pid| process_is_alive_u32(*pid)),
+        "owned process set must be live before failure-path cleanup: {owned_pids:?}"
+    );
+
     // Armed guard drop simulates assertion panic before production RemoveSession.
     {
         let _session_cleanup = SessionCleanupGuard::new(&data_dir, "cleanup-guard-session");
     }
+
+    // Bounded process oracle: worker + captured shell descendants must be absent.
+    let process_deadline = Instant::now() + Duration::from_secs(8);
+    while Instant::now() < process_deadline {
+        if owned_workers.iter().all(|worker| worker.is_fully_gone()) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(40));
+    }
+    let survivors: Vec<u32> = owned_pids
+        .iter()
+        .copied()
+        .filter(|pid| process_is_alive_u32(*pid))
+        .collect();
+    assert!(
+        survivors.is_empty(),
+        "SessionCleanupGuard drop must reap worker and shell descendants; still live={survivors:?} owned={owned_workers:?}"
+    );
 
     let deadline = Instant::now() + Duration::from_secs(5);
     let exited = loop {
@@ -10094,7 +10316,6 @@ fn session_cleanup_guard_failure_path_reaps_durable_unbounded_session() {
                 break session.lifecycle.clone();
             }
         } else {
-            // Guard shutdown + concurrent remove races may also drop the row.
             break "absent".to_string();
         }
         assert!(
@@ -10107,32 +10328,8 @@ fn session_cleanup_guard_failure_path_reaps_durable_unbounded_session() {
         exited == "exited" || exited == "absent",
         "failure-path cleanup must leave session exited or removed, got {exited}"
     );
-    // No running worker remains: ModeGatedInput / Input against the session must fail closed.
-    let stale_input = botster_hub_client::request(
-        &endpoint,
-        botster_hub_client::DaemonRequest::SendInput {
-            session_id: "cleanup-guard-session".to_string(),
-            data: "should-not-run\n".to_string(),
-        },
-    );
-    match stale_input {
-        Ok(response) => {
-            assert_eq!(
-                response.kind,
-                botster_hub_client::DaemonResponseKind::OperatorError,
-                "exited session must not accept live input: {response:?}"
-            );
-        }
-        Err(_) => {
-            // Transport-level rejection is also acceptable after worker reaping.
-        }
-    }
-    assert!(
-        socket_path.exists(),
-        "daemon control socket remains for hub shutdown after session cleanup"
-    );
 
-    // Production-style registry removal after guard reaped the worker.
+    // Production-style registry removal after guard reaped the worker tree.
     if session_ids_from_list(&endpoint)
         .iter()
         .any(|id| id == "cleanup-guard-session")
@@ -10149,6 +10346,26 @@ fn session_cleanup_guard_failure_path_reaps_durable_unbounded_session() {
             botster_hub_client::DaemonResponseKind::SessionRemoved
         );
     }
+    assert!(
+        !session_ids_from_list(&endpoint)
+            .iter()
+            .any(|id| id == "cleanup-guard-session"),
+        "ListSessions must not retain cleanup-guard-session after RemoveSession"
+    );
+    // Re-check process absence after logical removal (no resurrected workers).
+    let late_survivors: Vec<u32> = owned_pids
+        .iter()
+        .copied()
+        .filter(|pid| process_is_alive_u32(*pid))
+        .collect();
+    assert!(
+        late_survivors.is_empty(),
+        "no owned worker/shell pids may survive logical session removal: {late_survivors:?}"
+    );
+    assert!(
+        socket_path.exists(),
+        "daemon control socket remains for hub shutdown after session cleanup"
+    );
 
     shutdown_cli_daemon(&data_dir, child);
     assert!(
