@@ -42,7 +42,32 @@ const LATE_ATTACH_HISTORY_SESSION_ID: &str = "late-attach-history-fixture-sessio
 const LATE_ATTACH_HISTORY_SUBSCRIPTION_ID: &str = "late-attach-history-fixture-subscription";
 const LATE_ATTACH_NO_HISTORY_SESSION_ID: &str = "late-attach-no-history-fixture-session";
 const LATE_ATTACH_NO_HISTORY_SUBSCRIPTION_ID: &str = "late-attach-no-history-fixture-subscription";
-const LATE_ATTACH_HISTORY_PAYLOAD: &[u8] = &[0x00, 0xff, 0x47, 0x54, 0x59, 0x01];
+/// Frozen GHOSTSNP magic shared by both late-attach goldens.
+const GHOSTSNP_MAGIC: &[u8] = b"GHOSTSNP";
+/// Core pin used to generate both late-attach GHOSTSNP goldens.
+const LATE_ATTACH_GHOSTSNP_CORE_PIN: &str = "2c5171a6cb3b073c53620a9838d8b08480dd215c";
+/// Ghostty submodule pin used to generate both late-attach GHOSTSNP goldens.
+const LATE_ATTACH_GHOSTSNP_GHOSTTY_PIN: &str = "5e9ba17a22ba8e40bf8de7d3e7555b8378cb1880";
+/// Golden A: 24×80 Ghostty terminal after writing exactly `history-before-live\r\n`.
+///
+/// Recipe (locked): create terminal, `write_output(b"history-before-live\r\n")`,
+/// export once. Must not reuse complete-v1 or any history-bearing dual-use golden
+/// for the no-history scenario. Import must contain the history marker.
+const LATE_ATTACH_HISTORY_PAYLOAD: &[u8] =
+    include_bytes!("../fixtures/ghostsnp/late-attach-history-marker-v1.ghostsnp");
+/// Golden A length / SHA-256 identity pins (content identity for external smoke).
+const LATE_ATTACH_HISTORY_PAYLOAD_LEN: usize = 1176;
+const LATE_ATTACH_HISTORY_PAYLOAD_SHA256: &str =
+    "fc8664159efdc7bd6959dd294485c6bc2f87ad8ea2fb3a0a16ab78b2eb87fd77";
+/// Golden B: 24×80 fresh idle Ghostty terminal with zero writes, exported immediately.
+///
+/// Distinct from Golden A. Import must be blank (no history marker, no alternate-screen
+/// text, no complete-v1 cell markers). Forbidden: reusing complete-v1 or Golden A.
+const LATE_ATTACH_NO_HISTORY_PAYLOAD: &[u8] =
+    include_bytes!("../fixtures/ghostsnp/late-attach-blank-v1.ghostsnp");
+const LATE_ATTACH_NO_HISTORY_PAYLOAD_LEN: usize = 1157;
+const LATE_ATTACH_NO_HISTORY_PAYLOAD_SHA256: &str =
+    "b0e28fe69ba590f067236a2a0b1eb8b05d2aa0be74fda4324e55a6066eac328c";
 const LATE_ATTACH_HISTORY_SCREEN_TEXT: &str = "history-before-live\r\n";
 const LATE_ATTACH_LIVE_DATA: &str = "live-after-attach\r\n";
 const LATE_ATTACH_NO_HISTORY_LIVE_DATA: &str = "live-without-history\r\n";
@@ -1579,7 +1604,7 @@ pub fn late_attach_history_events() -> Vec<DaemonEvent> {
             session_id: LATE_ATTACH_HISTORY_SESSION_ID.to_string(),
             subscription_id: LATE_ATTACH_HISTORY_SUBSCRIPTION_ID.to_string(),
             history: botster_hub_client::DaemonOpaqueHistoryPayload::from_bytes(
-                LATE_ATTACH_HISTORY_PAYLOAD,
+                late_attach_history_payload_bytes(),
             ),
         },
         DaemonEvent::AttachState {
@@ -1600,10 +1625,13 @@ pub fn late_attach_history_events() -> Vec<DaemonEvent> {
     ]
 }
 
-/// Return an idle late-attach sequence without fabricated scrollback.
+/// Return an idle late-attach sequence with an explicit blank GHOSTSNP Snapshot.
 ///
-/// Production backends may emit an opaque authoritative blank snapshot between
-/// `attaching` and `attached`; that optional envelope is covered by live tests.
+/// Production Ghostty always captures a snapshot on attach; when non-empty the
+/// data plane emits `Snapshot` before `Attached`. Golden B is a fresh idle
+/// export (zero writes). Visible restore remains empty via
+/// `no_history_read_screen_text`; clients must not treat Snapshot length as
+/// renderable history.
 #[must_use]
 pub fn late_attach_no_history_events() -> Vec<DaemonEvent> {
     vec![
@@ -1611,6 +1639,13 @@ pub fn late_attach_no_history_events() -> Vec<DaemonEvent> {
             session_id: LATE_ATTACH_NO_HISTORY_SESSION_ID.to_string(),
             subscription_id: LATE_ATTACH_NO_HISTORY_SUBSCRIPTION_ID.to_string(),
             state: "attaching".to_string(),
+        },
+        DaemonEvent::Snapshot {
+            session_id: LATE_ATTACH_NO_HISTORY_SESSION_ID.to_string(),
+            subscription_id: LATE_ATTACH_NO_HISTORY_SUBSCRIPTION_ID.to_string(),
+            history: botster_hub_client::DaemonOpaqueHistoryPayload::from_bytes(
+                late_attach_no_history_payload_bytes(),
+            ),
         },
         DaemonEvent::AttachState {
             session_id: LATE_ATTACH_NO_HISTORY_SESSION_ID.to_string(),
@@ -1628,6 +1663,70 @@ pub fn late_attach_no_history_events() -> Vec<DaemonEvent> {
             code: Some(0),
         },
     ]
+}
+
+/// Provenance and content-identity pins for the dual late-attach GHOSTSNP goldens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LateAttachGhostsnpProvenance {
+    pub core_pin: &'static str,
+    pub ghostty_pin: &'static str,
+    pub terminal_rows: u16,
+    pub terminal_cols: u16,
+    pub history_payload_len: usize,
+    pub history_payload_sha256: &'static str,
+    pub blank_payload_len: usize,
+    pub blank_payload_sha256: &'static str,
+    pub ghostsnp_magic: &'static [u8],
+}
+
+/// Return frozen golden provenance (Core/Ghostty pins, sizes, SHAs, magic).
+#[must_use]
+pub fn late_attach_ghostsnp_provenance() -> LateAttachGhostsnpProvenance {
+    LateAttachGhostsnpProvenance {
+        core_pin: LATE_ATTACH_GHOSTSNP_CORE_PIN,
+        ghostty_pin: LATE_ATTACH_GHOSTSNP_GHOSTTY_PIN,
+        terminal_rows: 24,
+        terminal_cols: 80,
+        history_payload_len: LATE_ATTACH_HISTORY_PAYLOAD_LEN,
+        history_payload_sha256: LATE_ATTACH_HISTORY_PAYLOAD_SHA256,
+        blank_payload_len: LATE_ATTACH_NO_HISTORY_PAYLOAD_LEN,
+        blank_payload_sha256: LATE_ATTACH_NO_HISTORY_PAYLOAD_SHA256,
+        ghostsnp_magic: GHOSTSNP_MAGIC,
+    }
+}
+
+/// SHA-256 hex digest of opaque payload bytes (external smoke content identity).
+#[must_use]
+pub fn late_attach_history_payload_sha256() -> &'static str {
+    late_attach_ghostsnp_provenance().history_payload_sha256
+}
+
+/// SHA-256 hex digest of the blank no-history GHOSTSNP golden.
+#[must_use]
+pub fn late_attach_no_history_payload_sha256() -> &'static str {
+    late_attach_ghostsnp_provenance().blank_payload_sha256
+}
+
+/// Frozen history GHOSTSNP bytes (Golden A).
+#[must_use]
+pub fn late_attach_history_payload_bytes() -> &'static [u8] {
+    debug_assert!(LATE_ATTACH_HISTORY_PAYLOAD.starts_with(GHOSTSNP_MAGIC));
+    debug_assert_eq!(
+        LATE_ATTACH_HISTORY_PAYLOAD.len(),
+        LATE_ATTACH_HISTORY_PAYLOAD_LEN
+    );
+    LATE_ATTACH_HISTORY_PAYLOAD
+}
+
+/// Frozen blank GHOSTSNP bytes (Golden B).
+#[must_use]
+pub fn late_attach_no_history_payload_bytes() -> &'static [u8] {
+    debug_assert!(LATE_ATTACH_NO_HISTORY_PAYLOAD.starts_with(GHOSTSNP_MAGIC));
+    debug_assert_eq!(
+        LATE_ATTACH_NO_HISTORY_PAYLOAD.len(),
+        LATE_ATTACH_NO_HISTORY_PAYLOAD_LEN
+    );
+    LATE_ATTACH_NO_HISTORY_PAYLOAD
 }
 
 /// Return stable serde JSON for downstream clients that mirror the fixture.
@@ -7898,15 +7997,57 @@ mod tests {
             "idle fixture must not fabricate scrollback"
         );
         assert!(scenario.no_history_read_screen_text.is_empty());
+        let no_history_snapshot =
+            scenario
+                .no_history_then_live
+                .iter()
+                .find_map(|event| match event {
+                    DaemonEvent::Snapshot { history, .. } => Some(history),
+                    _ => None,
+                });
+        let no_history_snapshot =
+            no_history_snapshot.expect("no_history emits explicit blank GHOSTSNP Snapshot");
+        let blank = no_history_snapshot
+            .decoded_bytes()
+            .expect("no_history snapshot decodes");
         assert!(
-            scenario.no_history_then_live.iter().any(|event| {
+            blank.starts_with(GHOSTSNP_MAGIC),
+            "no_history Snapshot must be GHOSTSNP"
+        );
+        assert_eq!(blank, LATE_ATTACH_NO_HISTORY_PAYLOAD);
+        let attaching = scenario
+            .no_history_then_live
+            .iter()
+            .position(|event| {
+                matches!(event, DaemonEvent::AttachState { state, .. } if state == "attaching")
+            })
+            .expect("attaching");
+        let snapshot = scenario
+            .no_history_then_live
+            .iter()
+            .position(|event| matches!(event, DaemonEvent::Snapshot { .. }))
+            .expect("snapshot");
+        let attached = scenario
+            .no_history_then_live
+            .iter()
+            .position(|event| {
+                matches!(event, DaemonEvent::AttachState { state, .. } if state == "attached")
+            })
+            .expect("attached");
+        let live = scenario
+            .no_history_then_live
+            .iter()
+            .position(|event| {
                 matches!(
                     event,
                     DaemonEvent::TerminalOutput { data, .. }
                         if data.contains("live-without-history")
                 )
-            }),
-            "no-history fixture should still include later live terminal output"
+            })
+            .expect("live");
+        assert!(
+            attaching < snapshot && snapshot < attached && attached < live,
+            "no_history must preserve attaching < Snapshot < attached < live"
         );
     }
 
@@ -7928,10 +8069,109 @@ mod tests {
                         botster_hub_client::DaemonHistoryEncoding::Base64
                     );
                     assert!(!payload.is_empty());
+                    assert!(
+                        payload.starts_with(GHOSTSNP_MAGIC),
+                        "late-attach Snapshot must start with GHOSTSNP, got {:?}",
+                        &payload[..payload.len().min(16)]
+                    );
                 }
                 _ => {}
             }
         }
+    }
+
+    #[test]
+    fn late_attach_goldens_have_distinct_content_identity_and_pinned_provenance() {
+        assert_eq!(
+            LATE_ATTACH_HISTORY_PAYLOAD.len(),
+            LATE_ATTACH_HISTORY_PAYLOAD_LEN
+        );
+        assert_eq!(
+            LATE_ATTACH_NO_HISTORY_PAYLOAD.len(),
+            LATE_ATTACH_NO_HISTORY_PAYLOAD_LEN
+        );
+        assert_ne!(
+            LATE_ATTACH_HISTORY_PAYLOAD, LATE_ATTACH_NO_HISTORY_PAYLOAD,
+            "history and blank goldens must not dual-use the same bytes"
+        );
+        assert_ne!(
+            LATE_ATTACH_HISTORY_PAYLOAD_SHA256,
+            LATE_ATTACH_NO_HISTORY_PAYLOAD_SHA256
+        );
+        assert_eq!(
+            hex_sha256(LATE_ATTACH_HISTORY_PAYLOAD),
+            LATE_ATTACH_HISTORY_PAYLOAD_SHA256
+        );
+        assert_eq!(
+            hex_sha256(LATE_ATTACH_NO_HISTORY_PAYLOAD),
+            LATE_ATTACH_NO_HISTORY_PAYLOAD_SHA256
+        );
+        assert!(LATE_ATTACH_HISTORY_PAYLOAD.starts_with(GHOSTSNP_MAGIC));
+        assert!(LATE_ATTACH_NO_HISTORY_PAYLOAD.starts_with(GHOSTSNP_MAGIC));
+        // Provenance pins required by the approved plan.
+        assert_eq!(
+            LATE_ATTACH_GHOSTSNP_CORE_PIN,
+            "2c5171a6cb3b073c53620a9838d8b08480dd215c"
+        );
+        assert_eq!(
+            LATE_ATTACH_GHOSTSNP_GHOSTTY_PIN,
+            "5e9ba17a22ba8e40bf8de7d3e7555b8378cb1880"
+        );
+    }
+
+    #[test]
+    fn late_attach_ghostsnp_goldens_import_with_semantic_screen_state() {
+        use botster_core::contract::terminal_screen::{
+            TerminalScreenSize, TerminalSnapshotPayload,
+        };
+        use botster_core::engine::TerminalScreenRuntime;
+        use botster_terminal_ghostty::{GHOSTTY_SNAPSHOT_FORMAT, GhosttyTerminal};
+
+        let size = TerminalScreenSize::new(24, 80);
+
+        let mut history_restored = GhosttyTerminal::new(size).expect("history import terminal");
+        history_restored
+            .import_snapshot(&TerminalSnapshotPayload::new(
+                LATE_ATTACH_HISTORY_PAYLOAD.to_vec(),
+                size,
+                Some(GHOSTTY_SNAPSHOT_FORMAT.to_owned()),
+            ))
+            .expect("import Golden A");
+        let history_text = history_restored.screen_state().plain_text;
+        assert!(
+            history_text.contains("history-before-live"),
+            "Golden A import must contain history marker; got {:?}",
+            history_text.chars().take(120).collect::<String>()
+        );
+        assert!(
+            !history_text.contains("alternate"),
+            "Golden A must not be the complete-v1 alternate-screen story"
+        );
+
+        let mut blank_restored = GhosttyTerminal::new(size).expect("blank import terminal");
+        blank_restored
+            .import_snapshot(&TerminalSnapshotPayload::new(
+                LATE_ATTACH_NO_HISTORY_PAYLOAD.to_vec(),
+                size,
+                Some(GHOSTTY_SNAPSHOT_FORMAT.to_owned()),
+            ))
+            .expect("import Golden B");
+        let blank_text = blank_restored.screen_state().plain_text;
+        let non_ws: String = blank_text.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            non_ws.is_empty(),
+            "Golden B import must be blank; got {:?}",
+            blank_text.chars().take(120).collect::<String>()
+        );
+        assert!(!blank_text.contains("history-before-live"));
+        assert!(!blank_text.contains("alternate"));
+    }
+
+    fn hex_sha256(bytes: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        format!("{:x}", hasher.finalize())
     }
 
     #[test]
@@ -7976,6 +8216,11 @@ mod tests {
     #[test]
     fn late_attach_history_fixture_serializes_to_stable_client_json() {
         let value = late_attach_history_conformance_fixture_json();
+        let history_payload =
+            botster_hub_client::DaemonOpaqueHistoryPayload::from_bytes(LATE_ATTACH_HISTORY_PAYLOAD);
+        let blank_payload = botster_hub_client::DaemonOpaqueHistoryPayload::from_bytes(
+            LATE_ATTACH_NO_HISTORY_PAYLOAD,
+        );
 
         assert_eq!(
             value,
@@ -7998,7 +8243,7 @@ mod tests {
                         "type": "snapshot",
                         "session_id": LATE_ATTACH_HISTORY_SESSION_ID,
                         "subscription_id": LATE_ATTACH_HISTORY_SUBSCRIPTION_ID,
-                        "payload_base64": "AP9HVFkB",
+                        "payload_base64": history_payload.payload_base64,
                         "payload_encoding": "base64",
                         "bytes": LATE_ATTACH_HISTORY_PAYLOAD.len(),
                     },
@@ -8027,6 +8272,14 @@ mod tests {
                         "session_id": LATE_ATTACH_NO_HISTORY_SESSION_ID,
                         "subscription_id": LATE_ATTACH_NO_HISTORY_SUBSCRIPTION_ID,
                         "state": "attaching",
+                    },
+                    {
+                        "type": "snapshot",
+                        "session_id": LATE_ATTACH_NO_HISTORY_SESSION_ID,
+                        "subscription_id": LATE_ATTACH_NO_HISTORY_SUBSCRIPTION_ID,
+                        "payload_base64": blank_payload.payload_base64,
+                        "payload_encoding": "base64",
+                        "bytes": LATE_ATTACH_NO_HISTORY_PAYLOAD.len(),
                     },
                     {
                         "type": "attach_state",
