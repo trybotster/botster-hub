@@ -109,9 +109,17 @@ cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
 External install smoke (after publish / clean pack install): package 0.1.30, conf 35, `verifyPackageAssets().ok`, history Snapshot SHA == Golden A, no_history Snapshot SHA == Golden B ≠ A, both sequences attaching < snapshot < attached < terminal_output, empty no_history ReadScreen oracle, single no_history Snapshot.
 
+## PR and package coordinates
+
+- PR: https://github.com/trybotster/botster-hub/pull/208
+- Commit: `efff96a`
+- Package: `@trybotster/hub-test-support@0.1.30` / conf **35**
+- Packed tarball external smoke: **passed** (clean install, dual SHAs, ordering, `verifyPackageAssets`)
+- Registry publish: **blocked on OTP** (`npm publish` returned `EOTP`). Human must complete `npm publish packages/hub-test-support` (or packed tarball) with `--otp`. Until then, consumers can use the packed tarball / merged source pin.
+
 ## Unverified behavior or residual risk
 
-- npm registry publication and clean external install smoke complete after commit (publish script requires a clean worktree). If registry credentials are unavailable, pack tarball is the fallback coordinate for consumers.
+- Registry coordinate `@trybotster/hub-test-support@0.1.30` is not yet visible on npmjs until OTP publish completes.
 - Live idle Snapshot may not byte-equal Golden B under different PTY env; production still emits non-trivial GHOSTSNP before attached with blank ReadScreen.
 - libghostty-vt import tests require Zig 0.16.0 (same as session-worker builds).
 
