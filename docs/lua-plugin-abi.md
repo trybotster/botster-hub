@@ -105,6 +105,48 @@ family and every record before bounded delivery. Reconnect invokes the provider
 again rather than replaying cached rows. Unload removes the descriptor and
 resource and closes held subscriptions for that family.
 
+### Empty `items` encoding
+
+Lua empty tables serialize as JSON objects by default. For entity frames only,
+Hub coerces a top-level `items = {}` into a JSON array `[]` after default mlua
+decode. Nested empty tables inside rows, `entity`, or `patch` stay objects
+(`{}`). Do not rely on whole-frame empty-table-as-array conversion.
+
+### Live mutation publish (`botster.entity_publish`)
+
+Packages that mutate durable entity state must update durable truth first, then
+publish an ordered mutation frame for held-open subscribers:
+
+```lua
+local published = botster.entity_publish({
+  type = "entity_upsert", -- or entity_patch / entity_remove
+  entity_type = "project-pipelines.membership",
+  snapshot_seq = next_seq, -- package-owned, strictly increasing per family
+  id = "row-1",
+  entity = { id = "row-1", status = "claimed" },
+})
+-- published.ok, published.status, published.last_accepted_seq, published.high_water_seq
+```
+
+Admission is synchronous on the HubRuntime bridge pumped during `invoke_plugin`:
+
+| `status` | Meaning |
+| --- | --- |
+| `accepted` | Frame is next in family order; queued for control fanout |
+| `pending_gap` | Within pending window (W=16); retained until hole fills |
+| `resync_scheduled` | Outside window; high-water retained; provider resync scheduled |
+| `stale_sequence` | `seq < last_accepted_seq` (rejected) |
+| `duplicate_sequence` | `seq == last_accepted_seq` (rejected) |
+
+Fanout and provider resync run on the daemon control path after the handler
+returns. Lua does not wait for subscriber delivery. Packages own increasing
+`snapshot_seq` and durable provider truth; Hub does not invent product rows.
+
+Provider resync is coalesced per family with exponential backoff (50ms…2s), at
+most 2 provider calls per second, and at most 8 attempts per need cycle before
+`resync_degraded` observability. Snapshots never roll an advanced subscriber
+backward (`snapshot_seq < sub.last_applied_seq` is not delivered to that sub).
+
 ## Rust-Emitted Events
 
 Plugins subscribe to hub-emitted lifecycle events with the injected `events`

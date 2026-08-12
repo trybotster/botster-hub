@@ -43,13 +43,18 @@ use crate::lifecycle::{
     package_entity_owner_token,
 };
 use crate::lua_runtime::{
-    HubCoordinationBridge, HubCoordinationResponse, LuaPluginHostApi, LuaPluginRuntime,
-    LuaPluginRuntimeError, PendingCoordinationOperation, SharedHubCapabilityRuntime,
+    HubCoordinationBridge, HubCoordinationResponse, HubEntityPublishBridge, LuaPluginHostApi,
+    LuaPluginRuntime, LuaPluginRuntimeError, PendingCoordinationOperation,
+    SharedHubCapabilityRuntime,
 };
 use crate::managed_git_worktrees::{
     MANAGED_GIT_OPERATION_TIMEOUT, ManagedGitError, ManagedGitRequest, PreparedManagedWorktree,
     adopt_unrecorded_managed_worktrees, managed_worktree_id, prepare_managed_worktree,
     rollback_prepared_worktree,
+};
+use crate::package_entity_fanout::{
+    PackageEntityFamilyState, PackageEntityMutation, PackageEntityPublishResult,
+    coerce_entity_frame_empty_items, parse_publish_mutation,
 };
 use crate::packages::{PackageRecord, PackageRegistry, PackageRegistryError, PackageState};
 use crate::persistence::{FileHubStateStore, HubState, HubStateStore, HubStateStoreError};
@@ -84,6 +89,9 @@ pub struct HubRuntime {
     managed_git_coordinator: ManagedGitCoordinator,
     managed_git_operations: Mutex<Vec<PendingManagedGitOperation>>,
     coordination_bridge: HubCoordinationBridge,
+    entity_publish_bridge: HubEntityPublishBridge,
+    package_entity_families: Arc<Mutex<BTreeMap<String, PackageEntityFamilyState>>>,
+    package_entity_fanout: Arc<Mutex<VecDeque<PackageEntityMutation>>>,
     last_capability_cleanup: Option<PluginCleanupResult>,
     session_contexts: SharedSessionContexts,
 }
@@ -227,6 +235,9 @@ impl HubRuntime {
             managed_git_coordinator: ManagedGitCoordinator::new(),
             managed_git_operations: Mutex::new(Vec::new()),
             coordination_bridge: HubCoordinationBridge::new(),
+            entity_publish_bridge: HubEntityPublishBridge::new(),
+            package_entity_families: Arc::new(Mutex::new(BTreeMap::new())),
+            package_entity_fanout: Arc::new(Mutex::new(VecDeque::new())),
             config,
             state: RwLock::new(state),
             core_daemon,
@@ -299,6 +310,9 @@ impl HubRuntime {
             managed_git_coordinator: ManagedGitCoordinator::new(),
             managed_git_operations: Mutex::new(Vec::new()),
             coordination_bridge: HubCoordinationBridge::new(),
+            entity_publish_bridge: HubEntityPublishBridge::new(),
+            package_entity_families: Arc::new(Mutex::new(BTreeMap::new())),
+            package_entity_fanout: Arc::new(Mutex::new(VecDeque::new())),
             config,
             state: RwLock::new(state),
             core_daemon,
@@ -327,6 +341,12 @@ impl HubRuntime {
     #[must_use]
     pub fn coordination_bridge(&self) -> HubCoordinationBridge {
         self.coordination_bridge.clone()
+    }
+
+    /// Return the package entity publish bridge used by Lua helpers.
+    #[must_use]
+    pub fn entity_publish_bridge(&self) -> HubEntityPublishBridge {
+        self.entity_publish_bridge.clone()
     }
 
     /// Return the shared session-type spawn bridge used by Lua helpers.
@@ -394,6 +414,7 @@ impl HubRuntime {
         LuaPluginHostApi {
             capabilities: self.capability_runtime.clone(),
             coordination: self.coordination_bridge(),
+            entity_publish: self.entity_publish_bridge(),
             session_types: self.session_type_spawner.clone(),
             spawn_targets: self.spawn_targets.clone(),
             worktrees: self.worktrees.clone(),
@@ -581,6 +602,8 @@ impl HubRuntime {
         request_id: RequestId,
         package_name: &str,
     ) -> PluginCleanupResult {
+        // Drop fanout state while descriptors are still loaded so family ids resolve.
+        self.drop_package_entity_families_for(package_name);
         let plugin_key = PluginKey(package_name.to_string());
         let capability_cleanup = self.cleanup_plugin_capabilities(&plugin_key).ok();
         let mut lifecycle_cleanup = self
@@ -1113,10 +1136,196 @@ impl HubRuntime {
 
     fn fulfill_pending_plugin_requests(&self) {
         self.fulfill_pending_coordination_requests();
+        self.fulfill_pending_entity_publish_requests();
         self.fulfill_pending_session_type_reads();
         self.fulfill_pending_session_type_spawns();
         self.accept_pending_managed_git_operations();
         self.advance_managed_git_operations();
+    }
+
+    fn fulfill_pending_entity_publish_requests(&self) {
+        while let Some(pending) = self.entity_publish_bridge.take_pending() {
+            let result = self.admit_package_entity_publish(pending.plugin_key, pending.frame);
+            let _ = pending.response.send(result);
+        }
+    }
+
+    fn admit_package_entity_publish(
+        &self,
+        plugin_key: PluginKey,
+        frame: serde_json::Value,
+    ) -> Result<PackageEntityPublishResult, String> {
+        let mutation = parse_publish_mutation(frame)?;
+        let entity_type = mutation.entity_type().to_string();
+        let package_name = plugin_key.0.as_str();
+        let owned_families = self.plugin_entity_provider_families(package_name);
+        if !owned_families.contains(&entity_type) {
+            return Err(format!(
+                "entity_publish family {entity_type} is not provided by package {package_name}"
+            ));
+        }
+        let entity_kind = EntityKind(entity_type.clone());
+        let owner_token = package_entity_owner_token(package_name);
+        EntityContract::validate_entity_type(&entity_kind, Some(&owner_token))
+            .map_err(|error| error.to_string())?;
+
+        let now = Instant::now();
+        let mut families = self
+            .package_entity_families
+            .lock()
+            .expect("package entity family lock");
+        let family = families.entry(entity_type).or_default();
+        let (result, ready) = family.admit(mutation, now);
+        drop(families);
+        if !ready.is_empty() {
+            let mut fanout = self
+                .package_entity_fanout
+                .lock()
+                .expect("package entity fanout lock");
+            fanout.extend(ready);
+        }
+        Ok(result)
+    }
+
+    /// Drain admitted package entity mutations for control-path fanout.
+    #[must_use]
+    pub fn take_package_entity_fanout(&self) -> Vec<PackageEntityMutation> {
+        let mut fanout = self
+            .package_entity_fanout
+            .lock()
+            .expect("package entity fanout lock");
+        fanout.drain(..).collect()
+    }
+
+    /// Snapshot of package entity family admission state for one family.
+    #[must_use]
+    pub fn package_entity_family_state(
+        &self,
+        entity_type: &str,
+    ) -> Option<PackageEntityFamilyState> {
+        self.package_entity_families
+            .lock()
+            .expect("package entity family lock")
+            .get(entity_type)
+            .cloned()
+    }
+
+    /// Apply a provider snapshot sequence to the shared family floor.
+    ///
+    /// Returns mutations that became ready after the floor advanced.
+    pub fn apply_package_entity_provider_snapshot(
+        &self,
+        entity_type: &str,
+        snapshot_seq: u64,
+    ) -> Vec<PackageEntityMutation> {
+        let now = Instant::now();
+        let mut families = self
+            .package_entity_families
+            .lock()
+            .expect("package entity family lock");
+        let family = families.entry(entity_type.to_string()).or_default();
+        let ready = family.apply_provider_snapshot_seq(snapshot_seq, now);
+        if !ready.is_empty() {
+            let mut fanout = self
+                .package_entity_fanout
+                .lock()
+                .expect("package entity fanout lock");
+            fanout.extend(ready.iter().cloned());
+        }
+        ready
+    }
+
+    /// Mark family resync needed (e.g. catching_up subscriber or overflow).
+    pub fn mark_package_entity_resync_needed(&self, entity_type: &str) {
+        let now = Instant::now();
+        let mut families = self
+            .package_entity_families
+            .lock()
+            .expect("package entity family lock");
+        families
+            .entry(entity_type.to_string())
+            .or_default()
+            .resync
+            .mark_needed(now);
+    }
+
+    /// Families with an eligible provider resync attempt right now.
+    #[must_use]
+    pub fn package_entity_resync_eligible_families(&self) -> Vec<String> {
+        let now = Instant::now();
+        let families = self
+            .package_entity_families
+            .lock()
+            .expect("package entity family lock");
+        families
+            .iter()
+            .filter(|(_, state)| state.resync.can_attempt(now))
+            .map(|(entity_type, _)| entity_type.clone())
+            .collect()
+    }
+
+    /// Record a resync attempt; returns whether the family entered degraded.
+    pub fn record_package_entity_resync_attempt(&self, entity_type: &str) -> bool {
+        let now = Instant::now();
+        let mut families = self
+            .package_entity_families
+            .lock()
+            .expect("package entity family lock");
+        families
+            .entry(entity_type.to_string())
+            .or_default()
+            .resync
+            .record_attempt(now)
+    }
+
+    /// Clear resync need after successful convergence when no gap remains.
+    pub fn recompute_package_entity_resync(&self, entity_type: &str) {
+        let now = Instant::now();
+        let mut families = self
+            .package_entity_families
+            .lock()
+            .expect("package entity family lock");
+        if let Some(family) = families.get_mut(entity_type) {
+            family.recompute_resync_need(now);
+        }
+    }
+
+    /// Drop all package entity admission state for families owned by a package.
+    pub fn drop_package_entity_families_for(&self, package_name: &str) {
+        let families: BTreeSet<String> = self.plugin_entity_provider_families(package_name);
+        let mut state = self
+            .package_entity_families
+            .lock()
+            .expect("package entity family lock");
+        for family in &families {
+            state.remove(family);
+        }
+        let mut fanout = self
+            .package_entity_fanout
+            .lock()
+            .expect("package entity fanout lock");
+        fanout.retain(|mutation| !families.contains(mutation.entity_type()));
+    }
+
+    /// Resync attempt counter for observability (attempts field across families).
+    #[must_use]
+    pub fn package_entity_resync_attempt_total(&self, entity_type: &str) -> u32 {
+        self.package_entity_families
+            .lock()
+            .expect("package entity family lock")
+            .get(entity_type)
+            .map(|family| family.resync.attempts)
+            .unwrap_or(0)
+    }
+
+    /// Whether the family is currently marked resync_degraded.
+    #[must_use]
+    pub fn package_entity_resync_degraded(&self, entity_type: &str) -> bool {
+        self.package_entity_families
+            .lock()
+            .expect("package entity family lock")
+            .get(entity_type)
+            .is_some_and(|family| family.resync.degraded)
     }
 
     fn fulfill_pending_coordination_requests(&self) {
@@ -1418,6 +1627,7 @@ impl HubRuntime {
             })),
         });
         let value = completed_plugin_payload(outcome.result, "plugin entity provider")?;
+        let value = coerce_entity_frame_empty_items(value);
         let frame: EntityFrame = serde_json::from_value(value).map_err(|error| {
             crate::McpToolError::new(
                 "invalid_entity_provider",
@@ -2467,8 +2677,10 @@ fn validate_plugin_surface_binding_value(
                     if let Some(path) = object.get("source").and_then(serde_json::Value::as_str) {
                         validate_plugin_surface_binding_path(path, admitted_families)?;
                     }
-                    if let Some(exclude) = object.get("exclude").and_then(serde_json::Value::as_object)
-                        && let Some(path) = exclude.get("source").and_then(serde_json::Value::as_str)
+                    if let Some(exclude) =
+                        object.get("exclude").and_then(serde_json::Value::as_object)
+                        && let Some(path) =
+                            exclude.get("source").and_then(serde_json::Value::as_str)
                     {
                         validate_plugin_surface_binding_path(path, admitted_families)?;
                     }

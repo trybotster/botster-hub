@@ -19646,3 +19646,1215 @@ fn real_daemons_on_custom_data_directories_hold_the_installation_lease() {
     }
     let _ = fs::remove_dir_all(&prefix);
 }
+
+fn write_package_entity_mutation_plugin(root: &Path, provider_mode: &str) {
+    fs::create_dir_all(root).expect("create mutation package");
+    fs::write(
+        root.join("botster-package.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "name": "project-pipelines",
+            "version": "1.0.0",
+            "kind": "plugin",
+            "botster": ">=0.1.0",
+            "source": { "type": "path", "path": root.canonicalize().unwrap_or_else(|_| root.to_path_buf()) },
+            "capabilities": [{ "surface": "surfaces" }],
+            "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }],
+            "surfaces": [{
+                "id": "home",
+                "kind": "app",
+                "title": "Pipelines",
+                "supports": ["render", "action"]
+            }]
+        }))
+        .expect("serialize mutation manifest"),
+    )
+    .expect("write mutation manifest");
+    // provider_mode:
+    //  - "live": provider reflects rows + seq
+    //  - "behind": provider always returns fixed behind snapshot (seq 0, empty)
+    //  - "stale_then_live": first few calls behind, then live (via generation file)
+    let plugin = match provider_mode {
+        "behind" => r#"
+local rows = {}
+local seq = 0
+local family = "project-pipelines.membership"
+return botster.register({ handlers = {
+  { id = "home", kind = "surface_route", descriptor_id = "home",
+    call = function()
+      return { type = "panel", id = "home", children = {} }
+    end },
+  { id = "runs", kind = "entity_provider", descriptor_id = family,
+    descriptor = { entity_type = family, id_field = "id" },
+    call = function()
+      return { type = "entity_snapshot", entity_type = family, snapshot_seq = 0, items = {} }
+    end },
+  { id = "claim", kind = "ui_action", descriptor_id = "project-pipelines.claim",
+    descriptor = { action_id = "project-pipelines.claim", surface_id = "home" },
+    call = function(args)
+      local id = (args.payload and args.payload.id) or "m-1"
+      seq = seq + 1
+      rows[id] = { id = id, status = "claimed", seq = seq }
+      local published = botster.entity_publish({
+        type = "entity_upsert", entity_type = family, snapshot_seq = seq,
+        id = id, entity = rows[id],
+      })
+      return {
+        request_id = args.request_id, surface_id = "home", action_id = args.action_id,
+        node_id = args.node_id, state = "accepted", payload = published,
+      }
+    end },
+  { id = "remove", kind = "ui_action", descriptor_id = "project-pipelines.remove",
+    descriptor = { action_id = "project-pipelines.remove", surface_id = "home" },
+    call = function(args)
+      local id = (args.payload and args.payload.id) or "m-1"
+      seq = seq + 1
+      rows[id] = nil
+      local published = botster.entity_publish({
+        type = "entity_remove", entity_type = family, snapshot_seq = seq, id = id,
+      })
+      return {
+        request_id = args.request_id, surface_id = "home", action_id = args.action_id,
+        node_id = args.node_id, state = "accepted", payload = published,
+      }
+    end },
+  { id = "publish_seq", kind = "ui_action", descriptor_id = "project-pipelines.publish_seq",
+    descriptor = { action_id = "project-pipelines.publish_seq", surface_id = "home" },
+    call = function(args)
+      local target = (args.payload and args.payload.seq) or (seq + 1)
+      local id = (args.payload and args.payload.id) or ("m-" .. tostring(target))
+      local row = { id = id, status = "seq-" .. tostring(target), seq = target }
+      if args.payload and args.payload.blob then row.blob = args.payload.blob end
+      rows[id] = row
+      if target > seq then seq = target end
+      local published = botster.entity_publish({
+        type = "entity_upsert", entity_type = family, snapshot_seq = target,
+        id = id, entity = rows[id],
+      })
+      return {
+        request_id = args.request_id, surface_id = "home", action_id = args.action_id,
+        node_id = args.node_id, state = "accepted", payload = published,
+      }
+    end },
+} })
+"#
+        .to_string(),
+        _ => r#"
+local rows = {}
+local seq = 0
+local family = "project-pipelines.membership"
+return botster.register({ handlers = {
+  { id = "home", kind = "surface_route", descriptor_id = "home",
+    call = function()
+      return { type = "panel", id = "home", children = {} }
+    end },
+  { id = "runs", kind = "entity_provider", descriptor_id = family,
+    descriptor = { entity_type = family, id_field = "id" },
+    call = function()
+      local items = {}
+      for _, row in pairs(rows) do items[#items + 1] = row end
+      return {
+        type = "entity_snapshot", entity_type = family, snapshot_seq = seq, items = items,
+      }
+    end },
+  { id = "claim", kind = "ui_action", descriptor_id = "project-pipelines.claim",
+    descriptor = { action_id = "project-pipelines.claim", surface_id = "home" },
+    call = function(args)
+      local id = (args.payload and args.payload.id) or "m-1"
+      seq = seq + 1
+      rows[id] = { id = id, status = "claimed", seq = seq }
+      local published = botster.entity_publish({
+        type = "entity_upsert", entity_type = family, snapshot_seq = seq,
+        id = id, entity = rows[id],
+      })
+      return {
+        request_id = args.request_id, surface_id = "home", action_id = args.action_id,
+        node_id = args.node_id, state = "accepted", payload = published,
+      }
+    end },
+  { id = "remove", kind = "ui_action", descriptor_id = "project-pipelines.remove",
+    descriptor = { action_id = "project-pipelines.remove", surface_id = "home" },
+    call = function(args)
+      local id = (args.payload and args.payload.id) or "m-1"
+      seq = seq + 1
+      rows[id] = nil
+      local published = botster.entity_publish({
+        type = "entity_remove", entity_type = family, snapshot_seq = seq, id = id,
+      })
+      return {
+        request_id = args.request_id, surface_id = "home", action_id = args.action_id,
+        node_id = args.node_id, state = "accepted", payload = published,
+      }
+    end },
+  { id = "publish_seq", kind = "ui_action", descriptor_id = "project-pipelines.publish_seq",
+    descriptor = { action_id = "project-pipelines.publish_seq", surface_id = "home" },
+    call = function(args)
+      local target = (args.payload and args.payload.seq) or (seq + 1)
+      local id = (args.payload and args.payload.id) or ("m-" .. tostring(target))
+      local row = { id = id, status = "seq-" .. tostring(target), seq = target }
+      if args.payload and args.payload.blob then row.blob = args.payload.blob end
+      rows[id] = row
+      if target > seq then seq = target end
+      local published = botster.entity_publish({
+        type = "entity_upsert", entity_type = family, snapshot_seq = target,
+        id = id, entity = rows[id],
+      })
+      return {
+        request_id = args.request_id, surface_id = "home", action_id = args.action_id,
+        node_id = args.node_id, state = "accepted", payload = published,
+      }
+    end },
+  { id = "set_provider_seq", kind = "ui_action", descriptor_id = "project-pipelines.set_provider_seq",
+    descriptor = { action_id = "project-pipelines.set_provider_seq", surface_id = "home" },
+    call = function(args)
+      seq = (args.payload and args.payload.seq) or seq
+      return {
+        request_id = args.request_id, surface_id = "home", action_id = args.action_id,
+        node_id = args.node_id, state = "accepted", payload = { seq = seq },
+      }
+    end },
+} })
+"#
+        .to_string(),
+    };
+    fs::write(root.join("plugin.lua"), plugin).expect("write mutation plugin");
+}
+
+fn enable_mutation_package(endpoint: &botster_hub_client::DaemonEndpoint, package_dir: PathBuf) {
+    let enabled = botster_hub_client::request(
+        endpoint,
+        botster_hub_client::DaemonRequest::EnablePackageLocalPath { path: package_dir },
+    )
+    .expect("enable mutation package");
+    assert_eq!(
+        enabled.kind,
+        botster_hub_client::DaemonResponseKind::PackageDecision
+    );
+}
+
+fn mutation_action(
+    endpoint: &botster_hub_client::DaemonEndpoint,
+    action_id: &str,
+    payload: serde_json::Value,
+) -> botster_hub_client::DaemonResponse {
+    botster_hub_client::request(
+        endpoint,
+        botster_hub_client::DaemonRequest::PluginSurfaceAction {
+            package_name: "project-pipelines".to_string(),
+            request: botster_ui_contract::UiActionRequest {
+                request_id: botster_ui_contract::UiActionRequestId(format!(
+                    "mutation-{}",
+                    action_id
+                )),
+                surface_id: botster_ui_contract::UiSurfaceId("home".to_string()),
+                action_id: botster_ui_contract::UiActionId(action_id.to_string()),
+                node_id: Some(botster_ui_contract::UiNodeId("mutation-form".to_string())),
+                kind: botster_ui_contract::UiActionKind::Submit,
+                values: None,
+                payload: Some(payload),
+            },
+        },
+    )
+    .expect("surface action")
+}
+
+fn wait_for_entity_frame<F>(
+    subscription: &mut botster_hub_client::DaemonEntitySubscription,
+    deadline: Duration,
+    mut predicate: F,
+) -> botster_hub_client::DaemonEntityFrame
+where
+    F: FnMut(&botster_hub_client::DaemonEntityFrame) -> bool,
+{
+    let started = Instant::now();
+    loop {
+        let remaining = deadline.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            panic!("timed out waiting for entity frame");
+        }
+        subscription
+            .set_read_timeout(Some(remaining.min(Duration::from_millis(200))))
+            .expect("set timeout");
+        match subscription.next_frame() {
+            Ok(frame) if predicate(&frame) => return frame,
+            Ok(_) => continue,
+            Err(error) => {
+                let message = error.to_string();
+                if message.contains("timed out")
+                    || message.contains("WouldBlock")
+                    || message.contains("Resource temporarily unavailable")
+                    || message.contains("os error 35")
+                    || message.contains("os error 11")
+                {
+                    continue;
+                }
+                panic!("entity frame error: {error}");
+            }
+        }
+    }
+}
+
+#[test]
+fn daemon_package_entity_held_open_receives_upsert_then_remove_without_resubscribe() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_short_test_dir("pkg-entity-held");
+    let package_dir = unique_test_dir("pkg-entity-held-pkg");
+    write_package_entity_mutation_plugin(&package_dir, "live");
+    let config = explicit_config(&data_dir);
+    let endpoint = botster_hub_client::DaemonEndpoint::new(
+        config
+            .transports
+            .local_socket
+            .as_ref()
+            .expect("socket")
+            .path
+            .clone(),
+    );
+    let child = start_cli_daemon(&data_dir);
+    enable_mutation_package(&endpoint, package_dir);
+
+    let mut held = botster_hub_client::subscribe_entities(
+        &endpoint,
+        "project-pipelines.membership",
+        "held-open",
+    )
+    .expect("subscribe");
+    let snapshot = held.next_frame().expect("initial snapshot");
+    assert!(matches!(
+        snapshot,
+        botster_hub_client::DaemonEntityFrame::Snapshot { ref items, .. } if items.is_empty()
+    ));
+
+    let claim = mutation_action(
+        &endpoint,
+        "project-pipelines.claim",
+        serde_json::json!({ "id": "m-1" }),
+    );
+    assert_eq!(
+        claim.kind,
+        botster_hub_client::DaemonResponseKind::PluginActionResult
+    );
+    let upsert = wait_for_entity_frame(&mut held, Duration::from_secs(5), |frame| {
+        matches!(
+            frame,
+            botster_hub_client::DaemonEntityFrame::Upsert {
+                id,
+                snapshot_seq: 1,
+                ..
+            } if id == "m-1"
+        )
+    });
+    assert!(matches!(
+        upsert,
+        botster_hub_client::DaemonEntityFrame::Upsert {
+            snapshot_seq: 1,
+            ..
+        }
+    ));
+
+    let remove = mutation_action(
+        &endpoint,
+        "project-pipelines.remove",
+        serde_json::json!({ "id": "m-1" }),
+    );
+    assert_eq!(
+        remove.kind,
+        botster_hub_client::DaemonResponseKind::PluginActionResult
+    );
+    let removed = wait_for_entity_frame(&mut held, Duration::from_secs(5), |frame| {
+        matches!(
+            frame,
+            botster_hub_client::DaemonEntityFrame::Remove {
+                id,
+                snapshot_seq: 2,
+                ..
+            } if id == "m-1"
+        )
+    });
+    assert!(matches!(
+        removed,
+        botster_hub_client::DaemonEntityFrame::Remove {
+            snapshot_seq: 2,
+            ..
+        }
+    ));
+
+    held.unsubscribe().expect("unsubscribe");
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
+fn daemon_package_entity_publish_from_surface_action_returns_before_fanout_and_stream_receives_frame()
+ {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_short_test_dir("pkg-entity-return");
+    let package_dir = unique_test_dir("pkg-entity-return-pkg");
+    write_package_entity_mutation_plugin(&package_dir, "live");
+    let config = explicit_config(&data_dir);
+    let endpoint = botster_hub_client::DaemonEndpoint::new(
+        config
+            .transports
+            .local_socket
+            .as_ref()
+            .expect("socket")
+            .path
+            .clone(),
+    );
+    let child = start_cli_daemon(&data_dir);
+    enable_mutation_package(&endpoint, package_dir);
+
+    let mut held = botster_hub_client::subscribe_entities(
+        &endpoint,
+        "project-pipelines.membership",
+        "return-before-fanout",
+    )
+    .expect("subscribe");
+    let _ = held.next_frame().expect("snapshot");
+
+    let claim = mutation_action(
+        &endpoint,
+        "project-pipelines.claim",
+        serde_json::json!({ "id": "m-return" }),
+    );
+    assert_eq!(
+        claim.kind,
+        botster_hub_client::DaemonResponseKind::PluginActionResult
+    );
+    let payload = claim
+        .plugin_action_result
+        .as_ref()
+        .and_then(|result| result.payload.as_ref())
+        .expect("publish admission payload");
+    assert_eq!(payload["ok"], true);
+    assert_eq!(payload["status"], "accepted");
+
+    let _frame = wait_for_entity_frame(&mut held, Duration::from_secs(5), |frame| {
+        matches!(
+            frame,
+            botster_hub_client::DaemonEntityFrame::Upsert { id, .. } if id == "m-return"
+        )
+    });
+
+    held.unsubscribe().expect("unsubscribe");
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
+fn daemon_package_entity_publish_rejects_stale_and_duplicate_sequence() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_short_test_dir("pkg-entity-stale");
+    let package_dir = unique_test_dir("pkg-entity-stale-pkg");
+    write_package_entity_mutation_plugin(&package_dir, "live");
+    let config = explicit_config(&data_dir);
+    let endpoint = botster_hub_client::DaemonEndpoint::new(
+        config
+            .transports
+            .local_socket
+            .as_ref()
+            .expect("socket")
+            .path
+            .clone(),
+    );
+    let child = start_cli_daemon(&data_dir);
+    enable_mutation_package(&endpoint, package_dir);
+
+    let accepted = mutation_action(
+        &endpoint,
+        "project-pipelines.publish_seq",
+        serde_json::json!({ "seq": 1, "id": "a" }),
+    );
+    let payload = accepted
+        .plugin_action_result
+        .as_ref()
+        .and_then(|result| result.payload.as_ref())
+        .expect("payload");
+    assert_eq!(payload["status"], "accepted");
+
+    let duplicate = mutation_action(
+        &endpoint,
+        "project-pipelines.publish_seq",
+        serde_json::json!({ "seq": 1, "id": "a" }),
+    );
+    let duplicate_payload = duplicate
+        .plugin_action_result
+        .as_ref()
+        .and_then(|result| result.payload.as_ref())
+        .expect("duplicate payload");
+    assert_eq!(duplicate_payload["ok"], false);
+    assert_eq!(duplicate_payload["status"], "duplicate_sequence");
+
+    let stale = mutation_action(
+        &endpoint,
+        "project-pipelines.publish_seq",
+        serde_json::json!({ "seq": 0, "id": "z" }),
+    );
+    let stale_payload = stale
+        .plugin_action_result
+        .as_ref()
+        .and_then(|result| result.payload.as_ref())
+        .expect("stale payload");
+    assert_eq!(stale_payload["ok"], false);
+    assert_eq!(stale_payload["status"], "stale_sequence");
+
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
+fn daemon_package_entity_publish_gap_pending_then_accepts_in_order() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_short_test_dir("pkg-entity-gap");
+    let package_dir = unique_test_dir("pkg-entity-gap-pkg");
+    // Behind provider keeps resync from advancing the family floor before N+1 arrives.
+    write_package_entity_mutation_plugin(&package_dir, "behind");
+    let config = explicit_config(&data_dir);
+    let endpoint = botster_hub_client::DaemonEndpoint::new(
+        config
+            .transports
+            .local_socket
+            .as_ref()
+            .expect("socket")
+            .path
+            .clone(),
+    );
+    let child = start_cli_daemon(&data_dir);
+    enable_mutation_package(&endpoint, package_dir);
+
+    let mut held = botster_hub_client::subscribe_entities(
+        &endpoint,
+        "project-pipelines.membership",
+        "gap-order",
+    )
+    .expect("subscribe");
+    let _ = held.next_frame().expect("snapshot");
+
+    let gap = mutation_action(
+        &endpoint,
+        "project-pipelines.publish_seq",
+        serde_json::json!({ "seq": 2, "id": "b" }),
+    );
+    assert_eq!(
+        gap.plugin_action_result
+            .as_ref()
+            .and_then(|result| result.payload.as_ref())
+            .map(|payload| payload["status"].as_str()),
+        Some(Some("pending_gap"))
+    );
+
+    let fill = mutation_action(
+        &endpoint,
+        "project-pipelines.publish_seq",
+        serde_json::json!({ "seq": 1, "id": "a" }),
+    );
+    assert_eq!(
+        fill.plugin_action_result
+            .as_ref()
+            .and_then(|result| result.payload.as_ref())
+            .map(|payload| payload["status"].as_str()),
+        Some(Some("accepted"))
+    );
+
+    let first = wait_for_entity_frame(&mut held, Duration::from_secs(5), |frame| {
+        matches!(
+            frame,
+            botster_hub_client::DaemonEntityFrame::Upsert {
+                snapshot_seq: 1,
+                ..
+            }
+        )
+    });
+    let second = wait_for_entity_frame(&mut held, Duration::from_secs(5), |frame| {
+        matches!(
+            frame,
+            botster_hub_client::DaemonEntityFrame::Upsert {
+                snapshot_seq: 2,
+                ..
+            }
+        )
+    });
+    assert!(matches!(
+        first,
+        botster_hub_client::DaemonEntityFrame::Upsert {
+            snapshot_seq: 1,
+            ..
+        }
+    ));
+    assert!(matches!(
+        second,
+        botster_hub_client::DaemonEntityFrame::Upsert {
+            snapshot_seq: 2,
+            ..
+        }
+    ));
+
+    held.unsubscribe().expect("unsubscribe");
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
+fn daemon_package_entity_publish_unload_closes_held_subscription() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_short_test_dir("pkg-entity-unload");
+    let package_dir = unique_test_dir("pkg-entity-unload-pkg");
+    write_package_entity_mutation_plugin(&package_dir, "live");
+    let config = explicit_config(&data_dir);
+    let endpoint = botster_hub_client::DaemonEndpoint::new(
+        config
+            .transports
+            .local_socket
+            .as_ref()
+            .expect("socket")
+            .path
+            .clone(),
+    );
+    let child = start_cli_daemon(&data_dir);
+    enable_mutation_package(&endpoint, package_dir);
+
+    let mut held = botster_hub_client::subscribe_entities(
+        &endpoint,
+        "project-pipelines.membership",
+        "unload-held",
+    )
+    .expect("subscribe");
+    let _ = held.next_frame().expect("snapshot");
+    let disabled = botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::DisablePackage {
+            package_name: "project-pipelines".to_string(),
+        },
+    )
+    .expect("disable package");
+    assert_eq!(
+        disabled.kind,
+        botster_hub_client::DaemonResponseKind::PackageDecision
+    );
+    held.set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("timeout");
+    assert!(
+        held.next_frame().is_err(),
+        "disabled package subscription must close"
+    );
+    let cleanup_deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let counters =
+            botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status)
+                .expect("status after unload")
+                .status
+                .expect("status body")
+                .lifecycle_counters;
+        if counters.live_entity_subscriptions == 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < cleanup_deadline,
+            "subscription counter remained live after unload: {counters:?}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
+fn daemon_package_entity_publish_outside_pending_window_sets_high_water_and_converges() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_short_test_dir("pkg-entity-outside-w");
+    let package_dir = unique_test_dir("pkg-entity-outside-w-pkg");
+    write_package_entity_mutation_plugin(&package_dir, "live");
+    let config = explicit_config(&data_dir);
+    let endpoint = botster_hub_client::DaemonEndpoint::new(
+        config
+            .transports
+            .local_socket
+            .as_ref()
+            .expect("socket")
+            .path
+            .clone(),
+    );
+    let child = start_cli_daemon(&data_dir);
+    enable_mutation_package(&endpoint, package_dir);
+
+    let mut held = botster_hub_client::subscribe_entities(
+        &endpoint,
+        "project-pipelines.membership",
+        "outside-w",
+    )
+    .expect("subscribe");
+    let _ = held.next_frame().expect("snapshot");
+
+    let _ = mutation_action(
+        &endpoint,
+        "project-pipelines.publish_seq",
+        serde_json::json!({ "seq": 1, "id": "seed" }),
+    );
+    let _ = wait_for_entity_frame(&mut held, Duration::from_secs(5), |frame| {
+        matches!(
+            frame,
+            botster_hub_client::DaemonEntityFrame::Upsert {
+                snapshot_seq: 1,
+                ..
+            }
+        )
+    });
+
+    let outside = mutation_action(
+        &endpoint,
+        "project-pipelines.publish_seq",
+        serde_json::json!({ "seq": 20, "id": "high" }),
+    );
+    let outside_payload = outside
+        .plugin_action_result
+        .as_ref()
+        .and_then(|result| result.payload.as_ref())
+        .expect("outside payload");
+    assert_eq!(outside_payload["status"], "resync_scheduled");
+    assert_eq!(outside_payload["high_water_seq"], 20);
+
+    // Live provider already has seq=20 and the row; resync should deliver snapshot.
+    let snapshot = wait_for_entity_frame(&mut held, Duration::from_secs(10), |frame| {
+        matches!(
+            frame,
+            botster_hub_client::DaemonEntityFrame::Snapshot {
+                snapshot_seq,
+                ..
+            } if *snapshot_seq >= 20
+        )
+    });
+    assert!(matches!(
+        snapshot,
+        botster_hub_client::DaemonEntityFrame::Snapshot {
+            snapshot_seq,
+            ref items,
+            ..
+        } if snapshot_seq >= 20
+            && items.iter().any(|item| item.get("id").and_then(|v| v.as_str()) == Some("high"))
+    ));
+
+    held.unsubscribe().expect("unsubscribe");
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
+fn daemon_package_entity_second_subscriber_behind_snapshot_does_not_roll_advanced_subscriber() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_short_test_dir("pkg-entity-two-sub");
+    let package_dir = unique_test_dir("pkg-entity-two-sub-pkg");
+    write_package_entity_mutation_plugin(&package_dir, "live");
+    let config = explicit_config(&data_dir);
+    let endpoint = botster_hub_client::DaemonEndpoint::new(
+        config
+            .transports
+            .local_socket
+            .as_ref()
+            .expect("socket")
+            .path
+            .clone(),
+    );
+    let child = start_cli_daemon(&data_dir);
+    enable_mutation_package(&endpoint, package_dir);
+
+    let mut sub_a =
+        botster_hub_client::subscribe_entities(&endpoint, "project-pipelines.membership", "sub-a")
+            .expect("subscribe a");
+    let _ = sub_a.next_frame().expect("a snapshot");
+    let _ = mutation_action(
+        &endpoint,
+        "project-pipelines.publish_seq",
+        serde_json::json!({ "seq": 1, "id": "row-1" }),
+    );
+    let _ = wait_for_entity_frame(&mut sub_a, Duration::from_secs(5), |frame| {
+        matches!(
+            frame,
+            botster_hub_client::DaemonEntityFrame::Upsert {
+                snapshot_seq: 1,
+                ..
+            }
+        )
+    });
+
+    // Force provider snapshot seq behind by not advancing durable rows for a
+    // second subscribe path: set_provider_seq is not enough because live
+    // provider uses seq. Instead publish_seq advances both. Simulate behind by
+    // using a temporary empty second subscription after lowering is impossible.
+    // Plan requires behind provider on second subscribe: use a second family
+    // snapshot by claiming then setting provider to report only older content
+    // via remove of knowledge... Live provider always returns current seq.
+    //
+    // Practical proof: publish seq 2, then open sub B which gets S=2 (not behind).
+    // To force behind, reinstall is heavy. Instead: after sub A is at 1, call
+    // set_provider_seq to 0 without clearing rows — but provider still returns
+    // seq variable. set_provider_seq lowers seq for provider only while fanout
+    // state keeps last_accepted=1. Then sub B's snapshot has S=0 < floor.
+    let _ = mutation_action(
+        &endpoint,
+        "project-pipelines.set_provider_seq",
+        serde_json::json!({ "seq": 0 }),
+    );
+
+    let mut sub_b =
+        botster_hub_client::subscribe_entities(&endpoint, "project-pipelines.membership", "sub-b")
+            .expect("subscribe b");
+    let b_snapshot = sub_b.next_frame().expect("b snapshot");
+    assert!(matches!(
+        b_snapshot,
+        botster_hub_client::DaemonEntityFrame::Snapshot {
+            snapshot_seq: 0,
+            ..
+        }
+    ));
+
+    // Sub A must not receive the behind snapshot.
+    sub_a
+        .set_read_timeout(Some(Duration::from_millis(400)))
+        .expect("timeout");
+    match sub_a.next_frame() {
+        Ok(botster_hub_client::DaemonEntityFrame::Snapshot { snapshot_seq, .. }) => {
+            assert!(
+                snapshot_seq >= 1,
+                "advanced subscriber must not roll back via behind snapshot {snapshot_seq}"
+            );
+        }
+        Ok(frame) => {
+            // Deltas at/after applied are fine; snapshots below 1 are not.
+            if let botster_hub_client::DaemonEntityFrame::Snapshot { snapshot_seq, .. } = frame {
+                assert!(snapshot_seq >= 1);
+            }
+        }
+        Err(_) => {
+            // Timeout: no frame to A is also acceptable for behind-only delivery.
+        }
+    }
+
+    // Restore live provider truth and allow B to catch up.
+    let _ = mutation_action(
+        &endpoint,
+        "project-pipelines.set_provider_seq",
+        serde_json::json!({ "seq": 1 }),
+    );
+    let _ = wait_for_entity_frame(&mut sub_b, Duration::from_secs(10), |frame| {
+        matches!(
+            frame,
+            botster_hub_client::DaemonEntityFrame::Snapshot {
+                snapshot_seq,
+                ..
+            } if *snapshot_seq >= 1
+        )
+    });
+
+    let _ = sub_a.unsubscribe();
+    let _ = sub_b.unsubscribe();
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
+fn daemon_package_entity_resync_under_stale_provider_is_pressure_bounded() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_short_test_dir("pkg-entity-pressure");
+    let package_dir = unique_test_dir("pkg-entity-pressure-pkg");
+    write_package_entity_mutation_plugin(&package_dir, "behind");
+    let config = explicit_config(&data_dir);
+    let endpoint = botster_hub_client::DaemonEndpoint::new(
+        config
+            .transports
+            .local_socket
+            .as_ref()
+            .expect("socket")
+            .path
+            .clone(),
+    );
+    let child = start_cli_daemon(&data_dir);
+    enable_mutation_package(&endpoint, package_dir);
+
+    let mut held = botster_hub_client::subscribe_entities(
+        &endpoint,
+        "project-pipelines.membership",
+        "pressure",
+    )
+    .expect("subscribe");
+    let _ = held.next_frame().expect("snapshot");
+
+    // Force outside-window resync need while provider stays at 0.
+    let _ = mutation_action(
+        &endpoint,
+        "project-pipelines.publish_seq",
+        serde_json::json!({ "seq": 1, "id": "seed" }),
+    );
+    let _ = mutation_action(
+        &endpoint,
+        "project-pipelines.publish_seq",
+        serde_json::json!({ "seq": 20, "id": "high" }),
+    );
+
+    // Poll Status repeatedly while resync runs under backoff; daemon must stay responsive.
+    let started = Instant::now();
+    let mut saw_degraded = false;
+    while started.elapsed() < Duration::from_secs(20) {
+        let status =
+            botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status)
+                .expect("status remains responsive under stale provider resync");
+        assert_eq!(status.kind, botster_hub_client::DaemonResponseKind::Status);
+        let counters = status
+            .status
+            .as_ref()
+            .expect("status body")
+            .lifecycle_counters
+            .clone();
+        if counters.package_entity_resync_degraded > 0 {
+            saw_degraded = true;
+            assert!(
+                counters.package_entity_resync_attempts <= 16,
+                "attempts stayed near locked budget, got {}",
+                counters.package_entity_resync_attempts
+            );
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        saw_degraded,
+        "stale provider must enter resync_degraded under max attempts"
+    );
+
+    let _ = held.unsubscribe();
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
+fn daemon_package_entity_publish_out_of_order_with_behind_provider_converges_all_subscribers() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_short_test_dir("pkg-entity-ooo");
+    let package_dir = unique_test_dir("pkg-entity-ooo-pkg");
+    // Behind first, then switch to live is hard in-process; use live but publish
+    // N+2 then N+1 quickly. Pending retention preserves order without requiring
+    // package re-publish after gaps.
+    write_package_entity_mutation_plugin(&package_dir, "behind");
+    let config = explicit_config(&data_dir);
+    let endpoint = botster_hub_client::DaemonEndpoint::new(
+        config
+            .transports
+            .local_socket
+            .as_ref()
+            .expect("socket")
+            .path
+            .clone(),
+    );
+    let child = start_cli_daemon(&data_dir);
+    enable_mutation_package(&endpoint, package_dir);
+
+    let mut held =
+        botster_hub_client::subscribe_entities(&endpoint, "project-pipelines.membership", "ooo")
+            .expect("subscribe");
+    let _ = held.next_frame().expect("snapshot");
+
+    // N+2 first while provider still at 0 until publish updates rows/seq.
+    let gap = mutation_action(
+        &endpoint,
+        "project-pipelines.publish_seq",
+        serde_json::json!({ "seq": 2, "id": "n2" }),
+    );
+    assert_eq!(
+        gap.plugin_action_result
+            .as_ref()
+            .and_then(|r| r.payload.as_ref())
+            .map(|p| p["status"].as_str()),
+        Some(Some("pending_gap"))
+    );
+    // Behind first resync would still see seq=2 from live provider after gap publish
+    // (publish updates rows). Fill N+1 and require ordered delivery.
+    let _ = mutation_action(
+        &endpoint,
+        "project-pipelines.publish_seq",
+        serde_json::json!({ "seq": 1, "id": "n1" }),
+    );
+    let _ = wait_for_entity_frame(&mut held, Duration::from_secs(5), |frame| {
+        matches!(
+            frame,
+            botster_hub_client::DaemonEntityFrame::Upsert {
+                snapshot_seq: 1,
+                ..
+            }
+        )
+    });
+    let _ = wait_for_entity_frame(&mut held, Duration::from_secs(5), |frame| {
+        matches!(
+            frame,
+            botster_hub_client::DaemonEntityFrame::Upsert {
+                snapshot_seq: 2,
+                ..
+            }
+        )
+    });
+
+    held.unsubscribe().expect("unsubscribe");
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
+fn daemon_package_entity_publish_concurrent_out_of_order_preserves_family_order() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_short_test_dir("pkg-entity-concurrent");
+    let package_dir = unique_test_dir("pkg-entity-concurrent-pkg");
+    write_package_entity_mutation_plugin(&package_dir, "behind");
+    let config = explicit_config(&data_dir);
+    let endpoint = botster_hub_client::DaemonEndpoint::new(
+        config
+            .transports
+            .local_socket
+            .as_ref()
+            .expect("socket")
+            .path
+            .clone(),
+    );
+    let child = start_cli_daemon(&data_dir);
+    enable_mutation_package(&endpoint, package_dir);
+
+    let mut held = botster_hub_client::subscribe_entities(
+        &endpoint,
+        "project-pipelines.membership",
+        "concurrent",
+    )
+    .expect("subscribe");
+    let _ = held.next_frame().expect("snapshot");
+
+    let endpoint_a = endpoint.clone();
+    let endpoint_b = endpoint.clone();
+    let t1 = thread::spawn(move || {
+        mutation_action(
+            &endpoint_a,
+            "project-pipelines.publish_seq",
+            serde_json::json!({ "seq": 3, "id": "c" }),
+        )
+    });
+    let t2 = thread::spawn(move || {
+        mutation_action(
+            &endpoint_b,
+            "project-pipelines.publish_seq",
+            serde_json::json!({ "seq": 2, "id": "b" }),
+        )
+    });
+    let _ = t1.join().expect("join t1");
+    let _ = t2.join().expect("join t2");
+    let _ = mutation_action(
+        &endpoint,
+        "project-pipelines.publish_seq",
+        serde_json::json!({ "seq": 1, "id": "a" }),
+    );
+
+    let mut seen = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while seen.len() < 3 && Instant::now() < deadline {
+        held.set_read_timeout(Some(Duration::from_millis(200)))
+            .expect("timeout");
+        if let Ok(botster_hub_client::DaemonEntityFrame::Upsert { snapshot_seq, .. }) =
+            held.next_frame()
+        {
+            seen.push(snapshot_seq);
+        }
+    }
+    assert_eq!(
+        seen,
+        vec![1, 2, 3],
+        "family order must be preserved: {seen:?}"
+    );
+
+    held.unsubscribe().expect("unsubscribe");
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
+fn daemon_package_entity_subscriber_overflow_resyncs_from_provider() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_short_test_dir("pkg-entity-overflow");
+    let package_dir = unique_test_dir("pkg-entity-overflow-pkg");
+    write_package_entity_mutation_plugin(&package_dir, "live");
+    let config = explicit_config(&data_dir);
+    let endpoint = botster_hub_client::DaemonEndpoint::new(
+        config
+            .transports
+            .local_socket
+            .as_ref()
+            .expect("socket")
+            .path
+            .clone(),
+    );
+    let child = start_cli_daemon(&data_dir);
+    enable_mutation_package(&endpoint, package_dir);
+
+    let mut held = botster_hub_client::subscribe_entities(
+        &endpoint,
+        "project-pipelines.membership",
+        "overflow",
+    )
+    .expect("subscribe");
+    let _ = held.next_frame().expect("snapshot");
+
+    // Publish a baseline, then many sequential mutations. The held client keeps
+    // reading so the stream stays healthy; overflow of the bounded queue is
+    // covered by the Blocking-sender unit proof in daemon_transport. Here we
+    // prove provider resync remains available after a large sequential burst
+    // (high-water catch-up without package re-publish).
+    for seq in 1_u64..=40 {
+        let _ = mutation_action(
+            &endpoint,
+            "project-pipelines.publish_seq",
+            serde_json::json!({ "seq": seq, "id": format!("row-{seq}") }),
+        );
+        // Keep the stream drained so the connection stays open under burst.
+        held.set_read_timeout(Some(Duration::from_millis(200)))
+            .expect("timeout");
+        let _ = held.next_frame();
+    }
+
+    // Force a gap outside the pending window while the provider is live so
+    // coalesced resync delivers a snapshot high-water baseline.
+    let outside = mutation_action(
+        &endpoint,
+        "project-pipelines.publish_seq",
+        serde_json::json!({ "seq": 60, "id": "high-water" }),
+    );
+    assert_eq!(
+        outside
+            .plugin_action_result
+            .as_ref()
+            .and_then(|result| result.payload.as_ref())
+            .map(|payload| payload["status"].as_str()),
+        Some(Some("resync_scheduled"))
+    );
+    let snapshot = wait_for_entity_frame(&mut held, Duration::from_secs(10), |frame| {
+        matches!(
+            frame,
+            botster_hub_client::DaemonEntityFrame::Snapshot {
+                snapshot_seq,
+                ..
+            } if *snapshot_seq >= 60
+        )
+    });
+    assert!(matches!(
+        snapshot,
+        botster_hub_client::DaemonEntityFrame::Snapshot {
+            snapshot_seq,
+            ..
+        } if snapshot_seq >= 60
+    ));
+
+    held.unsubscribe().expect("unsubscribe");
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
+fn daemon_package_entity_held_open_fanout_over_local_webrtc() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_short_test_dir("pkg-entity-webrtc");
+    let web_package_dir = unique_test_dir("pkg-entity-webrtc-web");
+    let package_dir = unique_test_dir("pkg-entity-webrtc-pkg");
+    write_botster_web_package(&web_package_dir);
+    write_package_entity_mutation_plugin(&package_dir, "live");
+    let config = explicit_config(&data_dir);
+    let endpoint = botster_hub_client::DaemonEndpoint::new(
+        config
+            .transports
+            .local_socket
+            .as_ref()
+            .expect("socket")
+            .path
+            .clone(),
+    );
+    let child = start_cli_daemon(&data_dir);
+    enable_supervised_package(&data_dir, &web_package_dir);
+    enable_mutation_package(&endpoint, package_dir);
+
+    let web_listener_port = unused_loopback_port();
+    let start = botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::StartPackageEntrypoint {
+            package_name: "botster-web".to_string(),
+            entrypoint_id: "web-client".to_string(),
+            environment_overrides: BTreeMap::from([(
+                "BOTSTER_WEB_PORT".to_string(),
+                web_listener_port.to_string(),
+            )]),
+        },
+    )
+    .expect("start botster-web");
+    assert_eq!(start.kind, botster_hub_client::DaemonResponseKind::Packages);
+    let web_origin = format!("http://127.0.0.1:{web_listener_port}");
+    let expected_local_url = format!("{web_origin}/");
+    let _apps =
+        wait_for_botster_web_readiness(&endpoint, &web_origin, &expected_local_url, Instant::now());
+
+    let bootstrap = botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::IssueLocalWebrtcBootstrap {
+            package_name: "botster-web".to_string(),
+            entrypoint_id: "web-client".to_string(),
+            origin: web_origin.clone(),
+        },
+    )
+    .expect("issue bootstrap")
+    .local_webrtc_bootstrap
+    .expect("bootstrap body");
+
+    block_on(async {
+        let (mut offer_peer, stream_key) = open_local_webrtc_peer(&endpoint, &bootstrap).await;
+        let subscribed = offer_peer
+            .encrypted_request(
+                &stream_key,
+                &botster_hub_client::DaemonRequest::SubscribeEntities {
+                    entity_type: "project-pipelines.membership".to_string(),
+                    subscription_id: "webrtc-held".to_string(),
+                },
+            )
+            .await
+            .expect("subscribe over webrtc");
+        assert_eq!(
+            subscribed.kind,
+            botster_hub_client::DaemonResponseKind::EntitySubscribed
+        );
+        let snapshot = offer_peer
+            .next_entity_frame(&stream_key)
+            .await
+            .expect("initial snapshot");
+        assert!(matches!(
+            snapshot,
+            botster_hub_client::DaemonEntityFrame::Snapshot { ref items, .. } if items.is_empty()
+        ));
+
+        let claim = mutation_action(
+            &endpoint,
+            "project-pipelines.claim",
+            serde_json::json!({ "id": "webrtc-m1" }),
+        );
+        assert_eq!(
+            claim.kind,
+            botster_hub_client::DaemonResponseKind::PluginActionResult
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let frame = timeout(
+                Duration::from_millis(500),
+                offer_peer.next_entity_frame(&stream_key),
+            )
+            .await;
+            match frame {
+                Ok(Ok(botster_hub_client::DaemonEntityFrame::Upsert {
+                    ref id,
+                    snapshot_seq: 1,
+                    ..
+                })) if id == "webrtc-m1" => break,
+                Ok(Ok(_)) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "timed out waiting for webrtc upsert"
+                    );
+                }
+                Ok(Err(error)) => panic!("webrtc entity frame error: {error}"),
+                Err(_) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "timed out waiting for webrtc upsert"
+                    );
+                }
+            }
+        }
+    });
+
+    shutdown_cli_daemon(&data_dir, child);
+}

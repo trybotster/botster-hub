@@ -1937,6 +1937,15 @@ pub struct DaemonLifecycleCounters {
     pub entity_delivery_overflows: u64,
     pub entity_delivery_failures: u64,
     pub stalled_writes: u64,
+    /// Package entity provider resync attempts across families.
+    #[serde(default)]
+    pub package_entity_resync_attempts: u64,
+    /// Times a family entered resync_degraded after max attempts.
+    #[serde(default)]
+    pub package_entity_resync_degraded: u64,
+    /// Package entity mutations accepted for fanout.
+    #[serde(default)]
+    pub package_entity_publish_accepted: u64,
 }
 
 impl DaemonLifecycleCounters {

@@ -43,6 +43,7 @@ pub mod lua_runtime;
 pub mod maintenance;
 pub mod managed_git_worktrees;
 pub mod mcp;
+pub mod package_entity_fanout;
 pub mod packages;
 pub mod persistence;
 pub mod profile;
