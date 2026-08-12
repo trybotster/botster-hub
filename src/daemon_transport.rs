@@ -7947,7 +7947,7 @@ fn daemon_event_from_client(event: HubClientEvent) -> DaemonEvent {
         } => DaemonEvent::TerminalOutput {
             session_id: session_id.0,
             subscription_id: subscription_id.0,
-            data: String::from_utf8_lossy(&data).to_string(),
+            payload: botster_hub_client::DaemonLiveOutputPayload::from_bytes(&data),
         },
         HubClientEvent::Snapshot {
             session_id,
@@ -8868,11 +8868,49 @@ mod tests {
     }
 
     #[test]
+    fn daemon_event_projection_preserves_exact_live_output_bytes() {
+        let session_id = SessionId("daemon-live-session".to_string());
+        let subscription_id = SubscriptionId("daemon-live-subscription".to_string());
+        let payload = vec![0x00, 0x1b, 0xff, 0xc0, 0xe2];
+        let live = daemon_event_from_client(HubClientEvent::TerminalOutput {
+            session_id,
+            subscription_id,
+            data: payload.clone(),
+        });
+
+        assert_eq!(
+            live,
+            DaemonEvent::TerminalOutput {
+                session_id: "daemon-live-session".to_string(),
+                subscription_id: "daemon-live-subscription".to_string(),
+                payload: botster_hub_client::DaemonLiveOutputPayload::from_bytes(&payload),
+            }
+        );
+        let DaemonEvent::TerminalOutput {
+            payload: decoded, ..
+        } = live
+        else {
+            panic!("expected live output");
+        };
+        assert_eq!(
+            decoded.decoded_bytes().expect("validated live payload"),
+            payload
+        );
+        assert_ne!(
+            String::from_utf8_lossy(&payload).as_bytes(),
+            payload.as_slice(),
+            "lossy UTF-8 would have changed these bytes"
+        );
+    }
+
+    #[test]
     fn daemon_egress_diagnostics_classify_terminal_and_control_backpressure() {
         let terminal = daemon_events(vec![DaemonEvent::TerminalOutput {
             session_id: "session-redacted".to_string(),
             subscription_id: "subscription-redacted".to_string(),
-            data: "private terminal payload".to_string(),
+            payload: botster_hub_client::DaemonLiveOutputPayload::from_bytes(
+                b"private terminal payload",
+            ),
         }]);
         let control = daemon_response_base(DaemonResponseKind::Sessions);
 

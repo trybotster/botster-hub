@@ -21,8 +21,8 @@ use serde_json::Value;
 mod typescript;
 
 pub const PROTOCOL: &str = "botster-hub-daemon-v1";
-pub const PROTOCOL_VERSION: u16 = 6;
-pub const CONFORMANCE_FIXTURE_REVISION: u16 = 35;
+pub const PROTOCOL_VERSION: u16 = 7;
+pub const CONFORMANCE_FIXTURE_REVISION: u16 = 36;
 /// Version of the local WebRTC delivery chunk framing protocol.
 pub const LOCAL_WEBRTC_DELIVERY_CHUNK_VERSION: u16 = 2;
 /// Serialized local WebRTC delivery frames must remain strictly below this size.
@@ -442,10 +442,11 @@ fn write_terminal_events(
     output: &mut impl Write,
 ) -> DaemonTransportResult<()> {
     for event in events {
-        if let DaemonEvent::TerminalOutput { data, .. } = event {
-            output
-                .write_all(data.as_bytes())
-                .map_err(DaemonTransportError::Io)?;
+        if let DaemonEvent::TerminalOutput { payload, .. } = event {
+            let data = payload
+                .decoded_bytes()
+                .map_err(|error| DaemonTransportError::Io(std::io::Error::other(error)))?;
+            output.write_all(&data).map_err(DaemonTransportError::Io)?;
             output.flush().map_err(DaemonTransportError::Io)?;
         }
     }
@@ -2336,7 +2337,7 @@ impl DaemonOpaqueHistoryPayload {
 
     /// Decode the opaque bytes after validating their declared length.
     pub fn decoded_bytes(&self) -> Result<Vec<u8>, String> {
-        decode_history_payload(&self.payload_base64, self.bytes)
+        decode_validated_base64_payload(&self.payload_base64, self.bytes, "opaque history")
     }
 }
 
@@ -2344,7 +2345,7 @@ impl TryFrom<UncheckedDaemonOpaqueHistoryPayload> for DaemonOpaqueHistoryPayload
     type Error = String;
 
     fn try_from(payload: UncheckedDaemonOpaqueHistoryPayload) -> Result<Self, Self::Error> {
-        decode_history_payload(&payload.payload_base64, payload.bytes)?;
+        decode_validated_base64_payload(&payload.payload_base64, payload.bytes, "opaque history")?;
         Ok(Self {
             payload_base64: payload.payload_base64,
             payload_encoding: payload.payload_encoding,
@@ -2363,13 +2364,81 @@ impl<'de> Deserialize<'de> for DaemonOpaqueHistoryPayload {
     }
 }
 
-fn decode_history_payload(payload_base64: &str, bytes: usize) -> Result<Vec<u8>, String> {
+/// Validated live PTY output serialized as flat daemon event fields.
+///
+/// Field names match Snapshot/Scrollback so generated clients share one envelope,
+/// but these bytes are renderable terminal output and must be concatenated without
+/// UTF-8 repair. Do not reuse [`DaemonOpaqueHistoryPayload`] here: that type is
+/// opaque engine state that must not be rendered.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DaemonLiveOutputPayload {
+    pub payload_base64: String,
+    pub payload_encoding: DaemonHistoryEncoding,
+    pub bytes: usize,
+}
+
+#[derive(Deserialize)]
+struct UncheckedDaemonLiveOutputPayload {
+    payload_base64: String,
+    payload_encoding: DaemonHistoryEncoding,
+    bytes: usize,
+    #[serde(flatten)]
+    extra: BTreeMap<String, Value>,
+}
+
+impl DaemonLiveOutputPayload {
+    #[must_use]
+    pub fn from_bytes(payload: &[u8]) -> Self {
+        Self {
+            payload_base64: base64::engine::general_purpose::STANDARD.encode(payload),
+            payload_encoding: DaemonHistoryEncoding::Base64,
+            bytes: payload.len(),
+        }
+    }
+
+    /// Decode the live output bytes after validating their declared length.
+    pub fn decoded_bytes(&self) -> Result<Vec<u8>, String> {
+        decode_validated_base64_payload(&self.payload_base64, self.bytes, "live output")
+    }
+}
+
+impl TryFrom<UncheckedDaemonLiveOutputPayload> for DaemonLiveOutputPayload {
+    type Error = String;
+
+    fn try_from(payload: UncheckedDaemonLiveOutputPayload) -> Result<Self, Self::Error> {
+        if payload.extra.contains_key("data") {
+            return Err("legacy terminal_output data field is rejected".to_string());
+        }
+        decode_validated_base64_payload(&payload.payload_base64, payload.bytes, "live output")?;
+        Ok(Self {
+            payload_base64: payload.payload_base64,
+            payload_encoding: payload.payload_encoding,
+            bytes: payload.bytes,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for DaemonLiveOutputPayload {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let payload = UncheckedDaemonLiveOutputPayload::deserialize(deserializer)?;
+        Self::try_from(payload).map_err(serde::de::Error::custom)
+    }
+}
+
+fn decode_validated_base64_payload(
+    payload_base64: &str,
+    bytes: usize,
+    label: &str,
+) -> Result<Vec<u8>, String> {
     let payload = base64::engine::general_purpose::STANDARD
         .decode(payload_base64)
-        .map_err(|error| format!("invalid opaque history base64: {error}"))?;
+        .map_err(|error| format!("invalid {label} base64: {error}"))?;
     if payload.len() != bytes {
         return Err(format!(
-            "opaque history byte length mismatch: declared {bytes}, decoded {}",
+            "{label} byte length mismatch: declared {bytes}, decoded {}",
             payload.len()
         ));
     }
@@ -2395,7 +2464,7 @@ fn decode_history_payload(payload_base64: &str, bytes: usize) -> Result<Vec<u8>,
 /// let live = botster_hub_client::DaemonEvent::TerminalOutput {
 ///     session_id: "session".to_string(),
 ///     subscription_id: "subscription".to_string(),
-///     data: "live output\r\n".to_string(),
+///     payload: botster_hub_client::DaemonLiveOutputPayload::from_bytes(b"live output\r\n"),
 /// };
 ///
 /// let events = vec![snapshot, live];
@@ -2409,10 +2478,16 @@ pub enum DaemonEvent {
         session_id: String,
         state: String,
     },
+    /// Live PTY bytes for a subscription.
+    ///
+    /// `payload` serializes to validated base64 fields. Clients concatenate the
+    /// decoded bytes without UTF-8 repair. Legacy `{ "data": "..." }` JSON is
+    /// rejected.
     TerminalOutput {
         session_id: String,
         subscription_id: String,
-        data: String,
+        #[serde(flatten)]
+        payload: DaemonLiveOutputPayload,
     },
     /// Initial opaque engine state for a subscription.
     ///
@@ -2667,7 +2742,7 @@ mod tests {
                         DaemonEvent::TerminalOutput {
                             session_id: "session".to_string(),
                             subscription_id: "subscription".to_string(),
-                            data: "late-output".to_string(),
+                            payload: DaemonLiveOutputPayload::from_bytes(b"late-output"),
                         },
                         DaemonEvent::ProcessExit {
                             session_id: "session".to_string(),
@@ -2733,7 +2808,7 @@ mod tests {
                     vec![DaemonEvent::TerminalOutput {
                         session_id: "session".to_string(),
                         subscription_id: "subscription".to_string(),
-                        data: "final-output".to_string(),
+                        payload: DaemonLiveOutputPayload::from_bytes(b"final-output"),
                     }],
                 ),
             )
@@ -2982,7 +3057,7 @@ mod tests {
             DaemonEvent::TerminalOutput {
                 session_id: "session".to_string(),
                 subscription_id: "subscription".to_string(),
-                data: "live-output".to_string(),
+                payload: DaemonLiveOutputPayload::from_bytes(b"live-output"),
             },
         ];
         let mut output = Vec::new();
@@ -2990,6 +3065,193 @@ mod tests {
         write_terminal_events(&events, &mut output).expect("terminal events write");
 
         assert_eq!(output, b"live-output");
+    }
+
+    #[test]
+    fn live_output_events_round_trip_exact_bytes() {
+        let cases: &[&[u8]] = &[
+            b"",
+            b"ascii",
+            b"\x00",
+            b"\x1b[31mred\x1b[0m",
+            b"\xff",
+            b"\xc0",
+            "€".as_bytes(),
+        ];
+        for payload in cases {
+            let event = DaemonEvent::TerminalOutput {
+                session_id: "session".to_string(),
+                subscription_id: "subscription".to_string(),
+                payload: DaemonLiveOutputPayload::from_bytes(payload),
+            };
+            let value = serde_json::to_value(&event).expect("live output serializes");
+            assert_eq!(value["type"], "terminal_output");
+            assert_eq!(value["payload_encoding"], "base64");
+            assert_eq!(value["bytes"], payload.len());
+            assert!(value.get("data").is_none());
+            let round_tripped: DaemonEvent =
+                serde_json::from_value(value).expect("live output deserializes");
+            let DaemonEvent::TerminalOutput {
+                payload: decoded, ..
+            } = round_tripped
+            else {
+                panic!("expected terminal output");
+            };
+            assert_eq!(
+                decoded.decoded_bytes().expect("validated payload"),
+                *payload
+            );
+        }
+    }
+
+    #[test]
+    fn live_output_split_utf8_frames_concatenate_without_replacement() {
+        let first = DaemonLiveOutputPayload::from_bytes(&[0xE2]);
+        let second = DaemonLiveOutputPayload::from_bytes(&[0x82, 0xAC]);
+        let mut concatenated = first.decoded_bytes().expect("first fragment");
+        concatenated.extend(second.decoded_bytes().expect("second fragment"));
+        assert_eq!(concatenated, "€".as_bytes());
+        assert!(
+            !concatenated
+                .windows(3)
+                .any(|window| window == [0xEF, 0xBF, 0xBD])
+        );
+    }
+
+    #[test]
+    fn live_output_rejects_invalid_base64_unknown_encoding_and_length_mismatch() {
+        for value in [
+            serde_json::json!({
+                "type": "terminal_output",
+                "session_id": "session",
+                "subscription_id": "subscription",
+                "payload_base64": "not base64",
+                "payload_encoding": "base64",
+                "bytes": 3
+            }),
+            serde_json::json!({
+                "type": "terminal_output",
+                "session_id": "session",
+                "subscription_id": "subscription",
+                "payload_base64": "AP8B",
+                "payload_encoding": "hex",
+                "bytes": 3
+            }),
+            serde_json::json!({
+                "type": "terminal_output",
+                "session_id": "session",
+                "subscription_id": "subscription",
+                "payload_base64": "AP8B",
+                "payload_encoding": "base64",
+                "bytes": 4
+            }),
+        ] {
+            serde_json::from_value::<DaemonEvent>(value)
+                .expect_err("invalid live output metadata must fail deserialization");
+        }
+    }
+
+    #[test]
+    fn live_output_rejects_retired_data_key_on_an_otherwise_valid_envelope() {
+        let event = DaemonEvent::TerminalOutput {
+            session_id: "session".to_string(),
+            subscription_id: "subscription".to_string(),
+            payload: DaemonLiveOutputPayload::from_bytes(b"live-after-attach\r\n"),
+        };
+        let mut value = serde_json::to_value(&event).expect("serialize current live envelope");
+        assert!(value.get("data").is_none());
+        value["data"] = serde_json::json!("live-after-attach\r\n");
+        value["future_hint"] = serde_json::json!(1);
+
+        let error = serde_json::from_value::<DaemonEvent>(value)
+            .expect_err("retired data key must fail even when the current envelope is valid");
+        assert!(
+            error
+                .to_string()
+                .contains("legacy terminal_output data field is rejected"),
+            "expected retired-field rejection, got {error}"
+        );
+
+        let mut forward = serde_json::to_value(&event).expect("serialize current live envelope");
+        forward["future_hint"] = serde_json::json!(1);
+        serde_json::from_value::<DaemonEvent>(forward)
+            .expect("unrelated unknown fields remain forward-tolerant");
+    }
+
+    #[test]
+    fn terminal_writer_writes_decoded_payload_bytes() {
+        let events = vec![
+            DaemonEvent::Snapshot {
+                session_id: "session".to_string(),
+                subscription_id: "subscription".to_string(),
+                history: DaemonOpaqueHistoryPayload::from_bytes(b"must-not-render"),
+            },
+            DaemonEvent::Scrollback {
+                session_id: "session".to_string(),
+                subscription_id: "subscription".to_string(),
+                history: DaemonOpaqueHistoryPayload::from_bytes(&[0xff]),
+            },
+            DaemonEvent::TerminalOutput {
+                session_id: "session".to_string(),
+                subscription_id: "subscription".to_string(),
+                payload: DaemonLiveOutputPayload::from_bytes(&[0x00, 0x1b, 0xff, 0xc0]),
+            },
+        ];
+        let mut output = Vec::new();
+        write_terminal_events(&events, &mut output).expect("terminal events write");
+        assert_eq!(output, [0x00, 0x1b, 0xff, 0xc0]);
+    }
+
+    #[test]
+    fn readme_runtime_example_reports_current_protocol_and_conformance() {
+        let readme = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../README.md"));
+        assert!(
+            readme.contains(&format!("protocol_version={PROTOCOL_VERSION}")),
+            "README runtime example must report PROTOCOL_VERSION={PROTOCOL_VERSION}"
+        );
+        assert!(
+            readme.contains(&format!(
+                "conformance_fixture_revision={CONFORMANCE_FIXTURE_REVISION}"
+            )),
+            "README runtime example must report CONFORMANCE_FIXTURE_REVISION={CONFORMANCE_FIXTURE_REVISION}"
+        );
+    }
+
+    #[test]
+    fn protocol_seven_rejects_protocol_six_and_accepts_conformance_floor_thirty_five() {
+        assert_eq!(PROTOCOL_VERSION, 7);
+        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 36);
+
+        let protocol_six = DaemonCompatibilityRequirement {
+            protocol_version: 6,
+            minimum_conformance_fixture_revision: 35,
+            ..DaemonCompatibilityRequirement::current()
+        };
+        let error = ensure_compatible(&protocol_six, &DaemonCompatibility::current())
+            .expect_err("protocol-6 client must fail closed against protocol 7");
+        assert!(error.diagnostic.contains("unsupported protocol version 7"));
+
+        let protocol_seven_floor_thirty_five = DaemonCompatibilityRequirement {
+            protocol_version: 7,
+            minimum_conformance_fixture_revision: 35,
+            ..DaemonCompatibilityRequirement::current()
+        };
+        ensure_compatible(
+            &protocol_seven_floor_thirty_five,
+            &DaemonCompatibility::current(),
+        )
+        .expect("protocol-7 client with conformance floor 35 accepts hub revision 36");
+    }
+
+    #[test]
+    fn generated_typescript_terminal_output_uses_payload_fields() {
+        let generated = daemon_protocol_typescript();
+        assert!(generated.contains(
+            "{ type: \"terminal_output\"; session_id: string; subscription_id: string; payload_base64: string; payload_encoding: \"base64\"; bytes: number }"
+        ));
+        assert!(!generated.contains(
+            "{ type: \"terminal_output\"; session_id: string; subscription_id: string; data: string }"
+        ));
     }
 
     #[test]
@@ -3015,7 +3277,9 @@ mod tests {
                 "type": "terminal_output",
                 "session_id": "session",
                 "subscription_id": "subscription",
-                "data": "live-data"
+                "payload_base64": "bGl2ZS1kYXRh",
+                "payload_encoding": "base64",
+                "bytes": 9
             }
         ]);
 
@@ -5246,7 +5510,7 @@ mod tests {
             DaemonEvent::TerminalOutput {
                 session_id: "session".to_string(),
                 subscription_id: "subscription".to_string(),
-                data: "output".to_string(),
+                payload: DaemonLiveOutputPayload::from_bytes(b"output"),
             },
             DaemonEvent::Snapshot {
                 session_id: "session".to_string(),
@@ -5425,8 +5689,8 @@ mod tests {
 
     #[test]
     fn protocol_six_and_conformance_thirty_two_define_the_cold_cut_boundary() {
-        assert_eq!(PROTOCOL_VERSION, 6);
-        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 35);
+        assert_eq!(PROTOCOL_VERSION, 7);
+        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 36);
 
         let requirement = DaemonCompatibilityRequirement::current();
         let protocol_error = ensure_compatible(
@@ -5479,7 +5743,7 @@ mod tests {
         .expect("serialize current status");
         let stale: StaleStatus =
             serde_json::from_value(status_value).expect("stale status ignores additive identity");
-        assert_eq!(stale.compatibility.protocol_version, 6);
+        assert_eq!(stale.compatibility.protocol_version, 7);
         assert_eq!(stale.host_id, "hub");
         assert_eq!(stale.schema_version, 1);
     }
@@ -5490,8 +5754,8 @@ mod tests {
         // conformance revision with a floor, so an additive request must ride the
         // conformance revision: bumping the protocol would break every existing
         // first-party client that never issues this request.
-        assert_eq!(PROTOCOL_VERSION, 6);
-        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 35);
+        assert_eq!(PROTOCOL_VERSION, 7);
+        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 36);
         assert_eq!(
             current_feature_list(),
             vec![
