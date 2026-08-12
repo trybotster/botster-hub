@@ -10297,6 +10297,8 @@ fn session_cleanup_guard_failure_path_reaps_durable_unbounded_session() {
         },
     )
     .expect("spawn unbounded session");
+    // Arm immediately after Spawn so census/assertion panics still clean up.
+    let session_cleanup = SessionCleanupGuard::new(&data_dir, "cleanup-guard-session");
     let list_before =
         botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::ListSessions)
             .expect("list before failure path");
@@ -10339,10 +10341,8 @@ fn session_cleanup_guard_failure_path_reaps_durable_unbounded_session() {
         "must track exact non-root shell PIDs before guard drop"
     );
 
-    // Armed guard drop simulates assertion panic before production RemoveSession.
-    {
-        let _session_cleanup = SessionCleanupGuard::new(&data_dir, "cleanup-guard-session");
-    }
+    // Same guard, simulated unwind before production RemoveSession.
+    drop(session_cleanup);
 
     // Bounded process oracle: exact worker + exact shell descendant PIDs must be absent.
     let tracked_pids: Vec<u32> = tracked_worker_pids
