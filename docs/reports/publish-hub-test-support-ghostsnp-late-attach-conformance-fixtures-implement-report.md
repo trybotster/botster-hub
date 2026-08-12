@@ -107,19 +107,37 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 ```
 
-External install smoke (after publish / clean pack install): package 0.1.30, conf 35, `verifyPackageAssets().ok`, history Snapshot SHA == Golden A, no_history Snapshot SHA == Golden B ≠ A, both sequences attaching < snapshot < attached < terminal_output, empty no_history ReadScreen oracle, single no_history Snapshot.
+### Registry external consumer smoke (required)
+
+Clean temp directory, `npm install --no-save --package-lock=false @trybotster/hub-test-support@0.1.30` (public registry only; no tarball/path override). Install resolved under `node_modules/@trybotster/hub-test-support`.
+
+Asserted:
+
+1. `metadata.package_version === "0.1.30"`
+2. `metadata.conformance_fixture_revision === 35`
+3. `verifyPackageAssets().ok === true`
+4. history Snapshot starts with `GHOSTSNP`, SHA-256 `fc8664159efdc7bd6959dd294485c6bc2f87ad8ea2fb3a0a16ab78b2eb87fd77` (len 1176)
+5. no_history Snapshot starts with `GHOSTSNP`, SHA-256 `b0e28fe69ba590f067236a2a0b1eb8b05d2aa0be74fda4324e55a6066eac328c` (len 1157)
+6. history SHA ≠ blank SHA
+7. both sequences: attaching < snapshot < attached < terminal_output
+8. no_history: empty `no_history_read_screen_text`, exactly one Snapshot, no Scrollback
+
+`npm view @trybotster/hub-test-support@0.1.30 version dist.tarball --json` returns version `0.1.30` and a registry tarball URL.
 
 ## PR and package coordinates
 
 - PR: https://github.com/trybotster/botster-hub/pull/208
-- Commit: `efff96a`
+- Implement commits: `efff96a` (fixtures), `e1e0515` / `ae17001` (report hygiene), plus this registry-proof update
 - Package: `@trybotster/hub-test-support@0.1.30` / conf **35**
-- Packed tarball external smoke: **passed** (clean install, dual SHAs, ordering, `verifyPackageAssets`)
-- Registry publish: **blocked on OTP** (`npm publish` returned `EOTP`). Human must complete `npm publish packages/hub-test-support` (or packed tarball) with `--otp`. Until then, consumers can use the packed tarball / merged source pin.
+- Registry publish: **complete** (human published after EOTP; coordinate resolves from npm)
+- Registry external smoke: **passed** (public install, dual SHAs, ordering, `verifyPackageAssets`)
+- Review findings addressed this visit:
+  - `finding_1786512165_459454` (blocker publish) — registry + clean consumer smoke
+  - `finding_1786512165_695539` (whitespace) — `git diff --check origin/main...HEAD` exit 0
+  - `finding_1786512165_523976` (absolute paths) — plan/report path-neutral
 
 ## Unverified behavior or residual risk
 
-- Registry coordinate `@trybotster/hub-test-support@0.1.30` is not yet visible on npmjs until OTP publish completes.
 - Live idle Snapshot may not byte-equal Golden B under different PTY env; production still emits non-trivial GHOSTSNP before attached with blank ReadScreen.
 - libghostty-vt import tests require Zig 0.16.0 (same as session-worker builds).
 
