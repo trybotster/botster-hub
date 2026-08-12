@@ -5,7 +5,13 @@ edition = "2024"
 description = "External-client test harness for isolated botster-hub daemon tests"
 repository = "https://github.com/trybotster/botster-hub"
 license-file = "../../LICENSE"
-include = ["Cargo.toml", "src/**/*.rs", "fixtures/plugin-contract-matrix/**", "../../LICENSE"]
+include = [
+    "Cargo.toml",
+    "src/**/*.rs",
+    "fixtures/plugin-contract-matrix/**",
+    "fixtures/ghostsnp/**",
+    "../../LICENSE",
+]
 
 [dependencies]
 botster-core = { git = "https://github.com/trybotster/botster-core", branch = "main" }
@@ -14,3 +20,10 @@ botster-ui-contract = { path = "../botster-ui-contract" }
 libc = "0.2.177"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
+
+[dev-dependencies]
+# Import-semantic proof for frozen GHOSTSNP late-attach goldens. Same Core pin
+# as the workspace lockfile (botster-core main). Requires Zig 0.16.0 for
+# libghostty-vt, matching hub session-worker production builds.
+botster-terminal-ghostty = { git = "https://github.com/trybotster/botster-core", branch = "main", features = ["libghostty-vt"] }
+sha2 = "0.10"
