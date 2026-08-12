@@ -104,7 +104,7 @@ Recorded after rebuilding at the final review-fix commit (path-neutral `target/d
 
 | Identity | Value |
 | --- | --- |
-| Hub git SHA | final commit after review fixes (see gate evidence `commit`) |
+| Hub git SHA | `938b9d95f7232c0ca747de61bf910f524d852b3a` |
 | Core lock pin | `2c5171a6cb3b073c53620a9838d8b08480dd215c` |
 | Hub binary realpath | `$CARGO_TARGET_DIR/debug/botster-hub` (resolved under pipeline worktree `target/debug/botster-hub`) |
 | Session worker realpath | `$CARGO_TARGET_DIR/debug/botster-session-worker` (resolved under pipeline worktree `target/debug/botster-session-worker`) |
