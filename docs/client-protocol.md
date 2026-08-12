@@ -986,15 +986,19 @@ That helper still connects through the daemon socket, but terminal bytes are
 delivered by the hub-owned client/session actor data plane rather than by a
 private session-worker frame contract.
 
-`DaemonEvent::TerminalOutput.data` is renderable terminal text. In contrast,
+`DaemonEvent::TerminalOutput` carries renderable live PTY bytes in the same
+validated envelope as Snapshot/Scrollback: `payload_base64`, literal
+`payload_encoding: "base64"`, and `bytes` as the exact decoded length. The
+client DTO rejects invalid base64, unknown encodings, mismatched lengths, and
+legacy `{ "data": "..." }` JSON. Clients concatenate decoded live bytes without
+UTF-8 repair; a multi-byte character may be split across separate live frames.
+
 `DaemonEvent::Snapshot.payload_base64` and
-`DaemonEvent::Scrollback.payload_base64` are opaque binary engine state encoded
-as standard padded base64. Their `payload_encoding` is the literal `base64`,
-and `bytes` is the exact decoded payload length. The client DTO rejects invalid
-base64, unknown encodings, and mismatched lengths during deserialization. The
-hub preserves the decoded bytes without UTF-8 conversion.
-Clients must never append opaque payloads to a terminal, attempt backend-specific
-decoding, or infer visible history from byte length or non-emptiness.
+`DaemonEvent::Scrollback.payload_base64` are opaque binary engine state, not
+terminal text. Clients must never append opaque payloads to a terminal, attempt
+backend-specific decoding, or infer visible history from byte length or
+non-emptiness. The hub preserves both live and history bytes without UTF-8
+conversion.
 
 The attach/drain ordering contract is that explicit `Attach` enters the
 core-owned SessionIo/ClientWorker subscription path and requests initial
@@ -1009,8 +1013,8 @@ but authoritative initial history has not been delivered. `attached` means
 initial snapshot delivery is complete and live output may flow. Initial history
 is therefore delivered before readiness and later live output.
 Clients that restore visible content request `ReadScreen`, present its text,
-buffering any live terminal output until restoration is installed, then append
-subsequent live output. An idle terminal may produce `attaching`, an optional
+buffering any live terminal output bytes until restoration is installed, then
+append subsequent decoded live bytes. An idle terminal may produce `attaching`, an optional
 authoritative blank `snapshot`, then `attached`: opaque snapshot bytes can
 encode dimensions, parser state, and backend metadata without representing
 prior renderable terminal output. Clients must not infer visible history from
@@ -1019,10 +1023,10 @@ and the daemon does not maintain a separate scrollback cache. The wire-defined
 `detached` state remains part of the client contract and clients must tolerate
 it, although no production core component emits it as of the core revision
 recorded in `Cargo.lock`.
-`stream_attach` writes only
-`TerminalOutput` data into its output writer; clients that need event kind,
-opaque history payloads, byte-count metadata, or ordering
-metadata should use `DaemonConnection` with `Attach` and `Drain`.
+`stream_attach` writes only decoded `TerminalOutput` payload bytes into its
+output writer; clients that need event kind, opaque history payloads,
+byte-count metadata, or ordering metadata should use `DaemonConnection` with
+`Attach` and `Drain`.
 
 Each socket attach cycle owns a fresh transport-local `subscription_id`.
 When a persistent daemon socket closes without an explicit `Detach`, the hub
@@ -1037,7 +1041,7 @@ source for retained visible terminal markers.
 Attach `Snapshot`/`Scrollback` and `DaemonRequest::CaptureSnapshot` both describe
 backend-opaque state. Their payloads, formats, and byte counts must never be used
 as evidence that visible terminal history exists. Only `ReadScreen.text` and
-later `TerminalOutput.data` are renderable terminal text.
+later decoded `TerminalOutput` payload bytes are renderable terminal text.
 
 `DaemonRequest::ReadScreen`, `DaemonRequest::ReadModeFlags`,
 `DaemonRequest::ModeGatedInput`, and
@@ -1337,6 +1341,16 @@ golden. Both sequences are `attaching → Snapshot → attached → live`. Visib
 restore remains the ReadScreen oracle; clients must not treat Snapshot length as
 renderable history and must not dual-use a history-bearing golden as no-history.
 The published package coordinate is `@trybotster/hub-test-support@0.1.30`.
+
+Cold-replacing live `TerminalOutput.data` with the validated
+`payload_base64` / `payload_encoding` / `bytes` envelope advances
+`PROTOCOL_VERSION` to 7 and `CONFORMANCE_FIXTURE_REVISION` to 36. An unchanged
+protocol-6 client cannot deserialize the new live-output shape, so handshake
+must fail closed at `ensure_compatible()` rather than on the first live frame.
+A protocol-7 client with minimum conformance 35 still accepts hub revision 36.
+Legacy `{ "data": "..." }` JSON is rejected. No new feature token is added;
+`FEATURE_TERMINAL_STREAMING` still names streaming. The prepared package
+coordinate is `@trybotster/hub-test-support@0.1.31`.
 
 ## Isolated Integration Tests For External Clients
 

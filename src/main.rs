@@ -887,7 +887,8 @@ fn smoke_local_webrtc_round_trip(
                 },
             )
             .await?;
-        let mut observed = String::new();
+        let mut observed = Vec::new();
+        let marker = b"webrtc:from-smoke-webrtc";
         for _ in 0..120 {
             let drain = offer_peer
                 .encrypted_request(
@@ -898,11 +899,15 @@ fn smoke_local_webrtc_round_trip(
                 )
                 .await?;
             for event in drain.events {
-                if let DaemonEvent::TerminalOutput { data, .. } = event {
-                    observed.push_str(&data);
+                if let DaemonEvent::TerminalOutput { payload, .. } = event {
+                    let bytes = payload.decoded_bytes().map_err(SmokeError::Webrtc)?;
+                    observed.extend_from_slice(&bytes);
                 }
             }
-            if observed.contains("webrtc:from-smoke-webrtc") {
+            if observed
+                .windows(marker.len())
+                .any(|window| window == marker)
+            {
                 break;
             }
             sleep(Duration::from_millis(30)).await;
@@ -916,7 +921,10 @@ fn smoke_local_webrtc_round_trip(
             )
             .await;
         let _ = offer_peer.peer.close().await;
-        if observed.contains("webrtc:from-smoke-webrtc") {
+        if observed
+            .windows(marker.len())
+            .any(|window| window == marker)
+        {
             Ok(())
         } else {
             Err(SmokeError::Webrtc(format!(
@@ -3861,11 +3869,11 @@ fn print_daemon_events(events: &[DaemonEvent]) {
             DaemonEvent::TerminalOutput {
                 session_id,
                 subscription_id,
-                data,
+                payload,
             } => {
                 println!(
                     "event=terminal_output session_id={session_id} subscription_id={subscription_id} bytes={}",
-                    data.len()
+                    payload.bytes
                 );
             }
             DaemonEvent::Snapshot {
