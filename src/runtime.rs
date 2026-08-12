@@ -8,12 +8,12 @@
 use botster_core::{
     BotsterEngineObservation, BotsterEngineOutput, BoundaryJson, ClientId, CoreSession,
     CoreSessionMetadata, EntityContract, EntityFrame, EntityKind, EnvelopeId, EnvelopeTarget,
-    ManagedSessionRuntimeError, ModeFreshnessToken, MultiplexerEngineError, PluginCapabilityRuntime,
-    PluginCleanupResult, PluginHandlerKind, PluginInvocationFailure, PluginInvocationFailureKind,
-    PluginInvocationOutcome, PluginInvocationRequest, PluginInvocationResult, PluginKey,
-    PluginWorkerDebugSnapshot, RequestId, Rgb, RoutedEnvelope, RoutedEnvelopeDrainOutcome,
-    RoutedEnvelopePublishOutcome, SessionId, SessionLifecycleState, SessionRuntimeErrorKind,
-    SessionSpawnRequest, SubscriptionId, TerminalColorProfile,
+    ManagedSessionRuntimeError, ModeFreshnessToken, MultiplexerEngineError,
+    PluginCapabilityRuntime, PluginCleanupResult, PluginHandlerKind, PluginInvocationFailure,
+    PluginInvocationFailureKind, PluginInvocationOutcome, PluginInvocationRequest,
+    PluginInvocationResult, PluginKey, PluginWorkerDebugSnapshot, RequestId, Rgb, RoutedEnvelope,
+    RoutedEnvelopeDrainOutcome, RoutedEnvelopePublishOutcome, SessionId, SessionLifecycleState,
+    SessionRuntimeErrorKind, SessionSpawnRequest, SubscriptionId, TerminalColorProfile,
 };
 use botster_core_daemon::{
     AcknowledgeRoutedEnvelopeRequest, CaptureSnapshotRequest, CaptureSnapshotResult, CoreDaemon,
@@ -2534,8 +2534,10 @@ fn validate_plugin_surface_binding_value(
                     if let Some(path) = object.get("source").and_then(serde_json::Value::as_str) {
                         validate_plugin_surface_binding_path(path, admitted_families)?;
                     }
-                    if let Some(exclude) = object.get("exclude").and_then(serde_json::Value::as_object)
-                        && let Some(path) = exclude.get("source").and_then(serde_json::Value::as_str)
+                    if let Some(exclude) =
+                        object.get("exclude").and_then(serde_json::Value::as_object)
+                        && let Some(path) =
+                            exclude.get("source").and_then(serde_json::Value::as_str)
                     {
                         validate_plugin_surface_binding_path(path, admitted_families)?;
                     }

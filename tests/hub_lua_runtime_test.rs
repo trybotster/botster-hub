@@ -3271,10 +3271,7 @@ return botster.register({
     let families = botster_ui_contract::collect_entity_option_families(&surface);
     assert_eq!(
         families,
-        vec![
-            "project-pipelines.run".to_string(),
-            "session".to_string()
-        ]
+        vec!["project-pipelines.run".to_string(), "session".to_string()]
     );
 
     for (subscription_id, generation) in [("first", 1_u64), ("reconnect", 2_u64)] {
