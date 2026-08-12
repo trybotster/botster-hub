@@ -51,6 +51,7 @@ const TEST_LOCAL_RUNTIME_READINESS_BUDGET_MS_ENV: &str =
     "BOTSTER_HUB_TEST_LOCAL_RUNTIME_READINESS_BUDGET_MS";
 
 mod operator_console;
+mod update;
 
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) enum CommandOutcome {
@@ -116,6 +117,7 @@ fn dispatch_command(command: &str, args: Vec<String>) -> Result<CommandOutcome, 
         "up" => local_runtime_up(args)
             .map(|()| CommandOutcome::Completed)
             .map_err(|error| error.to_string()),
+        "update" => update::run(args).map(|()| CommandOutcome::Completed),
         "down" => local_runtime_down(args)
             .map(|()| CommandOutcome::DaemonStopped)
             .map_err(|error| error.to_string()),
@@ -246,6 +248,7 @@ fn stateful_command(command: &str) -> bool {
         command,
         "start"
             | "up"
+            | "update"
             | "down"
             | "doctor"
             | "smoke"
@@ -344,6 +347,7 @@ fn command_usage(command: &str) -> &'static str {
     match command {
         "start" => "start",
         "up" => "up",
+        "update" => "update",
         "down" => "down",
         "doctor" => "doctor",
         "smoke" => "smoke",
@@ -1497,7 +1501,7 @@ fn spawn_local_runtime_daemon(
         .arg("--data-dir")
         .arg(&options.data_directory)
         .arg("--session-worker-bin")
-        .arg(session_worker_bin)
+        .arg(&session_worker_bin)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
@@ -1526,9 +1530,13 @@ fn spawn_local_runtime_daemon(
         });
     }
 
-    if let Err(error) =
-        write_runtime_daemon_metadata(&options.data_directory, config, hub_bin, child.id())
-    {
+    if let Err(error) = write_runtime_daemon_metadata(
+        &options.data_directory,
+        config,
+        hub_bin,
+        &session_worker_bin,
+        child.id(),
+    ) {
         let _ = terminate_owned_runtime_child(&mut child);
         return Err(error);
     }
@@ -1693,6 +1701,8 @@ struct LocalRuntimeDaemonMetadata {
     data_directory_arg: Option<String>,
     socket_path: String,
     hub_bin: String,
+    #[serde(default)]
+    session_worker_bin: Option<String>,
 }
 
 fn recover_owned_stale_runtime_daemon(
@@ -1742,6 +1752,7 @@ fn write_runtime_daemon_metadata(
     data_directory: &Path,
     config: &botster_hub::HubConfig,
     hub_bin: &Path,
+    session_worker_bin: &Path,
     pid: u32,
 ) -> Result<(), LocalRuntimeError> {
     let metadata = LocalRuntimeDaemonMetadata {
@@ -1750,6 +1761,7 @@ fn write_runtime_daemon_metadata(
         data_directory_arg: Some(data_directory.display().to_string()),
         socket_path: configured_local_socket_path(config)?.display().to_string(),
         hub_bin: stable_path_string(hub_bin),
+        session_worker_bin: Some(stable_path_string(session_worker_bin)),
     };
     let bytes =
         serde_json::to_vec_pretty(&metadata).map_err(LocalRuntimeError::SerializeMetadata)?;
@@ -5564,6 +5576,7 @@ Interactive operator console:
 
 Daily runtime commands:
   botster-hub up [--data-dir <path>] [...]
+  botster-hub update <core|all> [--data-dir <path>]
   botster-hub down [--data-dir <path>]
   botster-hub status [--data-dir <path>]
   botster-hub check-update [--data-dir <path>]
@@ -5613,6 +5626,7 @@ Packages:
         "up" => {
             "usage: botster-hub up [--data-dir <path>] [--session-worker-bin <path>]"
         }
+        "update" => "usage: botster-hub update <core|all> [--data-dir <path>]",
         "down" => "usage: botster-hub down [--data-dir <path>]",
         "doctor" => "usage: botster-hub doctor [--data-dir <path>]",
         "smoke" => {
@@ -5741,7 +5755,7 @@ Packages:
         "providers" | "providers list" => "usage: botster-hub providers list [--data-dir <path>]",
         "inspect" => "usage: botster-hub inspect [--data-dir <path>] <session-id>",
         _ => {
-            "usage: botster-hub <help|up|down|doctor|smoke|open|reload|start|status|sessions|shutdown|mcp-serve|apps|packages|providers|inspect|run-one>"
+            "usage: botster-hub <help|up|update|down|doctor|smoke|open|reload|start|status|sessions|shutdown|mcp-serve|apps|packages|providers|inspect|run-one>"
         }
     }
 }
@@ -5888,6 +5902,7 @@ mod cli_data_dir_tests {
         let cases = [
             ("start", vec![], 0),
             ("up", vec![], 0),
+            ("update", vec!["core"], 0),
             ("down", vec![], 0),
             ("doctor", vec![], 0),
             ("smoke", vec![], 0),

@@ -453,6 +453,88 @@ For daily first-party local development, install and enable `botster-web` and
 `botster-hub up` and `botster-hub down`. `up` never discovers sibling
 checkouts or accepts package-path flags.
 
+### Source checkout updates
+
+Use an explicit update scope. Bare `botster-hub update` returns usage.
+
+```sh
+botster-hub update core
+botster-hub update all
+```
+
+`update core` updates the Hub checkout and its locked Core dependencies. It
+builds Hub and `botster-session-worker` from the same `Cargo.lock` Core
+revision. It then replaces the selected daemon and refreshes local package
+registrations.
+
+When the targeted Cargo update changes `Cargo.lock`, the command commits only
+that file with the message `Update locked Botster Core revision`. The command
+does not stage or commit another file. A commit-hook failure stops the update
+before daemon replacement and leaves the hook result visible for recovery.
+
+`update all` also updates each enabled direct local package repository. Each
+package must own a `botster-update.json` build contract. Hub does not infer a
+package tool, dependency command, artifact path, or sibling repository.
+
+The contract contains an ordered `steps` array. Each step contains `argv`, an
+optional package-relative `cwd`, and a positive `timeout_seconds`. An empty
+array means that the package needs registration refresh only.
+
+```json
+{
+  "steps": [
+    {
+      "argv": ["package-owned-command", "install"],
+      "timeout_seconds": 300
+    },
+    {
+      "argv": ["package-owned-command", "build"],
+      "cwd": "client",
+      "timeout_seconds": 600
+    }
+  ]
+}
+```
+
+Both scopes use the normal data directory precedence. The precedence is
+`--data-dir`, then `BOTSTER_HUB_DATA_DIR`, then `$HOME/.botster/hub`.
+
+```sh
+botster-hub update core --data-dir /path/to/runtime
+botster-hub update all --data-dir /path/to/runtime
+```
+
+The update requires clean Git repositories, including no untracked files. It
+requires an upstream branch for Hub and each selected package. It uses Git
+fetch plus a fast-forward-only merge. It never stashes, resets, checks out, or
+discards changes. Registry packages stay pinned.
+
+The update keeps a healthy daemon running while it updates and builds source.
+A dirty repository, lock conflict, fetch failure, dependency failure, package
+contract failure, or build failure leaves that daemon running. Correct the
+reported problem, preserve all user changes, and run the same command again.
+
+After all builds pass, the update stops the daemon. It starts the built Hub
+path with the built worker path. It refreshes package registrations through
+the new daemon. It then restores only package entrypoints that were running
+before replacement.
+
+If the new daemon cannot start, the command prints an exact recovery command.
+Run that command after you correct the reported startup problem:
+
+```sh
+/path/to/target/debug/botster-hub start \
+  --data-dir /path/to/runtime \
+  --session-worker-bin /path/to/target/debug/botster-session-worker
+```
+
+The source checkout update command is separate from `check-update`. The latter
+checks managed release metadata. The source command does not use the managed
+installer and does not change a sibling Core checkout.
+
+The source command builds the debug profile under `target/debug`. It does not
+build a release profile.
+
 Build `botster-hub` normally with Cargo before treating this as a daily stack.
 The session path also needs a built `botster-session-worker` next to the
 `botster-hub` binary, or an explicit `--session-worker-bin <path>`. First-party
