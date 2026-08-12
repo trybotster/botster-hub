@@ -17,7 +17,7 @@ Approved plan: rev 9 (`docs/plans/expose-one-authoritative-ghostty-terminal-cont
 | Protocol | 6 |
 | Conformance fixture revision | 34 |
 | Feature token | `mode_gated_input` |
-| npm package candidate | `@trybotster/hub-test-support@0.1.29` |
+| npm package | `@trybotster/hub-test-support@0.1.29` (published; clean external install smoke pass) |
 | `teardown_class_applies` | false |
 
 ## Repository playbook and other playbooks/notes applied
@@ -74,7 +74,7 @@ Approved plan: rev 9 (`docs/plans/expose-one-authoritative-ghostty-terminal-cont
 ## Deviations from plan
 
 1. **Worker package path:** Core pin places `botster-session-worker` under `-p botster-core-daemon` (plan text still said `botster-core` in places). Implementation + plan artifact updated.
-2. **npm publish:** Package `0.1.29` assets are prepared; live publish requires human OTP (`EOTP`). Tracking as residual until human answers `question_1786502181_357293`.
+2. **npm publish:** Human published `@trybotster/hub-test-support@0.1.29` (`question_1786502181_357293`). Clean external install smoke against public registry passed (no worktree override).
 3. **No public CaptureColorAndSnapshot:** follows plan rev 8/9 (control-path GHOSTSNP forbidden).
 
 ## Tests and downstream proof run
@@ -114,9 +114,8 @@ Exact SHA and `realpath` outputs are captured in the Implement gate evidence for
 
 ## Unverified behavior or residual risk
 
-- **npm OTP publish:** `@trybotster/hub-test-support@0.1.29` not on registry until human publishes with OTP. Generated package contents verified locally via `npm test` and dry-run. Blocking human question open.
 - **GHOSTSNP color decode on Hub:** intentionally not done (charter: Hub does not decode GHOSTSNP). OSC mutation proof asserts non-empty GHOSTSNP Snapshot after OSC; Core already proved color/GHOSTSNP agreement on the pin.
-- **External clean-install npm smoke against registry 0.1.29:** blocked until publish.
+- **npm release chain:** `@trybotster/hub-test-support@0.1.29` published; clean external install smoke passed (metadata 0.1.29, conf 34, mode_gated_input, ModeGatedInput TS, mode_generation/mode_revision, verifyPackageAssets).
 
 ## Missing vault guidance discovered
 
@@ -135,6 +134,22 @@ Exact SHA and `realpath` outputs are captured in the Implement gate evidence for
 | Finding | Fix |
 | --- | --- |
 | `finding_1786502051_578270` | SessionCleanupGuard + production ShutdownSession/RemoveSession on all unbounded external_hub fixtures; failure-path regression added |
-| `finding_1786502051_560543` | Human OTP question opened; publish + clean install smoke pending answer |
+| `finding_1786502051_560543` | Published 0.1.29; clean external install smoke passed (public npm, no worktree override) |
 | `finding_1786502051_839249` | clippy allow on ModeFlags ctor; cargo fmt; trailing whitespace scrubbed |
 | `finding_1786502051_518271` | Report rewritten path-neutral with dual-SHA/provenance table |
+
+
+## Clean external npm install smoke (public 0.1.29)
+
+```text
+mktemp clean directory (not the ticket worktree)
+npm install @trybotster/hub-test-support@0.1.29
+verifyPackageAssets()
+assert metadata.package_version == 0.1.29
+assert metadata.conformance_fixture_revision == 34
+assert required_features includes mode_gated_input
+assert ModeFlags fixture has mode_generation/mode_revision
+assert daemon-protocol.ts contains mode_gated_input + DaemonModeGatedInputResult
+assert install path is node_modules (not botster-sessions worktree)
+result: pass
+```
