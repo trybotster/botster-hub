@@ -6,7 +6,7 @@
 | --- | --- |
 | Target repository | `botster-hub` |
 | Target id | `tgt_7e208a0c76a44980a83b63af976b1f22` |
-| Worktree | `/Users/jasonconigliari/botster-sessions/trybotster-botster-hub-project-pipelines-ticket_1786509361_611999` |
+| Worktree | pipeline-provided ticket worktree |
 | Branch | `project-pipelines/ticket_1786509361_611999` |
 | Base | `89dae7e15a844bcb7411b83b32581121720e23eb` |
 | Plan | `docs/plans/publish-hub-test-support-ghostsnp-late-attach-conformance-fixtures.md` rev **3** |
