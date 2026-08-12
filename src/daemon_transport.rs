@@ -4415,7 +4415,8 @@ fn register_entity_subscription(
             // touched here because we only deliver to this subscription.
             let catching_up = snapshot_seq < family_floor;
             if catching_up {
-                runtime.mark_package_entity_resync_needed(&entity_type);
+                // New catching-up subscriber re-arms even after degraded.
+                runtime.rearm_package_entity_resync(&entity_type);
             }
             (snapshot_seq, items, catching_up)
         };
@@ -5080,6 +5081,48 @@ fn drive_package_entity_fanout(daemon: &mut HubDaemon, state: &mut DaemonControl
             }
             // seq == applied + 1
             let frame = package_mutation_to_daemon_frame(subscription_id, &mutation);
+            if entity_frame_exceeds_limit(&frame) {
+                state.lifecycle_counters.entity_delivery_attempts = state
+                    .lifecycle_counters
+                    .entity_delivery_attempts
+                    .saturating_add(1);
+                let error = DaemonEntityFrame::Error {
+                    subscription_id: subscription_id.clone(),
+                    entity_type: entity_type.clone(),
+                    code: "entity_provider_frame_too_large".to_string(),
+                    message: "package entity mutation exceeds daemon frame limit".to_string(),
+                };
+                match subscription.sender.try_send(error) {
+                    Ok(()) => {
+                        state.lifecycle_counters.entity_delivery_successes = state
+                            .lifecycle_counters
+                            .entity_delivery_successes
+                            .saturating_add(1);
+                        // Do not advance applied seq; schedule resync for recovery.
+                        subscription.package_catching_up = true;
+                        subscription.resync_reason =
+                            Some("entity_provider_frame_too_large".to_string());
+                        runtime.mark_package_entity_resync_needed(&entity_type);
+                    }
+                    Err(EntityFrameTrySendError::Full) => {
+                        state.lifecycle_counters.entity_delivery_overflows = state
+                            .lifecycle_counters
+                            .entity_delivery_overflows
+                            .saturating_add(1);
+                        subscription.package_catching_up = true;
+                        subscription.resync_reason = Some("subscriber_overflow".to_string());
+                        runtime.mark_package_entity_resync_needed(&entity_type);
+                    }
+                    Err(EntityFrameTrySendError::Disconnected) => {
+                        state.lifecycle_counters.entity_delivery_failures = state
+                            .lifecycle_counters
+                            .entity_delivery_failures
+                            .saturating_add(1);
+                        dead.push(subscription_id.clone());
+                    }
+                }
+                continue;
+            }
             state.lifecycle_counters.entity_delivery_attempts = state
                 .lifecycle_counters
                 .entity_delivery_attempts
@@ -5161,7 +5204,9 @@ fn package_mutation_to_daemon_frame(
 }
 
 fn drive_package_entity_resync(daemon: &mut HubDaemon, state: &mut DaemonControlState) {
-    // Ensure catching_up / overflow subscribers re-arm coalesced resync need.
+    // Stagnant catching_up / overflow may keep `needed` set when not degraded.
+    // Do not rearm degraded families here — only a new publish or a newly
+    // catching-up subscribe may clear degradation and start another cycle.
     if let Some(runtime) = daemon.runtime() {
         for subscription in state.entity_subscriptions.values() {
             if subscription.package_catching_up || subscription.resync_reason.is_some() {

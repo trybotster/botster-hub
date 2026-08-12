@@ -3674,3 +3674,201 @@ return botster.register({
         other => panic!("expected patch mutation, got {other:?}"),
     }
 }
+
+#[test]
+fn non_provider_handler_payload_is_not_empty_items_coerced() {
+    let root = unique_short_test_dir("non-provider-items");
+    fs::create_dir_all(&root).expect("create package");
+    fs::write(
+        root.join("botster-package.json"),
+        serde_json::json!({
+            "name": "project-pipelines",
+            "version": "1.0.0",
+            "kind": "plugin",
+            "botster": ">=0.1.0",
+            "source": { "type": "path", "path": root.canonicalize().expect("path") },
+            "capabilities": [{ "surface": "surfaces" }, { "surface": "mcp" }],
+            "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }]
+        })
+        .to_string(),
+    )
+    .expect("manifest");
+    fs::write(
+        root.join("plugin.lua"),
+        r#"
+return botster.register({
+  tools = {
+    {
+      name = "project-pipelines.echo_shape",
+      description = "Return a colliding entity-shaped object that is not a provider frame.",
+      handler = "echo_shape",
+      call = function()
+        return {
+          type = "entity_snapshot",
+          entity_type = "not-a-provider",
+          snapshot_seq = 1,
+          items = {},
+        }
+      end,
+    },
+  },
+  handlers = {
+    {
+      id = "runs",
+      kind = "entity_provider",
+      descriptor_id = "project-pipelines.run",
+      descriptor = { entity_type = "project-pipelines.run", id_field = "id" },
+      call = function()
+        return {
+          type = "entity_snapshot",
+          entity_type = "project-pipelines.run",
+          snapshot_seq = 1,
+          items = {},
+        }
+      end,
+    },
+  },
+})
+"#,
+    )
+    .expect("plugin");
+    let mut policy = default_package_policy();
+    policy
+        .install_local_path(&root, "install")
+        .expect("install");
+    policy
+        .enable("project-pipelines", "enable")
+        .expect("enable");
+    let registry = policy.registry().clone();
+    let mut hub = explicit_runtime("non-provider-items");
+    hub.load_lua_plugin_package(&registry, "project-pipelines")
+        .expect("load");
+
+    // Provider path still coerces empty items to an array.
+    let (_, provider_items) = hub
+        .plugin_entity_snapshot("project-pipelines.run", "provider-sub")
+        .expect("provider empty items");
+    assert!(provider_items.is_empty());
+
+    // MCP tool with colliding keys must keep object-shaped items.
+    let tool = hub
+        .call_plugin_mcp_tool(botster_hub::McpCallRequest {
+            name: "project-pipelines.echo_shape".to_string(),
+            arguments: serde_json::json!({}),
+        })
+        .expect("mcp tool");
+    assert_eq!(tool["type"], "entity_snapshot");
+    assert!(
+        tool["items"].is_object(),
+        "non-provider handler items must remain object, got {}",
+        tool["items"]
+    );
+}
+
+#[test]
+fn entity_publish_rejects_oversized_mutation_at_admission() {
+    let root = unique_short_test_dir("publish-oversized");
+    fs::create_dir_all(&root).expect("create package");
+    fs::write(
+        root.join("botster-package.json"),
+        serde_json::json!({
+            "name": "project-pipelines",
+            "version": "1.0.0",
+            "kind": "plugin",
+            "botster": ">=0.1.0",
+            "source": { "type": "path", "path": root.canonicalize().expect("path") },
+            "capabilities": [{ "surface": "surfaces" }],
+            "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }]
+        })
+        .to_string(),
+    )
+    .expect("manifest");
+    fs::write(
+        root.join("plugin.lua"),
+        r#"
+return botster.register({
+  handlers = {
+    {
+      id = "runs",
+      kind = "entity_provider",
+      descriptor_id = "project-pipelines.run",
+      descriptor = { entity_type = "project-pipelines.run", id_field = "id" },
+      call = function()
+        return {
+          type = "entity_snapshot",
+          entity_type = "project-pipelines.run",
+          snapshot_seq = 0,
+          items = {},
+        }
+      end,
+    },
+    {
+      id = "big",
+      kind = "ui_action",
+      descriptor_id = "project-pipelines.big",
+      descriptor = {
+        action_id = "project-pipelines.big",
+        surface_id = "project-pipelines.home",
+      },
+      call = function(args)
+        local ok, err = pcall(function()
+          botster.entity_publish({
+            type = "entity_upsert",
+            entity_type = "project-pipelines.run",
+            snapshot_seq = 1,
+            id = "run-1",
+            entity = { id = "run-1", blob = string.rep("x", 1024 * 1024) },
+          })
+        end)
+        return {
+          request_id = args.request_id,
+          surface_id = "project-pipelines.home",
+          action_id = "project-pipelines.big",
+          node_id = args.node_id,
+          state = "accepted",
+          payload = { ok = ok, err = tostring(err) },
+        }
+      end,
+    },
+  },
+})
+"#,
+    )
+    .expect("plugin");
+    let mut policy = default_package_policy();
+    policy
+        .install_local_path(&root, "install")
+        .expect("install");
+    policy
+        .enable("project-pipelines", "enable")
+        .expect("enable");
+    let registry = policy.registry().clone();
+    let mut hub = explicit_runtime("publish-oversized");
+    hub.load_lua_plugin_package(&registry, "project-pipelines")
+        .expect("load");
+    let result = hub
+        .dispatch_plugin_surface_action(
+            "project-pipelines",
+            &ui_action_request(
+                "big-upsert",
+                "project-pipelines.home",
+                "project-pipelines.big",
+                "form",
+                serde_json::json!({}),
+                serde_json::json!({}),
+            ),
+        )
+        .expect("surface action completes");
+    assert_eq!(result.state, UiActionResultState::Accepted);
+    let payload = result.payload.expect("payload");
+    assert_eq!(payload["ok"], false);
+    let err = payload["err"].as_str().unwrap_or_default();
+    assert!(
+        err.contains("entity_provider_frame_too_large") || err.contains("frame limit"),
+        "expected frame limit error, got {err}"
+    );
+    assert!(
+        hub.take_package_entity_fanout().is_empty(),
+        "oversized mutation must not enter fanout"
+    );
+}

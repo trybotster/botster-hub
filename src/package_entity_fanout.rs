@@ -192,7 +192,15 @@ impl Default for PackageEntityResyncState {
 }
 
 impl PackageEntityResyncState {
+    /// Schedule coalesced resync when not already degraded.
+    ///
+    /// A degraded family stays ineligible until [`Self::rearm`] from a new
+    /// publish or a new catching-up subscription. Stagnant catching_up alone
+    /// must not start another attempt cycle.
     pub fn mark_needed(&mut self, now: Instant) {
+        if self.degraded {
+            return;
+        }
         if !self.needed {
             self.needed = true;
             // Immediate first attempt for this need cycle.
@@ -202,13 +210,22 @@ impl PackageEntityResyncState {
         }
     }
 
+    /// Explicit re-arm after a new publish or a newly catching-up subscribe.
+    pub fn rearm(&mut self, now: Instant) {
+        self.degraded = false;
+        self.needed = true;
+        self.next_eligible_at = now;
+        self.attempts = 0;
+        self.attempt_times.clear();
+        self.last_attempt_at = None;
+    }
+
     pub fn clear_needed(&mut self) {
         self.needed = false;
         self.attempts = 0;
         self.attempt_times.clear();
         self.last_attempt_at = None;
-        // Degraded flag is sticky until a later successful re-arm path clears it
-        // explicitly when convergence succeeds after re-arm.
+        // Degraded flag is sticky until rearm or successful convergence.
     }
 
     pub fn clear_degraded_on_progress(&mut self) {
@@ -294,15 +311,24 @@ impl PackageEntityFamilyState {
             self.last_accepted_seq = seq;
             ready.push(mutation);
             ready.extend(self.drain_consecutive_pending());
+            // A successful accept may clear residual resync need after drain.
+            self.recompute_resync_need(now);
             PackageEntityPublishStatus::Accepted
         } else if seq <= self.last_accepted_seq + PACKAGE_ENTITY_PENDING_WINDOW {
+            if self.pending_by_seq.contains_key(&seq) {
+                return (
+                    self.result(PackageEntityPublishStatus::DuplicateSequence),
+                    Vec::new(),
+                );
+            }
             self.high_water_seq = self.high_water_seq.max(seq);
             self.pending_by_seq.insert(seq, mutation);
-            self.resync.mark_needed(now);
+            // New publish re-arms even after degraded.
+            self.resync.rearm(now);
             PackageEntityPublishStatus::PendingGap
         } else {
             self.high_water_seq = self.high_water_seq.max(seq);
-            self.resync.mark_needed(now);
+            self.resync.rearm(now);
             PackageEntityPublishStatus::ResyncScheduled
         };
 
@@ -412,9 +438,9 @@ fn validate_mutation_record(
     if id.0.is_empty() {
         return Err("entity_publish upsert requires non-empty id".to_string());
     }
-    if let Ok(record_id) = botster_core::EntityContract::extract_record_id(entity_type, entity)
-        && record_id.0 != id.0
-    {
+    let record_id = botster_core::EntityContract::extract_record_id(entity_type, entity)
+        .map_err(|error| error.to_string())?;
+    if record_id.0 != id.0 {
         return Err(format!(
             "entity_publish upsert id {} does not match entity record id {}",
             id.0, record_id.0
@@ -516,5 +542,92 @@ mod tests {
         assert!(state.pending_by_seq.is_empty());
         assert_eq!(state.high_water_seq, 20);
         assert!(state.resync.needed);
+    }
+
+    #[test]
+    fn duplicate_pending_sequence_rejects_without_replacing() {
+        let mut state = PackageEntityFamilyState::default();
+        let now = Instant::now();
+        let first = PackageEntityMutation::Upsert {
+            entity_type: "f".into(),
+            snapshot_seq: 2,
+            id: "first".into(),
+            entity: json!({"id":"first","status":"original"}),
+        };
+        let (gap, ready) = state.admit(first.clone(), now);
+        assert_eq!(gap.status, PackageEntityPublishStatus::PendingGap);
+        assert!(ready.is_empty());
+        let (dup, ready) = state.admit(
+            PackageEntityMutation::Upsert {
+                entity_type: "f".into(),
+                snapshot_seq: 2,
+                id: "second".into(),
+                entity: json!({"id":"second","status":"replacement"}),
+            },
+            now,
+        );
+        assert_eq!(dup.status, PackageEntityPublishStatus::DuplicateSequence);
+        assert!(ready.is_empty());
+        assert_eq!(
+            state.pending_by_seq.get(&2),
+            Some(&first),
+            "first pending body must remain intact"
+        );
+    }
+
+    #[test]
+    fn degraded_mark_needed_does_not_start_new_cycle() {
+        let mut resync = PackageEntityResyncState::default();
+        let now = Instant::now();
+        resync.rearm(now);
+        for _ in 0..PACKAGE_ENTITY_RESYNC_MAX_ATTEMPTS {
+            let _ = resync.record_attempt(now);
+        }
+        assert!(resync.degraded);
+        assert!(!resync.needed);
+        resync.mark_needed(now);
+        assert!(resync.degraded);
+        assert!(
+            !resync.needed,
+            "stagnant mark_needed must not re-arm degraded"
+        );
+        resync.rearm(now);
+        assert!(!resync.degraded);
+        assert!(resync.needed);
+        assert_eq!(resync.attempts, 0);
+    }
+
+    #[test]
+    fn upsert_validation_requires_extractable_record_id() {
+        assert!(
+            parse_publish_mutation(json!({
+                "type": "entity_upsert",
+                "entity_type": "project-pipelines.run",
+                "snapshot_seq": 1,
+                "id": "run-1",
+                "entity": { "status": "missing-id" }
+            }))
+            .is_err()
+        );
+        assert!(
+            parse_publish_mutation(json!({
+                "type": "entity_upsert",
+                "entity_type": "project-pipelines.run",
+                "snapshot_seq": 1,
+                "id": "run-1",
+                "entity": { "id": "other", "status": "mismatch" }
+            }))
+            .is_err()
+        );
+        assert!(
+            parse_publish_mutation(json!({
+                "type": "entity_upsert",
+                "entity_type": "project-pipelines.run",
+                "snapshot_seq": 1,
+                "id": "run-1",
+                "entity": { "id": "run-1", "status": "ok" }
+            }))
+            .is_ok()
+        );
     }
 }

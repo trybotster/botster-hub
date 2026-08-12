@@ -1168,6 +1168,14 @@ impl HubRuntime {
         let owner_token = package_entity_owner_token(package_name);
         EntityContract::validate_entity_type(&entity_kind, Some(&owner_token))
             .map_err(|error| error.to_string())?;
+        // Reject oversized mutation bodies at admission so they never enter
+        // pending/fanout queues (same 1 MiB daemon frame bound as snapshots).
+        if package_entity_mutation_exceeds_limit(&mutation) {
+            return Err(
+                "entity_publish frame exceeds daemon frame limit (entity_provider_frame_too_large)"
+                    .to_string(),
+            );
+        }
 
         let now = Instant::now();
         let mut families = self
@@ -1235,7 +1243,10 @@ impl HubRuntime {
         ready
     }
 
-    /// Mark family resync needed (e.g. catching_up subscriber or overflow).
+    /// Mark family resync needed (e.g. overflow or residual gap).
+    ///
+    /// No-ops while the family is `resync_degraded`; only [`Self::rearm_package_entity_resync`]
+    /// or a new publish admission restarts a need cycle after degradation.
     pub fn mark_package_entity_resync_needed(&self, entity_type: &str) {
         let now = Instant::now();
         let mut families = self
@@ -1247,6 +1258,21 @@ impl HubRuntime {
             .or_default()
             .resync
             .mark_needed(now);
+    }
+
+    /// Explicitly re-arm resync after a new catching-up subscription (or other
+    /// progress event that must clear degradation).
+    pub fn rearm_package_entity_resync(&self, entity_type: &str) {
+        let now = Instant::now();
+        let mut families = self
+            .package_entity_families
+            .lock()
+            .expect("package entity family lock");
+        families
+            .entry(entity_type.to_string())
+            .or_default()
+            .resync
+            .rearm(now);
     }
 
     /// Families with an eligible provider resync attempt right now.
@@ -2474,6 +2500,55 @@ fn current_unix_seconds() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or(0)
+}
+
+fn package_entity_mutation_exceeds_limit(
+    mutation: &crate::package_entity_fanout::PackageEntityMutation,
+) -> bool {
+    // Match daemon_transport DAEMON_MAX_FRAME_BYTES without coupling modules.
+    const DAEMON_MAX_FRAME_BYTES: usize = 1024 * 1024;
+    let frame = match mutation {
+        crate::package_entity_fanout::PackageEntityMutation::Upsert {
+            entity_type,
+            snapshot_seq,
+            id,
+            entity,
+        } => serde_json::json!({
+            "type": "entity_upsert",
+            "subscription_id": "admission-size-check",
+            "entity_type": entity_type,
+            "snapshot_seq": snapshot_seq,
+            "id": id,
+            "entity": entity,
+        }),
+        crate::package_entity_fanout::PackageEntityMutation::Patch {
+            entity_type,
+            snapshot_seq,
+            id,
+            patch,
+        } => serde_json::json!({
+            "type": "entity_patch",
+            "subscription_id": "admission-size-check",
+            "entity_type": entity_type,
+            "snapshot_seq": snapshot_seq,
+            "id": id,
+            "patch": patch,
+        }),
+        crate::package_entity_fanout::PackageEntityMutation::Remove {
+            entity_type,
+            snapshot_seq,
+            id,
+        } => serde_json::json!({
+            "type": "entity_remove",
+            "subscription_id": "admission-size-check",
+            "entity_type": entity_type,
+            "snapshot_seq": snapshot_seq,
+            "id": id,
+        }),
+    };
+    serde_json::to_vec(&frame)
+        .map(|bytes| bytes.len() > DAEMON_MAX_FRAME_BYTES)
+        .unwrap_or(true)
 }
 
 fn completed_plugin_payload(

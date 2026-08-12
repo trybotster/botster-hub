@@ -392,17 +392,11 @@ impl PluginRuntime for LuaPluginRuntime {
                 payload: None,
             }),
             Ok(value) => match lua.from_value::<serde_json::Value>(value) {
-                Ok(value) => {
-                    // Field-exact empty items for entity frames: only top-level
-                    // `items: {}` becomes `[]`. Nested empty tables stay objects.
-                    let value =
-                        crate::package_entity_fanout::coerce_entity_frame_empty_items(value);
-                    PluginInvocationResult::Completed(PluginInvocationSuccess {
-                        request_id: request.request_id,
-                        handler: request.handler,
-                        payload: Some(BoundaryJson(value)),
-                    })
-                }
+                Ok(value) => PluginInvocationResult::Completed(PluginInvocationSuccess {
+                    request_id: request.request_id,
+                    handler: request.handler,
+                    payload: Some(BoundaryJson(value)),
+                }),
                 Err(error) => failed(
                     request,
                     PluginInvocationFailureKind::HandlerFailed,
