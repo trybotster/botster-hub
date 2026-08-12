@@ -39,7 +39,7 @@ library path separately; this hub documents only the product host path above.
 
 ```sh
 # Once per checkout: build the PTY worker that CoreDaemon supervises.
-cargo build --locked -p botster-core --bin botster-session-worker
+cargo build --locked -p botster-core-daemon --bin botster-session-worker
 
 # One terminal: start or reuse Hub and attach its operator console.
 cargo run
@@ -97,7 +97,7 @@ hub-native routed envelopes and guarded notification writes:
 | Surface | Status on the product path |
 | --- | --- |
 | Attach + drain terminal egress | Product. Control ops ack through CoreDaemon; bytes arrive via drain/subscription. Late attach may replay prior output as Snapshot/Scrollback/TerminalOutput events when the worker path emits them. |
-| Hub `ReadScreen` / `ReadModeFlags` / `CaptureSnapshot` | Product. Routes `HubClientApi` → `HubRuntime` → `CoreDaemon` readback. `ReadScreen` returns session text; targeted `ReadModeFlags` returns the authoritative session id and exact `mouse_mode: u8`; `CaptureSnapshot` returns metadata only (rows/cols/format/byte count). Errors stay errors rather than fabricated mouse-off results, and mode readback has no pushed event. Opaque snapshot bytes stay on the attach/drain data plane. Hub never decodes snapshot wire magic (`GHOSTSNP`) or asserts payload layout — cold cutover is enforced in core/restty, not hub. |
+| Hub `ReadScreen` / `ReadModeFlags` / `ModeGatedInput` / `CaptureSnapshot` | Product. Routes `HubClientApi` → `HubRuntime` → `CoreDaemon` readback. `ReadScreen` returns session text; `ReadModeFlags` returns full authoritative `ModeFlags` plus `mode_generation`/`mode_revision` freshness; `ModeGatedInput` admits race-free mode-dependent Kitty/mouse input via Core's 5s default timeout; `CaptureSnapshot` returns metadata only (rows/cols/format/byte count) — never GHOSTSNP bytes. Errors stay errors rather than fabricated mouse-off results, and mode readback has no pushed event. Opaque GHOSTSNP snapshot bytes stay only on the attach/drain `DaemonEvent::Snapshot` data plane (`Scrollback` is never importable as GHOSTSNP). Hub never decodes snapshot wire magic or synthesizes OSC 10/11/12 replies — startup color baseline is applied once via Core `with_terminal_color_profile` (FG `#FFFFFF` / BG `#282C34` / cursor `#FFFFFF`) for pre-attach session-side replies. |
 | Subscription history | Product. History and live terminal output flow through attach/drain events, not through readback responses. |
 | `report_delivery_*` pressure helpers | Still unfinished. Not exposed on the hub client product surface yet. |
 
@@ -240,7 +240,7 @@ the only operation that makes a retained reference unavailable.
 | `guarded_write` | Exposed | Hub admits the request; CoreDaemon owns readiness and delivery states. |
 | `publish` / `drain` / `acknowledge` routed envelope | Exposed | Single CoreDaemon coordination bus for native MCP and Lua. |
 | `release_sessions_for_restart` / `adoption_scan` / `adopt_session` | Exposed | Explicit daemon restart/adoption over worker-backed sessions. |
-| `read_screen` / `read_mode_flags` / `capture_snapshot` | Exposed | Daemon-backed terminal readback through `HubRuntime` and `CoreDaemon`; `read_mode_flags` returns only authoritative `session_id` plus exact `mouse_mode: u8` and preserves errors; `capture_snapshot` returns metadata only, keeping opaque bytes on the attach/drain data plane. |
+| `read_screen` / `read_mode_flags` / `mode_gated_input` / `capture_snapshot` | Exposed | Daemon-backed terminal readback and mode-gated input through `HubRuntime` and `CoreDaemon`; `read_mode_flags` returns full `ModeFlags` + freshness and preserves errors; `mode_gated_input` is the only mode-dependent input path (feature `mode_gated_input`, conf rev 34, protocol 6); `capture_snapshot` returns metadata only, keeping opaque GHOSTSNP bytes on the attach/drain Snapshot data plane. |
 | `report_delivery_*` | Deferred | Delivery-pressure reporting is not exposed on the production hub path yet. |
 | `PluginCapabilityRuntime::submit` | Exposed | Hub owns concrete local capability policy and submits through core request contracts. |
 | `PluginCapabilityRuntime::drain_events` | Exposed | Plugin capability completions and timer events are drained through a hub-owned path. |

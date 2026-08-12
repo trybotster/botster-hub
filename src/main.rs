@@ -220,7 +220,7 @@ fn dispatch_console_command(
 fn console_start_error(error: LocalRuntimeError) -> String {
     match error {
         LocalRuntimeError::MissingSessionWorkerBinary(path) => format!(
-            "missing botster-session-worker binary at {}. Install the complete Botster distribution, or in a source checkout run `cargo build --locked -p botster-core --bin botster-session-worker` so the worker is beside botster-hub, then rerun `botster-hub`",
+            "missing botster-session-worker binary at {}. Install the complete Botster distribution, or in a source checkout run `cargo build --locked -p botster-core-daemon --bin botster-session-worker` so the worker is beside botster-hub, then rerun `botster-hub`",
             path.display()
         ),
         other => other.to_string(),
@@ -3573,7 +3573,27 @@ fn print_daemon_response(response: DaemonResponse) -> Result<(), OperatorError> 
             println!("response=read_mode_flags");
             if let Some(mode_flags) = response.mode_flags {
                 println!("session_id={}", mode_flags.session_id);
+                println!("kitty_enabled={}", mode_flags.kitty_enabled);
+                println!("cursor_visible={}", mode_flags.cursor_visible);
+                println!("bracketed_paste={}", mode_flags.bracketed_paste);
                 println!("mouse_mode={}", mode_flags.mouse_mode);
+                println!("alt_screen={}", mode_flags.alt_screen);
+                println!("focus_reporting={}", mode_flags.focus_reporting);
+                println!("application_cursor={}", mode_flags.application_cursor);
+                println!("mode_generation={}", mode_flags.mode_generation);
+                println!("mode_revision={}", mode_flags.mode_revision);
+            }
+        }
+        DaemonResponseKind::ModeGatedInput => {
+            println!("response=mode_gated_input");
+            if let Some(result) = response.mode_gated_input {
+                println!("session_id={}", result.session_id);
+                println!("admitted={}", result.admitted);
+                println!("bytes_written={}", result.bytes_written);
+                println!("mouse_mode={}", result.mouse_mode);
+                println!("mode_generation={}", result.mode_generation);
+                println!("mode_revision={}", result.mode_revision);
+                println!("error_kind={:?}", result.error_kind);
             }
         }
         DaemonResponseKind::CaptureSnapshot => {

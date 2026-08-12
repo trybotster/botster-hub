@@ -1000,7 +1000,11 @@ The attach/drain ordering contract is that explicit `Attach` enters the
 core-owned SessionIo/ClientWorker subscription path and requests initial
 terminal history for that subscription. The guaranteed per-subscription order
 is `attaching`, optional `snapshot` or `scrollback` history, `attached`, then
-later live `terminal_output`. `attaching` means the subscription was requested
+later live `terminal_output`. Clients that restore Ghostty terminal state must
+import only verified `DaemonEvent::Snapshot` payloads that begin with the
+upstream `GHOSTSNP` / `ghostty-terminal-snapshot-v1` magic; `Scrollback` events
+are never GHOSTSNP and must not be imported as durable terminal state.
+`attaching` means the subscription was requested
 but authoritative initial history has not been delivered. `attached` means
 initial snapshot delivery is complete and live output may flow. Initial history
 is therefore delivered before readiness and later live output.
@@ -1035,17 +1039,27 @@ backend-opaque state. Their payloads, formats, and byte counts must never be use
 as evidence that visible terminal history exists. Only `ReadScreen.text` and
 later `TerminalOutput.data` are renderable terminal text.
 
-`DaemonRequest::ReadScreen`, `DaemonRequest::ReadModeFlags`, and
+`DaemonRequest::ReadScreen`, `DaemonRequest::ReadModeFlags`,
+`DaemonRequest::ModeGatedInput`, and
 `DaemonRequest::CaptureSnapshot` are control-plane request/response readback
 operations for a running session. They route through the same production path
 as other local clients:
 `daemon_transport -> HubClientApi -> HubRuntime -> CoreDaemon`. `ReadScreen`
-returns `DaemonReadScreen { session_id, text }`. `ReadModeFlags` returns
-`DaemonModeFlags { session_id, mouse_mode }`, where `mouse_mode` is the exact
-authoritative `u8` bitmask (`0` is off and combined tracking plus SGR reporting
-is `9`). The other core mode booleans are not authoritative and are not exposed.
-Unknown sessions and backend failures return `operator_error` with no
+returns `DaemonReadScreen { session_id, text }`. `ReadModeFlags` returns the full
+authoritative `DaemonModeFlags` projection (`session_id`, `kitty_enabled`,
+`cursor_visible`, `bracketed_paste`, `mouse_mode`, `alt_screen`,
+`focus_reporting`, `application_cursor`) plus mode freshness
+(`mode_generation`, `mode_revision`). `mouse_mode` is the exact authoritative
+`u8` bitmask (`0` is off and combined tracking plus SGR reporting is `9`).
+Kitty keyboard and mouse encodings must use `ModeGatedInput` with the freshness
+token from `ReadModeFlags`; plain `SendInput` is only for non-mode-dependent
+input. Unknown sessions and backend failures return `operator_error` with no
 `mode_flags` body; clients must not substitute a successful zero value.
+`CaptureSnapshot` returns metadata only and never GHOSTSNP control-path bytes;
+current palette/special colors after session start are restored from data-plane
+GHOSTSNP install only. The Hub startup color profile (FG `#FFFFFF`, BG
+`#282C34`, cursor `#FFFFFF`) is the pre-attach OSC 10/11/12 baseline only and
+must not be reapplied after Snapshot install.
 `CaptureSnapshot` returns `DaemonCaptureSnapshot { session_id, rows, cols,
 payload_format, payload_bytes }`. The hub does not expose the opaque snapshot
 bytes in this response. Mode flags are probed on demand and never arrive as a

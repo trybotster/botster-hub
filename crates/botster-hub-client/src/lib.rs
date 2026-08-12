@@ -22,7 +22,7 @@ mod typescript;
 
 pub const PROTOCOL: &str = "botster-hub-daemon-v1";
 pub const PROTOCOL_VERSION: u16 = 6;
-pub const CONFORMANCE_FIXTURE_REVISION: u16 = 33;
+pub const CONFORMANCE_FIXTURE_REVISION: u16 = 34;
 /// Version of the local WebRTC delivery chunk framing protocol.
 pub const LOCAL_WEBRTC_DELIVERY_CHUNK_VERSION: u16 = 2;
 /// Serialized local WebRTC delivery frames must remain strictly below this size.
@@ -42,6 +42,8 @@ pub const FEATURE_TERMINAL_READBACK: &str = "terminal_readback";
 pub const FEATURE_SESSION_ENTITY_SUBSCRIPTIONS: &str = "session_entity_subscriptions";
 pub const FEATURE_SESSION_TYPE_ENTITY_SUBSCRIPTIONS: &str = "session_type_entity_subscriptions";
 pub const FEATURE_PLUGIN_ENTITY_SUBSCRIPTIONS: &str = "plugin_entity_subscriptions";
+/// Race-free mode-dependent terminal input via `ModeGatedInput` + mode freshness.
+pub const FEATURE_MODE_GATED_INPUT: &str = "mode_gated_input";
 const ATTACH_DRAIN_INTERVAL: Duration = Duration::from_millis(25);
 
 /// Authenticated plaintext carried by one complete local WebRTC delivery.
@@ -660,6 +662,7 @@ fn current_feature_list() -> Vec<&'static str> {
         FEATURE_SESSION_ENTITY_SUBSCRIPTIONS,
         FEATURE_SESSION_TYPE_ENTITY_SUBSCRIPTIONS,
         FEATURE_PLUGIN_ENTITY_SUBSCRIPTIONS,
+        FEATURE_MODE_GATED_INPUT,
     ]
 }
 
@@ -717,6 +720,15 @@ pub enum DaemonRequest {
     SendInput {
         session_id: String,
         data: String,
+    },
+    /// Race-free mode-dependent PTY input. Requires a freshness token from
+    /// [`DaemonRequest::ReadModeFlags`]. Plain [`DaemonRequest::SendInput`] must
+    /// not be used for Kitty keyboard or mouse encodings.
+    ModeGatedInput {
+        session_id: String,
+        data: String,
+        mode_generation: u64,
+        mode_revision: u64,
     },
     Resize {
         session_id: String,
@@ -968,6 +980,8 @@ pub struct DaemonResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode_flags: Option<DaemonModeFlags>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode_gated_input: Option<DaemonModeGatedInputResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capture_snapshot: Option<DaemonCaptureSnapshot>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub spawn_targets: Vec<DaemonSpawnTarget>,
@@ -1051,6 +1065,7 @@ pub enum DaemonResponseKind {
     SessionContext,
     ReadScreen,
     ReadModeFlags,
+    ModeGatedInput,
     CaptureSnapshot,
     SpawnTargets,
     SpawnTargetValidation,
@@ -1087,10 +1102,114 @@ pub struct DaemonReadScreen {
     pub text: String,
 }
 
+/// Authoritative terminal mode flags plus mode-freshness token for gated input.
+///
+/// Marked non-exhaustive so additive mode fields remain source-compatible for
+/// external Rust consumers that construct this DTO.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct DaemonModeFlags {
     pub session_id: String,
+    pub kitty_enabled: bool,
+    pub cursor_visible: bool,
+    pub bracketed_paste: bool,
     pub mouse_mode: u8,
+    pub alt_screen: bool,
+    pub focus_reporting: bool,
+    pub application_cursor: bool,
+    /// Worker/session mode-owner epoch. Changes only on new worker ownership.
+    pub mode_generation: u64,
+    /// Monotonic complete-mode counter within [`Self::mode_generation`].
+    pub mode_revision: u64,
+}
+
+impl DaemonModeFlags {
+    /// Build a full mode-flags response body.
+    #[must_use]
+    pub fn new(
+        session_id: impl Into<String>,
+        kitty_enabled: bool,
+        cursor_visible: bool,
+        bracketed_paste: bool,
+        mouse_mode: u8,
+        alt_screen: bool,
+        focus_reporting: bool,
+        application_cursor: bool,
+        mode_generation: u64,
+        mode_revision: u64,
+    ) -> Self {
+        Self {
+            session_id: session_id.into(),
+            kitty_enabled,
+            cursor_visible,
+            bracketed_paste,
+            mouse_mode,
+            alt_screen,
+            focus_reporting,
+            application_cursor,
+            mode_generation,
+            mode_revision,
+        }
+    }
+}
+
+/// Result of a race-free mode-gated terminal input admit attempt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct DaemonModeGatedInputResult {
+    pub session_id: String,
+    /// Whether the worker wrote **all** input bytes to the PTY.
+    pub admitted: bool,
+    /// Number of request payload bytes actually written to the PTY.
+    pub bytes_written: usize,
+    pub kitty_enabled: bool,
+    pub cursor_visible: bool,
+    pub bracketed_paste: bool,
+    pub mouse_mode: u8,
+    pub alt_screen: bool,
+    pub focus_reporting: bool,
+    pub application_cursor: bool,
+    pub mode_generation: u64,
+    pub mode_revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_kind: Option<String>,
+}
+
+impl DaemonModeGatedInputResult {
+    /// Build a full mode-gated input result body.
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        session_id: impl Into<String>,
+        admitted: bool,
+        bytes_written: usize,
+        kitty_enabled: bool,
+        cursor_visible: bool,
+        bracketed_paste: bool,
+        mouse_mode: u8,
+        alt_screen: bool,
+        focus_reporting: bool,
+        application_cursor: bool,
+        mode_generation: u64,
+        mode_revision: u64,
+        error_kind: Option<String>,
+    ) -> Self {
+        Self {
+            session_id: session_id.into(),
+            admitted,
+            bytes_written,
+            kitty_enabled,
+            cursor_visible,
+            bracketed_paste,
+            mouse_mode,
+            alt_screen,
+            focus_reporting,
+            application_cursor,
+            mode_generation,
+            mode_revision,
+            error_kind,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3180,10 +3299,18 @@ mod tests {
 
         let response = DaemonResponse {
             kind: DaemonResponseKind::ReadModeFlags,
-            mode_flags: Some(DaemonModeFlags {
-                session_id: "mode-session".to_string(),
-                mouse_mode: 9,
-            }),
+            mode_flags: Some(DaemonModeFlags::new(
+                "mode-session",
+                false,
+                true,
+                false,
+                9,
+                false,
+                false,
+                false,
+                1,
+                2,
+            )),
             ..daemon_response_example(DaemonResponseKind::ReadModeFlags)
         };
         let value = serde_json::to_value(response).expect("mode response serializes");
@@ -3191,17 +3318,114 @@ mod tests {
             value["mode_flags"],
             serde_json::json!({
                 "session_id": "mode-session",
+                "kitty_enabled": false,
+                "cursor_visible": true,
+                "bracketed_paste": false,
                 "mouse_mode": 9,
+                "alt_screen": false,
+                "focus_reporting": false,
+                "application_cursor": false,
+                "mode_generation": 1,
+                "mode_revision": 2,
             })
         );
 
         let generated = daemon_protocol_typescript();
         assert!(generated.contains(r#"| { type: "read_mode_flags"; session_id: string }"#));
         assert!(generated.contains("mode_flags?: DaemonModeFlags | null;"));
+        assert!(generated.contains("mode_generation: number;"));
+        assert!(generated.contains("mode_revision: number;"));
+        assert!(generated.contains(r#"| { type: "mode_gated_input"; session_id: string; data: string; mode_generation: number; mode_revision: number }"#));
+        assert!(generated.contains("mode_gated_input?: DaemonModeGatedInputResult | null;"));
+        assert!(generated.contains("export interface DaemonModeGatedInputResult"));
+        assert!(generated.contains(FEATURE_MODE_GATED_INPUT));
+    }
+
+    #[test]
+    fn mode_gated_input_protocol_is_serde_stable_and_generated() {
+        let request = DaemonRequest::ModeGatedInput {
+            session_id: "mode-session".to_string(),
+            data: "x".to_string(),
+            mode_generation: 1,
+            mode_revision: 2,
+        };
         assert_eq!(
-            generated_interface("DaemonModeFlags"),
-            "export interface DaemonModeFlags {\n  session_id: string;\n  mouse_mode: number;\n}\n"
+            serde_json::to_value(&request).expect("mode gated request serializes"),
+            serde_json::json!({
+                "type": "mode_gated_input",
+                "session_id": "mode-session",
+                "data": "x",
+                "mode_generation": 1,
+                "mode_revision": 2,
+            })
         );
+
+        let response = DaemonResponse {
+            kind: DaemonResponseKind::ModeGatedInput,
+            mode_gated_input: Some(DaemonModeGatedInputResult::new(
+                "mode-session",
+                true,
+                1,
+                false,
+                true,
+                false,
+                9,
+                false,
+                false,
+                false,
+                1,
+                2,
+                None,
+            )),
+            ..daemon_response_example(DaemonResponseKind::ModeGatedInput)
+        };
+        let value = serde_json::to_value(response).expect("mode gated response serializes");
+        assert_eq!(
+            value["mode_gated_input"],
+            serde_json::json!({
+                "session_id": "mode-session",
+                "admitted": true,
+                "bytes_written": 1,
+                "kitty_enabled": false,
+                "cursor_visible": true,
+                "bracketed_paste": false,
+                "mouse_mode": 9,
+                "alt_screen": false,
+                "focus_reporting": false,
+                "application_cursor": false,
+                "mode_generation": 1,
+                "mode_revision": 2,
+            })
+        );
+    }
+
+    #[test]
+    fn new_client_rejects_hub_missing_mode_gated_input_feature() {
+        let requirement = DaemonCompatibilityRequirement::current();
+        // Keep conformance at the current floor so the feature-token check is the
+        // first rejection (not the conf floor). Models old Hub on protocol 6 that
+        // never advertised mode_gated_input.
+        let mut old_hub = DaemonCompatibility::current();
+        old_hub.features.retain(|feature| feature != FEATURE_MODE_GATED_INPUT);
+        let error = ensure_compatible(&requirement, &old_hub).expect_err("missing feature");
+        assert!(
+            error
+                .diagnostic
+                .contains("missing required feature(s): mode_gated_input"),
+            "unexpected diagnostic: {}",
+            error.diagnostic
+        );
+    }
+
+    #[test]
+    fn old_client_accepts_hub_with_mode_gated_input_at_protocol_6() {
+        let mut old_client = DaemonCompatibilityRequirement::current();
+        old_client
+            .required_features
+            .retain(|feature| feature != FEATURE_MODE_GATED_INPUT);
+        old_client.minimum_conformance_fixture_revision = 33;
+        ensure_compatible(&old_client, &DaemonCompatibility::current())
+            .expect("old client accepts newer hub with extra feature and conf floor");
     }
 
     #[test]
@@ -4189,6 +4413,12 @@ mod tests {
                 session_id: "session".to_string(),
                 data: "input".to_string(),
             },
+            DaemonRequest::ModeGatedInput {
+                session_id: "session".to_string(),
+                data: "input".to_string(),
+                mode_generation: 1,
+                mode_revision: 1,
+            },
             DaemonRequest::Resize {
                 session_id: "session".to_string(),
                 rows: 24,
@@ -4421,6 +4651,7 @@ mod tests {
             DaemonRequest::Attach { .. } => "attach",
             DaemonRequest::Detach { .. } => "detach",
             DaemonRequest::SendInput { .. } => "send_input",
+            DaemonRequest::ModeGatedInput { .. } => "mode_gated_input",
             DaemonRequest::Resize { .. } => "resize",
             DaemonRequest::ShutdownSession { .. } => "shutdown_session",
             DaemonRequest::Drain { .. } => "drain",
@@ -4499,6 +4730,7 @@ mod tests {
             DaemonResponseKind::SessionContext,
             DaemonResponseKind::ReadScreen,
             DaemonResponseKind::ReadModeFlags,
+            DaemonResponseKind::ModeGatedInput,
             DaemonResponseKind::CaptureSnapshot,
             DaemonResponseKind::SpawnTargets,
             DaemonResponseKind::SpawnTargetValidation,
@@ -4546,6 +4778,7 @@ mod tests {
             DaemonResponseKind::SessionContext => "session_context",
             DaemonResponseKind::ReadScreen => "read_screen",
             DaemonResponseKind::ReadModeFlags => "read_mode_flags",
+            DaemonResponseKind::ModeGatedInput => "mode_gated_input",
             DaemonResponseKind::CaptureSnapshot => "capture_snapshot",
             DaemonResponseKind::SpawnTargets => "spawn_targets",
             DaemonResponseKind::SpawnTargetValidation => "spawn_target_validation",
@@ -4644,10 +4877,33 @@ mod tests {
                 session_id: "session".to_string(),
                 text: "ready".to_string(),
             }),
-            mode_flags: Some(DaemonModeFlags {
-                session_id: "session".to_string(),
-                mouse_mode: 9,
-            }),
+            mode_flags: Some(DaemonModeFlags::new(
+                "session",
+                false,
+                true,
+                false,
+                9,
+                false,
+                false,
+                false,
+                1,
+                1,
+            )),
+            mode_gated_input: Some(DaemonModeGatedInputResult::new(
+                "session",
+                true,
+                1,
+                false,
+                true,
+                false,
+                9,
+                false,
+                false,
+                false,
+                1,
+                1,
+                None,
+            )),
             capture_snapshot: Some(DaemonCaptureSnapshot {
                 session_id: "session".to_string(),
                 rows: 24,
@@ -5165,7 +5421,7 @@ mod tests {
     #[test]
     fn protocol_six_and_conformance_thirty_two_define_the_cold_cut_boundary() {
         assert_eq!(PROTOCOL_VERSION, 6);
-        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 33);
+        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 34);
 
         let requirement = DaemonCompatibilityRequirement::current();
         let protocol_error = ensure_compatible(
@@ -5230,7 +5486,7 @@ mod tests {
         // conformance revision: bumping the protocol would break every existing
         // first-party client that never issues this request.
         assert_eq!(PROTOCOL_VERSION, 6);
-        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 33);
+        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 34);
         assert_eq!(
             current_feature_list(),
             vec![
@@ -5247,6 +5503,7 @@ mod tests {
                 FEATURE_SESSION_ENTITY_SUBSCRIPTIONS,
                 FEATURE_SESSION_TYPE_ENTITY_SUBSCRIPTIONS,
                 FEATURE_PLUGIN_ENTITY_SUBSCRIPTIONS,
+                FEATURE_MODE_GATED_INPUT,
             ],
             "the authoring read is a request, not a negotiated capability",
         );

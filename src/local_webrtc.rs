@@ -1707,6 +1707,7 @@ fn response_with_diagnostic(diagnostic: DaemonDiagnostic) -> DaemonResponse {
         session_context: None,
         read_screen: None,
         mode_flags: None,
+        mode_gated_input: None,
         capture_snapshot: None,
         spawn_targets: Vec::new(),
         spawn_target_validation: None,

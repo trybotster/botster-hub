@@ -68,6 +68,7 @@ pub use capabilities::HubCapabilityRuntime;
 pub use client_api::{
     HubClientAdmission, HubClientApi, HubClientCapability, HubClientCaptureSnapshot,
     HubClientError, HubClientEvent, HubClientGuardedWrite, HubClientIdentity, HubClientModeFlags,
+    HubClientModeGatedInputResult,
     HubClientObservationKind, HubClientOperation, HubClientPackage, HubClientPackageAvailability,
     HubClientPackageAvailabilityReason, HubClientPackageAvailabilityState,
     HubClientPackageClassification, HubClientPackageConfiguration,

@@ -9188,6 +9188,15 @@ fn external_hub_client_read_mode_flags_drives_real_daemon_socket_protocol() {
     };
     assert_eq!(mode_flags.session_id, "external-client-session");
     assert_eq!(mode_flags.mouse_mode, 9);
+    assert_ne!(
+        mode_flags.mode_generation, 0,
+        "freshness generation must be non-zero on a live worker"
+    );
+    assert!(
+        mode_flags.mode_revision >= 1,
+        "freshness revision should advance with mode changes, got {}",
+        mode_flags.mode_revision
+    );
 
     let detach = connection
         .request(&botster_hub_client::DaemonRequest::Detach {
@@ -9308,6 +9317,673 @@ fn external_hub_client_read_mode_flags_drives_real_daemon_socket_protocol() {
         shutdown_session.kind,
         botster_hub_client::DaemonResponseKind::Events
     );
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+const GHOSTSNP_MAGIC: &[u8] = b"GHOSTSNP";
+
+fn wait_for_mode_flags<F>(
+    connection: &mut botster_hub_client::DaemonConnection,
+    session_id: &str,
+    mut predicate: F,
+) -> botster_hub_client::DaemonModeFlags
+where
+    F: FnMut(&botster_hub_client::DaemonModeFlags) -> bool,
+{
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let response = connection
+            .request(&botster_hub_client::DaemonRequest::ReadModeFlags {
+                session_id: session_id.to_string(),
+            })
+            .expect("read_mode_flags");
+        assert_eq!(
+            response.kind,
+            botster_hub_client::DaemonResponseKind::ReadModeFlags
+        );
+        let mode_flags = response.mode_flags.expect("mode flags body");
+        if predicate(&mode_flags) {
+            return mode_flags;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for mode flags on {session_id}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn collect_attach_events(
+    connection: &mut botster_hub_client::DaemonConnection,
+    session_id: &str,
+    subscription_id: &str,
+    until_live_marker: Option<&str>,
+) -> Vec<botster_hub_client::DaemonEvent> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut events = Vec::new();
+    while Instant::now() < deadline {
+        let drain = connection
+            .request(&botster_hub_client::DaemonRequest::Drain {
+                session_id: session_id.to_string(),
+            })
+            .expect("drain");
+        events.extend(drain.events);
+        let attached = events.iter().any(|event| {
+            matches!(
+                event,
+                botster_hub_client::DaemonEvent::AttachState {
+                    subscription_id: sub,
+                    state,
+                    ..
+                } if sub == subscription_id && state == "attached"
+            )
+        });
+        let saw_live = until_live_marker.map_or(true, |marker| {
+            events.iter().any(|event| {
+                matches!(
+                    event,
+                    botster_hub_client::DaemonEvent::TerminalOutput {
+                        subscription_id: sub,
+                        data,
+                        ..
+                    } if sub == subscription_id && data.contains(marker)
+                )
+            })
+        });
+        if attached && saw_live {
+            break;
+        }
+        thread::sleep(Duration::from_millis(30));
+    }
+    events
+}
+
+fn first_snapshot_payload(
+    events: &[botster_hub_client::DaemonEvent],
+    subscription_id: &str,
+) -> Vec<u8> {
+    for event in events {
+        if let botster_hub_client::DaemonEvent::Snapshot {
+            subscription_id: sub,
+            history,
+            ..
+        } = event
+            && sub == subscription_id
+        {
+            return history
+                .decoded_bytes()
+                .expect("snapshot payload decodes")
+                .to_vec();
+        }
+    }
+    panic!("expected Snapshot event for {subscription_id}, got {events:?}");
+}
+
+#[test]
+fn external_hub_ghostty_snapshot_install_before_live_rejects_scrollback_as_ghostsnp() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_test_dir("external-hub-ghostsnp-order");
+    let config = explicit_config(&data_dir);
+    let socket_path = config
+        .transports
+        .local_socket
+        .as_ref()
+        .expect("local socket")
+        .path
+        .clone();
+    let endpoint = botster_hub_client::DaemonEndpoint::new(socket_path);
+    let child = start_cli_daemon(&data_dir);
+    let mut connection =
+        botster_hub_client::DaemonConnection::connect(&endpoint).expect("connect");
+
+    connection
+        .request(&botster_hub_client::DaemonRequest::Spawn {
+            session_id: "ghostsnp-order-session".to_string(),
+            command: "printf 'retained-before-attach\\n'; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done".to_string(),
+        })
+        .expect("spawn");
+    connection
+        .request(&botster_hub_client::DaemonRequest::Attach {
+            session_id: "ghostsnp-order-session".to_string(),
+            subscription_id: "ghostsnp-order-sub".to_string(),
+        })
+        .expect("attach");
+
+    // Seed retained content, then reattach so Snapshot is non-empty history.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut observed = String::new();
+    while Instant::now() < deadline {
+        let drain = connection
+            .request(&botster_hub_client::DaemonRequest::Drain {
+                session_id: "ghostsnp-order-session".to_string(),
+            })
+            .expect("drain");
+        for event in drain.events {
+            if let botster_hub_client::DaemonEvent::TerminalOutput { data, .. } = event {
+                observed.push_str(&data);
+            }
+        }
+        if observed.contains("retained-before-attach") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    connection
+        .request(&botster_hub_client::DaemonRequest::Detach {
+            session_id: "ghostsnp-order-session".to_string(),
+            subscription_id: "ghostsnp-order-sub".to_string(),
+        })
+        .expect("detach");
+    connection
+        .request(&botster_hub_client::DaemonRequest::Attach {
+            session_id: "ghostsnp-order-session".to_string(),
+            subscription_id: "ghostsnp-order-resub".to_string(),
+        })
+        .expect("reattach");
+    connection
+        .request(&botster_hub_client::DaemonRequest::SendInput {
+            session_id: "ghostsnp-order-session".to_string(),
+            data: "live-after-snapshot\n".to_string(),
+        })
+        .expect("live input");
+
+    let events = collect_attach_events(
+        &mut connection,
+        "ghostsnp-order-session",
+        "ghostsnp-order-resub",
+        Some("echo:live-after-snapshot"),
+    );
+
+    let attaching = events.iter().position(|event| {
+        matches!(
+            event,
+            botster_hub_client::DaemonEvent::AttachState {
+                subscription_id,
+                state,
+                ..
+            } if subscription_id == "ghostsnp-order-resub" && state == "attaching"
+        )
+    });
+    let snapshot = events.iter().position(|event| {
+        matches!(
+            event,
+            botster_hub_client::DaemonEvent::Snapshot {
+                subscription_id,
+                ..
+            } if subscription_id == "ghostsnp-order-resub"
+        )
+    });
+    let attached = events.iter().position(|event| {
+        matches!(
+            event,
+            botster_hub_client::DaemonEvent::AttachState {
+                subscription_id,
+                state,
+                ..
+            } if subscription_id == "ghostsnp-order-resub" && state == "attached"
+        )
+    });
+    let live = events.iter().position(|event| {
+        matches!(
+            event,
+            botster_hub_client::DaemonEvent::TerminalOutput {
+                subscription_id,
+                data,
+                ..
+            } if subscription_id == "ghostsnp-order-resub"
+                && data.contains("echo:live-after-snapshot")
+        )
+    });
+    let (attaching, snapshot, attached, live) = (
+        attaching.expect("attaching"),
+        snapshot.expect("snapshot"),
+        attached.expect("attached"),
+        live.expect("live"),
+    );
+    assert!(
+        attaching < snapshot && snapshot < attached && attached < live,
+        "ordering attaching < Snapshot < attached < live failed: {events:?}"
+    );
+
+    let payload = first_snapshot_payload(&events, "ghostsnp-order-resub");
+    assert!(
+        payload.starts_with(GHOSTSNP_MAGIC),
+        "Snapshot must be GHOSTSNP; got {:?}",
+        &payload[..payload.len().min(16)]
+    );
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            botster_hub_client::DaemonEvent::Scrollback {
+                subscription_id,
+                history,
+                ..
+            } if subscription_id == "ghostsnp-order-resub"
+                && history
+                    .decoded_bytes()
+                    .map(|bytes| bytes.starts_with(GHOSTSNP_MAGIC))
+                    .unwrap_or(false)
+        )),
+        "Scrollback must never carry GHOSTSNP magic: {events:?}"
+    );
+
+    // Control path CaptureSnapshot is metadata-only — never GHOSTSNP bytes.
+    let capture = connection
+        .request(&botster_hub_client::DaemonRequest::CaptureSnapshot {
+            session_id: "ghostsnp-order-session".to_string(),
+        })
+        .expect("capture snapshot metadata");
+    assert_eq!(
+        capture.kind,
+        botster_hub_client::DaemonResponseKind::CaptureSnapshot
+    );
+    let meta = capture
+        .capture_snapshot
+        .as_ref()
+        .expect("capture body");
+    assert!(meta.payload_bytes > 0);
+    assert_eq!(
+        meta.payload_format.as_deref(),
+        Some("ghostty-terminal-snapshot-v1")
+    );
+    let capture_json = serde_json::to_value(&capture).expect("serialize capture");
+    assert!(
+        capture_json.get("payload_base64").is_none(),
+        "control CaptureSnapshot must not expose payload_base64: {capture_json}"
+    );
+
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
+fn external_hub_mode_gated_kitty_stale_token_rejects_and_reprobe_admits() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_test_dir("external-hub-mode-gated-kitty");
+    let config = explicit_config(&data_dir);
+    let socket_path = config
+        .transports
+        .local_socket
+        .as_ref()
+        .expect("local socket")
+        .path
+        .clone();
+    let endpoint = botster_hub_client::DaemonEndpoint::new(socket_path);
+    let child = start_cli_daemon(&data_dir);
+    let mut connection =
+        botster_hub_client::DaemonConnection::connect(&endpoint).expect("connect");
+
+    connection
+        .request(&botster_hub_client::DaemonRequest::Spawn {
+            session_id: "mode-gated-kitty".to_string(),
+            command: concat!(
+                "printf ready; while IFS= read -r line; do ",
+                "printf \"echo:%s\\n\" \"$line\"; ",
+                "if [ \"$line\" = enable-modes ]; then ",
+                "printf '\\033[?1000h\\033[?1006h\\033[=1;1u'; ",
+                "fi; ",
+                "done"
+            )
+            .to_string(),
+        })
+        .expect("spawn");
+    connection
+        .request(&botster_hub_client::DaemonRequest::Attach {
+            session_id: "mode-gated-kitty".to_string(),
+            subscription_id: "mode-gated-kitty-sub".to_string(),
+        })
+        .expect("attach");
+
+    let baseline = wait_for_mode_flags(&mut connection, "mode-gated-kitty", |flags| {
+        flags.mode_generation != 0
+    });
+
+    let enable = connection
+        .request(&botster_hub_client::DaemonRequest::ModeGatedInput {
+            session_id: "mode-gated-kitty".to_string(),
+            data: "enable-modes\n".to_string(),
+            mode_generation: baseline.mode_generation,
+            mode_revision: baseline.mode_revision,
+        })
+        .expect("enable modes");
+    assert_eq!(
+        enable.kind,
+        botster_hub_client::DaemonResponseKind::ModeGatedInput
+    );
+    let enable_result = enable.mode_gated_input.expect("enable result");
+    assert!(enable_result.admitted, "baseline token should admit enable");
+
+    let after = wait_for_mode_flags(&mut connection, "mode-gated-kitty", |flags| {
+        flags.kitty_enabled && flags.mouse_mode == 9
+    });
+    assert!(after.kitty_enabled);
+    assert_eq!(after.mouse_mode, 9);
+
+    let stale = connection
+        .request(&botster_hub_client::DaemonRequest::ModeGatedInput {
+            session_id: "mode-gated-kitty".to_string(),
+            data: "stale-kitty\n".to_string(),
+            mode_generation: baseline.mode_generation,
+            mode_revision: baseline.mode_revision,
+        })
+        .expect("stale gated input");
+    let stale_result = stale.mode_gated_input.expect("stale result");
+    assert!(!stale_result.admitted, "stale token must reject");
+    assert_eq!(stale_result.bytes_written, 0);
+
+    thread::sleep(Duration::from_millis(100));
+    let screen = connection
+        .request(&botster_hub_client::DaemonRequest::ReadScreen {
+            session_id: "mode-gated-kitty".to_string(),
+        })
+        .expect("screen after stale");
+    let text = screen.read_screen.expect("screen body").text;
+    assert!(
+        !text.contains("echo:stale-kitty"),
+        "stale gated input must write zero PTY bytes; screen={text}"
+    );
+
+    let fresh = connection
+        .request(&botster_hub_client::DaemonRequest::ModeGatedInput {
+            session_id: "mode-gated-kitty".to_string(),
+            data: "fresh-kitty\n".to_string(),
+            mode_generation: after.mode_generation,
+            mode_revision: after.mode_revision,
+        })
+        .expect("fresh gated input");
+    let fresh_result = fresh.mode_gated_input.expect("fresh result");
+    assert!(fresh_result.admitted, "reprobed token must admit");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut saw_fresh = false;
+    while Instant::now() < deadline {
+        let screen = connection
+            .request(&botster_hub_client::DaemonRequest::ReadScreen {
+                session_id: "mode-gated-kitty".to_string(),
+            })
+            .expect("screen after fresh");
+        if screen
+            .read_screen
+            .expect("screen body")
+            .text
+            .contains("echo:fresh-kitty")
+        {
+            saw_fresh = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(30));
+    }
+    assert!(saw_fresh, "fresh gated input should reach the PTY");
+
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
+fn external_hub_mode_gated_mouse_stale_token_rejects_and_reprobe_admits() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_test_dir("external-hub-mode-gated-mouse");
+    let config = explicit_config(&data_dir);
+    let socket_path = config
+        .transports
+        .local_socket
+        .as_ref()
+        .expect("local socket")
+        .path
+        .clone();
+    let endpoint = botster_hub_client::DaemonEndpoint::new(socket_path);
+    let child = start_cli_daemon(&data_dir);
+    let mut connection =
+        botster_hub_client::DaemonConnection::connect(&endpoint).expect("connect");
+
+    connection
+        .request(&botster_hub_client::DaemonRequest::Spawn {
+            session_id: "mode-gated-mouse".to_string(),
+            command: concat!(
+                "printf ready; while IFS= read -r line; do ",
+                "printf \"echo:%s\\n\" \"$line\"; ",
+                "if [ \"$line\" = enable-mouse ]; then ",
+                "printf '\\033[?1000h\\033[?1006h'; ",
+                "fi; ",
+                "done"
+            )
+            .to_string(),
+        })
+        .expect("spawn");
+    connection
+        .request(&botster_hub_client::DaemonRequest::Attach {
+            session_id: "mode-gated-mouse".to_string(),
+            subscription_id: "mode-gated-mouse-sub".to_string(),
+        })
+        .expect("attach");
+
+    let baseline = wait_for_mode_flags(&mut connection, "mode-gated-mouse", |flags| {
+        flags.mode_generation != 0
+    });
+    let enable = connection
+        .request(&botster_hub_client::DaemonRequest::ModeGatedInput {
+            session_id: "mode-gated-mouse".to_string(),
+            data: "enable-mouse\n".to_string(),
+            mode_generation: baseline.mode_generation,
+            mode_revision: baseline.mode_revision,
+        })
+        .expect("enable mouse");
+    assert!(
+        enable
+            .mode_gated_input
+            .expect("enable body")
+            .admitted
+    );
+
+    let after = wait_for_mode_flags(&mut connection, "mode-gated-mouse", |flags| {
+        flags.mouse_mode == 9
+    });
+    assert_eq!(after.mouse_mode, 9);
+
+    let stale = connection
+        .request(&botster_hub_client::DaemonRequest::ModeGatedInput {
+            session_id: "mode-gated-mouse".to_string(),
+            data: "stale-mouse\n".to_string(),
+            mode_generation: baseline.mode_generation,
+            mode_revision: baseline.mode_revision,
+        })
+        .expect("stale mouse input");
+    assert!(!stale.mode_gated_input.expect("stale body").admitted);
+
+    let fresh = connection
+        .request(&botster_hub_client::DaemonRequest::ModeGatedInput {
+            session_id: "mode-gated-mouse".to_string(),
+            data: "fresh-mouse\n".to_string(),
+            mode_generation: after.mode_generation,
+            mode_revision: after.mode_revision,
+        })
+        .expect("fresh mouse input");
+    assert!(fresh.mode_gated_input.expect("fresh body").admitted);
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut saw_fresh = false;
+    while Instant::now() < deadline {
+        let screen = connection
+            .request(&botster_hub_client::DaemonRequest::ReadScreen {
+                session_id: "mode-gated-mouse".to_string(),
+            })
+            .expect("screen");
+        if screen
+            .read_screen
+            .expect("body")
+            .text
+            .contains("echo:fresh-mouse")
+        {
+            saw_fresh = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(30));
+    }
+    assert!(saw_fresh, "fresh mouse gated input should reach PTY");
+
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
+fn external_hub_ghostty_snapshot_reflects_osc_palette_and_specials() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_test_dir("external-hub-osc-snapshot");
+    let config = explicit_config(&data_dir);
+    let socket_path = config
+        .transports
+        .local_socket
+        .as_ref()
+        .expect("local socket")
+        .path
+        .clone();
+    let endpoint = botster_hub_client::DaemonEndpoint::new(socket_path);
+    let child = start_cli_daemon(&data_dir);
+    let mut connection =
+        botster_hub_client::DaemonConnection::connect(&endpoint).expect("connect");
+
+    connection
+        .request(&botster_hub_client::DaemonRequest::Spawn {
+            session_id: "osc-snapshot-session".to_string(),
+            command: [
+                "printf ready; ",
+                "printf '\\033]4;3;rgb:1111/2222/3333\\033\\\\'; ",
+                "printf '\\033]10;rgb:aaaa/bbbb/cccc\\033\\\\'; ",
+                "printf '\\033]11;rgb:0101/0202/0303\\033\\\\'; ",
+                "printf '\\033]12;rgb:fefe/fdfd/fcfc\\033\\\\'; ",
+                "printf 'echo:color-mutated\\n'; ",
+                "while IFS= read -r line; do printf \"echo:%s\\n\" \"$line\"; done",
+            ]
+            .concat(),
+        })
+        .expect("spawn");
+
+    // Wait for mutations to land, then attach for data-plane Snapshot.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let screen = botster_hub_client::request(
+            &endpoint,
+            botster_hub_client::DaemonRequest::ReadScreen {
+                session_id: "osc-snapshot-session".to_string(),
+            },
+        )
+        .expect("read screen");
+        if screen
+            .read_screen
+            .as_ref()
+            .map(|body| body.text.contains("echo:color-mutated"))
+            .unwrap_or(false)
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "timeout waiting for color mutation");
+        thread::sleep(Duration::from_millis(30));
+    }
+
+    connection
+        .request(&botster_hub_client::DaemonRequest::Attach {
+            session_id: "osc-snapshot-session".to_string(),
+            subscription_id: "osc-snapshot-sub".to_string(),
+        })
+        .expect("attach");
+    let events = collect_attach_events(
+        &mut connection,
+        "osc-snapshot-session",
+        "osc-snapshot-sub",
+        None,
+    );
+    let payload = first_snapshot_payload(&events, "osc-snapshot-sub");
+    assert!(
+        payload.starts_with(GHOSTSNP_MAGIC),
+        "post-OSC Snapshot must be GHOSTSNP; got {:?}",
+        &payload[..payload.len().min(16)]
+    );
+    assert!(
+        payload.len() > GHOSTSNP_MAGIC.len(),
+        "GHOSTSNP payload must carry durable color/mode state beyond magic"
+    );
+    // Current colors live in GHOSTSNP only after session start. Hub startup
+    // defaults (#FFFFFF/#282C34) must not be treated as current post-install.
+    // Hub does not decode GHOSTSNP; Core proves color agreement. Here we prove
+    // the authoritative byte path is Snapshot and is non-empty GHOSTSNP.
+
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
+fn external_hub_osc_101112_session_side_replies_with_startup_baseline() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_test_dir("external-hub-osc-baseline");
+    let config = explicit_config(&data_dir);
+    let socket_path = config
+        .transports
+        .local_socket
+        .as_ref()
+        .expect("local socket")
+        .path
+        .clone();
+    let endpoint = botster_hub_client::DaemonEndpoint::new(socket_path);
+    let child = start_cli_daemon(&data_dir);
+
+    let script_path = data_dir.join("osc_query_child.py");
+    fs::create_dir_all(&data_dir).expect("data dir");
+    fs::write(
+        &script_path,
+        r#"#!/usr/bin/env python3
+import sys
+import time
+sys.stdout.write("ready\n")
+sys.stdout.flush()
+sys.stdout.buffer.write(b"\x1b]10;?\x1b\\\x1b]11;?\x1b\\\x1b]12;?\x1b\\")
+sys.stdout.flush()
+time.sleep(2)
+sys.stdout.write("done\n")
+sys.stdout.flush()
+"#,
+    )
+    .expect("write script");
+
+    // No client attach: OSC replies must come from session-side Ghostty using the
+    // Hub startup baseline profile, not Hub query synthesis.
+    botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::Spawn {
+            session_id: "osc-baseline-session".to_string(),
+            command: format!("python3 {}", script_path.display()),
+        },
+    )
+    .expect("spawn osc child");
+
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let mut text = String::new();
+    while Instant::now() < deadline {
+        let screen = botster_hub_client::request(
+            &endpoint,
+            botster_hub_client::DaemonRequest::ReadScreen {
+                session_id: "osc-baseline-session".to_string(),
+            },
+        )
+        .expect("read screen");
+        text = screen.read_screen.expect("screen body").text;
+        if text.to_ascii_lowercase().contains("]12;rgb:") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    let lowered = text.to_ascii_lowercase();
+    // Product defaults: FG #FFFFFF, BG #282C34, cursor #FFFFFF
+    for expected in [
+        "]10;rgb:ffff/ffff/ffff",
+        "]11;rgb:2828/2c2c/3434",
+        "]12;rgb:ffff/ffff/ffff",
+    ] {
+        assert!(
+            lowered.contains(expected),
+            "expected OSC baseline {expected} in session screen; text={text}"
+        );
+    }
+    let seq10 = lowered.find("]10;rgb:ffff/ffff/ffff").expect("osc10");
+    let seq11 = lowered.find("]11;rgb:2828/2c2c/3434").expect("osc11");
+    let seq12 = lowered.find("]12;rgb:ffff/ffff/ffff").expect("osc12");
+    assert!(seq10 < seq11 && seq11 < seq12, "OSC reply order broken: {text}");
+
     shutdown_cli_daemon(&data_dir, child);
 }
 
@@ -16531,7 +17207,7 @@ fn cli_operator_console_reuses_before_worker_lookup_and_reports_missing_worker()
     let mut missing = OperatorConsolePty::spawn_binary(&isolated_hub, &fresh_data_dir);
     missing.wait_for("missing botster-session-worker binary");
     missing.wait_for("Install the complete Botster distribution");
-    missing.wait_for("cargo build --locked -p botster-core --bin botster-session-worker");
+    missing.wait_for("cargo build --locked -p botster-core-daemon --bin botster-session-worker");
     missing.wait_for_exit();
     assert!(
         !fresh_data_dir
