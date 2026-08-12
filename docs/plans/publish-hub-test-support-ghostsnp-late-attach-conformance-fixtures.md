@@ -1,8 +1,11 @@
 # Plan: Publish hub-test-support with GHOSTSNP late-attach conformance fixtures
 
-Ticket: `ticket_1786509361_611999`  
-Run: `run_1786509517_796604`  
-Pipeline: `botster_stack_delivery` / step `botster_stack_plan`  
+Ticket: `ticket_1786509361_611999`
+
+Run: `run_1786509517_796604`
+
+Pipeline: `botster_stack_delivery` / step `botster_stack_plan`
+
 Plan revision: **3** (addresses Plan Review `review_1786510742_952675`)
 
 ## Plan Review disposition
@@ -24,7 +27,7 @@ Rev 2 incorrectly reused Ghostty **`complete-v1`** for both sequences. That gold
 | --- | --- |
 | Target repository | `botster-hub` |
 | Target id | `tgt_7e208a0c76a44980a83b63af976b1f22` |
-| Spawn path | `/Users/jasonconigliari/Projects/botster-hub` |
+| Spawn path | resolved botster-hub target |
 | Base | `89dae7e15a844bcb7411b83b32581121720e23eb` |
 | Core lock pin | `2c5171a6cb3b073c53620a9838d8b08480dd215c` |
 | Ghostty submodule pin (Core README / vendor) | `5e9ba17a22ba8e40bf8de7d3e7555b8378cb1880` |
