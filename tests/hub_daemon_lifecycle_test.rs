@@ -5528,6 +5528,7 @@ fn has_failure_diagnostic(diagnostics: &[botster_hub_client::DaemonDiagnostic]) 
             botster_hub_client::DaemonDiagnosticKind::CompatibilityMismatch
                 | botster_hub_client::DaemonDiagnosticKind::UnsupportedFeature
                 | botster_hub_client::DaemonDiagnosticKind::TerminalStreamUnavailable
+                | botster_hub_client::DaemonDiagnosticKind::WorkerCompatibility
                 | botster_hub_client::DaemonDiagnosticKind::ActionFailure
                 | botster_hub_client::DaemonDiagnosticKind::DaemonStartupFailure
         )

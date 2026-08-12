@@ -500,9 +500,11 @@ Both scopes use the normal data directory precedence. The precedence is
 `--data-dir`, then `BOTSTER_HUB_DATA_DIR`, then `$HOME/.botster/hub`.
 
 ```sh
-botster-hub update core --data-dir /path/to/runtime
-botster-hub update all --data-dir /path/to/runtime
+botster-hub update core
+botster-hub update all
 ```
+
+Use `--data-dir /path/to/runtime` only for an isolated runtime override.
 
 The update requires clean Git repositories, including no untracked files. It
 requires an upstream branch for Hub and each selected package. It uses Git
@@ -524,14 +526,22 @@ path with the built worker path. It refreshes package registrations through
 the new daemon. It then restores only package entrypoints that were running
 before replacement.
 
+Before replacement, the update probes every nonterminal durable session. The
+update preserves a session only when its worker returns a valid JSON-safe mode
+token. The update terminates an incompatible worker before daemon replacement.
+If termination fails, the update stops before daemon replacement and reports
+the affected session and worker identity.
+
 If the new daemon cannot start, the command prints an exact recovery command.
 Run that command after you correct the reported startup problem:
 
 ```sh
 /path/to/target/debug/botster-hub start \
-  --data-dir /path/to/runtime \
   --session-worker-bin /path/to/target/debug/botster-session-worker
 ```
+
+The recovery command includes `--data-dir` only for an isolated runtime
+override.
 
 The source checkout update command is separate from `check-update`. The latter
 checks managed release metadata. The source command does not use the managed
@@ -591,15 +601,15 @@ enabled_package_count=2
 app_count=2
 app package=botster-web app_id=web-client kind=web_app lifecycle_state=running local_url=http://127.0.0.1:49152/
 web=http://127.0.0.1:49152/
-tui=botster-hub apps open --data-dir $HOME/.botster/hub botster-tui
-mcp=botster-hub mcp-serve --data-dir $HOME/.botster/hub
-status=botster-hub status --data-dir $HOME/.botster/hub
-apps=botster-hub apps list --data-dir $HOME/.botster/hub
-down=botster-hub down --data-dir $HOME/.botster/hub
+tui=botster-hub apps open botster-tui
+mcp=botster-hub mcp-serve
+status=botster-hub status
+apps=botster-hub apps list
+down=botster-hub down
 ```
 
-These emitted copy/paste commands pin the exact resolved runtime. Ordinary
-operator examples below omit the optional flag and use the canonical default.
+These emitted commands omit the optional flag for the canonical default. An
+isolated runtime includes its explicit `--data-dir` override.
 
 The console accepts request/response commands without a repeated
 `botster-hub` prefix. Foreground terminal apps temporarily own the terminal and

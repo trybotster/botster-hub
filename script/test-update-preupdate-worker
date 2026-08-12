@@ -1,0 +1,18 @@
+#!/bin/sh
+set -eu
+
+fixture_root="$(mktemp -d "${TMPDIR:-/tmp}/botster-update-preworker.XXXXXX")"
+trap 'rm -rf "$fixture_root"' EXIT HUP INT TERM
+
+cargo install \
+  --git https://github.com/trybotster/botster-core.git \
+  --rev 4d0d1d8832d19352454a0789419a3e31e67d50df \
+  --root "$fixture_root/install" \
+  --bin botster-session-worker \
+  --locked \
+  botster-core-daemon
+
+BOTSTER_PREUPDATE_WORKER_BIN="$fixture_root/install/bin/botster-session-worker" \
+  cargo test -p botster-hub --test update_command_test \
+  update_all_replaces_an_incompatible_preupdate_worker_and_proves_attach_order \
+  -- --ignored --exact --test-threads=1

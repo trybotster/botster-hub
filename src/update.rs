@@ -9,19 +9,21 @@ use std::os::unix::process::CommandExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use botster_core::PackageSource;
 use botster_hub::{
-    DaemonPackage, DaemonRequest, FileHubStateStore, HubState, PackageRecord,
-    daemon_transport_request,
+    DaemonPackage, DaemonRequest, DaemonResponse, DaemonResponseKind, FileHubStateStore, HubState,
+    PackageRecord, daemon_transport_request,
 };
 use serde::Deserialize;
 
 use super::{
-    DataArgs, LocalRuntimeOptions, complete_owned_runtime_daemon_shutdown, explicit_config,
-    owned_runtime_daemon_pid, read_runtime_daemon_metadata, spawn_local_runtime_daemon,
+    DataArgs, LocalRuntimeOptions, command_data_dir_args, complete_owned_runtime_daemon_shutdown,
+    explicit_config, owned_runtime_daemon_pid, read_runtime_daemon_metadata,
+    spawn_local_runtime_daemon,
 };
 
 const SOURCE_LOCK_FILE: &str = ".botster-update.lock";
@@ -30,6 +32,10 @@ const PACKAGE_CONTRACT_FILE: &str = "botster-update.json";
 const CORE_SIDECAR_SUFFIX: &str = "core-revision";
 const GIT_TIMEOUT: Duration = Duration::from_secs(120);
 const CARGO_TIMEOUT: Duration = Duration::from_secs(1_800);
+const JSON_SAFE_INTEGER_MAX: u64 = (1_u64 << 53) - 1;
+const WORKER_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+const WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+const WORKER_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UpdateScope {
@@ -112,6 +118,26 @@ struct UpdateVerification<'a> {
     sidecar: &'a Path,
     enabled_packages: &'a BTreeSet<String>,
     restored_entrypoints: &'a [EntrypointIdentity],
+    terminated_sessions: &'a BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorkerCompatibilityIssue {
+    code: &'static str,
+    detail: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorkerRecoveryIdentity {
+    pid: u32,
+    control_socket: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IncompatibleSession {
+    session_id: String,
+    issue: WorkerCompatibilityIssue,
+    worker: WorkerRecoveryIdentity,
 }
 
 struct UpdateLock {
@@ -432,6 +458,11 @@ fn execute(
     } else {
         Vec::new()
     };
+    let terminated_sessions = if daemon_running {
+        terminate_incompatible_sessions(&options.data_directory, &config)?
+    } else {
+        BTreeSet::new()
+    };
 
     if daemon_running {
         let response = daemon_transport_request(&config, DaemonRequest::DaemonShutdown)
@@ -448,10 +479,11 @@ fn execute(
         session_worker_bin: Some(worker_bin.clone()),
     };
     spawn_local_runtime_daemon(&hub_bin, &runtime_options, &config).map_err(|error| {
+        let data_dir_args = command_data_dir_args(&options.data_directory);
         format!(
-            "start updated daemon: {error}; recovery: {} start --data-dir {} --session-worker-bin {}",
+            "start updated daemon: {error}; recovery: {} start{} --session-worker-bin {}",
             hub_bin.display(),
-            options.data_directory.display(),
+            data_dir_args,
             worker_bin.display()
         )
     })?;
@@ -473,12 +505,13 @@ fn execute(
             },
         )
         .map_err(|error| {
+            let data_dir_args = command_data_dir_args(&options.data_directory);
             format!(
-                "restore package entrypoint {}/{}: {error}; updated daemon remains running; recovery: {} packages start-entrypoint --data-dir {} {} {}",
+                "restore package entrypoint {}/{}: {error}; updated daemon remains running; recovery: {} packages start-entrypoint{} {} {}",
                 entrypoint.package_name,
                 entrypoint.entrypoint_id,
                 hub_bin.display(),
-                options.data_directory.display(),
+                data_dir_args,
                 entrypoint.package_name,
                 entrypoint.entrypoint_id
             )
@@ -494,6 +527,7 @@ fn execute(
             sidecar: &sidecar,
             enabled_packages: &selection.enabled,
             restored_entrypoints: &running_entrypoints,
+            terminated_sessions: &terminated_sessions,
         },
     )?;
 
@@ -510,6 +544,10 @@ fn execute(
     println!("core_revision={core_revision}");
     println!("daemon_pid={new_pid}");
     println!("package_count={}", selection.build.len());
+    println!(
+        "terminated_incompatible_session_count={}",
+        terminated_sessions.len()
+    );
     Ok(())
 }
 
@@ -601,6 +639,256 @@ fn snapshot_running_entrypoints(
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect(),
+    )
+}
+
+fn terminate_incompatible_sessions(
+    data_directory: &Path,
+    config: &botster_hub::HubConfig,
+) -> Result<BTreeSet<String>, String> {
+    let sessions = daemon_transport_request(config, DaemonRequest::ListSessions)
+        .map_err(|error| format!("worker compatibility list_sessions failed: {error}"))?
+        .sessions;
+    let candidates: Vec<_> = sessions
+        .into_iter()
+        .filter(|session| is_nonterminal_session_lifecycle(&session.lifecycle))
+        .collect();
+    let mut incompatible = Vec::new();
+    let mut missing_identity = Vec::new();
+    for session in candidates {
+        let issue = bounded_mode_probe(config, &session.session_id);
+        let Some(issue) = issue else {
+            continue;
+        };
+        let Some(worker) = durable_worker_identity(data_directory, &session.session_id) else {
+            missing_identity.push(session.session_id);
+            continue;
+        };
+        incompatible.push(IncompatibleSession {
+            session_id: session.session_id,
+            issue,
+            worker,
+        });
+    }
+    if !missing_identity.is_empty() {
+        return Err(format!(
+            "worker compatibility termination blocked: code=missing_worker_identity still_incompatible={}",
+            missing_identity.join(",")
+        ));
+    }
+
+    let mut terminated = BTreeSet::new();
+    for (index, session) in incompatible.iter().enumerate() {
+        println!(
+            "worker_compatibility={}",
+            serde_json::json!({
+                "action": "terminate",
+                "session_id": session.session_id,
+                "worker_pid": session.worker.pid,
+                "code": session.issue.code,
+                "detail": session.issue.detail,
+            })
+        );
+        let shutdown = bounded_session_shutdown(config, &session.session_id).map_err(|error| {
+            worker_termination_error(&terminated, &incompatible[index..], &error)
+        })?;
+        if shutdown.kind != DaemonResponseKind::Events {
+            return Err(worker_termination_error(
+                &terminated,
+                &incompatible[index..],
+                &format!("unexpected response {:?}", shutdown.kind),
+            ));
+        }
+        if let Err(error) = wait_for_worker_exit(&session.worker) {
+            return Err(worker_termination_error(
+                &terminated,
+                &incompatible[index..],
+                &error,
+            ));
+        }
+        terminated.insert(session.session_id.clone());
+    }
+    Ok(terminated)
+}
+
+fn bounded_session_shutdown(
+    config: &botster_hub::HubConfig,
+    session_id: &str,
+) -> Result<DaemonResponse, String> {
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let config = config.clone();
+    let session_id = session_id.to_string();
+    thread::spawn(move || {
+        let response =
+            daemon_transport_request(&config, DaemonRequest::ShutdownSession { session_id })
+                .map_err(|error| error.to_string());
+        let _ = sender.send(response);
+    });
+    match receiver.recv_timeout(WORKER_SHUTDOWN_TIMEOUT) {
+        Ok(response) => response,
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(format!(
+            "ShutdownSession exceeded {} seconds",
+            WORKER_SHUTDOWN_TIMEOUT.as_secs()
+        )),
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Err("ShutdownSession probe thread disconnected".to_string())
+        }
+    }
+}
+
+fn is_nonterminal_session_lifecycle(lifecycle: &str) -> bool {
+    !matches!(lifecycle, "exited" | "failed" | "stale")
+}
+
+fn bounded_mode_probe(
+    config: &botster_hub::HubConfig,
+    session_id: &str,
+) -> Option<WorkerCompatibilityIssue> {
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let config = config.clone();
+    let session_id = session_id.to_string();
+    thread::spawn(move || {
+        let response = daemon_transport_request(
+            &config,
+            DaemonRequest::ReadModeFlags {
+                session_id: session_id.clone(),
+            },
+        );
+        let issue = match response {
+            Ok(response) => worker_compatibility_issue(&response),
+            Err(error) => Some(WorkerCompatibilityIssue {
+                code: "transport_error",
+                detail: error.to_string(),
+            }),
+        };
+        let _ = sender.send(issue);
+    });
+    match receiver.recv_timeout(WORKER_PROBE_TIMEOUT) {
+        Ok(issue) => issue,
+        Err(mpsc::RecvTimeoutError::Timeout) => Some(WorkerCompatibilityIssue {
+            code: "timeout",
+            detail: format!(
+                "ReadModeFlags exceeded {} seconds",
+                WORKER_PROBE_TIMEOUT.as_secs()
+            ),
+        }),
+        Err(mpsc::RecvTimeoutError::Disconnected) => Some(WorkerCompatibilityIssue {
+            code: "transport_error",
+            detail: "worker compatibility probe thread disconnected".to_string(),
+        }),
+    }
+}
+
+fn worker_compatibility_issue(response: &DaemonResponse) -> Option<WorkerCompatibilityIssue> {
+    if response.kind != DaemonResponseKind::ReadModeFlags {
+        let error_code = response
+            .error
+            .as_ref()
+            .map(|error| error.code.as_str())
+            .unwrap_or("none");
+        return mode_probe_issue(response.kind, None, Some(error_code));
+    }
+    mode_probe_issue(
+        response.kind,
+        response
+            .mode_flags
+            .as_ref()
+            .map(|mode_flags| mode_flags.mode_generation),
+        None,
+    )
+}
+
+fn mode_probe_issue(
+    kind: DaemonResponseKind,
+    mode_generation: Option<u64>,
+    error_code: Option<&str>,
+) -> Option<WorkerCompatibilityIssue> {
+    if kind != DaemonResponseKind::ReadModeFlags {
+        return Some(WorkerCompatibilityIssue {
+            code: "read_mode_flags_rejected",
+            detail: format!(
+                "response={kind:?} error_code={}",
+                error_code.unwrap_or("none")
+            ),
+        });
+    }
+    let Some(mode_generation) = mode_generation else {
+        return Some(WorkerCompatibilityIssue {
+            code: "missing_mode_flags",
+            detail: "ReadModeFlags returned no mode_flags body".to_string(),
+        });
+    };
+    if mode_generation == 0 || mode_generation > JSON_SAFE_INTEGER_MAX {
+        return Some(WorkerCompatibilityIssue {
+            code: "unsafe_mode_generation",
+            detail: format!(
+                "mode_generation={mode_generation} json_safe_max={JSON_SAFE_INTEGER_MAX}"
+            ),
+        });
+    }
+    None
+}
+
+fn durable_worker_identity(
+    data_directory: &Path,
+    session_id: &str,
+) -> Option<WorkerRecoveryIdentity> {
+    let session_path = Path::new(session_id);
+    if session_path.components().count() != 1
+        || !matches!(session_path.components().next(), Some(Component::Normal(_)))
+    {
+        return None;
+    }
+    let bytes = fs::read(
+        data_directory
+            .join("sessions")
+            .join(format!("{session_id}.json")),
+    )
+    .ok()?;
+    let record: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    let recovery = record.get("recovery_identity")?;
+    Some(WorkerRecoveryIdentity {
+        pid: recovery.get("worker_pid")?.as_u64()?.try_into().ok()?,
+        control_socket: PathBuf::from(recovery.get("worker_control_socket")?.as_str()?),
+    })
+}
+
+fn wait_for_worker_exit(worker: &WorkerRecoveryIdentity) -> Result<(), String> {
+    let deadline = Instant::now() + WORKER_EXIT_TIMEOUT;
+    while Instant::now() < deadline {
+        if !process_exists(worker.pid) && !worker.control_socket.exists() {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    Err(format!(
+        "worker exit proof failed for pid={} socket_present={}",
+        worker.pid,
+        worker.control_socket.exists()
+    ))
+}
+
+fn process_exists(pid: u32) -> bool {
+    let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    result == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+fn worker_termination_error(
+    terminated: &BTreeSet<String>,
+    still_incompatible: &[IncompatibleSession],
+    error: &impl std::fmt::Display,
+) -> String {
+    format!(
+        "worker compatibility termination failed: already_terminated={} still_incompatible={} error={error}",
+        terminated.iter().cloned().collect::<Vec<_>>().join(","),
+        still_incompatible
+            .iter()
+            .map(|session| format!(
+                "{}:pid={}:code={}",
+                session.session_id, session.worker.pid, session.issue.code
+            ))
+            .collect::<Vec<_>>()
+            .join(",")
     )
 }
 
@@ -987,6 +1275,13 @@ fn verify_update(
             ));
         }
     }
+    for session_id in expected.terminated_sessions {
+        if status.recovered_sessions.contains(session_id) {
+            return Err(format!(
+                "updated daemon recovered incompatible session {session_id}"
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -1175,6 +1470,37 @@ source = "git+https://example.test/core#abc123"
         let error = load_package_contract(&package).unwrap_err();
 
         assert!(error.contains("step 1 has empty argv"));
+    }
+
+    #[test]
+    fn worker_mode_probe_requires_a_json_safe_generation() {
+        assert!(mode_probe_issue(DaemonResponseKind::ReadModeFlags, Some(1), None).is_none());
+        let zero = mode_probe_issue(DaemonResponseKind::ReadModeFlags, Some(0), None).unwrap();
+        assert_eq!(zero.code, "unsafe_mode_generation");
+        let unsafe_generation = mode_probe_issue(
+            DaemonResponseKind::ReadModeFlags,
+            Some(JSON_SAFE_INTEGER_MAX + 1),
+            None,
+        )
+        .unwrap();
+        assert_eq!(unsafe_generation.code, "unsafe_mode_generation");
+        let rejected = mode_probe_issue(
+            DaemonResponseKind::OperatorError,
+            None,
+            Some("mode_read_failed"),
+        )
+        .unwrap();
+        assert_eq!(rejected.code, "read_mode_flags_rejected");
+    }
+
+    #[test]
+    fn update_probes_all_nonterminal_session_lifecycles() {
+        for lifecycle in ["starting", "running", "stopping", "recovering"] {
+            assert!(is_nonterminal_session_lifecycle(lifecycle), "{lifecycle}");
+        }
+        for lifecycle in ["exited", "failed", "stale"] {
+            assert!(!is_nonterminal_session_lifecycle(lifecycle), "{lifecycle}");
+        }
     }
 
     #[test]

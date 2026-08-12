@@ -8020,6 +8020,7 @@ fn runtime_error_code(
             crate::HubClientOperation::Spawn | crate::HubClientOperation::SpawnSessionType,
             crate::HubClientRuntimeErrorKind::Runtime,
         ) => "spawn_failed",
+        (_, crate::HubClientRuntimeErrorKind::ModeReadFailed) => "mode_read_failed",
         (_, crate::HubClientRuntimeErrorKind::Runtime) => "runtime_error",
         (_, crate::HubClientRuntimeErrorKind::State) => "state_error",
     }
@@ -8048,6 +8049,10 @@ fn runtime_error_message(
             | crate::HubClientRuntimeErrorKind::Runtime,
         ) => "session type spawn failed before the session started; verify the configured session worker and session type command"
             .to_string(),
+        (crate::HubClientOperation::ReadModeFlags, crate::HubClientRuntimeErrorKind::ModeReadFailed) => {
+            "session worker failed the authoritative mode read; replace or terminate the incompatible worker"
+                .to_string()
+        }
         _ => format!("runtime failed while handling {operation:?}: {kind:?}"),
     }
 }
@@ -8106,6 +8111,15 @@ fn runtime_error_diagnostics(
         )
     {
         return vec![DaemonDiagnostic::terminal_stream_unavailable(
+            operation_label(operation),
+            message,
+        )];
+    }
+
+    if kind == crate::HubClientRuntimeErrorKind::ModeReadFailed
+        && operation == crate::HubClientOperation::ReadModeFlags
+    {
+        return vec![DaemonDiagnostic::worker_compatibility(
             operation_label(operation),
             message,
         )];
@@ -8722,14 +8736,17 @@ mod tests {
         let response = daemon_operator_error(crate::HubClientError::Runtime {
             request_id: RequestId("mode-flags-backend-failure".to_string()),
             operation: crate::HubClientOperation::ReadModeFlags,
-            kind: crate::HubClientRuntimeErrorKind::Runtime,
+            kind: crate::HubClientRuntimeErrorKind::ModeReadFailed,
         });
 
         assert_eq!(response.kind, DaemonResponseKind::OperatorError);
         assert!(response.mode_flags.is_none());
         let error = response.error.expect("operator error body");
-        assert_eq!(error.code, "runtime_error");
+        assert_eq!(error.code, "mode_read_failed");
         assert_eq!(error.operation, "read_mode_flags");
+        assert!(error.diagnostics.iter().any(|diagnostic| {
+            diagnostic.kind == botster_hub_client::DaemonDiagnosticKind::WorkerCompatibility
+        }));
     }
 
     #[test]

@@ -4376,11 +4376,23 @@ fn print_local_runtime_ready(
         outcome.web.package_state
     );
     println!("web={}", outcome.web.local_url);
-    println!("tui=botster-hub apps open --data-dir {dir} botster-tui");
-    println!("mcp=botster-hub mcp-serve --data-dir {dir}");
-    println!("status=botster-hub status --data-dir {dir}");
-    println!("apps=botster-hub apps list --data-dir {dir}");
-    println!("down=botster-hub down --data-dir {dir}");
+    let data_dir_args = command_data_dir_args(&outcome.options.data_directory);
+    println!("tui=botster-hub apps open{data_dir_args} botster-tui");
+    println!("mcp=botster-hub mcp-serve{data_dir_args}");
+    println!("status=botster-hub status{data_dir_args}");
+    println!("apps=botster-hub apps list{data_dir_args}");
+    println!("down=botster-hub down{data_dir_args}");
+}
+
+fn command_data_dir_args(data_directory: &Path) -> String {
+    let canonical = DataDirectoryOption::RuntimeDefault
+        .resolve(&RuntimeEnvironment::from_current_process())
+        .ok();
+    if canonical.as_deref() == Some(data_directory) {
+        String::new()
+    } else {
+        format!(" --data-dir {}", data_directory.display())
+    }
 }
 
 struct SessionCommand {
@@ -5996,6 +6008,19 @@ mod cli_data_dir_tests {
         .expect("resolve environment data directory");
 
         assert_eq!(resolved, ["--data-dir", "/tmp/environment"]);
+    }
+
+    #[test]
+    fn printed_commands_omit_the_canonical_default_data_directory() {
+        let canonical = DataDirectoryOption::RuntimeDefault
+            .resolve(&RuntimeEnvironment::from_current_process())
+            .expect("resolve the canonical default data directory");
+
+        assert!(command_data_dir_args(&canonical).is_empty());
+        assert_eq!(
+            command_data_dir_args(Path::new("/tmp/botster-isolated-runtime")),
+            " --data-dir /tmp/botster-isolated-runtime"
+        );
     }
 
     #[test]

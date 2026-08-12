@@ -317,6 +317,183 @@ fn update_all_missing_package_contract_leaves_the_running_daemon_unchanged() {
     assert!(daemon.wait().unwrap().success());
 }
 
+#[test]
+#[ignore = "run through script/test-update-preupdate-worker"]
+fn update_all_replaces_an_incompatible_preupdate_worker_and_proves_attach_order() {
+    let preupdate_worker = PathBuf::from(
+        std::env::var_os("BOTSTER_PREUPDATE_WORKER_BIN")
+            .expect("script must supply the real pre-update worker"),
+    )
+    .canonicalize()
+    .expect("resolve pre-update worker");
+    let root = unique_test_dir("preupdate-worker");
+    let data_dir = root.join("data");
+    fs::create_dir_all(&data_dir).unwrap();
+    let source = create_real_build_update_source(&root);
+    let source_target = source.join("target/debug");
+    let hub_bin = PathBuf::from(env!("CARGO_BIN_EXE_botster-hub"))
+        .canonicalize()
+        .unwrap();
+    let old_pid = start_detached_daemon(&hub_bin, &preupdate_worker, &data_dir, &root);
+    wait_for_status(&hub_bin, &data_dir);
+    let data_directory_arg = data_dir.clone();
+    let data_dir = data_dir.canonicalize().unwrap();
+    write_runtime_metadata(
+        &data_dir,
+        &data_directory_arg,
+        &hub_bin,
+        &preupdate_worker,
+        old_pid,
+    );
+    let endpoint = botster_hub_client::DaemonEndpoint::new(data_dir.join("botster-hub.sock"));
+    let old_session = "preupdate-incompatible-session";
+    let spawn = botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::Spawn {
+            session_id: old_session.to_string(),
+            command: "sleep 120".to_string(),
+        },
+    )
+    .expect("spawn through the pre-update worker");
+    assert_eq!(spawn.kind, botster_hub_client::DaemonResponseKind::Spawned);
+    let old_identity = read_worker_identity(&data_dir, old_session);
+
+    let old_probe = botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::ReadModeFlags {
+            session_id: old_session.to_string(),
+        },
+    )
+    .expect("probe the pre-update worker");
+    let old_is_incompatible = old_probe.kind
+        != botster_hub_client::DaemonResponseKind::ReadModeFlags
+        || old_probe.mode_flags.as_ref().is_none_or(|flags| {
+            flags.mode_generation == 0 || flags.mode_generation > ((1_u64 << 53) - 1)
+        });
+    assert!(
+        old_is_incompatible,
+        "fixed pre-update worker must reproduce the incompatibility: {old_probe:?}"
+    );
+
+    let path = format!(
+        "{}:{}",
+        source.join("fake-bin").display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let update = Command::new(&hub_bin)
+        .args(["update", "all", "--data-dir"])
+        .arg(&data_dir)
+        .env("BOTSTER_ENV", "test")
+        .env("BOTSTER_HUB_TEST_UPDATE_SOURCE_ROOT", &source)
+        .env("PATH", path)
+        .output()
+        .expect("run production update with a pre-update worker");
+    assert!(
+        update.status.success(),
+        "{}",
+        String::from_utf8_lossy(&update.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&update.stdout);
+    assert!(
+        stdout.contains("\"code\":\"unsafe_mode_generation\"")
+            || stdout.contains("\"code\":\"read_mode_flags_rejected\"")
+    );
+    wait_for_process_exit(old_identity.0);
+    assert!(
+        !old_identity.1.exists(),
+        "old worker socket survived update"
+    );
+
+    let status = botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status)
+        .expect("status from updated daemon")
+        .status
+        .expect("status body");
+    assert!(!status.recovered_sessions.contains(&old_session.to_string()));
+
+    let new_session = "postupdate-compatible-session";
+    let spawn = botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::Spawn {
+            session_id: new_session.to_string(),
+            command: "sleep 120".to_string(),
+        },
+    )
+    .expect("spawn through updated worker");
+    assert_eq!(spawn.kind, botster_hub_client::DaemonResponseKind::Spawned);
+    let mut connection =
+        botster_hub_client::DaemonConnection::connect(&endpoint).expect("connect updated daemon");
+    connection
+        .request(&botster_hub_client::DaemonRequest::Attach {
+            session_id: new_session.to_string(),
+            subscription_id: "postupdate-attach".to_string(),
+        })
+        .expect("attach updated session");
+    let events = collect_attach_events(&mut connection, new_session, "postupdate-attach");
+    let attaching = event_position(&events, "postupdate-attach", "attaching");
+    let snapshot = events
+        .iter()
+        .position(|event| {
+            matches!(event,
+            botster_hub_client::DaemonEvent::Snapshot { subscription_id, .. }
+                if subscription_id == "postupdate-attach")
+        })
+        .expect("production attach Snapshot");
+    let attached = event_position(&events, "postupdate-attach", "attached");
+    assert!(attaching < snapshot && snapshot < attached, "{events:?}");
+    let payload = events
+        .iter()
+        .find_map(|event| match event {
+            botster_hub_client::DaemonEvent::Snapshot {
+                subscription_id,
+                history,
+                ..
+            } if subscription_id == "postupdate-attach" => {
+                Some(history.decoded_bytes().expect("decode GHOSTSNP").to_vec())
+            }
+            _ => None,
+        })
+        .expect("Snapshot payload");
+    let mut projection = botster_terminal_ghostty::GhosttyClientProjection::new(
+        botster_core::TerminalScreenSize::new(24, 80),
+    )
+    .expect("create client projection");
+    projection
+        .install_ghostsnp(&payload)
+        .expect("install production GHOSTSNP before mode read");
+    let mode_flags = connection
+        .request(&botster_hub_client::DaemonRequest::ReadModeFlags {
+            session_id: new_session.to_string(),
+        })
+        .expect("read modes after GHOSTSNP install");
+    assert_eq!(
+        mode_flags.kind,
+        botster_hub_client::DaemonResponseKind::ReadModeFlags
+    );
+    let generation = mode_flags
+        .mode_flags
+        .expect("mode flags body")
+        .mode_generation;
+    assert!((1..=((1_u64 << 53) - 1)).contains(&generation));
+
+    botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::ShutdownSession {
+            session_id: new_session.to_string(),
+        },
+    )
+    .expect("shutdown post-update session");
+    let shutdown = Command::new(source_target.join("botster-hub"))
+        .args(["shutdown", "--data-dir"])
+        .arg(&data_dir)
+        .output()
+        .expect("shutdown updated daemon");
+    assert!(
+        shutdown.status.success(),
+        "{}",
+        String::from_utf8_lossy(&shutdown.stderr)
+    );
+}
+
 fn git(root: &Path, args: &[&str]) {
     let status = Command::new("git")
         .args(args)
@@ -384,6 +561,118 @@ source = "git+https://example.invalid/core#abc123"
     git(&source, &["remote", "add", "origin", &remote_text]);
     git(&source, &["push", "-u", "origin", "main"]);
     source
+}
+
+fn create_real_build_update_source(root: &Path) -> PathBuf {
+    let remote = root.join("real-build-remote.git");
+    assert!(
+        Command::new("git")
+            .args(["init", "--bare"])
+            .arg(&remote)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let source = root.join("real-build-source");
+    fs::create_dir_all(source.join("fake-bin")).unwrap();
+    git(&source, &["init"]);
+    git(
+        &source,
+        &["config", "user.email", "update-test@example.invalid"],
+    );
+    git(&source, &["config", "user.name", "Update Test"]);
+    fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.lock"),
+        source.join("Cargo.lock"),
+    )
+    .unwrap();
+    fs::write(source.join(".gitignore"), "target/\n").unwrap();
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+    let cargo_script = source.join("fake-bin/cargo");
+    fs::write(
+        &cargo_script,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = update ]; then exit 0; fi\nexec '{}' \"$@\" --manifest-path '{}' --target-dir '{}'\n",
+            cargo,
+            manifest.display(),
+            source.join("target").display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&cargo_script, fs::Permissions::from_mode(0o755)).unwrap();
+    git(
+        &source,
+        &["add", ".gitignore", "Cargo.lock", "fake-bin/cargo"],
+    );
+    git(&source, &["commit", "-m", "fixture"]);
+    let remote_text = remote.to_string_lossy().into_owned();
+    git(&source, &["remote", "add", "origin", &remote_text]);
+    git(&source, &["push", "-u", "origin", "main"]);
+    source
+}
+
+fn read_worker_identity(data_dir: &Path, session_id: &str) -> (u32, PathBuf) {
+    let record: serde_json::Value = serde_json::from_slice(
+        &fs::read(data_dir.join("sessions").join(format!("{session_id}.json"))).unwrap(),
+    )
+    .unwrap();
+    let recovery = &record["recovery_identity"];
+    (
+        recovery["worker_pid"].as_u64().unwrap() as u32,
+        PathBuf::from(recovery["worker_control_socket"].as_str().unwrap()),
+    )
+}
+
+fn wait_for_process_exit(pid: u32) {
+    for _ in 0..400 {
+        let exists = unsafe { libc::kill(pid as libc::pid_t, 0) } == 0;
+        if !exists {
+            return;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    panic!("process {pid} did not exit");
+}
+
+fn collect_attach_events(
+    connection: &mut botster_hub_client::DaemonConnection,
+    session_id: &str,
+    subscription_id: &str,
+) -> Vec<botster_hub_client::DaemonEvent> {
+    let mut events = Vec::new();
+    for _ in 0..200 {
+        let response = connection
+            .request(&botster_hub_client::DaemonRequest::Drain {
+                session_id: session_id.to_string(),
+            })
+            .expect("drain attach events");
+        events.extend(response.events);
+        if events.iter().any(|event| {
+            matches!(event,
+            botster_hub_client::DaemonEvent::AttachState { subscription_id: id, state, .. }
+                if id == subscription_id && state == "attached")
+        }) {
+            return events;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    panic!("attach did not complete: {events:?}");
+}
+
+fn event_position(
+    events: &[botster_hub_client::DaemonEvent],
+    subscription_id: &str,
+    expected_state: &str,
+) -> usize {
+    events
+        .iter()
+        .position(|event| {
+            matches!(event,
+            botster_hub_client::DaemonEvent::AttachState { subscription_id: id, state, .. }
+                if id == subscription_id && state == expected_state)
+        })
+        .unwrap_or_else(|| panic!("missing {expected_state} event: {events:?}"))
 }
 
 fn create_direct_local_package(root: &Path) -> PathBuf {

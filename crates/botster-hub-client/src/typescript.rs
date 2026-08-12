@@ -1419,6 +1419,7 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             "compatibility_mismatch",
             "unsupported_feature",
             "terminal_stream_unavailable",
+            "worker_compatibility",
             "action_failure",
             "daemon_startup_failure",
             "backpressure",
