@@ -20,11 +20,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use botster_core::{RunnableEntrypointHubConnection, RunnableEntrypointHubConnectionTransport};
 use botster_hub_client::{
     DaemonCompatibility, DaemonCompatibilityRequirement, DaemonConnection, DaemonDiagnostic,
-    DaemonDiagnosticKind, DaemonEndpoint, DaemonEntityFrame, DaemonEvent, DaemonModeFlags,
-    DaemonOperatorError, DaemonRequest, DaemonResponse, DaemonResponseKind, DaemonSessionEntity,
-    DaemonSessionType, DaemonSessionTypeDefinition, DaemonSessionTypeExecution,
-    DaemonSessionTypeMutationSource, DaemonSessionTypeSource, DaemonSessionTypeWorkingDirectory,
-    DaemonTransportError, ensure_compatible,
+    DaemonDiagnosticKind, DaemonEndpoint, DaemonEntityFrame, DaemonEvent, DaemonLiveOutputPayload,
+    DaemonModeFlags, DaemonOperatorError, DaemonRequest, DaemonResponse, DaemonResponseKind,
+    DaemonSessionEntity, DaemonSessionType, DaemonSessionTypeDefinition,
+    DaemonSessionTypeExecution, DaemonSessionTypeMutationSource, DaemonSessionTypeSource,
+    DaemonSessionTypeWorkingDirectory, DaemonTransportError, ensure_compatible,
 };
 use botster_ui_contract::{
     UiActionId, UiActionKind, UiActionRequest, UiActionRequestId, UiActionResult,
@@ -1615,7 +1615,7 @@ pub fn late_attach_history_events() -> Vec<DaemonEvent> {
         DaemonEvent::TerminalOutput {
             session_id: LATE_ATTACH_HISTORY_SESSION_ID.to_string(),
             subscription_id: LATE_ATTACH_HISTORY_SUBSCRIPTION_ID.to_string(),
-            data: LATE_ATTACH_LIVE_DATA.to_string(),
+            payload: DaemonLiveOutputPayload::from_bytes(LATE_ATTACH_LIVE_DATA.as_bytes()),
         },
         DaemonEvent::ProcessExit {
             session_id: LATE_ATTACH_HISTORY_SESSION_ID.to_string(),
@@ -1655,7 +1655,9 @@ pub fn late_attach_no_history_events() -> Vec<DaemonEvent> {
         DaemonEvent::TerminalOutput {
             session_id: LATE_ATTACH_NO_HISTORY_SESSION_ID.to_string(),
             subscription_id: LATE_ATTACH_NO_HISTORY_SUBSCRIPTION_ID.to_string(),
-            data: LATE_ATTACH_NO_HISTORY_LIVE_DATA.to_string(),
+            payload: DaemonLiveOutputPayload::from_bytes(
+                LATE_ATTACH_NO_HISTORY_LIVE_DATA.as_bytes(),
+            ),
         },
         DaemonEvent::ProcessExit {
             session_id: LATE_ATTACH_NO_HISTORY_SESSION_ID.to_string(),
@@ -2969,12 +2971,12 @@ fn many_pty_live_output_index(events: &[DaemonEvent]) -> Option<usize> {
     for (index, event) in events.iter().enumerate() {
         if let DaemonEvent::TerminalOutput {
             subscription_id,
-            data,
+            payload,
             ..
         } = event
             && subscription_id == MANY_PTY_SUBSCRIPTION_ID
         {
-            output.push_str(data);
+            output.push_str(&live_output_utf8(payload));
             if output.contains(MANY_PTY_LIVE_MARKER) {
                 return Some(index);
             }
@@ -2984,17 +2986,35 @@ fn many_pty_live_output_index(events: &[DaemonEvent]) -> Option<usize> {
 }
 
 fn many_pty_terminal_output(events: &[DaemonEvent]) -> String {
-    events
-        .iter()
-        .filter_map(|event| match event {
-            DaemonEvent::TerminalOutput {
-                subscription_id,
-                data,
-                ..
-            } if subscription_id == MANY_PTY_SUBSCRIPTION_ID => Some(data.as_str()),
-            _ => None,
+    let mut output = String::new();
+    for event in events {
+        if let DaemonEvent::TerminalOutput {
+            subscription_id,
+            payload,
+            ..
+        } = event
+            && subscription_id == MANY_PTY_SUBSCRIPTION_ID
+        {
+            output.push_str(&live_output_utf8(payload));
+        }
+    }
+    output
+}
+
+fn live_output_utf8(payload: &DaemonLiveOutputPayload) -> String {
+    String::from_utf8_lossy(&payload.decoded_bytes().unwrap_or_default()).into_owned()
+}
+
+#[cfg(test)]
+fn live_output_contains(payload: &DaemonLiveOutputPayload, needle: &str) -> bool {
+    payload
+        .decoded_bytes()
+        .map(|bytes| {
+            bytes
+                .windows(needle.len())
+                .any(|window| window == needle.as_bytes())
         })
-        .collect()
+        .unwrap_or(false)
 }
 
 fn many_pty_tail(text: &str) -> String {
@@ -7959,8 +7979,8 @@ mod tests {
             .position(|event| {
                 matches!(
                     event,
-                    DaemonEvent::TerminalOutput { data, .. }
-                        if data.contains("live-after-attach")
+                    DaemonEvent::TerminalOutput { payload, .. }
+                        if live_output_contains(payload, "live-after-attach")
                 )
             })
             .expect("fixture includes later live output");
@@ -8043,8 +8063,8 @@ mod tests {
             .position(|event| {
                 matches!(
                     event,
-                    DaemonEvent::TerminalOutput { data, .. }
-                        if data.contains("live-without-history")
+                    DaemonEvent::TerminalOutput { payload, .. }
+                        if live_output_contains(payload, "live-without-history")
                 )
             })
             .expect("live");
@@ -8224,6 +8244,9 @@ mod tests {
         let blank_payload = botster_hub_client::DaemonOpaqueHistoryPayload::from_bytes(
             LATE_ATTACH_NO_HISTORY_PAYLOAD,
         );
+        let history_live = DaemonLiveOutputPayload::from_bytes(LATE_ATTACH_LIVE_DATA.as_bytes());
+        let no_history_live =
+            DaemonLiveOutputPayload::from_bytes(LATE_ATTACH_NO_HISTORY_LIVE_DATA.as_bytes());
 
         assert_eq!(
             value,
@@ -8260,7 +8283,9 @@ mod tests {
                         "type": "terminal_output",
                         "session_id": LATE_ATTACH_HISTORY_SESSION_ID,
                         "subscription_id": LATE_ATTACH_HISTORY_SUBSCRIPTION_ID,
-                        "data": LATE_ATTACH_LIVE_DATA,
+                        "payload_base64": history_live.payload_base64,
+                        "payload_encoding": "base64",
+                        "bytes": LATE_ATTACH_LIVE_DATA.len(),
                     },
                     {
                         "type": "process_exit",
@@ -8294,7 +8319,9 @@ mod tests {
                         "type": "terminal_output",
                         "session_id": LATE_ATTACH_NO_HISTORY_SESSION_ID,
                         "subscription_id": LATE_ATTACH_NO_HISTORY_SUBSCRIPTION_ID,
-                        "data": LATE_ATTACH_NO_HISTORY_LIVE_DATA,
+                        "payload_base64": no_history_live.payload_base64,
+                        "payload_encoding": "base64",
+                        "bytes": LATE_ATTACH_NO_HISTORY_LIVE_DATA.len(),
                     },
                     {
                         "type": "process_exit",

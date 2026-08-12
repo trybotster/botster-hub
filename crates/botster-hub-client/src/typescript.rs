@@ -1440,7 +1440,9 @@ pub(crate) fn daemon_protocol_typescript() -> String {
                 &[
                     ("session_id", "string"),
                     ("subscription_id", "string"),
-                    ("data", "string"),
+                    ("payload_base64", "string"),
+                    ("payload_encoding", "\"base64\""),
+                    ("bytes", "number"),
                 ],
             ),
             (
