@@ -9378,7 +9378,7 @@ fn collect_attach_events(
                 } if sub == subscription_id && state == "attached"
             )
         });
-        let saw_live = until_live_marker.map_or(true, |marker| {
+        let saw_live = until_live_marker.is_none_or(|marker| {
             events.iter().any(|event| {
                 matches!(
                     event,
@@ -9419,6 +9419,48 @@ fn first_snapshot_payload(
     panic!("expected Snapshot event for {subscription_id}, got {events:?}");
 }
 
+/// Production path: shut down the durable worker session, then remove it from the registry.
+fn production_shutdown_and_remove_session(
+    endpoint: &botster_hub_client::DaemonEndpoint,
+    session_id: &str,
+) {
+    let shutdown = botster_hub_client::request(
+        endpoint,
+        botster_hub_client::DaemonRequest::ShutdownSession {
+            session_id: session_id.to_string(),
+        },
+    )
+    .expect("production ShutdownSession");
+    assert_eq!(
+        shutdown.kind,
+        botster_hub_client::DaemonResponseKind::Events,
+        "ShutdownSession should return events for {session_id}"
+    );
+    let remove = botster_hub_client::request(
+        endpoint,
+        botster_hub_client::DaemonRequest::RemoveSession {
+            session_id: session_id.to_string(),
+        },
+    )
+    .expect("production RemoveSession");
+    assert_eq!(
+        remove.kind,
+        botster_hub_client::DaemonResponseKind::SessionRemoved,
+        "RemoveSession should remove {session_id}"
+    );
+}
+
+fn session_ids_from_list(endpoint: &botster_hub_client::DaemonEndpoint) -> Vec<String> {
+    let list =
+        botster_hub_client::request(endpoint, botster_hub_client::DaemonRequest::ListSessions)
+            .expect("list sessions");
+    assert_eq!(list.kind, botster_hub_client::DaemonResponseKind::Sessions);
+    list.sessions
+        .into_iter()
+        .map(|session| session.session_id)
+        .collect()
+}
+
 #[test]
 fn external_hub_ghostty_snapshot_install_before_live_rejects_scrollback_as_ghostsnp() {
     let _guard = daemon_test_guard();
@@ -9433,8 +9475,7 @@ fn external_hub_ghostty_snapshot_install_before_live_rejects_scrollback_as_ghost
         .clone();
     let endpoint = botster_hub_client::DaemonEndpoint::new(socket_path);
     let child = start_cli_daemon(&data_dir);
-    let mut connection =
-        botster_hub_client::DaemonConnection::connect(&endpoint).expect("connect");
+    let mut connection = botster_hub_client::DaemonConnection::connect(&endpoint).expect("connect");
 
     connection
         .request(&botster_hub_client::DaemonRequest::Spawn {
@@ -9442,6 +9483,7 @@ fn external_hub_ghostty_snapshot_install_before_live_rejects_scrollback_as_ghost
             command: "printf 'retained-before-attach\\n'; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done".to_string(),
         })
         .expect("spawn");
+    let mut session_cleanup = SessionCleanupGuard::new(&data_dir, "ghostsnp-order-session");
     connection
         .request(&botster_hub_client::DaemonRequest::Attach {
             session_id: "ghostsnp-order-session".to_string(),
@@ -9577,10 +9619,7 @@ fn external_hub_ghostty_snapshot_install_before_live_rejects_scrollback_as_ghost
         capture.kind,
         botster_hub_client::DaemonResponseKind::CaptureSnapshot
     );
-    let meta = capture
-        .capture_snapshot
-        .as_ref()
-        .expect("capture body");
+    let meta = capture.capture_snapshot.as_ref().expect("capture body");
     assert!(meta.payload_bytes > 0);
     assert_eq!(
         meta.payload_format.as_deref(),
@@ -9592,6 +9631,8 @@ fn external_hub_ghostty_snapshot_install_before_live_rejects_scrollback_as_ghost
         "control CaptureSnapshot must not expose payload_base64: {capture_json}"
     );
 
+    production_shutdown_and_remove_session(&endpoint, "ghostsnp-order-session");
+    session_cleanup.disarm();
     shutdown_cli_daemon(&data_dir, child);
 }
 
@@ -9609,8 +9650,7 @@ fn external_hub_mode_gated_kitty_stale_token_rejects_and_reprobe_admits() {
         .clone();
     let endpoint = botster_hub_client::DaemonEndpoint::new(socket_path);
     let child = start_cli_daemon(&data_dir);
-    let mut connection =
-        botster_hub_client::DaemonConnection::connect(&endpoint).expect("connect");
+    let mut connection = botster_hub_client::DaemonConnection::connect(&endpoint).expect("connect");
 
     connection
         .request(&botster_hub_client::DaemonRequest::Spawn {
@@ -9626,6 +9666,7 @@ fn external_hub_mode_gated_kitty_stale_token_rejects_and_reprobe_admits() {
             .to_string(),
         })
         .expect("spawn");
+    let mut session_cleanup = SessionCleanupGuard::new(&data_dir, "mode-gated-kitty");
     connection
         .request(&botster_hub_client::DaemonRequest::Attach {
             session_id: "mode-gated-kitty".to_string(),
@@ -9714,6 +9755,8 @@ fn external_hub_mode_gated_kitty_stale_token_rejects_and_reprobe_admits() {
     }
     assert!(saw_fresh, "fresh gated input should reach the PTY");
 
+    production_shutdown_and_remove_session(&endpoint, "mode-gated-kitty");
+    session_cleanup.disarm();
     shutdown_cli_daemon(&data_dir, child);
 }
 
@@ -9731,8 +9774,7 @@ fn external_hub_mode_gated_mouse_stale_token_rejects_and_reprobe_admits() {
         .clone();
     let endpoint = botster_hub_client::DaemonEndpoint::new(socket_path);
     let child = start_cli_daemon(&data_dir);
-    let mut connection =
-        botster_hub_client::DaemonConnection::connect(&endpoint).expect("connect");
+    let mut connection = botster_hub_client::DaemonConnection::connect(&endpoint).expect("connect");
 
     connection
         .request(&botster_hub_client::DaemonRequest::Spawn {
@@ -9748,6 +9790,7 @@ fn external_hub_mode_gated_mouse_stale_token_rejects_and_reprobe_admits() {
             .to_string(),
         })
         .expect("spawn");
+    let mut session_cleanup = SessionCleanupGuard::new(&data_dir, "mode-gated-mouse");
     connection
         .request(&botster_hub_client::DaemonRequest::Attach {
             session_id: "mode-gated-mouse".to_string(),
@@ -9766,12 +9809,7 @@ fn external_hub_mode_gated_mouse_stale_token_rejects_and_reprobe_admits() {
             mode_revision: baseline.mode_revision,
         })
         .expect("enable mouse");
-    assert!(
-        enable
-            .mode_gated_input
-            .expect("enable body")
-            .admitted
-    );
+    assert!(enable.mode_gated_input.expect("enable body").admitted);
 
     let after = wait_for_mode_flags(&mut connection, "mode-gated-mouse", |flags| {
         flags.mouse_mode == 9
@@ -9819,6 +9857,8 @@ fn external_hub_mode_gated_mouse_stale_token_rejects_and_reprobe_admits() {
     }
     assert!(saw_fresh, "fresh mouse gated input should reach PTY");
 
+    production_shutdown_and_remove_session(&endpoint, "mode-gated-mouse");
+    session_cleanup.disarm();
     shutdown_cli_daemon(&data_dir, child);
 }
 
@@ -9836,8 +9876,7 @@ fn external_hub_ghostty_snapshot_reflects_osc_palette_and_specials() {
         .clone();
     let endpoint = botster_hub_client::DaemonEndpoint::new(socket_path);
     let child = start_cli_daemon(&data_dir);
-    let mut connection =
-        botster_hub_client::DaemonConnection::connect(&endpoint).expect("connect");
+    let mut connection = botster_hub_client::DaemonConnection::connect(&endpoint).expect("connect");
 
     connection
         .request(&botster_hub_client::DaemonRequest::Spawn {
@@ -9854,6 +9893,7 @@ fn external_hub_ghostty_snapshot_reflects_osc_palette_and_specials() {
             .concat(),
         })
         .expect("spawn");
+    let mut session_cleanup = SessionCleanupGuard::new(&data_dir, "osc-snapshot-session");
 
     // Wait for mutations to land, then attach for data-plane Snapshot.
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -9873,7 +9913,10 @@ fn external_hub_ghostty_snapshot_reflects_osc_palette_and_specials() {
         {
             break;
         }
-        assert!(Instant::now() < deadline, "timeout waiting for color mutation");
+        assert!(
+            Instant::now() < deadline,
+            "timeout waiting for color mutation"
+        );
         thread::sleep(Duration::from_millis(30));
     }
 
@@ -9904,6 +9947,8 @@ fn external_hub_ghostty_snapshot_reflects_osc_palette_and_specials() {
     // Hub does not decode GHOSTSNP; Core proves color agreement. Here we prove
     // the authoritative byte path is Snapshot and is non-empty GHOSTSNP.
 
+    production_shutdown_and_remove_session(&endpoint, "osc-snapshot-session");
+    session_cleanup.disarm();
     shutdown_cli_daemon(&data_dir, child);
 }
 
@@ -9950,6 +9995,7 @@ sys.stdout.flush()
         },
     )
     .expect("spawn osc child");
+    let mut session_cleanup = SessionCleanupGuard::new(&data_dir, "osc-baseline-session");
 
     let deadline = Instant::now() + Duration::from_secs(8);
     let mut text = String::new();
@@ -9982,9 +10028,133 @@ sys.stdout.flush()
     let seq10 = lowered.find("]10;rgb:ffff/ffff/ffff").expect("osc10");
     let seq11 = lowered.find("]11;rgb:2828/2c2c/3434").expect("osc11");
     let seq12 = lowered.find("]12;rgb:ffff/ffff/ffff").expect("osc12");
-    assert!(seq10 < seq11 && seq11 < seq12, "OSC reply order broken: {text}");
+    assert!(
+        seq10 < seq11 && seq11 < seq12,
+        "OSC reply order broken: {text}"
+    );
+
+    production_shutdown_and_remove_session(&endpoint, "osc-baseline-session");
+    session_cleanup.disarm();
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+/// Failure path: an armed SessionCleanupGuard must shut down a durable unbounded
+/// worker session when production RemoveSession never ran (panic / early return).
+#[test]
+fn session_cleanup_guard_failure_path_reaps_durable_unbounded_session() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_test_dir("session-cleanup-guard-failure");
+    let config = explicit_config(&data_dir);
+    let socket_path = config
+        .transports
+        .local_socket
+        .as_ref()
+        .expect("local socket")
+        .path
+        .clone();
+    let endpoint = botster_hub_client::DaemonEndpoint::new(socket_path.clone());
+    let child = start_cli_daemon(&data_dir);
+
+    botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::Spawn {
+            session_id: "cleanup-guard-session".to_string(),
+            command:
+                "printf ready; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done"
+                    .to_string(),
+        },
+    )
+    .expect("spawn unbounded session");
+    let list_before =
+        botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::ListSessions)
+            .expect("list before failure path");
+    assert!(
+        list_before.sessions.iter().any(|session| {
+            session.session_id == "cleanup-guard-session" && session.lifecycle == "running"
+        }),
+        "spawned unbounded session must be running before failure-path cleanup"
+    );
+
+    // Armed guard drop simulates assertion panic before production RemoveSession.
+    {
+        let _session_cleanup = SessionCleanupGuard::new(&data_dir, "cleanup-guard-session");
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let exited = loop {
+        let list =
+            botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::ListSessions)
+                .expect("list after failure-path guard drop");
+        if let Some(session) = list
+            .sessions
+            .iter()
+            .find(|session| session.session_id == "cleanup-guard-session")
+        {
+            if session.lifecycle == "exited" {
+                break session.lifecycle.clone();
+            }
+        } else {
+            // Guard shutdown + concurrent remove races may also drop the row.
+            break "absent".to_string();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "SessionCleanupGuard drop must shut down durable worker session"
+        );
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        exited == "exited" || exited == "absent",
+        "failure-path cleanup must leave session exited or removed, got {exited}"
+    );
+    // No running worker remains: ModeGatedInput / Input against the session must fail closed.
+    let stale_input = botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::SendInput {
+            session_id: "cleanup-guard-session".to_string(),
+            data: "should-not-run\n".to_string(),
+        },
+    );
+    match stale_input {
+        Ok(response) => {
+            assert_eq!(
+                response.kind,
+                botster_hub_client::DaemonResponseKind::OperatorError,
+                "exited session must not accept live input: {response:?}"
+            );
+        }
+        Err(_) => {
+            // Transport-level rejection is also acceptable after worker reaping.
+        }
+    }
+    assert!(
+        socket_path.exists(),
+        "daemon control socket remains for hub shutdown after session cleanup"
+    );
+
+    // Production-style registry removal after guard reaped the worker.
+    if session_ids_from_list(&endpoint)
+        .iter()
+        .any(|id| id == "cleanup-guard-session")
+    {
+        let remove = botster_hub_client::request(
+            &endpoint,
+            botster_hub_client::DaemonRequest::RemoveSession {
+                session_id: "cleanup-guard-session".to_string(),
+            },
+        )
+        .expect("remove exited session after failure-path shutdown");
+        assert_eq!(
+            remove.kind,
+            botster_hub_client::DaemonResponseKind::SessionRemoved
+        );
+    }
 
     shutdown_cli_daemon(&data_dir, child);
+    assert!(
+        !socket_path.exists(),
+        "hub shutdown must remove the control socket after durable-session cleanup"
+    );
 }
 
 #[test]

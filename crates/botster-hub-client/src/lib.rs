@@ -1125,7 +1125,11 @@ pub struct DaemonModeFlags {
 
 impl DaemonModeFlags {
     /// Build a full mode-flags response body.
+    ///
+    /// One field per public DTO member so constructors stay aligned with the
+    /// non-exhaustive wire shape without a separate builder layer.
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         session_id: impl Into<String>,
         kitty_enabled: bool,
@@ -3406,7 +3410,9 @@ mod tests {
         // first rejection (not the conf floor). Models old Hub on protocol 6 that
         // never advertised mode_gated_input.
         let mut old_hub = DaemonCompatibility::current();
-        old_hub.features.retain(|feature| feature != FEATURE_MODE_GATED_INPUT);
+        old_hub
+            .features
+            .retain(|feature| feature != FEATURE_MODE_GATED_INPUT);
         let error = ensure_compatible(&requirement, &old_hub).expect_err("missing feature");
         assert!(
             error
@@ -4878,31 +4884,10 @@ mod tests {
                 text: "ready".to_string(),
             }),
             mode_flags: Some(DaemonModeFlags::new(
-                "session",
-                false,
-                true,
-                false,
-                9,
-                false,
-                false,
-                false,
-                1,
-                1,
+                "session", false, true, false, 9, false, false, false, 1, 1,
             )),
             mode_gated_input: Some(DaemonModeGatedInputResult::new(
-                "session",
-                true,
-                1,
-                false,
-                true,
-                false,
-                9,
-                false,
-                false,
-                false,
-                1,
-                1,
-                None,
+                "session", true, 1, false, true, false, 9, false, false, false, 1, 1, None,
             )),
             capture_snapshot: Some(DaemonCaptureSnapshot {
                 session_id: "session".to_string(),

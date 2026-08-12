@@ -311,8 +311,7 @@ fn collect_entity_option_families_child(child: &UiChild, families: &mut BTreeSet
             }
         },
         UiChild::BindIf(bind_if) => match bind_if {
-            crate::UiBindIf::BindIf { node, .. }
-            | crate::UiBindIf::PresentationIf { node, .. } => {
+            crate::UiBindIf::BindIf { node, .. } | crate::UiBindIf::PresentationIf { node, .. } => {
                 collect_entity_option_families_node(node, families)
             }
         },
@@ -373,16 +372,17 @@ pub fn project_entity_options(
 
     // order keys → option value → record id (UTF-8 bytes). Record id makes
     // first-after-sort independent of map insertion order across runtimes.
-    ranked.sort_by(|(left, left_keys, left_id), (right, right_keys, right_id)| {
-        for (left_key, right_key) in left_keys.iter().zip(right_keys.iter()) {
-            let cmp =
-                compare_optional_utf8_strings(left_key.as_deref(), right_key.as_deref());
-            if cmp != std::cmp::Ordering::Equal {
-                return cmp;
+    ranked.sort_by(
+        |(left, left_keys, left_id), (right, right_keys, right_id)| {
+            for (left_key, right_key) in left_keys.iter().zip(right_keys.iter()) {
+                let cmp = compare_optional_utf8_strings(left_key.as_deref(), right_key.as_deref());
+                if cmp != std::cmp::Ordering::Equal {
+                    return cmp;
+                }
             }
-        }
-        utf8_byte_cmp(&left.value, &right.value).then_with(|| utf8_byte_cmp(left_id, right_id))
-    });
+            utf8_byte_cmp(&left.value, &right.value).then_with(|| utf8_byte_cmp(left_id, right_id))
+        },
+    );
 
     // First-after-sort wins for duplicate values.
     let mut seen = BTreeSet::new();
@@ -433,7 +433,10 @@ fn matches_where(record: &Map<String, Value>, r#where: &BTreeMap<String, Value>)
 }
 
 fn string_field(record: &Map<String, Value>, field: &str) -> Option<String> {
-    record.get(field).and_then(Value::as_str).map(str::to_string)
+    record
+        .get(field)
+        .and_then(Value::as_str)
+        .map(str::to_string)
 }
 
 fn compare_optional_utf8_strings(left: Option<&str>, right: Option<&str>) -> std::cmp::Ordering {

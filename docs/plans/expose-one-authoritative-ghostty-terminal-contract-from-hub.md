@@ -1,7 +1,7 @@
 # Plan: Expose one authoritative Ghostty terminal contract from Hub
 
-Ticket: `ticket_1786471489_718500`  
-Run: `run_1786476458_719916`  
+Ticket: `ticket_1786471489_718500`
+Run: `run_1786476458_719916`
 Plan **revision 9** after Plan Review `review_1786499667_906431` (`changes_required`)
 
 ## Target
@@ -80,10 +80,10 @@ Path: public client → daemon socket → `daemon_transport` → attach/subscrip
 
 ### Startup baseline (host profile)
 
-1. Explicit host config if present  
-2. Else FG `#FFFFFF`, BG `#282C34`, cursor `#FFFFFF` @ indexes `0x1000/0x1001/0x1002`  
-3. Applied once at `CoreDaemon` construction via `with_terminal_color_profile`  
-4. Does not rewrite durable sessions; not “current” after Snapshot install  
+1. Explicit host config if present
+2. Else FG `#FFFFFF`, BG `#282C34`, cursor `#FFFFFF` @ indexes `0x1000/0x1001/0x1002`
+3. Applied once at `CoreDaemon` construction via `with_terminal_color_profile`
+4. Does not rewrite durable sessions; not “current” after Snapshot install
 
 Mode-gated timeout: Core **`DEFAULT_MODE_GATED_INPUT_TIMEOUT` = 5s** (Hub does not override for production).
 
@@ -125,8 +125,8 @@ Published baseline (npm `@trybotster/hub-test-support@0.1.28`): `PROTOCOL_VERSIO
 
 **Handshake proofs (required):**
 
-1. **New client vs old Hub:** client built with rev34 / required `mode_gated_input` connecting to Hub advertising protocol 6 **without** `mode_gated_input` → `ensure_compatible` fails **before** any `ModeGatedInput` dispatch (missing required feature).  
-2. **Old client vs new Hub:** client requiring only pre-34 features / conf floor ≤33 connects to Hub advertising protocol 6, features including `mode_gated_input`, conf ≥34 → **accepts** (conformance is a floor; extra features OK).  
+1. **New client vs old Hub:** client built with rev34 / required `mode_gated_input` connecting to Hub advertising protocol 6 **without** `mode_gated_input` → `ensure_compatible` fails **before** any `ModeGatedInput` dispatch (missing required feature).
+2. **Old client vs new Hub:** client requiring only pre-34 features / conf floor ≤33 connects to Hub advertising protocol 6, features including `mode_gated_input`, conf ≥34 → **accepts** (conformance is a floor; extra features OK).
 3. Generated TypeScript + clean installed npm package (`>0.1.28`, candidate **0.1.29**) contain: feature string `mode_gated_input`, `ModeGatedInput` request, gated result fields, `mode_generation` / `mode_revision` on mode flags.
 
 Expanding `ReadModeFlags` with freshness fields is covered by the same conformance rev 34 identity (not a separate protocol bump).
