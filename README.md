@@ -509,6 +509,11 @@ requires an upstream branch for Hub and each selected package. It uses Git
 fetch plus a fast-forward-only merge. It never stashes, resets, checks out, or
 discards changes. Registry packages stay pinned.
 
+For `update all`, the command loads and validates all selected package build
+contracts before it fetches a repository or updates a dependency. An initial
+preflight failure does not change source inputs. The command validates each
+contract again after it updates the package repository.
+
 The update keeps a healthy daemon running while it updates and builds source.
 A dirty repository, lock conflict, fetch failure, dependency failure, package
 contract failure, or build failure leaves that daemon running. Correct the

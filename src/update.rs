@@ -361,11 +361,19 @@ fn execute(
     for package in &selection.build {
         ensure_clean_git_repository(&package.root, &package.name, runner)?;
     }
+    for package in &selection.build {
+        load_package_contract(package)?;
+    }
 
     fast_forward_repository(source_root, "botster-hub", runner)?;
     for package in &selection.build {
         fast_forward_repository(&package.root, &package.name, runner)?;
     }
+    let package_contracts = selection
+        .build
+        .iter()
+        .map(load_package_contract)
+        .collect::<Result<Vec<_>, _>>()?;
 
     run_required(
         runner,
@@ -406,8 +414,8 @@ fn execute(
         "build session worker",
     )?;
 
-    for package in &selection.build {
-        run_package_contract(package, runner)?;
+    for (package, contract) in selection.build.iter().zip(&package_contracts) {
+        run_package_contract(package, contract, runner)?;
     }
 
     let target_dir = cargo_target_directory(source_root);
@@ -771,10 +779,7 @@ fn run_required(
     }
 }
 
-fn run_package_contract(
-    package: &LocalPackage,
-    runner: &mut dyn CommandRunner,
-) -> Result<(), String> {
+fn load_package_contract(package: &LocalPackage) -> Result<PackageBuildContract, String> {
     let path = package.root.join(PACKAGE_CONTRACT_FILE);
     let bytes = fs::read(&path).map_err(|error| {
         format!(
@@ -786,13 +791,13 @@ fn run_package_contract(
     let contract: PackageBuildContract = serde_json::from_slice(&bytes)
         .map_err(|error| format!("parse package update contract {}: {error}", path.display()))?;
     for (index, step) in contract.steps.iter().enumerate() {
-        let Some(program) = step.argv.first() else {
+        if step.argv.is_empty() {
             return Err(format!(
                 "package {} step {} has empty argv",
                 package.name,
                 index + 1
             ));
-        };
+        }
         if step.timeout_seconds == 0 {
             return Err(format!(
                 "package {} step {} has zero timeout",
@@ -800,6 +805,18 @@ fn run_package_contract(
                 index + 1
             ));
         }
+        resolve_contract_cwd(&package.root, step.cwd.as_deref())?;
+    }
+    Ok(contract)
+}
+
+fn run_package_contract(
+    package: &LocalPackage,
+    contract: &PackageBuildContract,
+    runner: &mut dyn CommandRunner,
+) -> Result<(), String> {
+    for (index, step) in contract.steps.iter().enumerate() {
+        let program = &step.argv[0];
         let cwd = resolve_contract_cwd(&package.root, step.cwd.as_deref())?;
         let status = runner.stream(
             program,
@@ -1137,8 +1154,27 @@ source = "git+https://example.test/core#abc123"
             name: "fixture".to_string(),
             root,
         };
-        let error = run_package_contract(&package, &mut FailedBuildRunner).unwrap_err();
+        let contract = load_package_contract(&package).unwrap();
+        let error = run_package_contract(&package, &contract, &mut FailedBuildRunner).unwrap_err();
         assert!(error.contains("step 1 failed"));
+    }
+
+    #[test]
+    fn package_contract_validation_rejects_invalid_steps_before_execution() {
+        let root = unique_test_dir("invalid-package-contract");
+        fs::write(
+            root.join(PACKAGE_CONTRACT_FILE),
+            r#"{"steps":[{"argv":[],"timeout_seconds":10}]}"#,
+        )
+        .unwrap();
+        let package = LocalPackage {
+            name: "fixture".to_string(),
+            root,
+        };
+
+        let error = load_package_contract(&package).unwrap_err();
+
+        assert!(error.contains("step 1 has empty argv"));
     }
 
     #[test]
