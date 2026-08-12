@@ -10257,7 +10257,7 @@ fn session_cleanup_guard_failure_path_reaps_durable_unbounded_session() {
             "worker pid must be live before guard drop: {worker:?}"
         );
         assert!(
-            worker.descendant_pids.len() >= 1,
+            !worker.descendant_pids.is_empty(),
             "worker tree must include the worker root: {worker:?}"
         );
         // Shell child of the unbounded fixture should appear under the worker.
