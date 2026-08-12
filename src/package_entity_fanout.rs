@@ -211,13 +211,16 @@ impl PackageEntityResyncState {
     }
 
     /// Explicit re-arm after a new publish or a newly catching-up subscribe.
+    ///
+    /// Resets the per-need-cycle attempt counter and clears degradation, but
+    /// **retains** the rolling one-second attempt history so `can_attempt`
+    /// still enforces ≤2 provider calls per family per wall-clock second.
     pub fn rearm(&mut self, now: Instant) {
         self.degraded = false;
         self.needed = true;
         self.next_eligible_at = now;
         self.attempts = 0;
-        self.attempt_times.clear();
-        self.last_attempt_at = None;
+        self.prune_attempt_times(now);
     }
 
     pub fn clear_needed(&mut self) {
@@ -248,11 +251,7 @@ impl PackageEntityResyncState {
             .count() as u32
     }
 
-    /// Record a provider attempt. Returns true when the cycle enters degraded.
-    pub fn record_attempt(&mut self, now: Instant) -> bool {
-        self.attempts = self.attempts.saturating_add(1);
-        self.last_attempt_at = Some(now);
-        self.attempt_times.push_back(now);
+    fn prune_attempt_times(&mut self, now: Instant) {
         while self
             .attempt_times
             .front()
@@ -260,6 +259,14 @@ impl PackageEntityResyncState {
         {
             self.attempt_times.pop_front();
         }
+    }
+
+    /// Record a provider attempt. Returns true when the cycle enters degraded.
+    pub fn record_attempt(&mut self, now: Instant) -> bool {
+        self.attempts = self.attempts.saturating_add(1);
+        self.last_attempt_at = Some(now);
+        self.attempt_times.push_back(now);
+        self.prune_attempt_times(now);
         let exponent = self.attempts.saturating_sub(1).min(6);
         let backoff = PACKAGE_ENTITY_RESYNC_INITIAL_BACKOFF
             .saturating_mul(1u32 << exponent)
@@ -311,8 +318,9 @@ impl PackageEntityFamilyState {
             self.last_accepted_seq = seq;
             ready.push(mutation);
             ready.extend(self.drain_consecutive_pending());
-            // A successful accept may clear residual resync need after drain.
-            self.recompute_resync_need(now);
+            // Every accepted publish is progress: re-arm when a gap remains, or
+            // clear degraded fully when the family converges.
+            self.after_publish_progress(now);
             PackageEntityPublishStatus::Accepted
         } else if seq <= self.last_accepted_seq + PACKAGE_ENTITY_PENDING_WINDOW {
             if self.pending_by_seq.contains_key(&seq) {
@@ -333,6 +341,17 @@ impl PackageEntityFamilyState {
         };
 
         (self.result(status), ready)
+    }
+
+    fn after_publish_progress(&mut self, now: Instant) {
+        let gap_or_pending =
+            self.last_accepted_seq < self.high_water_seq || !self.pending_by_seq.is_empty();
+        if gap_or_pending {
+            self.resync.rearm(now);
+        } else {
+            self.resync.clear_needed();
+            self.resync.clear_degraded_on_progress();
+        }
     }
 
     /// Apply a provider snapshot sequence to the family floor.
@@ -377,7 +396,8 @@ impl PackageEntityFamilyState {
             self.last_accepted_seq < self.high_water_seq || !self.pending_by_seq.is_empty();
         if gap_or_high_water {
             self.resync.mark_needed(now);
-        } else if self.resync.needed {
+        } else {
+            // Always clear degraded on convergence, even when needed was already false.
             self.resync.clear_needed();
             self.resync.clear_degraded_on_progress();
         }
@@ -629,5 +649,85 @@ mod tests {
             }))
             .is_ok()
         );
+    }
+
+    #[test]
+    fn rearm_preserves_rolling_rate_window() {
+        let mut resync = PackageEntityResyncState::default();
+        let now = Instant::now();
+        resync.rearm(now);
+        // record_attempt does not consult can_attempt; force two wall-clock hits.
+        let _ = resync.record_attempt(now);
+        let _ = resync.record_attempt(now);
+        assert_eq!(resync.attempts, 2);
+        assert!(
+            !resync.can_attempt(now),
+            "rate cap or backoff must block further attempts"
+        );
+        resync.rearm(now);
+        assert_eq!(resync.attempts, 0);
+        assert!(
+            !resync.can_attempt(now),
+            "after re-arm, retained one-second history must keep a third call ineligible"
+        );
+    }
+
+    #[test]
+    fn in_order_publish_rearms_when_gap_remains_and_clears_degraded_on_convergence() {
+        let mut state = PackageEntityFamilyState::default();
+        let now = Instant::now();
+        let _ = state.admit(
+            PackageEntityMutation::Upsert {
+                entity_type: "f".into(),
+                snapshot_seq: 1,
+                id: "a".into(),
+                entity: json!({"id":"a"}),
+            },
+            now,
+        );
+        let _ = state.admit(
+            PackageEntityMutation::Upsert {
+                entity_type: "f".into(),
+                snapshot_seq: 20,
+                id: "z".into(),
+                entity: json!({"id":"z"}),
+            },
+            now,
+        );
+        state.resync.degraded = true;
+        state.resync.needed = false;
+        let (result, _) = state.admit(
+            PackageEntityMutation::Upsert {
+                entity_type: "f".into(),
+                snapshot_seq: 2,
+                id: "b".into(),
+                entity: json!({"id":"b"}),
+            },
+            now,
+        );
+        assert_eq!(result.status, PackageEntityPublishStatus::Accepted);
+        assert!(state.resync.needed);
+        assert!(!state.resync.degraded);
+        assert_eq!(state.last_accepted_seq, 2);
+        assert_eq!(state.high_water_seq, 20);
+
+        state.last_accepted_seq = 19;
+        state.resync.degraded = true;
+        state.resync.needed = false;
+        let (done, _) = state.admit(
+            PackageEntityMutation::Upsert {
+                entity_type: "f".into(),
+                snapshot_seq: 20,
+                id: "z2".into(),
+                entity: json!({"id":"z2"}),
+            },
+            now,
+        );
+        assert_eq!(done.status, PackageEntityPublishStatus::Accepted);
+        assert!(!done.resync_needed);
+        assert!(!done.resync_degraded);
+        assert!(!state.resync.degraded);
+        assert!(!state.resync.needed);
+        assert_eq!(state.last_accepted_seq, 20);
     }
 }
