@@ -3357,67 +3357,95 @@ fn process_probe(pid: libc::pid_t) -> Result<bool, String> {
     }
 }
 
-fn process_is_alive_u32(pid: u32) -> bool {
-    process_probe(pid as libc::pid_t).unwrap_or(false)
+/// Fail closed: census/kill-probe errors must not become "absent".
+fn process_is_alive_u32(pid: u32) -> Result<bool, String> {
+    process_probe(pid as libc::pid_t)
+}
+
+fn process_must_be_alive(pid: u32, label: &str) -> Result<(), String> {
+    match process_is_alive_u32(pid)? {
+        true => Ok(()),
+        false => Err(format!("{label} pid {pid} is not live")),
+    }
+}
+
+fn process_must_be_absent(pid: u32, label: &str) -> Result<(), String> {
+    match process_is_alive_u32(pid)? {
+        false => Ok(()),
+        true => Err(format!("{label} pid {pid} is still live")),
+    }
 }
 
 #[derive(Debug, Clone)]
 struct SessionWorkerProcessIdentity {
     pid: u32,
     command: String,
-    descendant_pids: Vec<u32>,
-}
-
-impl SessionWorkerProcessIdentity {
-    fn all_pids(&self) -> Vec<u32> {
-        let mut pids = self.descendant_pids.clone();
-        if !pids.contains(&self.pid) {
-            pids.push(self.pid);
-        }
-        pids
-    }
-
-    fn is_fully_gone(&self) -> bool {
-        self.all_pids()
-            .into_iter()
-            .all(|pid| !process_is_alive_u32(pid))
-    }
+    /// Exact non-root shell/descendant PIDs that must be observed before cleanup.
+    shell_descendant_pids: Vec<u32>,
 }
 
 /// Portable census of true `botster-session-worker` binaries (not hub argv mentions).
-fn session_worker_process_identities() -> Vec<SessionWorkerProcessIdentity> {
-    let Ok(output) = Command::new("ps").args(["-axo", "pid=,command="]).output() else {
-        return Vec::new();
-    };
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| {
-            let line = line.trim();
-            let mut parts = line.split_whitespace();
-            let pid = parts.next()?.parse::<u32>().ok()?;
-            let argv0 = parts.next()?;
-            let is_worker = Path::new(argv0)
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name == "botster-session-worker");
-            if !is_worker {
-                return None;
-            }
-            let rest = parts.collect::<Vec<_>>().join(" ");
-            let command = format!("{argv0} {rest}");
-            Some(SessionWorkerProcessIdentity {
-                pid,
-                command,
-                descendant_pids: worker_owned_descendant_pids(pid),
-            })
-        })
-        .collect()
+fn session_worker_process_identities() -> Result<Vec<SessionWorkerProcessIdentity>, String> {
+    let output = Command::new("ps")
+        .args(["-axo", "pid=,command="])
+        .output()
+        .map_err(|error| format!("ps worker census failed: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "ps worker census exited with {}: stderr={:?}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let mut workers = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let line = line.trim();
+        let mut parts = line.split_whitespace();
+        let Some(pid_token) = parts.next() else {
+            continue;
+        };
+        let Ok(pid) = pid_token.parse::<u32>() else {
+            continue;
+        };
+        let Some(argv0) = parts.next() else {
+            continue;
+        };
+        let is_worker = Path::new(argv0)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name == "botster-session-worker");
+        if !is_worker {
+            continue;
+        }
+        let rest = parts.collect::<Vec<_>>().join(" ");
+        let command = format!("{argv0} {rest}");
+        let descendant_pids = worker_owned_descendant_pids(pid)?;
+        let shell_descendant_pids: Vec<u32> = descendant_pids
+            .iter()
+            .copied()
+            .filter(|candidate| *candidate != pid)
+            .collect();
+        workers.push(SessionWorkerProcessIdentity {
+            pid,
+            command,
+            shell_descendant_pids,
+        });
+    }
+    Ok(workers)
 }
 
-fn worker_owned_descendant_pids(root_pid: u32) -> Vec<u32> {
-    let Ok(output) = Command::new("ps").args(["-axo", "pid=,ppid="]).output() else {
-        return vec![root_pid];
-    };
+fn worker_owned_descendant_pids(root_pid: u32) -> Result<Vec<u32>, String> {
+    let output = Command::new("ps")
+        .args(["-axo", "pid=,ppid="])
+        .output()
+        .map_err(|error| format!("ps parent census failed: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "ps parent census exited with {}: stderr={:?}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
     let mut edges: Vec<(u32, u32)> = Vec::new();
     for line in String::from_utf8_lossy(&output.stdout).lines() {
         let mut parts = line.split_whitespace();
@@ -3434,13 +3462,16 @@ fn worker_owned_descendant_pids(root_pid: u32) -> Vec<u32> {
     while changed {
         changed = false;
         for &(pid, ppid) in &edges {
-            if owned.contains(&ppid) && !owned.contains(&pid) && process_is_alive_u32(pid) {
+            if !owned.contains(&ppid) || owned.contains(&pid) {
+                continue;
+            }
+            if process_is_alive_u32(pid)? {
                 owned.push(pid);
                 changed = true;
             }
         }
     }
-    owned
+    Ok(owned)
 }
 
 fn worker_belongs_to_data_dir(worker: &SessionWorkerProcessIdentity, data_dir: &Path) -> bool {
@@ -3476,20 +3507,25 @@ fn worker_executable_from_this_worktree(worker: &SessionWorkerProcessIdentity) -
 fn capture_new_session_workers_for_data_dir(
     data_dir: &Path,
     before_pids: &std::collections::BTreeSet<u32>,
-) -> Vec<SessionWorkerProcessIdentity> {
-    let deadline = Instant::now() + Duration::from_secs(5);
+) -> Result<Vec<SessionWorkerProcessIdentity>, String> {
+    let deadline = Instant::now() + Duration::from_secs(8);
     loop {
         // Never adopt host-global "any new pid" — require this worktree's worker
         // binary, then prefer data-dir attribution when present.
-        let live_ours: Vec<SessionWorkerProcessIdentity> = session_worker_process_identities()
+        let live_ours: Vec<SessionWorkerProcessIdentity> = session_worker_process_identities()?
             .into_iter()
             .filter(|worker| {
-                !before_pids.contains(&worker.pid)
-                    && process_is_alive_u32(worker.pid)
-                    && worker_executable_from_this_worktree(worker)
+                !before_pids.contains(&worker.pid) && worker_executable_from_this_worktree(worker)
             })
             .collect();
-        let owned_by_dir: Vec<SessionWorkerProcessIdentity> = live_ours
+        // Fail closed on kill-probe errors for candidate workers.
+        let mut live_alive = Vec::new();
+        for worker in live_ours {
+            if process_is_alive_u32(worker.pid)? {
+                live_alive.push(worker);
+            }
+        }
+        let owned_by_dir: Vec<SessionWorkerProcessIdentity> = live_alive
             .iter()
             .filter(|worker| worker_belongs_to_data_dir(worker, data_dir))
             .cloned()
@@ -3497,25 +3533,49 @@ fn capture_new_session_workers_for_data_dir(
         let live = if !owned_by_dir.is_empty() {
             owned_by_dir
         } else {
-            live_ours
+            live_alive
         };
         if !live.is_empty() {
             // Refresh descendant trees after a short settle so the shell child is included.
-            thread::sleep(Duration::from_millis(50));
-            return live
-                .into_iter()
-                .map(|mut worker| {
-                    worker.descendant_pids = worker_owned_descendant_pids(worker.pid);
-                    worker
-                })
-                .filter(|worker| process_is_alive_u32(worker.pid))
-                .collect();
+            thread::sleep(Duration::from_millis(80));
+            let mut refreshed = Vec::new();
+            for worker in live {
+                if !process_is_alive_u32(worker.pid)? {
+                    continue;
+                }
+                let descendant_pids = worker_owned_descendant_pids(worker.pid)?;
+                let shell_descendant_pids: Vec<u32> = descendant_pids
+                    .iter()
+                    .copied()
+                    .filter(|candidate| *candidate != worker.pid)
+                    .collect();
+                // Require at least one live non-root descendant (sh -c shell).
+                let mut live_shells = Vec::new();
+                for pid in shell_descendant_pids {
+                    if process_is_alive_u32(pid)? {
+                        live_shells.push(pid);
+                    }
+                }
+                if live_shells.is_empty() {
+                    // Keep polling until shell child appears; fixture is sh -c.
+                    continue;
+                }
+                refreshed.push(SessionWorkerProcessIdentity {
+                    pid: worker.pid,
+                    command: worker.command,
+                    shell_descendant_pids: live_shells,
+                });
+            }
+            if !refreshed.is_empty() {
+                return Ok(refreshed);
+            }
         }
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for botster-session-worker from this worktree after Spawn; data_dir={}",
-            data_dir.display()
-        );
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "timed out waiting for botster-session-worker + live shell descendant from this worktree; data_dir={}",
+                data_dir.display()
+            ));
+        }
         thread::sleep(Duration::from_millis(30));
     }
 }
@@ -10205,7 +10265,7 @@ sys.stdout.flush()
 /// worker session when production RemoveSession never ran (panic / early return).
 ///
 /// Proves logical-session exit/removal **and** authoritative absence of the
-/// captured session-worker PID and its shell descendants (not merely stale input).
+/// captured session-worker PID and at least one exact non-root shell descendant.
 #[test]
 fn session_cleanup_guard_failure_path_reaps_durable_unbounded_session() {
     let _guard = daemon_test_guard();
@@ -10222,6 +10282,7 @@ fn session_cleanup_guard_failure_path_reaps_durable_unbounded_session() {
     let child = start_cli_daemon(&data_dir);
 
     let before_pids: std::collections::BTreeSet<u32> = session_worker_process_identities()
+        .expect("baseline worker census must succeed")
         .into_iter()
         .map(|worker| worker.pid)
         .collect();
@@ -10246,37 +10307,36 @@ fn session_cleanup_guard_failure_path_reaps_durable_unbounded_session() {
         "spawned unbounded session must be running before failure-path cleanup"
     );
 
-    let owned_workers = capture_new_session_workers_for_data_dir(&data_dir, &before_pids);
+    let owned_workers = capture_new_session_workers_for_data_dir(&data_dir, &before_pids)
+        .expect("must capture worker + live shell descendant after Spawn");
     assert!(
         !owned_workers.is_empty(),
         "must capture live botster-session-worker for this data_dir after Spawn"
     );
+
+    let mut tracked_worker_pids = Vec::new();
+    let mut tracked_shell_pids = Vec::new();
     for worker in &owned_workers {
+        process_must_be_alive(worker.pid, "worker")
+            .unwrap_or_else(|error| panic!("{error}; worker={worker:?}"));
         assert!(
-            process_is_alive_u32(worker.pid),
-            "worker pid must be live before guard drop: {worker:?}"
+            !worker.shell_descendant_pids.is_empty(),
+            "fixture starts sh -c; must observe at least one live non-root shell PID before cleanup: {worker:?}"
         );
-        assert!(
-            !worker.descendant_pids.is_empty(),
-            "worker tree must include the worker root: {worker:?}"
-        );
-        // Shell child of the unbounded fixture should appear under the worker.
-        assert!(
-            worker
-                .descendant_pids
-                .iter()
-                .any(|pid| *pid != worker.pid && process_is_alive_u32(*pid))
-                || worker.descendant_pids.iter().all(|pid| *pid == worker.pid),
-            "expected worker-owned shell descendants when present: {worker:?}"
-        );
+        for shell_pid in &worker.shell_descendant_pids {
+            assert_ne!(
+                *shell_pid, worker.pid,
+                "shell descendant must differ from worker root: {worker:?}"
+            );
+            process_must_be_alive(*shell_pid, "shell descendant")
+                .unwrap_or_else(|error| panic!("{error}; worker={worker:?}"));
+            tracked_shell_pids.push(*shell_pid);
+        }
+        tracked_worker_pids.push(worker.pid);
     }
-    let owned_pids: Vec<u32> = owned_workers
-        .iter()
-        .flat_map(|worker| worker.all_pids())
-        .collect();
     assert!(
-        owned_pids.iter().any(|pid| process_is_alive_u32(*pid)),
-        "owned process set must be live before failure-path cleanup: {owned_pids:?}"
+        !tracked_shell_pids.is_empty(),
+        "must track exact non-root shell PIDs before guard drop"
     );
 
     // Armed guard drop simulates assertion panic before production RemoveSession.
@@ -10284,23 +10344,45 @@ fn session_cleanup_guard_failure_path_reaps_durable_unbounded_session() {
         let _session_cleanup = SessionCleanupGuard::new(&data_dir, "cleanup-guard-session");
     }
 
-    // Bounded process oracle: worker + captured shell descendants must be absent.
+    // Bounded process oracle: exact worker + exact shell descendant PIDs must be absent.
+    let tracked_pids: Vec<u32> = tracked_worker_pids
+        .iter()
+        .chain(tracked_shell_pids.iter())
+        .copied()
+        .collect();
     let process_deadline = Instant::now() + Duration::from_secs(8);
-    while Instant::now() < process_deadline {
-        if owned_workers.iter().all(|worker| worker.is_fully_gone()) {
+    loop {
+        let mut all_absent = true;
+        let mut survivors = Vec::new();
+        for pid in &tracked_pids {
+            match process_is_alive_u32(*pid) {
+                Ok(true) => {
+                    all_absent = false;
+                    survivors.push(*pid);
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    panic!("process probe failed for pid {pid} after guard drop: {error}");
+                }
+            }
+        }
+        if all_absent {
             break;
         }
+        assert!(
+            Instant::now() < process_deadline,
+            "SessionCleanupGuard drop must reap exact worker and shell PIDs; still live={survivors:?} workers={owned_workers:?} shells={tracked_shell_pids:?}"
+        );
         thread::sleep(Duration::from_millis(40));
     }
-    let survivors: Vec<u32> = owned_pids
-        .iter()
-        .copied()
-        .filter(|pid| process_is_alive_u32(*pid))
-        .collect();
-    assert!(
-        survivors.is_empty(),
-        "SessionCleanupGuard drop must reap worker and shell descendants; still live={survivors:?} owned={owned_workers:?}"
-    );
+    for pid in &tracked_worker_pids {
+        process_must_be_absent(*pid, "worker after guard drop")
+            .unwrap_or_else(|error| panic!("{error}"));
+    }
+    for pid in &tracked_shell_pids {
+        process_must_be_absent(*pid, "shell descendant after guard drop")
+            .unwrap_or_else(|error| panic!("{error}"));
+    }
 
     let deadline = Instant::now() + Duration::from_secs(5);
     let exited = loop {
@@ -10352,16 +10434,15 @@ fn session_cleanup_guard_failure_path_reaps_durable_unbounded_session() {
             .any(|id| id == "cleanup-guard-session"),
         "ListSessions must not retain cleanup-guard-session after RemoveSession"
     );
-    // Re-check process absence after logical removal (no resurrected workers).
-    let late_survivors: Vec<u32> = owned_pids
-        .iter()
-        .copied()
-        .filter(|pid| process_is_alive_u32(*pid))
-        .collect();
-    assert!(
-        late_survivors.is_empty(),
-        "no owned worker/shell pids may survive logical session removal: {late_survivors:?}"
-    );
+    // Re-check exact tracked PIDs after logical removal (no resurrection).
+    for pid in &tracked_worker_pids {
+        process_must_be_absent(*pid, "worker after RemoveSession")
+            .unwrap_or_else(|error| panic!("{error}"));
+    }
+    for pid in &tracked_shell_pids {
+        process_must_be_absent(*pid, "shell descendant after RemoveSession")
+            .unwrap_or_else(|error| panic!("{error}"));
+    }
     assert!(
         socket_path.exists(),
         "daemon control socket remains for hub shutdown after session cleanup"
