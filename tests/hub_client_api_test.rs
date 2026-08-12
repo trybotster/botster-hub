@@ -3794,6 +3794,17 @@ fn read_mode_flags_returns_exact_authoritative_values_and_session_attribution() 
     };
     assert_eq!(off.session_id, off_session_id);
     assert_eq!(off.mouse_mode, 0);
+    assert_ne!(off.mode_generation, 0);
+    // Full ModeFlags projection is present (not mouse-only).
+    let _ = (
+        off.kitty_enabled,
+        off.cursor_visible,
+        off.bracketed_paste,
+        off.alt_screen,
+        off.focus_reporting,
+        off.application_cursor,
+        off.mode_revision,
+    );
 
     let deadline = Instant::now() + Duration::from_secs(5);
     let on = loop {
@@ -3824,6 +3835,8 @@ fn read_mode_flags_returns_exact_authoritative_values_and_session_attribution() 
     };
     assert_eq!(on.session_id, on_session_id);
     assert_eq!(on.mouse_mode, 9);
+    assert_ne!(on.mode_generation, 0);
+    assert!(on.mode_revision >= 1);
 
     let missing = api
         .handle_request(

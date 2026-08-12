@@ -67,6 +67,7 @@ export type DaemonRequest =
   | { type: "attach"; session_id: string; subscription_id: string }
   | { type: "detach"; session_id: string; subscription_id: string }
   | { type: "send_input"; session_id: string; data: string }
+  | { type: "mode_gated_input"; session_id: string; data: string; mode_generation: number; mode_revision: number }
   | { type: "resize"; session_id: string; rows: number; cols: number }
   | { type: "shutdown_session"; session_id: string }
   | { type: "drain"; session_id: string }
@@ -137,6 +138,7 @@ export interface DaemonResponse {
   session_context?: DaemonSessionContext | null;
   read_screen?: DaemonReadScreen | null;
   mode_flags?: DaemonModeFlags | null;
+  mode_gated_input?: DaemonModeGatedInputResult | null;
   capture_snapshot?: DaemonCaptureSnapshot | null;
   spawn_targets?: DaemonSpawnTarget[];
   spawn_target_validation?: DaemonSpawnTargetValidation | null;
@@ -174,7 +176,31 @@ export interface DaemonReadScreen {
 
 export interface DaemonModeFlags {
   session_id: string;
+  kitty_enabled: boolean;
+  cursor_visible: boolean;
+  bracketed_paste: boolean;
   mouse_mode: number;
+  alt_screen: boolean;
+  focus_reporting: boolean;
+  application_cursor: boolean;
+  mode_generation: number;
+  mode_revision: number;
+}
+
+export interface DaemonModeGatedInputResult {
+  session_id: string;
+  admitted: boolean;
+  bytes_written: number;
+  kitty_enabled: boolean;
+  cursor_visible: boolean;
+  bracketed_paste: boolean;
+  mouse_mode: number;
+  alt_screen: boolean;
+  focus_reporting: boolean;
+  application_cursor: boolean;
+  mode_generation: number;
+  mode_revision: number;
+  error_kind?: string | null;
 }
 
 export interface DaemonCaptureSnapshot {
@@ -224,6 +250,7 @@ export type DaemonResponseKind =
   | "session_context"
   | "read_screen"
   | "read_mode_flags"
+  | "mode_gated_input"
   | "capture_snapshot"
   | "spawn_targets"
   | "spawn_target_validation"

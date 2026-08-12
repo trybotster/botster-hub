@@ -1,6 +1,6 @@
 {
   "name": "@trybotster/hub-test-support",
-  "version": "0.1.28",
+  "version": "0.1.29",
   "description": "Node-consumable Botster hub client protocol and plugin contract test assets",
   "license": "SEE LICENSE IN LICENSE",
   "type": "module",

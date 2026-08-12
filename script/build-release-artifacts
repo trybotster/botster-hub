@@ -118,7 +118,7 @@ echo "core_revision=$core_revision"
 echo "version=$VERSION"
 
 BOTSTER_BUILD_REVISION="$hub_revision" cargo build --locked --release
-cargo build --locked --release -p botster-core --bin botster-session-worker
+cargo build --locked --release -p botster-core-daemon --bin botster-session-worker
 
 mkdir -p "$OUT_DIR"
 cp target/release/botster-hub "$OUT_DIR/botster-hub"

@@ -131,11 +131,8 @@ fn generated_fixtures_deserialize_and_validate_through_rust_authority() {
         for frame in &frames {
             apply_entity_options_frame(&mut store, frame);
         }
-        let projection = project_entity_options_from_store(
-            &descriptor,
-            &store,
-            timeline["selection"].as_str(),
-        );
+        let projection =
+            project_entity_options_from_store(&descriptor, &store, timeline["selection"].as_str());
         let expected: botster_ui_contract::EntityOptionsProjection =
             serde_json::from_value(step["expected_projection"].clone()).expect("projection");
         assert_eq!(projection, expected);

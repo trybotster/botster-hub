@@ -2015,6 +2015,30 @@ fn handle_runtime_control_request(
             )?;
             events_response(response.body)
         }
+        DaemonRequest::ModeGatedInput {
+            session_id,
+            data,
+            mode_generation,
+            mode_revision,
+        } => {
+            let now = tick(logical_clock);
+            let response = api.handle_request(
+                runtime,
+                &packages,
+                HubClientRequest::ModeGatedInput {
+                    request_id: request_id("daemon-sessions-mode-gated-input"),
+                    session_id: SessionId(session_id),
+                    data: data.into_bytes(),
+                    mode_generation,
+                    mode_revision,
+                    now_seconds: now,
+                },
+            )?;
+            let HubClientResponseBody::ModeGatedInput(result) = response.body else {
+                return Err(DaemonTransportError::UnexpectedResponse);
+            };
+            Ok(daemon_mode_gated_input(result))
+        }
         DaemonRequest::Resize {
             session_id,
             rows,
@@ -2510,6 +2534,7 @@ fn handle_runtime_control_request(
             session_context: None,
             read_screen: None,
             mode_flags: None,
+            mode_gated_input: None,
             capture_snapshot: None,
             spawn_targets: Vec::new(),
             spawn_target_validation: None,
@@ -4272,6 +4297,7 @@ fn control_request_operation_label(request: &DaemonRequest) -> &'static str {
         DaemonRequest::Attach { .. } => "attach",
         DaemonRequest::Detach { .. } => "detach",
         DaemonRequest::SendInput { .. } => "send_input",
+        DaemonRequest::ModeGatedInput { .. } => "mode_gated_input",
         DaemonRequest::Drain { .. } => "drain",
         DaemonRequest::Resize { .. } => "resize",
         DaemonRequest::ShutdownSession { .. } => "shutdown_session",
@@ -5612,6 +5638,7 @@ fn daemon_response_base(kind: DaemonResponseKind) -> DaemonResponse {
         session_context: None,
         read_screen: None,
         mode_flags: None,
+        mode_gated_input: None,
         capture_snapshot: None,
         spawn_targets: Vec::new(),
         spawn_target_validation: None,
@@ -5700,10 +5727,38 @@ fn daemon_read_screen(screen: HubClientReadScreen) -> DaemonResponse {
 
 fn daemon_mode_flags(mode_flags: HubClientModeFlags) -> DaemonResponse {
     let mut response = daemon_response_base(DaemonResponseKind::ReadModeFlags);
-    response.mode_flags = Some(DaemonModeFlags {
-        session_id: mode_flags.session_id.0,
-        mouse_mode: mode_flags.mouse_mode,
-    });
+    response.mode_flags = Some(DaemonModeFlags::new(
+        mode_flags.session_id.0,
+        mode_flags.kitty_enabled,
+        mode_flags.cursor_visible,
+        mode_flags.bracketed_paste,
+        mode_flags.mouse_mode,
+        mode_flags.alt_screen,
+        mode_flags.focus_reporting,
+        mode_flags.application_cursor,
+        mode_flags.mode_generation,
+        mode_flags.mode_revision,
+    ));
+    response
+}
+
+fn daemon_mode_gated_input(result: crate::HubClientModeGatedInputResult) -> DaemonResponse {
+    let mut response = daemon_response_base(DaemonResponseKind::ModeGatedInput);
+    response.mode_gated_input = Some(botster_hub_client::DaemonModeGatedInputResult::new(
+        result.session_id.0,
+        result.admitted,
+        result.bytes_written,
+        result.kitty_enabled,
+        result.cursor_visible,
+        result.bracketed_paste,
+        result.mouse_mode,
+        result.alt_screen,
+        result.focus_reporting,
+        result.application_cursor,
+        result.mode_generation,
+        result.mode_revision,
+        result.error_kind,
+    ));
     response
 }
 
@@ -8070,6 +8125,7 @@ fn operation_label(operation: crate::HubClientOperation) -> &'static str {
         crate::HubClientOperation::Attach => "attach",
         crate::HubClientOperation::Detach => "detach",
         crate::HubClientOperation::Input => "input",
+        crate::HubClientOperation::ModeGatedInput => "mode_gated_input",
         crate::HubClientOperation::Resize => "resize",
         crate::HubClientOperation::DrainRuntime => "drain_runtime",
         crate::HubClientOperation::Shutdown => "shutdown",
