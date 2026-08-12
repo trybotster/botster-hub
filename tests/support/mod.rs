@@ -12,7 +12,7 @@ pub fn ensure_session_worker_binary() {
                 "build",
                 "--locked",
                 "-p",
-                "botster-core",
+                "botster-core-daemon",
                 "--bin",
                 "botster-session-worker",
             ])

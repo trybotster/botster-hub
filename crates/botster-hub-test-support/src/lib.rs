@@ -1541,17 +1541,15 @@ pub fn mode_flags_conformance_scenario() -> ModeFlagsConformanceScenario {
         },
         mouse_off: ModeFlagsConformanceSuccess {
             response_kind: DaemonResponseKind::ReadModeFlags,
-            mode_flags: DaemonModeFlags {
-                session_id: SESSION_ID.to_string(),
-                mouse_mode: 0,
-            },
+            mode_flags: DaemonModeFlags::new(
+                SESSION_ID, false, true, false, 0, false, false, false, 1, 1,
+            ),
         },
         mouse_on: ModeFlagsConformanceSuccess {
             response_kind: DaemonResponseKind::ReadModeFlags,
-            mode_flags: DaemonModeFlags {
-                session_id: SESSION_ID.to_string(),
-                mouse_mode: 9,
-            },
+            mode_flags: DaemonModeFlags::new(
+                SESSION_ID, false, true, false, 9, false, false, false, 1, 2,
+            ),
         },
         unknown_session: ModeFlagsConformanceFailure {
             response_kind: DaemonResponseKind::OperatorError,
@@ -7625,6 +7623,7 @@ mod tests {
                     botster_hub_client::FEATURE_SESSION_ENTITY_SUBSCRIPTIONS,
                     botster_hub_client::FEATURE_SESSION_TYPE_ENTITY_SUBSCRIPTIONS,
                     botster_hub_client::FEATURE_PLUGIN_ENTITY_SUBSCRIPTIONS,
+                    botster_hub_client::FEATURE_MODE_GATED_INPUT,
                 ],
                 "supported_features": [
                     botster_hub_client::FEATURE_SESSIONS,
@@ -7640,6 +7639,7 @@ mod tests {
                     botster_hub_client::FEATURE_SESSION_ENTITY_SUBSCRIPTIONS,
                     botster_hub_client::FEATURE_SESSION_TYPE_ENTITY_SUBSCRIPTIONS,
                     botster_hub_client::FEATURE_PLUGIN_ENTITY_SUBSCRIPTIONS,
+                    botster_hub_client::FEATURE_MODE_GATED_INPUT,
                 ],
                 "diagnostic_kinds": [
                     "connected",
