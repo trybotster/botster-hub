@@ -29,7 +29,8 @@ Targeted notes included the approved plan list: Hub host-profile and data-plane 
 
 ## Files changed
 
-- `crates/botster-hub-client/src/lib.rs` — `DaemonLiveOutputPayload`, cold-turkey `TerminalOutput` replacement, protocol 7 / conformance 36, unit proofs
+- `crates/botster-hub-client/src/lib.rs` — `DaemonLiveOutputPayload`, cold-turkey `TerminalOutput` replacement, protocol 7 / conformance 36, unit proofs, retired `data` key rejection on an otherwise valid envelope
+- `README.md` — runtime example reports protocol 7 / conformance 36
 - `crates/botster-hub-client/src/typescript.rs` and `generated/daemon-protocol.ts`
 - `src/daemon_transport.rs` — `daemon_event_from_client` uses `from_bytes`; projection test
 - `src/main.rs` — WebRTC smoke and operator event printer use decoded payload bytes
@@ -96,6 +97,11 @@ Downstream-shaped proof:
 
 - TUI scratch worktree at `fbe6cbc37b43f619fc3ff521cb7d5bd1d783abf1`, cargo patch of local `botster-hub-client` + `botster-ui-contract`. Production compile failed at `DaemonEvent::TerminalOutput { data }` in `crates/botster-tui/src/app.rs` (~3748) and test constructors (`data` field gone; `payload` required). `DaemonDiagnosticKind::WorkerCompatibility` is an additional exhaustive-match break from the newer client crate.
 - Web has no Rust hub-client crate. `BOTSTER_HUB_CLIENT_DAEMON_PROTOCOL=<generated daemon-protocol.ts> node scripts/check-daemon-protocol-drift.mjs` failed: vendored `terminal_output` still types `data: string`.
+
+## Review return (`review_1786566696_871984`)
+
+- `finding_1786566696_941039`: reject retired `data` on a valid current envelope. `UncheckedDaemonLiveOutputPayload` now fails when the leftover `data` key is present and still ignores unrelated unknown fields. Test `live_output_rejects_retired_data_key_on_an_otherwise_valid_envelope` starts from a serialized current event, adds only `data`, and requires deserialization to fail.
+- `finding_1786566696_629344`: README runtime example now reports `protocol_version=7` and `conformance_fixture_revision=36`. `readme_runtime_example_reports_current_protocol_and_conformance` asserts those literals stay current.
 
 ## Unverified behavior or residual risk
 

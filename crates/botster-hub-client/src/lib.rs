@@ -2382,6 +2382,8 @@ struct UncheckedDaemonLiveOutputPayload {
     payload_base64: String,
     payload_encoding: DaemonHistoryEncoding,
     bytes: usize,
+    #[serde(flatten)]
+    extra: BTreeMap<String, Value>,
 }
 
 impl DaemonLiveOutputPayload {
@@ -2404,6 +2406,9 @@ impl TryFrom<UncheckedDaemonLiveOutputPayload> for DaemonLiveOutputPayload {
     type Error = String;
 
     fn try_from(payload: UncheckedDaemonLiveOutputPayload) -> Result<Self, Self::Error> {
+        if payload.extra.contains_key("data") {
+            return Err("legacy terminal_output data field is rejected".to_string());
+        }
         decode_validated_base64_payload(&payload.payload_base64, payload.bytes, "live output")?;
         Ok(Self {
             payload_base64: payload.payload_base64,
@@ -3147,19 +3152,30 @@ mod tests {
     }
 
     #[test]
-    fn live_output_rejects_legacy_data_string_json() {
-        let error = serde_json::from_value::<DaemonEvent>(serde_json::json!({
-            "type": "terminal_output",
-            "session_id": "session",
-            "subscription_id": "subscription",
-            "data": "live-after-attach\r\n"
-        }))
-        .expect_err("legacy terminal_output.data must fail deserialization");
-        let message = error.to_string();
+    fn live_output_rejects_retired_data_key_on_an_otherwise_valid_envelope() {
+        let event = DaemonEvent::TerminalOutput {
+            session_id: "session".to_string(),
+            subscription_id: "subscription".to_string(),
+            payload: DaemonLiveOutputPayload::from_bytes(b"live-after-attach\r\n"),
+        };
+        let mut value = serde_json::to_value(&event).expect("serialize current live envelope");
+        assert!(value.get("data").is_none());
+        value["data"] = serde_json::json!("live-after-attach\r\n");
+        value["future_hint"] = serde_json::json!(1);
+
+        let error = serde_json::from_value::<DaemonEvent>(value)
+            .expect_err("retired data key must fail even when the current envelope is valid");
         assert!(
-            message.contains("payload_base64") || message.contains("missing field"),
-            "legacy data field should not be accepted, got {message}"
+            error
+                .to_string()
+                .contains("legacy terminal_output data field is rejected"),
+            "expected retired-field rejection, got {error}"
         );
+
+        let mut forward = serde_json::to_value(&event).expect("serialize current live envelope");
+        forward["future_hint"] = serde_json::json!(1);
+        serde_json::from_value::<DaemonEvent>(forward)
+            .expect("unrelated unknown fields remain forward-tolerant");
     }
 
     #[test]
@@ -3184,6 +3200,21 @@ mod tests {
         let mut output = Vec::new();
         write_terminal_events(&events, &mut output).expect("terminal events write");
         assert_eq!(output, [0x00, 0x1b, 0xff, 0xc0]);
+    }
+
+    #[test]
+    fn readme_runtime_example_reports_current_protocol_and_conformance() {
+        let readme = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../README.md"));
+        assert!(
+            readme.contains(&format!("protocol_version={PROTOCOL_VERSION}")),
+            "README runtime example must report PROTOCOL_VERSION={PROTOCOL_VERSION}"
+        );
+        assert!(
+            readme.contains(&format!(
+                "conformance_fixture_revision={CONFORMANCE_FIXTURE_REVISION}"
+            )),
+            "README runtime example must report CONFORMANCE_FIXTURE_REVISION={CONFORMANCE_FIXTURE_REVISION}"
+        );
     }
 
     #[test]
