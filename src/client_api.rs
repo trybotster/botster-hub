@@ -2133,6 +2133,7 @@ pub enum HubClientRuntimeErrorKind {
     UnknownSession,
     SessionAlreadyExists,
     SpawnFailed,
+    ModeReadFailed,
     Runtime,
     State,
 }
@@ -2164,6 +2165,9 @@ fn runtime_error(
                 botster_core::MultiplexerEngineError::SessionAlreadyExists { .. },
             ),
         )) => HubClientRuntimeErrorKind::SessionAlreadyExists,
+        HubRuntimeError::CoreDaemon(_) if operation == HubClientOperation::ReadModeFlags => {
+            HubClientRuntimeErrorKind::ModeReadFailed
+        }
         HubRuntimeError::CoreDaemon(_) => HubClientRuntimeErrorKind::Runtime,
         HubRuntimeError::State(_) => HubClientRuntimeErrorKind::State,
         HubRuntimeError::Credentials(_) => HubClientRuntimeErrorKind::State,

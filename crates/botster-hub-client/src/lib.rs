@@ -2255,6 +2255,16 @@ impl DaemonDiagnostic {
     }
 
     #[must_use]
+    pub fn worker_compatibility(operation: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            kind: DaemonDiagnosticKind::WorkerCompatibility,
+            operation: Some(operation.into()),
+            feature: Some(FEATURE_MODE_GATED_INPUT.to_string()),
+            message: Some(message.into()),
+        }
+    }
+
+    #[must_use]
     pub fn daemon_startup_failure(message: impl Into<String>) -> Self {
         Self {
             kind: DaemonDiagnosticKind::DaemonStartupFailure,
@@ -2286,6 +2296,7 @@ pub enum DaemonDiagnosticKind {
     CompatibilityMismatch,
     UnsupportedFeature,
     TerminalStreamUnavailable,
+    WorkerCompatibility,
     ActionFailure,
     DaemonStartupFailure,
     Backpressure,
