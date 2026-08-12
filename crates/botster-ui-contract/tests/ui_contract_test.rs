@@ -3642,7 +3642,10 @@ fn entity_options_duplicate_values_use_record_id_utf8_tiebreak() {
     };
     assert_eq!(left, expected);
     assert_eq!(
-        left.options[0].metadata.get("spawn_point").map(String::as_str),
+        left.options[0]
+            .metadata
+            .get("spawn_point")
+            .map(String::as_str),
         Some("from-a-early"),
         "winner must be lower UTF-8 record id a-early, not insertion-order first"
     );
@@ -3674,7 +3677,8 @@ fn entity_options_where_values_must_be_json_strings() {
 fn entity_options_timeline_fixture_matches_projector_and_collector() {
     use botster_ui_contract::{
         EntityOptionsFrame, apply_entity_options_frame, collect_entity_option_families,
-        conformance_fixtures_json, entity_family_subscription_id, project_entity_options_from_store,
+        conformance_fixtures_json, entity_family_subscription_id,
+        project_entity_options_from_store,
     };
 
     let conformance = conformance_fixtures_json();
@@ -3714,10 +3718,6 @@ fn entity_options_timeline_fixture_matches_projector_and_collector() {
         let projection = project_entity_options_from_store(&descriptor, &store, selection);
         let expected: botster_ui_contract::EntityOptionsProjection =
             serde_json::from_value(step["expected_projection"].clone()).expect("projection");
-        assert_eq!(
-            projection, expected,
-            "projection after {}",
-            step["name"]
-        );
+        assert_eq!(projection, expected, "projection after {}", step["name"]);
     }
 }

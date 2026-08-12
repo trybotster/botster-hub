@@ -8,20 +8,21 @@
 use botster_core::{
     BotsterEngineObservation, BotsterEngineOutput, BoundaryJson, ClientId, CoreSession,
     CoreSessionMetadata, EntityContract, EntityFrame, EntityKind, EnvelopeId, EnvelopeTarget,
-    ManagedSessionRuntimeError, MultiplexerEngineError, PluginCapabilityRuntime,
-    PluginCleanupResult, PluginHandlerKind, PluginInvocationFailure, PluginInvocationFailureKind,
-    PluginInvocationOutcome, PluginInvocationRequest, PluginInvocationResult, PluginKey,
-    PluginWorkerDebugSnapshot, RequestId, RoutedEnvelope, RoutedEnvelopeDrainOutcome,
-    RoutedEnvelopePublishOutcome, SessionId, SessionLifecycleState, SessionRuntimeErrorKind,
-    SessionSpawnRequest, SubscriptionId,
+    ManagedSessionRuntimeError, ModeFreshnessToken, MultiplexerEngineError,
+    PluginCapabilityRuntime, PluginCleanupResult, PluginHandlerKind, PluginInvocationFailure,
+    PluginInvocationFailureKind, PluginInvocationOutcome, PluginInvocationRequest,
+    PluginInvocationResult, PluginKey, PluginWorkerDebugSnapshot, RequestId, Rgb, RoutedEnvelope,
+    RoutedEnvelopeDrainOutcome, RoutedEnvelopePublishOutcome, SessionId, SessionLifecycleState,
+    SessionRuntimeErrorKind, SessionSpawnRequest, SubscriptionId, TerminalColorProfile,
 };
 use botster_core_daemon::{
     AcknowledgeRoutedEnvelopeRequest, CaptureSnapshotRequest, CaptureSnapshotResult, CoreDaemon,
     CoreDaemonConfig, CoreDaemonError, DaemonSession, DrainResult, DrainRoutedEnvelopesRequest,
-    GuardedWriteRequest, GuardedWriteResult, PublishRoutedEnvelopeRequest, ReadModeFlagsRequest,
-    ReadModeFlagsResult, ReadScreenRequest, ReadScreenResult, RegistrySessionState,
-    RoutedEnvelopeDeliveryStateResult, SessionAdoptionReport, SessionAdoptionState,
-    SessionLifecycleBaseline, SessionLifecycleChanges, SessionLifecycleCursor, SpawnSessionRequest,
+    GuardedWriteRequest, GuardedWriteResult, ModeGatedInputOutcome, PublishRoutedEnvelopeRequest,
+    ReadModeFlagsRequest, ReadModeFlagsResult, ReadScreenRequest, ReadScreenResult,
+    RegistrySessionState, RoutedEnvelopeDeliveryStateResult, SessionAdoptionReport,
+    SessionAdoptionState, SessionLifecycleBaseline, SessionLifecycleChanges,
+    SessionLifecycleCursor, SpawnSessionRequest,
 };
 use botster_ui_contract::{UiActionRequest, UiActionResult, UiNode};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -1869,6 +1870,33 @@ impl HubRuntime {
         )
     }
 
+    /// Admit mode-dependent PTY input under Core's race-free mode-gated path.
+    ///
+    /// Production uses Core's default 5s timeout. Hub does not override that bound.
+    pub fn mode_gated_input(
+        &mut self,
+        client_id: ClientId,
+        session_id: SessionId,
+        data: impl Into<Vec<u8>>,
+        mode_generation: u64,
+        mode_revision: u64,
+        now_seconds: u64,
+    ) -> Result<ModeGatedInputOutcome, CoreDaemonError> {
+        self.core_daemon
+            .lock()
+            .expect("core daemon mutex")
+            .mode_gated_input(
+                client_id,
+                session_id,
+                data,
+                Some(ModeFreshnessToken {
+                    mode_generation,
+                    mode_revision,
+                }),
+                now_seconds,
+            )
+    }
+
     /// Resize a session terminal through the core daemon.
     pub fn resize(
         &mut self,
@@ -2669,7 +2697,46 @@ fn json_null() -> serde_json::Value {
 }
 
 fn core_daemon_config(config: &HubConfig) -> CoreDaemonConfig {
-    CoreDaemonConfig::new(&config.data_directory).with_worker_path(session_worker_path(config))
+    // Host profile supplies the initial/reset Ghostty color baseline. After
+    // attach, current colors come from data-plane GHOSTSNP only.
+    CoreDaemonConfig::new(&config.data_directory)
+        .with_worker_path(session_worker_path(config))
+        .with_terminal_color_profile(default_terminal_color_profile())
+}
+
+/// Product default Ghostty special colors for pre-attach OSC 10/11/12 replies.
+///
+/// Foreground/cursor `#FFFFFF`, background `#282C34` at Ghostty reserved indexes.
+fn default_terminal_color_profile() -> TerminalColorProfile {
+    const COLOR_INDEX_FOREGROUND: u16 = 0x1000;
+    const COLOR_INDEX_BACKGROUND: u16 = 0x1001;
+    const COLOR_INDEX_CURSOR: u16 = 0x1002;
+    let mut colors = std::collections::HashMap::new();
+    colors.insert(
+        COLOR_INDEX_FOREGROUND,
+        Rgb {
+            r: 0xff,
+            g: 0xff,
+            b: 0xff,
+        },
+    );
+    colors.insert(
+        COLOR_INDEX_BACKGROUND,
+        Rgb {
+            r: 0x28,
+            g: 0x2c,
+            b: 0x34,
+        },
+    );
+    colors.insert(
+        COLOR_INDEX_CURSOR,
+        Rgb {
+            r: 0xff,
+            g: 0xff,
+            b: 0xff,
+        },
+    );
+    TerminalColorProfile { colors }
 }
 
 fn session_worker_path(config: &HubConfig) -> PathBuf {

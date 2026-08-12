@@ -437,7 +437,7 @@ capture_in artifact-assets "$artifact_consumer" node --input-type=module -e \
 
 if [ -z "$hub_bin" ]; then
   capture_in build-hub "$hub_repo" cargo build --locked --bin botster-hub -p botster-hub
-  capture_in build-session-worker "$hub_repo" cargo build --locked --bin botster-session-worker -p botster-core
+  capture_in build-session-worker "$hub_repo" cargo build --locked --bin botster-session-worker -p botster-core-daemon
   hub_bin=$hub_repo/target/debug/botster-hub
   session_worker_bin=$hub_repo/target/debug/botster-session-worker
 else
@@ -872,7 +872,7 @@ if [ "$mode" = upgrade ] || [ "$mode" = all ]; then
   capture_in build-pre-cutover-worker "$old_hub" env \
     CARGO_HOME="$old_cargo_home" CARGO_TARGET_DIR="$old_target" \
     ZIG_LOCAL_CACHE_DIR="$old_zig_local_cache" ZIG_GLOBAL_CACHE_DIR="$old_zig_global_cache" \
-    cargo build --locked --bin botster-session-worker -p botster-core
+    cargo build --locked --bin botster-session-worker -p botster-core-daemon
   old_hub_bin=$old_target/debug/botster-hub
   old_worker_bin=$old_target/debug/botster-session-worker
   capture_in build-pre-cutover-web "$old_web" npm ci

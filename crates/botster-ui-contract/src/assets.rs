@@ -847,18 +847,19 @@ fn entity_options_reactive_timeline_fixture() -> Value {
     let mut store = crate::EntityFamilyStore::new();
     let mut timeline = Vec::new();
 
-    let mut push_step = |name: &str, frames: Vec<EntityOptionsFrame>, store: &mut crate::EntityFamilyStore| {
-        for frame in &frames {
-            apply_entity_options_frame(store, frame);
-        }
-        let projection = project_entity_options_from_store(&descriptor, store, Some(selection));
-        timeline.push(json!({
-            "name": name,
-            "frames": frames,
-            "expected_store": store,
-            "expected_projection": projection,
-        }));
-    };
+    let mut push_step =
+        |name: &str, frames: Vec<EntityOptionsFrame>, store: &mut crate::EntityFamilyStore| {
+            for frame in &frames {
+                apply_entity_options_frame(store, frame);
+            }
+            let projection = project_entity_options_from_store(&descriptor, store, Some(selection));
+            timeline.push(json!({
+                "name": name,
+                "frames": frames,
+                "expected_store": store,
+                "expected_projection": projection,
+            }));
+        };
 
     push_step(
         "source_snapshot",

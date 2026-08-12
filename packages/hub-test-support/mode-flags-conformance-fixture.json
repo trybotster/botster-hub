@@ -5,9 +5,17 @@
     "operation": "read_mode_flags",
     "response_kind": "operator_error"
   },
-  "conformance_fixture_revision": 33,
+  "conformance_fixture_revision": 34,
   "mouse_off": {
     "mode_flags": {
+      "alt_screen": false,
+      "application_cursor": false,
+      "bracketed_paste": false,
+      "cursor_visible": true,
+      "focus_reporting": false,
+      "kitty_enabled": false,
+      "mode_generation": 1,
+      "mode_revision": 1,
       "mouse_mode": 0,
       "session_id": "mode-flags-fixture-session"
     },
@@ -15,6 +23,14 @@
   },
   "mouse_on": {
     "mode_flags": {
+      "alt_screen": false,
+      "application_cursor": false,
+      "bracketed_paste": false,
+      "cursor_visible": true,
+      "focus_reporting": false,
+      "kitty_enabled": false,
+      "mode_generation": 1,
+      "mode_revision": 2,
       "mouse_mode": 9,
       "session_id": "mode-flags-fixture-session"
     },

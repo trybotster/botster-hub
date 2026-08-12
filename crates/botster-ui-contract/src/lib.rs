@@ -34,11 +34,10 @@ mod entity_options;
 
 pub use assets::{conformance_fixtures_json, json_schema, typescript_declarations};
 pub use entity_options::{
-    EntityFamilyStore, EntityOption, EntityOptionsFrame, EntityOptionsProjection,
-    EntityRecordItem, UiEntityOptionsExclude, UiEntityOptionsKind, UiEntityOptionsSource,
-    apply_entity_options_frame, apply_entity_options_frames, collect_entity_option_families,
-    entity_family_subscription_id, project_entity_options, project_entity_options_from_store,
-    validate_entity_options_source,
+    EntityFamilyStore, EntityOption, EntityOptionsFrame, EntityOptionsProjection, EntityRecordItem,
+    UiEntityOptionsExclude, UiEntityOptionsKind, UiEntityOptionsSource, apply_entity_options_frame,
+    apply_entity_options_frames, collect_entity_option_families, entity_family_subscription_id,
+    project_entity_options, project_entity_options_from_store, validate_entity_options_source,
 };
 
 /// Transport-neutral UI surface metadata carried by a package manifest.

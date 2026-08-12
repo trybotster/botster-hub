@@ -1,7 +1,7 @@
 {
   "protocol": "botster-hub-daemon-v1",
   "protocol_version": 6,
-  "conformance_fixture_revision": 33,
+  "conformance_fixture_revision": 34,
   "required_features": [
     "sessions",
     "terminal_streaming",
@@ -15,7 +15,8 @@
     "terminal_readback",
     "session_entity_subscriptions",
     "session_type_entity_subscriptions",
-    "plugin_entity_subscriptions"
+    "plugin_entity_subscriptions",
+    "mode_gated_input"
   ],
   "supported_features": [
     "sessions",
@@ -30,7 +31,8 @@
     "terminal_readback",
     "session_entity_subscriptions",
     "session_type_entity_subscriptions",
-    "plugin_entity_subscriptions"
+    "plugin_entity_subscriptions",
+    "mode_gated_input"
   ],
   "diagnostic_kinds": [
     "connected",
