@@ -132,10 +132,10 @@ function assertDialogFormComposition(source) {
 }
 
 assert.equal(metadata.package_name, "@trybotster/hub-test-support");
-assert.equal(metadata.package_version, "0.1.30");
+assert.equal(metadata.package_version, "0.1.31");
 assert.equal(metadata.protocol, "botster-hub-daemon-v1");
-assert.equal(metadata.protocol_version, 6);
-assert.equal(metadata.conformance_fixture_revision, 35);
+assert.equal(metadata.protocol_version, 7);
+assert.equal(metadata.conformance_fixture_revision, 36);
 
 // Package README ships in the npm tarball; keep install pin sites tied to package.json.
 {
@@ -372,7 +372,7 @@ assert.deepEqual(
 );
 assert.equal(supportMatrix.session_type_authoring.admission_group, "allow_runtime");
 
-assert.equal(sessionLifecycleFixture.conformance_fixture_revision, 35);
+assert.equal(sessionLifecycleFixture.conformance_fixture_revision, 36);
 assert.equal(sessionLifecycleFixture.entity_type, "session");
 assert.deepEqual(
   sessionLifecycleFixture.normalized_frames.map((frame) => frame.type),
@@ -410,7 +410,7 @@ assert.equal(
 assert.equal(sessionLifecycleFixture.overflow.snapshot_precedes_later_deltas, true);
 assert.equal(sessionLifecycleFixture.overflow.failed_snapshot_delivery_closes_subscription, true);
 
-assert.equal(sessionPluginBindingFixture.conformance_fixture_revision, 35);
+assert.equal(sessionPluginBindingFixture.conformance_fixture_revision, 36);
 assert.equal(sessionPluginBindingFixture.binding_family, "/session");
 const sessionPluginMaterialization = materializeSessionPluginBindingScenario(
   sessionPluginBindingFixture,
@@ -657,10 +657,17 @@ for (const event of lateAttachFixture.history_then_live) {
 }
 assert.equal(lateAttachFixture.read_screen_text.match(/history-before-live/g)?.length, 1);
 assert.equal(lateAttachFixture.no_history_read_screen_text, "");
+function liveOutputText(event) {
+  assert.equal(event.payload_encoding, "base64");
+  assert.equal(event.data, undefined);
+  const payload = Buffer.from(event.payload_base64, "base64");
+  assert.equal(event.bytes, payload.length);
+  return payload.toString("utf8");
+}
 let restoredPresentation = lateAttachFixture.read_screen_text;
 const bufferedLive = lateAttachFixture.history_then_live
   .filter((event) => event.type === "terminal_output")
-  .map((event) => event.data)
+  .map(liveOutputText)
   .join("");
 restoredPresentation += bufferedLive;
 assert.equal(
@@ -679,7 +686,7 @@ const noHistoryAttachedIndex = lateAttachFixture.no_history_then_live.findIndex(
 );
 const noHistoryLiveIndex = lateAttachFixture.no_history_then_live.findIndex(
   (event) =>
-    event.type === "terminal_output" && event.data.includes("live-without-history"),
+    event.type === "terminal_output" && liveOutputText(event).includes("live-without-history"),
 );
 const noHistoryLastInitialStateIndex = lateAttachFixture.no_history_then_live.findLastIndex(
   (event) => event.type === "snapshot" || event.type === "scrollback",
@@ -712,7 +719,7 @@ assert.equal(
   lateAttachFixture.no_history_then_live.filter((event) => event.type === "snapshot").length,
   1,
 );
-assert.equal(lateAttachFixture.conformance_fixture_revision, 35);
+assert.equal(lateAttachFixture.conformance_fixture_revision, 36);
 
 const verification = verifyPackageAssets();
 assert.deepEqual(verification, { ok: true, failures: [] });

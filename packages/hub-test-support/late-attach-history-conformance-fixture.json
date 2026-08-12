@@ -1,5 +1,5 @@
 {
-  "conformance_fixture_revision": 35,
+  "conformance_fixture_revision": 36,
   "history_then_live": [
     {
       "session_id": "late-attach-history-fixture-session",
@@ -22,7 +22,9 @@
       "type": "attach_state"
     },
     {
-      "data": "live-after-attach\r\n",
+      "bytes": 19,
+      "payload_base64": "bGl2ZS1hZnRlci1hdHRhY2gNCg==",
+      "payload_encoding": "base64",
       "session_id": "late-attach-history-fixture-session",
       "subscription_id": "late-attach-history-fixture-subscription",
       "type": "terminal_output"
@@ -59,7 +61,9 @@
       "type": "attach_state"
     },
     {
-      "data": "live-without-history\r\n",
+      "bytes": 22,
+      "payload_base64": "bGl2ZS13aXRob3V0LWhpc3RvcnkNCg==",
+      "payload_encoding": "base64",
       "session_id": "late-attach-no-history-fixture-session",
       "subscription_id": "late-attach-no-history-fixture-subscription",
       "type": "terminal_output"

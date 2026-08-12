@@ -51,6 +51,28 @@ use support::{
 };
 
 static REAL_DAEMON_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn live_output_utf8(
+    payload: impl std::borrow::Borrow<botster_hub_client::DaemonLiveOutputPayload>,
+) -> String {
+    String::from_utf8_lossy(&payload.borrow().decoded_bytes().unwrap_or_default()).into_owned()
+}
+
+fn live_output_contains(
+    payload: impl std::borrow::Borrow<botster_hub_client::DaemonLiveOutputPayload>,
+    needle: &str,
+) -> bool {
+    payload
+        .borrow()
+        .decoded_bytes()
+        .map(|bytes| {
+            bytes
+                .windows(needle.len())
+                .any(|window| window == needle.as_bytes())
+        })
+        .unwrap_or(false)
+}
+
 const OPERATOR_CONSOLE_READINESS_LIVENESS_BACKSTOP: Duration = Duration::from_secs(60);
 const OPERATOR_CONSOLE_READER_DRAIN_BACKSTOP: Duration = Duration::from_secs(2);
 const OPERATOR_CONSOLE_OUTPUT_PROGRESS_BACKSTOP: Duration = LOCAL_RUNTIME_DAEMON_READINESS_BUDGET;
@@ -8147,13 +8169,14 @@ fn fast_exit_attach_diagnostic_records_subscription_event_order() {
                 botster_hub_client::DaemonEvent::TerminalOutput {
                     session_id: event_session_id,
                     subscription_id: event_subscription_id,
-                    data,
+                    payload,
                 } => {
+                    let data = live_output_utf8(payload);
                     response_renderable_bytes += data.len();
-                    observed.push_str(data);
+                    observed.push_str(&data);
                     if event_session_id == &session_id && event_subscription_id == &subscription_id
                     {
-                        matching_observed.push_str(data);
+                        matching_observed.push_str(&data);
                     } else if data.contains(&expected) {
                         mismatched_marker = true;
                     }
@@ -8285,12 +8308,13 @@ fn fast_exit_attach_diagnostic_records_subscription_event_order() {
                     botster_hub_client::DaemonEvent::TerminalOutput {
                         session_id: event_session_id,
                         subscription_id: event_subscription_id,
-                        data,
+                        payload,
                     } => {
+                        let data = live_output_utf8(payload);
                         if event_session_id == &session_id
                             && event_subscription_id == &subscription_id
                         {
-                            tail_matching_observed.push_str(data);
+                            tail_matching_observed.push_str(&data);
                         } else if data.contains(&expected) {
                             mismatched_marker = true;
                         }
@@ -9374,8 +9398,8 @@ fn external_hub_client_read_mode_flags_drives_real_daemon_socket_protocol() {
             })
             .expect("external drain request");
         for event in drain.events {
-            if let botster_hub_client::DaemonEvent::TerminalOutput { data, .. } = event {
-                observed.push_str(&data);
+            if let botster_hub_client::DaemonEvent::TerminalOutput { payload, .. } = event {
+                observed.push_str(&live_output_utf8(payload));
             }
         }
         if observed.contains("echo:external-input") {
@@ -9608,9 +9632,9 @@ fn collect_attach_events(
                     event,
                     botster_hub_client::DaemonEvent::TerminalOutput {
                         subscription_id: sub,
-                        data,
+                        payload,
                         ..
-                    } if sub == subscription_id && data.contains(marker)
+                    } if sub == subscription_id && live_output_contains(payload, marker)
                 )
             })
         });
@@ -9725,8 +9749,8 @@ fn external_hub_ghostty_snapshot_install_before_live_rejects_scrollback_as_ghost
             })
             .expect("drain");
         for event in drain.events {
-            if let botster_hub_client::DaemonEvent::TerminalOutput { data, .. } = event {
-                observed.push_str(&data);
+            if let botster_hub_client::DaemonEvent::TerminalOutput { payload, .. } = event {
+                observed.push_str(&live_output_utf8(payload));
             }
         }
         if observed.contains("retained-before-attach") {
@@ -9794,10 +9818,10 @@ fn external_hub_ghostty_snapshot_install_before_live_rejects_scrollback_as_ghost
             event,
             botster_hub_client::DaemonEvent::TerminalOutput {
                 subscription_id,
-                data,
+                payload,
                 ..
             } if subscription_id == "ghostsnp-order-resub"
-                && data.contains("echo:live-after-snapshot")
+                && live_output_contains(payload, "echo:live-after-snapshot")
         )
     });
     let (attaching, snapshot, attached, live) = (
@@ -9858,6 +9882,540 @@ fn external_hub_ghostty_snapshot_install_before_live_rejects_scrollback_as_ghost
     production_shutdown_and_remove_session(&endpoint, "ghostsnp-order-session");
     session_cleanup.disarm();
     shutdown_cli_daemon(&data_dir, child);
+}
+
+fn start_isolated_live_output_hub(name: &str) -> botster_hub_test_support::IsolatedHub {
+    botster_hub_test_support::IsolatedHubBuilder::new()
+        .hub_bin(env!("CARGO_BIN_EXE_botster-hub"))
+        .session_worker_bin(session_worker_binary_path())
+        .root(unique_short_test_dir(name))
+        .name(name)
+        .start()
+        .expect("start isolated hub with explicit worker path")
+}
+
+fn live_output_decoded_bytes(
+    payload: impl std::borrow::Borrow<botster_hub_client::DaemonLiveOutputPayload>,
+) -> Vec<u8> {
+    payload
+        .borrow()
+        .decoded_bytes()
+        .expect("validated live payload decodes")
+}
+
+fn event_is_exact_live_payload(
+    event: &botster_hub_client::DaemonEvent,
+    subscription_id: &str,
+    expected: &[u8],
+) -> bool {
+    match event {
+        botster_hub_client::DaemonEvent::TerminalOutput {
+            subscription_id: event_subscription_id,
+            payload,
+            ..
+        } if event_subscription_id == subscription_id => {
+            live_output_decoded_bytes(payload) == expected
+        }
+        _ => false,
+    }
+}
+
+fn payload_has_utf8_replacement(bytes: &[u8]) -> bool {
+    bytes.windows(3).any(|window| window == [0xEF, 0xBF, 0xBD])
+}
+
+fn python_bytes_literal(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|byte| byte.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn write_python_wait_then_write_script(release_path: &Path, bytes: &[u8]) -> PathBuf {
+    let script_path = unique_short_test_dir("live-output-script").join("write.py");
+    fs::create_dir_all(script_path.parent().expect("script parent")).expect("create script dir");
+    fs::write(
+        &script_path,
+        format!(
+            "import os\nimport time\np = {path:?}\nwhile not os.path.exists(p):\n    time.sleep(0.01)\nos.write(1, bytes([{bytes}]))\n",
+            path = release_path,
+            bytes = python_bytes_literal(bytes),
+        ),
+    )
+    .expect("write wait-then-write script");
+    script_path
+}
+
+fn write_python_split_utf8_script(first_release: &Path, second_release: &Path) -> PathBuf {
+    let script_path = unique_short_test_dir("live-split-script").join("write.py");
+    fs::create_dir_all(script_path.parent().expect("script parent")).expect("create script dir");
+    fs::write(
+        &script_path,
+        format!(
+            "import os\nimport time\na = {first:?}\nb = {second:?}\nwhile not os.path.exists(a):\n    time.sleep(0.01)\nos.write(1, bytes([226]))\nwhile not os.path.exists(b):\n    time.sleep(0.01)\nos.write(1, bytes([130, 172]))\n",
+            first = first_release,
+            second = second_release,
+        ),
+    )
+    .expect("write split UTF-8 script");
+    script_path
+}
+
+fn python_script_command(script_path: &Path) -> String {
+    format!("python3 -u {}", script_path.display())
+}
+
+fn shutdown_short_lived_session(endpoint: &botster_hub_client::DaemonEndpoint, session_id: &str) {
+    let shutdown = botster_hub_client::request(
+        endpoint,
+        botster_hub_client::DaemonRequest::ShutdownSession {
+            session_id: session_id.to_string(),
+        },
+    )
+    .expect("shutdown short-lived session");
+    assert!(
+        matches!(
+            shutdown.kind,
+            botster_hub_client::DaemonResponseKind::Events
+                | botster_hub_client::DaemonResponseKind::SessionCleanup
+        ),
+        "shutdown should complete {session_id}, got {:?}",
+        shutdown.kind
+    );
+}
+
+fn drain_until(
+    connection: &mut botster_hub_client::DaemonConnection,
+    session_id: &str,
+    mut predicate: impl FnMut(&botster_hub_client::DaemonEvent) -> bool,
+) -> Vec<botster_hub_client::DaemonEvent> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut events = Vec::new();
+    while Instant::now() < deadline {
+        let drain = connection
+            .request(&botster_hub_client::DaemonRequest::Drain {
+                session_id: session_id.to_string(),
+            })
+            .expect("drain live output");
+        let found = drain.events.iter().any(&mut predicate);
+        events.extend(drain.events);
+        if found {
+            return events;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    panic!("timed out waiting for live output predicate, events={events:?}");
+}
+
+#[test]
+fn external_hub_live_output_preserves_exact_bytes() {
+    let _guard = daemon_test_guard();
+    let expected: &[u8] = &[0x00, 0x1b, 0x5b, 0x31, 0x6d, 0xff, 0xc0];
+    let hub = start_isolated_live_output_hub("live-exact-bytes");
+    let endpoint = hub.endpoint().clone();
+    let release_path = unique_short_test_dir("live-exact-bytes-release").join("go");
+    let script_path = write_python_wait_then_write_script(&release_path, expected);
+    let mut connection = botster_hub_client::DaemonConnection::connect(&endpoint).expect("connect");
+    connection
+        .request(&botster_hub_client::DaemonRequest::Spawn {
+            session_id: "exact-bytes-session".to_string(),
+            command: python_script_command(&script_path),
+        })
+        .expect("spawn write(2) producer");
+    connection
+        .request(&botster_hub_client::DaemonRequest::Attach {
+            session_id: "exact-bytes-session".to_string(),
+            subscription_id: "exact-bytes-sub".to_string(),
+        })
+        .expect("attach");
+    fs::create_dir_all(release_path.parent().expect("release parent")).expect("create release dir");
+    fs::write(&release_path, b"go").expect("release write(2) producer");
+
+    let events = drain_until(
+        &mut connection,
+        "exact-bytes-session",
+        |event| match event {
+            botster_hub_client::DaemonEvent::TerminalOutput { payload, .. } => {
+                live_output_decoded_bytes(payload)
+                    .windows(expected.len())
+                    .any(|window| window == expected)
+            }
+            _ => false,
+        },
+    );
+    let mut concatenated = Vec::new();
+    for event in &events {
+        if let botster_hub_client::DaemonEvent::TerminalOutput { payload, .. } = event {
+            let bytes = live_output_decoded_bytes(payload);
+            assert!(
+                !payload_has_utf8_replacement(&bytes),
+                "live payload must not contain U+FFFD: {bytes:?}"
+            );
+            concatenated.extend(bytes);
+        }
+    }
+    assert!(
+        concatenated
+            .windows(expected.len())
+            .any(|window| window == expected),
+        "concatenated live bytes must preserve the write(2) sequence, got {concatenated:?}"
+    );
+
+    shutdown_short_lived_session(&endpoint, "exact-bytes-session");
+    hub.shutdown().expect("shutdown isolated hub");
+}
+
+#[test]
+fn external_hub_live_output_preserves_split_utf8_frames() {
+    let _guard = daemon_test_guard();
+    let first = [0xE2];
+    let second = [0x82, 0xAC];
+    let hub = start_isolated_live_output_hub("live-split-utf8");
+    let endpoint = hub.endpoint().clone();
+    let mut connection = botster_hub_client::DaemonConnection::connect(&endpoint).expect("connect");
+    let first_release = unique_short_test_dir("live-split-first").join("go");
+    let second_release = unique_short_test_dir("live-split-second").join("go");
+    let script_path = write_python_split_utf8_script(&first_release, &second_release);
+    connection
+        .request(&botster_hub_client::DaemonRequest::Spawn {
+            session_id: "split-utf8-session".to_string(),
+            command: python_script_command(&script_path),
+        })
+        .expect("spawn split UTF-8 producer");
+    connection
+        .request(&botster_hub_client::DaemonRequest::Attach {
+            session_id: "split-utf8-session".to_string(),
+            subscription_id: "split-utf8-sub".to_string(),
+        })
+        .expect("attach");
+    fs::create_dir_all(first_release.parent().expect("first release parent"))
+        .expect("create first release dir");
+    fs::write(&first_release, b"go").expect("release first fragment");
+
+    let first_events = drain_until(&mut connection, "split-utf8-session", |event| {
+        event_is_exact_live_payload(event, "split-utf8-sub", &first)
+    });
+    let first_index = first_events
+        .iter()
+        .position(|event| event_is_exact_live_payload(event, "split-utf8-sub", &first))
+        .expect("first fragment payload");
+    assert!(
+        first_events[first_index + 1..].iter().all(|event| {
+            !matches!(
+                event,
+                botster_hub_client::DaemonEvent::TerminalOutput {
+                    subscription_id,
+                    ..
+                } if subscription_id == "split-utf8-sub"
+            )
+        }),
+        "second live frame arrived before producer release: {first_events:?}"
+    );
+    for _ in 0..5 {
+        let extra = connection
+            .request(&botster_hub_client::DaemonRequest::Drain {
+                session_id: "split-utf8-session".to_string(),
+            })
+            .expect("drain before release");
+        assert!(
+            extra.events.iter().all(|event| {
+                !matches!(
+                    event,
+                    botster_hub_client::DaemonEvent::TerminalOutput {
+                        subscription_id,
+                        ..
+                    } if subscription_id == "split-utf8-sub"
+                )
+            }),
+            "second live frame arrived before producer release: {extra:?}"
+        );
+    }
+
+    fs::create_dir_all(second_release.parent().expect("second release parent"))
+        .expect("create second release dir");
+    fs::write(&second_release, b"go").expect("release second fragment");
+
+    let second_events = drain_until(&mut connection, "split-utf8-session", |event| {
+        event_is_exact_live_payload(event, "split-utf8-sub", &second)
+    });
+    let second_index = second_events
+        .iter()
+        .position(|event| event_is_exact_live_payload(event, "split-utf8-sub", &second))
+        .expect("second fragment payload");
+    let first_payload = live_output_decoded_bytes(match &first_events[first_index] {
+        botster_hub_client::DaemonEvent::TerminalOutput { payload, .. } => payload,
+        other => panic!("expected first live payload, got {other:?}"),
+    });
+    let second_payload = live_output_decoded_bytes(match &second_events[second_index] {
+        botster_hub_client::DaemonEvent::TerminalOutput { payload, .. } => payload,
+        other => panic!("expected second live payload, got {other:?}"),
+    });
+    assert_eq!(first_payload, first);
+    assert_eq!(second_payload, second);
+    let mut concatenated = first_payload;
+    concatenated.extend(second_payload);
+    assert_eq!(concatenated, [0xE2, 0x82, 0xAC]);
+    assert!(!payload_has_utf8_replacement(&concatenated));
+
+    shutdown_short_lived_session(&endpoint, "split-utf8-session");
+    hub.shutdown().expect("shutdown isolated hub");
+}
+
+#[test]
+fn external_hub_live_output_keeps_ghostsnp_then_attached_then_bytes() {
+    let _guard = daemon_test_guard();
+    let expected = b"live-payload-bytes";
+    let hub = start_isolated_live_output_hub("live-order-bytes");
+    let endpoint = hub.endpoint().clone();
+    let release_path = unique_short_test_dir("live-order-release").join("go");
+    let script_path = write_python_wait_then_write_script(&release_path, expected);
+    let mut connection = botster_hub_client::DaemonConnection::connect(&endpoint).expect("connect");
+    connection
+        .request(&botster_hub_client::DaemonRequest::Spawn {
+            session_id: "order-bytes-session".to_string(),
+            command: python_script_command(&script_path),
+        })
+        .expect("spawn live producer");
+    let attach = connection
+        .request(&botster_hub_client::DaemonRequest::Attach {
+            session_id: "order-bytes-session".to_string(),
+            subscription_id: "order-bytes-sub".to_string(),
+        })
+        .expect("attach");
+    fs::create_dir_all(release_path.parent().expect("release parent")).expect("create release dir");
+    fs::write(&release_path, b"go").expect("release live producer");
+
+    let mut events = attach.events;
+    events.extend(drain_until(
+        &mut connection,
+        "order-bytes-session",
+        |event| {
+            event_is_exact_live_payload(event, "order-bytes-sub", expected)
+                || matches!(
+                    event,
+                    botster_hub_client::DaemonEvent::TerminalOutput { payload, .. }
+                        if live_output_decoded_bytes(payload)
+                            .windows(expected.len())
+                            .any(|window| window == expected)
+                )
+        },
+    ));
+
+    let attaching = events.iter().position(|event| {
+        matches!(
+            event,
+            botster_hub_client::DaemonEvent::AttachState {
+                subscription_id,
+                state,
+                ..
+            } if subscription_id == "order-bytes-sub" && state == "attaching"
+        )
+    });
+    let snapshot = events.iter().position(|event| {
+        matches!(
+            event,
+            botster_hub_client::DaemonEvent::Snapshot {
+                subscription_id,
+                ..
+            } if subscription_id == "order-bytes-sub"
+        )
+    });
+    let attached = events.iter().position(|event| {
+        matches!(
+            event,
+            botster_hub_client::DaemonEvent::AttachState {
+                subscription_id,
+                state,
+                ..
+            } if subscription_id == "order-bytes-sub" && state == "attached"
+        )
+    });
+    let live = events.iter().position(|event| {
+        matches!(
+            event,
+            botster_hub_client::DaemonEvent::TerminalOutput {
+                subscription_id,
+                payload,
+                ..
+            } if subscription_id == "order-bytes-sub"
+                && live_output_decoded_bytes(payload)
+                    .windows(expected.len())
+                    .any(|window| window == expected)
+        )
+    });
+    let (attaching, snapshot, attached, live) = (
+        attaching.expect("attaching"),
+        snapshot.expect("snapshot"),
+        attached.expect("attached"),
+        live.expect("live bytes"),
+    );
+    assert!(
+        attaching < snapshot && snapshot < attached && attached < live,
+        "ordering attaching < Snapshot < attached < live failed: {events:?}"
+    );
+    let snapshot_bytes = first_snapshot_payload(&events, "order-bytes-sub");
+    assert!(
+        snapshot_bytes.starts_with(GHOSTSNP_MAGIC),
+        "Snapshot must start with GHOSTSNP"
+    );
+    for event in &events {
+        if let botster_hub_client::DaemonEvent::TerminalOutput { payload, .. } = event {
+            let value = serde_json::to_value(event).expect("serialize live event");
+            assert!(
+                value.get("data").is_none(),
+                "live event must not have data: {value}"
+            );
+            assert_eq!(value["payload_encoding"], "base64");
+            assert_eq!(value["bytes"], payload.bytes);
+            assert!(value.get("payload_base64").is_some());
+        }
+    }
+
+    shutdown_short_lived_session(&endpoint, "order-bytes-session");
+    hub.shutdown().expect("shutdown isolated hub");
+}
+
+#[test]
+fn external_hub_webrtc_live_output_preserves_exact_bytes() {
+    let _guard = daemon_test_guard();
+    let expected: &[u8] = &[0x00, 0x1b, 0xff, 0xc0];
+    let hub = start_isolated_live_output_hub("webrtc-exact-bytes");
+    let package_dir = unique_test_dir("webrtc-exact-bytes-web");
+    write_botster_web_package(&package_dir);
+    enable_supervised_package(hub.data_dir(), &package_dir);
+    let endpoint = hub.endpoint().clone();
+    let web_listener_port = unused_loopback_port();
+    let start = botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::StartPackageEntrypoint {
+            package_name: "botster-web".to_string(),
+            entrypoint_id: "web-client".to_string(),
+            environment_overrides: BTreeMap::from([(
+                "BOTSTER_WEB_PORT".to_string(),
+                web_listener_port.to_string(),
+            )]),
+        },
+    )
+    .expect("start botster-web entrypoint");
+    assert_eq!(start.kind, botster_hub_client::DaemonResponseKind::Packages);
+    let bootstrap = botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::IssueLocalWebrtcBootstrap {
+            package_name: "botster-web".to_string(),
+            entrypoint_id: "web-client".to_string(),
+            origin: format!("http://127.0.0.1:{web_listener_port}"),
+        },
+    )
+    .expect("issue local WebRTC bootstrap")
+    .local_webrtc_bootstrap
+    .expect("bootstrap response includes local WebRTC bootstrap");
+    let stream_key = local_webrtc_stream_key(&bootstrap.grant_secret);
+
+    block_on(async {
+        let (mut offer_peer, offer) = LocalWebrtcOfferPeer::create_offer()
+            .await
+            .expect("create WebRTC offer peer");
+        let signal = botster_hub_client::request(
+            &endpoint,
+            botster_hub_client::DaemonRequest::LocalWebrtcSignal {
+                grant_id: bootstrap.grant_id.clone(),
+                grant_secret: bootstrap.grant_secret.clone(),
+                origin: bootstrap.expected_origin.clone(),
+                offer,
+            },
+        )
+        .expect("signal local WebRTC offer");
+        let answer = signal
+            .local_webrtc_answer
+            .as_ref()
+            .expect("signal response includes WebRTC answer")
+            .answer
+            .clone();
+        offer_peer
+            .accept_answer(answer)
+            .await
+            .expect("offer peer accepts answer");
+
+        let release_path = unique_short_test_dir("webrtc-exact-release").join("go");
+        let script_path = write_python_wait_then_write_script(&release_path, expected);
+        botster_hub_client::request(
+            &endpoint,
+            botster_hub_client::DaemonRequest::Spawn {
+                session_id: "webrtc-exact-bytes-session".to_string(),
+                command: python_script_command(&script_path),
+            },
+        )
+        .expect("spawn write(2) producer");
+        offer_peer
+            .encrypted_request(
+                &stream_key,
+                &botster_hub_client::DaemonRequest::Attach {
+                    session_id: "webrtc-exact-bytes-session".to_string(),
+                    subscription_id: "webrtc-exact-bytes-sub".to_string(),
+                },
+            )
+            .await
+            .expect("attach over encrypted WebRTC");
+        fs::create_dir_all(release_path.parent().expect("release parent"))
+            .expect("create webrtc release dir");
+        fs::write(&release_path, b"go").expect("release webrtc write(2) producer");
+
+        let mut concatenated = Vec::new();
+        for _ in 0..120 {
+            let drain = offer_peer
+                .encrypted_request(
+                    &stream_key,
+                    &botster_hub_client::DaemonRequest::Drain {
+                        session_id: "webrtc-exact-bytes-session".to_string(),
+                    },
+                )
+                .await
+                .expect("drain over encrypted WebRTC");
+            for event in drain.events {
+                if let botster_hub_client::DaemonEvent::TerminalOutput { payload, .. } = event {
+                    let bytes = live_output_decoded_bytes(payload);
+                    assert!(
+                        !payload_has_utf8_replacement(&bytes),
+                        "WebRTC live payload must not contain U+FFFD: {bytes:?}"
+                    );
+                    concatenated.extend(bytes);
+                }
+            }
+            if concatenated
+                .windows(expected.len())
+                .any(|window| window == expected)
+            {
+                break;
+            }
+            sleep(Duration::from_millis(30)).await;
+        }
+        assert!(
+            concatenated
+                .windows(expected.len())
+                .any(|window| window == expected),
+            "encrypted WebRTC Drain must preserve exact live bytes, got {concatenated:?}"
+        );
+        let _ = offer_peer.peer.close().await;
+    });
+
+    let shutdown = botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::ShutdownSession {
+            session_id: "webrtc-exact-bytes-session".to_string(),
+        },
+    )
+    .expect("shutdown webrtc exact-bytes session");
+    assert!(
+        matches!(
+            shutdown.kind,
+            botster_hub_client::DaemonResponseKind::Events
+                | botster_hub_client::DaemonResponseKind::SessionCleanup
+        ),
+        "shutdown should complete the write(2) session, got {:?}",
+        shutdown.kind
+    );
+    hub.shutdown().expect("shutdown isolated hub");
 }
 
 /// Fresh idle Ghostty attach: production emits GHOSTSNP Snapshot before Attached.
@@ -10729,8 +11287,8 @@ fn session_entity_subscription_pushes_snapshot_ordered_deltas_and_fresh_reconnec
             })
             .expect("drain terminal output alongside entity pump");
         for event in drain.events {
-            if let botster_hub_client::DaemonEvent::TerminalOutput { data, .. } = event {
-                terminal_output.push_str(&data);
+            if let botster_hub_client::DaemonEvent::TerminalOutput { payload, .. } = event {
+                terminal_output.push_str(&live_output_utf8(payload));
             }
         }
         thread::sleep(Duration::from_millis(20));
@@ -10809,8 +11367,8 @@ fn session_entity_subscription_pushes_snapshot_ordered_deltas_and_fresh_reconnec
         .expect("release entity fixture through terminal input");
     assert_eq!(release.kind, botster_hub_client::DaemonResponseKind::Events);
     for event in release.events {
-        if let botster_hub_client::DaemonEvent::TerminalOutput { data, .. } = event {
-            terminal_output.push_str(&data);
+        if let botster_hub_client::DaemonEvent::TerminalOutput { payload, .. } = event {
+            terminal_output.push_str(&live_output_utf8(payload));
         }
     }
     let release_deadline = Instant::now() + Duration::from_secs(5);
@@ -10821,8 +11379,8 @@ fn session_entity_subscription_pushes_snapshot_ordered_deltas_and_fresh_reconnec
             })
             .expect("drain terminal output after releasing entity fixture");
         for event in drain.events {
-            if let botster_hub_client::DaemonEvent::TerminalOutput { data, .. } = event {
-                terminal_output.push_str(&data);
+            if let botster_hub_client::DaemonEvent::TerminalOutput { payload, .. } = event {
+                terminal_output.push_str(&live_output_utf8(payload));
             }
         }
         thread::sleep(Duration::from_millis(20));
@@ -11926,8 +12484,8 @@ fn shutdown_from_another_connection_preserves_process_exit_for_attached_subscrip
         observed_marker |= marker_drain.events.iter().any(|event| {
             matches!(
                 event,
-                botster_hub_client::DaemonEvent::TerminalOutput { data, .. }
-                    if data.contains("cross-connection-exiting")
+                botster_hub_client::DaemonEvent::TerminalOutput { payload, .. }
+                    if live_output_contains(payload, "cross-connection-exiting")
             )
         });
         assert!(
@@ -12017,8 +12575,8 @@ fn shutdown_from_another_connection_preserves_process_exit_for_attached_subscrip
     assert!(
         attached_drain.events.iter().any(|event| matches!(
             event,
-            botster_hub_client::DaemonEvent::TerminalOutput { data, .. }
-                if data.contains("cross-connection-tail")
+            botster_hub_client::DaemonEvent::TerminalOutput { payload, .. }
+                if live_output_contains(payload, "cross-connection-tail")
         )),
         "final terminal output must be preserved with the process exit: {:?}",
         attached_drain.events
@@ -12123,10 +12681,13 @@ fn session_entity_subscription_observes_attached_natural_exit_with_pending_egres
         .events
         .iter()
         .filter_map(|event| match event {
-            botster_hub_client::DaemonEvent::TerminalOutput { data, .. } => Some(data.as_str()),
+            botster_hub_client::DaemonEvent::TerminalOutput { payload, .. } => {
+                Some(live_output_utf8(payload))
+            }
             _ => None,
         })
-        .collect::<String>();
+        .collect::<Vec<_>>()
+        .join("");
     assert_eq!(retained_output.matches("pending-first").count(), 1);
     assert_eq!(retained_output.matches("pending-second").count(), 1);
     assert!(
@@ -12155,8 +12716,8 @@ fn session_entity_subscription_observes_attached_natural_exit_with_pending_egres
         drained_again.events.iter().all(|event| {
             !matches!(
                 event,
-                botster_hub_client::DaemonEvent::TerminalOutput { data, .. }
-                    if data.contains("pending-first") || data.contains("pending-second")
+                botster_hub_client::DaemonEvent::TerminalOutput { payload, .. }
+                    if live_output_contains(payload, "pending-first") || live_output_contains(payload, "pending-second")
             ) && !matches!(
                 event,
                 botster_hub_client::DaemonEvent::ProcessExit { code: Some(7), .. }
@@ -12617,8 +13178,8 @@ fn local_webrtc_chunks_oversized_encrypted_daemon_response() {
                 .await
                 .expect("drain over encrypted WebRTC data channel");
             for event in drain.events {
-                if let botster_hub_client::DaemonEvent::TerminalOutput { data, .. } = event {
-                    observed.push_str(&data);
+                if let botster_hub_client::DaemonEvent::TerminalOutput { payload, .. } = event {
+                    observed.push_str(&live_output_utf8(payload));
                 }
             }
             if observed.contains("webrtc:from-local-webrtc") {
@@ -13257,13 +13818,13 @@ fn local_webrtc_peer_close_detaches_terminal_subscriptions() {
             .expect("drain after WebRTC peer close");
         for event in drain.events {
             if let botster_hub_client::DaemonEvent::TerminalOutput {
-                data,
+                payload,
                 subscription_id,
                 ..
             } = &event
                 && subscription_id == "socket-after-webrtc-close-subscription"
             {
-                observed.push_str(data);
+                observed.push_str(&live_output_utf8(payload));
             }
             events_after_close.push(event);
         }
@@ -13282,10 +13843,10 @@ fn local_webrtc_peer_close_detaches_terminal_subscriptions() {
                 event,
                 botster_hub_client::DaemonEvent::TerminalOutput {
                     subscription_id,
-                    data,
+                    payload,
                     ..
                 } if subscription_id == "local-webrtc-drop-subscription"
-                    && data.contains("drop:after-webrtc-close")
+                    && live_output_contains(payload, "drop:after-webrtc-close")
             )
         }),
         "closed WebRTC peer subscription must not receive later output: {events_after_close:?}"
@@ -13374,8 +13935,8 @@ fn external_hub_client_spawns_botster_web_runtime_session_request_shape() {
             })
             .expect("drain botster-web runtime session");
         for event in drain.events {
-            if let botster_hub_client::DaemonEvent::TerminalOutput { data, .. } = event {
-                observed.push_str(&data);
+            if let botster_hub_client::DaemonEvent::TerminalOutput { payload, .. } = event {
+                observed.push_str(&live_output_utf8(payload));
             }
         }
         if observed.contains("web:from-web-action") {
@@ -13485,8 +14046,8 @@ fn external_hub_client_duplicate_botster_web_runtime_spawn_is_rejected_without_c
             })
             .expect("drain original botster-web runtime session after duplicate rejection");
         for event in drain.events {
-            if let botster_hub_client::DaemonEvent::TerminalOutput { data, .. } = event {
-                observed.push_str(&data);
+            if let botster_hub_client::DaemonEvent::TerminalOutput { payload, .. } = event {
+                observed.push_str(&live_output_utf8(payload));
             }
         }
         if observed.contains("web:after-duplicate") {
@@ -13671,7 +14232,7 @@ fn external_hub_client_reports_compatibility_descriptor_and_mismatch_diagnostics
             "{attempt}: {message}"
         );
         assert!(
-            message.contains("unsupported protocol version 6"),
+            message.contains("unsupported protocol version 7"),
             "{attempt}: {message}"
         );
     }
@@ -14019,12 +14580,12 @@ fn external_daemon_same_session_reattach_replays_opaque_history_before_live_outp
         for event in drain.events {
             if let botster_hub::DaemonEvent::TerminalOutput {
                 subscription_id,
-                data,
+                payload,
                 ..
             } = event
                 && subscription_id == "late-history-first-subscription"
             {
-                first_observed.push_str(&data);
+                first_observed.push_str(&live_output_utf8(payload));
             }
         }
         if first_observed.contains("retained-before-attach") {
@@ -14057,12 +14618,12 @@ fn external_daemon_same_session_reattach_replays_opaque_history_before_live_outp
         for event in drain.events {
             if let botster_hub::DaemonEvent::TerminalOutput {
                 subscription_id,
-                data,
+                payload,
                 ..
             } = event
                 && subscription_id == "late-history-first-subscription"
             {
-                first_observed.push_str(&data);
+                first_observed.push_str(&live_output_utf8(payload));
             }
         }
         if first_observed.contains("after:retained-after-attach") {
@@ -14134,10 +14695,10 @@ fn external_daemon_same_session_reattach_replays_opaque_history_before_live_outp
                 event,
                 botster_hub::DaemonEvent::TerminalOutput {
                     subscription_id,
-                    data,
+                    payload,
                     ..
                 } if subscription_id == "late-history-reattach-subscription"
-                    && data.contains("after:live-after-late")
+                    && live_output_contains(payload, "after:live-after-late")
             )
         });
         if saw_live {
@@ -14211,10 +14772,10 @@ fn external_daemon_same_session_reattach_replays_opaque_history_before_live_outp
                 event,
                 botster_hub::DaemonEvent::TerminalOutput {
                     subscription_id,
-                    data,
+                    payload,
                     ..
                 } if subscription_id == "late-history-reattach-subscription"
-                    && data.contains("after:live-after-late")
+                    && live_output_contains(payload, "after:live-after-late")
             )
         })
         .expect("late subscription should receive later live output");
@@ -14256,10 +14817,10 @@ fn external_daemon_same_session_reattach_replays_opaque_history_before_live_outp
                 event,
                 botster_hub::DaemonEvent::TerminalOutput {
                     subscription_id,
-                    data,
+                    payload,
                     ..
                 } if subscription_id == "late-history-first-subscription"
-                    && data.contains("after:live-after-late")
+                    && live_output_contains(payload, "after:live-after-late")
             )
         }),
         "socket cleanup should detach the old subscription before later live output, got {observed_events:?}"
@@ -14344,10 +14905,10 @@ fn external_daemon_same_session_reattach_replays_opaque_history_before_live_outp
                 event,
                 botster_hub::DaemonEvent::TerminalOutput {
                     subscription_id,
-                    data,
+                    payload,
                     ..
                 } if subscription_id == "no-history-reattach-subscription"
-                    && data.contains("after:live-only")
+                    && live_output_contains(payload, "after:live-only")
             )
         });
         if saw_live {
@@ -14401,10 +14962,10 @@ fn external_daemon_same_session_reattach_replays_opaque_history_before_live_outp
                 event,
                 botster_hub::DaemonEvent::TerminalOutput {
                     subscription_id,
-                    data,
+                    payload,
                     ..
                 } if subscription_id == "no-history-reattach-subscription"
-                    && data.contains("after:live-only")
+                    && live_output_contains(payload, "after:live-only")
             )
         })
         .expect("late no-history subscription should receive live output");
@@ -14522,9 +15083,10 @@ fn daemon_detaches_subscription_when_attach_connection_drops() {
                 event,
                 botster_hub::DaemonEvent::TerminalOutput {
                     subscription_id,
-                    data,
+                    payload,
                     ..
-                } if subscription_id == "dropped-subscription" && data.contains("after-eof")
+                } if subscription_id == "dropped-subscription"
+                    && live_output_contains(payload, "after-eof")
             )
         }),
         "dropped attach subscription received later terminal output: {observed_events:?}"
@@ -14606,8 +15168,8 @@ fn daemon_notify_session_defers_without_observed_readiness_over_socket() {
             })
             .expect("drain guarded socket session");
         for event in drain.events {
-            if let botster_hub::DaemonEvent::TerminalOutput { data, .. } = event {
-                observed.push_str(&data);
+            if let botster_hub::DaemonEvent::TerminalOutput { payload, .. } = event {
+                observed.push_str(&live_output_utf8(payload));
             }
         }
         if observed.contains("echo:notify-socket") {
