@@ -1328,6 +1328,16 @@ untouched. A protocol-6 client pinned at conformance 31 keeps working against a
 Hub reporting 32 and simply never issues the new request, so `botster-tui` and
 `botster-web` need no repin.
 
+Publishing authentic dual GHOSTSNP late-attach fixtures advances
+`CONFORMANCE_FIXTURE_REVISION` to 35 and leaves `PROTOCOL_VERSION` at 6.
+Revision 35 freezes two distinct Ghostty-exported goldens under Core pin
+`2c5171a6…` / Ghostty pin `5e9ba17a…`: history Snapshot carries a
+`history-before-live` marker golden; no-history Snapshot carries a blank idle
+golden. Both sequences are `attaching → Snapshot → attached → live`. Visible
+restore remains the ReadScreen oracle; clients must not treat Snapshot length as
+renderable history and must not dual-use a history-bearing golden as no-history.
+The published package coordinate is `@trybotster/hub-test-support@0.1.30`.
+
 ## Isolated Integration Tests For External Clients
 
 External clients that need a true live-hub integration test should depend on the

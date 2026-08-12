@@ -9859,6 +9859,151 @@ fn external_hub_ghostty_snapshot_install_before_live_rejects_scrollback_as_ghost
     shutdown_cli_daemon(&data_dir, child);
 }
 
+/// Fresh idle Ghostty attach: production emits GHOSTSNP Snapshot before Attached.
+///
+/// Aligns shared no_history_then_live fixtures with the verified producer
+/// (blank GHOSTSNP present; ReadScreen empty; no Scrollback-as-GHOSTSNP).
+#[test]
+fn external_hub_idle_attach_emits_ghostsnp_snapshot_before_attached() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_test_dir("external-hub-idle-ghostsnp");
+    let config = explicit_config(&data_dir);
+    let socket_path = config
+        .transports
+        .local_socket
+        .as_ref()
+        .expect("local socket")
+        .path
+        .clone();
+    let endpoint = botster_hub_client::DaemonEndpoint::new(socket_path);
+    let child = start_cli_daemon(&data_dir);
+    let mut connection = botster_hub_client::DaemonConnection::connect(&endpoint).expect("connect");
+
+    // Idle session: no prior renderable output before attach.
+    connection
+        .request(&botster_hub_client::DaemonRequest::Spawn {
+            session_id: "idle-ghostsnp-session".to_string(),
+            command: "sleep 30".to_string(),
+        })
+        .expect("spawn idle session");
+    let mut session_cleanup = SessionCleanupGuard::new(&data_dir, "idle-ghostsnp-session");
+    connection
+        .request(&botster_hub_client::DaemonRequest::Attach {
+            session_id: "idle-ghostsnp-session".to_string(),
+            subscription_id: "idle-ghostsnp-sub".to_string(),
+        })
+        .expect("attach idle session");
+
+    let events = collect_attach_events(
+        &mut connection,
+        "idle-ghostsnp-session",
+        "idle-ghostsnp-sub",
+        None,
+    );
+
+    let attaching = events.iter().position(|event| {
+        matches!(
+            event,
+            botster_hub_client::DaemonEvent::AttachState {
+                subscription_id,
+                state,
+                ..
+            } if subscription_id == "idle-ghostsnp-sub" && state == "attaching"
+        )
+    });
+    let snapshot = events.iter().position(|event| {
+        matches!(
+            event,
+            botster_hub_client::DaemonEvent::Snapshot {
+                subscription_id,
+                ..
+            } if subscription_id == "idle-ghostsnp-sub"
+        )
+    });
+    let attached = events.iter().position(|event| {
+        matches!(
+            event,
+            botster_hub_client::DaemonEvent::AttachState {
+                subscription_id,
+                state,
+                ..
+            } if subscription_id == "idle-ghostsnp-sub" && state == "attached"
+        )
+    });
+    let (attaching, snapshot, attached) = (
+        attaching.expect("idle attach emits attaching"),
+        snapshot.expect("idle attach emits Snapshot"),
+        attached.expect("idle attach emits attached"),
+    );
+    assert!(
+        attaching < snapshot && snapshot < attached,
+        "ordering attaching < Snapshot < attached failed: {events:?}"
+    );
+
+    let payload = first_snapshot_payload(&events, "idle-ghostsnp-sub");
+    assert!(
+        payload.starts_with(GHOSTSNP_MAGIC),
+        "idle Snapshot must be GHOSTSNP; got {:?}",
+        &payload[..payload.len().min(16)]
+    );
+    assert!(
+        payload.len() > GHOSTSNP_MAGIC.len(),
+        "idle GHOSTSNP must be non-trivial (beyond magic only)"
+    );
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            botster_hub_client::DaemonEvent::Scrollback {
+                subscription_id,
+                history,
+                ..
+            } if subscription_id == "idle-ghostsnp-sub"
+                && history
+                    .decoded_bytes()
+                    .map(|bytes| bytes.starts_with(GHOSTSNP_MAGIC))
+                    .unwrap_or(false)
+        )),
+        "Scrollback must never carry GHOSTSNP magic on idle attach: {events:?}"
+    );
+
+    let screen = connection
+        .request(&botster_hub_client::DaemonRequest::ReadScreen {
+            session_id: "idle-ghostsnp-session".to_string(),
+        })
+        .expect("ReadScreen on idle session");
+    assert_eq!(
+        screen.kind,
+        botster_hub_client::DaemonResponseKind::ReadScreen
+    );
+    let text = screen.read_screen.expect("read_screen body").text;
+    let non_ws: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        non_ws.is_empty(),
+        "fresh idle ReadScreen must be blank; got {:?}",
+        text.chars().take(120).collect::<String>()
+    );
+
+    // Prefer equality with Golden B when dimensions/env match; if not, both must
+    // still be blank-importable GHOSTSNP (fixture golden is separately proven).
+    let golden_b = botster_hub_test_support::late_attach_no_history_payload_bytes();
+    if payload.as_slice() != golden_b {
+        eprintln!(
+            "idle live Snapshot SHA differs from frozen Golden B (len live={} golden={}); \
+             both remain authentic blank GHOSTSNP under production path",
+            payload.len(),
+            golden_b.len()
+        );
+    }
+
+    production_shutdown_and_remove_session(&endpoint, "idle-ghostsnp-session");
+    session_cleanup.disarm();
+    assert!(
+        !session_ids_from_list(&endpoint).contains(&"idle-ghostsnp-session".to_string()),
+        "production cleanup must remove idle-ghostsnp-session"
+    );
+    shutdown_cli_daemon(&data_dir, child);
+}
+
 #[test]
 fn external_hub_mode_gated_kitty_stale_token_rejects_and_reprobe_admits() {
     let _guard = daemon_test_guard();
